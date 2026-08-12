@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · RoPE 旋转位置编码</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · RoPE 旋转位置编码</h1>
+  <p class="subtitle">用旋转把相对位置编码进 q/k —— 完整推导内积只依赖相对距离，手写 rotate_half，理解长度外推的来龙去脉</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">复数与旋转、缩放点积注意力（C1）、三角恒等式</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_rope.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Su 2021 (RoFormer)、Chen 2023 (PI)、Peng 2023 (YaRN)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么需要位置编码</a></li>
+      <li><a href="#idea">核心思想：旋转而非相加</a></li>
+      <li><a href="#math">数学推导：内积只依赖相对距离</a></li>
+      <li><a href="#multi">多维推广与频率谱</a></li>
+      <li><a href="#impl">高效实现：rotate_half</a></li>
+      <li><a href="#extra">长度外推：PI 与 NTK</a></li>
+      <li><a href="#decay">远程衰减性质</a></li>
+      <li><a href="#interop">与 GQA/MLA/多模态的交互</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么需要位置编码</h2>
+  <p>Transformer 的自注意力是<strong>置换等变（permutation-equivariant）</strong>的：如果你打乱输入 token 的顺序，注意力的输出也只是相应地被打乱——它<em>根本看不见顺序</em>。把 <code>[狗, 咬, 人]</code> 重排成 <code>[人, 咬, 狗]</code>，纯注意力会给出语义等价的表示，因为 <code>softmax(QK^T)V</code> 里没有任何一项依赖“谁在第几位”。可是语言里顺序是核心信息（<code>狗咬人</code> ≠ <code>人咬狗</code>），所以必须<strong>额外把位置信息注入模型</strong>——这是一切位置编码方案的共同出发点。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>位置编码就是给模型一块<strong>时钟</strong>，让它知道每个词在第几位。但难点不是<em>怎么写个时钟</em>——给每个位置一个编号谁都会——而是<em>让模型容易读出两个词的相对距离</em>，并且换一个训练时没见过的、更长的序列时，这块时钟还得准。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，我们希望注意力分数 <code>⟨q_m, k_n⟩</code> 是相对距离 <code>m−n</code> 的函数（平移不变），而非绝对位置 <code>m, n</code> 各自的函数。绝对位置编码不保证这一点——它把 <code>m</code> 的信息和 <code>n</code> 的信息分别塞进 query、key，相对关系要靠模型从绝对值里自己<em>减</em>出来。RoPE 用一个优雅的构造把“相对”直接焊进内积。</p></div>
+  </div>  <p>为什么“相对”这么重要？因为语言的统计规律大体是<strong>平移不变</strong>的：一个动词与它前面三个位置的主语的关系，不该因为这句话出现在文档的第 10 个词还是第 1000 个词而改变。把这种先验直接写进架构（而不是指望模型从数据里学出来），既省样本、又天然支持外推到更长的序列。这正是 RoPE 相比绝对位置编码的根本优势。</p>  <h3>两条历史路线</h3>  <p>在 RoPE 之前，位置信息主要有两种注入方式，各有硬伤：</p>  <table>
+    <thead><tr><th>方案</th><th>做法</th><th>问题</th></tr></thead>
+    <tbody>
+      <tr><td>绝对正弦 (2017)</td><td>把 sin/cos 位置向量加到 embedding 上</td><td>相对关系要模型自己从绝对值里学；外推差</td></tr>
+      <tr><td>可学习绝对位置</td><td>每个位置一个可训练向量</td><td>训练长度之外完全无定义，根本不能外推</td></tr>
+      <tr><td>相对位置偏置 (T5/ALiBi)</td><td>在 attention 分数上加距离相关的偏置项</td><td>需改注意力实现；与线性注意力/某些核不易兼容</td></tr>
+      <tr><td><strong>RoPE (2021)</strong></td><td>把 q/k 按位置<strong>旋转</strong>一个角度</td><td>几乎无缺点，迅速成为事实标准</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>学完本模块你应当能回答：<strong>为什么 Llama 用 RoPE 而不是绝对位置编码？base 这个旋钮到底在调什么？为什么把 base 从 10000 调到 500000 就能支持更长上下文？</strong>——并且能在 numpy 里把 RoPE 与它的两种外推修法都实现出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="idea"><span class="num">2</span>核心思想：旋转而非相加</h2>
+  <p>RoPE 的一句话总结：<strong>不要把位置加到向量上，而是把向量旋转一个正比于位置的角度</strong>。位置 <code>m</code> 越大，旋转越多。这个“旋转而非相加”的转换，正是让内积自动只依赖相对距离的关键——一个看似微小的改动，却把“相对位置”从“模型要费力学的东西”变成了“架构免费送的恒等式”。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>想象每个 query/key 都是钟面上的一根指针。位置 <code>m</code> 越大，指针转得越多。两根指针的<strong>夹角</strong>只取决于它们位置之<strong>差</strong> <code>m−n</code>——这正是我们想要的相对位置！而内积 = <code>|q||k|cos(夹角)</code>，于是 <code>⟨q_m, k_n⟩</code> 自动只依赖 <code>m−n</code>，绝对位置在旋转中相互抵消。把“相加”换成“旋转”，本质是把信息编码进<em>相位</em>而非<em>幅值</em>，而相位差天然就是相对量。</p>
+  </div>  <p>为什么旋转能做到、相加做不到？因为加法把绝对位置 <code>m</code> 的信息和向量内容<em>混在了一起</em>（<code>x+p_m</code>），内积展开后会出现 <code>p_m·p_n</code> 这类只依赖绝对位置的交叉项，怎么也消不掉；而旋转把位置信息放进一个<strong>正交变换</strong>里，两个旋转在内积里以<em>逆</em>的形式相遇（<code>R_m^T R_n = R_{n−m}</code>），绝对部分自然约掉、只剩相对部分。这就是“旋转”相对“相加”的结构性优势。</p>  <p>把一个 <code>d</code> 维向量两两配对成 <code>d/2</code> 个 2D 平面，每个平面用一个不同的频率独立旋转。低维用高频（指针转得快、分辨近距离），高维用低频（转得慢、覆盖远距离），叠加起来就是一座<strong>多尺度的相对位置时钟</strong>。下面把这套构造从 2D 情形开始严格推出来——你会看到整个证明只需要一行复数运算。</p>  <p>还要先记住一个容易忽略的设计点：RoPE<strong>只作用在 Q 和 K 上，不作用在 V 上</strong>。原因是我们想改变的是<em>注意力分数如何依赖位置</em>（分数由 <code>Q·K</code> 决定），而 V 只是被加权求和的“内容”，给它旋转既无必要也会破坏内容本身。这一点在实现时极易写错——若不慎给 V 也加了 RoPE，模型仍能训练但质量会下降且行为诡异，是一个典型的“静默 bug”，务必记牢。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="math"><span class="num">3</span>数学推导：内积只依赖相对距离</h2>
+  <h3>2D 情形：一个旋转就够了</h3>  <p>取一对坐标 <code>(x1, x2)</code>，在位置 <code>m</code> 处旋转角度 <code>mθ</code>，就是乘一个标准的 2×2 旋转矩阵：</p>  <div class="math-block">\[R(m\theta)\begin{pmatrix}x_1\\x_2\end{pmatrix}=\begin{pmatrix}\cos m\theta & -\sin m\theta\\ \sin m\theta & \cos m\theta\end{pmatrix}\begin{pmatrix}x_1\\x_2\end{pmatrix}\]</div>  <p>旋转矩阵是<strong>正交</strong>的（行列式为 1、保持长度与夹角），这保证了 RoPE 不改变向量的模长，只改变方向——它给向量盖了一个“位置时间戳”，却不放大或缩小它的尺度。这一点很重要：位置编码不该悄悄改变激活的能量，否则会干扰后续的归一化与 softmax。</p>  <h3>复数视角让证明变得透明</h3>  <p>把 <code>(x1, x2)</code> 看成复数 <code>z = x1 + i·x2</code>，那么旋转角度 <code>mθ</code> 就是乘上 <code>e^{imθ}</code>（欧拉公式：<code>e^{iα}=cosα+i·sinα</code> 正好是旋转矩阵）。设 query 复数 <code>q</code> 在位置 <code>m</code>、key 复数 <code>k</code> 在位置 <code>n</code>，它们旋转后的内积（复数内积取实部）是：</p>  <div class="math-block">\[\langle R_m q,\;R_n k\rangle = \mathrm{Re}\big[(e^{im\theta}q)\overline{(e^{in\theta}k)}\big]=\mathrm{Re}\big[q\bar k\, e^{i(m-n)\theta}\big]\]</div>  <div class="callout intuition"><span class="label">关键一步</span>
+    <p>看最后一项：<strong>只剩 m−n</strong>！绝对位置 <code>m</code>、<code>n</code> 在共轭相乘 <code>e^{imθ}·e^{−inθ}=e^{i(m−n)θ}</code> 时精确抵消，内积严格只依赖相对距离。这就是 RoPE 的全部魔法，一行复数运算讲完——没有近似、没有“靠模型学”，是一个<em>恒等式</em>。</p>
+  </div>  <p>这一步的深刻之处在于：相对位置不变性不是 RoPE 训练出来的某种<em>倾向</em>，而是它的<strong>数学结构强制保证</strong>的<em>性质</em>。无论权重怎么变、训练到哪一步，只要用了 RoPE，内积就只依赖相对距离。把这个恒等式与“可学习绝对位置全靠模型自己悟”对比，就明白 RoPE 为什么样本效率更高、外推更自然——它把正确的先验<em>焊死</em>在了架构里。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="multi"><span class="num">4</span>多维推广与频率谱</h2>
+  <p>二维讲清了，推广到 <code>d</code> 维就是把向量配成 <code>d/2</code> 个 2D 子空间，第 <code>i</code> 对用一个专属频率：</p>  <div class="math-block">\[\theta_i = \text{base}^{-2i/d},\qquad i=0,1,\dots,d/2-1,\quad \text{base}=10000\]</div>  <p>于是位置 <code>m</code> 处的整体旋转是一个<strong>分块对角矩阵</strong> <code>diag(R(mθ_0), R(mθ_1), …, R(mθ_{d/2−1}))</code>——每个 2×2 块独立旋转、互不干扰。不同维度对用不同角速度，构成多尺度的相对位置时钟：</p>  <table>
+    <thead><tr><th>维度对 i</th><th>频率 θ_i</th><th>波长 2π/θ_i</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td>小 i（前面的维度）</td><td>高（≈1）</td><td>短（几个 token）</td><td>分辨<em>近距离</em>细节</td></tr>
+      <tr><td>大 i（后面的维度）</td><td>低（≈1e-4）</td><td>长（上万 token）</td><td>编码<em>远距离</em>粗略位置</td></tr>
+    </tbody>
+  </table>  <div class="ascii">d 维向量配成 d/2 个 2D 平面，各转各的频率（一座多尺度时钟）：
+  维度对 0   ↻↻↻↻↻↻↻↻   高频 θ≈1        波长 ~几个 token   分辨“相邻”
+  维度对 1   ↻ ↻ ↻ ↻     ...
+  维度对 2   ↻   ↻   ↻    频率递减
+     ⋮          ⋮
+  维度对 d/2-1 ↻ . . . . . 低频 θ≈1e-4   波长 ~上万 token   定位“全文”
+  位置 m 的整体旋转 = diag(R(mθ_0), R(mθ_1), …, R(mθ_{d/2-1}))</div>  <div class="callout intuition"><span class="label"></span>
+    <p>和傅里叶变换、和钟表完全一样：秒针转得快（高频、分辨秒级），时针转得慢（低频、覆盖 12 小时）。多个频率叠加，模型既能精确分辨相邻的两个词，又能感知段落级、篇章级的远距离结构。<strong>base 越大，最低频越低、最长波长越长</strong>——这就是 base 这个旋钮的物理含义，也是长上下文外推的关键所在。</p>
+  </div>  <p>这里埋一个贯穿全课的伏笔：<code>θ_i = base^{−2i/d}</code> 这条频率公式，连同 base，几乎决定了 RoPE 的一切行为。最高频（<code>i=0</code>，θ≈1）的波长只有几个 token，负责局部分辨；最低频（<code>i=d/2−1</code>）的波长可达上万 token，负责远程定位。一旦推理序列比“最长波长”还长，最低频也开始<em>卷绕</em>（相位绕过 2π 回到起点），位置就不再单调可分——这正是下一节“长度外推”要解决的病根。</p>  <p>从信息论角度也能体会这套设计的精妙：用单一频率，要么分辨率高但量程短，要么量程长但分辨率粗；而<strong>几何级数排布的多频率</strong>让 RoPE 在对数尺度上均匀覆盖了从“相邻”到“全文”的所有距离尺度，用 <code>d/2</code> 个频率换来了跨数量级的位置表达力。这与 SSM 里 HiPPO 用不同衰减率的状态通道覆盖多时间尺度（模块 05）异曲同工——都是“多尺度”这一思想的不同化身。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="impl"><span class="num">5</span>高效实现：rotate_half</h2>
+  <p>理论上每对维度做一次 2D 旋转，但直接构造分块对角旋转矩阵既慢又费内存。工程上用 <strong>rotate_half</strong> 技巧（GPT-NeoX / Llama 约定）：把维度劈成前后两半，预计算好 <code>cos</code>、<code>sin</code> 表，旋转就退化成逐元素的乘加。</p>  <pre><code>def rotate_half(x):          # x: (..., d)
+    x1, x2 = x[..., :d//2], x[..., d//2:]
+    return concat(-x2, x1)   # 把后半取负搬到前面
+
+def apply_rope(x, cos, sin): # cos/sin 形状 (T, d)，已 broadcast 好
+    return x * cos + rotate_half(x) * sin</code></pre>  <p>为什么这等价于旋转？展开看单个分量：对配对的两维 <code>(a, b)</code>，<code>apply_rope</code> 给出 <code>a·cosθ − b·sinθ</code> 和 <code>b·cosθ + a·sinθ</code>——正是 2D 旋转的两个输出。<code>rotate_half</code> 的“后半取负搬到前面”恰好实现了 <code>−sin</code> 那一项。全程只有逐元素乘和加，没有矩阵乘、没有分支，可以完美融入现有的 attention kernel（包括 FlashAttention 的融合内核）。</p>  <div class="callout warn"><span class="label"></span>
+    <p>半旋转（GPT-NeoX/Llama）与<strong>交错式（interleaved）</strong>是 RoPE 的两种等价实现：半旋转把维度分前后两半配对 <code>(i, i+d/2)</code>，交错式配对相邻维 <code>(2i, 2i+1)</code>。两者数值上等价，但<strong>权重排布不同</strong>。迁移权重、复现论文时务必先确认对方用的是哪种约定。</p>
+  </div>  <div class="callout danger"><span class="label">致命陷阱</span>
+    <p>这条约定不一致是一个<strong>静默灾难</strong>：把一个交错式训练的 checkpoint 直接喂给半旋转实现（或反过来），代码<em>不会报错</em>——形状全对、能正常前向、loss 也能算出来，只是模型输出彻底是乱码、或在长序列上莫名其妙地崩。因为错的是<em>位置维度怎么配对</em>，属于语义错误而非类型错误，任何 shape 检查都拦不住。<strong>它是 RoPE 实现里最隐蔽、最折磨人的 bug 之一</strong>：唯一的防线是把模块配套 notebook 里那组不变量测试（位置 0 不旋转、保模长、相对距离相同则内积相等、两种实现数值一致）当成移植权重后的强制自检，跑过了再信。</p>
+  </div>  <p>用一个最小例子把“cos/sin 表”落到实处：取 <code>d=4</code>（两对维度），频率 <code>θ_0=1, θ_1=0.01</code>。在位置 <code>m=2</code> 处，第 0 对转 <code>2·1=2 rad</code>、第 1 对转 <code>2·0.01=0.02 rad</code>。于是 <code>cos[2] = [cos2, cos0.02, cos2, cos0.02]</code>、<code>sin[2] = [sin2, sin0.02, sin2, sin0.02]</code>（半旋转约定下前后两半重复同一组角）。把这两张表预计算好缓存起来，所有 token、所有层都复用——这也是为什么 RoPE 几乎不增加计算与显存开销。</p>  <p>配套 notebook 会从零实现 <code>rotate_half</code> 与显式的交错式旋转（练习 1），并<strong>数值验证两者一致</strong>，同时确认 RoPE 保持模长、位置 0 不旋转、相对距离相同则内积相等等性质——把这些不变量都写成 <code>assert</code>，正是确认实现无误的标准手段，也是你日后改任何位置编码时的第一道防线。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="extra"><span class="num">6</span>长度外推：PI 与 NTK</h2>
+  <p>RoPE 的相对位置不变性只在<strong>训练见过的长度内</strong>可靠。当推理序列远长于训练长度，模型会遇到<em>训练时从未出现过的旋转角度</em>：最低频维度的相位卷绕到一个全新的区间，落进“数据空洞”，性能骤降甚至胡言乱语。这就是<strong>长度外推（length extrapolation）</strong>问题，也是长上下文模型工程的核心战场。</p>  <p>根因要从频率谱看：训练长度 <code>L_train</code> 决定了每个维度在训练中扫过的最大相位 <code>(L_train−1)·θ_i</code>。高频维度早早就转过很多圈（它们的相位本就在 [0, 2π) 内反复，外推时没新东西）；而低频维度在训练里可能连一圈都没转完，外推到 <code>L_test ≫ L_train</code> 时，它们的相位第一次进入“未见区”——模型对这些角度毫无经验。所以外推的本质是<strong>如何安顿这些低频维度</strong>。</p>  <h3>两个直觉性的修法（C25 详解）</h3>  <ul>
+    <li><strong>位置插值 PI（Chen 2023）</strong>：把位置 <code>m</code> 缩放成 <code>m·L_train/L_test</code>，让最大角度落回训练区间。代价：所有频率被等比压缩，高频分辨率随之下降（相邻词变得不那么可分），需要少量微调补偿。</li>
+    <li><strong>NTK-aware（bloc97 2023）</strong>：不压位置，而是<em>不均匀地放大 base</em>——高频几乎不动（保住局部分辨率）、低频拉长（覆盖更远）。YaRN 在此基础上进一步分频段处理（“ramp”），是当前长上下文外推的主流。</li>
+  </ul>  <table>
+    <thead><tr><th>外推方法</th><th>动了什么</th><th>对高频</th><th>对低频</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td>直接外推</td><td>什么都不改</td><td>正常</td><td>进入未见相位区</td><td>性能骤降</td></tr>
+      <tr><td>PI 位置插值</td><td>位置 m → m·L_train/L_test</td><td>被压缩、分辨率下降</td><td>落回训练区间</td><td>高频变糊，需微调</td></tr>
+      <tr><td>NTK-aware</td><td>不均匀放大 base</td><td>几乎不动</td><td>波长拉长、覆盖更远</td><td>经验公式，无微调即可用</td></tr>
+      <tr><td>YaRN</td><td>分频段（ramp）混合上两者</td><td>保留</td><td>拉长</td><td>当前主流，需少量微调</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>把 base 从 10000 调到 500000（Llama-3 的做法）本质就是在改 RoPE 的频率谱，让最长波长放大约 50 倍。<strong>理解了本模块的频率/波长关系，C25 的 PI、NTK、YaRN 就是水到渠成</strong>——它们都只是在同一条 <code>θ_i=base^{−2i/d}</code> 公式上做手脚（要么动 <code>m</code>、要么动 <code>base</code>）。模块 01 练习 2、3 会让你亲手实现 PI 与 NTK 缩放，并验证它们对频率谱的不同影响。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="decay"><span class="num">7</span>远程衰减性质</h2>
+  <p>RoPE 还自带一个常被忽视的好性质：<strong>远程衰减（long-range decay）</strong>。如果把随机 q、k 在相对距离 <code>m−n</code> 上的内积<em>期望</em>画出来，会看到它随距离增大而震荡衰减——也就是说，模型天然对距离远的 token 赋予较低的注意力先验，无需额外学习。这是一个免费的归纳偏置：架构本身就倾向“近处更相关”。</p>  <p>这条性质从哪来？把多频率项加起来看：近距离时各频率的旋转都还“对得上”，每一项的相位差都小、余弦都接近 1，内积大；距离一拉开，不同频率以不同速度旋转，相位错开、有正有负，求和时相互抵消（相消干涉），期望内积便震荡着衰减下去。这与信号处理里“多频率正弦叠加在远处去相关”、与<span class="term">Riemann–Lebesgue</span> 引理（高频成分的积分趋于零）是同一回事。</p>  <p>可以用一个更具体的类比理解：把每个频率想成一个旋转的单位向量，近处它们大致同向（合向量长），远处它们指向四面八方（合向量短）。<strong>频率谱越宽（base 越大、维度越多），这种远处去相关越平滑</strong>——这也从另一个角度解释了 base 的作用：它不只决定能表示多远，还塑造了衰减曲线的形状。</p>  <div class="ascii">期望内积 E[⟨q_m, k_n⟩]  （随相对距离 |m-n|）
+  高 │█
+     │█▆
+     │█ ▅▃     ▂        ← 震荡衰减：近处高、远处趋零并上下摆动
+     │█   ▂ ▃▁  ▁ ▂  ▁ ▁ ▂ ▁
+   0 └──────────────────────────────►  距离
+        近          中           远</div>  <p>配套 notebook 会用<strong>蒙特卡洛</strong>把这条衰减曲线真正画出来：对大量随机 q、k，在每个距离上求内积均值，你会亲眼看到“近处高、远处震荡衰减”的形状（上图是它的示意）。这也解释了为什么 RoPE 模型在没有任何额外机制时，就比绝对位置编码更不容易“把注意力发散到无关的遥远 token”——衰减先验帮它默认聚焦局部。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="interop"><span class="num">8</span>与 GQA/MLA/多模态的交互</h2>
+  <p>RoPE 几乎和所有现代组件兼容，但接口处有不少要小心的细节，正是“架构组件互相牵制”的典型——理解这些交互，能帮你预判“换了一个组件，还要连带改什么”：</p>  <ul>
+    <li><strong>与 GQA（模块 02）</strong>：GQA 共享 K 头，直接对每个共享的 K 头加 RoPE 即可，无额外难点——RoPE 与 GQA 完全正交，各管各的。</li>
+    <li><strong>与 MLA（模块 02）</strong>：DeepSeek 的 MLA 把 K/V 压成低秩潜向量缓存，而 RoPE 必须加在“展开后的 K”上、又没法事先加进压缩的潜向量里（旋转与低秩投影不可交换），于是 DeepSeek 设计了<strong>解耦 RoPE</strong>——单独留几维专门承载位置（加 RoPE、不压缩），其余维度走低秩压缩（不加 RoPE），两部分拼接。模块 02 第 7 节展开。</li>
+    <li><strong>Partial RoPE</strong>：只对一部分维度加旋转、其余保留无旋转，部分模型用它在“位置敏感”与“内容敏感”之间取平衡——无旋转的维度可以专注表达与位置无关的语义。</li>
+    <li><strong>多模态</strong>：图像/视频的位置是 2D/3D 的，于是出现 axial RoPE（行、列各一套频率）、以及视频里把时间/高/宽分解的时空 RoPE。一维 RoPE 的“一座时钟”要扩成“几座正交的时钟”。</li>
+  </ul>  <p>再举一个实践中极易踩坑的交互：<strong>KV cache 与 RoPE 的施加时机</strong>。推理时缓存的应当是<em>已经加过 RoPE 的 K</em>（否则每步都要重算旋转），但这又意味着如果你想做 PI/NTK 这类“改变位置映射”的外推，必须在缓存<em>之前</em>就决定好缩放——缓存里存的是带了特定相位的 K，事后再改 base 就对不上了。框架里这类“何时加 RoPE、缓存里存什么”的约定，是长上下文推理 bug 的高发区。</p>  <p>这些交互的共同教训是：位置编码不是一个可以孤立设计的模块。一旦你改了注意力的缓存方式（MLA）、改了序列的维度结构（多模态）、或改了推理时的外推策略（PI/NTK），就得重新回答“位置信息该接在哪、以什么形式接、何时接”。把 RoPE 学透——它的频率谱、它的施加位置、它的不变量——是理解后续所有变体的地基。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>RoPE 是少数“一经提出就几乎统治了整个领域”的设计——从 Llama 到 Qwen 到 DeepSeek 几乎无一例外——但正因为它如此基础，围绕它的开放问题反而格外重要，也格外活跃：</p>  <ul>
+    <li>RoPE 的<em>最优 base</em>与上下文长度的关系仍主要是经验调参。“base 大约要让最长波长覆盖上下文”只是个粗略法则，为什么某个具体的 base 在某个长度上最好、外推到多远开始崩，缺乏可预测的理论。</li>
+    <li>极长上下文下，高频维度几乎无用（它们的相位早已反复卷绕、对超长距离不提供可分辨的信息），低频维度又最稀缺。是否应当<em>自适应地丢弃高频、把表达力重分配给低频</em>？这与“每个维度的边际位置效用”有关，YaRN 的分频段处理是初步尝试。</li>
+    <li>RoPE 与<em>注意力 sink</em>、长度泛化、训练时见到的位置分布之间的相互作用，是当前长上下文研究的热点。为什么有些模型外推好、有些差，为什么训练时混入长样本能帮外推，尚无完整解释。</li>
+    <li>RoPE 与<em>线性注意力 / SSM</em>（模块 05）的结合——这些架构没有显式的 <code>QK^T</code> 分数矩阵，如何在其中保留“相对位置”这一先验，是一个正在探索的方向（部分线性注意力工作借鉴了 RoPE 的相位思想）。</li>
+  </ul>  <p>一个更宏观的视角：RoPE 的成功揭示了一条方法论——<strong>把正确的归纳偏置直接写进架构，往往比指望模型从数据里学出来更高效</strong>。相对位置不变性、远程衰减，这些本可以“靠大数据 + 大模型硬学”的性质，RoPE 用几行复数运算就免费给了。这条思路在本课反复出现：RMSNorm 把尺度不变性写进归一化、MoE 把稀疏性写进前馈、SSM 把多时间尺度记忆写进状态矩阵。学每一个组件时，都不妨问一句：<em>它把什么先验焊进了架构？</em></p>  <div class="callout paper"><span class="label"></span>
+    <p>必读：RoFormer（RoPE 原始推导）、GPT-NeoX（rotate_half 工程实现）、Position Interpolation（PI）、YaRN（分频段外推）。它们各自“解决了什么问题、为何值得读”见 <code>references.md</code> 的位置编码一节。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">课程总览与环境</div></a>
+    <a class="next" href="../02_attention_variants/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">注意力变体 MHA→GQA→MLA</div></a>
+  </div>
+
+</div>
+</body>
+</html>

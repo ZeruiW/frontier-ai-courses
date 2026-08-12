@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · Kubernetes 编排</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · Kubernetes 编排</h1>
+  <p class="subtitle">声明式 + 水平触发控制循环 · Pod→Service→Ingress 对象模型 · 三种探针的时序契约 · GPU 资源模型的盲区 · 装箱调度与碎片</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–02、进程与资源限制的基本概念</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_kubernetes.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Kubernetes 官方文档（Pod Lifecycle / Scheduling / Resource Management）、Borg 论文、kube-scheduler 源码结构</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#idea">K8s 的唯一核心思想：声明式 + 控制循环</a></li>
+      <li><a href="#objects">对象模型：从 Pod 到 Ingress 的六层</a></li>
+      <li><a href="#probes">探针：三种，各管一段生命周期</a></li>
+      <li><a href="#resources">资源模型：requests / limits 与 GPU 的特殊性</a></li>
+      <li><a href="#scheduling">调度：装箱、亲和与碎片</a></li>
+      <li><a href="#stateful">有状态与配置：什么时候 Deployment 不够用</a></li>
+      <li><a href="#ledger">算一笔账：副本数、装箱率与碎片</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="idea"><span class="num">1</span>K8s 的唯一核心思想：声明式 + 控制循环</h2>
+  <p>Kubernetes 的表面复杂度是出了名的——几十种资源类型、上百个字段、无穷的 CRD。但它的<strong>核心思想只有一个</strong>，而且你在模块 00 已经写过它了：</p>  <div class="ascii">        ┌──────────────────────────────────────────────┐
+        │  while True:                                 │
+        │      desired = read_spec()      # 你想要什么  │
+        │      current = observe_world()  # 现在是什么  │
+        │      act(diff(desired, current))# 补上差距    │
+        └──────────────────────────────────────────────┘
+                        这就是 reconcile 循环。
+
+K8s = 一堆这样的循环，各管一件事，通过一个共享的状态存储（etcd）互相协作。
+
+  Deployment 控制器  → 保证「ReplicaSet 的副本数 = 我 spec 里写的」
+  ReplicaSet 控制器  → 保证「Pod 数量 = 我 spec 里写的」
+  调度器 scheduler   → 保证「每个 Pod 都被分配到一个节点」
+  kubelet            → 保证「本节点上该跑的容器都在跑」
+  端点控制器         → 保证「Service 的端点列表 = 所有 ready 的 Pod」
+  HPA                → 保证「Deployment 的副本数 = 按指标算出来的数」（模块 04）</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这个设计如此强大？因为<strong>它把「怎么做」从你的脑子里挪到了系统里</strong>。命令式世界里，「把服务从 3 个副本升级到新版本」是一串你必须亲自编排的步骤（起一个新的、等它就绪、摘掉一个旧的、再起一个……），中途任何一步失败你都得写恢复逻辑。声明式世界里你只说「我要 3 个副本、镜像是 v2」，剩下的是控制器的事——而且它<em>持续</em>负责，机器宕了它补，人误删了它补。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说，控制器是一个<span class="term">幂等</span>的、<span class="term">水平触发</span>（level-triggered）的函数。水平触发意味着它<strong>只看当前状态，不看事件历史</strong>——这是它能容忍消息丢失、重复、乱序的根本原因。相比之下，边沿触发（edge-triggered，「收到创建事件就创建」）的系统一旦丢一条消息就永久错位。K8s 所有控制器都是水平触发的，所以「重放一遍」永远安全。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>带走这一条，你就能自己推导出 K8s 的大部分行为：<strong>凡是你观察到的现象，都应该能被解释成「某个控制器在把现实拽向它的期望」</strong>。Pod 被删了又出现？ReplicaSet 控制器干的。改了 Pod 的镜像结果被改回去了？Deployment 控制器干的（它管的是模板，你改实例没用）。删了 Deployment 但 Pod 还在？孤儿 Pod 没了 owner，没人管它了。<em>遇到诡异行为，先问「是哪个循环在动」</em>。</p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>这个设计也有它的代价，必须知道：<strong>一切都是最终一致的（eventually consistent）</strong>。你 <code>kubectl apply</code> 之后，「Deployment 已更新」不等于「Pod 已重建」不等于「Service 端点已更新」不等于「Ingress 已把流量切过去」。每一跳都是一个独立循环，各有各的延迟（几百毫秒到几秒）。模块 01 讲的优雅停机要 <code>preStop: sleep 5</code>，根源就在这里——<em>端点摘除的传播比你想象的慢</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="objects"><span class="num">2</span>对象模型：从 Pod 到 Ingress 的六层</h2>
+  <p>K8s 的对象很多，但一个无状态推理服务只需要理解六个，而且它们是层层包裹的关系。</p>  <div class="ascii">外部用户
+   │  https://api.example.com/v1/chat/completions
+   ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Ingress / Gateway      七层路由：域名、路径、TLS、限流       │
+├─────────────────────────────────────────────────────────────┤
+│ Service (ClusterIP)    稳定的虚拟 IP + DNS 名；负载均衡      │
+│   ↳ 端点列表 = 所有 **ready** 的 Pod IP  ← readiness 在这生效 │
+├─────────────────────────────────────────────────────────────┤
+│ Deployment             管版本与滚动更新策略（模块 04）        │
+│   ↳ ReplicaSet(v2)     管「副本数 = N」                      │
+│       ↳ ReplicaSet(v1) 旧版本，滚动期间副本数递减到 0        │
+├─────────────────────────────────────────────────────────────┤
+│ Pod                    调度与资源的最小单位；共享网络命名空间 │
+│   ├─ initContainer     顺序跑完才启动主容器（拉权重就在这）   │
+│   ├─ container: server 你的推理服务                          │
+│   └─ container: sidecar 日志/指标/代理（可选）               │
+├─────────────────────────────────────────────────────────────┤
+│ Node                   一台机器；kubelet 在上面执行           │
+└─────────────────────────────────────────────────────────────┘</div>  <table>
+    <thead><tr><th>对象</th><th>一句话职责</th><th>LLM 服务里的关键点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Pod</strong></td><td>一组共享网络与存储的容器，调度的最小单位</td><td>GPU 是 Pod 级申请；initContainer 是拉权重的标准位置</td></tr>
+      <tr><td><strong>ReplicaSet</strong></td><td>保证「有 N 个匹配标签的 Pod」</td><td>你几乎不直接操作它；滚动更新时会同时存在两个</td></tr>
+      <tr><td><strong>Deployment</strong></td><td>管理 ReplicaSet 的版本切换与滚动策略</td><td><code>maxSurge/maxUnavailable</code> 决定更新期间的容量曲线（模块 04）</td></tr>
+      <tr><td><strong>Service</strong></td><td>给一组 Pod 一个稳定的 IP/DNS，做四层负载均衡</td><td><strong>端点列表只包含 ready 的 Pod</strong>——这是 readiness 探针的全部意义</td></tr>
+      <tr><td><strong>Ingress / Gateway</strong></td><td>七层入口：域名、路径、TLS、超时、缓冲</td><td>SSE 必须在这里关缓冲、调大超时（模块 02）</td></tr>
+      <tr><td><strong>ConfigMap / Secret</strong></td><td>配置与密钥的外置载体</td><td>模型路径、限流额度放 ConfigMap；API key 放 Secret（且启用静态加密）</td></tr>
+    </tbody>
+  </table>  <p>有个概念上的坑值得点破：<strong>Service 不是一个进程，是一条规则</strong>。它没有实体，只是 kube-proxy（或 eBPF/IPVS）在每个节点上写下的一组转发规则，把「访问这个虚拟 IP」重写成「随机挑一个健康 Pod 的真实 IP」。理解这一点你就明白为什么 Service 的负载均衡是<em>连接级</em>而非<em>请求级</em>的——对 HTTP/1.1 短连接没问题，但对 <strong>HTTP/2 或长连接（SSE、gRPC）就会严重不均</strong>：一条连接建立后所有请求都打给同一个 Pod。</p>  <div class="callout danger"><span class="label">Service 的四层负载均衡骗过了很多人</span>
+    <p>这是 LLM 服务的第二个高频坑：<strong>用普通 Service 做 gRPC 或长连接 SSE 的负载均衡，会导致 Pod 负载严重倾斜</strong>。10 个客户端连上来，可能 8 条连接落到同一个 Pod，其余 Pod 闲着。解决办法：①用支持七层的 Ingress/Gateway（Envoy 系）做<em>请求级</em>负载均衡；②客户端侧做连接池 + 定期重连（<code>maxConnectionAge</code>）；③用服务网格。<em>只要你的服务是流式的，就必须处理这件事</em>——而它在压测（通常每个虚拟用户一条新连接）中往往看不出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="probes"><span class="num">3</span>探针：三种，各管一段生命周期</h2>
+  <p>模块 02 定义了 <code>/healthz</code> 与 <code>/ready</code> 的语义，这里讲它们如何被 kubelet 使用。K8s 有<strong>三种</strong>探针，很多人只知道两种，而漏掉的那种恰恰是 LLM 服务最需要的。</p>  <table>
+    <thead><tr><th>探针</th><th>失败后果</th><th>何时开始探</th><th>LLM 服务典型配置</th></tr></thead>
+    <tbody>
+      <tr><td><strong>startupProbe</strong></td><td>杀掉容器重建</td><td>容器启动后立刻，<strong>成功之前另外两个探针不生效</strong></td><td><code>failureThreshold: 60, periodSeconds: 10</code> → 给模型加载 10 分钟窗口</td></tr>
+      <tr><td><strong>livenessProbe</strong></td><td>杀掉容器重建</td><td>startupProbe 成功后</td><td><code>periodSeconds: 20, failureThreshold: 3</code>，只测事件循环</td></tr>
+      <tr><td><strong>readinessProbe</strong></td><td>从 Service 端点摘除（<strong>不重启</strong>）</td><td>startupProbe 成功后</td><td><code>periodSeconds: 5, failureThreshold: 2</code>，测权重+队列</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>startupProbe 是为「启动慢」的应用发明的</strong>，简直是为 LLM 量身定做。没有它，你会陷入两难：liveness 的 <code>initialDelaySeconds</code> 设短了，模型还在加载就被判定为死、杀掉重来，形成<em>重启死循环</em>（永远加载不完）；设长了（比如 600 秒），那么服务真的在运行期挂掉时，也要等 10 分钟才被发现。startupProbe 解开了这个结：<em>启动期用宽松的它，启动完切换到严格的 liveness</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>三者的时序契约是：<code>startupProbe</code> 成功（或未配置）之前，<code>liveness</code> 与 <code>readiness</code> 都不执行；成功之后 startupProbe 不再执行，另两个开始按各自周期运行。最坏启动容忍时间 = <code>failureThreshold × periodSeconds + initialDelaySeconds</code>。发现故障的最坏延迟 = <code>liveness.failureThreshold × liveness.periodSeconds</code>。<strong>这两个数字要分别对着「最慢的冷启动」和「可接受的故障发现时间」来定</strong>，而不是抄默认值。</p></div>
+  </div>  <pre><code># LLM 推理服务的探针配置（可直接用的骨架）
+startupProbe:                    # 给模型加载最多 10 分钟
+  httpGet: {path: /health, port: 8000}
+  periodSeconds: 10
+  failureThreshold: 60           # 60 × 10s = 600s 窗口
+livenessProbe:                   # 只测「进程是否卡死」，不测依赖
+  httpGet: {path: /health, port: 8000}
+  periodSeconds: 20
+  failureThreshold: 3            # 最坏 60s 发现进程假死
+readinessProbe:                  # 测「现在能否服务」，摘流量用
+  httpGet: {path: /ready, port: 8000}
+  periodSeconds: 5
+  failureThreshold: 2            # 最坏 10s 摘除
+  successThreshold: 1
+terminationGracePeriodSeconds: 180   # ← 必须 &gt; 最长一次生成的时间
+lifecycle:
+  preStop:
+    exec: {command: ["sh", "-c", "sleep 5"]}   # 等端点传播（模块 01）</code></pre>  <div class="callout warn"><span class="label"></span>
+    <p>探针配置有三个反复出现的错误。<strong>①探针超时太短</strong>：<code>timeoutSeconds</code> 默认只有 1 秒，而一个满载的 Python 服务在 GIL 争抢下可能 1.5 秒才响应健康检查 → 探针失败 → 被摘流量或重启 → <em>过载引发的重启风暴</em>。这是「越忙越挂」的经典正反馈。<strong>②liveness 和 readiness 指向同一个端点</strong>：过载时 readiness 该失败（摘流量、自我保护），但 liveness 跟着失败就会被重启，前功尽弃。<strong>③readiness 不检查队列深度</strong>：Pod 明明积压严重却仍在接流量，无法把压力反馈给负载均衡器。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="resources"><span class="num">4</span>资源模型：requests / limits 与 GPU 的特殊性</h2>
+  <p>这是 K8s 里概念最微妙、也最容易配错的部分。两个数字，语义完全不同：</p>  <table>
+    <thead><tr><th></th><th><code>requests</code></th><th><code>limits</code></th></tr></thead>
+    <tbody>
+      <tr><td>含义</td><td><strong>调度依据</strong>：节点必须有这么多可分配资源才放得下</td><td><strong>运行时上限</strong>：cgroup 强制执行</td></tr>
+      <tr><td>CPU 超了</td><td>—</td><td>被<strong>限流（throttle）</strong>，变慢但不死</td></tr>
+      <tr><td>内存超了</td><td>—</td><td>被 <strong>OOMKilled</strong>，直接杀</td></tr>
+      <tr><td>谁看它</td><td>kube-scheduler</td><td>kubelet / cgroup</td></tr>
+    </tbody>
+  </table>  <p>两者的关系决定了 Pod 的 <span class="term">QoS class</span>，而 QoS 决定了节点内存紧张时<strong>谁先被驱逐</strong>：</p>  <ul>
+    <li><strong>Guaranteed</strong>（requests == limits，且所有容器都设了）：最后被驱逐。<em>生产 LLM 服务应该都是这一档。</em></li>
+    <li><strong>Burstable</strong>（requests &lt; limits）：中间档。适合能容忍被限流的批处理。</li>
+    <li><strong>BestEffort</strong>（什么都不设）：<strong>第一个被杀</strong>。绝不要在生产用。</li>
+  </ul>  <h3>GPU 的三个特殊之处</h3>  <p>GPU 在 K8s 里不是普通资源，它有三条你必须知道的规则，否则配置会以诡异的方式失败：</p>  <table>
+    <thead><tr><th>规则</th><th>含义</th><th>后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 整数、不可超卖</strong></td><td><code>nvidia.com/gpu: 1</code>，不能写 <code>0.5</code></td><td>一张卡同时只服务一个 Pod（除非用 MIG/MPS/时间片）</td></tr>
+      <tr><td><strong>② requests 必须等于 limits</strong></td><td>K8s 对扩展资源（extended resource）强制此规则</td><td>GPU Pod 天然是 Guaranteed QoS</td></tr>
+      <tr><td><strong>③ 显存不由 K8s 管</strong></td><td>K8s 只数「几张卡」，不知道你用了多少 GB 显存</td><td>同卡多进程会互相 OOM；显存超限的表现是 CUDA OOM 而非 OOMKilled，K8s 完全看不见</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">K8s 看不见显存</span>
+    <p>规则 ③ 的后果值得展开：<strong>K8s 的资源模型对 GPU 显存是「盲」的</strong>。你在 Pod spec 里写 <code>nvidia.com/gpu: 1</code>，K8s 保证给你一整张卡，但它不知道你的 vLLM 把 <code>gpu_memory_utilization</code> 设成了 0.9 还是 0.5，也不会在你 OOM 时给出有意义的事件——你只会在容器日志里看到 <code>torch.cuda.OutOfMemoryError</code>，Pod 状态可能还是 <code>Running</code>（如果进程捕获了异常）或 <code>Error</code>。<em>显存规划必须在应用层做</em>：算清 权重 + 激活 + KV 缓存 的预算（C08/C24 的内容），把 <code>--gpu-memory-utilization</code> 显式设死，别指望 K8s 帮你兜底。</p>
+  </div>  <p>最后一个常被忽略的资源：<strong><code>ephemeral-storage</code></strong>。模型权重下载到 <code>emptyDir</code> 会占节点磁盘，不声明的话节点磁盘被打满会触发 <em>DiskPressure</em>，kubelet 开始驱逐 Pod——而且驱逐的往往不是罪魁祸首。<code>requests.ephemeral-storage: 200Gi</code> 应该和 GPU 一起声明。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="scheduling"><span class="num">5</span>调度：装箱、亲和与碎片</h2>
+  <p>调度器要回答一个简单的问题：<strong>这个 Pod 放哪台机器</strong>？它分两阶段做——先<span class="term">过滤（filter）</span>掉放不下的节点，再对剩下的<span class="term">打分（score）</span>选最高的。</p>  <div class="ascii">待调度 Pod: 需要 2 GPU, 16 CPU, 128Gi 内存
+
+  阶段一：过滤（硬约束，不满足直接淘汰）
+    节点A [8 GPU 空闲 4 | CPU 96 空闲 40]  ✓ 放得下
+    节点B [8 GPU 空闲 1 | CPU 96 空闲 80]  ✗ GPU 不够
+    节点C [8 GPU 空闲 6 | CPU 96 空闲 10]  ✗ CPU 不够
+    节点D [8 GPU 空闲 8 | CPU 96 空闲 96]  ✓ 放得下
+    还要过：nodeSelector / taint-toleration / 亲和性 / 拓扑约束 / 端口冲突
+
+  阶段二：打分（软偏好，选分最高的）
+    LeastAllocated（默认，偏向空的）  → 选 D  ← 均衡负载，但制造碎片
+    MostAllocated（装箱，偏向满的）   → 选 A  ← 省节点，便于缩容
+    ImageLocality（本地已有镜像加分）  → 看情况（模块 01 的冷启动杠杆）</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>默认策略 <code>LeastAllocated</code>「优先放到最空的节点」，对普通 web 服务合理（分散风险），但对 GPU 集群<strong>往往是错的</strong>。因为它会让每台机器都用掉一点 GPU，产生大量<em>碎片</em>：8 台机器各剩 1 张卡，看起来还有 8 张卡空闲，但一个需要 2 卡的任务哪儿都放不下。GPU 集群通常应该用 <code>MostAllocated</code>（装箱），把任务挤到少数节点，留出完整的空节点。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：这是经典的<span class="term">向量装箱（vector bin packing）</span>问题，NP-hard。K8s 用的是在线贪心（Pod 一个个来，来了就决定，不回溯）。在线贪心的竞争比有理论下界，实践中 <em>first-fit-decreasing</em>（按需求降序放第一个装得下的）通常接近最优。这解释了一条重要的运维经验：<strong>大 Pod 应该先调度</strong>——用 <code>PriorityClass</code> 给大任务更高优先级，否则一堆小 Pod 先把每台机器都占一点，大任务就永远排不进去（这叫 <em>resource stranding</em>，资源搁浅）。</p></div>
+  </div>  <table>
+    <thead><tr><th>调度工具</th><th>作用</th><th>LLM 场景用法</th></tr></thead>
+    <tbody>
+      <tr><td><code>nodeSelector</code> / <code>nodeAffinity</code></td><td>把 Pod 限制到某类节点</td><td>只调度到有 A100/H100 标签的节点</td></tr>
+      <tr><td><code>taint</code> / <code>toleration</code></td><td>节点主动排斥 Pod，除非 Pod 明确容忍</td><td>GPU 节点打 taint，防止普通 Pod 占用宝贵机器</td></tr>
+      <tr><td><code>podAntiAffinity</code></td><td>同类 Pod 尽量/必须分散</td><td>同一服务的副本分散到不同节点，避免单机故障全灭</td></tr>
+      <tr><td><code>topologySpreadConstraints</code></td><td>跨可用区/机架均匀分布</td><td>跨 AZ 均分副本，抗单区故障</td></tr>
+      <tr><td><code>PriorityClass</code> + 抢占</td><td>高优先级 Pod 可驱逐低优先级</td><td>在线推理抢占离线批处理的 GPU</td></tr>
+      <tr><td><code>PodDisruptionBudget</code></td><td>自愿驱逐时至少保留 N 个可用</td><td>节点维护/缩容时不至于把服务全摘掉</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <code>podAntiAffinity</code> 与装箱是<strong>直接冲突</strong>的：前者要分散、后者要集中。怎么选？<em>看你在防什么</em>。防单机故障 → 反亲和（副本分散）；防资源碎片 → 装箱。生产上的常见折中是「<strong>软反亲和 + 拓扑分布</strong>」：要求跨可用区均匀（硬约束，防区域故障），但同区内允许装箱（软偏好，省钱）。这个组合几乎是大规模 GPU 服务的标配。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="stateful"><span class="num">6</span>有状态与配置：什么时候 Deployment 不够用</h2>
+  <p>无状态推理服务用 Deployment 就够了。但有三类情况需要别的东西，值得知道边界在哪。</p>  <table>
+    <thead><tr><th>场景</th><th>用什么</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td>单副本推理（无状态）</td><td><strong>Deployment</strong></td><td>Pod 可随意替换，名字/身份无所谓</td></tr>
+      <tr><td>多节点张量并行的一个模型实例</td><td><strong>StatefulSet</strong> 或 <strong>LeaderWorkerSet</strong></td><td>各 rank 需要<em>稳定的网络标识</em>（<code>pod-0</code>、<code>pod-1</code>）才能互相发现并建立通信组</td></tr>
+      <tr><td>离线批量推理 / 评测作业</td><td><strong>Job</strong> / <strong>CronJob</strong></td><td>跑完就结束，要的是「完成」而非「常驻」（模块 05 详述）</td></tr>
+      <tr><td>每节点一个的守护进程</td><td><strong>DaemonSet</strong></td><td>GPU driver 插件、日志采集、<em>模型权重预热缓存</em>（模块 01）</td></tr>
+    </tbody>
+  </table>  <p><strong>多节点推理</strong>是 LLM 特有的、Deployment 处理不了的场景：一个 405B 模型需要跨 2 台 8 卡机做张量并行，这 16 个进程<em>共同构成一个副本</em>，必须一起启动、一起就绪、一起销毁，还要能互相寻址。用 Deployment 的话，16 个 Pod 是互相独立的，K8s 不知道它们是一个整体（挂一个应该重启全部）。社区为此发展出了 <code>LeaderWorkerSet</code> 这类抽象。</p>  <h3>配置与密钥</h3>  <p>模块 01 的运行时契约第 ⑤ 条要求配置外置。K8s 提供两个载体，用法上有几条硬规矩：</p>  <ul>
+    <li><strong>ConfigMap 改了不会自动重启 Pod</strong>。挂载为文件时内容<em>会</em>更新（有 kubelet 同步延迟，约 1 分钟），但作为环境变量注入的<em>不会</em>。想让配置变更触发滚动更新，标准做法是把 ConfigMap 的哈希写进 Pod 模板的 annotation。</li>
+    <li><strong>Secret 默认只是 base64，不是加密</strong>。必须启用 etcd 静态加密（<code>EncryptionConfiguration</code>），或用外部密钥管理（External Secrets Operator + Vault/KMS）。<em>base64 不是安全措施，只是编码</em>。</li>
+    <li><strong>永远不要把密钥写进镜像或 Git</strong>。这条听起来是废话，但 registry 里的历史层是永久可读的——一次误提交，删了也还在。</li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <p>还有一个 LLM 特有的配置问题：<strong>模型版本应该放哪</strong>？放 ConfigMap 里（不触发重启）会导致「配置说是 v3，Pod 里跑的还是 v2」；正确做法是把模型标识<em>放进 Pod 模板</em>（环境变量或 initContainer 参数），这样改它就<strong>天然触发一次滚动更新</strong>——把「换模型」变成一次可灰度、可回滚的标准发布，而不是一次神秘的热更新。这是把模块 04 的所有安全网都用上的前提。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">7</span>算一笔账：副本数、装箱率与碎片</h2>
+  <p>把本模块的决策换算成钱。假设 8 卡节点、每副本 2 卡，需要 13 个副本（来自模块 02 的容量规划）。</p>  <div class="math-block">\[N_{nodes} = \left\lceil \frac{R \cdot g}{G_{node}} \right\rceil \text{（理想装箱）}, \qquad \eta = \frac{R \cdot g}{N_{nodes} \cdot G_{node}}\]</div>  <table>
+    <thead><tr><th>策略</th><th>节点数</th><th>装箱率 η</th><th>月成本（$32/节点·h）</th><th>抗单机故障</th></tr></thead>
+    <tbody>
+      <tr><td>理想装箱（每节点 4 副本）</td><td>⌈26/8⌉ = 4</td><td>26/32 = 81%</td><td>$92,160</td><td>一台挂 = 少 4/13 容量</td></tr>
+      <tr><td>硬反亲和（每节点 1 副本）</td><td>13</td><td>26/104 = 25%</td><td>$299,520</td><td>一台挂 = 少 1/13 容量</td></tr>
+      <tr><td>跨 3 AZ 均分 + 区内装箱</td><td>6</td><td>26/48 = 54%</td><td>$138,240</td><td>一区挂 = 少 1/3 容量</td></tr>
+    </tbody>
+  </table>  <p>读这张表的方式：<strong>硬反亲和的可用性是用 3.25 倍的成本买来的</strong>。这笔交易值不值，取决于你的 SLO 和单机故障率。如果单机年故障率 2%、13 台机器中一台挂了导致 8% 容量损失、恢复 10 分钟——这点错误预算消耗，远远不值 20 万美元/月的溢价。<em>中间那行（跨 AZ + 区内装箱）几乎总是正确答案</em>。</p>  <p>再算碎片这笔账。假设集群 20 个节点、每节点 8 卡，混跑 1 卡/2 卡/4 卡三种任务。用 <code>LeastAllocated</code>（分散）时，每个节点都会被占用一部分，剩余量分散成很多个 1–3 卡的空隙；一个新来的 4 卡任务可能<strong>整个集群都放不下，尽管总空闲有 30 张卡</strong>。用 <code>MostAllocated</code>（装箱）则会留出完整的空节点。notebook 会把这两种策略都实现，量化「总空闲卡数」与「最大可容纳任务」的差距——你会看到后者可以相差好几倍。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的智慧：<strong>K8s 不是一个「运行容器的地方」，而是一组把你的意图持续变成现实的控制循环；你的全部工作是把意图表达清楚（spec）并让系统能观测到现实（探针与指标）</strong>。意图表达不清（探针语义混淆、资源没声明）或现实观测不到（没有 readiness、没有队列深度指标），控制循环就会朝着错误的方向努力——<em>而且非常勤奋地努力</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>GPU 的细粒度共享</strong>：MIG（硬件切分，隔离好但粒度固定）、MPS（进程共享，无隔离）、时间片（K8s device plugin 的 <code>timeSlicing</code>，无显存隔离）各有取舍，都不理想。让 K8s 原生理解「显存 GB」而不只是「几张卡」，是社区长期诉求（DRA / Dynamic Resource Allocation 正在推进），但显存的动态性（KV 缓存随负载涨缩）让静态声明本身就不合适。</li>
+    <li><strong>多节点推理的一等公民抽象</strong>：LeaderWorkerSet、Ray Serve、Kubernetes JobSet 都在尝试表达「一组 Pod 构成一个逻辑副本」。gang scheduling（要么全调度、要么都不调度，避免部分启动死锁）在 K8s 默认调度器里仍需靠 Volcano/Koordinator 等插件补齐。</li>
+    <li><strong>拓扑感知调度</strong>：多节点推理对网络拓扑极度敏感（同机架 NVLink/InfiniBand vs 跨机架以太网，带宽差一个数量级）。让调度器理解 NUMA、PCIe 拓扑、网络亲和性，把一个模型的各 rank 放到物理上最近的位置，仍是活跃工程方向。</li>
+    <li><strong>调度器的目标函数之争</strong>：装箱率、公平性、优先级、能耗、碳强度——这些目标互相冲突且没有公认权重。多目标在线调度的理论保证与实践算法都还很粗糙。</li>
+    <li><strong>推理专用的编排层</strong>：KServe、Ray Serve、vLLM production stack、Kubernetes Gateway API Inference Extension 都在做「比 Deployment 更懂 LLM」的抽象（模型版本、KV 缓存亲和路由、prefill/decode 分池）。标准尚未收敛，是当前变化最快的一层。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Kubernetes 官方文档的 <em>Pod Lifecycle</em>、<em>Configure Liveness, Readiness and Startup Probes</em>、<em>Resource Management for Pods and Containers</em>、<em>Assigning Pods to Nodes</em>（这四篇是本模块的一手来源，写得远好于大多数二手教程）；Verma et al. 2015 <em>Large-scale cluster management at Google with Borg</em>（K8s 的思想源头，尤其调度与优先级）；Burns et al. 2016 <em>Borg, Omega, and Kubernetes</em>（三代设计的取舍复盘）；Coffman et al. 的 bin packing 综述（装箱的理论边界）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_serving_api/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 推理服务 API</div></a>
+    <a class="next" href="../04_rollout_autoscaling/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 发布策略与自动扩缩</div></a>
+  </div>
+
+</div>
+</body>
+</html>

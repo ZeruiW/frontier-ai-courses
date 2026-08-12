@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 生成指标谱系</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 08</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 生成指标谱系</h1>
+  <p class="subtitle">把 BLEU/ROUGE/METEOR/BERTScore 当成对「文本质量」的测量 —— n-gram 重叠、clipped precision 与 brevity penalty、ROUGE-L 的 LCS、嵌入贪心匹配，以及最要命的问题：它们和人评相关吗、什么时候会骗你</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–02、n-gram/字符串基础、相关系数（Pearson/Spearman）、一点点动态规划</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_generation_metrics.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Papineni 2002（BLEU）、Lin 2004（ROUGE）、Zhang 2020（BERTScore）、Callison-Burch 2006</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么需要自动指标：代理与元评测</a></li>
+      <li><a href="#ngram">基本单位：n-gram 与重叠</a></li>
+      <li><a href="#bleu">BLEU：精度 + clipping + brevity penalty</a></li>
+      <li><a href="#rouge">ROUGE：召回视角与 LCS</a></li>
+      <li><a href="#beyond">超越 n-gram：METEOR 与 BERTScore</a></li>
+      <li><a href="#meta">元评测：与人评的相关</a></li>
+      <li><a href="#fail">失效模式与对抗</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么需要自动指标：代理与元评测</h2>
+  <p>分类任务的评测有个奢侈的前提：<strong>答案唯一</strong>。预测要么等于金标、要么不等于，<code>accuracy</code> 一算了之。可一旦模型开始<strong>生成文本</strong>——翻译、摘要、对话、代码——这个前提就崩了。一句话有无数种说对的方式：“The cat is on the mat” 和 “There is a cat on the mat” 都对，但逐字符比对会判后者全错。于是我们需要<strong>自动生成指标</strong>：一个能把「候选文本 vs 参考文本」压成一个分数、且这个分数<em>最好能代表人类觉得它有多好</em>的函数。</p>  <p>这一模块的立场，也是全课的立场：<strong>一个自动指标本身没有价值，它的全部价值在于它与人类判断的相关程度</strong>。BLEU 报 0.32 这个数字毫无意义；有意义的是「BLEU 在这批系统上与人评的相关达到 0.9」这件事。换句话说，自动指标是人评的<em>廉价代理</em>，而代理的好坏要靠<strong>元评测（meta-evaluation）</strong>——拿指标分数去和人评分数算相关——来检验。这把整章的逻辑串了起来：先从零造出这些指标（懂它们在算什么），再考它们的效度（它们和人评相关吗），最后看它们在哪些地方系统性地骗人。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：自动指标像体温计。体温计本身不是健康，但它和健康状态高度相关、又便宜又快，所以有用。可如果有人学会了「含一口冰水让体温计读数变好看」，体温计就被<strong>攻破</strong>了——这正是生成指标被刷分、被对抗时发生的事。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：设人类质量判断为 $h$、自动指标为 $m$，我们关心的是估计两者的相关 $\rho(m, h)$（Pearson/Spearman/Kendall）。指标的「效度」就是这个 $\rho$ 有多高、在多大范围的系统/句子上稳定。一个指标可以在某分布上 $\rho=0.9$、换个分布就掉到 $0.3$——所以「BLEU 好不好」永远是一个<em>依语境而定</em>的问题，没有脱离数据的标准答案。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话定调：<strong>把每个生成指标都当成一支需要被标定的体温计</strong>。本章给你三件事——把指标从零造出来（第 2–5 节）、用相关性给它标定（第 6 节）、找出它在什么情况下会失灵（第 7 节）。学完你不会再问“BLEU 是多少分算好”，而会问“在我的任务上，这个指标和人评的相关够高吗，它会被什么愚弄”。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ngram"><span class="num">2</span>基本单位：n-gram 与重叠</h2>
+  <h3>基本单位：n-gram 与重叠</h3>  <p>几乎所有经典生成指标的底层货币都是 <span class="term">n-gram</span>——文本里连续 $n$ 个 token 的片段。1-gram 是单词、2-gram 是相邻词对、以此类推。它们的核心思想朴素得惊人：<strong>候选和参考共享的 n-gram 越多，内容越可能对得上</strong>。</p>  <div class="ascii">句子: "the cat sat"
+  1-grams (unigram): (the,) (cat,) (sat,)
+  2-grams (bigram) : (the,cat) (cat,sat)
+  3-grams (trigram): (the,cat,sat)
+
+为什么要看高阶 n-gram?
+  unigram 重叠 -&gt; 抓「用词对不对」（内容/词汇）
+  bigram+ 重叠 -&gt; 抓「语序/搭配对不对」（流畅/局部结构）</div>  <p>为什么不只看 unigram？因为单看词袋会把 “dog bites man” 和 “man bites dog” 判成完全一样——内容词全同、语序却天差地别。高阶 n-gram 把<strong>局部语序</strong>也纳入：bigram 不同就会扣分。这是一种廉价但有效的「流畅度」近似——真正连贯的句子，其相邻词对（bigram）、三连词（trigram）也更可能与参考重合。</p>  <p>但 n-gram 的局限同样根植于此：它只认<strong>表面字符串</strong>，不认语义。同义替换（“big” vs “large”）、改写、词形变化（“run” vs “running”）都会被判为不重叠，哪怕意思完全一样。第 5 节的 METEOR 与 BERTScore 正是为补这个洞而生。先记住这条主线：<strong>BLEU/ROUGE = n-gram 重叠的不同打包方式</strong>（BLEU 偏精度、ROUGE 偏召回、ROUGE-L 用子序列），它们共享同一个表面匹配的先天软肋。</p>  <p>还有一个实现层面的细节，会直接影响分数：<strong>分词（tokenization）</strong>。我们这里用最朴素的「小写 + 按空格切」，但真实指标怎么切词会让同一对句子的 BLEU 差出好几个点——标点是否独立成 token、是否做 sub-word、大小写是否归一，都会改变 n-gram 的命中。这就是为什么严肃的 MT 评测要用<strong>标准化的分词器</strong>（如 sacreBLEU 固定一套规则并报告其签名）：脱离了固定的分词，BLEU 分数<em>不可跨论文比较</em>。这是一个常被忽视、却实实在在的可复现性陷阱——记住它，本课 notebook 为聚焦机制而用简单分词，但生产中务必锁死分词规则。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="bleu"><span class="num">3</span>BLEU：精度 + clipping + brevity penalty</h2>
+  <h3>BLEU：精度视角 + 两个关键修正</h3>  <p><span class="term">BLEU</span>（Papineni 等 2002）是机器翻译评测的奠基指标，立场是<strong>精度（precision）</strong>：候选里说出来的 n-gram，有多少比例在参考里能找到？朴素精度 = 候选与参考重叠的 n-gram 数 ÷ 候选的 n-gram 总数。但朴素精度有两个致命漏洞，BLEU 的精髓正是补这两个洞。</p>  <p>漏洞一：<strong>重复刷分</strong>。参考是 “the cat sat”，候选输出 “the the the the”——unigram “the” 在参考里出现过，于是朴素精度判它 4/4 = 100%！修正办法是 <span class="term">clipped precision</span>（修剪精度）：每个 n-gram 的命中次数被<strong>截断</strong>到它在参考中出现的最大次数。“the” 在参考只出现 1 次，所以候选里 4 个 “the” 只算 1 个命中，精度跌到 1/4。</p>  <div class="math-block">\[p_n=\frac{\sum_{g\in\text{cand}}\min\big(\text{count}_{\text{cand}}(g),\ \max_{\text{ref}}\text{count}_{\text{ref}}(g)\big)}{\sum_{g\in\text{cand}}\text{count}_{\text{cand}}(g)}\]</div>  <p>漏洞二：<strong>偏爱短句</strong>。纯精度奖励「少说少错」——只输出一个最有把握的词，精度可能 100%，但显然不是好翻译。修正是 <span class="term">brevity penalty</span>（简短惩罚 BP）：候选比参考短就乘一个 <1 的惩罚因子。最后 BLEU 把 1~4 阶的修剪精度取<strong>几何平均</strong>（任一阶为 0 就整体趋于 0，逼模型各阶都要好），再乘 BP：</p>  <div class="math-block">\[\text{BLEU}=\underbrace{\min\!\Big(1,\ e^{1-r/c}\Big)}_{\text{brevity penalty}}\cdot\exp\!\Big(\tfrac1N\sum_{n=1}^{N}\log p_n\Big),\quad c=|\text{cand}|,\ r=|\text{ref}|\]</div>  <p>为什么偏偏用<strong>几何</strong>平均而非算术平均？因为几何平均对「短板」极其敏感：算术平均下，4-gram 精度为 0 只是少加一项、影响有限；几何平均下，任何一项为 0 会把整体直接拖到 0。这正是设计者想要的——它逼模型<em>在所有阶上都不能太差</em>：光是词对（unigram）（内容词对）还不够，还得有连贯的 bigram、trigram（局部流畅）。一个把正确的词随机打乱顺序的候选，unigram 精度可能很高，但 bigram/trigram 精度会塌，几何平均如实地把它判低。这是 BLEU 用一个标量同时约束「内容」与「流畅」的巧妙之处。</p>  <div class="callout warn"><span class="label"></span>
+    <p>几何平均的脾气要记住：只要<strong>任何一阶精度为 0</strong>（比如候选没有一个 4-gram 命中），整个 BLEU 就被拖到 0。这在<strong>单句</strong>上极常见（短句很难有 4-gram 命中），所以原始 BLEU 是为<strong>语料级</strong>（把所有句子的命中数汇总后再算）设计的；句子级 BLEU 必须加<em>平滑（smoothing）</em>才不至于动辄归零。这也是「BLEU 适合比系统、不适合比单句」的技术根源。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rouge"><span class="num">4</span>ROUGE：召回视角与 LCS</h2>
+  <h3>ROUGE：召回视角与最长公共子序列</h3>  <p><span class="term">ROUGE</span>（Lin 2004）是摘要评测的标准，立场与 BLEU 互补——它看<strong>召回（recall）</strong>：参考里的内容，有多少被候选覆盖到了？因为摘要的核心诉求是「别漏掉要点」，召回比精度更贴题。<span class="term">ROUGE-N</span> 就是 n-gram 召回：</p>  <div class="math-block">\[\text{ROUGE-}N=\frac{\sum_{g\in\text{ref}}\min\big(\text{count}_{\text{cand}}(g),\ \text{count}_{\text{ref}}(g)\big)}{\sum_{g\in\text{ref}}\text{count}_{\text{ref}}(g)}\]</div>  <p>注意分母从 BLEU 的「候选 n-gram 总数」换成了「<strong>参考</strong> n-gram 总数」——这一字之差，就是精度与召回的全部区别。实务里 BLEU 偏精度、ROUGE 偏召回，于是常常<strong>两个一起报</strong>：高 BLEU 低 ROUGE = 说的都对但漏了很多；高 ROUGE 低 BLEU = 覆盖全但啰嗦掺水。</p>  <p>更有意思的是 <span class="term">ROUGE-L</span>：它不用固定长度的 n-gram，而用候选与参考的<strong>最长公共子序列</strong>（LCS, Longest Common Subsequence）。子序列不要求连续——“the cat quickly sat” 与 “the cat sat” 的 LCS 是 “the cat sat”（长度 3），尽管中间插了词。这让 ROUGE-L 能<em>奖励语序大体正确的长片段</em>，又不像高阶 n-gram 那样因一个插入词就全盘崩掉。LCS 由经典动态规划求得：</p>  <div class="math-block">\[\text{LCS}[i,j]=\begin{cases}\text{LCS}[i\!-\!1,j\!-\!1]+1 & a_i=b_j\\[2pt]\max(\text{LCS}[i\!-\!1,j],\ \text{LCS}[i,j\!-\!1]) & a_i\ne b_j\end{cases}\]</div>  <p>有了 LCS 长度 $L$，ROUGE-L 取召回 $R=L/|\text{ref}|$、精度 $P=L/|\text{cand}|$，再合成 F 值 $F=(1+\beta^2)PR/(R+\beta^2 P)$（常取 $\beta=1$）。notebook 里你会从零把这张 DP 表填出来、在已知小例子上验证 LCS 长度，再算出 ROUGE-L 的 F——这是本模块<strong>两个 worked 核心</strong>之一（另一个是 BLEU）。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="beyond"><span class="num">5</span>超越 n-gram：METEOR 与 BERTScore</h2>
+  <h3>超越 n-gram：METEOR 与 BERTScore</h3>  <p>n-gram 指标的阿喀琉斯之踵是<strong>只认表面字符串</strong>：同义词、改写、词形变化一律判为不匹配。两条改进路线应运而生。</p>  <p><span class="term">METEOR</span>（Banerjee & Lavie 2005）在 unigram 层面做更聪明的<strong>对齐</strong>：匹配时不仅看完全相同，还看<em>词干相同</em>（run≈running）、<em>同义词</em>（big≈large）。它算召回加权的 F 值（召回权重更高，因为漏译比啰嗦更糟），再乘一个<strong>碎片化惩罚</strong>——如果匹配的词在候选里东一块西一块、语序很乱，就扣分。代价是它需要词干器和同义词库（如 WordNet），跨语言不易移植；好处是它与人评的相关通常明显高于 BLEU。</p>  <p><span class="term">BERTScore</span>（Zhang 等 2020）走得更远：用预训练语言模型把每个 token 编码成<strong>语境向量</strong>，再算候选与参考 token 之间的余弦相似度矩阵，做<strong>贪心匹配</strong>：每个候选 token 找它在参考里最相似的 token（取最大相似度）求平均得精度 $P$；每个参考 token 找候选里最相似的求平均得召回 $R$；合成 F。因为是在向量空间里比，“happy” 和 “glad” 的相似度很高——它终于能抓住<strong>同义改写</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：从 BLEU 到 BERTScore，是从「逐字对答案」进化到「看意思对不对」。BLEU 问“你用的词和标准答案一样吗”，BERTScore 问“你用的词和标准答案意思接近吗”——后者显然更接近人类怎么判。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨说：BERTScore 的 $P=\frac1{|c|}\sum_{i}\max_j \cos(c_i,r_j)$，$R=\frac1{|r|}\sum_{j}\max_i \cos(c_i,r_j)$，$F=2PR/(P+R)$。它把硬性的 n-gram 命中换成了<em>软性的最大相似匹配</em>。notebook 用玩具随机嵌入（确定性、L2 归一化）从零复现这套贪心匹配——机制与真实 BERTScore 一模一样，只是把 BERT 换成可控的小向量，好验证、好观察。</p></div>
+  </div>  <div class="callout danger"><span class="label">语义指标≠不可攻破</span>
+    <p>别被「语义指标」四个字哄住：BERTScore 也能被愚弄。它依赖<strong>具体的嵌入模型</strong>，而嵌入空间的几何并不完美——反义词（“good”/“bad”）在很多嵌入里余弦相似度也不低（因为它们出现在相似语境），于是把 “a good movie” 改成 “a bad movie” 可能只让 BERTScore 微跌。更别提它继承了底层模型的全部偏见与盲区。<em>没有任何自动指标是不可攻破的</em>——这正是下一节的主题。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="meta"><span class="num">6</span>元评测：与人评的相关</h2>
+  <h3>元评测：指标的价值 = 与人评的相关</h3>  <p>造出指标只是第一步，真正的问题是：<strong>它可信吗？</strong>答案靠<span class="term">元评测</span>——拿一批系统/句子，同时收集自动指标分数与人类质量判断，算两者的相关。相关越高，指标越能当人评的代理。</p>  <p>有三种常用的相关系数，各问不同的问题：</p>  <table>
+    <thead><tr><th>相关系数</th><th>看什么</th><th>适用</th><th>脾气</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">Pearson</span> r</td><td>线性相关强度</td><td>指标与人评近似线性时</td><td>对异常值与非线性敏感</td></tr>
+      <tr><td><span class="term">Spearman</span> ρ</td><td><strong>秩</strong>相关（单调即可）</td><td>只关心排序对不对</td><td>抗非线性、抗异常值</td></tr>
+      <tr><td><span class="term">Kendall</span> τ</td><td>成对一致的比例（同序对−逆序对）</td><td>样本少、要稳健排序</td><td>解释直观、计算稍重</td></tr>
+    </tbody>
+  </table>  <p>评测实践里<strong>最该关心 Spearman/Kendall</strong>，因为我们通常只在乎指标能不能把系统<em>排对序</em>——谁第一、谁第二，而非精确的分数差。一个把所有分数压缩或拉伸但保持顺序的指标，Pearson 会变、Spearman 不变，而后者才是我们要的。notebook 会从零实现 Spearman（对两列分别求秩、再算秩上的 Pearson），并与 <code>scipy.stats.spearmanr</code> 对拍。</p>  <p>还有一个常被忽视却致命的区分：<strong>系统层 vs 句子层</strong>相关。BLEU 在<strong>系统层</strong>（把每个系统的几千句汇总成一个分再相关）往往与人评相关很高（0.9+），但在<strong>句子层</strong>（每个句子一个分）相关可能低得可怜（0.3）。原因是单句噪声极大（几何平均动辄归零），汇总后噪声被平均掉了。所以「BLEU 与人评高度相关」这句话，必须问清是哪一层——把系统层的高相关错当成句子层的可靠，是评测里常见的张冠李戴。</p>  <p>元评测自身也有<strong>陷阱</strong>，值得警惕两点。其一，相关系数也是估计量、<em>也有方差</em>：只比了 5 个系统就算出 Spearman=0.8，这个 0.8 的置信区间宽得能从 0.2 跨到 0.98——说明不了什么。要么多比系统、要么对相关本身做 bootstrap 给区间（这正呼应模块 00 的纪律）。其二，相关高<strong>不等于</strong>可互换：指标和人评可能在「区分好系统」上高度相关，却在「区分两个都很好的顶尖系统」上完全失灵——而后者恰恰是今天最需要分辨的场景。所以一个在旧系统上验证过的指标，未必还能可靠地排序新一代模型。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这条因果链：<strong>人评是构念（你真正想要的），自动指标是它的代理，相关系数是代理质量的度量</strong>。汇报一个新指标时，正确的姿势不是说“我的指标得分更高”，而是说“我的指标与人评的（句子层）Spearman 比 BLEU 高 0.15”——前者是循环论证（用指标证明指标），后者才是真正的效度证据。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fail"><span class="num">7</span>失效模式与对抗</h2>
+  <h3>失效模式与对抗：指标什么时候骗你</h3>  <p>既然指标只是代理，它就一定有<strong>代理与目标脱节</strong>的地方。把这些失效模式记牢，是避免被自己的评测误导的护身符：</p>  <table>
+    <thead><tr><th>失效模式</th><th>怎么发生</th><th>后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>高分≠更好</strong></td><td>BLEU 高的系统人评未必更好（Callison-Burch 2006）</td><td>据 BLEU 选型可能选错</td></tr>
+      <tr><td><strong>重复刷分</strong></td><td>灌入高频 n-gram（被 clipping 部分挡住，但仍可钻空）</td><td>分数虚高</td></tr>
+      <tr><td><strong>长度博弈</strong></td><td>调长度蹭 BP 或召回，与质量无关</td><td>长度成混杂因素</td></tr>
+      <tr><td><strong>改写惩罚</strong></td><td>正确的同义改写被 n-gram 判为不匹配</td><td>惩罚真正好的多样化输出</td></tr>
+      <tr><td><strong>嵌入愚弄</strong></td><td>反义词/对抗扰动让 BERTScore 失真</td><td>语义指标也不安全</td></tr>
+      <tr><td><strong>无参考偏流畅</strong></td><td>reference-free 指标偏好流畅而非正确</td><td>流利的胡说被打高分</td></tr>
+    </tbody>
+  </table>  <p>最经典的警示来自 Callison-Burch 等 2006：他们发现在某些系统对比中，<strong>BLEU 更高的系统，人评反而更差</strong>——尤其当两个系统的<em>产出风格</em>不同时（如基于短语 vs 基于规则），BLEU 的 n-gram 偏好会系统性地偏袒其中一类，与真实质量脱钩。这不是 BLEU 算错了，而是它测的「n-gram 重叠」这个构念，和「翻译质量」这个构念在那里分了岔——回到模块 00 的语言：这是一个<strong>效度</strong>问题。</p>  <p>对抗的视角更尖锐：任何固定的自动指标，一旦成为<strong>优化目标</strong>（Goodhart 定律：当度量变成目标，它就不再是好度量），就会被钻空子。RLHF 里直接拿 BLEU/长度当奖励，模型会学会生成「高指标但低质量」的输出（reward hacking）。这就是为什么前沿越来越依赖<em>学习型指标</em>和<em>人类偏好</em>——但它们同样会被新的对抗攻破，只是门槛更高。<strong>没有银弹</strong>：聪明的评测者总是多指标交叉、定期用人评校准、对结论做敏感性分析，而非盲信任何单一数字。</p>  <p>长度（length）值得单独点名，因为它是最隐蔽的混杂因素。BLEU 的 brevity penalty 只罚过短、不罚过长，于是「啰嗦但塞满参考词」的候选可能蒙混过关；ROUGE 这类召回指标更是天然偏爱长输出（说得越多越可能覆盖参考）。结果是：当你比较两个系统时，若它们的平均输出长度不同，你看到的指标差异里<strong>混入了纯长度效应</strong>，未必反映质量。严肃的做法是<em>报告长度、或做长度控制</em>（如只比相近长度的输出），否则「我的系统 ROUGE 更高」可能只是「我的系统话更多」。这与模块 04 里人评的长度偏置、模块 07 里 A/B 的混杂，是同一个测量科学问题的不同化身。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个务实的纪律：<strong>永远不要只用一个自动指标下结论</strong>。至少同时看一个精度型（BLEU/chrF）、一个召回型（ROUGE）、一个语义型（BERTScore），再周期性地抽样做人评校准它们。当它们<em>彼此矛盾</em>时（常有），那恰恰是你最该亲眼看看输出的信号——分歧处藏着指标的盲区。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <p>生成评测是当下最不稳定、也最关键的领域之一——模型进步太快，旧指标纷纷失效。几个前沿：</p>  <ul>
+    <li><strong>学习型指标（BLEURT、COMET）</strong>：直接在人评数据上训练一个回归模型来打分，与人评相关远高于 BLEU。但它们<em>不透明</em>（黑箱给分，难解释为何）、<em>可被对抗</em>、且<em>跨域/跨语言可能失效</em>——在训练分布外的可靠性是开放问题。</li>
+    <li><strong>LLM-as-a-judge</strong>：用强 LLM 当评委直接判「哪个更好」或打分，灵活、便宜、与人评相关高。但它带着系统性偏置（位置、长度、<strong>自我偏好</strong>——偏爱自己家族模型的输出），且“模型给模型打分”有循环风险。如何去偏、如何防止评测被 judge 的盲区主导，是最热的议题。</li>
+    <li><strong>无参考评测（reference-free / QE）</strong>：长文本、开放对话往往没有唯一参考，于是出现「不看标准答案、直接判质量」的指标。它们省去了昂贵的参考，却更容易被<em>表面流畅性</em>带偏——流利的事实错误（幻觉）可能拿高分。</li>
+    <li><strong>指标的元评测本身</strong>：用什么数据、什么相关系数、什么粒度来判一个指标好不好，社区尚无定论（WMT metrics shared task 在推动标准化）。一个新指标“更好”的主张，越来越要求严格的元评测协议（多语言、多系统、句子层 + 系统层、带显著性）才被接受。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Papineni 2002（BLEU）、Lin 2004（ROUGE）、Zhang 2020（BERTScore）、Callison-Burch 2006（BLEU 失效）、Banerjee & Lavie 2005（METEOR）、Sellam 2020（BLEURT）/ Rei 2020（COMET）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_inter_annotator_agreement/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 标注者一致性 IAA</div></a>
+    <a class="next" href="../04_human_evaluation/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 人类评测方法论</div></a>
+  </div>
+
+</div>
+</body>
+</html>

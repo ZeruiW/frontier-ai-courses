@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 扩散模型 DDPM</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 扩散模型 DDPM</h1>
+  <p class="subtitle">前向加噪 q(x_t|x_0) 的闭式、反向去噪 p、噪声预测目标 ε-prediction、反向采样、噪声调度，以及与 VAE/score matching 的统一 —— 把生成拆成许多步小去噪，既稳又锐的新王</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（去噪 AE/score）、模块 02（VAE/重参数/变分界）、高斯、马尔可夫链</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_diffusion.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Sohl-Dickstein 2015、Ho et al. 2020（DDPM）、Song & Ermon 2019</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#idea">扩散的思想：拆成许多步小去噪</a></li>
+      <li><a href="#forward">前向加噪与一步到位的闭式</a></li>
+      <li><a href="#reverse">反向过程与噪声预测目标</a></li>
+      <li><a href="#build">从零实现前向与训练目标</a></li>
+      <li><a href="#sampling">反向采样：从噪声生成数据</a></li>
+      <li><a href="#schedule">噪声调度：被低估的关键旋钮</a></li>
+      <li><a href="#unify">与 VAE / score 的统一</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="idea"><span class="num">1</span>扩散的思想：拆成许多步小去噪</h2>
+  <p>前三族模型各有取舍：AE 采不了样，VAE 能采样但糊，GAN 锐利但难训、易坍塌。扩散模型（diffusion model；奠基 Sohl-Dickstein 2015，发扬光大 Ho 2020 的 DDPM）找到了一条<strong>既稳又锐</strong>的新路，一举成为图像/音频/视频生成的新王。它的核心想法初听<em>近乎荒诞</em>：把一张图<strong>逐步加噪</strong>成纯雪花噪声，再训练一个网络学会<strong>逐步去噪</strong>、把雪花一步步还原成图——生成时就从纯噪声出发，一路去噪「采」出新图。</p>  <p>为什么这个看似绕远的过程反而成功了？关键在于它把一个<strong>极难的任务拆成了许多个极简单的任务</strong>。「从纯噪声一步生成一张逼真图」难如登天（这正是 GAN/VAE 的解码器要硬扛的）；但「把一张<em>只加了一点点噪声</em>的图去掉那一点点噪声」却<strong>简单得多</strong>——几乎是个线性去噪问题。扩散把生成分解成几十上百个这样的小步，每步只需做一点点去噪，累积起来却能完成从噪声到数据的惊人跨越。这就是它「既稳又锐」的秘密：每一步都好学（稳），许多步累积出高保真（锐）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：让你凭空雕一座完美的雕像（一步生成）极难；但给你一块<strong>快完成、只差一点点瑕疵</strong>的雕像，让你修掉那点瑕疵，就容易多了。扩散训练的网络就是这样一个「修瑕疵的工匠」——它在各种瑕疵程度（噪声水平）上都练过修复。生成时，从一块「全是瑕疵」的料（纯噪声）开始，让工匠一遍遍地修，每遍修掉一点，最终修出一座完整雕像。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：扩散定义两个过程。<strong>前向过程</strong> <code>q</code> 是<em>固定、无需学习</em>的，逐步给数据加高斯噪声，<code>T</code> 步后变成 <code>\mathcal{N}(0,I)</code>；<strong>反向过程</strong> <code>p_\theta</code> 是<em>可学习</em>的，逐步去噪。神奇之处在于：当每步加的噪声足够小时，反向的每一步<strong>也是高斯</strong>，于是可以用一个网络参数化它。训练目标最终简化成一个朴素的「预测噪声」MSE，稳如监督学习。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住扩散与前几族的关系：<strong>扩散 = 在所有噪声水平上训练的超级去噪自编码器（模块 01）+ 一个把它们串起来的采样链</strong>。还记得模块 01 说去噪 AE 学的是「往数据流形上拉」的方向（score）吗？扩散就是把这件事做到极致：不只在一个噪声水平、而在从微噪到纯噪的<em>整个连续谱</em>上学去噪，再用这些去噪方向一步步把纯噪声引导回数据。带着这个视角读本章，会非常顺。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="forward"><span class="num">2</span>前向加噪与一步到位的闭式</h2>
+  <h3>前向过程：逐步加噪与「一步到位」的闭式</h3>  <p>前向过程是一条固定的马尔可夫链，每步给当前样本加一点点高斯噪声。设噪声调度 <code>\{\beta_t\}_{t=1}^T</code>（一组小正数），则：</p>  <div class="math-block">\[q(x_t\mid x_{t-1})=\mathcal{N}\!\big(x_t;\ \sqrt{1-\beta_t}\,x_{t-1},\ \beta_t I\big)\]</div>  <p>每步做两件事：把上一步的样本<strong>缩小一点点</strong>（乘 <code>\sqrt{1-\beta_t}&lt;1</code>，防止方差爆炸），再<strong>加一点点噪声</strong>（方差 <code>\beta_t</code>）。重复 <code>T</code> 次（通常几百到一千步），原始信号被噪声彻底淹没，<code>x_T</code> 趋近标准正态 <code>\mathcal{N}(0,I)</code>——与原数据无关的纯噪声。</p>  <p>逐步模拟这条链很慢。DDPM 的第一个关键便利是：前向过程可以<strong>一步跳到任意时刻 </strong><code>t</code>，有闭式解。令 <code>\alpha_t=1-\beta_t</code>、<code>\bar\alpha_t=\prod_{s=1}^t\alpha_s</code>（累积乘积），则：</p>  <div class="math-block">\[q(x_t\mid x_0)=\mathcal{N}\!\big(x_t;\ \sqrt{\bar\alpha_t}\,x_0,\ (1-\bar\alpha_t)I\big)\ \Longleftrightarrow\ x_t=\sqrt{\bar\alpha_t}\,x_0+\sqrt{1-\bar\alpha_t}\,\epsilon,\ \ \epsilon\sim\mathcal{N}(0,I)\]</div>  <p>这个闭式<strong>无比重要</strong>：它意味着训练时我们不用真的跑 <code>t</code> 步加噪，而是<strong>直接</strong>从 <code>x_0</code>、随机抽一个 <code>t</code> 和一个噪声 <code>\epsilon</code>，一行就算出 <code>x_t</code>。注意这个式子的形状——<code>x_t</code> 是<em>原信号</em> <code>x_0</code> 和<em>纯噪声</em> <code>\epsilon</code> 的一个加权混合，权重 <code>\sqrt{\bar\alpha_t}</code> 随 <code>t</code> 从 1 降到 0（信号渐隐）、<code>\sqrt{1-\bar\alpha_t}</code> 从 0 升到 1（噪声渐显）。这不正是模块 02/04 反复出现的<strong>重参数化</strong> <code>\mu+\sigma\epsilon</code> 吗？前向过程本质就是一次重参数化采样。</p>  <div class="callout paper"><span class="label"></span>
+    <p>这个「一步到位」的闭式是 DDPM 高效训练的命脉。它把扩散从「要模拟一条长链」变成「随机抽个时刻、一步加噪、预测噪声」的简单回归。notebook 第 1 节会把它与逐步模拟<strong>对拍</strong>：验证「直接用闭式算 <code>x_t</code>」和「老老实实加噪 <code>t</code> 步」给出统计上一致的分布。这是理解整个 DDPM 的地基。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="reverse"><span class="num">3</span>反向过程与噪声预测目标</h2>
+  <h3>反向过程与噪声预测目标</h3>  <p>生成需要<strong>反过来</strong>：从 <code>x_T\sim\mathcal{N}(0,I)</code> 出发，逐步去噪回 <code>x_0</code>。这要求我们知道反向条件分布 <code>p(x_{t-1}|x_t)</code>。一个关键事实是：当每步噪声 <code>\beta_t</code> 足够小，反向的每一步<strong>也近似是高斯</strong>，于是可以用一个网络去参数化它的均值（方差常取固定值）。</p>  <p>但直接让网络预测均值不够漂亮。DDPM 的第二个关键洞察是：通过一番推导（用贝叶斯公式和前向闭式），反向均值可以重写成只依赖一个量——<strong>加在 </strong><code>x_t</code><strong> 上的那个噪声 </strong><code>\epsilon</code>。于是与其预测均值，不如让网络 <code>\epsilon_\theta(x_t,t)</code><strong>直接预测噪声</strong>。这把训练目标简化成了一个朴素得不可思议的形式：</p>  <div class="math-block">\[\mathcal{L}_{\text{simple}}=\mathbb{E}_{x_0,\,t,\,\epsilon}\Big[\big\|\,\epsilon-\epsilon_\theta(\sqrt{\bar\alpha_t}\,x_0+\sqrt{1-\bar\alpha_t}\,\epsilon,\ t)\,\big\|^2\Big]\]</div>  <p>读懂这个损失：随机抽一个数据 <code>x_0</code>、一个时刻 <code>t</code>、一个噪声 <code>\epsilon</code>；用闭式合成带噪样本 <code>x_t</code>；让网络看着 <code>x_t</code> 和 <code>t</code><strong>猜出当初加的噪声 </strong><code>\epsilon</code>；用 MSE 惩罚猜错。<strong>就这么简单</strong>——一个标准的回归任务，没有对抗、没有 KL 平衡、没有移动靶。这就是扩散训练<em>稳如监督学习</em>的根源。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么「猜噪声」就等于「学会生成」？因为如果网络能准确说出「<code>x_t</code> 里哪部分是噪声」，那把这部分噪声<strong>减掉一点</strong>，就得到一个<em>噪声更少、更像真实数据</em>的样本。反复做，就从纯噪声一路走回数据。猜噪声 = 知道往哪个方向去噪 = 知道怎么生成。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：可以证明 <code>\epsilon_\theta(x_t,t)</code> 预测的噪声，与数据分布的<strong>score</strong> <code>\nabla_{x_t}\log q(x_t)</code> 只差一个已知尺度因子（<code>\epsilon_\theta\approx-\sqrt{1-\bar\alpha_t}\,\nabla_{x_t}\log q(x_t)</code>）。所以「预测噪声」和 Song & Ermon 的「估计 score」是<strong>同一件事的两种说法</strong>——这正是模块 01 去噪 AE「学 score」那条线的终极兑现。</p></div>
+  </div>  <p>为什么「预测出噪声」就立刻能「去噪」？用前向闭式反解一下就一目了然，这也是个值得动手的<strong>微例</strong>。前向给出 <code>x_t=\sqrt{\bar\alpha_t}\,x_0+\sqrt{1-\bar\alpha_t}\,\epsilon</code>，把它当成关于 <code>x_0</code> 的方程解开：<code>\hat x_0=(x_t-\sqrt{1-\bar\alpha_t}\,\epsilon_\theta)/\sqrt{\bar\alpha_t}</code>。也就是说，<strong>只要网络猜对了噪声 </strong><code>\epsilon</code><strong>，把它按比例从 </strong><code>x_t</code><strong> 里减掉、再除以信号系数，当场就还原出对干净图 </strong><code>x_0</code><strong> 的估计</strong>。代个数感受一下：设某时刻 <code>\bar\alpha_t=0.36</code>，则 <code>\sqrt{\bar\alpha_t}=0.6</code>、<code>\sqrt{1-\bar\alpha_t}=0.8</code>；若真实 <code>x_0=1.0</code> 且抽到 <code>\epsilon=0.5</code>，则带噪样本 <code>x_t=0.6\times1.0+0.8\times0.5=1.0</code>。网络看到 <code>x_t=1.0</code>、若准确预测出 <code>\epsilon_\theta=0.5</code>，反解得 <code>\hat x_0=(1.0-0.8\times0.5)/0.6=1.0</code>——精确还原。这说明「预测噪声」和「预测干净图」在数学上是<em>等价</em>的（差一个确定的线性变换），DDPM 选预测噪声只是因为它的损失尺度在各时刻更均衡、更好训。反向采样每一步做的，本质就是这个「估噪声 → 反解出 <code>\hat x_0</code> 的方向 → 往那挪一点」的循环。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把这个 score 联系记牢，它是连接全课的金线：<strong>去噪自编码器（模块 01）→ 预测噪声（本模块）→ score 估计（Song &amp; Ermon）→ 速度场（模块 05）</strong>，本质都是在学「往数据流形/高密度区移动的方向」。扩散只是把它在所有噪声水平上系统地学了一遍，并配上采样链。理解了这条金线，五族模型在你眼里就连成了一个整体。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="build"><span class="num">4</span>从零实现前向与训练目标</h2>
+  <h3>从零实现：前向加噪与训练目标</h3>  <p>把 DDPM 落到 numpy。需要的零件出奇地少：一个噪声调度、前向闭式加噪、一个预测噪声的小网络、以及那个简单的 MSE 损失。先看前两个。</p>  <pre><code># 噪声调度（线性 beta）与累积量
+betas = np.linspace(1e-4, 0.02, T)          # 每步噪声方差，从小到大
+alphas = 1 - betas
+alpha_bars = np.cumprod(alphas)             # ᾱ_t = ∏ α_s
+
+# 前向闭式：一步加噪到任意 t
+def q_sample(x0, t, eps):
+    ab = alpha_bars[t]                       # 形状广播到 (N,1)
+    return np.sqrt(ab)*x0 + np.sqrt(1-ab)*eps</code></pre>  <p>训练循环同样朴素：每步随机抽一批 <code>x_0</code>、给每个样本随机抽一个时刻 <code>t</code> 和噪声 <code>\epsilon</code>，合成 <code>x_t</code>，让网络预测 <code>\epsilon</code>，最小化 MSE。网络 <code>\epsilon_\theta(x_t,t)</code> 需要<strong>把时刻 </strong><code>t</code><strong> 也作为输入</strong>（因为不同噪声水平下去噪方式不同）——玩具实现里可以把 <code>t</code>（或其某种编码，如 <code>\bar\alpha_t</code>）拼接到 <code>x_t</code> 上喂进网络。真实模型用正弦时间嵌入（类似位置编码），但玩具版拼一个标量就够看清机制。</p>  <p>一个对初学者重要的澄清：<strong>整个前向过程没有任何可学参数</strong>。<code>\beta_t</code> 是预先定好的，加噪是确定的公式。<strong>唯一要训练的，是那个预测噪声的网络 </strong><code>\epsilon_\theta</code>。这比 VAE（编码器+解码器都要学）和 GAN（G+D 都要学）都简单——扩散只有一个网络、一个 MSE 损失。notebook 会从零实现这个网络的前向、反向（手写）、训练，并验证损失稳定下降。</p>  <div class="callout warn"><span class="label"></span>
+    <p>两个易错点：① <code>\bar\alpha_t</code> 是<strong>累积</strong>乘积（<code>np.cumprod</code>），不是单步 <code>\alpha_t</code>——搞混会让加噪程度完全错；② 闭式里是 <code>\sqrt{\bar\alpha_t}</code> 和 <code>\sqrt{1-\bar\alpha_t}</code>，两个<strong>根号</strong>别漏，且系数平方和恒为 1（信号方差 + 噪声方差守恒）。notebook 会断言 <code>\bar\alpha_t</code> 单调下降、首尾趋近 1 和 0，把调度的正确性钉死。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sampling"><span class="num">5</span>反向采样：从噪声生成数据</h2>
+  <h3>反向采样：从噪声生成数据</h3>  <p>训练好 <code>\epsilon_\theta</code> 后，生成就是跑反向链。从 <code>x_T\sim\mathcal{N}(0,I)</code> 开始，对 <code>t=T,T-1,\dots,1</code> 依次执行一步去噪。DDPM 的反向采样公式（每步）是：</p>  <div class="math-block">\[x_{t-1}=\frac{1}{\sqrt{\alpha_t}}\Big(x_t-\frac{1-\alpha_t}{\sqrt{1-\bar\alpha_t}}\,\epsilon_\theta(x_t,t)\Big)+\sigma_t z,\quad z\sim\mathcal{N}(0,I)\ (t>1)\]</div>  <p>拆开看这一步在做什么：括号里是<strong>用预测的噪声把 </strong><code>x_t</code><strong> 往「干净」的方向拉一步</strong>（减掉按比例的预测噪声），前面的 <code>1/\sqrt{\alpha_t}</code> 做尺度还原；最后再加一点新噪声 <code>\sigma_t z</code>（除了最后一步 <code>t=1</code> 不加）。加这点噪声很关键：它让反向过程保持<strong>随机性</strong>，从而能从同一个起点采出多样的样本（去掉它就变成确定性采样，即 DDIM 的雏形）。</p>  <p>注意反向采样<strong>必须一步步来</strong>、不能像前向那样跳：因为每一步的去噪都依赖上一步的结果 <code>x_t</code>，是个严格的序贯过程。这也是扩散<strong>采样慢</strong>的根源——生成一个样本要跑 <code>T</code> 次网络前向（几百上千次），远慢于 GAN/VAE 的一次前向。加速采样（用更少步数）是扩散的核心工程问题，DDIM、各种快速采样器（以及模块 05 的流匹配）都在攻这个点。但本课先把<strong>最朴素、最能看清机制的 </strong><code>T</code><strong> 步采样</strong>实现出来。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把反向采样想成「<strong>一群点从纯噪声出发，被去噪方向场一步步推回数据分布</strong>」。初始时点们均匀散布（标准正态），每一步 <code>\epsilon_\theta</code> 告诉每个点「往哪挪能更像真数据」，点们逐渐聚拢、成形，最终落到数据分布的形状上（如双峰、月牙）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：反向链近似了真实的反向条件分布 <code>p(x_{t-1}|x_t)</code>。每步的均值由 <code>\epsilon_\theta</code> 决定（去噪方向），方差 <code>\sigma_t^2</code> 通常取 <code>\beta_t</code> 或其变体。整条链从 <code>\mathcal{N}(0,I)</code> 把概率质量逐步搬运到数据分布 <code>p(x_0)</code> 上——这与模块 05 的「速度场搬运分布」是同一回事的离散版。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>notebook 会在 1D 双峰和 2D 分布上跑通完整的「训练 <code>\epsilon_\theta</code> → 反向采样」，并用分布距离验证生成样本收敛到目标。你会看到一个比 GAN<strong>稳定得多</strong>的过程：损失平滑下降（监督回归），采样可靠地给出覆盖良好的多峰分布——<em>没有模式坍塌、没有训练振荡</em>。亲手跑一遍，你就懂了为什么扩散取代 GAN 成为主流。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="schedule"><span class="num">6</span>噪声调度：被低估的关键旋钮</h2>
+  <h3>噪声调度：一个被低估的关键旋钮</h3>  <p>噪声调度 <code>\{\beta_t\}</code> 决定了「加噪多快、各时刻的信噪比如何分布」，对样本质量影响巨大，却常被初学者忽略。最简单的是<strong>线性调度</strong>（<code>\beta_t</code> 从 <code>10^{-4}</code> 线性增到 <code>0.02</code>，DDPM 原版），但它在末段加噪太快，导致中间时刻信息利用不充分。</p>  <p>Nichol & Dhariwal 2021 提出的<strong>cosine 调度</strong>让 <code>\bar\alpha_t</code> 按余弦曲线下降，使加噪更均匀地分布在各时刻、尤其改善了高分辨率生成。一个统一的分析语言是<strong>信噪比（SNR）</strong> <code>\bar\alpha_t/(1-\bar\alpha_t)</code>：它随 <code>t</code> 单调下降，调度的本质就是设计这条 SNR 曲线的形状。</p>  <p>把 SNR 用几个数算出来，你就懂了「线性调度末段加噪太快」到底指什么。SNR <code>=\bar\alpha_t/(1-\bar\alpha_t)</code> 衡量「信号方差 ÷ 噪声方差」：<code>\bar\alpha_t=0.99</code> 时 SNR <code>\approx 99</code>（信号几乎完好），<code>\bar\alpha_t=0.5</code> 时 SNR <code>=1</code>（信噪各半，这是去噪最吃劲、对网络最有信息量的「中段」），<code>\bar\alpha_t=0.01</code> 时 SNR <code>\approx 0.01</code>（几乎全是噪声）。线性调度的毛病在于：<code>\bar\alpha_t</code> 在末段掉得太猛，SNR 很快就砸到接近 0，导致大量靠后的时刻 <code>t</code> 都处在「信号已基本没了、网络学不到什么」的低信息区——等于把宝贵的训练预算浪费在了几乎全噪的样本上。cosine 调度正是来修这个：它让 <code>\bar\alpha_t</code> 下降得更平缓、更晚才逼近 0，从而把更多时刻保持在 SNR 适中、对学习最有价值的区间。<strong>「设计调度」说到底就是「设计 SNR 随时间怎么衰减」，好的调度把训练算力花在信噪比最有教益的中段</strong>。这个视角也直接解释了为什么后续工作要按 SNR 给不同 <code>t</code> 的损失重新加权（min-SNR 等）。</p>  <table>
+    <thead><tr><th>调度</th><th>特点</th><th>适用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>线性 linear</strong></td><td><code>\beta_t</code> 线性增；末段加噪偏快</td><td>DDPM 原版、低分辨率够用</td></tr>
+      <tr><td><strong>cosine</strong></td><td><code>\bar\alpha_t</code> 余弦下降；加噪更均匀</td><td>高分辨率、改善质量</td></tr>
+      <tr><td><strong>SNR 视角</strong></td><td>直接设计 <code>\bar\alpha_t/(1-\bar\alpha_t)</code> 曲线</td><td>统一分析与损失加权</td></tr>
+    </tbody>
+  </table>  <p>调度还与<strong>损失加权</strong>相关：<code>\mathcal{L}_{\text{simple}}</code> 对所有 <code>t</code> 等权，但有些时刻（中等噪声）对感知质量更重要。后续工作（如 <code>v</code>-prediction、min-SNR 加权）通过重新加权不同 <code>t</code> 的损失来改善——但这些属于前沿（C28），本课只需理解<strong>调度 = 设计信号如何随时间被噪声淹没</strong>这一核心。</p>  <p>一个常被初学者忽略却很要紧的点：调度的「步数 <code>T</code>」和「每步强度 <code>\beta_t</code>」要<strong>配合</strong>。真实 DDPM 用 <code>T=1000</code> 配很小的 <code>\beta</code>（<code>10^{-4}\sim 0.02</code>），靠步数多来累积出充分加噪。如果像本课玩具那样把 <code>T</code> 取小（几十步），就得把 <code>\beta_{\max}</code> 调大一些，否则末步 <code>\bar\alpha_T</code> 还很大、<code>x_T</code> 远不是纯噪声、采样起点与训练假设不符。notebook 里我们特意把玩具调度的 <code>\beta_{\max}</code> 调到能让 <code>\bar\alpha_T</code> 接近 0——这个「让前向真正走到纯噪声」的细节，是采样能成功的隐形前提。</p>  <p>notebook 会让你亲手对比线性调度下不同 <code>t</code> 的 <code>\bar\alpha_t</code> 与 SNR，直观看到「信号如何随 <code>t</code> 渐隐」，并验证调度的基本性质（<code>\bar\alpha_t</code> 单调降、SNR 单调降、信号方差+噪声方差恒为 1）。理解调度，你才算真正掌握了扩散的「时间轴」——它是连接前向加噪、训练损失加权、反向采样三者的统一坐标。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="unify"><span class="num">7</span>与 VAE / score 的统一</h2>
+  <h3>扩散与 VAE / score 的统一</h3>  <p>扩散看似自成一派，其实与前面学的模型有深刻联系，把它放进全景才算学透。</p>  <p><strong>与 VAE 的关系</strong>：扩散可以看成一个<strong>层级极深的 VAE</strong>——把 <code>x_1,\dots,x_T</code> 看作 <code>T</code> 层隐变量，前向过程是<em>固定的</em>（无参数的）编码器，反向过程是解码器。扩散的训练目标其实是一个类 ELBO 的<strong>变分下界</strong>（各步 KL 之和），DDPM 证明它在重参数化后简化为那个简单的去噪 MSE。所以<strong>扩散 = 固定编码器 + 多层隐变量 + 变分下界</strong>，与模块 02 的 VAE 一脉相承，只是隐变量结构特殊（逐步加噪）使得目标能极大简化。</p>  <p><strong>与 score / 去噪 AE 的关系</strong>：如第 3 节所述，预测噪声 = 估计 score = 学去噪方向。这把扩散、Song & Ermon 的 score-based 模型、和模块 01 的去噪自编码器统一了起来——它们都在学 <code>\nabla_x\log p(x)</code>，区别只在「在多少个噪声水平上学」「怎么用学到的 score 采样」。</p>  <table>
+    <thead><tr><th>模型</th><th>编码/前向</th><th>解码/生成</th><th>目标</th></tr></thead>
+    <tbody>
+      <tr><td>VAE（模块 02）</td><td>可学编码器 q(z|x)</td><td>解码器一步采样</td><td>ELBO（重建−KL）</td></tr>
+      <tr><td>扩散 DDPM（本模块）</td><td><strong>固定</strong>逐步加噪</td><td><strong>可学</strong>逐步去噪（T 步）</td><td>变分界 → 去噪 MSE</td></tr>
+      <tr><td>score-based</td><td>（加噪扰动）</td><td>Langevin / SDE 采样</td><td>score matching</td></tr>
+    </tbody>
+  </table>  <p>回到模块 03 末尾埋的伏笔——扩散为何能同时拿到 VAE 的稳和 GAN 的锐？现在答案完整了：它的训练目标是<strong>监督回归（预测噪声的 MSE）</strong>，所以像 VAE 一样稳（无对抗、无移动靶、无 KL 平衡之苦）；它把生成<strong>拆成许多步小去噪</strong>，每步只需修一点点、累积出高保真，所以像 GAN 一样锐、且因为覆盖整个分布而<em>不易模式坍塌</em>。VAE 的糊源于「一步到位 + 信息受限」，扩散用「多步渐进」化解了它；GAN 的不稳源于「对抗鞍点」，扩散用「监督回归」化解了它。它精准地补上了两族各自的短板。</p>  <p>这个统一视角的价值，是让你看清扩散<strong>不是石头里蹦出来的新魔法</strong>，而是 VAE 的「变分下界」+ 去噪 AE 的「学 score」+ 重参数化技巧，在「逐步加噪」这个特殊结构下的<em>精妙合流</em>。理解了这一点，你就站在了扩散的真正地基上：它的每一块零件你都在前几个模块见过。下一模块流匹配会再进一步，把这条「学搬运方向」的线推到<strong>连续极限</strong>——把「逐步去噪」看成「沿一个速度场连续流动」，从而统一扩散与流、并让采样可以极少步。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>加速采样</strong>：朴素 DDPM 要 <code>T</code> 步（几百上千次网络前向），太慢。DDIM（确定性、可跳步）、各种高阶 ODE/SDE 求解器、以及蒸馏（把多步老师蒸成一步学生）是核心攻关方向。模块 05 的流匹配/rectified flow 正是这条线的延伸。</li>
+    <li><strong>连续时间与 SDE 视角</strong>：Song et al. 2021 用随机微分方程统一了 DDPM 与 score-based，并引出确定性的「概率流 ODE」。这把扩散与连续归一化流（模块 05）连了起来，是当前理论主线（前沿展开在 C28）。</li>
+    <li><strong>引导与可控生成</strong>：classifier guidance、classifier-free guidance 让扩散能按文本/类别条件生成（文生图的关键）。如何在保真与多样、可控与忠实之间权衡，是应用前沿（C28 详述，本课不展开）。</li>
+    <li><strong>架构与潜在扩散</strong>：把扩散从像素空间搬到 VAE 的潜在空间（latent diffusion，Stable Diffusion 的骨架）大幅降低成本；用 Transformer 替代 U-Net（DiT）是当前主流架构方向——这些都是 C28 前沿扩散课的内容，本模块只打基础。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Sohl-Dickstein et al. 2015（扩散奠基）、Ho et al. 2020（DDPM，重点读前向闭式与简化损失的推导）、Song & Ermon 2019（score 视角）。想统一理解读 Luo 2022 的统一推导、Song et al. 2021（SDE）。清单见 <code>references.md</code>。<strong>本课是基础课，只到 DDPM 与基本采样为止</strong>；DiT、概率流 ODE、引导与蒸馏等前沿在 C28。下一模块流匹配会展示扩散的「连续极限」如何让采样可以极少步——这是通往现代文生图的桥梁。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_gan/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 生成对抗网络 GAN</div></a>
+    <a class="next" href="../05_flow_matching/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 流匹配 Flow Matching</div></a>
+  </div>
+
+</div>
+</body>
+</html>

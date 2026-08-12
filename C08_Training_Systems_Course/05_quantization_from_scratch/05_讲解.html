@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 量化从零：int8/int4 与 GPTQ/AWQ 思想</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 07</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 量化从零：int8/int4 与 GPTQ/AWQ 思想</h1>
+  <p class="subtitle">把 fp16 权重压成 int8/int4——scale 与 zero-point 怎么定、per-channel 为什么误差更小、int4 怎么打包，全部在真实 GPT-2 权重上测。</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（显存账）、浮点格式（模块 02）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_quantization_from_scratch.ipynb（真实数据）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Dettmers 2022 (LLM.int8)；Frantar 2023 (GPTQ)；Lin 2023 (AWQ)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么量化：显存 + 带宽两本账</a></li>
+      <li><a href="#sym">对称量化（absmax）</a></li>
+      <li><a href="#asym">非对称量化（zero-point）</a></li>
+      <li><a href="#err">量化误差方差推导：s²/12</a></li>
+      <li><a href="#real">从零算一遍：真实 GPT-2 权重</a></li>
+      <li><a href="#int4">粒度与 int4 打包</a></li>
+      <li><a href="#gptq">GPTQ / AWQ：误差感知量化</a></li>
+      <li><a href="#drill">面试 drill：分布与误差问答</a></li>
+      <li><a href="#frontier">研究前沿、评测纪律与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么量化：显存 + 带宽两本账</h2>
+  <p>量化（quantization）就是把权重从 fp16（2 字节）压到 int8（1 字节）甚至 int4（0.5 字节）。它的两个收益直接落在模块 01 的两本账上：<strong>显存</strong>和<strong>带宽</strong>。先把这两笔收益讲清，才知道量化到底在买什么、代价付在哪。</p>  <ul>
+    <li><strong>显存减半 / 减四</strong>：fp16→int8 权重显存对半砍，fp16→int4 砍到四分之一。模块 01 算过推理显存约 $2P$，量化后变 $P$ 甚至 $0.5P$——让原本放不进小卡的大模型放得下。</li>
+    <li><strong>带宽减半 / 减四</strong>：模块 01 的 roofline 指出自回归解码是 <strong>memory-bound</strong>，每生成一个 token 都要把整套权重从 HBM 搬一遍。权重位宽减半，搬运量减半，<strong>解码直接变快</strong>——这是量化在推理上提速的物理根据。</li>
+  </ul>  <p>代价只有一个字：<strong>精度损失</strong>。把连续的 fp16 值塞进 256 个（int8）或 16 个（int4）整数格子，必然产生舍入误差。本章的全部技术——对称 / 非对称、per-channel/group、GPTQ/AWQ——都是在回答同一个问题：<em>如何在压到这么少的位数下，把精度损失压到最小</em>。</p>  <div class="callout intuition"><span class="label"></span>
+  记住量化的两本账：<strong>显存</strong>（让模型放得下）与<strong>带宽</strong>（让解码更快）。前者对应模块 01 的 $2P$ 显存账，后者对应 roofline 的 memory-bound 解码。<strong>量化省的是空间和搬运，不是计算</strong>——这也解释了它为什么主要用于推理而非训练（训练的瓶颈是优化器状态那 12P，且多需 fp32 精度累加）。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sym"><span class="num">2</span>对称量化（absmax）</h2>
+  <p>最简单的方案是<strong>对称量化</strong>（symmetric / absmax）：找权重绝对值的最大值，把 $[-\max|W|,\ \max|W|]$ 线性映射到 $[-127,127]$（int8）。</p>  <div class="math-block">\[s=\frac{\max|W|}{127},\qquad q=\mathrm{round}(W/s)\in[-127,127],\qquad \hat W=q\cdot s\]</div>  <p>$s$ 是 <span class="term">scale</span>（缩放因子），量化就是除以 $s$ 再取整，反量化就是乘回 $s$。<strong>对称</strong>的含义是：实数 0 精确映射到整数 0（无偏移），且正负范围关于 0 对称。它特别适合权重，因为<strong>权重通常近似零均值、左右对称分布</strong>——notebook 里你会在真实 GPT-2 张量上看到这个钟形对称分布确实成立。</p>  <p>为什么对权重选对称而不是更灵活的非对称？因为权重既然关于 0 对称，对称量化就<em>不浪费任何一侧的格子</em>，而且省掉了 zero-point（下一节）这个额外参数与额外加减运算。注意 int8 对称只用到 $[-127,127]$ 而非 $[-128,127]$——牺牲一个格子换来<em>零点严格对称、反量化无偏</em>，这是工程上常见的取舍。</p>  <div class="callout intuition"><span class="label"></span>
+  对称量化的一句话：<strong>用最大绝对值定一把对称的尺子，零对零、正负对称</strong>。它对<em>零均值对称</em>的权重最贴合，是权重量化的默认选择。下一节会看到，一旦数据不对称（如激活），这把对称尺子就开始浪费格子，需要换工具。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="asym"><span class="num">3</span>非对称量化（zero-point）</h2>
+  <p>当数据<strong>不对称</strong>时，对称量化就吃亏了。最典型的是 <span class="term">ReLU</span> 之后的激活——全是非负数。用对称尺子去量化全正数据，负的那一半 $[-127,0)$ 全部空置、<strong>浪费了一半范围</strong>，等效精度直接腰斩。对策是<strong>非对称量化</strong>（asymmetric）：引入一个 <span class="term">zero-point</span> 把真实区间 $[\min,\max]$ 平移映射到 $[0,255]$（uint8）。</p>  <div class="math-block">\[s=\frac{\max-\min}{255},\quad z=\mathrm{round}(-\min/s),\quad q=\mathrm{round}(W/s)+z\in[0,255],\quad \hat W=(q-z)\cdot s\]</div>  <p>zero-point $z$ 是<strong>真实 0 对应的那个整数值</strong>。它把整个区间平移，让 $\min$ 对齐到整数 0、$\max$ 对齐到 255，<em>256 个格子一个不浪费</em>地铺满数据的真实范围。代价是反量化要多做一次减 $z$，以及多存一个 $z$。经验法则很清晰：<strong>权重用对称（零均值对称），激活用非对称（常偏正、不对称）</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>量化就是把一把连续的尺子刻成 256 个（int8）或 16 个（int4）格子。<strong>对称</strong>：格子关于 0 对称排开；<strong>非对称</strong>：先平移让最小值对齐第一个格子，再均匀分。格子越少（int4），同一个数被四舍五入得越狠，误差越大。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>对称把 $[-\max|W|,\max|W|]$ 映到 $[-127,127]$、零点固定；非对称把 $[\min,\max]$ 映到 $[0,255]$、用 zero-point $z$ 平移。数据若不关于 0 对称（如 ReLU 后全正），非对称避免空置半个范围，等效步长 $s$ 更小、误差更低。这就是<em>激活用非对称</em>的原因。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+  高频混淆点：<strong>权重对称、激活非对称</strong>，别记反。原因不是约定俗成，是分布决定的——权重近似零均值对称、对称尺子不浪费；激活（尤其 ReLU 后）偏正不对称、必须用 zero-point 平移才不糟蹋格子。面试若被问<em>为什么不统一用一种</em>，答<strong>分布形状不同，对称浪费了不对称数据的一半范围</strong>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="err"><span class="num">4</span>量化误差方差推导：s²/12</h2>
+  <p>要量化地比较各种方案，得先有误差的数学。把一个实数 round 到步长为 $s$ 的格点，量化误差 $e=\hat W-W$ 可近似看作<strong>均匀分布</strong>在 $[-s/2,\ s/2]$ 上（只要 $s$ 远小于数据范围、误差不系统偏向某侧）。由均匀分布的矩直接积分：</p>  <div class="math-block">\[\mathbb E[e]=0,\qquad \mathrm{Var}(e)=\int_{-s/2}^{s/2} e^2\cdot\frac{1}{s}\,de=\frac{1}{s}\cdot\frac{e^3}{3}\Big|_{-s/2}^{s/2}=\frac{s^2}{12},\qquad \mathrm{RMSE}=\frac{s}{\sqrt{12}}\]</div>  <p>这条 $\mathrm{Var}(e)=s^2/12$ 是整章的定量基石。它说误差的大小<strong>只由步长 $s$ 决定</strong>，且随 $s$ 平方增长。于是<strong>减小 $s$ 就直接减小误差</strong>——这正是 per-channel/per-group 量化的全部动机：每个局部用自己的、更小的 $s$，误差就更小。也解释了 int4 为何误差大：格子只有 16 个，$s$ 被迫取得很大（约是 int8 的 16 倍量级），误差随之放大。</p>  <p>怎么把它变成可报告的<strong>相对误差</strong>？把 RMSE 除以权重的标准差：相对误差 $\approx \mathrm{RMSE}/\mathrm{std}(W)=(s/\sqrt{12})/\mathrm{std}(W)$。对一个近似正态、$\max|W|\approx k\cdot\mathrm{std}(W)$（$k$ 约 4–6）的权重张量，int8 对称的 $s=\max|W|/127$ 很小，算出的相对误差通常在<strong>零点几个百分点</strong>量级——这就是<em>int8 几乎无损</em>这个经验印象的来源。</p>  <div class="callout intuition"><span class="label"></span>
+  把 $\mathrm{Var}(e)=s^2/12$ 刻进脑子：<strong>量化误差随步长平方走，步长由最大绝对值和格子数决定</strong>。于是两条推论顺理成章——① 格子多（int8 vs int4）误差小；② 局部 scale（per-channel vs per-tensor）让 $s$ 更小、误差更小。本章后面所有粒度与算法的优劣，都能用这一条公式来解释。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="real"><span class="num">5</span>从零算一遍：真实 GPT-2 权重</h2>
+  <p>把 $s^2/12$ 落到一个真实张量上走一遍，你才真正握住量化的手感。配套 notebook 在 GPT-2 的 <code>h.0.attn.c_proj.weight</code> 上做 absmax int8 量化（这是一个 $768\times768$ 的注意力输出投影矩阵）。下面给出完整的<strong>纸面计算路径</strong>——不需要真跑，notebook 会实测验证每一步，包括 $\mathrm{Var}(e)\approx s^2/12$。</p>  <h4>第一步：从张量统计量算出 scale</h4>  <p>真实 GPT-2 权重近似零均值正态，典型地 $\mathrm{std}(W)\approx0.05$、$\max|W|\approx0.5$（约 $10$ 个标准差处的尾巴，深网权重常有这样的长尾）。per-tensor 对称的步长就是 $s=\max|W|/127=0.5/127\approx3.9\times10^{-3}$。</p>  <h4>第二步：由 s 推 RMSE 与相对误差</h4>  <p>由 $\mathrm{RMSE}=s/\sqrt{12}=3.9\times10^{-3}/3.46\approx1.1\times10^{-3}$。把它除以 $\mathrm{std}(W)$ 得到<strong>相对误差</strong>：$\mathrm{RMSE}/\mathrm{std}(W)\approx1.1\times10^{-3}/0.05\approx2.3\%$。这是 per-tensor int8 的量级——已经不算大，但还不到<em>无损</em>。这也印证了 int8 通常掉一点点、需要实测确认而非默认无损。</p>  <div class="math-block">\[s=\frac{\max|W|}{127},\quad \mathrm{RMSE}=\frac{s}{\sqrt{12}},\quad \text{相对误差}=\frac{\mathrm{RMSE}}{\mathrm{std}(W)}\approx\frac{\max|W|}{127\sqrt{12}\,\mathrm{std}(W)}\]</div>  <h4>第三步：per-channel 为什么把误差再压一截</h4>  <p>per-tensor 的 $s$ 被<em>全矩阵</em>那个 $0.5$ 的离群最大值撑大。改成 per-channel，每列单独取 $\max$：大多数列的局部 $\max|W|$ 远小于 $0.5$（也许只有 $0.2$），于是它们的局部 $s\approx0.2/127\approx1.6\times10^{-3}$，相对误差降到约 $0.9\%$——<strong>误差小一截</strong>正是这么来的。只有含离群值的那一两列仍用大 $s$，但坏处被<em>隔离</em>在那几列，不再拖累全矩阵。notebook 会实测出 per-channel 的整体 RMSE 明显低于 per-tensor，且每列的 $\mathrm{Var}(e)$ 都贴近各自的 $s^2/12$。</p>  <div class="callout warn"><span class="label"></span>
+  这条计算路径里有个口径必须说清：相对误差 $\approx\max|W|/(127\sqrt{12}\,\mathrm{std}(W))$ 的大小<strong>取决于权重分布的尾巴有多长</strong>（$\max|W|$ 与 $\mathrm{std}$ 的比值）。尾巴越长（离群越重），per-tensor 越吃亏、per-channel 收益越大。所以同样是 int8，不同层、不同矩阵的误差可以差好几倍——报告时别用一个笼统的百分比盖住所有层。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="int4"><span class="num">6</span>粒度与 int4 打包</h2>
+  <p>有了 $s^2/12$，粒度的选择就清晰了：用越局部的 scale，每个局部的 $\max$ 越小、$s$ 越小、误差越低。三种粒度从粗到细：</p>  <table>
+    <thead><tr><th>粒度</th><th>几个 scale</th><th>优点</th><th>致命弱点 / 代价</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">per-tensor</span></td><td>整个矩阵 1 个</td><td>最省、实现最简</td><td>一个离群值撑大全局 $s$，其余值量化极粗</td></tr>
+      <tr><td><span class="term">per-channel</span></td><td>每列 / 行 1 个</td><td>误差显著下降</td><td>多存少量 scale（每列一个标量）</td></tr>
+      <tr><td><span class="term">per-group</span></td><td>每 128 个元素 1 组</td><td>误差最低、最灵活</td><td>多存更多 scale，int4 常配它</td></tr>
+    </tbody>
+  </table>  <p>per-tensor 的致命弱点要重点理解：<strong>一个离群值（outlier）就能毁掉整个矩阵的量化</strong>。$s=\max|W|/127$ 取的是<em>全矩阵</em>的最大绝对值，只要某一列藏着一个极端大的值，$s$ 就被它撑大，于是<em>所有其他正常值</em>都得用这个粗大的步长去量化，误差集体恶化。per-channel 把 scale 局部化到每列，离群值只撑大它所在那一列的 $s$，不再殃及全矩阵。</p>  <p>per-group 更进一步：把每 128 个元素分一组、各用一个 scale，误差最低，但要存的 scale 也最多（一个 $4096\times4096$ 矩阵按 128 分组就有 $4096\times32$ 个 scale）。这点存储开销相对省下的几个 GB 权重微不足道。notebook 里你会在真实 GPT-2 的 <code>h.0.attn.c_proj.weight</code> 上实测：per-channel 的相对误差比 per-tensor<strong>小一截</strong>，并验证误差方差确实贴近理论的 $s^2/12$。</p>  <div class="callout warn"><span class="label"></span>
+  粒度是报告口径里最常被含糊的一项。说<em>我做了 int8 量化</em>几乎没有信息量——必须讲清是<strong>per-tensor 还是 per-channel/per-group、group size 多大</strong>。同样是 int8，per-tensor 遇到离群值可能掉 5 个点，per-group 可能几乎无损。<strong>粒度决定精度，含糊就等于没说</strong>。
+  </div>
+  <p>int4 只有 16 个值（$-8\sim7$ 或 $0\sim15$），一个值只需 4 个比特，于是<strong>两个 int4 能塞进一个字节</strong>。打包用位运算：高 4 位放一个、低 4 位放另一个，解包再用移位和掩码取出。</p>  <div class="math-block">\[\text{byte}=(q_{\text{hi}}\ll 4)\,|\,q_{\text{lo}},\qquad q_{\text{hi}}=\text{byte}\gg 4,\qquad q_{\text{lo}}=\text{byte}\,\&\,\text{0xF}\]</div>  <div class="ascii"> 一个字节 (8 bit) 装两个 int4：
+   bit:  7 6 5 4 | 3 2 1 0
+         └─ q_hi ┘ └─ q_lo ┘
+   打包: byte = (q_hi &lt;&lt; 4) | q_lo
+   解包: q_hi = byte &gt;&gt; 4 ;  q_lo = byte &amp; 0xF
+ 例: q_hi=5(0101), q_lo=12(1100) → byte=0101 1100 = 0x5C</div>  <p>这样 int4 权重显存是 fp16 的 <strong>1/4</strong>——模块 01 的 $2P$ 推理显存直接压到 $0.5P$。代价由上一节的 $s^2/12$ 早已注定：格子从 256 跌到 16，步长 $s$ 被迫放大约 16 倍量级，误差随之显著增大。所以 int4 几乎从不单独使用，而是<strong>配 per-group + 误差感知量化（GPTQ/AWQ）</strong>才能把精度拉回可用。下表把 int8 与 int4 的账并排对比：</p>  <table>
+    <thead><tr><th>位宽</th><th>格子数</th><th>显存比（vs fp16）</th><th>相对误差量级</th><th>典型搭配</th></tr></thead>
+    <tbody>
+      <tr><td>int8</td><td>256</td><td>1/2</td><td>零点几个百分点</td><td>per-tensor / per-channel</td></tr>
+      <tr><td>int4</td><td>16</td><td>1/4</td><td>明显更大（数倍）</td><td>per-group + GPTQ/AWQ</td></tr>
+    </tbody>
+  </table>  <p>一句话抓住权衡：<strong>int4 把显存再砍一半（相对 int8），但误差大一个量级，必须靠更细的粒度和更聪明的算法来补</strong>。如果有人说<em>我用 int4 量化且几乎无损</em>，你应当立刻追问：<em>per-group 吗？group size 多少？用了 GPTQ 还是 AWQ？</em>——这些细节才是 int4 能否可用的关键。</p>  <div class="callout warn"><span class="label"></span>
+  int4 的两个常见误区：① 以为<strong>int4 和 int8 误差差不多</strong>（错，格子少 16 倍，误差大得多）；② 以为<strong>打包只是省一半存储的小技巧</strong>——其实它配合 per-group + GPTQ 才是 int4 实际可用的前提。单纯 per-tensor int4 几乎一定会让模型能力明显塌陷。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="gptq"><span class="num">7</span>GPTQ / AWQ：误差感知量化</h2>
+  <p>朴素量化对每个权重<strong>独立四舍五入</strong>，完全忽略了一个事实：不同权重对最终输出的影响天差地别。前沿方法的共同信念是——<strong>量化误差不该被均匀对待，要优先保护对输出影响大的权重</strong>。两条代表性路线：</p>  <ul>
+    <li><strong>GPTQ</strong>（Frantar et al. 2023）：<strong>逐列量化</strong>，每量化完一列，就立刻<em>调整剩余未量化的列</em>来补偿这一列引入的误差——基于二阶 <span class="term">Hessian</span> 信息决定怎么补偿，使整个权重矩阵造成的<strong>输出误差</strong>最小，而非单个权重误差最小。</li>
+    <li><strong>AWQ</strong>（Lin et al. 2023，activation-aware）：观察到<strong>少数被大激活乘到的权重</strong>对输出影响最大，于是对这些重要通道做<strong>保护性缩放</strong>（量化前放大、量化后缩回），让量化的舍入误差尽量避开这些敏感通道。</li>
+  </ul>  <p>两者的精神一致：从<em>逐权重独立</em>升级到<em>感知全局影响</em>。GPTQ 用 Hessian 看<em>权重之间的相互补偿</em>，AWQ 用激活统计看<em>哪些权重被放大、最该保护</em>。这也是为什么 int4 这种高误差场景几乎离不开它们——$s^2/12$ 说误差总量被位宽钉死，但<strong>误差落在哪里</strong>可以被这些算法重新分配，让它落在不痛不痒的权重上。</p>  <div class="callout danger"><span class="label"></span>
+  <strong>离群值（outlier features）是 LLM 量化的头号敌人。</strong>Dettmers 发现大模型的某些激活维度存在<strong>极端离群值</strong>，会把 per-tensor int8 的 scale 撑爆、毁掉精度。<span class="term">LLM.int8()</span> 的解法是<strong>混合精度分解</strong>：把这些离群维度单独留 fp16 计算，其余维度走 int8——用一点点 fp16 的代价，守住整体精度。这正是<em>不均匀对待量化误差</em>思想最早、最有名的实例。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="drill"><span class="num">8</span>面试 drill：分布与误差问答</h2>
+  <p>把本章压成一组面试问答。量化题考的是你能否分清<em>分布决定方案</em>、<em>步长决定误差</em>，而不是背 API。下面逐条给出标准答法与口径：</p>  <ul>
+    <li><em>对称 vs 非对称，选哪个？</em> → 看分布：<strong>权重对称（零均值）用对称、激活不对称（如 ReLU 后全正）用非对称</strong>；对称浪费不对称数据的半个范围。</li>
+    <li><em>per-channel 为什么误差小？</em> → 误差 $\propto s$、$s=\max/格子数$；per-channel 让每列用各自更小的局部 $\max$，<strong>把离群值的影响隔离在单列</strong>，整体步长更小、误差更低（$\mathrm{Var}=s^2/12$）。</li>
+    <li><em>int4 为什么要配 per-group + GPTQ？</em> → int4 只 16 级、$s$ 大、误差大一个量级；per-group 缩小每组 $s$，GPTQ/AWQ 把误差<strong>重新分配到不重要的权重</strong>，两者合力才把精度拉回可用。</li>
+    <li><em>量化模型评测要注意什么？</em> → 必须<strong>重跑真实任务</strong>；困惑度可能只涨一点，但推理 / 长尾知识可能塌方，别拿一个 perplexity 数字代表全部能力。</li>
+  </ul>  <p>再串几个高频陷阱的正确反应：<em>权重和激活用同一种量化吗</em> → <strong>不，权重对称、激活非对称</strong>；<em>离群值有什么危害</em> → <strong>撑大 per-tensor 的全局 $s$、毁掉精度</strong>，解法是 per-channel/group 或 LLM.int8 的混合精度分解；<em>int4 是不是几乎无损</em> → <strong>看粒度与算法</strong>，per-tensor int4 几乎一定塌方、per-group + GPTQ 才可能接近无损。</p>  <div class="callout danger"><span class="label"></span>
+  扣分陷阱集锦：① 把<strong>权重 / 激活的对称性记反</strong>；② 以为<strong>per-channel 是玄学</strong>（其实就是缩小局部 $s$、$s^2/12$ 直接解释）；③ 以为<strong>int4 和 int8 误差差不多</strong>（差一个量级）；④ 量化后<strong>不重测就宣称无损</strong>（某些能力可能已塌方）。这四点几乎是量化面试的必设坑。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿、评测纪律与开放问题</h2>
+  <p>量化是部署侧最活跃的方向之一，而它对<strong>评测</strong>的意义常被低估，先把这条讲透，再看前沿。最重要的一条纪律：<strong>量化后必须重新跑评测</strong>。困惑度（perplexity）可能只涨一点点，给人<em>几乎无损</em>的错觉，但某些能力——多步推理、长尾事实知识——可能<strong>直接塌方</strong>。<em>别假设量化只掉一点点</em>，要用真实任务实测。</p>  <p>还有一条报告口径的纪律：说清楚<strong>量化了什么、怎么量化的</strong>。权重、激活、KV cache 的量化难度<em>依次递增</em>——KV cache 量化对长上下文显存尤其关键（呼应模块 06）。说<em>int4 量化</em>时必须交代是 per-tensor 还是 per-group、group size 多大、有没有用 GPTQ；这些直接决定精度，含糊其辞等于没报。</p>  <p>前沿则在沿几个方向继续推进，每一条都把本章的某个思想做到极致：</p>  <ul>
+    <li><span class="term">QLoRA</span> / NF4：用 4-bit NormalFloat 量化冻结的主权重 + LoRA 微调，把大模型微调塞进单张消费卡（呼应模块 01 的 LoRA 显存账）。</li>
+    <li><span class="term">SmoothQuant</span>：把激活的量化难度（离群值）通过数学等价变换<strong>迁移到权重上</strong>，让激活更好量化。</li>
+    <li><span class="term">AQLM</span> / 向量量化：不再逐元素量化，而是把权重向量映射到一个学习出的码本（codebook），在极低位宽下逼近无损。</li>
+    <li><strong>4-bit scaling laws</strong>（Dettmers & Zettlemoyer 2023）：系统研究<em>位宽与模型规模如何权衡</em>，回答<em>同样的显存预算下该选大模型低位宽还是小模型高位宽</em>。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+  Dettmers et al. 2022 <em>LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale</em>；Frantar et al. 2023 <em>GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</em>；Lin et al. 2023 <em>AWQ: Activation-aware Weight Quantization</em>；Dettmers & Zettlemoyer 2023 <em>The case for 4-bit precision: k-bit Inference Scaling Laws</em>。详见课程 references。
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_flashattention/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · FlashAttention</div></a>
+    <a class="next" href="05_quantization_from_scratch.ipynb"><div class="dir">下一模块 →</div><div class="t">打开配套练习</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 知识蒸馏</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 知识蒸馏</h1>
+  <p class="subtitle">soft label 里的暗知识、温度如何放大类间结构、KD 损失的 KL 与 T² 缩放、logit/feature/attention/自蒸馏 —— 把大模型的「看法」装进一个本就更小的学生</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、softmax 与交叉熵、KL 散度、反向传播、一点点训练经验</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_distillation.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Hinton 2015 (蒸馏)、Romero 2014 (FitNets)、Sanh 2019 (DistilBERT)、Wang 2020 (MiniLM)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what">蒸馏是什么：暗知识与软标签</a></li>
+      <li><a href="#temp">温度：放大暗知识</a></li>
+      <li><a href="#loss">蒸馏损失：KL 与 T² 缩放</a></li>
+      <li><a href="#what2">蒸馏什么：logit/feature/attention/自</a></li>
+      <li><a href="#onpolicy">on-policy 蒸馏</a></li>
+      <li><a href="#compare">蒸馏在压缩家族里的定位</a></li>
+      <li><a href="#recipe">一个蒸馏训练的配方</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what"><span class="num">1</span>蒸馏是什么：暗知识与软标签</h2>
+  <p>前三个模块都是「把同一个模型压小」：量化压 bit、fp8 压训练精度。这个模块换一种思路——<strong>把一个大模型的「知识」转移进一个本来就更小的模型</strong>。这就是 <span class="term">knowledge distillation</span>（知识蒸馏，Hinton et al. 2015）。</p>  <p>设定很简单：有一个训练好的大 <span class="term">teacher</span>（教师）模型，和一个待训练的小 <span class="term">student</span>（学生）模型。蒸馏让学生不只学数据的硬标签，还<strong>模仿教师的输出</strong>，从而用比直接训练小模型更好的质量、把大模型的能力「装」进小模型。</p>  <p>它和前面的压缩有个本质区别：量化/剪枝是<strong>改造既有模型</strong>（同一套参数变便宜），蒸馏是<strong>训练一个新的小模型</strong>（参数量直接小）。所以蒸馏的压缩率不受 bit 数限制——学生可以是教师的 1/10、1/100，只要它学得会。代价是蒸馏要<strong>训练</strong>（比 PTQ 贵），且需要一个好教师。</p>  <p>蒸馏在今天的 LLM 生态里其实<strong>无处不在</strong>，远超「压缩」这个标签。很多广受欢迎的小模型，都是从更强的大模型蒸馏（或用其生成数据训练）而来；把一个慢但强的推理模型蒸馏成快模型、把多个专家模型蒸馏进一个统一模型、把对齐好的行为蒸馏给新模型——这些都是蒸馏。它已经从一个「让模型变小」的技巧，长成了「在模型之间转移能力」的通用工具。本模块讲的虽是最经典的分类式蒸馏，但其核心（软标签、温度、KL）正是这一切的基础。</p>  <p>蒸馏最反直觉、也最迷人的一点是：<strong>学生从教师那里学到的，比从原始数据标签学到的更多</strong>。为什么？因为教师的输出是一个完整的<strong>概率分布</strong>，而硬标签只是一个 one-hot。这个分布里藏着教师对<em>类与类之间相似度</em>的判断——这就是 Hinton 说的 <span class="term">dark knowledge</span>（暗知识）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：硬标签像考试只告诉你「正确答案是 B」；教师的软标签像一位老师告诉你「答案是 B，但 D 也很有道理（0.2 分），A 完全不对（0.001 分）」。后者携带的信息多得多——它告诉你各个选项之间的关系。学生从这种「带解释的答案」里，能学到数据本身（硬标签）给不了的结构。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：一张猫的图片，硬标签是 <code>[猫=1, 狗=0, 车=0]</code>；教师软标签可能是 <code>[猫=0.7, 狗=0.29, 车=0.001]</code>。<code>狗=0.29 ≫ 车=0.001</code> 这个<strong>相对关系</strong>编码了「猫比起车更像狗」的知识。学生模仿这个分布，等于额外学到了类间的几何结构——这是 one-hot 硬标签完全没有的信息。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住蒸馏：<strong>教师的软标签比硬标签信息更丰富，因为它编码了类间相似度（暗知识）；学生模仿这个分布，就能用更小的体量学到更多</strong>。而要把暗知识<em>放大</em>到学生看得清，需要一个关键旋钮——<strong>温度</strong>。下一节讲它。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="temp"><span class="num">2</span>温度：放大暗知识</h2>
+  <h3>温度：放大暗知识</h3>  <p>暗知识藏在软标签的<strong>非目标类概率</strong>里，但有个问题：训练好的教师通常很<strong>自信</strong>——正确类概率接近 1，其余接近 0。比如 <code>[0.999, 0.0009, 0.0001]</code>，那点宝贵的类间结构被压得几乎看不见。<span class="term">temperature</span>（温度）就是用来<strong>把它放大</strong>的。</p>  <p>温度 <code>T</code> 加在 softmax 的 logit 上：<code>softmax(z/T)</code>。<code>T&gt;1</code> 会<strong>软化</strong>分布——把尖锐的概率拉平，让小概率变大、大概率变小，暗知识里的相对关系<strong>浮现出来</strong>。</p>  <div class="math-block">\[p_i(T) = \frac{\exp(z_i/T)}{\sum_j \exp(z_j/T)}, \qquad T>1 \text{ 软化分布，放大类间结构}\]</div>  <div class="ascii">同一组 logit [5, 2, 1, 0.5]，不同温度下的 softmax：
+
+  T=1 (原始):  ████████████████████░░░  [0.93, 0.05, 0.02, 0.01]  尖锐
+  T=2:         ██████████████░░░░░░░░░  [0.68, 0.15, 0.09, 0.07]
+  T=4:         █████████░░░░░░░░░░░░░░░  [0.46, 0.22, 0.17, 0.15]
+  T=8:         ███████░░░░░░░░░░░░░░░░░  [0.35, 0.24, 0.21, 0.20]  软
+
+  温度越高 -&gt; 分布越软 -&gt; 非目标类的相对关系(暗知识)越清晰
+  教师、学生用同一个 T 算软标签, 让学生学到这些关系</div>  <p>蒸馏时<strong>教师和学生用同一个温度 T</strong>算软标签，让学生去匹配教师<em>软化后</em>的分布。训练完，学生<strong>推理时用 T=1</strong>（正常温度）。温度只在蒸馏训练阶段起「放大镜」的作用，帮学生看清暗知识。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>温度的作用可以这样体会：教师太自信时，软标签几乎退化成硬标签（暗知识被压没了），蒸馏就没了优势。升高温度把分布「摊开」，那些被压到 0.001 的非目标类概率被放大到 0.1 量级，学生才能<em>看清并学到</em>「猫像狗不像车」这种关系。<code>T</code> 是个超参，太小放大不够、太大则把有用信号也抹平，典型取 <code>2~10</code>，需要调。</p>
+  </div>  <p>从数学上看温度做了什么也很有启发。<code>z/T</code> 把所有 logit 之差缩小 <code>T</code> 倍，于是 softmax 后各概率之比 <code>p_i/p_j = exp((z_i−z_j)/T)</code> 被压向 1（更均匀）。<code>T→∞</code> 时趋于均匀分布（全 <code>1/C</code>），<code>T→0</code> 时趋于 one-hot（退化成 argmax）。<code>T=1</code> 是原始 softmax。所以温度本质是一个<strong>在「均匀」与「尖锐」之间连续滑动</strong>的旋钮——蒸馏要的是中间某个位置：软到能看见暗知识，又不至于软到把类别信息也抹平。</p>  <p>还有个微妙处值得点出：温度不仅放大了<strong>暗知识</strong>，也放大了教师的<strong>噪声/不确定性</strong>。如果教师对某些样本本就拿不准，高温会把这份不确定也忠实地传给学生——这通常是好事（学生学到了「这里该不确定」），但若教师的不确定来自它自己的缺陷，就可能误导学生。这是为什么蒸馏损失常常<em>配一项硬标签交叉熵</em>（下一节）：用真值给学生一个不被教师噪声带偏的锚点。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="loss"><span class="num">3</span>蒸馏损失：KL 与 T² 缩放</h2>
+  <h3>蒸馏损失：KL 散度与 T² 缩放</h3>  <p>学生要<strong>匹配教师的软标签分布</strong>，衡量两个分布差异的标准工具是 <span class="term">KL divergence</span>（KL 散度）。蒸馏损失就是教师软标签 <code>p_T</code> 与学生软标签 <code>p_S</code> 之间的 KL：</p>  <div class="math-block">\[\mathcal{L}_{KD} = T^2 \cdot \mathrm{KL}\big(p_T(T)\,\|\,p_S(T)\big) = T^2\sum_i p_{T,i}\log\frac{p_{T,i}}{p_{S,i}}\]</div>  <p>注意那个 <strong>T² 因子</strong>，它不是装饰。软标签是 <code>softmax(z/T)</code>，对学生 logit 求梯度时会带出一个 <code>1/T</code> 因子（链式法则），又因为损失里有两处涉及 <code>z/T</code>，梯度量级整体缩小成 <code>1/T²</code>。乘上 <code>T²</code> 正好<strong>抵消</strong>这个缩小，让蒸馏损失的梯度量级与温度无关——这样调温度时不用重调学习率，也能和硬标签损失放在一起按固定权重相加。</p>  <p>完整的蒸馏损失通常是<strong>两项加权和</strong>：软标签的 KL（学教师）+ 硬标签的交叉熵（学真值）：</p>  <div class="math-block">\[\mathcal{L} = \alpha\, \underbrace{T^2\,\mathrm{KL}(p_T\|p_S)}_{\text{学教师(暗知识)}} + (1-\alpha)\, \underbrace{\mathrm{CE}(y, p_S(T{=}1))}_{\text{学真值(硬标签)}}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么还要硬标签那一项？因为教师也会犯错。纯学教师，学生的上限就是教师；加上硬标签，学生在教师出错的样本上还能从真值得到纠正。<code>α</code> 平衡两者：教师很强就多信教师（α 大），教师一般就多信真值。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>硬标签项用 <code>T=1</code> 的学生分布算交叉熵（真值是确定的，不需软化）；软标签项用温度 <code>T</code>。两项的梯度因为 T² 缩放而量级可比，能直接相加。这就是 Hinton 蒸馏的标准损失，DistilBERT 等都是它的变体。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见错误是<strong>忘记 T² 缩放</strong>。不乘 T²，蒸馏损失的梯度会比硬标签损失小 <code>T²</code> 倍（T=4 时小 16 倍），导致软标签项几乎不起作用、蒸馏退化成普通训练。本模块 notebook 会让你亲眼看到：去掉 T²，蒸馏损失的梯度量级随 T 暴跌；加上 T²，量级稳定——这是蒸馏能正常工作的必要细节。</p>
+  </div>  <p>为什么用<strong>KL 散度</strong>而不是别的距离？因为我们要学生<em>匹配教师的整个分布</em>，而 KL 正是衡量「用学生分布近似教师分布」的信息损失。展开 <code>KL(p_T‖p_S) = Σ p_T log p_T − Σ p_T log p_S</code>，第一项只含教师（对学生是常数），所以对学生求梯度时只剩 <code>−Σ p_T log p_S</code>——这恰好是<strong>以教师软标签为目标的交叉熵</strong>。换句话说，蒸馏在数学上就是「拿教师的软分布当标签做交叉熵」，只不过标签从 one-hot 换成了教师的完整分布。理解这点，KL 蒸馏就不再是个陌生的公式，而是交叉熵的自然推广。</p>  <p>关于梯度还有个漂亮的事实：softmax+交叉熵的梯度有著名的简洁形式 <code>p_S − p_T</code>（预测减目标）。蒸馏也继承了它——KD 损失对学生 logit 的梯度（温度 <code>T</code> 下）正是 <code>(p_S − p_T)/T</code>，乘上 T² 后是 <code>(p_S − p_T)·T</code>。本模块 notebook 直接用这个解析梯度做梯度下降，让你看到学生 logit 如何一步步被推向教师——不需要自动微分，纯 numpy 就能把蒸馏的学习过程完整跑出来。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="what2"><span class="num">4</span>蒸馏什么：logit/feature/attention/自</h2>
+  <h3>蒸馏什么：logit / feature / attention / 自蒸馏</h3>  <p>Hinton 的原始蒸馏匹配<strong>输出 logit</strong>，但「知识」不只在输出层。蒸馏发展出多个层面，匹配教师不同部位的信息：</p>  <ul>
+    <li><strong>logit 蒸馏</strong>（Hinton 2015）：匹配输出概率分布。最经典、最通用，本模块 notebook 从零实现的就是它。</li>
+    <li><strong>feature 蒸馏</strong>（FitNets）：匹配中间层的隐藏表示。学生中间层去拟合教师中间层（常需一个投影对齐维度），让学生学到教师的内部特征，不只是最终判断。</li>
+    <li><strong>attention 蒸馏</strong>（TinyBERT、MiniLM）：匹配注意力图或注意力里的关系（query-key、value-value 的相似度矩阵）。在 Transformer 蒸馏里极有效，因为注意力承载了大量结构信息。</li>
+    <li><strong>自蒸馏</strong>（self-distillation, Born-Again Networks）：教师和学生<em>同架构</em>（甚至同一模型的不同阶段）。用上一代的自己当教师反复蒸馏，竟能超过教师——说明蒸馏不只是压缩，还能提质。</li>
+  </ul>  <table>
+    <thead><tr><th>蒸馏类型</th><th>匹配什么</th><th>代表工作</th><th>适用</th></tr></thead>
+    <tbody>
+      <tr><td>logit</td><td>输出概率分布</td><td>Hinton 2015</td><td>通用，最简单</td></tr>
+      <tr><td>feature</td><td>中间层表示</td><td>FitNets</td><td>学生/教师差距大时</td></tr>
+      <tr><td>attention</td><td>注意力图/关系</td><td>TinyBERT, MiniLM</td><td>Transformer 蒸馏</td></tr>
+      <tr><td>self</td><td>自己(同架构)</td><td>Born-Again Nets</td><td>提质而非压缩</td></tr>
+    </tbody>
+  </table>  <p>这些类型<strong>可以组合</strong>：真实的强蒸馏（如 DistilBERT、MiniLM）常常 logit + feature + attention 一起上，让学生在输出、中间表示、注意力多个层面都对齐教师。匹配的层面越多，学生学得越像，但实现也越复杂、越依赖教师与学生的架构对应。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>从「匹配什么」的角度看，蒸馏的本质是<strong>把教师的某种「行为签名」当作额外的监督信号</strong>。logit 蒸馏用「输出分布」当签名，feature 用「中间表示」，attention 用「注意力模式」。签名取得越深、越细，传递的知识越多，但也越要求学生有能力复现它。选哪种，取决于学生和教师有多像、以及你愿意付多少实现成本。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="onpolicy"><span class="num">5</span>on-policy 蒸馏</h2>
+  <h3>on-policy 蒸馏：在学生自己的输出上学</h3>  <p>经典蒸馏在<strong>固定数据集</strong>上做：拿训练集的输入、收集教师在这些输入上的软标签、训学生匹配。但这对<strong>生成式模型</strong>（LLM）有个隐患——<span class="term">on-policy distillation</span>（on-policy 蒸馏）就是来解决它的。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>问题在于<strong>训练-推理分布不匹配</strong>（exposure bias）。学生在固定数据集上学教师，但推理时它要在<em>自己生成的</em>上下文上继续生成。如果学生生成时走偏到了训练集没覆盖的状态，它就没学过教师在那些状态下会怎么做——错误会累积。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>on-policy 蒸馏的解法：让学生<strong>先自己生成</strong>一些样本，再让教师在<strong>这些学生生成的样本</strong>上给出软标签/反馈，学生据此学习。这样学生学的是「在我自己会到达的状态下，教师会怎么做」，直接对齐了训练与推理的分布。</p></div>
+  </div>  <p>这条线在 LLM 蒸馏里越来越重要（GKD、on-policy KD 等）。它把蒸馏从「模仿教师在标准数据上的答案」升级为「在学生自己的轨迹上获得教师指导」，本质上更接近强化学习的 on-policy 思想——用学生自己的分布采样、再用教师当「奖励/参考」。对生成质量、尤其长序列生成的稳定性，提升明显。</p>  <div class="callout paper"><span class="label"></span>
+    <p>on-policy / 广义蒸馏（GKD，Agarwal 2023；Gu 2023）指出固定数据集蒸馏的分布不匹配，主张在学生生成的样本上蒸馏。这是把蒸馏用到现代生成式 LLM 的关键演进。基础仍是 Hinton 2015 的软标签 + 温度 + KL。完整清单见 <code>references.md</code>。</p>
+  </div>  <p>再说一个 LLM 蒸馏里很现实的分支：<strong>黑盒 vs 白盒</strong>。白盒蒸馏要拿到教师的完整 logit 分布（像本课做的），但很多强教师只开放 API，你只能拿到它<em>生成的文本</em>（黑盒）。黑盒蒸馏退而求其次：用教师生成大量高质量样本，再拿这些样本对学生做普通的监督微调（SFT）——本质是「用教师当数据标注器」。今天很多开源小模型就是这么从更强的模型「蒸」出来的。它丢掉了软标签的暗知识（只剩硬的生成文本），但胜在不需要教师内部访问、工程简单。</p>  <p>on-policy 还揭示了蒸馏与<strong>强化学习</strong>的深层联系。把教师看成「奖励模型/参考策略」，让学生在自己的采样轨迹上获得教师的偏好信号，这套结构和 RLHF/RLAIF 几乎同形。区别只在信号来源：蒸馏的「奖励」是教师的分布或判断，RLHF 的是人类偏好。理解这层联系，你会发现「蒸馏」「对齐」「RL」在生成式模型上正越走越近——它们都是在用某个<em>更可信的信号源</em>去塑造学生的行为分布。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="compare"><span class="num">6</span>蒸馏在压缩家族里的定位</h2>
+  <h3>蒸馏 vs 量化/剪枝：压缩家族里的定位</h3>  <p>把蒸馏放回整个压缩家族，它的定位就清楚了：</p>  <table>
+    <thead><tr><th>手段</th><th>怎么压</th><th>压缩来源</th><th>需要训练吗</th><th>压缩率</th></tr></thead>
+    <tbody>
+      <tr><td>量化(01/02)</td><td>权重低 bit</td><td>每参数更少 bit</td><td>否(PTQ)</td><td>2~4×(bit 限制)</td></tr>
+      <tr><td>fp8(03)</td><td>训练低精度</td><td>更快训练</td><td>是(训练时)</td><td>训练加速,非模型变小</td></tr>
+      <tr><td><strong>蒸馏(04)</strong></td><td>换小模型</td><td>参数量直接更少</td><td><strong>是</strong></td><td>不受 bit 限制(可 10×+)</td></tr>
+      <tr><td>剪枝(05)</td><td>删权重</td><td>更少非零参数</td><td>通常要微调</td><td>受稀疏度限制</td></tr>
+    </tbody>
+  </table>  <p>蒸馏的独特之处：它是唯一<strong>不受单参数 bit 数限制</strong>的压缩——别人是「让每个参数更便宜」，蒸馏是「直接用更少的参数」。理论上学生可以任意小，只要它的容量装得下教师传授的知识。代价也明确：要训练（成本高于 PTQ），且质量上限依赖教师和学生架构。</p>  <p>更重要的是蒸馏<strong>和其他压缩正交、可叠加</strong>：先蒸馏出一个小学生，再把学生量化到 int4，再 2:4 剪枝——三种手段各砍一刀，复合压缩率远超任何单一手段。真实的极致压缩（如端侧部署）往往就是这套组合拳。理解每种手段压的是<em>哪个维度</em>（bit / 参数量 / 稀疏），才能合理地把它们叠起来而不互相打架。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一个统一视角：量化压「每个参数的 bit」，剪枝压「参数的个数（置 0）」，蒸馏压「模型的整体容量（换小网络）」。三者作用在不同维度，所以能叠加。蒸馏最「彻底」（直接换小模型）但也最「贵」（要训练）；量化最「便宜」（PTQ 几小时）但压缩率受 bit 限制。按预算和质量要求组合它们，是压缩工程的核心决策。</p>
+  </div>  <p>一个常被追问的硬问题：<strong>给定算力预算，蒸馏一个小模型，真的比「直接用更多数据训这个小模型」好吗</strong>？答案是<em>通常好，但增益的来源有争议</em>。一派认为是暗知识（教师传递了类间结构这种额外监督）；另一派认为蒸馏更像一种<strong>强正则化</strong>（软标签比 one-hot 更平滑，抑制过拟合）；还有人指出教师其实充当了<strong>数据增强/标签平滑</strong>的角色。多半三者都有贡献。实践上的共识是：教师越强、学生越小、数据越有限，蒸馏相对直接训练的优势越明显。</p>  <p>最后给一个真实的<strong>复合压缩</strong>例子，把全课串起来。要把一个 70B 模型部署到端侧：① 先<strong>蒸馏</strong>出一个 7B 学生（参数 10×↓）；② 对学生做 <strong>GPTQ/AWQ int4</strong>（每参数 bit 4×↓，模块 02）；③ 再叠 <strong>2:4 稀疏</strong>（模块 05，又约 2×）。三刀复合下来，等效压缩可达几十倍，远非任何单一手段能及。理解每种手段压的是哪个维度、彼此是否正交，才能这样安全地叠加而不让误差互相放大——这正是本课五个模块要共同教会你的系统视角。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="recipe"><span class="num">7</span>一个蒸馏训练的配方</h2>
+  <h3>把它跑起来：一个蒸馏训练的配方</h3>  <p>蒸馏训练一个学生的标准流程：</p>  <ol>
+    <li>准备好<strong>教师</strong>（训练好的大模型）与<strong>学生</strong>（随机初始化的小模型，架构自定）；</li>
+    <li>对每个 batch：教师前向得 logit（<strong>教师不更新，no_grad</strong>），学生前向得 logit；</li>
+    <li>算两者在温度 <code>T</code> 下的软标签，求 <strong>KL 蒸馏损失 ×T²</strong>；</li>
+    <li>（可选）加硬标签交叉熵项，按 <code>α</code> 加权；（可选）加 feature/attention 蒸馏项；</li>
+    <li>反向、更新<strong>学生</strong>参数；</li>
+    <li>训练完，学生<strong>用 T=1 推理</strong>（温度只在蒸馏阶段用）。</li>
+  </ol>  <p>关键的工程点：教师只做前向、<strong>全程冻结</strong>（省一半显存与算力，且教师不该变）；温度 <code>T</code> 和权重 <code>α</code> 是要调的超参；学生架构可以和教师不同（更浅、更窄、更少层），只要输出维度（类数/词表）对得上 logit 蒸馏。feature 蒸馏则需要额外的投影层来对齐中间维度。</p>  <p>把这条流程和本模块串起来：温度（s2）放大暗知识，KL+T²（s3）是损失，匹配的层面（s4）决定传递多少知识，on-policy（s5）解决生成式的分布不匹配。蒸馏不是「让小模型硬背大模型的答案」，而是<strong>让小模型学会大模型对世界的「看法」</strong>（类间结构、内部特征、注意力模式）——这才是它能用小体量逼近大模型的根本。</p>  <p>成本上还有个实用提醒：蒸馏的大头开销是<strong>教师前向</strong>。每个训练样本都要教师跑一遍拿软标签，这在教师很大时不便宜。常见的省钱做法是<strong>离线缓存教师输出</strong>——预先把训练集过一遍教师、把软标签（或 top-k logit）存盘，之后多轮训练学生时直接读缓存，不必每轮重跑教师。这把「教师前向」从每步成本变成一次性成本，是大规模蒸馏的标准工程。理解了这点，你就能估算蒸馏的真实开销并把它优化下来。</p>  <div class="callout warn"><span class="label"></span>
+    <p>蒸馏的常见失败：教师太强、学生容量不够（学不动，需要 feature/attention 蒸馏帮忙）；温度/α 没调好（暗知识没放大或硬标签主导）；忘了 T² 缩放（软标签项失效）；教师和学生分布差太远（固定数据集蒸馏的分布不匹配，需 on-policy）。理解了每个旋钮在干什么，蒸馏掉点时你才知道该往哪个方向调，而不是盲目试。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>LLM 的蒸馏（黑盒/白盒）</strong>：能不能只用 API（黑盒，只拿到教师生成的文本）蒸馏出小模型？还是需要教师的 logit（白盒）？黑盒蒸馏（用教师生成数据做 SFT）是当前小模型的主流做法之一。</li>
+    <li><strong>on-policy 与 RL 的融合</strong>：on-policy 蒸馏与 RLHF/RLAIF 越来越像——用学生自己的采样 + 教师当参考/奖励。两者如何统一、怎么最有效，是活跃方向。</li>
+    <li><strong>蒸馏 vs 直接训练小模型</strong>：给定算力，是蒸馏一个小模型好，还是直接用更多数据训小模型好？「蒸馏的真正增益来自哪里」（暗知识？正则化？）仍有争论。</li>
+    <li><strong>跨模态/跨架构蒸馏</strong>：把大语言模型蒸馏进不同架构（如 SSM、MoE→dense），或跨模态蒸馏（视觉→语言），需要新的对齐方式，是工程热点。</li>
+    <li><strong>蒸馏与其他压缩的协同</strong>：蒸馏 + 量化 + 剪枝怎么联合优化（而非依次做）以达到最优复合压缩，是把压缩推到极致的系统问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Hinton et al. 2015（蒸馏奠基，软标签+温度+T²，本模块主线）、Romero et al. 2014（FitNets，feature 蒸馏）、Sanh et al. 2019（DistilBERT，工业级蒸馏）、Wang et al. 2020（MiniLM，attention 蒸馏）、Agarwal/Gu 2023（on-policy/GKD）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_fp8_training/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · fp8 训练</div></a>
+    <a class="next" href="../05_pruning/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 剪枝与稀疏</div></a>
+  </div>
+
+</div>
+</body>
+</html>

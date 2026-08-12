@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Continuous Batching</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · Continuous Batching</h1>
+  <p class="subtitle">静态批处理为何浪费、迭代级（iteration-level）连续批处理让完成即让位/到达即补位、prefill 与 decode 的张力与 chunked prefill、抢占与 SLO/goodput —— 把 GPU 一直喂满的调度术</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01、自回归解码、一点点排队论/调度常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_continuous_batching.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Yu et al. 2022 (Orca)、Agrawal et al. 2024 (Sarathi-Serve)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#static">静态批处理为何浪费</a></li>
+      <li><a href="#continuous">核心思想：迭代级调度</a></li>
+      <li><a href="#loop">调度循环：引擎的心跳</a></li>
+      <li><a href="#interference">prefill 与 decode 的张力</a></li>
+      <li><a href="#chunked">Chunked Prefill 切碎喂</a></li>
+      <li><a href="#preempt">抢占：显存压力下不死锁</a></li>
+      <li><a href="#metrics">账本：吞吐、延迟与 goodput</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="static"><span class="num">1</span>静态批处理为何浪费</h2>
+  <p>上一模块我们把 KV 显存管好了，batch 能开大了。但「能开大」不等于「一直满」。本模块要解决的是<strong>时间维度</strong>的浪费：在一段时间里，GPU 到底有多少时刻是真的在干活、有多少时刻在干等？答案取决于<strong>批处理的粒度</strong>——而这正是 continuous batching 与传统静态批处理的分水岭。</p>  <p>先看传统做法：<span class="term">static batching</span>（静态批处理，也叫请求级批处理）。它的逻辑很自然：凑齐一批请求（比如 8 个），打包成一个 batch 一起喂进模型，整批<strong>同步推进</strong>——所有请求一起 prefill、一起 decode，每一步所有请求各产出一个 token，直到<strong>批内最长的那个请求</strong>生成完，整批才一起返回、再接下一批。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>问题出在「整批同步、等最长」这六个字。一个 batch 里，有的请求只想生成 10 个 token，有的要生成 500 个。短的早早就停了，但它占的那个 batch 槽位<strong>不能让出来</strong>——它必须陪着最长的那个请求一直跑到结束。于是 GPU 在为一堆「已经写完 EOS、却还在 batch 里凑数」的请求做无用的前向。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，设 batch 内各请求的生成长度为 <code>L_1, ..., L_B</code>。静态批处理的总迭代步数 = <code>max(L_i)</code>，而真正有效的 token 产出是 <code>sum(L_i)</code>。GPU 的<strong>有效利用率</strong> ≈ <code>sum(L_i) / (B × max(L_i))</code>。当长度差异很大时（真实负载下生成长度方差极大），这个比值可以低到 20–30%。</p></div>
+  </div>  <div class="ascii">静态批处理：整批同步，短请求被最长请求拖死（█=有效计算 ░=空转气泡）
+
+  请求A (10 tok):  █ █ █ █ █ █ █ █ █ █ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░
+  请求B (20 tok):  █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █
+  请求C ( 6 tok):  █ █ █ █ █ █ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░
+                   └────────── 整批必须跑满 20 步 ──────────┘
+  气泡(░)全是 GPU 在为已完成的请求空转。利用率 = (10+20+6)/(3×20) = 60%。
+  更糟：新请求 D 即使现在到了，也得等这一整批 20 步跑完才能上车。</div>  <p>为什么这个浪费在 LLM 服务里尤其致命？因为生成长度的<strong>方差极大</strong>。同一个聊天接口，有人问「今天星期几」（生成 5 个 token 就停），有人让它「写一篇两千字的文章」（生成上千 token）。这种<em>天然的、不可预测的</em>长度分布，意味着任何一个静态 batch 里几乎总会混着长短悬殊的请求——而静态批处理偏偏要让它们<strong>步调一致</strong>。生成长度越参差，气泡越大、利用率越低。这不是某种可以靠调参绕过的边缘情况，而是生成式负载的<strong>内在结构</strong>，正是它让静态批处理在 LLM 时代彻底失效、催生了连续批处理。</p>  <div class="callout danger"><span class="label">static batching 两宗罪</span>
+    <p>静态批处理有<strong>两宗罪</strong>，都源于「请求级」这个粗粒度：① <strong>队内气泡</strong>——短请求停了却不能让位，GPU 为它空转；② <strong>队首阻塞</strong>（head-of-line blocking）——新请求必须等当前整批全部结束才能进入，哪怕 batch 里早就有请求完成、腾出了算力。前者浪费吞吐，后者推高延迟。下一节的 continuous batching 用「迭代级」粒度一举消灭这两宗罪。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="continuous"><span class="num">2</span>核心思想：迭代级调度</h2>
+  <h3>核心思想：把调度粒度从「请求」降到「迭代」</h3>  <p>解药出奇地简洁，由 <span class="term">Orca</span>（Yu et al. 2022）提出，叫 <span class="term">iteration-level batching</span>（迭代级批处理），在 vLLM 里叫 <span class="term">continuous batching</span>。一句话：<strong>不在「整个请求」的粒度上调度，而在「每一个解码迭代」的粒度上调度</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把「等整批跑完再换一批」改成「每跑完一步就重新组队」。某个请求这一步生成了 EOS？立刻把它请出 batch、返回结果，它的槽位<strong>当场</strong>让给等待队列里的新请求。于是 batch 的成员是<strong>流动</strong>的——完成即让位、到达即补位，GPU 永远在为「还没写完的请求」干活，几乎没有空转气泡。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>关键洞察是：在 Transformer 的一个 decode 迭代里，batch 内各请求<em>彼此独立</em>——请求 A 的第 50 个 token 和请求 B 的第 3 个 token，在同一次前向里只是 batch 维上的两行，互不影响。既然每一步本就是独立处理 batch 里的每一行，那么<strong>每一步换掉其中几行</strong>（踢走完成的、塞进新来的）在计算上毫无障碍。静态批处理白白放弃了这个自由度。</p></div>
+  </div>  <p>Orca 还配了一个关键技巧叫 <span class="term">selective batching</span>（选择性批处理）：不同请求处在不同阶段（有的在 prefill、有的在 decode；序列长度也不同），不能简单地堆成一个规整的张量。selective batching 对能批的算子（如逐 token 的矩阵乘）按 batch 合并、对不能批的算子（如注意力，因每个请求的 KV 长度不同）<strong>逐请求</strong>处理。配合上一模块的 PagedAttention（KV 本就不要求连续、按块存取），不同长度的请求可以无痛地共处一个 batch。</p>  <div class="ascii">连续批处理：完成即让位、到达即补位（每列是一个迭代步）
+
+  迭代:     1   2   3   4   5   6   7   8
+  slot0:    A   A   A   A  [D] D   D   D     &lt;- A 第4步完成, D 立刻补位
+  slot1:    B   B   B   B   B   B   B   B
+  slot2:    C   C  [E]  E   E   E  [F] F     &lt;- C 第2步完成, E 补; E 完成, F 补
+            └ batch 成员每步都在流动，几乎无气泡 ┘
+  对比静态：同样这些请求，静态要 max(L) 步且新请求要排队整批；连续几乎步步满载。</div>  <div class="callout paper"><span class="label"></span>
+    <p>这就是 Orca（Yu et al. 2022, OSDI）的核心贡献：iteration-level scheduling + selective batching，把生成式 Transformer 服务的吞吐相比静态批处理提升数倍。它是现代所有高吞吐引擎（vLLM、TensorRT-LLM 的 in-flight batching、TGI）的共同底座。原文见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="loop"><span class="num">3</span>调度循环：引擎的心跳</h2>
+  <h3>调度循环：引擎的心跳</h3>  <p>把上面的思想落成代码，就是一个<strong>调度循环</strong>（scheduler loop）——它是整个推理引擎的心跳。每一次循环 = 一个迭代（一次模型前向），循环体做四件事：</p>  <ol>
+    <li><strong>纳新</strong>：从等待队列（waiting）里挑请求加入运行 batch——只要显存（KV 块）放得下。新请求先要做 prefill。</li>
+    <li><strong>前向一步</strong>：对当前 batch 里所有运行中的请求执行一次模型前向，每个请求产出一个新 token。</li>
+    <li><strong>退役</strong>：检查谁生成了 EOS 或达到了 max_tokens，把它移出 batch、返回结果、释放它的 KV 块（回上一模块的 free list）。</li>
+    <li><strong>处理压力</strong>：若显存不够纳新、甚至不够让现有请求继续，触发抢占（第 6 节）。</li>
+  </ol>  <p>vLLM 把请求组织成<strong>三个队列</strong>来驱动这个循环，是理解真实引擎的关键模型：</p>  <table>
+    <thead><tr><th>队列</th><th>English</th><th>含义</th><th>流向</th></tr></thead>
+    <tbody>
+      <tr><td><strong>等待</strong></td><td>waiting</td><td>已到达、尚未开始（或被抢占后等待重新调度）</td><td>→ running（显存够时）</td></tr>
+      <tr><td><strong>运行</strong></td><td>running</td><td>正在 batch 里逐 token 生成的请求</td><td>→ 完成 / → swapped（被抢占）</td></tr>
+      <tr><td><strong>换出</strong></td><td>swapped</td><td>因显存压力被换出到 CPU 的请求，等待换回</td><td>→ running（显存松动时）</td></tr>
+    </tbody>
+  </table>  <p>每个迭代，调度器在这三个队列间流转请求：尽量从 waiting/swapped 补入 running 把 batch 填满，把完成的请求移出 running 释放显存，把放不下的请求降级到 swapped。这套「三队列 + 每迭代再调度」的结构，就是 vLLM <code>Scheduler</code> 的骨架。本模块 notebook 会从零写一个可运行的简化版——你会亲眼看到 batch 成员如何随迭代流动、吞吐如何因此远超静态。</p>  <p>这里有一个容易被忽略却至关重要的<strong>约束</strong>：纳新受两道闸门同时把守——<strong>batch 容量</strong>（一次前向能并行处理多少序列，受 kernel 与延迟限制）和<strong>KV 显存</strong>（上一模块的 free list 里还有没有块）。真实负载下，先撞上的往往是显存这道闸：哪怕 batch 槽还空着，只要 free list 见底，就一个新请求也纳不进来。这就是为什么模块 01 的显存管理是模块 02 调度的<em>前提</em>——分页 KV 把利用率从 40% 提到 96%，等价于把「能同时在 running 里的请求数」放大了一倍多，调度器才有足够的请求去把每一步填满。两个模块在这里<strong>咬合</strong>成一台机器。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把调度器想成餐厅领位员：餐厅（GPU）有固定数量的桌子（batch 槽 / KV 显存）。领位员不会「等一整批客人全吃完才放下一批」（静态），而是<strong>哪张桌子一空就立刻领下一位等位的客人</strong>（连续）。同样数量的桌子，翻台率天差地别——这就是吞吐的来源。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="interference"><span class="num">4</span>prefill 与 decode 的张力</h2>
+  <h3>prefill 与 decode 的张力</h3>  <p>连续批处理把 batch 填满了，但填的是什么？这里藏着一个新麻烦。回忆模块 00：一次推理有两个性格迥异的阶段——<span class="term">prefill</span>（一次嚼完整段 prompt，一步处理几百上千个 token，<strong>算力受限</strong>）和 <span class="term">decode</span>（每步只产 1 个 token，<strong>带宽受限</strong>）。当它们<strong>混在同一个 batch 里</strong>时，矛盾就来了。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>想象一个迭代里，既有几十个正在 decode（各要 1 个 token、很快）的请求，又突然来了一个 prompt 长达 4000 token 的新请求要 prefill。这个 prefill 会让这一步的计算量暴涨几十倍——所有正在 decode 的请求都得<strong>陪着等</strong>这一大坨 prefill 算完，它们这一步的 token 延迟（TPOT）被狠狠拉高。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这叫 <span class="term">prefill-decode interference</span>（预填充-解码干扰）。它的根源是两阶段的<strong>计算量极不对称</strong>：一次 prefill 的 FLOPs ∝ <code>prompt_len</code>，而一次 decode 步的 FLOPs ∝ <code>1</code>（每请求）。把一个长 prefill 塞进 decode 流，就像在顺畅的车流里插进一辆超长卡车，后面所有车都被迫减速。</p></div>
+  </div>  <p>最朴素的应对是「prefill 优先、单独成步」：来了 prefill 就先把它做完再继续 decode。但这只是把干扰从「拖慢这一步」变成「这一步全用来 prefill，decode 全停」——TTFT 是降了，正在生成的请求的 TPOT 却出现了<strong>尖峰</strong>。两阶段同卡共存的根本张力，需要更聪明的办法，就是下一节的 chunked prefill。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个反直觉但重要的点：<strong>把 prefill 和 decode 混跑能提高吞吐（GPU 更满），却会伤害延迟（互相干扰）</strong>。吞吐与延迟的张力在这里再次显形。后面会看到两条解药：chunked prefill（在同一卡上把 prefill 切碎、温柔地混入 decode）和 PD 分离（模块 04，干脆把两阶段拆到不同卡上彻底隔离）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="chunked"><span class="num">5</span>Chunked Prefill 切碎喂</h2>
+  <h3>Chunked Prefill：把长 prefill 切碎喂</h3>  <p>Sarathi-Serve（Agrawal et al. 2024）给出的解法叫 <span class="term">chunked prefill</span>（分块预填充）：既然一个长 prefill 会一次性占满计算、阻塞 decode，那就<strong>把它切成若干小块</strong>，每个迭代只做一小块 prefill，其余预算留给正在生成的请求继续 decode。</p>  <p>具体机制是给每个迭代设一个 <span class="term">token budget</span>（token 预算，比如每步最多处理 512 个 token）。调度器先把正在 decode 的请求排进去（每个占 1 个 token 预算），剩下的预算用来做某个长 prefill 的<strong>一个分块</strong>。下一个迭代继续做这个 prefill 的下一块，直到整段 prompt 填完。于是长 prefill 被<strong>摊薄</strong>到多个迭代里，每一步的计算量都被预算压在一个温和的水平，decode 再也不会被一次性的大 prefill 噎住。</p>  <div class="math-block">\[\text{chunks} = \left\lceil \frac{\text{prompt\_len}}{\text{budget} - \text{num\_decode}} \right\rceil,\qquad \sum_{\text{chunks}} \text{prefill\_tokens} = \text{prompt\_len}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>核心收益是<strong>把 TPOT 的尖峰削平</strong>：原本一个 4000-token 的 prefill 会让某一步暴涨、所有 decode 卡顿一下；切成 8 块后，这 8 步每步只多做 500 token 的 prefill，decode 的节奏几乎不受影响。代价是这个 prefill 自己的 TTFT 略有增加（要跨多步才填完），但通常很值——用一点 TTFT 换平稳的 TPOT。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>一个关键的<strong>不变量</strong>必须守住：无论怎么切块，所有分块的 prefill token 数加起来<strong>必须精确等于</strong> prompt 长度，且每一步的总 token 数不超过预算。切块只是改变 prefill 的<em>时间分布</em>，绝不能多算或漏算 token。notebook 里会把这个不变量用 <code>assert</code> 钉死。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>Chunked prefill 出自 Sarathi-Serve（Agrawal et al. 2024, OSDI），副标题就叫「Taming the Throughput-Latency Tradeoff」。它和 PD 分离是处理 prefill-decode 干扰的两条主流路线（一条在单卡内调度、一条跨卡隔离）。详见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="preempt"><span class="num">6</span>抢占：显存压力下不死锁</h2>
+  <h3>抢占：显存压力下如何不死锁</h3>  <p>连续批处理不停地把新请求塞进 batch，迟早会撞上显存墙：当前正在跑的请求都在生成、各自的 KV 还在增长，free list 见底了，连让现有请求多生成一个 token 的块都拿不出来。这时必须<span class="term">preemption</span>（抢占）——主动暂停一些请求，腾出显存让其余请求推进，否则系统会<strong>死锁</strong>（谁都拿不到块、谁都没法前进）。</p>  <p>抢占有两种恢复手段，各有取舍：</p>  <table>
+    <thead><tr><th>手段</th><th>English</th><th>做法</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>换出</strong></td><td>swap</td><td>把被抢占请求的 KV 块拷到 CPU 内存，腾出 GPU 显存；稍后换回继续</td><td>占 CPU↔GPU 传输带宽；KV 越大越贵</td></tr>
+      <tr><td><strong>重算</strong></td><td>recompute</td><td>直接丢弃 KV，请求降回 waiting；轮到它时重新 prefill 算 KV</td><td>白白重做 prefill；prompt 越长越贵</td></tr>
+    </tbody>
+  </table>  <p>挑谁来抢占，是个<strong>策略</strong>问题，直接影响公平性与延迟。常见做法是抢占<strong>最晚到达</strong>或<strong>已生成最少</strong>的请求（损失最小，符合「保护快完成的请求」直觉），但要小心<strong>饥饿</strong>（starvation）——如果总抢占同一个倒霉请求，它可能永远跑不完。真实调度器会用优先级、到达时间、已等待时长等加权来防饥饿。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>抢占就像餐厅满座时，请一桌还没上菜的客人先到等候区（换出/重算），把桌子让给马上要结账离开那桌后面的人，等有空位再请回来。关键是别老让同一桌一直让座（饥饿），也别让座成本太高（换出大 KV / 重算长 prompt）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>无论用哪种手段，必须保证的<strong>核心不变量</strong>是：系统永远能<strong>推进</strong>——只要至少有一个请求能跑，调度器就不会卡死。具体地，当无法纳新时优先保证 running 队列里<em>已有</em>的请求能继续（抢占别人来喂它们），实在不行就把最该牺牲的请求换出。notebook 会模拟一个过载场景，断言：即使请求总 KV 需求远超显存，系统也能逐个把它们跑完、不死锁。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>抢占是<strong>过载保护</strong>，不是常态——如果一个系统频繁抢占，说明它接的请求超过了显存能力，正确的反应是限流（admission control）或扩容，而非靠抢占硬扛。抢占保证的是「过载时优雅降级而非崩溃」，把它当安全网，而非性能手段。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="metrics"><span class="num">7</span>账本：吞吐、延迟与 goodput</h2>
+  <h3>把账算清：吞吐、延迟与 goodput</h3>  <p>说了这么多，连续批处理到底赢在哪、赢多少？把它量化成可计算的指标。先厘清两个延迟（模块 00 已铺垫）：<span class="term">TTFT</span>（首 token 延迟，从到达到吐第一个 token，由 prefill + 排队决定）和 <span class="term">TPOT</span>（每 token 延迟，进入稳定生成后平均每个输出 token 的耗时，由 decode 步决定）。</p>  <p>吞吐这一侧，连续批处理的胜利来自<strong>消灭气泡</strong>：静态批处理的有效利用率 ≈ <code>sum(L_i)/(B·max(L_i))</code>，而连续批处理几乎步步满载、利用率接近 1。在生成长度方差大的真实负载下，这直接translate成数倍吞吐。但裸吞吐不是终点——一个吞吐很高、却让一半请求 TTFT 超时的系统是没用的。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>真正该优化的是 <span class="term">goodput</span>（有效吞吐）：在满足 <span class="term">SLO</span>（如 P99 TTFT < 1s、TPOT < 50ms）的前提下，系统每秒能交付多少 token / 完成多少请求。goodput 把「快」和「达标」绑在一起——只有既快又不违约的产出才算数。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>一个排队论直觉帮你把握全局：<span class="term">Little's Law</span> 说   <div class="math-block">\[L = \lambda W\]</div>稳态下系统内平均请求数 <code>L</code> = 到达率 <code>λ</code> × 平均停留时间 <code>W</code>。连续批处理通过提高吞吐（能消化更高的 λ）和压低 W（请求不再排队等整批），在同样的 SLO 下扛住更高的负载。</p></div>
+  </div>  <p>Little's Law 还给出一个实用的<strong>反推</strong>：若 SLO 要求平均停留时间 <code>W</code> 不超过某个值，而系统稳态请求数 <code>L</code> 受显存（能同时容纳的 KV）封顶，那么系统能承受的最大到达率就是 <code>λ_max = L/W</code>。这把三件事串了起来——<strong>显存决定 L、调度效率决定 W、二者之商决定能扛多大流量</strong>。模块 01 把 L 撑大（分页提利用率），模块 02 把 W 压小（连续批处理消气泡），它们合起来抬高的正是这个 <code>λ_max</code>。一旦到达率超过它，请求就会在 waiting 队列里越积越多、延迟雪崩——这时正确的反应是限流或扩容，而非继续硬塞。</p>  <p>notebook 的压轴会把 static 与 continuous 两个调度器喂同一批请求（带各自的到达时刻、prompt 长、生成长），跑出各自的总完成时间、GPU 利用率、每个请求的 TTFT/TPOT，再算 P50/P99 与 SLO 达标率。你会<strong>亲眼看到</strong>连续批处理的吞吐严格高于静态、且延迟分布更紧——这就是 Orca 那几倍提升从哪些数字里长出来的。这也再次呼应全课的账本方法论：把系统收益还原成可断言的整数。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>PD 分离（模块 04 的伏笔）</strong>：chunked prefill 在单卡内调度两阶段，但干扰只能缓解、不能根除。更彻底的路线是把 prefill 与 decode<strong>拆到不同 GPU</strong>（DistServe / Splitwise），各自用最优配置，再传输 KV。这是当前高端服务系统的主流方向，模块 04 详解。</li>
+    <li><strong>SLO 感知与公平调度</strong>：现实里不同请求有不同优先级与 SLO（付费用户 vs 免费、交互 vs 批处理）。如何在连续批处理里做<strong>带优先级、防饥饿、保 SLO</strong>的调度，仍是活跃的研究问题（如 VTC 公平调度、优先级抢占策略）。</li>
+    <li><strong>投机解码 × 批处理的交互</strong>：投机解码（模块 03）一步确认多个 token，会改变 batch 里各请求的「步长」，与连续批处理的迭代级调度耦合复杂——大 batch 下投机的收益会被摊薄，如何协同调度是开放问题。</li>
+    <li><strong>调度的预测与自适应</strong>：最优的 batch 大小、token 预算、抢占策略都依赖对请求生成长度的<strong>预测</strong>（而生成长度事先未知）。用小模型预测输出长度来指导调度（如 length prediction），是提升 goodput 的前沿尝试。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Yu et al. 2022（Orca，本模块的源头）、Agrawal et al. 2024（Sarathi-Serve，chunked prefill）；延伸读 vLLM 论文的调度章节、Splitwise/DistServe（PD 分离，模块 04）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_paged_attention/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · PagedAttention 与 KV 管理</div></a>
+    <a class="next" href="../03_speculative/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 投机解码 Speculative Decoding</div></a>
+  </div>
+
+</div>
+</body>
+</html>

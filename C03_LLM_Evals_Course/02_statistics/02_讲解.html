@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 统计严谨性：误差棒、配对检验与功效</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 9</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 统计严谨性：误差棒、配对检验与功效</h1>
+  <p class="subtitle">Statistical Rigor —— 把 eval 当成统计估计问题：没有误差棒的分数只是一个随机数的一次实现</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">概率论基础（期望/方差/正态分布）、假设检验初步</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_statistical_rigor.ipynb（纯 numpy/scipy 模拟）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Miller 2024 (arXiv:2411.00640)、Efron &amp; Tibshirani 1993、Dror et al. 2018</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 75 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">没有误差棒的 eval 不算完成</a></li>
+      <li><a href="#clt">CLT 与基本误差棒：Wald 与 Wilson 区间</a></li>
+      <li><a href="#bootstrap">Bootstrap：当解析公式不够用</a></li>
+      <li><a href="#paired">模型对比的核心：配对设计</a></li>
+      <li><a href="#cluster">Clustered SE：当题目不独立</a></li>
+      <li><a href="#power">功效分析：检出 Δ 需要多少题</a></li>
+      <li><a href="#multiple">多重比较：跑 20 个 benchmark 总有一个"显著"</a></li>
+      <li><a href="#variance">方差来源分解：题目 / 解码 / prompt</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>没有误差棒的 eval 不算完成</h2>
+
+  <p>打开任何一个 leaderboard：模型 A 在某 benchmark 上 71.2%，模型 B 70.4%，于是结论是"A 更强"。
+  这个推理链条缺了关键一环：<strong>71.2% 不是模型能力的真值，而是一个随机变量的一次实现</strong>。
+  换一批题、换一个随机种子、换一个 prompt 模板，数字就会变。
+  [Miller 2024]（<em>Adding Error Bars to Evals</em>）系统地把这件事讲清楚了：
+  eval 是一个<span class="term">统计估计问题</span>（statistical estimation problem），
+  必须像对待任何实验科学的测量一样，报告点估计 <em>和</em> 不确定度。</p>
+
+  <p>关键的概念转换是：<strong>benchmark 里的 $n$ 道题，应被视为从某个潜在"题目分布"
+  $\mathcal{D}$ 中抽出的样本</strong>。我们真正关心的从来不是"模型在这 198 道 GPQA 题上对了多少"——
+  那只要查表就知道，没有任何不确定性——而是"模型在<em>这类问题</em>上的真实能力 $\theta = \mathbb{E}_{x\sim\mathcal{D}}[s(x)]$"。
+  观测分数 $\hat\theta$ 只是 $\theta$ 的估计量，估计就有抽样误差。</p>
+
+  <div class="ascii">
+   "这类问题"的总体分布 𝒟（无限的题目宇宙）
+        │
+        │ 抽样（出题人写下 n 道题 —— 这一步引入抽样随机性）
+        ▼
+   benchmark：x₁ … xₙ ──► 模型推理 ──► 得分 s(x₁) … s(xₙ) ∈ {0,1}
+        │                                   │
+        │                                   ▼
+        │                       点估计  θ̂ = (1/n) Σ s(xᵢ)
+        │                                   │
+        ▼                                   ▼
+   我们想知道的真值 θ = E_𝒟[s(x)]   ⇐  θ̂ ± 1.96·SE(θ̂)   （95% 置信区间）
+  </div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>同一个模型，把 MMLU 重新出一遍题（同样的科目、同样的难度分布、不同的具体题目），
+      分数不会一模一样。问"模型多强"就像问"硬币正面概率多大"——你抛了 $n$ 次得到一个频率，
+      频率附近有一圈不确定的范围。<strong>误差棒就是把这圈范围写出来。</strong>
+      两个模型分差比这圈范围小，那这次对比什么也没说明。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设题目 $x_i \overset{\text{iid}}{\sim} \mathcal{D}$，得分函数 $s(x_i)\in\{0,1\}$（先讨论二元打分；连续打分同理）。
+      估计量 $\hat\theta = \frac1n\sum_i s(x_i)$ 满足 $\mathbb{E}[\hat\theta]=\theta$、
+      $\mathrm{Var}(\hat\theta)=\sigma^2/n$。由中心极限定理，$n$ 足够大时
+      $\hat\theta \;\dot\sim\; \mathcal{N}(\theta,\, \sigma^2/n)$，
+      由此构造置信区间与假设检验。整章所有内容都是这个框架在不同场景下的展开。</p>
+    </div>
+  </div>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>这不是学术洁癖，而是日常事故的根源。</strong>frontier lab 的发布对比、安全评测的"能力未达阈值"结论、
+  论文里"我们的方法提升 1.5%"，大量建立在 200–500 题的 benchmark 上——后面会算给你看，这种规模下
+  95% 置信区间宽达 ±4–7 个百分点，1.5% 的"提升"完全可能是噪声。
+  <strong>对做 model evaluation 的研究者，"先问 n 是多少、误差棒是多少"应该成为肌肉记忆。</strong></div>
+
+  <div class="callout paper"><span class="label"></span>
+  [Miller 2024] arXiv:2411.00640 是本章的骨架文献，五条核心建议：
+  ①用 CLT 给所有 eval 分数报 SE；②对同题多次采样用方差缩减的估计；③模型对比用<strong>配对差值</strong>的 SE；
+  ④题目成簇时用 <strong>clustered SE</strong>；⑤跑 eval 之前做<strong>功效分析</strong>。
+  本章 2–8 节就按这条线展开；notebook 里你会把每一条都亲手实现一遍。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="clt"><span class="num">2</span>CLT 与基本误差棒：Wald 与 Wilson 区间</h2>
+
+  <p>二元打分下，$s(x_i)$ 是参数为 $p$ 的 Bernoulli 变量（$p$ 即真实准确率 $\theta$）。逐步推导<span class="term">标准误</span>（standard error, SE）：</p>
+
+  <div class="math-block">
+  $$
+  \begin{aligned}
+  \mathrm{Var}(s(x_i)) &= \mathbb{E}[s^2] - (\mathbb{E}[s])^2 = p - p^2 = p(1-p) \\[4pt]
+  \mathrm{Var}(\hat p) &= \mathrm{Var}\!\Big(\tfrac1n\textstyle\sum_i s(x_i)\Big)
+     = \frac{1}{n^2}\sum_i \mathrm{Var}(s(x_i)) = \frac{p(1-p)}{n} \\[4pt]
+  \mathrm{SE}(\hat p) &= \sqrt{\frac{p(1-p)}{n}}
+     \;\;\xrightarrow{\;p\text{ 未知，代入 }\hat p\;}\;\;
+     \widehat{\mathrm{SE}} = \sqrt{\frac{\hat p(1-\hat p)}{n}}
+  \end{aligned}
+  $$
+  </div>
+
+  <p>由 CLT，$\frac{\hat p - p}{\mathrm{SE}} \dot\sim \mathcal{N}(0,1)$，于是得到最常用的
+  <span class="term">Wald 区间</span>：</p>
+
+  <div class="math-block">
+  $$ \text{Wald: } \quad \hat p \;\pm\; z_{1-\alpha/2}\,\sqrt{\frac{\hat p(1-\hat p)}{n}},
+     \qquad z_{0.975}\approx 1.96 $$
+  </div>
+
+  <p>方便、好记，但它做了两次近似：①用 $\hat p$ 替代了 $p$ 来估计方差；②假设正态近似已经成立。
+  当 <strong>$n$ 小或 $p$ 接近 0/1</strong> 时两个近似同时崩坏。典型病症：</p>
+
+  <ul>
+    <li><strong>区间越界</strong>：$\hat p = 8/10$ 时 Wald 区间是 $[0.552,\, 1.048]$——上界超过 1，概率没有意义。</li>
+    <li><strong>覆盖率塌陷</strong>：$n=20,\ p=0.95$ 时，名义 95% 的 Wald 区间实际只覆盖真值约 <strong>64%</strong> 的时间（notebook 里你会亲手复现这个数字）。极端情形 $\hat p = 1$ 时 $\widehat{\mathrm{SE}}=0$，区间宽度为零，必然不含真值（除非 $p$ 恰为 1）。</li>
+  </ul>
+
+  <p>更稳健的解析解是 <span class="term">Wilson 区间</span>：不把 $\hat p$ 代入方差，而是直接对
+  $|\hat p - p| = z\sqrt{p(1-p)/n}$ 关于 $p$ 解二次方程（即反转 score test）：</p>
+
+  <div class="math-block">
+  $$
+  (\hat p - p)^2 = z^2 \frac{p(1-p)}{n}
+  \;\;\Longrightarrow\;\;
+  p = \frac{\hat p + \frac{z^2}{2n} \;\pm\; \dfrac{z}{\sqrt{n}}\sqrt{\hat p(1-\hat p) + \dfrac{z^2}{4n}}}{1 + \frac{z^2}{n}}
+  $$
+  </div>
+
+  <p>注意它的结构：区间中心从 $\hat p$ 向 $1/2$ 收缩（$\hat p + z^2/2n$ 再除以 $1+z^2/n$），
+  相当于自动加了约 $z^2 \approx 4$ 道"半对半错"的虚拟题，因此永不越界、小样本下覆盖率好得多。
+  同样的 $8/10$，Wilson 给 $[0.490,\, 0.943]$。</p>
+
+  <table>
+    <thead><tr><th>方法</th><th>公式来源</th><th>越界?</th><th>小 n / 极端 p 的覆盖率</th><th>什么时候用</th></tr></thead>
+    <tbody>
+      <tr><td>Wald</td><td>CLT + 插入 $\hat p$</td><td>会</td><td>差（可塌到 60%）</td><td>$n\gtrsim 100$ 且 $0.1\lesssim p \lesssim 0.9$ 的快速估算</td></tr>
+      <tr><td>Wilson</td><td>反转 score test</td><td>不会</td><td>好</td><td><strong>默认选择</strong>——成本与 Wald 相同</td></tr>
+      <tr><td>Clopper–Pearson</td><td>反转精确二项检验</td><td>不会</td><td>保守（偏宽）</td><td>需要"保证覆盖不低于名义值"的场合</td></tr>
+      <tr><td>Bootstrap percentile</td><td>重采样（下一节）</td><td>不会</td><td>中等偏好</td><td>统计量复杂、没有解析 SE 时</td></tr>
+    </tbody>
+  </table>
+
+  <p>有了 SE，就能感受不同规模 benchmark 的"分辨率"（95% CI 半宽 $\approx 1.96\,\mathrm{SE}$）：</p>
+
+  <table>
+    <thead><tr><th>Benchmark</th><th>n</th><th>典型 $\hat p$</th><th>95% CI 半宽</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>MMLU test [Hendrycks 2021]</td><td>14,042</td><td>0.70</td><td>±0.8 pp</td><td>1 pp 的分差勉强可辨</td></tr>
+      <tr><td>MATH-500</td><td>500</td><td>0.70</td><td>±4.0 pp</td><td>3 pp 分差≈噪声</td></tr>
+      <tr><td>GPQA-diamond [Rein 2023]</td><td>198</td><td>0.50</td><td>±7.0 pp</td><td>5 pp 分差完全无法区分</td></tr>
+      <tr><td>HumanEval [Chen 2021]</td><td>164</td><td>0.85</td><td>±5.5 pp</td><td>同上</td></tr>
+      <tr><td>AIME（单年）</td><td>30</td><td>0.50</td><td>±17.9 pp</td><td>单模型分数几乎没有信息量</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  这张表是单模型分数的不确定度。你可能会想"两个模型比较时误差还要翻倍（两个 SE 叠加）"——
+  方向对，但<strong>结论错</strong>：比较用的题是同一批时，配对设计能让比较的不确定度
+  <em>低于</em>单模型的不确定度。这是第 4 节的主题，也是本章最重要的实战技巧。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="bootstrap"><span class="num">3</span>Bootstrap：当解析公式不够用</h2>
+
+  <p>均值型统计量有现成 SE 公式，但 eval 里大量统计量没有：经过答案抽取与过滤后的 win-rate、
+  pass@k 聚合 [Chen 2021]、按学科加权的宏平均、Elo 分。
+  <span class="term">Bootstrap</span> [Efron &amp; Tibshirani 1993] 提供了一个几乎万能的替代品。</p>
+
+  <p>原理是<span class="term">plug-in 原则</span>：我们想知道统计量 $\hat\theta$ 在"从 $\mathcal{D}$ 反复抽 $n$ 题"下的分布，
+  但 $\mathcal{D}$ 未知；于是用<strong>经验分布 $\hat{\mathcal{D}}_n$（在观测样本上均匀放质量 $1/n$）替代 $\mathcal{D}$</strong>，
+  这一替代后的世界里"反复抽样"就是可执行的——即<strong>有放回重采样</strong>：</p>
+
+  <div class="math-block">
+  $$
+  \text{for } b=1..B:\quad
+  x^{*(b)}_1,\dots,x^{*(b)}_n \overset{\text{iid}}{\sim} \hat{\mathcal{D}}_n
+  \;\;\Longrightarrow\;\;
+  \hat\theta^{*(b)} = T\big(x^{*(b)}_{1..n}\big)
+  $$
+  $$
+  \widehat{\mathrm{SE}}_{\text{boot}} = \mathrm{sd}\big(\hat\theta^{*(1..B)}\big), \qquad
+  \text{percentile CI: } \big[\,Q_{\alpha/2}\big(\hat\theta^{*}\big),\; Q_{1-\alpha/2}\big(\hat\theta^{*}\big)\,\big]
+  $$
+  </div>
+
+  <p><span class="term">Percentile CI</span> 直接取 $B$ 个重采样统计量的 $\alpha/2$ 与 $1-\alpha/2$ 分位数。
+  什么时候 bootstrap 优于解析式：</p>
+
+  <ul>
+    <li><strong>统计量没有（或你不想推导）解析 SE</strong>：组合指标、中位数、比值、过滤后的子集指标。</li>
+    <li><strong>分布偏斜</strong>：percentile CI 自动不对称，比强行对称的 Wald 更贴近真实分布形状。</li>
+    <li><strong>保持联合结构</strong>：按"题目"为单位重采样时，同一道题上多个模型的结果一起被抽到/丢掉——这天然给出配对比较与 cluster 版本（第 4、5 节）。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>Bootstrap 不是免费午餐。</strong>①它模拟的是"从经验分布抽样"，<em>无法</em>修复 $n$ 本身太小的问题——
+  30 道 AIME 题 bootstrap 一百万次，区间照样不可信；②对均值型统计量、中等以上 $n$，
+  bootstrap CI 与 Wald/Wilson 几乎重合（notebook 会验证），此时它只是更贵，并不更准；
+  ③percentile 法在小样本/重偏斜下仍有偏差，讲究的场合用 BCa（bias-corrected and accelerated）修正。
+  正确心态：bootstrap 是<strong>通用性</strong>工具，不是<strong>精度</strong>工具。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="paired"><span class="num">4</span>模型对比的核心：配对设计</h2>
+
+  <p>评测中 90% 的问题不是"模型 A 多强"，而是"<strong>A 是否强于 B</strong>"。
+  这时有一个被大量从业者忽视、却能白捡 2–3 倍有效样本量的事实：
+  <strong>A 和 B 是在同一批题上测的</strong>。利用这一点的设计叫<span class="term">配对设计</span>（paired design）。</p>
+
+  <p>记第 $i$ 题上两模型的得分为 $a_i, b_i \in \{0,1\}$，关心差值 $\Delta = \theta_B - \theta_A$。
+  两种估计方式的点估计完全相同（$\hat\Delta = \bar b - \bar a$），<strong>方差却天差地别</strong>：</p>
+
+  <div class="math-block">
+  $$
+  \underbrace{\mathrm{Var}_{\text{unpaired}}(\hat\Delta) = \frac{\sigma_A^2 + \sigma_B^2}{n}}_{\text{把 } \bar a,\,\bar b \text{ 当独立样本}}
+  \qquad\text{vs}\qquad
+  \underbrace{\mathrm{Var}_{\text{paired}}(\hat\Delta) = \frac{\sigma_A^2 + \sigma_B^2 - 2\,\mathrm{Cov}(a_i,b_i)}{n}}_{\text{利用同题成对}}
+  $$
+  </div>
+
+  <p>推导只有一行：$\hat\Delta = \frac1n\sum_i d_i$，其中 $d_i = b_i - a_i$ 是<strong>每题差值</strong>，
+  $\mathrm{Var}(d_i) = \sigma_A^2+\sigma_B^2-2\mathrm{Cov}(a_i,b_i)$。配对的 SE 就是把 $d_i$ 当一个普通样本：</p>
+
+  <div class="math-block">
+  $$ \mathrm{SE}_{\text{paired}}(\hat\Delta) \;=\; \frac{\mathrm{sd}(d_1,\dots,d_n)}{\sqrt n}
+  \;=\; \sqrt{\frac{\widehat{\mathrm{Var}}(d_i)}{n}} $$
+  </div>
+
+  <p>关键在 $\mathrm{Cov}(a_i,b_i)$：<strong>两个模型的对错在题目维度上强正相关</strong>——难题大家一起错，
+  简单题大家一起对（共享的"题目难度"潜变量）。相关越强，配对减掉的方差越多。</p>
+
+  <h3>数值示例：未配对对比如何把真实差异淹没在噪声里</h3>
+
+  <p>$n=1000$，真实准确率 $p_A=0.70,\ p_B=0.73$（$\Delta=3$ pp）：</p>
+
+  <table>
+    <thead><tr><th></th><th>SE$(\hat\Delta)$</th><th>$z = \hat\Delta/\mathrm{SE}$</th><th>双侧 p 值</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>未配对（独立两样本）</td><td>$\sqrt{\frac{.21+.197}{1000}} = 0.0202$</td><td>1.49</td><td>0.137</td><td>"无显著差异" ✗</td></tr>
+      <tr><td>配对（对错相关 $\rho=0.7$）</td><td>$\sqrt{\frac{.407 - 2(.142)}{1000}} = 0.0111$</td><td>2.71</td><td>0.007</td><td>检出真实差异 ✓</td></tr>
+    </tbody>
+  </table>
+
+  <p>同样的数据、同样的点估计，未配对分析得出"没差别"，配对分析正确检出 3 pp 的差异。
+  $\rho=0.7$ 对应两模型约 12% 的题目不一致率——这在同档模型的真实评测里是常见量级。
+  <strong>用未配对检验分析配对数据，等于白白把有效样本量砍掉一半以上。</strong></p>
+
+  <h3>McNemar 检验：只看分歧</h3>
+
+  <p>配对二元数据有一个优雅的专用检验。把 $n$ 道题按两模型对错分成 2×2：</p>
+
+  <div class="ascii">
+                     模型 B 对      模型 B 错
+   模型 A 对      n₁₁ (都对)      n₁₀ (A 对 B 错)
+   模型 A 错      n₀₁ (A 错 B 对)  n₀₀ (都错)
+
+   点估计:  Δ̂ = (n₀₁ − n₁₀)/n      ← 只由分歧格决定！
+   都对/都错的题对"谁更强"零贡献，只是噪声的旁观者。
+  </div>
+
+  <p><span class="term">McNemar 检验</span>的原假设是"分歧题里两个方向各占一半"，即
+  $n_{01} \sim \mathrm{Binomial}(n_{01}+n_{10},\, \tfrac12)$。大样本卡方形式：</p>
+
+  <div class="math-block">
+  $$ \chi^2 = \frac{(n_{01}-n_{10})^2}{n_{01}+n_{10}} \;\dot\sim\; \chi^2_1
+  \qquad \text{（小样本用精确二项检验）} $$
+  </div>
+
+  <p>沿用上面的例子：$n_{01}=75,\ n_{10}=45$（分歧共 120 题，$\hat\Delta=30/1000=3$ pp），
+  $\chi^2 = 30^2/120 = 7.5$，$p\approx 0.006$——与配对 z 检验一致（两者渐近等价）。</p>
+
+  <h3>Paired bootstrap：通用配对方案</h3>
+
+  <p>当打分不是 0/1（如 rubric 分数、judge 评分）或统计量更复杂时，用<span class="term">paired bootstrap</span>：
+  以<strong>题目为单位</strong>重采样索引 $i$，每次抽到一道题就同时带上 $(a_i, b_i)$，
+  对每个重采样集计算 $\hat\Delta^{*(b)}$，看其分布是否远离 0。
+  它自动保留了 $a_i, b_i$ 的相关结构，是 McNemar 的非参数推广。notebook 练习 2 你会实现它。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  一句话记住本节：<strong>比较两个模型时，永远分析"每题差值" $d_i$，而不是两个总分。</strong>
+  报告里也应当报 $\hat\Delta \pm 1.96\,\mathrm{SE}_{\text{paired}}$，
+  而不是给两个各自带误差棒的分数让读者自己脑补（读者会错误地用"误差棒是否重叠"判断显著性——
+  重叠与否对应的检验既不是 5% 也不是任何固定水平）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="cluster"><span class="num">5</span>Clustered SE：当题目不独立</h2>
+
+  <p>到目前为止我们假设题目 i.i.d.，但很多 benchmark 违反它：阅读理解数据集（如 DROP）一篇文章配多道题；
+  合成 benchmark 用同一模板填不同参数生成一族题；agent 评测中同一环境拆出多个 checkpoint。
+  同簇题目共享语境/模板/环境，模型在它们上的得分<strong>正相关</strong>：擅长这篇文章就整簇都对，反之整簇都错。</p>
+
+  <p>朴素 SE 公式的推导用到 $\mathrm{Var}(\sum_i s_i) = \sum_i \mathrm{Var}(s_i)$——
+  这一步只在独立时成立。正相关时真实方差里多出一堆正的协方差项，
+  <strong>朴素 SE 系统性低估不确定度</strong>，置信区间虚假地窄，显著性虚假地强。</p>
+
+  <p>设题目分成簇 $c = 1..C$（簇是独立抽样的单位，如"文章"），<span class="term">clustered SE</span> [Miller 2024]：</p>
+
+  <div class="math-block">
+  $$
+  \widehat{\mathrm{Var}}_{\text{clust}}(\hat\theta)
+  = \frac{1}{n^2} \sum_{c=1}^{C} \Big( \sum_{i \in c} \big(s_i - \hat\theta\big) \Big)^{\!2}
+  $$
+  </div>
+
+  <p>直觉：先把每簇的残差<strong>求和再平方</strong>——簇内正相关使整簇残差同号、求和后不抵消，
+  方差被如实放大；若题目其实独立，交叉项期望为 0，公式退化回朴素方差。
+  低估的倍数由<span class="term">设计效应</span>（design effect）刻画：</p>
+
+  <div class="math-block">
+  $$ \mathrm{DEFF} = 1 + (\bar m - 1)\,\rho_{\text{ICC}},
+     \qquad \mathrm{SE}_{\text{true}} \approx \sqrt{\mathrm{DEFF}}\cdot \mathrm{SE}_{\text{naive}} $$
+  </div>
+
+  <p>其中 $\bar m$ 是平均簇大小，$\rho_{\text{ICC}}$ 是簇内相关系数。
+  20 簇 × 每簇 50 题、中等簇内相关（$\rho_{\text{ICC}}\approx 0.3$）时 DEFF $\approx 16$——
+  <strong>SE 被低估 4 倍</strong>，名义上的"1000 题"有效样本量只相当于约 60 道独立题。
+  [Miller 2024] 在 DROP 上报告了约 3 倍的差距，量级一致。notebook 里你会复现 4 倍的版本。</p>
+
+  <p>重采样版本是 <span class="term">cluster bootstrap</span>：以<strong>簇为单位</strong>有放回抽 $C$ 个簇
+  （抽中一簇就带上整簇题目），对每个重采样集算统计量，取 sd 为 SE。
+  原则与配对 bootstrap 同源：<strong>重采样的单位 = 独立性的单位</strong>。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  实战检查清单：拿到任何 benchmark 先问"<strong>独立抽样的单位是什么？</strong>"
+  一篇文章多道题 → 按文章聚簇；同模板多参数 → 按模板聚簇；同一对话多轮打分 → 按对话聚簇；
+  agent 任务多个 milestone → 按任务聚簇。簇结构不明时，把候选簇变量都试一遍取最保守的 SE。
+  发布"模型通过/未通过安全阈值"这类结论时，错误地窄的 CI 是最危险的统计 bug。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="power"><span class="num">6</span>功效分析：检出 Δ 需要多少题</h2>
+
+  <p>前几节回答"测完之后误差多大"；<span class="term">功效分析</span>（power analysis）反过来，在<strong>跑 eval 之前</strong>回答：
+  "如果两模型真实差距是 $\Delta$，我需要多少题才能大概率检出？"
+  <span class="term">功效</span>（power, $1-\beta$）= 真实差异存在时，检验正确拒绝原假设的概率。惯例目标 80% 或 90%。</p>
+
+  <p>推导（未配对、双侧水平 $\alpha$）：要在 $|z| > z_{1-\alpha/2}$ 处拒绝，且当真值为 $\Delta$ 时拒绝概率达 $1-\beta$，
+  需要"信号 ≥ 两个临界值之和"：</p>
+
+  <div class="math-block">
+  $$
+  \frac{\Delta}{\mathrm{SE}(\hat\Delta)} \;\ge\; z_{1-\alpha/2} + z_{1-\beta}
+  \quad\Longrightarrow\quad
+  n_{\text{unpaired}} \;\ge\; \frac{2\,\bar p(1-\bar p)\,\big(z_{1-\alpha/2}+z_{1-\beta}\big)^2}{\Delta^2}
+  \;\;\text{（每个模型）}
+  $$
+  </div>
+
+  <p>配对设计下把分子换成每题差值的方差 $\sigma_d^2$（≈ 两模型的分歧率 $r$，因为 $d_i\neq 0$ 当且仅当分歧）：</p>
+
+  <div class="math-block">
+  $$ n_{\text{paired}} \;\ge\; \frac{\sigma_d^2\,\big(z_{1-\alpha/2}+z_{1-\beta}\big)^2}{\Delta^2},
+     \qquad \sigma_d^2 = r - \Delta^2 \;\approx\; r $$
+  </div>
+
+  <p>代入数字（$\alpha=0.05 \Rightarrow z=1.96$；power $=0.8 \Rightarrow z=0.84$；$(1.96+0.84)^2 \approx 7.85$），
+  在 $p\approx 0.7$ 附近：</p>
+
+  <table>
+    <thead><tr><th>要检出的 $\Delta$</th><th>未配对所需 n（每模型）</th><th>配对所需 n（分歧率 12%）</th><th>能胜任的 benchmark</th></tr></thead>
+    <tbody>
+      <tr><td>5 pp</td><td>≈ 1,250</td><td>≈ 370</td><td>MMLU、大型套件</td></tr>
+      <tr><td>3 pp</td><td>≈ 3,560</td><td>≈ 1,040</td><td>MMLU；MATH-500 不够</td></tr>
+      <tr><td>2 pp</td><td>≈ 8,080</td><td>≈ 2,350</td><td>几乎只有 MMLU 级别</td></tr>
+      <tr><td>1 pp</td><td>≈ 32,600</td><td>≈ 9,400</td><td>没有单一 benchmark 够大</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  注意 $n \propto 1/\Delta^2$：<strong>想分辨小一半的差距，要四倍的题</strong>。
+  这就是为什么"在 198 题的 GPQA-diamond 上 A 比 B 高 2 pp"是一句没有统计内容的话——
+  按上表它需要几千题，缺口不是 10%，是 <strong>40 倍</strong>。
+  而功效不足的检验给出的"不显著"也同样没有内容：它既不能确认差异、也不能排除差异。
+  小 benchmark 上的小分差，无论方向，都应当被读作"未测出"。</div>
+
+  <p>notebook 里你会用模拟画出完整的<span class="term">功效曲线</span>（power curve）：
+  固定 $\Delta=3$ pp，扫 $n$ 从 100 到 5000，对每个 $n$ 重复模拟数百次、统计检出率——
+  并直观看到配对检验的曲线整体左移（同样功效省 2–3 倍题目）。
+  练习 3 你会把 $n_{\text{required}}$ 公式写成函数。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="multiple"><span class="num">7</span>多重比较：跑 20 个 benchmark 总有一个"显著"</h2>
+
+  <p>新模型发布通常同时报 10–30 个 benchmark。在每个上都做 $\alpha=0.05$ 的检验，
+  即使两模型<strong>处处无差异</strong>，至少出现一次假阳性的概率（<span class="term">family-wise error rate</span>, FWER）是：</p>
+
+  <div class="math-block">
+  $$ \mathrm{FWER} = 1 - (1-\alpha)^m
+     \;\;\xrightarrow{m=20,\ \alpha=0.05}\;\; 1 - 0.95^{20} \approx 0.64 $$
+  </div>
+
+  <p>64% 的概率白捡至少一个"显著提升"。营销稿里"在 GPQA 上显著超越"的常见生成机制就是：
+  跑 20 个 benchmark，挑出碰巧显著的那个讲故事。两类标准修正 [Dror 2018]：</p>
+
+  <table>
+    <thead><tr><th></th><th>Bonferroni</th><th>Benjamini–Hochberg (FDR)</th></tr></thead>
+    <tbody>
+      <tr><td>控制目标</td><td>FWER：任何一个假阳性的概率 ≤ α</td><td>FDR：被拒绝者中假阳性的期望比例 ≤ α</td></tr>
+      <tr><td>做法</td><td>每个检验用 $\alpha/m$（等价于 $p_i \cdot m$ 与 $\alpha$ 比）</td><td>升序排 $p_{(1)}\le\dots\le p_{(m)}$，找最大的 $k$ 使 $p_{(k)} \le \frac{k}{m}\alpha$，拒绝前 $k$ 个</td></tr>
+      <tr><td>保守程度</td><td>最保守，功效损失大</td><td>更宽松，检出更多真实效应</td></tr>
+      <tr><td>适用</td><td>少数高风险结论（安全阈值、发布主张）</td><td>大规模筛查（30 个 benchmark 找"哪些方向有信号"）</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  多重性藏在很多不像"多重检验"的地方：扫了 5 个 prompt 模板挑最好的、试了 3 个温度、
+  消融了 8 个变体之后报最强组合、训练中每个 checkpoint 都评一次挑峰值——
+  <strong>每一次"挑选"都是一次隐形检验</strong>。被挑出的那个配置的分数是有偏的
+  （selection bias / winner's curse），它的名义 CI 不再有效。诚实做法：用独立的 held-out
+  题目集对选中配置重测一次，报重测分数。这与模块 05 的"对 benchmark 过拟合"一脉相承。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="variance"><span class="num">8</span>方差来源分解：题目 / 解码 / prompt</h2>
+
+  <p>前面所有 SE 只刻画了一种随机性：<strong>题目抽样</strong>。真实 eval 报告的数字还受另外两类扰动。
+  把它们分开测、分开报，是高质量 eval 报告与"一个孤零零的数"的分水岭：</p>
+
+  <div class="ascii">
+   报告分数的总不确定度
+   ├── ① 题目抽样方差     这 n 道题只是题目宇宙的一个样本
+   │      随 n 增大而缩小 (∝ 1/n) ；用本章 SE/CI 刻画
+   ├── ② 解码随机性方差   temperature&gt;0 / 采样解码，同一题重测结果会变
+   │      随每题重测次数 K 增大而缩小 (∝ 1/(nK))
+   └── ③ Prompt/模板方差  换措辞、换 few-shot、换选项顺序，分数整体平移
+          ⚠ 系统性偏移：加题、重测都不能消除，只能多模板测量
+  </div>
+
+  <p>形式化②：设第 $i$ 题在给定模型与解码设置下的"真实每题正确率"为 $p_i$（对解码随机性取期望），
+  每题独立重测 $K$ 次取平均 $\bar s_i$。由全方差公式，分数 $\hat\theta=\frac1n\sum_i \bar s_i$ 的方差分解为：</p>
+
+  <div class="math-block">
+  $$
+  \mathrm{Var}(\hat\theta)
+  = \underbrace{\frac{\mathrm{Var}_i(p_i)}{n}}_{\text{① 题目间（question-level）}}
+  + \underbrace{\frac{\mathbb{E}_i\big[p_i(1-p_i)\big]}{nK}}_{\text{② 题内解码（within-question）}}
+  $$
+  </div>
+
+  <p>两个推论 [Miller 2024]：(a) 增大 $K$ 只压缩第二项，第一项是地板——
+  <strong>对噪声大的 eval，加题比每题重测更有效</strong>，除非解码方差占大头；
+  (b) 报分数时应报 $\frac1n\sum_i \bar s_i$（每题先平均再汇总），其 SE 直接用 $\bar s_i$ 的样本方差除以 $n$，
+  两层随机性自动都被计入。</p>
+
+  <p>三类方差怎么测、怎么报：</p>
+
+  <table>
+    <thead><tr><th>来源</th><th>怎么测</th><th>怎么报</th><th>怎么缩小</th></tr></thead>
+    <tbody>
+      <tr><td>① 题目抽样</td><td>SE 公式 / bootstrap / clustered SE</td><td>95% CI（必报）</td><td>加题；配对比较</td></tr>
+      <tr><td>② 解码随机性</td><td>每题重测 $K$ 次（如 $K=5$），方差分解出 ②</td><td>每题均值入总分；附 $K$ 与温度</td><td>增大 $K$；或 greedy 解码（代价：偏离部署分布）</td></tr>
+      <tr><td>③ prompt/模板</td><td>$M$ 个语义等价模板各测一遍</td><td>跨模板均值 ± 极差/标准差</td><td>无法靠采样消除；标准化模板 + 报告敏感度</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout paper"><span class="label"></span>
+  ③ 的量级常常吓人：仅改动格式（分隔符、大小写、选项标号），同一模型在同一任务上的分数可以摆动
+  十几个百分点 [Sclar 2023]，足以重排 leaderboard [Alzahrani 2024]。
+  它不是随机噪声而是<strong>系统性偏移</strong>——本章的 CI 完全不覆盖它。这是下一模块（03）的主战场。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>评测的实验设计（design of experiments）</strong>：与其测完再算误差，不如在采样阶段就省题——
+    分层抽样（按学科/难度配额）、基于 IRT（item response theory）的自适应选题、
+    用少量"高区分度"题逼近全量分数。开放问题：这些压缩方法在<em>分布外的新模型</em>上是否仍然无偏？
+    用旧模型们拟合的题目参数对新一代模型可能系统性失效。</li>
+    <li><strong>Sequential testing</strong>：实践中评测是流式的——跑了 500 题看一眼，不显著就再加 500。
+    这种 optional stopping 会使固定样本 p 值失效（不断窥视，假阳性率远超 5%）。
+    解法是 always-valid inference：group-sequential 边界、e-values / e-processes、混合鞅置信序列，
+    允许"随时看、随时停"而保持错误率。eval harness 对这类方法的支持几乎是空白——
+    工程上反而最该内建（模块 07 会回看这个缺口）。</li>
+    <li><strong>报告规范</strong>：[Miller 2024] 给了统计侧清单（SE、配对、聚簇、功效），
+    [Biderman 2024] 给了工程侧清单（版本、模板、答案抽取的完整披露）。
+    但截至今天，主流 leaderboard 和模型卡仍普遍不报误差棒。开放问题：什么样的报告标准既严谨又
+    轻量到能被业界真正采纳？"误差棒成为 eval 报告的默认项"在社区层面尚未发生。</li>
+    <li><strong>非 i.i.d. 的根本挑战</strong>：本章框架假设题目从固定分布 $\mathcal{D}$ 抽样，但"我们关心的能力分布"
+    本身定义模糊——GPQA 的 198 题是其作者过程的产物，不是任何明确总体的随机样本。
+    抽样误差之外还有"总体定义误差"，后者无法用本章工具量化。这与模块 08 的
+    time-horizon 度量 [Kwa 2025] 相关：换一种"总体"参数化（任务时长），部分绕开题目分布的任意性。</li>
+    <li><strong>评测视角小结</strong>：审稿或审报告时的四连问——n 多大、误差棒在哪、对比配对了吗、
+    挑过配置吗（多重性）。四问问完，多数"显著提升"会当场缩水。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>写出二元准确率的 SE 与 Wald、Wilson 区间；解释 $n$ 小或 $p$ 接近 0/1 时 Wald 覆盖率为何塌陷、Wilson 为何不会。</li>
+      <li>配对设计为什么能大幅缩小模型对比的方差？写出 $\mathrm{SE}_{\text{paired}}$ 公式，并说明 McNemar 检验为何只用分歧格 $n_{01}, n_{10}$。</li>
+      <li>题目成簇时朴素 SE 错在哪一步？写出 clustered 方差公式，并用设计效应估算 20 簇 × 50 题、ICC=0.3 时 SE 被低估几倍。</li>
+      <li>用功效公式估算：$p\approx0.7$、要以 80% 功效检出 $\Delta=2$ pp，未配对需要多少题？据此解释为什么 30 题 AIME 上 5 pp 的分差几乎没有信息量。</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../01_benchmark_landscape/01_讲解.html"><div class="dir">← 上一章</div><div class="t">01 · 评测分类学与 benchmark 全景</div></a>
+    <a class="next" href="../03_prompt_sensitivity/03_讲解.html"><div class="dir">下一章 →</div><div class="t">03 · 答案抽取与 prompt 敏感性</div></a>
+  </div>
+
+</div>
+</body>
+</html>

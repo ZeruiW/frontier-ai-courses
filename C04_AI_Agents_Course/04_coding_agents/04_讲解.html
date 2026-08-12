@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 编码 Agent 解剖：SWE-bench</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 9</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 编码 Agent 解剖：SWE-bench</h1>
+  <p class="subtitle">Coding Agents &amp; SWE-bench —— 把"修一个真实 GitHub issue"变成可执行、可复现、可比较的评测任务</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（agent 循环）、模块 03（沙箱与 harness）、git / pytest 基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span><span class="badge api">API可选</span> 04_coding_agents.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">SWE-bench (2023)、SWE-agent (2024)、Agentless (2024)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么编码 agent 是 agent 评测的主战场</a></li>
+      <li><a href="#anatomy">SWE-bench 构造解剖：从 PR 历史到任务实例</a></li>
+      <li><a href="#metrics">指标与坑：resolved rate 与 Verified 的诞生</a></li>
+      <li><a href="#spectrum">Agent 设计光谱：SWE-agent / Agentless / OpenHands</a></li>
+      <li><a href="#localization">定位（localization）是瓶颈</a></li>
+      <li><a href="#context">上下文工程：repo map、文件裁剪与测试输出</a></li>
+      <li><a href="#controversy">评测争议：污染、选择偏差与不报成本的刷榜</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么编码 agent 是 agent 评测的主战场</h2>
+
+  <p>在所有 agent 形态中，<span class="term">编码 agent（coding agent）</span>是当前商业价值最高、迭代最快的一支：
+  从补全式的 Copilot，到 IDE 内的 Cursor，再到端到端接管 issue 的 Devin / Claude Code 类产品，
+  "让模型替你写代码、修 bug"已经是真实付费场景。对评测研究者来说，它还有一个更根本的吸引力：</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>代码是少数自带"可执行 ground truth"的领域。</strong>一个补丁好不好，不需要人工打分、不需要 LLM-as-judge——
+  跑测试就知道。这让编码任务成为 agent 能力评测（乃至 agentic RL 训练）的天然试验田：
+  反馈廉价、客观、可大规模自动化。本课程后面讲的很多评测方法论（模块 06），最早都是在编码 agent 上被验证的。</div>
+
+  <p>但在 2023 年之前，主流代码评测是 HumanEval / MBPP 这类<strong>函数级合成题</strong>：给一个函数签名 + docstring，写十几行代码。
+  这与真实软件工程相差甚远——真实工作是在一个几十万行的陈年仓库里，读懂一段含混的 issue 描述，找到该改的三行代码，并且不弄坏其他任何东西。
+  <strong>SWE-bench</strong> [Jimenez 2023] 的贡献正是把这种"真实 GitHub issue 修复"工业化地变成了可评测任务：
+  从 12 个流行 Python 仓库（django、sympy、scikit-learn、matplotlib 等）的 PR 历史中，
+  自动构造出 2,294 个任务实例，每个实例 = 一个真实 issue + 当时的仓库快照 + 一套可执行的验收测试。</p>
+
+  <p>它的难度信号非常诚实：发布时最强模型（Claude 2，配 BM25 检索）的解决率只有 <strong>1.96%</strong>；
+  两年多后，前沿模型驱动的 agent 在其修订版（Verified）上已超过 70%。一个基准能完整记录一代能力跃迁，
+  这正是它成为编码 agent"事实标准"的原因——也是它的每一个设计细节与缺陷都值得解剖的原因。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="anatomy"><span class="num">2</span>SWE-bench 构造解剖：从 PR 历史到任务实例</h2>
+
+  <p>SWE-bench 的核心构造思想：<strong>历史上每一个"解决了某 issue 且修改了测试"的 merged PR，都是一份免费的标注数据。</strong>
+  PR 改动的源码是参考答案（gold patch），PR 新增/修改的测试是验收标准（test patch）。流水线如下：</p>
+
+  <div class="ascii">
+  12 个流行 Python 仓库的全部 PR 历史 (~9 万)
+       │  ① 属性过滤: PR 已合并 + 关联至少一个 issue + 修改了测试文件
+       ▼
+  候选 (issue, base_commit, gold patch, test patch)
+       │  ② 执行过滤: 能装环境; 测试在打 gold patch 前 fail、打后 pass
+       ▼
+  2,294 个任务实例, 每个含:
+    • problem_statement   issue 原文(模型唯一的需求来源)
+    • repo @ base_commit  完整仓库快照(模型的工作现场)
+    • FAIL_TO_PASS 测试   修复前红 → 修复后绿   证明"修好了"
+    • PASS_TO_PASS 测试   修复前绿 → 修复后仍绿  证明"没修坏"
+
+  ── 评测一个 agent ──────────────────────────────────────────────
+  agent(problem_statement, repo) ──► model patch
+       │ git apply 到干净快照 (沙箱内, 见模块 03)
+       ▼
+  跑 FAIL_TO_PASS ∧ PASS_TO_PASS ──► 全绿 ⇒ resolved ✓ 否则 ✗
+  </div>
+
+  <p>注意两个容易被忽略的设计决定：①评测时 agent <strong>看不到</strong> test patch——验收测试是隐藏的，
+  防止模型直接对着测试硬编码（overfit to tests）；②gold patch 只是"一种"正确解，
+  评分完全基于测试执行，agent 给出不同写法的正确修复同样得分。这就是<span class="term">执行驱动评测（execution-based evaluation）</span>。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>FAIL_TO_PASS 测试回答"你到底修没修好"，PASS_TO_PASS 测试回答"你有没有顺手把别的弄坏"。
+      两组必须同时全绿才算解决。只看第一组，agent 可以删掉报错的功能来"修好"；只看第二组，agent 什么都不做就满分。
+      <strong>双重验证缺一不可。</strong></p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设实例 $i$ 的验收测试集为 $F_i$（fail-to-pass）与 $P_i$（pass-to-pass），agent 补丁为 $\hat{\delta}_i$。
+      判定函数 $r_i = \mathbb{1}\!\left[\forall t \in F_i \cup P_i:\ \mathrm{pass}(t \mid \mathrm{repo}_i \oplus \hat{\delta}_i)\right]$。
+      $F_i$ 是对 issue 需求的<em>必要不充分</em>形式化：测试通过不等价于语义正确（测试可能过弱），
+      这正是第 3 节 Verified 要处理的测量效度问题。$P_i$ 则近似回归约束，控制副作用。</p>
+    </div>
+  </div>
+
+  <div class="callout paper"><span class="label"></span>
+  [Jimenez 2023] 还做了一个重要的对照实验：把"该改哪些文件"作为先验直接喂给模型（<span class="term">oracle retrieval</span>），
+  解决率显著高于 BM25 自行检索的设置。这一结果在 2023 年就预告了第 5 节的主题——<strong>定位（localization）是编码 agent 的第一瓶颈</strong>。
+  另外，官方还从中抽出 300 个较轻量的实例组成 <strong>SWE-bench Lite</strong>，降低评测成本，是论文里最常见的比较子集。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="metrics"><span class="num">3</span>指标与坑：resolved rate 与 Verified 的诞生</h2>
+
+  <p>SWE-bench 的主指标是 <span class="term">resolved rate（% resolved）</span>——被完全解决的实例占比：</p>
+
+  <div class="math-block">
+  $$ \mathrm{Resolved} \;=\; \frac{1}{N}\sum_{i=1}^{N} r_i,
+     \qquad
+     r_i \;=\; \mathbb{1}\!\left[\;\forall t\in F_i:\ \mathrm{pass}(t)\;\wedge\;\forall t\in P_i:\ \mathrm{pass}(t)\;\right] $$
+  </div>
+
+  <p>它是逐实例的 0/1 伯努利变量的均值，所以报告时应附上标准误（在 $N=300$ 的 Lite 上，30% 附近的解决率标准误约
+  $\sqrt{0.3\times 0.7/300}\approx 2.6$ 个百分点——榜单上 2 分以内的差距基本不可分辨）：</p>
+
+  <div class="math-block">
+  $$ \mathrm{SE}(\widehat{\mathrm{Resolved}}) \;=\; \sqrt{\frac{\hat{p}(1-\hat{p})}{N}} $$
+  </div>
+
+  <h3>指标没问题，任务本身有问题</h3>
+
+  <p>2024 年，OpenAI 组织 93 名职业软件工程师对随机抽取的 1,699 个 SWE-bench 实例逐一人工审查 [OpenAI 2024]，
+  发现<strong>约三分之一的任务存在会扭曲测量结果的缺陷</strong>，主要三类：</p>
+
+  <table>
+    <thead><tr><th>缺陷类型</th><th>表现</th><th>对测量的影响</th></tr></thead>
+    <tbody>
+      <tr><td><strong>测试过强 / 过窄</strong></td><td>FAIL_TO_PASS 检查了 issue 没要求的实现细节（如特定报错文案、特定内部结构），只有 gold patch 那一种写法能过</td><td><strong>假阴性</strong>：语义正确的修复被判失败 → 系统性低估能力</td></tr>
+      <tr><td><strong>issue 描述欠定（underspecified）</strong></td><td>issue 原文缺少复现步骤或期望行为，正确解无法仅凭 problem_statement 推出（信息在 PR 讨论里）</td><td>任务退化为"猜 gold patch"，测的不是工程能力</td></tr>
+      <tr><td><strong>测试与 issue 无关 / 环境不稳</strong></td><td>验收测试覆盖了别的改动，或环境本身 flaky</td><td>噪声：结果不可复现、不可归因</td></tr>
+    </tbody>
+  </table>
+
+  <p>由此诞生 <strong>SWE-bench Verified</strong>：500 个经人工逐条确认"issue 可解、测试公平、环境可靠"的实例子集。
+  切换到 Verified 后，同一批模型的得分普遍显著上升——说明原版确实在<em>系统性低估</em>模型能力，而不是模型变强了。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>这是本课程反复出现的核心教训：评测分数 = 模型能力 × 任务质量 × harness 质量。</strong>
+  在一个三分之一任务有缺陷的基准上，"模型 A 比 B 高 3 分"可能完全是噪声或缺陷分布的伪影。
+  做 model evaluation 的第一反应不应该是"分数是多少"，而是"这个分数的<em>测量效度（validity）</em>如何"——
+  Verified 的故事证明：审计基准本身，和评测模型一样重要。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="spectrum"><span class="num">4</span>Agent 设计光谱：SWE-agent / Agentless / OpenHands</h2>
+
+  <p>同一个基准，催生了三种代表性的系统设计哲学，构成一条从"全自主循环"到"固定流水线"的<span class="term">agency 光谱</span>：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>SWE-agent [Yang 2024]</th><th>Agentless [Xia 2024]</th><th>OpenHands [Wang 2024]</th></tr></thead>
+    <tbody>
+      <tr><td>核心思想</td><td>为 LM 定制<strong>Agent-Computer Interface（ACI）</strong>：界面设计与模型能力同等重要</td><td>砍掉自主性：<strong>定位 → 修复 → 验证</strong>三段固定 pipeline，无 agent 循环</td><td>通用 agent 平台：事件流架构 + 沙箱运行时，agent 以代码为统一行动语言（CodeAct）</td></tr>
+      <tr><td>决策结构</td><td>ReAct 式循环，模型每步自选命令</td><td>每阶段固定的 prompt 序列，模型不做流程决策</td><td>ReAct 式循环 + 可插拔 agent/工具/微 agent</td></tr>
+      <tr><td>关键机制</td><td>专用文件查看器（100 行窗口）、限流搜索（结果过多则摘要）、带语法检查守卫的编辑命令</td><td>层级定位（文件→类/函数→行）、采样多个候选 diff、用回归测试+复现测试投票选 patch</td><td>Docker 沙箱、浏览器、IPython 执行器；行动=可执行代码片段</td></tr>
+      <tr><td>失败模式</td><td>循环中迷路、重复无效编辑、上下文被历史塞满</td><td>流程外的问题无法自适应（如需要先复现、需要多文件协同重构）</td><td>通用性带来的接口噪声；步数多、成本高</td></tr>
+      <tr><td>SWE-bench Lite（2024 年中、同代模型）</td><td>~18%（GPT-4）</td><td>~27%（GPT-4o，均价约 $0.34/题）</td><td>~26%（claude-3.5-sonnet）</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>"更多 agency 不一定更高分"。</strong>Agentless 用一条没有任何自主循环的三段流水线，
+  在当时同代模型下打平甚至超过了复杂 agent 框架，且成本低一个量级。解释很朴素：当模型的规划/纠错能力还不足以
+  支撑长循环时，自主性带来的主要是<em>积累错误的机会</em>；把人类对任务结构的先验（先定位、再改、再验证）硬编码进流程，
+  等于免费送给模型一个可靠的"系统 2"。随着模型变强，天平又摆回 agentic 一侧——2025 年的 Verified 榜首
+  多是极简 scaffold + 强模型。<strong>评测启示：榜单分数衡量的是"模型 × scaffold"的乘积，归因时必须把两者拆开。</strong></div>
+
+  <div class="callout paper"><span class="label"></span>
+  [Yang 2024] 的 ACI 概念值得单独记住：人用的界面（IDE、滚动、鼠标）对 LM 并不友好——LM 没有持久视觉、
+  上下文有限、对冗长输出敏感。SWE-agent 证明：把 shell 换成一套为 LM 设计的紧凑命令集（看文件按窗口翻页、
+  编辑后自动跑 linter 并在出错时回滚提示），同一个 GPT-4 的解决率可以翻倍。<strong>接口即能力的放大器</strong>——
+  这与模块 03 的 harness 设计、模块 05 的 GUI 接口一脉相承。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="localization"><span class="num">5</span>定位（localization）是瓶颈</h2>
+
+  <p>修一个 bug 的实际信息流是：issue 的几句话 → 几十万行代码中的两三行。
+  大量失败案例的根因不是"不会写修复代码"，而是<strong>根本没找到该改的地方</strong>。
+  [Jimenez 2023] 的 oracle retrieval 实验、[Xia 2024] 的消融都指向同一结论：定位质量直接决定上限。主流策略按粒度分层：</p>
+
+  <table>
+    <thead><tr><th>粒度</th><th>方法</th><th>优点 / 局限</th></tr></thead>
+    <tbody>
+      <tr><td><strong>文件级</strong></td><td>BM25 / 嵌入检索 issue↔文件；或把仓库目录树喂给 LLM 让它点名可疑文件（Agentless 第一段）</td><td>便宜、可批量；但 issue 用词与代码标识符常常对不上（词汇鸿沟）</td></tr>
+      <tr><td><strong>函数/类级</strong></td><td>在候选文件内展示类/函数骨架（signature + docstring），LLM 二次筛选</td><td>骨架比全文省 10 倍 token；依赖第一层不漏</td></tr>
+      <tr><td><strong>行级</strong></td><td>展示候选函数全文让 LLM 指认具体行；或用报错 traceback / 测试失败栈帧直接锚定</td><td>traceback 是最高质量的免费定位信号——能复现 bug 的 agent 定位几乎免费</td></tr>
+    </tbody>
+  </table>
+
+  <p>把定位看成检索问题，就可以用标准检索指标单独评测它：设 gold patch 触及的文件集合为 $G_i$，检索返回前 $k$ 个文件为 $R_i^k$，则</p>
+
+  <div class="math-block">
+  $$ \mathrm{Recall@}k \;=\; \frac{1}{N}\sum_i \frac{|G_i \cap R_i^k|}{|G_i|} $$
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>评测视角：resolved rate 是端到端指标，定位错误会被"沉默吸收"。</strong>
+  诊断一个编码 agent 时，先单独量它的定位 Recall@k（gold patch 给了你免费标注），
+  再看"定位正确的子集"上的修复成功率——两者相乘逼近端到端表现。失败归因从此有了抓手：
+  是没找到地方，还是找到了改不对。配套 notebook 的迷你任务把这两步显式拆开。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="context"><span class="num">6</span>上下文工程：repo map、文件裁剪与测试输出</h2>
+
+  <p>仓库装不进上下文窗口，这是编码 agent 与玩具任务的本质区别。所有成熟系统都在做同一件事：
+  <span class="term">上下文工程（context engineering）</span>——在有限 token 预算内最大化"与当前决策相关的信息密度"。三个典型手段：</p>
+
+  <ul>
+    <li><strong>Repo map（仓库地图）</strong>：用 AST/tree-sitter 抽取全仓库的符号骨架（文件 → 类/函数签名），
+    几千 token 就能给模型一张"这仓库有什么、在哪儿"的地图。这是 Agentless 层级定位与各类 IDE agent 的标配第一步。</li>
+    <li><strong>文件裁剪与窗口化</strong>：永远不要整文件平铺。SWE-agent 的 100 行查看窗口、Agentless 的"骨架优先、按需展开函数体"，
+    都是在控制单步观测的 token 上限——既防上下文溢出，也防模型注意力被无关代码稀释。</li>
+    <li><strong>测试输出的信息密度</strong>：pytest 一次失败可以打出几百行 traceback，其中对决策有用的往往只有最后几帧 + assert 差异。
+    成熟 harness 会截断重复栈帧、保留末端摘要行（<code>2 failed, 3 passed</code>）与最深的用户代码帧。
+    粗暴 <code>tail -n 50</code> 和精心设计的摘要，对 agent 表现的影响可达数个百分点。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  一条贯穿模块 03→05 的原则：<strong>观测（observation）不是越多越好，而是越"可决策"越好。</strong>
+  给 LM 的每一个 token 都在和别的 token 竞争注意力。上下文工程的本质是替模型做信息论意义上的压缩——
+  这也是为什么同模型不同 scaffold 的分差可以大于相邻两代模型的分差。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="controversy"><span class="num">7</span>评测争议：污染、选择偏差与不报成本的刷榜</h2>
+
+  <p>SWE-bench 越是事实标准，它的测量缺陷就越被放大利用。三个必须知道的争议：</p>
+
+  <p><strong>① 数据污染（contamination）。</strong>这 12 个仓库是全网最流行的 Python 项目，其 2023 年前的代码、issue、
+  乃至 gold patch 所在的 PR，大概率都在现代模型的预训练语料里。审计研究发现过两类泄漏：模型能仅凭 instance_id
+  或 issue 片段"回忆"出 gold patch 的文件路径甚至内容；以及部分 issue 正文/评论里本来就贴了解决方案。
+  污染让 resolved rate 部分变成<em>记忆测验</em>。缓解方向：用模型 cutoff 之后新建的实例（live 化）、换语料外仓库、做记忆探针对照实验。</p>
+
+  <p><strong>② Verified 的选择偏差。</strong>Verified 修复了任务质量，但"被 93 位标注者判为干净"本身是一次过滤：
+  欠定的、环境复杂的、测试苛刻的任务被剔除，留下的分布天然偏向描述清晰、改动局部的任务。
+  在 Verified 上的 70% 不能外推为"能解决 70% 的真实 issue"——它是"干净可验证子分布"上的 70%。
+  比较不同来源的分数时，必须先对齐用的是 full / Lite / Verified 哪个集合。</p>
+
+  <p><strong>③ 不报成本的刷榜。</strong>[Kapoor 2024] 系统性地指出了 agent 榜单的通病：只报准确率、不报成本。
+  采样 100 个候选 patch 再投票、用 10 倍 token 的反思循环、跑 pass@k 取最好——这些都能买分。
+  不报成本时，"更强的 agent"与"更烧钱的重试"在榜单上不可区分。他们的处方是<strong>成本-准确率联合报告</strong>：
+  把每个 agent 画在 (cost, accuracy) 平面上，只比较 Pareto 前沿：</p>
+
+  <div class="math-block">
+  $$ a' \text{ 支配 } a \iff \mathrm{acc}(a') \ge \mathrm{acc}(a)\ \wedge\ \mathrm{cost}(a') \le \mathrm{cost}(a)\,,
+  \text{ 且至少一个不等式严格成立} $$
+  </div>
+
+  <p>被支配的 agent 不应出现在结论里。Agentless 的报告方式（27.3%，$0.34/题）是这一规范的早期践行者。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>读榜单的最小尽职清单：</strong>用的哪个子集（full/Lite/Verified）？pass@1 还是 best-of-n？
+  单题预算与总成本多少？沙箱里能不能上网（联网=可以搜到原 PR）？测试是否对 agent 隐藏？
+  五个问题里有一个答不上来，这个分数就先不要进你的对比表。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>走出"Python 单语种"</strong>：多语言（Java/TS/Go/Rust 等）与多模态（带截图的前端 issue）SWE-bench 变体相继出现。
+    开放问题：跨语言的 resolved rate 差距，多大程度上是模型能力差异，多大程度上是各语言测试生态/构建系统对 harness 的友好度差异？评测前要先校准 harness 本身的通过率上限。</li>
+    <li><strong>issue 复杂度分层</strong>：Verified 已按"人类工程师预估修复时长"（&lt;15 分钟 / 15 分钟–1 小时 / 1–4 小时…）标注难度。
+    把 resolved rate 按时长分桶报告，与 METR 的 time-horizon 方法论 [Kwa 2025]（模块 06）直接接轨——单一总分会掩盖"短任务饱和、长任务全挂"的真实结构。</li>
+    <li><strong>过程奖励与轨迹级评测</strong>：resolved 是纯结果指标，对"瞎猫碰上死耗子"与"系统化调试"一视同仁。
+    给定位正确性、复现成功、中间测试运行等步骤定义过程信号（process reward），既能做更细的失败归因，也是 agentic RL 的训练信号来源。开放问题：过程奖励如何避免被 agent 钻空子（reward hacking）？</li>
+    <li><strong>抗污染的"活基准"</strong>：按月用模型 cutoff 之后的新 issue 滚动构建实例，牺牲可比性换取效度。开放问题：滚动集合之间的难度漂移如何校准，才能维持纵向可比的能力曲线？</li>
+    <li><strong>模型与 scaffold 的归因分离</strong>：同一模型在不同 scaffold 下分差可达 2–3 倍。标准化"参考 scaffold"（类似 ImageNet 的标准数据增强）还是鼓励自由 scaffold + 强制报告成本？两条路线的张力尚未解决。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>SWE-bench 如何从 PR 历史自动构造任务？FAIL_TO_PASS 与 PASS_TO_PASS 各防住哪类作弊，为什么缺一不可？</li>
+      <li>原版 SWE-bench 约 1/3 任务有哪三类缺陷？Verified 修复了什么，又引入了什么新的偏差？</li>
+      <li>SWE-agent 的 ACI、Agentless 的三段 pipeline、OpenHands 的通用框架各押注什么？"更多 agency 不一定更高分"的机制解释是什么？</li>
+      <li>给你一个 resolved rate 比 SOTA 高 2 分的新 agent 论文，你会按什么清单质询它（子集/成本/污染/定位归因/统计显著性）？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../03_sandbox_harness/03_讲解.html"><div class="dir">← 上一章</div><div class="t">03 · 沙箱、轨迹与 agent harness</div></a>
+    <a class="next" href="../05_computer_use/05_讲解.html"><div class="dir">下一章 →</div><div class="t">05 · Computer Use：截图→动作</div></a>
+  </div>
+
+</div>
+</body>
+</html>

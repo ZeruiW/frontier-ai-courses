@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 性能剖析与调试</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 性能剖析与调试</h1>
+  <p class="subtitle">profiling（算子耗时/显存）、瓶颈定位（roofline 回顾）、调试 NaN/OOM、确定性 —— 从零写一个玩具 profiler（计时+显存追踪）并做 NaN 溯源，把整门课的工具串成『测量→定位→优化→验证』的闭环，对照 torch profiler / Nsight / anomaly detection</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">全部前置模块、模块 00 的瓶颈三分法与 roofline、一点点浮点常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_profiling_debugging.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Williams 2009（Roofline）、PyTorch Profiler/Nsight 文档、Reproducibility/anomaly 文档</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#measure">先测量，别猜</a></li>
+      <li><a href="#timing">怎么测得准：计时的陷阱</a></li>
+      <li><a href="#attribute">按算子归因：找出热点</a></li>
+      <li><a href="#memprof">显存追踪：峰值与 OOM</a></li>
+      <li><a href="#nan">调试 NaN：定位第一个出错算子</a></li>
+      <li><a href="#determ">确定性与可复现</a></li>
+      <li><a href="#loop">把它串起来：优化的闭环</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="measure"><span class="num">1</span>先测量，别猜</h2>
+  <p>你已经会写 autograd、会编译融合、会混合精度省显存。但所有这些优化都建立在一个前提上：<strong>你知道瓶颈在哪、知道哪里出了错</strong>。这个收尾模块讲的就是这套<strong>观测与调试</strong>的功夫——profiling（性能剖析）找慢、debugging 找 bug（尤其 NaN/OOM）。它不性感，却是把前面所有本事用对地方的<em>眼睛</em>。</p>  <p>先立一条铁律，它几乎是性能工程的第一信条：<strong>先测量，别猜</strong>。新手最常犯的错是凭直觉优化——觉得某段慢就去改它，结果发现瓶颈根本在别处，白忙一场。性能直觉<em>经常</em>是错的，因为现代系统太复杂（异步、缓存、内核启动开销）。唯一可靠的方法是<strong>用 profiler 测出每部分的真实耗时与显存，让数据告诉你该优化什么</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：优化程序就像给病人治病。<strong>不先诊断就开药</strong>是庸医——你以为是这里疼，可能病根在别处。profiler 就是听诊器和 CT，它告诉你时间和显存真正花在哪。本模块教你造一台简易的「听诊器」（玩具 profiler），并学会读它的报告。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：profiling = 把程序的总耗时/显存<strong>归因</strong>到各个算子或代码段。关键产出是「按算子聚合的耗时表」（哪个 matmul/softmax 花了多少）与「显存随时间的曲线」（峰值在哪、什么时候 OOM）。拿到这些，再结合模块 00 的<strong>瓶颈三分法</strong>（算力/访存/开销受限）判断<em>性质</em>，就知道该用哪种武器（融合、混合精度、减少内核启动）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>任何优化的闭环都是『测量 → 定位瓶颈 → 优化 → 再测量验证』</strong>。本模块 notebook 会用 numpy 造一个玩具 profiler（计时 + 显存追踪 + 按算子归因），用 roofline 给瓶颈定性，并实现一个 <strong>NaN 溯源器</strong>（逐算子检查、定位首个产生 NaN 的运算）。这些在真实里是 <code>torch.profiler</code>/Nsight/anomaly detection 做的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="timing"><span class="num">2</span>怎么测得准：计时的陷阱</h2>
+  <h3>怎么测得准：计时的陷阱</h3>  <p>计时听起来简单（<code>t0=time(); 跑; t1=time()</code>），但在深度学习里有几个<strong>会让你量错</strong>的坑，不知道它们，你的 profiling 结论会是错的：</p>  <ul>
+    <li><strong>GPU 异步执行</strong>：GPU 算子是<em>异步下发</em>的——CPU 把内核丢给 GPU 就立刻返回，不等它算完。所以 <code>t1-t0</code> 量到的是「下发时间」而非「执行时间」。必须在计时前后 <code>torch.cuda.synchronize()</code>（等 GPU 真的算完），否则你会量出荒谬的「0.1 毫秒训练一个 batch」。这是 GPU 计时的<strong>头号坑</strong>。</li>
+    <li><strong>预热（warmup）</strong>：第一次运行包含一次性开销（CUDA 上下文初始化、cuDNN 算法选择、<code>torch.compile</code> 的编译）。要先跑几次<em>热身</em>、丢弃，再measure 稳态。</li>
+    <li><strong>测量波动</strong>：单次计时有噪声（调度、其他进程）。应跑多次取<strong>中位数/最小值</strong>（最小值最接近无干扰的真实耗时），而非单次或平均（平均易被偶发卡顿拉高）。</li>
+    <li><strong>墙钟 vs 设备时间</strong>：墙钟（wall-clock）含 CPU 开销、数据加载、同步等待；设备时间只算 GPU 计算。两者差距大，说明瓶颈在 GPU 之外（数据管线、Python 开销）——这是 overhead-bound 的信号。</li>
+  </ul>  <p>把头号坑用一组数走一遍，你就再也不会忘 <code>synchronize</code>。设一个 matmul 在 GPU 上真实算 8ms，但 CPU 把这个内核<em>下发</em>出去只花 0.05ms。三种测法量到的天差地别：</p>  <div class="ascii">同一个 8ms 的 GPU matmul，三种计时：
+  (a) t0=time(); y=matmul(x); t1=time()                 → 0.05ms  ❌ 只量到「下发」
+  (b) t0=time(); y=matmul(x); sync(); t1=time()         → 8.0ms   ✅ 等到真算完
+  (c) for _ in range(50): matmul(x);  sync(); 再计时一次 → 8.0ms   ✅ warmup 后稳态
+陷阱: (a) 让你以为「快了 160 倍」，其实一秒都没省——内核还在排队等着跑</div>  <p>看 (a) 与 (b) 的差：少一句 <code>sync()</code>，你量的是「把活儿派出去」的时间，不是「活儿干完」的时间——这就是无数「优化后没变快」事故的根源。(c) 再叠上 warmup，把首次的 CUDA 上下文初始化、cuDNN 选 kernel、编译等一次性开销甩掉，量到的才是<strong>稳态执行时间</strong>。三步缺一不可：<strong>warmup → 多次 → 每次 sync → 取最小</strong>。</p>  <p>本模块 notebook 的玩具 profiler 在 CPU 上跑（无 GPU 异步问题），但会<strong>把这些原则做进接口</strong>：用上下文管理器计时一段代码、支持 warmup 与多次取最小、按名字累加各算子耗时。你写的 <code>with prof.timer('matmul'):</code> 就是 <code>torch.profiler.record_function</code> 的精神——给代码段打标签、归因耗时。把玩具与真实工具对上号：</p>  <table>
+    <thead><tr><th>能力</th><th>本模块 numpy 玩具 profiler</th><th>真实 torch.profiler / Nsight</th></tr></thead>
+    <tbody>
+      <tr><td>计时</td><td>上下文管理器 <code>with prof.timer(name)</code>（CPU，墙钟）</td><td><code>record_function</code> + CUDA event，区分墙钟/设备时间</td></tr>
+      <tr><td>异步</td><td>无（CPU 同步执行）</td><td>必须 <code>synchronize</code>/CUDA event 才量准 GPU</td></tr>
+      <tr><td>归因</td><td>按名字累加耗时 → 占比表</td><td><code>key_averages()</code>：算子耗时/占比/调用次数/自身 vs 累计</td></tr>
+      <tr><td>显存</td><td>自写计数器，记 <code>peak</code></td><td><code>max_memory_allocated()</code>、内存时间线、分配栈</td></tr>
+      <tr><td>可视化</td><td>打印表格</td><td>Chrome/Perfetto trace、时间线火焰图</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>一个真实发生过无数次的故事：有人「优化」了模型、测得快了 10 倍，欣喜地上线，结果没变快——因为他忘了 <code>synchronize</code>，之前量的全是<strong>内核下发时间</strong>，根本没量到真实计算。<strong>不 synchronize 的 GPU 计时，全是错的</strong>。记住这条，能省你无数debug 时间。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="attribute"><span class="num">3</span>按算子归因：找出热点</h2>
+  <h3>按算子归因：找出热点</h3>  <p>profiler 最核心的产出是一张<strong>按算子聚合的耗时表</strong>：把总时间拆成每个算子花了多少、占比多少、被调用几次。这张表直接告诉你<strong>优化哪里最值</strong>——根据 <span class="term">Amdahl's law</span>（阿姆达尔定律），优化一个只占 5% 时间的算子，最多让整体快 5%；而优化那个占 60% 的热点，收益大得多。</p>  <pre><code># 玩具 profiler 的典型报告（本模块 notebook 产出）
+算子            总耗时(ms)   占比     调用次数
+matmul             142.3    71.2%        12
+softmax             28.7    14.4%         6
+layernorm           19.1     9.6%        12
+add(bias)            9.6     4.8%        24
+----------------------------------------
+结论: matmul 是热点(71%) -&gt; 优化它(更好的 GEMM/Tensor Core)收益最大</code></pre>  <p>读这张表的方法：先看<strong>占比最大的几项</strong>（它们是优化的重点），再结合<strong>调用次数</strong>判断<em>是单次贵还是被调用太多次</em>。比如一个算子占 30% 但被调用 1000 次，说明它单次便宜、是<strong>大量小内核</strong>（可能 overhead-bound，该融合/用 CUDA Graph）；另一个占 30% 但只调用 2 次，说明是单次昂贵的大算子（可能 compute-bound，该优化算法或换精度）。<strong>占比 + 次数</strong>一起看，才能定性瓶颈。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：profiler 报告就像家庭账单——先找出最大的开销项（房租？=最大的算子），别在买咖啡上省钱（优化占 1% 的算子）。把精力放在大头上，这是优化的 ROI 思维。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，这呼应模块 00 的<strong>瓶颈三分法</strong>：拿到耗时归因后，对热点算子判断它是<em>算力受限</em>（大 matmul，已榨满算力 → 换 Tensor Core/精度）、<em>访存受限</em>（softmax/逐元素 → 融合，减少 HBM 往返）、还是<em>开销受限</em>（一堆小内核 → 合并、CUDA Graph）。<strong>归因找『哪里』，三分法定『性质』，性质决定『用什么武器』</strong>。</p></div>
+  </div>  <p>阿姆达尔定律值得算一遍，它能治好「优化了却没变快」的困惑。设某段占总时间的比例为 <code>f</code>，你把它加速 <code>s</code> 倍，则整体加速比是 <code>1 / ((1-f) + f/s)</code>。代入：优化一个占 <code>f=5%</code> 的算子、哪怕让它快到<em>无穷快</em>（<code>s→∞</code>），整体也只快 <code>1/0.95 ≈ 1.05</code> 倍——5%。而优化那个占 <code>f=70%</code> 的热点、只让它快 2 倍，整体就能快 <code>1/(0.3+0.35) ≈ 1.54</code> 倍。<strong>收益由占比主导，不由你优化得多猛</strong>——这就是为什么必须先 profile 找占比大的，而非凭直觉猛攻某一处。</p>  <p>本模块 notebook 会让玩具 profiler 产出这样一张表，并据它做决策：识别热点算子、判断是「单次贵」还是「次数多」、给出对应的优化方向。你会亲手把「一团模糊的『程序很慢』」变成「matmul 占 71%、该优化它」的精确诊断。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="memprof"><span class="num">4</span>显存追踪：峰值与 OOM</h2>
+  <h3>显存追踪：峰值与 OOM</h3>  <p>性能的另一半是<strong>显存</strong>（模块 04 算过账，这里是<em>测</em>）。profiler 要追踪显存随时间的变化，定位<strong>峰值</strong>（决定能否放进卡）和 <span class="term">OOM</span> 的元凶。</p>  <p>核心是维护一个<strong>运行中的显存计数器</strong>：每次分配张量就加、释放就减，记录历史最大值（峰值）。这能回答关键问题：峰值是多少？发生在哪一步？哪个张量是压垮骆驼的最后一根稻草？回忆模块 04，训练显存峰值通常在<strong>反向开始时</strong>（参数+梯度+优化器状态+全部激活同时在场）——profiler 会让你<em>看到</em>这个峰值。</p>  <div class="ascii">显存随时间（一次训练 step）：
+  显存
+   ^                          ___峰值(反向开始)
+   |               前向激活↗ /   \↘ 反向逐步释放激活
+   |        ________/              \____
+   |  参数+优化器(常驻)
+   +----------------------------------------&gt; 时间
+            前向 ------&gt;|&lt;------ 反向
+   OOM 判据: 峰值 &gt; 显存容量</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：显存追踪就像盯着水位线。你想知道水位最高到哪（峰值）、什么时候最高（反向开始）、再加一点会不会溢出（OOM）。知道峰值构成，才知道该用模块 04 的哪招去降它（减 batch？checkpointing？混合精度？）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：维护 <code>current_mem</code> 与 <code>peak_mem</code>，在每次「分配/释放」事件更新。OOM 发生当 <code>peak_mem &gt; capacity</code>。真实里 <code>torch.cuda.max_memory_allocated()</code> 给峰值，<code>torch.cuda.memory_summary()</code> 给明细。注意实测峰值常高于理论账——分配器<strong>碎片</strong>、缓存未释放都会占额外显存。</p></div>
+  </div>  <p>一个常让人困惑的现象：<strong>实测峰值往往明显高于你算的理论账</strong>，OOM 也常在「理论上还够」时发生。元凶通常是<strong>显存碎片化</strong>——分配器把显存切成块复用，反复分配/释放不同大小的张量后，会留下许多<em>放不下大张量的小空隙</em>（就像停车场里零散的空位停不下一辆大巴）。于是总空闲量够、却没有<em>连续</em>的一大块，申请就失败。对策有：复用相同形状的缓冲、调分配器策略（<code>PYTORCH_CUDA_ALLOC_CONF</code>）、必要时 <code>empty_cache</code>。理解碎片，才不会在「明明还有 5GB 空闲却 OOM」时一头雾水——这是纸面显存账与真实 profiler 之间的那道缝。</p>  <div class="ascii">碎片如何让「总量够、却 OOM」(■=占用 □=空闲, 每格 1GB):
+  分配/释放若干不同大小张量后:  ■ □ ■ □ ■ □ ■ □   空闲共 4GB，但全是 1GB 碎块
+  申请一个连续 2GB 张量:        放不下！没有相邻的两格 □  → OOM(理论上明明还剩 4GB)
+  对策: 复用同形状缓冲(不制造杂乱空隙) / expandable_segments / 必要时 empty_cache 整理</div>  <p>这也解释了为什么<strong>峰值显存才是真正要盯的指标</strong>：分配器一般不把已申请的大块还给系统，所以一次瞬时峰值会把「水位」顶高、之后即使释放也难被别的形状复用。省显存的本质，是<strong>压低那一个峰值时刻</strong>（减 batch、checkpointing、及时释放不再用的激活），而不是减少总分配次数。</p>  <p>本模块 notebook 会实现一个<strong>显存追踪器</strong>：模拟训练中张量的分配/释放，记录显存曲线与峰值，判断给定容量下是否 OOM，并验证「上 checkpointing 后峰值下降」。这把模块 04 的纸面显存账变成了<em>可观测的曲线</em>——你不仅会算峰值，还能定位它、验证优化真的降了它。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="nan"><span class="num">5</span>调试 NaN：定位第一个出错算子</h2>
+  <h3>调试 NaN：找到第一个出错的算子</h3>  <p>训练中最让人头疼的 bug 是 <strong>loss 变成 NaN</strong>。NaN 一旦出现就会<strong>像瘟疫一样传染</strong>——它参与的任何运算结果都是 NaN，几步之内整个网络的参数全变 NaN。等你发现时，到处都是 NaN，根本看不出<em>它最初从哪来</em>。调试的关键，是定位<strong>第一个</strong>产生 NaN 的算子。</p>  <p>NaN 的常见源头就那么几个，记住它们能大幅缩小排查范围：</p>  <table>
+    <thead><tr><th>NaN 来源</th><th>怎么产生</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><code>log(0)</code> / <code>log(负)</code></td><td>概率为 0 取对数（如 <code>log(softmax)</code> 直接算）</td><td>用 <code>log_softmax</code>、加 <code>eps</code></td></tr>
+      <tr><td><code>0/0</code> / <code>inf/inf</code></td><td>归一化时分母为 0</td><td>分母加 <code>eps</code>、检查掩码</td></tr>
+      <tr><td><code>exp(大数)</code> → inf</td><td>softmax 未减最大值、logits 过大</td><td>数值稳定 softmax（减 max）</td></tr>
+      <tr><td>梯度爆炸</td><td>学习率过大、无梯度裁剪、循环深</td><td><strong>梯度裁剪</strong>、降 lr、检查初始化</td></tr>
+      <tr><td>fp16 上溢</td><td>半精度下中间值超 65504</td><td>loss scaling、敏感处用 fp32（模块 04）</td></tr>
+    </tbody>
+  </table>  <p>怎么定位第一个 NaN？真实框架有 <strong>anomaly detection</strong>（<code>torch.autograd.set_detect_anomaly(True)</code>）：它在每个算子后检查输出，一出现 NaN/Inf 就报错并<strong>指出是哪个算子</strong>（连反向也能定位）。代价是大幅变慢（每个算子都查），所以只在调试时开。它的原理很简单——<strong>逐算子检查输出是否含 NaN，第一个出现的就是源头</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：NaN 调试像查传染病源头。等所有人都病了（全是 NaN）没用，要找<strong>零号病人</strong>——第一个出 NaN 的算子。一旦找到它、检查它的输入，病因（log(0)？除零？溢出？）就清楚了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：<code>np.isnan(x).any() or np.isinf(x).any()</code> 检测一个张量是否被污染。在计算流水的每一步后插入这个检查，第一个触发的步骤就是源头。本模块的 NaN 溯源器就是把这个检查<strong>自动插入每个算子之后</strong>，并报告第一个出问题的算子名 + 它的输入——正是 anomaly detection 的玩具版。</p></div>
+  </div>  <p>一个更难的变体是<strong>反向里的 NaN</strong>：前向一切正常、loss 是有限值，反向却出 NaN。常见于某些算子在特定输入下<em>前向有定义但导数发散</em>——比如 <code>sqrt(x)</code> 在 <code>x=0</code> 处前向是 0、但导数 <code>1/(2√x)</code> 是 inf；<code>x/||x||</code> 在 <code>x=0</code> 处也是。这类 NaN 用普通的「检查前向输出」抓不到，正是 <code>set_detect_anomaly</code> 同时<strong>插桩反向</strong>的价值——它能告诉你是哪个算子的 <em>backward</em> 产生了 NaN。对策是给这些算子换数值稳定的实现（如 <code>x/(||x||+eps)</code>）或自定义稳定的 VJP（呼应模块 01 的自定义算子）。</p>  <p>本模块 notebook 会构造一个<strong>故意含 NaN 源</strong>的计算流水（如某处 <code>log(0)</code>），用自写的溯源器<strong>精确定位到那一步</strong>，并验证「定位到的算子确实是第一个 NaN 源」、以及「修复（加 eps）后流水变干净」。你会体会到：有了逐算子检查，NaN 调试从「大海捞针」变成「直接定位 + 对症 + 验证」的闭环。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="determ"><span class="num">6</span>确定性与可复现</h2>
+  <h3>确定性与可复现</h3>  <p>最后一个常被忽视、却在调试与科研里至关重要的话题：<span class="term">determinism</span>（确定性）——让程序<strong>每次运行结果逐位一致</strong>。没有确定性，你没法复现 bug（这次 NaN、下次不 NaN）、没法比较两次实验（差异是改动带来的还是随机噪声？）、没法让审稿人重跑你的结果。</p>  <p>不确定性的来源有几处：<strong>随机种子</strong>（初始化、dropout、数据打乱——最易控，固定 seed 即可）；更隐蔽的是<strong>并行规约的顺序</strong>——GPU 上多线程用原子操作累加（如 <code>atomicAdd</code>），完成顺序不定，而浮点加法<strong>不满足结合律</strong>（<code>(a+b)+c ≠ a+(b+c)</code> 在浮点下），于是每次的累加顺序不同→结果有微小差异→可能累积放大。</p>  <div class="math-block">\[\text{浮点加法不结合：}\quad (a+b)+c\ \neq\ a+(b+c)\quad\Rightarrow\quad\text{并行规约顺序不定}\ \Rightarrow\ \text{结果不可复现}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：要复现，先固定所有随机种子（这能解决大半）。剩下的不确定来自「并行时谁先加谁后加」——因为浮点加法换个顺序结果就差一点点。要完全确定，得强制用<strong>固定顺序</strong>的（通常更慢的）算法。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：PyTorch 用 <code>torch.use_deterministic_algorithms(True)</code> 强制选确定性内核（禁用顺序不定的 atomic 规约），配合固定所有 RNG seed（<code>torch.manual_seed</code>、<code>cudnn.deterministic</code>）。代价是<strong>性能下降</strong>（确定性内核常更慢）。所以这是个权衡：调试/复现时开，追求极致性能时关。</p></div>
+  </div>  <p>本模块 notebook 会演示这个权衡：用一个「乱序求和」模拟并行规约，展示<strong>同样的数、不同顺序、结果有微小差异</strong>；再展示固定顺序如何恢复确定性。你会亲眼看到浮点不结合性如何制造不可复现——这是理解「为什么我的训练不能完全复现」的钥匙，也呼应了模块 01 数值梯度对拍为何要留容差（浮点本就不精确）。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="loop"><span class="num">7</span>把它串起来：优化的闭环</h2>
+  <h3>把它串起来：优化的闭环</h3>  <p>现在把整门课的工具拼成一个完整的<strong>性能工程闭环</strong>——这也是真实工作中优化一个模型的标准流程：</p>  <ol>
+    <li><strong>测量（本模块 profiler）</strong>：跑 profiler，拿到按算子的耗时表 + 显存峰值。先 warmup、记得 synchronize、多次取最小。</li>
+    <li><strong>定位 + 定性（本模块 + 模块 00）</strong>：找占比最大的热点；用瓶颈三分法判断它是算力/访存/开销受限。</li>
+    <li><strong>选武器（前面所有模块）</strong>：访存受限 → 算子融合（模块 02）；显存不够 → 混合精度 + checkpointing（模块 04）；开销受限 → 编译减少内核启动（模块 02）；算力受限 → 换精度/Tensor Core。</li>
+    <li><strong>再测量验证</strong>：优化后重新 profile，确认热点真的降了、且没引入 NaN（NaN 溯源）、结果仍正确（对拍）。</li>
+    <li><strong>迭代</strong>：瓶颈往往会<em>转移</em>——优化掉 matmul 后，softmax 可能变成新热点。回到第 1 步，直到收益不值得为止。</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>这个闭环串起了整门课：<strong>autograd（01）让你能训，编译（02）/精度显存（04）让你训得快训得省，profiling（05）让你知道往哪使劲、确认使对了</strong>。而 JAX（03）展示了另一条函数式的实现路线。框架的全部工程，本质就是为这个「能训 → 训得好 → 知道为什么」的闭环服务。你现在每一环的内核都亲手写过了。</p>
+  </div>  <p>一个贯穿始终的纪律值得再强调：<strong>每一步优化都要『测量前、测量后』并『对拍正确性』</strong>。性能优化最危险的不是没变快，而是<em>悄悄算错了</em>（融合改了语义、精度丢了信息、并行引入了竞态）。本课从模块 01 的数值梯度对拍、到 02 的融合保语义、到 04 的重算逐位一致、到本模块的 NaN 溯源——<strong>『先有 ground truth，再优化，优化后对拍』</strong>这条线，就是真实框架开发的核心工作流。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>自动性能调优</strong>：能否让系统<em>自动</em>完成「测量→定位→优化」闭环？autotuning（如 Triton 的 autotune）、学习型代价模型、编译器自动选优化策略，都是把人从手动 profiling 里解放出来的尝试。</li>
+    <li><strong>分布式 profiling</strong>：多卡/多机训练里，瓶颈可能是<strong>通信</strong>（all-reduce 等待）而非计算。如何在分布式下精确归因（计算 vs 通信 vs 等待）、定位掉队的卡（straggler），是大规模训练的难题（与 C08 交叉）。</li>
+    <li><strong>可复现性 vs 性能</strong>：完全确定性代价高。能否设计既快又确定的并行规约（如固定顺序的树形规约、可复现的 atomic）？这是数值计算与系统的交叉课题。</li>
+    <li><strong>NaN/异常的自动诊断</strong>：anomaly detection 能定位算子，但解释<em>为什么</em>（哪个输入、什么数值条件触发）仍靠人。自动根因分析、训练稳定性的预警，是 MLOps 的活跃方向（与 C37 交叉）。</li>
+    <li><strong>观测的标准化</strong>：PyTorch profiler、Nsight、XLA 的 trace 格式各异。统一的性能追踪格式（如 Perfetto/Chrome trace）、跨框架的 profiling 工具，让经验可迁移，是生态层面的努力。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Williams 等 2009《Roofline》（瓶颈定性的模型）、PyTorch Profiler 与 Nsight 文档（真实 profiling 工具）、PyTorch Reproducibility 与 <code>torch.autograd.set_detect_anomaly</code> 文档（确定性与 NaN 溯源）、Horace He《Making DL Go Brrrr》（贯穿全课的瓶颈三分世界观）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_mixed_precision_memory/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 混合精度与显存</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

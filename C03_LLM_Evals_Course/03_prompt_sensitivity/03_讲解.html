@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 答案抽取与 prompt 敏感性</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 9</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 答案抽取与 prompt 敏感性</h1>
+  <p class="subtitle">Answer Extraction &amp; Prompt Sensitivity —— 你报告的那个分数，有多少是模型的，有多少是 harness 的？</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（benchmark 全景）、模块 02（方差与置信区间）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span><span class="badge gpu">GPU可选</span> 03_prompt_sensitivity.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Sclar 2023 · Alzahrani 2024 · Zheng 2023</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#harness">同一模型同一基准，分数差 10+ 分从哪来：harness 解剖</a></li>
+      <li><a href="#surface">表层特征敏感性：分隔符、空格也能改分 [Sclar 2023]</a></li>
+      <li><a href="#options">选项敏感性：顺序、标号与 position bias [Alzahrani 2024; Zheng 2023]</a></li>
+      <li><a href="#extraction">答案抽取 pipeline：正则、兜底链与 unparseable</a></li>
+      <li><a href="#confound">混淆变量：答错，还是没按格式答？</a></li>
+      <li><a href="#fewshot">few-shot 的坑：示例选择、顺序与泄漏</a></li>
+      <li><a href="#practice">最佳实践：把"分数"升级为"分布 + 配置"</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="harness"><span class="num">1</span>同一模型同一基准，分数差 10+ 分从哪来：harness 解剖</h2>
+
+  <p>一个让所有评测从业者警醒的现象：<strong>同一个开源模型、同一个 benchmark（比如 MMLU），不同团队跑出的分数可以相差 10 分以上</strong>——模型权重一个比特都没变。HELM 早期系统性对比就暴露了这一点 [Liang 2022]，lm-evaluation-harness 的维护者把它总结为可复现评测的头号教训 [Biderman 2024]。差异不来自模型，而来自<span class="term">评测 harness</span>——把"模型"变成"分数"的那一整套胶水代码。</p>
+
+  <p>把 harness 拆开看，每一个环节都是一个自由度：</p>
+
+  <div class="ascii">
+            harness 的自由度（每个 [方括号] 都是一个可改变分数的旋钮）
+
+  题目 x ──► [① prompt 模板]──► [② few-shot 拼接]──► [③ 解码参数] ──► 模型原始输出
+              · 措辞/分隔符        · 几个示例? 0/5/25     · temperature      │
+              · 选项标号 A/B/1/2   · 示例怎么选/排序       · max_tokens       ▼
+              · chat template?    · 示例答案的格式        · stop tokens   [④ 答案抽取]
+                                                                          · 正则/兜底链
+   分数 ◄──── [⑥ 聚合与报告] ◄──── [⑤ 比对评分] ◄─────────────────────────────┘
+              · micro/macro 平均    · exact match? 宽松匹配?
+              · unparseable 算错还是剔除?   · logprob 选择 vs 生成式回答
+  </div>
+
+  <table>
+    <thead><tr><th>harness 维度</th><th>典型分歧</th><th>对分数的影响方式</th></tr></thead>
+    <tbody>
+      <tr><td>prompt 模板</td><td>原版 MMLU 格式 vs chat 风格 vs 自定义指令</td><td>表层特征敏感性（§2），单点可差数分到数十分</td></tr>
+      <tr><td>few-shot 数量与内容</td><td>0-shot vs 5-shot；示例固定还是随机</td><td>改变任务"演示"，base 模型尤其敏感（§6）</td></tr>
+      <tr><td>选项呈现</td><td>顺序、标号 A/B/C/D vs 1/2/3/4</td><td>position bias 与 token bias（§3）</td></tr>
+      <tr><td>评分方式</td><td>logprob 比较选项 vs 自由生成后抽取</td><td>两种评法测的不是同一种能力（§4）</td></tr>
+      <tr><td>抽取规则</td><td>严格正则 vs 兜底链 vs 人工检查</td><td>系统性偏置：惩罚"话多"的模型（§4–5）</td></tr>
+      <tr><td>解码参数</td><td>greedy vs temperature&gt;0；max_tokens 截断</td><td>引入随机性；截断会把正确推理"掐"在答案前</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  论文里一句轻描淡写的 "we evaluate on MMLU"，背后是上表 6 个维度的具体选择。<strong>不写清 harness 配置的分数，严格说不可比也不可复现。</strong>本模块的目标：让你既能定量测量这些自由度造成的方差，又能在自己的评测里控制并报告它们。模块 02 讲了抽样方差，本模块讲的是另一类方差来源——<em>规格方差（specification variance）</em>，两者要分开报告。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="surface"><span class="num">2</span>表层特征敏感性：分隔符、空格也能改分 [Sclar 2023]</h2>
+
+  <p>Sclar et al. 2023 做了一个系统实验：保持 prompt 的<em>语义</em>完全不变，只改<span class="term">表层特征（spurious features）</span>——字段分隔符（<code>Answer:</code> vs <code>Answer :</code> vs <code>ANSWER:</code>）、大小写、空格与换行、选项间的连接符。结果：<strong>在 LLaMA-2-13B 等模型的 few-shot 任务上，仅语义等价的格式变化就能造成最高 76 个百分点的准确率差异，超过 10 分的差异比比皆是</strong>。更糟的是：格式好坏在模型间不迁移——对模型 A 最优的模板可能是模型 B 的最差模板，所以"给每个模型调到最好"与"全部用同一模板"两种做法会给出不同的排名。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>你跑一个模板得到 67.3 分，这个数不是"模型的 MMLU 能力"，而是"模型 × 这一个模板"的得分。换个分隔符可能就是 62 或 71。
+      单一模板的分数，只是从一大堆合理模板里<strong>随机抽了一个</strong>算出来的一次实现——你看到的是一个样本点，不是那个分布。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设语义等价的合理模板空间为 $\mathcal{T}$，模型在模板 $T$ 下的真实准确率为 $s(T)$。一次评测报告的
+      $\hat{s}(T_0)$ 是 $\{s(T):T\in\mathcal{T}\}$ 这一分布的单次实现（再叠加模块 02 讲的有限样本噪声）。
+      模型能力的诚实刻画是该分布的位置与离散度 $\big(\mathbb{E}_{T\sim\mathcal{T}}[s(T)],\ \mathrm{sd}_{T\sim\mathcal{T}}[s(T)]\big)$，而非任意单点。</p>
+    </div>
+  </div>
+
+  <p>Sclar 等人提出 <span class="term">FORMATSPREAD</span>：在模板空间中采样 $K$ 个语义等价模板，报告性能区间。核心统计量是<strong>极差（spread）</strong>：</p>
+
+  <div class="math-block">
+  $$ \Delta(\mathcal{T}) \;=\; \max_{T\in\mathcal{T}} s(T)\;-\;\min_{T\in\mathcal{T}} s(T),
+     \qquad
+     \hat{s}(T) \;=\; \frac{1}{n}\sum_{i=1}^{n}\mathbf{1}\!\left[\,\mathrm{extract}\big(f(x_i;T)\big)=y_i\,\right] $$
+  </div>
+
+  <p>注意 $\hat{s}(T)$ 的定义里显式写出了 $\mathrm{extract}(\cdot)$——抽取函数是评测函数的一部分，它自己也是敏感性来源（§4）。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>[Sclar 2023]</strong> 的两个工程要点：①模板空间用一个小文法（grammar）定义——字段名 × 分隔符 × 大小写 × 空白的组合，保证"语义等价"是受控的；②朴素地评 $K$ 个模板要 $K$ 倍算力，他们用 bandit 式的自适应采样近似估计 spread 的上下界，把成本压到可接受。对评测从业者的直接含义：<strong>论文之间 1–2 分的差距，若没有跨模板的方差报告，不构成"超越"的证据</strong>——这条与模块 02 的置信区间结论同构，但方差来源不同。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="options"><span class="num">3</span>选项敏感性：顺序、标号与 position bias [Alzahrani 2024; Zheng 2023]</h2>
+
+  <p>多选题（<span class="term">MCQA</span>）是 LLM 评测中最常见的题型，它引入了一类专属的敏感性：<strong>模型对"选项怎么摆"的反应，常常大过对"选项是什么"的反应。</strong></p>
+
+  <h3>3.1 两类偏置：position bias 与 token bias</h3>
+
+  <p>Zheng et al. 2023 的核心发现：LLM 在 MCQA 上存在系统性的<span class="term">选择偏置（selection bias）</span>，可分解为两种：</p>
+  <ul>
+    <li><strong>位置偏置 position bias</strong>：偏好某个<em>位置</em>上的选项（如总倾向第一个/最后一个）；</li>
+    <li><strong>标号偏置 token bias</strong>：偏好某个<em>标号 token</em>（如无论内容如何都更爱输出 "A" 或 "C"）。</li>
+  </ul>
+  <p>他们的实验表明<strong>标号偏置往往是主导因素</strong>：把正确答案移动到不同标号下，模型准确率随之大幅波动；不同模型偏爱的标号还不一样。Zheng 等人提出 <span class="term">PriDe</span>（Debiasing with Prior estimation）：用一小部分样本上的选项排列（permutation）估计模型对各标号的先验偏好 $\pi_c$，再把它从预测中除掉：</p>
+
+  <div class="math-block">
+  $$ \tilde{p}(d_i \mid x) \;\propto\; \frac{p(c_i \mid x)}{\pi_{c_i}} $$
+  </div>
+  <p>其中 $c_i$ 是标号（A/B/C/D），$d_i$ 是挂在该标号下的内容。直觉：观测到的"选 A 的概率"是"内容对"与"就爱说 A"两个因素的乘积，除以先验 $\pi_{c_i}$ 即近似剥离后者。</p>
+
+  <h3>3.2 排行榜会被"摆法"重排 [Alzahrani 2024]</h3>
+
+  <p>Alzahrani et al. 2024 把扰动做到了排行榜尺度：在 MMLU 上施加微小扰动——打乱选项顺序、把标号从 A/B/C/D 换成 1/2/3/4 或 (a)/(b)、微调答案格式——然后看开源排行榜的排名变化。结果：<strong>个别扰动能让模型在榜上移动多达 8 个名次</strong>。当 benchmark 成为优化目标（"benchmarks are targets"），模型可能恰好过拟合到某一种摆法上；换一种语义完全等价的摆法，排名洗牌。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  这意味着"榜上 A 比 B 高 1.5 分"这类结论的脆弱性是<strong>双重的</strong>：模块 02 告诉你它可能在抽样噪声以内；本节告诉你即使统计显著，它也可能只在<em>这一种选项摆法</em>下成立。两关都过了，结论才站得住。</div>
+
+  <h3>3.3 CircularEval：把"猜对"变成"必须都对"</h3>
+
+  <p>一个优雅的工程对策是 <span class="term">CircularEval</span>（由 MMBench 提出并推广，VLM 课模块 07 有展开；此处独立讲清）。做法：把每道题的选项<strong>循环移位</strong> $k$ 次（4 选项即 4 种摆法，正确答案依次落在 A/B/C/D 上），同一道题问 $k$ 遍，<strong>全部答对才记这题为对</strong>：</p>
+
+  <div class="math-block">
+  $$ \mathrm{acc}_{\mathrm{circ}} \;=\; \frac{1}{n}\sum_{i=1}^{n}\ \prod_{k=0}^{K-1}\mathbf{1}\!\left[\hat{y}_i^{(k)}=y_i^{(k)}\right] $$
+  </div>
+
+  <p>它同时压制两类问题：①position/token bias——靠偏爱某个标号蒙对的题，换个移位就露馅；②随机猜测——4 选项下单次猜对概率 $1/4$，循环全对的概率骤降为 $(1/4)^4\approx 0.39\%$（假设各次独立），基线噪声几乎被消除。代价是 $K$ 倍推理算力，以及指标变得更严格（数值会显著低于普通 accuracy，不可与之直接比较）。notebook 实验 2 与练习 3 会让你亲手实现它。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  CircularEval 的本质是<strong>把"对扰动的鲁棒性"并入正确性定义</strong>：它测的不再是"在某一种摆法下你会不会"，而是"无论怎么摆你都会不会"。这是一种通用思路——任何已知的敏感轴（选项顺序、模板、标号体系）都可以这样"乘进"指标里，代价是算力与更保守的数值。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="extraction"><span class="num">4</span>答案抽取 pipeline：正则、兜底链与 unparseable</h2>
+
+  <p>生成式评测的最后一公里：模型给了你一段自由文本，你要从里面挖出"它选了什么"。这个看似琐碎的步骤，是无数评测 bug 的藏身处。真实的模型输出长这样：</p>
+
+  <div class="ascii">
+   "Answer: B"                       ← 理想情况
+   "the answer is (b)."              ← 小写 + 括号 + 句号
+   "**B**"                           ← markdown 加粗
+   "选 B"                            ← 换了语言
+   "B) Paris"                        ← 复述了整个选项
+   "Option A is tempting, but ...    ← 推理在前，答案在后：
+    therefore the answer is C."        朴素正则会抓到 A（错！）
+   "I cannot determine this."        ← 拒答 / unparseable
+  </div>
+
+  <h3>4.1 兜底链设计与它的系统性偏置</h3>
+
+  <p>工业级抽取通常是一条<span class="term">兜底链（fallback chain）</span>：从最严格、误报率最低的模式开始，逐级放宽：</p>
+
+  <div class="ascii">
+   ① 显式声明（取最后一次出现）        "answer is X" / "Answer: X" / "选 X"
+        │ 未命中
+        ▼
+   ② 强格式标记                       "**X**" / 行首 "X)" / "(X)."
+        │ 未命中
+        ▼
+   ③ 独立字母 token                   整段输出就是一个 "B"
+        │ 未命中
+        ▼
+   ④ 返回 None → 计入 unparseable 率（必须单独报告，而非悄悄算错/算对）
+  </div>
+
+  <p>两条设计铁律：<strong>取最后一次显式声明而非第一次</strong>（CoT 模型先讨论各选项再给答案，"第一个出现的字母"会系统性抓到被讨论的错误选项）；<strong>宁可 None 不要瞎猜</strong>（把 unparseable 悄悄判错，会把"格式问题"伪装成"能力问题"，见 §5）。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  抽取错误不是随机噪声，而是<strong>系统性偏置</strong>：严格正则系统性惩罚话多的、双语的、爱用 markdown 的模型；first-match 抽取系统性惩罚做显式推理的模型。如果你比较的两个模型恰好一个简洁一个啰嗦，抽取规则本身就能制造出几个点的"能力差距"。比较多个模型时，<strong>必须用同一条抽取链，并对每个模型抽样人工检查 unparseable 与抽取错误</strong>。</div>
+
+  <h3>4.2 logprob 选择 vs 生成式回答：两种评法测的不是同一件事</h3>
+
+  <p>MCQA 有两种根本不同的评法：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>logprob-based 选择</th><th>生成式回答 + 抽取</th></tr></thead>
+    <tbody>
+      <tr><td>机制</td><td>比较各候选的条件对数概率，取 argmax</td><td>自由解码，再从文本中抽取答案</td></tr>
+      <tr><td>公式</td><td>$\hat{a}=\arg\max_{c}\ \tfrac{1}{|c|}\log p_\theta(c\mid x)$（常做长度归一）</td><td>$\hat{a}=\mathrm{extract}(f_\theta(x))$</td></tr>
+      <tr><td>需要答案抽取？</td><td>不需要——这是它最大的工程优势</td><td>需要，引入本节全部问题</td></tr>
+      <tr><td>能否配合 CoT</td><td>不能（不生成推理过程）</td><td>能，且对难题往往必要</td></tr>
+      <tr><td>测的能力</td><td>判别/识别：哪个候选更"像话"</td><td>生成：能否产出并表达正确答案</td></tr>
+      <tr><td>额外敏感性</td><td>长度归一方式、是否含标号、base 模型友好</td><td>解码参数、max_tokens 截断、格式遵循</td></tr>
+      <tr><td>典型使用方</td><td>lm-evaluation-harness 的经典任务 [Gao 2023]</td><td>chat 模型评测、agent 评测、前沿能力评测</td></tr>
+    </tbody>
+  </table>
+
+  <p>同一模型在两种评法下分数可以差很多分且<strong>排序都可能不同</strong>——它们本来就在测不同的能力切面。报告时必须写明用的是哪一种；对比不同来源的分数时，先确认评法一致，否则比较无意义 [Biderman 2024]。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="confound"><span class="num">5</span>混淆变量：答错，还是没按格式答？</h2>
+
+  <p>一个被严格 harness 判错的样本，背后有两种完全不同的失败：<strong>能力失败</strong>（模型真不会）与<strong>格式失败</strong>（模型会，但没按你要的格式说，或者你的抽取链没接住）。这两者在"accuracy 下降"里完全<span class="term">混淆（confounded）</span>，而它们对应的结论截然不同：前者是"模型不行"，后者是"评测不行"。对小模型、base 模型与非英语模型，格式失败的占比尤其高——这正是 notebook 用 1.5B 小模型做实验的原因之一。</p>
+
+  <h3>格式宽松度梯度实验（leniency ladder）</h3>
+
+  <p>分离这两种失败的标准做法：<strong>固定模型与输出不动，只移动抽取规则的宽松度</strong>，从严到宽评同一批输出：</p>
+
+  <div class="ascii">
+   L0 仅接受 "Answer: X" 精确格式      acc = 0.41   ┐
+   L1 + 大小写/括号/句号容忍           acc = 0.52   │ 这一段全是
+   L2 + 显式声明句式/中文/加粗         acc = 0.63   │ "格式/抽取"损失
+   L3 + 人工(或 LLM)逐条判读           acc = 0.66   ┘
+                                       ────────────
+   L3 仍答错的 34%                     ← 这才是能力问题
+  </div>
+
+  <div class="math-block">
+  $$ \underbrace{1-\mathrm{acc}_{L0}}_{\text{观测误差}}
+     \;=\; \underbrace{1-\mathrm{acc}_{L3}}_{\text{能力误差}}
+     \;+\; \underbrace{\mathrm{acc}_{L3}-\mathrm{acc}_{L0}}_{\text{格式/抽取误差}} $$
+  </div>
+
+  <p>若 $\mathrm{acc}_{L3}-\mathrm{acc}_{L0}$ 很大，说明你的评测在大量测量"指令遵循"而非目标能力。此时要么改进 prompt（明确格式要求 + few-shot 演示格式），要么放宽抽取链，要么<strong>把格式遵循作为一个独立指标单独报告</strong>。能力引出（elicitation）视角下，这属于"评测方未尽引出义务"——模块 06 展开。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  一个值得内化的原则：<strong>unparseable 率与格式损失 $(\mathrm{acc}_{\text{宽}}-\mathrm{acc}_{\text{严}})$ 是评测质量指标，不是模型能力指标。</strong>它们高，先怀疑 harness，再怀疑模型。安全评测里这点更要命：把"模型没按格式答"误判成"模型没有该危险能力"，会系统性低估风险。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="fewshot"><span class="num">6</span>few-shot 的坑：示例选择、顺序与泄漏</h2>
+
+  <p><span class="term">few-shot（in-context）示例</span>是 harness 的又一大自由度。它带来三类经典问题：</p>
+
+  <ul>
+    <li><strong>示例选择方差</strong>：换一组（同样合理的）示例，分数可动数个百分点。示例与测试题的难度/领域/标签分布是否匹配都有影响。诚实的做法是随机抽多组示例报均值±方差，而不是报你试出来最好的那组。</li>
+    <li><strong>示例顺序方差</strong>：同一组示例不同排列，结果可显著不同——模型存在 recency bias（更模仿最后一个示例）与多数标签偏置（示例答案集中在某标号会拉高该标号的输出概率）。这与 §2 的模板敏感性同根：都是模型对"语义无关的表层排布"的过度依赖，Sclar 2023 的模板文法里 few-shot 的拼接格式正是敏感维度之一。</li>
+    <li><strong>demonstration 泄漏</strong>：两种形态——①示例直接泄答案模式：示例答案恰好都是 "C"，模型学到"这场考试答案是 C"这一捷径，而非任务本身；②示例与测试题来自同一数据集的同一来源，示例事实上"教"了测试题的特定知识或题式，使分数无法外推。更隐蔽的是：若 benchmark 的 few-shot 示例是公开固定的（很多榜单如此），训练数据里见过这几个示例的模型相当于提前拿到了考卷格式——这与模块 05 的污染问题连成一条线。</li>
+    </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  few-shot 数量本身就是排行榜上的常见"作弊面"：0-shot 与 5-shot 的 MMLU 分数可差很多，但表格里往往只写 "MMLU"。<strong>看到任何 few-shot 分数，先问三件事：几个示例？怎么选的？答案标号分布是否均衡？</strong>三问有一个答不上来，这个数就要打折扣。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="practice"><span class="num">7</span>最佳实践：把"分数"升级为"分布 + 配置"</h2>
+
+  <p>把本章所有内容收敛成可执行的清单——这也是你审稿、复现实验、搭自家 harness 时的检查表：</p>
+
+  <table>
+    <thead><tr><th>#</th><th>实践</th><th>对应风险（出处）</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><strong>多模板报均值±方差</strong>：≥3–5 个语义等价模板，报 $\mathbb{E}[s]$、$\mathrm{sd}[s]$ 与极差，而非单点</td><td>表层敏感性 [Sclar 2023]</td></tr>
+      <tr><td>2</td><td><strong>选项扰动检查</strong>：顺序置换/循环移位下复评；MCQA 报告 position bias 矩阵，必要时用 CircularEval 或 PriDe 式去偏</td><td>选择偏置 [Zheng 2023; Alzahrani 2024]</td></tr>
+      <tr><td>3</td><td><strong>固定并公开 harness 全配置</strong>：模板原文、few-shot 数与示例、解码参数、抽取代码、harness 版本号——理想情况直接公开可执行配置</td><td>不可复现 [Biderman 2024; Gao 2023]</td></tr>
+      <tr><td>4</td><td><strong>报告 unparseable 率</strong>：作为一等公民指标；模型间比较时附格式宽松度梯度</td><td>抽取偏置与混淆（§4–5）</td></tr>
+      <tr><td>5</td><td><strong>抽取链取"最后显式声明"+ 兜底 + None</strong>；对每个被比较模型抽样人工核查抽取正确性</td><td>first-match 偏置（§4）</td></tr>
+      <tr><td>6</td><td><strong>few-shot 示例多组随机 + 标号均衡</strong>；写明示例来源</td><td>示例方差与泄漏（§6）</td></tr>
+      <tr><td>7</td><td><strong>方差分解报告</strong>：把抽样方差（模块 02）与模板/示例方差分别报告，结论的显著性要同时扛住两者</td><td>规格方差被冒充为能力差距</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  统一的心智模型：评测结果是 $\,\mathrm{score}(\text{model},\ \text{harness},\ \text{data sample})\,$ 的函数，你想声称的却只关于第一个参数。<strong>所有最佳实践本质上都是同一件事：要么把后两个参数固定并公开（可复现），要么对它们求期望并报方差（鲁棒）。</strong>只报一个单点而不交代后两者，是评测领域大多数不可复现结论的来源。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>"合理模板空间"如何定义？</strong> FORMATSPREAD 用文法生成语义等价模板，但真实用户的 prompt 分布远比文法宽。对"部署面向用户的模型"，也许应对真实用户 prompt 分布求期望——可这个分布没人有。评测视角：声明你的模板空间，是比声明单一模板更高一档、但仍不完备的诚实。</li>
+    <li><strong>鲁棒性该不该进排行榜主指标？</strong> 报分布而非单点（如 mean−sd 作为保守分）会改变激励：模型厂商将被迫优化稳健性而非调表层格式。但也会让榜单更难读、算力成本 $K$ 倍。怎样的聚合既抗操纵又可沟通，是开放的机制设计问题 [Alzahrani 2024]。</li>
+    <li><strong>结构化输出会终结抽取问题吗？</strong> JSON mode / function calling / constrained decoding 可以让"抽取"无损化，但它改变了被测对象：约束解码下模型的分布被截断，可能伤害（也可能帮助）实际能力表现，而且各家实现不一——抽取问题没有消失，而是变成了"约束实现敏感性"。这一交互目前缺乏系统研究。</li>
+    <li><strong>MCQA 范式本身的有效性。</strong> logprob 与生成式两种评法的分歧（§4.2）提示 MCQA 测到的是混合能力；加上选项可被"只看选项不看题"利用（模块 05 的 no-input 基线思想），前沿评测正在向自由生成 + 程序化判分 / LLM judge（模块 04）迁移——后者引入新的敏感性，循环并未终结。</li>
+    <li><strong>指令遵循与能力的解耦评测。</strong> §5 的梯度实验是事后补救；更好的设计是把两者分开测：能力题给最大格式宽容，格式遵循单独建 benchmark。如何设计"对格式失败免疫"的能力评测（如多回合澄清、交互式打分），仍是开放问题——对安全评测的能力下界估计尤为关键。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>同一模型同一 benchmark 分数差 10 分，列出至少 5 个 harness 层面的可能原因，并说明各自的检查方法。</li>
+      <li>"单一模板的分数是模板抽样的一次实现"是什么意思？FORMATSPREAD 报告什么统计量，为什么 [Sclar 2023]？</li>
+      <li>position bias 与 token bias 有何区别 [Zheng 2023]？CircularEval 如何同时压制选择偏置与随机猜测，其代价是什么？</li>
+      <li>设计一条答案抽取兜底链：为什么取"最后一次显式声明"？unparseable 该如何处理与报告？如何用格式宽松度梯度把"没按格式答"从"答错"里分离出来？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../02_statistics/02_讲解.html"><div class="dir">← 上一章</div><div class="t">02 · 统计严谨性</div></a>
+    <a class="next" href="../04_llm_judge/04_讲解.html"><div class="dir">下一章 →</div><div class="t">04 · LLM-as-a-Judge 深剖</div></a>
+  </div>
+
+</div>
+</body>
+</html>

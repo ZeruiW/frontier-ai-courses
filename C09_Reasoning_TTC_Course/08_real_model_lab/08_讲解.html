@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · 真模型实验室：用 Gemini 复跑全课实验（BONUS）</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">BONUS 08</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>08 · 真模型实验室：用 Gemini 复跑全课实验（BONUS）</h1>
+  <p class="subtitle">Real-Model Lab —— 模拟器给了你机制直觉，现在去现实世界收外部效度：把 02/03/05/06/07 的关键实验在真模型上重测一遍</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">全课 00–07（尤其 02/03/06/07 的实验结论）；LLM_Evals_Course 03（答案抽取）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge" style="background:#7c3aed;color:#fff">API</span> 08_real_model_lab.ipynb —— Gemini API（无 key 自动回退 mock，全程可跑）</div></div>
+    <div class="item"><div class="k">核心材料</div><div class="v">Wang 2022、Cobbe 2021、Snell 2024、Muennighoff 2025 (s1)、Mirzadeh 2024、Gemini API thinking 文档</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 45 分钟 + 跑 40 分钟（mock）/ 60 分钟（真 API）</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">模拟 vs 真实测量：为什么两者都要</a></li>
+      <li><a href="#design">真模型实验的设计要点：预算、采样参数、答案抽取</a></li>
+      <li><a href="#discipline">API 评测的工程纪律：重试 · 限速 · 缓存 · 成本预估</a></li>
+      <li><a href="#gemini">Gemini API 速览：generateContent 与 thinkingConfig</a></li>
+      <li><a href="#cards">逐实验设计卡：A/B/C/D + scaling 对照</a></li>
+      <li><a href="#interpret">结果解读：外推限度与定性对照</a></li>
+      <li><a href="#safety">安全与成本提示</a></li>
+      <li><a href="#frontier">从这里出发：把实验台升级成研究项目</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>模拟 vs 真实测量：为什么两者都要</h2>
+
+  <p>00–07 的全部实验跑在<strong>模拟推理器</strong>上：每步成功率 $p$、verifier 噪声 $\sigma$、题目难度分布全部由你设定，
+  ground truth 完全已知。这是做<strong>机制研究</strong>的理想实验台——但它回答不了一个问题：
+  <em>这些结论在真实模型上还成立吗？</em>本模块就是来补这一块的。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>模拟器像风洞：可控、可重复、便宜，能把"majority voting 为什么会被系统性偏差卡住"这种机制问题拆到根上。
+      但风洞里的飞机没遇到过真天气。真模型实验就是试飞：贵、吵、不可控变量一堆，但只有它能告诉你
+      风洞结论的<strong>外推范围</strong>。先风洞后试飞，是工程学的标准流程——评测科学也一样。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>模拟实验提供<span class="term">internal validity</span>（内部效度）：变量可控、因果链清晰、
+      结论可与解析解对照（如 02 的 majority@N 期望公式）。真模型实验提供<span class="term">external validity</span>
+      （外部效度）：测量对象就是部署对象。二者的分工是<strong>理论模型预测 → 真实测量检验</strong>：
+      模拟给出定性形状（曲线上升/饱和/分叉），真模型检验该形状是否出现、在何处偏离。
+      只有模拟没有测量是空中楼阁，只有测量没有模拟则无法归因——这正是 evaluation scientist 的日常工作循环。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  本模块每个实验都遵循同一张表格：<strong>模拟预测（00–07 已得）→ 真模型观测 → 一致 / 偏离 / 无法判定</strong>。
+  注意我们对照的是<strong>定性形状</strong>而不是具体数值——模拟器的 $p=0.8$ 和 Gemini 在你那 20 道题上的正确率没有数值上的对应关系。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="design"><span class="num">2</span>真模型实验的设计要点：预算、采样参数、答案抽取</h2>
+
+  <p>把模拟实验搬到真模型，有三个新自由度必须钉死，否则结果不可解释：</p>
+
+  <table>
+    <thead><tr><th>设计维度</th><th>本模块的选择</th><th>为什么重要</th></tr></thead>
+    <tbody>
+      <tr><td><strong>采样参数</strong></td><td>多样性采样用 <code>temperature=1.0</code>（self-consistency 需要多样的推理路径 [Wang 2022]）；verifier 与判分用 <code>temperature≈0</code>（要的是稳定判断不是多样性）</td><td>02 模块证明过：聚合的收益来自路径多样性。temperature=0 采 16 条全一样，majority@N 曲线必然是平线——这不是模型问题，是实验设计错误</td></tr>
+      <tr><td><strong>预算口径</strong></td><td>统一用 token 计数（API 返回的 <code>usageMetadata</code>），thinking token 单独记</td><td>05/06 的教训：不报预算口径的准确率没有意义。真模型的"一次采样"成本随输出长度浮动，必须实际计量</td></tr>
+      <tr><td><strong>答案抽取</strong></td><td>鲁棒的 <code>extract_answer</code>：先找"答案是 X"模式，再退化到最后一个数字；抽取失败显式记 <code>None</code> 而非算错</td><td>LLM_Evals_Course 03 的核心教训：抽取器的失败会被算成模型的失败。真模型的输出格式远比模拟器脏——这是搬到真模型后<strong>第一个</strong>新增误差源</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>抽取误差会污染所有下游结论。</strong>正确顺序是：先在若干条真实输出上人工检查 extract_answer 的命中率，
+  确认抽取可靠，再去解读 majority@N 曲线。如果发现"加大 N 反而掉点"，第一怀疑对象是抽取器而不是模型——
+  把"答案是 12 美元"抽成 None 的 bug 在聚合实验里会被放大 N 倍。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="discipline"><span class="num">3</span>API 评测的工程纪律：重试 · 限速 · 缓存 · 成本预估</h2>
+
+  <p>API 评测是工程活。四条纪律，每条都对应一类真实事故：</p>
+
+  <ol>
+    <li><strong>成本预估先行</strong>：跑任何实验前先算 token 成本。估算公式很粗糙但必须有：
+    <div class="math-block">$$ \text{cost} \approx \sum_{\text{prompt}} n_{\text{samples}} \cdot
+    \left( \frac{T_{\text{in}}}{1000} \cdot P_{\text{in}} + \frac{T_{\text{out}}}{1000} \cdot P_{\text{out}} \right) $$</div>
+    其中 $T_{\text{in}} \approx \text{len(prompt)}/4$（英文）。本模块全部实验在 gemini-2.5-flash 上约 $10^5$–$10^6$ token 量级，
+    成本在一美元以内——但同样的代码换 pro 档模型加 32k thinking budget，成本能翻两个数量级。<strong>预估是习惯不是仪式。</strong></li>
+    <li><strong>缓存（caching）</strong>：以 <code>hash(prompt + 全部采样参数)</code> 为 key 把响应落盘。
+    好处有三：断点续跑不重复计费、实验可复现、调试下游代码（抽取/聚合/画图）零成本。
+    注意 key 必须包含 temperature / thinking_budget 等<strong>所有</strong>影响输出的参数，否则会拿错缓存——一个经典的静默 bug。</li>
+    <li><strong>重试与限速（retry &amp; rate limiting）</strong>：429/5xx 用指数退避（exponential backoff）重试 2–3 次；
+    免费档 Gemini 有 RPM/TPD 限额，批量实验要主动 sleep。重试时注意：<strong>对幂等的 generateContent 可以安全重试，但重试得到的是新采样</strong>——
+    如果你在做方差敏感的实验，重试策略本身就是实验设置的一部分，要写进报告。</li>
+    <li><strong>优雅回退（graceful fallback）</strong>：没有 key 时自动切到确定性 mock。这不只是方便——它把"实验逻辑"与"模型后端"解耦，
+    让聚合/抽取/画图代码可以在 CI 里零成本测试。生产评测 harness 都长这样：后端可插拔，逻辑可单测。</li>
+  </ol>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>绝不把 API key 写进代码或 notebook 输出。</strong>从环境变量 <code>GEMINI_API_KEY</code> 读取；
+  notebook 提交前检查输出 cell 里没有泄漏 key（报错 traceback 里的 URL 是常见泄漏点——本模块的 API 层会在异常信息里抹掉 key）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="gemini"><span class="num">4</span>Gemini API 速览：generateContent 与 thinkingConfig</h2>
+
+  <p>本模块只用一个 REST 端点，纯标准库 <code>urllib</code> 即可调用，不需要 SDK：</p>
+
+  <div class="ascii">
+  POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+  Header:  x-goog-api-key: $GEMINI_API_KEY        （或 ?key=... 查询参数）
+  Body: {
+    "contents": [{"parts": [{"text": "你的 prompt"}]}],
+    "generationConfig": {
+      "temperature": 1.0,          ← 采样温度
+      "candidateCount": 4,         ← 一次请求返回多条采样（上限 8）
+      "maxOutputTokens": 1024,
+      "thinkingConfig": {"thinkingBudget": 512}   ← 思考预算（token 数）
+    }
+  }
+  返回: candidates[i].content.parts[*].text  +  usageMetadata
+        （promptTokenCount / candidatesTokenCount / thoughtsTokenCount）
+  </div>
+
+  <p>关键参数是 <span class="term">thinkingConfig.thinkingBudget</span>——这就是 06 模块
+  <strong>budget forcing</strong> 的产品化形态：gemini-2.5 系列允许把内部思考的 token 预算设为
+  0（关闭思考，flash 档支持）、固定值（128–24576），或 -1（动态：模型自行决定想多久）。
+  gemini-3 系列则改用粗粒度的 <code>thinkingLevel</code>（low/high）。这给了评测者一个在 s1 [Muennighoff 2025]
+  里要靠注入 "Wait" 才能实现的能力：<strong>外生地控制思考长度，扫出 accuracy-budget 曲线</strong>。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  对照阅读：s1 的 budget forcing 靠解码端干预（截断思考 / 追加 "Wait" 强制延长），是研究者的 hack；
+  thinkingBudget 是同一思想的 API 原语。两者都把"思考多久"从模型内生变量变成实验自变量——
+  这正是 06 模块"预算扫描"实验在现实中可执行的原因。注意 API 文档明言 budget 是<strong>软目标</strong>，
+  实际 thoughtsTokenCount 可能略超——所以报告时要记录实际用量而非名义预算。</div>
+
+  <p>没有 key 时，notebook 自动切换到 <code>MockGemini</code>：一个对内置题库按难度参数化正确率、
+  带可复现 rng 的确定性模拟模型，接口与真 API 完全一致。它本质上就是 00–07 的模拟推理器穿上了 API 的衣服——
+  所以 mock 路径跑出的曲线会精确复现模拟版结论，这本身就是一次对照实验。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="cards"><span class="num">5</span>逐实验设计卡：A/B/C/D + scaling 对照</h2>
+
+  <p>四个实验共用一个 20 题的小题库（自写 GSM8K 风格应用题 + 数字谜题，唯一数值答案，带难度标签）。
+  题库小是刻意的：这是<strong>方法论演示</strong>不是 benchmark——第 6 节会讲小样本下该怎么解读。</p>
+
+  <div class="card">
+    <strong>实验 A（对应 02）· Self-Consistency：majority@N 曲线</strong>
+    <ul style="margin:8px 0 0">
+      <li><strong>模拟预测</strong>：N 增大时准确率单调上升并收敛；若模型对某题有<strong>系统性偏差</strong>（最频繁的错误答案比正确答案更常见），majority 会收敛到错误答案——加算力救不了 [02 模块]</li>
+      <li><strong>设计</strong>：每题 temperature=1.0 采 16 条，取前 N 条做 majority voting，画 accuracy vs N（N=1..16），按难度分层</li>
+      <li><strong>看什么</strong>：曲线形状是否复现"上升收敛"；难题是否出现 plateau（被偏差卡住的现实版）</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <strong>实验 B（对应 03）· LLM-as-Verifier 的 Best-of-N</strong>
+    <ul style="margin:8px 0 0">
+      <li><strong>模拟预测</strong>：verifier 好于随机时 BoN &gt; random；verifier 与 majority 谁强取决于 verifier 质量与答案分布 [03 模块；Cobbe 2021 的 GSM8K verifier 正是此设计]</li>
+      <li><strong>设计</strong>：复用 A 的采样作候选；用低 temperature 的 Gemini 当 verifier 给每条解答打 1–10 分（prompt 模板在 notebook）；三线对比：BoN（取最高分）vs majority vs random</li>
+      <li><strong>看什么</strong>：真 LLM verifier 是否提供超过 majority 的信号；verifier 给错误解答打高分的案例（Goodhart 的现实素材）</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <strong>实验 C（对应 06）· Thinking Budget 扫描</strong>
+    <ul style="margin:8px 0 0">
+      <li><strong>模拟预测</strong>：简单题在小预算就饱和（早停无损），难题准确率随预算上升 [06 模块的 overthinking/underthinking 不对称]</li>
+      <li><strong>设计</strong>：thinkingBudget ∈ {0, 512, 2048} 三档（模型不支持时退化方案：maxOutputTokens + "直接给答案"/"展示完整推理"的 prompt 控制），按难度分层画 accuracy vs budget</li>
+      <li><strong>看什么</strong>：两条难度分层曲线是否一条平、一条升——这是为"按题分配预算"的 compute-optimal 路由 [Snell 2024] 提供的现实证据</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <strong>实验 D（对应 07）· GSM-Symbolic 式扰动</strong>
+    <ul style="margin:8px 0 0">
+      <li><strong>模拟预测</strong>：模板记忆模型在换数字后大幅掉点、加无关从句后再掉一截；真算术模型基本不掉 [07 模块；Mirzadeh 2024]</li>
+      <li><strong>设计</strong>：题库每题做两种扰动——换数字（答案随之重算）、加无关从句（GSM-NoOp 式）——测三个版本的准确率差</li>
+      <li><strong>看什么</strong>：掉点幅度。前沿模型在这种小学题上通常只轻微掉点，但 NoOp 从句的影响常大于换数字——与 Mirzadeh 2024 的发现定性一致</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <strong>对照卡（对应 05）· Inference Scaling 视角再看实验 A</strong>
+    <ul style="margin:8px 0 0">
+      <li><strong>模拟预测</strong>：coverage / 准确率随 $\log N$ 近似线性上升后饱和 [05 模块；Brown 2024 "Large Language Monkeys" 的幂律]</li>
+      <li><strong>设计</strong>：不跑新实验——把实验 A 的 x 轴换成总 token 数（N × 平均每条 token），就是一条真实的 inference scaling 曲线</li>
+      <li><strong>看什么</strong>：同一份数据换个坐标系就回答另一个问题——这是评测里"一次采集、多次分析"的省钱习惯</li>
+    </ul>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="interpret"><span class="num">6</span>结果解读：外推限度与定性对照</h2>
+
+  <p>20 道题 × 1 个模型的实验能下什么结论？这是本模块最重要的方法论训练：</p>
+
+  <ul>
+    <li><strong>能下的结论</strong>：定性形状的复现与否（"majority@N 在这组题上单调上升"）；机制存在性（"verifier 确实给一条错误解答打了 9 分"——存在性只需一个反例）；工程可行性（"thinkingBudget 确实能外生控制思考长度"）。</li>
+    <li><strong>不能下的结论</strong>：任何带数值的外推（"Gemini 在小学数学上 majority@16 提升 7 个点"——20 题的二项标准误 $\sqrt{p(1-p)/20} \approx 0.09$，7 个点在噪声里）；跨模型/跨任务的推广（单模型单数据集）；与模拟器参数的数值对应。</li>
+    <li><strong>正确的报告姿势</strong>：每条结论标注样本量与不确定度（02 模块与 LLM_Evals_Course 02 的 CI 纪律）；模拟 vs 真实的对照表只填"一致 / 偏离 / 无法判定"三档，偏离处写下候选解释（抽取误差？题库太易饱和？预算口径不一致？）。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>"无法判定"是合法且常见的格子。</strong>真模型在你的 20 道题上可能全对——此时 majority@N 是平线，
+  既不验证也不否证模拟预测，只说明题库难度对该模型饱和了。正确反应不是换结论而是换题库（提高难度），
+  这恰好就是 07 模块讲的 benchmark saturation 在你桌面上的微缩版。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="safety"><span class="num">7</span>安全与成本提示</h2>
+
+  <ul>
+    <li><strong>Key 管理</strong>：环境变量注入，不进代码、不进 git、不进 notebook 输出。怀疑泄漏立即在 AI Studio 吊销重发。</li>
+    <li><strong>成本上限</strong>：notebook 默认参数下全部实验约几十万 token（flash 档 ≪ $1）。改大 N、换 pro 档、加大 thinkingBudget 前先重跑成本预估 cell。免费档注意 RPM 限额，触发 429 时 notebook 的退避重试会自动处理，但整体耗时会拉长。</li>
+    <li><strong>缓存即账本</strong>：磁盘缓存目录就是你的完整请求记录，跑完实验可以从缓存统计实际 token 用量与等效成本——审计你自己的实验是个好习惯。</li>
+    <li><strong>数据卫生</strong>：发给 API 的题目视为公开数据（免费档的数据可能被用于改进模型）。不要把私有评测集通过免费 API 跑——这会污染未来模型的训练数据，制造你自己课上学过的 contamination [07 模块]。</li>
+    <li><strong>本地替代</strong>：有 RTX 4090 的话，可把 <code>llm_generate</code> 的后端换成本地推理服务（vLLM / Ollama 的 OpenAI 兼容端点），零 API 成本复跑全部实验——接口已为此解耦。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>从这里出发：把实验台升级成研究项目</h2>
+
+  <ul>
+    <li><strong>换更难的题库</strong>：把 20 道自写题换成 AIME 或 GSM-Symbolic 的公开切片，本 notebook 的全部代码不需要改——这是"逻辑与后端解耦"的回报。</li>
+    <li><strong>跨模型对照</strong>：同一套实验在 flash / pro / 本地开源推理模型上各跑一遍，看哪些定性结论是模型不变的（candidate universal laws）、哪些是模型特异的。</li>
+    <li><strong>verifier 研究</strong>：实验 B 的 LLM verifier 可以系统升级——换 prompt（rubric 式 vs 直接打分）、换温度、self-consistency 化 verifier 本身，复现 03 模块"verifier 质量决定 BoN 上限"的现实版。</li>
+    <li><strong>thinking 经济学</strong>：用 usageMetadata 的 thoughtsTokenCount 做真实的 token-per-correct-answer 核算，复现 06 的帕累托前沿——这是 2025 年后推理模型评测报告的标配图。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>模拟实验与真模型实验各买到什么效度？为什么对照的是定性形状而不是数值？</li>
+      <li>API 评测的四条工程纪律是什么？缓存 key 漏掉采样参数会造成什么 bug？</li>
+      <li>thinkingBudget 与 s1 的 budget forcing 是什么关系？为什么报告时要记实际 thoughtsTokenCount？</li>
+      <li>20 题 × 1 模型的实验，哪些结论合法、哪些越界？"无法判定"时正确的下一步是什么？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../07_evaluating_reasoning/07_讲解.html"><div class="dir">← 上一章</div><div class="t">07 · 评测推理模型</div></a>
+    <a class="next" href="../index.html"><div class="dir">完成全部模块 →</div><div class="t">⌂ 返回课程主页</div></a>
+  </div>
+
+</div>
+</body>
+</html>

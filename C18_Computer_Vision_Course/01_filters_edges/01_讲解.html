@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 图像滤波与边缘</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 图像滤波与边缘</h1>
+  <p class="subtitle">卷积/相关、高斯/盒滤波、Sobel 梯度、Canny 五步、非极大抑制、形态学——纯 numpy 从零，与简化版 Canny 对拍</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">线性代数、numpy 索引/切片；模块 00 的图像加载管线</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_filters_edges.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Canny 1986、Sobel & Feldman 1968、Marr & Hildreth 1980、Serra 1982（形态学）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#conv">卷积与相关：一切的原子操作</a></li>
+      <li><a href="#pad">边界、步幅与输出尺寸</a></li>
+      <li><a href="#smooth">平滑滤波：盒滤波与高斯</a></li>
+      <li><a href="#sobel">Sobel 梯度：边缘的幅值与方向</a></li>
+      <li><a href="#canny">Canny 边缘检测：五步流水线</a></li>
+      <li><a href="#morph">形态学：清理二值结果</a></li>
+      <li><a href="#use">低层视觉在现代管线里的位置</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="conv"><span class="num">1</span>卷积与相关：一切的原子操作</h2>
+  <p>计算机视觉里几乎所有低层操作——模糊、锐化、求梯度、检边——本质都是同一个动作：<strong>拿一个小窗口（核）滑过整张图，每到一处就把核覆盖的像素做一次加权求和，结果写进输出的对应位置</strong>。把这一个动作写对、写快，本课的低层视觉就握住了一半，后面模块 02 的 HOG 特征、模块 04 的分割后处理都建立在它之上。这个滑窗运算有两个长得几乎一样、却差一个细节的版本：<span class="term">convolution</span>（卷积）与 <span class="term">cross-correlation</span>（相关），新手常把它们混为一谈，但理解差别能帮你看清 numpy 实现与 PyTorch conv 层之间的关系。</p>  <p>相关最直白：核 <code>K</code> 停在像素 <code>(i,j)</code> 上，把核覆盖的邻域逐位相乘再求和，写进输出的 <code>(i,j)</code>，然后核滑到下一个位置重复。卷积只多一步：先把核<strong>翻转 180°</strong>（上下、左右各翻一次）再做相关。两者的差别写成公式一目了然——区别只在核下标前是加号还是减号：</p>  <div class="math-block">\[(\text{corr})\;O[i,j]=\sum_{u,v}K[u,v]\,I[i+u,\;j+v]\qquad(\text{conv})\;O[i,j]=\sum_{u,v}K[u,v]\,I[i-u,\;j-v]\]</div>  <p>为什么要费事翻转？因为只有翻转后的卷积才满足<strong>交换律与结合律</strong>（<code>(f*g)*h=f*(g*h)</code>），这两条代数性质极其有用：它让「先高斯模糊、再求 Sobel 梯度」可以预先把两个核合成一个、一次卷积搞定，也让整套线性系统/傅里叶分析的理论成立。而深度学习框架（PyTorch/TF）的 conv 层<strong>其实做的是相关</strong>（不翻转）——这并不矛盾，因为那里的核是<em>学出来的</em>，翻不翻转只是把学到的参数做个镜像，对表达能力毫无影响，省掉翻转还更快。对<strong>对称核</strong>（如高斯、盒滤波）翻转前后核完全一样，于是卷积与相关给出<em>完全相同</em>的结果，这也是两者常被混用的原因。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把核想成一个「小印章」：相关是直接拿印章往图上一处处盖、看每个位置的局部有多像这个印章图案；卷积是把印章先转半圈再盖。当你想检测「图里某处有没有出现这个图案」时，用相关最自然——哪里响应值最大，图案就最可能出现在哪里。这正是经典模板匹配（template matching）和 CNN 学到边缘/纹理检测器的共同直觉：核就是要匹配的模式。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说，卷积是<strong>线性平移不变</strong>（LTI，linear time/shift-invariant）系统的唯一形式：任何同时满足「线性」和「平移不变」（图整体平移，输出也只是同样平移）的图像操作，都<em>必然</em>能写成与某个核的卷积——这是一条很强的表示定理。更进一步，核的傅里叶变换就是这个系统的<strong>频率响应</strong>，它把空间域里「滑窗加权」和频率域里「放大/压制哪些频率」联系起来，「低通核=模糊」「高通核=检边」这些说法的严格来源正在于此。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住贯穿本模块的一条主线：<strong>核的形状决定它检测什么</strong>。权重全为正且和为 1 → 平滑（低通，平均掉高频噪声）；中心为正、四周为负、整体和为 0 → 检测变化/突变（高通，对平坦区零响应、对边缘强响应）；左负右正、上下对称 → 检测水平方向的梯度。本节之后的每一个滤波器——盒滤波、高斯、Sobel——都只是这条规则的一个具体实例，看到核就能猜出它干什么。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pad"><span class="num">2</span>边界、步幅与输出尺寸</h2>
+  <p>核滑到图像边缘时会探出去——比如 3×3 核停在第 0 行时，上面那一行已经在图外了。必须决定<strong>边界外的像素算什么值</strong>，这就是 <span class="term">padding</span>（填充）。它看似是工程细节，却直接影响输出尺寸和边界处的正确性，处理不当会在结果里冒出肉眼可见的假象。三种最常见的做法是：<strong>补零</strong>（zero，边界外一律当 0，最简单）、<strong>复制</strong>（replicate，把最边的一行/列向外延伸）、和<strong>镜像</strong>（reflect，以边界为轴把内部像素翻折出去）。它们在边界处的行为差异很大，下面的表会逐一对比。</p>  <p>填充量与步幅一起决定了输出的尺寸。给定 <code>H×W</code> 的输入图、<code>k×k</code> 的核、每边填充 <code>p</code> 个像素、步幅 <code>s</code>（核每次滑动几个像素），输出的高宽由下式给出（⌊·⌋ 是向下取整，对应核完整覆盖的位置数）：</p>  <div class="math-block">\[H_{out}=\left\lfloor\frac{H+2p-k}{s}\right\rfloor+1,\qquad W_{out}=\left\lfloor\frac{W+2p-k}{s}\right\rfloor+1\]</div>  <p>有两个常用特例值得背下来。<strong>'valid'</strong> 卷积：<code>p=0</code>，完全不填充，核只在完整覆盖的位置取值，输出比输入<em>缩小 k−1</em>（边缘信息会丢一圈）。<strong>'same'</strong> 卷积：取 <code>p=⌊k/2⌋</code> 且 <code>s=1</code>，输出与输入<em>同尺寸</em>，是滤波时最常用的设置。而步幅 <code>s&gt;1</code> 会让核跳着取值、顺带<strong>下采样</strong>（输出分辨率变小约 s 倍）——这正是现代 CNN 里用 strided convolution 替代池化层做降采样的原理，本课模块 02 也会提到。本课的 numpy 卷积默认用 <code>'same' + reflect</code>，保证滤波前后图像尺寸不变、且边界不出暗框。</p>  <table>
+    <thead><tr><th>填充模式</th><th>边界外的值</th><th>适用 / 副作用</th></tr></thead>
+    <tbody>
+      <tr><td>zero（补零）</td><td>一律当 0</td><td>最简单、可分析；但在边界引入人造暗边与虚假强梯度</td></tr>
+      <tr><td>replicate（复制）</td><td>重复最边一行/列</td><td>避免暗边，边界略有拖影/方向偏置</td></tr>
+      <tr><td>reflect（镜像）</td><td>以边界翻折内部像素</td><td>最平滑、无强度突变，求边缘时的首选</td></tr>
+    </tbody>
+  </table>  <p>为什么 reflect 通常最好？因为它在边界处<strong>不引入任何新的强度突变</strong>——翻折出去的像素和内部像素连续过渡，梯度算子不会在边界误判出边缘。补零则相反：图内是亮的、图外突然变 0，等于在四周凭空造了一条强边。</p>  <div class="callout warn"><span class="label"></span>
+    <p>边界处理绝不是可以随手糊弄的小事。补零会在图像四周制造一圈<strong>人造的强梯度</strong>，求边缘时会沿着图像边框冒出一圈<em>根本不存在的假边</em>，让 Canny 的结果明显出错。这是初学者最容易忽略、调试时却百思不解的陷阱。<strong>凡是求梯度、检边、做形态学，优先用 reflect 或 replicate</strong>。notebook 的练习会让你亲手对比补零与镜像在边界处的差异，看到那圈假边。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="smooth"><span class="num">3</span>平滑滤波：盒滤波与高斯</h2>
+  <p>平滑（模糊）的核心目的是<strong>压制高频噪声</strong>，为后续求梯度做准备。这一步几乎是所有边缘检测的前置——原因很本质：噪声本身就是<em>剧烈的局部强度变化</em>，而边缘也是强度变化，如果不先把噪声压下去，求梯度时噪声会被当成无数条假边缘，淹没真实边缘。最简单的平滑核是 <span class="term">box filter</span>（盒滤波）：核里每个权重都是 <code>1/k²</code>，本质就是取邻域的算术平均。它的优点是极快（配合积分图可以 O(1) 算任意大窗口的均值），但有两个毛病：<strong>各向异性</strong>（方形核对水平/竖直方向和对角方向不一视同仁，糊出来略带方块感）和<strong>振铃</strong>（它的频率响应有旁瓣，会在边缘附近产生波纹状的伪影）。</p>  <p>更好的平滑核是 <span class="term">Gaussian blur</span>（高斯模糊），权重按二维高斯分布给出，离核中心越远的像素权重越小、贡献越少：</p>  <div class="math-block">\[G(u,v)=\frac{1}{2\pi\sigma^2}\exp\!\Big(-\frac{u^2+v^2}{2\sigma^2}\Big)\]</div>  <p>高斯核有一串漂亮且实用的性质：它是<strong>各向同性</strong>的（旋转对称，对所有方向一视同仁，不会糊出方块感）；它的频率响应单调下降、<strong>没有旁瓣</strong>（不振铃，比盒滤波干净得多）；它还是唯一一种「平滑后不会凭空产生新的局部极值」的核（尺度空间理论的基石）。这些性质合起来，让高斯成为求边缘前事实上的标准前处理。参数 <code>σ</code>（标准差）控制糊的程度——σ 越大、核越宽，去噪越强但也越丢细节，是去噪与保细节的经典权衡。核的半径通常取 <code>⌈3σ⌉</code>（这样覆盖了高斯 99.7% 的权重，截断误差可忽略）。</p>  <p>还有一个对工程极其重要的性质：高斯核是<strong>可分离</strong>（separable）的——二维高斯恰好等于两个一维高斯的外积 <code>G(u,v)=g(u)·g(v)</code>。这意味着一次二维卷积可以拆成<strong>先沿每一行做一维卷积、再沿每一列做一维卷积</strong>两步，把每个像素需要的乘加次数从 <code>k²</code> 降到 <code>2k</code>。核越大省得越多（k=15 时快近 8 倍），这是经典 CV 里标志性的加速技巧。notebook 会从零实现并验证「先行后列的两次一维卷积」与「直接二维卷积」给出完全相同的结果。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话选核：要快、不太在乎质量（如实时预览）用盒滤波；要<strong>正确</strong>（求边缘前的去噪、要各向同性、不要振铃）就一律用高斯。而且高斯的可分离性还白送你约 k/2 倍的加速，大核场景下几乎没有理由用盒滤波。<strong>σ 是你最该调的旋钮</strong>：噪声大就调大 σ，但别大到把要检测的细节也糊没。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sobel"><span class="num">4</span>Sobel 梯度：边缘的幅值与方向</h2>
+  <p>边缘的定义是<strong>强度剧烈变化的地方</strong>，数学上即梯度幅值大的地方。连续图像的梯度是向量 <code>∇I=(∂I/∂x, ∂I/∂y)</code>，指向强度上升最快的方向、长度等于上升速率；但图像是离散的，偏导只能用差分近似。最朴素的中心差分核 <code>[-1,0,1]</code> 虽然能估梯度，却对噪声<em>极其</em>敏感（差分会放大高频噪声）。<span class="term">Sobel operator</span>（Sobel 算子）的聪明之处，是<strong>在沿一个方向做差分的同时，沿垂直方向做一层平滑</strong>，于是抗噪能力大增。它的两个核长这样：</p>  <div class="math-block">\[S_x=\begin{bmatrix}-1&0&1\\-2&0&2\\-1&0&1\end{bmatrix},\qquad S_y=\begin{bmatrix}-1&-2&-1\\0&0&0\\1&2&1\end{bmatrix}\]</div>  <p>仔细看 <code>S_x</code> 的结构：它正好是「水平方向的差分 <code>[-1,0,1]</code>」与「竖直方向的平滑 <code>[1,2,1]</code>」的外积——所以 Sobel 本身就是<strong>可分离</strong>的，而那层 [1,2,1] 平滑（高斯的粗糙离散近似）就是它比纯差分更抗噪的来源。<code>S_x</code> 估的是 <code>∂I/∂x</code>（水平方向的变化，因此对<em>竖直</em>边缘响应最强），<code>S_y</code> 估 <code>∂I/∂y</code>（对<em>水平</em>边缘响应最强）。把这两个分量合起来，就得到边缘的<strong>幅值与方向</strong>：</p>  <div class="math-block">\[|\nabla I|=\sqrt{g_x^2+g_y^2}\quad(\text{边缘强度}),\qquad \theta=\operatorname{atan2}(g_y,g_x)\quad(\text{梯度方向，⊥ 边缘走向})\]</div>  <p>幅值大就说明这里有边缘、且越大边缘越强；方向 θ 指向强度上升最快的方向，恰好<strong>垂直于边缘的走向</strong>（沿边缘走强度不变，垂直跨过边缘强度才变）。这两个量是后续一切的基础：Canny 的非极大抑制要用方向 θ 找邻居（第 5 节），模块 02 的 HOG 特征要统计方向直方图。这里必须用 <code>atan2(gy,gx)</code> 而非 <code>atan(gy/gx)</code>——前者利用 gx、gy 各自的符号，给出完整的 <code>[-π, π]</code> 范围、不丢象限，后者会把指向相反的两个梯度混为一谈。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 Sobel 想成两个互补的「方向探测器」：一个专门对竖直边缘敏感、一个专门对水平边缘敏感。任何朝向的边缘，都能被分解到这两个探测器上得到 gx、gy 两个分量；再用勾股定理把分量合成总强度、用反正切合成朝向——就像把一个力分解到 x、y 轴上算分量、再合成回去，是同一套向量运算。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从信号处理看，Sobel 是对一阶空间导数的有限差分近似，并隐含了一层 <code>[1,2,1]/4</code> 的二项平滑（高斯的离散逼近），因此信噪比明显高于裸差分。如果想在更大的尺度上、更准地估梯度，可以用 5×5 Sobel 或权重更优化的 Scharr 核，代价是边缘定位会变粗——这又是一次「尺度 vs 定位精度」的经典权衡，和高斯的 σ 选择如出一辙。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>求 Sobel 前有两条务必遵守的前处理纪律：① <strong>把图归一化到 [0,1]</strong>（统一不同来源图像的强度范围，梯度幅值才可比）；② 对有噪声的真实图<strong>先做高斯平滑</strong>。直接对带噪原图求梯度，噪声的高频会淹没真实边缘、冒出满屏碎点。Canny 把高斯平滑放在第一步，正是为此——求导和去噪必须配套。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="canny"><span class="num">5</span>Canny 边缘检测：五步流水线</h2>
+  <p><span class="term">Canny edge detector</span>（Canny 1986）是边缘检测的黄金标准，几十年过去仍是几乎所有边缘任务的默认基线。它之所以经典，是因为 Canny 没有拍脑袋设计算法，而是先把「什么叫好的边缘检测」严格地形式化成三个准则——<strong>高检测率</strong>（真边不漏、假边不报）、<strong>高定位精度</strong>（检出的边缘位置要准、不能偏移）、<strong>单一响应</strong>（一条真实边缘只产生<em>一个像素宽</em>的响应，不能糊成一片或一条边报好几次），再从这三条准则用变分法推导出最优滤波，并落地成一条五步流水线。理解这三个准则，就理解了下面每一步<em>为什么</em>存在。</p>  <div class="ascii">Canny 五步流水线：
+  ① 高斯平滑     去噪，防止噪声被当成边缘
+       ↓
+  ② Sobel 梯度   求每像素的幅值 |∇I| 与方向 θ
+       ↓
+  ③ 非极大抑制   沿梯度方向只留局部最大 → 把粗边细化成 1 像素宽
+       ↓
+  ④ 双阈值       高阈值=强边, 低阈值=弱边, 之间丢弃
+       ↓
+  ⑤ 滞后连接     弱边只有连到强边才保留 → 接好断裂、滤掉孤立噪点</div>  <p>第 ③ 步 <span class="term">non-maximum suppression (edges)</span>（非极大抑制）是 Canny 的灵魂，也是它满足「单一响应」准则的关键。Sobel 给出的梯度幅值图里，一条真实边缘往往是<strong>好几像素宽的模糊隆起</strong>（因为高斯平滑和 Sobel 本身都会让响应扩散）。NMS 的做法是：对每个像素，沿它的<strong>梯度方向</strong>（即垂直于边缘的方向）看前后两个邻居，<strong>只有当这个像素的幅值比两侧邻居都大（是局部峰）时才保留，否则置零</strong>。这样就把模糊的隆起<em>削成一像素宽的脊线</em>。实现时通常把连续的梯度方向 θ 量化到 0°/45°/90°/135° 四档，以便直接取整数坐标的邻居（避免插值）。</p>  <p>第 ④⑤ 步 <span class="term">hysteresis thresholding</span>（双阈值滞后连接）解决「单阈值两难」：只用一个阈值，调高了会让本该连续的边缘<em>断成虚线</em>，调低了又会冒出一堆噪声点。Canny 的巧解是用两个阈值。高于 <code>t_high</code> 的像素是<strong>强边</strong>，无条件保留（它们几乎肯定是真边）；介于 <code>t_low</code> 与 <code>t_high</code> 之间的是<strong>弱边</strong>，它们处境暧昧——<strong>只有当它能通过连通路径连到某条强边时才保留</strong>，否则当噪声丢弃。背后的假设是：真边上的弱响应点总会和强响应点相连，而孤立的噪声点连不到任何强边。这样既接好了真边的断裂，又滤掉了孤立噪点，一举两得。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>Canny 的整体哲学可以浓缩成一句话：<strong>先用平滑+梯度找出所有候选边缘点，再用 NMS 把粗候选削成一像素细线，最后用「弱边必须连到强边才算数」的连通规则去伪存真</strong>。五步里每一步都在精确地落实那三个准则之一——这种「先定义好目标、再逐条满足」的设计思路，本身就值得学。notebook 会从零实现一个简化版 Canny（四方向量化的 NMS + 双阈值），并验证它的输出确实是一像素宽的细线、强边被完整保留。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="morph"><span class="num">6</span>形态学：清理二值结果</h2>
+  <p>无论是 Canny 输出的边缘图，还是模块 04 的分割掩码，二值结果常常带着毛刺、小洞、细小的断裂和孤立噪点。<span class="term">morphology (erosion/dilation)</span>（数学形态学，Serra 1982）是清理这些瑕疵的标准工具，它的整套理论建立在集合运算上，核心是两个基本算子加一个<strong>结构元</strong>（structuring element，通常是 3×3 的小窗口，定义「邻域」的形状）。对二值图，这两个算子有极简的等价形式：</p>  <ul>
+    <li><strong>腐蚀 erosion</strong>：只有当结构元<em>完全落在前景内</em>时，中心像素才保留为前景，否则变背景 → 前景<strong>收缩</strong>、磨掉小突起、断开细的连接桥。等价于在邻域里取 <strong>min</strong>（任一邻居是背景就变背景）。</li>
+    <li><strong>膨胀 dilation</strong>：只要结构元<em>碰到任意一个前景像素</em>，中心就置为前景 → 前景<strong>扩张</strong>、填小洞、补缺口、加粗边缘。等价于在邻域里取 <strong>max</strong>（任一邻居是前景就变前景）。</li>
+  </ul>  <p>单独用腐蚀或膨胀会改变物体的大小，所以实践中更常用它们的<strong>复合</strong>算子，复合后物体尺寸近似还原、只清掉瑕疵：<strong>开运算</strong>（opening，先腐蚀再膨胀）能<em>去掉比结构元小的亮噪点</em>而大体保住物体形状，适合清理分割掩码上的散点；<strong>闭运算</strong>（closing，先膨胀再腐蚀）能<em>填补小的暗洞、连接靠得很近的块</em>，适合补全断裂的边缘。「先缩再扩」和「先扩再缩」一加一减，正好把大物体还原、只留下对小瑕疵的净效果。</p>  <table>
+    <thead><tr><th>运算</th><th>= </th><th>效果</th><th>典型用途</th></tr></thead>
+    <tbody>
+      <tr><td>腐蚀 erosion</td><td>邻域 min</td><td>前景缩小</td><td>断开细连接、去毛刺</td></tr>
+      <tr><td>膨胀 dilation</td><td>邻域 max</td><td>前景扩大</td><td>填缺口、加粗边缘</td></tr>
+      <tr><td>开 opening</td><td>先腐蚀后膨胀</td><td>去小亮噪点</td><td>清理分割掩码的散点</td></tr>
+      <tr><td>闭 closing</td><td>先膨胀后腐蚀</td><td>填小暗洞</td><td>补全断裂的边缘/掩码</td></tr>
+    </tbody>
+  </table>  <p>形态学在本课多处复用：模块 01 用它清理 Canny 边缘的毛刺，模块 04 用它在连通域标记前清理分割掩码（先开运算去散点、再标连通域），是低层视觉与分割之间的桥梁。</p>  <div class="callout warn"><span class="label"></span>
+    <p>结构元的<strong>形状和大小决定效果</strong>：太大的结构元会抹掉真实的小目标。对二值图，腐蚀/膨胀分别就是邻域 min/max——这也是为什么它们能用和卷积几乎一样的滑窗代码实现。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="use"><span class="num">7</span>低层视觉在现代管线里的位置</h2>
+  <p>既然端到端 CNN 这么强，为什么还要花一整个模块学手工滤波？三个理由，每个都和后面的课程紧密相关。其一，<strong>CNN 的第一层卷积学到的，几乎就是这些手工核</strong>——把训练好的 AlexNet/ResNet 第一层卷积核可视化出来，你会看到一堆 Gabor 状的边缘检测器、方向检测器、颜色对比检测器，和 Sobel/高斯惊人地像（这在 AlexNet 论文的图里清晰可见）。理解了 Sobel 和高斯，你就理解了任何 CNN 最底层那几层<em>到底在算什么</em>，而不是把它当黑盒。</p>  <p>其二，<strong>手工 CV 至今仍是大量工程实践的主力</strong>，并未被深度学习取代：边缘与角点用于相机标定、SLAM、图像配准、拼接、工业缺陷检测、文档/票据处理；形态学用于 OCR 预处理、二维码定位、医学影像后处理。在数据稀缺、算力受限、或要求<strong>可解释、可控、可调</strong>的场景，一条手工 CV 管线往往比深度模型更稳、更省、更好 debug——因为每一步你都知道它在干什么、出错了能精确定位。</p>  <p>其三，也是本课最直接的动机，<strong>它们是后续每个模块的零件</strong>：本模块的梯度直接喂给模块 02 的 HOG 特征；边缘和连通域是模块 04 分割后处理的基础；各种滤波（模糊、锐化）是模块 02/05 数据增强的组成部分。换句话说，把这些低层原子操作亲手写对、理解透，后面的高层任务才有可靠的地基——这正是为什么本课从滤波与边缘讲起。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>可以把低层视觉看成「视觉的算术」：加减乘除级别的基本操作。高层任务（检测、分割）是用这些算术搭起来的「方程」。不会算术，方程也搭不稳。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从信号处理看，整门低层视觉就是<strong>线性滤波 + 非线性后处理</strong>：卷积是线性部分，NMS/阈值/形态学是非线性部分。深度网络只是把「人手设计的滤波 + 固定非线性」换成「数据学出的滤波 + 可学非线性」，骨架完全一致。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>低层视觉看似是「解决了的老问题」，实则在深度学习时代被重新激活。一方面，经典算子（Canny、高斯、形态学）仍是不可替代的工程基线；另一方面，「让网络学边缘/滤波」「把经典算子写成可微模块嵌入网络」「从频率域理解 CNN 的脆弱性」都是活跃方向。了解这些前沿，能帮你判断什么时候该用经典手工方法、什么时候该上深度模型，以及二者如何结合。</p>  <ul>
+    <li><strong>可学习的边缘检测</strong>：HED、RCF 等用深度网络融合多尺度特征做边缘检测，在 BSDS500 上远超 Canny；但它们需要标注、且可解释性下降。「学到的边缘」与「Canny 的边缘」语义是否一致，仍有讨论。</li>
+    <li><strong>各向异性与保边滤波</strong>：双边滤波、引导滤波、各向异性扩散在平滑去噪的同时<em>保住边缘</em>，是高斯（无差别糊掉边缘）的进化。它们也启发了深度网络里的非局部/注意力模块。</li>
+    <li><strong>可微分经典算子</strong>：把 Canny、形态学写成可微版本嵌入网络（differentiable morphology / edge），让经典先验与深度学习联合训练，是「经典 + 深度」融合的活跃方向。</li>
+    <li><strong>频率域视角的再发现</strong>：从傅里叶/小波到现代的「频率偏置」研究——CNN 偏好低频、对高频脆弱，理解滤波的频率响应有助于解释对抗鲁棒性与泛化。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：<strong>Canny 1986</strong>（边缘检测的形式化与五步法，本模块的源头）、<strong>Sobel &amp; Feldman 1968</strong>（梯度算子）、<strong>Serra 1982</strong>（数学形态学）。它们解决了什么、为何至今是基线，见 <code>references.md</code>。下一模块把这里的梯度直接用进 HOG 特征做图像分类。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_classification/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 图像分类</div></a>
+  </div>
+
+</div>
+</body>
+</html>

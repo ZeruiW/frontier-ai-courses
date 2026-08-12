@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 叠加假说与稀疏自编码器</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 叠加假说与稀疏自编码器</h1>
+  <p class="subtitle">Superposition &amp; Sparse Autoencoders —— 模型的"概念"比维度多：先理解它怎么把 n 个特征塞进 d&lt;n 维，再亲手训一个 SAE 把它们拆回来</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（线性表示假说）、模块 02（residual stream）、线性代数、梯度下降</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_superposition_sae.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Elhage 2022 (Toy Models)、Bricken 2023 (Monosemanticity)、Templeton 2024 (Scaling)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#poly">为什么神经元多义：polysemanticity 不是 bug</a></li>
+      <li><a href="#superposition">叠加假说的数学：重要性 × 稀疏度的相变</a></li>
+      <li><a href="#sae">字典学习与 SAE：目标函数逐项拆解</a></li>
+      <li><a href="#practice">SAE 实务：dead features、L0–重建权衡、autointerp</a></li>
+      <li><a href="#scaling">从 Towards 到 Scaling Monosemanticity（Golden Gate Claude）</a></li>
+      <li><a href="#critique">SAE 的批评与局限：feature splitting 与"暗物质"</a></li>
+      <li><a href="#eval">对评测与审计的意义（评测视角）</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="poly"><span class="num">1</span>为什么神经元多义：polysemanticity 不是 bug</h2>
+
+  <p>早期视觉模型可解释性研究（[Olah 2020] <em>Zoom In</em>，distill.pub/2020/circuits/zoom-in）发现：有些神经元干净地对应单一概念（曲线检测器、车轮检测器），
+  但更多神经元是<span class="term">polysemantic（多义的）</span>——同一个神经元同时对"猫的脸 + 汽车前脸 + 猫腿"这种毫不相干的输入组合放电。
+  在 LLM 里这更普遍：随便挑一个 MLP 神经元看它的 top activations，常常是"学术引用 + 英文对话中的 hedging + 韩语文本"这样的大杂烩。</p>
+
+  <p>这对 interpretability 是致命的：<strong>如果"神经元"不是分析的正确单元，那什么才是？</strong>模块 01 的线性表示假说给了方向——概念是激活空间里的<em>方向</em>，
+  不必与坐标轴（神经元）对齐。而叠加假说进一步回答了"为什么不对齐"：</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>模型想表达的概念数量远超它的维度数。residual stream 只有几千维，但世界上值得区分的概念（人名、语法结构、化学名词、代码模式……）有几百万个。
+      怎么办？<strong>挤着放。</strong>因为绝大多数概念在任何一段文本里都<em>不出现</em>（稀疏性），把它们放在"几乎垂直但不完全垂直"的方向上，
+      互相之间的串扰大部分时间是零——偶尔同时出现才打架。神经元多义只是这种"挤着放"投影到坐标轴上的表象。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>叠加假说（<span class="term">superposition hypothesis</span>，[Elhage 2022]）：模型在 $d$ 维激活空间中线性表示 $n \gg d$ 个特征
+      $\{f_i\}$，每个特征对应方向 $W_i \in \mathbb{R}^d$，激活近似为稀疏线性组合 $a \approx \sum_i x_i W_i$，其中系数向量 $x$ 高度稀疏。
+      由于 $n > d$，$\{W_i\}$ 不可能两两正交，必然存在干涉（<span class="term">interference</span>）$W_i^\top W_j \neq 0$；
+      模型利用特征的稀疏性 + 非线性（ReLU 滤掉小幅串扰）把干涉的期望代价压到低于"多表示一个特征"的收益。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  一句话版本：<strong>模型在内部做了"压缩感知"</strong>。它是一个比自己大得多的稀疏模型的低维投影 —— [Elhage 2022] 的原话是
+  "neural networks 是在<em>模拟</em>一个更大的网络"。这也预告了解药：既然激活是稀疏字典的线性叠加，那就用字典学习把它解码回去（第 3 节）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="superposition"><span class="num">2</span>叠加假说的数学：重要性 × 稀疏度的相变</h2>
+
+  <h3>2.1 Toy Models of Superposition 的设定</h3>
+  <p>[Elhage 2022]（transformer-circuits.pub/2022/toy_model）用一个极小的模型把叠加现象变成可以完整分析的对象。设定如下，notebook 第 1 节会逐行复现：</p>
+
+  <ul>
+    <li><strong>数据</strong>：$x \in \mathbb{R}^n$，每个特征 $x_i$ 以概率 $p$ 取 $\mathrm{Uniform}[0,1]$、以概率 $1-p$ 为 0。<span class="term">sparsity</span> $S = 1-p$。</li>
+    <li><strong>模型</strong>：线性 bottleneck autoencoder，$h = Wx \in \mathbb{R}^d$（$d &lt; n$），重建 $\hat{x} = \mathrm{ReLU}(W^\top h + b) = \mathrm{ReLU}(W^\top W x + b)$。</li>
+    <li><strong>损失</strong>：重要性加权 MSE，$L = \mathbb{E}_x \sum_i I_i (x_i - \hat{x}_i)^2$，重要性 $I_i$ 递减（如 $I_i = 0.9^i$）。</li>
+  </ul>
+
+  <p>关键观察对象是 Gram 矩阵 $W^\top W \in \mathbb{R}^{n\times n}$：对角元 $\|W_i\|^2$ 表示特征 $i$ "被表示的程度"，非对角元 $W_i^\top W_j$ 是特征间的干涉。结论呈现干净的<strong>相变（phase transition）</strong>：</p>
+
+  <table>
+    <thead><tr><th>稀疏度</th><th>模型策略</th><th>$W^\top W$ 形态</th></tr></thead>
+    <tbody>
+      <tr><td>$S \approx 0$（特征稠密）</td><td><strong>PCA 模式</strong>：只表示最重要的 $d$ 个特征，各占一个正交方向，其余特征完全丢弃</td><td>左上角 $d\times d$ 近似单位阵，其余全零</td></tr>
+      <tr><td>$S \to 1$（特征稀疏）</td><td><strong>叠加模式</strong>:表示远多于 $d$ 个特征，组织成反平行对（antipodal pairs）、三角形、四面体等"几何晶体"，容忍小干涉</td><td>对角元多数非零，非对角出现成片的小幅干涉项</td></tr>
+    </tbody>
+  </table>
+
+  <p>为什么稀疏性是开关？考虑表示第 $n_0+1$ 个特征的边际收益与代价：收益 $\propto I_i \cdot p$（它出现时能被重建）；
+  代价是它与已有特征的干涉——但<strong>干涉只在两个特征同时激活时才产生损失</strong>，概率 $\propto p^2$。当 $p \to 0$，
+  代价（$O(p^2)$）比收益（$O(p)$）下降得更快，于是"多挤一个特征进来"永远划算，直到几何上再也塞不下。
+  非线性在这里不可或缺：ReLU + 负 bias 可以把小幅负向干涉直接砍成零，等于给干涉上了个"免赔额"。</p>
+
+  <h3>2.2 能塞多少？Johnson–Lindenstrauss 与近正交方向</h3>
+  <p>"几乎垂直的方向"到底有多少个？如果要求严格正交，$d$ 维空间只有 $d$ 个。但若放松到 $|\cos\theta| \le \epsilon$，
+  答案出现质变——由 <span class="term">Johnson–Lindenstrauss lemma</span> 的反向推论：</p>
+
+  <div class="math-block">
+  $$ N_{\max}(d, \epsilon) \;\ge\; \exp\!\big(c\, \epsilon^2 d\big) $$
+  </div>
+
+  <p>即 $d$ 维空间里可以放下<strong>指数多个</strong>两两近正交（干涉 $\le \epsilon$）的方向。一个 4096 维的 residual stream，
+  按 $\epsilon = 0.1$ 估算就能容纳天文数字级的特征方向。这给叠加假说提供了"容量"侧的理论支撑：
+  瓶颈从来不是方向数量，而是<em>同时激活</em>的特征数量——一旦同时激活的特征太多，干涉噪声以 $\sqrt{k}\,\epsilon$ 级别累积，线性读出就会失真。
+  这正是"稀疏性买容量"的精确含义。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  [Elhage 2022] <em>Toy Models of Superposition</em> 还有两个常被忽略的贡献：(i) 发现特征会组织成正多面体（digons、triangles、pentagons），
+  且随稀疏度变化发生"几何相变"；(ii) 指出叠加让模型可以在叠加态上直接做<strong>计算</strong>（computation in superposition），
+  而不只是存储——这是后续 [Hänni 2024, arXiv:2408.05451] 等工作的起点。相变的能量学分析另见 [Scherlis 2022, arXiv:2210.01892]（polysemanticity 与 capacity 的视角）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="sae"><span class="num">3</span>字典学习与 SAE：目标函数逐项拆解</h2>
+
+  <h3>3.1 把问题摆正：这是一个字典学习问题</h3>
+  <p>叠加假说说激活 $a \approx \sum_i x_i W_i$，$x$ 稀疏。那么"找回特征"在数学上就是经典的
+  <span class="term">sparse dictionary learning</span> / <span class="term">sparse coding</span>（[Olshausen &amp; Field 1996] 用它解释 V1 视皮层感受野）：
+  给定激活样本 $\{a^{(k)}\}$，求字典 $D$ 与稀疏码 $h^{(k)}$ 使 $a^{(k)} \approx D^\top h^{(k)}$ 且 $h^{(k)}$ 尽量稀疏。
+  经典解法（如 K-SVD）对每个样本要解一次优化；SAE 的工程贡献是用一个<strong>前向编码器把推断摊销掉</strong>（amortized inference），从而能在数十亿 token 的激活上跑。</p>
+
+  <h3>3.2 SAE 的结构与目标函数</h3>
+  <div class="math-block">
+  $$ h = \mathrm{ReLU}(W_e\, a + b_e) \in \mathbb{R}^m, \qquad
+     \hat{a} = W_d^\top h + b_d \in \mathbb{R}^d, \qquad m \gg d $$
+  $$ \mathcal{L} = \underbrace{\big\|\,a - \hat{a}\,\big\|_2^2}_{\text{重建 MSE}}
+     \;+\; \lambda \underbrace{\|h\|_1}_{\text{稀疏惩罚}} $$
+  </div>
+
+  <p>逐项拆解每个设计决定：</p>
+  <ul>
+    <li><strong>过完备（overcomplete）</strong>：$m \gg d$（实践中 8×–256× 扩张）。字典方向数必须超过维度数，否则拆不开叠加——这直接来自 $n > d$ 的假设。</li>
+    <li><strong>ReLU 编码器</strong>：保证 $h \ge 0$，特征是"激活或不激活"，与"特征有方向、幅度非负"的图景一致；也让 $\|h\|_1 = \sum_j h_j$ 可微（除原点外）。</li>
+    <li><strong>L1 而非 L0</strong>：真正想要的稀疏度量是 <span class="term">L0</span>（非零特征个数），但 L0 不可微；L1 是其最紧凸代理。代价是 <span class="term">shrinkage</span>——L1 会系统性把激活值往 0 压，低估特征幅度（第 6 节的改进方向之一）。</li>
+    <li><strong>decoder 列归一化</strong>：约束 $\|W_{d,j}\|_2 = 1$。否则模型可以把 $h_j$ 缩小 10 倍、$W_{d,j}$ 放大 10 倍，L1 罚降低而重建不变——L1 惩罚被"作弊"绕过。归一化后 $h_j$ 才有"特征 $j$ 的激活强度"这一可比语义。实现上每步训练后重新归一化，并把梯度中与 $W_{d,j}$ 平行的分量投影掉（notebook 用简化版：只做重归一化）。</li>
+    <li><strong>tied vs untied</strong>：早期工作令 $W_e = W_d$（tied，参数减半）；[Bricken 2023] 发现 untied 更好——编码器的最优解不是字典的转置，因为编码器还要负责"在干涉中判断特征是否真的激活"，这个去噪任务需要不同的权重。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>SAE 重建的是激活，不是行为。</strong>$\mathcal{L}$ 里没有任何一项关心模型的输出。所以评估 SAE 时除了重建 $R^2$，
+  还必须看 <span class="term">loss recovered</span>：把模型该层激活替换为 SAE 重建后，下游 LM loss 恢复了多少。
+  两者可能显著脱节——重建误差里"看起来很小"的分量可能恰恰是行为上重要的方向（第 6 节"暗物质"）。</div>
+
+  <h3>3.3 训练侧的实现细节（notebook 全部手写）</h3>
+  <p>反向传播只有四条链，全部可以手推（notebook 练习 2 会让你与数值梯度对拍）：
+  $\partial\mathcal{L}/\partial \hat a = 2(\hat a - a)$；经 decoder 得 $\partial\mathcal{L}/\partial h = W_d\,\partial\mathcal{L}/\partial \hat a + \lambda\,\mathrm{sign}(h)$；
+  经 ReLU 门控 $\mathbb{1}[h>0]$；最后落到 $W_e, b_e, W_d, b_d$。优化器用手写 Adam，全程 numpy。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="practice"><span class="num">4</span>SAE 实务：dead features、L0–重建权衡、autointerp</h2>
+
+  <h3>4.1 dead features 与 resampling</h3>
+  <p><span class="term">dead feature</span>：训练中再也不激活（或激活频率 &lt; $10^{-6}$）的字典单元。成因：初始化不好 + L1 把弱特征压死后，
+  ReLU 梯度恒为零，再也救不回来。大 SAE 里 dead 比例可达 30%+，纯粹浪费容量。[Bricken 2023] 的
+  <span class="term">resampling</span> 方案：定期检查激活频率，把 dead 单元的 decoder 方向重置为<strong>当前重建误差最大的样本方向</strong>（归一化），
+  encoder 行设为同方向的小幅缩放、bias 置零——让这个单元"转岗"去解释模型最解释不了的数据。后续工程改进包括
+  ghost grads 与更好的初始化（$W_e = W_d^\top$ 初始化 + 按数据均值设 $b_d$）。notebook 练习 4 实现一个最小版。</p>
+
+  <h3>4.2 L0–重建权衡：SAE 的帕累托前沿</h3>
+  <p>$\lambda$ 扫描出 SAE 评估的核心图景：横轴平均 <span class="term">L0</span>（每个样本激活的特征数），纵轴重建质量（$R^2$ 或 loss recovered）。
+  $\lambda$ 大 → 稀疏但重建差；$\lambda$ 小 → 重建好但每样本激活上百特征、可解释性崩坏。<strong>不存在免费午餐，只有帕累托前沿</strong>；
+  不同 SAE 架构（标准 ReLU、Gated [Rajamanoharan 2024, arXiv:2404.16014]、TopK [Gao 2024, arXiv:2406.04093]、
+  JumpReLU [Rajamanoharan 2024, arXiv:2407.14435]）的比较就是看谁的前沿更靠外。TopK 干脆直接取每样本最大的 $K$ 个激活、扔掉 L1，
+  把稀疏度变成硬约束，消除 shrinkage；JumpReLU 用带阈值的激活 + L0 的直通估计器。notebook 第 4 节画出你自己的前沿。</p>
+
+  <h3>4.3 特征解释与 autointerp</h3>
+  <p>训完 SAE 只是开始：$m$ 个特征是什么意思？标准流程是看每个特征的 <strong>top-activating examples</strong>（在大语料上激活最强的片段）加上
+  logit 影响（该特征方向经 unembedding 推高哪些 token）。人工看几百万特征不现实，于是
+  <span class="term">autointerp</span> [Bills 2023, OpenAI]：用 LLM 阅读 top examples 写出自然语言解释，再用另一次 LLM 调用基于解释<em>预测</em>新样本上的激活、
+  与真实激活算相关性作为解释分数。注意它衡量的是"解释能否预测激活"，与"特征是否因果上驱动行为"是两回事——评测人要分清这两种 validity。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="scaling"><span class="num">5</span>从 Towards 到 Scaling Monosemanticity</h2>
+
+  <p><strong>[Bricken 2023] <em>Towards Monosemanticity</em></strong>（transformer-circuits.pub/2023/monosemantic-features）：
+  在一个 1 层 transformer 的 MLP 激活（$d=512$）上训了最高 256× 扩张的 SAE，第一次系统性地展示：拆出来的特征
+  （阿拉伯语特征、DNA 序列特征、法律文本特征……）比任何神经元都<strong>单义（monosemantic）</strong>得多，且通过激活干预验证了因果性。
+  同期 [Cunningham 2023, arXiv:2309.08600] 在 Pythia 上独立得到类似结论。这两篇把 SAE 从"字典学习的旧想法"变成了 interp 的中心工具。</p>
+
+  <p><strong>[Templeton 2024] <em>Scaling Monosemanticity</em></strong>（transformer-circuits.pub/2024/scaling-monosemanticity）：
+  把 SAE 训到 Claude 3 Sonnet 的中层 residual stream 上，3400 万特征。找到了大量抽象、多模态、跨语言的特征：不安全代码特征、
+  谄媚（sycophancy）特征、欺骗特征、生物武器相关特征——<strong>safety-relevant features 第一次被直接观察到</strong>。
+  最出圈的演示是 <span class="term">Golden Gate Claude</span>：把"金门大桥"特征 clamp 到高值，模型在任何对话里都坚信自己是金门大桥。
+  这一手干预既是科学验证（特征是因果的，不只是相关的），也是模块 06 steering 的直接铺垫。
+  同年 DeepMind 发布 <strong>Gemma Scope</strong> [Lieberum 2024, arXiv:2408.05147]，开源了 Gemma 2 全层 JumpReLU SAE，把研究门槛降到消费级 GPU。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  注意叙事结构：toy model（第 2 节）<em>预言</em>了"特征以稀疏线性方向存在于叠加态"，SAE（第 3 节）是针对这个数据生成假设设计的<em>反演算法</em>，
+  而 Bricken/Templeton 是把反演算法用在真模型上并部分验证了预言。notebook 让你在一个 ground truth 已知的世界里走完整条链：
+  你能拿真特征方向和 SAE 字典对答案——真实模型里没有这种奢侈。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="critique"><span class="num">6</span>SAE 的批评与局限：feature splitting 与"暗物质"</h2>
+
+  <p>2024–2025 年社区对 SAE 的态度从狂热回归冷静。做评测的人尤其要知道这些局限，因为它们决定了"基于 SAE 的审计证据"能有多硬：</p>
+
+  <ul>
+    <li><strong>feature splitting（特征分裂）</strong>：[Bricken 2023] 就发现，扩张倍数变大时，一个"数学"特征会分裂成"代数""几何""数论"等更细的特征。
+    特征清单不是唯一的——它依赖字典大小这个<em>你选的</em>超参数。这动摇了"模型有一份客观特征清单，SAE 把它找出来"的朴素图景；
+    更像是在不同分辨率下给同一连续结构拍照。相关病理还有 <span class="term">feature absorption</span> [Chanin 2024, arXiv:2409.14507]：
+    "以 S 开头"特征会被"Short"等具体 token 特征吸收出难以预测的空洞，破坏基于特征的检测器。</li>
+    <li><strong>重建误差的"暗物质"</strong>：SAE 永远有残差 $a - \hat a$。[Engels 2024, arXiv:2410.14670] 发现残差中约一半方差可以从 $a$ 本身<em>线性预测</em>——
+    即存在系统性的、SAE 结构性漏掉的成分（可能是更深的叠加、非线性结构、或假设之外的东西），而非随机噪声。换激活替换视角看，
+    残差虽小但行为上不可忽略：丢掉它，下游 loss 的退化常超过其方差占比的预期。</li>
+    <li><strong>线性、各向同性假设可能根本不对</strong>：有些概念是多维流形（[Engels 2024, arXiv:2405.14860]：星期、月份构成环状特征）；
+    cross-layer 的特征在单层 SAE 里会被重复学习。Anthropic 2025 年的 circuits 工作（<em>Circuits Updates</em>、
+    [Lindsey 2025] <em>On the Biology of a Large Language Model</em>，transformer-circuits.pub/2025/attribution-graphs/biology）
+    已经转向 <span class="term">cross-layer transcoder</span> + attribution graphs，并明确讨论了 SAE 范式的诸多局限（重建误差导致的虚假路径、特征不唯一等）。</li>
+    <li><strong>下游有用性受质疑</strong>：[Kantamneni 2025, arXiv:2502.16681] 在 probing 等下游任务上系统比较，发现 SAE 特征常常打不过简单 baseline（直接在原始激活上训 probe）；
+    [Karvonen 2025] SAEBench 则试图把"SAE 好不好"从单一前沿图变成多维标准化评测。"无监督找到的特征是否比任务驱动的方法更有用"目前是开放问题。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  给评测科学家的解读纪律：<strong>SAE 特征是"假设生成器"，不是"事实陈述器"。</strong>"我们找到了欺骗特征"的完整意思是：
+  "我们找到了一个在疑似欺骗的语料上激活、且解释分数尚可的字典方向"。从这里到"模型在欺骗"还差：因果干预验证、行为侧 eval 复核、
+  以及对 feature splitting/absorption 的鲁棒性检查。审计报告里这几步缺一不可。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>对评测与审计的意义（评测视角）</h2>
+
+  <p>为什么 RS-Evaluation 技能栈要专门学 SAE？因为它是目前唯一<strong>无监督、可规模化</strong>的"模型内部概念清单"获取方式，
+  补上行为评测的两个结构性盲区：</p>
+
+  <p><strong>① 发现你没想到要测的行为。</strong>行为评测只能测你写进 benchmark 的东西（known unknowns）。SAE 特征清单提供了一条反向路径：
+  先看模型内部有哪些 safety-relevant 特征（欺骗、谄媚、危险知识、角色扮演越狱），再反推该设计什么评测。
+  [Templeton 2024] 展示的危险特征清单本质上是一份<em>自动生成的红队提纲</em>。模型审计竞赛类工作（如 Anthropic 2025 的 auditing game：
+  在植入隐藏目标的模型上比较审计技术）中，SAE 是参赛队伍真实用到的工具之一。</p>
+
+  <p><strong>② 监控与取证。</strong>部署时把少量关键特征的激活当作"仪表盘"：欺骗特征在 agent 执行任务中途飙升，是行为日志看不到的预警信号。
+  [MacDiarmid 2024]（Anthropic，<em>Simple probes can catch sleeper agents</em>）显示哪怕简单 probe 都能在 sleeper agent 说出后门触发词之前报警——
+  SAE 特征提供了 probe 之外的无监督备选，且自带"这个方向是什么意思"的解释。互补关系要想清楚：probe 有监督、便宜、针对性强但需要预先定义标签；
+  SAE 无监督、贵、但能发现未预期的概念。</p>
+
+  <p><strong>③ 给 safety case 提供白盒证据。</strong>"模型不会 X"的论证如果只有行为证据，总受"它只是在评测里装乖"的质疑（sandbagging、evaluation awareness）。
+  内部证据（"X 对应的特征在全评测集上激活为零"）虽然受第 6 节所有局限折扣，但与行为证据<em>失败模式不相关</em>，组合起来置信度更高。
+  这是模块 07 的主线，这里先立住论点：<strong>interp 证据的价值不在于单独多强，而在于与行为证据的误差不相关。</strong></p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>架构竞赛远未收敛</strong>：TopK / JumpReLU / Gated / Matryoshka SAE（嵌套字典对抗 feature splitting）、transcoder（重建 MLP 的输入→输出映射而非激活本身）、
+    cross-layer transcoder。评测它们的标准本身（SAEBench、loss recovered、autointerp 分数、下游任务）也在演化——这是一个"测量工具与被测对象共同演化"的领域。</li>
+    <li><strong>特征的本体论地位</strong>：特征清单随字典大小、随机种子、训练数据分布漂移，多少是"模型的真实结构"、多少是"SAE 的视角"？
+    [Elhage 2022] 的几何相变提示真实结构存在；feature splitting 提示我们的快照分辨率任意。需要"分辨率无关"的特征定义。</li>
+    <li><strong>从特征到电路</strong>：拆出特征只是名词表，机制是动词。sparse feature circuits [Marks 2024, arXiv:2403.19647]、
+    attribution graphs [Lindsey 2025] 把 SAE/transcoder 特征连成因果图，已能端到端讲清"模型怎么做多步推理/写诗押韵"的个案。规模化与自动化是瓶颈。</li>
+    <li><strong>评测视角的开放问题</strong>：(i) SAE-based 监控的 ROC 曲线在对抗性条件下（模型知道被监控）还剩多少？(ii) autointerp 分数虚高——
+    解释"预测激活"容易、"预测行为影响"难，怎么设计后者的标准化评测？(iii) 把"interp 证据 + 行为证据"组合进 safety case 的形式化框架（多少独立性、多少折扣）还不存在。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>叠加假说的精确陈述是什么？稀疏度为什么是"叠加 vs PCA"相变的开关（收益 $O(p)$ vs 代价 $O(p^2)$）？</li>
+      <li>JL lemma 在叠加故事里扮演什么角色？"容量瓶颈不是方向数而是同时激活数"是什么意思？</li>
+      <li>SAE 目标函数每一项的作用；为什么必须归一化 decoder 列？L1 的 shrinkage 问题是什么，TopK/JumpReLU 怎么绕开？</li>
+      <li>dead features 怎么产生、resampling 怎么救？L0–重建帕累托前沿怎么读？</li>
+      <li>feature splitting 和"暗物质"分别动摇了 SAE 叙事的哪个环节？作为审计证据时各打什么折扣？</li>
+      <li>SAE 对评测科学家的三个用途（发现未预期行为 / 部署监控 / safety case 白盒证据）各自的前提条件是什么？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../04_activation_patching/04_讲解.html"><div class="dir">← 上一章</div><div class="t">04 · Activation Patching：因果干预</div></a>
+    <a class="next" href="../06_steering/06_讲解.html"><div class="dir">下一章 →</div><div class="t">06 · Steering Vectors 与表示工程</div></a>
+  </div>
+
+</div>
+</body>
+</html>

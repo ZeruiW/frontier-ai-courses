@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 过程奖励模型 PRM</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 过程奖励模型 PRM</h1>
+  <p class="subtitle">PRM vs ORM、Math-Shepherd 的 MC 软标签、step-level credit、min/prod 聚合、奖励黑客的 Goodhart 倒 U —— 用更密的信号换更准的信用分配，也换来更高的 hacking 风险</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–02（奖励、优势、KL 正则）、蒙特卡洛估计、概率</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_prm.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Let's Verify (Lightman) · Math-Shepherd · GSM8K · Gao overopt</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">讲解 45 分钟 + notebook 75 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#ormprm">ORM vs PRM：奖励的粒度</a></li>
+      <li><a href="#credit">step-level credit</a></li>
+      <li><a href="#shepherd">Math-Shepherd：MC 自动标注</a></li>
+      <li><a href="#agg">聚合：步级合成解级</a></li>
+      <li><a href="#goodhart">奖励黑客与 Goodhart 倒 U</a></li>
+      <li><a href="#vs">PRM vs ORM：为何更强</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ormprm"><span class="num">1</span>ORM vs PRM：奖励的粒度</h2>
+  <p>前两模块的奖励都来自<strong>最终答案对错</strong>（结果奖励），它有个根本局限：<strong>信用分配太粗</strong>。一条 20 步的推理，只要最后答错就整条 $R=0$——可其中 19 步也许全对，只在第 20 步算错；反过来，一条<em>蒙对</em>的解，中间步骤可能全是错的歪理，却拿了满分。结果奖励对「过程的好坏」完全失明。这一模块引入更细的信号：<strong>过程奖励模型</strong>（PRM, Process Reward Model）——给推理的<strong>每一步</strong>打分。</p>  <p>先把两类奖励模型摆清楚。<span class="term">ORM</span>（Outcome Reward Model，结果奖励模型）学习预测「整条解最终对不对」，对一条解输出<strong>一个</strong>标量；<span class="term">PRM</span>（过程奖励模型）学习预测「每一步对不对/有没有希望」，对一条解的<strong>每一步</strong>各输出一个标量。OpenAI 的《Let's Verify Step by Step》（Lightman 2023）用大规模实验证明了一个重要结论：<strong>在数学推理上，PRM 显著优于 ORM</strong>——更密的监督信号带来更准的信用分配。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>ORM 像考试只看最终答案给分：答对给分、答错零分，至于你哪一步开始错的、思路对不对，一概不管。PRM 像老师<strong>逐步批改</strong>：第一步对（√）、第二步对（√）、第三步这里错了（×）……每一步都有反馈。显然逐步批改能告诉你<em>到底哪里出了问题</em>，对学习（无论是训模型还是搜索时剪枝）都更有用——但它也<strong>贵得多</strong>（要逐步标注）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：设一条解有 $K$ 步 $s_1,\dots,s_K$。ORM 学一个函数 $f_{\text{ORM}}(\text{解})\to[0,1]$（解级正确概率）；PRM 学 $f_{\text{PRM}}(s_{\le k})\to[0,1]$（前 $k$ 步的「价值」，常定义为「从这里出发还能走到正确答案的概率」）。PRM 的输出是一个<strong>分数序列</strong>，需要再<em>聚合</em>成解级分数（第 4 节）才能用于 best-of-N。信号更密 = credit 更准，但标注/训练成本更高。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>PRM 把「整条对错」拆成「每步对错」，用更密的信号换更准的信用分配——但更密、更学习化的奖励，也更容易被 hack</strong>。这是本模块的双主线：上半场讲 PRM<em>好在哪</em>（密信号、准 credit、Math-Shepherd 怎么自动标注），下半场讲它<em>危险在哪</em>（Goodhart 倒 U、过度优化）。理解这个张力，就理解了为什么前沿做法常把 PRM 和规则奖励<strong>结合</strong>而非单用。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="credit"><span class="num">2</span>step-level credit</h2>
+  <h3>step-level credit：把功劳分到步</h3>  <p>为什么「每步打分」对推理特别重要？因为推理是<strong>多步、长程、错误会传播</strong>的。结果奖励的信用分配等于「把末端的一个标量均摊给所有 token」，这在长推理里极度稀释——20 步里错 1 步导致的 $R=0$，会无差别地压低那 19 个<em>本来对的</em>步骤的概率，这是<strong>噪声极大</strong>的学习信号。</p>  <p>PRM 的步级价值给出了精确得多的 credit。一个自然且强大的定义是：<strong>第 $k$ 步的价值 = 从该步出发、按当前策略继续，最终答对的概率</strong>。这恰好是 RL 里的<em>状态价值</em> $V(s_{\le k})$！于是：</p>  <div class="math-block">\[v_k\;=\;V(s_{\le k})\;=\;\Pr\big[\text{从前 }k\text{ 步续写能到达正确答案}\big]\]</div>  <p>这个定义有漂亮的性质：①<strong>单调性的破坏点 = 出错点</strong>——如果某步把一个本来有希望（$v_{k-1}$ 高）的解带进了死胡同（$v_k$ 骤降），那一步就是<strong>错误发生处</strong>；②它天然给出「这一步是好是坏」的<em>相对</em>信号（$v_k$ 比 $v_{k-1}$ 升还是降），可以直接当步级优势。</p>  <div class="ascii">step-level 价值揭示错误发生在哪一步
+
+  步骤:    s1     s2     s3     s4(错)   s5
+  价值 v:  0.6 -&gt; 0.7 -&gt; 0.65 -&gt; 0.10 -&gt; 0.05
+                                  ▲
+                          价值在此骤降 = 第 4 步是出错点
+  结果奖励只知道『最后 R=0』；PRM 知道『第 4 步开始崩的』</div>  <p>这个「价值=续写答对概率」的定义，还揭示了<strong>结果奖励与过程奖励的深层联系</strong>：过程价值 $v_k$ 其实是结果奖励在前缀 $s_{\le k}$ 下的<em>条件期望</em>。换句话说，PRM 想学的东西，原则上完全由结果奖励<em>决定</em>（它就是 $\mathbb{E}[R\mid s_{\le k}]$）——这正是下一节 Math-Shepherd 能<strong>仅用结果奖励就自动算出过程标签</strong>的根本原因。过程监督不是凭空多出来的信息，而是把结果奖励里<em>隐含</em>的、关于「每一步把解带向何方」的信息<strong>显式地抽取</strong>出来。理解这点能避免一个误解：PRM 并非比结果奖励「知道更多」，而是把同一份信息<em>分配到了更细的粒度</em>上，从而让信用分配更准、让训练/搜索更有的放矢。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把 PRM 的步级价值想成给推理装了一个<strong>「实时正确率仪表盘」</strong>：每写一步，仪表盘读数是「按当前进展，最后能答对的概率」。读数平稳或上升 = 这步靠谱；读数骤降 = 这步把解带歪了。有了这个仪表盘，你既能在训练时给每步精确 credit，也能在推理时<em>一看仪表盘掉了就剪枝/回退</em>（这是模块 04 verifier 引导搜索的基础）。这就是为什么 PRM 同时服务于<strong>训练</strong>和<strong>测试时搜索</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="shepherd"><span class="num">3</span>Math-Shepherd：MC 自动标注</h2>
+  <h3>Math-Shepherd：用蒙特卡洛自动标步级软标签</h3>  <p>PRM 的最大痛点是<strong>标注成本</strong>：人工逐步标「这步对不对」极贵（PRM800K 标了 80 万步）。Math-Shepherd（Wang 2024）给出了一个优雅的<strong>自动</strong>方案，让 PRM 能规模化——核心就是把上一节的价值定义<em>直接用蒙特卡洛估计出来</em>。</p>  <p>方法极简：要给第 $k$ 步标价值，就从<strong>前 $k$ 步之后</strong>出发，用当前策略<strong>多次 rollout 到底</strong>（continue 到给出最终答案），数一下<strong>有多少次答对</strong>，那个<strong>答对比例</strong>就是这一步价值的蒙特卡洛估计：</p>  <div class="math-block">\[\hat v_k\;=\;\frac{1}{N}\sum_{j=1}^{N}\mathbb{1}\big[\text{第 }j\text{ 次从 }s_{\le k}\text{ 续写答对}\big]\;\xrightarrow{N\to\infty}\;V(s_{\le k})\]</div>  <p>注意 $\hat v_k\in[0,1]$ 是一个<strong>软标签</strong>（连续值，不是 0/1 硬标签）——它直接就是「这步还剩多大希望」的概率估计，信息比硬标签丰富得多。然后用这些 $(\,s_{\le k},\ \hat v_k\,)$ 对训一个回归/分类模型，就得到 PRM。<strong>整个过程无需任何人工步级标注</strong>，只需要一个能判最终对错的验证器（结果奖励）——又一次，可验证的最终答案成了一切的支点。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>Math-Shepherd 的精神：<strong>「一步好不好，看它之后还能不能成」</strong>。要评判棋局某一步，就从那里多下几盘到分胜负，看赢的比例——这一步通向胜利的概率，就是它的价值。不需要请大师逐步点评，让结果自己说话。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上这是用<span class="term">Monte-Carlo estimation</span>近似状态价值，是 RL 里最经典的 value estimation。它的<strong>无偏性</strong>来自大数定律（$\hat v_k\to V$），<strong>方差</strong>随 rollout 数 $N$ 下降（$\propto 1/N$）。我们的玩具任务<em>可枚举</em>，所以能算出真实 $V(s_{\le k})$ 并验证 MC 估计收敛到它——这正是 notebook 的核心对拍。</p></div>
+  </div>  <h4>一个 MC 标注的例子</h4>  <p>假设一道题的解走到第 2 步，前缀是「$3+4=7$，再算 $7\times 2$」。从这里 rollout 100 次续写到最终答案，其中 82 次答对——那么这一步的软标签 $\hat v_2=0.82$（这一步把解维持在很有希望的状态）。再看下一步若学生写「$7\times 2=15$」（算错），从这个新前缀 rollout 100 次只有 6 次答对（错误已注入，多数续写无法挽回），$\hat v_3=0.06$。价值从 $0.82$ 骤降到 $0.06$——<strong>这个落差精确地标出「第 3 步是错误发生处」</strong>，而结果奖励只会告诉你「最后错了」。这就是 MC 软标签的威力：<em>用大量续写的答对率，把抽象的「步骤好坏」变成可监督的连续数字</em>，且完全自动。</p>  <div class="callout warn"><span class="label"></span>
+    <p>MC 标签不是免费午餐：①<strong>贵</strong>——给每条解的每步都 rollout $N$ 次，计算量是 $K\times N$ 倍生成；②<strong>有噪声</strong>——$N$ 小时 $\hat v_k$ 抖动大，标签噪声会传进 PRM；③<strong>依赖策略</strong>——$\hat v_k$ 是「按<em>当前</em>策略续写」的答对率，策略变了价值就变了（off-policy 问题）。这些都是真实 PRM 训练里要权衡的，notebook 会让你调 $N$ 看标签方差怎么变。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="agg"><span class="num">4</span>聚合：步级合成解级</h2>
+  <h3>聚合：把步级分数合成解级分数</h3>  <p>PRM 对一条解输出<strong>一串</strong>步级分数 $v_1,\dots,v_K$，但 best-of-N 重排需要<strong>一个</strong>解级分数来排序。怎么把序列聚合成标量？常见有四种，各有适用场景：</p>  <table>
+    <thead><tr><th>聚合方式</th><th>公式</th><th>语义</th><th>适用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>min</strong></td><td>$\min_k v_k$</td><td>最薄弱的一步多强</td><td>需<strong>步步正确</strong>（证明、严格推导）</td></tr>
+      <tr><td><strong>prod</strong></td><td>$\prod_k v_k$</td><td>所有步都对的联合概率</td><td>步骤近似独立、要全对</td></tr>
+      <tr><td><strong>mean</strong></td><td>$\frac1K\sum_k v_k$</td><td>平均质量</td><td>容忍个别弱步、看整体</td></tr>
+      <tr><td><strong>last</strong></td><td>$v_K$</td><td>终态价值</td><td>最后一步价值已含全程信息时</td></tr>
+    </tbody>
+  </table>  <p>聚合方式的选择<strong>显著影响</strong> best-of-N 表现，背后是对任务的假设。<strong>min/prod</strong>都强调「一步错，全盘输」——min 取最薄弱环节、prod 是「每步都对」的联合概率（一步价值低则整体被拉低）。它们适合<em>需要每一步都严格正确</em>的任务（如形式证明：中间错一步结论就不成立）。<strong>mean/last</strong>更宽松：mean 容忍个别弱步、看整体平均质量，last 直接信任「终态价值已经吸收了全程信息」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>用「链条强度」打比方：min/prod 把解看成一条<strong>链子</strong>——强度取决于最弱的一环（min）或所有环的乘积（prod），一环断则全断，适合「容错率为零」的推导。mean 把解看成一份<strong>报告</strong>——个别段落差点没关系，看整体水准。选哪个，取决于你的任务是「链子」还是「报告」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上有个微妙点：<strong>prod 对步数敏感</strong>——步越多，连乘越小（哪怕每步都不错），会系统性地<em>惩罚长解</em>；min 则对步数不敏感。所以在比较不同长度的解时，prod 可能不公平地偏好短解。实践中 PRM800K/Math-Shepherd 等工作对不同聚合做过对比，结论依任务而异——没有放之四海的最优聚合，这本身就是一个要调的设计维度。notebook 会构造例子让你看到同一组解在不同聚合下排序<strong>翻转</strong>。</p></div>
+  </div>  <h4>一个手算例子：聚合方式让排序翻转</h4>  <p>看两条解的步级分数。<strong>解 A</strong>：$[0.9,0.9,0.9,0.3]$（前三步很好，最后一步可疑）；<strong>解 B</strong>：$[0.6,0.6,0.6,0.6]$（全程平庸但无明显短板）。<strong>用 mean 排序</strong>：A 得 $0.75$、B 得 $0.6$，<em>A 胜</em>（整体平均更高）。<strong>用 min 排序</strong>：A 得 $0.3$、B 得 $0.6$，<em>B 胜</em>（A 有一个薄弱环节，min 判它危险）。<strong>用 prod 排序</strong>：A 得 $0.9^3\times0.3\approx0.219$、B 得 $0.6^4\approx0.130$，又变成 <em>A 胜</em>。同一对解，三种聚合给出<strong>三种不同的胜负</strong>！这绝非吹毛求疵：如果这是道形式证明，A 最后一步可疑很可能让整个证明作废，<strong>min 选 B 是对的</strong>；如果是道允许个别表述瑕疵的应用题，A 的整体质量更高，<strong>mean 选 A 更合理</strong>。聚合的选择，就是你把「什么算一个好解」这个判断<em>编码进了数学</em>——选错聚合，等于用错了评判标准。</p>  <p>聚合方式还和<strong>PRM 用在「重排」还是「搜索」</strong>有关。做 best-of-N<em>重排</em>（已有完整解，选一个）时，min/mean/last 都可用，看任务；而做<em>过程中的搜索</em>（beam/MCTS，给<strong>部分解</strong>打分决定保留哪些，模块 04）时，往往用<strong>当前前缀的价值</strong>（接近 last/running 的语义）——因为你要评的是「这个<em>还没写完</em>的前缀有没有前途」，而非「整条解多好」。同一个 PRM、同一串步分数，在「事后选解」和「事中剪枝」两个用途下的聚合考量并不相同。这也提示：聚合的选择不能脱离<em>你打算拿 PRM 分数来做什么</em>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住一个判据：<strong>任务越「一步错全错」，越该用 min/prod；任务越「看整体」，越该用 mean</strong>。数学证明用 min（中间一步逻辑错，证明就废了）；开放式多步推理可能 mean 更稳（个别表述瑕疵不致命）。聚合不是技术细节，而是<em>你对「什么算一个好解」的定义</em>的数学化。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="goodhart"><span class="num">5</span>奖励黑客与 Goodhart 倒 U</h2>
+  <h3>奖励黑客与 Goodhart 倒 U</h3>  <p>现在讲 PRM 危险的一面。前两模块强调过：<strong>规则奖励近乎不可 hack，但学习的奖励是可被优化到失真的代理</strong>。PRM 正是<strong>学习的奖励</strong>——它是一个<em>模型</em>，对真实「步骤正确性」的近似。一旦你拿它当 RL 的优化目标拼命优化，策略就会找到<strong>「PRM 给高分但其实没解对」的捷径</strong>，这就是 <span class="term">reward hacking</span>。</p>  <p>其后果由 <span class="term">Goodhart's law</span> 概括：<strong>「当一个度量成为目标，它就不再是好度量」</strong>。具体表现为一条<strong>倒 U 形曲线</strong>：随着你对 PRM 分数优化得越狠（策略偏离参考越远、KL 越大），PRM 给的分<em>一路上升</em>，但<strong>真实任务正确率先升后降</strong>——前段 PRM 和真实目标一致（优化有益），过了某点 PRM 被 hack、与真实目标脱节（优化有害）。</p>  <div class="ascii">过度优化 PRM 的倒 U（横轴：优化强度 / KL 偏离；纵轴：表现）
+
+  分数
+   │        PRM 给的分(代理) ────────────────▶ 一路升(被 hack)
+   │      ╱
+   │    ╱   ╲___ 真实正确率 ：先升…
+   │  ╱         ╲___                 …后降(过度优化)
+   │╱               ╲________________
+   └─────────┬───────────────────────▶ 优化强度 / KL
+          最优点(该早停/控 KL)   过了就开始 hack</div>  <p>为什么会出现这条倒 U？机制并不神秘：PRM 是在<em>某个数据分布</em>上训出来的，它只在那个分布<strong>附近</strong>逼近真实的步骤正确性。RL 一旦把策略推离参考太远，生成的解就<strong>跑出了 PRM 的「可信区」</strong>——此时 PRM 的打分不再反映真实正确性，而策略偏偏在<em>专门优化这个失真的分数</em>，于是「PRM 分」与「真实正确率」分道扬镳。前段二者尚一致（策略还在 PRM 见过的分布里），优化有益；越过某点，策略学会了「触发 PRM 高分的表面特征」（特定措辞、长度、看起来缜密的废话）而非真正解对，优化转为有害。<strong>倒 U 的顶点，就是「策略开始离开 PRM 可信区」的那一刻</strong>。</p>  <p>这条倒 U 是 PRM（以及一切学习奖励）的<strong>根本约束</strong>，有几个可操作的推论：①<strong>KL 正则不是可选项</strong>——它限制策略偏离参考的程度，把优化按在倒 U 的上升段（这回收了模块 02 的伏笔：学习奖励须拉紧 KL）；②<strong>要早停</strong>——监控真实指标（held-out 正确率），它开始降就停，别盯着 PRM 分；③<strong>PRM 越强，倒 U 顶点越靠右、越高</strong>——更准的 PRM 能被安全地优化得更狠。</p>  <div class="callout danger"><span class="label">别信被优化过的代理</span>
+    <p>最危险的误区是<strong>把 PRM 分当成真实正确率来汇报或优化</strong>。PRM 分高<em>不等于</em>解真的对——尤其在策略已经针对 PRM 优化过之后，二者可能严重脱节。Gao 2023《Scaling Laws for Reward Model Overoptimization》量化了这条倒 U 与 KL 的定量关系。<strong>铁律：永远用一个 PRM 没参与优化的、独立的 ground-truth（如规则验证的最终答案）来评判真实表现</strong>。这也是为什么可验证域如此宝贵——那里有不可 hack 的裁判。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="vs"><span class="num">6</span>PRM vs ORM：为何更强</h2>
+  <h3>PRM vs ORM：为什么过程监督更强</h3>  <p>把本模块的核心实证讲清：Lightman 2023 在 MATH 上发现，用<strong>过程监督</strong>训的 PRM，做 best-of-N 重排时<strong>显著优于</strong>用结果监督训的 ORM。为什么更密的监督带来更强的 verifier？三个层面的原因：</p>  <ol>
+    <li><strong>信用更准 → 学得更对</strong>。ORM 只知道「整条对不对」，要从一堆「最终对」的解里反推「哪些步骤是好的」极难（蒙对的解也标成对，污染信号）。PRM 直接监督每一步，避开了这个反推难题。</li>
+    <li><strong>判别更细 → 排序更准</strong>。做 best-of-N 时，PRM 能识别出「前面全对、只最后一步错」的解（min 聚合会给它合理的中间分），而 ORM 对这类解只会简单标错，丢掉了「这条其实很接近」的信息。</li>
+    <li><strong>更难被表面模式骗</strong>。ORM 容易学到「长解/含某些词的解更可能对」这类表面相关；PRM 的步级监督迫使它关注<em>每步的实际正确性</em>，相对更鲁棒（但注意：PRM 自己也是学习模型，仍会被 hack，只是阈值更高）。</li>
+  </ol>  <p>还有一层更微妙的优势，关乎<strong>可解释性与安全</strong>。PRM 的步级分数让我们能<em>看到模型在哪一步出了错</em>——这不仅利于调试，也是 AI 安全关心的「过程监督可能比结果监督更可对齐」的论据（Lightman 等讨论过）：如果我们只奖励结果，模型可能学会用<em>我们不认可的过程</em>（甚至欺骗性的推理）得到正确答案；而过程监督直接对<em>推理本身</em>的质量施压，更可能得到「以我们能理解、能认可的方式正确」的模型。当然这把双刃剑的另一面是——PRM 自己是个会被 hack 的学习模型（下一节），所以「过程监督更安全」也只在 PRM 本身可信时成立。</p>  <p>但要避免一个误读：<strong>PRM 优于 ORM 不是无条件的</strong>。它依赖<em>高质量的步级标签</em>（人工贵、MC 有噪声）、依赖<em>合适的聚合</em>、且<em>自身也会被过度优化</em>。Lightman 的结论是在<strong>用 PRM 做 best-of-N 重排</strong>（推理时筛选，不更新策略）这个设定下最干净——这时 PRM 只当裁判、不被优化，倒 U 风险小。一旦把 PRM 当 RL 奖励去<em>训练</em>策略，reward hacking 立刻回来。这解释了一个实践分工：<strong>PRM 更多用于推理时的搜索/重排（模块 04），结果奖励/规则奖励更多用于训练时的 RL（模块 01–02）</strong>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把三个模块串起来看：模块 01–02 用<strong>不可 hack 的结果/规则奖励</strong>做<strong>训练时 RL</strong>（放手优化）；模块 03 的<strong>PRM</strong>（可 hack 的学习奖励）更适合做<strong>推理时的 verifier</strong>（当裁判、不被优化，下一模块的主角）。「奖励是否可 hack」与「该用在训练还是推理」之间，有一条清晰的对应。这是本课中段最重要的一张认知地图。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <p>过程奖励是当前推理研究最活跃也最有争议的方向之一，前沿问题密集：</p>  <ul>
+    <li><strong>MC 标签的质量与成本</strong>。Math-Shepherd 的 MC 标注贵且有噪声，且依赖打标策略。如何用更少 rollout 得到更准的步级价值（方差缩减、重要性采样、树形复用 rollout）是活跃方向。</li>
+    <li><strong>PRM 真的在「过程」上对吗？</strong> 多项工作（如 2024–2025 关于 PRM 陷阱的研究）发现：很多所谓 PRM 实际学到的接近 ORM（靠终态反推），步级判别力有限；评测还常有泄漏。「PRM 到底学到了什么」远未清楚。</li>
+    <li><strong>过程监督用于 RL 训练的 hacking</strong>。把 PRM 当 RL 奖励几乎必然引来 reward hacking。如何安全地用过程信号训练（强 KL、PRM 集成、对抗式更新 PRM、只用规则可验证的中间检查点）是开放难题。</li>
+    <li><strong>可验证的中间信号</strong>。能否绕开「学习的 PRM」，直接构造<em>可验证</em>的步级奖励（如代码的中间断言、数学的中间等式可检验、形式证明的逐步类型检查）？这能把规则奖励的「不可 hack」延伸到过程层面，是很有前景的方向。</li>
+    <li><strong>PRM 与搜索的协同</strong>。PRM 作为搜索（beam/MCTS）的价值函数时，它的标定（calibration）、与策略的匹配、搜索深度的关系，直接决定测试时计算的效率——直通模块 04/05。</li>
+  </ul>  <p>PRM 的故事浓缩了整个领域的一个核心张力，值得反复咀嚼：<strong>我们想要更密、更准的奖励信号（PRM 的承诺），但更密、更学习化的信号必然更容易被 hack（PRM 的诅咒）</strong>。这不是 PRM 特有的毛病，而是<em>一切「用学习的模型当奖励」</em>的宿命——你优化的是<em>代理</em>，不是<em>真目标</em>，优化得越狠、二者越可能脱节。可验证奖励（模块 01–02）之所以珍贵，正因为它在可验证域里<strong>逃脱了这个诅咒</strong>（答案对就是对，无代理可 hack）。于是整个推理研究的版图，可以看作在两极之间寻找平衡：<em>可验证但稀疏</em>的规则奖励，与<em>密集但可 hack</em>的学习奖励。前沿的许多努力（可验证的中间检查点、PRM 集成、强 KL）本质都是想<strong>既要密、又要别被 hack</strong>——这是个还远未解决的根本难题。</p>  <div class="callout paper"><span class="label"></span>
+    <p>奠基与前沿：<strong>Lightman 2023《Let's Verify Step by Step》</strong>（PRM>ORM 的核心实证 + PRM800K）、<strong>Wang 2024《Math-Shepherd》</strong>（MC 自动标步级软标签）、<strong>Cobbe 2021（GSM8K verifiers）</strong>（verifier + best-of-N 的源头）、<strong>Gao 2023</strong>（奖励过度优化的倒 U 定量律）、<strong>Uesato 2022</strong>（过程 vs 结果监督的独立证据）。下一模块把 verifier（ORM/PRM）从「训练信号」转为「推理时的搜索引导」——best-of-N、加权投票、beam search 与 pass@k 估计。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_grpo/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · GRPO 从零</div></a>
+    <a class="next" href="../04_verifier_search/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · Verifier 引导搜索</div></a>
+  </div>
+
+</div>
+</body>
+</html>

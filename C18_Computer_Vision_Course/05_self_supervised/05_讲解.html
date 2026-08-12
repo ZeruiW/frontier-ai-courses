@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 自监督视觉</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 自监督视觉</h1>
+  <p class="subtitle">对比学习 SimCLR/InfoNCE、掩码重建 MAE、增强不变性、表示坍缩、linear probe 评估——纯 numpy 从零实现并验证</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02 的分类/表示、softmax/交叉熵；线性代数（内积/余弦）；numpy</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_self_supervised.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Chen SimCLR、He MAE、He MoCo、Grill BYOL、Caron DINO、Oord CPC（InfoNCE）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么要自监督</a></li>
+      <li><a href="#contrastive">对比学习：拉近正对、推开负对</a></li>
+      <li><a href="#infonce">InfoNCE / NT-Xent 损失</a></li>
+      <li><a href="#mae">掩码重建：MAE</a></li>
+      <li><a href="#collapse">表示坍缩与如何避免</a></li>
+      <li><a href="#probe">评估表示：linear probe</a></li>
+      <li><a href="#connect">自监督与全课的闭环</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么要自监督</h2>
+  <p>前四个模块解决的全是<strong>有标签</strong>的任务：分类要人标类别、检测要人画框、分割要人逐像素描掩码。问题在于，这些标注极其昂贵且难以规模化——ImageNet 动用上千名标注员标了 1400 万张图，一张语义分割图逐像素描边往往要几十分钟，医学影像还得请专家。与之形成刺眼对比的是：<strong>无标签图像几乎是无限的</strong>，互联网上躺着数十亿张随手可得的照片。这个供给上的巨大落差，正是 <span class="term">self-supervised learning (SSL)</span>（自监督学习）的出发点——它的目标是<strong>完全不用人工标签，仅凭数据自身学到通用的视觉表示</strong>，再用极少量标签迁移到下游任务。</p>  <p>它怎么做到「无标签却有监督」？核心是构造 <span class="term">pretext / downstream task</span>（代理任务/下游任务）的二段式：先用代理任务<strong>从数据本身自动生成监督信号</strong>做预训练，再在下游任务上评估或微调。代理任务的设计五花八门（早期有预测旋转角度、补全色彩、拼图块顺序等），但本课聚焦最成功的两类——「把同一张图的两个增强视图认成同一张」（对比学习）、「遮住图像一大部分让模型补全」（掩码重建）。它们的共同妙处在于：标签来自数据自身的结构，<em>一分钱标注费都不花</em>；但要把任务解好，模型就<strong>不得不理解图像的语义结构</strong>——于是好表示作为副产品被顺带学了出来，这正是自监督的全部精髓。</p>  <div class="ascii">监督 vs 自监督：
+  监督学习:   图 + 人工标签 ──► 学表示+分类     （标签贵、有限）
+  自监督:     海量无标签图 ──►【代理任务】──► 学通用表示
+                            (对比/掩码,免标注)      │
+                                                   ▼
+              少量标签 ──►【linear probe / 微调】──► 下游任务</div>  <p>从历史看，自监督在视觉上的突破比在 NLP 上来得晚、也更曲折。NLP 里 BERT 的「完形填空」、GPT 的「预测下一词」早已统治预训练，但图像是连续、空间高度冗余的信号，简单照搬「预测被遮像素」一度效果平平——遮一小块靠邻域插值就补上了，模型学不到语义。直到 2020 年前后，对比学习（SimCLR/MoCo）率先证明了无监督表示可以逼近甚至追平监督预训练，随后 MAE 用「高比例掩码 + 非对称编解码」让生成式路线在视觉上也真正奏效，自监督才一跃成为视觉表示学习的主流引擎。理解对比与掩码这两条路线各自的设计取舍与适用场景，就握住了现代视觉预训练的主线，也能看懂为什么不同任务会偏好不同的自监督方法。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>自监督的赌注可以这样理解：<strong>解好一个「免标注但很难」的任务，所需的理解和解下游真任务是相通的</strong>。一个模型若能补全被遮住大半的猫脸、能认出同一只猫在不同裁剪/光照下的两个视图，就说明它已经<em>懂</em>了猫的结构与语义——这种「懂」沉淀在表示里，就是我们想要的好表示。本模块从零实现两大范式：对比学习（SimCLR/InfoNCE）和掩码重建（MAE）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="contrastive"><span class="num">2</span>对比学习：拉近正对、推开负对</h2>
+  <p><span class="term">contrastive learning</span>（对比学习）的核心是构造 <span class="term">positive / negative pair</span>（正对/负对）：<strong>正对</strong> = 同一张图经两次不同随机增强得到的两个视图（语义相同，只是表面不同）；<strong>负对</strong> = 来自不同图的视图（语义不同）。训练目标极其直白：在表示空间里<strong>把正对拉近、把负对推开</strong>。整个监督信号完全来自这种「谁和谁是同一张图」的成对关系，不需要任何人工标签——这正是它「自监督」的来源。</p>  <p>为什么这套机制能学到好表示？关键在于：要让「同一张图随机裁剪 + 颜色抖动后的两个视图」在表示空间里靠得很近，模型就<strong>被迫忽略裁剪位置、颜色、亮度等表面变化</strong>，转而抓住两个视图共有的<strong>不变语义内容</strong>（这是一只猫，无论裁的是头还是身、调亮还是调暗）。这就是 <span class="term">data augmentation invariance</span>（增强不变性）的精髓，也引出一条贯穿对比学习的铁律——<strong>你选什么增强，就决定了模型学会对什么不变</strong>。增强不是预处理细节，而是对比学习的灵魂与监督信号本身。</p>  <div class="ascii">对比学习的一个 batch：
+  图A ─增强1─► 视图 a1 ┐ 正对(拉近)
+  图A ─增强2─► 视图 a2 ┘
+  图B ─增强1─► 视图 b1   } a1 与 b1/b2 是负对(推开)
+  图B ─增强2─► 视图 b2
+  表示空间: 同图视图聚成簇，不同图的簇互相远离</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：给你一大堆打乱的照片，每个物体都被拍了两次（角度、光线略有不同）。对比学习要做的，就是教模型「认出哪两张其实是同一个物体的两次拍摄」。要稳定做到这点，模型必须学会看穿角度光线这些表面差异、直抵物体本质——而这种「认本质」的能力，恰恰就是我们想要的语义表示。它无需任何人告诉它「这是猫」，只需告诉它「这两张是一对」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从信息论看，对比学习等价于<strong>最大化正对两个视图表示之间的互信息下界</strong>——InfoNCE 损失正是这个下界的一种形式（CPC，Oord 2018）。负对在这里扮演「对比的基准」：没有负对，模型完全可以耍赖，把所有输入都映射到同一个点（<span class="term">representation collapse</span>，表示坍缩），此时正对损失趋零、曲线很漂亮，表示却毫无信息。所以负对不是可有可无的配角，而是防止作弊的结构性约束（第 5 节详谈）。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>增强的选择是对比学习<strong>最关键、最该调</strong>的设计，其重要性甚至超过网络结构。SimCLR 的系统实验发现，<strong>随机裁剪 + 颜色抖动</strong>这一组合至关重要、缺一不可：只裁剪不抖色，模型会偷懒用颜色直方图就把不同图区分开（学不到形状语义）；只抖色不裁剪，又学不到空间与尺度上的不变性。而增强强度也要小心拿捏——太弱则两个视图几乎一样、学不到有意义的不变性，太强则会破坏语义（把猫裁成一片纯背景，这个「正对」就名不副实，反而变成了喂给模型的错误监督）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="infonce"><span class="num">3</span>InfoNCE / NT-Xent 损失</h2>
+  <p>对比学习的损失叫 <span class="term">InfoNCE / NT-Xent</span>（SimCLR 里称 NT-Xent，normalized temperature-scaled cross entropy）。设一个 batch 有 N 张图、每张做两次增强共 <code>2N</code> 个视图，对其中某个视图 <code>i</code>，它唯一的正样本是同图的孪生视图 <code>j(i)</code>，其余 <code>2N−2</code> 个全是负样本。视图 i 的损失写成：</p>  <div class="math-block">\[\ell_i=-\log\frac{\exp\!\big(\operatorname{sim}(z_i,z_{j(i)})/\tau\big)}{\sum_{k\ne i}\exp\!\big(\operatorname{sim}(z_i,z_k)/\tau\big)},\qquad \operatorname{sim}(u,v)=\frac{u^\top v}{\lVert u\rVert\lVert v\rVert}\]</div>  <p>看出门道了吗？这个式子就是一个<strong>交叉熵</strong>——把对比学习重新表述成一个分类问题：「在 <code>2N−1</code> 个候选里认出那个正样本」，正样本就是「正确类别」，softmax 的分子是正对相似度、分母是与所有候选相似度之和。因此<strong>最小化 InfoNCE = 让正对相似度显著高于所有负对相似度</strong>。这里用<strong>余弦相似度</strong>（先把表示 L2 归一化再做内积），让相似度落在 <code>[−1,1]</code>、与向量模长无关——否则模型会用「把正样本模长拉大」这种与语义无关的捷径来降损失。</p>  <p><span class="term">temperature (τ)</span>（温度）是 InfoNCE 最关键的超参，它给每个相似度除以 τ 后再进 softmax。<strong>τ 越小，softmax 分布越尖锐</strong>，损失越<strong>聚焦于最难的负样本</strong>（即那个与正对最像、最容易混淆的负对），梯度更集中、表示分得更开；但 τ 太小会让 logits 爆炸、数值不稳，SimCLR 实践中取 τ≈0.1–0.5。还有一个不起眼却重要的工程细节：SimCLR 在编码器表示和对比损失之间插了一个<strong>投影头</strong>（projection head，一个小 MLP），让 InfoNCE 作用在<em>投影后</em>的空间，而下游任务用<em>投影前</em>的表示——因为对比损失会让投影空间丢掉一些对下游有用、但对「区分正负对」无用的信息，隔一层投影头能把这种损害挡在表示之外。</p>  <div class="callout danger"><span class="label"></span>
+    <p>InfoNCE 从零实现时有三个高频 bug，每个都会让损失看似在降、表示却是废的：① 忘了<strong>把自己从分母里排除</strong>（分母不能含 <code>sim(z_i, z_i)</code>，否则这个恒等于最大值的项会主导整个 softmax，损失虚低）；② 忘了对表示做 <strong>L2 归一化</strong>，导致模长而非方向主导相似度；③ <strong>正样本索引 j(i) 配错</strong>（视图 i 的正样本是它的孪生增强视图，不是它自己，也不是 batch 里随便哪个）。notebook 会从零实现 InfoNCE 并逐项验证：完美匹配时正对损失趋近 0、完全随机表示时损失≈<code>log(2N−1)</code>，用这两个解析基准兜底。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mae"><span class="num">4</span>掩码重建：MAE</h2>
+  <p>自监督的另一大范式是<strong>生成式</strong>的，代表作是 <span class="term">masked autoencoder (MAE)</span>（掩码自编码器，He 2022）。它的思路朴素得近乎暴力——<strong>把图像切成块、随机遮住其中一大部分，让模型根据可见块重建出被遮块的像素</strong>。要补全被遮住的半张猫脸、被挡住的物体轮廓，模型就必须理解物体的结构、纹理与上下文，于是好表示在「学会补全」的过程中被学出来。这正是 NLP 里 BERT「完形填空」在视觉上的对应物，把「预测被 mask 的词」换成了「重建被 mask 的图块」。</p>  <p>MAE 有两个看似反直觉、实则关键的设计。其一，<span class="term">masking ratio</span>（掩码比例）要<strong>非常高，约 75%</strong>——远高于 BERT 的 15%。原因是图像的<strong>空间冗余极大</strong>：相邻像素高度相关，只遮一小部分，模型靠局部纹理插值就能补出来，任务太简单、学不到全局语义。只有遮掉约四分之三，才逼模型从稀疏的可见块去<em>推断</em>整体结构。其二，<strong>非对称编解码器</strong>：<strong>编码器只处理可见的那 25% 块</strong>（被遮的块根本不输入编码器，于是计算量省去约 75%，预训练极快、可扩展到大模型），只有一个轻量解码器才接收「可见块表示 + 被遮位置的占位符」去重建全图。</p>  <div class="ascii">MAE 流程：
+  原图切块 ──► 随机掩掉 75% ──► 编码器只看可见的 25%
+                                      │
+                            (可见块的表示)
+                                      ▼
+  重建全部块 ◄── 轻量解码器 ◄── 可见块表示 + 被掩位置的占位符
+  损失 = 仅在被掩块上算 重建像素 与 原像素 的 MSE</div>  <p>损失<strong>只在被掩块上</strong>计算重建像素与原像素的 MSE（可见块不计入，否则模型会退化成「把看得见的部分原样抄过去」这种毫无意义的平凡解）。预训练完成后，<strong>解码器被整个丢掉</strong>，只保留编码器作为下游任务的特征提取器——解码器的唯一使命就是在预训练阶段提供重建监督，用完即弃。本课用一个 toy 版（小图、随机掩块、纯 numpy 重建）把这套机制讲清、跑通，并用 assert 验证一个核心直觉：<strong>掩码比例越高，重建误差越依赖对全局结构的理解</strong>、越无法靠相邻像素的局部插值蒙混过关——这正是 MAE 要把比例设到 75% 的根本原因。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把对比与掩码两条路线放在一起对照，能更看清它们的分工：<strong>对比学习学到的是「判别性」表示</strong>——它显式地把不同图在空间里拉开，所以下游做分类、检索这类「区分」任务时天然顺手；<strong>掩码重建学到的是「生成性」表示</strong>——它从局部理解到全局，特征更细粒度，做下游微调（fine-tune）时往往更强。两者各擅胜场，是当下自监督的两大主力，也共同启发了图文等多模态预训练的设计。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="collapse"><span class="num">5</span>表示坍缩与如何避免</h2>
+  <p>自监督有一个致命且隐蔽的失败模式：<span class="term">representation collapse</span>（表示坍缩）——模型把<strong>所有输入都映射到同一个点</strong>（或同一个极低维的子空间）。一旦坍缩，正对损失会趋近 0（既然所有东西都在一个点上，正对当然「最近」）、损失曲线看起来完美下降，但学到的表示<strong>彻底没有信息</strong>，下游任务一塌糊涂。坍缩的可怕之处在于它<em>不报错、损失还好看</em>，所以理解「每种自监督方法靠什么机制避免坍缩」，是读懂 SSL 论文设计动机的一把关键钥匙。</p>  <table>
+    <thead><tr><th>方法</th><th>靠什么避免坍缩</th></tr></thead>
+    <tbody>
+      <tr><td>SimCLR / 对比</td><td>负样本——把不同图推开，若坍缩到一点会让负对损失爆炸，从而被排斥</td></tr>
+      <tr><td>MoCo</td><td>动量编码器 + 队列，提供大量稳定的负样本</td></tr>
+      <tr><td>BYOL / SimSiam</td><td>无负样本，靠在线/目标双网络 + 预测头 + 停梯度(stop-gradient)打破对称</td></tr>
+      <tr><td>MAE / 掩码重建</td><td>重建像素目标——坍缩到一点就无法重建出各不相同的图，天然不坍缩</td></tr>
+      <tr><td>Barlow Twins / VICReg</td><td>正则化表示的协方差矩阵，显式去相关 + 保持各维方差非零</td></tr>
+    </tbody>
+  </table>  <p>最经典、最易理解的避免手段是<strong>负样本</strong>（对比学习）：既然损失要求「把不同图推开」，模型就不可能把所有东西都挤到一点——那样负对相似度会拉满、损失爆炸。但 BYOL（Grill 2020）带来一个震撼的反例：<strong>它完全不用负样本，却也不坍缩</strong>，靠的是在线网络与动量更新的目标网络之间加一个预测头、并对目标分支做停梯度，用这种非对称结构打破了「全部映到一点」的退化解。这一发现颠覆了「对比必须有负对」的共识，其确切机理至今仍有理论研究。而生成式的 MAE 则<strong>对坍缩天然免疫</strong>：要逐图重建出各不相同的原始像素，不同图的表示就必须不同，根本没有坍缩的余地——这是判别式与生成式自监督的一个深刻区别。</p>  <div class="callout warn"><span class="label"></span>
+    <p>诊断坍缩有一个简单可靠的信号：<strong>监控表示的方差或有效秩</strong>，而不要只盯着损失。坍缩时表示几乎全相同，各维方差趋零、协方差矩阵的有效秩骤降到接近 1。所以训练任何自监督模型时，除了画损失曲线，务必额外记录一批样本表示的标准差或奇异值谱——损失好看但方差塌了，就是坍缩。notebook 会刻意构造一个会坍缩的玩具场景，并演示如何用方差信号把它检测出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="probe"><span class="num">6</span>评估表示：linear probe</h2>
+  <p>辛苦学到了表示，怎么客观地判断它好不好？SSL 社区的标准评测协议是 <span class="term">linear probe (evaluation)</span>（线性探针）：<strong>把自监督学到的表示完全冻结，只在它之上训练一个线性分类器</strong>，再用下游任务（通常是分类）的 held-out 准确率来衡量表示质量。这个协议简单、便宜、可复现，几乎是每篇 SSL 论文的「标准考试」，也是横向比较不同自监督方法的通用标尺。</p>  <p>为什么偏偏要用<strong>线性</strong>分类器、而且要<strong>冻结</strong>表示？两个理由都很本质。其一是<strong>公平</strong>：冻结表示能确保我们测的是<em>表示本身</em>的质量，而不是让一个强大的分类器去「补救」一个糙表示（这呼应了模块 02 的结论——表示足够好时，线性分类器就够用）。其二，<strong>linear probe 准确率高，当且仅当类别在表示空间里近似线性可分</strong>——而「把不同语义线性地摆开」恰恰就是「好表示」的可操作定义。所以 linear probe 不只是个评测手段，它同时把「表示好」这个抽象概念，翻译成了一个可计算、可比较的数字。</p>  <div class="math-block">\[\text{冻结 }\phi(x)\ \Rightarrow\ \text{只训 }W,b:\quad \hat y=\operatorname{softmax}(W\phi(x)+b),\qquad \text{报 held-out accuracy}\]</div>  <p>评估表示其实有一个从轻到重的谱系，linear probe 处在最常用的中间档，理解三者的取舍能帮你读懂不同论文报告的数字到底意味着什么：</p>  <ul>
+    <li><strong>linear probe</strong>：冻结表示，只在其上训练一个线性头。最常用，直接测线性可分性，成本低（几秒到几分钟）、可比性强，是 SSL 论文的默认主指标。</li>
+    <li><strong>k-NN 评估</strong>：连分类器都不训，直接在表示空间用最近邻投票分类。完全无参、无训练、无超参可调，测的是表示的纯几何结构，结果最干净但通常偏严格，常作为 linear probe 的补充佐证。</li>
+    <li><strong>fine-tune 微调</strong>：解冻表示与分类头一起端到端训练。测的是「把这个表示当作初始化权重」的价值，准确率通常最高，但它混入了微调本身带来的增益，已不再纯粹反映预训练表示的好坏——比较时务必和 linear probe 分开报告。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>linear probe 的妙处在于它把一个含糊的问题——「这个表示到底好不好」——变成了一道有标准答案的考试：<strong>把表示冻死，看一个最简单的线性分类器能从中读出多少信息</strong>。读得多，说明语义已被线性地组织好了；读不出，说明表示还很糙。notebook 会分别冻结对比学习和 MAE 学到的玩具表示、各训一个线性探针，并与「随机初始化表示」这个下界对比，直观看到自监督确实把准确率从随机水平显著拉高了。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="connect"><span class="num">7</span>自监督与全课的闭环</h2>
+  <p>自监督把整门课闭合成一个完整的环。前四个模块都在「有标签」的世界里干活——做分类、检测、分割；而自监督回头解决了那个最根本的问题：<strong>标签从哪来？能不能不要？</strong>它学到的表示，恰恰就是喂给前面任何一个任务的输入。换句话说，前面是「给定表示怎么用、怎么评」，这里是「表示本身怎么无监督地造出来」，两端正好接成闭环。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>可以这样俯瞰全课的结构：模块 01 给你「视觉的算术」（滤波、边缘、梯度这些原子操作）；模块 02–04 给你「带标签的三大任务」（分类、检测、分割，以及它们各自的评测口径）；模块 05 给你「不依赖标签也能学出表示」的引擎。最后这块拼上去，一套从最底层像素运算、到高层任务、再到无监督表示学习的视觉地基就完整了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>技术上，自监督学到的特征提取器 <code>φ_θ</code> 可以直接替换模块 02 里手工设计的 HOG、也可以替换从零训练的 CNN backbone——事实上，现代的检测器、分割器几乎都不再从零训 backbone，而是用<strong>自监督或大规模预训练的 backbone 再微调</strong>。而你在模块 02 写过的 linear probe、模块 03/04 写过的 IoU/mAP/Dice，正是用来评估这些预训练表示「迁移得好不好」的工具。前后模块在这里真正咬合到了一起。</p></div>
+  </div>  <p>把视野再放大一层：<strong>自监督 + Transformer</strong>（用 MAE 预训练 ViT、或用 DINO 做自蒸馏）已经是当下视觉<strong>基础模型</strong>的核心配方，也是几乎所有多模态大模型（VLM）视觉编码器的来源——你日常用的那些图文模型，它们的「眼睛」大概率就是这样被自监督地预训练出来的。因此理解对比学习与掩码重建这两条主线，等于理解了驱动现代视觉表示学习的引擎；而你在前几个模块亲手写对的那些评测口径，正是衡量这台引擎好坏的仪表盘。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>用一句话收束整门课：<strong>低层视觉是零件、三大任务是应用、自监督是引擎、评测口径是标尺</strong>。你这一路用 numpy 从零写对的每一个机制——卷积、Sobel/Canny、HOG、IoU、NMS、mAP、Dice、InfoNCE、MAE——都不是玩具练习，而是日后读懂论文、复现系统、审查别人评测结果时实打实的硬通货。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>自监督是当前视觉乃至整个表示学习中最活跃的方向之一，远未尘埃落定。短短几年里，它已从「能不能逼近监督」走到「成为视觉基础模型的默认预训练方式」，但核心问题仍然敞开：对比与掩码两条路线正在融合、自监督正在向多模态急速扩张、连「怎么评一个表示好不好」这件最基本的事都在被重新反思。下面几条是值得持续关注的开放问题，对评测科学家尤其重要——因为正如第 6 节所强调的，<strong>单独一个 linear probe 数字远不足以刻画一个表示的真实价值</strong>（它可能在标准集上很高，却在分布偏移、鲁棒性或公平性上崩掉）。</p>  <ul>
+    <li><strong>掩码 vs 对比的统一</strong>：iBOT、data2vec、I-JEPA 等试图融合两条路线（在表示空间而非像素空间做重建），「哪种自监督目标最好、能否统一」仍是开放问题。</li>
+    <li><strong>多模态自监督</strong>：CLIP（图文对比）把自监督推向跨模态，成为 VLM 的基石；进一步扩展到图-文-音-视频的统一预训练是当前前沿。</li>
+    <li><strong>扩展律与数据</strong>：SSL 表示质量如何随数据量/模型规模扩展、数据质量与去重的影响、性能是否会饱和，是大规模预训练的核心议题。</li>
+    <li><strong>评测的局限</strong>：linear probe 准确率与真实下游效用、鲁棒性、公平性未必一致；如何<em>全面</em>评估表示质量（而非只盯一个 probe 数字）仍待解决。</li>
+    <li><strong>坍缩与几何的理论</strong>：BYOL/SimSiam 不用负样本却不坍缩的确切机理、对比学习最终学到的表示具有何种几何结构，仍有活跃的理论研究。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：<strong>Chen SimCLR</strong>（对比学习集大成）、<strong>He MAE</strong>（掩码重建，本模块两大支柱）、<strong>He MoCo</strong>（动量对比）、<strong>Grill BYOL</strong>（无负样本却不坍缩）、<strong>Caron DINO</strong>（自蒸馏，注意力涌现分割）、<strong>Oord CPC</strong>（InfoNCE 之源），详见 <code>references.md</code>。至此你已走完核心 CV 的低层 → 三大任务 → 自监督的全谱系。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_segmentation/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 图像分割</div></a>
+    <a class="next" href="../index.html"><div class="dir">下一模块 →</div><div class="t">返回课程主页</div></a>
+  </div>
+
+</div>
+</body>
+</html>

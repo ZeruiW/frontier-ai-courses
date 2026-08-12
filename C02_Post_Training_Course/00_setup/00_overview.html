@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>00 · 课程总览与环境</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 00 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>00 · 课程总览与环境</h1>
+  <p class="subtitle">Post-Training &amp; Alignment —— 预训练给了模型能力，后训练决定它"是谁"</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">Transformer / 交叉熵、PyTorch 基础、概率论（KL 散度）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 00_environment_check.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">InstructGPT (2022)、DPO (2023)、DeepSeek-R1 (2025)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 40 分钟 + 跑 20 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#pipeline">后训练管线全景：base model 是怎么变成 assistant 的</a></li>
+      <li><a href="#map">8 模块地图：监督 → 强化 → 评测与前沿</a></li>
+      <li><a href="#method">学习法：推导 · 玩具实现 · 真实小模型实跑</a></li>
+      <li><a href="#env">环境配置：conda + requirements + ipykernel</a></li>
+      <li><a href="#selftest">前置自测 5 问</a></li>
+      <li><a href="#evalview">全局图景与评测视角：每个阶段引入能力，也引入偏差</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">1</span>后训练管线全景：base model 是怎么变成 assistant 的</h2>
+
+  <p>预训练（<span class="term">pre-training</span>）在万亿级 token 上做 next-token prediction，给模型注入了几乎全部的<strong>知识与能力</strong>。
+  但一个刚出炉的 <span class="term">base model</span> 只会"续写"：你问它"法国的首都是哪里？"，它可能回你"德国的首都是哪里？意大利的首都是哪里？"——因为训练语料里考卷长这样。
+  <strong>后训练（<span class="term">post-training</span>）不再注入多少新知识，而是塑造模型的行为：它是谁、为谁服务、什么该说、怎么思考。</strong></p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>预训练像读完了整个图书馆，后训练像入职培训：先看示范学会"怎么回答"（SFT），
+      再根据别人对你两份答案的偏好反馈调整风格与价值观（RLHF/DPO），
+      最后在有标准答案的任务上反复刷题、自己摸索出解题套路（RLVR）。
+      每一步都不教新知识，教的是<strong>行为</strong>。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>后训练是在预训练分布 $p_{\text{base}}$ 的支撑集内做<strong>分布调制</strong>：SFT 用极大似然把概率质量搬到示范分布上；
+      RLHF/DPO 在 KL 约束下最大化奖励 $\max_\pi \mathbb{E}[r(x,y)] - \beta\, \mathrm{KL}(\pi \| \pi_{\text{ref}})$；
+      RLVR 用可验证奖励信号直接强化能通向正确答案的推理轨迹。三者共享同一个核心原语：<strong>序列的对数概率 $\log \pi_\theta(y|x)$</strong>。</p>
+    </div>
+  </div>
+
+  <p>完整管线如下，注意每个阶段的<strong>数据形态</strong>和<strong>目标函数</strong>都不一样——这张图是全课的骨架，后面每个模块都在放大其中一格：</p>
+
+  <div class="ascii">
+              预训练                                后  训  练  (本课范围)
+  ┌─────────────────────┐   ┌────────────────┐   ┌─────────────────────┐   ┌────────────────────┐
+  │   Base Model        │──►│  ① SFT          │──►│ ② 偏好对齐           │──►│ ③ 推理 RL           │
+  │   (只会续写)         │   │  指令微调        │   │  RLHF(PPO) / DPO     │   │  RLVR / GRPO        │
+  └─────────────────────┘   └────────────────┘   └─────────────────────┘   └────────────────────┘
+   数据: 万亿 token 原始文本   数据: (prompt,        数据: (prompt, chosen,    数据: (prompt, 可验证
+         (网页/书籍/代码)            response) 示范对         rejected) 偏好对           答案) 例如数学题
+         规模 ~10¹² token           规模 ~10⁴–10⁶           规模 ~10⁴–10⁶             规模 ~10³–10⁵
+   目标: next-token 交叉熵    目标: 只对 response     目标: max E[r] − β·KL     目标: 组相对优势 ×
+         L = −Σ log p(tᵢ|t<ᵢ)       算交叉熵                (PPO) 或 DPO              规则奖励 (对/错,
+                                    (loss masking)          闭式偏好损失              格式) 的策略梯度
+   产物: 知识与能力           产物: 会听指令、         产物: helpful / honest /  产物: long CoT、
+         的"原料"                   会用 chat 格式          harmless 的助手           会反思的推理模型
+         ────────────────── 模块 01 ────────────── 模块 02/03/04 ─────────── 模块 05 ──────────
+  </div>
+
+  <p>把四个目标函数并排写出来，能看清这条管线在数学上的递进：</p>
+
+  <div class="math-block">
+  $$ \text{Pre-train / SFT:}\quad \mathcal{L} = -\sum_{i\,\in\,\mathcal{M}} \log \pi_\theta(t_i \mid t_{&lt;i})
+     \qquad \begin{cases}\text{预训练: } \mathcal{M}=\text{全部 token}\\[2pt] \text{SFT: } \mathcal{M}=\text{仅 response token}\end{cases} $$
+  </div>
+
+  <div class="math-block">
+  $$ \text{RLHF:}\quad \max_{\pi_\theta}\; \mathbb{E}_{x\sim\mathcal{D},\,y\sim\pi_\theta}\big[\, r_\phi(x,y)\,\big]
+     \;-\; \beta\,\mathrm{KL}\!\big(\pi_\theta(\cdot|x)\,\|\,\pi_{\text{ref}}(\cdot|x)\big) $$
+  </div>
+
+  <div class="math-block">
+  $$ \text{RLVR:}\quad r(x,y) = \mathbb{1}[\,\text{answer}(y)=\text{answer}^*(x)\,] + \lambda\cdot\mathbb{1}[\,\text{format ok}\,]
+     \quad\text{（奖励来自规则验证器，而非学出来的 } r_\phi \text{）} $$
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  注意三条公式里反复出现的 $\log \pi_\theta(y|x)$——<strong>逐 token logprob 是整个后训练的"原子操作"</strong>：
+  SFT 最大化它，PPO/GRPO 用新旧策略的 logprob 比值做 importance ratio，DPO 用 policy 和 reference 的 logprob 差做隐式奖励，KL 惩罚也是两组 logprob 之差。
+  本模块 notebook 的冒烟测试就是先把它跑通。</div>
+
+  <div class="callout paper"><span class="label"></span>
+  这条 SFT → RM → RLHF 三段式管线由 <strong>InstructGPT</strong> [Ouyang 2022] 确立，至今仍是工业界主干；
+  <strong>DPO</strong> [Rafailov 2023] 证明偏好对齐可以绕过显式 RM 与 RL 循环；
+  <strong>DeepSeek-R1</strong> [DeepSeek-AI 2025] 则展示了纯 RLVR 能"涌现"出反思与长链推理。三篇是本课的纲。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="map"><span class="num">2</span>8 模块地图：监督 → 强化 → 评测与前沿</h2>
+
+  <p>课程沿管线顺序展开，分三条轨道。<strong>建议严格按序学</strong>：03 的 PPO 依赖 02 的 reward model，04 的 DPO 推导直接从 03 的 RLHF 目标出发，06 的评测要用到前面所有阶段的失败模式。</p>
+
+  <table>
+    <thead><tr><th>轨道</th><th>模块</th><th>主题</th><th>你将亲手实现</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="3"><strong>监督阶段</strong><br>00–02</td>
+          <td>00</td><td>课程总览与环境（本章）</td><td>logprob 计算、KL 散度</td></tr>
+      <tr><td>01</td><td>SFT 与 loss masking</td><td>chat template、masked 交叉熵、LoRA 微调</td></tr>
+      <tr><td>02</td><td>奖励模型：Bradley-Terry 与 reward hacking</td><td>BT 损失、训练玩具 RM、观察 overoptimization</td></tr>
+      <tr><td rowspan="3"><strong>强化对齐</strong><br>03–05</td>
+          <td>03</td><td>RLHF 与 PPO</td><td>策略梯度 → clipped surrogate → KL penalty，手写 PPO 循环</td></tr>
+      <tr><td>04</td><td>DPO 家族：推导与实跑</td><td>从 RLHF 目标推出 DPO，对比 IPO/KTO/SimPO</td></tr>
+      <tr><td>05</td><td>推理模型与 RLVR/GRPO</td><td>group advantage、format reward，手写 GRPO</td></tr>
+      <tr><td rowspan="2"><strong>评测与前沿 ★</strong><br>06–07</td>
+          <td>06</td><td>对齐的评测 ★</td><td>测量 sycophancy / length bias、审 LLM-as-judge</td></tr>
+      <tr><td>07</td><td>前沿：CAI、self-play 与 weak-to-strong</td><td>RLAIF 模拟、weak-to-strong 实验复现</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  对做 model evaluation 的人来说，<strong>06 是本课的"目的地"</strong>，00–05 是抵达它的必经之路：
+  不亲手训过一个会 reward hacking 的 RM、没见过 PPO 把策略推到 KL 爆炸，就很难在评测中把一个行为异常<em>归因</em>到正确的训练阶段。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="method"><span class="num">3</span>学习法：推导 · 玩具实现 · 真实小模型实跑</h2>
+
+  <p>每个模块都按同一个三层结构组织，对应"懂原理 → 懂实现 → 懂工程"：</p>
+
+  <ul>
+    <li><strong>第一层：推导</strong>（HTML 讲解）——每个损失函数从动机出发完整推导，不跳步。你应该能在白板上从 RLHF 目标推出 DPO。</li>
+    <li><strong>第二层：玩具实现</strong>（notebook 主体）——<strong>核心算法全部用纯 PyTorch 在玩具规模实现，CPU 可跑</strong>：3-token 词表的"语言模型"、几十个参数的策略网络。规模小到每个中间张量都能打印出来看。</li>
+    <li><strong>第三层：真实小模型实跑</strong>（notebook 可选段）——用 <code>Qwen/Qwen2.5-0.5B-Instruct</code> 走一遍真实工具链（peft/trl），标 <span class="badge gpu">GPU可选</span>，全部带确定性 mock 回退，没有 GPU、不下载模型也能跑通全流程。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>✏️ 练习必做，不是可选。</strong>每个 notebook 含 2–4 道练习：给函数骨架 + <code>TODO</code>，配 assert 自测 cell，全过才算通过；末尾有 📖 参考答案，但先自己写。
+  后训练的算法（PPO 的 ratio clipping、DPO 的 logprob 差、GRPO 的组归一化）全是"看着都懂、一写就错"的类型——肌肉记忆只能靠写。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="env"><span class="num">4</span>环境配置：conda + requirements + ipykernel</h2>
+
+  <p>全课共用一个 conda 环境 <code>posttrain</code>，并注册成 Jupyter kernel（所有 notebook 的 kernelspec 都指向它）：</p>
+
+  <div class="ascii">
+  # 1. 建环境（Python 3.11）
+  conda create -n posttrain python=3.11 -y
+  conda activate posttrain
+
+  # 2. 装依赖（课程根目录的 requirements.txt，CPU 即可；含 peft / trl / transformers）
+  pip install -r requirements.txt
+
+  # 3. 注册 Jupyter kernel —— name 必须是 posttrain
+  python -m ipykernel install --user --name posttrain --display-name "Post-Training Course"
+
+  # 4.（可选）API key：只影响个别评测/真实模型 cell，缺了也能跑通全课
+  export HF_TOKEN=hf_...          # 拉取需要授权的 HF 模型/数据集
+  export OPENAI_API_KEY=sk-...    # 模块 06 LLM-as-judge 对比实验
+
+  # 5. 启动
+  jupyter lab
+  </div>
+
+  <table>
+    <thead><tr><th>依赖</th><th>用途</th><th>哪些模块用</th></tr></thead>
+    <tbody>
+      <tr><td><code>torch</code> / <code>numpy</code> / <code>scipy</code></td><td>玩具实现 + 统计检验</td><td>全部</td></tr>
+      <tr><td><code>transformers</code> (≥4.49) / <code>datasets</code></td><td>真实小模型与数据加载</td><td>01–06 可选段</td></tr>
+      <tr><td><code>peft</code></td><td>LoRA/QLoRA 微调</td><td>01、04</td></tr>
+      <tr><td><code>trl</code></td><td>SFTTrainer / DPOTrainer / GRPOTrainer 对照实现</td><td>01、04、05</td></tr>
+      <tr><td><code>openai</code> / <code>anthropic</code></td><td>LLM-as-judge（env 检测 + 优雅回退）</td><td>06</td></tr>
+    </tbody>
+  </table>
+
+  <p>配置完成后，先跑本模块的 <code>00_environment_check.ipynb</code>：它会自检所有依赖版本、检测 device 与 API key，并用一个 3-token 玩具语言模型做 <strong>logprob 冒烟测试</strong>——这是全课最核心的原语，必须先跑通再进模块 01。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="selftest"><span class="num">5</span>前置自测 5 问</h2>
+
+  <p>下面 5 问覆盖了本课依赖的全部前置概念。<strong>能口头回答 4 问以上</strong>即可直接开始；否则按括号里的指引补课（每个点 1–2 小时足够）。</p>
+
+  <ol>
+    <li><strong>交叉熵</strong>：写出分类交叉熵损失 $-\log p_\theta(y^*)$，并说明"最小化交叉熵 = 最大化正确 token 的 logprob"为什么成立。（不熟 → 复习极大似然估计）</li>
+    <li><strong>Policy gradient 直觉</strong>：一句话解释 $\nabla_\theta \mathbb{E}[R] = \mathbb{E}[R \cdot \nabla_\theta \log \pi_\theta(a)]$ 在做什么——为什么"提高高回报动作的 logprob"就是它的全部？（不熟 → REINFORCE 推导，模块 03 也会从头讲）</li>
+    <li><strong>KL 散度</strong>：写出 $\mathrm{KL}(P\|Q)=\sum_i p_i \log\frac{p_i}{q_i}$，并回答：它对称吗？什么时候为 0？为什么 RLHF 用它把策略"拴"在 reference model 附近？（不熟 → notebook 练习 2 会让你亲手实现）</li>
+    <li><strong>LoRA 概念</strong>：LoRA 把权重更新约束成 $\Delta W = BA$（低秩分解），为什么这能把可训练参数降低两个数量级而效果损失很小？（不熟 → 知道"冻结原权重、只训低秩旁路"即可，模块 01 详讲）</li>
+    <li><strong>logprob 计算</strong>：给定 LLM 输出的 logits 张量（形状 <code>[seq_len, vocab]</code>）和一个 token 序列，如何算出该序列的总 log 概率？（不熟 → 这正是 notebook 练习 1，做完就熟）</li>
+  </ol>
+
+  <div class="callout intuition"><span class="label"></span>
+  注意第 1、2、5 问其实是同一件事的三个侧面：<strong>后训练的所有算法最终都化归为"调整某些序列的 logprob"</strong>——SFT 无条件抬高示范序列，RLHF/GRPO 按回报加权抬高或压低采样序列，DPO 抬高 chosen 压低 rejected。抓住这条主线，整门课就是一个故事。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="evalview"><span class="num">6</span>全局图景与评测视角：每个阶段引入能力，也引入偏差</h2>
+
+  <p>本课的独特视角：把后训练管线当作<strong>评测对象的"病史"</strong>来读。每个训练阶段在赋予模型新能力的同时，都系统性地引入了可测量的行为偏差——而且这些偏差不是 bug，是目标函数的<em>必然产物</em>：</p>
+
+  <table>
+    <thead><tr><th>阶段</th><th>引入的能力</th><th>引入的偏差</th><th>偏差的根源</th></tr></thead>
+    <tbody>
+      <tr><td><strong>SFT</strong></td><td>指令遵循、对话格式</td><td><span class="term">格式偏置</span>：模仿示范的表面风格（markdown、列表、固定开场白），benchmark 上"格式刷分"</td><td>极大似然学的是示范分布的全部特征，分不清内容与形式 [Zhou 2023, LIMA]</td></tr>
+      <tr><td><strong>RLHF</strong></td><td>helpful / harmless 偏好</td><td><span class="term">谄媚 sycophancy</span>：迎合用户既有观点；以及 length bias（越长越高分）</td><td>RM 学的是"人类标注者喜欢什么"，而人偏爱认同自己、内容详尽的回答 [Sharma 2023]</td></tr>
+      <tr><td><strong>RLVR</strong></td><td>long CoT、自我反思</td><td><span class="term">过度思考 overthinking</span>：简单问题也展开千 token 推理；CoT 可能与真实计算脱节</td><td>奖励只看最终答案对错，更长的探索在训练中平均回报更高</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>评测人不懂管线，就无法归因。</strong>看到一个模型在 judge 评测里分数虚高，你必须能分诊：是 SFT 格式刷分（换 length-controlled 评测试试 [Dubois 2024]）？是 RLHF 的 sycophancy（换对抗性 persona 试试）？还是 judge 自身的偏置？
+  三种病根对应三种完全不同的修复路径——开错药方比不开更糟。这正是模块 06 的核心训练内容，也与《LLM 评测科学》课的 judge 偏置、contamination 章节直接互通：那门课教你<em>怎么测</em>，这门课教你<em>为什么模型会变成这样</em>。</div>
+
+  <p>一个有用的心智模型：<strong>后训练阶段越靠后，行为越"讨喜"，但与 base model 真实能力分布的 KL 距离越大</strong>。评测一个对齐后的模型，本质上是在测量"这段 KL 预算花得值不值"——买到了多少安全与有用性，付出了多少多样性、校准度（calibration）与诚实性的代价 [Askell 2021 的 alignment tax]。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>对齐是表层的还是深层的？</strong> superficial alignment hypothesis [Zhou 2023] 认为后训练只学了"格式与风格"，知识全部来自预训练。若为真，对齐评测应聚焦行为稳健性而非能力；但 RLVR 涌现推理 [DeepSeek-AI 2025] 似乎是反例——能力确实在后训练中变化了。这条争论决定了"能力评测"与"对齐评测"能否解耦。</li>
+    <li><strong>RM 是真实偏好的劣质代理。</strong> 对 proxy reward 的过度优化必然偏离真实目标 [Gao 2022 的 overoptimization scaling laws]。开放问题：能否在线检测"策略开始 hack RM"的拐点？评测视角：RewardBench 式静态评测能多大程度预测 RM 在 RL 中的下游表现？</li>
+    <li><strong>Process vs outcome supervision。</strong> 只奖励最终答案（ORM）会纵容"歪打正着"的错误推理；逐步监督（PRM [Lightman 2023]）更可靠但标注极贵，且 CoT 的<em>忠实性</em>（faithfulness）本身存疑——模型写下的推理未必是它真实的计算路径。这直接威胁所有基于 CoT 的评测与监控方案。</li>
+    <li><strong>对齐方法的可扩展性。</strong> 当模型强于标注者，人类偏好还能当监督信号吗？weak-to-strong generalization [Burns 2023]、Constitutional AI / RLAIF [Bai 2022] 是两条主要回应路线，模块 07 展开。评测视角：怎么评一个"评测者本身已看不懂其输出"的模型？</li>
+    <li><strong>后训练配方的科学化。</strong> 各家管线（先 DPO 还是先 RLHF？RLVR 数据配比？）仍以 ablation 玄学为主，缺少预测性理论。Tülu 3 [Lambert 2024] 是少数全开源配方，值得精读。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>画出 base model → SFT → 偏好对齐 → 推理 RL 的完整管线，标出每个阶段的数据形态与目标函数。</li>
+      <li>SFT 已经能让模型听指令了，为什么还需要偏好对齐？RLHF 目标中的 KL 项是防什么的？</li>
+      <li>SFT / RLHF / RLVR 各自系统性地引入了什么行为偏差？拿到一个评测异常，你会怎么归因到训练阶段？</li>
+      <li>为什么说逐 token logprob 是后训练的核心原语？至少举出三个用到它的算法环节。</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../index.html"><div class="dir">← 上一章</div><div class="t">课程主页</div></a>
+    <a class="next" href="../01_sft/01_讲解.html"><div class="dir">下一章 →</div><div class="t">01 · SFT 与 loss masking</div></a>
+  </div>
+
+</div>
+</body>
+</html>

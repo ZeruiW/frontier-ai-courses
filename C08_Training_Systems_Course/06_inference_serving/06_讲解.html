@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · 推理服务：KV Cache、Batching、Speculative Decoding</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 06 / 07</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>06 · 推理服务：KV Cache、Batching、Speculative Decoding</h1>
+  <p class="subtitle">prefill 与 decode 两个相，KV cache 怎么吃显存、continuous batching 怎么提吞吐、投机解码怎么无损提速——全部算到真实数字。</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（roofline / 显存）、注意力与 KV（C1 课程）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 06_inference_serving.ipynb（真实模型 KV 维度）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Kwon 2023 (vLLM/PagedAttention)；Leviathan 2023 (Speculative Decoding)；Ainslie 2023 (GQA)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#phase">动机：推理的两个相 prefill 与 decode</a></li>
+      <li><a href="#roofline">直觉：用 roofline 看穿 decode 为何 memory-bound</a></li>
+      <li><a href="#kv">数学推导：KV cache 把 O(S²) 降为 O(S) 与显存公式</a></li>
+      <li><a href="#kvnum">从零算账：KV cache 的真实数值例（0.5 MB/token → 64 GB）</a></li>
+      <li><a href="#batch">从零算账：给定显存预算的最大并发推导（80GB → 约 33 条）</a></li>
+      <li><a href="#cbatch">从零实现思路：continuous batching 为何碾压静态批处理</a></li>
+      <li><a href="#spec">数学推导：speculative decoding 无损加速与期望加速比</a></li>
+      <li><a href="#drill">面试 drill：推理系统五连问与四大陷阱</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="phase"><span class="num">1</span>动机：推理的两个相 prefill 与 decode</h2>
+  <p>到目前为止本课谈的几乎都是<strong>训练</strong>。但模型造出来是要<strong>用</strong>的，而<strong>推理</strong>（inference）的成本结构与训练完全不同，甚至连<em>瓶颈在哪</em>都不一样：一个 7B 模型训练时是典型的 compute-bound 大 matmul 流水线，可一旦上线逐字生成回答，它会突然变成 memory-bound——昂贵的张量核心大量空转，等着从显存里把权重搬进来。不理解这个反差，你会买错卡、batch 开错、把钱烧在算力上而真正瓶颈在带宽。</p>  <p>LLM 推理天然分两个相（phase），性质截然不同。第一相叫 <span class="term">prefill</span>：模型一次性吃下整段 prompt，把所有输入 token <strong>并行</strong>地过一遍前向，算出每个位置的 K、V 并填进缓存，最后从最后一个位置采样出第一个生成 token。因为是整段并行的大矩阵乘矩阵（matmul），算术强度高，<strong>compute-bound</strong>，优化目标是把算力吃满。第二相叫 <span class="term">decode</span>（也叫 generation / autoregressive 相）：从第一个生成 token 开始，一次只产 1 个 token，下一个 token 依赖上一个，无法并行。此时的核心运算是<strong>矩阵×向量</strong>（一个 token 的隐藏向量乘权重矩阵），<strong>memory-bound</strong>，优化目标是减少搬运。</p>  <p>把这两相分开想，是理解本章一切技巧的钥匙——<span class="term">KV cache</span>、<span class="term">continuous batching</span>、<span class="term">speculative decoding</span> 治的都是同一个病：decode 相严重 memory-bound。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>prefill 像<strong>读题</strong>：一口气把整道题读完，脑子全速运转，越快越好。decode 像<strong>一个字一个字往纸上写答案</strong>：写每个字之前都要把整本<em>草稿（权重）</em>翻一遍，而真正动笔写的那一下子其实很快——你的时间全花在翻草稿上。所以让 decode 快，关键不是手写得更快，而是<strong>少翻草稿</strong>（少搬权重）或<strong>一次翻草稿多写几个字</strong>（batching / 投机）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>prefill 处理长度 $S$ 的 prompt 时，矩阵乘是 $(S\times h)\cdot(h\times h)$，一次权重搬运摊到 $S$ 个 token，算术强度 $\sim S$，在 ridge point 右侧（compute-bound）；decode 每步只算 $(1\times h)\cdot(h\times h)$，搬全部权重只产 1 个 token，算术强度 $\sim O(1)$，在 ridge point 左侧（memory-bound）。同一份权重，两相站在 roofline 的两边。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="roofline"><span class="num">2</span>直觉：用 roofline 看穿 decode 为何 memory-bound</h2>
+  <p>回顾模块 01 的 <span class="term">roofline</span> 模型：一段计算到底是被算力卡住还是被带宽卡住，由它的<strong>算术强度</strong>（arithmetic intensity，每搬运 1 字节做多少次浮点运算，单位 FLOP/byte）决定。硬件有一个 ridge point：算术强度高于它，受算力（峰值 FLOP/s）限制；低于它，受带宽（GB/s）限制。A100 的 ridge point 大约在 $312\text{e}12 / 2039\text{e}9 \approx 153$ FLOP/byte 这个量级——也就是说，每从显存搬 1 字节，至少要做 153 次浮点运算才不浪费算力。</p>  <div class="math-block">\[\text{算术强度}=\frac{\text{FLOPs}}{\text{搬运字节}},\qquad \text{算术强度}>\text{ridge}\Rightarrow\text{compute-bound};\quad \text{算术强度}<\text{ridge}\Rightarrow\text{memory-bound}\]</div>  <p>decode 每步只生成 1 个 token：要把整个权重（数 GB）从显存搬进片上，却只做 $\sim 2N$ 次浮点运算（后面模块 07 会推导单 token 前向 $\approx 2N$ FLOPs）。算术强度约等于 $2N / (2N) = O(1)$ FLOP/byte——因为 bf16 权重每个参数 2 字节，搬运量 $\approx 2N$ 字节，计算量 $\approx 2N$ FLOPs，<strong>二者同阶</strong>，算术强度被死死压在个位数，远低于 ridge point 的 153。结论刺眼：decode 时昂贵的张量核心<strong>绝大部分时间在等数据</strong>，算力利用率可能只有百分之几。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话记住 decode 为什么慢：<strong>它不是算不过来，而是喂不饱。</strong>权重每搬一趟只服务 1 个 token，太亏。所以提速的三条路全指向同一个动作——让<em>每搬一趟权重</em>产出更多 token：batch 多请求共享搬运（continuous batching）、一趟验证多个候选 token（speculative decoding）、或把权重搬得更便宜（量化，呼应模块 05）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="kv"><span class="num">3</span>数学推导：KV cache 把 O(S²) 降为 O(S) 与显存公式</h2>
+  <p>自回归生成有一个结构性浪费。生成第 $t$ 个 token 时，注意力要让它<strong>回看之前所有 token</strong>——也就是对位置 $1\dots t$ 的 key、value 做注意力。最朴素的实现每生成一步都把前面所有 token 的 K、V 从头算一遍，那么生成长度 $S$ 的序列，总 K/V 计算是 $1+2+\dots+S=O(S^2)$。但有个关键观察：位置 $i$ 的 K、V <strong>只依赖位置 $i$ 自己的输入</strong>，与后面生成什么无关，所以它一旦算出来就再也不会变。</p>  <p><span class="term">KV cache</span> 就是把已经算过的 K、V 存进显存，每步<strong>只算新 token 的 K、V 并追加</strong>，历史部分直接从缓存读。于是每步的 K/V 计算从 $O(S)$（重算全部）降到 $O(1)$（只算 1 个），整段生成从 $O(S^2)$ 降到 $O(S)$。这是 LLM 服务的第一性优化，没有它逐字生成根本不可用。</p>  <p>代价是显存。每个序列的 KV cache 大小有一条必须背下来的公式：</p>  <div class="math-block">\[\text{KV bytes}=2\cdot L\cdot S\cdot h\cdot b\]</div>  <p>逐项解释：$2$ 是因为要同时存 K 和 V；$L$ 是层数（每一层都有自己的一份 KV）；$S$ 是当前序列长度（已生成 + prompt）；$h$ 是隐藏维（hidden size，等于所有注意力头拼起来的维度）；$b$ 是每个数的字节数（bf16 是 2，int8 是 1）。<strong>注意它对 $S$ 线性增长</strong>——序列越长缓存越大，这正是长上下文（long context）服务显存噩梦的根源。</p>  <div class="callout danger"><span class="label">推理显存的真正大头常常是 KV，不是权重</span>
+    <p><strong>长上下文 + 大 batch 时，KV cache 会超过模型权重本身。</strong>很多人第一反应想不到：权重是固定的（7B 模型 bf16 约 14 GB），可 KV cache 随并发数和序列长度<strong>线性叠加</strong>。所以一张 80 GB 卡能跑多大并发，往往不是权重决定的，而是 KV 决定的——下一节用真实维度把这笔账算到具体数字。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>生成第 100 个字时要回看前 99 个字。KV cache 就是把前面字的<em>记忆</em>存着，不用每写一个字就把全文重读一遍，只把新字的记忆追加进去。省了海量重复计算，但这些记忆本身占地方：文越长、同时服务的人越多，占得越多——多到能盖过模型本身。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>GQA（<span class="term">grouped-query attention</span>）让多个 query 头共享一组 KV 头，把上式里的 $h$（在 KV 口径上）缩小数倍——这是 LLaMA-2/3 等现代模型的标配，纯粹为了推理时省 KV 显存。MQA（<span class="term">multi-query attention</span>）是极端版：所有 query 头共享 1 组 KV，缩到最小但表达力略损（第 9 节还有 MLA）。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="kvnum"><span class="num">4</span>从零算账：KV cache 的真实数值例（0.5 MB/token → 64 GB）</h2>
+  <p>光有公式不够，面试官真正想听的是你<strong>把数字代进去</strong>。我们用一个 7B-class 模型的真实量级维度：层数 $L\approx 32$，隐藏维 $h\approx 4096$，权重用 bf16（$b=2$ 字节）。先算<strong>每个 token 占多少 KV</strong>：把 $S=1$ 代入公式（即单 token 的增量）。</p>  <div class="math-block">\[\text{KV/token}=2\cdot L\cdot h\cdot b=2\times 32\times 4096\times 2\ \text{B}=524288\ \text{B}\approx 0.5\ \text{MB/token}\]</div>  <p>记住这个锚点：<strong>7B 模型每个 token 约 0.5 MB KV</strong>（bf16、无 GQA 折扣）。接着算单条序列：长度 $S=4096$ 的上下文。</p>  <div class="math-block">\[\text{KV}_{\text{1 seq}}=0.5\ \text{MB/token}\times 4096\ \text{token}\approx 2048\ \text{MB}\approx 2\ \text{GB}\]</div>  <p>一条 4K 序列就要 2 GB KV。现在把并发拉到 $\text{batch}=32$ 条同样长的序列：</p>  <div class="math-block">\[\text{KV}_{\text{batch}}=2\ \text{GB}\times 32\approx 64\ \text{GB}\]</div>  <p>64 GB——<strong>远超 14 GB 的模型权重本身</strong>，几乎吃满一张 80 GB 的 A100。这就把上一节那句<em>「KV 可超权重」</em>从口号变成了铁一般的数字。再看 <span class="term">GQA</span> 的威力：若把 KV 头从 32 组降到 8 组（典型 GQA 配置），KV 在头维度上缩 $32/8=4$ 倍，单 token 降到约 0.125 MB，batch=32 的 KV 从 64 GB 降到约 16 GB——一下子腾出 48 GB 给更大的 batch。这就是 GQA 为何是现代推理标配。</p>  <table>
+    <thead><tr><th>口径</th><th>数值（7B-class, bf16）</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>每 token KV</td><td>≈ 0.5 MB</td><td>2·L·h·b = 2·32·4096·2</td></tr>
+      <tr><td>单条 4K 序列</td><td>≈ 2 GB</td><td>0.5 MB × 4096</td></tr>
+      <tr><td>batch=32 × 4K</td><td>≈ 64 GB</td><td>2 GB × 32，已超 14 GB 权重</td></tr>
+      <tr><td>GQA 8 组后 batch=32</td><td>≈ 16 GB</td><td>KV 头 32→8，缩 4×</td></tr>
+      <tr><td>int8 KV 量化后</td><td>再砍一半</td><td>b: 2→1（呼应模块 05）</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>别把 $h$ 和 KV 头维度混为一谈。上面 $2\cdot L\cdot S\cdot h\cdot b$ 里的 $h$ 在<strong>无 GQA</strong>时确实等于隐藏维；有 GQA 时，KV 部分的有效维度是 <code>n_kv_heads × head_dim</code>，比隐藏维小数倍。面试时若模型用了 GQA，务必把这个折扣算进去，否则会把 KV 高估几倍。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="batch"><span class="num">5</span>从零算账：给定显存预算的最大并发推导（80GB → 约 33 条）</h2>
+  <p>KV 公式最实用的下游问题就是面试高频题：<strong>给定一张卡，最多能并发服务多少条序列？</strong>思路是把显存当预算来分账。一张卡的显存先被权重占掉一块，剩下的全部留给 KV cache（外加少量激活与碎片，back-of-envelope 时先忽略），再除以单条序列的 KV，就是最大并发数。</p>  <div class="math-block">\[\text{最大并发}=\Big\lfloor\frac{\text{卡显存}-\text{权重显存}}{\text{单序列 KV}}\Big\rfloor\]</div>  <p>代真实数字：一张 80 GB 的 A100，跑 7B 模型（bf16 权重约 14 GB），单条序列按上一节的 4K 长度算 2 GB KV：</p>  <div class="math-block">\[\text{预算}=80-14=66\ \text{GB},\qquad \text{最大并发}=\Big\lfloor\frac{66}{2}\Big\rfloor\approx 33\ \text{条}\]</div>  <p>约 33 条并发。这个数字立刻告诉你很多事：想服务更多用户，要么缩短上下文（$S$ 小则单序列 KV 小），要么上 GQA（把那 2 GB 缩成 0.5 GB，并发直接翻到约 132 条），要么 KV 量化到 int8（再翻倍），要么换显存更大的卡。注意这是<strong>理论上界</strong>：真实系统还要扣激活、临时 buffer 与碎片浪费——这正是第 9 节 PagedAttention 要解决的。</p>  <div class="ascii">80 GB A100 显存预算分账（7B, bf16, 4K 上下文）
+┌────────────────────────────────────────────────┐
+│ 权重 14 GB │  KV cache 预算 66 GB  → 约 33 条并发 │
+├────────────┼───────────────────────────────────┤
+│ 权重 14 GB │  GQA 8组：单序列0.5GB → 约132条并发  │
+└────────────┴───────────────────────────────────┘
+结论：并发数由 KV 预算决定，不是由权重决定。</div>  <div class="callout intuition"><span class="label"></span>
+    <p>把显存想成固定大小的停车场：权重是永远停着的几辆大巴（固定车位），剩下车位全给 KV cache 这些<em>临时小车</em>。序列越长小车越大越占位，GQA/量化把小车压扁，同样车位能塞更多并发。面试时能现场把这个停车场账算出来，比背任何术语都有说服力。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cbatch"><span class="num">6</span>从零实现思路：continuous batching 为何碾压静态批处理</h2>
+  <p>既然 decode 是 memory-bound、搬一趟权重只服务 batch=1 太亏，最直接的解药就是 <span class="term">batching</span>：把多个请求拼在一起，一次搬权重同时服务多个序列。算术强度随 batch 线性上升，decode 从 memory-bound 被拉回 compute-friendly，吞吐成倍涨。问题在于<strong>怎么 batch</strong>。</p>  <p>最朴素的 <span class="term">static batching</span>（静态批处理）：凑齐一批请求一起开跑，<strong>等整批全部生成完</strong>再换下一批。但不同请求的生成长度天差地别——有人要 20 个 token，有人要 2000 个。静态批处理被最长的那个拖死：短请求早早算完，它的 GPU 槽位却空等着最长请求收尾，期间那部分算力纯属浪费。</p>  <p><span class="term">continuous batching</span>（连续批处理，vLLM 的核心调度机制）换了思路：<strong>以 token 为粒度调度，而非以请求为粒度</strong>。每生成一步都重新组批：哪个序列生成完了（吐出 EOS），立刻把它的槽位让给排队中的新请求，<strong>不等整批</strong>。于是 GPU 几乎永远满载，吞吐相比静态批处理可提升数倍。</p>  <div class="ascii">静态 batching:  [req1====][空闲........]   ← 等最长的 req2 收尾
+                [req2================]      整批跑完前 req1 槽位空等
+                  ↑ 浪费的 GPU 时间
+
+continuous:     [req1====][req3======]     ← req1 一完成立刻插入 req3
+                [req2================]      槽位不空等，吞吐 ↑↑
+                [req4==][req5=========]</div>  <div class="callout intuition"><span class="label"></span>
+    <p>静态批处理像<strong>拼车必须等全车人都到目的地才发下一趟</strong>——先到的人干等。连续批处理像<strong>出租车随上随下</strong>：哪个座位空了立刻拉下一个客人，车（GPU）一刻不停。对评测尤其重要：你大规模跑 eval 时，请求长度参差不齐，连续批处理能把同样的卡的有效吞吐拉高几倍，直接省钱。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="spec"><span class="num">7</span>数学推导：speculative decoding 无损加速与期望加速比</h2>
+  <p>decode 慢的根因是<strong>串行 + memory-bound</strong>：每步只产 1 token，且每步都要搬全部权重。<span class="term">speculative decoding</span>（投机解码）用一招把串行偷换成并行验证。它配一个小而快的 <span class="term">draft model</span>（草稿模型）和原本的大 <span class="term">target model</span>（目标模型）：draft 先快速自回归猜出 $k$ 个候选 token，然后 target <strong>一次前向并行验证</strong>这 $k$ 个位置——因为给定前缀，target 算这 $k$ 个位置的概率是一个 $k$-token 的 matmul，和 prefill 一样 compute-friendly，一趟权重搬运服务了 $k$ 个位置。</p>  <p>验证规则是<strong>从头逐个接受</strong>：对每个候选位置，按一个精心设计的接受概率决定接不接受；第一个被拒的位置，用 target 的（修正后）分布重采样一个 token 顶上，后面的候选全部丢弃。Leviathan 等人证明：这套接受-重采样规则使得<strong>最终输出分布与直接用 target 逐 token 解码完全一致</strong>——这是<em>无损</em>（lossless）的，不是近似。draft 只影响<em>速度</em>，不影响<em>分布</em>。</p>  <p>现在推导期望加速。设每个候选 token 被接受的概率为 $\alpha$（接受率，draft 与 target 越像 $\alpha$ 越高）。猜 $k$ 个 token，第 $i$ 个能被接受要求前 $i$ 个都通过，期望接受长度是几何级数求和：</p>  <div class="math-block">\[\mathbb{E}[\text{接受数}]=\sum_{i=1}^{k}\alpha^{i}=\frac{\alpha(1-\alpha^{k})}{1-\alpha}\]</div>  <p>每一轮投机花掉 target 的<strong>一次前向</strong>，产出 $\mathbb{E}[\text{接受数}]+1$ 个 token（被接受的那些，加上拒绝点重采样补的那 1 个）。相对朴素逐 token 解码的加速比约为：</p>  <div class="math-block">\[\text{加速比}\approx\frac{\mathbb{E}[\text{接受数}]+1}{1}\]</div>  <p>代数字：$\alpha=0.7$、$k=4$。$\mathbb{E}[\text{接受数}]=0.7+0.49+0.343+0.2401\approx 1.78$，加速比 $\approx 1.78+1\approx 2.8\times$。这正是文献里报告的 2–3× 量级。</p>  <table>
+    <thead><tr><th>接受率 α</th><th>k=4 时 E[接受]</th><th>近似加速比</th></tr></thead>
+    <tbody>
+      <tr><td>0.5</td><td>≈ 0.94</td><td>≈ 1.9×</td></tr>
+      <tr><td>0.7</td><td>≈ 1.78</td><td>≈ 2.8×</td></tr>
+      <tr><td>0.8</td><td>≈ 2.36</td><td>≈ 3.4×</td></tr>
+      <tr><td>0.9</td><td>≈ 3.10</td><td>≈ 4.1×</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>两个陷阱必须现场点破。其一，<strong>draft 太差则 α 低、收益微薄</strong>——$\alpha=0.5$ 时加速不到 2×，若 draft 本身还慢，净收益可能为负。其二，<strong>draft 本身有成本</strong>：上面的加速比忽略了 draft 生成 $k$ 个 token 的开销，真实加速要扣掉它，所以 draft 必须<em>又快又准</em>（常用同族小模型、n-gram、或 Medusa 式多头自投机）。投机解码不是免费午餐，它在 draft 质量与开销之间走钢丝。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="drill"><span class="num">8</span>面试 drill：推理系统五连问与四大陷阱</h2>
+  <p>把前七节压缩成一套能直接上场的问答。面试官问推理系统，无非围绕这几个高频点，每个都给你<strong>一句话答案 + 一个数字</strong>。</p>  <ol>
+    <li><strong>KV cache 有多大？</strong> 背公式 $2LShb$，再给锚点：<em>7B 模型每 token 约 0.5 MB（bf16）</em>，4K 序列约 2 GB，batch=32 约 64 GB。能现场报数字就赢了。</li>
+    <li><strong>给定 80 GB 卡，7B 模型最大并发多少？</strong> $(80-14)/2\approx 33$ 条；上 GQA 8 组单序列降到 0.5 GB，约 132 条。</li>
+    <li><strong>decode 为什么比 prefill 慢那么多？</strong> decode 是 memory-bound——每步搬全部权重只产 1 个 token，算术强度 $O(1)$，远低于 roofline ridge point，算力大量空转；prefill 整段并行是 compute-bound。</li>
+    <li><strong>投机解码为什么是无损的？</strong> 接受-重采样规则保证最终分布等于 target 逐 token 解码的分布；draft 只影响速度不影响分布。期望加速 $\approx \mathbb{E}[\text{接受}]+1$。</li>
+    <li><strong>continuous 比静态 batching 快多少？</strong> 取决于请求长度方差，典型数倍；原理是以 token 为粒度调度、序列一完成立刻让出槽位、不等整批。</li>
+  </ol>  <div class="callout danger"><span class="label"></span>
+    <p><strong>四个最爱考的反直觉陷阱，记牢：</strong></p>  <ul>
+    <li>「权重才是显存大头」——错。<strong>KV cache 可超权重</strong>，长上下文大 batch 时是绝对主力。</li>
+    <li>「decode 是算力不够」——错。<strong>decode 是 memory-bound</strong>，瓶颈是带宽不是 FLOPs。</li>
+    <li>「GQA 是为了省训练算力」——错。<strong>GQA 主要为推理省 KV 显存</strong>（也略省带宽）。</li>
+    <li>「投机解码会损失质量」——错。<strong>无损</strong>；但 <strong>draft 差则无收益甚至负收益</strong>。</li>
+  </ul>
+  </div>  <p>能把这四条边界条件说清楚的人，面试官立刻知道你<em>真懂推理系统</em>而不是背了几个名词。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>把这些前沿名词和它们治的病对上号，你就能跟上社区讨论。</p>  <ul>
+    <li><span class="term">PagedAttention</span>（vLLM）：像操作系统的虚拟内存分页一样管理 KV cache，把 KV 切成固定大小的 block 按需分配，消除连续显存碎片，让 KV 利用率<strong>接近 100%</strong>——这是让第 5 节「理论 33 条」真正逼近上界的关键，也是现代推理引擎吞吐飞跃的根基。</li>
+    <li><span class="term">KV cache 量化</span>：把缓存的 K、V 存成 int8 甚至 int4，长上下文服务直接省一半到四分之三显存（呼应模块 05 的量化）。</li>
+    <li><span class="term">chunked prefill</span> 与 <span class="term">disaggregation</span>：prefill（compute-bound）和 decode（memory-bound）性质相反，挤在同一批里会互相拖累；把它们<strong>拆开调度</strong>（甚至跑在不同卡池），各自吃满最适合的硬件。</li>
+    <li>注意力变体谱系 <span class="term">MQA</span> / <span class="term">GQA</span> / <span class="term">MLA</span>：从「所有头共享 1 组 KV」到「分组共享」到 DeepSeek 的「低秩 latent KV」，本质都是在 KV 显存与表达力之间找更好的点。</li>
+    <li><span class="term">prefix caching</span>：多个请求若共享同一段前缀（比如同一个 system prompt），可以复用那段已算好的 KV，省掉重复 prefill——对 agent、RAG 这类长且重复前缀的场景收益巨大。</li>
+  </ul>  <p><strong>开放问题</strong>：超长上下文（百万 token）下 KV 管理是否还有质变级新结构？推理成本与评测预算的权衡——大规模 eval 跑一遍烧多少卡时、能否用上述技巧砍到可承受？这既是工程问题，也直接决定下游评测与部署的经济性。</p>  <div class="callout paper"><span class="label"></span>
+    <p><strong>核心参考：</strong></p>  <ul>
+    <li>Kwon et al. 2023 — <em>Efficient Memory Management for LLM Serving with PagedAttention</em>（vLLM）。</li>
+    <li>Leviathan et al. 2023 — <em>Fast Inference from Transformers via Speculative Decoding</em>。</li>
+    <li>Ainslie et al. 2023 — <em>GQA: Training Generalized Multi-Query Transformer Models</em>。</li>
+    <li>Pope et al. 2022 — <em>Efficiently Scaling Transformer Inference</em>。</li>
+  </ul>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../05_quantization_from_scratch/05_讲解.html"><div class="dir">← 上一模块</div><div class="t">05 · 量化从零</div></a>
+    <a class="next" href="06_inference_serving.ipynb"><div class="dir">下一模块 →</div><div class="t">打开配套练习</div></a>
+  </div>
+
+</div>
+</body>
+</html>

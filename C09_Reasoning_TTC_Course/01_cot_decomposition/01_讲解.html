@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · CoT 与任务分解：误差复利的数学</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · CoT 与任务分解：误差复利的数学</h1>
+  <p class="subtitle">Chain-of-Thought —— 为什么"想出声"有用：一步大跳 vs 多步小跳的权衡，是推理模型与测试时计算的全部起点</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">概率基础、sigmoid 函数、对 transformer 前向计算的大致概念</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_cot_error_compounding.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Nye 2021、Wei 2022、Kojima 2022、Zhou 2022、Feng 2023、Merrill &amp; Sabharwal 2023</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#history">CoT 的提出与证据：从 scratchpad 到 "Let's think step by step"</a></li>
+      <li><a href="#depth">视角①：计算深度 —— CoT 是把循环重新接回 transformer</a></li>
+      <li><a href="#error">视角②：误差分解 —— 误差复利的数学与最优分解粒度</a></li>
+      <li><a href="#dist">视角③：分布匹配 —— 训练语料里本来就有 step-by-step</a></li>
+      <li><a href="#emergence">CoT 的涌现与模型规模：小模型"想出声"反而有害</a></li>
+      <li><a href="#length">CoT 长度与任务难度的适配</a></li>
+      <li><a href="#eval">对评测的意义：CoT 是 elicitation 的一部分</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="history"><span class="num">1</span>CoT 的提出与证据：从 scratchpad 到 "Let's think step by step"</h2>
+
+  <p>2021–2022 年的四篇工作把"让模型先写中间步骤、再给答案"从民间技巧变成了实证科学，
+  也定义了本课程后面所有<span class="term">测试时计算（test-time compute, TTC）</span>方法的原点：</p>
+
+  <table>
+    <thead><tr><th>工作</th><th>核心做法</th><th>关键证据</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Scratchpad</strong><br>[Nye 2021, arXiv:2112.00114]</td>
+          <td>训练/微调模型在给出答案前，先把中间计算结果写进一块"草稿区"（scratchpad），如长加法的逐位进位</td>
+          <td>同一模型，直接出答案在 8 位加法上接近全错；带 scratchpad 后大幅可解。证明瓶颈不（只）在"知识"，而在<strong>单次前向能完成的计算量</strong></td></tr>
+      <tr><td><strong>Few-shot CoT</strong><br>[Wei 2022, arXiv:2201.11903]</td>
+          <td>不微调，仅在 few-shot 示例里把"问题→答案"换成"问题→推理链→答案"</td>
+          <td>GSM8K 等数学/常识/符号推理基准上大幅提升，且增益<strong>随模型规模涌现</strong>（&lt;10B 模型几乎无增益甚至下降）</td></tr>
+      <tr><td><strong>Zero-shot CoT</strong><br>[Kojima 2022, arXiv:2205.11916]</td>
+          <td>连示例都不要，只在问题后加一句 <code>"Let's think step by step."</code></td>
+          <td>MultiArith 17.7%→78.7%、GSM8K 10.4%→40.7%（text-davinci-002）。说明推理链的能力<strong>已经在模型里</strong>，prompt 只是把它"引出来"（elicit）</td></tr>
+      <tr><td><strong>Least-to-Most</strong><br>[Zhou 2022, arXiv:2205.10625]</td>
+          <td>显式两阶段：先让模型把难问题<strong>分解</strong>为一串由易到难的子问题，再顺序逐个求解、把已解子问题拼进上下文</td>
+          <td>在 SCAN 等组合泛化任务上从 CoT 的 ~16% 提到 99%+：当测试难度<em>超出</em>示例难度时，显式分解比"自由发挥"的 CoT 强得多 —— <span class="term">easy-to-hard generalization</span> 的早期证据</td></tr>
+    </tbody>
+  </table>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>这四篇连起来读是一条完整的逻辑链：① 模型一口气算不动长计算，给它草稿纸就行（Nye）；
+      ② 不用重新训练，给几个带过程的例子它就会用草稿纸（Wei）；③ 连例子都不用，说一句"一步一步想"就够（Kojima）；
+      ④ 草稿纸怎么用也有讲究——先拆题再逐个做，比想到哪写到哪更稳（Zhou）。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>把模型在任务 $x$ 上的表现写成 $\mathbb{E}_{z\sim p_\theta(z\mid x,\,c)}\,[\,\mathrm{acc}(y(z))\,]$，
+      其中 $z$ 是生成的 token 序列、$c$ 是 prompt 策略。这四篇工作固定 $\theta$ 只动 $c$，就把准确率移动了几十个百分点 ——
+      即<strong>测得的能力是 $(\theta, c)$ 联合的函数</strong>。对 evaluation 而言这是本章最重要的一句话：你测的从来不是"模型能力"，
+      而是"模型 × elicitation 策略"的组合（第 7 节展开）。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  本课程的主线问题从这里开始：<strong>多生成的这些 token，到底买到了什么？</strong>
+  本章给三种互补的答案（计算深度 / 误差分解 / 分布匹配），其中第二种——误差复利的数学——是配套 notebook 的全部内容，
+  也是后面模块讨论 self-consistency、搜索、process reward 的共同语言。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="depth"><span class="num">2</span>视角①：计算深度 —— CoT 是把循环重新接回 transformer</h2>
+
+  <p>第一种解释从计算复杂度出发。transformer 的一次前向是<strong>固定深度</strong>的电路：
+  不管问题多难，输入到输出都只经过 $L$ 层（GPT-3 是 96 层），每层做的是有界并行计算。
+  形式语言理论给出的刻画是：固定精度的 decoder-only transformer 单次前向可计算的函数类
+  落在常数深度阈值电路 <span class="term">$\mathsf{TC}^0$</span> 内 —— 一个相当受限的类，
+  （在 $\mathsf{TC}^0 \neq \mathsf{NC}^1$ 等标准猜想下）连求解需要内在串行性的问题
+  （如图连通性、迭代复合、模拟有限状态机任意步）都装不下。</p>
+
+  <p>但 LLM 不是只做一次前向 —— <strong>自回归生成把输出写回输入</strong>。每生成一个 token，
+  就把一次"深度 $L$ 的计算结果"存入上下文，供后续所有前向读取。CoT 的中间步骤本质上是<strong>外置的寄存器</strong>：</p>
+
+  <div class="ascii">
+  无 CoT（一次前向，深度固定 L）：
+     x ──► [ L 层 transformer ] ──► answer        可用串行深度 = L
+
+  有 CoT（生成 T 个中间 token）：
+     x ──► [L 层] ──► z₁ ─┐
+     x,z₁ ──► [L 层] ──► z₂ ─┐                    可用串行深度 ≈ L·T
+     x,z₁,z₂ ──► [L 层] ──► z₃ ─┐                 （中间变量经上下文传递，
+        ...                      ▼                  相当于展开一个循环）
+     x,z₁..z_T ──► [L 层] ──► answer
+  </div>
+
+  <p>这一直觉已被定理化。[Feng 2023, arXiv:2305.15408] 证明：存在数学/动态规划类问题，
+  任何<strong>多项式规模</strong>的有界深度 transformer 直接输出答案都无法解决，但允许生成 CoT 后，
+  <strong>固定大小</strong>的自回归 transformer 即可逐步解出 —— CoT 带来的不是"提示技巧"而是表达力的相变。
+  [Merrill &amp; Sabharwal 2023, arXiv:2310.07923] 给出系统刻画：以 CoT 步数 $t(n)$ 为资源，
+  $t(n)=O(\log n)$ 步只把 $\mathsf{TC}^0$ 略微推高，而<strong>多项式步数的 CoT 把可解类推到 $\mathsf{P}$</strong>
+  （多项式时间可解问题）。粗略地：</p>
+
+  <div class="math-block">
+  $$ \underbrace{\mathsf{TC}^0}_{\text{无 CoT}} \;\subsetneq?\;
+     \underbrace{\mathsf{CoT}[\,O(\log n)\,]}_{\text{对数步}} \;\subsetneq?\;
+     \underbrace{\mathsf{CoT}[\,\mathrm{poly}(n)\,] = \mathsf{P}}_{\text{多项式步}} $$
+  </div>
+
+  <div class="callout paper"><span class="label"></span>
+  这给"测试时计算"一个干净的第一性原理：<strong>CoT token 数是和层数、参数量并列的第三种资源轴</strong>。
+  训练时砸 FLOPs 买的是 $\theta$，测试时砸 token 买的是串行深度。模块 02（test-time scaling laws）会把这条轴定量化；
+  注意该视角的边界：它说的是<em>表达力上界</em>（能不能表示），不保证训练真的学到了该算法，也不解释为什么写的是<em>自然语言</em>步骤 —— 后者见第 4 节。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="error"><span class="num">3</span>视角②：误差分解 —— 误差复利的数学与最优分解粒度</h2>
+
+  <p>第二种解释不谈电路，谈<strong>错误率</strong>，这是本章 notebook 的主角。出发点是一个所有做过评测的人都见过的现象：
+  模型在"难的一步"上错误率高，在"简单的一步"上错误率低。把一个难任务分解成多个简单步骤，是在做一笔交易：</p>
+
+  <ul>
+    <li><strong>收益</strong>：每一步变简单，单步正确率上升；</li>
+    <li><strong>代价</strong>：步骤变多，而<strong>错误是乘性累积的</strong> —— 任何一步错，通常全盘皆错。这就是
+    <span class="term">误差复利（error compounding）</span>。</li>
+  </ul>
+
+  <h3>3.1 最小模型</h3>
+  <p>把"单步正确率"建模为单步难度 $d$ 的函数。借用 IRT（item response theory）的两参数 logistic 形式：</p>
+  <div class="math-block">
+  $$ p(d) \;=\; \sigma(a - b\,d) \;=\; \frac{1}{1+e^{-(a-b d)}} $$
+  </div>
+  <p>其中 $a$ 是模型<strong>能力（ability）</strong>，$b&gt;0$ 是难度敏感系数。一个总难度 $D$ 的任务：
+  <strong>一步到位</strong>的成功率是 $p_{\text{direct}} = \sigma(a-bD)$；<strong>均匀分解为 $k$ 步</strong>、
+  每步难度 $D/k$、步骤间独立且一错全错，则链式成功率为：</p>
+  <div class="math-block">
+  $$ P_{\text{chain}}(k) \;=\; \big[\,\sigma(a - bD/k)\,\big]^{k} $$
+  </div>
+
+  <p>两个极端都不好：$k=1$ 时单步太难（$\sigma(a-bD)$ 很小）；$k\to\infty$ 时单步难度趋于 0，
+  但单步正确率封顶在 $\sigma(a)&lt;1$，于是 $P_{\text{chain}} \le \sigma(a)^k \to 0$ —— 复利吃掉一切。
+  <strong>中间存在最优分解粒度 $k^*$，$P_{\text{chain}}(k)$ 是倒 U 形。</strong></p>
+
+  <h3>3.2 最优步数的解析刻画</h3>
+  <p>对 $k$ 做连续松弛，令 $f(k)=\log P_{\text{chain}} = k\log\sigma(u)$，其中 $u = a - bD/k$ 是"单步有效能力余量"。
+  利用 $\frac{\mathrm d}{\mathrm du}\log\sigma(u) = 1-\sigma(u)$ 与 $\frac{\mathrm du}{\mathrm dk} = bD/k^2$：</p>
+  <div class="math-block">
+  $$ f'(k) \;=\; \log\sigma(u) \;+\; k\,(1-\sigma(u))\,\frac{bD}{k^2}
+            \;=\; \log\sigma(u) \;+\; (a-u)\,(1-\sigma(u)) $$
+  </div>
+  <p>注意最后一个表达式<strong>只通过 $u$ 依赖 $k$ 和 $D$</strong>。于是一阶条件 $f'(k^*)=0$ 给出一个只关于
+  $u$ 的方程：</p>
+  <div class="math-block">
+  $$ \log\sigma(u^*) + (a-u^*)\,\big(1-\sigma(u^*)\big) \;=\; 0 $$
+  </div>
+  <p>它确定了一个<strong>与 $D$ 无关的最优单步难度</strong> $d^* = (a-u^*)/b$。立即得到两个漂亮的推论：</p>
+  <ol>
+    <li><strong>最优步数对难度近似线性：$k^*(D) = D/d^* \propto D$。</strong>任务越难，越值得细分解 ——
+    且"每步该多难"只由模型能力 $a$ 决定，与任务总难度无关。这与 least-to-most、推理模型"难题想得更长"的行为定性一致；</li>
+    <li><strong>能力越强，最优单步可以越难（$d^*$ 随 $a$ 增大）</strong>：强模型应该迈大步、少复利；弱模型被迫小步走，而小步走又被复利惩罚 —— 这正是第 5 节"CoT 对小模型有害"的种子。</li>
+  </ol>
+
+  <h3>3.3 加入传递噪声与自我纠错</h3>
+  <p>真实推理链不止"做对/做错"二元：中间步骤可能引入<strong>会被后续步骤继承、放大的错误</strong>
+  （抄错一个数、引用错一个中间结论）。最小扩展：每步除了以 $p(D/k)$ 做对当步外，还以概率
+  $\varepsilon$ 引入一个传递性错误，模型以概率 $r$ 在后续步骤中察觉并纠正它（<span class="term">self-correction</span>），
+  则每步有效成功率变为：</p>
+  <div class="math-block">
+  $$ q \;=\; p(D/k)\cdot\big(1-\varepsilon(1-r)\big), \qquad
+     P_{\text{chain}} = q^{\,k} $$
+  </div>
+  <p>$\varepsilon$ 把整条倒 U 曲线往下压、并把 $k^*$ 往左推（步骤越多暴露面越大，分解的收益被噪声税抵消）；
+  $r$ 则把曲线抬回去。这一个小扩展预告了课程的两条线：<strong>步骤级验证</strong>（process reward model，模块 06）
+  本质是把 $\varepsilon(1-r)$ 压小；<strong>self-correction 的真实 $r$ 有多大</strong>（模块 07 会讲：没有外部信号时，
+  intrinsic self-correction 的 $r$ 常常接近 0 甚至为负 [Huang 2023, arXiv:2310.01798]）。notebook 第 4 节实现并扫描这两个参数。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  这个模型刻意极简：步骤独立、难度均匀分解、一错全错，全部可疑。但它的价值在于<strong>给出可证伪的定性预测</strong>
+  （倒 U 形、$k^*\propto D$、能力-增益交叉），而这些预测与大量实证现象对得上。把它当成推理版的"理想气体方程"：
+  错得精确，比对得模糊有用。三条假设的松动方向见第 8 节。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="dist"><span class="num">4</span>视角③：分布匹配 —— 训练语料里本来就有 step-by-step</h2>
+
+  <p>前两个视角解释"为什么多写 token <em>能</em>帮忙"，但不解释"为什么<em>那句咒语</em>有效"。
+  第三个视角是统计的：预训练语料里大量存在 step-by-step 体裁 —— 教科书例题、解题网站、代码注释、证明 ——
+  这些文本中"逐步推导"与"正确结论"高度共现。CoT prompt 的作用是把模型的条件分布<strong>导向语料中质量更高的那个子分布</strong>：</p>
+  <div class="math-block">
+  $$ p_\theta(\text{answer}\mid x,\ \text{“think step by step”})
+     \;\approx\; p_{\text{corpus}}(\text{answer}\mid x,\ \text{体裁=详解})
+     \;\neq\; p_{\text{corpus}}(\text{answer}\mid x,\ \text{体裁=任意}) $$
+  </div>
+  <p>三个推论值得记住：① CoT 增益依赖"语料里存在该任务的逐步文本"——对语料中罕见逐步示范的任务（如某些纯符号操作），
+  CoT 增益显著缩水；② <strong>格式敏感性是该视角的直接预言</strong>：既然作用机制是"激活某个体裁"，
+  那么换措辞、换分隔符、换语言都会改变激活的体裁，从而改变成绩（第 7 节的评测含义）；
+  ③ 它与视角①不矛盾而是互补 —— 语料给了模型"逐步计算"的程序库（学得到），CoT 给了执行这些程序的串行预算（跑得动），
+  误差分解视角（视角②）则刻画执行的可靠性（跑得稳）。三者分别对应<em>学什么、有多少算力、错多少</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="emergence"><span class="num">5</span>CoT 的涌现与模型规模：小模型"想出声"反而有害</h2>
+
+  <p>[Wei 2022] 的实证：CoT 增益是<span class="term">涌现能力（emergent ability）</span>的典型案例 ——
+  在 ~10B 以下模型上，CoT 相对直接作答<strong>无增益甚至为负</strong>；跨过某个规模后增益陡然出现并持续扩大。
+  小模型的失败模式很有诊断价值：能写出"看起来像推理"的流畅链条，但中间步骤事实性/逻辑性错误密布 —— 即
+  $\varepsilon$ 大而 $r\approx 0$，链条越长错误越多。</p>
+
+  <p>第 3 节的模型给出一个干净的机制解释，不需要任何神秘的"相变"：定义 <strong>CoT 增益</strong></p>
+  <div class="math-block">
+  $$ \mathrm{gain}(a) \;=\; \max_{k\ge 2} P_{\text{chain}}(k;\,a) \;-\; p_{\text{direct}}(a) $$
+  </div>
+  <p>在 $a$ 很小（弱模型）的渐近区，$\sigma(z)\approx e^{z}$，于是
+  $P_{\text{chain}}(k)\approx e^{ka-bD}$ 而 $p_{\text{direct}}\approx e^{a-bD}$ ——
+  <strong>分解把能力惩罚 $a$ 乘了 $k$ 倍</strong>（每一步都要重新"付"一次能力税），$\mathrm{gain}(a)&lt;0$；
+  $a$ 大时单步正确率进入饱和区，复利温和而单步难度下降的收益巨大，$\mathrm{gain}(a)&gt;0$。
+  增益曲线在中间穿过零点 —— 一条连续机制产生了"看起来像涌现"的相变。notebook 第 5 节复现这条交叉曲线。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  这与 [Schaeffer 2023, arXiv:2304.15004]"涌现是度量选择的海市蜃楼"的论点同构：底层量（$a$）平滑增长，
+  经过一个非线性观测函数（$\max_k$ 与乘性链）后，表观指标出现陡峭转折。
+  对 evaluation 的提醒：报告"模型 X 没有 CoT 能力"前，先确认这不是 $a$ 还没过交叉点的平滑现象 —— 二者的 scaling 预测完全不同。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="length"><span class="num">6</span>CoT 长度与任务难度的适配</h2>
+
+  <p>$k^*(D)\propto D$ 的另一面：<strong>固定一个 CoT 长度去对付所有难度，必然两头亏</strong>。
+  简单任务上，超出 $k^*$ 的步骤是纯暴露面 —— 每多一步多付一次 $1-q$ 的复利税，这是
+  <span class="term">overthinking</span> 现象的最简模型（推理模型在 2+3 这种题上写三页纸、准确率反而被自己绕错）；
+  困难任务上，短于 $k^*$ 的链条等于强迫模型迈它迈不动的大步。实证侧与此一致：CoT 长度存在任务相关的最优点、
+  过长的链与错误率上升相关，而推理模型 post-training 的重要目标之一正是学会<strong>难度自适应的思考预算</strong>
+  （难题多想、简单题速答 —— 模块 04/08 详述）。</p>
+
+  <p>评测含义先记一条：比较两个模型的"推理能力"时，若 A 默认输出 200 token 的链、B 默认输出 2000 token，
+  你比的同时是<em>能力</em>与<em>预算分配策略</em>两件事。控制 token 预算的比较（accuracy at matched compute）
+  才能把它们拆开 —— 这是模块 02 的核心方法论。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>对评测的意义：CoT 是 elicitation 的一部分</h2>
+
+  <p><strong>① CoT prompt 属于 elicitation，必须报告。</strong>Kojima 一句话 30 个点的教训：
+  能力测量对引出方式极度敏感。一份合格的评测报告必须固定并公开：是否允许 CoT、prompt 措辞、few-shot 示例及其格式、
+  答案抽取规则（从链中抓最终答案的正则/judge 本身就有错误率）。"模型 A 比 B 强 5 分"在不同 elicitation 下完全可能反号。
+  尤其在 safety/capability evaluation 语境下，<strong>没有充分 elicitation 的评测给出的只是能力下界</strong> ——
+  而下界被误读为上界，是危险能力评估里最经典的失败模式。</p>
+
+  <p><strong>② 格式敏感性是系统误差，不是噪声。</strong>视角③预言、实证反复确认：
+  CoT 增益随措辞、分隔符、示例顺序、语言而显著波动（同一模型同一基准常见数个点的摆动）。
+  这不是均值为零的随机噪声 —— 不同模型对格式的偏好不同，固定一种格式会<strong>系统性偏袒某些模型</strong>。
+  对策：多 prompt 变体报告均值与极差，或把 prompt 作为随机因素纳入显著性检验（与 LLM_Evals 课模块 02 的统计工具衔接）。</p>
+
+  <p><strong>③ "答案在想之前就定了"：CoT 忠实性问题（预告模块 07）。</strong>
+  本章三个视角默认生成的链就是模型<em>实际使用</em>的计算。这个假设会塌：
+  实证上存在 CoT 与答案因果脱钩的证据 —— 截断或篡改链却不改变答案、模型被注入偏置（如示例答案全是 A）后给出
+  <strong>事后合理化（post-hoc rationalization）</strong>的链而绝口不提偏置 [Turpin 2023, arXiv:2305.04388]。
+  此时 CoT 是写给评测者看的"说明文"，不是计算轨迹。于是"读链评推理"（process-based evaluation）的效度存疑：
+  链写得好 ≠ 推理对，链有错 ≠ 答案靠运气。<span class="term">faithfulness</span> 的度量与改进是模块 07 的主题 ——
+  在那之前，对一切"我们检查了模型的推理过程"的声明保持职业性怀疑。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>松动极简模型的三条假设。</strong>步骤独立 → 真实链有错误传播与纠错的马尔可夫结构（notebook 的 $\varepsilon, r$ 只是一阶近似）；
+    均匀分解 → 最优分解应是非均匀的（难的子步骤再细分），对应一个递归的分解问题；
+    一错全错 → 有些错误可被绕过（推理存在冗余路径）。把 $p(d)$ 换成对真实模型逐步测量的经验曲线，是把这套数学接到实证上的直接路径 —— 也是好的 research 项目。</li>
+    <li><strong>潜空间推理（latent / internalized CoT）。</strong>串行深度一定要花在<em>自然语言 token</em> 上吗？
+    连续思维向量（Coconut [Hao 2024, arXiv:2412.06769]）、循环深度（depth-recurrent）架构试图把中间计算留在隐空间。
+    表达力视角下等价，但对评测是坏消息：可读的链消失了，faithfulness 问题从"链可能骗你"变成"连链都没有"。</li>
+    <li><strong>CoT 何时是必要的？</strong>实证综述显示 CoT 增益高度集中在数学/符号/算法类任务，
+    在许多常识与知识任务上接近零 —— 与视角①的预测一致（这些任务不需要串行深度）。
+    "哪类任务的计算结构需要多少串行步数"缺一个可操作的预测理论，它同时也是"该给评测多少 token 预算"的理论。</li>
+    <li><strong>从 prompt 到 RL：分解策略的内化。</strong>本章的 $k$ 由 prompt 设计者选择；推理模型（o1/R1 风格）用 RL 让模型自己学
+    $k(D)$。它学到的分解策略接近 $k^*$ 吗？overthinking 的普遍存在暗示并不接近 —— 测试时计算的"配置效率"
+    （同样 token 买到多少准确率）正在成为评测对象本身（模块 02、08）。</li>
+    <li><strong>评测视角的总开放问题。</strong>当模型的"思考"变成可变长度、可隐藏、可不忠实的对象，
+    "能力"的操作性定义就必须带上预算与 elicitation 的脚注。<em>accuracy@budget 曲线</em>（而非单点分数）
+    是否应成为推理评测的默认报告格式？本课程的立场是肯定的 —— 模块 02 见。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>四篇奠基工作（Nye / Wei / Kojima / Zhou）各自的实验设计回答了什么不同的问题？</li>
+      <li>为什么说"transformer 单次前向是常数深度电路，CoT 扩展串行深度"？Merrill &amp; Sabharwal 的结论中 CoT 步数扮演什么角色？</li>
+      <li>从 $P_{\text{chain}}(k)=[\sigma(a-bD/k)]^k$ 出发，推导倒 U 形与 $k^*(D)\propto D$；解释 $d^*$ 为何只依赖 $a$ 不依赖 $D$。</li>
+      <li>用误差分解模型解释"CoT 对小模型有害"，并说明它与"涌现 vs 度量海市蜃楼"之争的关系。</li>
+      <li>评测中 CoT 带来的三类系统性问题（elicitation 依赖、格式敏感、忠实性）分别如何缓解或声明？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../00_setup/00_overview.html"><div class="dir">← 上一章</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_self_consistency/02_讲解.html"><div class="dir">下一章 →</div><div class="t">02 · Test-Time Scaling Laws：token 预算的经济学</div></a>
+  </div>
+
+</div>
+</body>
+</html>

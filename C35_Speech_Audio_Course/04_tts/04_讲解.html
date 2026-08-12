@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · TTS 与声码器</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · TTS 与声码器</h1>
+  <p class="subtitle">把谱图还原成能听的波形 —— 声学特征→波形的逆问题、Griffin-Lim 相位重建（从零迭代）、神经声码器演进：从零实现 Griffin-Lim 并对拍谱收敛度随迭代单调改善，理解一切声码器的共同使命</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（STFT/谱图/相位）、复数、迭代/投影直觉；GAN/自回归（神经声码器，概念即可）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_tts.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Griffin &amp; Lim 1984、van den Oord 2016 (WaveNet)、Kong 2020 (HiFi-GAN)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#intro">从谱图回到波形：生成方向</a></li>
+      <li><a href="#inverse">逆问题：从谱图回波形缺了什么</a></li>
+      <li><a href="#gl">Griffin-Lim：交替投影恢复相位</a></li>
+      <li><a href="#converge">收敛与质量：Griffin-Lim 的脾气</a></li>
+      <li><a href="#neural">神经声码器：用数据学会相位</a></li>
+      <li><a href="#bigpic">大图景：声码器在镜像中的位置</a></li>
+      <li><a href="#roadmap">从零实现的路线图</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="intro"><span class="num">1</span>从谱图回到波形：生成方向</h2>
+  <p>前三个模块都在<strong>分析</strong>（波形→特征→文字/token）。本模块掉头做<strong>生成</strong>：把声学特征（梅尔谱）还原成<em>能听的波形</em>。这是 <span class="term">TTS (Text-to-Speech)</span>（语音合成）流水线的后半段，也是一个<strong>信息不完整的逆问题</strong>——因为模块 01 早就告诉过我们，谱图通常<strong>只有幅度、丢了相位</strong>。</p>  <p>现代 TTS 几乎都是两段式：先用 <span class="term">acoustic model</span>（声学模型，如 Tacotron、FastSpeech）把文本/音素变成梅尔谱，再用 <span class="term">vocoder</span>（声码器）把梅尔谱变成波形。本模块聚焦后半段——<strong>声码器</strong>，尤其是它最核心的难题：<strong>相位重建</strong>。前半段（文本→梅尔，本质是个 seq2seq，与模块 02 的对齐思想相通）我们只做概览。</p>  <p>为什么相位重建是核心难题？因为梅尔谱（甚至线性幅度谱）只记录了每个时频点的<strong>强度</strong>，丢掉了<strong>相位</strong>。而要合成波形，必须把相位<em>造</em>回来——同一份幅度谱配不同相位，能合成出从清晰人声到刺耳噪声的天差地别结果。本模块从零实现经典的无学习解 <span class="term">Griffin-Lim</span>（迭代恢复相位），并讲清神经声码器（WaveNet、HiFi-GAN）如何用数据驱动的方式碾压它。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>谱图只告诉你『每个时频点多响』，没告诉你『波怎么对齐』（相位）；要变回声音，必须把相位猜回来</strong>。Griffin-Lim 的猜法是『反复在时域和频域之间来回投影，逼出一组自洽的相位』；神经声码器的猜法是『让网络从海量数据里学会该配什么相位』。本模块手写前者，理解后者。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="inverse"><span class="num">2</span>逆问题：从谱图回波形缺了什么</h2>
+  <h3>逆问题：从谱图回到波形，缺了什么</h3>  <p>先把链路反过来看清楚。模块 01 的正向是：波形 → STFT（复数）→ 取模 → 幅度谱（丢相位）。生成要走反向：<strong>幅度谱 → ? → 波形</strong>。如果我们有<strong>完整的复数 STFT</strong>（幅度 + 相位），反向是平凡的——直接 <span class="term">overlap-add (OLA)</span>（重叠相加）做 iSTFT 即可无损还原：</p>  <div class="math-block">\[\hat x = \text{iSTFT}(X) = \text{OLA}\big(\text{IDFT}(X[t,\cdot])\big)\big/\text{(窗能量归一)}\]</div>  <div class="callout intuition"><span class="label"></span>
+    <p><strong>worked 微例（为什么要『除以窗能量』）</strong>：先撇开相位，只看 OLA 的归一。设分析时每帧乘 Hann 窗 $w$，合成时<em>又乘一次</em> $w$（常见的 WOLA 约定），那么任一采样点叠进去的权重就是各覆盖帧的 $w^2$ 之和 $\sum_t w^2[n-tH]$。这个『重叠窗能量和是否为常数』正是 <span class="term">COLA / constant overlap-add</span> 条件。有个反直觉的事实：50% 重叠（$H=N/2$）对 Hann 只满足 $\sum_t w[n-tH]=1$（<em>单窗</em> COLA），但 $\sum_t w^2$ 并<strong>不</strong>是常数（在 $0.5\sim1.0$ 间起伏）——所以<strong>加窗合成需要 75% 重叠</strong>（$H=N/4$），此时 $\sum_t w^2[n-tH]=1.5$（处处相等）。于是正确的 iSTFT 要<strong>逐采样点除以 $\sum_t w^2[n-tH]$</strong>（这里即除以 $1.5$）；除错了系数，重建会整体缩放、或在 COLA 不成立时出现<strong>周期性幅度起伏</strong>（听上去像颤音）。这就是 s7 路线图里『iSTFT∘STFT ≈ 恒等』那个 assert 在守护的东西——一旦写错，中段误差会从 $10^{-7}$ 跳到 $10^{-2}$ 立刻现形。</p>
+  </div>  <p>问题在于我们<strong>只有幅度 $|X|$，没有相位 $\angle X$</strong>。直接给幅度配一个随机相位再 iSTFT，会得到刺耳的噪声——因为相位决定了相邻帧的波形如何<strong>对齐拼接</strong>，随机相位让帧与帧之间的波形互相打架（OLA 处的不一致）。所以声码器的核心任务可以精确地表述为：<strong>给定幅度谱，找一组相位，使得 iSTFT 出来的波形『自洽』</strong>（它的 STFT 幅度尽量等于给定幅度）。</p>  <p>更进一步，TTS 里我们常常连完整的线性幅度谱都没有，只有<span class="term">mel spectrogram</span>（梅尔谱，维度更低、还做了梅尔压缩）。于是还要先 <span class="term">mel inversion</span>（梅尔逆变换）：用梅尔滤波器组的伪逆从梅尔谱近似还原线性幅度谱，再做相位重建。这一步本身有损（梅尔是降维投影、不可逆），是 Griffin-Lim 式声码器音质受限的原因之一。</p>  <p>把『丢了什么』量化一下，更能体会逆问题的难度。一个 STFT 复谱有<strong>两个自由度</strong>（实部虚部，或等价地幅度 + 相位）；幅度谱只保留了<strong>一半</strong>（幅度），相位被完全丢弃。更糟的是，相位不是可以随便填的——相邻帧因为<strong>重叠</strong>而共享样本，它们的相位必须<em>互相协调</em>才能在 overlap-add 处拼出连续波形（这叫『一致性约束』，consistency）。所以相位重建不是『独立地给每个时频点猜一个角度』，而是要找一组<strong>满足帧间一致性</strong>的全局相位——这正是它非凸、且只能迭代逼近的根源。若再从梅尔谱出发，连幅度都是<em>被压缩过的近似</em>（80 维梅尔 vs 几百维线性频点），信息进一步流失。理解了『丢了一半（相位）+ 剩下的一半还可能被梅尔压过』，你就明白为何 Griffin-Lim 只能做到『可懂但有瑕疵』，以及神经声码器靠『学真实语音先验』补回信息的价值。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>想象你只拿到一张照片的『亮度图』（每个像素多亮），却丢了『颜色』（相位）。要还原照片，你得猜一组颜色让整张图看起来协调。随机上色会一团糟；Griffin-Lim 的做法是反复『涂一版→看哪里不协调→修正』，直到自洽。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：相位重建是求解 $\min_{x}\;\big\lVert\,|\text{STFT}(x)| - A\,\big\rVert_F^2$，其中 $A$ 是给定幅度谱。这是个<strong>非凸</strong>问题（幅度算子非线性）。Griffin-Lim 是它的一种<strong>交替投影</strong>解法（投影到『STFT 幅度=A 的集合』与『合法时域信号的集合』之间），保证目标函数<em>单调不增</em>——这正是 notebook 要验证的收敛性质。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="gl"><span class="num">3</span>Griffin-Lim：交替投影恢复相位</h2>
+  <h3>Griffin-Lim：交替投影恢复相位</h3>  <p><span class="term">Griffin-Lim</span>（Griffin & Lim 1984）是相位重建的经典无学习算法。思想极简：<strong>反复在时域与频域之间投影，每轮保持幅度不变、只更新相位，直到自洽</strong>。一轮迭代是：</p>  <ol>
+    <li>从当前复谱 $S$ 做 <strong>iSTFT</strong> 得时域信号 $x$（这一步把『各帧』强制拼成一个<em>合法的、自洽的时域信号</em>，OLA 自动调和了帧间冲突）；</li>
+    <li>对 $x$ 做 <strong>STFT</strong> 得新复谱 $S'$，取出它的<strong>相位</strong> $\angle S'$（这是当前信号『自然』的相位）；</li>
+    <li>把相位换上、<strong>幅度强制还原成给定的 $A$</strong>：$S \leftarrow A\cdot e^{i\angle S'}$（我们坚持幅度必须是 $A$，只让相位演化）。</li>
+  </ol>  <div class="math-block">\[S^{(0)}=A\,e^{i\phi_0}\ (\phi_0\text{ 随机});\qquad S^{(k+1)} = A\cdot \exp\!\big(i\,\angle\,\text{STFT}(\text{iSTFT}(S^{(k)}))\big)\]</div>  <p>两步各是一个<strong>投影</strong>：iSTFT→STFT 把谱投影到『合法时域信号的 STFT』集合（满足帧间一致性）；换幅度把谱投影到『幅度=A』集合。在两个集合间交替投影，目标 $\big\lVert |S|-A\big\rVert$<strong>单调不增</strong>——这是 Griffin-Lim 收敛性的来源（一种 von Neumann 交替投影 / POCS）。注意它通常收敛到<strong>局部最优</strong>（问题非凸），且依赖初始相位；但实践中几十次迭代就能得到可懂的语音。</p>  <p>为什么『iSTFT 再 STFT』这一步等价于<strong>投影到合法信号集</strong>？关键在于<strong>STFT 是冗余的</strong>：因为帧间重叠，并非任意一个 $(T\times F)$ 的复矩阵都是某个时域信号的 STFT（绝大多数矩阵『不自洽』，相邻帧的重叠区对不上）。而 iSTFT（overlap-add）会把任意复谱<em>强行平均</em>成一个<strong>唯一确定的</strong>时域信号 $x$——再对 $x$ 做 STFT，得到的就一定是<em>自洽的</em>（落在合法集里）。所以这一来一回，几何上正是『把不自洽的谱拉回到最近的自洽谱』。Griffin-Lim 的两步因此是在『自洽但幅度可能不对』和『幅度对但可能不自洽』两个集合间来回拉——交替投影理论保证这种来回会让两集合间的距离单调收缩。理解了『STFT 冗余 → iSTFT 是投影』这一层，你就真正懂了 Griffin-Lim 为何收敛，而不只是会背它的步骤。</p>  <div class="ascii">给定幅度谱 A，随机初相 φ0
+  S = A·e^{iφ0}
+  repeat:
+    x = iSTFT(S)             # 投影1: 强制成合法时域信号(OLA 调和帧间)
+    S'= STFT(x)              # 看这个信号的自然相位
+    S = A · e^{i·∠S'}        # 投影2: 换上新相位, 幅度强制= A
+  return iSTFT(S)            # 最终波形
+
+  每轮: ‖ |STFT(x)| - A ‖  单调不增  → 谱收敛度改善</div>  <div class="callout intuition"><span class="label"></span>
+    <p>Griffin-Lim 的灵魂是<strong>两个『不肯让步』的约束反复拉扯</strong>：『你必须是个能播放的时域信号』(iSTFT) 和 『你的幅度必须等于 A』(换幅度)。一个信号很难同时完美满足两者（因为 A 来自一个被丢了相位、甚至被梅尔压过的谱），但反复在两者间投影，会逼出一个<em>尽量同时满足两者</em>的折中——那组折中的相位，就是我们要的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="converge"><span class="num">4</span>收敛与质量：Griffin-Lim 的脾气</h2>
+  <h3>收敛与质量：Griffin-Lim 的脾气</h3>  <p>Griffin-Lim 能用，但有明确的<strong>脾气</strong>，理解它才能用好、也才能理解神经声码器为何更优：</p>  <table>
+    <thead><tr><th>性质</th><th>表现</th><th>原因/对策</th></tr></thead>
+    <tbody>
+      <tr><td>收敛性</td><td>谱收敛度（‖|S|−A‖）随迭代单调下降</td><td>交替投影保证；但收敛到局部最优</td></tr>
+      <tr><td>迭代次数</td><td>几十次后边际改善变小</td><td>实践常 30–100 次；快版 Fast Griffin-Lim 加动量</td></tr>
+      <tr><td>初相敏感</td><td>不同随机初相 → 不同结果</td><td>好的初相（如全零相位、前一帧外推）能提速</td></tr>
+      <tr><td>音质上限</td><td>可懂但有金属感/混响感</td><td>丢相位 + 局部最优的固有损失，神经声码器解决</td></tr>
+      <tr><td>梅尔→线性</td><td>若从梅尔谱出发，先伪逆还原线性谱（有损）</td><td>额外损失源；高质量 TTS 用神经声码器直接吃梅尔</td></tr>
+    </tbody>
+  </table>  <p>衡量收敛用 <span class="term">spectral convergence</span>（谱收敛度）：$\text{SC}=\big\lVert |S^{(k)}|-A\big\rVert_F / \lVert A\rVert_F$，越小越好。它被 $\lVert A\rVert_F$ 归一化，所以是个<em>无量纲的相对误差</em>，可跨信号比较。notebook 会跑 Griffin-Lim 并<strong>记录每轮的谱收敛度</strong>，验证它<strong>单调下降</strong>（对拍这个不变量），并画出收敛曲线感受『几十次后趋平』。这把抽象的『迭代算法』变成一条你能看见的下降曲线。给个数量级的直觉：<strong>随机相位</strong>直接 iSTFT 的 SC 常在 $0.7\sim1.0$（几乎完全不自洽），跑几十轮 Griffin-Lim 后通常掉到 $0.1\sim0.2$ 量级再趋平——<em>掉一个数量级</em>正是『迭代有效』的标志，而趋平不到 $0$ 则是『非凸局部最优 + 丢相位』的固有上限的体现。notebook 的 assert 就盯两件事：每轮 SC 不上升、且末轮 SC $\ll$ 随机相位的 SC。</p>  <p>Griffin-Lim 的音质上限是<strong>结构性的</strong>：它只用『幅度自洽』这一个约束，没有任何关于『真实语音相位长什么样』的先验。真实语音的相位有强结构（声带脉冲的规律、共振峰的群延迟），Griffin-Lim 看不见这些，只能找一个数学上自洽的相位——结果往往可懂但带<em>金属感、混响感</em>。要突破这个上限，就得给系统注入『真实语音相位的知识』——这正是神经声码器的切入点。</p>  <p>再补一个<strong>初相位的工程技巧</strong>，它便宜却实用。Griffin-Lim 对初始相位敏感（非凸、收敛到局部最优），所以<em>好的初相能显著提速、提质</em>。常见做法有三：全零相位（最简，但易卡）、用前一帧的相位做<strong>线性外推</strong>（利用相邻帧相位的连续性，给一个合理猜测）、或在 TTS 里直接拿一个<strong>廉价声码器的输出</strong>的相位当初值。这引出一个更一般的认识：相位重建不是非黑即白的『有学习 vs 无学习』，而是一个<strong>光谱</strong>——从纯迭代的 Griffin-Lim，到加了少量先验/初值启发的混合法，再到全数据驱动的神经声码器。理解这个光谱，你在实际项目里就能按<em>质量要求、算力预算、是否有训练数据</em>三个维度，在这条光谱上选一个合适的点，而不是非此即彼。</p>  <div class="callout paper"><span class="label"></span>
+    <p>Griffin-Lim 原始论文（Griffin & Lim 1984，见 <code>references.md</code>）给出了算法与其作为最小二乘谱估计的解释。后续 Fast Griffin-Lim（Perraudin 2013）加动量项显著加速。它至今仍是<strong>快速、零训练的基线声码器</strong>与许多 TTS demo 的默认回退，理解它是理解一切声码器的起点。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="neural"><span class="num">5</span>神经声码器：用数据学会相位</h2>
+  <h3>神经声码器：用数据学会相位</h3>  <p>Griffin-Lim 的天花板，被<span class="term">neural vocoder</span>（神经声码器）一举突破。核心区别：<strong>不靠数学自洽猜相位，而是让网络从海量真实语音里学会『该配什么相位/波形』</strong>。几个里程碑：</p>  <ul>
+    <li><strong>WaveNet</strong>（van den Oord 2016，<span class="term">WaveNet</span>）：<span class="term">autoregressive vocoder</span>，用扩张因果卷积逐采样点建模 $p(x_t\mid x_{<t},\text{mel})$。首次合成出接近真人的语音，但<strong>逐点自回归极慢</strong>（一秒音频要跑上万次前向）。</li>
+    <li><strong>WaveRNN / Parallel WaveNet</strong>：用更小的 RNN 或蒸馏成并行模型加速，缓解 WaveNet 的慢。</li>
+    <li><strong>HiFi-GAN</strong>（Kong 2020）：用 <strong>GAN</strong> 做<strong>并行</strong>声码器——生成器一次性把梅尔谱映成波形，多尺度判别器逼它产出真实的波形细节（含相位）。质量接近 WaveNet 而速度快几个数量级，是当前 TTS 的主力声码器。</li>
+    <li><strong>扩散 / 流声码器</strong>：用扩散模型或流模型生成波形，质量高，是近年的另一条主线。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>Griffin-Lim 像一个只会做数学题的人：给它幅度，它能算出一组『自洽』的相位，但听起来总差点意思——因为它没听过真人说话。神经声码器像一个听过几千小时录音的人：你给它梅尔谱，它凭经验直接『脑补』出最像真人的波形，连相位带细节一起给你。前者靠逻辑，后者靠记忆+泛化。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>技术上，神经声码器把『相位重建』从一个<strong>显式优化问题</strong>变成了一个<strong>条件生成问题</strong>：$x = G(\text{mel})$，$G$ 是学出来的。它隐式地学到了真实语音相位的强先验，所以能产出 Griffin-Lim 给不出的自然度。代价是要训练、要数据、要算力，且自回归的（WaveNet）还很慢——这又催生了并行化（HiFi-GAN）。质量、速度、训练成本的三角权衡，和模块 03 的比特率三角异曲同工。</p></div>
+  </div>  <p>把两段式 TTS 拼全：<strong>文本 → [声学模型] → 梅尔谱 → [声码器] → 波形</strong>。<span class="term">Tacotron 2</span>（声学模型用注意力 seq2seq）+ WaveNet（声码器）是这套范式的奠基；<span class="term">FastSpeech</span>（非自回归声学模型）+ HiFi-GAN 是其现代高效版。注意声学模型那一段的<strong>文本↔梅尔帧对齐</strong>，又是模块 02 的对齐问题换了个方向（这次是『一个音素该对应几帧』）——对齐的主题再次出现。</p>  <p>为什么不直接『文本 → 波形』一步到位、非要中间过一道梅尔谱？这个<strong>两段式</strong>的设计有深刻理由。其一是<strong>难度分解</strong>：文本到梅尔是『预测内容与韵律』（语言层面，序列短、信息密），梅尔到波形是『填充声学细节与相位』（信号层面，序列极长），两者性质迥异，分开各用擅长的模型更好训。其二是<strong>可复用与可替换</strong>：梅尔谱是一个<em>标准中间接口</em>——同一个声码器（如 HiFi-GAN）能服务于不同的声学模型，换 TTS 风格只需换前半段；声码器还能独立用于语音转换、语音增强。其三是<strong>数据效率</strong>：声码器（梅尔↔波形）可以用<em>大量无文本的纯音频</em>训练（不需要文本标注），而声学模型只需较少的文本-音频对。这种『用标准中间表示解耦两个子问题』的思想，在工程上反复出现（编译器的 IR、模块 03 的离散 token 也是同类接口）——值得作为一种通用设计直觉记住。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="bigpic"><span class="num">6</span>大图景：声码器在镜像中的位置</h2>
+  <h3>把它串起来：声码器在大图景中的位置</h3>  <p>退一步看，本模块在整门课里是<strong>『生成』方向的第一块</strong>，它和前面的『分析』模块构成镜像：</p>  <div class="ascii">分析方向(模块01-03)            生成方向(模块04-05)
+  波形 ──STFT──► 幅度谱           梅尔谱 ──声码器──► 波形      ← 本模块
+  波形 ──ASR───► 文字             文字 ──TTS──────► 波形
+  波形 ──编码──► 离散token        离散token ──解码/语音LM──► 波形  ← 模块05
+
+  共同难点：分析丢了相位 → 生成必须把相位造回来</div>  <p>这张镜像图揭示了一个深刻的对称：<strong>模块 01 丢掉的相位，正是模块 04 要还回来的东西</strong>；模块 03 的编解码解码器，本质也是一种声码器（从离散 token 还原波形，同样要造相位/细节）。所以本模块的相位重建<em>不是孤立技巧</em>，而是『一切音频生成』的共同子问题——无论你从梅尔谱、从文字、还是从 token 出发，最后一步『变回波形』都要面对相位。</p>  <p>也正因如此，模块 03 的神经编解码解码器与模块 04 的神经声码器在技术上<strong>高度同源</strong>（都是『条件 → 波形』的生成网络，都用类似的对抗/谱损失）。事实上，现代语音 LM（模块 05）常常<strong>直接用神经编解码的解码器当声码器</strong>——生成离散 token，再用编解码解码器还原波形。本模块手写的 Griffin-Lim 是这一切的<em>无学习原型</em>：理解了『为什么要造相位、怎么造』，你就理解了所有声码器/解码器的共同使命。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="roadmap"><span class="num">7</span>从零实现的路线图</h2>
+  <h3>从零实现的路线图</h3>  <p>notebook 会把本模块拆成可验证的几块，对拍可信参考与不变量：</p>  <div class="ascii">幅度谱 A (来自已知波形的 |STFT|)
+  │
+  ├─ istft(S): overlap-add 逆变换 ──对拍── 完整复谱时 iSTFT∘STFT ≈ 恒等
+  │
+  ├─ griffin_lim(A, n_iter): 交替投影 ──验证── 谱收敛度随迭代单调下降  ★
+  │
+  ├─ 收敛曲线: SC(k) 随 k 下降并趋平 ──验证── 单调 + 收敛
+  │
+  └─ 随机相位 vs GL: GL 的谱收敛度 ≪ 随机相位 ──验证── GL 确实有效</div>  <p>其中<strong>最关键的对拍/验证</strong>有两个：(1) <strong>iSTFT 正确性</strong>——给一个<em>完整复谱</em>（含真相位），iSTFT 再 STFT 应近似还原原谱（误差 $<10^{-6}$），这验证我们的 overlap-add 与窗归一写对了；(2) <strong>Griffin-Lim 收敛</strong>——从随机相位出发，谱收敛度 SC(k) 必须<strong>随迭代单调下降</strong>，且远优于『随机相位直接 iSTFT』。这两个一过，你就确信相位重建实现正确。</p>  <p>这套『先验证逆变换无损（有真相位时），再验证迭代算法收敛（无相位时）』的拆解，是验证一切<em>分析-合成</em>系统的通法。它把一个看似玄乎的『从谱图变回声音』，还原成两个可单独 assert 的命题——这正是本课『从零 + 对拍』方法论的威力。</p>  <p>特别说说<strong>iSTFT 那个『无损往返』测试</strong>为何是地基。overlap-add 的窗能量归一极易写错（合成时是否再乘一次窗、除以 $\sum w$ 还是 $\sum w^2$、边界帧如何处理），写错了<em>不会报错</em>，只是让重建信号有周期性的幅度起伏（听上去像颤音）或边界爆音。可一旦你拿一个<strong>已知波形</strong>、取它的完整复谱（含真相位）、做 iSTFT 再比对原波形，任何归一错误都会让中段误差从 $10^{-7}$ 跳到 $10^{-2}$，立刻现形。所以先把『有真相位时 iSTFT∘STFT ≈ 恒等』这一关 assert 死，再去做 Griffin-Lim——否则你分不清『重建难听』是 Griffin-Lim 没收敛，还是 iSTFT 本身就写错了。<em>先确保逆变换正确，再谈相位重建</em>，是声码器开发不可跳过的顺序。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>相位的回归</strong>：丢相位是几十年默认，但 complex spectrogram 声码器、相位感知损失、以及直接建模波形/复谱的方法在重新重视相位——它对音质（尤其瞬态、清辅音）其实重要。</li>
+    <li><strong>速度 vs 质量</strong>：自回归声码器（WaveNet）质量高但慢；并行（HiFi-GAN/扩散）快但训练复杂。实时、高保真、低算力三者兼得仍是工程追求（尤其端侧 TTS）。</li>
+    <li><strong>声码器与编解码的统一</strong>：神经编解码解码器与神经声码器同源，语音 LM 直接复用编解码解码器。『一个解码器服务识别/合成/编解码/生成』的统一是趋势。</li>
+    <li><strong>零样本与可控</strong>：从几秒参考音色克隆说话人（VALL-E 走 token 路线，模块 05），或精细控制韵律/情感，是 TTS 的活跃方向。声码器要忠实地把这些控制落到波形。</li>
+    <li><strong>评测</strong>：声码器质量主要靠主观 MOS，客观指标（PESQ、谱收敛度、Mel 距离）与人耳感知仍有差距。如何客观、可复现地评测合成音质是开放问题。</li>
+  </ul>  <div class="card"><strong>✅ 本章你应该能回答：</strong>  <ol>
+    <li>为什么从谱图还原波形是个逆问题？缺的是什么？有完整复谱时为什么是平凡的？</li>
+    <li>写出 Griffin-Lim 的一轮迭代（两步投影）；为什么幅度强制不变、只更新相位？</li>
+    <li>Griffin-Lim 为什么收敛？收敛到全局还是局部最优？谱收敛度怎么定义？</li>
+    <li>Griffin-Lim 的音质上限为何是结构性的？神经声码器凭什么突破它？</li>
+    <li>两段式 TTS 的两段分别是什么？声码器与神经编解码解码器为何同源？</li>
+  </ol></div>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读（详见 <code>references.md</code>）：Griffin & Lim 1984（本模块核心）、van den Oord 2016（WaveNet，神经声码器开山）、Shen 2017（Tacotron 2，两段式范式）、Kong 2020（HiFi-GAN，并行声码器）、Ren 2019（FastSpeech）。下一模块把离散 token 纳入语言模型，生成方向的终点。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_codecs/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 神经音频编解码</div></a>
+    <a class="next" href="../05_speech_llms/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 语音 LLM 与流式</div></a>
+  </div>
+
+</div>
+</body>
+</html>

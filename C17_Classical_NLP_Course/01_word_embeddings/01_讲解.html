@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 词嵌入 word2vec</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 词嵌入 word2vec</h1>
+  <p class="subtitle">分布假设：观其伴知其义 —— 从 one-hot 的困境到 skip-gram + 负采样，纯 numpy 从零训出有几何结构的词向量，验证相似与类比（king−man+woman）</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">线性代数（向量/内积/范数）、softmax 与 sigmoid、梯度下降、模块 00</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_word_embeddings.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Mikolov 2013（word2vec×2）、Pennington 2014（GloVe）、Levy & Goldberg 2014、SLP 第 6 章</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#onehot">从 one-hot 的困境说起</a></li>
+      <li><a href="#distrib">分布假设与共现矩阵</a></li>
+      <li><a href="#word2vec">word2vec：用预测任务学向量</a></li>
+      <li><a href="#negsamp">负采样：绕过 O(V) 的 softmax</a></li>
+      <li><a href="#glove">GloVe：直接拟合全局共现</a></li>
+      <li><a href="#use">相似度与词类比：用向量算术</a></li>
+      <li><a href="#pipeline">完整训练流水线与易混点</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="onehot"><span class="num">1</span>从 one-hot 的困境说起</h2>
+  <p>先问一个看似幼稚、实则深刻的问题：<strong>计算机怎么「表示」一个词？</strong>最朴素的答案是给每个词一个编号，或者等价地，一个 <span class="term">one-hot vector</span>——词表有 $V$ 个词，每个词就是一个长度 $V$、只有自己那一位为 1 的向量。这看起来无害，却藏着一个致命缺陷。</p>  <p>用 one-hot，任意两个不同词的内积都是 0、余弦相似度都是 0。也就是说，在 one-hot 的世界里，<strong>cat 和 dog 的相似程度，和 cat 和 democracy 的相似程度，完全一样——都是零</strong>。模型无法知道 cat 和 dog 都是动物、都能 run、都会出现在「my ___ is hungry」里。每个词都是一座孤岛，词与词之间没有任何可计算的关系。更糟的是维度灾难：词表动辄几十万，one-hot 是几十万维的稀疏向量，既浪费又无法泛化——见过「good movie」不能帮助理解没见过的「great film」。</p>  <p>我们想要的是<strong>稠密、低维、且能编码语义关系</strong>的向量：让 cat 和 dog 的向量靠得近，让「国王之于王后」的关系和「男人之于女人」的关系在向量空间里<em>平行</em>。这样的向量叫 <span class="term">word embedding</span>（词嵌入/词向量）。问题是：我们既没有人标注「哪些词相似」，也没有词典定义可用，怎么<strong>纯粹从无标注的文本里</strong>学出这种结构？答案藏在一句语言学名言里。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>one-hot 像给每个词发一个互不相同的身份证号——号码之间没有任何含义，123 号和 124 号的人没有任何关系。词嵌入则像给每个词在地图上标一个坐标，意义相近的词坐标也相近，于是「距离」「方向」都有了含义。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：one-hot $\in\{0,1\}^V$，满足 $\langle e_i, e_j\rangle=\delta_{ij}$（不同词正交，相似度恒 0）；embedding $\in\mathbb{R}^d$（$d\ll V$，如 100–300），是稠密实向量，其内积/余弦编码语义相似度。从 one-hot 到 embedding，本质是学一个矩阵 $E\in\mathbb{R}^{V\times d}$，把稀疏正交的 one-hot 映射到稠密有结构的低维空间。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>本模块要回答的核心问题：<strong>如何只靠「词出现在什么上下文里」这一条线索，无监督地学出有几何结构的词向量？</strong>——答案是分布假设 + word2vec 的负采样训练。学完你能从一段莎士比亚文本里训出词向量，并验证相似词聚在一起、类比关系成为平行向量。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="distrib"><span class="num">2</span>分布假设与共现矩阵</h2>
+  <p>1957 年，语言学家 <strong>J.R. Firth</strong> 留下一句被引用至今的话：<em>「You shall know a word by the company it keeps」</em>（观其伴，知其义）。这就是 <span class="term">distributional hypothesis</span>（分布假设）：<strong>意义相近的词，倾向于出现在相似的上下文里</strong>。</p>  <p>这个假设之所以强大，是因为它把抽象的「意义」变成了<strong>可从文本统计出来的东西</strong>。你不需要懂 tezgüino 是什么，但如果你读到「A bottle of ___ is on the table」「Everybody likes ___」「We make ___ out of corn」，你立刻能推断它是某种（用玉米酿的）酒类饮料——因为它出现的上下文和 wine、beer 高度重合。<strong>上下文分布就是意义的指纹</strong>。</p>  <p>怎么把分布假设变成数字？最直接的做法是建一个 <span class="term">co-occurrence matrix</span>（共现矩阵）：统计每个词在每个词的上下文窗口里出现了多少次。设窗口半径为 $m$，矩阵 $X\in\mathbb{R}^{V\times V}$ 的元素：</p>  <div class="math-block">\[X_{ij} = \#\{\text{词 } j \text{ 出现在词 } i \text{ 的 } \pm m \text{ 窗口内的次数}\}\]</div>  <p>$X$ 的第 $i$ 行，就是词 $i$ 的「上下文指纹」——一个 $V$ 维向量。分布假设说：<strong>两个词的行向量越像，它们意义越近</strong>。于是「学词向量」第一版答案呼之欲出：直接拿共现矩阵的行当词向量。但它有两个毛病：① 维度还是 $V$（高维稀疏）；② 原始计数被高频词（the、of）主导。改进有两步——用 <span class="term">PPMI</span>（正点互信息）替代原始计数以消除高频偏置，再用 SVD 降维。这条「计数派」路线能work，但 2013 年，一条更高效的「预测派」路线横空出世。</p>  <div class="callout paper"><span class="label"></span>
+    <p>分布假设是几乎所有现代表示学习的哲学根基——从 word2vec 到 BERT 到今天的大模型，「用上下文预测/重建」的自监督训练，本质都是分布假设的工程化。Levy & Goldberg 2014 更证明了：word2vec 的负采样<strong>隐式地就是在分解一个 PMI 矩阵</strong>，「预测派」与「计数派」殊途同归。详见 references。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="word2vec"><span class="num">3</span>word2vec：用预测任务学向量</h2>
+  <p>2013 年 Mikolov 等人提出 <span class="term">word2vec</span>，核心想法朴素得惊人：<strong>与其费力建大矩阵再分解，不如训练一个小神经网络去做「预测上下文」的任务，把学到的权重当词向量</strong>。它有两个对偶的版本：</p>  <table>
+    <thead><tr><th>模型</th><th>任务</th><th>输入 → 输出</th><th>特点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Skip-gram</strong> 跳字</td><td>用中心词预测上下文</td><td>中心词 $w_c$ → 每个上下文词 $w_o$</td><td>低频词友好、小语料稳健（本课主推）</td></tr>
+      <tr><td><strong>CBOW</strong> 连续词袋</td><td>用上下文预测中心词</td><td>上下文词（求和）→ 中心词 $w_c$</td><td>训练快、高频词友好</td></tr>
+    </tbody>
+  </table>  <p>聚焦 skip-gram。它给每个词<strong>两套</strong>向量：作为中心词时用 <code>v_w</code>（输入向量），作为上下文词时用 <code>u_w</code>（输出向量）。给定中心词 $c$，预测某个上下文词 $o$ 的概率，用 softmax 定义：</p>  <div class="math-block">\[P(o \mid c) = \frac{\exp(u_o^\top v_c)}{\sum_{w=1}^{V} \exp(u_w^\top v_c)}\]</div>  <p>训练目标是最大化语料中所有「中心词-真实上下文词」对的对数概率。直觉上：<strong>让真实共现的词对，其向量内积尽量大</strong>（softmax 概率高）。梯度下降会把经常共现的词的向量拉近、不共现的推远——分布假设就这样被<em>编码进了向量的几何</em>。但这个 softmax 有个致命的工程问题：分母要对<strong>整个词表 $V$</strong>求和。</p>  <div class="callout warn"><span class="label"></span>
+    <p>softmax 分母 $\sum_{w=1}^V \exp(u_w^\top v_c)$ 每算一次梯度都要遍历整个词表。$V$ 是几十万时，每个训练样本、每步更新都要做几十万次内积——在十亿词语料上这是完全无法承受的。word2vec 能跑起来，全靠下一节的 <strong>负采样</strong> 把这个 $O(V)$ 的归一化绕过去。这是它从「理论可行」到「实际可用」的关键一跃。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="negsamp"><span class="num">4</span>负采样：绕过 O(V) 的 softmax</h2>
+  <p>负采样的洞察是：我们<strong>不需要真的算出归一化的概率</strong>，只需要一个能把词向量训出结构的<em>代理任务</em>。<span class="term">negative sampling</span> 把「在 $V$ 路上做 softmax」换成一个简单得多的二分类问题：</p>  <p><strong>给定一个词对 $(c, o)$，判断它是「真的共现对」还是「随机凑的假对」。</strong>对每个真实对 $(c, o)$（正样本），随机抽 $k$ 个词 $\{w_1,\dots,w_k\}$ 当<strong>负样本</strong>（假装它们是上下文，但其实是噪声）。训练让模型：对正样本输出「真」，对负样本输出「假」。用 logistic（sigmoid $\sigma$）做二分类，单个正样本的损失为：</p>  <div class="math-block">\[\mathcal{L} = -\log \sigma(u_o^\top v_c) \;-\; \sum_{i=1}^{k} \log \sigma(-u_{w_i}^\top v_c)\]</div>  <p>逐项读懂它：第一项 $-\log\sigma(u_o^\top v_c)$ 要让<strong>真实对的内积变大</strong>（$\sigma\to1$，损失$\to0$）；第二项每一个 $-\log\sigma(-u_{w_i}^\top v_c)$ 要让<strong>负样本的内积变小</strong>（$\sigma(-x)\to1$ 即 $x\to-\infty$）。一句话：<strong>把真实共现词拉近、把随机词推远</strong>。代价从 $O(V)$ 骤降到 $O(k)$（$k$ 通常 5–20），这是 word2vec 可扩展的全部秘密。</p>  <p>梯度也很干净。记 $s=u_o^\top v_c$，对正样本 $\frac{\partial\mathcal L}{\partial v_c}=(\sigma(s)-1)\,u_o$，对负样本 $\frac{\partial\mathcal L}{\partial v_c}=\sigma(u_{w_i}^\top v_c)\,u_{w_i}$。注意 $\sigma(s)-1$ 正是「预测概率 − 标签(1)」——这和逻辑回归的梯度一模一样。notebook 会从零推导并实现这套梯度，与数值梯度对拍验证。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把训练想成「拔河」：每见到一个真实词对，就把这两个词的向量往一起拽；同时随手抓 $k$ 个不相干的词，把它们往外推。千万次这样的拉扯之后，常一起出现的词自然聚成团，向量空间的几何就长出了语义。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>负样本不是均匀抽，而是按 <span class="term">noise distribution</span> $P_n(w)\propto f(w)^{0.75}$（词频的 3/4 次方）抽。这个指数是 word2vec 论文的经验发现：它压低 the/of 等超高频词被抽中的概率、抬高低频词，比按词频（$\alpha=1$）或均匀（$\alpha=0$）都显著更好。3/4 是个魔法常数，notebook 会复现它的效果。</p></div>
+  </div>  <div class="callout danger"><span class="label">魔鬼在超参</span>
+    <p>负采样训练出的词向量质量，对几个超参很敏感：负样本数 $k$、窗口大小 $m$、噪声分布指数、是否对高频词做子采样（subsampling）。这些「工程细节」常常比模型结构本身影响更大（Levy et al. 2015）。本课用小语料、小维度让你看清机制；要训生产级词向量，这些旋钮都得调。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="glove"><span class="num">5</span>GloVe：直接拟合全局共现</h2>
+  <p>word2vec 是「预测派」（局部窗口、在线 SGD）。2014 年 Pennington 等人的 <span class="term">GloVe</span> 走「计数派」回马枪：<strong>既然全局共现矩阵 $X$ 已经包含了所有统计信息，为什么不直接拟合它？</strong></p>  <p>GloVe 的出发点是一个观察：<strong>共现概率的「比值」才编码了意义</strong>。比如对 ice 和 steam，看它们与探针词的共现比 $P(k\mid\text{ice})/P(k\mid\text{steam})$：对 $k=$solid 这个比值很大（ice 相关），对 $k=$gas 很小（steam 相关），对 $k=$water 或 fashion 则接近 1（都相关或都不相关）。比值放大了区分性的信息。GloVe 推导出：要让词向量的内积去拟合共现计数的对数。最终的加权最小二乘损失是：</p>  <div class="math-block">\[J = \sum_{i,j=1}^{V} f(X_{ij}) \big( w_i^\top \tilde{w}_j + b_i + \tilde{b}_j - \log X_{ij} \big)^2\]</div>  <p>读它：核心是让 $w_i^\top\tilde w_j+b_i+\tilde b_j$ 去逼近 $\log X_{ij}$（共现计数的对数），$b$ 是偏置项。外面套的 <span class="term">weighting function</span> $f(X_{ij})$ 是点睛之笔——它对<strong>极低频共现降权</strong>（计数小、噪声大、不可信）、对<strong>极高频共现封顶</strong>（避免 the-of 这类对主导损失），典型取 $f(x)=\min((x/x_{\max})^\alpha, 1)$，$\alpha=0.75$（又是 3/4！）。</p>  <p>GloVe 与 word2vec 在效果上难分伯仲，但视角互补：word2vec 是<strong>局部、在线、隐式</strong>地利用共现（一次看一个窗口），GloVe 是<strong>全局、批量、显式</strong>地拟合共现统计。理论上（Levy & Goldberg）它们都在做某种矩阵分解。notebook 会用 numpy 实现一个迷你 GloVe（建共现 → 加权最小二乘 → 梯度下降），并和 skip-gram 的结果对照。</p>  <div class="callout paper"><span class="label"></span>
+    <p>GloVe 论文最精彩的是它的<strong>推导</strong>：从「共现比值才有意义」这个观察出发，一步步推出「内积拟合对数共现」的目标函数，而非拍脑袋。强烈建议读原文的推导部分。它和 word2vec 的关系（Levy & Goldberg 2014 证明 SGNS≈隐式 PMI 分解）是理解词向量本质的关键，见 references。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="use"><span class="num">6</span>相似度与词类比：用向量算术</h2>
+  <p>词向量训出来了，怎么<strong>用</strong>、怎么<strong>评</strong>它好不好？两个经典操作：相似度检索与类比。</p>  <h3>余弦相似度：找近义词</h3>  <p>衡量两个词向量有多像，标准是 <span class="term">cosine similarity</span>（余弦相似度）——夹角的余弦，只看方向不看长度：</p>  <div class="math-block">\[\cos(u, v) = \frac{u \cdot v}{\|u\|\,\|v\|} \in [-1, 1]\]</div>  <p>为什么用余弦而非欧氏距离？因为词向量的<strong>长度</strong>常和词频相关（高频词向量更长），而我们关心的是<strong>语义方向</strong>。余弦归一化掉长度，只比较方向，更稳健。给定一个词，把它和词表里所有词算余弦、取最大的几个，就是它的「近义词」。在好的词向量里，cat 的近邻会是 dog、kitten、pet，而非随机词。</p>  <h3>词类比：向量算术里的语义</h3>  <p>word2vec 最惊艳的发现是 <span class="term">analogy</span>（词类比）：<strong>king − man + woman ≈ queen</strong>。用向量算术做类比！这揭示了一个深刻现象：某些语义/句法关系，在向量空间里近似是<strong>平行的位移向量</strong>——「男→女」这个变换，无论施加在 king、actor、uncle 上，都是大致相同的方向位移。</p>  <div class="ascii">词向量空间里的「平行四边形」结构（示意）
+
+   man  ───────►  king        位移向量 (king-man) ≈ (queen-woman)
+    │               │         =&gt; king - man + woman ≈ queen
+    │ (性别向量)     │ (性别向量)
+    ▼               ▼
+  woman ───────► queen
+
+  解法：算 v = vec(king) - vec(man) + vec(woman)，找余弦最近的词（排除输入词）</div>  <p>具体做法：算目标向量 $v=\text{vec(king)}-\text{vec(man)}+\text{vec(woman)}$，再在词表里找与 $v$ 余弦最近的词（要排除 king/man/woman 三个输入词，否则常返回输入自己）。类比任务（语义类：国家-首都、句法类：动词时态）是评估词向量质量的经典基准。notebook 会在训练出的向量上实现完整的类比检索。</p>  <div class="callout warn"><span class="label"></span>
+    <p>词类比虽惊艳，但别神化它：① 平行四边形结构只对部分关系成立，且依赖「排除输入词」这个技巧；② 词向量会<strong>继承语料的社会偏见</strong>（如 man:doctor::woman:nurse），这是 AI 伦理的重要议题；③ 它衡量的是向量空间的全局几何，不代表模型「理解」了关系。把它当作有用的诊断工具，而非智能的证据。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">7</span>完整训练流水线与易混点</h2>
+  <p>把前面的零件拼起来，看清词向量的完整训练流程，也理清几个易混点。一个端到端的 skip-gram + 负采样训练长这样：</p>  <div class="ascii">skip-gram + 负采样 训练流水线
+
+  原始文本 ──分词──► token 序列 ──建词表──► word2id
+     │
+     ▼ (滑窗，半径 m)
+  生成 (中心词, 上下文词) 正样本对   ──┐
+     │                                │
+     ▼ (按 f(w)^0.75 抽 k 个)          │
+  每个正对配 k 个负样本               ──┤
+                                       ▼
+  对每个 (c, o, negs):
+    前向: s = u·v ; loss = -logσ(u_o·v_c) - Σ logσ(-u_neg·v_c)
+    反向: 算 ∂L/∂v_c, ∂L/∂u_o, ∂L/∂u_neg
+    更新: v_c -= lr·grad ; u -= lr·grad
+     │
+     ▼ (多个 epoch)
+  词向量 = 输入向量 v_w （或 v_w + u_w）──► 相似度 / 类比</div>  <p>几个常让初学者困惑的点，一次说清：</p>  <ul>
+    <li><strong>为什么有两套向量（v 和 u）？</strong> 因为一个词作中心词和作上下文词扮演不同角色。数学上两套向量让优化更容易（避免词和自己内积的退化）。最终取 $v_w$ 或 $v_w+u_w$ 都可，后者常略好。</li>
+    <li><strong>窗口大小 m 影响什么？</strong> 窗口大（如 10）→ 捕捉主题相关（topical：football、coach、stadium）；窗口小（如 2）→ 捕捉句法/近义（syntactic：football、basketball）。按下游任务选。</li>
+    <li><strong>词向量是静态的。</strong> 经典词向量给每个词<strong>一个固定向量</strong>，无法处理一词多义（bank=银行/河岸用同一向量）。这正是 ELMo/BERT 等<strong>上下文相关</strong>词向量要解决的——同一个词在不同句子里有不同向量。这是经典通向现代的关键一步。</li>
+    <li><strong>子采样高频词（subsampling）。</strong> 训练时以一定概率丢弃 the/of 等超高频词，既加速又提质（让模型多看有信息的词对）。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>整个 word2vec 就是：滑窗造词对、配几个随机负样本、用逻辑回归式的拉近推远、重复百万次。简单到能在一页纸上写完，效果却好到开启了一个时代。这正是经典 NLP 的魅力——<strong>朴素的思想 + 正确的工程 = 强大的结果</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从优化角度，SGNS（skip-gram negative sampling）是在最大化 $\sum_{(c,o)}\log\sigma(u_o^\top v_c)+\sum_{\text{neg}}\log\sigma(-u^\top v_c)$。Levy & Goldberg 2014 证明其最优解满足 $u_o^\top v_c=\mathrm{PMI}(o,c)-\log k$，即它隐式分解了一个移位 PMI 矩阵——这把「预测派」word2vec 和「计数派」PMI-SVD 在理论上完全统一了。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>词嵌入是 2013–2018 年 NLP 的基础设施，但它有根本局限，这些局限催生了今天的范式：</p>  <ul>
+    <li><strong>静态 → 上下文相关</strong>：经典词向量给一词一向量，无法处理多义。<strong>ELMo（2018）、BERT（2018）</strong> 让词向量依赖整个句子——同一个 bank 在「river bank」和「bank account」里有不同向量。这是从 word2vec 到 Transformer 时代最关键的跃迁，而其内核（用上下文预测/重建）仍是分布假设。</li>
+    <li><strong>词级 → 子词级</strong>：OOV（未登录词）和形态丰富的语言是词级向量的痛点。<strong>fastText（用字符 n-gram）、BPE/WordPiece 子词切分</strong> 让模型能组合出没见过的词，今天所有大模型的 tokenizer 都走子词路线。</li>
+    <li><strong>词 → 句/文档</strong>：怎么从词向量得到句子向量？简单平均、加权（SIF）、到 Sentence-BERT，是表示学习从词向上的延伸。</li>
+    <li><strong>可解释性与偏见</strong>：词向量会编码训练语料的社会偏见（性别、种族刻板印象），如何度量与去偏（debiasing）是活跃的伦理研究方向。</li>
+    <li><strong>多语言与对齐</strong>：能否把不同语言的词向量对齐到同一空间，实现无监督翻译？跨语言词嵌入是个迷人的分支。</li>
+  </ul>  <p>但请记住贯穿全课的主线：这些前沿无一例外地<strong>站在分布假设的肩膀上</strong>。BERT 的 masked language modeling 是「用上下文预测被遮的词」——分布假设的极致；大模型的 embedding 层、它学到的语义几何，都是 word2vec 故事的续集。理解了本模块的 skip-gram、负采样、共现、类比，你就握住了读懂这一切「现代表示学习」的钥匙——它们只是把同一个思想，在更深的网络、更大的数据上做得更彻底。</p>  <div class="callout paper"><span class="label"></span>
+    <p>延伸必读（见 <code>../references.md</code>）：Mikolov 2013 两篇（word2vec 与负采样）、Pennington 2014（GloVe）是源头；Levy & Goldberg 2014（SGNS = 隐式 PMI 分解）打通预测派与计数派；Bojanowski 2017（fastText）走向子词；Jurafsky & Martin《SLP》第 6 章是向量语义的最佳系统读物。下一站模块 02，我们从「表示词」转向「给词序列赋概率」。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_ngram_lm/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · N-gram 语言模型</div></a>
+  </div>
+
+</div>
+</body>
+</html>

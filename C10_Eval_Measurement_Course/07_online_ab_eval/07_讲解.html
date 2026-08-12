@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · 在线 A/B 评测</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 07 / 08</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>07 · 在线 A/B 评测</h1>
+  <p class="subtitle">把评测搬到真实流量上 —— 随机化让组间差异等于因果效应；假设检验、功效与样本量、多重比较校正、序贯检验与偷看、CUPED 方差缩减，全部纯 numpy 从零实现并与 scipy 对拍</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、概率与抽样分布、正态分布、一点点回归（CUPED 用到最小二乘斜率）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 07_online_ab_eval.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Kohavi 2020（A/B 实战）、Deng 2013（CUPED）、Johari 2017（偷看）、Benjamini-Hochberg 1995</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">把评测搬到线上：随机化与因果</a></li>
+      <li><a href="#testing">假设检验：是不是运气</a></li>
+      <li><a href="#twosample">两样本检验：z 检验与 t 检验</a></li>
+      <li><a href="#power">功效分析与样本量</a></li>
+      <li><a href="#multiple">多重比较：假阳性泛滥</a></li>
+      <li><a href="#sequential">序贯检验与偷看</a></li>
+      <li><a href="#cuped">CUPED：方差缩减</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>把评测搬到线上：随机化与因果</h2>
+  <p>前六个模块都在<strong>离线</strong>测量：拿一个固定的测试集、一批标注、一组人评，算出分数。但模型最终是给<strong>真人</strong>用的，而离线分数高，未必等于用户体验好——线下涨了 2 个 BLEU 点的翻译模型，线上可能因为更啰嗦反而被用户嫌弃。这一模块把评测搬到<strong>线上</strong>：用 <span class="term">A/B test</span>（随机对照实验，RCT）直接在真实流量上测量「这个改动到底有没有让指标变好」。</p>  <p>A/B 实验的灵魂是<strong>随机化</strong>。把用户随机分到对照组(A，旧版)与处理组(B，新版)，由于分组只看一枚硬币、与用户本身的任何属性无关，两组在<em>一切其它因素</em>（活跃度、地域、设备、时段……）上都<strong>统计可比</strong>。于是两组指标的差异，就只能归因于唯一的不同——你的改动。这正是随机化的魔力：它把一个<em>因果</em>问题（我的改动<em>导致</em>了指标变化吗）变成一个<em>可测量</em>的对照差异，绕开了观察性数据里千头万绪的混杂。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：你想知道一种新肥料是否增产。最蠢的做法是把新肥料用在阳光好的那块地、旧肥料用在背阴地——结果分不清是肥料还是阳光的功劳。正确做法是把每块地<strong>掷硬币</strong>决定用哪种肥料，让阳光、土质等差异在两组间被随机抹平。A/B 实验就是给软件改动掷硬币。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：随机分配让处理 $T$ 与潜在结果独立，于是组间均值差 $\bar Y_B-\bar Y_A$ 是平均处理效应（ATE）的<strong>无偏估计</strong>。剩下的全部工作，是回答一个统计问题——这个观测到的差异，有多大可能只是<strong>抽样波动</strong>而非真实效应？这就是假设检验。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>本模块要回答的核心问题只有一个，但它无处不在：<strong>我看到的这点差别，是真本事，还是抽样噪声？</strong>（处理组转化率 12.1% vs 对照 11.8%，是新功能起作用了，还是这 0.3 个点纯属运气？）回答它需要四件配套的手艺：会做检验（算 p 值）、会算功效（实验值不值得做）、会防假阳性（多重比较与偷看）、会提灵敏度（CUPED 方差缩减）。本模块逐一从零实现。</p>
+  </div>  <p>为什么离线评测做得再好也替代不了线上 A/B？因为离线指标和真实目标之间隔着一条<strong>效度的鸿沟</strong>（回到模块 00 的语言）。你在固定测试集上优化 BLEU、accuracy、胜率，赌的是「这些代理指标涨了，用户体验也会涨」——但这个赌注常常落空：模型可能学会了讨好你的离线指标却惹恼真人，或者你的测试集分布早已偏离了线上真实流量。A/B 实验之所以是评测的<em>终审法庭</em>，正因为它把测量对象从「与某个静态金标的吻合度」换成了<strong>真实用户在真实环境里的真实行为</strong>——这是效度最高、也最难造假的一种测量。本课前六模块教你把离线测量做得可信，这一模块教你在离线之上，用线上实验给最终结论封顶。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="testing"><span class="num">2</span>假设检验：是不是运气</h2>
+  <h3>假设检验：把「是不是运气」变成一个概率</h3>  <p>假设检验是一套<strong>反证法</strong>式的推理。我们想证明「B 比 A 好」，却<em>先假设它不好</em>——设立<strong>原假设</strong> $H_0$：两组无差异（处理效应为 0）。然后问：<strong>如果 $H_0$ 为真</strong>，我们观测到「至少这么大」的组间差异的概率有多少？这个概率就是 <span class="term">p-value</span>。p 值小（如 < 0.05），说明「在无差异的世界里，这么大的差异太罕见了」，于是我们<strong>拒绝</strong> $H_0$，相信差异是真的。</p>  <div class="math-block">\[p\text{-value} = P\big(\,|\text{统计量}| \ge |\text{观测值}| \;\big|\; H_0\ \text{为真}\,\big)\]</div>  <div class="callout danger"><span class="label">p 值不是什么</span>
+    <p>p 值是评测中<strong>误读最严重</strong>的概念，必须记牢它<strong>不是</strong>什么：①它<strong>不是</strong>「$H_0$ 为真的概率」，也不是「差异由运气造成的概率」——它是<em>假设 $H_0$ 为真时、数据这么极端的概率</em>，条件方向反了；②p=0.04 <strong>不代表</strong>效应大，大样本下微不足道的效应也能给出极小的 p（所以永远要看<span class="term">effect size</span>）；③p > 0.05 <strong>不证明</strong>「无差异」，可能只是功效不够、没看见而已（<em>absence of evidence ≠ evidence of absence</em>）。</p>
+  </div>  <p>检验会犯两类错误，是一对此消彼长的矛盾。<strong>第一类错误</strong>（$\alpha$，假阳性）：$H_0$ 其实为真，你却拒绝了它——把噪声当成了效应、上线了一个其实没用的功能。<strong>第二类错误</strong>（$\beta$，假阴性）：$H_0$ 其实为假（真有效应），你却没拒绝——错过了一个真正的改进。<strong>功效</strong>（power）$=1-\beta$，即「真有效应时能发现它」的概率。我们的惯例是把 $\alpha$ 钉死在一个小值（如 0.05，容忍 5% 假阳性），然后在这个约束下尽量把功效做高。这两个旋钮的取舍贯穿整个实验设计：$\alpha$ 调小则更不容易误报、但也更难发现真效应（功效下降）。</p>  <p>$\alpha$ 的选择不是一个纯统计问题，而是一个<strong>成本权衡</strong>。$\alpha=0.05$ 是约定俗成，但它隐含地说「误上线一个没用的功能，比错过一个好功能，糟糕 19 倍」（因为我们容忍 5% 假阳性、却常追求 80% 功效即 20% 假阴性）。这个权衡该随场景变：改一个无关痛痒的按钮颜色，假阳性代价低，$\alpha$ 可松；改核心计费逻辑或安全相关功能，假阳性代价极高，$\alpha$ 该收紧到 0.01 甚至更低。把 $\alpha$ 当成「你愿意为这个决策承担多大的误报风险」的旋钮，而非一个抄来的魔法数字 0.05。</p>  <p>注意一个常被忽略的前提：上面这套推理只在<strong>分析方案预先定好</strong>时才成立——你得在看数据<em>之前</em>就定下指标、$\alpha$、样本量与停止规则。一旦你边看数据边决定「再多收点」「换个指标试试」「现在显著了就停」，p 值的数学保证就失效了（第 6 节的偷看问题）。这是把假设检验从「仪式」变成「可信推断」的分水岭，也是 <span class="term">p-hacking</span> 的根源——在足够多的自由度（指标、子群、停止时点）里翻找，总能翻出一个 p<0.05。预注册（preregistration）分析方案，是科学诚信对这种自由度的回应。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="twosample"><span class="num">3</span>两样本检验：z 检验与 t 检验</h2>
+  <h3>两样本检验：从零实现 z 检验与 t 检验</h3>  <p>线上指标大致两类，对应两种检验。<strong>比例型</strong>指标（点击率、转化率，每个用户是 0/1）用<strong>两比例 z 检验</strong>；<strong>连续型</strong>指标（人均时长、人均收入）用<strong>两样本 t 检验</strong>。两者形式一致：都是<code>(观测差异) / (差异的标准误)</code>，再查参考分布得 p 值。</p>  <p>两比例 z 检验。设两组转化率 $\hat p_A,\hat p_B$、样本量 $n_A,n_B$。在 $H_0$（两组真实比例相等）下，用合并比例 $\hat p=\frac{x_A+x_B}{n_A+n_B}$ 估计共同方差，统计量为：</p>  <div class="math-block">\[z = \frac{\hat p_B-\hat p_A}{\sqrt{\hat p(1-\hat p)\left(\frac{1}{n_A}+\frac{1}{n_B}\right)}},\qquad p\text{-value}=2\big(1-\Phi(|z|)\big)\]</div>  <p>连续型用 <span class="term">Welch's t-test</span>（不假设两组方差相等，比经典 t 检验更稳健，是线上实验的默认）。它的标准误直接由两组各自的样本方差拼成：</p>  <div class="math-block">\[t=\frac{\bar Y_B-\bar Y_A}{\sqrt{\frac{s_A^2}{n_A}+\frac{s_B^2}{n_B}}},\qquad \text{自由度由 Welch–Satterthwaite 公式近似}\]</div>  <div class="callout intuition"><span class="label"></span>
+    <p>两个公式长得吓人，但结构是同一句话：<strong>信号除以噪声</strong>。分子是你关心的组间差异（信号），分母是「如果纯靠抽样波动，这个差异本身会抖多大」（噪声=标准误）。比值大（远离 0）说明信号盖过了噪声 → 差异可信。<em>所有</em>假设检验本质都在算这个信噪比，只是噪声的估法因指标类型而异。</p>
+  </div>  <p>本模块 notebook 会把这两个检验<strong>纯 numpy 从零写出来</strong>，再用 <code>scipy.stats.ttest_ind(..., equal_var=False)</code> 和 <code>scipy.stats.norm</code> 当<strong>参考对拍</strong>——要求自己算的 $t$、$z$、$p$ 与 scipy 一致到 $10^{-6}$。这是本课的纪律：不调库地理解机制，但用库来证明你的实现没错。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="power"><span class="num">4</span>功效分析与样本量</h2>
+  <h3>功效分析：实验值不值得做？</h3>  <p>最该在<strong>跑实验之前</strong>做、却最常被跳过的一步是<span class="term">power analysis</span>。它回答：要可靠地检出一个我在意的最小效应，我需要多少样本？若你的真实效应是 +0.5%，但实验只有功效 20%，那么<strong>即使改动真的有用，你也有 80% 的概率看不到显著</strong>——白跑一场，还可能误判「没效果」而砍掉一个好功能。</p>  <p>四个量被一道方程拴在一起：显著性水平 $\alpha$、功效 $1-\beta$、<span class="term">MDE</span>（最小可检出效应）、样本量 $n$。给定任意三个，第四个就定了。最常用的是反解样本量。对两样本均值检验（每组各 $n$、标准差 $\sigma$、要检出的均值差 $\Delta$）：</p>  <div class="math-block">\[n \;\approx\; \frac{2\,\sigma^2\,(z_{1-\alpha/2}+z_{1-\beta})^2}{\Delta^2}\]</div>  <p>这个公式蕴含三条朴素却重要的直觉：①样本量与<strong>效应平方成反比</strong>——要检出小一半的效应，需要<strong>四倍</strong>的样本（这就是为什么微小提升的实验贵得吓人）；②与<strong>方差成正比</strong>——指标越吵，需要越多样本（这也是第 7 节方差缩减的价值所在）；③与 $(z_\alpha+z_\beta)^2$ 成正比——要更高的功效或更严的 $\alpha$，都要加样本。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把它当成「实验的预算表」：你想看清多小的差别（MDE）、想多大把握看清（功效），决定了你要买多少流量（样本量）。想看清头发丝粗细的差别，就得用显微镜（海量样本）；只想看清拳头大小的差别，肉眼（小样本）就够。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>notebook 会两路验证：先用公式算出目标 MDE 下的 $n$，再用<strong>蒙特卡洛模拟</strong>在那个 $n$ 上反复跑实验、统计真实检出率，确认模拟功效确实达到了目标（如 0.8）。<strong>解析公式 ⇄ 模拟</strong>互相对拍，是确信你的样本量算对了的最佳方式。</p></div>
+  </div>  <p>功效分析还逼你在跑实验前做一件健康的事：<strong>诚实面对你的指标有多吵、你的流量有多少</strong>。很多线上指标（尤其人均收入这类长尾、偏态指标）方差巨大，代入公式一算，会发现要检出一个 1% 的提升需要几百万用户、跑好几周——这时你有两个理性选择：要么承认「这个量级的改动在这个指标上根本测不动」，要么先去想办法把方差降下来（第 7 节的 CUPED）。无论哪个，都好过<em>懵懂地跑一个注定看不见结果的实验</em>、再对着不显著的结果空欢喜或瞎猜。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个致命的实践陷阱：<strong>功效不足的「不显著」毫无信息量</strong>。如果实验功效只有 30%，那么 p > 0.05 既可能是「真没效应」，也可能是「有效应但你没本事看见」，二者无法区分。所以报告负结果前，先报功效——一个高功效实验的不显著才是有意义的「大概率没用」证据。Card 等 2020 发现大量 NLP 实验功效严重不足，差异多落在噪声里——这个教训对在线和离线评测一样适用。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="multiple"><span class="num">5</span>多重比较：假阳性泛滥</h2>
+  <h3>多重比较：检验做多了，假阳性会泛滥</h3>  <p>一个实验常常不只看一个指标、不只比一个变体。但每多做一次检验，就多一次<strong>假阳性的机会</strong>。在 $\alpha=0.05$ 下做 $m$ 个<em>都无真效应</em>的独立检验，至少出现一个假阳性的概率是 $1-(1-0.05)^m$：做 20 个就高达 64%，做 100 个几乎必然有「显著」结果。这就是 <span class="term">multiple comparisons</span> 问题——<strong>检验做得够多，总能蒙到显著</strong>。</p>  <div class="ascii">做 m 个无效应检验，至少一个假阳性的概率 (α=0.05)：
+  m=1   ████                                5%
+  m=5   ████████████████                   23%
+  m=10  ██████████████████████████████     40%
+  m=20  ████████████████████████████████████████  64%
+  =&gt; 看的指标/变体越多，越容易被随机波动骗。</div>  <p>两类主流校正。<strong>Bonferroni</strong>控制<span class="term">FWER</span>（族错误率，即「出现哪怕一个假阳性」的概率）：把阈值从 $\alpha$ 收紧到 $\alpha/m$，简单但保守，当 $m$ 大时几乎什么都拒不掉（功效被牺牲殆尽）。<strong>Benjamini-Hochberg</strong>控制 <span class="term">FDR</span>（错误发现率，即「被拒绝的里有多少其实是假的」的期望比例），对 $m$ 个 p 值升序排，找最大的 $k$ 使 $p_{(k)}\le \frac{k}{m}\alpha$，拒绝前 $k$ 个。它远不那么保守，是高维筛选（很多指标、很多子群）的现代默认。</p>  <table>
+    <thead><tr><th>方法</th><th>控制什么</th><th>阈值规则</th><th>保守度 / 功效</th><th>适用场景</th></tr></thead>
+    <tbody>
+      <tr><td>不校正</td><td>—</td><td>$p<\alpha$</td><td>假阳性泛滥</td><td>只有单一预设主指标时</td></tr>
+      <tr><td><strong>Bonferroni</strong></td><td><span class="term">FWER</span> 族错误率</td><td>$p<\alpha/m$</td><td>最保守、功效低</td><td>决策关键指标、零容忍假阳性</td></tr>
+      <tr><td><strong>Benjamini-Hochberg</strong></td><td><span class="term">FDR</span> 错误发现率</td><td>$p_{(k)}\le \frac{k}{m}\alpha$</td><td>较宽松、功效高</td><td>探索多指标/多子群、可控次品率</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>FWER vs FDR 的区别像「零容忍 vs 可控次品率」。Bonferroni（FWER）说：我一个假阳性都不能要——代价是漏掉很多真的。BH（FDR）说：我允许发现里有 5% 是假的，换来发现更多真的。探索阶段（找候选指标）用 FDR，决策阶段（要不要上线这个关键指标）用更严的 FWER。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨说：设 $V$=假阳性数、$R$=总拒绝数。FWER$=P(V\ge 1)$；FDR$=E[V/\max(R,1)]$。当所有原假设都为真时两者相等，但有真效应时 FDR 控制允许更多拒绝、功效更高。BH 在 p 值独立或正相关时严格控制 FDR$\le \frac{m_0}{m}\alpha\le\alpha$。</p></div>
+  </div>  <p>notebook 会构造一组<strong>全是无效应</strong>的检验，亲眼看到不校正时假阳性如何泛滥、Bonferroni/BH 校正后如何被压回 $\alpha$；再混入若干真效应，验证 BH 在控制 FDR 的同时比 Bonferroni 多发现真效应。这把「为什么不能盯着 20 个指标挑显著的报」变成可量化的事实。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="sequential"><span class="num">6</span>序贯检验与偷看</h2>
+  <h3>序贯检验与偷看：别边看边停</h3>  <p>线上实验数据是<strong>逐渐累积</strong>的，于是有个巨大的诱惑：每天看一眼，一旦显著就立刻叫停、宣布胜利。这叫 <span class="term">peeking</span>（偷看），而它会<strong>严重抬高假阳性率</strong>。原因是：在 $H_0$ 为真时，p 值会随数据累积随机游走，偶尔会瞬时跌破 0.05。你看的次数越多，撞上这种<em>一闪而过的假显著</em>并据此叫停的概率就越大。每天偷看一个月，真实假阳性率能从 5% 飙到 20–30%。</p>  <div class="ascii">H0 为真时，p 值随天数随机游走（每天偷看一次）：
+  p  0.05 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+     0.4 ●
+     0.2   ●   ●       ●         ●
+     0.1     ●   ● ●     ● ●   ●   ●
+     0.03          ●←偷看到这天就「显著」叫停！其实 H0 为真
+  =&gt; 看得越勤，越容易在某个偶然低点误判胜利。</div>  <p>正确的做法有两类。最简单的是<strong>预先固定样本量、只在终点看一次</strong>（fixed-horizon）——朴素 p 值的保证只对「看一次」成立。若确实想中途监控、提前停（这在伦理或成本上常有必要），就得用<strong>序贯检验</strong>：用一套随看的次数而<em>收紧</em>的阈值，把总假阳性预算 $\alpha$ 分摊到每一次窥视上。经典方法是 <span class="term">alpha-spending</span>（O'Brien-Fleming、Pocock）与现代的 <strong>always-valid p 值</strong>（混合序贯比检验），后者让你<em>任何时刻</em>停下都保证 $\alpha$ 受控。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>最朴素的序贯校正：把偷看也当成多重比较。要看 $L$ 次，就用 Bonferroni 把每次的阈值收到 $\alpha/L$（这是保守版 Pocock）。notebook 会先量化「偷看 $L$ 次、不校正」的真实假阳性率有多离谱，再演示这条简单的 $\alpha/L$ 校正把它压回 $\alpha$ 附近——代价是每次需要更强的证据才能停，这正是「想多看几眼」应付的学费。</p>
+  </div>  <p>一个相关但不同的现实问题是<span class="term">novelty effect</span>（新奇效应）：用户对新改动短期内的异常反应（一窝蜂尝鲜或本能抗拒）会污染早期读数。这与偷看叠加起来尤其危险——早期既有新奇噪声、又有偷看的假显著。稳妥的纪律是：<strong>预设运行时长、覆盖完整的周期（至少一两周，含工作日/周末）、到点再看</strong>，让新奇效应消退、让样本攒够。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="cuped"><span class="num">7</span>CUPED：方差缩减</h2>
+  <h3>CUPED：用实验前数据免费提升灵敏度</h3>  <p>回到样本量公式：$n\propto \sigma^2/\Delta^2$。效应 $\Delta$ 由你的改动决定、改不了；但<strong>方差 $\sigma^2$ 是可以缩小的</strong>——缩小一半方差，等价于样本量翻倍（或实验时间减半）。<span class="term">CUPED</span>（Controlled-experiment Using Pre-Experiment Data，Deng 等 2013）就是这样一个<strong>近乎免费的午餐</strong>：用<em>实验前</em>就能观测到的协变量（如用户实验前的活跃度），把指标里<em>可被它解释的那部分波动</em>扣掉。</p>  <p>核心很简单。设结果 $Y$、一个实验前协变量 $X$（必须与处理无关——它发生在实验<em>之前</em>）。构造调整后指标：</p>  <div class="math-block">\[Y^{\text{cuped}} = Y - \theta\,(X - \bar X),\qquad \theta = \frac{\operatorname{Cov}(Y,X)}{\operatorname{Var}(X)}\]</div>  <p>这个 $\theta$ 正是 $Y$ 对 $X$ 回归的斜率。两个关键性质：①<strong>无偏</strong>——因为 $E[X-\bar X]=0$，调整不改变均值期望，$E[Y^{\text{cuped}}]=E[Y]$，所以处理效应的估计不被扭曲；②<strong>方差缩减</strong>——可以证明 $\operatorname{Var}(Y^{\text{cuped}})=(1-\rho^2)\operatorname{Var}(Y)$，其中 $\rho=\operatorname{corr}(X,Y)$。即<strong>方差按 $1-\rho^2$ 缩小</strong>：若实验前指标与实验中指标相关 $\rho=0.7$，方差直接砍掉 $49\%$，相当于免费把样本量近乎翻倍。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直觉：用户本身有快有慢，这种<strong>个体差异</strong>淹没了你那点小小的处理效应。但用户实验前的表现，已经<em>预告</em>了他实验中大概多活跃。把这份可预测的个体差异减掉，剩下的波动里信噪比就高多了——就像测体重前先脱掉每个人厚薄不一的外套，再比谁真的胖了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨说：CUPED 是<strong>控制变量法</strong>（control variates）在 A/B 上的应用。$X$ 必须<strong>前实验</strong>（pre-treatment）才能保证与处理独立、不引入偏差；$\theta$ 用<em>两组合并</em>的数据估计。这是工业界（微软、Netflix 等）提升实验灵敏度的标配，也把「方差缩减」从理论变成日常吞吐的杠杆。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>CUPED 的红线是<strong>协变量必须是实验前的、与处理无关的</strong>。若你拿一个<em>实验中</em>受改动影响的变量去调整（如实验期的某行为），就等于把处理效应自己减掉了一部分——既有偏、又可能凭空造出或抹掉效应。记住：CUPED 减的是「与你的改动无关的、本就存在的个体差异」，绝不能碰被改动污染的量。</p>  <p>最后把视角拉回本课主线：<strong>方差缩减不是在线实验的专利，而是整个评测科学都该有的意识</strong>。离线基准比较两个模型时，配对评测（在同一批样本上比，而非各跑各的）、按难度分层、控制随机种子，本质都是 CUPED 式的方差缩减——用结构信息扣掉无关波动，让真实差异从噪声里浮出来。模块 00 说每个分数都是带方差的估计量；这一节告诉你，那个方差往往是可以<em>主动压小</em>的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <p>在线实验是工业界评测最成熟的领域之一，但前沿仍在快速移动，且越来越多地与机器学习评测交汇：</p>  <ul>
+    <li><strong>Always-valid inference / 任意时刻有效的 p 值</strong>：让实验者<em>随时</em>看、随时停而不抬高假阳性的现代序贯方法（混合序贯比检验、置信序列）。它把「偷看」从禁忌变成合法操作，正在取代固定样本量成为大平台的默认（Johari 等）。</li>
+    <li><strong>机器学习增强的方差缩减（CUPED++/CUPAC）</strong>：用 ML 模型从多个实验前特征预测 $Y$、再把预测当控制变量，比单变量 CUPED 缩更多方差。如何在保证无偏的前提下用上任意复杂的预测器，是活跃方向。</li>
+    <li><strong>样本比失衡（SRM）与护栏指标</strong>：实验中两组实际样本比偏离预期（如本该 50/50 却 48/52）往往是埋点/分流 bug 的信号，会让结论全错；护栏指标（不该被改动影响的指标，如崩溃率）用来兜底。SRM 检测已成上线前的标准体检。</li>
+    <li><strong>异质处理效应与 Simpson 悖论</strong>：平均看无效、分群看却有强效应（或方向相反）很常见。用因果森林、元学习器估计<em>谁</em>从改动中受益，比一个平均 ATE 信息丰富得多，但也带来新的多重比较与可信度挑战。</li>
+    <li><strong>长期效应与代理指标</strong>：A/B 只能跑几周，但真正关心的是长期留存/收入。如何用短期代理指标<em>无偏地</em>预测长期效应（surrogate index），是连接离线评测与商业目标的圣杯。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Kohavi、Tang & Xu 2020《Trustworthy Online Controlled Experiments》（A/B 实战权威，覆盖功效、偷看、SRM、护栏）；Deng 等 2013《CUPED》（方差缩减原始论文）；Johari 等 2017（偷看与 always-valid 推断）；Benjamini & Hochberg 1995（FDR）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../06_calibration_uncertainty/06_讲解.html"><div class="dir">← 上一模块</div><div class="t">06 · 校准与不确定性</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

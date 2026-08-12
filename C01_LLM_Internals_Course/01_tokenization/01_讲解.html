@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · Tokenization：从零实现 BPE</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · Tokenization：从零实现 BPE</h1>
+  <p class="subtitle">Byte Pair Encoding —— LLM 看世界的"眼睛"：模型从不读字符，它读的是你给它的 token</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">Python 基础、Unicode/UTF-8 大致概念</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_bpe_from_scratch.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Sennrich 2015 (BPE)、Kudo 2018 (SentencePiece)、Karpathy minbpe</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么不用字符也不用单词：三角权衡</a></li>
+      <li><a href="#bpe">BPE 算法：统计 → 合并 → 重复</a></li>
+      <li><a href="#bytelevel">byte-level BPE（GPT-2 风格）</a></li>
+      <li><a href="#compare">BPE vs WordPiece vs Unigram/SentencePiece</a></li>
+      <li><a href="#pitfalls">tokenizer 的工程坑</a></li>
+      <li><a href="#eval">tokenization 对评测的影响（评测视角）</a></li>
+      <li><a href="#vocab-scaling">词表大小的 scaling 考量</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么不用字符也不用单词：三角权衡</h2>
+
+  <p>语言模型的输入必须是有限词表上的离散符号序列。把文本切成什么粒度的符号，是一个三方权衡：
+  <strong>词表大小（vocab size）、序列长度（sequence length）、未登录词（<span class="term">OOV, out-of-vocabulary</span>）覆盖</strong>。三者不可兼得。</p>
+
+  <table>
+    <thead><tr><th>方案</th><th>词表大小</th><th>序列长度</th><th>OOV 问题</th><th>致命缺陷</th></tr></thead>
+    <tbody>
+      <tr><td>字符级 character-level</td><td>极小（几百）</td><td>极长</td><td>几乎没有</td><td>序列太长：attention 是 $O(n^2)$，且每个符号语义太弱，模型要花容量学拼写</td></tr>
+      <tr><td>单词级 word-level</td><td>巨大（数十万仍不够）</td><td>短</td><td>严重：新词/拼错/形态变化全变 <code>&lt;UNK&gt;</code></td><td>开放词汇语言（德语复合词、土耳其语黏着形态）词表爆炸</td></tr>
+      <tr><td><strong>子词级 subword（BPE 等）</strong></td><td>中等（3 万–25 万，可控）</td><td>中等</td><td>可归约到字符/字节，无 <code>&lt;UNK&gt;</code></td><td>切分由频率统计决定，会引入本章第 5 节的各种工程坑</td></tr>
+    </tbody>
+  </table>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>字符级：什么都认识，但一句话被切成几百块，模型算不动也学不动。单词级：一块就是一个完整意思，
+      但词典永远收不全，没见过的词直接抓瞎。子词级是折中：常见词整块保留（"the" 是一个 token），
+      罕见词拆成有意义的碎片（"tokenization" → "token"+"ization"），实在不认识就退到字符/字节，永远不会"完全不认识"。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设词表大小 $|V|$、平均序列长度 $n$。embedding/softmax 参数量 $\propto |V|\cdot d$，attention 计算量 $\propto n^2$，
+      固定上下文窗口下可容纳的信息量 $\propto$ 每 token 平均信息量。subword 分词在保证<em>完备覆盖</em>
+      （任意字符串可被编码）的前提下，用数据驱动的方式在 $|V|$ 与 $n$ 之间寻找经验最优点 —— 这正是
+      [Sennrich 2015] 把压缩算法 BPE 引入 NMT 的动机：让罕见词由已知子词单元组合表达，开放词汇翻译不再依赖 <code>&lt;UNK&gt;</code>。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  一个有用的视角：<strong>tokenizer 本质是一个无损压缩器</strong>。它学到的"合并规则"就是语料的统计规律；
+  压缩率越高，同样的上下文窗口塞进越多文本。本章第 6、7 节会看到，这个"压缩"视角直接决定了评测公平性与词表 scaling 的取舍。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="bpe"><span class="num">2</span>BPE 算法 [Sennrich 2015]：统计 → 合并 → 重复</h2>
+
+  <p><span class="term">BPE (Byte Pair Encoding)</span> 原本是 1994 年的数据压缩算法，[Sennrich 2015] 把它改造成分词器训练算法。
+  核心循环只有三步，且分<strong>训练（学合并规则）</strong>与<strong>编码（应用合并规则）</strong>两个阶段：</p>
+
+  <div class="ascii">
+  ── 训练阶段（在语料上离线进行一次）─────────────────────────────
+                ┌────────────────────────────────────┐
+                │ 初始化：把语料切成最小单元序列        │
+                │ （字符级 BPE：字符；byte-level：字节）│
+                └──────────────────┬─────────────────┘
+                                   ▼
+              ┌──► ① 统计所有相邻 pair 的出现频率 get_stats
+              │                    │
+              │                    ▼
+              │     ② 找到频率最高的 pair (a,b)
+              │        把它合并成一个新符号 ab，记录规则 (a,b)→ab
+              │                    │
+              │                    ▼
+              │     ③ 在整个语料中执行替换 merge
+              │                    │
+              └────────────────────┘  重复，直到学满 k 个 merges
+                                      （词表 = 初始单元 + k 个新符号）
+
+  ── 编码阶段（推理时对任意新文本进行）───────────────────────────
+     文本 → 最小单元序列 → 按"训练时学到的先后顺序"依次应用每条
+     merge 规则 → token id 序列
+  </div>
+
+  <p>形式化地，训练目标是每一步贪心地选择频率最高的相邻对：</p>
+  <div class="math-block">
+  $$ (a^*, b^*) = \arg\max_{(a,b)} \; \mathrm{count}\big((a,b)\big), \qquad
+     V \leftarrow V \cup \{a^* b^*\} $$
+  </div>
+  <p>重复 $k$ 次后 $|V| = |V_0| + k$。注意这是<strong>贪心算法</strong>：每步只看当前最频繁的 pair，不保证全局最优压缩 —— 但实践中足够好且极其简单。</p>
+
+  <h3>手推一个小例子</h3>
+  <p>语料（已按最小单元切开，<code>_</code> 表示空格）：<code>l o w _ l o w _ l o w e r _ l o w e s t</code>。逐轮合并：</p>
+
+  <table>
+    <thead><tr><th>轮次</th><th>当前频率最高的 pair</th><th>频率</th><th>新符号</th><th>合并后语料</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><code>(l, o)</code></td><td>4</td><td><code>lo</code></td><td><code>lo w _ lo w _ lo w e r _ lo w e s t</code></td></tr>
+      <tr><td>2</td><td><code>(lo, w)</code></td><td>4</td><td><code>low</code></td><td><code>low _ low _ low e r _ low e s t</code></td></tr>
+      <tr><td>3</td><td><code>(low, _)</code></td><td>2</td><td><code>low_</code></td><td><code>low_ low_ low e r _ low e s t</code></td></tr>
+      <tr><td>4</td><td><code>(low, e)</code></td><td>2</td><td><code>lowe</code></td><td><code>low_ low_ lowe r _ lowe s t</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>4 轮之后，"low" 已经是一个独立 token，而 "lower"/"lowest" 共享前缀 <code>lowe</code> —— 罕见词被表达为常见子词的组合，这正是 BPE 的全部要义。
+  配套 notebook 会让你亲手实现 <code>get_stats</code> / <code>merge</code> / 训练循环，并在真实语料上观察 <code>th</code>、<code>e_</code> 这类高频组合最先被合并出来。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>编码时必须按训练顺序应用 merges。</strong>merge 规则之间有依赖（规则 2 的 <code>lo</code> 来自规则 1），
+  乱序应用会得到不同切分。实现 <code>encode</code> 时的标准做法：循环查找"当前序列中所有可合并 pair 里、训练序号最小的那个"，合并之，直到无规则可用。这也是 [Karpathy minbpe] 的实现方式。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="bytelevel"><span class="num">3</span>byte-level BPE（GPT-2 风格）：从 256 个字节起步</h2>
+
+  <p>原版 BPE 以<em>字符</em>为最小单元，这在 Unicode 世界有个麻烦：字符集合本身是开放的（约 15 万个已分配码位，还在增长），
+  初始词表收不全就仍有 OOV。GPT-2 的解法干脆利落：<strong>把文本先 UTF-8 编码成字节流，以 256 个字节值为初始词表做 BPE</strong>。</p>
+
+  <ul>
+    <li><strong>天然无 OOV</strong>：任何字符串（任何语言、emoji、二进制乱码）都是字节序列，256 个基础符号 100% 覆盖，<code>&lt;UNK&gt;</code> 彻底消失。</li>
+    <li><strong>与 Unicode 的关系</strong>：UTF-8 是变长编码 —— ASCII 字符 1 字节、多数欧洲字符 2 字节、<strong>常用汉字 3 字节</strong>、emoji 通常 4 字节。byte-level BPE 的"起跑线"对非拉丁文字天然更长（一个汉字还没合并前就占 3 个初始单元），这是第 5 节多语言不公平的根源之一。</li>
+    <li><strong>解码要小心</strong>：单个 token 可能停在一个多字节字符的中间，不是合法 UTF-8。解码时需 <code>bytes.decode("utf-8", errors="replace")</code> 容错 —— notebook 里会演示。</li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  谱系速览：[Sennrich 2015] 字符级 BPE 用于 NMT → GPT-2 (2019) byte-level BPE，词表 50257 → GPT-4/cl100k、Llama 3 (128k)、Qwen (152k) 全部沿用 byte-level BPE，只是词表更大、预切分正则更讲究。动手层面的最佳参考是 [Karpathy minbpe]：~200 行 Python 复现 GPT 系 tokenizer 的训练与编码，本课 notebook 即取其精神。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  实际工程中（GPT-2 起）还有一步<strong>预切分（pre-tokenization）</strong>：先用正则把文本切成"词块"（字母段、数字段、空格+词段……），
+  BPE 合并只在词块内部进行、不跨边界。这防止学出 <code>dog.</code>、<code>the_cat</code> 这种跨词垃圾 token，也解释了为什么 GPT 系 token 常以空格开头（如 <code>" the"</code>）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="compare"><span class="num">4</span>BPE vs WordPiece vs Unigram / SentencePiece</h2>
+
+  <p>BPE 不是唯一的子词算法。三大主流方案对比：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>BPE [Sennrich 2015]</th><th>WordPiece (BERT)</th><th>Unigram LM [Kudo 2018]</th></tr></thead>
+    <tbody>
+      <tr><td>训练方向</td><td>自底向上：从小单元逐步<strong>合并</strong></td><td>自底向上合并</td><td>自顶向下：从大候选词表逐步<strong>剪枝</strong></td></tr>
+      <tr><td>合并/保留准则</td><td>pair 频率最大 $\max \mathrm{count}(a,b)$</td><td>互信息式打分 $\max \frac{\mathrm{count}(ab)}{\mathrm{count}(a)\,\mathrm{count}(b)}$</td><td>删除该 token 后语料 unigram 似然损失最小</td></tr>
+      <tr><td>编码方式</td><td>按训练顺序确定性应用 merges</td><td>贪心最长匹配（greedy longest-match-first）</td><td>Viterbi 求最大似然切分；可按概率<strong>采样</strong>多种切分</td></tr>
+      <tr><td>切分唯一性</td><td>确定性</td><td>确定性</td><td>概率性 → 支持 subword regularization（训练时采样切分作数据增强）</td></tr>
+      <tr><td>代表模型</td><td>GPT 系、Llama、Qwen（byte-level）</td><td>BERT 系（<code>##</code> 前缀标记词中片段）</td><td>T5、mT5、ALBERT（经 SentencePiece）</td></tr>
+    </tbody>
+  </table>
+
+  <p><span class="term">SentencePiece</span> [Kudo 2018] 严格说不是第四种算法，而是一个<strong>实现框架</strong>：
+  它把空格当成普通字符（替换为 <code>▁</code>）直接在原始文本流上训练，从而做到<em>语言无关</em>（不依赖"用空格分词"这个英语假设，对中文/日文友好），
+  内部可选 BPE 或 Unigram 作为算法后端。Llama 1/2 用的就是 SentencePiece-BPE。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="pitfalls"><span class="num">5</span>tokenizer 的工程坑：每个都坑过真实系统</h2>
+
+  <h3>5.1 前导空格</h3>
+  <p>GPT 系预切分把空格归给后面的词，所以 <code>"hello"</code> 和 <code>" hello"</code> 是<strong>两个完全不同的 token</strong>（不同 id、不同 embedding）。
+  后果：prompt 末尾多/少一个空格，下一个 token 的分布可能截然不同；做 few-shot 模板或 logprob 评测时，拼接处的空格处理不一致会系统性偏移结果。</p>
+
+  <h3>5.2 数字切分：为什么 LLM 算术差与 tokenization 有关</h3>
+  <p>BPE 按频率合并，数字也不例外：<code>"12345"</code> 可能被切成 <code>"123"+"45"</code>，而 <code>"12346"</code> 却是 <code>"1"+"2346"</code> ——
+  <strong>切分边界与数位（个十百千）完全无关</strong>。模型要做加法，得先在内部"反解"出每个 token 覆盖了哪几位，相当于戴着毛手套打算盘。
+  这就是为什么 Llama 3、Qwen 等现代 tokenizer 强制数字按 1–3 位分组切分，而推理模型干脆逐位切。notebook 会用 <code>"12345+67890"</code> 直观对比。</p>
+
+  <h3>5.3 多语言不公平</h3>
+  <p>词表合并预算被训练语料分布主导：英语占大头 → 英语词大量整词成 token；中文语料占比低 → 很多汉字停留在 2–3 个字节碎片。
+  结果是<strong>同样语义内容，中文消耗的 token 数常为英文的 1.5–2 倍以上</strong>。这不是学术细节，而是真金白银：</p>
+  <ul>
+    <li><strong>成本</strong>：API 按 token 计费，同样的任务中文用户付更多钱。</li>
+    <li><strong>上下文劣势</strong>：同样 128k 窗口，中文塞进的实际内容更少。</li>
+    <li><strong>能力劣势</strong>：序列更长 + 单 token 语义更碎 → 同等算力下非英语任务表现被系统性拖累。</li>
+  </ul>
+
+  <h3>5.4 特殊 token 注入风险</h3>
+  <p><code>&lt;|endoftext|&gt;</code>、<code>&lt;|im_start|&gt;</code> 这类控制 token 不应从用户文本中编码出来。如果 tokenizer 对用户输入开启了特殊 token 解析
+  （如 HF tokenizer 的某些调用路径），攻击者在输入里写下字面的 <code>&lt;|im_start|&gt;system</code> 就可能伪造对话边界、注入系统指令。
+  <strong>防御原则：用户文本一律按普通文本编码（special token 当作字面字符串切碎），控制 token 只能由模板代码插入。</strong>做红队评测时这是必查项。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  还有一类经典故障是 <strong>glitch token</strong>（如 GPT-2/3 的 "SolidGoldMagikarp"）：训练 tokenizer 的语料里高频、但训练模型的语料里几乎没出现的 token，
+  embedding 近乎未训练，喂给模型会触发否认、复读、乱码等异常行为。教训：<strong>tokenizer 和模型是在不同数据上"训练"的两个组件</strong>，两者的错配本身就是一个攻击面与评测对象。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">6</span>tokenization 对评测的影响（评测视角）</h2>
+
+  <p>对做 model evaluation 的人，tokenizer 不是实现细节，而是<strong>测量仪器的一部分</strong>。三条铁律：</p>
+
+  <p><strong>① logprob 比较必须同 tokenizer。</strong>多选题评测常比较各选项的 $\log p(\text{choice}\mid\text{prompt})$。
+  选项的切分方式（token 数、是否带前导空格）直接进入求和项数与每项取值：</p>
+  <div class="math-block">
+  $$ \log p(\text{choice}) = \sum_{i=1}^{m} \log p(t_i \mid \text{prompt}, t_{&lt;i}),
+     \qquad m \text{ 由 tokenizer 决定} $$
+  </div>
+  <p>跨模型比较原始 logprob 时，若 tokenizer 不同，$m$ 与切分位置都不同，数值不可直接比；
+  常用缓解是按字节归一化（bits per byte）或只比较模型内部的相对排序。同理，length-normalized accuracy 里的"length"用 token 数还是字节数，结论可能反转。</p>
+
+  <p><strong>② 压缩率影响"每 token 智能"。</strong>两个模型各自报告"上下文 8k token"，若 A 的 tokenizer 压缩率比 B 高 30%，
+  A 实际能看到的文本多 30%；"每 token 推理成本/延迟"的比较同样被压缩率扭曲。公平比较应折算到<strong>每字节/每字符</strong>。</p>
+
+  <p><strong>③ tokenizer 不同的模型，perplexity 不可直接比。</strong>perplexity 是按 token 平均的指数化负对数似然：</p>
+  <div class="math-block">
+  $$ \mathrm{PPL} = \exp\!\Big(-\tfrac{1}{N}\sum_{i=1}^{N}\log p(t_i\mid t_{&lt;i})\Big) $$
+  </div>
+  <p>$N$（token 数）由 tokenizer 决定：把同一段文本切得越碎，每步预测越容易，PPL 看起来越低 —— 纯粹的分母游戏。
+  跨 tokenizer 的标准做法是换算成与切分无关的 <span class="term">bits per byte (BPB)</span>：
+  $\mathrm{BPB} = \frac{-\sum_i \log_2 p(t_i)}{\text{UTF-8 字节数}}$，分母回到客观的字节数，才可比。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  实战 checklist：跑任何涉及 logprob / PPL / 长度归一化的评测前，先回答 —— 各模型 tokenizer 是否相同？选项前导空格是否一致？
+  归一化分母用的是 token、字符还是字节？这三问能拦下大部分"评测出来的差距其实是 tokenizer 差距"的事故。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="vocab-scaling"><span class="num">7</span>词表大小的 scaling 考量</h2>
+
+  <p>词表从 GPT-2 的 50k 涨到 Llama 3 / GPT-4o / Qwen 的 128k–200k+，不是无脑堆大，而是一组权衡：</p>
+
+  <table>
+    <thead><tr><th>词表变大</th><th>收益</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="1">压缩</td><td>压缩率↑：同样文本 token 数↓ → 训练/推理 FLOPs↓、有效上下文↑、多语言覆盖↑</td><td>收益边际递减：高频合并早已学完，新增 token 越来越偏门</td></tr>
+      <tr><td rowspan="1">参数</td><td>—</td><td>embedding + lm_head 参数 $\approx 2|V|d$。小模型尤其吃亏：0.5B 模型配 150k 词表、$d=1024$，仅词表相关参数就 ~3 亿，占比过半</td></tr>
+      <tr><td rowspan="1">学习</td><td>常见整词有专属表征，语义更整</td><td>长尾 token 出现次数过少，embedding 训不充分（glitch token 风险↑）；softmax 计算量↑</td></tr>
+    </tbody>
+  </table>
+
+  <p>经验规律：<strong>最优词表大小随模型规模增长</strong> —— 大模型摊得起词表参数、也有足够数据喂饱长尾 token，所以 frontier 模型词表持续变大；
+  而小模型（&lt;1B）用过大词表会把参数预算浪费在 embedding 上。这与模块 05 的 scaling laws 一脉相承：词表大小本质是参数分配问题的一个维度，
+  也有工作（如 Tao et al. 2024 的 vocabulary scaling laws 方向）试图给出 $|V|^*$ 随 compute 的定量关系。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>byte-level 无 tokenizer 架构</strong>：ByT5、MegaByte、Byte Latent Transformer (BLT) 等直接消费字节流，让模型内部"学出"动态分块（BLT 按预测熵决定 patch 边界），换取对拼写扰动/多语言的鲁棒性。代价是序列变长 ~4 倍，靠层级/局部模块补效率。tokenizer 是否会像手工特征一样最终被端到端学习取代，仍是开放问题。</li>
+    <li><strong>多语言公平</strong>：如何在固定词表预算下做语言间公平分配（按语料重采样、按语言配额）？"token 税"的测量本身已成为评测课题 —— 同一基准换语言后成绩下降，多少归因于 tokenizer、多少归因于模型能力，需要可控实验拆解。</li>
+    <li><strong>tokenizer 移植/手术</strong>：给已训练模型换词表（扩中文词表、对齐两个模型的 tokenizer 以便蒸馏/拼接）如何不伤能力？embedding 初始化与继续训练策略仍偏经验。</li>
+    <li><strong>评测视角</strong>：随评测越来越依赖 logprob 与长度归一化，"tokenizer 差异引入的测量误差"需要被当成系统误差显式报告；BPB 等切分无关指标应成为跨模型比较的默认选项。模型对自身 token 边界的"自我认知"缺陷（数不对字母、strawberry 问题）也提示：一些"能力缺陷"其实是<strong>感知接口缺陷</strong>，评测归因时必须区分。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>字符级 / 单词级 / 子词级分词各自的代价是什么？BPE 在三角权衡中站在哪里？</li>
+      <li>手写 BPE 训练循环的三个步骤；为什么编码时必须按训练顺序应用 merges？</li>
+      <li>byte-level BPE 为什么天然无 OOV？它对中文等非拉丁语言带来什么系统性劣势？</li>
+      <li>为什么 tokenizer 不同的两个模型 perplexity 不可直接比？正确的跨模型指标是什么？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../00_setup/00_overview.html"><div class="dir">← 上一章</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_attention_transformer/02_讲解.html"><div class="dir">下一章 →</div><div class="t">02 · 手写 Attention 与 Transformer Block</div></a>
+  </div>
+
+</div>
+</body>
+</html>

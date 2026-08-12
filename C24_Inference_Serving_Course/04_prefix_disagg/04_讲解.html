@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · Prefix Cache 与 PD 分离</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · Prefix Cache 与 PD 分离</h1>
+  <p class="subtitle">复用共享前缀的 KV（命中即跳过 prefill）、RadixAttention 用前缀树自动复用、prefill/decode 分离到不同 GPU 各自优化、用 TTFT/TPOT 分解 SLO —— 把重复计算和阶段干扰一并消掉</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（KV/分页/CoW）、模块 02（调度）、前缀树/trie 基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_prefix_disagg.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Zheng et al. 2024 (SGLang/RadixAttention)、Zhong et al. 2024 (DistServe)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#waste">重复 prefill 的浪费</a></li>
+      <li><a href="#prefixcache">Prefix Cache 与命中</a></li>
+      <li><a href="#radixattn">RadixAttention 与前缀树</a></li>
+      <li><a href="#radixops">radix 树：插入与最长前缀匹配</a></li>
+      <li><a href="#pdmotive">PD 分离的动机</a></li>
+      <li><a href="#kvtransfer">KV 传输与资源配比</a></li>
+      <li><a href="#slo">SLO 分解：TTFT/TPOT 映射资源</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="waste"><span class="num">1</span>重复 prefill 的浪费</h2>
+  <p>模块 01 我们用 <span class="term">copy-on-write</span> 让两个共享前缀的序列零拷贝地共用 KV 块。本模块把这件事<strong>推到极致并系统化</strong>：当成千上万个请求反复带着相同的前缀涌来时，我们不仅要共享 KV 的存储，更要<strong>彻底跳过对这些前缀的重复计算</strong>。</p>  <p>先看清浪费有多普遍。现实里的 prompt 极少是彼此无关的随机串，它们大量共享前缀：</p>  <ul>
+    <li><strong>公共 system prompt</strong>：同一个服务的所有请求往往带同一段几百到上千 token 的系统指令（角色设定、安全规则、工具说明）。</li>
+    <li><strong>few-shot 示例</strong>：同一个任务的所有请求带同一组示例，动辄数千 token，每个请求都把它重算一遍。</li>
+    <li><strong>多轮对话历史</strong>：第 k 轮请求的前缀 = 前 k−1 轮的全部内容；同一会话里<em>每一轮都把之前所有轮重新 prefill</em>一次。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这些共享前缀的 K、V 是<strong>逐位相同</strong>的——同样的 token、同样的位置、同样的权重，算出来必然一样。为它们各算各的、各存各的，是在把昂贵的 prefill 算力和宝贵的显存大把大把地烧掉。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说：注意力的 K、V 是输入前缀的<strong>确定性函数</strong>。若两个请求的前 <code>L</code> 个 token 完全相同，则它们前 <code>L</code> 个位置的 KV 完全相同。于是这部分 prefill 是<strong>可记忆化（memoizable）</strong>的纯计算——经典的「用缓存换重算」场景。</p></div>
+  </div>  <p>代价直接落在 <span class="term">TTFT</span> 上。回忆模块 00：TTFT（首 token 延迟）主要由 prefill 决定。一个带 2000 token 公共前缀的请求，若每次都从头 prefill，用户就得为这 2000 token 的计算白等一次；而如果前缀已被缓存，prefill 只需处理那几十个<em>新增</em>的 token，TTFT 可以从几百毫秒掉到几十毫秒。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块前半：<strong>共享前缀的 KV 是确定性的、可缓存的；缓存它就能跳过重复 prefill，直接砍 TTFT</strong>。难点不在「能不能缓存」，而在「如何<em>自动、跨请求、细粒度</em>地发现并复用任意公共前缀」——这正是 RadixAttention 要解决的，也是本模块后半 PD 分离的伏笔：prefill 省下来了，decode 的瓶颈就更突出，于是想把两阶段拆开各自优化。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="prefixcache"><span class="num">2</span>Prefix Cache 与命中</h2>
+  <h3>Prefix Cache：缓存前缀的 KV，命中即跳过 prefill</h3>  <p><span class="term">prefix cache</span>（前缀缓存）的机制朴素而有力：把已经算过的前缀连同它的 KV 存起来；新请求到达时，先查它的 prompt 有多长一段前缀<strong>命中</strong>了缓存，命中的部分直接复用 KV、<strong>跳过 prefill</strong>，只对未命中的剩余 token 做 prefill。</p>  <p>于是一次请求的 prefill 工作量从「处理整个 prompt」变成「只处理新增后缀」。定义<span class="term">prefix hit rate</span>（前缀命中率）为命中 token 数 ÷ prompt 总 token 数，则：</p>  <div class="math-block">\[\text{需要 prefill 的 token} = (1-\text{hit\_rate})\times L_{\text{prompt}},\qquad \text{省下的算力} \propto \text{hit\_rate}\times L_{\text{prompt}}\]</div>  <p>命中率越高，省下的 prefill 越多、TTFT 越低。在多轮对话里命中率尤其惊人：第 k 轮的前缀几乎全是前 k−1 轮，命中率随轮数趋近 1，意味着除了最新一轮的输入，几乎不用再 prefill 任何东西。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把它想成函数的<strong>记忆化</strong>：第一次算 <code>f(前缀)</code> 时把结果存进字典，以后凡是同样的前缀直接查字典返回。区别只在于这里的「键」是变长的 token 序列、且我们想匹配的是<strong>最长的那段公共前缀</strong>，而不仅仅是「整段完全相同」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>正因为要匹配<strong>最长公共前缀</strong>（而非整串相等），朴素的「prompt 字符串 → KV」哈希表是不够的：它只能命中<em>完全相同</em>的 prompt，无法让「前 1900 token 相同、后 100 token 不同」的两个请求共享那 1900。我们需要一个能做<strong>最长前缀匹配</strong>的数据结构——前缀树。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>前缀缓存不是免费的：缓存的 KV 也占显存，缓存越多、留给运行中请求的 KV 越少。所以前缀缓存必须配<strong>淘汰策略</strong>（哪些前缀该被踢出去腾地方）和<strong>引用计数</strong>（正在被某请求使用的前缀不能踢）。这把我们引向一个能同时支持「最长前缀匹配 + 共享 + 带引用计数的淘汰」的统一结构。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="radixattn"><span class="num">3</span>RadixAttention 与前缀树</h2>
+  <h3>RadixAttention：用基数树自动复用前缀</h3>  <p><span class="term">RadixAttention</span>（SGLang 提出）的核心洞察是：把<strong>所有请求的 KV 统一组织成一棵 </strong><span class="term">radix tree</span><strong>（基数树 / 压缩前缀树）</strong>，让公共前缀自然地对应<strong>树上共享的路径</strong>。这样前缀复用变成<em>自动、跨请求、细粒度</em>的——程序员什么都不用声明。</p>  <p>它的工作方式：每条从根到某节点的路径，就是一个被缓存的前缀；这条路径上挂着对应的 KV 块。新请求到达时，拿它的 token 序列从根开始<strong>沿树往下走，能走多远就复用多远</strong>（这就是最长前缀匹配）；走不动了，就从该节点<strong>长出一条新分支</strong>存放未命中部分的 KV。</p>  <div class="ascii">radix 前缀树：公共前缀 = 共享路径（[..] 是一条边携带的 token 段）
+
+            (root)
+              │ [You are a helpful assistant.]      &lt;- 公共 system prompt，所有请求共享
+            (node A)
+          ┌───┴─────────────┐
+   [Translate to French:]   [Summarize:]            &lt;- 两类任务在此分叉
+      (node B)                (node C)
+        │ [Hello]              │ [The cat...]
+     (leaf B1)              (leaf C1)
+
+  新请求 “You are a helpful assistant. Translate to French: Bye”:
+    从 root 走 A(命中 system) -&gt; B(命中 Translate) -&gt; 在 B 后命中 [Hello] 失败，
+    在 B 处长出新边 [Bye]。只需 prefill “Bye”，其余全部命中复用。</div>  <p>「<strong>radix（基数）压缩</strong>」指的是：树的一条边可以携带<strong>多个 token</strong>（一整段没有分叉的序列压成一条边），而不是每个 token 一个节点。这让树又浅又省内存。当一条边的中间出现分叉（新请求只匹配了这条边的前一半）时，就把这条边<strong>从中间裂开（split）</strong>成两段，在裂点处分叉——这是 radix 树插入的关键操作。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>和模块 01 的 CoW 是什么关系？CoW 是<strong>微观</strong>机制：两个序列共享某几个物理块、写时分叉。RadixAttention 是<strong>宏观</strong>机制：用一棵树自动发现「哪些请求该共享哪段前缀」，再调用块级共享 + 引用计数去落实。前者是积木，后者是用积木自动搭楼的建筑师。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>淘汰用带<span class="term">reference count</span>的 <span class="term">LRU eviction</span>：每个被请求正在使用的前缀路径，其节点引用计数 > 0，<strong>不可淘汰</strong>；缓存满时，从<strong>引用计数为 0 的叶子</strong>里挑最久未访问的删除（删叶子才不会切断别人还在用的前缀）。这保证「正在服务的前缀绝不被踢」，同时回收无人使用的旧前缀。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>RadixAttention 出自 Zheng et al. 2024（SGLang）。它把模块 01 的块级共享，升级成由前缀树驱动的、跨请求自动前缀复用，是结构化 LLM 程序（多轮、并行、分支）高效执行的基石。细节见 <code>references.md</code> 的 SGLang 条目。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="radixops"><span class="num">4</span>radix 树：插入与最长前缀匹配</h2>
+  <h3>radix 树：插入与最长前缀匹配</h3>  <p>把 RadixAttention 的数据结构讲到能动手写。核心是两个操作：<strong>最长前缀匹配</strong>（查）与<strong>插入</strong>（增）。先定义最长前缀匹配——它必须<strong>等价于暴力前缀匹配</strong>，这是本模块 notebook 的核心不变量。</p>  <p>暴力版很简单：对缓存里<em>每一个</em>已存序列，逐位比较它与 query 的公共前缀长度，取最大值。这是 ground truth：</p>  <div class="math-block">\[\text{match\_len}(q)=\max_{s\in\text{cache}}\ \big|\text{lcp}(q,\ s)\big|,\quad \text{lcp}= \text{最长公共前缀}\]</div>  <p>树版要在一棵 radix 树上得到<strong>同样的答案</strong>，但只需 O(匹配长度) 而非遍历整个缓存。匹配过程是：从根开始，看哪条出边的 token 段是 query 当前位置的前缀，命中就顺着走、累加匹配长度，并在一条边内做<em>逐 token</em>比较（边可能只匹配一部分）；走到无法继续就停，返回累计的匹配长度。</p>  <pre><code># radix 树最长前缀匹配（伪代码）——返回匹配长度，应等于暴力 lcp
+def match_prefix(root, q):
+    node, i = root, 0
+    while i &lt; len(q):
+        child = node.children.get(q[i])      # 用首 token 索引出边
+        if child is None:
+            break                            # 没有以 q[i] 开头的边 -&gt; 停
+        edge = child.tokens                  # 这条边携带的 token 段
+        j = 0
+        while j &lt; len(edge) and i &lt; len(q) and edge[j] == q[i]:
+            i += 1; j += 1                   # 在边内逐 token 比对
+        if j &lt; len(edge):
+            break                            # 边只匹配了一部分 -&gt; 停在边中间
+        node = child                         # 整条边匹配 -&gt; 进入下一节点
+    return i                                 # 累计匹配的 token 数</code></pre>  <p>插入则在匹配停下的位置接着做：若停在某条边的中间（只匹配了边的前 j 个 token），就把这条边<strong>裂成两段</strong>（前 j 个 token 一段、剩下的一段），在裂点建一个分叉节点，再把 query 的剩余后缀作为新边挂上去；若恰好停在某节点上，直接从该节点长出一条携带剩余后缀的新边。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么坚持「树版 == 暴力版」？因为 radix 树的全部价值是<strong>加速</strong>（把 O(缓存总量) 的匹配降到 O(匹配长度)），它绝不能<em>改变</em>匹配结果——否则就会复用错前缀、读到别人的 KV，悄悄改变输出。notebook 会对大量随机 query 断言两者逐字相等，这就是数据结构正确性的铁证。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pdmotive"><span class="num">5</span>PD 分离的动机</h2>
+  <h3>PD 分离：prefill 与 decode 拆到不同 GPU</h3>  <p>前缀复用把重复 prefill 砍掉后，我们换个视角看整座引擎。模块 00 讲过：<strong>prefill 算力受限、decode 带宽受限</strong>，两者性格迥异。把它们放在<strong>同一块 GPU 上混跑</strong>，会互相伤害。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一个长 prompt 的 prefill 占满了算力，正在逐 token 生成的请求就得排队等它算完——它们的 <span class="term">TPOT</span> 被一次大 prefill 狠狠拖高，用户看到「打字机突然卡住一下」。反过来，为了照顾 decode 的延迟而限制 prefill 批量，又浪费了 prefill 的算力。一块 GPU 同时讨好两种负载，谁都讨好不好。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这叫 <span class="term">prefill–decode interference</span>（预填充-解码干扰）。模块 02 的 chunked prefill 是一种<em>缓解</em>（把长 prefill 切碎插空），但治标不治本——两阶段仍在抢同一份算力与带宽。更彻底的办法是<strong>物理隔离</strong>：让它们根本不在同一块 GPU 上。</p></div>
+  </div>  <p><span class="term">PD disaggregation</span>（prefill–decode 分离，DistServe 提出）就是这个彻底方案：把集群里的 GPU 分成两个池——<strong>prefill 实例</strong>专做 prefill（追求高算力利用、可大批量），<strong>decode 实例</strong>专做 decode（追求高带宽、大 batch、稳定低 TPOT）。请求先到 prefill 实例算出 prompt 的 KV，再把 KV<strong>传给</strong> decode 实例继续逐 token 生成。</p>  <div class="ascii">colocate（混跑） vs disaggregate（分离）
+
+  colocate:   [GPU] prefill 和 decode 抢同一块卡 -&gt; 长 prefill 卡住 decode，TPOT 抖动
+
+  disaggregate:
+     请求 ─▶ [Prefill 池]  算出 prompt KV ──KV 传输(NVLink/RDMA)──▶ [Decode 池] 逐 token 生成
+              算力受限、可大批                                        带宽受限、大 batch、TPOT 稳
+     好处：两阶段各自独立优化、独立扩缩容；prefill 不再干扰 decode 的 TPOT</div>  <p>分离还带来一个常被忽视的好处：<strong>两阶段可以用不同的并行策略与硬件</strong>。prefill 算力受限，适合用更激进的张量并行把一次大矩阵乘摊到多卡、追求低延迟；decode 带宽受限，适合用更大的 batch 和更省带宽的并行方式。混跑时这两套策略只能二选一（同一组 GPU 上的模型切分是固定的），分离后则各取所需——这是「专池专用」在并行维度上的延伸。</p>  <p>分离的代价是多了一次 <strong>KV 传输</strong>（把 prefill 算出的 KV 从一个池搬到另一个池）。它划不划算，取决于传输开销是否远小于「混跑干扰带来的延迟损失」——在长 prompt、高并发场景下通常划算，这也是 DistServe 用 <span class="term">goodput</span>（满足 SLO 的吞吐）而非裸吞吐来衡量收益的原因：分离的目标不是把某个数字单纯做大，而是让<strong>更多请求同时满足 TTFT 和 TPOT 的承诺</strong>。一个裸吞吐很高、却让一半请求 TPOT 超时的系统，goodput 可能还不如一个吞吐略低但人人达标的系统——这正是分离要纠正的偏差。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="kvtransfer"><span class="num">6</span>KV 传输与资源配比</h2>
+  <h3>KV 传输与资源配比</h3>  <p>PD 分离要回答两个量化问题：KV 传输的代价多大？prefill 与 decode 实例该按什么比例配？</p>  <p>先看<strong>KV 传输</strong>。prefill 实例算完一个请求，要把它整段 prompt 的 KV（大小 ≈ 模块 01 的公式：<code>2 × L × H_kv × d_head × prompt_len × bytes</code>）经 <span class="term">NVLink</span> / <span class="term">RDMA</span> 搬到 decode 实例。传输时间 ≈ KV 字节 ÷ 互连带宽。只要这个时间远小于 prefill 本身、且能与计算重叠（边算边传），它就被很好地隐藏。</p>  <p>这里有个关键的工程技巧：KV 是<strong>逐层</strong>算出来的，所以可以<strong>逐层流式传输</strong>——prefill 实例算完第 1 层的 KV 就立刻开始传它，同时继续算第 2 层，让传输与计算<em>流水线重叠</em>。这样 KV 传输几乎不增加端到端延迟，是 PD 分离在实践中可行的关键。反过来，若互连带宽太低（如跨节点走慢速网络），传输就盖不住、成为新瓶颈，分离反而变慢——所以 PD 分离通常要求 prefill 与 decode 实例之间有高速互连（同机 NVLink 或 RDMA）。</p>  <div class="callout danger"><span class="label">KV 传输 = 分离的生死线</span>
+    <p>把 KV 传输的账算到具体数字上就明白它为何是 PD 分离的生死线：一个 Llama-3-70B、prompt 长 4096 的请求，其 KV ≈ <code>2×80×8×128×4096×2 ≈ 1.3 GB</code>。走同机 NVLink（数百 GB/s）传它只要几毫秒、轻松藏进 prefill；可一旦跨节点走普通以太网（几 GB/s），同一份 KV 要传上百毫秒——这<strong>比整个 decode 还久</strong>，分离非但不加速，反而凭空给每个请求加上一截致命延迟。所以 PD 分离的前提是<strong>高速互连，且 KV 与计算流水重叠</strong>；脱离这个前提谈分离，等于把瓶颈从「两阶段干扰」搬到了「跨机搬 KV」，得不偿失。</p>
+  </div>  <p>再看<strong>资源配比</strong>（PD ratio = prefill 实例数 ∶ decode 实例数）。配比的原则是让两个池的<strong>吞吐相匹配</strong>：单位时间里 prefill 池能处理的请求数，应约等于 decode 池能消化的请求数，否则一边堆积、一边空闲。用一个简单的平衡式刻画：</p>  <div class="math-block">\[\frac{N_P}{N_D}=\frac{\lambda\cdot L_{\text{prompt}}/r_P}{\lambda\cdot L_{\text{gen}}/r_D}=\frac{L_{\text{prompt}}/r_P}{L_{\text{gen}}/r_D}\]</div>  <p>其中 <code>N_P, N_D</code> 是两池实例数、<code>λ</code> 是请求到达率、<code>L_prompt / L_gen</code> 是平均 prompt / 生成长度、<code>r_P / r_D</code> 是单实例的 prefill / decode 速率（token/s）。直觉：<strong>一个请求在 prefill 上要花的时间 ∝ prompt 长度 ÷ prefill 速率，在 decode 上要花的时间 ∝ 生成长度 ÷ decode 速率</strong>；两池实例数之比，就该等于这两个时间之比，才能让请求在两池间顺畅流动、谁都不成瓶颈。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：prefill 池是「备菜区」、decode 池是「炒菜区」。如果每道菜备菜要 2 分钟、炒菜要 6 分钟，那炒菜区就得是备菜区的 3 倍人手，否则备好的菜堆在传菜口、炒菜区却忙不过来。配比就是让两个工序的产能对齐。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>现实更复杂：prompt/生成长度是分布而非定值、到达率随时间波动、KV 传输也占带宽。所以生产系统会<strong>动态</strong>调配比（按实时负载在两池间迁移 GPU），而非用一个静态比例。但上面的平衡式是一切动态策略的<em>出发点</em>——先算出静态最优，再围绕它做反馈调节。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>PD 分离不是万灵药：当 prompt 很短（prefill 本就便宜）、或互连带宽不足（KV 传输成了新瓶颈）、或请求量小不够填满两个池时，分离的额外传输与碎片化反而得不偿失。它是<strong>大 prompt、高并发、SLO 严苛</strong>场景下的利器，而非默认选择——是否分离本身就是一个要按负载权衡的决策。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="slo"><span class="num">7</span>SLO 分解：TTFT/TPOT 映射资源</h2>
+  <h3>SLO 分解：把 TTFT/TPOT 映射到资源</h3>  <p>把前后两半（前缀复用 + PD 分离）统一到一个框架下：服务的承诺是 <span class="term">SLO</span>，通常拆成两个延迟指标，而它们恰好<strong>一一对应两个阶段</strong>：</p>  <table>
+    <thead><tr><th>SLO 指标</th><th>由哪个阶段决定</th><th>压低它的手段（本课）</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">TTFT</span> 首 token 延迟</td><td>prefill</td><td>前缀复用（跳过重复 prefill）、chunked prefill、PD 分离的 prefill 池专门优化</td></tr>
+      <tr><td><span class="term">TPOT</span> 单 token 延迟</td><td>decode</td><td>大 batch 摊薄权重、投机解码（模块 03）、量化（模块 05）、PD 分离让 decode 不被 prefill 干扰</td></tr>
+    </tbody>
+  </table>  <p>于是「满足 SLO」被分解成两个可分别下手的子问题：想压 TTFT，就在 prefill 这一侧做文章（缓存、切块、专池）；想压 TPOT，就在 decode 这一侧做文章（批量、投机、量化、隔离）。PD 分离的深层价值正在于此——它把两个本来纠缠在一起的 SLO 指标<strong>解耦</strong>，让你能独立地为各自配资源、各自达标，而不必在同一块 GPU 上做令人头疼的折中。</p>  <table>
+    <thead><tr><th>维度</th><th>Colocate（混跑）</th><th>Disaggregate（分离）</th></tr></thead>
+    <tbody>
+      <tr><td>TPOT 稳定性</td><td>差（被长 prefill 周期性打断）</td><td>好（decode 池不受 prefill 干扰）</td></tr>
+      <tr><td>资源利用</td><td>单池简单，但两负载互相迁就</td><td>两池各自打满，但需 KV 传输</td></tr>
+      <tr><td>扩缩容</td><td>只能整体扩</td><td>两阶段独立扩缩容</td></tr>
+      <tr><td>适用</td><td>中小规模、短 prompt、负载均衡</td><td>大规模、长 prompt、SLO 严苛</td></tr>
+    </tbody>
+  </table>  <p>notebook 会把这套 SLO 账算清：给定负载（到达率、prompt/生成长）与两池速率，算出满足 TTFT/TPOT 所需的配比；再对比 colocate 与 disaggregate 下 decode 的 TPOT 稳定性，<strong>亲眼看到</strong>分离如何把 prefill 对 decode 的干扰消掉。这呼应全课的账本方法论——把系统收益还原成可断言的数字。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>KV 池化与跨实例共享</strong>：把前缀 KV 从单实例的树提升为集群级的<strong>KV 池</strong>（如 Mooncake），让任意实例、任意会话、甚至跨节点共享同一份前缀 KV，并做分级存储（GPU/CPU/远端）与按热度迁移——这是把 RadixAttention 从单卡推广到数据中心。</li>
+    <li><strong>缓存淘汰与命中率的博弈</strong>：在显存有限下，如何在「多缓存前缀以提命中率」与「多留显存给运行请求以提 batch」之间动态权衡？带引用计数的 LRU 只是起点，按前缀复用频率、长度、计算成本的代价感知淘汰仍是开放问题。</li>
+    <li><strong>PD 配比的动态自适应</strong>：真实负载的 prompt/生成长度分布与到达率时刻在变，静态配比必然次优。如何用实时反馈在 prefill/decode 两池间无缝迁移 GPU、并平滑处理迁移期的 KV，是分离式服务的核心难题。</li>
+    <li><strong>与投机/量化的叠加</strong>：前缀复用、PD 分离、投机解码（模块 03）、KV 量化（模块 05）是<em>正交</em>的加速维度，但叠加时彼此影响（如量化的 KV 还能否被前缀树精确匹配、投机解码在分离架构下如何放置 draft 模型），联合优化是活跃方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Zheng et al. 2024（SGLang/RadixAttention，本模块前半源头）、Zhong et al. 2024（DistServe/PD 分离，后半源头）；延伸读 Mooncake（KV 池化）、Splitwise（相位分离）、Sarathi-Serve（chunked prefill）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_speculative/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 投机解码 Speculative Decoding</div></a>
+    <a class="next" href="../05_fp8_serving/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · fp8 与量化服务</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 预训练目标与配方的改良</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 预训练目标与配方的改良</h1>
+  <p class="subtitle">RoBERTa：零架构改动提升 7 分 · ELECTRA：判别式目标把信号密度拉回 1.0 · DeBERTa：解耦注意力与相对位置 · ALBERT：参数量 ≠ 效率 · 四个正交维度的横向对比</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–01、交叉熵与二元交叉熵、参数量估算</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_pretraining_objectives.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Liu et al. 2019（RoBERTa）★、Clark et al. 2020（ELECTRA）★、He et al. 2021（DeBERTa）★、Lan et al. 2020（ALBERT）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#roberta">RoBERTa：一篇「只调配方」却影响深远的论文</a></li>
+      <li><a href="#electra">ELECTRA：把生成式目标换成判别式</a></li>
+      <li><a href="#deberta">DeBERTa：解耦注意力与相对位置</a></li>
+      <li><a href="#albert">ALBERT：参数共享与它的真实代价</a></li>
+      <li><a href="#compare">四条改进线的横向对比</a></li>
+      <li><a href="#modern">编码器的现代化：被遗忘的十年</a></li>
+      <li><a href="#ledger">算一笔账：四种改进的效率对比</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="roberta"><span class="num">1</span>RoBERTa：一篇「只调配方」却影响深远的论文</h2>
+  <p>BERT 发布一年后，RoBERTa 出现了。它<strong>没有改动任何架构</strong>——同样的双向 Transformer、同样的 MLM 目标、同样的层数和维度。它只做了一件事：<em>把训练配方系统地重调了一遍</em>。结果在 GLUE 上大幅超越 BERT，甚至超过了当时一批号称有架构创新的工作。</p>  <p>这个结果本身是本模块最重要的一课：<strong>BERT 是严重欠训练的（significantly undertrained）</strong>。它的改动清单值得逐条理解，因为每一条都对应一个可迁移的经验。</p>  <table>
+    <thead><tr><th>改动</th><th>BERT</th><th>RoBERTa</th><th>为什么有效</th></tr></thead>
+    <tbody>
+      <tr><td><strong>去掉 NSP</strong></td><td>MLM + NSP</td><td>只有 MLM</td><td>NSP 能被主题捷径攻破（模块 01 已验证），还占用算力</td></tr>
+      <tr><td><strong>动态掩码</strong></td><td>预处理时掩一次，全程复用（静态）</td><td>每个 epoch 重新采样掩码位置</td><td>同一句话在不同 epoch 被掩的位置不同 → 有效样本量翻倍</td></tr>
+      <tr><td><strong>更多数据</strong></td><td>16GB（BooksCorpus + Wiki）</td><td>160GB（+CC-News, OpenWebText, Stories）</td><td>10 倍数据，直接的规模收益</td></tr>
+      <tr><td><strong>更大 batch</strong></td><td>256 序列</td><td>8192 序列（配更大 lr）</td><td>MLM 梯度噪声大，大 batch 显著降噪</td></tr>
+      <tr><td><strong>更长训练</strong></td><td>1M 步</td><td>最多 500k 步 × 8k batch ≈ 更多 token</td><td>欠训练是主要瓶颈</td></tr>
+      <tr><td><strong>整句输入</strong></td><td>句对（为 NSP 服务）</td><td>连续填满 512 的完整文本片段</td><td>去掉 NSP 后没必要凑句对，长片段信息更完整</td></tr>
+      <tr><td><strong>byte-level BPE</strong></td><td>WordPiece 30k</td><td>byte-BPE 50k</td><td>无未登录词、跨语言更鲁棒</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>动态掩码</strong>这一条最值得单独说，因为它揭示了一个常被忽略的问题：BERT 在数据预处理阶段就把掩码固定下来了（为了效率，实际做了 10 份不同的副本），于是模型在 40 个 epoch 里会<em>反复看到同一句话的同一个挖空版本</em>。这相当于人为缩小了有效数据量、增加了过拟合风险。动态掩码让每次看到的挖空位置都不同，等于免费扩充了数据。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地看这个收益：静态掩码下，一句长度 <code>L</code> 的话只提供了 <code>k</code>（副本数）种挖空模式；动态掩码下有 <code>C(0.85L, 0.15L)</code> 种可能——天文数字。当然实际收益远小于这个组合数（不同挖空之间高度相关），但方向是明确的：<strong>训练时的随机性是一种免费的数据增强</strong>。这个思想在数据增强（C51）、dropout、SpecAugment 里反复出现。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>RoBERTa 给整个领域的教训，用一句话说：<strong>在宣布一个架构创新有效之前，先确认你的 baseline 是充分训练的</strong>。2019–2020 年有相当一批「改进 BERT」的工作，其收益在 RoBERTa 式的充分训练 baseline 下就消失了。这个现象在深度学习里反复上演（后来在推荐系统、图神经网络、时序预测领域都有类似的「baseline 没调好」的复盘论文）。<em>C40（研究方法论）会把这件事作为可复现性的核心案例。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="electra"><span class="num">2</span>ELECTRA：把生成式目标换成判别式</h2>
+  <p>RoBERTa 把配方推到了极限，但 MLM 的<strong>结构性缺陷</strong>还在：信号密度只有 15%，且引入了下游不存在的 <code>[MASK]</code>。ELECTRA 换了个思路，把这两个问题一起解决。</p>  <h3>RTD：替换 token 检测</h3>  <div class="ascii">原句:      the  chef  cooked  the  meal
+             │     │      │      │     │
+   ① 用一个**小生成器**（小 BERT，MLM 训练）把 15% 的位置替换成「它认为合理」的词
+             ↓
+被污染:    the  chef   ate    the  meal        ← cooked 被换成了 ate（很像真的！）
+             │     │      │      │     │
+   ② **判别器**（真正要的模型）对**每个位置**判断：这个 token 是原始的还是被替换的？
+             ↓
+标签:      orig  orig  REPLACED orig  orig     ← 每个位置都有信号！
+
+关键差异:
+  · 判别器**每个位置都产生训练信号** → 信号密度 1.0×（MLM 只有 0.15×）
+  · 输入里**没有 [MASK]** → 预训练与下游的输入分布一致，不需要 80/10/10 补丁
+  · 生成器是**辅助**的，训练完就扔掉，只保留判别器</div>  <p>这个设计在细节上有几个精妙之处，值得看清：</p>  <ul>
+    <li><strong>生成器要「小」而不是「强」</strong>。论文发现生成器规模是判别器的 1/4 到 1/2 时效果最好。太强的生成器会造出几乎无法分辨的替换，判别任务变得过难、信号变噪声；太弱则替换太离谱，任务过易。<em>这是对抗式设置里常见的「难度匹配」问题</em>。</li>
+    <li><strong>不是 GAN</strong>。虽然结构上像生成器-判别器，但生成器<em>不接收</em>来自判别器的对抗梯度（文本离散，梯度传不回去）。生成器只是用自己的 MLM 损失独立训练。所以 ELECTRA 是「两个协同训练的模型」，不是对抗博弈——这一点论文特别澄清过，也是常见误解。</li>
+    <li><strong>损失加权</strong>。总损失是 <code>L_MLM(生成器) + λ·L_RTD(判别器)</code>，论文取 <code>λ=50</code>。因为二分类损失的数值尺度远小于 30k 类交叉熵，不加权的话判别器几乎不更新。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>ELECTRA 的收益有多大？论文报告：<strong>ELECTRA-Small 用 1/30 的算力达到 GPT（同期）的 GLUE 分数；ELECTRA-Base 用 1/4 的算力匹配 RoBERTa</strong>。在小算力区间优势尤其明显——这对「没有大集群但要一个好用的编码器」的团队极有价值。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要看清它的代价与边界。<strong>①每次信号的信息量小</strong>：二分类最多 1 bit，而 MLM 是 <code>log₂(30522) ≈ 14.9</code> bit。所以 6.7 倍的密度优势换算成实际效率优势约 4 倍，不是 6.7 倍（模块 01 已算过）。<strong>②判别器不学生成</strong>：ELECTRA 的判别器没有语言建模头，不能算词概率、不能做需要生成的任务，比 BERT 更「纯粹地只是个编码器」。<strong>③训练流程更复杂</strong>：要同时维护两个模型、调 λ 与生成器规模比，工程上比 MLM 麻烦。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>ELECTRA 体现了一个非常一般的设计模式：<strong>当你的自监督任务只在少数位置产生信号时，考虑把「生成」换成「判别」</strong>——判别任务通常可以在每个位置上定义。同样的思路在对比学习（判别正负样本对）、RLHF 的奖励模型（判别偏好）、以及各种「用一个模型造样本、另一个模型判真伪」的方案里都出现过。<em>记住这个模式，比记住 ELECTRA 的具体结构更有用。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="deberta"><span class="num">3</span>DeBERTa：解耦注意力与相对位置</h2>
+  <p>RoBERTa 改配方、ELECTRA 改目标，DeBERTa 改的是<strong>注意力本身怎么用位置信息</strong>。它是这一线里在 GLUE/SuperGLUE 上走得最远的（DeBERTa-v3 至今仍是很多编码器任务的强基线）。</p>  <h3>核心洞察：内容与位置应该分开算</h3>  <p>BERT 的做法是把位置嵌入<strong>加</strong>到词嵌入上，然后一起做注意力。这意味着注意力分数里，内容与位置的贡献被<em>纠缠</em>在一起了。展开 <code>(x_i + p_i)W_q · ((x_j + p_j)W_k)ᵀ</code> 会得到四项：</p>  <div class="math-block">\[\underbrace{x_iW_qW_k^Tx_j^T}_{\text{内容→内容}} + \underbrace{x_iW_qW_k^Tp_j^T}_{\text{内容→位置}} + \underbrace{p_iW_qW_k^Tx_j^T}_{\text{位置→内容}} + \underbrace{p_iW_qW_k^Tp_j^T}_{\text{位置→位置}}\]</div>  <p>DeBERTa 的 <span class="term">disentangled attention</span>（解耦注意力）做两件事：<strong>①用相对位置替代绝对位置</strong>（<code>p_{i→j}</code> 只依赖 <code>i−j</code>，而非 <code>i</code> 和 <code>j</code> 各自的绝对值）；<strong>②只保留前三项，丢掉「位置→位置」项</strong>（用相对位置后，这一项对所有 <code>(i,j)</code> 只依赖距离，是个常数偏置，信息量很小）。</p>  <div class="math-block">\[A_{ij} = \underbrace{x_iW_{q,c}(x_jW_{k,c})^T}_{\text{内容→内容}} + \underbrace{x_iW_{q,c}(r_{i-j}W_{k,r})^T}_{\text{内容→位置}} + \underbrace{r_{j-i}W_{q,r}(x_jW_{k,c})^T}_{\text{位置→内容}}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么解耦有用？举个例子：「deep」和「learning」这两个词，它们的注意力权重应该同时取决于<em>它们是什么词</em>（内容）和<em>它们挨得多近</em>（位置）。把两者加在一起再投影，模型必须从一个混合向量里隐式地拆出这两种信息；显式地分开算，等于把这个归纳偏置直接写进架构。<strong>相对位置还带来一个附赠好处：长度外推能力</strong>——绝对位置嵌入表只有 512 行，相对位置只需要覆盖一个距离窗口。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>DeBERTa 还有第二个组件：<span class="term">EMD</span>（Enhanced Mask Decoder）。因为相对位置本身不包含绝对位置信息（「第一个词」这个事实丢了），而 MLM 预测某些词时绝对位置是有用的（比如句首更可能是大写词），所以 DeBERTa 在<em>输出层之前</em>把绝对位置信息注入回去。<strong>这是个很聪明的分工：让中间层用相对位置做通用的上下文建模，只在最后需要时才用绝对位置</strong>。DeBERTa-v3 进一步把预训练目标换成了 ELECTRA 的 RTD（并改进了权重共享方式），是「两条改进线合流」的典型。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>解耦注意力的代价是<strong>计算量与实现复杂度</strong>：三项注意力分数意味着约 2 倍的注意力计算（论文报告约 1.5–2× 的训练开销），而且相对位置的索引计算（<code>clip(i−j)</code> 的分桶）实现起来容易出错。工程上还有一个现实问题：<em>DeBERTa 的注意力实现与 FlashAttention 等标准 kernel 不兼容</em>，因为它不是标准的 <code>QKᵀ</code>。这在需要极致推理速度时是个真实的取舍。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="albert"><span class="num">4</span>ALBERT：参数共享与它的真实代价</h2>
+  <p>ALBERT 走的是第四条路：<strong>不改目标、不改配方，改的是参数怎么放</strong>。它想回答一个问题——能不能在参数量小很多的情况下保持性能？它用了三个技术：</p>  <table>
+    <thead><tr><th>技术</th><th>做法</th><th>省了多少</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>嵌入分解</strong><br>factorized embedding</td><td>词嵌入先投到低维 <code>E</code>（如 128），再升到 <code>H</code>（如 768）。参数从 <code>V×H</code> 变成 <code>V×E + E×H</code></td><td>BERT-base 的嵌入表占 23M/110M ≈ 21%，分解后降到约 4M</td><td>多一次投影；表达力略降</td></tr>
+      <tr><td><strong>跨层参数共享</strong><br>cross-layer sharing</td><td>所有 Transformer 层<strong>共用同一份权重</strong></td><td>12 层的参数变成 1 层的量，省掉约 85M</td><td><strong>推理速度完全没变</strong>（层数没少，还是要算 12 次）</td></tr>
+      <tr><td><strong>SOP 替代 NSP</strong></td><td>负例改为同一对句子的顺序颠倒</td><td>—</td><td>无（纯改进，模块 01 已验证）</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">参数量不是效率</span>
+    <p>ALBERT 最容易被误读的一点：<strong>参数少 ≠ 跑得快</strong>。跨层共享把 ALBERT-base 的参数量从 110M 压到 12M（省 89%），听起来惊人；但推理时它仍然要跑 12 层前向，<em>FLOPs 与延迟和 BERT-base 几乎一模一样</em>。省下的只是<strong>显存中存放权重的空间</strong>和<strong>模型文件的大小</strong>。而且 ALBERT 论文中真正涨分的配置是 ALBERT-xxlarge（<code>H=4096</code>），它虽然只有 235M 参数，但<strong>比 BERT-large 慢约 3 倍</strong>——因为每层更宽。<em>「参数量」是个很差的效率代理指标，要看 FLOPs 和实测延迟。</em></p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>那跨层共享到底带来了什么？两件事：<strong>①正则化效果</strong>——强制所有层学同一个变换，是很强的约束，能防止过拟合、提升训练稳定性；<strong>②让「更宽但参数可控」成为可能</strong>——因为层间共享，你可以把 <code>H</code> 加到 4096 而参数量还在可控范围，从而在<em>同等参数预算</em>下获得更强的表达力。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但后来的实践并没有大规模采用参数共享，原因是<strong>它优化的是一个不太重要的指标</strong>。在实际部署里，权重占用的显存通常不是瓶颈（KV 缓存和激活才是，见 C08/C24），而推理延迟才是。既然共享不省延迟，那用同样的 FLOPs 预算去训一个参数更多的模型通常更划算。<em>ALBERT 的历史价值更多在于它提出的 SOP（被广泛采纳）和它对「参数量 vs 计算量」这个区分的澄清。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="compare"><span class="num">5</span>四条改进线的横向对比</h2>
+  <p>把四个工作放在一起，你会看到它们其实在优化<strong>四个不同的东西</strong>——这才是理解这段历史的正确方式。</p>  <table>
+    <thead><tr><th>工作</th><th>改的是什么</th><th>核心指标改善</th><th>今天的地位</th></tr></thead>
+    <tbody>
+      <tr><td><strong>RoBERTa</strong></td><td>训练配方（数据、batch、步数、动态掩码）</td><td>同架构下 GLUE +2~3 分</td><td>✅ 仍是标准基线；它的配方经验被普遍继承</td></tr>
+      <tr><td><strong>ELECTRA</strong></td><td>预训练目标（生成式 → 判别式）</td><td><strong>算力效率约 4×</strong></td><td>✅ RTD 被 DeBERTa-v3 等继承；小算力场景首选</td></tr>
+      <tr><td><strong>DeBERTa</strong></td><td>注意力对位置的使用方式</td><td>SuperGLUE 上首次超人类基线</td><td>✅ <strong>v3 至今是编码器任务的最强基线之一</strong></td></tr>
+      <tr><td><strong>ALBERT</strong></td><td>参数放置（共享与分解）</td><td>参数量 −89%（但不省延迟）</td><td>🔶 SOP 被继承；参数共享未成主流</td></tr>
+    </tbody>
+  </table>  <p>从这张表里能提炼出三条对<em>今天</em>仍然适用的判断：</p>  <ul>
+    <li><strong>配方 &gt; 架构</strong>（在同一代技术内）。RoBERTa 用零架构创新击败了一批有架构创新的工作。做研究时，先确认 baseline 训练充分，否则你的「改进」可能只是在补别人的欠训练。</li>
+    <li><strong>目标函数的信号密度是一等公民</strong>。ELECTRA 的收益不来自更聪明的表示，而来自「每个位置都有信号」。设计任何自监督任务时都该问：我的信号密度是多少？</li>
+    <li><strong>效率指标要选对</strong>。参数量、FLOPs、延迟、显存是四个不同的东西，优化其中一个可能对另一个毫无帮助（ALBERT）甚至有害。<em>先明确你被什么卡住，再选优化目标。</em></li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>还有一条隐含的启示：<strong>这四个工作是「正交」的，所以可以叠加</strong>。DeBERTa-v3 = DeBERTa 的解耦注意力 + ELECTRA 的 RTD + RoBERTa 式的充分训练，效果确实比任何单项都好。<em>当你看到一个领域里出现几个改动不同维度的工作时，「把它们叠起来」往往是一个被低估的、高回报的方向</em>——虽然它不够「新颖」，但工程价值巨大。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="modern"><span class="num">6</span>编码器的现代化：被遗忘的十年</h2>
+  <p>这里要说一个容易被忽略的事实：<strong>BERT 的架构停留在 2018 年</strong>。而 2019–2025 年间，decoder-only 那条线积累了大量架构与工程改进，这些改进<em>绝大多数对 encoder 同样适用，但长期没人去做</em>——因为注意力都在 LLM 上。</p>  <table>
+    <thead><tr><th>组件</th><th>BERT (2018)</th><th>现代做法</th><th>对 encoder 的收益</th></tr></thead>
+    <tbody>
+      <tr><td>位置编码</td><td>学习式绝对位置，硬上限 512</td><td>RoPE / ALiBi / 相对位置</td><td>支持长文档；可外推</td></tr>
+      <tr><td>归一化位置</td><td>post-LN（残差后归一化）</td><td>pre-LN / RMSNorm</td><td>训练更稳，可去掉 warmup 的一部分</td></tr>
+      <tr><td>激活函数</td><td>GELU + 标准 FFN</td><td>GLU 族（SwiGLU/GeGLU）</td><td>同参数量下效果更好</td></tr>
+      <tr><td>注意力实现</td><td>朴素 <code>QKᵀ</code></td><td>FlashAttention</td><td>长序列显著提速与省显存</td></tr>
+      <tr><td>注意力模式</td><td>全注意力 O(L²)</td><td>局部+全局交替（Longformer 式）</td><td>长文档从不可行变可行</td></tr>
+      <tr><td>padding</td><td>补齐到定长</td><td>unpadding / 变长序列打包</td><td>batch 内长度差异大时省一半算力</td></tr>
+      <tr><td>分词器</td><td>WordPiece 30k</td><td>BPE 50k+ / 更好的多语言覆盖</td><td>无 UNK；跨语言</td></tr>
+    </tbody>
+  </table>  <p>把这些装进 encoder 会发生什么？近两年的 <em>ModernBERT</em> 一类工作给出了答案：<strong>在同等参数量下大幅超越原始 BERT/RoBERTa，同时把上下文长度从 512 提到 8192，推理速度还更快</strong>。这说明 encoder 线的潜力远未被榨干——只是过去几年整个社区的注意力被 decoder 吸走了。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>这件事对你的实际意义：<strong>如果你今天要选一个编码器做分类/检索，不要默认选 <code>bert-base-uncased</code></strong>。它是 2018 年的技术，而同等成本下有明显更好的选项（DeBERTa-v3、现代化的 BERT 变体、或者专门的嵌入模型）。<em>「默认选项」的惯性是工程里一个真实的成本来源</em>——很多团队至今在用 BERT-base，不是因为评估后觉得它最好，而是因为教程里都是它。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">7</span>算一笔账：四种改进的效率对比</h2>
+  <p>把四个工作的改进量化到同一个尺度上——<strong>达到同等 GLUE 分数所需的算力</strong>（以 BERT-base 为 1.0）。数字取自各论文报告的量级。</p>  <table>
+    <thead><tr><th>模型</th><th>参数量</th><th>预训练算力（相对）</th><th>GLUE 量级</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>BERT-base</td><td>110M</td><td>1.0×</td><td>~79</td><td>基线</td></tr>
+      <tr><td>RoBERTa-base</td><td>125M</td><td>~4×（更多数据与步数）</td><td>~86</td><td>算力换分数，不是效率改进</td></tr>
+      <tr><td>ELECTRA-base</td><td>110M</td><td><strong>~0.25×</strong>（达到 RoBERTa 分数）</td><td>~86</td><td><strong>真正的效率改进</strong></td></tr>
+      <tr><td>ALBERT-base</td><td>12M</td><td>~1.0×</td><td>~80</td><td>参数少但算力不省</td></tr>
+      <tr><td>DeBERTa-base</td><td>140M</td><td>~1.5×（解耦注意力更贵）</td><td>~88</td><td>分数换算力，效果最强</td></tr>
+    </tbody>
+  </table>  <p>读这张表的正确方式：<strong>「更好」有两种完全不同的含义</strong>。RoBERTa 和 DeBERTa 是<em>用更多算力换更高分数</em>（帕累托前沿上向右上移动）；ELECTRA 是<em>用更少算力达到同样分数</em>（向左平移）。ALBERT 是<em>用同样算力换更小的权重文件</em>（第三个维度）。<em>它们不在同一个坐标轴上竞争，所以问「谁最好」是个坏问题；正确的问题是「我被什么卡住」</em>。</p>  <p>给三种常见约束下的实际建议：</p>  <ul>
+    <li><strong>算力受限（个人/小团队要自己预训练）</strong>：ELECTRA 式的 RTD 目标，收益最大。</li>
+    <li><strong>只做微调、追求效果</strong>：直接用 DeBERTa-v3 系列的开源权重，不要从 BERT-base 起步。</li>
+    <li><strong>推理延迟受限</strong>：先看能不能蒸馏到更小的模型（模块 05），而不是选参数共享的模型——<em>参数共享不省延迟</em>。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的智慧：<strong>同一个架构上，「训练配方」「目标函数」「位置信息的用法」「参数放置」是四个几乎正交的改进维度；每个维度的改进优化的是不同的指标，叠加起来往往能得到超过任何单项的结果</strong>。当你面对一个「已经被研究透了」的架构时，先把这四个维度列出来，通常会发现还有没被系统探索的组合。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>判别式目标的信息论上界</strong>：RTD 每个位置只有 1 bit，为什么效果能接近每位置 15 bit 的 MLM？「信号密度 × 信息量」这个朴素乘积显然不是完整故事，缺乏理论刻画。也有工作尝试多分类版本的替换检测（判断被替换成了哪一类），介于两者之间。</li>
+    <li><strong>最优生成器-判别器规模比</strong>：ELECTRA 报告 1/4–1/2 最优，但这个比值如何随规模缩放、是否有理论依据，尚不清楚。它与 GAN 中的「判别器不能太强」有相似的味道，但机制不同（无对抗梯度）。</li>
+    <li><strong>相对位置编码的统一理解</strong>：DeBERTa 的解耦注意力、T5 的相对位置偏置、RoPE、ALiBi 是四种不同的相对位置方案，它们的表达力与外推能力之间的关系缺乏统一理论。什么任务需要哪种，目前主要靠实验。</li>
+    <li><strong>encoder 的缩放律</strong>：decoder-only 有成熟的 Chinchilla 式缩放律（C21），但 encoder + MLM 的最优参数-数据配比缺乏系统研究。掩码率、模型规模、数据量三者的联合缩放律尤其空白。</li>
+    <li><strong>编码器的现代化边界</strong>：把现代组件装进 encoder 能带来多大提升，以及是否存在「encoder 特有」的架构改进（而不只是移植 decoder 的），仍在探索。encoder 的双向性是否允许一些 decoder 做不到的结构（如迭代式精化），是个开放方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Liu et al. 2019 <em>RoBERTa</em>（重点读消融表，它系统地拆开了每一项改动的贡献）、Clark et al. 2020 <em>ELECTRA</em>（读它的生成器规模消融与「不是 GAN」的澄清）、He et al. 2021 <em>DeBERTa</em> 与 2023 <em>DeBERTa-v3</em>（解耦注意力的推导与 RTD 的结合）、Lan et al. 2020 <em>ALBERT</em>（SOP 的动机与参数共享的真实收益）。补充：Wettig et al. 2023 <em>Should You Mask 15%?</em>、以及 ModernBERT 一类编码器现代化的工作。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_mlm_bert/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · MLM 与双向编码器</div></a>
+    <a class="next" href="../03_finetuning/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 下游微调三范式</div></a>
+  </div>
+
+</div>
+</body>
+</html>

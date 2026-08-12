@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · CRF 与结构化预测</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · CRF 与结构化预测</h1>
+  <p class="subtitle">HMM 的判别式升级 —— 特征函数、对数线性模型、全局归一的配分函数（=CRF 版前向）、Viterbi 解码、结构化感知机，纯 numpy 从零做 NER</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 03（HMM/前向/Viterbi）、逻辑回归、对数线性模型、log-sum-exp</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_crf_sequence.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Lafferty 2001（CRF）、Collins 2002（结构化感知机）、McCallum 2000（MEMM）、Lample 2016</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#disc">判别式：从生成 P(O,S) 到条件 P(S|O)</a></li>
+      <li><a href="#feat">特征函数与对数线性模型</a></li>
+      <li><a href="#partition">配分函数 = CRF 版的前向算法</a></li>
+      <li><a href="#perceptron">解码与结构化感知机</a></li>
+      <li><a href="#ner">BIO 编码与 NER 特征模板</a></li>
+      <li><a href="#pipeline">完整 NER 系统与评测要点</a></li>
+      <li><a href="#family">模型家族：两条优美的对偶</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="disc"><span class="num">1</span>判别式：从生成 P(O,S) 到条件 P(S|O)</h2>
+  <p>上一模块的 HMM 是<strong>生成式</strong>序列模型——它对「标签和词怎么一起被生成」建模。这一模块换一种哲学：<strong>判别式</strong>。我们不关心词是怎么生成的，只关心<strong>给定词，标签该是什么</strong>——直接对 $P(S\mid O)$ 建模。这就是 <span class="term">CRF</span>（条件随机场）的出发点，也是 2010 年代序列标注的主力方法。</p>  <p>为什么要换哲学？回忆 HMM 的硬伤：它的发射假设「词只由当前标签生成」，让它<strong>无法自然利用重叠特征</strong>。比如做 <span class="term">NER</span>（命名实体识别）时，判断一个词是不是人名/地名，我们有大量线索：词本身、是否首字母大写、后缀是不是 -ton/-ville、前一个词是不是 Mr.、它在不在地名词典里……这些线索高度重叠、相互关联，HMM 没有自然的位置安放它们。判别式模型则可以把<strong>任意特征</strong>一股脑塞进去——这是 CRF 碾压 HMM 的根本原因。</p>  <p>先理清<strong>生成式 vs 判别式</strong>这对贯穿机器学习的概念：</p>  <table>
+    <thead><tr><th>维度</th><th>生成式 (HMM, 朴素贝叶斯)</th><th>判别式 (CRF, 逻辑回归)</th></tr></thead>
+    <tbody>
+      <tr><td>建模对象</td><td>联合分布 $P(O, S)$</td><td>条件分布 $P(S \mid O)$</td></tr>
+      <tr><td>能否生成数据</td><td>能（可采样出 (O,S)）</td><td>不能（只会判别）</td></tr>
+      <tr><td>特征灵活性</td><td>受限（发射独立假设）</td><td><strong>任意、可重叠</strong></td></tr>
+      <tr><td>数据需求</td><td>较少（有先验结构）</td><td>较多（纯靠数据学）</td></tr>
+      <tr><td>典型精度</td><td>好</td><td><strong>通常更高</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>生成式像「先理解世界怎么运作，再回答问题」（HMM 先建模词和标签怎么一起产生）；判别式像「不管世界怎么运作，只专心答对这道题」（CRF 只学给定词如何标标签）。后者把全部精力花在刀刃上，所以通常答得更准。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>贝叶斯视角：生成式建模 $P(O,S)=P(S)P(O\mid S)$ 再用贝叶斯求 $P(S\mid O)$；判别式直接参数化 $P(S\mid O)$。判别式不浪费容量去建模 $P(O)$（我们根本不关心词本身的分布），且不受发射独立假设束缚，可用任意特征——代价是失去生成能力、更依赖数据量。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>本模块的核心问题：<strong>如何在保留 HMM 的动态规划高效推断的同时，获得判别式 + 任意特征的强大表达力？</strong>——答案是线性链 CRF：用特征函数打分、在整条序列上全局归一（配分函数），前向算法与 Viterbi 原样复用。学完你能从零实现 CRF 的对数配分函数与结构化感知机，做 NER。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="feat"><span class="num">2</span>特征函数与对数线性模型</h2>
+  <p>CRF 的基本构件是 <span class="term">feature function</span>（特征函数）。一个特征函数 $f_k(y_{t-1}, y_t, x, t)$ 看「前一个标签、当前标签、整个观测序列、当前位置」，输出一个分数（通常 0/1 或实数）。线性链 CRF 给一整条标签序列 $y$ 打分，是所有位置、所有特征的加权和：</p>  <div class="math-block">\[\mathrm{score}(y, x) = \sum_{t=1}^{T} \sum_{k} \lambda_k\, f_k(y_{t-1}, y_t, x, t)\]</div>  <p>$\lambda_k$ 是特征 $k$ 的权重（模型要学的参数）。特征大致分两类，恰好对应 HMM 的两种概率，但更灵活：</p>  <ul>
+    <li><strong>发射型特征（emission / state）</strong>：把当前标签和观测的某个属性绑定，如「当前词=London 且 标签=B-LOC」「当前词首字母大写 且 标签=B-PER」「当前词后缀=-ton 且 标签=B-LOC」。对应 HMM 的发射，但可以用<strong>任意观测属性</strong>（大小写、后缀、词典命中、邻近词……），不限于词本身。</li>
+    <li><strong>转移型特征（transition）</strong>：把相邻两个标签绑定，如「前一标签=B-PER 且 当前标签=I-PER」。对应 HMM 的转移，编码标签之间的依赖（如 I-PER 不能紧跟 O）。</li>
+  </ul>  <p>怎么从特征得分变成概率？用 <span class="term">log-linear model</span>（对数线性模型）的形式——指数化得分再归一：</p>  <div class="math-block">\[P(y \mid x) = \frac{1}{Z(x)} \exp\big(\mathrm{score}(y, x)\big), \qquad Z(x) = \sum_{y'} \exp\big(\mathrm{score}(y', x)\big)\]</div>  <p>分子是该标签序列得分的指数，分母 $Z(x)$ 是 <span class="term">partition function</span>（配分函数）——对<strong>所有可能的标签序列</strong>求和，保证概率归一。注意这里的归一是<strong>全局的</strong>（在整条序列上），这正是 CRF 区别于其前身 MEMM（局部归一）的关键，也是它避免「标签偏置」的根本。</p>  <div class="callout warn"><span class="label"></span>
+    <p>配分函数 $Z(x)=\sum_{y'}\exp(\mathrm{score})$ 要对所有标签序列求和——共 $S^T$ 条，又是指数爆炸！如果硬算，CRF 根本训不动。救星是：线性链结构（标签只有相邻依赖）让 $Z(x)$ 可以用<strong>前向算法</strong>在 $O(TS^2)$ 算出来——和模块 03 的 HMM 前向<strong>同一个动态规划</strong>。这就是为什么我们先学 HMM：CRF 的高效推断完全建立在它之上。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="partition"><span class="num">3</span>配分函数 = CRF 版的前向算法</h2>
+  <p>配分函数 $Z(x)$ 是 CRF 的计算核心。直接算要枚举 $S^T$ 条标签序列，不可行。但因为线性链 CRF 的得分是<strong>逐位置可加</strong>的（只有相邻标签耦合），我们可以用<strong>和 HMM 前向算法完全同构</strong>的动态规划，在对数空间高效算出 $\log Z(x)$。</p>  <p>定义<strong>对数前向变量</strong> $\alpha_t(j)$：到位置 $t$、当前标签为 $j$ 的所有部分序列的得分指数和（取对数）。递推是：</p>  <div class="math-block">\[\alpha_t(j) = \log\!\sum_{i} \exp\big(\alpha_{t-1}(i) + \text{trans}(i, j) + \text{emit}(j, x, t)\big)\]</div>  <p>其中 $\text{trans}(i,j)$ 是「从标签 $i$ 转到 $j$」的转移特征得分，$\text{emit}(j,x,t)$ 是「位置 $t$ 标签为 $j$」的发射特征得分。最后 $\log Z(x)=\log\sum_j\exp(\alpha_T(j))$。把它和 HMM 前向并排看，结构一模一样——只是 HMM 用概率相乘（对数相加），CRF 用特征得分相加，求和都用 <span class="term">log-sum-exp</span>。</p>  <div class="ascii">HMM 前向  vs  CRF 对数前向：同一个 DP, 只是「乘概率」换成「加得分」
+
+  HMM:  α_t(j) = [ Σ_i α_{t-1}(i) · A_ij ] · B_j,o_t       (概率相乘)
+  CRF:  α_t(j) = logΣ_i exp[ α_{t-1}(i) + trans(i,j) + emit(j,x,t) ]  (得分相加, 对数空间)
+
+  HMM:  P(O)   = Σ_i α_T(i)
+  CRF:  log Z  = logΣ_j exp(α_T(j))         &lt;- 配分函数, 训练求梯度要它</div>  <p>为什么训练需要 $\log Z$？因为 CRF 的训练目标是最大化训练数据的对数似然 $\sum\log P(y\mid x)=\sum[\mathrm{score}(y,x)-\log Z(x)]$。对参数 $\lambda_k$ 求梯度，会得到一个漂亮的形式：<strong>梯度 = 真实特征计数 − 模型期望特征计数</strong>。前者直接数训练数据，后者需要 $Z(x)$ 和前向-后向算出的边缘概率。这个「经验 − 期望」的梯度形式是所有对数线性/最大熵模型的共性，也连接到能量模型与对比学习。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住 CRF 的计算：<strong>配分函数 Z(x) = CRF 版的前向算法</strong>，解码 = CRF 版的 Viterbi。你在模块 03 学的两个 DP，在 CRF 里换个皮（概率→得分、相乘→相加）就直接复用。这也是为什么说 CRF 是 HMM 的判别式升级——算法骨架没变，变的是「打分方式」和「归一范围」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="perceptron"><span class="num">4</span>解码与结构化感知机</h2>
+  <p>解码 CRF（给新句子标标签）和 HMM 一样用 <span class="term">Viterbi</span>：找得分最高的标签序列 $\arg\max_y\mathrm{score}(y,x)$。注意解码不需要 $Z(x)$——因为 $Z(x)$ 对所有 $y$ 都一样，求 argmax 时是常数。Viterbi 递推把对数前向里的「log-sum-exp（求和）」换成「max（取最大）」，再加回溯指针：</p>  <div class="math-block">\[\delta_t(j) = \max_{i}\big[\delta_{t-1}(i) + \text{trans}(i, j)\big] + \text{emit}(j, x, t)\]</div>  <p>又是熟悉的 <strong>sum→max 对偶</strong>：配分函数（前向）对所有路径求和，解码（Viterbi）取最优路径。模块 03 的 Viterbi 代码几乎可以原样搬过来，只把「转移/发射概率」换成「转移/发射特征得分」。</p>  <p>训练 CRF 的标准方法是<strong>梯度上升最大化对数似然</strong>（需要前向-后向算期望特征），但它有点复杂。这里我们用一个<strong>更简洁、更直观</strong>的等价物来理解结构化学习：<span class="term">structured perceptron</span>（结构化感知机，Collins 2002）。</p>  <p>结构化感知机的训练循环简单到惊人：</p>  <div class="ascii">结构化感知机 (Collins 2002) 训练循环
+
+  对每个训练样本 (x, y_true):
+    1. 用当前权重做 Viterbi 解码:  y_pred = argmax_y score(y, x)
+    2. 如果 y_pred != y_true:
+         权重 += features(x, y_true)     # 真值特征 +1
+         权重 -= features(x, y_pred)     # 预测特征 -1
+    (预测对了就什么都不做)
+  重复多轮; 最终权重取多轮平均(averaged perceptron, 更稳)</div>  <p>它的逻辑朴素而深刻：<strong>解码错了，就奖励正确答案的特征、惩罚错误答案的特征</strong>；解码对了就不动。它<strong>不需要算配分函数 $Z(x)$</strong>（只需 Viterbi 解码），实现极简，却能学出和 CRF 很接近的效果，是理解结构化学习的最佳跳板。notebook 会从零实现它，在 NER 上随训练把 F1 提上去。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>结构化感知机就是「错题本」式学习：做错一道题（标错一个序列），就把正确解法记一笔、把错误解法扣一笔，下次少犯。简单、不需要复杂的概率计算，效果却出奇地好。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>感知机更新 $\lambda \mathrel{+}= \phi(x,y_{\text{true}})-\phi(x,y_{\text{pred}})$ 其中 $\phi$ 是特征计数向量。它可视为对<strong>感知机损失</strong> $\max_y\mathrm{score}(y,x)-\mathrm{score}(y_{\text{true}},x)$ 的随机次梯度下降。与 CRF 的「经验−期望」梯度相比，它把「期望（对所有 $y$ 加权）」近似成「最优单点（argmax 的 $y_{\text{pred}}$）」——这正是 sum→max 在学习层面的又一次体现。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ner"><span class="num">5</span>BIO 编码与 NER 特征模板</h2>
+  <p>CRF 用在 NER 上，需要把「找实体」这件事转成<strong>逐词标注</strong>。标准编码是 <span class="term">BIO</span>（也叫 IOB）体系：</p>  <ul>
+    <li><code>B-XXX</code>：一个 XXX 类实体的<strong>开始</strong>（Begin），如 B-PER（人名开始）、B-LOC（地名开始）。</li>
+    <li><code>I-XXX</code>：实体的<strong>内部/延续</strong>（Inside），如 I-PER（人名的后续词）。</li>
+    <li><code>O</code>：<strong>非实体</strong>（Outside），普通词。</li>
+  </ul>  <p>例如「Barack Obama visited Paris」标成 <code>B-PER I-PER O B-LOC</code>：Barack=人名开始、Obama=人名延续、visited=非实体、Paris=地名开始。这样跨多词的实体（Barack Obama）就被编码成了一串逐词标签，序列标注模型（HMM/CRF）就能处理它。解码出标签后，把连续的 B-I 段拼回实体即可。</p>  <p>BIO 编码还自带<strong>标签依赖约束</strong>，正是转移特征该捕捉的：I-PER 只能跟在 B-PER 或 I-PER 后面（不能 O→I-PER，也不能 B-LOC→I-PER）。HMM 要靠转移概率隐式学这个；CRF 可以用转移特征<strong>显式</strong>编码，甚至直接把非法转移的权重压到极低。这种「硬约束 + 软偏好」的混合，是 CRF 在 NER 上的一大优势。</p>  <p>特征工程是经典 NER 的工程核心。一个实用的特征模板会为每个位置生成大量特征：</p>  <div class="ascii">NER 常用特征模板 (在每个位置 t 实例化)
+
+  发射型 (绑定 当前标签 y_t):
+    word=&lt;w_t&gt;          当前词本身
+    is_cap=&lt;bool&gt;       首字母是否大写        &lt;- 人名/地名强信号
+    suffix3=&lt;w_t[-3:]&gt;  后三个字符            &lt;- -ton/-ville=&gt;地名
+    prefix=&lt;w_t[0]&gt;     首字符
+    prev_word=&lt;w_{t-1}&gt; 前一个词              &lt;- 'Mr.'=&gt;后面是人名
+    in_gazetteer=&lt;bool&gt; 是否在地名/人名词典里
+  转移型 (绑定 y_{t-1}, y_t):
+    trans=&lt;y_{t-1}&gt;_&lt;y_t&gt;   标签转移          &lt;- 编码 BIO 合法性</div>  <div class="callout paper"><span class="label"></span>
+    <p>特征工程曾是 NER 系统的胜负手——好的特征模板能让简单的 CRF 逼近复杂模型。CoNLL-2003 是 NER 的标准评测（英德两语，PER/LOC/ORG/MISC 四类实体），经典 CRF 系统在上面长期是 SOTA，直到 BiLSTM-CRF（Lample 2016）用神经网络自动学特征才接棒——但 CRF 层（前向 + Viterbi）被完整保留。详见 references。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">6</span>完整 NER 系统与评测要点</h2>
+  <p>把零件拼成一个完整的 CRF/结构化感知机 NER 系统，并理清训练评测要点。端到端流程：</p>  <div class="ascii">结构化感知机 NER 训练与评测流水线
+
+  标注语料 (词, BIO标签) ──特征模板──► 每个位置的特征集
+     │
+     ▼ (初始化权重 w = 0)
+  多轮训练:
+    对每句: Viterbi 解码 y_pred ; 若 != y_true 则 w += φ(true) - φ(pred)
+     │
+     ▼ (权重取多轮平均)
+  averaged perceptron 权重 w*
+     │
+     ▼ (新句子)
+  Viterbi 解码 -&gt; BIO 标签 -&gt; 拼回实体
+     │
+     ▼ (与真值比, 实体级)
+  实体级 Precision / Recall / F1</div>  <p>几个关键的训练评测要点：</p>  <ul>
+    <li><strong>实体级评测，不是词级</strong>：NER 的 F1 通常按<strong>完整实体</strong>算——一个实体的边界和类型<strong>全对</strong>才算对（Barack Obama 标成 B-PER O 算错）。这比词级严格得多，也更符合实际需求。模块 05 会细讲 P/R/F1。</li>
+    <li><strong>平均感知机（averaged perceptron）</strong>：把训练过程中每一步的权重平均起来用，而非只用最后一步。这是个简单但极有效的正则化技巧，显著提升泛化、减少震荡。</li>
+    <li><strong>特征哈希与稀疏</strong>：真实 NER 的特征数达百万级，权重向量极稀疏（用 dict 存）。每次更新只动当前序列涉及的少量特征——这让 CRF/感知机在大特征空间下依然高效。</li>
+    <li><strong>CRF vs 结构化感知机</strong>：CRF 最大化对数似然（需配分函数、给出概率），结构化感知机最小化感知机损失（只需 Viterbi、不给概率）。二者特征/解码相同，感知机是 CRF 的「轻量近似」，理解了它就理解了 CRF 的骨架。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>整个 CRF/感知机 NER 就是：设计特征、用 Viterbi 解码、错了就调权重、重复。它把「识别实体」这个看似复杂的任务，拆成了「给每个词打标签 + 处理标签依赖」，再用我们熟悉的动态规划解决。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从优化看，CRF 是凸优化（对数似然是凹的），有全局最优；结构化感知机非概率，但平均化后有不错的泛化界（Collins 2002 给了 mistake bound）。二者都属于<strong>结构化预测</strong>——预测的不是一个标量/类别，而是一个有内部结构（这里是序列）的对象，其核心挑战正是「在指数大的输出空间上高效推断」，靠的还是那套 DP。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="family"><span class="num">7</span>模型家族：两条优美的对偶</h2>
+  <p>退一步，看清 CRF 与前后模型的<strong>血缘关系</strong>——这能帮你把整个序列建模的版图连成一张网：</p>  <table>
+    <thead><tr><th>模型</th><th>类型</th><th>归一</th><th>特征</th><th>与 CRF 的关系</th></tr></thead>
+    <tbody>
+      <tr><td><strong>朴素贝叶斯</strong></td><td>生成式</td><td>—</td><td>条件独立</td><td>逻辑回归的生成式对应</td></tr>
+      <tr><td><strong>逻辑回归</strong></td><td>判别式</td><td>单点</td><td>任意</td><td><strong>CRF 的「无结构」特例</strong>（T=1）</td></tr>
+      <tr><td><strong>HMM</strong></td><td>生成式</td><td>局部</td><td>受限（发射独立）</td><td>CRF 的生成式对应</td></tr>
+      <tr><td><strong>MEMM</strong></td><td>判别式</td><td>局部</td><td>任意</td><td>CRF 的前身（有标签偏置）</td></tr>
+      <tr><td><strong>线性链 CRF</strong></td><td>判别式</td><td><strong>全局</strong></td><td>任意</td><td>—</td></tr>
+      <tr><td><strong>BiLSTM-CRF</strong></td><td>判别式（神经）</td><td>全局</td><td>自动学</td><td>CRF 层 = 本模块</td></tr>
+    </tbody>
+  </table>  <p>这张表藏着两条优美的对偶。<strong>第一条：生成式 ↔ 判别式</strong>。朴素贝叶斯↔逻辑回归、HMM↔CRF 是两对「生成-判别」镜像——左边建联合、右边建条件，结构相同。<strong>第二条：有结构 ↔ 无结构</strong>。逻辑回归是「序列长度 1」的 CRF，CRF 是「带序列结构」的逻辑回归。理解了这两条对偶，五个模型在你脑中就不再是孤立的名字，而是一个有坐标的二维空间。</p>  <p>最关键的传承是<strong>标签偏置问题（label bias）</strong>与<strong>全局归一</strong>。CRF 的前身 MEMM 在每个位置<em>局部</em>归一（每步是个独立的 softmax），导致一个反直觉的缺陷：转移选择少的状态会被<strong>不当地偏好</strong>（因为它的概率质量没被「分散」）。Lafferty 2001 的洞察是：在<strong>整条序列上全局归一</strong>（一个 $Z(x)$ 管全序列）就能根治它——这正是 CRF 名字里「条件随机场」的精髓，也是它战胜 MEMM 的决定性优势。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句话：<strong>CRF = 逻辑回归 + 序列结构 = HMM 的判别式 + 任意特征 + 全局归一</strong>。它继承了 HMM 的动态规划（前向/Viterbi），获得了逻辑回归的特征自由度，并用全局归一根治了标签偏置。这三者的结合，让它统治了深度学习前的序列标注。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>CRF 是经典序列标注的巅峰，但它也有局限，这些局限被神经方法接手——而 CRF 本身并未退场，反而以「输出层」的身份延续至今：</p>  <ul>
+    <li><strong>特征靠人工</strong>：经典 CRF 的威力依赖精心设计的特征模板，这既是手艺也是负担（领域迁移要重做特征）。<strong>BiLSTM-CRF / BERT-CRF</strong> 用神经网络<strong>自动学特征</strong>，CRF 层只负责标签依赖——人工特征工程被自动表示学习取代，但 CRF 的前向 + Viterbi<strong>原样保留</strong>。</li>
+    <li><strong>只建模相邻依赖</strong>：线性链 CRF 的高效来自「标签只有相邻耦合」。更长程的标签依赖（如篇章级一致性）需要一般图 CRF（推断变难，常要近似）或神经方法。</li>
+    <li><strong>结构化预测的延伸</strong>：CRF 是「输出是序列」的结构化预测。把输出换成树（句法分析）、图（关系抽取），就是更广的结构化预测领域，其核心挑战「在指数大输出空间上推断」与本模块一脉相承。</li>
+    <li><strong>CRF 层活在今天</strong>：即便在 Transformer 时代，需要<strong>强标签依赖约束</strong>的任务（NER、分词）仍常在 BERT 顶上加一个 CRF 层来保证输出合法（如禁止 O→I-PER）。你学的前向/Viterbi 直接活在这些现代系统里。</li>
+  </ul>  <p>把整个序列标注的进化链连起来：<strong>HMM（生成式）→ MEMM（判别式局部归一，标签偏置）→ CRF（判别式全局归一）→ BiLSTM-CRF / BERT-CRF（神经特征 + CRF 层）</strong>。每一步都在改进「特征从哪来、怎么归一」，但前向-后向、Viterbi 这套动态规划骨架<em>贯穿始终、从未改变</em>。这就是学经典 CRF 的终极回报：你不仅掌握了一个强模型，更握住了一条从 1989（HMM）延续到今天（BERT-CRF）的算法主线——理解它，现代序列模型的输出层对你就再无秘密。</p>  <div class="callout paper"><span class="label"></span>
+    <p>延伸必读（见 <code>../references.md</code>）：Lafferty 2001（CRF 原始论文，全局归一根治标签偏置）、Collins 2002（结构化感知机，本模块 worked 的依据）、McCallum 2000（MEMM，理解标签偏置由来）、Sutton & McCallum 2011（CRF 长篇导论）、Lample 2016（BiLSTM-CRF，经典通向神经）。下一站模块 05 · NLP 流水线，从序列标注转向文本分类与完整评测。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_hmm/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 隐马尔可夫模型 HMM</div></a>
+    <a class="next" href="../05_nlp_pipeline/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · NLP 流水线与评测</div></a>
+  </div>
+
+</div>
+</body>
+</html>

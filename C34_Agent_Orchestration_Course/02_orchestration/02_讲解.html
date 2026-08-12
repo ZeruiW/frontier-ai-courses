@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 编排模式（Orchestration）</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 编排模式（Orchestration）</h1>
+  <p class="subtitle">给多个 agent 选一种接线方式 —— pipeline / fan-out / router / supervisor-worker 四大模式、任务分解与结果合成、错误传播与组合；从零写一个能分解-扇出-合成的 orchestrator</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–01、subagent 派生与回传、Python 函数复合与字典分派</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_orchestration.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Building effective agents（五种 workflow）、multi-agent research system、AutoGen / MetaGPT</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">什么是编排：给 agent 选接线方式</a></li>
+      <li><a href="#base">两块基石：任务分解与结果合成</a></li>
+      <li><a href="#pipeline">模式一：pipeline（流水线）</a></li>
+      <li><a href="#fanout">模式二：fan-out（并行扇出）</a></li>
+      <li><a href="#router">模式三：router（路由）</a></li>
+      <li><a href="#supervisor">模式四：supervisor-worker（主从）</a></li>
+      <li><a href="#compose">组合、错误传播与可观测</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>什么是编排：给 agent 选接线方式</h2>
+  <p>上一模块我们造好了<strong>worker 这个零件</strong>——一个能被派生、有隔离上下文、会回传结构化结果的 subagent。本模块造<strong>orchestrator 那个大脑</strong>：用什么<strong>拓扑</strong>把这些 worker 组织起来、怎么分解任务、怎么合成结果。这就是<span class="term">orchestration</span>（编排）。</p>  <p>「编排」听起来抽象，其实就是回答一个问题：<strong>多个步骤 / 多个 agent，按什么样的连接方式协同？</strong>是排成一条直线（上一步喂下一步）？是摊成一片同时跑（互不依赖）？是先分流再分派（不同输入走不同处理）？还是一个主管动态决定派谁干什么？这些连接方式不是越复杂越好——恰恰相反，Anthropic《Building effective agents》给出的五种 workflow 模式，每一种都对应一类任务结构，<strong>选对拓扑比堆 agent 重要得多</strong>。</p>  <p>本模块聚焦四种最核心、最常用的编排模式，并把它们从零实现：<strong>pipeline（流水线）</strong>——步骤串成链；<strong>fan-out（并行扇出）</strong>——子任务摊开并行；<strong>router（路由）</strong>——按输入分流到专精处理者；<strong>supervisor-worker（主从）</strong>——一个 supervisor 动态调度 worker。再加上贯穿始终的两件事：<strong>任务分解</strong>（把大任务拆成子任务）与<strong>结果合成</strong>（把子结果汇成最终答案）。</p>  <p>一个关键的认知先建立起来：编排有两种<strong>控制来源</strong>——<em>代码编排</em>与<em>模型编排</em>。代码编排（workflow）是你用 if / for / 函数把路径写死，路径固定、可预测、好调试；模型编排（agentic）是让 LLM 自己决定下一步派谁、做什么，更灵活、但更不可控。pipeline / fan-out / router 偏代码编排（路径基本固定），supervisor-worker 偏模型编排（supervisor 动态决策）。<strong>能用代码编排解决的，就别让模型自由发挥</strong>——这是编排工程里最重要的克制，贯穿全模块。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>编排 = 给多个 agent / 步骤选一种『接线方式』</strong>。直线接（pipeline）、并联接（fan-out）、带开关的分流接（router）、还是一个调度员临时接（supervisor-worker）。本模块教你这四种接线方式各自的形状、适用场景、和怎么从零接出来；更教你<em>先选对接线方式、能写死就别让模型乱接</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="base"><span class="num">2</span>两块基石：任务分解与结果合成</h2>
+  <h3>编排的两块基石：任务分解与结果合成</h3>  <p>无论哪种拓扑，编排都绕不开两件事：开头的<strong>任务分解（decompose）</strong>和结尾的<strong>结果合成（synthesize）</strong>。它们像编排的「入口」与「出口」，拓扑只是中间的连接方式。</p>  <p><span class="term">task decomposition</span>（任务分解）是把一个大任务拆成若干可独立完成、可并行或可串联的子任务。分得好坏直接决定后续——分得太粗失去并行机会，分得太细则协调成本爆炸（每个子任务都要派 agent、收结果）。分解可以是<em>代码规则</em>（如「按公司名拆」「按章节拆」）也可以是<em>LLM 决定</em>（让模型读任务后输出子任务列表）；前者确定可控，后者灵活但需校验。</p>  <p><span class="term">synthesis</span>（结果合成）是把多个子结果合并成一个连贯的最终答案。简单任务可以直接拼接（如把各段摘要连起来），复杂任务则需要<strong>再过一遍 LLM</strong>去整合——因为子结果之间可能重复、矛盾、或需要重新组织才连贯。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把编排想成办一桌菜。分解 = 把「办一桌菜」拆成「切菜、炒荤、炒素、煲汤」几个子任务；拓扑 = 这些子任务怎么排（切完才能炒？还是几个灶同时开？）；合成 = 最后摆盘上桌，把各道菜组织成一顿连贯的饭。分解拆错了（比如忘了主食）、或合成乱摆（汤泼在饭上），再好的灶也救不回来。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，一个通用 orchestrator 是 <code>orchestrate(task) = synth(task, [run(st) for st in split(task)])</code> 的某种变体。pipeline 把 split 退化成「按顺序串」、synth 退化成「取最后一步」；fan-out 把 run 并行化；router 把 split 退化成「选一条路」；supervisor-worker 让 split 和 run 都由一个 agent 动态驱动。本模块逐一实现这些变体。</p></div>
+  </div>  <p>一个常被忽视的分解原则：<strong>分解要尊重依赖关系</strong>。有些子任务天然独立（三家公司的财报），可以并行；有些有依赖（先查用户 id 才能查订单），必须串行。分解时若把有依赖的当独立的并行派出去，下游 subagent 就会拿到还没准备好的输入而失败。所以更通用的分解不是「一个列表」，而是一张<strong>依赖图（DAG）</strong>——无依赖的并行、有依赖的按拓扑序串。本模块的 fan-out 处理独立子任务，依赖图调度留作练习。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">3</span>模式一：pipeline（流水线）</h2>
+  <h3>模式一：pipeline（流水线 / 链式）</h3>  <p>最简单的编排是<span class="term">pipeline</span>（流水线，Anthropic 称 prompt chaining）：把多个步骤串成一条链，<strong>上一步的输出是下一步的输入</strong>。适合能清晰拆成<strong>固定顺序</strong>子步骤的任务——每一步专注做好一件事，再把半成品传给下一步。</p>  <div class="ascii">  输入 ──► [步骤1] ──► [步骤2] ──► [步骤3] ──► 输出
+          起草        校对        翻译
+          (LLM)       (LLM)       (LLM)
+  每一步: 上一步的输出 = 这一步的输入；专注做好一件事</div>  <p>典型例子：「写一篇产品文案」可以拆成 <code>起草 → 校对润色 → 翻译成英文</code> 三步流水线。每一步用一个专门的提示 / agent，比让一个 agent 一口气「写完并校对并翻译」质量更高——因为每一步上下文更聚焦、目标更单一。这正是<strong>把复杂任务拆成简单步骤</strong>的威力。</p>  <p>pipeline 的一个增强是在步骤之间加<strong>检查门（gate）</strong>：上一步的输出先过一个校验，不合格就停 / 重试 / 走补救分支，合格才进下一步。比如「起草 → <em>检查字数是否达标</em> → 校对」，字数不够就回去重写。这让流水线不只是盲目串联，而能在中途拦住坏的中间结果，避免错误一路传到底。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>pipeline 像工厂的传送带：每个工位只干一道工序（拧一个螺丝），干完传给下一个工位。好处是每个工位简单、专精、好优化；代价是它是<strong>串行</strong>的——总时间是各工序之和，且任一工位卡住，整条线就停。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，pipeline 是函数复合：<code>output = step_n(...step_2(step_1(input)))</code>。实现成一个 <code>run_pipeline(input, steps)</code>：steps 是一串处理函数，依次把上一步输出喂给下一步。加 gate 就是在 step 之间插入 <code>if not check(x): handle()</code>。本模块 notebook 从零实现带 gate 的 pipeline。</p></div>
+  </div>  <p>什么时候用 pipeline？当任务<strong>能被清晰拆成固定的、有先后依赖的步骤</strong>时。它是最可控、最好调试的编排——路径完全确定，每一步的输入输出都看得见。<strong>能用 pipeline 就别上更复杂的模式</strong>：很多看似需要「智能 agent」的任务，其实是一条写死的流水线就能漂亮解决的（起草-校对-翻译、提取-校验-入库）。这是模块 00「能简单就别复杂」在编排上的第一个落点。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="fanout"><span class="num">4</span>模式二：fan-out（并行扇出）</h2>
+  <h3>模式二：fan-out（并行扇出 / map-reduce）</h3>  <p>当子任务<strong>互不依赖</strong>时，pipeline 的串行就太浪费了——该用 <span class="term">fan-out</span>（并行扇出）：把子任务<strong>同时</strong>分给多个 agent 跑，再<strong>汇总</strong>。这就是模块 01 的 subagent 扇出在编排层的正式化，也常被叫做 <span class="term">map-reduce</span>（map=扇出、reduce=合成）。</p>  <div class="ascii">  输入 ──► split 分解 ──┬──► [worker1] ──┐
+                       ├──► [worker2] ──┤── gather ──► synth ──► 输出
+                       └──► [worker3] ──┘   (扇入)      (合成)
+  三个 worker 同时跑；总时间 ≈ max(各 worker)，而非求和</div>  <p>Anthropic 把并行化分成两种形态，都属于 fan-out：<strong>sectioning（分块）</strong>——把一个任务切成互不依赖的块，每块一个 worker（如「同时分析一份文档的不同章节」）；<strong>voting（投票）</strong>——把<em>同一个</em>任务跑多次、取共识（如「让三个 agent 各判一次这段代码有没有漏洞，多数说有就算有」），用冗余换可靠。本模块重点实现 sectioning 式 fan-out，voting 留作练习思路。</p>  <p>fan-out 的合成比 pipeline 复杂，因为它要把<strong>多份平行的结果</strong>归一。三种常见合成策略：<strong>拼接</strong>（各结果直接连起来，适合互补的块）、<strong>归约</strong>（如求和 / 取最值 / 计数）、<strong>再合成</strong>（把所有结果喂回一个 LLM 让它整合成连贯答案，适合需要重新组织的场景）。选哪种取决于子结果之间的关系：互补就拼接、同质就归约、需要重组就再合成。</p>  <p>fan-out 继承了模块 01 的两条铁律——<strong>结果数 == worker 数</strong>（部分失败也一个不少）、<strong>按 id 对齐</strong>。在编排层还要加一条：合成前要<strong>决定如何对待失败的子结果</strong>——是全有才合成（任一失败则整体失败）、还是尽力合成（用成功的、标注缺失）。生产里多选「尽力合成」：5 个里 4 个成功，给一个标注了「缺第 3 块」的答案，比直接报错对用户更友好。这与模块 01 的失败隔离一脉相承。</p>  <div class="callout warn"><span class="label"></span>
+    <p>fan-out 的前提是<strong>子任务真的互不依赖</strong>。一个常见误用是把有隐含依赖的任务硬并行——比如「总结这份报告」和「基于总结提建议」，后者依赖前者，并行派出去后者就拿不到总结。<strong>并行前先确认依赖</strong>：能并行的并行（提速），有依赖的串行或建依赖图（正确）。把不该并行的并行了，错误不报、只表现为下游莫名拿到空输入——又是一类难查的隐蔽 bug。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="router"><span class="num">5</span>模式三：router（路由）</h2>
+  <h3>模式三：router（路由）</h3>  <p>有些任务的输入<strong>种类很杂</strong>：客服系统里有人问退款、有人问物流、有人问技术。用一个万能 agent 处理所有类别，往往样样不精；更好的办法是 <span class="term">routing</span>（路由）——先判断输入属于哪一类，再分派给<strong>专门处理该类</strong>的下游 agent / 提示。</p>  <div class="ascii">                    ┌──► [退款处理 agent]
+  输入 ──► [router] ─┼──► [物流查询 agent]
+          分类       └──► [技术支持 agent]
+  让每条路径都用最合适、最专精的处理者；分错了就全错</div>  <p>router 的核心是那个<strong>分类器</strong>：它读输入，输出一个类别标签，orchestrator 据此选下游。分类器可以是<em>规则</em>（关键词匹配：含「退款」走退款）、也可以是<em>一个轻量 LLM</em>（让小模型读输入判类别）。无论哪种，关键是<strong>类别要互斥且穷尽</strong>——每个输入恰好落入一类，且有一个<em>兜底类别</em>（default / fallback）接住所有没匹配上的，绝不让一个输入「无路可走」。</p>  <p>router 的价值在于<strong>关注点分离</strong>：每个下游处理者只需擅长一个窄领域，提示更聚焦、工具更精简、质量更高、也更好维护。加一个新类别只需加一条路由规则 + 一个新下游，其余不动；改一个下游的处理逻辑不影响其他路径。这种<em>可插拔的专精</em>是 router 比「万能 agent」更工程化的根本。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>router 像医院的分诊台：先判断你是该挂内科、外科还是急诊，再送你去对的科室。分诊台本身不看病，只做一件事——把人送对地方。送错了科室（分类错），后面再厉害的医生也对不上症。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，router 是 <code>route(input) = handlers[classify(input)](input)</code>：classify 给标签、handlers 是「标签 → 处理函数」的表、default 兜底。它和模块 01 的工具分发、模块 03 的权限策略其实同构——都是「按某个 key 查表分派」。实现一个 router 就是写好 classify + handlers 表 + default。本模块 notebook 从零实现它。</p></div>
+  </div>  <p>router 还能和其他模式<strong>组合</strong>：路由到的某个下游本身可以是一条 pipeline、或一个 fan-out。真实系统极少是单一模式，而是这些模式的<strong>嵌套与组合</strong>——一个 router 把退款类路由到一条「核身份 → 查订单 → 退款」的 pipeline，把研究类路由到一个 fan-out。理解每个模式的形状后，关键能力是<em>把它们像积木一样拼起来</em>去匹配真实任务的结构。这也是为什么本课逐个把模式讲透——它们是可组合的原语。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="supervisor"><span class="num">6</span>模式四：supervisor-worker（主从）</h2>
+  <h3>模式四：supervisor-worker（主从 / 动态编排）</h3>  <p>前三种模式的路径基本<strong>固定</strong>（pipeline 的步骤、fan-out 的分块、router 的类别都是预先设计的）。但有些任务无法预先确定路径——你事先不知道要派几个 worker、派去做什么、何时停。这时需要 <span class="term">supervisor-worker</span>（主从）：一个 <strong>supervisor agent</strong>（lead / orchestrator）<strong>动态</strong>决定派生哪些 worker、给什么任务、看了结果后是否继续派、何时收尾。</p>  <p>这是 orchestrator-worker 范式的「<strong>agent 自主</strong>」版本——supervisor 是个真正的 agent（一个 LLM 回路），它在循环里：看当前进展 → 决定下一步派谁干什么 → 收 worker 结果 → 再决定 → …… 直到判断任务完成。Anthropic 的 multi-agent research system 的 lead agent 正是这样：它不是按固定脚本派 subagent，而是根据研究的展开<em>动态</em>决定还需要查什么、派几个 subagent 去查。</p>  <div class="ascii">      ┌──────────────────────────────────────────┐
+      ▼                                          │
+  [supervisor] ──决定──► 派 worker(s) ──结果──► 看进展 ──┐
+   (LLM 回路)            (动态决定派谁/几个)              │
+      ▲                                                  │
+      └──────────  还不够? 再派一轮  ◄────────────────────┘
+               直到: supervisor 判断任务完成 / 超轮数(兜底)</div>  <p>supervisor-worker 比固定模式<strong>灵活得多</strong>（能应对开放、难以预先拆解的任务），但代价也大：<strong>更不可控</strong>（supervisor 可能派偏、可能停不下来）、<strong>更费 token</strong>（多轮动态决策 + 多个 worker）、<strong>更难调试</strong>（路径每次都不一样）。所以它要配两条护栏：<strong>轮数上限</strong>（supervisor 最多派几轮，兜底防死循环，与单 agent 的 max_steps 同理）和<strong>worker 数上限</strong>（每轮最多派几个，控成本）。<em>给自主性配上硬性边界</em>，是用好 supervisor-worker 的前提。</p>  <p>怎么在四种模式里选？一条实用的决策线：<strong>路径能预先定 → 用 pipeline / fan-out / router（代码编排，可控）；路径无法预先定、需要 agent 边看边决 → 才用 supervisor-worker（模型编排，灵活）</strong>。再强调一遍模块 00 的克制：supervisor-worker 是最强、也最贵最难控的，<em>不到非用不可，先试固定模式</em>。很多团队一上来就用 supervisor-worker，结果 token 爆炸、行为飘忽、难以复现——其实他们的任务用一条 pipeline 或一个 router 就够了。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>四种模式排成一条「<strong>可控 ↔ 灵活</strong>」的光谱：pipeline 最可控（路径写死）→ fan-out（路径写死但并行）→ router（路径在几条固定路里选）→ supervisor-worker 最灵活（路径运行时由 agent 决定）。<em>从左往右，灵活性涨、可控性 / 可调试性 / 成本可预测性跌</em>。选模式 = 在这条光谱上，挑能解决你任务的<strong>最靠左</strong>的那一个。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="compose"><span class="num">7</span>组合、错误传播与可观测</h2>
+  <h3>组合、错误传播与可观测</h3>  <p>真实编排几乎从不是单一模式，而是这些模式的<strong>嵌套组合</strong>：一个 router 路由到不同的 pipeline；一个 pipeline 的某一步是一个 fan-out；一个 supervisor 在某轮派出的 worker 内部又是一条 pipeline。把四种模式当作<strong>可组合的原语</strong>，按真实任务的结构拼起来，才是编排的实战形态。本节收口三个跨模式的共性问题。</p>  <p>第一是<strong>错误如何传播</strong>。不同拓扑里错误的扩散方式不同：pipeline 里一步错会<em>一路传到底</em>（所以要在步骤间设 gate 拦截）；fan-out 里一个 worker 错只<em>缺一块</em>（所以尽力合成）；router 里分类错会<em>送错整条路</em>（所以分类要保守、要有兜底）；supervisor-worker 里 supervisor 决策错会<em>带歪后续多轮</em>（所以要轮数兜底 + 中途可纠错）。<strong>设计编排时，先想清楚这条拓扑里错误会怎么扩散、在哪拦它</strong>。</p>  <p>第二是<strong>中间结果的校验</strong>。编排越复杂，越需要在关键节点校验中间结果（pipeline 的 gate、fan-out 合成前的过滤、router 分类后的确认）。一个朴素但极有效的做法是 <span class="term">evaluator-optimizer</span>（评估-优化）模式：一个 agent 产出结果，另一个 agent 按 rubric 评估并给反馈，不达标就带着反馈重做，循环到达标或超次数。它适合<em>有明确评判标准、且迭代能稳定提升</em>的任务（带评审的写作 / 编码）。本质是给编排加一个「自检 + 重试」回路，与模块 05 的重试、Reflexion 的反思相通。</p>  <p>第三是<strong>可观测</strong>。编排一复杂，「哪一步出的错」就难定位了——一个错误答案背后可能是 pipeline 第二步跑偏、或 fan-out 某个 worker 失败、或 router 分错类。所以编排<strong>天然需要追踪</strong>：把每一步、每个 worker、每次合成都记成一个带父子关系的 span，拼成一棵能回看的树。这正是模块 04 的主题——本模块先建立「编排必须可观测」的意识，模块 04 把 span 树这套工具系统化。<em>没有可观测的复杂编排，是无法调试、无法信任的黑箱</em>。</p>  <p>最后回到那条贯穿全模块的主线：<strong>编排工程的核心不是会写四种模式，而是会为任务选对模式、并克制地组合它们</strong>。选错拓扑（该并行的串行、该写死的让模型乱决）比代码 bug 更致命，因为它从结构上就低效或失控。动手前先问三连：<em>这任务能拆成固定步骤吗（→pipeline）？子任务互不依赖吗（→fan-out）？输入分几类吗（→router）？路径必须运行时定吗（→supervisor-worker）？</em>答对这三连，编排就成功了一大半。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>自动选择 / 生成编排拓扑</strong>：能否让系统读了任务后自己决定用哪种模式、怎么组合？目前拓扑多靠人工设计，「编排的自动化」（如让 LLM 生成一张子任务 DAG 并调度）是活跃方向，但生成的拓扑常不可靠、需校验。</li>
+    <li><strong>动态 vs 静态编排的取舍</strong>：supervisor-worker 的灵活与 pipeline 的可控之间，缺乏量化的选择判据。什么任务值得用动态编排换灵活、什么任务该用静态换可控，多靠经验拍板。</li>
+    <li><strong>结果合成的忠实性</strong>：把多份子结果合成连贯答案时，合成 agent 可能丢信息、被某份污染结果带偏、或制造子结果间本不存在的矛盾。如何让合成既忠实又能消解冲突，是质量瓶颈（与模块 01 合成、模块 03 注入防御相通）。</li>
+    <li><strong>依赖图调度与并行度</strong>：从「独立子任务列表」推广到「带依赖的 DAG」后，如何在尊重依赖的前提下最大化并行度、如何处理动态发现的新依赖，是把编排从玩具推向复杂真实任务的关键工程问题。</li>
+    <li><strong>多 agent 协议与互操作</strong>：AutoGen 的 group chat、Swarm 的 handoff、MetaGPT 的 SOP——各家的编排抽象不同，缺乏统一标准。随着 agent 生态成熟，「不同框架的 agent 如何编排到一起」会成为问题（类似 MCP 之于工具）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Anthropic《Building effective agents》（五种 workflow 模式：chaining / routing / parallelization / orchestrator-workers / evaluator-optimizer，本模块逐一对应）、《How we built our multi-agent research system》（supervisor-worker 的真实工程）、AutoGen（Wu 2023）/ MetaGPT（Hong 2023）/ Swarm（编排抽象的不同取法）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_subagents/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 子 Agent（Subagents）</div></a>
+    <a class="next" href="../03_permissions/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 权限与沙箱（Permissions）</div></a>
+  </div>
+
+</div>
+</body>
+</html>

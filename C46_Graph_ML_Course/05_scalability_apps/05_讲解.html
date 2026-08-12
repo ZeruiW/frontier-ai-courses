@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 可扩展与应用</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 可扩展与应用</h1>
+  <p class="subtitle">把前四块落地 —— 采样/子图/分块让 GNN 上大图；分清过平滑(越深越差)与过挤压(长程学不会)；链接预测(编码器+点积解码+负采样, 看 AUC)与图级分类(置换不变 readout)从零实现并收敛</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02–04（GCN/GAT/SAGE/图 Transformer、过平滑、采样）、二分类/交叉熵、AUC 概念</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_scalability_apps.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Kipf 2016 (VGAE)、Xu 2019 (GIN)、Chiang 2019 (Cluster-GCN)、Hu 2020 (OGB)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#scale">可扩展性：采样、子图、分块</a></li>
+      <li><a href="#patho">过平滑与过挤压的统一诊断</a></li>
+      <li><a href="#link">链接预测：编码器+解码器+负采样</a></li>
+      <li><a href="#auc">AUC：链接预测的正确度量</a></li>
+      <li><a href="#graphcls">图分类：readout 把节点汇成图</a></li>
+      <li><a href="#build">从零搭分类器与链接预测器</a></li>
+      <li><a href="#practice">应用落地的实务要点</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="scale"><span class="num">1</span>可扩展性：采样、子图、分块</h2>
+  <p>最后一个模块把前四块<strong>落地</strong>。我们已经会从零写 GCN、GAT、GraphSAGE、图 Transformer，但一直停在「节点分类 + 小图」。现实里 GNN 的两大挑战是：<strong>怎么在百万节点的大图上训练</strong>（可扩展性），以及<strong>怎么做节点分类之外的任务</strong>——尤其<strong>链接预测</strong>（边级）和<strong>图分类</strong>（图级）。这一模块就把这两件事讲透并从零实现，同时正面诊断贯穿全课的两大病理——过平滑与过挤压。</p>  <p>先看<strong>可扩展性</strong>。模块 02 的 GCN 要把整张归一化邻接 $\hat A$ 和所有节点特征塞进显存做整图前向；模块 03 已埋下伏笔——这在大图上不可行。三条主流路线：</p>  <table>
+    <thead><tr><th>方法</th><th>核心思想</th><th>代表</th><th>适用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>邻居采样</strong> neighbor sampling</td><td>每节点每层只采固定数目邻居</td><td>GraphSAGE</td><td>节点级、归纳</td></tr>
+      <tr><td><strong>子图采样</strong> subgraph sampling</td><td>每个 batch 采一个子图来训</td><td>GraphSAINT</td><td>方差可控的大图训练</td></tr>
+      <tr><td><strong>图分块</strong> graph clustering</td><td>先把图聚类成块，按块做 mini-batch</td><td>Cluster-GCN</td><td>超大图、整图近似</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把大图训练想成「吃大象」：没法一口吞下整张图，只能切块。邻居采样是「每次只尝一小撮邻居」；子图采样是「每次切一块连通的子图」；图分块是「先把大象切成几大块，每次啃一块」。三者都在用「局部一致性」近似「整图传播」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这三条路线的共同前提是模块 03 的洞察：<strong>GNN 的计算可以局部化</strong>——一个节点 $L$ 层的输出只依赖它 $L$-跳邻域。于是只要把「目标节点 + 其 $L$-跳（采样）邻域」装进一个 batch，就能做随机梯度下降，而不必每步都碰整张图。Cluster-GCN 更进一步：先聚类让块内边尽量多、块间边尽量少（最小化被切断的信息），再把每块当一个 batch。</p></div>
+  </div>  <p>这三条路线各有取舍，没有绝对赢家。<strong>邻居采样</strong>（GraphSAGE，模块 03 已实现）最直接，但有「邻域爆炸」的残留——即使每层采固定数，多层叠起来子图仍可能很大，且存在重复计算；<strong>子图采样</strong>（GraphSAINT）每个 batch 独立采一个子图、用归一化系数把采样偏差修正回无偏，方差更可控；<strong>图分块</strong>（Cluster-GCN）一次性把图聚类成若干块，每个 batch 取一块（或几块的组合）做<em>近似整图</em>的传播，省去了重复采样、但块间被切断的边会丢失信息（Cluster-GCN 用「每个 batch 随机组合多个块」来部分找回这些跨块边）。</p>  <p>从<strong>显存</strong>这个最硬的约束看，三者的取舍更清楚：整图 GCN 的显存是 $O(n)$（所有节点表示同时驻留），大图直接 OOM；邻居采样把它压到 $O(\text{batch}\times\prod_l s_l)$（只装采样子图），但层数一多 $\prod_l s_l$ 又会反弹；子图采样和分块则把每个 batch 的显存钉死在"一个固定大小的子图"上，<strong>与全图规模解耦</strong>——这是它们能上十亿边图的根本原因。一句话：<strong>采样省显存的代价是方差或偏差，工程上就是在"装得下"和"训得准"之间找平衡点</strong>，邻居数、块大小都是这条平衡线上的旋钮。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话串起可扩展性：<strong>大图训练 = 用「采样/分块的局部子图」近似「整图传播」，再做 mini-batch SGD</strong>。代价是引入采样方差（GraphSAINT 用归一化做无偏修正）或块间信息丢失（Cluster-GCN 用随机组合多个块缓解）。理解了这层「局部近似整图」，就理解了所有大图 GNN 训练方法的共同骨架——它们都在回答同一个问题：<em>如何在不碰整张图的前提下，让每个 mini-batch 的梯度尽量接近整图梯度</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="patho"><span class="num">2</span>过平滑与过挤压的统一诊断</h2>
+  <h3>过平滑与过挤压：两大病理的统一诊断</h3>  <p>在落地之前，必须把贯穿全课的两个病理彻底说清——它们是 GNN 实践中最常见的「为什么我的模型不 work」的根因，而且常被混淆。</p>  <table>
+    <thead><tr><th>病理</th><th>是什么</th><th>根因</th><th>症状</th><th>诊断指标</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>过平滑</strong> over-smoothing</td><td>深层后节点表示趋同</td><td>反复聚合=扩散收敛到平稳分布</td><td>层数一深，准确率掉</td><td><strong>Dirichlet 能量</strong>→0</td><td>残差/跳连、PairNorm、解耦传播(APPNP)</td></tr>
+      <tr><td><strong>过挤压</strong> over-squashing</td><td>长程信息穿瓶颈时失真</td><td>指数级邻域被压进固定维向量</td><td>长程依赖任务学不会</td><td><strong>敏感度/谱隙</strong> $\lambda_2$ 小</td><td>图重连、加虚拟节点、全局注意力(图 Transformer)</td></tr>
+    </tbody>
+  </table>  <p><strong>二者的区别极其重要，别搞混</strong>：过平滑是「层数太深」的病（信息<em>过度</em>混合，表示同质化）；过挤压是「图有瓶颈 + 需要长程」的病（信息<em>挤不过去</em>，长程依赖丢失）。它们甚至<strong>互相矛盾</strong>——为了解决过挤压（让远处信息传过来）你想加深层数，但加深又会引发过平滑。这个<strong>两难</strong>正是图学习最深刻的张力之一，也是图 Transformer（一步全局，同时缓解两者）如此吸引人的原因。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>过平滑像「一锅汤煮太久，所有食材都化成一个味道」——加热（聚合）过头，区别消失了。过挤压像「千军万马过独木桥」——信息要通过的瓶颈太窄，挤成一团、彼此踩踏、面目全非。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>定量上：过平滑用 Dirichlet 能量 $\mathcal E(H)=\operatorname{tr}(H^\top L H)$ 随层数衰减来诊断（模块 02 已实现）；过挤压用「输出对远处输入的雅可比敏感度」随距离衰减、或直接看谱隙 $\lambda_2$（模块 01）来诊断——$\lambda_2$ 越小、瓶颈越窄、过挤压越重。notebook 的过挤压实验在模块 04 已做（哑铃图），本模块聚焦过平滑的缓解。</p></div>
+  </div>  <div class="callout danger"><span class="label">别搞混</span>
+    <p>实践诊断口诀：<strong>模型「越深越差」→ 怀疑过平滑（查 Dirichlet 能量）；模型在「需要长程交互的任务上学不会」→ 怀疑过挤压（查谱隙/瓶颈）</strong>。对症下药：过平滑加残差/解耦传播/控制层数；过挤压做图重连/加虚拟节点/上全局注意力。把这两者分清，能省下大量盲目调参的时间。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="link"><span class="num">3</span>链接预测：编码器+解码器+负采样</h2>
+  <h3>链接预测：编码器 + 解码器 + 负采样</h3>  <p>现在转向第一个新任务——<strong>链接预测（link prediction）</strong>：预测两个节点之间是否（将）存在边。它是推荐系统（用户-商品）、知识图谱补全、社交好友推荐、蛋白质相互作用预测的共同抽象，可能是 GNN 最有商业价值的应用。</p>  <p>标准范式是<strong>编码器-解码器</strong>（GAE/VGAE，Kipf 2016）：</p>  <ol>
+    <li><strong>编码器（encoder）</strong>：用一个 GNN（GCN/SAGE/…）把每个节点编码成嵌入 $z_v\in\mathbb{R}^d$。这一步就是前几模块的内容；</li>
+    <li><strong>解码器（decoder）</strong>：用两个节点嵌入算一个「这条边存在的分数」。最简单的是<strong>点积解码器</strong>：$\hat A_{uv}=\sigma(z_u^\top z_v)$——嵌入越相似、内积越大、越可能有边；</li>
+    <li><strong>训练</strong>：把它当二分类——真实存在的边是正样本，不存在的节点对是负样本，用二元交叉熵训练。</li>
+  </ol>  <div class="math-block">\[\hat y_{uv}=\sigma(z_u^\top z_v),\qquad \mathcal L=-\!\!\sum_{(u,v)\in E^+}\!\!\log\hat y_{uv}\ -\!\!\sum_{(u,v)\in E^-}\!\!\log(1-\hat y_{uv})\]</div>  <p>这里的关键技巧是<strong>负采样（negative sampling）</strong>。图是稀疏的——真实存在的边（正样本）只有 $O(|E|)$ 个，而不存在的节点对（潜在负样本）有 $O(n^2)$ 个，绝大多数。若把所有非边都当负样本，既算不动、又会让损失被海量负样本淹没。负采样的做法是：<strong>每个正样本，随机采样一个（或几个）不存在的节点对作负样本</strong>，正负样本数量平衡。这与 NLP 的 word2vec 负采样、模块 01 提到的 DeepWalk 一脉相承——都是用采样把「与所有负例对比」近似成「与少数采样负例对比」。</p>  <p>点积解码器虽简单好用，却有个<strong>结构性的硬伤</strong>值得知道：它只看两个嵌入的相似度，<em>分不清结构对称的节点对</em>。设想两个节点 $a,b$ 在图里处于完全对称的位置（自同构等价），那么任何只靠节点嵌入的解码器都会给 $(a,x)$ 和 $(b,x)$ 相同的边分——但现实里这两条边可能一条存在、一条不存在。SEAL（Zhang 2018）的洞察是：<strong>把链接预测改造成"对每条候选边周围的子图做分类"</strong>，因为子图能看到 $a,b$ 各自的局部结构差异，从而突破点积的对称局限。这是链接预测表达力研究的代表作，notebook 用点积入门、references 指向 SEAL 这条更强的路。</p>  <div class="callout warn"><span class="label"></span>
+    <p>链接预测有两个<strong>极其容易犯的评测错误</strong>：其一，<strong>数据泄漏</strong>——必须在训练时<em>从图里删掉</em>测试边（否则编码器直接看到了答案）；其二，<strong>用错指标</strong>——因为正负极度不平衡，准确率会骗人（全预测「无边」也能很高），必须用 <strong>AUC</strong> 或 AP（average precision）。notebook 会从零实现 AUC 并强调先删测试边再训练。还有一个进阶坑：<strong>负采样的"难度"会左右评测结论</strong>——若负样本全是随机远点（太容易），AUC 会虚高；用"难负样本"（如共同邻居多但实际无边的对）才更贴近真实部署难度。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="auc"><span class="num">4</span>AUC：链接预测的正确度量</h2>
+  <h3>AUC：链接预测的正确度量</h3>  <p>链接预测（及任何类别极不平衡的二分类）的标准指标是 <span class="term">AUC</span>（ROC 曲线下面积）。它有一个无需积分、极其直观的等价定义（Mann–Whitney 统计量）：</p>  <div class="math-block">\[\mathrm{AUC}=\Pr\big(\text{score}(\text{正样本}) > \text{score}(\text{负样本})\big)\]</div>  <p>即「随机抽一对（正样本，负样本），模型给正样本更高分的概率」。AUC = 0.5 是瞎猜，1.0 是完美排序。它的好处是<strong>只依赖分数的排序、对阈值和类别不平衡完全不敏感</strong>——这正是链接预测需要的，因为正负样本比例悬殊、且我们关心的是「排序」（推荐 top-k）而非某个绝对阈值。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么不用准确率？设图里 1% 的节点对有边。一个「永远预测无边」的废模型准确率就有 99%——但它毫无用处。AUC 不会被这种不平衡欺骗：它问的是「正样本的分是否普遍高于负样本」，废模型的 AUC 恰好是 0.5。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>AUC 的 Mann–Whitney 形式还给了一个<strong>从零实现的捷径</strong>：不必画 ROC 曲线，直接统计「所有正负样本对中，正样本得分更高的比例」（平局算半个）即可。notebook 会用这个秩统计量从零实现 AUC，并对拍一个已知答案的小例子——这也是理解 AUC 本质（它就是个排序质量度量）的最好方式。</p></div>
+  </div>  <div class="callout intuition"><span class="label">手算一个 AUC</span>
+    <p>设两个正样本得分 $\{0.9,0.6\}$、两个负样本得分 $\{0.7,0.2\}$。枚举全部 $2\times 2=4$ 对（正,负）：$(0.9,0.7)\checkmark,(0.9,0.2)\checkmark,(0.6,0.7)\times,(0.6,0.2)\checkmark$——正样本胜出 3 对。$\text{AUC}=3/4=0.75$。注意第三对里负样本 $0.7$ 反而高于正样本 $0.6$，正是它把 AUC 从满分拉了下来。这个手算微例完整复现了 Mann–Whitney 定义，<strong>不需要任何曲线或阈值</strong>——notebook 会用同样的双重循环从零实现，并和一个排序库的结果对拍。若出现平局（正负得分相等）则那一对计 $0.5$。</p>
+  </div>  <p>除 AUC 外，链接预测还常报 <strong>AP / Hits@k / MRR</strong> 等。在推荐这类只关心 top-k 的场景，Hits@k（前 k 个预测里命中真实边的比例）甚至比 AUC 更贴合业务目标——因为用户只看推荐列表的前几条，模型在排名很靠后的样本上排得对不对无关紧要。但 AUC 是最通用、最易从零实现、也最适合教学的入口。记住：<strong>链接预测看 AUC（或 Hits@k），绝不看准确率</strong>——这是评测这类任务的第一纪律。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="graphcls"><span class="num">5</span>图分类：readout 把节点汇成图</h2>
+  <h3>图分类：readout 把节点汇成图</h3>  <p>第二个新任务是<strong>图分类（graph classification）</strong>：为<em>整张图</em>预测一个标签（这个分子有没有毒？这段代码有没有 bug？这个蛋白质是什么功能？）。它和节点分类的根本区别在于<strong>输出的粒度</strong>——一张图一个预测。</p>  <p>难点在于：GNN 算出来的是<strong>每个节点</strong>的表示 $H\in\mathbb{R}^{n\times d}$，但我们要的是<strong>一个</strong>图级向量。怎么把 $n$ 个节点向量汇成 1 个？这一步叫<span class="term">readout</span>（或图池化 graph pooling），它必须满足一个铁律——<strong>置换不变</strong>（模块 00）：换节点编号，图标签不能变。为什么这条铁律不可违？因为同一张图可以有 $n!$ 种节点编号，它们描述的是<em>同一个对象</em>，必须给出同一个图标签。若 readout 用了任何依赖编号顺序的操作（比如"把节点向量按编号拼接"或喂进一个不打乱的 RNN），换个编号就得到不同输出——模型会把同一张图的不同编号当成不同的图，训练彻底崩坏。这就是为什么 readout 只能用 sum/mean/max 这类对顺序不敏感的对称函数，与模块 03 聚合器的约束同源。</p>  <div class="math-block">\[h_G = \text{READOUT}\big(\{h_v : v\in V\}\big)\in\mathbb{R}^{d},\qquad \hat y_G = \text{MLP}(h_G)\]</div>  <p>最常用的 readout 就是对节点维做置换不变的聚合：</p>  <table>
+    <thead><tr><th>readout</th><th>公式</th><th>捕捉</th><th>特点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>sum 池化</strong></td><td><code>h_G = Σ_v h_v</code></td><td>总量（含图大小信息）</td><td><strong>表达力最强</strong>（GIN 用它）</td></tr>
+      <tr><td><strong>mean 池化</strong></td><td><code>h_G = mean_v h_v</code></td><td>平均（与图大小无关）</td><td>对大小鲁棒，但丢失总量</td></tr>
+      <tr><td><strong>max 池化</strong></td><td><code>h_G = max_v h_v</code></td><td>最显著特征</td><td>捕捉「有没有某结构」</td></tr>
+    </tbody>
+  </table>  <p>一个深刻的结论（来自 GIN，Xu 2019）：<strong>sum 池化的表达力强于 mean 和 max</strong>。直觉上，mean 会把「2 个红节点」和「4 个红节点」混淆（平均一样），max 会丢失重数（有几个红节点都一样），只有 sum 能区分节点的<strong>多重集（multiset）</strong>——而这正是判别图所必需的。配合 sum 聚合 + MLP，GIN 达到了消息传递 GNN 的表达力上界 1-WL。实践中也常<strong>拼接多种 readout</strong>（如 sum+mean+max）取长补短，或用更复杂的可学习池化（如 DiffPool、SortPool、attention pooling）。notebook 会实现三种 readout 并验证它们的置换不变性与表达力差异。</p>  <div class="dual">
+    <div class="plain"><h4>一个数字反例</h4>  <p>设图 A 的节点特征是 $\{1,1\}$、图 B 是 $\{1,1,1,1\}$（B 是 A 的"两份拷贝"）。<strong>mean</strong>：两者都得 $1$——分不开！<strong>max</strong>：两者都得 $1$——也分不开！<strong>sum</strong>：A 得 $2$、B 得 $4$——区分开了。这就是"sum 保多重集、mean/max 丢信息"最赤裸的一例：分子毒性常和"某官能团有几个"直接相关，丢了计数就丢了答案。</p></div>
+    <div class="formal"><h4>单射性才是关键</h4>  <p>GIN 的核心论证是：一个 readout（或聚合器）的表达力，等于它把"邻域多重集"映射到向量时的<strong>单射性（injectivity）</strong>——不同多重集必须给出不同向量。sum 在可数特征空间上可被构造成单射（配一个足够强的 MLP），而 mean/max 本质是有损的、不可能单射。于是 $\text{MLP}\big((1+\epsilon)h_v+\sum_{u\in N(v)}h_u\big)$ 这一更新式让 GIN 恰好达到 1-WL 上界——这把模块 02 的"表达力"话题、模块 03 的"聚合器选择"话题，在这里收束成同一个"单射"原理。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="build"><span class="num">6</span>从零搭分类器与链接预测器</h2>
+  <h3>从零搭一个图级分类器与链接预测器</h3>  <p>把零件拼起来，两个完整任务的流水线如下（notebook 全部从零实现并验证收敛）：</p>  <div class="ascii">链接预测（边级）：
+  GNN 编码器 -&gt; 节点嵌入 z_v
+  解码器：score(u,v) = σ(z_u · z_v)
+  训练：正样本=真实边(训练时删掉测试边！) + 负采样的非边；二元交叉熵
+  评估：AUC（不是准确率！）
+
+图级分类（图级）：
+  GNN 编码器 -&gt; 每节点表示 h_v
+  readout：h_G = sum/mean/max_v h_v  （置换不变！）
+  分类头：ŷ = MLP(h_G)
+  训练：图标签的交叉熵；一个 batch = 多张图</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>注意两个任务复用的都是前几模块的<strong>同一个编码器</strong>——GNN 负责把图变成好的节点表示，不同任务只是接不同的<strong>头</strong>：节点分类接逐节点 softmax、链接预测接成对解码器、图分类接 readout + MLP。<strong>编码器通用，任务靠头</strong>，这是 GNN 应用的统一范式。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>图级任务还有个节点级没有的细节：<strong>一个 batch 含多张大小不同的图</strong>。框架（PyG）用「把多张图拼成一张大的不连通图 + 一个 batch 向量记录每个节点属于哪张图」来高效处理，readout 时按图分组聚合。本课用小图、逐图处理，把机制讲清即可；这个「批处理多图」的工程技巧留给 references 的 PyG 文档。</p></div>
+  </div>  <p>这里还藏着一个本课反复强调、但在落地时最常被忽视的细节——<strong>节点特征的选择决定 GNN 能否看见结构</strong>。notebook 的图分类实验会让你亲眼撞上这个坑：如果用全 1 特征（每个节点特征相同），对称归一化的 GCN 几乎保持常信号，导致<strong>稀疏图和稠密图的 readout 几乎一样、模型分不开</strong>。换成<strong>度（degree）作为节点特征</strong>后，准确率立刻从随机水平跳到接近 100%。教训是：当图本身没有有意义的节点属性时，<em>务必手工注入结构特征</em>（度、聚类系数、RWSE、拉普拉斯位置编码等）——否则再强的 GNN 也是巧妇难为无米之炊。</p>  <p>应用全景值得一瞥，让你看到这些零件的现实威力：<strong>分子性质预测</strong>（图分类，原子=节点、键=边；MPNN 筛出抗生素 halicin 的著名工作，Stokes 2020）、<strong>推荐系统</strong>（链接预测，用户-商品二部图；工业级如 PinSAGE）、<strong>知识图谱补全</strong>（链接预测，带关系类型）、<strong>交通预测</strong>（路网上的时空 GNN）、<strong>组合优化</strong>（用 GNN 指导 TSP/SAT 求解）、<strong>物理模拟</strong>（粒子=节点的图网络）。这些看似天差地别的问题，骨架都是「编码器（前四模块）+ 任务头（本模块）」——这正是几何深度学习把图当成统一语言的力量。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="practice"><span class="num">7</span>应用落地的实务要点</h2>
+  <h3>把它跑起来：应用落地的实务要点</h3>  <p>从零或用框架做这些任务，几个实务要点（notebook 体现）：</p>  <table>
+    <thead><tr><th>任务</th><th>关键实务</th><th>最常见的坑</th></tr></thead>
+    <tbody>
+      <tr><td>链接预测</td><td>训练前从图删测试边；负采样平衡正负；报 AUC</td><td><strong>数据泄漏</strong>（没删测试边）、用准确率</td></tr>
+      <tr><td>图分类</td><td>选对 readout（sum 表达力强）；批处理多图</td><td>readout 不置换不变；小数据过拟合</td></tr>
+      <tr><td>大图训练</td><td>采样/分块；邻居数与块大小调参</td><td>采样方差大；块间信息丢失</td></tr>
+      <tr><td>异配图</td><td>别盲目用 GCN；考虑高通/解耦</td><td>默认同配假设导致还不如 MLP</td></tr>
+    </tbody>
+  </table>  <p>一个贯穿全课、必须内化的判断流程：拿到一个图任务，先问三件事——<strong>①任务是节点/边/图级？</strong>（决定最后接什么头）<strong>②图同配还是异配？</strong>（决定能不能用朴素 GCN）<strong>③需要长程依赖吗、图多大？</strong>（决定用 MPNN、图 Transformer 还是混合 + 采样）。这三问把全课的知识串成了一个可操作的决策树——这才是「学会图机器学习」的标志：不是会背某个模型，而是<em>会为问题选/拼出合适的架构</em>。</p>  <p>最后强调一遍本课的方法论收尾：你在 numpy 里从零实现并对拍/验证收敛的每一样东西——拉普拉斯、谱聚类、GCN 传播、GAT 注意力、SAGE 采样、LapPE、链接预测、readout——都能<strong>几乎一对一</strong>地搬到 PyG/DGL。框架给你的是速度和工程便利，但<strong>机制与正确性的判断力</strong>（什么该置换不变、归一化怎么取、负采样怎么做、AUC 为何如此）只能靠从零实现练出来。这，就是这门课的全部价值。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>可扩展性的极限</strong>：十亿边图上的 GNN 训练（采样方差、分布式、IO）仍是工程与理论的双重挑战。OGB-LSC 等大规模基准在推动这个方向。</li>
+    <li><strong>链接预测的表达力</strong>：朴素点积解码受限（如分不清结构对称的节点对）。SEAL（子图分类）、神经化的启发式（Common Neighbors 的可学版）等更强范式，以及链接预测的表达力理论，是热点。</li>
+    <li><strong>图池化的表达力与可学性</strong>：sum/mean/max 之外，DiffPool、SortPool、attention pooling 等可学池化能否在保持置换不变的同时更强？图级表达力（图同构）的边界仍在探索。</li>
+    <li><strong>异配与图结构学习</strong>：异配图上朴素聚合失效，催生了「学图结构本身」（structure learning）、高通滤波、解耦传播。「一个模型自适应同配/异配」是开放问题。</li>
+    <li><strong>图基础模型与 LLM × 图</strong>：能否预训练通用图模型？如何让 LLM 理解/推理图结构（把图编码进 prompt、或 GNN-LLM 混合）？这是当前最前沿、与大模型交汇的方向。</li>
+    <li><strong>可信图学习</strong>：GNN 的对抗鲁棒性（改几条边就能骗过）、公平性、可解释性（GNNExplainer），在金融/医疗等高风险应用中至关重要。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Kipf & Welling 2016（VGAE，链接预测奠基）、Xu 2019（GIN，readout 表达力）、Chiang 2019（Cluster-GCN，大图）、Hu 2020（OGB 基准）、Stokes 2020（GNN 发现抗生素，应用典范）。至此六模块走完——从图拉普拉斯到图 Transformer、从节点到图级任务，你已掌握几何深度学习图分支的完整骨架。下一步：拿起 PyG/DGL，去真实大图上把它们跑起来。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_graph_transformer/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 图 Transformer</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

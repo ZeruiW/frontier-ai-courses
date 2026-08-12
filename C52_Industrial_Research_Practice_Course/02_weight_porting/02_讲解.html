@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 框架迁移与权重对齐</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 框架迁移与权重对齐</h1>
+  <p class="subtitle">迁移的价值是把模糊的性能问题变成可二分定位的数值问题 · reshape ≠ transpose · 方阵层让形状检查失效 · RNN 门顺序 · 漏参数比映射错更危险 · 八步 checklist 与逐层对拍</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–01；线性代数（转置与 reshape 的区别）；C50 模块 01 的 state_dict 概念</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_weight_porting.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">PyTorch / TensorFlow 的层文档（权重形状与默认值）、cuDNN 的 RNN 权重布局、HF 各模型的 conversion 脚本</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么「换个框架重训一遍」通常不是答案</a></li>
+      <li><a href="#layout">权重布局：形状对了不等于内容对了</a></li>
+      <li><a href="#naming">命名映射：从「手写字典」到「结构化匹配」</a></li>
+      <li><a href="#numeric">数值等价：一套可复用的验证方法学</a></li>
+      <li><a href="#checklist">迁移 checklist：按这个顺序做</a></li>
+      <li><a href="#samefw">被忽略的一半：同框架内的迁移</a></li>
+      <li><a href="#ledger">算一笔账：迁移 vs 重训</a></li>
+      <li><a href="#frontier">生态动态与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么「换个框架重训一遍」通常不是答案</h2>
+  <p>拿到一份 TF 实现、要在 PyTorch 里用，直觉上有两条路：<strong>①照着代码重写并重新训练；②把训练好的权重搬过来</strong>。很多人默认选 ①，因为 ② 听起来麻烦。这个默认选择通常是错的。</p>  <table>
+    <thead><tr><th></th><th>重写 + 重训</th><th>权重迁移</th></tr></thead>
+    <tbody>
+      <tr><td>算力成本</td><td><strong>完整的训练成本</strong>（可能几万美元）</td><td>几乎为零</td></tr>
+      <tr><td>数据依赖</td><td><strong>需要原始训练数据</strong>（常常拿不到）</td><td>不需要</td></tr>
+      <tr><td>能否复现原结果</td><td>🔶 受随机性、超参、数据版本影响，常常复现不出</td><td><strong>✅ 数值等价，逐位可验证</strong></td></tr>
+      <tr><td>调试难度</td><td>「效果差 2 个点」——原因可能有二十个</td><td>「第 7 层数值对不上」——<strong>可定位到具体一层</strong></td></tr>
+      <tr><td>时间</td><td>数天到数周</td><td><strong>数小时到一两天</strong></td></tr>
+      <tr><td>前提</td><td>有数据、有算力、有完整超参</td><td>有权重文件、两边结构对应</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最关键的是<strong>第四行「调试难度」</strong>。重训失败时你面对的是一个<em>联合假设</em>：可能是学习率不同、可能是数据预处理不同、可能是初始化不同、可能是某个层的默认参数不同、也可能只是种子不好（C49 模块 03 讲过种子方差有 2–3 分）。<em>这些原因无法逐个排除。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>而权重迁移把问题变成了<strong>可分解、可定位的</strong>：喂同一个输入，逐层比较激活值，<em>第一个数值对不上的层就是问题所在</em>。这是一个「二分查找」而不是「大海捞针」。<strong>这就是本模块的核心方法学：迁移的正确做法不是「搬完跑一下看效果」，而是「搬一层、验一层」</strong>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>还有一个常被忽略的收益：<strong>权重迁移会强迫你真正读懂两边的实现</strong>。为了让第 7 层对上，你必须搞清楚它的权重布局、激活函数、归一化的 eps、是否有偏置。<em>这个过程产出的理解，远超「读一遍代码」</em>。很多人是在做迁移时才第一次发现「原来这个模型的 FFN 用的是 GEGLU 不是 GELU」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="layout"><span class="num">2</span>权重布局：形状对了不等于内容对了</h2>
+  <p>迁移的第一类坑：<strong>两个框架用同样的形状表示<em>不同</em>的东西，或者用不同的形状表示同一个东西</strong>。前者更危险，因为 <code>reshape</code> 会「成功」。</p>  <table>
+    <thead><tr><th>层</th><th>PyTorch 形状</th><th>TF/Keras 形状</th><th>转换</th><th>reshape 会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Linear / Dense</strong></td><td><code>(out, in)</code></td><td><code>(in, out)</code></td><td><strong>转置</strong> <code>.T</code></td><td>形状对但等价于用了转置矩阵——完全错</td></tr>
+      <tr><td><strong>Conv2d</strong></td><td><code>(out, in, kH, kW)</code></td><td><code>(kH, kW, in, out)</code></td><td><code>transpose(2,3,1,0)</code></td><td>形状对但卷积核彻底乱掉</td></tr>
+      <tr><td><strong>Conv1d</strong></td><td><code>(out, in, k)</code></td><td><code>(k, in, out)</code></td><td><code>transpose(2,1,0)</code></td><td>同上</td></tr>
+      <tr><td><strong>ConvTranspose2d</strong></td><td><code>(in, out, kH, kW)</code></td><td><code>(kH, kW, out, in)</code></td><td>注意 in/out <strong>本身就是反的</strong></td><td>极易搞错</td></tr>
+      <tr><td><strong>Embedding</strong></td><td><code>(vocab, dim)</code></td><td><code>(vocab, dim)</code></td><td>无需转换</td><td>—</td></tr>
+      <tr><td><strong>LayerNorm γ/β</strong></td><td><code>(dim,)</code></td><td><code>(dim,)</code></td><td>无需转换</td><td>—</td></tr>
+      <tr><td><strong>GRU/LSTM</strong></td><td><code>(3H, in)</code> / <code>(4H, in)</code>，<strong>门顺序固定</strong></td><td><code>(in, 3H)</code>，<strong>门顺序不同</strong></td><td>转置 + <strong>门重排</strong></td><td>形状对但门功能全错位</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>为什么 <code>reshape</code> 不能替代 <code>transpose</code></strong>，值得说清楚，因为这是最常见的错误。<code>reshape</code> 只是<em>重新解释同一块连续内存的形状</em>，元素的线性顺序不变；<code>transpose</code> 则是<em>改变元素的排列顺序</em>。对一个 <code>(16,3,5,5)</code> 的卷积核，<code>reshape(5,5,3,16)</code> 与 <code>transpose(2,3,1,0)</code> 得到的形状完全一样，但内容毫无关系。<em>而代码不会报任何错。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>RNN 的门顺序</strong>是更隐蔽的一类。PyTorch 的 GRU 权重是 <code>[W_r; W_z; W_n]</code>（reset、update、new）；TF/Keras 的顺序是 <code>[W_z; W_r; W_h]</code>（update、reset、new）——<em>前两个门是反的</em>。LSTM 同理：PyTorch 是 <code>[i; f; g; o]</code>，而 cuDNN/TF 的某些实现是 <code>[i; f; o; g]</code> 或 <code>[i; g; f; o]</code>。<strong>门顺序错了，模型仍能跑、loss 也能降（因为门是对称可学的），但用预训练权重时输出完全错。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">方阵层：形状检查这道防线失效</span>
+    <p>还有一个几乎无人提前想到的坑：<strong>PyTorch 的 <code>nn.Linear</code> 计算的是 <code>y = xWᵀ + b</code></strong>（注意那个转置），所以它存的 <code>weight</code> 是 <code>(out, in)</code>；而 Keras 的 <code>Dense</code> 计算 <code>y = xW + b</code>，存的是 <code>(in, out)</code>。<em>两者存的其实是同一个矩阵的转置</em>。如果你从 Keras 搬到 PyTorch 时忘了转置，且恰好 <code>in == out</code>（Transformer 里非常常见！），<strong>形状检查会通过，模型会跑，结果全错</strong>。这就是为什么方阵层是迁移事故的重灾区——<em>形状检查这道防线在方阵上完全失效</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="naming"><span class="num">3</span>命名映射：从「手写字典」到「结构化匹配」</h2>
+  <p>第二类工作是把两边的参数名对应起来。参数动辄几百个，手写映射既慢又易错。有三档做法：</p>  <table>
+    <thead><tr><th>做法</th><th>怎么做</th><th>适合</th><th>风险</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 手写字典</strong></td><td>逐条写 <code>{'tf/name': 'torch.name'}</code></td><td>小模型（&lt;30 个参数）</td><td>漏项、写错；改结构就要重写</td></tr>
+      <tr><td><strong>② 规则替换</strong></td><td>正则把命名约定映射过去（<code>kernel→weight</code>、<code>bias→bias</code>、<code>/</code>→<code>.</code>）</td><td>命名规整的模型</td><td>特例（如 <code>gamma/beta</code> vs <code>weight/bias</code>）</td></tr>
+      <tr><td><strong>③ 结构化匹配</strong></td><td>按<strong>形状 + 层序 + 类型</strong>自动配对，人工只确认歧义项</td><td>大模型</td><td>形状相同的层可能配错——<em>所以必须配数值验证</em></td></tr>
+      <tr><td><strong>④ 按数值验证反推</strong></td><td>先用 ② 或 ③ 得到候选映射，再逐层对拍，不匹配的手工修</td><td><strong>推荐组合</strong></td><td>—</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>实践中最有效的是 <strong>②+④ 的组合</strong>：先用规则映射覆盖 90% 的参数，再用逐层数值对拍找出剩下的问题。<em>关键在于「数值对拍」这一步不是可选的验证，而是映射过程的一部分</em>——它把「我以为映射对了」变成「我验证了映射对了」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>命名上还有几个几乎每次都会遇到的特例：<strong>①LayerNorm 的参数名</strong>——TF 叫 <code>gamma/beta</code>，PyTorch 叫 <code>weight/bias</code>；<strong>②Embedding 的名字</strong>——TF 常叫 <code>embeddings</code>，PyTorch 叫 <code>weight</code>；<strong>③BatchNorm 的四个量</strong>——<code>gamma/beta/moving_mean/moving_variance</code> vs <code>weight/bias/running_mean/running_var</code>，而且<em>后两个是 buffer 不是 parameter</em>，很容易在遍历参数时被漏掉；<strong>④权重共享</strong>——嵌入与输出层 tie 在一起时，一边可能只存一份、另一边存两份。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>「漏掉的参数」比「映射错的参数」更危险</strong>。映射错了通常会造成明显的输出异常；<em>而漏掉一个参数（如 BatchNorm 的 <code>running_var</code>）会让它保持随机初始化，模型在训练模式下看起来正常（用 batch 统计），一切到 eval 模式就崩</em>。所以迁移脚本的第一个断言应该是：<strong>目标模型的<em>每一个</em>参数与 buffer 都被赋值过</strong>——用一个 <code>assigned</code> 集合逐个记录，最后检查差集为空。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="numeric"><span class="num">4</span>数值等价：一套可复用的验证方法学</h2>
+  <p>这是本模块最核心的部分。<strong>「搬完跑一下看效果」是错误的验证方式</strong>——它把一个可精确定位的问题，变成了一个模糊的性能问题。正确做法是四步：</p>  <div class="ascii">① 固定输入
+   用同一个确定性输入（如 np.arange 或固定种子的随机数）喂给两边
+   ⚠️ 关掉一切随机性：dropout=eval、固定 seed、关掉数据增强
+
+② 抓取逐层激活
+   PyTorch: register_forward_hook 收集每层输出
+   TF/Keras: keras.Model(inputs, [层.output for 层 in model.layers])
+   -&gt; 得到两个 {层名: 激活} 字典
+
+③ 按执行顺序逐层对拍，**在第一个失配处停下**
+   for name in order:
+       报告 = allclose_report(ref[name], new[name])
+       if not 报告.ok: 这就是问题所在，不用看后面
+   （后面的层全错只是这一层的后果，看它们浪费时间）
+
+④ 按 dtype 与深度设定容差
+   fp32 单层 ~1e-6；fp32 96 层 ~1e-5；fp16 要放宽两个数量级
+   ⚠️ 容差设错会造成两类错误：太紧 -&gt; 假警报；太松 -&gt; 真错误被放过</div>  <table>
+    <thead><tr><th>失配的表现</th><th>最可能的原因</th><th>怎么确认</th></tr></thead>
+    <tbody>
+      <tr><td><strong>第一层就差很多</strong></td><td>输入预处理不同（归一化、通道顺序、缩放）</td><td>先对拍<em>输入张量本身</em>，不要从模型第一层开始</td></tr>
+      <tr><td><strong>某个卷积层开始差</strong></td><td>权重布局没转置；padding 模式不同（<code>same</code> 的实现有差异）</td><td>单独构造一个只有这一层的最小例子</td></tr>
+      <tr><td><strong>归一化层后差异变大</strong></td><td>eps 不同；BN 用了 batch 统计而非滑动统计（忘了 eval 模式）</td><td>打印两边的 eps 与 running 统计量</td></tr>
+      <tr><td><strong>差异很小但逐层累积</strong></td><td>正常的浮点误差；或 dtype 不一致（一边 fp32 一边 fp16）</td><td>对比 dtype；按深度调容差</td></tr>
+      <tr><td><strong>只有 batch>1 时差</strong></td><td>padding/mask 处理不同；BN 在不同 batch 上的统计</td><td>用 batch=1 与 batch=4 分别测</td></tr>
+      <tr><td><strong>只有某些输入时差</strong></td><td>控制流分支（追踪固化，模块 01）；数值边界（溢出、除零）</td><td>找出触发的输入特征</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这张表的用法是<strong>把「效果不对」这个模糊症状，翻译成一个可查表的具体现象</strong>。做法是：先跑逐层对拍拿到「第一个失配的层」与「差异的量级」，再对照表格定位原因。<em>这比「重新读一遍两边的代码」快一个数量级</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第一行值得单独强调：<strong>非常多的迁移问题其实出在模型之外</strong>——图像的通道顺序（RGB vs BGR）、归一化的均值方差、文本的分词器版本、是否加特殊 token。<em>所以对拍的第一步应该是对拍「喂进模型的那个张量」，而不是模型的第一层输出</em>。这一步能省掉大量在模型内部瞎找的时间。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个能大幅提速的技巧：<strong>先用「全 1 输入 + 全 1 权重」做结构性验证，再用真实权重做数值验证</strong>。全 1 输入下，任何布局错误都会立刻表现为数量级差异（因为求和的项数不同），而且结果是可以手算的。<em>这一步能在五分钟内抓出所有布局与形状类错误</em>，剩下的才是真正的数值细节（eps、精度、统计量）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="checklist"><span class="num">5</span>迁移 checklist：按这个顺序做</h2>
+  <table>
+    <thead><tr><th>步骤</th><th>做什么</th><th>验收断言</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 对齐输入</strong></td><td>确认预处理完全一致（归一化、通道序、分词器、特殊 token）</td><td><code>allclose(input_a, input_b)</code></td></tr>
+      <tr><td><strong>② 清点参数</strong></td><td>两边各列出全部 parameter <em>与 buffer</em>，比较总数与总元素数</td><td><code>sum(numel) 相等</code>（不等说明有结构差异）</td></tr>
+      <tr><td><strong>③ 建立映射</strong></td><td>规则映射 + 人工确认歧义项</td><td><strong>目标侧每个参数都被赋值过</strong>（差集为空）</td></tr>
+      <tr><td><strong>④ 布局转换</strong></td><td>对 Linear/Conv/RNN 做转置与门重排</td><td>往返转换无损：<code>back(fwd(w)) == w</code></td></tr>
+      <tr><td><strong>⑤ 对齐超参</strong></td><td>eps、momentum、激活函数变体、是否有 bias</td><td>逐项打印两边的值做人工核对</td></tr>
+      <tr><td><strong>⑥ 设为推理模式</strong></td><td><code>model.eval()</code> / <code>training=False</code>；关 dropout</td><td><strong>连续两次前向结果完全相同</strong>（否则还有随机性）</td></tr>
+      <tr><td><strong>⑦ 逐层对拍</strong></td><td>按执行顺序，第一个失配处停下</td><td>全部层通过给定容差</td></tr>
+      <tr><td><strong>⑧ 端到端对拍</strong></td><td>在一批真实数据上比最终输出与下游指标</td><td>指标差异 &lt; 容差；<strong>并记录进交付契约</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>步骤 ⑥ 的验收断言（「连续两次前向结果完全相同」）是个非常有用的小检查，<strong>它能一次性抓出所有未关闭的随机性</strong>——dropout 没关、BN 还在用 batch 统计、数据增强还开着、甚至某个自定义层里有随机数。<em>而这些随机性会让后面的对拍出现「时对时不对」的诡异现象，极难定位。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>步骤 ② 的「比较总元素数」也值得强调：<strong>它是最便宜的结构性检查</strong>。如果两边的参数总量对不上，说明结构本身就不同（少了一层、多了一个 bias、嵌入没有 tie），<em>这时任何映射工作都是白费</em>。<em>先确认总量相等，再谈逐个映射</em>——这个顺序能省掉大量返工。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>步骤 ⑧ 的最后半句「<strong>记录进交付契约</strong>」不要跳过。迁移后的模型与原模型<em>不是逐位相同的</em>（浮点顺序、kernel 实现都有差异），所以必须明确写出：在什么输入范围内、什么 dtype 下、容差是多少。<em>否则三个月后有人发现「输出差了 1e-4」，就会有一场关于「这算不算 bug」的无谓讨论</em>。模块 00 的 <code>Contract</code> 对象就是为此准备的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="samefw"><span class="num">6</span>被忽略的一半：同框架内的迁移</h2>
+  <p>「迁移」这个词容易让人只想到跨框架，但<strong>同一个框架内的迁移同样频繁，而且用的是完全一样的方法学</strong>。列出来你会发现它几乎是日常工作：</p>  <table>
+    <thead><tr><th>场景</th><th>什么变了</th><th>特有的坑</th></tr></thead>
+    <tbody>
+      <tr><td><strong>重构模型代码</strong></td><td>层的组织方式变了，权重应等价</td><td>参数名变了 → <code>load_state_dict</code> 报 missing/unexpected keys</td></tr>
+      <tr><td><strong>升级框架版本</strong></td><td>算子的默认参数或数值实现改了</td><td><em>不报错但数值微变</em>（如某版本改了 <code>gelu</code> 的默认近似）</td></tr>
+      <tr><td><strong>换注意力实现</strong></td><td>eager → SDPA → FlashAttention</td><td>数值不逐位相同（归约顺序不同）；mask 的语义可能不同</td></tr>
+      <tr><td><strong>合并 LoRA 权重</strong></td><td>adapter 被合进基座</td><td>缩放系数 α/r 用错 → 效果与不合并时不同（C50 模块 04）</td></tr>
+      <tr><td><strong>量化 / 反量化</strong></td><td>权重精度变了</td><td>容差要按量化误差设（模块 03）</td></tr>
+      <tr><td><strong>切换分布式策略</strong></td><td>DDP → FSDP → ZeRO-3</td><td><strong>保存/加载的 state_dict 形状不同</strong>（分片 vs 完整）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第一行是最常见的</strong>：你把 <code>self.attn = Attention(...)</code> 改成 <code>self.self_attn = Attention(...)</code>，旧 checkpoint 就加载不上了。PyTorch 的 <code>load_state_dict</code> 默认会报 missing/unexpected keys——<em>这是好事</em>。但很多人的第一反应是加 <code>strict=False</code> 把警告压掉，<strong>而那恰好把「加载失败」变成了「静默地用随机初始化」</strong>。<em>永远不要用 <code>strict=False</code> 来消除警告；要么修好映射，要么显式列出你打算忽略哪些键并解释为什么。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>第六行（分布式策略切换）</strong>是另一个高发区，且症状特别迷惑：FSDP/ZeRO-3 保存的可能是分片的 state_dict，每个 rank 只有一部分；直接拿去单卡加载会得到「形状不匹配」或者更糟——<em>加载成功但每个参数只有 1/N 的内容</em>。<strong>解法是保存时显式做 <code>state_dict_type=FULL_STATE_DICT</code> 的汇总</strong>，并在加载后跑一遍本模块的逐层对拍。<em>这类问题几乎无法靠读代码发现，只能靠数值验证。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>同框架迁移有一个跨框架迁移没有的<strong>额外风险：它看起来太安全了</strong>。跨框架时你知道要小心，会做对拍；<em>同框架时人们默认「都是 PyTorch，能加载上就是对的」，于是跳过验证</em>。但「能加载上」只证明了形状匹配——<strong>而本模块反复说明的正是「形状匹配什么都证明不了」</strong>（方阵层、门顺序、buffer 漏项，全都能通过形状检查）。<em>所以本模块的 checklist 应该原样用在同框架迁移上，一步都不省。</em></p>
+  </div>  <p>好消息是：<strong>前面建立的所有工具都直接适用</strong>——参数总量检查、覆盖检查、逐层对拍、随机性关闭断言、交付契约。<em>唯一需要调整的是容差</em>：同框架内、同 dtype 时容差可以设得很紧（<code>rtol=1e-6</code>），因为除非实现真的变了，否则应该逐位相同；<strong>而「逐位相同」是一个远比 <code>allclose</code> 强的断言，能力所及时就该用它</strong>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">7</span>算一笔账：迁移 vs 重训</h2>
+  <div class="math-block">\[C_{retrain} = \underbrace{T_{gpu} \cdot p_{gpu}}_{\text{算力}} + \underbrace{H_{debug} \cdot p_{hour}}_{\text{调参与复现}}, \qquad C_{port} = \underbrace{H_{port} \cdot p_{hour}}_{\text{迁移与验证}}\]</div>  <table>
+    <thead><tr><th>模型规模</th><th>重训算力</th><th>重训调试</th><th>迁移工时</th><th>迁移成本 / 重训成本</th></tr></thead>
+    <tbody>
+      <tr><td>小模型（&lt;100M）</td><td>~20 GPU·h = $80</td><td>~16 h = $960</td><td>~8 h = $480</td><td>≈ 0.46</td></tr>
+      <tr><td>中模型（1B）</td><td>~2,000 GPU·h = $8,000</td><td>~40 h = $2,400</td><td>~16 h = $960</td><td><strong>≈ 0.09</strong></td></tr>
+      <tr><td>大模型（&gt;10B）</td><td>~50,000 GPU·h = $200,000</td><td>~80 h = $4,800</td><td>~24 h = $1,440</td><td><strong>≈ 0.007</strong></td></tr>
+    </tbody>
+  </table>  <p>三点观察：</p>  <ul>
+    <li><strong>模型越大，迁移越划算</strong>——因为迁移的工时几乎不随模型规模增长（参数多了但映射规则不变），而重训算力线性甚至超线性增长。</li>
+    <li><strong>即使是小模型，迁移也更便宜</strong>——因为「重训」的主要成本不是算力而是<em>调试与复现的人力</em>（那 16 小时里大部分花在「为什么我的复现比论文低 2 个点」上）。</li>
+    <li><strong>而且迁移的成本方差小得多</strong>：迁移要么成功（数值对上）要么失败（对不上，但你知道在哪一层）；重训可能花两周还差 1 个点，且不知道为什么。</li>
+  </ul>  <p>什么时候<strong>应该</strong>重训而不是迁移？三种情况：</p>  <ul>
+    <li><strong>结构真的不同</strong>：你要改架构（换注意力、加层、改维度），迁移不了。<em>但即使这时，「迁移能迁的部分 + 只训新增部分」通常也比全量重训好。</em></li>
+    <li><strong>拿不到权重</strong>：只有论文没有 checkpoint。</li>
+    <li><strong>需要在新数据上适配</strong>：那本来就是微调而不是迁移。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的智慧：<strong>迁移的价值不在「省算力」，而在「把一个模糊的性能问题变成一个可二分定位的数值问题」</strong>。这个转变才是关键——它让「效果差 2 个点」这种最难查的 bug，变成「第 7 层的 LayerNorm eps 不对」这种十分钟能修的 bug。<em>凡是能把模糊问题变成可定位问题的做法，都值得优先采用</em>——这条原则在调试、在评测（C03 的分解式评估）、在生产诊断（C48 的分阶段指标）里反复出现。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>生态动态与开放问题</h2>
+  <ul>
+    <li><strong>自动化的权重迁移</strong>：HuggingFace 为每个模型手写 <code>convert_*_original_checkpoint_to_pytorch.py</code>，几百行且不可复用。<em>能否从两边的计算图自动推断映射</em>（图同构匹配 + 形状约束 + 数值验证）是个有价值但未解决的问题——难点在于同构匹配的歧义与算子语义的细微差异。</li>
+    <li><strong>数值等价的形式化</strong>：目前「等价」靠采样几个输入做 allclose。<em>能否给出「在整个输入域上误差有界」的保证</em>？对纯线性部分可以（矩阵范数），对含非线性与浮点归约的完整网络仍是开放的。这与神经网络验证（NN verification）领域相关。</li>
+    <li><strong>中间表示作为统一交换格式</strong>：ONNX 是当前的事实标准（模块 03），但它对训练图、动态控制流、自定义算子的支持一直不完善。StableHLO / MLIR 生态试图提供更通用的答案，尚未收敛。</li>
+    <li><strong>多后端框架</strong>：Keras 3 让同一份代码跑在 TF/JAX/PyTorch 后端上，本质是「不迁移，换后端」。它对新项目有效，但抽象泄漏（各后端的 dtype 提升规则、随机数、分布式语义不同）仍然存在。</li>
+    <li><strong>训练-推理图的一致性验证</strong>：模型在训练框架里的行为与导出后的行为可能不同（BN 模式、dropout、控制流分支）。<em>缺少自动化工具来验证「导出图与训练图在给定输入分布上数值一致」</em>——这正是本模块要你手写对拍的原因。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读（都是文档而非论文，因为这是工程问题）：PyTorch 的 <code>nn.Linear</code>/<code>nn.Conv2d</code>/<code>nn.GRU</code> 文档中的 <em>Shape</em> 与 <em>Variables</em> 小节（权重形状与门顺序的权威定义）；Keras 对应层的文档；cuDNN 的 RNN 权重布局说明（PyTorch 的门顺序源自它）。实践参考：HuggingFace <code>transformers</code> 里任意一个 <code>convert_*_to_pytorch.py</code> 脚本——<strong>读一遍真实的迁移脚本，胜过读十篇教程</strong>，尤其看它怎么处理命名映射与逐项断言。相邻课程：C50 模块 01（state_dict 与键名匹配）、C38（框架内部机制）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_tensorflow/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · TensorFlow / Keras 心智模型</div></a>
+    <a class="next" href="../03_export_runtime/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 模型导出与推理运行时</div></a>
+  </div>
+
+</div>
+</body>
+</html>

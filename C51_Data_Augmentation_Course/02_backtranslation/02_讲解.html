@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 回译与释义</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 回译与释义</h1>
+  <p class="subtitle">在语义空间而非词面空间操作 · 通顺性带来的虚假可信度 · 多样性主要来自解码温度 · 四类高危失效与否定奇偶检查 · 三级过滤流水线 · 「宽松生成 + 严格过滤」为何优于反过来</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–01；C49 模块 04（seq2seq 与 beam search）有帮助但不必需</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_backtranslation.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Sennrich et al. 2016（回译用于 NMT）★、Edunov et al. 2018（采样回译）★、Xie et al. 2020（UDA 用回译做一致性训练）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#bt">回译：用两次翻译换一个新说法</a></li>
+      <li><a href="#diversity">多样性从哪来：解码策略比中间语言更重要</a></li>
+      <li><a href="#failure">回译什么时候会毁掉标签：四类高危场景</a></li>
+      <li><a href="#check">自动保真度检验：三个廉价判据</a></li>
+      <li><a href="#paraphrase">释义模型：回译的更直接替代</a></li>
+      <li><a href="#ledger">算一笔账：保真-多样权衡前沿</a></li>
+      <li><a href="#uda">另一条路：不用增强样本当训练数据，而用它做一致性约束</a></li>
+      <li><a href="#compare">三种语义层手段的横向选择</a></li>
+      <li><a href="#practice">一条可直接照抄的回译管线</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bt"><span class="num">1</span>回译：用两次翻译换一个新说法</h2>
+  <p><span class="term">back-translation</span>（回译）是语义层增强的代表：<strong>把句子翻译到另一种语言，再翻回来</strong>。得到的句子通常语义相同、措辞不同。</p>  <div class="ascii">原文 (zh):  这家店的菜非常好吃，服务也不错。
+      │
+      │  正向翻译 (zh -&gt; en)
+      ▼
+中间 (en):  The food at this restaurant is delicious, and the service is good.
+      │
+      │  反向翻译 (en -&gt; zh)
+      ▼
+回译 (zh):  这家餐厅的食物很美味，服务也很好。      ← 语义相同、措辞全变
+
+为什么能保语义？因为「翻译」这个任务本身的训练目标就是**保持语义**。
+为什么措辞会变？因为翻译不是双射——en 的一个句子可以对应多个 zh 表达，
+反向模型只是选了其中一个（且解码策略决定选哪个）。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>回译相对词面增强的最大优势是<strong>它在「语义空间」而不是「词面空间」操作</strong>。EDA 删掉一个「不」字不会有任何机制阻止它；而翻译模型如果丢掉了否定，正向翻译的 loss 就会很高——<em>「保语义」这个约束是内建在模型里的</em>。所以回译的标签保真度通常比 EDA 高一个档次。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但它的失效方式更<strong>隐蔽</strong>。EDA 破坏标签时你能一眼看出来（句子变得不通顺）；<em>回译产出的句子总是通顺的</em>，即使语义已经漂移。「这家店不太干净」回译成「这家店比较干净」——句子完美，标签反了，而且你不看原文根本发现不了。<strong>通顺性给了它一种虚假的可信度</strong>，这是回译最需要防的一点。所以回译<em>更需要</em>自动的保真度检验（本模块第四节）。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>回译的第二个代价是<strong>成本</strong>。它需要两次 seq2seq 推理，对每条样本、每个增强副本都要跑一遍。1000 条样本 × 4 个副本 × 2 次翻译 = 8000 次生成。<em>这已经不是「几乎零成本」了</em>——它与「用 LLM 直接改写」的成本进入同一量级（模块 03），而后者可控性更强。所以现实的选择常常是：<strong>要么用便宜的词面增强，要么直接上 LLM；回译处在一个不太经济的中间地带</strong>——除非你恰好有现成的高质量翻译模型且不想调 LLM。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="diversity"><span class="num">2</span>多样性从哪来：解码策略比中间语言更重要</h2>
+  <p>一个常见误解是「换中间语言就能增加多样性」。实际上<strong>多样性的主要来源是反向翻译的解码策略</strong>。</p>  <table>
+    <thead><tr><th>多样性来源</th><th>怎么控制</th><th>效果</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>解码策略</strong></td><td>beam search → 采样（<code>do_sample=True</code>、<code>top_p</code>、温度）</td><td><strong>最主要</strong>：同一中间句能产出多个不同回译</td><td>温度过高会语义漂移</td></tr>
+      <tr><td><strong>中间语言（枢轴）</strong></td><td>zh→en→zh vs zh→de→zh vs zh→ja→zh</td><td>中等：不同语言的表达约束不同</td><td>需要多个翻译模型；小语种质量差</td></tr>
+      <tr><td><strong>多跳</strong></td><td>zh→en→de→zh</td><td>较高，但<strong>误差累积</strong></td><td>每跳都可能丢语义，保真度快速下降</td></tr>
+      <tr><td><strong>beam 里取第 k 名</strong></td><td>取 beam 的 top-k 而非 top-1</td><td>低（beam 的候选彼此很像）</td><td>几乎免费</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>Edunov et al. 2018 在 NMT 的合成数据场景里给出了一个重要发现：<strong>用采样（或加噪的 beam）做回译，比用纯 beam search 更有效</strong>。原因是 beam search 倾向于产出「最安全」的翻译——所有回译结果都很像，多样性极低，模型学不到新东西。<em>采样引入了多样性，代价是引入了噪声，而在合成数据的场景里这个交易是划算的</em>（因为原文的标签仍然由原始样本给定）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但注意这个结论<strong>不能直接搬到分类任务的增强上</strong>。在 NMT 里，回译产生的是「合成的源句 + 真实的目标句」，噪声主要影响源侧、而目标侧仍然是干净的人类文本。<em>在分类增强里，回译产生的是「新的输入 + 沿用的旧标签」——一旦语义漂移，标签就错了</em>。所以分类增强应该用<strong>更保守的采样温度</strong>（比 NMT 场景低），并且必须配保真度检验。这是同一个技术在两个任务上取舍不同的好例子。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>关于中间语言的选择有一条实用经验：<strong>语言距离越远，回译的措辞变化越大、语义漂移风险也越大</strong>。zh→en→zh 相对稳（英语资源最好、翻译质量最高）；zh→ja→zh 变化中等；zh→某个低资源语言→zh 则变化剧烈但常常已经漂了。<em>先用 en 做枢轴，只有在多样性明显不足时才引入第二个枢轴语言</em>——而且要为每个枢轴单独测保真度，别假设它们一样安全。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="failure"><span class="num">3</span>回译什么时候会毁掉标签：四类高危场景</h2>
+  <table>
+    <thead><tr><th>高危场景</th><th>例子</th><th>为什么危险</th></tr></thead>
+    <tbody>
+      <tr><td><strong>否定与双重否定</strong></td><td>「不是不好吃」→「还不错」（强度变了）；「没什么问题」→「有问题」（极性翻了）</td><td>翻译模型对否定的处理本就是已知弱点，尤其中英之间否定结构差异大</td></tr>
+      <tr><td><strong>程度与情感强度</strong></td><td>「还行」→「很好」；「有点贵」→「太贵了」</td><td>细粒度情感/评分任务上直接改标签；二分类任务上可能还能忍</td></tr>
+      <tr><td><strong>专业术语与实体</strong></td><td>「Transformer」→「变压器」→「transformer」（领域错了）；药名、型号、法条</td><td>翻译模型没有领域约束，会按通用语义翻</td></tr>
+      <tr><td><strong>数字、时间、单位</strong></td><td>「3 天内」→「within three days」→「三日内」（还行）；但「30%」→「三成」→「30 percent」可能丢精度</td><td>数值型信息抽取任务会直接错</td></tr>
+    </tbody>
+  </table>  <p>这四类的共同点是：<strong>它们都是「标签由局部的、语义敏感的片段决定」的情形</strong>。这和模块 01 的结论呼应——<em>无论哪种增强，最危险的都是「标签由少数关键成分决定」的样本</em>。所以模块 01 的保护思路在这里同样适用，只是实现方式不同：</p>  <ul>
+    <li><strong>约束解码</strong>：让回译时某些词必须出现（<code>force_words_ids</code>，C50 模块 01 提到过）。可以保护实体与数字。</li>
+    <li><strong>占位符替换</strong>：翻译前把实体/数字替换成 <code>&lt;ENT_0&gt;</code>、<code>&lt;NUM_1&gt;</code> 这类占位符，翻译后再换回。<em>这是工业界处理这个问题的标准做法</em>，简单且有效。</li>
+    <li><strong>事后过滤</strong>：回译后检查关键成分是否还在（否定词数量、实体、数字），不通过就丢弃这个副本。<strong>丢弃比修正更可靠</strong>。</li>
+  </ul>  <div class="callout danger"><span class="label">否定的奇偶性检查</span>
+    <p>特别提醒<strong>否定的处理</strong>，因为它是回译最容易翻车的地方且后果最严重。一个可操作的检查是：<em>比较原文与回译的「否定词计数的奇偶性」</em>——如果原文有 1 个否定词、回译有 0 个或 2 个，极性很可能变了，直接丢弃。这个检查极其粗糙，但它能挡住大部分致命案例，而成本几乎为零。<strong>notebook 会实现它并量化它挡住了多少破坏。</strong>「粗糙但零成本的过滤器」在数据管线里往往比「精细但昂贵的修正器」更值得先做。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="check"><span class="num">4</span>自动保真度检验：三个廉价判据</h2>
+  <p>既然回译产出的句子总是通顺、无法靠「读起来对不对」判断，就必须有自动判据。三个从便宜到贵的层次：</p>  <table>
+    <thead><tr><th>判据</th><th>怎么算</th><th>能抓什么</th><th>成本</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 关键成分一致性</strong></td><td>否定词计数、实体集合、数字集合、单位是否保持</td><td>极性翻转、实体错译、数值失真</td><td><strong>几乎零</strong></td></tr>
+      <tr><td><strong>② round-trip 相似度</strong></td><td>原文与回译的 token 重叠（如 BLEU / chrF / Jaccard）</td><td>语义大幅漂移（相似度过低）与<em>无效增强</em>（相似度过高=没变化）</td><td>低</td></tr>
+      <tr><td><strong>③ 模型一致性</strong></td><td>用一个已训练的分类器给原文与回译打分，看预测是否一致</td><td>微妙的语义漂移</td><td>中（需要一个模型）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>判据 ② 有一个反直觉的用法：<strong>它是「双边」过滤器而不是「单边」的</strong>。相似度太低说明语义漂了（要丢），但相似度<em>太高</em>也要丢——因为那意味着回译几乎等于原文，这个副本没有提供任何新信息，只是把数据复制了一遍（还浪费了两次翻译的算力）。<em>所以正确的做法是保留相似度落在一个中间带（如 Jaccard ∈ [0.3, 0.85]）的副本</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>判据 ③ 有个链式依赖问题要注意：<strong>你需要一个分类器来筛选增强数据，而这个分类器是用未增强的数据训的</strong>。这引入了一个偏差——被保留的增强样本会偏向「当前模型已经能正确分类的」，也就是<em>信息量较低的那些</em>。这在自训练/伪标签里是个已知问题（confirmation bias）。缓解办法是只用它做「明显不一致」的硬过滤（如两边预测相反且都很自信），而不是按置信度排序取 top-k。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把三个判据组合成一条流水线，顺序很重要：<strong>先跑最便宜的、能挡住最严重问题的</strong>。① 关键成分（挡致命错误，零成本）→ ② 相似度双边带（挡漂移与无效副本，低成本）→ ③ 模型一致性（可选，挡微妙漂移）。<em>这个「先便宜后贵」的多阶段过滤节奏，和 C43 模块 04 的大规模质量过滤是同一个模式</em>——在任何数据管线里都成立。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="paraphrase"><span class="num">5</span>释义模型：回译的更直接替代</h2>
+  <p>回译是「用两次翻译间接实现释义」。既然目标是释义，为什么不直接用<strong>释义模型</strong>（paraphrase model）？</p>  <table>
+    <thead><tr><th></th><th>回译</th><th>专门的释义模型</th><th>LLM 改写（模块 03）</th></tr></thead>
+    <tbody>
+      <tr><td>推理次数</td><td>2 次</td><td><strong>1 次</strong></td><td>1 次</td></tr>
+      <tr><td>可控性</td><td>低（只能调解码）</td><td>中（可训练成特定风格）</td><td><strong>高</strong>（prompt 里直接约束）</td></tr>
+      <tr><td>保语义</td><td>✅ 内建（翻译目标）</td><td>✅ 内建（训练目标就是释义）</td><td>🔶 靠 prompt 约束，可能不遵守</td></tr>
+      <tr><td>多样性</td><td>中（靠采样）</td><td>中</td><td><strong>高</strong>（可以要求「换一种更正式的说法」）</td></tr>
+      <tr><td>模型可得性</td><td>翻译模型很多、质量高</td><td>专门的释义模型较少、质量参差</td><td>任何指令模型都能做</td></tr>
+      <tr><td>成本</td><td>2× 生成</td><td>1× 生成</td><td>1× LLM 调用（更贵但更少次数）</td></tr>
+    </tbody>
+  </table>  <p>从这张表可以看出<strong>技术路线的历史演变</strong>：回译在 2016–2020 年是主流，因为当时高质量翻译模型远比高质量释义/指令模型容易得到。<em>而今天，「让 LLM 换一种说法」在可控性、多样性、实现简单度上全面胜出</em>——你可以直接要求「保持情感不变、换成更口语的说法、不要改变任何数字」，这些约束在回译里根本无法表达。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>所以本模块的一个诚实结论是：<strong>如果你今天有 LLM 可用，回译在大多数场景下已经不是最优选择</strong>。它仍然值得学，因为①它的思想（在语义空间而非词面空间做增强）是对的且会一直有用；②它的失效模式分析（否定、实体、数字）对 LLM 改写<em>完全适用</em>；③在没有 LLM 预算、但有现成翻译模型或需要完全离线的场景里，它是可行方案。<em>把这一节当成「语义层增强的通用方法论」来学，而不是「回译这个具体技巧」。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">6</span>算一笔账：保真-多样权衡前沿</h2>
+  <p>回译的两个旋钮（<strong>采样温度</strong>与<strong>相似度过滤带</strong>）共同决定你在保真-多样平面上的位置。这是本模块要让你亲手画出的东西。</p>  <div class="math-block">\[\text{保留率} = \Pr\big[\text{关键成分一致} \wedge \text{sim} \in [\tau_{lo}, \tau_{hi}]\big]\]</div>  <table>
+    <thead><tr><th>温度</th><th>保真度（过滤前）</th><th>多样性（过滤前）</th><th>过滤后保留率</th><th>过滤后保真度</th></tr></thead>
+    <tbody>
+      <tr><td>0.0（贪心/beam）</td><td>高</td><td><strong>很低</strong>（副本几乎相同）</td><td>低（多数因「太像」被丢）</td><td>高</td></tr>
+      <tr><td>0.7</td><td>中高</td><td>中</td><td><strong>较高</strong></td><td><strong>高</strong></td></tr>
+      <tr><td>1.3</td><td>低</td><td>高</td><td>低（多数因「漂移」被丢）</td><td>中</td></tr>
+    </tbody>
+  </table>  <p>这张表的关键在最后两列：<strong>过滤把不同温度下的「过滤后保真度」拉到接近的水平，代价是保留率不同</strong>。所以温度的作用不再是「保真 vs 多样」的直接权衡，而是「<em>要生成多少候选才能得到一个可用副本</em>」——也就是成本。</p>  <div class="math-block">\[\text{有效成本/副本} = \frac{2 \times \text{生成成本}}{\text{保留率}}\]</div>  <p>这个公式让温度选择变成一个纯成本问题：<strong>选让「保留率 × 多样性」最大的那个温度</strong>。notebook 会把这条曲线扫出来。</p>  <p>最后给一个与模块 01 对比的成本量级（相对 EDA=1）：</p>  <table>
+    <thead><tr><th>方法</th><th>相对算力成本</th><th>典型保真度（过滤后）</th><th>典型多样性</th><th>何时选</th></tr></thead>
+    <tbody>
+      <tr><td>EDA + 保护</td><td>1</td><td>0.98+</td><td>低-中</td><td>算力受限；只需要正则化</td></tr>
+      <tr><td>AEDA</td><td>1</td><td>1.00</td><td>低</td><td>要绝对安全的正则化</td></tr>
+      <tr><td>回译 + 过滤</td><td><strong>~1000</strong>（两次 seq2seq）</td><td>0.97+</td><td>中</td><td>有现成翻译模型且需离线</td></tr>
+      <tr><td>LLM 改写 + 过滤</td><td>~2000（含 API 费）</td><td>0.95–0.99（取决于 prompt）</td><td><strong>高</strong></td><td>有 LLM 预算；需要可控性</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的智慧：<strong>语义层增强的可靠性不来自「生成得多好」，而来自「过滤得多严」</strong>。任何生成式增强都会产出一部分坏样本（回译会漂移、LLM 会不遵守约束），而你无法通过调生成来消除它——<em>但你可以用几乎零成本的规则过滤把它们挡掉</em>。「宽松生成 + 严格过滤」几乎总是优于「保守生成 + 不过滤」，因为前者的多样性上限更高而保真度由过滤保证。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="uda"><span class="num">7</span>另一条路：不用增强样本当训练数据，而用它做一致性约束</h2>
+  <p>本模块（以及整门课）的默认框架是：<strong>增强样本 + 沿用原标签 → 加进训练集</strong>。这个框架的致命弱点已经反复出现——<em>一旦语义漂移，标签就错了</em>，所以必须投入大量精力在保真度检验上。</p>  <p>但还有一条完全不同的用法，它<strong>从根上绕开了保真度问题</strong>：<span class="term">一致性正则</span>（consistency training，Xie et al. 2020 的 UDA）。</p>  <div class="math-block">\[\mathcal{L} = \underbrace{\mathcal{L}_{sup}(x_l, y_l)}_{\text{有标注数据的常规损失}} + \lambda \cdot \underbrace{\mathrm{KL}\big(f(x_u) \,\|\, f(T(x_u))\big)}_{\text{无标注数据上：原样本与增强样本的预测要一致}}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>关键差别：<strong>第二项完全不用标签</strong>。它只要求「模型对 <code>x</code> 和 <code>T(x)</code> 给出一致的预测分布」。所以即使 <code>T</code> 偶尔改变了真实语义，你也没有<em>断言</em>一个错误的标签——你只是（错误地）要求两者一致，这个错误的代价远小于「往训练集里塞一条错标数据」。<em>而且它能吃无标注数据，这在低资源场景下是巨大的优势。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>代价有三个。<strong>①需要无标注数据</strong>（通常不是问题——无标注文本几乎总是充足的）。<strong>②需要调 <code>λ</code> 与置信度阈值</strong>（UDA 会只在模型对 <code>x</code> 足够自信时才施加一致性约束，否则会强化错误）。<strong>③训练更复杂</strong>：每步要跑原样本与增强样本两次前向。<em>但对「有大量无标注数据 + 少量标注」的场景，它通常显著优于把增强样本当训练数据。</em></p></div>
+  </div>  <table>
+    <thead><tr><th></th><th>增广式（本课默认框架）</th><th>一致性正则（UDA 式）</th></tr></thead>
+    <tbody>
+      <tr><td>增强样本的用法</td><td>当作带标签的训练数据</td><td>只用于「两次预测要一致」的约束</td></tr>
+      <tr><td><strong>对保真度的依赖</strong></td><td><strong>高</strong>（漂移=错标）</td><td><strong>低</strong>（不断言标签）</td></tr>
+      <tr><td>能否用无标注数据</td><td>❌</td><td><strong>✅ 这是它的主战场</strong></td></tr>
+      <tr><td>实现复杂度</td><td>低（改数据即可）</td><td>中（改损失函数与训练循环）</td></tr>
+      <tr><td>适合</td><td>只有标注数据、增强可控</td><td>无标注数据充足、增强不完全可靠</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>这条路线值得知道，因为它体现了一个更一般的设计思路：<strong>当你对某个信号的「正确性」没把握时，不要把它当成硬监督，而要把它降级成一个更弱的约束</strong>。同样的模式在别处反复出现——伪标签用置信度阈值筛（不自信就不用）、RLHF 用偏好序而非绝对分数、弱监督用多个噪声源投票。<em>「把不可靠的信号降级使用」比「努力让它变可靠」往往更划算</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="compare"><span class="num">8</span>三种语义层手段的横向选择</h2>
+  <p>把「换个说法」这件事的三种实现放在一起，给一个可执行的选择规则。</p>  <table>
+    <thead><tr><th>维度</th><th>回译</th><th>释义模型</th><th>LLM 改写</th></tr></thead>
+    <tbody>
+      <tr><td>最少依赖</td><td>两个方向的翻译模型</td><td>一个释义模型</td><td>一个指令模型（或 API）</td></tr>
+      <tr><td>每副本推理次数</td><td>2</td><td>1</td><td>1</td></tr>
+      <tr><td>能否指定约束</td><td>❌ 只能调解码</td><td>🔶 需要训练成特定风格</td><td><strong>✅ prompt 里直接写</strong></td></tr>
+      <tr><td>保语义的机制</td><td>翻译目标内建</td><td>释义目标内建</td><td>靠 prompt，<strong>可能不遵守</strong></td></tr>
+      <tr><td>失效模式</td><td>否定/实体/数字漂移</td><td>同左 + 释义模型质量参差</td><td>同左 + <strong>不遵守约束</strong>、风格同质化</td></tr>
+      <tr><td>离线可行</td><td>✅</td><td>✅</td><td>🔶（需自建模型）</td></tr>
+      <tr><td>需要的过滤</td><td>关键成分 + 双边相似度</td><td>同左</td><td>同左 + <strong>约束遵守性检查</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>选择规则可以压缩成三句话：<strong>①能调 LLM 且量不大 → 直接 LLM 改写</strong>（可控性碾压，且能表达「保持情感、不改数字、换成更口语」这类约束）；<strong>②必须离线或量极大 → 回译</strong>（翻译模型好找、质量稳定、可自建）；<strong>③有现成的高质量释义模型 → 用它</strong>（少一次推理）。<em>注意三者的过滤流水线是共用的</em>——这就是为什么本模块花最大篇幅讲过滤而不是讲生成。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个跨越三者的实用建议：<strong>不要只用一种</strong>。不同手段的失效模式不同（回译容易丢否定、LLM 容易不遵守约束、释义模型容易风格单一），<em>混合使用能让单一失效模式的影响被稀释，同时提高整体多样性</em>。混合的成本几乎为零（同一套过滤器），收益是实实在在的鲁棒性。这与集成学习「不同错误模式的模型混合更稳」是同一个道理。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>对 LLM 改写要特别加一条检查：<strong>约束遵守性</strong>。你在 prompt 里写「不要改变任何数字」，模型有相当概率还是改了——而这个失效不会被回译的关键成分检查之外的任何东西发现。<em>所以用 LLM 改写时，prompt 里写的每一条约束，都要有一个对应的自动检查</em>。「写了约束就以为模型会遵守」是 LLM 时代新增的一类天真，模块 03 会再遇到它。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="practice"><span class="num">9</span>一条可直接照抄的回译管线</h2>
+  <p>把本模块的结论压成一段伪代码。它的形状对<strong>任何生成式增强</strong>都适用，只需替换第 ② 步的生成器。</p>  <pre><code>for x, y in train_only:                     # ⚠️ 只对训练集做（模块 04 的铁律）
+    protected = extract_protected(x)         # ① 实体/数字 -&gt; 占位符，翻译前替换
+    x_masked  = mask_entities(x, protected)
+
+    for _ in range(n_candidates):            # ② 宽松生成：温度调到甜点区（本模块第 4 节）
+        z  = translate(x_masked, src-&gt;pivot, temperature=0.8, sample=True)
+        x2 = translate(z, pivot-&gt;src, temperature=0.8, sample=True)
+        x2 = unmask_entities(x2, protected)  # 换回实体与数字
+
+        # ③ 三级过滤：先便宜后贵，任何一级不过就丢弃（**丢弃比修正可靠**）
+        if not key_components_match(x, x2):  continue     # 否定词数 / 实体集 / 数字集
+        sim = jaccard(x, x2)
+        if not (LO &lt;= sim &lt;= HI):            continue     # **双边**：太低=漂移，太高=无效
+        if not model_consistent(x, x2):      continue     # 可选：两边预测明显相反则丢
+
+        emit(x2, y)                          # ④ 沿用原标签
+        break                                # 每条原样本取 1 个可用副本就够
+
+log_stage_drop_rates()                       # ⑤ 分阶段丢弃率 = 诊断报告（模块 04）</code></pre>  <table>
+    <thead><tr><th>这一步</th><th>对应本模块哪一节</th><th>调错了会怎样</th></tr></thead>
+    <tbody>
+      <tr><td>① 占位符替换</td><td>四类高危场景</td><td>实体被错译成另一个实体，且关键成分检查也发现不了（因为集合仍是「一个实体」）</td></tr>
+      <tr><td>② 温度</td><td>多样性来自解码策略</td><td>太低 → 副本几乎等于原文（白花两次翻译）；太高 → 保留率崩、成本翻倍</td></tr>
+      <tr><td>③ 三级过滤</td><td>自动保真度检验</td><td>少了双边中的上界 → 大量无效副本混进训练集</td></tr>
+      <tr><td>④ 沿用原标签</td><td>回译的基本假设</td><td>—（这正是保真度检验存在的理由）</td></tr>
+      <tr><td>⑤ 分阶段统计</td><td>模块 04</td><td>只知道「留下了 60%」，不知道该调温度还是该调过滤带</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这段伪代码里有个细节值得点出：<strong>第 ③ 步「任何一级不过就丢弃」而不是「尝试修正」</strong>。修正听起来更省（不浪费已生成的样本），但它有两个问题：<em>①修正逻辑本身可能引入新错误</em>（把回译里丢失的否定词加回去，位置往往不对）；<em>②被修正的样本质量分布与正常样本不同</em>，等于往训练集里塞了一批「人工缝合」的怪样本。<strong>丢弃是干净的，而生成成本远低于「修正错了」的代价。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>另一个细节是 <code>break</code>：<strong>每条原样本只取一个可用副本</strong>。为什么不多取几个？因为同一条原样本的多个回译副本彼此高度相似（它们都受同一个原文约束），<em>边际多样性收益很快趋零</em>，而每一个都要占训练集的一个位置、稀释原始样本的权重。<strong>「宽度优先」（每条原样本 1–2 个副本、覆盖更多原样本）通常优于「深度优先」（少数原样本各造十个副本）。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把整个模块的方法论提炼成一句可迁移的话：<strong>生成式增强的工程重心不在生成端，而在过滤端与统计端</strong>。生成端你能调的只有温度与枢轴（旋钮很少、效果有限）；过滤端决定了最终数据的保真度（也就是能不能用）；统计端决定了你能不能诊断问题、能不能回答「该改哪一步」。<em>看到一份增强管线的代码，先看它的过滤与日志写了多少行——那才是它的质量水位。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">10</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>采样回译的最优噪声水平</strong>：Edunov et al. 2018 在 NMT 上发现「加噪的 beam」最好，但那是合成源句的场景。<em>在分类增强（合成输入 + 沿用标签）里最优噪声应该更低，具体多低缺乏系统研究</em>。这是个边界清晰、容易做的实证问题。</li>
+    <li><strong>一致性正则化 vs 数据增广</strong>：UDA（Xie et al. 2020）不是把回译样本当额外训练数据，而是要求「原样本与回译样本的预测分布一致」（KL 项）。<em>这在半监督场景下利用了无标注数据</em>，且不依赖标签保真（因为不用标签）。这条路线与本课主线互补，值得知道它绕开了保真度问题。</li>
+    <li><strong>过滤器的偏差</strong>：用模型一致性做过滤会引入 confirmation bias（保留的都是模型已会的）。这与自训练/伪标签的经典问题同源。<em>如何设计不引入这种偏差的过滤器</em>（或量化它的影响）仍是开放的。</li>
+    <li><strong>低资源语言的回译</strong>：回译最需要的场景（低资源语言的分类任务）恰恰是翻译模型最差的场景——<em>这是一个结构性的鸡生蛋问题</em>。用多语言模型的零样本翻译、或用高资源语言做枢轴，效果都不理想。</li>
+    <li><strong>释义的「语义等价」到底怎么定义</strong>：所有语义层增强都假设存在「保持语义」这个操作，但语义等价在语用层面并不清晰（「还行」与「很好」在评论语境里是否等价？取决于任务）。<em>这个模糊性是保真度检验只能靠任务特定规则的根本原因</em>。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Sennrich, Haddow &amp; Birch 2016 <em>Improving Neural Machine Translation Models with Monolingual Data</em>（回译的出处）、Edunov et al. 2018 <em>Understanding Back-Translation at Scale</em>（**采样 vs beam 的关键消融**，本模块第二节的依据）、Xie et al. 2020 <em>Unsupervised Data Augmentation for Consistency Training</em>（把回译用于一致性正则而非直接增广，绕开保真度问题）。补充：Sugiyama &amp; Yoshinaga 2019 关于回译在文本分类上的消融；Feng et al. 2021 的 NLP 增强综述。相邻课程：C49 模块 04（seq2seq 与解码策略）、C43 模块 04（多阶段过滤的「先便宜后贵」节奏）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_lexical/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 词面增强</div></a>
+    <a class="next" href="../03_instruction_synthesis/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · LLM 驱动的指令数据合成</div></a>
+  </div>
+
+</div>
+</body>
+</html>

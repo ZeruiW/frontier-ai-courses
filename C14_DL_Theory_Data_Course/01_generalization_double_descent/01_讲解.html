@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 泛化与双下降</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 泛化与双下降</h1>
+  <p class="subtitle">bias-variance 分解、经典 U 型为何在过参数化区失效、interpolation threshold 的尖峰、double descent 的二次下降、最小范数解与隐式正则 —— 用随机特征回归在 CPU 上从零画出整条双下降</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、线性代数（最小二乘/伪逆/SVD）、概率（期望/方差）、基础机器学习</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_generalization_double_descent.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Belkin 2019、Nakkiran 2021、Belkin 2020、Bartlett 2020、Rahimi & Recht 2007</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#classic">经典图景：偏差-方差与 U 型</a></li>
+      <li><a href="#bvtoy">偏差-方差玩具实验</a></li>
+      <li><a href="#dd">插值阈值与双下降</a></li>
+      <li><a href="#minnorm">最小范数解与隐式正则</a></li>
+      <li><a href="#rf">随机特征回归：复现双下降</a></li>
+      <li><a href="#three">三种双下降与 EMC</a></li>
+      <li><a href="#eval">接回评测：怎么读反常曲线</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="classic"><span class="num">1</span>经典图景：偏差-方差与 U 型</h2>
+  <p>从机器学习的第一堂课起，我们就被教导一个看似铁律的图景：<strong>模型太简单会欠拟合，太复杂会过拟合，最好的模型在「不胖不瘦」的中间</strong>。这就是经典的<span class="term">bias-variance tradeoff</span>（偏差-方差权衡）。它如此根深蒂固，以至于「参数量大于样本数」长期被视为统计学上的灾难。然而现代深度网络——参数动辄是样本数的成百上千倍——却泛化得极好。这门课的第一个反常，就是要正面解决这个矛盾。</p>  <p>先把经典图景讲清楚，才能看清它在哪里失效。给定真函数 $f$、含噪观测 $y=f(x)+\varepsilon$，我们用训练集学一个 $\hat f$。在某个固定测试点 $x_0$ 上，对训练集随机性取期望，预测的均方误差可以<strong>精确分解</strong>为三项：</p>  <div class="math-block">\[\mathbb{E}\big[(y_0-\hat f(x_0))^2\big]=\underbrace{\big(f(x_0)-\mathbb{E}[\hat f(x_0)]\big)^2}_{\text{bias}^2}+\underbrace{\mathrm{Var}\big[\hat f(x_0)\big]}_{\text{variance}}+\underbrace{\sigma^2}_{\text{noise}}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>偏差是「模型族系统性地偏离真相」——比如用直线去拟合抛物线，再怎么调都差一截。方差是「模型对训练集的随机抖动太敏感」——换一批训练数据，学出来的函数就大变样。噪声是数据本身的随机性，谁也消不掉。经典直觉说：容量↑ → 偏差↓但方差↑，总误差先降后升，呈 <strong>U 型</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，这个分解对平方损失<em>恒成立</em>（是恒等式，不是近似），三项非负。经典学习理论（VC 维、Rademacher 复杂度）进一步给出泛化界 $\sim\sqrt{\text{complexity}/n}$，预言复杂度超过某点后泛化必然变差。<strong>U 型曲线与这些界，构成了「容量越大越危险」的理论基石</strong>——而双下降正是它的反例。</p></div>
+  </div>  <p>为什么这个分解如此重要，又如此具有误导性？重要，是因为它把「测试误差」这个黑盒拆成了三个可以分别归因、分别治理的来源——偏差靠增大模型族治、方差靠正则化或加数据治、噪声治不了只能认。误导，是因为它暗示了一个<strong>单调</strong>的故事：复杂度这一个旋钮同时控制偏差（单调降）和方差（单调升），于是总误差必然 U 型，于是「最优复杂度在中间」。这个单调假设在欠参数化区成立，但它<em>没有被证明</em>在所有区都成立——经典教材只是默认了它。双下降之所以震撼，正是因为它在过参数化区直接证伪了「方差随复杂度单调上升」这一条，从而推翻了整个 U 型结论。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住偏差-方差这把尺子，但也记住它的<strong>适用边界</strong>：U 型描述的是<em>欠参数化</em>区（容量 < 拟合训练集所需）。一旦进入<strong>过参数化</strong>区（容量足以完美插值训练集，且有富余），同一把尺子会读出反常的结果——方差不再单调上升，反而可能回落。本章就是去探明那条「U 型右臂之后」的曲线，那里藏着整个深度学习时代赖以成立的秘密。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bvtoy"><span class="num">2</span>偏差-方差玩具实验</h2>
+  <h3>偏差-方差的玩具实验：先确认经典图景</h3>  <p>理论要靠手感落地。最干净的玩具是<strong>多项式回归</strong>：用次数 $k$ 的多项式拟合一小撮含噪数据点，次数就是容量旋钮。我们对每个次数 $k$，在很多套独立采样的训练集上各拟合一次，就能<em>直接测量</em>偏差与方差：</p>  <ul>
+    <li><strong>偏差²</strong> = （所有训练集学出的平均预测 − 真值）² ——把多次拟合平均掉随机性后还剩的系统误差；</li>
+    <li><strong>方差</strong> = 各次拟合预测相对其平均的离散度 ——纯粹由训练集随机性引起的抖动；</li>
+    <li><strong>测试误差</strong> ≈ 偏差² + 方差 + 噪声，应当随次数先降后升（在欠参数化区）。</li>
+  </ul>  <p>低次（如直线）偏差大、方差小（欠拟合）；次数升高偏差迅速下降；但次数接近数据点数时，多项式开始剧烈穿过每个点、在点与点之间疯狂摆动（这就是著名的 Runge 现象），<strong>方差爆炸</strong>——这正是 U 型的右臂，也是经典理论最得意的预言。notebook 会把这条 U 型亲手测出来并 <code>assert</code> 它确实先降后升。</p>  <p>这个玩具还藏着一个<strong>通往双下降的线索</strong>：注意 U 型右臂的方差爆炸，恰恰发生在「次数 ≈ 数据点数」附近——也就是多项式自由度刚好够穿过每个点的时候。这并非巧合，正是下一节<em>插值阈值</em>的雏形。多项式回归止步于此（次数再高数值就溢出、无法继续观察），所以要看清阈值<em>之后</em>发生了什么，我们需要一个数值上更稳健的容量旋钮——随机特征（第 5 节）。但「方差在自由度≈样本数处冲顶」这个核心直觉，在这个最朴素的多项式玩具里就已经显形。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个易混点：偏差-方差里的「方差」指的是<strong>预测对训练集随机性的方差</strong>，不是数据的方差，也不是参数的方差。它只能通过「在多套独立训练集上重复拟合、看预测有多分散」来估计——这也是为什么 notebook 里要跑很多次独立实验取统计量。单看一次拟合是看不见方差的，正如单测一次身高看不出一个人群的身高方差。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dd"><span class="num">3</span>插值阈值与双下降</h2>
+  <p>现在把容量继续往上推，越过「恰好能拟合训练集」的那条线。这条线叫 <span class="term">interpolation threshold</span>（插值阈值），通常在 <strong>参数量 ≈ 样本数</strong> 附近——此处模型自由度刚好够穿过每一个训练点，训练误差首次降到 0。</p>  <p>Belkin 等 2019 的关键发现是：测试误差在<strong>插值阈值处冲到一个尖峰</strong>（经典 U 型的顶点其实就在这里），但只要<strong>继续增大容量、越过这个阈值，测试误差会再次下降</strong>，甚至降到比经典 U 型最低点还低。把这两段拼起来，就是 <span class="term">double descent</span>（双下降）：</p>  <div class="ascii">测试误差
+  │      经典 U 型区          ┊  现代过参数化区
+  │    （欠参数化）           ┊  （插值之后）
+  │        ___                ┊
+  │       /   \               ┊
+  │      /     \             ╱┊╲___
+  │  ___/       \           ╱ ┊    \________  &lt;- 第二次下降, 可能更低
+  │ /            \         ╱  ┊
+  │/              \______╱    ┊
+  └────────────────────────┊──────────────────▶ 模型容量(参数/特征数)
+   欠拟合   刚好    插值阈值(参数≈样本) 尖峰    过参数化(越大越好)
+                    训练误差在此首次=0</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最反直觉的一句话：<strong>在插值阈值右边，模型越大、越能完美背下训练集，测试反而越好</strong>。这跟「越复杂越过拟合」完全相反。深度学习之所以能用巨大模型，靠的就是工作在这条曲线的最右段。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么尖峰恰在 $n\approx d$？此处模型<em>勉强</em>能插值——只有唯一一个（或极少的）解能穿过所有点，它被噪声逼到极端、范数巨大、对数据扰动极敏感，方差因此爆炸。再增大容量后，能插值的解变成<strong>无穷多个</strong>，优化器得以从中挑一个<strong>范数小、更平滑</strong>的，方差随之回落。这是下一节的主角。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>这正是 Belkin, Hsu, Ma & Mandal 2019《Reconciling modern ML practice and the bias–variance trade-off》(PNAS) 的核心。Nakkiran 2021《Deep Double Descent》进一步证明它在真实深度网络上、且沿<strong>模型容量、样本数、训练步数</strong>三个轴都会出现。两篇是本模块的奠基必读，见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="minnorm"><span class="num">4</span>最小范数解与隐式正则</h2>
+  <h3>为什么过参数化反而更好：最小范数解</h3>  <p>双下降第二段「越大越好」的秘密，藏在一个简单的线性代数事实里。考虑过参数化线性回归 <code>Xw=y</code>，其中 $X\in\mathbb{R}^{n\times d}$、$d>n$（特征比样本多）。这是个<strong>欠定系统</strong>：方程少、未知多，有<strong>无穷多</strong>个解都能让训练误差为 0。</p>  <p>关键问题不是「能不能插值」（都能），而是<strong>插值的是哪一个解</strong>。从零初始化的梯度下降，在这个问题上有一个漂亮的性质：它收敛到<strong>范数最小</strong>的那个插值解，即伪逆解 <code>w* = X⁺y</code></p>  <div class="math-block">\[w^\star=\arg\min_{w}\ \|w\|_2\quad\text{s.t.}\quad Xw=y\qquad(\text{梯度下降从 }0\text{ 出发的隐式偏好})\]</div>  <p>这就是 <span class="term">implicit regularization</span>（隐式正则）：<strong>我们没有加任何正则项，优化算法本身却像加了 L2 正则一样，偏好范数小的解</strong>。而范数小的线性函数更<em>平滑</em>——对输入扰动不敏感——于是方差小、泛化好。容量越大（$d$ 越大），可行的插值解越多，能找到的最小范数解就可能越小、越平滑，这就解释了第二段的下降。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：要穿过一堆点画线，有无数种画法。「最小范数」相当于在所有能穿过的画法里，挑<strong>最不剧烈、最省力</strong>的那条。点越多余地越大，反而越容易找到一条又穿过所有点、又很平缓的线——这就是过参数化的好处。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，对最小二乘，从 0 出发的 GD 的迭代始终落在 $X$ 的行空间里，收敛点正是 $X^\top(XX^\top)^{-1}y=X^+y$，即满足 $Xw=y$ 中 $\|w\|_2$ 最小者。显式的<span class="term">ridge regression</span>（加 $\lambda\|w\|^2$）则能<strong>直接抹平插值阈值处的尖峰</strong>——最优 $\lambda>0$ 让曲线单调下降、不再双下降。这揭示双下降某种程度是「正则不足」的征兆。</p></div>
+  </div>  <p>这里值得停下来体会一个深刻的视角转换。经典理论把「插值」（训练误差=0）当作过拟合的同义词、洪水猛兽；而双下降告诉我们：<strong>插值本身无所谓好坏，关键是你插值时落在了哪个解上</strong>。在插值阈值处，你被迫落在那个唯一的、被噪声扭曲的烂解上；而在过参数化深处，你有自由落在一个又插值、又平滑的好解上。于是问题从「要不要插值」变成了「插值时怎么挑解」——这正是隐式正则要回答的。深度学习能用巨型模型完美拟合训练集还泛化良好，不是因为它<em>避免</em>了插值，而是因为它插值在了<em>对的</em>解上。</p>  <p>一个常被问到的问题：那 SGD 呢？真实训练用的不是解析的伪逆，而是迭代的随机梯度下降。答案是<strong>性质类似但更微妙</strong>。对平方损失的过参数化线性/随机特征模型，从 0 出发的 GD/SGD 确实收敛到最小 $\ell_2$ 范数解（可证）；但换成分类的指数/交叉熵损失，GD 隐式偏好的是<em>最大间隔</em>（max-margin）解而非最小范数；在多层网络上，优化器究竟隐式正则化了什么范数，至今没有完整答案（第 8 节）。本课用伪逆/最小二乘当 GD 的「理想化代言人」，是因为它给出闭式、可验证、且在我们关心的回归玩具上与 GD 收敛点一致——抓住机制，不被优化细节淹没。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把这条线索串起来：<strong>插值阈值处方差爆炸（被迫落在唯一的烂解）→ 过参数化提供无穷多插值解 → 隐式正则挑出最小范数的平滑解 → 方差回落、测试误差二次下降</strong>。notebook 会用伪逆构造最小范数解，并 <code>assert</code> 它的范数确实小于其他插值解、它的测试误差确实更低——把这条因果链逐环验证。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rf"><span class="num">5</span>随机特征回归：复现双下降</h2>
+  <h3>随机特征回归：在 CPU 上画出整条双下降</h3>  <p>多项式回归只能演示 U 型（容量一高就数值爆炸），要画出<strong>完整</strong>的双下降（含越过阈值的第二段），最干净的玩具是 <span class="term">random features</span>（随机特征）回归 [Rahimi & Recht 2007]。它把「容量」做成一个可平滑连续调节、又不会数值失控的旋钮。</p>  <p>做法三步：① 用一个<strong>固定随机</strong>矩阵 $W\in\mathbb{R}^{d\times p}$ 把输入 $x\in\mathbb{R}^d$ 升维成 $\phi(x)=\sigma(W^\top x)\in\mathbb{R}^p$（$\sigma$ 是非线性，如 <code>tanh</code> 或 <code>cos</code>）；② <strong>特征数 $p$ 就是容量</strong>——$p$ 从小到大扫过 $p\approx n$（插值阈值）；③ 在 $\phi(x)$ 上做普通最小二乘 / 最小范数回归。</p>  <div class="ascii">随机特征回归 = 一层固定随机隐层 + 可学线性输出
+
+  x ∈ R^d ──[ 固定随机 W (不训练) ]──▶ φ = σ(Wᵀx) ∈ R^p ──[ 线性 w (最小范数) ]──▶ ŷ
+                                          ↑
+                            特征数 p = 容量旋钮; 扫 p 看 double descent
+
+  p &lt; n : 欠定的反面(特征少), 拟合不了 -&gt; 高偏差
+  p ≈ n : 插值阈值 -&gt; 测试误差尖峰(唯一烂解, 方差爆炸)
+  p &gt; n : 过参数化 -&gt; 最小范数解平滑 -&gt; 测试误差二次下降</div>  <p>当 $p<n$（特征少于样本）用普通最小二乘；当 $p\ge n$（过参数化）用最小范数解（伪逆）。沿 $p$ 扫描、记录测试误差，就能画出<strong>教科书般的双下降曲线</strong>：测试误差在 $p\approx n$ 处冲高，之后随 $p$ 增大而下降。这几十行 numpy 在 CPU 上几秒跑完，却完整复刻了 Belkin 论文的核心图。</p>  <p>为什么随机特征是<strong>最理想</strong>的双下降玩具？三点：① 容量 $p$ 是一个<em>纯净</em>的旋钮——改它不改数据、不改优化、不改其他任何东西，于是观察到的曲线变化可以干净地归因于容量；② 它<em>数值稳健</em>——不像高次多项式那样一过阈值就溢出，$p$ 可以一直加到几百上千，让我们看清第二段下降的全貌；③ 它是真实深度网络的<em>可解析缩影</em>——一个固定随机隐层 + 可训练线性输出，正是「神经网络的最后一层 + 冻结的前面层」，Belkin 2020、Hastie 2022 等正是在这个模型上算出了双下降的闭式解。换言之，它小到能手算，又大到抓住了本质。</p>  <div class="callout warn"><span class="label"></span>
+    <p>复现双下降有几个<strong>必须踩对的细节</strong>，否则尖峰会糊掉：① 数据要<strong>含标签噪声</strong>（无噪声时尖峰很弱——尖峰本质是模型在过度拟合噪声）；② 过参数化区必须用<strong>最小范数解</strong>而非随便一个插值解（用 <code>np.linalg.lstsq</code> 或伪逆）；③ 测试误差要在独立测试集、且对随机 $W$ 多次平均以降噪。notebook 把这些都处理好并 <code>assert</code> 尖峰确实出现在 $p\approx n$。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="three"><span class="num">6</span>三种双下降与 EMC</h2>
+  <h3>三种双下降：不止关于容量</h3>  <p>Nakkiran 2021 的贡献是指出双下降<strong>不是一个孤立现象，而是沿三个不同的轴都会出现</strong>，且可以用一个统一量解释。理解这三种，能帮你在实践中正确归因各种反常曲线：</p>  <table>
+    <thead><tr><th>双下降类型</th><th>横轴（什么在增大）</th><th>尖峰出现在</th><th>实践含义</th></tr></thead>
+    <tbody>
+      <tr><td><strong>model-wise</strong> 模型维</td><td>模型容量（参数/特征数）</td><td>容量 ≈ 样本数</td><td>「加大模型有时先变差再变好」</td></tr>
+      <tr><td><strong>sample-wise</strong> 样本维</td><td>训练样本数 $n$</td><td>$n$ ≈ 模型容量</td><td><strong>「加数据有时反而更差」</strong>（最反直觉）</td></tr>
+      <tr><td><strong>epoch-wise</strong> 训练步维</td><td>训练步数 / epoch</td><td>训练到「刚好插值」时</td><td>「训练更久先变差再变好」</td></tr>
+    </tbody>
+  </table>  <p>其中 <strong>sample-wise</strong> 最违反直觉：<em>固定模型，增加训练数据，测试误差有时会先升后降</em>。原因是当 $n$ 从「远小于容量」涨到「≈容量」时，模型从舒服的过参数化区被<strong>推到插值阈值的尖峰上</strong>（此时 $n$ 恰好榨干了模型的自由度），再加数据才离开尖峰、回到正常下降。这解释了为什么「更多数据总是更好」并不永远成立。</p>  <p>Nakkiran 用 <span class="term">effective model complexity</span>（EMC，有效模型复杂度）把三者统一：EMC = 模型+优化过程能拟合到接近零训练误差的<strong>最大样本数</strong>。无论你动容量、动 $n$、还是动训练步数，只要让 <strong>EMC 越过实际样本数 $n$</strong>，就会路过那个尖峰。换句话说，双下降的真正横轴不是「参数量」而是「<em>有效</em>复杂度相对样本数的位置」——这是把零散现象收进一个框架的漂亮一步。</p>  <p>EMC 这个统一视角还顺手解释了一个工程上常见的困惑：<strong>为什么训练动力学（epoch-wise）也会双下降</strong>。训练初期，模型「有效用上」的复杂度很低（权重还小、还没拟合细节），随着训练推进，EMC 逐步增长；当 EMC 恰好爬到 $n$ 时，模型「勉强插值」训练集，正撞上尖峰；继续训练，EMC 超过 $n$，模型进入过参数化区、找到更平滑的解，测试误差二次下降。于是「训练时间」在 EMC 框架下和「参数量」「样本数」是同一回事——都是在调节 EMC 相对 $n$ 的位置。这个洞察是连接双下降与下一模块 grokking 的关键桥梁：grokking 的延迟泛化，某种意义上就是一次被极度拉长、且发生在测试集上的 epoch-wise 现象。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>实践锦囊：当你看到「加大模型 / 加数据 / 多训练」反而短暂变差，别急着判定为 bug 或调错参——先问「我是不是正路过某条双下降的插值阈值？」。判据是看训练误差：<strong>尖峰通常出现在训练误差刚刚接近 0 的位置</strong>。越过它继续推，往往柳暗花明。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>接回评测：怎么读反常曲线</h2>
+  <h3>把理论接回评测：为什么这关乎你读曲线</h3>  <p>这门课叫「理论与数据/生成媒体评测」，双下降不是为了理论而理论，而是直接改变你<strong>解读评测曲线</strong>的方式。几个具体场景：</p>  <ul>
+    <li><strong>scaling 实验的非单调</strong>：你扫模型大小、画「规模 vs 测试指标」，中途出现一个反常的隆起。经典直觉会让你怀疑实验出错；双下降告诉你这可能是插值阈值的尖峰，越过它会继续改善——别在尖峰处过早下结论。</li>
+    <li><strong>「加数据变差」的误判</strong>：数据增广/扩充后某个指标退步，容易被归咎于「新数据质量差」。sample-wise 双下降提示：也可能只是把模型推到了 EMC≈n 的尖峰，与数据质量无关。需要继续加数据或加正则来区分。</li>
+    <li><strong>early stopping 的再审视</strong>：epoch-wise 双下降意味着「测试误差回升就停」可能停在第一次下降之后、却错过第二次更低的下降。是否该早停，取决于你在曲线的哪一段。</li>
+    <li><strong>正则与尖峰</strong>：既然最优 ridge 能抹平尖峰，那么一条平滑下降的曲线 vs 一条带隆起的曲线，差别可能只是正则强度。比较模型时要控制住这个变量。</li>
+  </ul>  <p>还有一个更细但很实用的点：双下降意味着<strong>「模型选择」（model selection）的经典做法需要修正</strong>。经典做法是扫一遍容量、选验证误差最低的那个——这在 U 型世界里没问题（最低点唯一）。但在双下降世界里，验证误差有两个低谷（U 型底 + 过参数化深处），且后者常常更低。如果你的容量扫描范围不够大、只扫到了插值阈值附近就停，你会误以为「容量再大就过拟合了」而选了一个次优的小模型，完全错过过参数化区那个更好的解。<em>扫容量时一定要扫过插值阈值、扫到明显的过参数化区</em>，否则你的「最优模型」可能只是没看到第二段下降的假象。</p>  <p>更一般的教训是本课反复强调的：<strong>深度学习的曲线常常是非单调的，用线性世界的单调直觉去读会系统性误判</strong>。看到拐点，先在「已知现象库」里找匹配（双下降？下一模块的 grokking？），再用最小模型验证机制，最后才下结论。这正是评测科学家区别于调参工的地方。</p>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读（见 <code>references.md</code>）：Belkin 2019（双下降奠基）、Nakkiran 2021（三种双下降 + EMC）、Belkin 2020《Two models of double descent for weak features》（随机特征的可解析推导）、Bartlett 2020《Benign overfitting》（为何插值噪声仍能泛化）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>双下降的精确理论</strong>：随机矩阵理论（Hastie 2022 等）已能在随机特征/线性模型上算出风险曲线的渐近形状与最优正则，但对<em>真实深度网络</em>（多层、SGD、真实数据）的双下降仍缺乏同等精确的刻画。</li>
+    <li><strong>隐式正则的完整刻画</strong>：GD 在线性回归上收敛到最小 $\ell_2$ 范数已是定理，但在分类（指数损失下趋向 max-margin）、矩阵分解（趋向低核范数）、深网络上，优化器到底隐式偏好什么范数/复杂度，仍是活跃前沿。</li>
+    <li><strong>良性 vs 灾难性过拟合</strong>：什么时候插值噪声是「良性的」（仍泛化）、什么时候是灾难性的？Bartlett 等给了线性情形的条件（依赖协方差谱），但一般情形的边界尚不清楚。</li>
+    <li><strong>与 grokking 的关系</strong>：epoch-wise 双下降与 grokking 的延迟泛化都是「训练时间维」的反常，二者机制是否相通（都关乎从记忆解向平滑/泛化解的迁移）是有趣的开放问题——正是下一模块的主题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读清单（详见 <code>references.md</code>）：Belkin 2019、Nakkiran 2021 是地基；Belkin 2020、Hastie 2022 给可解析的理论；Bartlett 2020 解释良性过拟合；Rahimi & Recht 2007 是随机特征工具的源头。下一模块把「训练时间维」的反常推向极致——grokking。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_grokking_emergence/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · Grokking 与涌现</div></a>
+  </div>
+
+</div>
+</body>
+</html>

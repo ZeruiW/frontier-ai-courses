@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 策略优化：PPO 与 SAC</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 策略优化：PPO 与 SAC</h1>
+  <p class="subtitle">C13 的策略梯度长大成生产算法 —— 重要性比与信赖域(TRPO)、PPO 的 clipped surrogate、GAE 复用；最大熵 RL 与 SAC(连续动作、双 Q、温度自调、重参数化)；从零手写 numpy PPO</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">C13 模块 03/04（策略梯度、Actor-Critic、GAE）、模块 01（值方法对照）、概率/高斯分布、链式法则</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_ppo_sac.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Schulman 2017 (PPO)、2015 (TRPO)、Haarnoja 2018 (SAC)、Engstrom 2020</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 70 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">从值方法到策略方法：为什么需要 PPO/SAC</a></li>
+      <li><a href="#pg">回顾：策略梯度的方差与 on-policy 之痛</a></li>
+      <li><a href="#trpo">重要性采样与信赖域（TRPO 直觉）</a></li>
+      <li><a href="#ppo">PPO 的核心：clipped surrogate</a></li>
+      <li><a href="#maxent">最大熵 RL：SAC 的理论框架</a></li>
+      <li><a href="#sac">SAC 三大件：双 Q、压缩高斯、温度自调</a></li>
+      <li><a href="#compare">PPO vs SAC：怎么选</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>从值方法到策略方法：为什么需要 PPO/SAC</h2>
+  <p>模块 01 走的是<strong>值方法</strong>路线：学一个 $Q$，再对它贪婪。但 C13 还教过另一条路——<strong>策略方法</strong>：跳过值函数，直接参数化策略 $\pi_\theta(a|s)$ 并对期望回报上升。你已推过策略梯度定理与 REINFORCE、Actor-Critic、GAE。本模块把这条线<strong>长大成今天的生产级算法</strong>：PPO 与 SAC。</p>  <p>为什么值方法不够、需要策略方法？三个硬理由：① <strong>连续动作</strong>——机器人关节角是连续的，DQN 的 $\max_a$ 无法枚举无穷多动作；策略方法直接输出动作（或其分布），天然支持连续。② <strong>随机策略</strong>——有些任务（部分可观测、需要混合策略的博弈）最优策略本就是随机的，策略方法可以表示它，确定性的 argmax 不行。③ <strong>稳定的端到端优化</strong>——直接对你真正关心的目标（期望回报）求梯度，而非迂回地先学 $Q$ 再贪婪（值方法的策略是 $Q$ 的隐函数，$Q$ 一点误差可能让策略大跳）。</p>  <p>但朴素策略梯度（REINFORCE）有个致命的实用缺陷：<strong>样本效率极低且步子难控</strong>。它是严格 on-policy 的——每批数据更新一次就得扔掉重采（用旧策略的数据估新策略的梯度是有偏的）；而且一步走多大全凭学习率手调，走大了策略崩坏、走小了慢如蜗牛。本模块的两位主角正是来解决这两个痛点的：<strong>PPO</strong>用<strong>重要性采样 + 裁剪</strong>让一批数据能安全地复用多次、把步子约束在信赖域里；<strong>SAC</strong>用<strong>最大熵 + off-policy replay</strong>把样本效率再提一个量级，并专攻连续控制。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话定位本模块：<strong>PPO = 给策略梯度装上『信赖域刹车』，让一批数据能反复用且不会一脚踩崩；SAC = 把策略方法做成 off-policy + 最大熵，样本高效地搞定连续控制</strong>。学完你会从零手写一个 numpy PPO，在 numpy CartPole 上把存活步数从随机的 ~20 提到 ~150+；并实现 SAC 的三大件（双 Q 取 min、tanh 压缩高斯 + log-prob 修正、温度自调）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pg"><span class="num">2</span>回顾：策略梯度的方差与 on-policy 之痛</h2>
+  <h3>回顾与起点：策略梯度的方差问题</h3>  <p>策略梯度定理（C13）给出目标 $J(\theta)=\mathbb E_{\tau\sim\pi_\theta}[R(\tau)]$ 的梯度：</p>  <div class="math-block">\[\nabla_\theta J(\theta) = \mathbb{E}_{\pi_\theta}\Big[\sum_t \nabla_\theta \log \pi_\theta(a_t|s_t)\, \hat A_t\Big]\]</div>  <p>直觉：让<strong>优势为正</strong>的动作的对数概率上升、为负的下降，幅度正比于优势。这里 $\hat A_t$ 是优势估计——C13 已经讲过用 <span class="term">GAE</span> 在偏差与方差间插值地估它，本模块直接复用。（本模块假设你已熟悉 GAE 的来历；这里只复习它的公式与作用，把笔墨留给 PPO/SAC 的新内容。）</p>  <p>REINFORCE 的根本麻烦是<strong>高方差 + on-policy</strong>。高方差来自用单条轨迹的回报当梯度权重（baseline/优势能缓解但不能根治）；on-policy 来自梯度的期望是<em>在当前 $\pi_\theta$ 下</em>取的——一旦更新了 $\theta$，手里这批用旧策略采的数据就<strong>不再无偏</strong>，必须丢弃重采。结果是数据利用率极低：采一大批、只更新一小步、全扔掉。PPO 的核心贡献，就是用<strong>重要性采样</strong>让旧数据<em>能合法地多用几次</em>，同时用裁剪防止「多用」时步子失控。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个贯穿本模块的张力：策略优化永远在<strong>「用旧数据多更新几步以省样本」</strong>与<strong>「更新太多步使新策略偏离采样策略太远、估计失真」</strong>之间走钢丝。REINFORCE 选择极端保守（一步一扔），TRPO/PPO 找到了<em>能多走几步又不崩</em>的甜区，SAC 则干脆改用 off-policy replay 彻底复用历史。理解这条张力，三个算法的设计就都顺理成章了。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="trpo"><span class="num">3</span>重要性采样与信赖域（TRPO 直觉）</h2>
+  <h3>重要性采样与信赖域（TRPO 直觉）</h3>  <p>想用旧策略 $\pi_{\theta_{\text{old}}}$ 采的数据来估新策略 $\pi_\theta$ 的目标，靠的是<span class="term">importance sampling ratio</span>：</p>  <div class="math-block">\[r_t(\theta) = \frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)}, \qquad J^{\text{surr}}(\theta) = \mathbb{E}_{\theta_{\text{old}}}\big[r_t(\theta)\,\hat A_t\big]\]</div>  <p>这个<span class="term">surrogate objective</span>（代理目标）的妙处：期望是在<strong>旧策略</strong>下取的（所以能用旧数据），但通过比值 $r_t$ 反映了新策略。对它求梯度，在 $\theta=\theta_{\text{old}}$ 处恰好等于真实策略梯度——所以优化它就是在改进策略。问题在于：$r_t$ 偏离 1 越远，重要性采样的方差越爆炸、估计越不可信。如果不加约束地最大化它，优化器会把某些动作的概率推到极端（$r_t\to$ 很大），策略<strong>一步跳崩</strong>。</p>  <p><span class="term">TRPO</span>（信赖域策略优化，Schulman 2015）的解法是给优化加一个<strong>硬约束</strong>：新旧策略的 KL 散度不超过一个小阈值 $\delta$，在这个<strong>信赖域</strong>内最大化代理目标。它能证明<strong>单调改进</strong>（每步策略不会变差），理论非常漂亮：</p>  <div class="math-block">\[\max_\theta\ \mathbb{E}_{\theta_{\text{old}}}[r_t(\theta)\hat A_t]\quad \text{s.t.}\quad \mathbb{E}_{\theta_{\text{old}}}\big[\mathrm{KL}(\pi_{\theta_{\text{old}}} \,\|\, \pi_\theta)\big] \le \delta\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>信赖域的直觉就是<strong>给策略更新装个『安全带』</strong>：你可以往让优势变大的方向走，但每一步<em>不许</em>离当前策略太远（用 KL 衡量「远」）。这样既改进又不会因为步子太大把已经学好的行为弄崩。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>TRPO 的代价是<strong>实现复杂</strong>：那个 KL 约束的优化要用共轭梯度近似 Fisher 信息矩阵的逆 + 线搜索，二阶、笨重、易错。这正是 PPO 的动机——<strong>用一个一阶的、几行代码的裁剪技巧，近似 TRPO 的信赖域效果</strong>，把复杂的约束优化变成普通的 SGD。</p></div>
+  </div>  <p>所以记住这条脉络：<strong>REINFORCE（无约束，一步一扔）→ TRPO（硬 KL 信赖域，理论美但难实现）→ PPO（裁剪近似信赖域，一阶易实现，成为事实标准）</strong>。PPO 不是更聪明的数学，而是<em>更务实的工程</em>——下一节就是它的全部秘密。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="ppo"><span class="num">4</span>PPO 的核心：clipped surrogate</h2>
+  <h3>PPO 的核心：clipped surrogate</h3>  <p><span class="term">PPO</span>（近端策略优化，Schulman 2017）用一个<strong>裁剪</strong>操作把重要性比 $r_t$ 限制在 $[1-\epsilon, 1+\epsilon]$（典型 $\epsilon=0.2$）。它最大化的目标是：</p>  <div class="math-block">\[L^{\text{CLIP}}(\theta) = \mathbb{E}_t\Big[\min\big(r_t(\theta)\hat A_t,\ \ \text{clip}(r_t(\theta),\, 1-\epsilon,\, 1+\epsilon)\,\hat A_t\big)\Big]\]</div>  <p>这个 $\min$ 与 $\text{clip}$ 的组合看着绕，拆开看其实非常直白。分两种情况：</p>  <table>
+    <thead><tr><th>优势 $\hat A_t$</th><th>未裁剪项 $r_t\hat A_t$</th><th>裁剪如何起作用</th><th>效果</th></tr></thead>
+    <tbody>
+      <tr><td>$\hat A_t>0$（好动作）</td><td>想把 $r_t$ 推大以增大目标</td><td>$r_t>1+\epsilon$ 时被 clip 封顶，$\min$ 取裁剪值</td><td>概率最多升到 $(1+\epsilon)$ 倍，<strong>不奖励过大的更新</strong></td></tr>
+      <tr><td>$\hat A_t<0$（坏动作）</td><td>想把 $r_t$ 推小以增大目标</td><td>$r_t<1-\epsilon$ 时被 clip 托底，$\min$ 取裁剪值</td><td>概率最多降到 $(1-\epsilon)$ 倍，<strong>不惩罚过小的更新</strong></td></tr>
+    </tbody>
+  </table>  <p>关键在那个 $\min$：它让目标成为真实代理目标的<strong>悲观下界</strong>。当更新会把 $r_t$ 推出信赖域（好动作推太高、坏动作压太低）时，裁剪那一项「赢得」$\min$、其梯度变为零——于是<strong>优化器在该样本上不再获得继续推动的激励</strong>。这就用纯一阶的方式实现了「别离旧策略太远」，无需任何二阶 KL 计算。</p>  <p>有一个常被问到的细节值得点破：clip 只在<strong>「越界且方向是把目标推得更大」</strong>时才掐断梯度，它并<em>不</em>对称地阻止「往回拉」。举例：某好动作的 $r_t$ 已经涨到 1.5（越过 $1+\epsilon=1.2$），此时若它的优势仍为正，未裁剪项 $1.5\hat A$ 比裁剪项 $1.2\hat A$ 大，$\min$ 选裁剪项、梯度归零——刹住继续上推；但如果下一轮该动作的优势<em>变成了负</em>（重新评估后发现它其实不好），未裁剪项 $1.5\hat A$（更负）比裁剪项小，$\min$ 选未裁剪项、梯度恢复——允许把它<strong>拉回来</strong>。这个不对称正是设计精髓：<em>阻止过度自信的前进，但永远允许纠错</em>。</p>  <p>还要强调 PPO 是<strong>多轮 epoch</strong>复用同一批数据的：采一批后做若干次（如 10 次）梯度更新。正是因为有 clip 当刹车，这种「一批数据榨多次」才安全——没有 clip 的话，第二、三次更新就会把策略推到旧数据无法可靠评估的远处。所以 clip 不只是稳定器，更是<strong>数据复用的使能器</strong>，这是 PPO 比 REINFORCE 样本效率高的直接原因。</p>  <p>完整的 PPO 损失还有两个标准配件：<strong>值函数损失</strong>（用同一批数据回归 GAE 算出的回报，训练 critic）与<strong>熵奖励</strong>（鼓励策略保持随机、维持探索）：</p>  <div class="math-block">\[L(\theta) = \underbrace{L^{\text{CLIP}}}_{\text{策略}} - c_1\, \underbrace{(V_\theta(s_t)-\hat R_t)^2}_{\text{值函数}} + c_2\, \underbrace{\mathcal{H}[\pi_\theta(\cdot|s_t)]}_{\text{熵}}\]</div>  <div class="callout danger"><span class="label">实现即算法</span>
+    <p>一个 PPO 实践的重磅发现 [Engstrom 2020, Implementation Matters]：PPO 论文报告的强性能，<strong>相当一部分来自 clip 之外的「代码层面」细节</strong>——优势归一化（每批把 $\hat A$ 标准化）、学习率退火、梯度裁剪、价值函数裁剪、正交初始化等。去掉这些「小技巧」，纯 clip 的提升会大打折扣。教训：<strong>RL 的性能归因极易出错</strong>，一个算法的实际表现是「核心思想 + 一堆工程细节」的合力。本课 notebook 会带上优势归一化这个最重要的细节，并让你看到它的作用。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="maxent"><span class="num">5</span>最大熵 RL：SAC 的理论框架</h2>
+  <h3>最大熵 RL：SAC 的理论框架</h3>  <p>PPO 是 on-policy 的（每批数据更新有限几次就重采），样本效率仍受限。<span class="term">SAC</span>（软演员-评论家，Haarnoja 2018）走<strong>off-policy + 最大熵</strong>路线，把样本效率再提一个量级，是<strong>连续控制</strong>的主力算法。它的出发点是改写 RL 的目标——不只最大化回报，还要最大化策略的<strong>熵</strong>：</p>  <div class="math-block">\[J(\pi) = \sum_t \mathbb{E}_{(s_t,a_t)\sim\pi}\big[\,r(s_t,a_t) + \alpha\, \mathcal{H}\big(\pi(\cdot|s_t)\big)\,\big]\]</div>  <p>$\alpha$ 是<span class="term">temperature</span>（温度），权衡「拿回报」与「保持随机」。这个<span class="term">maximum entropy RL</span>目标有几个深刻好处：</p>  <ul>
+    <li><strong>更好的探索</strong>：策略被鼓励在不损失太多回报的前提下尽量随机，自动维持探索，不会过早塌缩到某个次优确定动作；</li>
+    <li><strong>更鲁棒</strong>：学到的是一族能完成任务的策略而非单一最优路径，对扰动与模型误差更稳健；</li>
+    <li><strong>更平滑的优化地形</strong>：熵正则让 Q 地形更平滑，缓解值方法的脆弱性。</li>
+  </ul>  <p>在最大熵框架下，最优策略不再是 $\arg\max_a Q$，而是<strong>玻尔兹曼分布</strong> $\pi(a|s)\propto\exp(Q(s,a)/\alpha)$——Q 值越高的动作概率越大，但所有动作都有非零概率（温度控制软硬）。$\alpha\to0$ 退回贪婪（标准 RL），$\alpha$ 大则接近均匀。这把「探索」从一个外挂的 $\varepsilon$ 变成了<strong>目标内生的、可学习的</strong>东西。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>最大熵的一句话直觉：<strong>不要把鸡蛋全放进一个篮子</strong>。标准 RL 一旦发现一个还不错的动作就死磕它；最大熵 RL 说「在它们一样好的范围内，请尽量保留多样性」——这让智能体既不会过早锁死、又对环境变化更有韧性。SAC 之所以采样高效又稳健，这个目标的功劳很大。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sac"><span class="num">6</span>SAC 三大件：双 Q、压缩高斯、温度自调</h2>
+  <h3>SAC 的三大件：双 Q、压缩高斯、温度自调</h3>  <p>把最大熵目标落成可跑的 off-policy 算法，SAC 有三个标志性设计，notebook 会逐一从零实现：</p>  <h4>① 双 Q 网络取 min（截断双 Q）</h4>  <p>和 DQN 一样，SAC 的 critic 也受<strong>过估计</strong>之害（甚至更严重，因为 actor 会主动找 Q 高的动作、放大高估）。SAC 学<strong>两个独立的 Q 网络</strong>，算目标时取<strong>两者的较小值</strong>：$y = r + \gamma\,(\min(Q_1,Q_2)(s',a') - \alpha\log\pi(a'|s'))$。取 min 系统性地压低高估（这是 TD3 引入、SAC 沿用的技巧）。注意目标里那个 $-\alpha\log\pi$ 项——这是最大熵目标带来的「软」Bellman 备份。</p>  <h4>② 随机策略 = 压缩高斯 + 重参数化</h4>  <p>连续动作下，actor 输出一个高斯分布的均值 $\mu(s)$ 与（log）标准差 $\sigma(s)$，动作从中采样。两个关键细节：</p>  <ul>
+    <li><strong>重参数化（reparameterization）</strong>：把 $a=\mu+\sigma\cdot\epsilon,\ \epsilon\sim\mathcal N(0,1)$，让梯度能<em>穿过采样</em>回传到 $\mu,\sigma$（直接对采样求导会断梯度）。这是 SAC 用低方差梯度训练随机策略的关键。</li>
+    <li><strong>tanh 压缩（squashing）</strong>：动作通常有界（如 $[-1,1]$），所以对高斯样本再套一个 $\tanh$。但这改变了概率密度，必须做<strong>雅可比修正</strong>：$\log\pi(a) = \log\mathcal N(u) - \sum_i\log(1-\tanh^2(u_i))$。这个修正项漏了，SAC 的熵估计就错，温度调节随之失灵。</li>
+  </ul>  <h4>③ 温度自动调节</h4>  <p>手调 $\alpha$ 很痛苦（不同任务、不同训练阶段的最优 $\alpha$ 差很多）。SAC 把它变成<strong>可学习参数</strong>，通过一个约束优化自动维持一个<strong>目标熵</strong>水平（常设为 $-\dim(\mathcal A)$）：</p>  <div class="math-block">\[J(\alpha) = \mathbb{E}\big[-\alpha\,(\log \pi(a|s) + \bar{\mathcal{H}})\big]\]</div>  <p>直觉：策略熵高于目标时 $\alpha$ 自动降（少奖励随机、多追回报），低于目标时 $\alpha$ 自动升（多鼓励探索）。这是个负反馈调节器，省去了对最敏感超参之一的手调。<strong>目标网络</strong>（软更新 $\bar\theta\leftarrow\tau\theta+(1-\tau)\bar\theta$）也是 SAC 的标配，稳定 Q 的自举目标——这点和 DQN 一脉相承。</p>  <p>把三大件放回致命三要素的视角看，会更有感觉：SAC 是<strong>彻底的 off-policy</strong>（从百万容量 replay 复用历史）+ <strong>自举</strong>（软 Bellman 备份）+ <strong>函数逼近</strong>——三要素全占，且因为 actor 会<em>主动搜索 Q 高的动作</em>，过估计的危害比 DQN 更烈。所以 SAC 的稳定不是靠一招，而是靠<strong>一套组合拳</strong>：双 Q 取 min 直接压高估、软更新让目标几乎不动、熵正则平滑 Q 地形、温度自调防止策略塌缩。这正呼应模块 01 的教训——深度 off-policy RL 的稳定从来是多个正交技巧的合力，而非单一银弹。理解这一点，你就能看懂为什么 SAC/TD3 的论文都在堆叠看似零碎的小技巧：每一个都在补上发散链条的一环。</p>  <div class="callout paper"><span class="label"></span>
+    <p>SAC 与近亲 TD3/DDPG 是连续控制的三大基线。区别：DDPG 确定性策略易脆；TD3 加双 Q + 目标平滑 + 延迟更新修脆性；SAC 用随机策略 + 最大熵 + 自动温度，通常最稳健、最省样本。详见 references 的 Haarnoja 2018、Fujimoto 2018、Lillicrap 2015。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="compare"><span class="num">7</span>PPO vs SAC：怎么选</h2>
+  <h3>PPO vs SAC：怎么选</h3>  <p>两个都是策略优化的主力，但定位不同。一张对照表帮你建立选型直觉：</p>  <table>
+    <thead><tr><th>维度</th><th>PPO</th><th>SAC</th></tr></thead>
+    <tbody>
+      <tr><td>数据使用</td><td>on-policy（每批用几次就重采）</td><td><strong>off-policy</strong>（replay 反复复用，样本高效得多）</td></tr>
+      <tr><td>动作空间</td><td>离散 / 连续都行</td><td>主要为<strong>连续</strong>（玻尔兹曼/高斯策略）</td></tr>
+      <tr><td>核心机制</td><td>clip 近似信赖域</td><td>最大熵 + 双 Q + 自动温度</td></tr>
+      <tr><td>稳定性 / 调参</td><td>非常稳、对超参不太敏感、易实现</td><td>稳，但部件多、实现细节（tanh 修正等）要小心</td></tr>
+      <tr><td>样本效率</td><td>中（on-policy 的代价）</td><td><strong>高</strong></td></tr>
+      <tr><td>并行扩展</td><td><strong>极易</strong>（大量并行 env，RLHF 标配）</td><td>相对难（off-policy + replay）</td></tr>
+      <tr><td>典型场景</td><td>并行模拟充足、含 RLHF/LLM、离散或连续</td><td>真实机器人等<strong>交互昂贵</strong>的连续控制</td></tr>
+    </tbody>
+  </table>  <p>经验法则：<strong>模拟器便宜、能大规模并行采样</strong>（游戏、RLHF）→ PPO，简单稳健、扩展性好，这也是它成为 LLM 对齐默认算法的原因（C22 的 GRPO 即 PPO 家族的变体）；<strong>真实交互昂贵、动作连续</strong>（机器人、控制）→ SAC，把每条宝贵经验榨干。</p>  <p>还要记住二者共享的<strong>策略梯度内核</strong>：都在用 $\nabla\log\pi\cdot(\text{某种优势/Q})$ 这一基本形式推动策略，差别在「优势怎么估、数据怎么用、步子怎么控、要不要熵」。把这个内核与四个旋钮（优势估计 / 数据复用 / 步长约束 / 熵正则）拆清楚，你就能看懂几乎任何策略优化算法的变体——包括 A2C、TRPO、PPO、SAC、TD3、以及 RLHF 里的 PPO/GRPO/DPO 一族。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>PPO 的脆弱与玄学</strong>：尽管「稳」，PPO 的性能高度依赖实现细节与超参 [Engstrom 2020]，跨任务复现常翻车。把「哪些细节真正重要、为什么」讲清楚仍是活跃课题。</li>
+    <li><strong>on-policy vs off-policy 的统一</strong>：能否兼得 PPO 的稳定扩展与 SAC 的样本效率？V-trace（IMPALA）、Retrace、以及各种「带重要性校正的 off-policy 策略梯度」都在这条线上推进。</li>
+    <li><strong>RLHF 中的策略优化</strong>：把 PPO 用到语言模型对齐带来新问题——奖励模型可被钻空子（reward hacking）、KL 正则锚定参考模型、价值网络昂贵。GRPO（去掉价值网、用组内相对优势，C22）、DPO（直接偏好优化，绕开 RL）是热门替代。</li>
+    <li><strong>连续控制的样本效率极限</strong>：SAC 仍需上十万到百万步。结合模型（下一模块）的 model-based + SAC（如 MBPO、Dreamer）把它再压低一两个量级，是当前连续控制 SOTA 的方向。</li>
+    <li><strong>探索仍是短板</strong>：最大熵只是<em>局部</em>探索（在动作上加随机），对<strong>稀疏奖励</strong>的深度探索无能为力——那需要内在动机（模块 05）。把策略优化与结构化探索结合是开放问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Schulman 2017（PPO）、Schulman 2015（TRPO）、Schulman 2016（GAE，C13 已引）、Haarnoja 2018（SAC）；强烈推荐 OpenAI Spinning Up 的 PPO/SAC 推导与 Engstrom 2020（implementation matters）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_dqn/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 值函数逼近与 DQN</div></a>
+    <a class="next" href="../03_offline_rl/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 离线强化学习</div></a>
+  </div>
+
+</div>
+</body>
+</html>

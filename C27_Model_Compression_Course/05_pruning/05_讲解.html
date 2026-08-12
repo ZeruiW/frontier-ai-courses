@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 剪枝与稀疏</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 剪枝与稀疏</h1>
+  <p class="subtitle">幅度剪枝、结构化 vs 非结构化、硬件友好的 2:4 半结构稀疏、SparseGPT 的逐层重建、彩票假说与 IMP —— 把既有模型的权重删成 0，省存储省计算（这门课的收尾）</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、模块 02（GPTQ 的逆 Hessian 补偿，SparseGPT 复用它）、矩阵乘</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_pruning.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Frantar 2023 (SparseGPT)、Mishra 2021 (2:4)、Frankle 2018 (彩票假说)、Han 2015 (Deep Compression)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what">剪枝是什么：把权重删成 0</a></li>
+      <li><a href="#magnitude">幅度剪枝：最简单的基线</a></li>
+      <li><a href="#structure">结构化 vs 非结构化：能否加速</a></li>
+      <li><a href="#twofour">2:4 稀疏：硬件能加速的甜点</a></li>
+      <li><a href="#finetune">剪枝-微调循环与 IMP</a></li>
+      <li><a href="#sparsegpt">SparseGPT：GPTQ 思想搬到剪枝</a></li>
+      <li><a href="#lottery">彩票假说</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what"><span class="num">1</span>剪枝是什么：把权重删成 0</h2>
+  <p>这是本课最后一个模块，也是压缩家族里最古老的一支：<span class="term">pruning</span>（剪枝）。它的想法朴素得近乎天真——神经网络里有<strong>大量权重其实没什么用</strong>，把它们直接置 0（删掉），模型照样工作。删掉的权重不必存、不必算，于是模型更小、更快。</p>  <p>剪枝和量化是<strong>正交</strong>的两条压缩线：量化压<em>每个权重的 bit 数</em>（16→4），剪枝压<em>非零权重的个数</em>（把一半权重变 0）。一个让每个数更便宜，一个让数更少。两者可以叠加——这也是为什么本课把它们分开讲，最后在压缩家族里合起来看。</p>  <p>剪枝的核心问题有两个：<strong>删哪些</strong>（重要性准则）和<strong>怎么删</strong>（稀疏结构）。删哪些——最经典的答案是<span class="term">magnitude pruning</span>（幅度剪枝）：删绝对值最小的权重，因为 <code>|w|</code> 小意味着它对输出贡献小。怎么删——是删散落各处的单个权重（非结构化），还是成块地删（结构化），这个选择决定了你能不能在真实硬件上拿到加速。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>剪枝就像给一棵过于茂密的树修枝：很多细枝（小权重）剪掉后，树（模型）的形态和功能几乎不变，却清爽轻便了。关键是<strong>剪对枝</strong>——剪掉无关紧要的，留下承重的主干。幅度剪枝赌的是「细（|w| 小）的枝不重要」，这个赌注大多数时候成立。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，剪枝给权重矩阵配一个 0/1 的<span class="term">pruning mask</span>（掩码） <code>M</code>，前向用 <code>W ⊙ M</code>（逐元素相乘）。<span class="term">sparsity</span>（稀疏度）= 掩码里 0 的比例。50% 稀疏即一半权重被置 0。剪枝的目标是：在给定稀疏度下，选一个掩码使模型质量损失最小。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住剪枝：<strong>把不重要的权重置 0，模型变稀疏，省存储省计算</strong>。难点不在「置 0」本身，而在两件事：<em>怎么判断哪些权重不重要</em>（准则：幅度、Hessian 显著性……），以及<em>怎么让稀疏的模式规整到硬件能加速</em>（结构：非结构化最准但难加速、2:4 是甜点）。这两条贯穿本模块。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="magnitude"><span class="num">2</span>幅度剪枝：最简单的基线</h2>
+  <h3>幅度剪枝：最简单也最有效的基线</h3>  <p>幅度剪枝的逻辑直白：<strong>绝对值越小的权重越不重要，优先删</strong>。给定目标稀疏度 <code>s</code>，就把所有权重按 <code>|w|</code> 排序，删掉最小的 <code>s</code> 比例，其余保留。</p>  <div class="math-block">\[\tau = \text{第 } s \text{ 分位的 } |w| \text{ 值}, \qquad M_{ij} = \begin{cases} 1 & |W_{ij}| > \tau \\ 0 & |W_{ij}| \le \tau \end{cases}, \qquad \hat W = W \odot M\]</div>  <p>尽管简单，幅度剪枝是个<strong>极强的基线</strong>——Han et al. 2015 的 Deep Compression 用它（配合重训和量化）把模型压缩一个数量级，至今多数复杂方法也只是小幅超越它。它能 work 的直觉是：训练好的网络里，权重分布通常集中在 0 附近，大量接近 0 的权重对输出的贡献微乎其微，删了几乎无感。</p>  <p>但幅度剪枝有个<strong>盲点</strong>，和模块 02 的 RTN 如出一辙：它只看权重本身（<code>|w|</code>），不看权重<strong>对输出的实际影响</strong>。一个 <code>|w|</code> 不大的权重，若总是乘以很大的激活，对输出的贡献其实很大，删了会掉点。这正是更高级的剪枝准则（如 SparseGPT 用 Hessian 显著性、Wanda 用 <code>|w|×‖激活‖</code>）要修正的——把激活纳入考量。这条线索我们在第 6 节展开。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个关于<strong>阈值</strong>的实现细节：剪枝到目标稀疏度，要正确算出第 <code>s</code> 分位的 <code>|w|</code> 阈值。用 <code>np.partition</code>（部分排序，<code>O(n)</code>）比全排序快。还要注意<strong>边界</strong>：稀疏度 0 不该删任何权重、稀疏度 1 该删光，以及 <code>|w|</code> 有并列值时的处理。本模块 notebook 会从零写幅度剪枝并 <code>assert</code> 实际稀疏度精确命中目标。</p>
+  </div>  <p>再补一个<strong>全局 vs 逐层</strong>的维度（和模块 01 的粒度遥相呼应）。幅度剪枝可以<strong>逐层</strong>做（每层各剪到同一比例），也可以<strong>全局</strong>做（把所有层的权重拼在一起、用一个统一阈值比 <code>|w|</code>，让各层稀疏度自适应）。全局通常更优——因为不同层的冗余度差异很大：有的层权重普遍小（冗余多，该多剪），有的层权重大（关键，该少剪）。用一个全局阈值，权重普遍小的层自然被剪得多、关键层被保护，比一刀切的逐层剪枝更合理。本模块 notebook 会把两者都实现、对比各层的实际稀疏度。</p>  <p>还要澄清一个常见混淆：稀疏度的<strong>分母</strong>。「50% 稀疏」指被置 0 的权重占<em>总权重</em>的 50%。但剪枝省的存储和计算<strong>只在权重那部分</strong>——激活、KV cache、其他开销不受剪枝影响。所以「50% 稀疏」不等于「模型省一半」，要看权重在总开销里的占比。理解这点，才能正确评估剪枝在你的具体场景里到底能省多少——这和模块 01「量化省的是权重带宽」是同一种「分清省的是哪部分」的清醒。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="structure"><span class="num">3</span>结构化 vs 非结构化：能否加速</h2>
+  <h3>结构化 vs 非结构化：能不能在硬件上加速</h3>  <p>剪枝的稀疏<strong>结构</strong>，直接决定它能不能在真实硬件上拿到加速。这是剪枝最容易被忽视、却最关键的一环。</p>  <ul>
+    <li><strong>非结构化剪枝</strong>（unstructured）：任意位置的单个权重都可删，得到散乱的 0。同稀疏度下<strong>掉点最少</strong>（最灵活），但稀疏模式不规则——通用 GPU 的稠密矩阵乘单元<strong>无法利用</strong>这种零散的 0（还是得把 0 也乘一遍），所以<em>理论省了计算，实际不加速</em>。</li>
+    <li><strong>结构化剪枝</strong>（structured）：成块地删——整行、整列、整个注意力头、整个通道。稀疏模式规整，删完直接<strong>缩小矩阵维度</strong>，通用硬件就能加速（小矩阵乘当然快）。代价是同稀疏度下<strong>掉点更多</strong>（约束更强，删整块容易误伤重要权重）。</li>
+    <li><strong>半结构化 / N:M 稀疏</strong>（semi-structured）：折中——每 M 个连续权重里恰好保留 N 个。既规整到特定硬件能加速，又比纯结构化灵活。<strong>2:4</strong> 是它的代表。</li>
+  </ul>  <div class="ascii">三种稀疏结构（▓=保留, ·=剪掉）：
+
+  非结构化(50%)        结构化(删整列)       2:4 半结构(每4留2)
+  ▓ · ▓ · · ▓ · ▓      ▓ ▓ · · ▓ ▓ · ·      ▓ · ▓ · | ▓ ▓ · ·
+  · ▓ · ▓ ▓ · ▓ ·      ▓ ▓ · · ▓ ▓ · ·      · ▓ · ▓ | · ▓ ▓ ·
+  ▓ · · ▓ · ▓ ▓ ·      ▓ ▓ · · ▓ ▓ · ·      ▓ ▓ · · | ▓ · · ▓
+  掉点最少             掉点最多             掉点中等
+  通用硬件不加速       通用硬件加速         Sparse Tensor Core 加速
+  (0也得乘)            (直接缩小矩阵)       (每4留2, 硬件原生支持)</div>  <div class="callout danger"><span class="label">稀疏 ≠ 加速</span>
+    <p>这是剪枝最反直觉的一课：<strong>非结构化剪枝省的计算，通用 GPU 用不上</strong>。你把 90% 权重置 0、理论上算量降到 1/10，但稠密矩阵乘单元不认识这些零散的 0——它仍然把整个矩阵（含 0）乘一遍，<em>一点没快</em>。要真加速，要么结构化（缩小矩阵）、要么 N:M（专用硬件），要么用专门的稀疏内核（开销大、常不划算）。这就是为什么<strong>2:4 稀疏</strong>如此重要——它是少数能在主流硬件上<em>真正兑现</em>加速的稀疏格式。下一节专讲它。</p>
+  </div>  <p>为什么零散的 0 用不上？回忆 C36 课的 GPU 内核：稠密矩阵乘把数据按规整的块（tile）喂给 Tensor Core，硬件并不逐个检查「这个数是不是 0」——它对整块无差别地乘加。一个 0 散落在块中间，硬件照样为它分配乘法器、照样从显存搬它。要跳过 0，硬件得知道「哪些位置是 0」并据此重排计算，这需要<strong>规整的稀疏模式</strong>（如 2:4 的每 4 个固定 2 个）才能高效编码与调度。零散的非结构化稀疏，编码这些位置的开销往往比省下的计算还大。</p>  <p>这给剪枝一个清醒的<strong>决策框架</strong>：先问「我要的是省存储还是省计算」。若只为<strong>省存储/显存</strong>（如模型装不下），非结构化剪枝 + 稀疏存储格式就够（存的时候只存非零值与索引）；若要<strong>省计算/真加速</strong>，就必须上结构化或 2:4，接受相应的精度代价。很多人剪枝后发现「没变快」，正是因为用了非结构化却期待加速——把这两个目标分清，是用对剪枝的前提，也呼应模块 00「先分清瓶颈再优化」的世界观。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="twofour"><span class="num">4</span>2:4 稀疏：硬件能加速的甜点</h2>
+  <h3>2:4 稀疏：硬件能加速的甜点</h3>  <p><span class="term">2:4 sparsity</span>（2:4 稀疏，Mishra et al. 2021）是 N:M 半结构稀疏的代表：<strong>每 4 个连续权重里，恰好保留 2 个、置 0 两个</strong>。它的稀疏度固定是 50%，但精妙之处在于——NVIDIA Ampere 起的 <span class="term">Sparse Tensor Core</span> 对这种模式有<strong>原生硬件支持</strong>，能给矩阵乘约 <strong>2× 加速</strong>。</p>  <p>为什么是 2:4，不是别的？因为它在<strong>规整</strong>（硬件能高效编码：每 4 个只需 2 bit 记录哪 2 个非零）和<strong>灵活</strong>（每组内可任选 2 个，比「删整列」自由得多）之间找到了甜点。硬件把保留的 2 个权重和它们的位置索引压缩存储，矩阵乘时只算这 2 个，于是吞吐翻倍。</p>  <div class="ascii">2:4 稀疏：每 4 个连续权重保留 |.| 最大的 2 个
+
+  原始一组:  [0.8, -0.1, 0.3, -0.6]
+  按 |.| 排:   0.8 &gt; 0.6 &gt; 0.3 &gt; 0.1
+  保留最大2:  [0.8,  0  , 0  , -0.6]   &lt;- 删掉 |.| 最小的 0.3, -0.1
+             └ 2 个非零 ┘
+
+  硬件存储: 2 个值 [0.8, -0.6] + 2-bit 位置索引 [00, 11]
+  矩阵乘只算这 2 个 -&gt; 2x 吞吐 (Sparse Tensor Core)</div>  <p>做 2:4 剪枝很简单：把权重每 4 个连续元素分一组，每组内删掉 <code>|w|</code> 最小的 2 个。但和普通幅度剪枝一样，直接剪会掉点，所以实践中要<strong>配合重训恢复</strong>（Mishra 论文的标准流程：稠密训练 → 2:4 剪枝 → 重训恢复）。重训让保留的权重补偿被删权重的功能，能把 2:4 的掉点压到很小。本模块 notebook 会从零写 2:4 mask 并验证每组恰好 2 个非零。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>2:4 稀疏是<strong>理论与硬件妥协的产物</strong>，也是剪枝里最实用的一招。纯非结构化最准但硬件不买账；纯结构化硬件友好但掉点大；2:4 卡在中间——50% 稀疏、掉点可控、且是<em>少数主流硬件原生加速</em>的稀疏格式。如果你只想从这个模块记住一件能直接用的事，就是它：<strong>2:4 稀疏 + 重训，约 2× 加速、精度损失小</strong>。</p>
+  </div>  <p>一个值得记住的对照：2:4 稀疏和模块 01 的 int4 量化常被相提并论，都给约 <strong>2× 的收益</strong>，且都能<strong>叠加</strong>（先 2:4 剪枝、再把保留权重量化到 int4，收益相乘）。区别在收益来源：量化省的是<em>每个权重的 bit</em>（带宽），2:4 省的是<em>一半的乘加</em>（计算 + 带宽）。二者作用维度不同，所以 NVIDIA 的工具链支持把它们组合——这又一次印证：不同压缩手段只要压的是正交维度，就能安全叠加，复合出远超单招的压缩率。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="finetune"><span class="num">5</span>剪枝-微调循环与 IMP</h2>
+  <h3>剪枝-微调循环：高稀疏度的关键</h3>  <p>剪枝越狠（稀疏度越高），掉点越多。但有个简单到惊人的办法能大幅挽回精度——<strong>剪完之后继续训练</strong>（<span class="term">fine-tuning</span> / 微调恢复）。</p>  <p>机制是这样的：剪枝删掉了一些权重，破坏了原来的功能平衡。但<strong>保留的权重还能动</strong>——继续训练几步，它们会<strong>调整自己去补偿</strong>被删权重的功能，把模型质量找回来。注意微调时要<strong>保持掩码固定</strong>（被剪的权重恒为 0，只更新保留的权重）。</p>  <p>更进一步是 <span class="term">iterative magnitude pruning</span>（IMP，迭代幅度剪枝）：不一次剪到目标稀疏度，而是<strong>剪一点→微调→再剪一点→再微调</strong>，反复多轮。比一次性剪到底掉点小得多——因为每次只剪一小步，网络有机会逐步适应，不会被一次大剪打懵。</p>  <div class="ascii">一次性剪枝 vs 迭代剪枝(IMP) 到 90% 稀疏：
+
+  一次性:  100% ──────────剪到→ 10% 权重  (掉点大, 网络被打懵)
+
+  IMP:     100% →剪→ 70% →微调→ 恢复 →剪→ 50% →微调→ ... →剪→ 10%
+                 每步只剪一点 + 微调恢复, 网络逐步适应
+           掉点小得多, 但要多轮训练(更贵)</div>  <div class="callout intuition"><span class="label"></span>
+    <p>剪枝-微调的智慧是：<strong>剪枝造成的损伤，可以靠剩下的权重重新学习来弥补</strong>。这呼应了一个更深的现象——网络是<em>冗余</em>的、有自我修复的弹性。删掉一部分，剩下的能补上。IMP 把这个修复过程拆成小步、反复进行，所以能爬到很高的稀疏度还不太掉点。代价是多轮训练（比一次剪贵），是「精度」与「成本」的权衡。</p>
+  </div>  <p>这里有个和 fp8（模块 03）的有趣对照。fp8 训练里我们<strong>保持掩码不存在</strong>（所有权重都参与），而剪枝微调里我们<strong>保持掩码固定</strong>——被剪的权重恒为 0，反向传播时它们的梯度被掩码挡住、不更新。实现上就是每步更新后乘一次掩码 <code>W = (W − lr·grad) ⊙ M</code>。漏了这一步，被剪的权重会在微调中<em>悄悄复活</em>（重新变成非零），稀疏度被破坏、加速也就没了。这是剪枝微调最常见的实现 bug，notebook 会 <code>assert</code> 微调前后稀疏度不变来堵住它。</p>  <p>从<strong>成本</strong>角度看剪枝的三条路，正好是一个谱：<strong>一次性剪枝</strong>（不重训，最便宜，但高稀疏度掉点大）→ <strong>剪枝 + 少量微调</strong>（中等成本，恢复不少精度）→ <strong>IMP</strong>（多轮剪-训，最贵，但能到最高稀疏度）。而下一节的 SparseGPT 提供了第四条、也是对大模型最实用的路：<strong>用校准数据做一次性逆 Hessian 重建</strong>——不重训，却能达到接近微调的效果。它是怎么做到的？下一节揭晓。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="sparsegpt"><span class="num">6</span>SparseGPT：GPTQ 思想搬到剪枝</h2>
+  <h3>SparseGPT：把 GPTQ 的思想搬到剪枝</h3>  <p>幅度剪枝 + 微调虽好，但微调要训练、成本高。能不能像模块 02 的 GPTQ 那样，<strong>不重训、只用校准数据做一次性（one-shot）重建</strong>，就把模型剪得很稀疏还不掉点？<span class="term">SparseGPT</span>（Frantar & Alistarh 2023）做到了。</p>  <p>SparseGPT 的洞察和 GPTQ 一模一样：剪枝也是一种对权重的扰动（把某些权重从原值改成 0），这个扰动对层输出的影响，可以用<strong>逆 Hessian 解析地补偿</strong>到保留的权重上。所以它把 GPTQ 的「逐列量化 + 误差补偿」框架直接搬到剪枝：</p>  <ul>
+    <li>用校准数据算 Hessian <code>H = XXᵀ</code>（和 GPTQ 同一个）；</li>
+    <li>按 <strong>OBS 显著性</strong> <code>w²/[H⁻¹]_{jj}</code> 决定剪哪些（不只看 <code>|w|</code>，还除以逆 Hessian 对角——把激活的影响纳入）；</li>
+    <li>逐列处理：剪掉的权重产生的误差，按逆 Hessian <strong>补偿到保留的权重</strong>上，使层输出尽量不变。</li>
+  </ul>  <p>效果惊人：SparseGPT 能把 175B 模型<strong>一次性剪到 50%+ 稀疏几乎不掉点、完全不用重训</strong>，几小时跑完。它还能和量化<strong>叠加</strong>（同时剪枝 + 量化），是大模型一次性压缩的代表。本模块 notebook 会从零实现一个简化版 SparseGPT，并验证它的层输出 MSE 明显<strong>低于普通幅度剪枝</strong>——和 GPTQ 优于 RTN 是同一个道理。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>看到这里你应该会心一笑：<strong>SparseGPT 之于幅度剪枝，正如 GPTQ 之于 RTN</strong>。幅度剪枝/RTN 只看权重本身（<code>|w|</code>），SparseGPT/GPTQ 用逆 Hessian 把<em>激活的影响</em>和<em>误差补偿</em>都纳进来。量化和剪枝在数学上是<strong>同一个「带约束的逐层重建」问题</strong>（模块 00 的统一框架）——约束一个是「落在量化网格上」，一个是「很多权重为 0」，但解法（逆 Hessian 补偿）完全相通。这就是为什么 SparseGPT 能复用 GPTQ 的全套机器。</p>
+  </div>  <p>把这个统一看到底，会发现整门课的后半段其实在反复讲<strong>同一件事</strong>。模块 00 提出 <code>min ‖Wx − Ŵx‖²</code> 这个带约束的逐层重建目标；模块 02 在「量化网格」约束下解它（GPTQ）；本模块在「很多权重为 0」约束下解它（SparseGPT）。约束不同，但都用<strong>逐列处理 + 逆 Hessian 误差补偿</strong>这同一台机器。甚至 SparseGPT 论文里，剪枝和量化可以<strong>在同一遍逐列循环里一起做</strong>——剪掉一些、量化剩下的、统一补偿误差。压缩到这个层次，量化与剪枝已经不是两件事，而是同一个优化问题的两种约束。</p>  <p>更妙的是 SparseGPT 能直接产出 <strong>2:4 稀疏</strong>。只要在选「剪哪些」时，按每 4 个一组、组内剪显著性最低的 2 个（而非全局选），就能在逆 Hessian 补偿的同时满足 2:4 的硬件约束——<strong>既享受一次性重建的精度，又拿到硬件加速</strong>。这正是 SparseGPT 在生产里最有价值的用法：one-shot 把大模型剪成 2:4、几乎不掉点、还能 2× 加速。它把本模块前面所有零件（幅度准则的升级、2:4 结构、误差补偿）合成了一招。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="lottery"><span class="num">7</span>彩票假说</h2>
+  <h3>彩票假说：稀疏网络为什么能训练</h3>  <p>最后一个深刻的话题：<span class="term">lottery ticket hypothesis</span>（彩票假说，Frankle & Carlin 2018）。它不直接给压缩方法，但深刻改变了我们对稀疏网络的理解。</p>  <p>假说是这样的：一个随机初始化的稠密网络里，存在一个<strong>稀疏子网</strong>（<span class="term">winning ticket</span>，中奖彩票），如果<strong>用它原始的初始化值</strong>单独训练，能达到和原稠密网络相当的精度。换句话说，稠密网络之所以好训，可能是因为它<em>内含</em>了这样一张「中奖彩票」，训练只是把它找出来。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：稠密网络像买了一大叠彩票，里面有一张是中奖的（那个稀疏子网）。你不需要全部这些彩票——只要能找出中奖那张、并用它最初的号码（初始化），单独它就能赢。训练大网络，某种意义上是在「抽出」这张中奖票。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>找中奖彩票的标准流程是 <strong>IMP + 回卷</strong>：训练 → 幅度剪枝 → 把保留权重<strong>重置回原始初始化</strong>（rewind）→ 重新训练，反复迭代。关键是<strong>回到初始化</strong>——用随机重置的权重训剪枝后的网络往往训不好，但用<em>原始初始化</em>就能，这正是假说的核心证据。</p></div>
+  </div>  <p>彩票假说的意义远超剪枝本身：它暗示<strong>稀疏网络不仅能存在，还能被独立训练到高精度</strong>——稀疏性可能是神经网络的内在属性，而非事后的妥协。后续工作（Frankle 2020）发现大模型上要回卷到训练<em>早期</em>（而非最初）才稳定，但核心洞察不变。它把剪枝从「压缩技巧」提升到了「理解网络本质」的高度。</p>  <p>彩票假说也给本课的两条剪枝路线提供了<strong>理论注脚</strong>。它解释了为什么「剪枝-微调/IMP」有效——你是在「找出并训练那张中奖彩票」；也暗示了为什么稀疏网络值得追求——如果好的稀疏子网本就存在，那么 SparseGPT 这类一次性方法就是在<em>不重训地逼近</em>它。不过要诚实地说：彩票假说在超大模型上的成立程度、以及「中奖彩票」能否在不先训练稠密网络的前提下被直接找到（训练时稀疏），仍是开放问题——这也是 s8 前沿里「sparse training」想攻克的圣杯。</p>  <div class="callout paper"><span class="label"></span>
+    <p>彩票假说（Frankle & Carlin 2018）+ rewinding（Frankle 2020）是理解稀疏可训练性的关键。它与 SparseGPT（一次性重建）、Han 2015（剪枝-重训）共同构成剪枝的三条主线。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>LLM 的一次性剪枝</strong>：SparseGPT、Wanda 把大模型 one-shot 剪到 50% 几乎不掉点，但更高稀疏度（70%+）仍掉点明显。如何在不重训下把 LLM 剪得更稀疏，是热点。</li>
+    <li><strong>结构化剪枝大模型</strong>：删整个注意力头、整层、整个 FFN 维度，能真加速但掉点大。如何在结构化约束下保住 LLM 能力（如 LLM-Pruner、Sheared-LLaMA）是活跃方向。</li>
+    <li><strong>稀疏 + 量化联合</strong>：SparseGPT 已能同时做，但「先剪还是先量化、误差如何不互相放大」仍需更系统的联合优化。</li>
+    <li><strong>2:4 之外的硬件稀疏</strong>：能否有更高稀疏度（如 1:4、2:8）的硬件支持？稀疏格式与硬件的协同设计是长期方向。</li>
+    <li><strong>训练时稀疏（sparse training）</strong>：与其训练稠密再剪枝，能否从头就训练稀疏网络（RigL、动态稀疏训练）省下稠密训练的成本？彩票假说给了理论希望，但稳定地做到仍难。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Frantar & Alistarh 2023（SparseGPT，逆 Hessian 一次性剪枝，本模块主线）、Mishra et al. 2021（2:4 稀疏与硬件支持）、Frankle & Carlin 2018（彩票假说）、Han et al. 2015（Deep Compression，幅度剪枝+重训奠基）、Sun et al. 2023（Wanda，更简单的剪枝准则）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_distillation/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 知识蒸馏</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

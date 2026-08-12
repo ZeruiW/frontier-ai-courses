@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 稀疏与滑窗注意力</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 稀疏与滑窗注意力</h1>
+  <p class="subtitle">算力墙：把 O(n²) 降成 O(n·W)。滑窗 + 多层感受野、dilated/block-sparse、attention sink 与 StreamingLLM、Longformer/BigBird 的局部+全局+随机——用召回率量化稀疏化漏掉了什么</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02、注意力/掩码、一点点图/感受野直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_sparse_attention.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Beltagy 2020 (Longformer)、Zaheer 2020 (BigBird)、Xiao 2023 (StreamingLLM)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">算力墙：注意力矩阵其实很稀疏</a></li>
+      <li><a href="#swa">滑动窗口 SWA 与多层感受野</a></li>
+      <li><a href="#blocks">dilated 与 block-sparse</a></li>
+      <li><a href="#sink">attention sink 与 StreamingLLM</a></li>
+      <li><a href="#global">Longformer 与 BigBird</a></li>
+      <li><a href="#recall">用召回率量化稀疏的损失</a></li>
+      <li><a href="#synergy">稀疏与其它杠杆的协同</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>算力墙：注意力矩阵其实很稀疏</h2>
+  <p>FlashAttention（模块 02）把注意力的显存从 <code>O(n²)</code> 降到了 <code>O(n)</code>，让长上下文「装得下」。但它没碰<strong>算力墙</strong>——注意力的计算量仍是 <code>O(n²)</code>。在 1M token 上，这个二次项即使有 FlashAttention 也慢得让人无法接受。本模块开始攻算力墙的第一条路：<strong>稀疏注意力</strong>——干脆别让每个 token 都看所有 token。</p>  <p>出发点是一个朴素却有力的观察：<strong>注意力矩阵其实非常稀疏</strong>。训练好的模型里，绝大多数 query-key 注意力权重都接近 0——每个 token 真正「在意」的只是少数几个 token（通常是<em>邻近的</em>和<em>少数特殊的</em>）。既然如此，何必把整个 <code>n×n</code> 都算出来？只算那些<strong>可能重要</strong>的连接，复杂度就能从 <code>O(n²)</code> 降到 <code>O(n·k)</code>（<code>k</code> 是每个 query 看的 key 数）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>稀疏注意力像给每个 token 配一副「只能看到附近 + 几个地标」的眼镜。大多数信息是局部的（相邻词、相邻句），所以看附近就够了；少数全局信息（文章主题、问题）则靠几个固定的「地标 token」传递。代价是：万一某个远处的、不在视野里的 token 恰好重要，就漏看了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，稀疏注意力用一个<strong>稀疏模式</strong>（一个 <code>n×n</code> 的布尔掩码 <code>Mask</code>）规定哪些 <code>(i,j)</code> 连接被保留：<code>S_{ij} = QᵢKⱼᵀ/√d</code> 若 <code>Mask_{ij}=1</code>，否则置 <code>-∞</code>（softmax 后权重为 0）。不同的稀疏注意力方法，区别全在<strong>怎么设计这个掩码</strong>——这就是本模块的主线。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把握全模块的核心张力：<strong>稀疏化是一场「省多少算力」与「漏多少信息」的交易</strong>。掩码越稀疏（每个 query 看越少 key），算力越省，但漏看重要连接的风险越大。所有稀疏注意力方法——滑窗、dilated、block-sparse、Longformer、BigBird——本质都是在回答同一个问题：<em>如何用尽量少的连接，覆盖尽量多的真实重要连接？</em> 而衡量这笔交易划不划算的尺子，就是本模块第 6 节的<strong>召回率</strong>。</p>
+  </div>  <p>在往下之前，先把稀疏注意力放进本课的坐标系。它和 FlashAttention（模块 02）有一个本质区别，务必分清：<strong>FlashAttention 是精确的——它算的还是完整的全注意力，只是用聪明的内存调度避免落盘；稀疏注意力是近似的——它真的不算某些连接，结果与全注意力不同</strong>。所以它们打的是不同的墙、可以叠加：先用 FlashAttention 把（剩下要算的）注意力做到 O(n) 显存，再用稀疏决定「哪些块根本不用算」。事实上工业界最高效的长上下文注意力，正是<em>块稀疏 + FlashAttention</em>的合体——稀疏说「跳过这些 K/V 块」，FlashAttention 高效地算「没被跳过的块」。带着这个「精确打底、稀疏减负」的框架读下去，每种稀疏模式的定位就清楚了。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="swa"><span class="num">2</span>滑动窗口 SWA 与多层感受野</h2>
+  <h3>最基本的稀疏模式：滑动窗口（SWA）</h3>  <p>最自然的稀疏先验是<strong>局部性</strong>：相邻 token 关系最紧密。<span class="term">sliding window attention</span>（滑窗注意力，SWA）让每个 token 只注意它前面（因果场景）的 <code>W</code> 个 token：</p>  <div class="math-block">\[\text{Mask}_{ij} = \begin{cases} 1 & i-W < j \le i \\ 0 & \text{否则} \end{cases}\qquad \text{复杂度 } O(n\cdot W)\]</div>  <p>窗口 <code>W</code> 是个常数（如 4096），于是复杂度从 <code>O(n²)</code> 降为 <code>O(n·W)</code>，即<strong>线性于序列长度</strong>。Mistral-7B 就用了 <code>W=4096</code> 的滑窗。</p>  <p>一个自然的疑问：每个 token 只看最近 4096 个，那它怎么利用更早的信息？答案藏在<strong>多层堆叠</strong>里——这是滑窗最精妙的地方：</p>  <div class="ascii">单层滑窗 W=3：token 5 只直接看到 3,4,5
+但信息会逐层「接力」传递，感受野随层数线性扩大：
+
+  层 0:  t5 ← {t3,t4,t5}                  感受野 = W
+  层 1:  t5 ← t3 ← {t1,t2,t3}             感受野 ≈ 2W
+  层 2:  t5 ← t1 ← {t-1,t0,t1}            感受野 ≈ 3W
+  ...
+  L 层后：感受野 ≈ L × W   （像 CNN 的多层卷积）</div>  <div class="callout intuition"><span class="label"></span>
+    <p>滑窗的关键洞察：<strong>单层是局部的，但多层堆叠后感受野线性扩大到 L×W</strong>。这和卷积神经网络一模一样——每层卷积核很小（局部），但深层神经元能「看到」很大的输入范围。所以一个 32 层、<code>W=4096</code> 的模型，理论感受野约 <code>32×4096≈131072</code>——足够长。<em>局部注意力 + 深度 = 长程建模</em>，这是滑窗能用的根本原因。notebook 会从零算出这条感受野扩张曲线。</p>
+  </div>  <p>但这里藏着一个必须戳破的乐观：<strong>「理论感受野 = L×W」不等于「有效感受野 = L×W」</strong>。信息要从 131072 token 外传到当前位置，得在 32 层里层层「接力」——每一跳都经过一次注意力加权与非线性，远处信息被稀释、被覆盖。所以一个 token 对窗口外、需要多跳才能抵达的信息，影响力随距离迅速衰减；真正能被有效利用的范围，往往<em>远小于</em> <code>L×W</code> 这个理论上界。这正是纯滑窗模型在「针落在很远处」的长程检索任务上仍可能失手的深层原因（第 6 节的召回率会量化它，模块 05 的 NIAH 会实测它）。理论感受野是「最远能传到哪」，有效感受野是「传到那里还剩多少信号」——两者的差距，是滑窗一切局限的根源。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="blocks"><span class="num">3</span>dilated 与 block-sparse</h2>
+  <h3>用更少预算覆盖更远：dilated 与 block-sparse</h3>  <p>滑窗每层只 +W 的感受野，对极长序列还是慢。两个改进思路：</p>  <h4>Dilated（空洞）注意力</h4>  <p>借鉴空洞卷积：窗口内不连续地取 key，而是<strong>按固定间隔（dilation）跳着取</strong>。同样看 <code>W</code> 个 key，但跨度扩大 <code>dilation</code> 倍，单层感受野立刻变大。多个头用不同 dilation，就能同时覆盖「精细的近处」和「粗粒度的远处」。</p>  <h4>Block-sparse（块稀疏）注意力</h4>  <p>把序列分成块，注意力以<strong>块</strong>为单位决定算或不算——只计算选定的 <code>(query 块, key 块)</code> 对。这是<strong>硬件友好</strong>的关键：被保留的每个块都是一个稠密小矩阵，可以用普通 GEMM 高效算（而逐元素的稀疏掩码对 GPU 不友好）。</p>  <p>用块账算一下省了多少。设 <code>n=128k</code>、块宽 128，则共 <code>T=1024</code> 个块，全注意力要算 <code>T²≈10⁶</code> 个块对。一个「对角带宽 3 块（局部）+ 第 0 列（全局 sink）」的因果块稀疏模式，每个 query 块只保留约 3 个局部块加 1 个全局块 ≈ 4 个 key 块，于是总块对 ≈ <code>4T≈4096</code>。<strong>从 10⁶ 降到 4×10³——约 250 倍</strong>，且复杂度从 <code>O(T²)</code> 变成 <code>O(T)</code>（线性于序列）。关键是这 4096 个块每个都是 128×128 的稠密小矩阵，喂给 GEMM 跑得飞快；被跳过的 99.6% 块连碰都不碰。这就是「理论稀疏」真正落成「实测加速」的样子——稀疏性必须卡在块的粒度上，才能既省 FLOPs 又讨好 GPU。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>逐元素稀疏（像滑窗的精确掩码）虽然省 FLOPs，但 GPU 讨厌不规则的访问。块稀疏把稀疏性提升到「块」的粒度：要么整块算（稠密 GEMM，硬件喜欢），要么整块跳过（完全不碰）。这是「理论稀疏」能变成「实际加速」的工程桥梁。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>BigBird、稀疏 Flash 等都基于块稀疏。一个典型的块稀疏模式 = <strong>对角块（局部）+ 第一列块（全局 sink）+ 少量随机块</strong>。每种块对应一类信息通路：对角=局部上下文、全局列=全局信息、随机=兜底远程连接。下一节的 Longformer/BigBird 就是这些块的不同配方。</p></div>
+  </div>  <div class="ascii">block-sparse 模式示意（█=计算, ·=跳过），按块的棋盘：
+
+        key块→  0    1    2    3    4    5
+  query块 0   █    ·    ·    ·    ·    ·     对角=局部窗口
+        1   █    █    ·    ·    ·    ·
+        2   █    █    █    ·    ·    ·     第0列=全局token(sink)
+        3   █    ·    █    █    ·    ·     (列0始终保留)
+        4   █    ·    ·    █    █    ·
+        5   █    ·    █    ·    █    █     偶有随机块=远程兜底</div>  <div class="callout warn"><span class="label"></span>
+    <p>一个实践要点：稀疏注意力的<strong>理论复杂度</strong>和<strong>实际加速</strong>常有落差。逐元素稀疏（如精确滑窗掩码）在 FLOPs 上很省，但在 GPU 上可能因不规则访问反而不快。所以工业界的稀疏注意力几乎都做成<strong>块粒度</strong>（block-sparse），并与 FlashAttention 的分块结构融合——本质是「跳过整个 K/V 块」。理论稀疏要落成真加速，必须对齐硬件的分块习惯。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sink"><span class="num">4</span>attention sink 与 StreamingLLM</h2>
+  <h3>一个救命的发现：attention sink 与 StreamingLLM</h3>  <p>现在讲本模块最反直觉、也最有名的发现。设想一个流式场景：模型要处理永不结束的输入（如长对话），显存有限，于是很自然地想——<strong>只保留最近的 W 个 token（滑窗），丢掉更早的</strong>。听起来合理，但 Xiao et al. 2023 发现：<strong>这样做会让模型性能急剧崩溃</strong>，困惑度暴涨。</p>  <p>更奇怪的是<strong>为什么</strong>崩。他们追查发现：序列<strong>最前面的几个 token</strong>（哪怕是毫无语义的起始符）吸走了<em>大量</em>注意力权重——即使后面的 token 与它们语义无关。一旦滑窗把这几个开头 token 丢掉，注意力分布就彻底乱了。这个现象叫 <span class="term">attention sink</span>（注意力汇聚点）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么会有 sink？因为 softmax<strong>强制注意力权重和为 1</strong>——每个 query 必须把它的「注意力预算」全部分配出去，哪怕它其实<em>什么都不想看</em>。于是模型学会了一个技巧：把多余的注意力<strong>倾倒</strong>到几个固定的、靠前的 token 上，当作「泄压阀」。这几个 sink token 成了注意力的垃圾桶，本身不传递信息，但它们的存在让 softmax 有地方安放多余的权重。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>证据很硬：去掉 sink、纯滑窗，困惑度暴涨；保留最前面几个 token 当 sink、其余用滑窗，困惑度立刻恢复正常。这就是 <span class="term">StreamingLLM</span> 的全部配方——<strong>几个 sink token（始终保留）+ 一个滑动窗口（保留最近的）</strong>——让模型能在不重置、不爆显存的情况下处理<em>无限长</em>的流式输入。简单到近乎作弊，却极其有效。</p></div>
+  </div>  <div class="ascii">StreamingLLM 的 KV 保留策略（处理到第 t 个 token 时）：
+
+  [sink][sink]  ......(丢弃中间)......  [滑动窗口最近 W 个]
+   ↑保留前几个                            ↑保留最近 W 个
+   (注意力泄压阀)                          (局部上下文)
+
+  纯滑窗（丢掉 sink）：困惑度暴涨 ✗
+  sink + 滑窗：       困惑度稳定，可处理无限流 ✓</div>  <div class="callout danger"><span class="label"></span>
+    <p>attention sink 是「机制理解能直接换来工程收益」的典范。如果不知道 sink 的存在，你会理所当然地丢掉开头 token、然后困惑为什么模型崩了。知道了，只需多保留 4 个 token，就解锁了无限流式推理。本模块 notebook 会让你<strong>亲手复现</strong>：构造一个有 sink 行为的注意力、对比「丢 sink 的纯滑窗」与「保 sink 的滑窗」，看到前者注意力分布失衡、后者保持健康。这是理解 > 调参的最好例子。</p>
+  </div>  <p>attention sink 还有一个更深的启示，它把本模块和模块 05 串了起来：既然模型会自发地把注意力集中在少数 token（sink 是其极端形式），那么<strong>「哪些 token 重要」是可以被观测和利用的</strong>。StreamingLLM 利用的是「最靠前的 token 重要」这一固定规律；而模块 05 的 H2O 会更进一步——动态地统计每个 token 累积吸走了多少注意力（heavy hitter），据此决定 KV cache 里保留谁、淘汰谁。你会发现 H2O 的保留策略（heavy hitter + 最近窗口）在结构上正是 StreamingLLM（sink + 滑窗）的「数据驱动版」。稀疏「不算哪些连接」与 KV 淘汰「不存哪些 token」，源头是同一个观察。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="global"><span class="num">5</span>Longformer 与 BigBird</h2>
+  <h3>把局部和全局拼起来：Longformer 与 BigBird</h3>  <p>纯滑窗有个根本短板：某些 token（如分类任务的 [CLS]、问答里的问题 token）需要被<strong>所有</strong>位置看到、也需要看到<strong>所有</strong>位置——它们是天然的「全局枢纽」，局部窗口装不下。解法是给稀疏模式加上少量<span class="term">global token</span>（全局 token）。</p>  <p><strong>Longformer</strong>（Beltagy et al. 2020）= <strong>滑窗（局部）+ 少量任务相关的全局 token</strong>。全局 token 与所有位置双向连接，充当信息高速公路；其余 token 走局部滑窗。复杂度仍是线性，却补回了「全局信息一跳可达」的能力。</p>  <p><strong>BigBird</strong>（Zaheer et al. 2020）更进一步 = <strong>滑窗 + 全局 token + 随机连接</strong>三者结合。随机连接的作用是<em>缩短任意两点间的「图距离」</em>：在一个只有局部边的图上，两个远点要走很多跳才能互通；加少量随机长边，就能让信息几跳内传遍全图（小世界网络的思想）。BigBird 在理论上能近似全注意力、且图灵完备。</p>  <p>一个容易忽视的复杂度陷阱：<strong>全局 token 的数量 <code>g</code> 必须是常数（或 <code>o(n)</code>），线性复杂度才成立</strong>。每个全局 token 与所有 <code>n</code> 个位置双向连接，贡献 <code>O(g·n)</code> 的计算；只要 <code>g</code> 固定（如几个 [CLS]/问题 token），这一项就是 <code>O(n)</code>，与滑窗的 <code>O(n·W)</code> 同阶。但若让「太多」token 变全局（<code>g</code> 随 <code>n</code> 增长），<code>O(g·n)</code> 就退化回二次——稀疏的好处荡然无存。这解释了为什么 Longformer/BigBird 都把全局 token 限制成<em>少数任务关键位置</em>，而非随意添加：全局连接是「一跳可达」的高速公路，但修太多高速公路，本身就成了二次开销。</p>  <table>
+    <thead><tr><th>方法</th><th>稀疏模式 = 哪些连接</th><th>复杂度</th><th>关键贡献</th></tr></thead>
+    <tbody>
+      <tr><td>滑窗 SWA</td><td>局部窗口</td><td><code>O(n·W)</code></td><td>局部性 + 多层感受野</td></tr>
+      <tr><td>StreamingLLM</td><td>sink + 局部窗口</td><td><code>O(n·W)</code></td><td>attention sink → 无限流</td></tr>
+      <tr><td>Longformer</td><td>局部 + 全局 token</td><td><code>O(n·W)</code></td><td>全局枢纽一跳可达</td></tr>
+      <tr><td>BigBird</td><td>局部 + 全局 + 随机</td><td><code>O(n·W)</code></td><td>随机边 → 近似全注意力</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>把这几种方法放在一起，会看到一个统一的「积木」视角：<strong>局部块（管邻近）+ 全局块（管枢纽）+ 随机块（管远程兜底）+ sink（管 softmax 泄压）</strong>。几乎所有稀疏注意力都是这几种积木的不同配方。理解了每种积木补的是什么洞，你就能看懂任何一篇新的稀疏注意力论文，甚至自己为特定任务搭一个稀疏模式——这正是 notebook 练习要练的能力。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="recall"><span class="num">6</span>用召回率量化稀疏的损失</h2>
+  <h3>稀疏化损失了什么？用召回率量化</h3>  <p>稀疏注意力是<strong>近似</strong>（不像 FlashAttention 那样精确），所以必须能<strong>量化它漏掉了多少</strong>。最直接的指标是<span class="term">召回率</span>（recall）：<strong>稀疏模式保留下来的注意力质量，占全注意力的比例</strong>。</p>  <p>一种实用算法：对每个 query，看全注意力下权重最大的 top-k 个 key（真正重要的连接），数稀疏掩码保留了其中几个。也可以直接算<strong>保留连接的注意力权重之和</strong>（全注意力 softmax 后，被掩码保留的位置的概率总和）——这个「概率质量召回」更连续、更能反映损失。</p>  <div class="math-block">\[\text{recall}_i = \frac{\sum_{j:\,\text{Mask}_{ij}=1} P^{\text{full}}_{ij}}{\sum_j P^{\text{full}}_{ij}} = \sum_{j:\,\text{Mask}_{ij}=1} P^{\text{full}}_{ij}\]</div>  <p>（因为全注意力的 <code>P^full</code> 每行和为 1，分母 = 1，所以召回率就是「被保留位置的概率质量之和」。）召回率 = 1 表示稀疏没漏任何重要连接；越低表示漏得越多。</p>  <p>用一个最小例子把这把尺子的刻度看清。设某 query 对 6 个 key 的全注意力权重是 <code>P^full = [0.40, 0.30, 0.05, 0.03, 0.02, 0.20]</code>（已归一化，和为 1）。注意位置 0、1 是邻近的强连接，位置 5 是一个远处的强连接（比如「针」）。现在比较两种稀疏模式：</p>  <table>
+    <thead><tr><th>稀疏模式</th><th>保留的位置</th><th>保留的权重之和 = 召回率</th><th>漏掉了什么</th></tr></thead>
+    <tbody>
+      <tr><td>滑窗 W=2（只看最近 2 个）</td><td>{4, 5}</td><td>0.02+0.20 = <strong>0.22</strong></td><td>邻近强连接 0.40+0.30，灾难</td></tr>
+      <tr><td>滑窗 W=2 + sink(位置0)</td><td>{0, 4, 5}</td><td>0.40+0.02+0.20 = <strong>0.62</strong></td><td>位置 1 的 0.30</td></tr>
+      <tr><td>局部窗(0,1)+全局(5)</td><td>{0, 1, 5}</td><td>0.40+0.30+0.20 = <strong>0.90</strong></td><td>仅琐碎的 0.10</td></tr>
+    </tbody>
+  </table>  <p>这张小表把全模块的论点一次性坐实：<strong>同样是省算力，「保留哪些连接」决定召回率天差地别</strong>。纯小窗口可能把最重要的连接全漏掉（0.22）；补一个 sink 立刻回血（0.62）；而若稀疏模式恰好覆盖了那个远处的强连接（位置 5），召回率飙到 0.90。这也精确演示了为什么纯滑窗在长程检索上危险——若「针」（位置 5 的 0.20）落在窗口外，它对召回率的那 0.20 贡献就凭空蒸发，而下游任务可能正需要它。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>召回率给了你一把诚实的尺子：调窗口大小 <code>W</code>、加不加 sink、加几个全局 token，每个选择都能用召回率量化它「保住了多少」。这把「稀疏化是玄学」变成了「稀疏化是可测量的工程权衡」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要诚实：召回率衡量的是<strong>注意力权重</strong>层面的保留，不直接等于<strong>下游任务</strong>的表现。一个稀疏模式可能召回率不高，却恰好保住了任务真正需要的那几个连接（或反之）。所以召回率是<em>快速诊断</em>，最终判定仍要靠真实长上下文评测（模块 05 的 NIAH/RULER）——这与模块 01 的代理指标是同一种「先快筛、再实测」的两层逻辑。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个具体而重要的失败模式：纯滑窗在<strong>长程检索</strong>任务上召回率会很低——因为「针」可能落在窗口之外，被完全漏看。这正是为什么纯滑窗模型在大海捞针（NIAH）上常常失败，而加了全局 token 或与精确注意力混合的模型表现更好。notebook 会构造这个场景，让你亲眼看到：同样的滑窗，针在窗口内召回率≈1、针在窗口外召回率≈0。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="synergy"><span class="num">7</span>稀疏与其它杠杆的协同</h2>
+  <h3>稀疏与其它杠杆的协同</h3>  <p>稀疏注意力不是孤立的，它和本课其它技术深度咬合：</p>  <ul>
+    <li><strong>稀疏 × FlashAttention</strong>：块稀疏的本质就是「在 FlashAttention 的分块循环里跳过某些 K/V 块」。两者天作之合——FlashAttention 提供高效的分块框架，稀疏提供「哪些块可跳」的规则。这是工业稀疏注意力的标准实现方式。</li>
+    <li><strong>稀疏 × 因果掩码</strong>：因果注意力本身就是一种稀疏（下三角）。滑窗 + 因果 = 一个带状下三角掩码，纯未来块和窗口外的过去块都跳过，省得更多。</li>
+    <li><strong>稀疏 ↔ KV 淘汰（模块 05）</strong>：稀疏问「哪些连接不算」，KV 淘汰问「哪些 token 的 KV 不存」——两者是同一个问题的两面（前者省算力，后者省显存）。attention sink 的发现同时启发了二者：H2O 类方法保留 heavy hitter + 最近窗口，结构上正是 StreamingLLM 的 sink + 滑窗。</li>
+  </ul>  <p>实践中的选择经验：<strong>局部性强的任务</strong>（多数语言建模、长文档）用滑窗 + sink 往往够好且最省；<strong>需要全局枢纽</strong>（分类、问答）加少量全局 token（Longformer 式）；<strong>追求接近全注意力的质量</strong>用 BigBird 式的局部+全局+随机；<strong>流式无限输入</strong>用 StreamingLLM。但牢记：稀疏是<em>近似</em>，上之前先确认 FlashAttention（精确、免费）已经不够用，再用召回率和真实评测确认稀疏的损失可接受。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>固定模式 vs 数据相关稀疏</strong>：滑窗/BigBird 是固定模式（不看内容）。Reformer（LSH）、Routing Transformer 等按内容动态选连接，理论上更精准，但路由开销与硬件友好性是难点。哪种更好仍随任务而异。</li>
+    <li><strong>稀疏的可学习性</strong>：能否让模型自己学出最优稀疏模式，而非人工设计？可微的稀疏掩码、可学习的 token 重要性是活跃方向。</li>
+    <li><strong>attention sink 的理论</strong>：sink 现象虽被广泛利用，其成因（softmax 必须分配满预算）的完整理论、以及能否通过改 softmax（如 off-by-one / softmax+1）从根上消除对 sink 的依赖，仍在研究。</li>
+    <li><strong>稀疏 vs 线性的取舍</strong>：稀疏保留了精确注意力的形式（只是少算），线性注意力（模块 04）彻底换掉了 softmax。两条降复杂度的路各有利弊，长上下文下如何选择、能否结合，是开放问题。</li>
+    <li><strong>超长下的有效性</strong>：稀疏让 1M 算得起，但「针在窗口外就漏看」的根本短板在超长下更突出。如何在稀疏预算内保证长程检索不崩，直接关系模块 05 的评测表现。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Beltagy et al. 2020（Longformer，局部+全局）、Zaheer et al. 2020（BigBird，加随机）、Xiao et al. 2023（StreamingLLM，attention sink，本模块的明星发现）、Child et al. 2019（Sparse Transformer，dilated/strided 之源）、Jiang et al. 2023（Mistral，滑窗的工业落地）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_flash_attention/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · FlashAttention 与 IO 复杂度</div></a>
+    <a class="next" href="../04_linear_ssm/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 线性注意力与 SSM</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · N-gram 语言模型</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · N-gram 语言模型</h1>
+  <p class="subtitle">给词序列赋概率 —— 马尔可夫假设、MLE、零概率灾难与平滑（Laplace/Good-Turing/Kneser-Ney）、困惑度、回退与插值，纯 numpy 从零并验证概率归一</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">概率（条件概率/链式法则）、对数运算、一点点信息论（熵/交叉熵）、模块 00</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_ngram_lm.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">SLP 第 3 章、Chen & Goodman 1999、Kneser & Ney 1995、Bengio 2003</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#lm">什么是语言模型</a></li>
+      <li><a href="#ngram">马尔可夫假设与 n-gram MLE</a></li>
+      <li><a href="#smooth">平滑：从 Laplace 到 Kneser-Ney</a></li>
+      <li><a href="#cont">续延概率：Kneser-Ney 的精髓</a></li>
+      <li><a href="#ppl">困惑度：语言模型的尺子</a></li>
+      <li><a href="#backoff">回退与插值</a></li>
+      <li><a href="#pipeline">完整流水线与实践要点</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="lm"><span class="num">1</span>什么是语言模型</h2>
+  <p>上一模块我们学会了把单个<strong>词</strong>表示成向量。这一模块上一个台阶：给整个<strong>词序列</strong>赋概率。这就是 <span class="term">language model</span>（语言模型）要做的事——回答「这句话有多像人话？」</p>  <p>形式上，语言模型给任意词序列 $w_1,w_2,\dots,w_n$ 一个概率 $P(w_1^n)$。它有什么用？太有用了：语音识别要在「recognize speech」和「wreck a nice beach」里选更可能的；机器翻译要在多个候选译文里挑最流畅的；输入法要预测你下一个字；拼写纠错要判断「their」还是「there」。而今天的 GPT，其训练目标——<strong>预测下一个词</strong>——正是语言模型的现代化身。可以说，<strong>语言模型是 NLP 最核心的对象，没有之一</strong>。</p>  <p>用概率的链式法则，任意序列的概率可以精确分解为一串条件概率：</p>  <div class="math-block">\[P(w_1^n) = \prod_{t=1}^{n} P(w_t \mid w_1, w_2, \dots, w_{t-1})\]</div>  <p>这个式子是<strong>精确</strong>的，但没法直接用：$P(w_t\mid w_1^{t-1})$ 要求我们估计「在任意长的前文之后，下一个词是什么」的概率。前文可以无限长、组合数爆炸，任何语料都见不全。我们需要一个<strong>近似</strong>——这就是马尔可夫假设登场的地方。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>语言模型就是「下一个词预测器」。给它一段前文，它告诉你每个可能的下一个词有多大概率。把每一步的概率乘起来，就是整句话的「像人话程度」。GPT 是这个想法用神经网络做到极致的版本。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>链式法则 $P(w_1^n)=\prod_t P(w_t\mid w_1^{t-1})$ 把联合概率分解为条件概率之积，是精确的恒等式。困难在于条件 $w_1^{t-1}$ 的长度随 $t$ 增长，状态空间 $V^{t-1}$ 指数爆炸。n-gram 用有限历史近似，神经语言模型用隐状态压缩历史——两条路线，同一个问题。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>本模块的核心问题：<strong>如何从有限语料估计「下一个词」的概率，且对没见过的词串也给出合理的非零概率？</strong>——答案是 n-gram（马尔可夫假设）+ 平滑（解决零概率）+ 用困惑度评测。学完你能从零实现一个带 Kneser-Ney 平滑的 n-gram 模型并算出它的困惑度。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ngram"><span class="num">2</span>马尔可夫假设与 n-gram MLE</h2>
+  <p><span class="term">Markov assumption</span>（马尔可夫假设）说：<strong>下一个词只依赖于前面有限个词</strong>，而非整个历史。取前 $n-1$ 个词，就得到 <span class="term">n-gram</span> 模型：</p>  <div class="math-block">\[P(w_t \mid w_1^{t-1}) \approx P(w_t \mid w_{t-n+1}^{t-1})\]</div>  <p>$n=1$ 是 <strong>unigram</strong>（每个词独立，$P(w_t)$）；$n=2$ 是 <strong>bigram</strong>（只看前一个词，$P(w_t\mid w_{t-1})$）；$n=3$ 是 <strong>trigram</strong>（看前两个词）。$n$ 越大，上下文越长、模型越强，但数据稀疏问题越严重——trigram 要见过所有三词组合才能估准，而组合数是 $V^3$。这是 n-gram 的根本张力：<strong>上下文长度 vs 数据稀疏</strong>。</p>  <p>怎么估计这些条件概率？最朴素的是 <span class="term">maximum likelihood estimation</span>（MLE，最大似然估计）：直接数频率。bigram 的 MLE 是：</p>  <div class="math-block">\[P_{\text{MLE}}(w_t \mid w_{t-1}) = \frac{\mathrm{count}(w_{t-1}, w_t)}{\mathrm{count}(w_{t-1})}\]</div>  <p>即「$w_{t-1}$ 后面跟 $w_t$ 的次数」除以「$w_{t-1}$ 出现的总次数」。直观、无偏、易算。我们还需要在句子两端加特殊符号 <code>&lt;s&gt;</code>（句首）和 <code>&lt;/s&gt;</code>（句尾），前者提供第一个词的上下文，后者让模型学会「何时结束」（否则句子概率无法正确归一）。</p>  <p>为什么 MLE 叫「最大似然」？因为在「各 n-gram 计数服从多项分布」的假设下，频率比 $\frac{c(w_1^n)}{c(w_1^{n-1})}$ 恰好是<strong>让训练数据出现概率最大</strong>的那组参数——可以用拉格朗日乘子法在「概率和为 1」的约束下求导验证。这也解释了 MLE 的双刃性：它对<em>见过的</em>数据拟合到极致（无偏），却也因此对<em>没见过的</em>数据毫不留情地判零——它只忠于训练集，不为泛化留余地。平滑正是给这份「过度忠诚」打的补丁。</p>  <div class="callout warn"><span class="label">零概率灾难</span>
+    <p>MLE 有一个致命缺陷：它给任何<strong>训练中没出现过的 n-gram 赋概率 0</strong>。而语言的组合是无穷的——再大的语料也见不全所有合理的词串。一旦测试句里有一个没见过的 bigram，整句概率就是 0、困惑度变成无穷大。这就是 <strong>零概率问题（zero-probability problem）</strong>，是 n-gram 模型必须解决的头号难题。下一节的平滑就是为它而生。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="smooth"><span class="num">3</span>平滑：从 Laplace 到 Kneser-Ney</h2>
+  <p>平滑（<span class="term">smoothing</span>）的核心思想朴素而深刻：<strong>从「见过的」事件那里匀一点概率质量给「没见过的」事件</strong>，让每个 n-gram 都有非零概率。最简单的是 <span class="term">Laplace</span>（加一）平滑：给每个计数都加 1 再归一。</p>  <div class="math-block">\[P_{\text{Laplace}}(w_t \mid w_{t-1}) = \frac{\mathrm{count}(w_{t-1}, w_t) + 1}{\mathrm{count}(w_{t-1}) + V}\]</div>  <p>分母加 $V$ 是为了保持归一（因为每个可能的后继词都加了 1，共加了 $V$）。Laplace 简单，但<strong>削峰太狠</strong>：词表大时，「加一」对高频 bigram 几乎没影响，却把巨量概率质量分给了海量从未出现的组合，导致见过的事件概率被严重低估。它主要作为教学起点。</p>  <p>更精细的是 <span class="term">Good-Turing</span>：用「出现 $r+1$ 次的 n-gram 种类数 $N_{r+1}$」来重估「出现 $r$ 次的 n-gram」的概率，把出现次数 $r$ 调整为 $r^*=(r+1)\frac{N_{r+1}}{N_r}$。它的洞察是：<strong>用「只出现一次的词有多少」来估计「还有多少没出现的词」</strong>。但它的真正威力，在被 Kneser-Ney 继承后才完全释放。</p>  <p>Good-Turing 的一个迷人之处是它的来历：它最早出自二战密码学家 Turing 与统计学家 Good 估计「还有多少种从没截获过的德军密码本」的工作——本质问题与「语料里还有多少种没见过的 n-gram」一模一样。它给出的关键量是：<strong>把出现 1 次的事件总数当作未见事件的概率质量</strong>（$N_1/N$），再把这部分质量按规律分给所有未见事件。直觉是：如果你见过很多「只出现一次」的词，说明语料还远没饱和、未见的词必然也很多，该多留点概率给它们。这个思想被 Kneser-Ney 的绝对折扣继承并简化。</p>  <p>公认最强的 n-gram 平滑是 <span class="term">Kneser-Ney</span>（KN），它有两个关键创新。第一个是 <span class="term">absolute discounting</span>（绝对折扣）：不按比例缩放，而是从每个非零计数里<strong>减去一个固定的折扣 $d$</strong>（如 0.75），把省下的质量匀给低阶模型。这符合 Good-Turing 的经验规律：高低频计数被「打折」的绝对量差不多。为什么是「绝对」折扣而非「比例」折扣？因为 Good-Turing 的经验观察表明，无论一个 n-gram 出现 2 次还是 200 次，它被「修正」掉的绝对量都接近一个常数 $d$——对高频项（200→199.25）几乎无感，对低频项（2→1.25）影响显著，恰好把概率从「可能高估的低频项」匀给未见项，这正是我们想要的。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>平滑就是「劫富济贫」：见过很多次的词串，匀出一点点概率，分给那些一次没见过、但合理的词串。Laplace 是粗暴地人人加一；Kneser-Ney 是精细地、有原则地分配，所以效果最好。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>绝对折扣后的 bigram：$P(w\mid w')=\frac{\max(c(w',w)-d,0)}{c(w')}+\lambda(w')\,P_{\text{cont}}(w)$。第一项是打折后的高阶估计，$\lambda(w')$ 是把折扣出的质量归一后的回退权重，$P_{\text{cont}}$ 是下一节的续延概率。这个结构（高阶折扣 + 低阶回退）是所有现代平滑的范式。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cont"><span class="num">4</span>续延概率：Kneser-Ney 的精髓</h2>
+  <p>Kneser-Ney 的第二个、也是最精妙的创新是 <span class="term">continuation probability</span>（续延概率）。它回答一个微妙的问题：<strong>低阶（回退）模型里，一个词的概率到底该用什么估计？</strong></p>  <p>先看一个经典例子。假设你要补全「I can't see without my reading ___」。候选有 <code>glasses</code> 和 <code>Francisco</code>。在很多语料里 <code>Francisco</code> 其实<strong>词频很高</strong>（因为 San Francisco 出现很多次）。如果回退到 unigram 用词频估计，模型会觉得 Francisco 很可能——这显然错了。</p>  <p>问题出在哪？<code>Francisco</code> 虽然高频，但它几乎<strong>只跟在 San 后面</strong>——它作为「新语境里的续延词」的能力很差。KN 的洞察是：低阶模型里，一个词的概率应该正比于它<strong>跟在多少种不同的词后面</strong>（即有多少种不同的前文），而非它出现多少次：</p>  <div class="math-block">\[P_{\text{cont}}(w) = \frac{|\{w' : c(w', w) > 0\}|}{|\{(w'', w''') : c(w'', w''') > 0\}|}\]</div>  <p>分子是「$w$ 前面出现过的不同词的种数」，分母是「所有不同 bigram 的总数」。<code>Francisco</code> 的分子很小（几乎只有 San），所以续延概率低；而 <code>glasses</code> 跟在很多词后面（reading、his、broken…），续延概率高。<strong>KN 用「语境多样性」取代「频次」来估计低阶概率</strong>——这是它碾压其他平滑的根本原因。</p>  <div class="ascii">为什么 Kneser-Ney 用续延概率而非词频？
+
+  Francisco: 词频高(出现多次)，但 99% 跟在 San 后面
+             =&gt; 前文种类少 =&gt; 续延概率 LOW  ✅ (它不是个好的「通用续延词」)
+
+  glasses:   词频中等，但跟在 reading/his/broken/my... 后面
+             =&gt; 前文种类多 =&gt; 续延概率 HIGH ✅
+
+  朴素回退(用词频): 错判 Francisco 很可能
+  KN 回退(用续延):  正确判 glasses 更可能</div>  <div class="callout paper"><span class="label"></span>
+    <p>Kneser-Ney（及其 modified 版本）在 Chen & Goodman 1999 的大规模实证中全面胜出，是神经语言模型之前的<strong>黄金标准</strong>。续延概率的思想——「重要的不是出现多少次，而是出现在多少种不同语境」——极其深刻，至今影响着各种平滑与正则化设计。原始论文见 references（Kneser & Ney 1995）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ppl"><span class="num">5</span>困惑度：语言模型的尺子</h2>
+  <p>有了能赋非零概率的语言模型，怎么评判它好不好？最重要的内在指标是 <span class="term">perplexity</span>（困惑度，PPL）。它的定义是测试集概率的几何平均的倒数：</p>  <div class="math-block">\[\mathrm{PPL}(w_1^N) = P(w_1^N)^{-\frac{1}{N}} = \exp\!\Big(-\frac{1}{N}\sum_{t=1}^{N}\log P(w_t \mid w_{t-n+1}^{t-1})\Big)\]</div>  <p>怎么理解这个数？困惑度是模型在每一步面临的<strong>有效分支数</strong>——平均而言，模型觉得「下一个词有多少种等可能的选择」。PPL=1 意味着模型完全确定（每步都笃定下一个词）；PPL=$V$ 意味着模型毫无信息（在整个词表里均匀瞎猜）。<strong>困惑度越低，模型越好</strong>。一个在英文上 PPL=100 的模型，大致相当于每个位置在 100 个词里挑——比在几万词里瞎猜（PPL≈词表大小）强得多。</p>  <p>困惑度其实就是<strong>交叉熵</strong>的指数：$\mathrm{PPL}=\exp(H)$，其中 $H=-\frac1N\sum\log P$ 是每词平均负对数似然（以 $e$ 为底则 PPL 用 $\exp$，以 2 为底则用 $2^H$，单位是比特）。这把语言模型评测和信息论焊死在一起：困惑度低 = 交叉熵低 = 模型对语言的「编码」更短 = 模型更懂语言。从 n-gram 到 GPT，困惑度始终是衡量语言模型的通用标尺。</p>  <p>为什么困惑度用<strong>几何平均</strong>（而非算术平均）的倒数？因为整句概率是每词条件概率的<em>连乘</em>，要得到「每词的代表性概率」自然该开 $N$ 次方（几何平均），其倒数才是「等价的均匀分支数」。这也解释了困惑度对<strong>单个极低概率词</strong>极其敏感：一个被模型判为 $10^{-9}$ 的词，会把整句的几何平均概率狠狠拉低、困惑度飙升——这正是它该有的行为（模型在某处严重失误就该被重罚），也是为什么平滑（不让任何词概率为 0）对困惑度如此关键。一个未平滑模型遇到任意未见词，困惑度直接 $=\infty$。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>困惑度就是「模型有多懵」。每读到一个词，模型心里大概有几个候选？候选越少（越笃定且对），困惑度越低。它把「这个模型多像人话」量化成了一个可比较的数字。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，PPL 是测试集上每词几何平均概率的倒数。关键纪律：① 必须在<strong>留出的测试集</strong>上算（训练集上算会过于乐观）；② 比较两个模型的 PPL 必须用<strong>同一个词表和同样的 OOV/分词处理</strong>（否则不可比）；③ 平滑保证测试集里的未见 n-gram 不会让 PPL 爆成无穷。</p></div>
+  </div>  <div class="callout danger"><span class="label">可比性陷阱</span>
+    <p>困惑度只是<strong>内在评测（intrinsic）</strong>——它衡量模型对语言的统计拟合，但<em>不直接</em>衡量它在下游任务（翻译质量、问答正确率）上的表现。PPL 低通常意味着下游好，但二者并非完全一致。报告 PPL 时务必说清：用了什么测试集、什么词表、怎么处理 OOV——否则数字之间不可比，这是论文里常见的陷阱。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="backoff"><span class="num">6</span>回退与插值</h2>
+  <p>当高阶 n-gram 没见过时，怎么利用低阶信息？两种经典策略：回退与插值。</p>  <h3>回退 backoff</h3>  <p><span class="term">backoff</span>（回退）的逻辑是「能用高阶就用高阶，不行才退而求其次」：如果 trigram $c(w_{t-2},w_{t-1},w_t)>0$ 就用 trigram；否则<strong>退</strong>到 bigram；再不行退到 unigram。Katz backoff 用 Good-Turing 折扣出的概率质量分给回退项，并精心设计回退权重 $\alpha$ 保证总概率归一。</p>  <div class="math-block">\[P_{\text{katz}}(w_t \mid w_{t-1}) = \begin{cases} P^*(w_t \mid w_{t-1}) & c(w_{t-1}, w_t) > 0 \\ \alpha(w_{t-1})\, P_{\text{katz}}(w_t) & \text{otherwise} \end{cases}\]</div>  <h3>插值 interpolation</h3>  <p><span class="term">interpolation</span>（插值）则<strong>总是</strong>把各阶混合起来，无论高阶见没见过：</p>  <div class="math-block">\[P_{\text{interp}}(w_t \mid w_{t-2}, w_{t-1}) = \lambda_3 P_3 + \lambda_2 P_2 + \lambda_1 P_1, \quad \sum_i \lambda_i = 1\]</div>  <p>$\lambda$ 是各阶权重，和为 1。它们可以在留出的验证集上学（用 EM 或网格搜索调到困惑度最低）。插值与回退的区别：回退是「非此即彼」（高阶有就只用高阶），插值是「兼收并蓄」（永远混合所有阶）。<strong>Kneser-Ney 本质是一种插值平滑</strong>——绝对折扣的高阶 + 续延概率的低阶，递归地插值到底。</p>  <p>notebook 会实现一个<strong>插值版 Kneser-Ney</strong>：高阶用绝对折扣，回退权重由「折扣出的总质量」决定，低阶用续延概率，并验证它在每个上下文下<strong>概率严格归一化</strong>（所有后继词概率和为 1）——这是平滑实现正确性的硬指标。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话区分：<strong>回退 = 高阶不行才退到低阶（用一个）；插值 = 永远把各阶加权混合（用全部）</strong>。现代实践里插值（尤其是 modified Kneser-Ney 插值）通常更稳更好，这也是为什么 KN 选择插值结构。理解这两者，你就掌握了 n-gram 平滑的全部骨架。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">7</span>完整流水线与实践要点</h2>
+  <p>把零件拼成一个完整的 n-gram 语言模型工作流，并理清几个实践要点。一个端到端的 n-gram LM 长这样：</p>  <div class="ascii">n-gram 语言模型 训练与评测流水线
+
+  训练语料 ──分词+加&lt;s&gt;&lt;/s&gt;──► token 序列
+     │
+     ▼ (滑窗数 n-gram)
+  统计 unigram/bigram/trigram 计数 + 续延计数
+     │
+     ▼ (绝对折扣 d + 续延概率 + 回退权重)
+  Kneser-Ney 概率表 P(w | 前文)  ──验证每个上下文下 Σ P = 1
+     │
+     ▼ (在留出测试集上)
+  困惑度 PPL = exp(-1/N Σ log P(w_t | 前文))
+     │
+     ▼
+  对比: MLE(会爆无穷) vs Laplace vs KN  =&gt; KN 的 PPL 最低</div>  <p>几个常困扰初学者的实践要点：</p>  <ul>
+    <li><strong>OOV（未登录词）处理。</strong> 测试集里总有训练时没见过的词。标准做法：训练时把低频词（如只出现 1 次的）替换成 <code>&lt;unk&gt;</code>，于是 <code>&lt;unk&gt;</code> 获得概率，测试时未见词都映射到它。否则未见词的 unigram 概率为 0，连 KN 也救不了。</li>
+    <li><strong>一定在对数空间算。</strong> 一句话的概率是几十个小于 1 的数连乘，会迅速下溢为 0。把概率取对数、连乘变<strong>连加</strong>（$\log P=\sum\log p$），是 LM 计算的铁律（和模块 03 的对数空间前向一脉相承）。</li>
+    <li><strong>数据划分。</strong> 困惑度必须在<strong>独立的测试集</strong>上算；调 $\lambda$、折扣 $d$ 等超参用<strong>验证集</strong>。在训练集上算 PPL 会严重高估模型。</li>
+    <li><strong>n 的选择。</strong> $n$ 越大越能捕捉长程依赖，但稀疏越严重、模型越大。实践中 trigram/4-gram 配 KN 是经典甜点；再长就该上神经语言模型了。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>整个 n-gram LM 就是：数各阶的 n-gram 频率、用平滑把零概率补上、在对数空间把每个词的概率加起来、取指数得困惑度。简单的计数 + 精巧的平滑，撑起了神经网络之前几十年的语言模型。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从信息论看，一个好的语言模型 = 一个好的<strong>压缩器</strong>：交叉熵 $H$ 是用该模型编码语料所需的每词平均比特数，PPL=$2^H$。降低困惑度等价于找到更短的编码、即更懂语言的统计规律。这个「语言建模 = 压缩」的视角，从 Shannon 一直贯穿到今天关于大模型的讨论。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>n-gram 是统计语言模型的起点，但它有结构性的天花板，这些天花板正是神经语言模型要突破的：</p>  <ul>
+    <li><strong>稀疏与维度灾难</strong>：n-gram 把词当离散符号，见过「good」帮不了没见过的「great」（它们是不同的符号）。<strong>Bengio 2003 的神经语言模型</strong> 用词向量（正是模块 01！）解决这个问题——相似的词有相似的向量，于是泛化成为可能。这是经典 n-gram 通向现代的关键桥梁。</li>
+    <li><strong>有限上下文</strong>：马尔可夫假设只看前 $n-1$ 个词，无法捕捉长程依赖（「我在法国长大……所以我说一口流利的 ___」需要很远的上下文）。<strong>RNN/LSTM</strong> 用隐状态压缩任意长历史，<strong>Transformer</strong> 用注意力直接连接远距离词——彻底打破了 n 的限制。</li>
+    <li><strong>平滑是打补丁</strong>：KN 等平滑是对稀疏问题的精巧补救，但本质是工程技巧。神经语言模型通过连续表示<em>从根本上</em>缓解了稀疏，不再需要这些补丁。</li>
+    <li><strong>但 n-gram 没有消失</strong>：它仍是极快的基线、仍用于资源受限场景（移动端输入法）、仍用于给神经模型做插值或重打分。困惑度、交叉熵这些评测传统更是被完整继承。</li>
+  </ul>  <p>把整条线索连起来看：<strong>n-gram 定义了「语言模型」这个问题和「困惑度」这把尺子；模块 01 的词向量解决了 n-gram 的稀疏；二者结合（神经语言模型）通向了今天的大模型</strong>。你今天看到的 GPT，其损失函数（预测下一个词的负对数似然）、其评测（困惑度）、其本质（序列概率建模），处处是本模块的遗产。理解了 n-gram 与平滑，你就理解了所有语言模型——从 1980 年代到今天——的共同灵魂。</p>  <div class="callout paper"><span class="label"></span>
+    <p>延伸必读（见 <code>../references.md</code>）：Jurafsky & Martin《SLP》第 3 章（n-gram 与平滑的最佳系统讲解）、Chen & Goodman 1999（平滑的权威实证，确立 KN）、Kneser & Ney 1995（KN 原始论文）、Bengio 2003（神经语言模型，从 n-gram 到神经的桥梁）。下一站模块 03，我们从「给序列赋概率」转向「给序列的每个词标隐藏标签」——隐马尔可夫模型。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_word_embeddings/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 词嵌入 word2vec</div></a>
+    <a class="next" href="../03_hmm/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 隐马尔可夫模型 HMM</div></a>
+  </div>
+
+</div>
+</body>
+</html>

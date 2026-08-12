@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · SSM 与 Mamba</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · SSM 与 Mamba</h1>
+  <p class="subtitle">线性时间序列建模 —— 从连续状态空间到离散 SSM、递推/卷积等价、HiPPO，再到 Mamba 的选择性与并行扫描，全部从零手写</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">线性递推、卷积、矩阵指数、RNN（C15）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_ssm_mamba.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Gu 2021 (S4)、Gu&Dao 2023 (Mamba)、Dao&Gu 2024 (SSD)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么要绕开注意力</a></li>
+      <li><a href="#cont">连续状态空间模型</a></li>
+      <li><a href="#disc">离散化与 Δ</a></li>
+      <li><a href="#dual">递推 vs 卷积：一份参数两种算法</a></li>
+      <li><a href="#hippo">HiPPO 与 S4 的长程记忆</a></li>
+      <li><a href="#mamba">Mamba：选择性 SSM</a></li>
+      <li><a href="#scan">并行扫描</a></li>
+      <li><a href="#frontier">研究前沿</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么要绕开注意力</h2>
+  <p>注意力的代价是 <code>O(T²)</code> 的计算与 <code>O(T)</code> 的 KV cache——序列越长越吃不消，这是前四个模块反复在对抗的根本约束。<span class="term">SSM</span>（State Space Model，状态空间模型）提供一条<strong>根本不同</strong>的路：用一个<strong>线性递推</strong>把全部历史压进一个<em>固定大小</em>的状态 <code>h</code> 里。训练时它能写成卷积并行算，推理时每步只更新这个状态——<strong>O(1) 显存、O(T) 总计算</strong>，缓存不再随序列增长。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>注意力像“每说一个字都回头把全文重读一遍”；SSM 像“边读边在脑子里维护一段固定长度的摘要”——摘要大小恒定，不管文章多长，更新摘要的成本都一样。这就是它在超长序列上结构性占优的来源：注意力随长度越读越慢、内存越占越多，SSM 始终匀速、内存恒定。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，SSM 是一个线性（时不变或时变）系统。它的魔力在于同一套参数有两种<strong>等价</strong>的计算形式：<strong>递推</strong>（推理友好，常数状态）与<strong>卷积</strong>（训练友好，可并行）。Mamba 在此基础上加入“选择性”，逼近注意力的内容寻址能力，同时保住线性复杂度。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把三种序列模型摆在一起对比，SSM 的位置就清楚了：<strong>RNN</strong> 是非线性递推（状态表达力强，但不可并行训练、易梯度消失）；<strong>注意力</strong> 放弃固定状态、让每个 token 直接看全历史（可并行、精确检索，但 O(T²) 且 KV 线性增长）；<strong>SSM</strong> 取两者之长——<em>线性</em>递推让它既有固定状态（推理省）、又能展开成卷积（训练并行）。代价是线性带来的表达力限制，而 Mamba 的选择性正是为补这一课。</p>
+  </div>  <p>为什么“线性”是关键？因为线性递推满足结合律，能被<em>重新结合</em>成卷积或并行扫描（后面会证）；而 RNN 的非线性递推做不到这点，只能老老实实一步步算，这正是 RNN 训练慢、无法吃满 GPU 的根源。SSM 用“放弃非线性”换来了“可并行 + 固定状态”这对在注意力时代极其珍贵的性质——理解了这笔交易，就理解了整个 SSM 家族（S4、Mamba、线性注意力、RetNet）存在的理由。</p>  <p>先把本模块的学习地图摆出来，免得在数学里迷路：我们会<strong>从连续系统出发（§2）→ 离散化成递推（§3）→ 揭示递推与卷积等价、这是高效训练/推理的根基（§4）→ 用 HiPPO 解决长程记忆（§5）→ 用 Mamba 的选择性补上“内容寻址”（§6）→ 用并行扫描让时变递推也能并行（§7）</strong>。每一步都在解决前一步暴露的一个具体短板，像搭积木一样把朴素 SSM 一路推到 Mamba。带着“这一节在补哪个短板”的问题读，会清晰很多。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="cont"><span class="num">2</span>连续状态空间模型</h2>
+  <p>从连续时间的线性系统出发（先看单输入单输出、状态维 N 的情形）：</p>  <div class="math-block">\[h'(t)=A\,h(t)+B\,x(t),\qquad y(t)=C\,h(t)\]</div>  <p>三个矩阵各司其职：<code>A∈R^{N×N}</code> 决定状态如何随时间演化与记忆衰减（它是“记忆的发动机”），<code>B</code> 把输入注入状态，<code>C</code> 从状态读出输出。这套方程在控制论里有上百年历史，但直接拿来建模离散的 token 序列前，要先把连续时间<strong>离散化</strong>成“一步一步推进”的形式。</p>  <p>先建立一点物理直觉。这套方程描述的就是一个<strong>带记忆的线性系统</strong>：状态 <code>h</code> 像一个“蓄水池”，输入 <code>x</code> 通过 <code>B</code> 往里注水，<code>A</code> 决定水自己的流失/混合速度（记忆衰减），<code>C</code> 决定从池子里舀多少水当输出。如果 <code>A</code> 的特征值实部为负，系统稳定（旧输入的影响随时间指数衰减）；越接近 0 衰减越慢、记忆越长。整个 SSM 序列建模，本质就是在学“怎样的注水、流失、舀水规律”能最好地概括一段序列。</p>  <p>为什么从连续时间出发，而不直接定义一个离散递推？因为连续形式让<em>步长 Δ</em>成为一个显式的、有物理意义的旋钮（“一步走多久”），后面 Mamba 让 Δ 随输入变化、从而“按内容决定记多久”，正是建立在这个连续视角上。而且连续系统的理论（尤其 HiPPO，第 5 节）给出了<code>A</code> 的最优初始化——离散视角下这套理论就不自然了。先连续、再离散，是 SSM 的标准叙事顺序，也是它和 RNN 在思想上的分野：RNN 直接定义离散非线性递推、把一切交给数据去学，SSM 则从连续线性系统的丰富理论里<em>继承</em>结构与初始化。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="disc"><span class="num">3</span>离散化与 Δ</h2>
+  <p><span class="term">Discretization</span>（离散化）：给定步长 <code>Δ</code>，用零阶保持（<span class="term">Zero-Order Hold</span>, ZOH，假设输入在一步内恒定）把连续的 <code>(A,B)</code> 变成离散的 <code>(Ā,B̄)</code>：</p>  <div class="math-block">\[\bar A=\exp(\Delta A),\qquad \bar B=(\Delta A)^{-1}(\exp(\Delta A)-I)\,\Delta B\]</div>  <p>当 <code>A</code> 是对角矩阵时（每个状态通道一个标量 <code>a</code>，这正是 S4/Mamba 的结构化假设），公式极简：<code>ā=exp(Δa)</code>，<code>b̄=(exp(Δa)−1)/a·b</code>。离散后就得到了一个干净的递推：</p>  <div class="math-block">\[h_t=\bar A\,h_{t-1}+\bar B\,x_t,\qquad y_t=C\,h_t\]</div>  <p>为什么是 ZOH 这个特定的离散化公式，而不是简单地用 <code>ā≈1+Δa</code>（前向欧拉）？因为 ZOH 假设“输入在每一步内保持恒定”，对采样的离散序列是更贴合的近似，得到的 <code>ā=exp(Δa)</code> 还<strong>天然保稳定</strong>——只要连续系统稳定（<code>a&lt;0</code>），<code>exp(Δa)</code> 必落在 <code>(0,1)</code>，离散系统也稳定。前向欧拉则可能在 Δ 稍大时让 <code>|ā|&gt;1</code> 而爆炸。这种“离散化方式影响数值稳定性”的考量，是 SSM 实现里的关键细节，notebook 练习 1 会让你验证 <code>ā∈(0,1)</code> 这条不变量。</p>  <p>注意对角化不只是为了公式好看：满 <code>N×N</code> 的 <code>A</code> 做矩阵指数和递推都是 <code>O(N²)</code>，而对角 <code>A</code> 把每个通道解耦成独立标量、降到 <code>O(N)</code>，这是 SSM 能高效计算的工程前提。可以把对角 SSM 想成 <code>N</code> 个互不干扰的“一阶记忆单元”并行工作，每个单元有自己的衰减率 <code>a</code> 和读出权重——这个图景在后面理解 HiPPO 的多尺度记忆时还会用到。</p>  <p>离散化的 <code>b̄=(exp(Δa)−1)/a·b</code> 也有直观含义：它是“这一步的输入应该被注入状态多少”的权重，和 Δ、和衰减率 a 都相关。当 <code>Δ→0</code>（极短步长），可以验证 <code>ā→1</code>（状态几乎不变）、<code>b̄→Δ·b→0</code>（几乎不进新信息），系统退化成“冻结”；这与直觉一致——步子迈得越小，单步变化越少。notebook 练习 1 会让你验证这个 <code>Δ→0</code> 的极限行为，它是检查离散化实现对不对的好探针。</p>  <div class="callout intuition"><span class="label"></span>
+    <p><code>Δ</code> 是“记忆时间尺度”这个旋钮：Δ 大 → <code>ā=exp(Δa)</code> 偏小 → 状态变化快、<em>记得短</em>（旧信息衰减快）；Δ 小 → <code>ā</code> 接近 1 → 状态变化慢、<em>记得久</em>。Mamba 的核心一招就是让 Δ<strong>随输入变化</strong>，于是模型能<em>按内容</em>决定“这段该记多久”——遇到重要信息就调小 Δ 长久记住，遇到填充词就调大 Δ 快速遗忘。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dual"><span class="num">4</span>递推 vs 卷积：一份参数两种算法</h2>
+  <h3>一份参数，两种算法</h3>  <p>现在揭示 SSM 最精彩的性质。把递推 <code>h_t=Āh_{t-1}+B̄x_t</code> 一层层展开代入，会发现 <code>y_t</code> 其实是输入的一个<strong>因果卷积</strong>：</p>  <div class="math-block">\[y_t=\sum_{k=0}^{t} \underbrace{C\bar A^{k}\bar B}_{\bar K_k}\,x_{t-k}\quad\Rightarrow\quad y=x * \bar K\]</div>  <p>卷积核 <code>K̄=(C B̄, C ĀB̄, C Ā²B̄, …)</code> 完全由 <code>(Ā,B̄,C)</code> 决定、与输入无关，可以一次性预计算出来。于是同一套参数有了两副面孔：</p>  <table>
+    <thead><tr><th>视角</th><th>形式</th><th>复杂度</th><th>用于</th></tr></thead>
+    <tbody>
+      <tr><td>递推 (recurrent)</td><td><code>h_t=Āh_{t-1}+B̄x_t</code></td><td>O(T)·常数状态</td><td>推理：逐 token、O(1) 显存、无 KV cache</td></tr>
+      <tr><td>卷积 (convolution)</td><td><code>y=x*K̄</code></td><td>可 FFT、O(T log T) 并行</td><td>训练：一次性并行整段序列</td></tr>
+    </tbody>
+  </table>  <p>再把这件事的意义彻底点透：训练时整段序列已知，可以用卷积（或 FFT）把整段 <code>y</code> 一次性并行算出来，吃满 GPU——这解决了 RNN“必须串行、训练慢”的致命伤；而上线后逐 token 生成时，切换到递推形式，每步只更新固定大小的状态 <code>h</code>，<strong>不需要 KV cache、显存恒定</strong>——这又避开了注意力“KV 随序列线性增长”的痛点。同一组参数、两套算法、各取所需，这是 SSM 相对注意力在长序列与流式场景下的<strong>结构性优势</strong>。</p>  <p>和注意力对比一下这两副面孔的意义就更清楚了：注意力<em>训练和推理用的是同一套 O(T²) 机制</em>（训练并行算整个分数矩阵、推理增量算一行），KV 缓存随序列线性涨；而 SSM<strong>训练用卷积（并行、不必显式存状态）、推理用递推（O(1) 状态、零 KV 增长）</strong>，两套算法各自在自己擅长的场景把效率拉满。这种“训练推理用不同但等价的算法”是 SSM 独有的灵活性，也是它在“既要训练快、又要推理省”这个双重目标上的杀手锏。</p>  <p>notebook 里我们会把同一组 <code>(Ā,B̄,C)</code> 用递推和卷积两种方式各算一遍，断言两者<strong>数值完全一致</strong>——这个 assert 通过的那一刻，你就亲手验证了“一份参数两种算法”这个 SSM 的根基。这也是为什么 SSM 既能高效训练又能高效推理，而不像 RNN 那样训练推理都受非线性拖累。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个至关重要的前提：只有<strong>线性时不变（LTI）</strong>的 SSM 才能写成卷积（卷积核与时间无关）。一旦像 Mamba 那样让参数 <code>B、C、Δ</code> 随输入变化（时变），卷积核每个位置都不同，卷积形式<em>立即失效</em>，必须改用并行扫描（第 7 节）。<strong>这正是 Mamba 实现远比 S4 复杂的根本原因</strong>——它放弃了卷积这条最省事的并行路，换来了选择性。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hippo"><span class="num">5</span>HiPPO 与 S4 的长程记忆</h2>
+  <p>朴素 SSM 有个致命难点：<strong>长程记忆</strong>。随机初始化的 <code>A</code> 要么让状态很快遗忘（<code>ā</code> 远小于 1，几步就忘光）、要么数值不稳定（<code>ā</code> 超过 1，爆炸）。怎么初始化 <code>A</code> 才能让 SSM 天生擅长记很久？<span class="term">HiPPO</span>（Gu 2020）给出了答案。</p>  <p>HiPPO 的思想是：把“记住历史”形式化为“用一组<strong>正交多项式</strong>去最优地逼近整段历史信号”，并推导出能实现这种“最优多项式压缩”的特定 <code>A</code> 矩阵。用这个 <code>A</code> 初始化，状态 <code>h</code> 就成了历史的一份<em>最优有损摘要</em>——新信息进来时，状态以最小化重构误差的方式更新。这让 SSM 从“随机记忆”变成“有理论保证的最优记忆”。</p>  <p><span class="term">S4</span>（Gu 2021）则解决了 HiPPO 矩阵的<em>计算</em>难题：HiPPO 给出的 <code>A</code> 不是对角的，直接算矩阵指数和卷积核很贵。S4 用一个<strong>结构化（对角 + 低秩，DPLR）</strong>的参数化让这套计算高效可行，首次在长程基准 LRA（Long Range Arena）上<strong>大幅超越 Transformer</strong>，证明了“线性状态空间也能做强序列模型”。后续工作（S4D、S5）进一步发现：把 A 简化成<em>纯对角</em>（配合合适的初始化）也能保住大部分效果，这才有了 Mamba 直接用对角 A 的简洁形式——本课 notebook 用的也是对角版，正是站在这条简化线的终点上。</p>  <p>可以把 HiPPO 理解成：精心设计的 <code>A</code> 让不同状态通道像不同时间尺度的“记忆滤波器”——有的通道衰减慢、记住远古，有的衰减快、跟踪近期，合起来无损地概括一段历史。这与模块 01 里 RoPE 用<em>多频率</em>覆盖多距离尺度、本课反复出现的“多尺度”思想异曲同工：<strong>用一组各管一段尺度的简单单元，拼出跨数量级的表达力</strong>。看懂了 RoPE 的频率谱，再看 HiPPO 的多尺度记忆会有似曾相识之感。</p>  <p>这里也回答了一个初学者常有的困惑：SSM 既然是“线性”的，为什么能比同样朴素的线性 RNN 强这么多？差别几乎全在<strong>初始化</strong>。一个随机初始化的线性递推确实很弱（要么快速遗忘、要么不稳）；而 HiPPO 给的 <code>A</code> 不是随机的，它是从“最优逼近历史”这个优化问题里<em>解</em>出来的结构。换句话说，S4/Mamba 的强大有很大一部分来自<em>一个好的起点</em>，而非更复杂的结构——这是深度学习里“初始化决定成败”的又一个有力例证，也提醒你读 SSM 论文时别忽略它对 A 初始化的讲究。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="mamba"><span class="num">6</span>Mamba：选择性 SSM</h2>
+  <p>S4 这类 SSM 是<strong>线性时不变（LTI）</strong>的：<code>Ā,B̄,C</code> 一经训练就固定、与具体输入无关，所以能写成卷积。但这也意味着它有个硬伤——它<strong>不能按内容选择性地关注或忽略</strong>。无论输入是关键信息还是无意义的填充，它都用同一套固定的递推去处理，而“按内容选择”恰恰是注意力的看家本领。</p>  <p><span class="term">Mamba</span>（Gu & Dao 2023）的突破就是<strong>selective SSM（选择性状态空间）</strong>：让 <code>B、C、Δ</code> 成为<strong>输入的函数</strong>（input-dependent）。最关键的是 <code>Δ</code> 随输入变化——回想第 3 节，Δ 控制“记多久”，于是 Mamba 能对每个 token<em>动态</em>地决定记忆的时间尺度：遇到重要 token 调小 Δ（长久记住），遇到无关 token 调大 Δ（快速遗忘）。这就用一种<em>不同于注意力</em>的机制，获得了类似注意力的“内容选择”能力。</p>  <p>用一个具体场景体会“选择性”的威力：合成任务<span class="term">Selective Copy</span>（从一串混了大量噪声 token 的序列里，只挑出并按序复制特定的目标 token）。LTI 的 S4 在这上面表现很差——它用固定递推一视同仁地处理所有输入，没法“跳过噪声、只记目标”。Mamba 因为 <code>B、Δ</code> 随输入变，遇到噪声 token 时可以让它几乎不进状态、遇到目标 token 时让它牢牢写入，于是轻松解决。这个对比实验是 Mamba 论文证明“选择性确实带来质变”的关键证据，notebook 也会用一个迷你版（对强输入 vs 弱输入的不同响应）让你直观感受。</p>  <p>代价立刻浮现：参数随时间变了，SSM 就<strong>不再是 LTI、不能写成卷积</strong>（失去了 FFT 并行这条最省事的路，回扣第 4 节的警告）。如果退回串行递推，又会像 RNN 一样训练奇慢。Mamba 的解法是用 <span class="term">Parallel Scan</span>（并行扫描）+ 硬件感知的核函数（把状态保持在 GPU 的 SRAM 里、避免反复读写 HBM），把时变递推也<em>并行</em>起来——既保留选择性，又在 GPU 上跑出高吞吐。这是“算法（扫描）+ 硬件（IO 感知）协同设计”的典范，和 FlashAttention 的精神一致（见 C36）。</p>  <div class="callout warn"><span class="label"></span>
+    <p>“选择性”是 Mamba 接近注意力质量的关键，也是它工程上比 S4 难得多的根源，这条因果链值得记死：<strong>选择性 = 参数时变 = 不能卷积 = 必须靠并行扫描 + 硬件感知实现</strong>。理解了这条链，你就懂了为什么 Mamba 的论文一半篇幅在讲 CUDA 实现——它的算法创新和工程实现是绑死的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="scan"><span class="num">7</span>并行扫描</h2>
+  <p><span class="term">Parallel Scan</span>（并行扫描，又称前缀扫描）是把<strong>串行递推并行化</strong>的通用算法，是 Mamba 训练能并行的算法心脏。它的适用条件是递推的“合成操作”满足<strong>结合律</strong>。我们来看一阶线性递推 <code>h_t=a_t·h_{t-1}+b_t</code> 为什么满足。</p>  <p>把每个时刻看成一个仿射变换 <code>(a_t, b_t)</code>，表示“把上一个状态 h 映射成 <code>a_t·h + b_t</code>”。两个相邻时刻的变换可以<strong>复合</strong>成一个等价变换：</p>  <div class="math-block">\[(a_j,b_j)\circ(a_i,b_i)=(a_j a_i,\; a_j b_i+b_j)\]</div>  <p>可以验证这个复合操作满足结合律（<code>(c∘b)∘a = c∘(b∘a)</code>）。一旦有了结合律，就能像求前缀和那样，用<strong>树形归并</strong>在 <code>O(log T)</code> 的并行深度内（而非 <code>O(T)</code> 串行步数）算出所有 <code>h_t</code>。这就是把“看似必须一步接一步”的递推，重排成“可大规模并行”的关键数学事实——它的经典出处是 Blelloch 1990 的前缀和算法。</p>  <div class="ascii">串行 vs 并行扫描（求所有前缀，T=8）：
+  串行: h1→h2→h3→h4→h5→h6→h7→h8     深度 O(T)=8 步
+  并行(Hillis-Steele): 每轮把间距翻倍地合并
+    轮1 (d=1): 相邻两两合并
+    轮2 (d=2): 间隔2合并
+    轮3 (d=4): 间隔4合并              深度 O(log T)=3 轮</div>  <p>为什么并行扫描对 Mamba 这么关键，值得再强调一遍因果：Mamba 的选择性让 <code>a_t, b_t</code> 每个时刻都不同（时变），卷积那条路（要求核与时间无关）彻底走不通；但只要<em>合成操作仍满足结合律</em>（而线性递推的仿射复合恰好满足，无论 a、b 是否随时间变），并行扫描就依然适用。所以并行扫描是比卷积<strong>更通用</strong>的并行手段——卷积只对 LTI 有效，扫描对时变也有效。Mamba 正是靠它，在放弃卷积后仍能并行训练，而不至于退回 RNN 的串行慢速。</p>  <p>还有一层硬件考量让 Mamba 的扫描不只是“理论可并行”：朴素实现会把每一步的状态都写回显存（HBM），而状态可能很大，反复读写 HBM 会让本应很快的扫描被带宽拖垮。Mamba 的<strong>硬件感知扫描</strong>把整个扫描过程的中间状态保持在 GPU 的片上 SRAM 里、只把最终输出写回 HBM，大幅减少访存——这正是它论文里强调的 “hardware-aware” 的含义，和 FlashAttention 把注意力中间结果留在 SRAM 的思路如出一辙（C36 详解）。算法上可并行、工程上还要省访存，两者缺一不可。</p>  <p>notebook 会实现串行扫描与 Hillis–Steele 并行扫描，并 <code>assert</code> 两者结果完全一致——亲手验证“结合律 ⇒ 可并行”这个抽象事实。把它和第 4 节的“递推=卷积”放在一起，你就集齐了 SSM 高效计算的两大法宝：<strong>LTI 时用卷积/FFT，时变（Mamba）时用并行扫描</strong>，而两者背后都是“线性 ⇒ 可重新结合 ⇒ 可并行”这同一个数学红利。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿</h2>
+  <p>SSM 从 2021 年的 S4 到 2023 年的 Mamba，几年间从“小众长序列基准上的赢家”变成“被认真当作注意力替代品”的主流候选，是当前最有希望挑战注意力霸权的方向之一，进展也因此异常密集：</p>  <ul>
+    <li><span class="term">Mamba-2</span> / SSD（Dao & Gu 2024）：提出“状态空间对偶（State Space Duality）”框架，证明（带掩码的）注意力与 SSM 在数学上是<strong>同一类计算的两种视角</strong>，并借此用矩阵乘法实现 SSM、吃满 GPU 的张量核——把两条看似对立的路线统一了起来。</li>
+    <li><strong>混合架构</strong>：Transformer 层与 Mamba 层交替堆叠（如 Jamba、Zamba），兼取注意力的精确检索与 SSM 的长序列效率，是目前很多长上下文模型的实用选择。</li>
+    <li>SSM 的<strong>检索短板</strong>：纯 SSM 在“大海捞针”式的精确召回（从长文里精确复制某个特定片段）上仍弱于注意力——固定大小的状态终究是有损压缩，存不下所有细节。这正是混合架构存在的核心动机。</li>
+    <li>与<span class="term">线性注意力</span>的统一：linear attention、RWKV、RetNet、SSM 本质上是同一大家族的不同切面（都用某种“固定大小的循环状态”替代线性增长的 KV），C25 长上下文课会把这张统一的大图谱展开。</li>
+  </ul>  <p>退一步看 SSM 和注意力的本质差异，能把这种张力理解得更透：注意力是<strong>非压缩</strong>的——它把每个历史 token 的 K/V 都原样存着，要用时精确检索，所以召回准但代价随序列线性增长；SSM 是<strong>压缩</strong>的——它把历史不断揉进一个固定大小的状态，所以省但有损。<em>无损但贵 vs 有损但省</em>，这是序列建模一个根本的权衡，没有免费的午餐。当任务对精确召回敏感（如长文档问答里捞某个具体数字）时注意力占优，当任务更看重对长序列的整体把握和吞吐效率时 SSM 占优——混合架构（隔几层注意力、其余 Mamba）就是想用少量注意力层补上 SSM 的召回短板，同时让大部分层享受 SSM 的线性效率，在同一个模型里兼得两者之长。</p>  <p>把整门课收束在这里看：模块 01–04 是在<em>改良</em>注意力（位置、KV、前馈、归一化），而模块 05 是在<em>替换</em>注意力。两条路线的终极问题是同一个——<strong>如何高效地建模长序列</strong>：是把注意力的 KV 压到极致（MLA），还是换成根本不需要大缓存的状态模型（Mamba），抑或两者混合？这正是当下架构研究最前沿、最激动人心的张力，也是你学完本课后最该持续关注的方向。</p>  <div class="callout paper"><span class="label"></span>
+    <p>必读：S4（Gu 2021，结构化 SSM 里程碑）、HiPPO（Gu 2020，记忆理论根基）、Mamba（Gu & Dao 2023，选择性 + 硬件感知）、Mamba-2/SSD（Dao & Gu 2024，与注意力的统一）、Blelloch 1990（并行扫描出处）。见 <code>references.md</code> 的 SSM/Mamba 一节。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_normalization/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">RMSNorm 与稳定性</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

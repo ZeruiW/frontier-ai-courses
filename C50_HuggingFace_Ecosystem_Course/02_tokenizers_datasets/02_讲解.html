@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · tokenizers 与 datasets</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · tokenizers 与 datasets</h1>
+  <p class="subtitle">fast tokenizer 的 offsets 与 word_ids 才是它的价值 · padding/truncation 的算力浪费 · map 的批处理与指纹缓存 · streaming 的缓冲打乱 · DataCollator 与 -100 的构造</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–01；C21 的 tokenizer 训练概念、C43 的数据工程概念（有帮助但不必需）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_tokenizers_datasets.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">tokenizers 文档（Encoding / offsets / word_ids）、datasets 文档（Process / Stream / Cache）、Apache Arrow</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#fast">fast tokenizer：offsets 与 word_ids 才是它的价值</a></li>
+      <li><a href="#padding">padding / truncation：四种组合与算力浪费</a></li>
+      <li><a href="#dataset">datasets：Arrow、map 与指纹缓存</a></li>
+      <li><a href="#streaming">streaming：什么时候用、代价是什么</a></li>
+      <li><a href="#collator">DataCollator：动态 padding 与标签构造</a></li>
+      <li><a href="#ledger">算一笔账：padding 浪费与截断率</a></li>
+      <li><a href="#frontier">生态动态与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fast"><span class="num">1</span>fast tokenizer：offsets 与 word_ids 才是它的价值</h2>
+  <p>很多人以为 <code>use_fast=True</code> 的价值只是「快」（Rust 实现，比 Python 版快 10–100 倍）。速度确实是它的名字来源，但<strong>对正确性而言，更重要的是它返回的两组对齐信息</strong>。</p>  <table>
+    <thead><tr><th>返回值</th><th>是什么</th><th>解决什么问题</th></tr></thead>
+    <tbody>
+      <tr><td><code>input_ids</code></td><td>token id 序列</td><td>喂给模型</td></tr>
+      <tr><td><code>attention_mask</code></td><td>1=真实 token，0=padding</td><td>让模型忽略 pad（漏传就会去注意 pad）</td></tr>
+      <tr><td><strong><code>offset_mapping</code></strong></td><td>每个 token 在<strong>原始字符串</strong>中的 <code>(start, end)</code> 字符区间</td><td>把模型的 token 级预测<strong>映射回原文字符位置</strong>——span 抽取、NER 高亮、实体链接全靠它</td></tr>
+      <tr><td><strong><code>word_ids()</code></strong></td><td>每个 token 属于第几个「词」（特殊 token 为 <code>None</code>）</td><td>把<strong>词级标注</strong>对齐到<strong>子词级</strong>——token 分类的必需品（C49 模块 03 那个坑）</td></tr>
+      <tr><td><code>token_type_ids</code></td><td>句 A / 句 B 标记</td><td>句对任务</td></tr>
+      <tr><td><code>overflowing_tokens</code></td><td>超长时被切出去的部分</td><td>滑窗处理长文档（配 <code>return_overflowing_tokens=True</code>）</td></tr>
+    </tbody>
+  </table>  <div class="ascii">text = "Washington is nice"
+                 0123456789...
+
+tokens:      [CLS]   Wash   ##ing  ##ton    is    nice   [SEP]
+input_ids:     101   6242    2075   2669   2003   3835    102
+offsets:     (0,0)  (0,4)  (4,7)  (7,10) (11,13)(14,18)  (0,0)
+                     └──── 三个子词的 offset 拼起来 = 原文 [0,10) = "Washington"
+word_ids():   None     0      0      0      1      2     None
+                     └──── 三个子词都属于**词 0**
+
+用途 ①（NER）：词级标注 ["B-LOC","O","O"] -&gt; 只给每个词的**第一个**子词打标签，
+              其余填 -100  -&gt;  [-100, B-LOC, -100, -100, O, O, -100]
+用途 ②（QA）：模型预测 span = token 3..5 -&gt; 用 offsets 换算成原文字符 [7,18)
+              -&gt; 直接从原始字符串切出答案，**不用 detokenize**（避免空格/大小写失真）</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么不能靠 <code>decode()</code> 把答案还原？因为<strong>分词不是无损可逆的</strong>。<code>decode(encode(text))</code> 常常与 <code>text</code> 不同——空格被规范化、大小写被 lowercase 模型改掉、某些 Unicode 被归一化。抽取式 QA 的答案必须<strong>逐字符来自原文</strong>（这是它相对生成式的核心优势，C49 模块 03 说过），所以只能靠 <code>offset_mapping</code> 从原始字符串切。<em>用 decode 拼答案是个常见错误，症状是「答案基本对但标点/空格有细微差异」，然后 EM 分数莫名偏低。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><code>word_ids()</code> 的作用同理不可替代。你有词级标注 <code>[('Washington','B-LOC'), ('is','O'), ('nice','O')]</code>，模型输出是子词级的。要计损失就必须知道「哪些子词属于哪个词」。手工做这个对齐（按空格切、再逐个匹配子词）在有标点、有连字符、有多语言的真实数据上极易出错。<strong><code>word_ids()</code> 是唯一可靠的来源</strong>，而它<em>只有 fast tokenizer 才有</em>——slow tokenizer 调用它会直接抛异常。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>两个具体的 gotcha：<strong>①<code>offset_mapping</code> 需要显式开启</strong>（<code>return_offsets_mapping=True</code>），而且它<em>只对 fast tokenizer 可用</em>。<strong>②特殊 token 的 offset 是 <code>(0,0)</code></strong>，不是 <code>None</code>——如果你用 <code>offset[0] == 0</code> 判断「是不是序列开头」，会把 <code>[CLS]</code> 和真正的第一个 token 混起来。正确做法是用 <code>sequence_ids()</code>（区分特殊 token / 句 A / 句 B）或 <code>word_ids()</code> 里的 <code>None</code> 来识别特殊 token。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="padding"><span class="num">2</span>padding / truncation：四种组合与算力浪费</h2>
+  <p>这两个参数看起来平淡，但组合起来直接决定你浪费多少算力。</p>  <table>
+    <thead><tr><th><code>padding</code></th><th>行为</th><th>每 batch 的序列长度</th><th>算力浪费</th></tr></thead>
+    <tbody>
+      <tr><td><code>False</code>（默认）</td><td>不 padding</td><td>各不相同（不能直接组 batch）</td><td>—</td></tr>
+      <tr><td><code>True</code> / <code>'longest'</code></td><td>补到<strong>本 batch</strong>最长</td><td>随 batch 变化</td><td><strong>最省</strong>（动态 padding）</td></tr>
+      <tr><td><code>'max_length'</code></td><td>补到 <code>max_length</code>（或模型上限）</td><td>固定</td><td><strong>可能浪费巨大</strong></td></tr>
+      <tr><td><code>'do_not_pad'</code></td><td>同 <code>False</code></td><td>—</td><td>—</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么 <code>padding='max_length'</code> 可能浪费巨大？因为注意力是 <code>O(L²)</code>。假设你的数据平均长度 60、最长 500，设 <code>max_length=512</code> 全补齐：每条都按 512 算，<strong>而实际有效计算只占 (60/512)² ≈ 1.4%</strong>。改成动态 padding（补到本 batch 最长），如果 batch 内长度接近，浪费就很小。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更进一步的优化是<strong>按长度分组（length grouping）</strong>：把长度接近的样本放进同一个 batch，让每个 batch 的最长值尽量接近其平均值。<code>Trainer</code> 里就是 <code>group_by_length=True</code>（配 <code>length_column_name</code>）。它的代价是<em>破坏了随机性</em>（同 batch 的样本长度相关），对某些任务可能有轻微影响，但对大多数任务是纯赚。notebook 会把三种策略的 padding 浪费率算出来对比，你会看到几倍的差距。</p></div>
+  </div>  <h3>truncation 的三种策略</h3>  <ul>
+    <li><strong><code>truncation=True</code>（=<code>'longest_first'</code>）</strong>：句对时优先截长的那句，逐 token 交替截直到达标。<em>默认，通常是对的。</em></li>
+    <li><strong><code>'only_second'</code></strong>：只截第二句。QA 任务用这个——<em>问题不能截，上下文可以</em>。这是个具体且重要的选择。</li>
+    <li><strong><code>'only_first'</code></strong>：只截第一句。少见。</li>
+  </ul>  <div class="callout danger"><span class="label">截断是静默的</span>
+    <p><strong>截断是静默的</strong>——超长输入被砍掉一半，不会有任何警告，训练照常进行，你只会看到「效果不如预期」。这是数据侧最隐蔽的 bug 之一。防护做法：<em>预处理时统计长度分布与截断率</em>，并把「截断率 &gt; X%」当作告警。notebook 会实现这个统计。另外 <code>return_overflowing_tokens=True</code> 可以把溢出部分作为额外样本返回（滑窗），这是长文档 QA 的标准做法，但要注意它会<strong>改变样本数量</strong>——<code>Dataset.map</code> 里用它必须配 <code>remove_columns</code>，否则新旧列长度不一致会报错。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dataset"><span class="num">3</span>datasets：Arrow、map 与指纹缓存</h2>
+  <p><code>datasets</code> 的三个核心设计决定了它的全部行为特征。</p>  <table>
+    <thead><tr><th>设计</th><th>是什么</th><th>带来什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Arrow 后端</strong></td><td>数据存成列式的 Arrow 文件，<strong>内存映射</strong>访问</td><td>可以用几百 MB 内存处理几百 GB 数据集；多进程共享零拷贝</td></tr>
+      <tr><td><strong>指纹缓存</strong></td><td>对 <code>(数据集状态, 函数字节码, 参数)</code> 做哈希，命中则直接读缓存文件</td><td>重跑脚本时 <code>map</code> 秒完成；但也带来「改了函数却没生效」的困惑</td></tr>
+      <tr><td><strong>惰性/流式</strong></td><td><code>IterableDataset</code> 边下边用，不落盘</td><td>TB 级数据集无需下载完；但不支持随机索引与 <code>len()</code></td></tr>
+    </tbody>
+  </table>  <h3>map 的四个关键参数</h3>  <pre><code>ds = ds.map(
+    tokenize_fn,
+    batched=True,            # ① 一次传一批（dict of lists）而不是一条 -&gt; 快 10-100 倍
+    batch_size=1000,         # ② 每批多少条
+    num_proc=8,              # ③ 多进程；⚠️ 与 batched 一起用时注意函数必须可 pickle
+    remove_columns=ds.column_names,   # ④ 删掉原始列
+)</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong><code>batched=True</code> 是最重要的一个</strong>。它让你的函数一次收到一批数据（<code>{'text': [...1000 条...]}</code>），于是可以调用 fast tokenizer 的<em>批量接口</em>——Rust 侧并行处理，比逐条调用快一到两个数量级。代价是函数签名变了：<code>batched=False</code> 时 <code>example['text']</code> 是字符串，<code>batched=True</code> 时是<strong>字符串列表</strong>。<em>这个签名切换是新手最常犯的错。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong><code>remove_columns</code> 什么时候必需？</strong>当你的函数<em>改变了样本数量</em>（如 <code>return_overflowing_tokens</code> 产生更多行）或者新列与旧列长度不一致时。<code>datasets</code> 会把返回的新列与保留的旧列拼在一起，长度不一致就报错 <code>Column lengths mismatch</code>。<em>规则：只要你的 map 可能改变行数，就必须 <code>remove_columns=ds.column_names</code></em>。另外它还能显著省磁盘——不删原始 <code>text</code> 列，缓存文件会大好几倍。</p></div>
+  </div>  <h3>指纹缓存：省时间也制造困惑</h3>  <p><code>map</code> 会算一个指纹：<strong>数据集当前状态的哈希 + 你的函数的字节码/闭包哈希 + 所有参数</strong>。指纹相同就直接读缓存文件，不重新计算。这让「改一行代码重跑脚本」从几分钟变成几秒。</p>  <p>但它也带来两类困惑：</p>  <ul>
+    <li><strong>改了函数却没生效</strong>：极少见但会发生——如果你的函数依赖外部可变状态（全局变量、文件内容、随机数），指纹没变但行为变了。<em>解法：把依赖显式作为参数传入（<code>fn_kwargs=</code>），或 <code>load_from_cache_file=False</code> 强制重算。</em></li>
+    <li><strong>缓存文件堆积</strong>：每次不同的 map 都生成一个缓存文件，一个大数据集反复处理会吃掉几十 GB 磁盘。<em>解法：用 <code>keep_in_memory=True</code>（小数据集）或定期清理 <code>~/.cache/huggingface/datasets</code>。</em></li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>关于指纹缓存有一条实用经验：<strong>调试预处理函数时先在小切片上跑</strong>（<code>ds.select(range(100))</code>），确认正确后再跑全量。这样既快，又避免生成一堆无用的大缓存文件。<em>而且能让你在几秒内迭代，而不是每次等几分钟</em>——这个习惯对数据预处理的开发效率影响很大。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="streaming"><span class="num">4</span>streaming：什么时候用、代价是什么</h2>
+  <p><code>load_dataset(..., streaming=True)</code> 返回 <code>IterableDataset</code>：边下边用，不落盘。对 TB 级数据集（C43 的场景）是唯一可行方案。</p>  <table>
+    <thead><tr><th>能力</th><th><code>Dataset</code>（内存映射）</th><th><code>IterableDataset</code>（流式）</th></tr></thead>
+    <tbody>
+      <tr><td>随机索引 <code>ds[42]</code></td><td>✅</td><td>❌ 只能顺序迭代</td></tr>
+      <tr><td><code>len(ds)</code></td><td>✅</td><td>❌（有些数据集有元信息，多数没有）</td></tr>
+      <tr><td><code>shuffle()</code></td><td>✅ 全局精确打乱</td><td>🔶 <strong>缓冲区近似打乱</strong>（<code>buffer_size</code>）</td></tr>
+      <tr><td><code>map()</code></td><td>✅ 提前算好并缓存</td><td>✅ 但是<strong>惰性</strong>的（迭代时才算）</td></tr>
+      <tr><td>磁盘占用</td><td>需要完整下载</td><td><strong>几乎为零</strong></td></tr>
+      <tr><td>多 epoch</td><td>✅</td><td>🔶 需要重新迭代（配 <code>set_epoch</code> 换 shuffle 种子）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>缓冲区打乱</strong>是流式的核心妥协，值得理解清楚。它维护一个大小 <code>N</code> 的缓冲区：先填满，然后每次随机吐一个、再补一个进来。<code>N</code> 越大越接近全局打乱，但内存占用也越大。<em>如果数据集在磁盘上是按某种顺序排列的（比如按来源、按时间），而 <code>buffer_size</code> 远小于一个「块」的大小，那么同一个 batch 里的样本会高度相关</em>——这会显著伤害训练。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>解决办法是两级打乱：<strong>①先打乱 shard 顺序</strong>（<code>datasets</code> 的流式 shuffle 会同时做这个），<strong>②再在缓冲区内打乱</strong>。这样即使 <code>buffer_size</code> 只有一万，样本也来自随机的不同 shard，相关性大幅降低。<em>C43 模块 02 有对这个近似质量的完整量化</em>——那门课让你算出「缓冲要多大才够」，本课只讲参数在哪。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>流式的一个实操坑：<strong>它与 <code>num_proc</code> / <code>DataLoader(num_workers=N)</code> 的交互</strong>。多 worker 各自迭代同一个流会导致<em>重复数据</em>，除非数据集支持按 shard 切分给不同 worker（<code>datasets</code> 会尽力处理，但对 shard 数少于 worker 数的情况会警告并降级）。<em>规则：流式训练时确保 shard 数 ≥ worker 数 × 进程数</em>，否则要么重复要么有 worker 空转。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="collator"><span class="num">5</span>DataCollator：动态 padding 与标签构造</h2>
+  <p><code>map</code> 之后每条样本还是变长的（如果你用了动态 padding）。<strong>把它们组成一个矩形张量、并构造 labels，是 collator 的职责</strong>。它在 <code>DataLoader</code> 里每个 batch 被调用一次。</p>  <table>
+    <thead><tr><th>Collator</th><th>做什么</th><th>用在哪</th></tr></thead>
+    <tbody>
+      <tr><td><code>DataCollatorWithPadding</code></td><td>补齐到本 batch 最长 + 生成 <code>attention_mask</code></td><td>分类任务（labels 已是标量）</td></tr>
+      <tr><td><code>DataCollatorForTokenClassification</code></td><td>同上 + 把 labels 也补齐（用 <code>-100</code>）</td><td>NER / 序列标注</td></tr>
+      <tr><td><code>DataCollatorForLanguageModeling</code></td><td><strong>现场做 MLM 掩码</strong>（<code>mlm_probability=0.15</code>，就是 C49 模块 01 的 80/10/10）</td><td>MLM 预训练</td></tr>
+      <tr><td><code>DataCollatorForLanguageModeling(mlm=False)</code></td><td>CLM：<code>labels = input_ids.clone()</code>，pad 位置置 <code>-100</code></td><td>CLM 预训练 / SFT</td></tr>
+      <tr><td><code>DataCollatorForSeq2Seq</code></td><td>补齐 input 与 labels + 生成 <code>decoder_input_ids</code></td><td>翻译 / 摘要</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>「动态掩码」就是在这里发生的</strong>。C49 模块 02 讲的 RoBERTa 相对 BERT 的一大改进——每个 epoch 重新采样掩码位置——在 HF 生态里是<em>默认行为</em>，因为 collator 在每个 batch 被调用时都会重新掩一次。你不需要做任何事就得到了动态掩码。<em>反过来，如果你想要静态掩码（复现 BERT 原始设置），得在 <code>map</code> 阶段就掩好并禁用 collator 的掩码。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>collator 里最容易出错的是 <strong><code>-100</code> 的处理</strong>。PyTorch 的 <code>CrossEntropyLoss(ignore_index=-100)</code> 是全生态的约定：labels 里为 <code>-100</code> 的位置不计损失。padding 位置、未被掩的位置、SFT 里的 prompt 部分——都要填 <code>-100</code>。<strong>漏填的后果是模型在学「预测 pad token」或「背诵 prompt」</strong>，loss 看起来正常（甚至更低，因为 pad 很容易预测）但效果差。<em>这是 SFT 里最经典的一个 bug</em>，模块 04 会再遇到它。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个能救命的调试习惯：<strong>训练开始前，取一个 batch 打印出来看</strong>。检查四件事——<code>input_ids</code> 解码回文本是否通顺、<code>attention_mask</code> 的 0 是否只在该在的位置、<code>labels</code> 里 <code>-100</code> 的比例是否符合预期、以及 <code>labels</code> 与 <code>input_ids</code> 的对齐关系是否正确。<em>这四个检查能在三十秒内发现 80% 的数据侧 bug</em>，而不用等训练跑完看效果。notebook 会把这个检查封装成一个函数。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">6</span>算一笔账：padding 浪费与截断率</h2>
+  <div class="math-block">\[\text{padding 浪费率} = 1 - \frac{\sum_i L_i}{B \cdot \max_i L_i} \quad(\text{按 token}), \qquad 1 - \frac{\sum_i L_i^2}{B\cdot(\max_i L_i)^2}\quad(\text{按注意力})\]</div>  <p>两个公式的区别很重要：<strong>线性部分（FFN、embedding）按第一个算，注意力按第二个算</strong>。因为注意力是平方的，长度不齐时它的浪费被放大。</p>  <table>
+    <thead><tr><th>策略</th><th>batch 内长度</th><th>token 浪费</th><th>注意力浪费</th></tr></thead>
+    <tbody>
+      <tr><td><code>padding='max_length'</code>（512）</td><td>[60, 80, 55, 500] → 全补 512</td><td>≈ 66%</td><td><strong>≈ 75%</strong></td></tr>
+      <tr><td><code>padding=True</code>（动态）</td><td>[60, 80, 55, 500] → 补到 500</td><td>≈ 65%</td><td>≈ 74%</td></tr>
+      <tr><td><code>padding=True</code> + 按长度分组</td><td>[55, 60, 80, …] 与 [500, …] 分开</td><td>≈ 10%</td><td><strong>≈ 20%</strong></td></tr>
+    </tbody>
+  </table>  <p>读这张表：<strong>动态 padding 在长度差异大的 batch 里帮助有限，真正的杠杆是「按长度分组」</strong>。这也解释了为什么 <code>group_by_length=True</code> 在长度分布长尾的数据上能带来 2–4 倍的吞吐提升。</p>  <p>第二笔账是<strong>截断率</strong>，它是数据质量的隐形杀手：</p>  <div class="math-block">\[\text{截断率} = \frac{|\{i : L_i > L_{max}\}|}{N}, \qquad \text{信息损失率} = \frac{\sum_i \max(0, L_i - L_{max})}{\sum_i L_i}\]</div>  <p>这两个数要分开看：<strong>截断率高但信息损失率低</strong>（很多样本只超出一点）通常可以接受；<strong>截断率低但信息损失率高</strong>（少数极长样本被砍掉大半）意味着你在丢弃某个特定子群体的数据——<em>这可能是系统性偏差，比随机丢失更危险</em>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句话：<strong>数据层的坑几乎全是「形状与对齐」的坑——padding 补在哪边、labels 里哪些位置填 -100、子词怎么对齐到词、offset 怎么映射回原文字符</strong>。它们全都不报错，只让效果变差。<em>所以本模块最该带走的是那个「打印一个 batch 检查四件事」的习惯</em>，以及「统计截断率并告警」的纪律。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>生态动态与开放问题</h2>
+  <ul>
+    <li><strong>序列打包（packing）</strong>：把多条短样本拼进一个定长序列以消除 padding 浪费，用 attention mask 或 <code>position_ids</code> 防止跨样本注意（cross-contamination）。<code>trl</code> 的 <code>SFTTrainer(packing=True)</code> 与 FlashAttention 的变长接口都支持，但「打包是否损害效果」在不同任务上结论不一，尤其对短样本任务。</li>
+    <li><strong>tokenizer 的多语言公平性</strong>：同样一句话，不同语言的 token 数差异可达数倍（中文、泰语、部分非洲语言尤其吃亏）。这直接转化为<em>相同信息量下更高的 API 费用与更小的有效上下文</em>。如何在有限词表下做到跨语言公平，是活跃的研究与工程问题。</li>
+    <li><strong>字节级与无分词模型</strong>：完全去掉 tokenizer（ByT5、MegaByte、以及近年的动态分块方案），从根上消除词表偏差与 OOV。代价是序列变长数倍，需要架构层面的补偿。目前尚未在通用场景胜出，但在多语言与代码上有吸引力。</li>
+    <li><strong>数据集格式的收敛</strong>：Arrow/Parquet 正在成为事实标准，但流式训练下的确定性打乱、断点续训的精确恢复（跑到第几个样本）、以及多 worker 的无重复切分，各家实现仍有差异。Mosaic StreamingDataset 与 <code>datasets</code> 的流式在这些语义上不完全一致。</li>
+    <li><strong>预处理的可复现性</strong>：指纹缓存让重跑变快，但也让「预处理版本」变成一个隐式状态。把 tokenizer 版本、预处理函数、参数一起写进数据集卡片与实验记录，是 C40/C37 强调但生态尚未强制的实践。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：tokenizers 文档的 <em>The tokenization pipeline</em> 与 <em>Encoding</em>（offsets/word_ids/sequence_ids 的准确语义）；datasets 文档的 <em>Process</em>（map 的全部参数）、<em>Stream</em>（IterableDataset 的限制）与 <em>Cache management</em>（指纹机制）；transformers 的 <em>Data Collator</em> API 文档（尤其 <code>DataCollatorForLanguageModeling</code> 的源码，80/10/10 就在那三行）。原理侧：C21（tokenizer 训练与数据配比）、C43（PB 级流式与吞吐）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_transformers_core/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · transformers 核心抽象</div></a>
+    <a class="next" href="../03_trainer/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · Trainer 与 TrainingArguments</div></a>
+  </div>
+
+</div>
+</body>
+</html>

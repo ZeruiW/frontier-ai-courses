@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 双塔召回</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 双塔召回</h1>
+  <p class="subtitle">现代工业召回的标准架构 —— user/item 双塔 embedding、in-batch 负采样的 softmax 训练、logQ 采样偏差校正、点积召回与 ANN，从零训练双塔并算 Recall@K（与 C11 RAG 检索同源）</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00/02、embedding 与点积、softmax/交叉熵、一点点对比学习</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_two_tower_retrieval.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Covington 2016 (YouTube)、Yi 2019 (logQ)、Huang 2013 (DSSM)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#idea">双塔架构：两个独立编码器 + 点积</a></li>
+      <li><a href="#vs_cross">双塔 vs cross-encoder</a></li>
+      <li><a href="#train">训练：对比学习 + softmax</a></li>
+      <li><a href="#inbatch">in-batch 负采样</a></li>
+      <li><a href="#logq">采样偏差与 logQ 校正</a></li>
+      <li><a href="#ann">召回与 ANN：向量到 Top-K</a></li>
+      <li><a href="#practice">工业实践与陷阱</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="idea"><span class="num">1</span>双塔架构：两个独立编码器 + 点积</h2>
+  <p>双塔模型（<span class="term">two-tower model</span>，又叫 <span class="term">dual encoder</span>）是<strong>现代工业召回的标准架构</strong>。YouTube、Google、淘宝、Meta 的召回层几乎都是它。如果说矩阵分解是「给每个用户/物品一个向量」，双塔就是把这个想法<strong>升级成神经网络、并解决了上规模与冷启动</strong>。</p>  <p>回忆模块 02：MF 给每个用户 ID、物品 ID 学一个 embedding，内积即评分。但 MF 有两个工业痛点：① <strong>只能处理见过的 ID</strong>（新用户/新物品没有 embedding，冷启动）；② <strong>用不了特征</strong>（用户的年龄/地域/历史行为、物品的类别/文本/画像都没法纳入）。双塔的解法很直接：<strong>把「查 embedding 表」换成「过一个神经网络」</strong>——一个塔（网络）吃用户的所有特征、输出一个用户向量；另一个塔吃物品的所有特征、输出一个物品向量；两向量点积（或余弦）就是匹配分。</p>  <div class="math-block">\[s(u, i) = \langle f_{\text{user}}(x_u),\ g_{\text{item}}(x_i)\rangle = \langle \mathbf{u},\ \mathbf{v}_i\rangle\]</div>  <div class="ascii">        用户塔 (user tower)                物品塔 (item tower)
+   用户特征 x_u                          物品特征 x_i
+   (ID/历史/年龄/地域...)                (ID/类别/文本/画像...)
+        │                                     │
+     [ MLP / embedding ]                  [ MLP / embedding ]
+        │                                     │
+        ▼                                     ▼
+   用户向量 u (d 维)                     物品向量 v_i (d 维)
+        └──────────── 点积 ⟨u, v_i⟩ ────────────┘
+                          = 匹配分
+
+   关键：两塔独立！物品向量可【离线预算】并建 ANN 索引</div>  <p>注意双塔和矩阵分解的连续性：如果把两个塔都退化成「ID embedding 查找表」（不接任何神经网络、不吃任何特征），双塔<strong>就退化成了 MF</strong>（用户 embedding · 物品 embedding）。所以双塔可以理解为<strong>「MF 的神经网络化 + 特征化」</strong>：保留「用户/物品各成一个向量、内积匹配」的骨架，但① 塔可以是任意深的网络，② 塔可以吃任意特征（ID、历史、文本、图像）。这两点扩展恰好补上了 MF 的两个短板——表达力和冷启动。本模块 notebook 的 worked 实现就先用最简的 ID embedding 双塔（= MF），让你看清骨架，再理解工业上怎么往塔里加特征。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>双塔的灵魂是<strong>「两塔独立」这个架构约束</strong>：用户塔只看用户、物品塔只看物品，二者直到最后<em>点积</em>才相遇。这看似限制了表达力（用户和物品不能在网络内部交互），却换来一个<strong>决定性的工程优势</strong>——物品向量<strong>不依赖用户</strong>，可以把全库十亿物品的向量<strong>离线算好、建成 ANN 索引</strong>；线上来一个用户，只需实时算他的用户向量、再用最大内积搜索（MIPS）从十亿物品里毫秒级取 Top-K。这就是双塔能做亿级召回的全部秘密。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="vs_cross"><span class="num">2</span>双塔 vs cross-encoder</h2>
+  <h3>双塔 vs cross-encoder：为什么召回必须用双塔</h3>  <p>有人会问：为什么不把用户和物品特征拼起来、一起喂进一个大网络（这样表达力更强）？这种架构叫 <span class="term">cross-encoder</span>（交叉编码器），它确实更准，但<strong>绝不能用于召回</strong>。原因是算力：</p>  <table>
+    <thead><tr><th>维度</th><th>双塔 dual-encoder</th><th>cross-encoder 交叉编码器</th></tr></thead>
+    <tbody>
+      <tr><td>输入</td><td>用户、物品分别编码</td><td>用户+物品拼起来一起编码</td></tr>
+      <tr><td>表达力</td><td>受限（只在点积处交互）</td><td><strong>强</strong>（全程交互）</td></tr>
+      <tr><td>物品向量</td><td><strong>可离线预算 + ANN 索引</strong></td><td>不可预算（依赖用户）</td></tr>
+      <tr><td>给 N 个物品打分</td><td>1 次用户塔 + N 次查表/ANN</td><td><strong>N 次完整前向</strong>（炸）</td></tr>
+      <tr><td>适用层</td><td><strong>召回</strong>（百万~十亿候选）</td><td>精排（几十~几百候选）</td></tr>
+    </tbody>
+  </table>  <p>差别是<strong>数量级</strong>的：双塔给十亿物品打分，只需算<em>一次</em>用户向量 + 一次 ANN 查询；cross-encoder 要对每个物品都跑一次完整前向——十亿次前向在几十毫秒内绝无可能。所以工业漏斗里<strong>双塔做召回（快、可预算）、cross-encoder 风格的重模型做精排（准、候选已经少）</strong>，各司其职。这也呼应模块 00 的漏斗：先粗后精，把昂贵算力留给最后少量候选。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句话记住分工：<strong>召回阶段「物品向量能不能离线算」是生死线</strong>——能（双塔），才可能在十亿库上做；不能（cross-encoder），就只配在精排处理几百个候选。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这也解释了为什么双塔<strong>刻意</strong>不让两塔交互：不是技术做不到，而是<em>一旦交互，物品向量就依赖具体用户，无法预算，召回就崩了</em>。架构上的「自我设限」换来工程上的可行性——这是系统设计里「约束即自由」的经典案例。理解这个取舍，你就理解了双塔为什么长这样。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="train"><span class="num">3</span>训练：对比学习 + softmax</h2>
+  <h3>训练：对比学习 + softmax</h3>  <p>双塔怎么训练？给定一批正样本对 $(u, i^+)$（用户 $u$ 真的交互过物品 $i^+$），我们希望<strong>正样本对的点积分高，用户与其他（负）物品的分低</strong>。这是一个<strong>对比学习（contrastive learning）</strong>/检索问题，最常用 softmax 交叉熵：把「从所有物品里选中 $i^+$」建模成一个 softmax 分类：</p>  <div class="math-block">\[P(i^+\mid u) = \frac{\exp(s(u, i^+)/\tau)}{\sum_{j\in \mathcal{I}} \exp(s(u, j)/\tau)}, \qquad \mathcal{L} = -\sum_{(u,i^+)} \log P(i^+\mid u)\]</div>  <p>其中 $\tau$ 是<strong>温度</strong>（控制分布尖锐度），$\mathcal{I}$ 理论上是全部物品。直觉：最大化「用户选中真正交互物品」的概率，等价于把用户向量拉向正物品、推离其他所有物品。这正是 Covington 2016（YouTube）召回的训练方式——把召回当成「从数百万视频里 softmax 选一个」的极端多分类。</p>  <div class="callout danger"><span class="label">分母炸了</span>
+    <p>但这里有个<strong>致命的计算问题</strong>：分母要对<strong>全部物品</strong>（百万~十亿）算 $\exp$ 求和——每个训练步都这样算，绝无可能。这就是为什么不能直接用全 softmax。解法是<strong>采样</strong>：只在一小撮采样的负物品上近似分母（sampled softmax）。而最聪明、最省的采样方式，就是下一节的<strong>in-batch 负采样</strong>——它几乎零额外成本地解决了这个问题，是双塔训练的点睛之笔。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="inbatch"><span class="num">4</span>in-batch 负采样</h2>
+  <h3>in-batch 负采样：双塔训练的点睛之笔</h3>  <p><strong>in-batch negatives（批内负采样）</strong>的想法绝妙而简单：训练时一个 batch 里有 $B$ 个正样本对 $(u_1,i_1),\dots,(u_B,i_B)$。对用户 $u_a$ 来说，它的正物品是 $i_a$，而<strong>同一 batch 里别人的正物品 $i_b\ (b\neq a)$ 就天然是 $u_a$ 的负物品</strong>！于是不用额外采样，一个 batch 就提供了 $B$ 个候选（1 正 $B-1$ 负）。</p>  <p>具体地，把 batch 内 $B$ 个用户向量堆成 $U\in\mathbb{R}^{B\times d}$、$B$ 个物品向量堆成 $V\in\mathbb{R}^{B\times d}$，算<strong>分数矩阵</strong> $S=UV^\top\in\mathbb{R}^{B\times B}$。$S_{ab}=\langle u_a, v_b\rangle$ 是「用户 $a$ 对物品 $b$」的分。我们希望<strong>对角线（正样本对）最大</strong>——这正好是一个「行 softmax，标签是对角」的分类：</p>  <div class="math-block">\[\mathcal{L} = -\frac{1}{B}\sum_{a=1}^{B} \log \frac{\exp(S_{aa}/\tau)}{\sum_{b=1}^{B} \exp(S_{ab}/\tau)}\]</div>  <div class="ascii">分数矩阵 S = U Vᵀ  (B×B)，标签 = 对角线
+
+          物品1  物品2  物品3  物品4
+  用户1  [ ★    .     .     .   ]   &lt;- 正例在对角，其余 3 个是 in-batch 负例
+  用户2  [ .    ★     .     .   ]
+  用户3  [ .    .     ★     .   ]
+  用户4  [ .    .     .     ★   ]
+
+  目标：每行 softmax，把对角(★)的概率推高 -&gt; 正例分高于同batch其他物品</div>  <p>这等价于对每一行做 softmax 交叉熵、标签是 $a$（对角位置）——一行代码 `cross_entropy(S/τ, labels=arange(B))`。好处：① <strong>零额外采样成本</strong>（负例就是 batch 里现成的）；② batch 越大，负例越多，近似越好（工业上 batch 开到几千上万就是为了多负例）；③ 实现极简，一个矩阵乘搞定。这是双塔训练的标准做法。</p>  <p>梯度也很优美。设行 softmax 概率为 $P_{ab}$，标签是对角，则 $\partial\mathcal{L}/\partial S_{ab}=(P_{ab}-\mathbb{1}[a=b])/B$——正例位置（对角）梯度为 $P_{aa}-1<0$（要把分推高），负例位置梯度为 $P_{ab}>0$（要把分压低）。再由 $S=UV^\top$ 链式回传到塔参数：$\partial\mathcal{L}/\partial U=(\partial\mathcal{L}/\partial S)V$、$\partial\mathcal{L}/\partial V=(\partial\mathcal{L}/\partial S)^\top U$。notebook worked 会把这套梯度从零写出并<strong>用数值梯度对拍</strong>，确保推导无误——这正是「自己会写」而非「调包」的体现。</p>  <p>不妨手算一个 $B=2$ 的微例把这套机制坐实。设温度 $\tau=1$，两个正样本对算出的分数矩阵 $S=\bigl[\begin{smallmatrix}2 & 0\\ 0 & 1\end{smallmatrix}\bigr]$（对角是正例分，已经偏高，符合期望）。第一行 softmax：$P_{11}=\frac{e^2}{e^2+e^0}=\frac{7.39}{7.39+1}\approx0.881$，$P_{12}\approx0.119$；第二行：$P_{22}=\frac{e^1}{e^0+e^1}\approx0.731$，$P_{21}\approx0.269$。损失 $\mathcal L=-\tfrac12(\ln 0.881+\ln 0.731)=-\tfrac12(-0.127-0.313)=0.220$。对角梯度 $\partial\mathcal L/\partial S_{11}=(0.881-1)/2=-0.060<0$（把正例分继续往上推）、$\partial\mathcal L/\partial S_{12}=0.119/2=+0.060>0$（把这个 in-batch 负例往下压）。可见：<strong>对角已经领先得越多，推它的梯度就越小</strong>——和 BPR 的难例聚焦同理，softmax 自动把力气留给「还没分开」的对。把这个 $2\times2$ 的手算结果当成 notebook 数值对拍的金标准，一眼就能看出代码写对没有。再留意温度 $\tau$ 的作用：若把 $\tau$ 调到 0.5（更尖锐），第一行变成 $\frac{e^{2/0.5}}{e^{4}+e^{0}}=\frac{e^4}{e^4+1}\approx0.982$，分布被拉得更极端、正例概率更高、损失更小但梯度也更「非此即彼」；$\tau$ 调大则分布趋平、正负难分。这就是为什么 $\tau$ 要调——它直接控制「正例要比负例领先多少分才算学好」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直觉记住 in-batch 的精妙：与其费力去全库采负例，不如<strong>白嫖</strong>——你这个 batch 里其他用户的正物品，对我而言不就是天然的负例吗？一个矩阵乘 $UV^\top$ 同时算出了所有「正例分」（对角）和「负例分」（非对角），一举两得。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但白嫖有代价（下一节）：batch 是按交互频率采的，热门物品<strong>更容易出现在 batch 里、被当负例</strong>，导致它们被系统性压低。这个采样偏差必须用 logQ 校正来纠。所以 in-batch 负采样和 logQ 校正是<em>一对</em>——前者提供廉价负例，后者修正它引入的偏差，缺一不可。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="logq"><span class="num">5</span>采样偏差与 logQ 校正</h2>
+  <h3>采样偏差与 logQ 校正</h3>  <p>in-batch 负采样有一个<strong>隐蔽但重要的偏差</strong>（Yi 2019 揭示）：batch 是从交互日志里采的，而<strong>热门物品出现在 batch 里的概率天然更高</strong>（它们交互多）。于是热门物品<strong>被当作负例的次数远多于冷门物品</strong>——模型被反复告知「别推这个热门物品」，导致系统性地<strong>低估热门物品</strong>的分数。这显然不对：热门物品本该有更高曝光。</p>  <p>Yi 2019 的修正叫 <strong>logQ correction（采样偏差校正）</strong>：从 logit 里<strong>减去该物品被采样的对数概率</strong> $\log Q(i)$，抵消「热门物品被频繁当负例」的偏差：</p>  <div class="math-block">\[S'_{ab} = S_{ab} - \log Q(i_b), \qquad \mathcal{L} = -\frac{1}{B}\sum_a \log\frac{\exp(S'_{aa}/\tau)}{\sum_b \exp(S'_{ab}/\tau)}\]</div>  <p>其中 $Q(i)$ 是物品 $i$ 在 batch 采样中出现的概率（≈ 它的流行度）。直觉：热门物品 $Q$ 大、$\log Q$ 大、被减得多，相当于<strong>把它作为负例时「打个折」</strong>，补偿它被过度当负例的事实。这个简单的修正在 Yi 2019 中带来显著的召回提升，是工业双塔的标配。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：in-batch 负采样像「随机抽人来当反面教材」，但热门的人总被抽中当反面教材，太冤了。logQ 校正就是<strong>按「被抽中当反面教材的频率」给每个人一个补偿分</strong>——越常被冤枉的，补偿越多。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地，这来自 sampled softmax 的理论：用采样分布 $Q$ 近似全 softmax 时，无偏估计要求 logit 修正为 $s - \log Q$。in-batch 负采样的 $Q$ 恰好正比于物品流行度，所以校正 = 减 $\log(\text{popularity})$。它把「有偏的 in-batch softmax」纠正回「无偏的全 softmax 近似」——这是 Yi 2019 论文的核心贡献。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个实践细节：logQ 校正只在<strong>训练</strong>时加（为了无偏估计损失），<strong>线上召回打分时不加</strong>（线上要的是真实的相关性分数 $\langle u,v\rangle$，不是去偏的训练 logit）。混淆这一点会让线上召回结果系统性偏移。记住：<em>校正是为了训练目标无偏，不是改变物品的真实分数</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ann"><span class="num">6</span>召回与 ANN：向量到 Top-K</h2>
+  <h3>召回与 ANN：从向量到 Top-K</h3>  <p>训练完，线上召回怎么做？三步：① 离线把全库物品过物品塔，得到 $n$ 个物品向量，建 <span class="term">ANN</span> 索引；② 线上来一个用户，过用户塔得到用户向量 $u$；③ 用 <span class="term">MIPS</span>（最大内积搜索）从索引里取与 $u$ 内积最大的 Top-K 物品。</p>  <p>第 ③ 步是关键瓶颈：从十亿向量里精确找内积最大的 K 个要 $O(n)$，太慢。<strong>近似最近邻（ANN）</strong>用亚线性时间换一点精度损失：</p>  <ul>
+    <li><strong>HNSW</strong>（分层可导航小世界图）：建一个多层图，查询时从顶层粗导航到底层精搜，$O(\log n)$ 量级，召回率高，当前最常用。</li>
+    <li><strong>IVF</strong>（倒排 + 量化，FAISS）：先把向量聚成若干簇，查询只搜最近的几个簇；配合乘积量化（PQ）压缩向量省内存，十亿级标配。</li>
+    <li><strong>ScaNN</strong>（Google）：各向异性量化，专门对齐内积（MIPS）而非欧氏距离，召回-速度权衡更优。</li>
+  </ul>  <p>一个数学细节：MIPS（最大内积）和最近邻（最小欧氏距离）<strong>不等价</strong>（内积大可能因为向量模长大，而非方向近）。但二者可互相转换——给向量加一维补偿模长，就能把 MIPS 化成欧氏最近邻，从而复用所有 ANN 算法。很多双塔直接用<strong>余弦相似度</strong>（先归一化向量），此时 MIPS = 最近邻，最省心。</p>  <p>ANN 的本质是一个<strong>速度-召回率权衡</strong>：它不保证找到精确的 Top-K，而是以极高概率找到<em>大部分</em>真正的 Top-K，换取亚线性甚至近常数的查询时间。工程上用「召回率@K（ANN 取的 K 个里有多少是精确 Top-K）」来量化这个损失，通常调到 95%+。对召回层而言这点损失完全可接受——反正后面还有粗排精排兜底，召回只要<strong>别漏太多</strong>。这又一次印证漏斗哲学：每一层都允许<em>适度不精确</em>，把精确性留给候选已经很少的下游。notebook 的 worked 用暴力 MIPS（小数据可精确），但你要记得工业上这一步永远是 ANN 近似。</p>  <p>把双塔放回整条工业漏斗看，它的位置和约束就一目了然。下表对比召回（本模块）、精排（模块 04/05）、重排三层——同一条链路上「候选规模、模型形态、优化目标、延迟预算」如何逐级变化：</p>  <table>
+    <thead><tr><th>阶段</th><th>候选规模</th><th>模型形态</th><th>核心目标</th><th>对错误的容忍</th></tr></thead>
+    <tbody>
+      <tr><td><strong>召回</strong>（本模块）</td><td>十亿 → 数百</td><td>双塔 + ANN（物品向量可离线）</td><td>Recall@K，<strong>别漏</strong></td><td>高（后面有兜底）</td></tr>
+      <tr><td><strong>精排</strong>（模块 04/05）</td><td>数百 → 数十</td><td>cross 结构、深度 CTR（用户物品充分交叉）</td><td>nDCG / 多目标，<strong>排准</strong></td><td>低（直接面向用户）</td></tr>
+      <tr><td><strong>重排</strong></td><td>数十 → 最终列表</td><td>轻量规则 / listwise</td><td>多样性、打散、业务约束</td><td>中（看体验与策略）</td></tr>
+    </tbody>
+  </table>  <p>这张表解释了双塔的全部「自我设限」：它待在漏斗最上游，要在<strong>最大的候选规模、最紧的延迟预算</strong>下工作，所以只能用「物品向量可预算」的双塔、只追求 Recall（别漏）、并容忍 ANN 的近似。越往下游候选越少、延迟预算越宽，才用得起交叉结构的重模型去抠 nDCG。把这三层的分工记牢，你看任何工业推荐系统的架构图都不会迷路——它们几乎都是这个漏斗的变体。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把双塔召回和模块 02 的 MF、模块 01 的 CF 串起来看：它们都是<strong>「把用户和物品映射到同一个向量空间，用几何近邻做召回」</strong>。CF 用手工共现相似度、MF 用 ID embedding 内积、双塔用神经网络编码特征——<strong>越来越强的「学表示」能力，但召回的几何本质（向量 + 最近邻）从未改变</strong>。这也正是 C11（RAG 检索）的内核：文本 query 塔 + 文档塔 + ANN。学到这里，你已经掌握了现代检索/召回的通用骨架。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="practice"><span class="num">7</span>工业实践与陷阱</h2>
+  <h3>双塔的工业实践与陷阱</h3>  <p>把双塔做好，有几个工业经验值得知道：</p>  <ul>
+    <li><strong>难负例（hard negatives）</strong>：纯 in-batch 负例大多是「太容易区分」的随机物品。混入<strong>难负例</strong>（同类但用户没交互的、或上一版模型误召回的）能显著提升排序质量。但要小心<em>假负例</em>（其实是用户喜欢只是没曝光的），混太多反伤害。</li>
+    <li><strong>特征工程</strong>：用户塔常喂「历史行为序列」（接模块 05），物品塔喂内容特征（文本/图像 embedding）——这正是双塔解决冷启动的方式：新物品没有 ID 交互，但有内容特征，照样能算出向量。</li>
+    <li><strong>温度 $\tau$</strong>：对收敛和召回效果敏感，常需调（或设为可学习）。$\tau$ 太大分布太平、学不动；太小过于尖锐、训练不稳。</li>
+    <li><strong>多塔/多兴趣</strong>：单个用户向量难表达多元兴趣（你既爱科幻又爱纪录片）。MIND（多兴趣）等用多个用户向量，召回时各取一路。</li>
+    <li><strong>双塔的天花板</strong>：因两塔不交互，表达力终究受限。所以它只做召回，精排还得靠能交互的重模型（模块 04/05）。</li>
+  </ul>  <p>这里有个反复出现的工业直觉值得单独点出：<strong>双塔训练里，「batch size」其实是个伪装的「负例数」超参</strong>。in-batch 负采样下，batch 越大，每个正例能对比的负例就越多（$B-1$ 个），sampled softmax 对全 softmax 的近似就越准，召回质量通常随之上升——这正是工业上把双塔 batch 开到几千甚至上万的真实动机（不是为了梯度更稳，而是为了更多负例）。但它也立刻把<strong>采样偏差放大</strong>：batch 越大，热门物品越频繁地作为别人的 in-batch 负例出现，logQ 校正就越不可省。所以「调大 batch」和「上 logQ 校正」在工程上是一对要同时做的动作。理解了「batch=负例数」这层伪装，你就明白为什么双塔的 batch size 远比一般分类任务激进、也明白它为什么离不开 logQ。</p>  <p>本模块 notebook 用真实/合成 MovieLens 的隐式正例对，从零实现双塔（这里塔就是 ID embedding + 可选 MLP）、in-batch 负采样的 softmax 损失、logQ 校正，训练后用点积召回算 <strong>Recall@K</strong>，并验证 logQ 校正确实改善了对热门/长尾的平衡。跑完你会对「亿级召回怎么训、怎么服务」有完整的第一手认识。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>采样偏差的更优校正</strong>：logQ 需要估计物品流行度 $Q$，流式估计、对长尾的处理仍有改进空间（Yi 2019 用 streaming frequency estimation）。</li>
+    <li><strong>难负例挖掘</strong>：如何自动挖掘有效难负例而不引入假负例，是召回质量的关键。ANN 自挖负例、跨 batch 负例队列（类比 MoCo）等是活跃方向。</li>
+    <li><strong>双塔 vs 生成式检索</strong>：新范式（如 DSI、生成式推荐 TIGER）直接用语言模型「生成」物品 ID，绕开向量索引。能否取代双塔仍是开放问题。</li>
+    <li><strong>多目标与多任务双塔</strong>：召回要同时考虑点击/时长/转化/多样性，如何在双塔里平衡多目标是工业难题。</li>
+    <li><strong>一致性与索引更新</strong>：物品向量离线算、ANN 索引定期重建，但模型在更新——训练与服务的 embedding 一致性、索引的实时更新是工程前沿。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Covington 2016（YouTube 双塔/召回，漏斗世界观）、Yi 2019（in-batch 负采样 + logQ 校正，本模块核心）、Huang 2013（DSSM 双编码器鼻祖）。进阶：FAISS（Johnson 2017）、HNSW（Malkov 2016）、ScaNN（Guo 2020）的 ANN。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_matrix_factorization/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 矩阵分解</div></a>
+    <a class="next" href="../04_learning_to_rank/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 排序学习</div></a>
+  </div>
+
+</div>
+</body>
+</html>

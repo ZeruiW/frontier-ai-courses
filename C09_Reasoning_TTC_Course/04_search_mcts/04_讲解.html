@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 推理即搜索：beam / Tree-of-Thoughts / MCTS 从零</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 推理即搜索：beam / Tree-of-Thoughts / MCTS 从零</h1>
+  <p class="subtitle">线性采样把每条 CoT 当成一锤子买卖；树搜索允许中途剪枝与回溯 —— 但只有当价值函数足够好时，它才赢得过暴力采样</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（self-consistency / best-of-N）、模块 03（verifier 与 PRM）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_search_mcts.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Yao 2023 (ToT)、Hao 2023 (RAP)、Kocsis &amp; Szepesvári 2006 (UCT)、Snell 2024、DeepSeek-R1 2025</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#formal">把推理形式化为树搜索</a></li>
+      <li><a href="#greedy-beam">greedy 与 beam search：最简单的树策略及其局限</a></li>
+      <li><a href="#tot">Tree of Thoughts：propose–evaluate–search 三件套</a></li>
+      <li><a href="#mcts">RAP 与 MCTS：四阶段循环与 UCT 公式</a></li>
+      <li><a href="#prm-heuristic">PRM 作为搜索启发：03 章与本章的接口</a></li>
+      <li><a href="#accounting">搜索的算力会计：节点数 vs 采样条数</a></li>
+      <li><a href="#when">树搜索什么时候赢、什么时候输</a></li>
+      <li><a href="#internalize">o1/R1 时代：显式搜索 vs 内化搜索</a></li>
+      <li><a href="#eval">评测视角：同预算下的公平比较协议</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="formal"><span class="num">1</span>把推理形式化为树搜索</h2>
+
+  <p>02 章的 self-consistency 与 best-of-N 把一条完整 CoT 当作不可分割的原子：采样 → 打分/投票 → 选答案。
+  本章换一个视角：<strong>多步推理本质上是在一棵树（更准确地说，一个图）上做搜索</strong>。形式化为一个确定性
+  <span class="term">MDP (Markov Decision Process)</span>：</p>
+
+  <table>
+    <thead><tr><th>搜索概念</th><th>推理对应物</th><th>例（数学题）</th></tr></thead>
+    <tbody>
+      <tr><td>状态 $s$</td><td>部分推理轨迹（问题 + 已生成的前 $t$ 步）</td><td>"设 $x$ 为…；两边平方得…"</td></tr>
+      <tr><td>动作 $a$</td><td>下一个推理步（一个 thought / step）</td><td>"移项并因式分解"</td></tr>
+      <tr><td>转移 $s'=f(s,a)$</td><td>把新步追加到轨迹（确定性拼接）</td><td>—</td></tr>
+      <tr><td>终止状态</td><td>给出最终答案的完整轨迹</td><td>"所以 $x=3$"</td></tr>
+      <tr><td>奖励 $r$</td><td>最终答案是否正确（稀疏、仅终点）</td><td>对/错</td></tr>
+      <tr><td>价值 $V^*(s)$</td><td>从该部分推理出发<strong>能否到达正确答案</strong></td><td>"这条路还有救吗"</td></tr>
+    </tbody>
+  </table>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>线性采样是"一口气写完整张卷子，写 N 份挑最好的"；树搜索是"每写一步就停下来问：这步靠谱吗？
+      不靠谱的当场撕掉（剪枝），靠谱的多写几个续法（展开），写到一半发现死路还能退回去换路（回溯）"。
+      两者的根本差别只有一个：<strong>算力花在哪一层粒度上做决策</strong> —— 整条轨迹，还是单个推理步。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设每步从提议分布 $p_\theta(a\mid s)$ 采样，深度 $D$、有效分支因子 $b$。独立采样 $N$ 条轨迹覆盖的不同前缀数
+      $\le N$；而树搜索在同样的节点预算 $B \approx N\!\cdot\!D$ 下，可以把预算<strong>非均匀地</strong>分配给高价值前缀。
+      其增益完全由两个量决定：① 真值 $V^*$ 在中间状态上的<strong>可分辨性</strong>（错误能否在中途被识别）；
+      ② 价值估计 $\hat V$ 与 $V^*$ 的相关性。若 $\hat V$ 与 $V^*$ 无关，树搜索退化为带额外开销的随机采样 ——
+      这正是 notebook 相图实验要复现的现象。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  关键洞察：<strong>搜索的全部价值来自"中途可判断"</strong>。如果一条推理只有写到最后才能判对错（如某些一步顿悟型谜题），
+  任何树搜索都不可能优于暴力采样 —— 因为没有任何中间信号可供剪枝。03 章训练的 PRM 之所以重要，正是因为它把
+  "中途可判断"从假设变成了工程能力。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="greedy-beam"><span class="num">2</span>greedy 与 beam search：最简单的树策略及其局限</h2>
+
+  <p><strong>greedy decoding</strong> 是宽度为 1 的退化搜索：每步取 $\arg\max_a p_\theta(a\mid s)$。
+  它的失败模式众所周知 —— 一步走错满盘皆输，且没有任何纠错机会。
+  <span class="term">beam search</span> 把宽度放大到 $W$：每层保留 $W$ 个最优前缀，各自展开 $b$ 个候选，再从 $W\!\cdot\!b$
+  个孩子里按打分函数取 top-$W$。</p>
+
+  <div class="ascii">
+  greedy (W=1)           beam (W=2)                 MCTS（非均匀分配）
+      ●                      ●                          ●
+      │                    ┌─┴─┐                     ┌──┼──┐
+      ●                    ●   ●                     ●  ●  ●
+      │                  ┌─┴┐ ┌┴─┐                  ┌┴┐    │
+      ●                  ●  ✂ ✂  ●                  ● ●    ●
+      │                  │       │                  │      ├──┐
+      ▼                  ▼       ▼                  ▼      ▼  ▼
+  一条路走到黑        每层保留固定 W 条          预算流向"看起来有希望"的子树
+  </div>
+
+  <p>用什么打分？传统 NLP 用累积 log-prob，但推理任务上这是个<strong>糟糕的启发</strong>：模型自信 ≠ 正确
+  （02 章已经看到 CoT 的众数答案和最高 log-prob 答案经常不一致）。推理场景下 beam search 的正确打开方式是
+  <strong>用价值模型打分</strong> —— 每个候选前缀过一遍 $\hat V(s)$，即 step-level 的 best-of-N
+  （Xie et al. 2023, arXiv:2305.00633 的 self-evaluation guided beam search；Snell et al. 2024 用 PRM 打分）。</p>
+
+  <p>beam search 的两个结构性局限：</p>
+  <ul>
+    <li><strong>无回溯</strong>：一层剪掉的前缀永远消失。若 $\hat V$ 在浅层噪声大（部分推理越短越难判断），好前缀会被过早杀死 —— 不可恢复。</li>
+    <li><strong>宽度固定</strong>：每层均匀花 $W\!\cdot\!b$ 个节点，不管这一层是"十字路口"还是"一本道"。预算分配与不确定性无关。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  还有一个常被忽略的退化：beam 内<strong>多样性塌缩</strong>。$W$ 条 beam 往往共享同一个浅层前缀，名义宽度 $W$、
+  有效宽度 ≪ $W$。NLP 里用 diverse beam / 温度来缓解；推理搜索里更常见的解法是直接换 MCTS —— UCT 的探索项天然反对全员挤一条路。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="tot"><span class="num">3</span>Tree of Thoughts：propose–evaluate–search 三件套</h2>
+
+  <p><strong>Tree of Thoughts</strong>（Yao et al. 2023, arXiv:2305.10601）是把"推理即搜索"落到 LLM 上的第一个完整框架。
+  它把任何 ToT 系统拆成三个可独立设计的组件：</p>
+
+  <table>
+    <thead><tr><th>组件</th><th>职责</th><th>LLM 实现方式</th></tr></thead>
+    <tbody>
+      <tr><td><strong>thought 分解</strong> + <strong>proposer</strong></td><td>定义"一步"的粒度；给定状态生成 $k$ 个候选下一步</td><td>同一 prompt 采样 $k$ 次（步骤短时），或单次 prompt 让模型列出 $k$ 个提案（步骤需多样时）</td></tr>
+      <tr><td><strong>evaluator</strong></td><td>估计状态价值 $\hat V(s)$</td><td>LLM 自评："这个中间结果 sure/likely/impossible 达到 24？"，或多个状态间投票</td></tr>
+      <tr><td><strong>search 算法</strong></td><td>决定展开顺序与剪枝</td><td>BFS 变体（≈ beam search，Game of 24 用 $W{=}5$）或 DFS 变体（深入 + 回溯，creative writing / crosswords）</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>Yao et al. 2023 的标志性结果</strong>：Game of 24（4 个数字经 +−×÷ 凑 24）上，GPT-4 + CoT 仅 4% 成功率，
+  CoT-SC（best of 100）9%，而 ToT（BFS, $b{=}5$）达 <strong>74%</strong>。注意任务的结构：每步是一次显式算术运算、
+  中间状态（剩余数字）可被廉价且较准确地评估 —— 这恰好是第 7 节"树搜索赢"的全部条件。把 ToT 搬到中间状态难评估的任务上，
+  增益会大幅缩水，这是读该论文时最该带走的 caveat。</div>
+
+  <p>ToT 的概念贡献大于算法贡献：BFS/DFS 本身是教科书内容，真正的创新是论证了<strong>同一个 LLM 可以分饰 proposer 与
+  evaluator 两角</strong>，从而无需外部模型就能搭出完整搜索循环。后续 Graph of Thoughts（Besta et al. 2024, arXiv:2308.09687）
+  把树推广到 DAG（允许 thought 聚合），属于同一谱系。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="mcts"><span class="num">4</span>RAP 与 MCTS：四阶段循环与 UCT 公式</h2>
+
+  <p><strong>RAP (Reasoning via Planning)</strong>（Hao et al. 2023, arXiv:2305.14992）比 ToT 更进一步：
+  把 LLM 同时当作 <span class="term">policy</span>（提议动作）和 <span class="term">world model</span>（预测动作后的新状态），
+  然后在其上跑标准 <span class="term">MCTS (Monte Carlo Tree Search)</span>。这把 AlphaGo 谱系
+  （Coulom 2006；Silver et al. 2016/2017）的搜索机械完整接入了 LLM 推理。</p>
+
+  <p>MCTS 每次迭代执行四个阶段，迭代之间增量地构建一棵<strong>非均匀</strong>的树：</p>
+
+  <div class="ascii">
+  ┌─► ① Selection 选择
+  │     从根出发，沿 UCT 最大的孩子下行，直到一个未完全展开的节点
+  │                    │
+  │                    ▼
+  │   ② Expansion 展开
+  │     为该节点新建一个未尝试过的孩子（树 +1 节点）
+  │                    │
+  │                    ▼
+  │   ③ Simulation / Rollout 模拟
+  │     从新孩子出发用廉价策略（随机/默认 policy）走到终点，得回报 r∈{0,1}
+  │     （AlphaZero 风格：用价值网络 V̂(leaf) 替代或混合 rollout）
+  │                    │
+  │                    ▼
+  │   ④ Backpropagation 回传
+  │     沿 selection 路径自下而上：N←N+1, W←W+r, Q=W/N
+  │                    │
+  └────────────────────┘  重复直到耗尽节点预算
+  </div>
+
+  <p>Selection 阶段的核心是 <span class="term">UCT (Upper Confidence bounds applied to Trees)</span>
+  （Kocsis &amp; Szepesvári 2006），它把 bandit 理论的 UCB1 搬到树上：</p>
+
+  <div class="math-block">
+  $$ a^* \;=\; \arg\max_{a}\;\underbrace{\frac{W(s,a)}{N(s,a)}}_{\text{exploitation：经验均值 } Q}
+     \;+\; c\,\underbrace{\sqrt{\frac{\ln N(s)}{N(s,a)}}}_{\text{exploration：不确定性红利}} $$
+  </div>
+
+  <p>三个值得在脑中过一遍的极限：</p>
+  <ul>
+    <li>$N(s,a)=0$：探索项 $\to\infty$，<strong>未访问的孩子无条件优先</strong>（实现时直接返回 $+\infty$）。</li>
+    <li>$c=0$：退化为纯贪心，只剥削当前 $Q$ 最高的孩子 —— 早期噪声估计会把搜索锁死在次优子树。</li>
+    <li>$c\to\infty$：退化为均匀轮询，等价于不带价值引导的 BFS —— 探索红利淹没一切经验信息。</li>
+  </ul>
+
+  <p>UCT 的理论保证：访问次数 $\to\infty$ 时根节点动作选择收敛到最优，且后悔（regret）以 $O(\log N)$ 增长。
+  实践中重要的不是渐近性，而是<strong>有限预算下 $c$ 的敏感性</strong> —— notebook 第 5 节会扫描 $c$，
+  你会看到最优 $c$ 依赖于回报噪声水平（rollout 越随机，越需要探索）。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>LLM + MCTS 的代表工作</strong>：RAP（Hao 2023, arXiv:2305.14992，Blocksworld 规划/GSM8K）、
+  TS-LLM（Feng et al. 2023, arXiv:2309.17179，AlphaZero 式 learned value + MCTS 训练推理模型）、
+  rStar / rStar-Math（Qi et al. 2024, arXiv:2408.06195，小模型互验 + MCTS 达到接近 o1 的数学成绩）。
+  共同配方：generator 提议步骤、PRM/value 评估、MCTS 分配预算 —— 三个组件分别对应本课程 01/03/04 三章。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="prm-heuristic"><span class="num">5</span>PRM 作为搜索启发：03 章与本章的接口</h2>
+
+  <p>03 章训练的 <span class="term">PRM (Process Reward Model)</span> 输出 $\hat V(s)\approx\Pr[\text{从 } s \text{ 能到达正确答案}]$ ——
+  这在搜索语言里就是<strong>启发式价值函数</strong>。两章的接口有三种典型形态：</p>
+
+  <ol>
+    <li><strong>beam search 的打分函数</strong>：每层用 $\hat V$ 给候选排序、保留 top-$W$。Snell et al. 2024 (arXiv:2408.03314)
+    称之为 PRM-guided beam search，在难题 + 小预算下显著优于 best-of-N。</li>
+    <li><strong>MCTS 的 leaf evaluation</strong>：用 $\hat V(\text{leaf})$ 替代（或按 $\lambda$ 混合）随机 rollout 的回报，
+    即 AlphaGo 的 $r = (1-\lambda)\, r_{\text{rollout}} + \lambda\, \hat V$。价值模型越准，越可以省掉昂贵的 rollout。</li>
+    <li><strong>先验注入</strong>（PUCT，AlphaZero 风格）：把 policy 先验 $p_\theta(a\mid s)$ 乘进探索项：
+    $Q + c\, p_\theta(a\mid s)\sqrt{N(s)}/(1{+}N(s,a))$ —— LLM 的 token 概率天然就是这个先验。</li>
+  </ol>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>搜索会放大价值函数的缺陷</strong>。best-of-N 只在 $N$ 个终点上查询 $\hat V$，而 beam/MCTS 在<strong>每个中间节点</strong>上
+  反复查询并据此做不可逆决策 —— $\hat V$ 的系统性偏差（如偏爱长推理、偏爱特定句式）会被搜索主动寻找并利用，
+  这是 03 章 Goodhart 过优化的搜索版，且比 best-of-N 版本更severe：搜索是一个<em>主动的对抗优化器</em>。
+  Snell 2024 观察到 beam search 在大预算下反而劣于 best-of-N，正是 PRM 被过度开采（over-exploitation）的征兆。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="accounting"><span class="num">6</span>搜索的算力会计：节点数 vs 采样条数</h2>
+
+  <p>"ToT 比 CoT 好"这类结论若不锚定算力就是噪声。建立统一记账单位：设一次"节点展开"= 生成一个推理步 + （若使用）一次价值查询。
+  各策略在预算 $B$ 下的开销：</p>
+
+  <table>
+    <thead><tr><th>策略</th><th>生成开销（推理步数）</th><th>价值查询次数</th><th>同预算 $B$ 的等效形态</th></tr></thead>
+    <tbody>
+      <tr><td>greedy</td><td>$D$</td><td>0</td><td>—（不随 $B$ 变化）</td></tr>
+      <tr><td>独立采样 $N$ 条</td><td>$N\!\cdot\! D$</td><td>$N$（仅终点，best-of-N 时）</td><td>$N = B/D$</td></tr>
+      <tr><td>beam（宽 $W$，分支 $b$）</td><td>$D\!\cdot\! W\!\cdot\! b$</td><td>$D\!\cdot\! W\!\cdot\! b$（每个候选一次）</td><td>$W = B/(D\, b)$</td></tr>
+      <tr><td>MCTS（$M$ 次迭代）</td><td>$M$（展开）$+\, M\!\cdot\!\bar L$（rollout 均长 $\bar L$）</td><td>$M$（leaf eval 时）</td><td>$M \approx B/(1+\bar L)$</td></tr>
+    </tbody>
+  </table>
+
+  <p>几条容易被论文掩盖的细账：</p>
+  <ul>
+    <li><strong>价值查询不免费</strong>：PRM 本身是一次 LLM forward。若 PRM 与 generator 同量级，beam search 的真实成本是表面生成成本的 ~2 倍；论文只报"采样条数"时要警惕。</li>
+    <li><strong>token ≠ 节点</strong>：步骤长度不一。严格比较应以 token 数或 FLOPs 记账；notebook 的玩具环境步长恒定，节点数即可。</li>
+    <li><strong>串行深度（latency）</strong>：$N$ 条独立采样完全并行（1 个串行轮次）；beam 是 $D$ 轮；MCTS 是 $M$ 轮严格串行 ——
+    同 FLOPs 下 MCTS 的 wall-clock 可能差一个数量级。评测报告应同时给出 compute 与 latency 两本账。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="when"><span class="num">7</span>树搜索什么时候赢、什么时候输</h2>
+
+  <p>把第 1 节的两个决定量展开为三个可操作的判据：</p>
+
+  <table>
+    <thead><tr><th>判据</th><th>树搜索赢</th><th>暴力采样赢</th></tr></thead>
+    <tbody>
+      <tr><td><strong>步骤可验证性</strong>（中间状态能否被判断）</td><td>高：算术/代码（可执行）、形式证明（可检查）、Game of 24（剩余数字可枚举）</td><td>低：需要全局顿悟的谜题、开放式写作 —— 中间状态无信号，剪枝即瞎剪</td></tr>
+      <tr><td><strong>价值函数质量</strong> $\rho(\hat V, V^*)$</td><td>高相关：搜索把预算精准导向可行子树</td><td>低相关/有系统偏差：剪枝杀死好前缀（false negative 不可恢复），或 Goodhart 开采 $\hat V$ 漏洞</td></tr>
+      <tr><td><strong>分支因子与解密度</strong></td><td>分支大、解稀疏、错误前缀多：剪枝节省的预算可观</td><td>解稠密（随机采样成功率已高）：$1-(1-p)^N$ 增长够快，搜索的额外机械是纯开销</td></tr>
+    </tbody>
+  </table>
+
+  <p>notebook 的<strong>相图实验</strong>把第二行变成定量曲线：固定预算，扫描价值模型噪声 $\sigma_v$ ——
+  $\sigma_v\!=\!0$（oracle）时 beam/MCTS 同预算优于独立采样；$\sigma_v$ 增大后 <strong>beam（硬剪枝、无回溯）率先跌破采样基线</strong>，
+  而带 rollout 的 MCTS 退化平缓 —— 它的回报有一半来自真实 rollout（无偏信号），加上该环境终点可免费精确验证（any-correct），
+  给了它一个接近采样的下界。两点引申：① rollout/混合 $\lambda$ 不是工程细节，而是对坏价值函数的<strong>保险</strong>（AlphaGo 用混合回报的深层原因）；
+  ② 这个下界依赖"终点可验证"——换成无免费验证器的任务（必须提交一条路径），MCTS 同样会跌破基线。
+  这组交叉曲线是你评估"某任务值不值得上搜索"时最该先画的图。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  一句话版本：<strong>搜索是用"判断"换"生成"的杠杆</strong>。判断准，杠杆放大收益；判断不准，杠杆同样放大损失。
+  暴力采样没有杠杆，所以永远不会比自己更差 —— 这就是它作为 baseline 的不可替代性。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="internalize"><span class="num">8</span>o1/R1 时代：显式搜索 vs 内化搜索</h2>
+
+  <p>2024 年 OpenAI o1 与 2025 年 DeepSeek-R1（arXiv:2501.12948）改变了搜索的存在形式。这些模型不在推理时跑外部 MCTS，
+  而是生成一条超长 CoT，其<strong>内部</strong>呈现出搜索的全部行为学特征：提出方案、自我评估（"wait, let me check"）、
+  回溯（"that's wrong, let me try another approach"）、分支比较。R1 论文记录的 <span class="term">aha moment</span> ——
+  纯 RL 训练中模型自发学会回头重审 —— 标志着 selection/expansion/backtracking 被<strong>内化（internalized）成了
+  线性 token 序列中的语言行为</span>，即 in-context search。</p>
+
+  <p>为什么内化路线赢了显式搜索（至少在当前一代）？</p>
+  <ul>
+    <li><strong>工程面</strong>：外部 MCTS 需要维护树、做 KV-cache 分叉管理、串行迭代；长 CoT 就是一次普通的自回归生成，与现有 serving 栈零摩擦。R1 论文明确报告其尝试的 MCTS 路线因 token 级搜索空间过大、value model 难训而失败。</li>
+    <li><strong>学习面</strong>：显式搜索的剪枝决策不可微、不进梯度；内化搜索的"何时回溯、回溯到哪"全部由 RL 端到端塑形，价值函数隐式地长在了 policy 里。Gandhi et al. 2024 的 Stream of Search（arXiv:2404.03683）提供了机制证据：把<strong>搜索轨迹本身</strong>（含失败分支与回溯标记）线性化为训练数据，模型就能学会在 context 内搜索，并自组合出新的搜索策略。</li>
+    <li><strong>但并非搜索已死</strong>：rStar-Math 等表明显式 MCTS 在<strong>训练数据合成</strong>端依然关键（搜出高质量轨迹再蒸馏）；且内化搜索的预算分配不可控（overthinking，见模块 06），显式搜索反而预算精确可控。两者更像分工：搜索上移到训练期，推理期留给内化的线性 CoT。</li>
+    </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  对 evaluation researcher 的提醒：内化搜索使"采样条数"不再是 TTC 的良好度量 —— R1 一条 32k token 的 CoT
+  在算力上等价于 02 章的几十条短 CoT。跨范式比较（ToT vs 长 CoT vs best-of-N）唯一公平的 x 轴是
+  <strong>总 token / FLOPs</strong>，这正是下一节与模块 05 的主题。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">9</span>评测视角：同预算下的公平比较协议</h2>
+
+  <p>比较 TTC 策略的实验极易做歪。一个最小公平协议（notebook 练习 4 实现其玩具版）：</p>
+
+  <ol>
+    <li><strong>统一记账单位</strong>：总生成 token（或节点）+ 总价值查询，两本账分开报；预算 $B$ 取多档（如 $2^k$ 网格），报完整曲线而非单点。</li>
+    <li><strong>预算严格执行</strong>：beam 宽度、采样条数、MCTS 迭代数都从 $B$ 反推（第 6 节公式），不允许任何策略隐性超支（常见作弊：beam search 的价值查询不计费）。</li>
+    <li><strong>控制混杂变量</strong>：所有策略共用同一 generator、同一 prompt、同一 $\hat V$；报告对解码温度、$c$、$W$ 等超参的敏感性（搜索类方法超参更多，cherry-picking 空间更大）。</li>
+    <li><strong>必含两个 baseline</strong>：暴力采样（任何搜索的下界检验）与 oracle 价值版本（搜索机械本身的上界）—— 两者夹出"价值函数质量"贡献了多少。</li>
+    <li><strong>按难度分层报告</strong>：Snell 2024 的核心发现是最优策略随难度切换（易题：少量采样即可；中等难度：搜索增益最大；超难题：什么都救不了）。聚合单一数字会掩盖这个结构。</li>
+  </ol>
+
+  <p>违反协议的典型论文病：用 100 次 rollout 的 MCTS 对比 $N{=}5$ 的 self-consistency（预算差 ~20 倍）；
+  或"ToT 优于 CoT"但 evaluator 查询未计费。审稿/复现时先重排算力账本，结论经常翻转 —— Chen et al. 2024
+  (arXiv:2403.02419) 系统地展示了 LLM-call 预算对齐后许多复合推理系统的增益消失。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">10</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>步骤粒度（thought granularity）</strong>：树的"动作"应该是 token、句子还是语义步？粒度太细则树爆炸、太粗则丧失剪枝点。目前全靠手工切分（换行/句号），自适应分割（如按 PRM 不确定性切步）仍开放。</li>
+    <li><strong>价值函数的浅层失明</strong>：$\hat V$ 在推理前几步几乎无信息（什么都还没发生），而 beam 的不可逆剪枝恰恰发生在浅层。深度自适应的宽度调度、或浅层用采样深层用搜索的混合策略，缺乏系统研究。</li>
+    <li><strong>内化搜索的可解释性与可控性</strong>：长 CoT 里的"回溯"是真搜索还是表演（rationalization）？能否从外部控制其探索-剥削倾向（类比 $c$）？budget forcing（模块 06）是粗糙的第一步。</li>
+    <li><strong>搜索-训练闭环</strong>：MCTS 合成数据 → 蒸馏 → 更强 policy → 更高效搜索（rStar-Math 的自进化循环）。该闭环的 scaling 行为、以及 verifier 误差在迭代中的累积，是 2025 年后的核心议题。</li>
+    <li><strong>评测基建</strong>：尚无被广泛采纳的"同 FLOPs TTC 排行榜"。把第 9 节协议标准化（统一记账、强制 baseline、难度分层）本身就是 evaluation 方向可发的论文。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>把推理形式化为搜索时，状态/动作/价值分别是什么？树搜索相对线性采样的本质新能力是哪两个？</li>
+      <li>写出 UCT 公式并解释两项的含义；$c=0$、$c\to\infty$、$N(s,a)=0$ 三个极限各发生什么？</li>
+      <li>MCTS 四阶段各做什么？PRM 可以从哪三个接口接入搜索？</li>
+      <li>给定节点预算 $B$，如何反推采样条数 / beam 宽度 / MCTS 迭代数以保证公平？价值查询为什么必须计费？</li>
+      <li>什么任务特征下树搜索赢/输给暴力采样？o1/R1 为什么放弃显式搜索、搜索去了哪里？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../03_verifiers_prm/03_讲解.html"><div class="dir">← 上一章</div><div class="t">03 · Verifier 与 PRM</div></a>
+    <a class="next" href="../05_ttc_scaling/05_讲解.html"><div class="dir">下一章 →</div><div class="t">05 · 测试时计算 Scaling Laws</div></a>
+  </div>
+
+</div>
+</body>
+</html>

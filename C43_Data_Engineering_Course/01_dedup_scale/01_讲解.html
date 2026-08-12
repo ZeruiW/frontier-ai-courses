@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 大规模去重</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 大规模去重</h1>
+  <p class="subtitle">精确 vs 近似去重 · MinHash 估 Jaccard · LSH banding 把 O(n²) 配对变近 O(n) · SimHash 汉明 · 跨分片并查集合并 —— 把「找所有相似文档对」从不可行做成可行的全套工程</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、集合与哈希、Jaccard/汉明相似度、大 O 复杂度</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_dedup_scale.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Lee et al. 2021、Broder 1997（MinHash）、Indyk & Motwani 1998（LSH）、Charikar 2002（SimHash）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么去重：规模 + 记忆 + 有效数据</a></li>
+      <li><a href="#exact">精确去重：O(n) 的开胃菜</a></li>
+      <li><a href="#minhash">MinHash：把集合压成定长签名</a></li>
+      <li><a href="#lsh">LSH banding：O(n²)→近 O(n)</a></li>
+      <li><a href="#simhash">SimHash：汉明距离的并行路线</a></li>
+      <li><a href="#merge">跨分片合并：并查集归簇</a></li>
+      <li><a href="#ledger">把账算到 PB 级：复杂度全景</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么去重：规模 + 记忆 + 有效数据</h2>
+  <p>我们从去重开篇，不是因为它最简单，而是因为它最锋利地展示了本课的核心命题——<strong>规模如何让正确的做法整体失效</strong>。去重还是任何大规模语料管线绕不过去的第一道工序：CommonCrawl 的网页里充斥着同一篇文章的不同抓取、模板化的样板页、被转载千百次的内容。</p>  <p>为什么非去不可？这不是洁癖，而是有硬证据的工程必需。<span class="term">Lee et al. 2021</span>（本模块的奠基论文）系统地证明了：训练数据里的重复会让模型<strong>逐字背诵</strong>（记忆隐私与版权风险）、让困惑度评估<strong>虚高</strong>（测试集若与训练集重复，等于开卷考试）、并<strong>稀释有效数据量</strong>（同一份内容出现 N 次，模型的有效见识并没有变成 N 倍，算力却白烧了 N 倍）。Carlini 等的记忆化研究进一步量化：一段文本在训练集里<em>重复次数越多，被模型逐字吐出的概率越高</em>。去重，是数据质量的地基。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>去重要解决两种重复。一种是<strong>逐字节完全相同</strong>——同一个文件被抓了两次，这种好办，比一下哈希就行。另一种要命得多：<strong>内容几乎一样但不逐字相同</strong>——同一篇新闻在不同网站的转载、只改了广告位的模板页、加了一句免责声明的复制品。这种「近重复」才是大规模去重的主战场。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：把每篇文档表示成其 <span class="term">shingle</span>（连续 k 个词/字符的集合，如 5-gram）集合，用 <span class="term">Jaccard similarity</span> 衡量两文档相似度 <code>J(A,B) = |A∩B| / |A∪B| ∈ [0,1]</code>。精确去重 = 找 <code>J=1</code> 的；近重复去重 = 找 <code>J ≥ τ</code>（如 <code>τ=0.8</code>）的。难点在于：直接算所有文档对的 Jaccard 需要 <code>C(n,2)</code> 次比较，在 <code>n=1e12</code> 时是天文数字。</p></div>
+  </div>  <div class="callout danger"><span class="label">O(n²) 的墙</span>
+    <p>本模块的核心张力一句话讲清：<strong>近重复去重在数学上就是「找所有相似的文档对」，而朴素地找相似对是 O(n²)——在万亿文档规模上等于不可行</strong>。1e12 篇文档两两比对是约 5e23 次比较，即便每秒 10 亿次也要跑一千多万年。整个模块都在回答：<em>怎么不做两两比对，也能找出几乎所有的近重复对</em>？答案是 MinHash + LSH（外加 SimHash 这条并行路线）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="exact"><span class="num">2</span>精确去重：O(n) 的开胃菜</h2>
+  <h3>精确去重：便宜，但只是开胃菜</h3>  <p>先把最便宜的一档做掉。<strong>精确去重</strong>删除逐字节完全相同的文档，做法是给每篇文档算一个<span class="term">content hash</span>（如 SHA-1/SHA-256），把哈希当 key 放进集合，重复的 key 跳过即可。</p>  <pre><code>seen = set()
+for doc in stream_documents():        # 流式，不需全部入内存
+    h = sha256(doc.bytes)
+    if h not in seen:
+        seen.add(h)
+        emit(doc)                     # 保留这一份</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>精确去重又快又稳：每篇文档只算一次哈希、查一次集合，整体是 <strong>O(n)</strong> 的线性扫描，还能流式做（一次只看一篇，内存里只留哈希集合）。强哈希（SHA-256）的碰撞概率小到可以当成零，所以「哈希相同」基本等价于「内容相同」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>复杂度账：时间 <code>O(n)</code>，空间 <code>O(n)</code>（存 n 个哈希，每个约 32 字节）。1e12 篇文档的哈希集合约 32 TB——单机放不下，但可以分桶（按哈希前缀分到不同机器）轻松并行。这就是为什么精确去重在工程上从来不是瓶颈。</p></div>
+  </div>  <p>但精确去重有个致命的局限：它<strong>抓不住近重复</strong>。同一篇文章，多了一个换行、改了一个标点、加了一句版权声明，字节就变了，SHA 哈希天差地别，精确去重会把它们当成两篇不同的文档全部保留。而真实网页里，近重复<em>远多于</em>逐字节重复——转载会自动加页眉页脚、CMS 会注入时间戳、镜像站会改链接。所以精确去重只是开胃菜，真正的硬骨头是下一节的近重复。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一个有用的心智模型：精确去重和近重复去重是<strong>两道串联的滤网</strong>，不是二选一。生产管线通常<em>先</em>做廉价的精确去重（O(n) 干掉海量逐字节重复，大幅缩小后续规模），<em>再</em>对剩下的做昂贵的近重复去重。先便宜后贵，是本课反复出现的工程节奏（模块 04 的多阶段过滤同理）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="minhash"><span class="num">3</span>MinHash：把集合压成定长签名</h2>
+  <h3>MinHash：把「比集合」变成「比定长签名」</h3>  <p>近重复去重的第一块基石是 <span class="term">MinHash</span>（Broder 1997）。它解决一个看似不可能的问题：<strong>不真的算交集并集，也能估出两个集合的 Jaccard 相似度</strong>，而且把每个集合压成一个定长的小签名。</p>  <p>核心洞察优雅得令人吃惊。取一个把 shingle 映射成整数的随机哈希函数 <code>h</code>，对集合 <code>A</code> 算出所有元素哈希值里的<strong>最小值</strong> <code>min(h(A))</code>。现在问：两个集合 <code>A、B</code> 的最小哈希值相等的概率是多少？答案正是它们的 Jaccard：</p>  <div class="math-block">\[\Pr\big[\min(h(A)) = \min(h(B))\big] = \frac{|A \cap B|}{|A \cup B|} = J(A,B)\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么？想象把并集 <code>A∪B</code> 里所有元素按哈希值排个序，谁排第一（哈希最小）是「随机」的。<code>min(h(A))=min(h(B))</code> 当且仅当这个「第一名」同时属于 A 和 B——也就是它落在交集里。并集里随便挑一个元素，它落在交集的概率正是 <code>|A∩B|/|A∪B|</code>。所以两个最小哈希撞上的概率，恰好就是 Jaccard。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>一个哈希只给你一个「相等/不等」的 0/1 信号，估计方差太大。于是用 <code>K</code> 个<strong>独立</strong>哈希函数，得到一个 <code>K</code> 维签名向量。两签名<strong>对应位置相等的比例</strong>就是 Jaccard 的无偏估计：<code>Ĵ = (#相等位) / K</code>，方差约 <code>J(1−J)/K</code>。<code>K</code> 越大越准，常用 <code>K=128~256</code>。</p></div>
+  </div>  <p>这一步的意义是<strong>降维 + 定长</strong>：一篇可能有几千个 shingle 的文档，被压成一个 <code>K=128</code> 维的整数向量（约 512 字节）。原本要比两个大集合的交并，现在只要比两个定长向量有多少位相等——<em>常数时间、可向量化、可序列化存盘</em>。MinHash 把「相似度」这个连续的、昂贵的量，变成了「定长签名的位匹配」这个廉价的、可批量处理的量。</p>  <p>再补一个常被忽略但工程上很关键的优化：<strong>K 个独立哈希看似要扫 K 遍数据，其实可以更省</strong>。一种做法是 <em>one-permutation hashing</em>（单次置换 MinHash）——只用一个哈希把 shingle 散布到 K 个桶里、每桶取最小，再对空桶做「向邻桶借值」的修补；另一种是用一个强哈希配 K 组随机仿射变换 <code>(a_i·x+b_i) mod p</code>（本课 notebook 用的就是这种），只需算一遍 <code>sha</code>、再向量化地套 K 组 (a,b)。这些技巧把签名计算从 <code>O(K·|shingle|)</code> 的哈希调用压到接近 <code>O(|shingle| + K)</code>，在万亿文档上是实打实的几十倍提速——这正是「算法结构对了之后，常数优化才有意义」的例子。</p>  <div class="callout warn"><span class="label"></span>
+    <p>两个实现陷阱。其一：<code>K</code> 个哈希必须<strong>互相独立</strong>，否则估计有偏——若用了线性相关的哈希族，不同位的「相等事件」会相互纠缠，方差不再是 <code>J(1−J)/K</code>，估计会系统性偏移。实践中用一族带不同随机种子的强哈希，或上面的 <code>(a·x+b) mod p</code> 仿射族（p 取大素数）。其二：MinHash 估的是 <strong>Jaccard</strong>，而 Jaccard 对文档长度差异敏感（长短悬殊的两篇即使一个完全是另一个的子集，Jaccard 也不高，因为并集被长的那篇撑大了）。要找「包含/子集关系」得用 containment 的变体（如 <code>|A∩B|/|A|</code>）。本模块 notebook 会从零实现并验证 MinHash 的无偏性。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="lsh"><span class="num">4</span>LSH banding：O(n²)→近 O(n)</h2>
+  <h3>LSH banding：把 O(n²) 的配对变成近 O(n)</h3>  <p>MinHash 把每篇文档变成了定长签名，但还没解决核心难题：你仍然不能把 <code>n</code> 个签名<strong>两两</strong>比对（那还是 <code>O(n²)</code>）。需要的是一种「只把可能相似的拉到一起比」的机制——这就是 <span class="term">LSH</span>（局部敏感哈希，Indyk & Motwani 1998）。</p>  <p>LSH 的精髓：设计一种哈希，让<strong>相似的文档大概率落进同一个桶、不相似的大概率分开</strong>。这样你只需对<em>每个桶内部</em>的文档做精细比对，而桶通常很小。具体到 MinHash，实现方式是 <span class="term">LSH banding</span>：</p>  <div class="ascii">一个 K=12 维的 MinHash 签名，切成 b=4 个 band、每 band r=3 行：
+
+  签名:  [ h1 h2 h3 | h4 h5 h6 | h7 h8 h9 | h10 h11 h12 ]
+           band 0      band 1     band 2      band 3
+
+  规则：把每个 band 的 r 个值打包哈希成一个「桶 id」。
+        两篇文档只要有 &gt;=1 个 band 的 r 个值完全相同 -&gt; 落进同一桶 -&gt; 成为候选对。
+
+  直觉：r 个值全相同很难（要 Jaccard 高才行），但有 b 次独立机会命中。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这能放大「相似就抓、不相似就放」？一个 band 的 r 行全部相等的概率约是 <code>J^r</code>（r 越大越苛刻）。但你有 <code>b</code> 个 band，<strong>至少一个 band 命中</strong>的概率是 <code>1 − (1 − J^r)^b</code>。这条曲线是一条陡峭的 <strong>S 形</strong>：在某个阈值以下几乎为 0（不相似的几乎不会成候选），阈值以上迅速逼近 1（相似的几乎必成候选）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>命中概率 <code>P(J) = 1 − (1 − J^r)^b</code>，其拐点（近似阈值）约为：</p>  <div class="math-block">\[\tau \approx \left(\frac{1}{b}\right)^{1/r}\]</div>  <p>调 <code>(b, r)</code> 就是调这个阈值与曲线陡度：增大 <code>b</code>（更多 band）降低阈值、提高召回（也增加候选量）；增大 <code>r</code>（每 band 更多行）提高阈值、更严格。给定目标 <code>τ</code>，反解出合适的 <code>(b,r)</code> 是去重调参的核心。</p></div>
+  </div>  <p>复杂度账，这才是 LSH 的全部意义所在：<strong>分桶是 O(n)</strong>（每篇文档算 b 个桶 id、丢进 b 个字典），候选对的数量远小于 <code>C(n,2)</code>——只有真正落进同一桶的才成候选。于是「找近重复对」从 <code>O(n²)</code> 降到了<strong>近 &lt;code&gt;O(n) + O(候选数)&lt;/code&gt;</strong>。在 1e12 文档上，这是「一千万年」和「几小时」的区别。这就是为什么 FineWeb、Dolma、RefinedWeb 的去重全都建立在 MinHash+LSH 之上。</p>  <div class="callout danger"><span class="label">LSH 的代价</span>
+    <p>LSH 不是免费的午餐，有两类误差必须用账目管住。<strong>假阴（漏检）</strong>：真的相似但运气不好、没有任何 band 命中，被漏掉（召回 < 1）；<strong>假阳（候选爆炸）</strong>：<code>b</code> 调太大时，大量不太相似的文档也成候选，精筛（对每个候选算真 Jaccard）的开销反而上去了。工程上的做法是：用 <code>(b,r)</code> 把阈值卡在目标相似度附近、让漏检率可接受，再对候选对做一遍真 Jaccard 精筛去掉假阳。notebook 会把召回率和候选量都量化出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="simhash"><span class="num">5</span>SimHash：汉明距离的并行路线</h2>
+  <h3>SimHash：另一条路线（汉明距离）</h3>  <p>MinHash+LSH 是去重的主路，但还有一条同样重要、Google 用它做了十亿级网页去重的并行路线——<span class="term">SimHash</span>（Charikar 2002，Manku et al. 2007 工程化）。理解它能让你的去重工具箱更完整。</p>  <p>SimHash 的目标和 MinHash 一样（找近重复），但用的相似度是<strong>余弦/汉明</strong>而非 Jaccard。做法：把文档的每个特征（如带权 token）用一个普通哈希映射成 <code>b</code> 位（如 64 位），对每一位做<strong>加权投票</strong>——该位哈希为 1 就 +权重、为 0 就 −权重；最后每位投票为正记 1、为负记 0，得到一个 <code>b</code> 位的<strong>指纹</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>关键性质：<strong>内容越相似的两篇文档，指纹的汉明距离越小</strong>（对应位不同的个数越少）。改动文档里少量词，只会翻转指纹里少数几位。于是「找近重复」变成「找指纹汉明距离 ≤ k 的文档对」（k 常取 3，对 64 位指纹）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>和 MinHash 的对比：MinHash 签名是 <code>K</code> 个整数（512+ 字节），SimHash 指纹是 <code>b</code> 个 bit（64 位=8 字节），<strong>更省空间、比对更快</strong>（异或后数 1 的个数即汉明距离，一条 CPU 指令）。代价是它估的是带权余弦相似而非 Jaccard，对「文档由哪些词构成」更敏感。</p></div>
+  </div>  <p>那 SimHash 怎么避免 O(n²)？同样靠分桶，但用的是<strong>鸽巢原理</strong>（pigeonhole）：把 <code>b</code> 位指纹切成若干块，若两指纹汉明距离 ≤ k，则<strong>至少有一块完全相同</strong>（因为 k 个差异位最多落进 k 块，总有块没被波及）。于是建多个索引、各按一块分桶，只比对同块的文档——这叫 <span class="term">多索引（multi-index）</span>。和 LSH banding 异曲同工：都是「按片段相等分桶，只比同桶的」。</p>  <p>从复杂度账看两者的取舍很有意思。<strong>存储</strong>：SimHash 的 64 位指纹（8 字节）比 MinHash 的 K=128 维签名（512 字节）省约 64 倍——在 1e12 文档上是 8 TB vs 512 TB 的差别。<strong>比对</strong>：SimHash 的汉明距离是一条 <code>popcount</code> 指令，MinHash 估 Jaccard 要数 K 个位的相等——SimHash 快得多。<strong>精度与语义</strong>：MinHash 的阈值直接是 Jaccard（「shingle 重叠多少」），语义直白、可解释；SimHash 估的是带权余弦（「由哪些词构成」），对词频更敏感，但阈值（汉明 ≤ k）与「相似多少」的对应不如 Jaccard 直观。这就是为什么社区文档级去重多用 MinHash，而 Google 这种<em>十亿级、签名必须极省</em>的场景选了 SimHash。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>怎么选 MinHash 还是 SimHash？经验法则：<strong>MinHash+LSH 在文档级近重复（转载、镜像）上是社区主流、阈值语义清晰</strong>（直接对应 Jaccard），FineWeb/Dolma 都用它；SimHash 在<strong>超大规模、签名要极省、且相似度更看重词构成</strong>时有优势，Google 网页去重是经典案例。两者不是对立，很多管线会按场景混用（如先 SimHash 粗筛、再 MinHash 精算）。notebook 会让你都实现一遍、对比签名大小与比对成本。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="merge"><span class="num">6</span>跨分片合并：并查集归簇</h2>
+  <h3>跨分片合并：分布式去重的最后一道工序</h3>  <p>到这里还差一块拼图。PB 级语料不可能在一台机器上去重——它被切成成千上万个 <span class="term">shard</span>（分片），每个 shard 在不同机器上独立处理。每台机器可以对<strong>自己的 shard 内部</strong>去重，但<strong>跨 shard 的重复</strong>（A 文档在 shard 1、它的近重复 B 在 shard 7）怎么办？这就是 <span class="term">cross-shard merge</span>（跨分片合并）。</p>  <p>LSH 天然支持分布式：分桶是按 band 的桶 id 做的，可以把<strong>同一个桶 id 的签名 shuffle 到同一台 reducer</strong>（就像 MapReduce 的 shuffle 阶段），于是无论原文档在哪个 shard，相似的会在 reduce 端汇到一起成为候选对。这一步是 <code>O(n)</code> 的数据搬运 + 桶内比对。</p>  <p>但候选对生成之后还有个<strong>传递性</strong>问题：去重的「重复」关系是会传染的——若 A≈B、B≈C，即便 A 和 C 没直接成候选，它们也属于<em>同一个重复簇</em>，最终每个簇只该保留一份。把零散的候选对<strong>归并成连通分量</strong>，正是 <span class="term">union-find</span>（并查集）的看家本领：</p>  <pre><code>uf = UnionFind(n)
+for (a, b) in candidate_pairs:       # LSH 跨分片汇总出的候选对
+    if true_jaccard(a, b) &gt;= tau:    # 精筛去假阳
+        uf.union(a, b)               # 把 a、b 并进同一簇
+# 每个连通分量保留一个代表（如下标最小的），其余删除
+keep = {uf.find(i) for i in range(n)}</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>并查集把「A≈B、B≈C」自动归并成一个簇 {A,B,C}，每簇只留一份。它的合并与查询几乎是常数时间（路径压缩 + 按秩合并后近 <code>O(α(n))</code>，α 是反阿克曼函数，实际上 ≤ 5）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要警惕：跨分片合并是整条去重管线里<strong>最难并行、最容易成串行瓶颈</strong>的一环——候选对的汇总（shuffle）和全局并查集本质上需要全局视野。Amdahl 定律（模块 00）在这里现身：前面的分桶再怎么并行，这一步的串行占比会封住整体加速比。生产系统会用分布式并查集或分层合并来缓解。</p></div>
+  </div>  <p>把整条流水串起来看：<strong>精确去重（O(n)）→ 每 shard 算 MinHash 签名（O(n)，易并行）→ 按 band 分桶 shuffle 汇候选（O(n)）→ 精筛 + 并查集归簇（近 O(n)，但有串行成分）→ 每簇留一份</strong>。每一步都是线性或近线性的，整条管线因此可扩展到 PB 级——这正是把一个朴素 O(n²) 问题工程化成可行系统的完整答案。notebook 会用并查集把多个 shard 的去重结果合并，并与「把所有数据放一起去重」的全局参考对拍一致。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">7</span>把账算到 PB 级：复杂度全景</h2>
+  <h3>把账算到 PB 级：去重管线的复杂度全景</h3>  <p>现在把本模块所有机制的账目并排放在一起，这张表就是「为什么大规模去重要这么做」的完整论证：</p>  <table>
+    <thead><tr><th>阶段</th><th>做什么</th><th>时间复杂度</th><th>空间</th><th>在 1e12 文档的可行性</th></tr></thead>
+    <tbody>
+      <tr><td>精确去重</td><td>内容哈希 + 集合</td><td><code>O(n)</code></td><td><code>O(n)</code> 哈希</td><td>✅ 分桶并行，轻松</td></tr>
+      <tr><td>朴素近重复</td><td><strong>两两算 Jaccard</strong></td><td><strong>&lt;code&gt;O(n²)&lt;/code&gt;</strong></td><td><code>O(1)</code></td><td>❌ ~1.6e7 年，不可行</td></tr>
+      <tr><td>MinHash 签名</td><td>K 个最小哈希/文档</td><td><code>O(n·K·|shingle|)</code></td><td><code>O(n·K)</code></td><td>✅ 逐文档独立，易并行</td></tr>
+      <tr><td>LSH 分桶</td><td>b 个 band 桶 id</td><td><code>O(n·b)</code></td><td><code>O(n·b)</code> 桶</td><td>✅ 近线性</td></tr>
+      <tr><td>候选精筛</td><td>对候选对算真 Jaccard</td><td><code>O(候选数)</code></td><td><code>O(1)</code></td><td>✅ 候选数 ≪ C(n,2)</td></tr>
+      <tr><td>跨分片合并</td><td>并查集归簇</td><td><code>O(候选数·α(n))</code></td><td><code>O(n)</code></td><td>⚠️ 近线性，但有串行瓶颈</td></tr>
+    </tbody>
+  </table>  <p>读这张表的方式是：朴素方案那一行是<strong>唯一不可行的</strong>（O(n²)），其余每一行都是线性或近线性。MinHash+LSH 的全部价值，就是<em>用一串 O(n) 的步骤，替换掉那一个 O(n²) 的步骤</em>，代价是引入了可控的漏检率（用 (b,r) 调）和候选精筛开销（用真 Jaccard 兜底）。</p>  <p>一个真实的数字感（来自 FineWeb/RefinedWeb 量级的公开报告）：CommonCrawl 单月快照经过精确去重 + MinHash 近重复去重后，文档量常常<strong>减少一半甚至更多</strong>——这意味着如果不去重，你会用双倍的存储、双倍的分词算力、双倍的训练步数，去喂模型大量它已经见过的内容。去重不是省钱的小优化，是让大规模训练<strong>在经济上可行</strong>的前提。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的工程智慧：<strong>当一个操作是「找所有满足某相似条件的对」时，第一反应不该是优化那个 O(n²) 的双重循环，而该是问「有没有一种哈希，能让满足条件的对大概率落进同一个桶」</strong>。LSH 与 SimHash 是这个思路在去重上的体现，但同样的「局部敏感哈希 + 分桶」思想，在近邻搜索、推荐召回、实体对齐里反复出现。学会它，你多了一把对付「大规模找相似」的通用钥匙。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>语义去重（semantic dedup）</strong>：MinHash/SimHash 都基于词面（lexical）重叠，抓不住「换了说法但意思一样」的重复。用 embedding + 近邻搜索做语义去重（如 SemDeDup）是新方向，但 embedding 的计算成本与「多相似才算重复」的语义阈值都是开放问题。</li>
+    <li><strong>去重的「度」</strong>：去得太狠会删掉合理的高频内容（如常见代码模板、标准法律条款），损失多样性；去得太松则记忆与污染风险。最优去重强度与下游性能的关系（Lee 2021 起的话题）仍在被各大语料的消融实验探索。</li>
+    <li><strong>子串级 vs 文档级</strong>：文档级去重（MinHash）会漏掉「一篇好文档里嵌了一段到处都有的样板」。Lee 2021 的 ExactSubstr 用后缀数组做子串级去重能抓到，但后缀数组的内存与跨机构建在 PB 级仍具挑战。两种粒度如何最优结合是工程难题。</li>
+    <li><strong>增量去重</strong>：语料每月新增一个 CommonCrawl 快照，重新对全量去重太贵。如何只对增量去重、又保证与历史全量的一致性（增量 LSH 索引），是生产系统的实际痛点。</li>
+    <li><strong>去重与公平/版权</strong>：去重会不成比例地删掉某些来源（高频转载的小语种、特定社区），可能放大数据偏差；同时去重也是降低逐字记忆、缓解版权风险的手段。这条工程操作的社会影响正受越来越多关注。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Lee et al. 2021（去重为何必要 + 两种方法）、Broder 1997（MinHash）、Indyk & Motwani 1998（LSH）、Charikar 2002（SimHash）；工程对标 FineWeb（Penedo 2024）、Dolma（Soldaini 2024）的去重章节。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_streaming_loaders/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 流式加载与分片</div></a>
+  </div>
+
+</div>
+</body>
+</html>

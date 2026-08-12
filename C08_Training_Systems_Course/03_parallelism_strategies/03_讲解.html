@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 并行策略：DP / TP / PP / ZeRO / FSDP</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 07</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 并行策略：DP / TP / PP / ZeRO / FSDP</h1>
+  <p class="subtitle">单卡放不下、想训得更快——四种并行各自分摊什么、通信代价多大、pipeline 的气泡从哪来，以及怎么把它们叠成 3D 并行。</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（显存四块账 $16P$）、模块 02（混合精度 / 重计算）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_parallelism_strategies.ipynb（真实数据）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Rajbhandari et al. 2020（ZeRO）；Shoeybi et al. 2019（Megatron-TP）；Huang et al. 2019（GPipe）；Narayanan et al. 2021（PTD-P）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么需要并行：放不下 vs 想更快</a></li>
+      <li><a href="#dp">数据并行 DP 与 all-reduce</a></li>
+      <li><a href="#zero">ZeRO / FSDP：分片那块最大的状态</a></li>
+      <li><a href="#ring">Ring all-reduce 推导：为何通信量与卡数无关</a></li>
+      <li><a href="#tp">张量并行 TP：切开每一层 + 显存账例</a></li>
+      <li><a href="#pp">流水线并行 PP 与气泡账例</a></li>
+      <li><a href="#drill">通信代价对比表 + 面试 drill</a></li>
+      <li><a href="#frontier">怎么选并行策略与前沿</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么需要并行：放不下 vs 想更快</h2>
+  <p>前两章都在单卡上腾挪——降精度、换算力、攒 batch。但模块 01 算过：pythia-6.9b 全量训练要约 119GB，连单张 80GB A100 都装不下。这时只有一条路：<strong>把模型 / 数据摊到多张卡上</strong>。并行的两个动机要分清：</p>
+  <ul>
+    <li><strong>动机一：单卡放不下</strong>——显存不够，必须把状态分摊到多卡（ZeRO/FSDP、TP、PP）。</li>
+    <li><strong>动机二：想训得更快</strong>——显存够，但想用更多卡分摊计算、缩短墙钟时间（DP）。</li>
+  </ul>
+  <div class="ascii"> DP   数据并行    每卡完整模型，分 batch           解决“想更快”，不省单卡显存
+ ZeRO 分片 DP     分 batch + 分优化器/梯度/参数    解决“放不下”，DP 的省显存版
+ TP   张量并行    每层矩阵切开放多卡              解决“单层都放不下”、降延迟，通信频繁
+ PP   流水线并行  不同层放不同卡                  解决“层数太多”，有气泡</div>
+  <p>有个关键区分要在一开始就立住：<strong>DP 切的是数据，TP/PP 切的是模型</strong>。DP 下每张卡都有完整模型、各看一部分样本，所以它天然能提速但不省单卡显存；TP/PP/ZeRO-3 则把模型本身拆开放到多卡，于是能放下单卡装不下的模型。“省显存”和“提速”是两个正交的目标，搞混它们是这一章最常见的概念错误——比如有人以为“多堆几张卡做 DP 就能训更大的模型”，这是错的，下一节会专门拆穿。</p>
+  <div class="callout intuition"><span class="label"></span>
+    <p>四种并行不是竞争关系而是<strong>分工</strong>：DP 解决“更快”，ZeRO/TP/PP 解决“放不下”的不同维度——ZeRO 切冗余状态、TP 切单层矩阵、PP 切层的序列。最大的模型把它们<strong>叠起来用（3D 并行）</strong>。这一章逐个讲清每种省什么、通信多大、什么场景用，最后给一条“先 ZeRO 再 TP 再 PP 再 DP”的选型决策链。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dp"><span class="num">2</span>数据并行 DP 与 all-reduce</h2>
+  <p><span class="term">data parallelism</span>（数据并行 DP）最简单：每张卡放一份<strong>完整</strong>模型，各自吃 batch 的一部分做前向反向，反向后用 <span class="term">all-reduce</span> 把各卡梯度求平均、同步，再各自用同一份平均梯度更新。扩展性极好，但<strong>每卡仍存完整的 16P 状态——一点显存都不省</strong>，纯为提速。</p>
+  <p>它的通信代价有个漂亮性质：和卡数几乎无关。</p>
+  <div class="math-block">\[\text{all-reduce 通信量}\approx 2P\cdot b_g\ \text{每步}\quad(\text{ring all-reduce，与卡数 }N\text{ 无关})\]</div>
+  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：DP 把“一大批数据”切给很多人同时算，算完各自的梯度后大家“对一次答案、取平均”再一起更新。人越多算得越快，但每个人桌上还是摆着一整套模型，所以省时间不省地方。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨说：同步 DP 等价于在更大的全局 batch 上做一步 SGD/Adam。关键是梯度同步用 ring all-reduce 实现，通信量约 $2P$ 且与 $N$ 无关（下一节推导），因此 DP 能扩到很多卡而通信不爆炸——这是它成为默认并行方式的根本原因。</p></div>
+  </div>
+  <p>“与卡数无关”是个值得品的结论。直觉上人多了通信总量该变大，但 ring all-reduce 把总量摊在环上、让每张卡的收发量稳定在约 $2P$，无论 8 卡还是 512 卡。这正是 DP 能<strong>水平扩展到上千卡</strong>的根本原因：算力随卡数线性涨，而每卡通信几乎不涨，通信占比反而被越来越大的计算量稀释。第 4 节会把这条性质从环形算法里一步步推出来——它不是魔法，是几何安排的必然。</p>
+  <div class="callout warn"><span class="label"></span>
+    <p>面试高频陷阱：“多卡 DP 是不是就能训更大的模型？”<strong>不能。</strong>DP 每卡都是完整的 16P 拷贝，单卡显存需求和单卡训练<em>一模一样</em>，只是吞吐变高。要省单卡显存得靠下一节的 ZeRO/FSDP——这正是 ZeRO 被发明出来的动机：在保留 DP 易用性的同时，把那些冗余拷贝分掉。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="zero"><span class="num">3</span>ZeRO / FSDP：分片那块最大的状态</h2>
+  <p>既然 DP 的浪费在于<strong>16P 状态在每张卡上各存一份完全相同的拷贝</strong>，自然的修法就是：别复制，分了它。<span class="term">ZeRO</span>（DeepSpeed）/ <span class="term">FSDP</span>（PyTorch）把 16P 状态<strong>分片</strong>到 $N$ 张卡，每卡只存 $1/N$，用到时再 <span class="term">all-gather</span> 临时凑齐。</p>
+  <table>
+    <thead><tr><th>阶段</th><th>分片什么</th><th>每卡显存（近似）</th><th>省了多少</th></tr></thead>
+    <tbody>
+      <tr><td>ZeRO-1</td><td>优化器状态（fp32 主权重+$m$+$v$，共 12P）</td><td>$2P+2P+12P/N$</td><td>只切最大那块</td></tr>
+      <tr><td>ZeRO-2</td><td>+ 梯度（2P）</td><td>$2P+(2P+12P)/N$</td><td>再切梯度</td></tr>
+      <tr><td>ZeRO-3 / FSDP</td><td>+ 参数（2P）</td><td>$\approx 16P/N$</td><td>近似线性下降</td></tr>
+    </tbody>
+  </table>
+  <p>读这张表：ZeRO-1 先切那块最大的 12P 优化器状态；ZeRO-2 再切 2P 梯度；ZeRO-3（即 FSDP）连参数也切，每卡显存压到约 <code>16P/N</code>——<strong>卡越多、每卡越省，近似线性</strong>。代价是 ZeRO-3 在前向 / 反向用到某层参数时要先 all-gather 把它凑齐、用完再丢，通信比 DP 多。</p>
+  <p>通信代价的阶梯也值得记：ZeRO-1/2 的通信量与普通 DP 基本同量级（约 $2P$，只是把 all-reduce 拆成 reduce-scatter + all-gather）；唯独 ZeRO-3 因为参数本身被分片，前向反向每用一层都要临时 all-gather 它，通信量大致<strong>翻到约 $3P$</strong>。所以实践里的取舍是：显存够就停在 ZeRO-2（省显存又不太增通信），显存实在紧才上 ZeRO-3。好在 FSDP 会把这次 all-gather 与计算<strong>重叠</strong>（prefetch 下一层参数），把额外通信大半藏到计算背后——这是第 8 节前沿的伏笔。</p>
+  <p>ZeRO 与 TP/PP 有个本质区别值得讲透：ZeRO 切的是<strong>状态的存储</strong>，计算图本身不变——每张卡逻辑上还是在跑“完整模型对自己那批数据”的前向反向，只是某层的参数 / 梯度 / 优化器状态<strong>临时借来、用完归还</strong>。而 TP/PP 切的是<strong>计算本身</strong>，每张卡只算模型的一部分。这就是为什么 ZeRO/FSDP 用起来几乎和普通 DP 一样无痛（不用改模型代码），而 TP/PP 要侵入式地改写每一层——前者是“偷偷把仓库分了”，后者是“把流水线本身拆了”。理解这点，你就懂了为什么实践中<strong>总是先试 FSDP，万不得已才上 TP/PP</strong>。</p>
+  <div class="callout intuition"><span class="label"></span>
+    <p>ZeRO 的洞见极简单却极有用：<strong>DP 里那些一模一样的拷贝是纯浪费，分片掉、用时再 gather</strong>。这一招让“用一堆中等卡训超大模型”成为现实，也是今天 FSDP 成为 PyTorch 默认大模型训练方式的原因。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ring"><span class="num">4</span>Ring all-reduce 推导：为何通信量与卡数无关</h2>
+  <p>DP/ZeRO 的通信都靠 <span class="term">ring all-reduce</span>，它那条“通信量 ≈ $2P$、与卡数无关”的性质值得亲手推一遍——这是面试里区分“背过”和“懂了”的分水岭。</p>
+  <p>把 $N$ 张卡排成环。每张卡持有完整梯度向量，先切成 $N$ 块。算法分两阶段：</p>
+  <ol>
+    <li><strong>reduce-scatter（$N-1$ 步）</strong>：每步每张卡把自己手里的一块发给右邻、同时从左邻收一块加进去。$N-1$ 步后，第 $i$ 张卡手里攒齐了“第 $i$ 块的全局和”。</li>
+    <li><strong>all-gather（$N-1$ 步）</strong>：再绕环传一圈，把每块的全局和广播到所有卡。$N-1$ 步后人人持有完整的求和结果。</li>
+  </ol>
+  <p>每一步每张卡只收 / 发一块 = $P/N$，两阶段共 $2(N-1)$ 步，于是每卡总通信量：</p>
+  <div class="math-block">\[2(N-1)\cdot\frac{P}{N}=2P\cdot\frac{N-1}{N}\xrightarrow{N\to\infty}2P\quad(\text{与 }N\text{ 几乎无关})\]</div>
+  <p>这条公式里藏着两层重要含义。第一，<strong>总通信量恒为约 $2P$，与卡数无关</strong>——这正是上一节 DP 能扩到上千卡的数学来源；卡越多，每张卡分到的块 $P/N$ 越小，但步数 $2(N-1)$ 越多，两者恰好抵消成常数。第二，时间还含一个<strong>延迟项</strong>：$2(N-1)$ 步，每步有一次网络往返，所以<strong>步数随 $N$ 线性增长</strong>。这意味着 ring 在带宽上不吃亏，但在<em>延迟</em>上随卡数变差——超大规模时要用树形 / 分层 all-reduce 把延迟也压下来。</p>
+  <div class="callout warn"><span class="label"></span>
+    <p>对比朴素的 all-to-master（所有卡把梯度发给一个主卡求和再广播回去）：主卡进出通信量是 <code>O(N·P)</code>，随卡数线性暴涨，主卡带宽立刻成瓶颈。<strong>ring all-reduce 把这个 $N$ 倍瓶颈摊成了与 $N$ 无关的 $2P$</strong>——这就是它统治分布式训练的原因。理解了这条推导，你也就懂了为什么 NCCL 这类通信库默认对大张量走 ring，而对小张量（延迟主导）才切回树形。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tp"><span class="num">5</span>张量并行 TP：切开每一层 + 显存账例</h2>
+  <p>当<strong>单独一层</strong>的矩阵都放不下，或想降低单层延迟，就用 <span class="term">tensor parallelism</span>（张量并行 TP）：把一层里的权重矩阵按列 / 行切到多卡，每卡算一部分，再 all-reduce / all-gather 拼回。</p>
+  <p>Megatron 的经典做法：MLP 的两个权重矩阵“前一个按列切、后一个按行切”，让中间的 all-gather 省掉，整个 MLP 前向 + 反向只需 <strong>2 次 all-reduce</strong>；attention 同理（按 head 切）也只需 2 次。代价是这些 all-reduce<strong>每层都要、且在前向反向关键路径上</strong>。</p>
+  <p>为什么“列切 + 行切”这套配对能把通信压到一层只 2 次？关键在于<strong>把通信留到最后再做</strong>。第一个矩阵按列切，每张卡独立算出输出的一部分列，中间不需要通信；第二个矩阵按行切，恰好吃掉上一步那部分列、各自算出对完整输出的部分贡献，最后一次 all-reduce 把各卡的部分贡献相加即得正确结果。中间的非线性（GeLU）逐元素作用、不跨切分维，所以也无需通信。<strong>一前向一反向各一次 all-reduce</strong>，这是 Megatron 论文最精巧的工程设计——把模型并行的通信降到了理论下界附近。</p>
+  <div class="ascii"> Megatron MLP 两矩阵的列切 + 行切（TP=2 为例）：
+          ┌── A 按列切 ──┐         ┌── B 按行切 ──┐
+   X ──┬─→ A_左 → GeLU → Y_左 ─┐       
+       └─→ A_右 → GeLU → Y_右 ─┤→ B_上·Y_左 + B_下·Y_右 ─(all-reduce)→ 输出
+   中间 GeLU 逐元素、不跨切分 → 全程无通信；只在最后求和一次</div>
+  <h4>worked：要几张卡才放得下 pythia-12b</h4>
+  <p>pythia-12b 约 11.6B 参数，全量训练状态 $16P ≈ 186$GB。要塞进 80GB A100，用 ZeRO-3（每卡约 $16P/N$）：</p>
+  <div class="math-block">\[\frac{16P}{N}\le 80\text{GB}\ \Rightarrow\ N\ge\frac{186}{80}\approx 2.3\ \Rightarrow\ N\ge 3\]</div>
+  <p>理论上 3 张卡能装下 $16P$ 部分；但还要给<strong>activation、通信缓冲、碎片</strong>留地方，实践里通常取 4–8 张卡才舒服。这正是 notebook 让你算的账：从纯状态下界，到叠上 activation 后的实际卡数。</p>
+  <div class="callout danger"><span class="label"></span>
+    <p>TP 的硬约束：通信<strong>非常频繁</strong>（每层前向反向各若干次 all-reduce），所以只在<strong>单机多卡、NVLink 高带宽</strong>内用。<strong>跨节点用 TP 会被以太网 / InfiniBand 带宽拖死</strong>——这就是“TP 限机内、DP/PP 跨机”这条铁律的来源。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pp"><span class="num">6</span>流水线并行 PP 与气泡账例</h2>
+  <p><span class="term">pipeline parallelism</span>（流水线并行 PP）把模型的层<strong>分段</strong>放到不同卡（卡1放1-9层、卡2放10-18层…），数据像工厂流水线一样依次流过各段。问题是<strong>气泡（bubble）</strong>：流水线<strong>填充</strong>（开头）和<strong>排空</strong>（结尾）阶段，总有卡在空等。</p>
+  <div class="math-block">\[\text{气泡占比}\approx\frac{p-1}{m+p-1}\quad(p=\text{流水段数},\ m=\text{micro-batch 数})\]</div>
+  <div class="ascii"> p=4 段, m=4 micro-batch（数字=正在算第几个 micro-batch）：
+ 卡1: 1 2 3 4 · · ·          ← 末尾排空时空闲
+ 卡2: · 1 2 3 4 · ·
+ 卡3: · · 1 2 3 4 ·
+ 卡4: · · · 1 2 3 4          ← 开头填充时空闲（气泡）
+ 增大 micro-batch 数 m 可摊薄气泡占比</div>
+  <p>把公式代成数字看气泡怎么被摊薄：</p>
+  <table>
+    <thead><tr><th>配置</th><th>气泡占比 $(p-1)/(m+p-1)$</th><th>解读</th></tr></thead>
+    <tbody>
+      <tr><td>p=4, m=4</td><td>3/7 ≈ 43%</td><td>micro-batch 太少，近一半时间在空等</td></tr>
+      <tr><td>p=4, m=16</td><td>3/19 ≈ 16%</td><td>m 加到段数 4 倍，气泡降到约六分之一</td></tr>
+      <tr><td>p=4, m=64</td><td>3/67 ≈ 4.5%</td><td>m 远大于 p，气泡几乎可忽略</td></tr>
+    </tbody>
+  </table>
+  <p>气泡只是 PP 的第一笔账，它还有第二笔<strong>显存不均</strong>的隐账常被忽略：在 GPipe 这种“先全部前向、再全部反向”的朴素调度里，第一段（卡1）要<strong>一直缓存全部 $m$ 个 micro-batch 的 activation</strong>等着最后才反向，峰值 activation 随 $m$ 线性涨。于是出现一个两难——$m$ 调大能压气泡，却把第一段的 activation 显存顶爆。1F1B 调度（前沿节）正是为破这个两难而生：让每段“前向一个、马上反向一个”，把在飞的 micro-batch 数从 $m$ 降到约 $p$，<strong>气泡不变但峰值 activation 大幅下降</strong>。记住这第二笔账，你才算真懂 PP 为什么难调。</p>
+  <div class="callout intuition"><span class="label"></span>
+    <p>PP 的口诀：<strong>气泡占比 ≈ (p−1)/(m+p−1)，只能靠把 micro-batch 数 m 调大来摊薄</strong>。所以 PP 几乎总是配<em>远大于段数的 micro-batch 数</em>（$m \gg p$）。这也是 1F1B 等调度（前沿节）要解决的问题——在不增大 $m$ 的前提下进一步压气泡、降峰值显存。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="drill"><span class="num">7</span>通信代价对比表 + 面试 drill</h2>
+  <p>把四种并行的通信特征摆成一张表，再过一遍高频面试题，你就能临场为任意规模配出合理的并行方案。看这张表的钥匙是<strong>两个维度：通信频率（决定能不能跨机）和省不省单卡显存（决定能不能放下更大模型）</strong>。TP 频率极高所以锁在机内，PP/DP 频率低所以能跨机；DP 不省单卡显存，其余三种都省。</p>
+  <table>
+    <thead><tr><th>并行</th><th>通信量 / 频率</th><th>适用范围</th><th>省单卡显存？</th></tr></thead>
+    <tbody>
+      <tr><td>DP</td><td>每步约 $2P$ all-reduce，频率低</td><td>提速；跨机也行</td><td>否（每卡完整 16P）</td></tr>
+      <tr><td>ZeRO/FSDP</td><td>比 DP 多（参数 all-gather）</td><td>放不下时首选；跨机可用</td><td>是（约 $16P/N$）</td></tr>
+      <tr><td>TP</td><td>每层多次 all-reduce，频率极高</td><td>仅单机多卡 NVLink</td><td>是（切单层矩阵）</td></tr>
+      <tr><td>PP</td><td>仅段边界传 activation，频率低</td><td>层极多、跨多机</td><td>是（每卡只放若干层）</td></tr>
+    </tbody>
+  </table>
+  <h4>面试 drill</h4>
+  <ol>
+    <li><strong>“这个模型至少几张卡能训？”</strong> 先算 $16P$，除以单卡可用显存（留 activation 和余量），向上取整就是 ZeRO-3 的下界。</li>
+    <li><strong>“TP 为什么限机内？”</strong> 每层多次 all-reduce、在关键路径上，跨节点带宽撑不住。</li>
+    <li><strong>“ZeRO-3 vs ZeRO-1 各省多少？”</strong> ZeRO-1 只切 12P 优化器状态；ZeRO-3 连参数梯度都切，每卡约 $16P/N$，近线性。</li>
+    <li><strong>“PP 气泡怎么减？”</strong> 增大 micro-batch 数 $m$（气泡 $(p-1)/(m+p-1)$），或换 1F1B 调度。</li>
+    <li><strong>“3D 并行怎么配？”</strong> TP 切单层（机内）× PP 切层段（跨机、配大 $m$）× DP/ZeRO 复制或分片（最外层提速）。</li>
+  </ol>
+  <p>再补一个把这几种并行串起来的直觉：它们解决的是<strong>正交的瓶颈</strong>，所以可以乘起来叠加而不互相替代。你不会用 PP 去解决“单层放不下”（那是 TP 的活），也不会指望 DP 帮你“放下更大的模型”（它只提速）。面试时若能脱口说出“哪种并行对哪种瓶颈”，并指出它们正交可叠，基本就证明你真懂了这一章，而不是背了四个名词。</p>
+  <div class="callout warn"><span class="label"></span>
+    <p>四个高频陷阱：①<strong>DP 不省单卡显存</strong>；②<strong>TP 跨机被网络拖死</strong>；③<strong>ZeRO-3 省显存但通信增</strong>（参数要 all-gather）；④<strong>PP 需要大 micro-batch</strong>否则气泡吃掉收益。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>怎么选并行策略与前沿</h2>
+  <p>把怎么选并行串成一条决策链，再点出仍在演进的前沿。决策链的总原则是<strong>按通信代价从低到高、逐层加码</strong>：能用通信便宜的就别用贵的，能放下就别为了放下而过度切分。</p>
+  <h4>怎么选（决策链）</h4>
+  <ol>
+    <li>先用 <strong>ZeRO/FSDP</strong> 把模型放下（简单、通信可控，今天的默认起点）。</li>
+    <li>单层太大或要降延迟 → 叠 <strong>TP</strong>（严格限机内 NVLink）。</li>
+    <li>层极多、要跨多机 → 叠 <strong>PP</strong>（配远大于段数的 micro-batch 摊气泡）。</li>
+    <li>还想更快 → 最外层套 <strong>DP</strong> 复制 / 扩样本。训最大模型（GPT-3、PaLM 级）正是 TP×PP×DP/ZeRO 的 3D 并行。</li>
+  </ol>
+  <h4>worked：给 70B 模型配 3D 并行</h4>
+  <p>把决策链落成数字。设要训一个 70B 模型，$16P ≈ 1120$GB，集群是 8 卡 / 节点（机内 NVLink）的 A100-80GB。一步步配：</p>
+  <ol>
+    <li><strong>TP=8</strong>：单层矩阵切到一台机的 8 张卡（机内 NVLink，承受得起每层多次 all-reduce）。这步把单卡要放的模型分量降到 $1/8$。</li>
+    <li><strong>PP=4</strong>：再把层分成 4 段、跨 4 台机（段边界只传 activation，频率低、能跨机）。于是一个 $8\times4=32$ 卡的组合放下整个模型一份。配大 micro-batch（如 $m=32$）把气泡压到约 $3/35≈9\%$。</li>
+    <li><strong>DP/ZeRO=N</strong>：上面 32 卡放下一份模型；想更快就再复制 $N$ 份，最外层 all-reduce 同步。要 256 卡就 $N=8$，要 1024 卡就 $N=32$。</li>
+  </ol>
+  <p>一句话读懂这个配法：<strong>TP 解决“单层放不下”（机内）、PP 解决“层太多放不下”（跨机）、DP 解决“想更快”（再外层）</strong>。每个维度对症一个瓶颈，乘起来才能上千卡训百亿~万亿参数。总卡数 = TP × PP × DP = $8\times4\times N$，这正是 notebook 让你反解的题。</p>
+  <p>并行的前沿大多围绕一个主题：<strong>让通信不再是瓶颈</strong>。要么把通信藏进计算（重叠），要么换一种切法让通信更便宜（序列 / 专家并行），要么改调度减少空等（1F1B）。</p>
+  <h4>前沿与开放问题</h4>
+  <ul>
+    <li><strong>通信与计算重叠</strong>：把 all-gather / all-reduce 藏到计算背后（如 FSDP 的 prefetch），让通信不占额外墙钟。</li>
+    <li><strong>sequence / context parallelism</strong>：沿序列维切分，专治长上下文里 activation 与注意力的显存压力（接模块 04）。</li>
+    <li><strong>MoE expert parallelism</strong>：把不同专家放不同卡，通信变成 token 路由的 all-to-all，负载均衡是新难题。</li>
+    <li><strong>1F1B 调度</strong>（Narayanan et al. 2021）：交错前向反向（one-forward-one-backward）在不增大 $m$ 的前提下进一步压气泡、降峰值 activation 显存。</li>
+  </ul>
+  <p>把这一章放回整门课的位置：模块 01 教你算账（瓶颈在哪），模块 02 教你在单卡上压账（精度 / 算力 / 时间换显存），本章教你把账<strong>分摊到多卡</strong>。三章合起来，你就有了从“一张卡跑得动什么”到“一个集群能训多大”的完整推理链。再往后，模块 04 的 FlashAttention 会回到单卡，继续在 Roofline 上把注意力从带宽墙推向算力墙——所有这些，都还是在打模块 01 立下的那本账。</p>
+  <div class="callout paper"><span class="label"></span>
+    <p>本章四篇地基论文：</p>
+  <ul>
+    <li>Rajbhandari et al. 2020 — <em>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</em>（分片 DP）。</li>
+    <li>Shoeybi et al. 2019 — <em>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</em>（张量并行 TP）。</li>
+    <li>Huang et al. 2019 — <em>GPipe: Easy Scaling with Micro-Batch Pipeline Parallelism</em>（流水线并行 PP 与气泡）。</li>
+    <li>Narayanan et al. 2021 — <em>Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (PTD-P)</em>（3D 并行与 1F1B 调度）。</li>
+  </ul>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_mixed_precision_checkpointing/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 混合精度与重计算</div></a>
+    <a class="next" href="03_parallelism_strategies.ipynb"><div class="dir">下一模块 →</div><div class="t">打开配套练习</div></a>
+  </div>
+
+</div>
+</body>
+</html>

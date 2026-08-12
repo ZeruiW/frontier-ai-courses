@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 消息传递与 GCN</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 消息传递与 GCN</h1>
+  <p class="subtitle">MPNN 框架（消息/聚合/更新）统一一切空间型 GNN；GCN 把谱卷积简化成一行 σ(ÂXW)，对称归一化稳住谱、自环留住自己；堆深则过平滑——用 Dirichlet 能量量化它</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（拉普拉斯、对称归一化、随机游走平稳分布）、MLP / softmax / 反向传播直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_message_passing.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Kipf & Welling 2017 (GCN)、Gilmer 2017 (MPNN)、Li 2018 (过平滑)、Wu 2019 (SGC)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#mpnn">消息传递框架：消息/聚合/更新</a></li>
+      <li><a href="#derive">从谱卷积到 GCN：一行公式的来历</a></li>
+      <li><a href="#norm">对称归一化 Â 为什么是它</a></li>
+      <li><a href="#impl">从零实现一层 GCN：前向与对拍</a></li>
+      <li><a href="#smooth">过平滑：为什么 GCN 不能太深</a></li>
+      <li><a href="#limits">GCN 的隐含假设与局限</a></li>
+      <li><a href="#train">GCN 的训练实务</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mpnn"><span class="num">1</span>消息传递框架：消息/聚合/更新</h2>
+  <p>上一模块我们把图变成了线性代数，并从拉普拉斯的谱里读出了图的结构。这一模块要迈出决定性的一步：<strong>把「在图上做卷积」变成一个可学习、可堆叠的神经网络层</strong>。终点是 <span class="term">GCN</span>（图卷积网络，Kipf & Welling 2017）——一个朴素到只有一行公式、却统治了整个 GNN 领域多年的传播规则。但在直接给出它之前，我们先建立一个更普适的框架，让 GCN 成为其中一个特例。</p>  <p>这个框架叫<strong>消息传递（message passing, MPNN）</strong>（Gilmer 2017）。它的洞察是：几乎所有空间型 GNN，无论叫什么名字，每一层都在做同样的三件事——</p>  <div class="ascii">消息传递的一层（对每个节点 v）：
+  ① 消息 message：对每个邻居 u，算一条消息   m_{u-&gt;v} = MSG(h_v, h_u, e_{uv})
+  ② 聚合 aggregate：把所有邻居消息汇成一个    a_v = AGG({ m_{u-&gt;v} : u in N(v) })
+  ③ 更新 update：用聚合结果更新节点状态        h_v' = UPD(h_v, a_v)
+
+  反复 L 层 -&gt; 每个节点的表示融入了 L 跳邻域的信息</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把它想成「每个节点在朋友圈里收集情报再更新认知」：每个朋友发来一条消息（消息函数），你把所有消息综合一下（聚合函数），再结合自己原来的想法更新（更新函数）。一层 = 一轮信息交换；堆 $L$ 层 = 情报从 $L$ 跳之外传到你这里。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>三个函数中，<strong>聚合（AGG）必须置换不变</strong>——邻居是个集合、本无顺序，所以聚合只能用 sum / mean / max 这类对顺序不敏感的运算。这是几何深度学习对图模型的硬约束（模块 00）。消息函数与更新函数则通常是可学习的（一层 MLP + 非线性）。不同的 GNN，无非是这三个函数的不同选择——GCN、GAT、GraphSAGE 都将被纳入这个框架。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么 MPNN 框架如此重要？因为它把「五花八门的 GNN 论文」压缩成「三个可替换的零件」。读任何一篇 GNN 论文，你只要问三个问题：它的<strong>消息</strong>是什么（传什么）、<strong>聚合</strong>是什么（怎么汇总）、<strong>更新</strong>是什么（怎么融进自身）？本模块的 GCN、下一模块的 GAT/SAGE，都会用这三问来定位。这是理解一切空间型 GNN 的总纲。</p>
+  </div>  <p>为了让这套「三问」从抽象变得可操作，先把全课要讲的几个主力模型用同一张表填进去——你会发现它们的差异全部落在这三个零件的不同填法上，<strong>骨架完全一致</strong>：</p>  <table>
+    <thead><tr><th>模型</th><th>消息 MSG</th><th>聚合 AGG</th><th>更新 UPD</th></tr></thead>
+    <tbody>
+      <tr><td><strong>GCN</strong>（本模块）</td><td>邻居特征 × 固定系数 $\hat A_{vu}$</td><td>求和</td><td>线性 $W$ + 非线性</td></tr>
+      <tr><td><strong>GAT</strong>（模块 03）</td><td>邻居特征（value）</td><td>按<em>可学</em>注意力 $\alpha_{vu}$ 加权和</td><td>非线性（多头拼接）</td></tr>
+      <tr><td><strong>GraphSAGE</strong>（模块 03）</td><td>邻居特征</td><td>可换聚合器（mean/pool/LSTM）</td><td>与自身<em>拼接</em>后 $W$ + 非线性</td></tr>
+      <tr><td><strong>GIN</strong>（模块 05）</td><td>邻居特征</td><td>求和（保多重集信息）</td><td>$(1+\epsilon)h_v$ + 邻域和，过 MLP</td></tr>
+    </tbody>
+  </table>  <p>这张表是全课的一张「索引」：每个后续模型都只是在某一列上做改动——GAT 改聚合权重、SAGE 改聚合器与更新、GIN 改聚合的单射性。读到那些模块时不妨回头对照这张表，看它到底动了哪个零件、为什么动。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="derive"><span class="num">2</span>从谱卷积到 GCN：一行公式的来历</h2>
+  <h3>从谱卷积到 GCN：一行公式的来历</h3>  <p>现在来推 GCN。上一模块说过，图卷积在谱域定义为 $g\star x=U\,\mathrm{diag}(\hat g)\,U^\top x$，但这有两个毛病：要做 $O(n^3)$ 特征分解，且滤波器不局部。ChebNet（Defferrard 2016）用切比雪夫多项式 $\hat g\approx\sum_{k=0}^{K}\theta_k T_k(\tilde\Lambda)$ 逼近滤波器，把谱卷积变成 $K$-跳的局部多项式、绕开特征分解。GCN 则做了三步<strong>激进的简化</strong>：</p>  <ol>
+    <li>取 $K=1$（只用一阶，即只看直接邻居），并令 $\lambda_{\max}\approx 2$，得到 $g\star x\approx\theta_0 x+\theta_1(L_{\text{sym}}-I)x=\theta_0 x-\theta_1 D^{-1/2}AD^{-1/2}x$；</li>
+    <li>进一步令 $\theta=\theta_0=-\theta_1$（共享参数、减少过拟合），得到 $g\star x\approx\theta(I+D^{-1/2}AD^{-1/2})x$；</li>
+    <li><strong>重整化技巧（renormalization）</strong>：$I+D^{-1/2}AD^{-1/2}$ 的特征值落在 $[0,2]$，反复相乘会数值不稳定。把它替换成「加自环再归一化」的 $\hat A=\tilde D^{-1/2}\tilde A\tilde D^{-1/2}$，其中 $\tilde A=A+I$、$\tilde D$ 是 $\tilde A$ 的度，谱半径被拉回 1 附近。</li>
+  </ol>  <p>把这条标量推导推广到多通道特征 $X\in\mathbb{R}^{n\times F}$、可学习权重 $W\in\mathbb{R}^{F\times F'}$、加非线性 $\sigma$，就得到 GCN 一层的<strong>最终形态</strong>：</p>  <div class="math-block">\[H^{(l+1)} = \sigma\!\Big(\hat A\, H^{(l)} W^{(l)}\Big),\qquad \hat A=\tilde D^{-1/2}\tilde A\,\tilde D^{-1/2},\ \ \tilde A=A+I\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>别被推导吓到，结果惊人地简单：一层 GCN 就是<strong>「按图结构把邻居（和自己）的特征加权平均一下（$\hat A H$），再做一次线性变换（$W$），再过个激活（$\sigma$）」</strong>。$\hat A H$ 负责<em>混合邻居信息</em>（这步没有参数，纯由图结构决定），$W$ 负责<em>变换特征</em>（这步是学出来的）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>用 MPNN 三问定位 GCN：<strong>消息</strong> = 源节点特征按边的归一化系数 $\hat A_{vu}$ 缩放；<strong>聚合</strong> = 求和（已含在 $\hat A H$ 的矩阵乘里）；<strong>更新</strong> = 线性变换 $W$ + 非线性 $\sigma$。注意 GCN 把「自己」也当成一个邻居（靠 $\tilde A=A+I$ 的自环），所以更新里不需要单独保留旧状态。</p></div>
+  </div>  <p>一个常被忽略的细节是<strong>矩阵乘的结合律带来的两种实现</strong>：$\hat A H W$ 既可以先算 $(\hat A H)$ 再乘 $W$，也可以先算 $(HW)$ 再左乘 $\hat A$。二者数学等价（notebook 会对拍），但计算量不同——当 $F'<F$（降维）时先 $HW$ 更省，反之先 $\hat A H$。真实框架据此优化，但结果必须一致。</p>  <div class="callout warn"><span class="label">重整化到底改了什么谱</span>
+    <p>第 3 步的「重整化」常被当成无关痛痒的工程小动作，其实它<strong>实打实地移动了谱</strong>。一阶近似给的算子是 $I+D^{-1/2}AD^{-1/2}$，其特征值落在 $[0,2]$、最大可达 2，反复自乘会让对应 $\lambda\approx 2$ 的高频分量被放大、数值爆炸。换成「先加自环再归一化」的 $\hat A=\tilde D^{-1/2}\tilde A\tilde D^{-1/2}$ 后，<strong>谱被整体压回 $[\,\approx\!-1,\,1\,]$、谱半径稳定在 1 附近</strong>（自环让每个节点先"自我加权"，相当于给算子加了阻尼）。代价是它<em>不再是任何拉普拉斯的精确多项式</em>——重整化是一个为数值稳定而做的、有理论代价的近似。Kipf & Welling 2017 §2.2 与 Wu 2019（SGC）对这步谱位移有细致分析，理解它才算真正读懂了"为什么是这个 $\hat A$"。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="norm"><span class="num">3</span>对称归一化 Â 为什么是它</h2>
+  <h3>对称归一化 Â：为什么是 D^{-1/2}AD^{-1/2}</h3>  <p>GCN 的灵魂藏在 $\hat A=\tilde D^{-1/2}\tilde A\tilde D^{-1/2}$ 这个<strong>对称归一化</strong>里。为什么不直接用 $\tilde A$（不归一化）？也不用更直观的行归一化 $\tilde D^{-1}\tilde A$（即随机游走的平均）？这背后有三层考虑。</p>  <p><strong>第一，防止尺度爆炸。</strong>若直接用 $\tilde A$ 聚合，高度数节点会把成百上千个邻居特征<em>加</em>起来，表示的范数随度数线性增长，几层之后数值失控、且高度数与低度数节点尺度严重失衡。归一化把每条边按两端度数缩小，化解这个问题。</p>  <p><strong>第二，对称性带来好的谱。</strong>对称归一化保持矩阵对称（$\hat A=\hat A^\top$），于是它有实特征值、正交特征基，谱半径稳定在 1（最大特征值恰为 1，对应度加权的常向量）。这对<strong>堆叠多层</strong>的数值稳定至关重要——反复乘一个谱半径为 1 的矩阵不会爆炸也不会消失。行归一化 $\tilde D^{-1}\tilde A$ 虽然也行随机、谱半径 1，但它<em>不对称</em>。</p>  <p><strong>第三，它给每条边一个介于两端度数之间的「软」归一化。</strong>具体地，边 $(v,u)$ 的系数是 <code>Â_{vu} = 1/√(d̃_v · d̃_u)</code>——既不是 $1/d_v$（只看自己度数，行归一化）也不是常数，而是<strong>几何平均式</strong>的折中。直觉上：连接两个高度数节点的边被压得很小（信息泛滥），连接低度数节点的边保留较大权重（信息稀缺更珍贵）。</p>  <table>
+    <thead><tr><th>归一化方式</th><th>公式</th><th>对称?</th><th>聚合语义</th><th>GCN 选它吗</th></tr></thead>
+    <tbody>
+      <tr><td>不归一化</td><td><code>Ã</code></td><td>是</td><td>邻居特征求和（尺度随度数爆炸）</td><td>否</td></tr>
+      <tr><td>行归一化</td><td><code>D̃⁻¹Ã</code></td><td>否</td><td>邻居特征平均（随机游走）</td><td>否（GraphSAGE-mean 近似用它）</td></tr>
+      <tr><td>对称归一化</td><td><code>D̃^{-1/2}ÃD̃^{-1/2}</code></td><td><strong>是</strong></td><td>按两端度数几何平均缩放</td><td><strong>是</strong> ✅</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>务必记得<strong>加自环</strong>（$\tilde A=A+I$）这一步！若忘了，$\hat A H$ 只聚合邻居、<strong>完全丢弃节点自身的旧特征</strong>——节点会「忘掉自己」，多层后表示退化。自环让节点在聚合时也把自己算进去（且自环边的归一化系数 $1/\tilde d_v$ 自动平衡）。这是从零实现 GCN 时最常见的 bug，notebook 会专门验证「有无自环」的差异。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="impl"><span class="num">4</span>从零实现一层 GCN：前向与对拍</h2>
+  <h3>从零实现一层 GCN：前向与对拍</h3>  <p>有了公式，实现一层 GCN 在 numpy 里只有几行。关键是把每一步都拆开、并和参考对拍，确保正确：</p>  <pre><code>def gcn_norm(A):
+    A_tilde = A + np.eye(len(A))           # 加自环
+    d = A_tilde.sum(1)
+    dinv_sqrt = np.diag(1.0 / np.sqrt(d))
+    return dinv_sqrt @ A_tilde @ dinv_sqrt # 对称归一化 Â
+
+def gcn_layer(A_hat, H, W, act=relu):
+    return act(A_hat @ H @ W)              # sigma(Â H W)</code></pre>  <p>看似平凡，但有三处一定要验证（notebook 全做）：其一，$\hat A$ 的每一行（含自环）的归一化是否正确——可对拍 $\hat A$ 的最大特征值是否为 1；其二，<strong>稀疏实现与稠密实现对拍</strong>：真实框架不会构造稠密 $\hat A$ 而是逐边聚合，我们写一个逐边版本，要求与 $\hat A H$ 逐位相等；其三，整层的<strong>置换等变</strong>：重排节点，输出应随之重排。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一个有用的心智图：把 $\hat A H$ 想成「模糊滤镜」——它让每个节点的特征向它邻居的特征靠拢一点（加权平均）。滤镜本身不带参数、由图结构固定；$W$ 则是「调色」——把模糊后的特征线性映射到新的语义空间。GCN 一层 = 一次模糊 + 一次调色 + 一次非线性。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>多层 GCN 把这个过程迭代：$H^{(0)}=X\to H^{(1)}\to\cdots\to H^{(L)}$。第 $l$ 层后，每个节点的表示融入了它 $l$ 跳邻域的信息（因为 $\hat A^l$ 连接了 $l$ 跳内的节点）。所以<strong>层数 = 感受野半径</strong>。这看起来「越深越好」，但下一节会揭示一个致命的反转。</p></div>
+  </div>  <p>训练时，GCN 通常用于<strong>半监督节点分类</strong>：图上只有少数节点带标签，最后一层接 softmax，用带标签节点的交叉熵做损失，梯度经 $\hat A$ 反传到所有节点。notebook 会在 SBM 合成图上从零实现完整训练（前向 + 交叉熵 + 解析梯度 + 梯度下降），并验证<strong>损失单调下降、准确率上升</strong>——这是「实现正确」最直接的证据。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="smooth"><span class="num">5</span>过平滑：为什么 GCN 不能太深</h2>
+  <h3>过平滑：为什么 GCN 不能太深</h3>  <p>CNN 越深越强（ResNet 上百层），但 GCN 反过来——<strong>超过 2–4 层，性能往往断崖式下跌</strong>。这个现象叫<strong>过平滑（over-smoothing）</strong>（Li 2018），是 GNN 最重要的病理之一，也是上一模块随机游走视角的直接后果。</p>  <p>根源在于：<strong>反复用 $\hat A$ 聚合 = 反复做扩散 = 随机游走收敛到平稳分布</strong>。我们在模块 01 证过，随机游走的平稳分布只依赖度（$\pi_i\propto d_i$），与初始信号无关。类比到 GCN：去掉非线性和 $W$，$L$ 层 GCN 就是 $\hat A^L X$；当 $L\to\infty$，$\hat A^L$ 把所有节点的特征<strong>抹成同一个（与度成正比的）向量</strong>，节点之间再也无法区分——判别信息被彻底平滑掉了。</p>  <p>怎么<strong>定量</strong>地诊断过平滑？用<span class="term">Dirichlet energy</span>（狄利克雷能量），它正是模块 01 那个心脏恒等式的多维版：</p>  <div class="math-block">\[\mathcal{E}(H)=\operatorname{tr}\!\big(H^\top L H\big)=\frac12\sum_{(i,j)\in E}\lVert h_i-h_j\rVert_2^2\]</div>  <p>它度量「相邻节点表示的差异总量」。<strong>过平滑 = Dirichlet 能量随层数指数衰减到 0</strong>（所有节点表示趋同则差异为 0）。notebook 会在合成图上逐层算 $\mathcal{E}(H^{(l)})$，画出它随层数指数下降的曲线——这就是过平滑的「心电图」。Oono & Suzuki 2020 证明了这个衰减速率由谱隙控制。</p>  <div class="dual">
+    <div class="plain"><h4>动手看衰减</h4>  <p>取一条两点边 $1\!-\!2$，初始特征 $h_1=1,h_2=-1$（差异最大）。去掉 $W$ 与非线性，只反复做 $\hat A$ 聚合（两点带自环的对称归一化把每个节点更新为自己与邻居的加权平均）。一步后两值相互靠拢、$\mathcal E$ 缩小；几步后 $h_1\approx h_2$、$\mathcal E\to 0$——节点表示<strong>肉眼可见地被抹平</strong>。</p></div>
+    <div class="formal"><h4>为什么是"指数"衰减</h4>  <p>把信号按 $\hat A$ 的特征基展开 $H=\sum_k c_k u_k$。一层聚合把第 $k$ 个分量乘上 $\mu_k$（$\hat A$ 的特征值，$|\mu_k|\le 1$，最大的 $\mu_1=1$ 对应度加权常向量）。$L$ 层后非平凡分量被乘 $\mu_k^{L}$，几何衰减；只有 $\mu_1=1$ 的"直流"分量幸存。于是 $\mathcal E(H^{(L)})\sim(\mu_2)^{2L}\to 0$，衰减速率正由<strong>谱隙 $1-\mu_2$</strong> 决定——隙大则塌得快。这就是 Oono & Suzuki 结论的一行直觉版。</p></div>
+  </div>  <div class="callout danger"><span class="label">深度 ≠ 更好</span>
+    <p>过平滑的实践含义：<strong>GNN 的「深度」和 CNN 的「深度」是两回事</strong>。GNN 加深主要是为了扩大感受野（多跳邻居），而非增加非线性表达力；但扩大感受野的同时不可避免地引入平滑。所以多数 GNN 任务在 2–4 层达到最优。要<em>既深又不过平滑</em>，需要专门设计：残差/跳连（JKNet）、归一化（PairNorm）、或<strong>解耦传播与变换</strong>（APPNP 用个性化 PageRank 一次性聚合多跳、SGC 预计算 $\hat A^K X$）——这些都在 references 里，是模块 05 的话题。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="limits"><span class="num">6</span>GCN 的隐含假设与局限</h2>
+  <h3>GCN 的隐含假设与局限</h3>  <p>GCN 极简极强，但它的简洁背后藏着几条<strong>隐含假设</strong>，了解它们才能知道何时 GCN 会失灵：</p>  <ul>
+    <li><strong>同配假设（homophily）</strong>：GCN 默认「相连节点倾向于同类」（引文网里互相引用的论文多半同主题）。它的聚合本质是「向邻居靠拢」，所以同配图上表现好。但在<strong>异配（heterophily）</strong>图上（如欺诈网络，骗子专连正常人），向邻居平均反而<em>抹掉</em>了判别信息——这时朴素 GCN 甚至不如不看图的 MLP。</li>
+    <li><strong>固定的聚合权重</strong>：$\hat A$ 的边权完全由度数决定、不可学习。GCN 无法表达「这个邻居比那个邻居更重要」——这正是下一模块 <strong>GAT 用注意力</strong> 要解决的。</li>
+    <li><strong>直推（transductive）</strong>：标准 GCN 在<em>整张固定图</em>上训练（$\hat A$ 是全图的），难以泛化到训练时未见过的新节点——这是下一模块 <strong>GraphSAGE 用采样 + 可学聚合器</strong> 要解决的。</li>
+    <li><strong>表达力上界</strong>：消息传递 GNN（含 GCN）的判别力被证明不超过 1-WL 同构测试（Xu 2019）——存在一些结构不同的图，GCN 给出完全相同的表示而分不开。</li>
+  </ul>  <p>关于<strong>1-WL 上界</strong>值得多说一句，因为它是后续整个"表达力"话题的源头。WL（Weisfeiler–Leman）测试是一个判断两图是否同构的经典启发式：反复给每个节点"哈希它自己 + 邻居标签的多重集"，看两图的标签分布是否始终一致。消息传递 GNN 的一层做的恰是同一件事（聚合邻居 + 更新），所以<strong>它分不开任何 1-WL 分不开的两张图</strong>。一个教科书反例：两个正则图——一个是六元环 $C_6$、另一个是两个三角形——每个节点的度都是 2、每一跳看到的邻域多重集完全相同，于是 GCN 给它们一模一样的表示、彻底分不开，尽管它们结构迥异（一个连通、一个不连通）。这个反例直接催生了模块 04 用谱位置编码、模块 05 用 GIN 的 sum 聚合去突破 1-WL 的努力。</p>  <p>把这些局限列出来不是贬低 GCN，恰恰相反——<strong>GCN 是理解后续所有改进的基准坐标系</strong>。GAT 改的是「固定权重」、GraphSAGE 改的是「直推 + 全邻居」、图 Transformer 改的是「只看局部 + 过挤压」、GIN 改的是「表达力」。每一个后续模型，都是在 GCN 的某条假设上做手术。理解了 GCN 的取舍，整张 GNN 地图就有了原点。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="train"><span class="num">7</span>GCN 的训练实务</h2>
+  <h3>把它跑起来：GCN 的训练实务</h3>  <p>从零训一个 GCN 做节点分类，有几个实务点值得记住（notebook 全部实现）：</p>  <table>
+    <thead><tr><th>环节</th><th>做法</th><th>陷阱</th></tr></thead>
+    <tbody>
+      <tr><td>归一化 Â</td><td>预计算一次（图不变则 Â 不变）</td><td>忘加自环；孤立点除零</td></tr>
+      <tr><td>层数</td><td>2 层起步（感受野 2 跳）</td><td>盲目加深 → 过平滑</td></tr>
+      <tr><td>损失</td><td>只在带标签节点上算交叉熵</td><td>把无标签节点也算进损失</td></tr>
+      <tr><td>正则</td><td>dropout（边/特征）、L2</td><td>小图易过拟合少量标签</td></tr>
+      <tr><td>评估</td><td>在 held-out 节点上看准确率</td><td>标签泄漏（用了测试节点信息）</td></tr>
+    </tbody>
+  </table>  <p>一个关键且优雅的点：GCN 是<strong>半监督</strong>的——即便只有极少节点带标签，无标签节点的特征也通过 $\hat A$ 参与了传播、塑造了带标签节点的表示，梯度也会反传去更新整张图相关的 $W$。所以 GCN 能<em>用图结构把少量标签的信息「传染」到全图</em>，这是它在 Cora（每类仅 20 个标签）上就能达到 80%+ 准确率的原因。</p>  <p>反向传播方面，GCN 的梯度沿 $\hat A$ 流动，与标准 MLP 没有本质区别（$\hat A$ 是常数矩阵，求导直接穿过）。notebook 会从零推导并实现一层/两层 GCN 的反向，用<strong>数值梯度对拍解析梯度</strong>（有限差分）确保反传正确——这是「真正理解一层在算什么」的试金石，也是从零实现区别于调库的核心价值。</p>  <p>还有一个常被新手忽略的细节：在 GCN 里，<strong>节点特征 $X$ 可以「什么都没有」</strong>。当节点没有有意义的属性时（很多图只有结构、没有特征），一个常用技巧是直接令 $X=I$（单位阵，即给每个节点一个 one-hot 身份），这时第一层的 $\hat A X W^{(0)}=\hat A W^{(0)}$ 退化为「给每个节点学一个由其邻域决定的嵌入」。notebook 的训练实验正是这么做的——用 $X=I$ 逼模型<em>纯靠图结构</em>做分类，从而最干净地检验「GCN 是否真的在利用拓扑」。这也呼应了模块 01 的 DeepWalk/node2vec：在无特征图上，结构本身就是信号。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块和模块 01 合起来看，一句话收束 GCN 的本质：<strong>GCN 一层 = 用对称归一化邻接做一步「低通滤波」，把高频（相邻剧烈变化）的成分压掉、保留低频（平滑）成分</strong>。这解释了它的一切——为什么同配图上好用（同类节点本就该平滑）、为什么堆深会过平滑（低通滤到极致只剩直流分量）、为什么异配图上失灵（异配的信号恰恰是高频的，被滤没了）。GCN 是个低通滤波器，记住这句，整个模块就立住了。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>对抗过平滑的深层 GNN</strong>：残差连接（GCNII）、跳跃知识（JKNet）、PairNorm/GroupNorm、以及<strong>传播-变换解耦</strong>（SGC、APPNP/PPNP）让 GNN 能堆到几十层不退化。「GNN 到底需不需要深」仍有争论。</li>
+    <li><strong>异配图上的 GNN</strong>：H2GCN、GPR-GNN、以及高通滤波器（让聚合能「区别于邻居」而非「靠拢邻居」）等专门处理异配。「一个 GNN 如何自适应同配/异配」是活跃方向。</li>
+    <li><strong>表达力的攀登</strong>：1-WL 上界（Xu 2019）激发了一批超越它的设计——高阶 GNN（k-WL）、子图 GNN、加随机特征/位置编码。表达力与计算成本、泛化之间的权衡尚无定论。</li>
+    <li><strong>可扩展的全图训练</strong>：标准 GCN 要整张 $\hat A$ 进显存，大图不可行。采样（GraphSAGE）、分块（Cluster-GCN）、预计算传播（SGC）是三条路线，模块 05 详谈。</li>
+    <li><strong>GCN 的理论理解</strong>：为什么如此简单的模型这么好用？从图信号处理（低通滤波器）、神经正切核、到泛化界，理论解释仍在完善（SGC 论文是重要一步）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Kipf & Welling 2017（GCN 原始，本模块的终点）、Gilmer 2017（MPNN 框架）、Li 2018（过平滑诊断）、Wu 2019（SGC，揭示 GCN 威力来自传播）。下一模块用 GAT/GraphSAGE 直接修补 GCN 的「固定权重」与「直推」两条局限。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_graph_basics/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 图与谱基础</div></a>
+    <a class="next" href="../03_gat_sage/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · GAT 与 GraphSAGE</div></a>
+  </div>
+
+</div>
+</body>
+</html>

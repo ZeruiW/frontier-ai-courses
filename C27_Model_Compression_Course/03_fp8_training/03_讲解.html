@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · fp8 训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · fp8 训练</h1>
+  <p class="subtitle">fp8 的 E4M3/E5M2 两种格式、动态/延迟 scaling 与 loss scaling 防上溢下溢、与 bf16 的混合精度配方 —— 用 7 个 bit 算矩阵乘换两倍吞吐而不让训练崩</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00/01、浮点表示（指数/尾数）、反向传播与链式法则、一点点训练经验</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_fp8_training.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Micikevicius 2017 (混合精度)、Micikevicius 2022 (FP8 Formats)、TransformerEngine、Peng 2023 (FP8-LM)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么训练要用 fp8（及它为何难）</a></li>
+      <li><a href="#formats">两种格式：E4M3 与 E5M2</a></li>
+      <li><a href="#scaling">Scaling：把张量挪进甜区</a></li>
+      <li><a href="#lossscale">Loss scaling：拯救下溢梯度</a></li>
+      <li><a href="#mixed">混合精度：哪里用 fp8</a></li>
+      <li><a href="#vsbf16">fp8 vs bf16：为什么不只用 bf16</a></li>
+      <li><a href="#step">一个 fp8 训练步的解剖</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么训练要用 fp8（及它为何难）</h2>
+  <p>前两个模块讲的是<strong>推理</strong>时的权重量化（把训练好的模型压小）。这个模块换个战场：<strong>训练时</strong>就用低精度浮点，具体说是 <span class="term">fp8</span>（8 位浮点）。目标不是省显存（虽然也省），而主要是<strong>省训练算力与带宽</strong>——Hopper/Ada 之后的 GPU 张量核心对 fp8 的吞吐是 bf16 的两倍，用 fp8 算矩阵乘能让训练显著加速。</p>  <p>但训练比推理<strong>脆弱得多</strong>。推理是一锤子买卖（量化错了大不了掉点），训练是个反馈回路（forward 算 loss、backward 算梯度、更新权重，循环上万步）。低精度引入的误差会<strong>沿着这个回路累积、放大</strong>，一个不小心就梯度 NaN、loss 发散、训练崩盘。所以 fp8 训练的核心问题不是「怎么 cast」，而是<strong>怎么 cast 才不让训练崩</strong>。</p>  <p>理解 fp8 训练，要先理解<strong>浮点格式的两难</strong>。一个 <code>b</code> 位浮点数把 bit 分给<span class="term">exponent</span>（指数，决定<strong>动态范围</strong>）和<span class="term">mantissa</span>（尾数，决定<strong>精度</strong>）。8 个 bit 实在太少（去掉符号位只剩 7 个分给指数和尾数），范围和精度<strong>两者都不够</strong>、还得互相抢。这就是为什么 fp8 有两种格式、还要配一套 scaling 机制——它们都是在和这 7 个 bit 的拮据搏斗。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：fp8 像一个只能写 7 位数字的小记事本。你得决定多少位记「这个数有多大」（指数）、多少位记「精确到几位」（尾数）。记大小的位多了，能表示的范围广但每个数粗糙；记精度的位多了，数精细但范围窄、稍大稍小就放不下。fp8 的两种格式就是这两种取舍。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，浮点数 = <code>(−1)^s × 1.mantissa × 2^(exp−bias)</code>。指数位数决定最大/最小可表示数之比（动态范围），尾数位数决定相对精度（约 <code>2^−mbits</code>）。fp32 有 8 指数 23 尾数（范围精度都充裕），bf16 有 8 指数 7 尾数（范围同 fp32、精度低），而 fp8 只能在 <code>4+3</code> 与 <code>5+2</code> 之间二选一——拆东墙补西墙。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>fp8 训练 = 用 7 个 bit 算矩阵乘换两倍吞吐，再用一套 scaling 把数值挪进 fp8 那个又窄又粗的甜区，别让它溢出或下溢</strong>。格式（E4M3/E5M2）解决「范围与精度怎么分」，scaling（动态/延迟/loss scaling）解决「怎么把张量挪进可表示区间」。这两件事配合好，fp8 训练才稳。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="formats"><span class="num">2</span>两种格式：E4M3 与 E5M2</h2>
+  <h3>两种 fp8 格式：E4M3 与 E5M2</h3>  <p>fp8 标准（Micikevicius et al. 2022）定义了两种格式，名字直接说明 bit 怎么分：</p>  <table>
+    <thead><tr><th>格式</th><th>符号/指数/尾数</th><th>动态范围</th><th>相对精度</th><th>典型用途</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">E4M3</span></td><td>1 / 4 / 3</td><td>小（约 ±448）</td><td>较高（3 尾数）</td><td>前向：权重、激活</td></tr>
+      <tr><td><span class="term">E5M2</span></td><td>1 / 5 / 2</td><td>大（约 ±57344）</td><td>较低（2 尾数）</td><td>反向：梯度</td></tr>
+    </tbody>
+  </table>  <p><strong>E4M3</strong>（4 指数、3 尾数）精度更高但范围小，最大约 <code>448</code>。用于<strong>前向</strong>——权重和激活的数值范围相对集中，更看重精度。</p>  <p><strong>E5M2</strong>（5 指数、2 尾数）范围大但精度低，最大约 <code>57344</code>。用于<strong>反向的梯度</strong>——梯度的数值跨度极大（不同层、不同时刻差好几个数量级），更需要范围来避免溢出/下溢，精度可以让步。</p>  <p>为什么前向用精度高的、反向用范围大的？这是个<strong>有数据支撑的工程选择</strong>：实验发现前向激活/权重的分布较集中（E4M3 的范围够用、精度更值钱），而梯度的分布有长尾、跨度大（E5M2 的范围更要紧）。把对的格式用在对的地方，是 fp8 训练配方的第一条。</p>  <div class="callout warn"><span class="label"></span>
+    <p>E4M3 的范围只有 <code>±448</code>——这<strong>小得吓人</strong>。bf16 能表示到 <code>3×10³⁸</code>，fp8 E4M3 超过 448 就溢出（变 inf 或被 clip）。这意味着你<strong>几乎不可能</strong>把一个原始张量直接 cast 成 E4M3 而不出问题——它要么有值超过 448（溢出），要么大量值远小于最小可表示数（下溢为 0）。所以 fp8 永远要配 scaling：先把张量缩放到 fp8 的甜区，算完再缩回来。下一节讲这个。</p>
+  </div>  <p>再深入一层看<strong>次正规数（subnormal）</strong>与下溢。浮点的最小正规数是 <code>2^emin</code>，比它更小的值靠次正规数表示（精度递减），再小就只能舍入成 0。E4M3 的最小次正规约 <code>2^−9 ≈ 0.002</code>——任何绝对值远小于这个的张量元素，cast 成 E4M3 就<strong>直接没了</strong>。权重和激活通常量级在 <code>0.01~1</code>、还算安全，但<strong>梯度</strong>可以小到 <code>1e−5</code> 甚至更低，不放大就成片下溢——这正是下下节 loss scaling 要解决的核心问题。</p>  <p>顺带说清 fp8 的两个<strong>特殊取舍</strong>（和 IEEE 标准略有不同）。E4M3 为了多挤出一点表示范围，牺牲了一部分 inf/NaN 的编码（只保留极少数特殊值），所以它的最大值是 448 而非按公式的 480。E5M2 则保留了完整的 inf/NaN 编码（梯度溢出检测要用到 inf）。这些细节本课的模拟做了简化（用规整公式），但要知道真实 fp8 在标准之外为「省一个 bit」做了哪些精打细算——这正是 8-bit 浮点拮据到极致的体现。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="scaling"><span class="num">3</span>Scaling：把张量挪进甜区</h2>
+  <h3>Scaling：把张量挪进 fp8 的甜区</h3>  <p>fp8 范围又窄又偏，直接用必然出事。解法是<strong>scaling</strong>：cast 进 fp8 前把张量乘一个缩放因子，让它的数值落进可表示区间；算完再除回来。</p>  <p>最自然的策略是<span class="term">dynamic scaling</span>（动态缩放）：扫一遍张量、取绝对值最大值 <span class="term">amax</span>，选缩放因子 <code>s = fp8_max / amax</code>，让最大的元素刚好顶到 fp8 的上界（既不溢出、又尽量用满范围）。</p>  <div class="math-block">\[s = \frac{\text{fp8\_max}}{\text{amax}(X)}, \qquad X_{\text{fp8}} = \mathrm{cast}_{\text{fp8}}(s \cdot X), \qquad \hat X = \frac{1}{s}\,X_{\text{fp8}}\]</div>  <p>但动态缩放有个<strong>性能问题</strong>：每次 cast 都要先完整扫一遍张量求 amax，这本身是一次访存，在访存受限的场景下不划算。于是有了 <span class="term">delayed scaling</span>（延迟缩放，TransformerEngine 的默认）：用<strong>前几步观测到的 amax 历史</strong>（滑动最大或滑动均值）来预测本步的缩放因子，省掉当步扫描的开销。代价是缩放因子<em>滞后</em>一点，万一这步张量突然变大可能溢出——所以要配合溢出检测与回退。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>动态缩放像每次过磅都重新称一遍重量再决定用多大的秤；延迟缩放像「根据最近几次的重量，提前选好秤」——省了称的时间，但万一这次特别重可能压坏秤（溢出），得有个保险。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>延迟缩放维护一个 <code>amax</code> 历史缓冲（如最近 16 步的每个张量的 amax），本步的缩放因子由历史 amax 计算（取最大或某种统计），本步实际的 amax 则记进缓冲、供未来用。它把「求 amax」和「用 amax」在时间上解耦，是 fp8 训练能真正提速的关键工程。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>scaling 的本质和模块 01 的量化 scale、模块 02 的 AWQ 缩放是<strong>同一个思想</strong>：<em>低精度格子有限，先把数据挪到格子分布最密、最该精确的地方</em>。量化是把权重挪进整数网格的好位置，fp8 scaling 是把张量挪进 fp8 浮点格子的甜区。区别在于 fp8 还要管动态范围（别溢出别下溢），且在训练循环里要随张量分布变化不断调整——这是「训练时低精度」比「推理时量化」更难的地方。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="lossscale"><span class="num">4</span>Loss scaling：拯救下溢梯度</h2>
+  <h3>Loss scaling：拯救下溢的梯度</h3>  <p>fp8 训练最经典、也最必须的技巧是 <span class="term">loss scaling</span>（损失缩放），它专治<strong>梯度下溢</strong>。这其实是从 fp16 训练（Micikevicius 2017）继承来的老招，在 fp8 下更不可或缺。</p>  <p>问题是这样的：很多梯度的数值<strong>非常小</strong>（尤其训练后期、深层网络）。小到低于 fp8 能表示的最小数时，它们被舍入成 <strong>0</strong>——这叫 <span class="term">gradient underflow</span>（梯度下溢）。梯度变 0，对应的权重就<strong>学不动了</strong>，训练停滞甚至跑偏。</p>  <p>loss scaling 的招数极简却有效：<strong>反向传播前，把 loss 乘一个大常数</strong> <code>L_scale</code>（如 1024）。由链式法则，所有梯度都被<strong>等比例放大</strong> <code>L_scale</code> 倍，本来要下溢为 0 的小梯度被<em>抬进</em>可表示区间。更新权重前再把梯度<strong>除回</strong> <code>L_scale</code>，数学上完全等价。</p>  <div class="math-block">\[\nabla_\theta (L_{\text{scale}}\cdot L) = L_{\text{scale}}\cdot \nabla_\theta L \quad\Longrightarrow\quad \text{放大后再 cast 到 fp8，更新前除回 } L_{\text{scale}}\]</div>  <div class="ascii">没有 loss scaling：           有 loss scaling (×1024)：
+
+  小梯度 1e-5                   1e-5 × 1024 = 0.0102
+      │ cast 到 fp8                  │ cast 到 fp8
+      ▼                             ▼
+      0  (下溢! 学不动)             0.0102  (保住了!)
+                                    │ 更新前 ÷1024
+                                    ▼
+                                  ~1e-5  (还原, 正常更新)</div>  <div class="callout danger"><span class="label"></span>
+    <p>loss scale 选多大是个<strong>两难</strong>：太小，小梯度仍下溢（白做）；太大，大梯度溢出成 inf（更糟，直接污染更新）。实践用<strong>动态 loss scaling</strong>：从一个大值开始，若某步出现 inf/NaN（溢出）就把 scale 减半、跳过这步；连续若干步正常就尝试翻倍。这样自动找到「尽量大但不溢出」的 scale。本模块 notebook 会从零实现这个动态调整逻辑，并验证它把下溢的梯度数量从几千降到个位数。</p>
+  </div>  <p>注意 loss scaling 和上一节的 dynamic scaling 容易混淆，但它们<strong>解决不同方向的问题</strong>、且常常叠加使用。dynamic scaling 是<em>逐张量</em>的、为了把<strong>某个张量</strong>挪进 fp8 甜区（缩放因子按该张量的 amax 算，前向反向都用）；loss scaling 是<em>全局</em>的、为了把<strong>整个反向图的所有梯度</strong>一起抬离下溢区（一个标量乘在 loss 上、沿链式法则传遍所有梯度）。一个治「这个张量放不进 fp8」，一个治「梯度普遍太小」。真实 fp8 训练里两者都在跑。</p>  <p>还有个值得玩味的细节：loss scaling 之所以<strong>免费</strong>，是因为它利用了梯度的<strong>线性</strong>。反向传播是线性算子，把 loss 乘 <code>c</code>，所有梯度就乘 <code>c</code>，最后除回 <code>c</code> 完全还原——数学上没有引入任何近似，只是借这个缩放把数值临时搬到 fp8 能表示的区间走一遭。这和模块 02 AWQ 的「权重乘 s、激活除 s」是同一种<em>利用等价变换搬运数值</em>的智慧，只不过这里搬的是梯度、为的是躲下溢。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="mixed"><span class="num">5</span>混合精度：哪里用 fp8</h2>
+  <h3>混合精度：哪里用 fp8，哪里不用</h3>  <p>fp8 训练<strong>从不是「全用 fp8」</strong>。它是一套<span class="term">mixed precision</span>（混合精度）配方：关键处保高精度，能省的地方用 fp8。乱用 fp8 一定崩。</p>  <table>
+    <thead><tr><th>环节</th><th>精度</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td>矩阵乘（GEMM）的输入</td><td>fp8 (E4M3)</td><td>这是吞吐瓶颈，用 fp8 换 2× 加速</td></tr>
+      <tr><td>矩阵乘的累加</td><td>fp32</td><td>累加几千个乘积，低精度会累积误差</td></tr>
+      <tr><td>梯度（反向 GEMM）</td><td>fp8 (E5M2)</td><td>范围大、精度可让步</td></tr>
+      <tr><td><strong>主权重</strong> master weights</td><td>fp32</td><td>累积微小更新，fp8 存会被吃掉</td></tr>
+      <tr><td>优化器状态（动量等）</td><td>fp32</td><td>对精度敏感，错了训练发散</td></tr>
+      <tr><td>LayerNorm / softmax</td><td>bf16/fp32</td><td>对精度敏感、且非吞吐瓶颈</td></tr>
+    </tbody>
+  </table>  <p>核心原则有两条。其一，<strong>算（GEMM）用 fp8、累加和存储用高精度</strong>：fp8 只在矩阵乘的输入端省吞吐，乘积的累加必须用 fp32（不然几千个数加起来误差爆炸）。其二，<span class="term">master weights</span>（主权重）必须是 fp32：每步的权重更新量通常极小，若权重本身只有 fp8 精度，这些小更新会被<strong>直接舍掉</strong>（大数吃小数），训练原地踏步。所以标准做法是 fp32 存一份主权重、前向时临时 cast 成 fp8 去算。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>混合精度的智慧是<strong>把低精度用在「不疼」的地方</strong>：矩阵乘的吞吐是大头、用 fp8 收益最大且相对耐受；而累加、主权重、优化器状态这些「记账」环节一旦精度不足就会系统性出错，必须保高精度。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这呼应模块 00 的世界观：fp8 训练省的主要是 GEMM 的算力/带宽（吞吐瓶颈），所以精度预算优先砸在那里；而把不在瓶颈上、却对数值敏感的环节（累加、权重累积、归一化）留在高精度。<strong>在瓶颈处省、在敏感处保</strong>——这是一切混合精度的通则。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住混合精度的一句话口诀：<strong>fp8 算、fp32 记</strong>。算（矩阵乘的乘法）用 fp8 抢吞吐；记（累加、主权重、优化器状态）用 fp32 保正确。再加上格式分工（前向 E4M3、梯度 E5M2）和数值保护（动态 scaling、loss scaling），就构成了完整的 fp8 训练配方。任何一环用错，训练都可能崩——这是 fp8 训练工程上比想象中难的原因。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="vsbf16"><span class="num">6</span>fp8 vs bf16：为什么不只用 bf16</h2>
+  <h3>fp8 vs bf16：为什么不直接用 bf16</h3>  <p>既然 fp8 这么难伺候，为什么不老老实实用 bf16？答案是<strong>吞吐</strong>——但要把账算清楚。</p>  <table>
+    <thead><tr><th>格式</th><th>bit</th><th>范围</th><th>精度</th><th>张量核心吞吐</th><th>训练稳定性</th></tr></thead>
+    <tbody>
+      <tr><td>fp32</td><td>32</td><td>极大</td><td>极高</td><td>1×（基准）</td><td>最稳</td></tr>
+      <tr><td>bf16</td><td>16</td><td>同 fp32</td><td>中（7 尾数）</td><td>约 2× </td><td>稳（现主流）</td></tr>
+      <tr><td>fp8</td><td>8</td><td>窄（E4M3 ±448）</td><td>低（3 尾数）</td><td>约 4×（vs fp32）</td><td>需精心调（scaling）</td></tr>
+    </tbody>
+  </table>  <p>bf16 是当下训练的<strong>主力</strong>：它保留了 fp32 的指数范围（8 指数位），只牺牲尾数精度，所以<strong>几乎不需要 loss scaling</strong>（范围够大、不下溢），又比 fp32 快约一倍、省一半显存。这是个甜点，所以绝大多数训练默认 bf16。</p>  <p>fp8 更进一步：再快一倍（张量核心对 fp8 吞吐约为 bf16 的 2 倍）、再省一半带宽。代价是<strong>范围和精度都不够</strong>，必须靠本模块的整套 scaling 机制把它喂稳。所以 fp8 的定位是：<strong>当训练规模大到「快一倍」能省下可观的钱和时间时，值得花工程力气把它调稳</strong>。对前沿大模型（训练成本以百万美元计）这笔账非常划算，对小模型则未必值得。</p>  <p>一个常被混淆的点：fp8 训练<strong>不是</strong>把模型变成 fp8 模型。训练完，权重通常以 bf16/fp16 保存与部署（推理再单独做 int4 量化，见模块 01/02）。fp8 只活在<em>训练过程的矩阵乘里</em>——它是一种<strong>训练加速手段</strong>，不是一种模型格式。把「fp8 训练」和「int4 推理量化」分清，是理解整个压缩技术栈的关键。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一个精度阶梯帮你记定位：fp32（最稳最慢，做基准与敏感环节）→ bf16（甜点，训练主流，范围够不用 loss scaling）→ fp8（最快但最娇气，前沿大模型用，必须全套 scaling 护着）。每降一档精度，吞吐翻倍、但数值稳定性的工程负担陡增。选哪档，是「省多少」和「调多累」的权衡。</p>
+  </div>  <p>再补一句历史视角，能帮你理解为什么是「fp16→bf16→fp8」这条路。早期混合精度用的是 <strong>fp16</strong>（5 指数 10 尾数），精度够但<strong>范围太小</strong>（最大约 65504），梯度极易溢出/下溢，必须靠 loss scaling 苦苦支撑——这正是 Micikevicius 2017 那篇论文要解决的痛点。后来 <strong>bf16</strong>（8 指数 7 尾数）用「牺牲尾数换回 fp32 的指数范围」一举绕开了大部分溢出问题，几乎不用 loss scaling，于是迅速成为主流。到了 fp8，bit 实在太少、范围精度都得抠，loss scaling 与 dynamic scaling 又一起回来了——某种意义上 fp8 训练是「带着 bf16 的经验、重新打一遍当年 fp16 的硬仗」。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="step"><span class="num">7</span>一个 fp8 训练步的解剖</h2>
+  <h3>把它跑起来：一个 fp8 训练步的解剖</h3>  <p>综合本模块，一个 fp8 训练步（一层的前向+反向）长这样：</p>  <ol>
+    <li>前向：从 fp32 主权重 cast 出 fp8(E4M3) 权重与激活（各自 dynamic/delayed scaling），做 fp8 GEMM、<strong>fp32 累加</strong>；</li>
+    <li>算 loss，乘 <strong>loss scale</strong>（如 1024）；</li>
+    <li>反向：梯度用 fp8(E5M2)（范围大）；反向 GEMM 同样 fp8 算、fp32 累加；</li>
+    <li>把梯度<strong>除回 loss scale</strong>，检查有无 inf/NaN（溢出则减半 loss scale、跳过这步）；</li>
+    <li>用 fp32 梯度更新 <strong>fp32 主权重</strong>（优化器状态也 fp32）；</li>
+    <li>更新 amax 历史，供下一步的 delayed scaling 用。</li>
+  </ol>  <p>这就是 <code>TransformerEngine</code> 的 <code>fp8_autocast</code> 在每层每步做的事。看起来步骤不少，但绝大部分（GEMM、累加）是硬件自动的，需要框架显式管理的就是<strong>三件事</strong>：cast 的 scaling（dynamic/delayed + amax 历史）、loss scaling（动态调整）、以及哪些张量保 fp32（主权重、累加、优化器）。</p>  <p>把这三件事和前面的模块串起来：scaling 是模块 01 量化 scale 的「带动态范围版」；loss scaling 是为了对抗低精度下溢（和模块 01 离群值撑大 scale 是一体两面——一个怕太大溢出、一个怕太小下溢）；混合精度的「在瓶颈处省、敏感处保」是模块 00 世界观的直接应用。fp8 训练不是孤立的黑魔法，而是把前面学的数值直觉用到训练回路里。</p>  <p>一个把全部串起来的<strong>数值平衡图</strong>：fp8 那条又窄又粗的可表示区间是固定的，你的全部工作就是<strong>把每个张量都恰好挪进它</strong>——前向的权重/激活靠 dynamic/delayed scaling 顶住上界、用满范围；反向的梯度靠 loss scaling 整体抬离下溢区；而累加、主权重、优化器这些「会累积误差」的环节干脆不进 fp8、留在 fp32。理解了「哪些数要挪进 fp8、怎么挪、哪些数坚决不挪」，你就掌握了 fp8 训练的全部要领——剩下的都是框架替你做的工程。</p>  <div class="callout warn"><span class="label"></span>
+    <p>最后强调 fp8 训练的<strong>调试纪律</strong>：它的失败往往是<em>静默</em>的——不报错，只是 loss 慢慢发散或停滞。排查要盯几个信号：梯度里 inf/NaN 的比例（溢出）、下溢为 0 的梯度比例（loss scale 太小）、各张量的 amax 是否贴近 fp8 上界（scaling 是否合理）。本模块 notebook 会把这些诊断量都打印出来，让你建立「fp8 训练健康度」的体感——这是真实用 fp8 训练时最值钱的经验。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>更低精度训练（fp6、fp4、MX 格式）</strong>：能不能训练时用比 fp8 更低的精度？微软的 MX（micro-scaling）格式给每个小块配一个共享缩放，让 fp4/fp6 训练成为可能，是当前最前沿的方向之一。</li>
+    <li><strong>fp8 用于优化器与通信</strong>：FP8-LM 把 fp8 推广到优化器状态和分布式 all-reduce 通信，进一步省显存与带宽。怎么在这些更敏感的环节用低精度而不发散，仍在探索。</li>
+    <li><strong>scaling 策略的自动化</strong>：delayed scaling 的历史长度、loss scaling 的调整策略目前多靠经验。能否让框架自适应地选最优 scaling，减少调参，是工程热点。</li>
+    <li><strong>随机舍入（stochastic rounding）</strong>：低精度累加和更新有系统性偏差，随机舍入让舍入在期望上无偏，能缓解 fp8 下的累积误差，正被更广泛地集成。</li>
+    <li><strong>fp8 与架构协同设计</strong>：某些激活函数、归一化在 fp8 下更稳。把模型架构和低精度训练协同设计（如选 fp8 友好的激活），是把 fp8 推到极致的方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Micikevicius et al. 2017（混合精度训练，loss scaling 与 master weights 的奠基）、Micikevicius et al. 2022（FP8 Formats，E4M3/E5M2 标准，本模块主线）、TransformerEngine 文档（delayed scaling 的工程实现）、Peng et al. 2023（FP8-LM，fp8 推广到优化器与通信）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_gptq_awq/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · GPTQ 与 AWQ</div></a>
+    <a class="next" href="../04_distillation/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 知识蒸馏</div></a>
+  </div>
+
+</div>
+</body>
+</html>

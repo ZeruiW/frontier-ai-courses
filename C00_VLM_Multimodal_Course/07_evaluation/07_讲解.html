@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · VLM 评测体系</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 07 / 10</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>07 · VLM 评测体系</h1>
+  <p class="subtitle">Evaluating Vision-Language Models —— 怎么把"它好像挺强"变成可复现、可归因、抗污染的数字</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">VLM 架构（03）、指令微调（05）、基本统计（置信区间、bootstrap）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge gpu">GPU</span><span class="badge api">API可选</span> 07_evaluation.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">MMMU、MMBench(CircularEval)、MMStar、MM-Vet、MathVista、LLM-as-Judge</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 75 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么 VLM 评测格外难</a></li>
+      <li><a href="#landscape">Benchmark 全景：大对比表</a></li>
+      <li><a href="#extract">答案抽取：多选 vs 开放，正则 vs LLM 抽取</a></li>
+      <li><a href="#circular">位置偏差与 CircularEval</a></li>
+      <li><a href="#judge">LLM-as-a-Judge：打分、偏差与一致性验证</a></li>
+      <li><a href="#contam">数据污染与语言先验：MMStar 的洞察</a></li>
+      <li><a href="#robust">鲁棒性评测：报告方差而非单点</a></li>
+      <li><a href="#methodology">评测方法论最佳实践（METR 风格）</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= 1 -->
+  <h2 id="why"><span class="num">1</span>为什么 VLM 评测格外难</h2>
+
+  <p>给一个分类器算 accuracy 是平凡的：预测标签和金标签比一下即可。<span class="term">VLM</span> 评测之所以是研究科学家的硬骨头，是因为<strong>它同时违反了经典评测的几乎所有简化假设</strong>。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>VLM 是用自然语言"说"出答案的。同一个意思可以有一百种说法，模型还可能答得对但格式不对、或者根本没看图全靠猜也蒙对了。你想测的是"它懂不懂图"，但量出来的数字里混进了"它会不会按格式说话""它语言先验强不强""你的抽取脚本写得好不好"。把这些噪声从信号里剥出来，才是评测的真功夫。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>令模型为条件生成分布 $p_\theta(y\mid x_{\text{img}}, x_{\text{txt}})$，金标准为 $y^\star$。我们想估计某能力维度上的真实正确率 $\mathrm{Acc}^\star$，但观测到的是 $\widehat{\mathrm{Acc}} = \mathrm{score}(\mathrm{extract}(\hat y), y^\star)$，其中解码采样、抽取函数 $\mathrm{extract}(\cdot)$、评分函数 $\mathrm{score}(\cdot)$ 都引入偏差。评测的目标是设计 $(\mathrm{extract}, \mathrm{score})$ 与协议，使 $\mathbb{E}[\widehat{\mathrm{Acc}}]\to\mathrm{Acc}^\star$ 且方差可估。</p>
+    </div>
+  </div>
+
+  <p>具体而言，VLM 评测有四个相互纠缠的难点：</p>
+  <ul>
+    <li><strong>开放生成（open-ended generation）</strong>：答案是自由文本，没有唯一正确字符串。"这是一只<em>橘猫</em>" vs "图中是一只<em>橙色的家猫</em>" 语义等价但字面不同。</li>
+    <li><strong>答案多样性</strong>：同一问题可有多个合理答案（描述类、推理类），exact-match 必然低估能力。</li>
+    <li><strong>能力多维（multi-dimensional capability）</strong>：感知（OCR、计数、空间）、知识、推理、定位（grounding）各是独立维度，单一总分会掩盖短板。一个 MMMU 高分模型可能 OCR 极差。</li>
+    <li><strong>指令遵循失败污染判分（instruction-following failure pollutes scoring）</strong>：模型可能<em>知道答案</em>但<em>不按要求格式输出</em>（要求只输出选项字母，它却写一段话），导致抽取失败、被判错。这把"能力"和"指令遵循"混为一谈。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>评测最常见的系统性错误：把抽取/格式失败当成能力失败。</strong> 如果你的 harness 在某模型上报告 35% accuracy，先别下结论——把所有 <code>unparseable</code> 的样本捞出来人看一遍。常见情况是模型其实答对了、只是输出了 "The answer is B because..." 而你的正则只匹配单字母。区分这两者，是本章贯穿始终的主线。</div>
+
+  <!-- ========================================================= 2 -->
+  <h2 id="landscape"><span class="num">2</span>Benchmark 全景：大对比表</h2>
+
+  <p>没有"一个 benchmark 测一切"。研究科学家要像选实验仪器一样选 benchmark：清楚每个测什么能力、用什么题型、什么指标、<strong>有什么已知坑</strong>。下表是 2023–2024 的主流 VLM benchmark 全景。</p>
+
+  <table>
+    <thead><tr><th>Benchmark</th><th>考什么能力</th><th>题型</th><th>指标</th><th>已知坑 / 评测视角</th></tr></thead>
+    <tbody>
+      <tr><td><strong>MMMU</strong> [Yue 2024]</td><td>大学学科级多模态推理（艺术/医/工/商，含图表、化学式、乐谱）</td><td>多选 + 少量开放</td><td>accuracy（按 LLM/正则抽取）</td><td>偏知识密集，部分题靠纯文字+学科常识即可答；图像有时是装饰</td></tr>
+      <tr><td><strong>MMBench</strong> [Liu 2023]</td><td>20 细分能力维度（感知/推理/属性）</td><td>多选（单字母）</td><td><strong>CircularEval</strong> accuracy（见 §4）</td><td>正是为对抗位置偏差而设计；中英双语；用 LLM 做答案抽取</td></tr>
+      <tr><td><strong>MME</strong> [Fu 2023]</td><td>14 子任务，感知 + 认知</td><td>Yes/No（每题正反两问）</td><td>accuracy + acc+（两问都对才算）</td><td>Yes/No 二分类天然有猜测基线 50%；对 prompt 极敏感、分数易抖</td></tr>
+      <tr><td><strong>MMStar</strong> [Chen 2024]</td><td>1500 题精选、强制"必须看图"的视觉核心能力</td><td>多选</td><td>accuracy + <em>multi-modal gain / leakage</em> 指标</td><td><strong>专为净化污染与语言先验而生</strong>（见 §6）；人工核验每题都需视觉</td></tr>
+      <tr><td><strong>MathVista</strong> [Lu 2024]</td><td>视觉数学推理（几何、函数图、统计图）</td><td>多选 + 数值开放</td><td>accuracy（数值需归一化比较）</td><td>数值答案抽取易错（单位、四舍五入、$\frac{1}{2}$ vs 0.5）；需 LLM 抽取</td></tr>
+      <tr><td><strong>MM-Vet</strong> [Yu 2023]</td><td>6 项核心能力的<em>组合</em>（识别+OCR+知识+空间+语言生成+数学）</td><td>开放生成</td><td><strong>LLM-as-Judge</strong> 给 0–1 软分</td><td>judge 偏差（长度/自我偏好）直接进分数；judge 模型版本变化致分数不可比</td></tr>
+      <tr><td><strong>SEED-Bench</strong> [Li 2024]</td><td>12 维（图像 9 + 视频 3）空间与时序理解</td><td>多选</td><td>accuracy（用 likelihood 选项打分）</td><td>用 token likelihood 而非生成，避开了格式问题但偏离真实用法</td></tr>
+      <tr><td><strong>DocVQA</strong></td><td>文档图像问答（表单、报告、票据）</td><td>开放短答（抽取式）</td><td><strong>ANLS</strong>（平均归一化编辑距离相似度）</td><td>高分辨率/OCR 瓶颈；ANLS 对 OCR 错字宽容但对语义错不敏感</td></tr>
+      <tr><td><strong>ChartQA</strong></td><td>图表读数与推理（柱/折线/饼）</td><td>开放短答（数值/类别）</td><td>relaxed accuracy（数值容 5% 误差）</td><td>数值容差阈值影响分数；"看图估值"与"算术"两类错误混在一起</td></tr>
+      <tr><td><strong>AI2D</strong></td><td>科学示意图理解（标注、箭头、流程）</td><td>多选</td><td>accuracy</td><td>图中文字/箭头的 grounding；选项often可被文字常识缩小</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  读这张表时抓三条主轴：<strong>①题型决定抽取难度</strong>（多选&lt;短答&lt;开放生成）；<strong>②指标决定你在测什么</strong>（exact-match / ANLS / relaxed-acc / judge 软分，各自的盲区不同）；<strong>③每个 benchmark 都有"漏判口"</strong>——要么靠语言先验能蒙、要么对 prompt 敏感、要么 judge 有偏。一份负责任的评测报告应该<em>组合</em>多个互补 benchmark，而非堆一个总分。</div>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>MMMU</strong> [Yue 2024, arXiv:2311.16502] 把 VLM 评测拉到"大学考试"难度，成为旗舰榜单；但 [Chen 2024, MMStar] 指出其中相当一部分题<em>不看图也能答</em>。两篇要对照读：前者定义了上限难度，后者揭露了榜单的可信度问题。</div>
+
+  <!-- ========================================================= 3 -->
+  <h2 id="extract"><span class="num">3</span>答案抽取：多选 vs 开放，正则 vs LLM 抽取</h2>
+
+  <p>评分前必须先从模型的自由文本里<strong>抽出可比对的答案</strong>。这一步看似工程琐事，实则是分数偏差的最大单点来源之一。</p>
+
+  <h3>3.1 三种打分范式</h3>
+  <table>
+    <thead><tr><th>范式</th><th>怎么做</th><th>优点</th><th>缺点 / 坑</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Likelihood 打分</strong>（SEED-Bench 式）</td><td>不让模型生成，而是比较 4 个选项各自的 $\log p_\theta(\text{option}\mid x)$，取最大</td><td>无格式问题、确定性、便宜</td><td>偏离真实 prompted 用法；对选项长度/先验敏感；闭源 API 给不了 logprob</td></tr>
+      <tr><td><strong>生成 + 正则抽取</strong></td><td>让模型生成，用 regex 抓选项字母 / 数值</td><td>贴近真实使用；可对 API 模型用</td><td>正则脆弱；指令不遵循直接判错（假阴性）</td></tr>
+      <tr><td><strong>生成 + LLM 抽取</strong>（MMBench 式）</td><td>让一个 LLM 把自由回答映射到某个选项</td><td>鲁棒于啰嗦/换序表达</td><td>引入 judge 成本与偏差；需固定 judge 版本以保证可复现</td></tr>
+    </tbody>
+  </table>
+
+  <h3>3.2 正则抽取的标准兜底链</h3>
+  <p>多选题的工程实践是一条<strong>降级匹配链（fallback chain）</strong>：先严后宽，最后兜底为 <code>unparseable</code> 单独统计——绝不静默判错。</p>
+
+  <div class="ascii">
+  模型原始输出
+       │
+       ▼
+  ① 严格：开头就是 "A"/"A."/"(A)"   ──命中──► 抽出 A
+       │ 未命中
+       ▼
+  ② 模式："answer is B" / "答案是 B" / "选 C"   ──命中──► 抽出该字母
+       │ 未命中
+       ▼
+  ③ 宽松：全文出现且仅出现一个孤立选项字母    ──命中──► 抽出它
+       │ 未命中 / 出现多个互相矛盾
+       ▼
+  ④ （可选）选项文本匹配：回答里含某选项的完整文本   ──命中──► 抽出对应字母
+       │ 未命中
+       ▼
+  ⑤ 标记 unparseable —— 进入"待人工/LLM 复核"桶，单独报告比例
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>抽取策略本身是一个超参，必须在论文/报告里写清楚。</strong> 不同 harness（lmms-eval、VLMEvalKit、原作者脚本）的抽取规则不同，能造成同一模型同一 benchmark 上 ±2~5 个点的差异。比较两个模型时，<strong>必须用同一套抽取代码与同一 prompt 模板</strong>，否则比较无效。这是复现失败的头号原因。</div>
+
+  <h3>3.3 指令遵循 vs 能力：如何分离</h3>
+  <p>当一个样本被抽取失败时，存在两种根因，必须区分（见 §1 的 danger 框）：</p>
+  <ul>
+    <li><strong>能力失败</strong>：模型真的不知道答案 → 应判错，这是我们想测的。</li>
+    <li><strong>指令遵循失败（instruction-following failure）</strong>：模型知道却没按格式说 → 这测的是"格式服从"不是"视觉能力"。</li>
+  </ul>
+  <p>实践分离手段：(a) 在 prompt 里给极明确的格式约束（"Answer with the option's letter only."）+ few-shot 示范；(b) 对 unparseable 样本用 LLM 抽取做二次救援，对比"严格正则 acc"与"LLM 抽取 acc"的差值——差值大说明该模型主要栽在格式而非能力；(c) 单独报告 <code>format-failure rate</code> 作为一个独立维度。notebook 里我们会实测这条差值。</p>
+
+  <!-- ========================================================= 4 -->
+  <h2 id="circular"><span class="num">4</span>位置偏差与 CircularEval</h2>
+
+  <p>多选题有一个隐蔽而致命的污染源：<span class="term">position bias</span>（选项位置偏差）。许多 VLM 对"答案放在哪个位置"有系统性偏好——例如倾向于选 A、或选最后一个、或选最长的那个选项——这部分"分数"与视觉理解无关。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>假设有道题正确答案是 C。如果你把它放在 A 的位置模型就选 A、放 C 的位置又选 C，那模型根本没在理解内容，只是在偏爱某个位置。朴素 accuracy 会把这种"碰巧位置对上了"算成答对。CircularEval 的做法是：同一道题，把四个选项轮着转一圈（C 当 A、当 B、当 C、当 D 各问一遍），<strong>四次都答对才算这题对</strong>。位置偏差一暴露就现原形。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>对一道 $k$ 选项题，令 $\sigma_j$ 为对选项做第 $j$ 次循环移位（cyclic shift）的置换，$j=0,\dots,k-1$。模型在第 $j$ 次的预测为 $\hat y_j$，对应的正确位置为 $\sigma_j(c^\star)$。CircularEval 的逐题正确性定义为全等连乘：</p>
+    </div>
+  </div>
+
+  <div class="math-block">
+  $$ \mathrm{Correct}_{\text{circ}}(i) \;=\; \prod_{j=0}^{k-1} \mathbb{1}\!\left[\,\hat y_j \;=\; \sigma_j(c^\star_i)\,\right]
+     \;\in\;\{0,1\}, \qquad
+     \mathrm{Acc}_{\text{circ}} \;=\; \frac{1}{N}\sum_{i=1}^{N}\mathrm{Correct}_{\text{circ}}(i). $$
+  </div>
+
+  <p>直观看流程：</p>
+  <div class="ascii">
+  原题（正确答案 = "猫"，初始放在 C）
+        选项: A.狗  B.鸟  C.猫  D.鱼
+   ┌─────────────────────────────────────────────┐
+   │  pass 0  A.狗 B.鸟 C.猫 D.鱼   正确位置=C  →  模型答 C ? ✓│
+   │  pass 1  A.猫 B.狗 C.鸟 D.鱼   正确位置=A  →  模型答 A ? ✓│
+   │  pass 2  A.鱼 B.猫 C.狗 D.鸟   正确位置=B  →  模型答 B ? ✗│  ← 位置一变就答错
+   │  pass 3  A.鸟 B.鱼 C.猫 D.狗   正确位置=C  →  模型答 C ? ✓│
+   └─────────────────────────────────────────────┘
+        4 次里错了 1 次  ⇒  CircularEval 判这题 = 错（0）
+        而朴素 accuracy（只看 pass 0）会判 = 对（1）
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  CircularEval 几乎总是<strong>低于</strong>朴素 accuracy。两者的<em>差值</em>本身是一个有用诊断量：差值大 ⇒ 模型严重依赖位置先验、视觉/推理脆弱；差值小 ⇒ 预测对选项排列鲁棒、更可信。MMBench [Liu 2023] 把 CircularEval 作为默认指标，正是为了挤掉这部分水分。代价是推理量 $\times k$。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  CircularEval 解决的是<em>位置</em>偏差，不解决<em>语言先验</em>偏差（不看图也能答）。后者要靠 §6 的 no-image 探针。两套诊断正交、需同时上。</div>
+
+  <!-- ========================================================= 5 -->
+  <h2 id="judge"><span class="num">5</span>LLM-as-a-Judge：打分、偏差与一致性验证</h2>
+
+  <p>开放生成任务（caption、MM-Vet、自由问答）无法 exact-match，主流做法是用一个强 LLM 当裁判（<span class="term">LLM-as-a-Judge</span>）给软分 [Zheng 2023, MT-Bench]。它把人类评估的成本降了几个数量级，但<strong>把裁判模型的偏差直接焊进了分数</strong>。</p>
+
+  <h3>5.1 打分 prompt 设计</h3>
+  <p>一个可靠的 judge prompt 应当：给出明确 rubric（评分量纲与每档定义）、提供金标准/参考答案、要求<em>先理由后打分</em>（reasoning-before-score，抑制随意性）、强制结构化输出（便于解析）。示意：</p>
+
+  <div class="ascii">
+  [System] 你是严格的视觉问答评分员。只依据"参考答案"判定正误，不臆测。
+  [Rubric]  5 = 完全正确且完整   3 = 部分正确/遗漏关键点   1 = 错误   0 = 答非所问/拒答
+  [Inputs]  Question: {q}
+            Reference answer: {gold}
+            Model answer: {pred}
+  [Format]  先写一句 reasoning，再单独一行输出  Score: <0-5>
+            评分时忽略表述风格与长度，只看与参考答案的语义一致性。
+  </div>
+
+  <h3>5.2 三大已知偏差</h3>
+  <table>
+    <thead><tr><th>偏差</th><th>表现</th><th>缓解</th></tr></thead>
+    <tbody>
+      <tr><td><strong>长度偏好 length bias</strong></td><td>更长/更啰嗦的回答被打更高分，即便信息量相同</td><td>rubric 明确"忽略长度"；对长度做控制实验；必要时长度归一</td></tr>
+      <tr><td><strong>位置偏好 position bias</strong>（成对比较时）</td><td>偏好排在前面（或后面）的候选；A/B 谁先出现影响胜负</td><td>两种顺序各评一次取平均（swap），不一致则记平局</td></tr>
+      <tr><td><strong>自我偏好 self-enhancement bias</strong></td><td>裁判倾向于给"与自己风格相近/自己家族"的回答更高分</td><td>用<em>不同家族</em>的模型当裁判；或多裁判投票；评测自家模型时尤其警惕</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>自我偏好是评测自家模型时最危险的陷阱。</strong> 用 GPT-4 当裁判去评 GPT 系列、或用自家模型评自家模型，分数会被系统性抬高。研究科学家做横向对比时，裁判应来自<em>与所有被测模型都不同源</em>的第三方，或至少披露裁判身份并做敏感性分析（换裁判看排名是否翻转）。</div>
+
+  <h3>5.3 与人类一致性如何验证</h3>
+  <p>judge 不是免费的真值，<strong>必须先验证它和人类标注的一致性，再拿它去刷分</strong>。标准流程：</p>
+  <ul>
+    <li>抽一个有人类标注的子集（几百条），让 judge 也打分。</li>
+    <li>算一致性：连续分用 <strong>Pearson / Spearman 相关</strong>，离散判定用 <strong>Cohen's $\kappa$</strong> 或 agreement rate；成对偏好用与人类的 agreement。</li>
+    <li>把这个一致性数字写进报告——它界定了 judge 分数的可信范围。$\kappa<0.4$ 的 judge 不该用来下结论。</li>
+  </ul>
+
+  <div class="math-block">
+  $$ \kappa \;=\; \frac{p_o - p_e}{1 - p_e}, \qquad
+     \rho_{\text{Spearman}} \;=\; 1 - \frac{6\sum_i d_i^2}{n(n^2-1)} $$
+  </div>
+  <p>其中 $p_o$ 是 judge 与人类的观测一致率、$p_e$ 是随机一致率；$d_i$ 是第 $i$ 个样本上 judge 与人类排名之差。[Zheng 2023] 报告强 LLM 裁判与人类的 agreement 可达 ~80%+（与人类彼此间的一致率相当），这是 LLM-as-Judge 被广泛采用的实证基础——但<strong>该结论依赖任务、rubric 与裁判模型，不可外推为"judge 永远可信"</strong>。</p>
+
+  <!-- ========================================================= 6 -->
+  <h2 id="contam"><span class="num">6</span>数据污染与语言先验：MMStar 的洞察</h2>
+
+  <p>当一个模型在某 benchmark 上分数异常高，研究科学家的第一反应应该是怀疑，而不是庆祝。两类"作弊"会虚高分数：</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>两种情况让分数虚高：①这道题的图片+答案在训练数据里出现过，模型背下来了（数据污染）；②这道题压根不用看图，光读题目和选项凭语言常识就能蒙对（语言先验）。两者的共同症状是：把图遮住，模型还能答对一大堆。一个真正测视觉的好 benchmark，遮图之后分数应该掉到接近瞎猜。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p><span class="term">data contamination</span>：测试样本（或其近邻）泄漏进训练语料，使模型在该样本上的表现反映记忆而非泛化。<span class="term">language prior leakage</span>：问题在语言模态上即可被边缘分布 $p(y\mid x_{\text{txt}})$ 高置信预测，图像信息冗余。两者都会让 $\widehat{\mathrm{Acc}}$ 高估真实视觉能力 $\mathrm{Acc}^\star_{\text{vision}}$。</p>
+    </div>
+  </div>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>MMStar</strong> [Chen 2024, arXiv:2403.20330, "Are We on the Right Way for Evaluating LMMs?"] 的核心实证：在多个流行 benchmark 上，<strong>把图像去掉、只喂文本，强 LLM 仍能答对相当比例的题</strong>（部分 benchmark 上 LLM-only 准确率远超随机基线）。这意味着这些榜单的分数里混入了大量"无需视觉"的成分。MMStar 因此人工筛选出 1500 道<em>确实必须看图</em>的题，并提出两个净化指标：</p>
+  </div>
+
+  <p>MMStar 定义两个诊断指标，把"视觉真贡献"和"泄漏"量化出来。记 $\mathrm{acc}_{\text{wv}}$ 为有图（with-vision）准确率、$\mathrm{acc}_{\text{wo}}$ 为去图（without-vision，纯文本）准确率、$\mathrm{acc}_{\text{rand}}$ 为随机猜测基线：</p>
+
+  <div class="math-block">
+  $$ \underbrace{\text{MG}}_{\text{multi-modal gain}} \;=\; \mathrm{acc}_{\text{wv}} - \mathrm{acc}_{\text{wo}},
+     \qquad
+     \underbrace{\text{ML}}_{\text{multi-modal leakage}} \;=\; \max\!\big(0,\; \mathrm{acc}_{\text{wo}} - \mathrm{acc}_{\text{rand}}\big). $$
+  </div>
+
+  <p><strong>MG（多模态增益）</strong>越大越好——它度量"看图到底带来多少额外正确率"，是视觉真实贡献。<strong>ML（多模态泄漏）</strong>越小越好——去图准确率超出随机基线的部分，就是语言先验/污染贡献的"水分"。一个理想的视觉 benchmark 应该 MG 高、ML 接近 0。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>answer-without-image 基线是每个 VLM 评测都该跑的"对照组"。</strong> 实现极简：把图像 token 从输入里抽掉（或换成空白/噪声图），其余 prompt 不变，重测一遍。$\mathrm{acc}_{\text{wo}}$ 越接近随机基线，说明该 benchmark（在你模型上）越"干净"。notebook §探针 会实测这一对照。这也是排查"高分是否可信"的第一把诊断工具。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  污染还有训练侧的检测手段（n-gram 重叠扫描、perplexity 异常、canary string、时间切分 train/test by date），但对闭源模型只能做行为侧（no-image 探针、动态/最新数据测试）。报告里应声明你对污染做了哪些控制——"未控制污染"本身就是一个 caveat。</div>
+
+  <!-- ========================================================= 7 -->
+  <h2 id="robust"><span class="num">7</span>鲁棒性评测：报告方差而非单点</h2>
+
+  <p>一个被广泛忽视的事实：<strong>VLM 的 benchmark 分数是一个随机变量，不是一个常数。</strong> 改一下 prompt 措辞、重排选项、给图加一点噪声、换一个 decoding seed，分数就会抖。只报一个数字是评测的"原罪"。</p>
+
+  <table>
+    <thead><tr><th>扰动维度</th><th>具体操作</th><th>测什么</th></tr></thead>
+    <tbody>
+      <tr><td>选项重排 option permutation</td><td>打乱多选选项顺序（CircularEval 是其特例）</td><td>对位置/排列的鲁棒性</td></tr>
+      <tr><td>Prompt 改写 paraphrase</td><td>同义改写指令/问题措辞</td><td>对表述的鲁棒性、指令敏感度</td></tr>
+      <tr><td>图像扰动 image perturbation</td><td>加高斯噪声、压缩、轻微裁剪/旋转、改分辨率</td><td>视觉特征的稳定性</td></tr>
+      <tr><td>解码随机性 decoding</td><td>多个 seed、不同 temperature</td><td>采样方差（贪心则为 0）</td></tr>
+    </tbody>
+  </table>
+
+  <p>正确的报告形态是<strong>分布而非点估计</strong>。对 $N$ 题、$R$ 次扰动重复，给出均值与置信区间。比例型指标的 Wald 近似置信区间（大样本）：</p>
+  <div class="math-block">
+  $$ \widehat{\mathrm{Acc}}\;\pm\; z_{1-\alpha/2}\sqrt{\frac{\widehat{\mathrm{Acc}}(1-\widehat{\mathrm{Acc}})}{N}}, \qquad
+     \text{(小样本/极端比例改用 Wilson 区间或 bootstrap)} $$
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  实务建议：<strong>bootstrap 比解析 CI 更省心也更稳健</strong>——对题目层面有放回重采样 $B=1000$ 次，每次算 accuracy，取 2.5%/97.5% 分位数即得 95% CI。它天然处理小样本、非独立、相关结构。报告时写成 <code>52.3% (95% CI 49.1–55.4)</code>，而不是孤零零的 52.3%。两个模型 CI 重叠就不能宣称谁更强。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>固定该固定的，扰动该扰动的。</strong> 测<em>能力</em>时要把解码、prompt、seed 全固定以消除噪声；测<em>鲁棒性</em>时则刻意扰动其中一维、固定其余，观察分数分布。两个目的不能混在一次跑里。</div>
+
+  <!-- ========================================================= 8 -->
+  <h2 id="methodology"><span class="num">8</span>评测方法论最佳实践（METR 风格）</h2>
+
+  <p>把前七节收敛成一套可操作的协议。这正是 frontier 评测组织（如 <span class="term">METR</span>、DeepMind 的 dangerous-capability 评测 [Phuong 2024]）反复强调的工程纪律——评测的可信度不在跑了多少 benchmark，而在<strong>每个数字是否可复现、可归因、抗污染</strong>。</p>
+
+  <table>
+    <thead><tr><th>原则</th><th>具体要求</th><th>不做会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><strong>可复现 reproducibility</strong></td><td>固定并公开 prompt 模板、decoding 参数（greedy/temperature/top-p）、seed、模型版本/权重哈希、抽取代码版本</td><td>别人复现不出你的数；你自己换台机器也复现不出</td></tr>
+      <tr><td><strong>报告不确定性</strong></td><td>给置信区间/方差（bootstrap），多 seed/多扰动；CI 重叠不宣称差异</td><td>把噪声当信号，排名翻来覆去</td></tr>
+      <tr><td><strong>防泄漏 anti-contamination</strong></td><td>跑 no-image 基线（MG/ML）、用动态/最新数据、披露污染控制手段</td><td>记忆冒充能力，高分不可信</td></tr>
+      <tr><td><strong>区分能力 vs 指令遵循</strong></td><td>单独报告 format-failure rate；对 unparseable 做 LLM 救援对比</td><td>把"不会说格式"误判为"看不懂图"</td></tr>
+      <tr><td><strong>能力归因 attribution</strong></td><td>把失败归到视觉编码器（分辨率/OCR/计数）vs LLM（推理/知识/指令）</td><td>开错药方——明明是分辨率问题却去换更大 LLM</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>归因（attribution）是研究科学家区别于"刷榜工程师"的核心技能。</strong> 同一个错误答案，根因可能在视觉侧（编码器看不清小字 → 提分辨率/换编码器，见模块 06/01）或语言侧（看清了但推理错 → 换更强 LLM/改指令数据，见模块 05）。可控诊断手法：(a) 把图换成高清版/裁剪到 ROI，错误是否消失 → 指向视觉；(b) 把图里的关键信息用文字直接喂进 prompt（绕过视觉），若答对则视觉是瓶颈、若仍错则 LLM 是瓶颈。把每个失败 case 归类，才能给出有信息量的诊断报告。</div>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>一句话总结红线：任何无法复现、不带不确定性、未做污染控制的 VLM 分数，都不应进入决策。</strong> 这是 METR 风格评测的底线，也是本章的方法论内核。</div>
+
+  <!-- ========================================================= 9 -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>动态 / 防污染基准（dynamic & contamination-resistant benchmarks）</strong>：用最新发布、训练截止日之后的数据持续刷新测试集（live benchmarks），或程序化生成题目。开放问题：如何在防污染与可比性（题难度漂移）之间平衡？如何让"新题"难度可控？</li>
+    <li><strong>过程评测（process evaluation）</strong>：不只看最终答案对错，还评估推理链（chain-of-thought）的每一步是否正确、是否真的"看图推理"而非事后编理由。开放问题：如何低成本、可靠地标注与评分中间步骤？过程正确而答案错、答案对而过程错，如何计分？</li>
+    <li><strong>判分器本身的可信度</strong>：LLM-as-Judge 的偏差（长度/位置/自我偏好）尚无通用解；judge 模型升级导致历史分数不可比。开放问题：能否构造"对抗 judge 偏差"的鲁棒评分协议？meta-evaluation（评测评测器）该如何标准化？</li>
+    <li><strong>能力的可分解性与归因</strong>：当前总分掩盖多维能力。开放问题：能否设计实验干预（如受控的图像/文本消融）把分数<em>因果地</em>归因到视觉编码器 vs connector vs LLM？</li>
+    <li><strong>agentic 评测（预告 → 模块 09）</strong>：当 VLM 变成能操作 GUI、调用工具、多步交互的智能体，"一题一答"范式失效。要评测的是<em>任务完成度</em>、安全性、长程一致性——这是 METR / computer-use 评测的主战场，模块 09 展开。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>VLM 评测为什么比分类难？"指令遵循失败污染判分"具体指什么，如何与能力失败分离？</li>
+      <li>写出 CircularEval 的判对公式，并说明它消除的是哪种偏差、不消除哪种。</li>
+      <li>LLM-as-Judge 有哪三大偏差？为什么评测自家模型时自我偏好特别危险？如何验证 judge 与人类的一致性？</li>
+      <li>MMStar 的 MG 与 ML 指标各度量什么？如何用 answer-without-image 基线判断一个 benchmark 是否"干净"？</li>
+      <li>为什么 benchmark 分数应报告为带置信区间的分布而非单点？两个模型 CI 重叠时能否宣称谁更强？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../06_highres_video/06_讲解.html"><div class="dir">← 上一章</div><div class="t">06 · 高分辨率、任意分辨率与视频</div></a>
+    <a class="next" href="../08_hallucination_safety/08_讲解.html"><div class="dir">下一章 →</div><div class="t">08 · 幻觉、鲁棒性与安全评估</div></a>
+  </div>
+
+</div>
+</body>
+</html>

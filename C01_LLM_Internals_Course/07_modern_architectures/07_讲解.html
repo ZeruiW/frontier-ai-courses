@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · 现代架构：RoPE / GQA / MoE / SSM</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 07 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>07 · 现代架构：RoPE / GQA / MoE / SSM</h1>
+  <p class="subtitle">Modern Architectures —— 从 GPT-2 到 Llama/Qwen/Mamba：每一处架构改动都是一笔算得清的账</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（attention/Transformer block）、模块 05（scaling laws）、模块 06（KV cache 记账）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 07_modern_architectures.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">RoPE [Su 2021]、GQA [Ainslie 2023]、Switch [Fedus 2021]、Mamba [Gu &amp; Dao 2023]</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 75 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#recipe">从 GPT-2 到 Llama/Qwen：现代 decoder 配方表</a></li>
+      <li><a href="#rope">RoPE：把位置编码成旋转</a></li>
+      <li><a href="#gqa">MQA → GQA：共享 KV 头，给 KV cache 减负</a></li>
+      <li><a href="#norm-ffn">RMSNorm 与 SwiGLU：归一化与 FFN 的替换</a></li>
+      <li><a href="#moe">MoE：用稀疏激活解耦参数量与 FLOPs</a></li>
+      <li><a href="#ssm">SSM / Mamba：把序列建模做成线性递推</a></li>
+      <li><a href="#eval">评测视角：架构差异如何体现在能力剖面上</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="recipe"><span class="num">1</span>从 GPT-2 到 Llama/Qwen：现代 decoder 配方表</h2>
+
+  <p>本课前六个模块搭建并榨干了一个 GPT-2 风格的 decoder。但 2023 年后你打开任何一个开源模型的
+  <code>config.json</code>（Llama、Qwen、Mistral……），会发现它们都收敛到了<strong>另一套高度一致的配方</strong>
+  [Touvron 2023]。这套配方的每一项改动都不是审美，而是针对原版 Transformer [Vaswani 2017] / GPT-2 [Radford 2019]
+  的某个具体痛点：</p>
+
+  <table>
+    <thead><tr><th>组件</th><th>GPT-2 / 原版 Transformer</th><th>现代配方（Llama / Qwen）</th><th>解决什么痛点</th></tr></thead>
+    <tbody>
+      <tr><td>位置编码</td><td>可学习绝对位置嵌入（加在输入上）</td><td><span class="term">RoPE</span> 旋转位置编码（作用在 Q/K 上）[Su 2021]</td><td>绝对位置无法外推、不显式编码相对距离</td></tr>
+      <tr><td>注意力 KV</td><td>MHA：每个 query 头配独立 K/V 头</td><td><span class="term">GQA</span>：多组 query 头共享少量 KV 头 [Ainslie 2023]</td><td>KV cache 随头数线性增长，推理显存/带宽爆炸（模块 06）</td></tr>
+      <tr><td>归一化</td><td>LayerNorm（减均值 + 缩放 + bias）</td><td><span class="term">RMSNorm</span>（只除 RMS）[Zhang &amp; Sennrich 2019]</td><td>LayerNorm 的均值中心化贡献小、计算/通信更贵</td></tr>
+      <tr><td>FFN 激活</td><td>GELU，两层 MLP</td><td><span class="term">SwiGLU</span> 门控 FFN [Shazeer 2020]</td><td>同参数量下 GLU 变体 perplexity 更优</td></tr>
+      <tr><td>线性层 bias</td><td>所有 Linear 带 bias</td><td>几乎全部去掉 bias</td><td>实测无益、省参数、训练更稳（Qwen2 仅 QKV 保留 bias）</td></tr>
+      <tr><td>LN 位置</td><td>GPT-2 已是 Pre-LN</td><td>Pre-Norm（沿用）[Xiong 2020]</td><td>Post-LN 深层训练不稳</td></tr>
+    </tbody>
+  </table>
+
+  <div class="ascii">
+  现代 decoder block（Llama 风格）—— 与模块 02 的 GPT-2 block 对照着看：
+
+      x ──►│RMSNorm│──►│ GQA Self-Attention │──►(+)──►│RMSNorm│──►│ SwiGLU FFN │──►(+)──► x'
+      │                  ▲ Q,K 先过 RoPE 旋转   ▲residual              (或 MoE 层)   ▲residual
+      └──────────────────┼─────────────────────┘                                    │
+                         │            └──────────────────────────────────────────────┘
+      位置信息不再加在输入嵌入上，而是在每一层 attention 内部注入（旋转 Q/K）
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  把这张配方表当成本模块的目录：第 2–4 节逐项拆解"稠密配方"（RoPE/GQA/RMSNorm/SwiGLU），
+  第 5–6 节讲两条更激进的路线 —— <strong>MoE 改 FFN</strong>（参数稀疏化）和 <strong>SSM 改 attention</strong>（时间混合算子整个换掉）。
+  贯穿的主线仍是模块 05/06 的算账思维：<em>每个改动在参数量、FLOPs、显存、质量四个账本上各记了什么</em>。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="rope"><span class="num">2</span>RoPE：把位置编码成旋转</h2>
+
+  <p>Attention 本身是置换不变的，必须显式注入位置信息。GPT-2 的做法是给每个绝对位置学一个向量加在输入上 ——
+  训练时只见过 1024 个位置，推理时第 1025 个位置就是未定义行为。而语言建模真正需要的多数是<strong>相对位置</strong>：
+  "前一个词""三个词之前"，而不是"全文第 871 个词"。</p>
+
+  <h3>2.1 核心构造：每对维度做一个二维旋转</h3>
+
+  <p><span class="term">RoPE（Rotary Position Embedding）</span> [Su 2021] 的做法：把 $d$ 维的 query/key 向量拆成
+  $d/2$ 个二维子空间，第 $i$ 个子空间 $(x_{2i}, x_{2i+1})$ 在位置 $m$ 处旋转角度 $m\theta_i$：</p>
+
+  <div class="math-block">
+  $$ f(\mathbf{x}, m) = R^d_{\Theta,m}\,\mathbf{x},\qquad
+  R^d_{\Theta,m} = \mathrm{blockdiag}\big(R(m\theta_0),\,R(m\theta_1),\,\dots,\,R(m\theta_{d/2-1})\big), $$
+  $$ R(\alpha)=\begin{pmatrix}\cos\alpha & -\sin\alpha\\ \sin\alpha & \cos\alpha\end{pmatrix},
+  \qquad \theta_i = b^{-2i/d},\quad b=\texttt{rope\_theta}\;(\text{默认 }10000) $$
+  </div>
+
+  <p>注意两点：①旋转作用在<strong>每一层的 Q 和 K 上</strong>（V 不转），而不是只在输入嵌入加一次；
+  ②不同子空间转速不同：$i$ 小的子空间 $\theta_i\!\approx\!1$ 转得快（分辨相邻 token），$i$ 大的子空间
+  $\theta_i\!\to\!b^{-1}$ 转得极慢（编码长程距离），波长从 $2\pi$ 一直铺到 $2\pi b$ —— 和原版 sinusoidal 编码同一套频率谱，但用法完全不同。</p>
+
+  <h3>2.2 关键性质：内积只依赖相对位置（证明梗概）</h3>
+
+  <p>RoPE 的全部价值浓缩在一个恒等式里。设 query 在位置 $m$、key 在位置 $n$，attention 分数是旋转后的内积：</p>
+
+  <div class="math-block">
+  $$ \langle R_m\mathbf{q},\, R_n\mathbf{k}\rangle
+   = \mathbf{q}^\top R_m^\top R_n \mathbf{k}
+   = \mathbf{q}^\top R_{n-m}\,\mathbf{k}
+   \;=\; g(\mathbf{q}, \mathbf{k},\, n-m) $$
+  </div>
+
+  <p><strong>证明梗概</strong>：$R_m$ 是分块对角的，逐块看即可。每个 $2\times2$ 旋转块满足旋转群的两条性质：
+  $R(\alpha)^\top = R(-\alpha)$（转置即反向旋转）与 $R(\alpha)R(\beta)=R(\alpha+\beta)$（角度可加）。
+  于是 $R(m\theta_i)^\top R(n\theta_i) = R((n-m)\theta_i)$，拼回分块对角矩阵即得 $R_m^\top R_n = R_{n-m}$。
+  等价的复数视角：把第 $i$ 对维度看成复数 $z_i$，旋转即乘 $e^{\mathrm{i}m\theta_i}$，则
+  $\langle q_m, k_n\rangle = \mathrm{Re}\sum_i q_i \bar{k}_i e^{\mathrm{i}(n-m)\theta_i}$ —— $m,n$ 只以差值出现。∎</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>把 q 和 k 都按各自位置"拧"了一个角度之后再做内积，两个旋转一抵消，剩下的只有<strong>角度差</strong>，
+      也就是位置差。模型学到的注意力模式因此自动是"看 5 个 token 之前"这种相对规则，整段文本平移后分数完全不变。
+      notebook 里你会亲手数值验证这一点。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>RoPE 是满足 $\langle f_q(\mathbf{q},m), f_k(\mathbf{k},n)\rangle = g(\mathbf{q},\mathbf{k},n-m)$
+      的一族线性位置变换的显式解 [Su 2021]。它以乘性正交变换实现相对位置编码：不增参数、不破坏向量范数
+      （$\|R_m\mathbf{x}\|=\|\mathbf{x}\|$，故不扰动 softmax 的温度），且对任意位置 $m$ 都有定义 ——
+      外推不再是"未定义"，只是"未见过的角度组合"。</p>
+    </div>
+  </div>
+
+  <h3>2.3 rope_theta 与长上下文外推</h3>
+
+  <p>外推的失败模式很具体：推理长度超出训练长度时，<strong>低频子空间出现训练中从未见过的角度</strong>，attention 分数分布漂移。
+  补救方向都是对频率谱 $\{\theta_i\}$ 动手术：最粗暴的是直接调大底数 $b$ ——
+  Llama-2 用 $10^4$，Llama-3 / Qwen2.5 直接预训练就用 $5\times10^5$ / $10^6$，让最低频波长远超上下文长度；
+  对已训好的模型则有 NTK-aware scaling（非均匀地拉伸频率）和 YaRN（按波长分段插值 + 温度校正）等做法，一句话概括：
+  <em>把没见过的角度映回见过的范围</em>。notebook 会读出 Qwen2.5 config 里的 <code>rope_theta=1000000</code> 与此对应。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  评测陷阱：宣称 128K 上下文的模型，其 RoPE 缩放可能让<strong>困惑度平滑</strong>但<strong>精确检索退化</strong> ——
+  perplexity 对"丢失远处细节"几乎不敏感。声称长上下文能力时必须配检索型评测（needle-in-a-haystack、多跳引用），
+  这是第 7 节评测视角的第一个案例。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="gqa"><span class="num">3</span>MQA → GQA：共享 KV 头，给 KV cache 减负</h2>
+
+  <p>接模块 06 的账本。MHA 的 KV cache 为什么贵？因为<strong>每个头</strong>都要存自己的 K 和 V：</p>
+
+  <div class="math-block">
+  $$ \text{KV cache} = 2 \times L \times n_{kv} \times d_{head} \times T \times \text{bytes} $$
+  </div>
+
+  <p>MHA 中 $n_{kv}=n_{head}$。<span class="term">MQA（Multi-Query Attention）</span> [Shazeer 2019] 的观察：
+  query 头的多样性重要，但 K/V 不必每头一份 —— 让<strong>所有 query 头共享同一组 K/V</strong>（$n_{kv}=1$），
+  cache 直接除以 $n_{head}$，解码时的显存带宽（模块 06 讲过这是 decode 的真瓶颈）同步骤降。代价是质量可测地下降、训练更不稳。</p>
+
+  <p><span class="term">GQA（Grouped-Query Attention）</span> [Ainslie 2023] 是两者的插值：把 $n_{head}$ 个 query 头分成
+  $n_{kv}$ 组，<strong>组内共享一组 KV</strong>。论文同时给出廉价改造法：把已训好的 MHA 的各组 KV 头做 mean-pooling 初始化，
+  再用约 5% 的预训练算力 uptrain，质量即可逼近 MHA。</p>
+
+  <div class="ascii">
+  MHA  (n_kv = n_head = 8)        GQA  (n_kv = 2)              MQA  (n_kv = 1)
+  Q: q0 q1 q2 q3 q4 q5 q6 q7     q0 q1 q2 q3 | q4 q5 q6 q7    q0 q1 q2 q3 q4 q5 q6 q7
+      │  │  │  │  │  │  │  │       └──┬──┘       └──┬──┘        └──────────┬─────────┘
+  KV: k0 k1 k2 k3 k4 k5 k6 k7        kv0           kv1                    kv0
+      cache ×8                     cache ×2                            cache ×1
+  </div>
+
+  <table>
+    <thead><tr><th></th><th>MHA</th><th>GQA</th><th>MQA</th></tr></thead>
+    <tbody>
+      <tr><td>KV 头数 $n_{kv}$</td><td>$n_{head}$</td><td>$n_{head}/g$（常取 8）</td><td>1</td></tr>
+      <tr><td>KV cache / 带宽</td><td>1×（基线）</td><td>$n_{kv}/n_{head}$（如 1/8）</td><td>$1/n_{head}$</td></tr>
+      <tr><td>质量</td><td>最好</td><td>≈ MHA（uptrain 后）</td><td>可测下降，长上下文检索任务掉得更明显</td></tr>
+      <tr><td>代表模型</td><td>GPT-2、Llama-1</td><td>Llama-2-70B、Llama-3、Qwen2.5、Mistral</td><td>PaLM、Falcon-7B</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>实例：Llama-2-70B</strong>（$L=80$，$d_{head}=128$，64 个 query 头、<strong>8 个 KV 头</strong>）。
+  4096 上下文、fp16 下：MHA 版 KV cache $=2\times80\times64\times128\times4096\times2\,\text{B}\approx 10.7\,\text{GB/序列}$；
+  GQA 8 头只需 $\approx 1.34\,\text{GB}$ —— 省下的 9 GB 直接变成 8 倍的并发 batch 或上下文长度。
+  这就是为什么 70B 级以上的现代模型没有一个还在用 MHA。notebook 里你会复用模块 06 的记账函数把这张表算出来。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="norm-ffn"><span class="num">4</span>RMSNorm 与 SwiGLU：归一化与 FFN 的替换</h2>
+
+  <h3>4.1 RMSNorm：去掉均值中心化</h3>
+
+  <div class="math-block">
+  $$ \mathrm{LayerNorm}(x) = \frac{x-\mu}{\sigma}\odot g + b
+  \qquad\Longrightarrow\qquad
+  \mathrm{RMSNorm}(x) = \frac{x}{\mathrm{RMS}(x)}\odot g,\quad
+  \mathrm{RMS}(x)=\sqrt{\tfrac{1}{d}\sum_{i} x_i^2+\epsilon} $$
+  </div>
+
+  <p>[Zhang &amp; Sennrich 2019] 做了一个干净的消融：LayerNorm 的收益主要来自<strong>重缩放不变性</strong>（除以尺度），
+  而非<strong>重中心化</strong>（减均值）。于是把 $\mu$、$b$ 全部砍掉，只留"除以 RMS 再逐维缩放"。
+  少一次对 $d$ 维的归约、少一份参数，质量不掉 —— 在千亿参数 × 每层两次 norm 的尺度下，这种"白捡的"工程简化没有理由不要。</p>
+
+  <h3>4.2 SwiGLU：给 FFN 加一道门</h3>
+
+  <div class="math-block">
+  $$ \mathrm{FFN}_{\text{GELU}}(x) = \mathrm{GELU}(xW_1)\,W_2
+  \qquad\Longrightarrow\qquad
+  \mathrm{FFN}_{\text{SwiGLU}}(x) = \big(\mathrm{SiLU}(xW_{gate}) \odot xW_{up}\big)\,W_{down} $$
+  $$ \mathrm{SiLU}(z)=z\cdot\sigma(z) $$
+  </div>
+
+  <p>[Shazeer 2020] 系统比较了 GLU 各变体：把 FFN 第一层拆成两支 —— 一支过 SiLU 当<strong>门控</strong>，一支线性<strong>携带内容</strong>，
+  逐元素相乘后再投影回去。同等参数预算下 SwiGLU 的 perplexity 稳定更好（论文自己说"我们没有解释，只有证据"）。
+  注意参数账：SwiGLU 有三个矩阵，为了和两矩阵的 GELU FFN 参数对齐，$d_{ff}$ 通常取 $\tfrac{8}{3}d$ 再取整 ——
+  这就是你在 config 里看到 Llama-7B $d_{ff}=11008\approx\tfrac{8}{3}\times4096$ 这种"怪数"的原因。
+  config 里的 <code>hidden_act: "silu"</code> 实际指的就是整套 SwiGLU 结构。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="moe"><span class="num">5</span>MoE：用稀疏激活解耦参数量与 FLOPs</h2>
+
+  <p>模块 05 的 scaling laws 把损失钉死在 $(N, D, C)$ 上，且稠密模型里 $C\approx 6ND$：<strong>参数多一倍，每个 token 的计算就贵一倍</strong>。
+  <span class="term">MoE（Mixture of Experts）</span> [Shazeer 2017] 打破这个绑定：把 FFN 复制成 $E$ 个<span class="term">专家（expert）</span>，
+  每个 token 只激活其中 $k$ 个。</p>
+
+  <h3>5.1 Router 与 top-k 门控</h3>
+
+  <div class="math-block">
+  $$ p = \mathrm{softmax}(x W_g)\in\mathbb{R}^{E},\qquad
+  \mathcal{T} = \mathrm{topk}(p, k),\qquad
+  y = \sum_{i\in\mathcal{T}} \frac{p_i}{\sum_{j\in\mathcal{T}} p_j}\, E_i(x) $$
+  </div>
+
+  <p>一个线性<span class="term">router</span> 给每个 token 对每个专家打分，取 top-$k$（Switch [Fedus 2021] 取 $k{=}1$，
+  Mixtral/DeepSeek 系常用 $k{=}2$ 或更细粒度的多专家），按归一化的门控权重加权求和。于是：</p>
+
+  <div class="math-block">
+  $$ \text{FFN 参数量} \propto E\cdot d\cdot d_{ff},\qquad
+  \text{每 token FFN FLOPs} \approx k\cdot\underbrace{4\,d\,d_{ff}}_{\text{单专家}} + \underbrace{2\,d\,E}_{\text{router，可忽略}}
+  \;\;\Rightarrow\;\; \frac{\text{FLOPs}_{\text{MoE}}}{\text{FLOPs}_{\text{全激活}}}\approx\frac{k}{E} $$
+  </div>
+
+  <p>参数量随 $E$ 涨、计算量随 $k$ 涨 —— <strong>解耦</strong>。$E{=}8,k{=}2$ 时模型"知识容量"近似 8 倍 FFN 参数，
+  每 token 只付 1/4 的全激活计算。Switch Transformer 用同样 FLOPs 预算换得 4–7 倍预训练加速 [Fedus 2021]。</p>
+
+  <h3>5.2 负载均衡：MoE 的阿喀琉斯之踵</h3>
+
+  <p>Router 是要训练的，而它有一个天然的正反馈坍缩模式：某个专家初期略好 → 分到更多 token → 学得更好 → 分到所有 token，
+  其余专家成为死参数。解法是加<span class="term">负载均衡辅助损失</span> [Fedus 2021]：</p>
+
+  <div class="math-block">
+  $$ \mathcal{L}_{aux} = \alpha\, E \sum_{i=1}^{E} f_i\, P_i,\qquad
+  f_i = \text{实际路由到专家 } i \text{ 的 token 占比（不可导，stop-grad）},\quad
+  P_i = \text{router 对专家 } i \text{ 的平均概率（可导）} $$
+  </div>
+
+  <p>均匀分配时 $f_i=P_i=1/E$，$\mathcal{L}_{aux}=1$ 取得最小值；越倾斜越大。梯度经由 $P_i$ 流回 router，
+  把概率质量从过载专家推开。notebook 里你会亲手造一次 router 坍缩，再用这个损失把它救回来。
+  其余已知不稳定性：router logits 数值爆炸（需加 z-loss 一类正则）、专家容量溢出丢 token（capacity factor 取舍）、
+  微调时路由分布漂移导致 MoE 比稠密模型更难 fine-tune。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  谈 MoE 模型时"参数量"是个陷阱词：Mixtral-8x7B 总参数 ≈ 47B，<strong>激活参数 ≈ 13B</strong>。
+  比较两个模型的"能力 per FLOPs"时用激活参数，比较显存占用与"知识容量"时用总参数 —— 评测报告里混用这两者是常见错误。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="ssm"><span class="num">6</span>SSM / Mamba：把序列建模做成线性递推</h2>
+
+  <p>前面所有改动都没动 attention 本身的 $O(T^2)$。<span class="term">SSM（State Space Model）</span>路线则直接换掉时间混合算子：
+  用一个固定大小的<strong>状态</strong>沿序列做线性递推 —— 本质上是一个精心参数化的线性 RNN：</p>
+
+  <div class="math-block">
+  $$ h'(t) = A\,h(t) + B\,x(t),\quad y(t) = C\,h(t)
+  \;\;\xrightarrow{\;\text{以步长 } \Delta \text{ 离散化}\;}\;\;
+  h_t = \bar{A}\,h_{t-1} + \bar{B}\,x_t,\quad y_t = C\,h_t,
+  \qquad \bar{A}=\exp(\Delta A) $$
+  </div>
+
+  <p>若 $A,B,C,\Delta$ 与输入无关（线性时不变，LTI），整个递推可写成一个长卷积、训练时 FFT 并行（S4 路线）。
+  <strong>Mamba</strong> [Gu &amp; Dao 2023] 的关键一步是让 $B, C, \Delta$ 成为<strong>输入的函数</strong>（<span class="term">选择性 selective</span>）：
+  $\Delta_t$ 大 → $\bar A\to 0$，状态被重置、专注当前输入；$\Delta_t$ 小 → 状态几乎原样保留、忽略当前 token。
+  这赋予了模型"按内容决定记什么、忘什么"的能力 —— 代价是不再 LTI、不能用卷积训练，论文为此设计了硬件感知的 parallel scan。</p>
+
+  <table>
+    <thead><tr><th></th><th>Attention（+KV cache）</th><th>SSM / Mamba</th></tr></thead>
+    <tbody>
+      <tr><td>训练（长度 $T$）</td><td>$O(T^2)$，高度并行</td><td>$O(T)$，parallel scan 并行</td></tr>
+      <tr><td>推理每 token</td><td>$O(T)$ —— 要扫整个 KV cache</td><td>$O(1)$ —— 只更新固定大小状态</td></tr>
+      <tr><td>推理内存</td><td>KV cache 随 $T$ 线性增长（模块 06 的全部痛苦）</td><td>常数（一个 $h_t$）</td></tr>
+      <tr><td>历史访问方式</td><td>无损：任意位置随机访问（softmax 查表）</td><td>有损：全部历史压进固定维状态</td></tr>
+      <tr><td>已知短板</td><td>长序列成本</td><td>精确召回/复制、长程多跳检索</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  一句话抓住本质权衡：<strong>attention 把整个历史原样留着、每步重新查询（贵但无损）；SSM 把历史压缩进一个定长状态（便宜但有损）</strong>。
+  信息论上，固定大小的状态不可能无损保存任意长的随机序列 —— 所以 SSM 在"逐字复制 5000 token 前的一段话"这类任务上
+  <em>必然</em>存在容量上限，这不是训练不足，是架构性质。notebook 用一个玩具复制任务把这条分界线演示出来。</div>
+
+  <p>因此 2024 年后的实用趋势是 <strong>hybrid 架构</strong>：大部分层用 Mamba/线性注意力拿 $O(T)$ 的吞吐，
+  间插少量全 attention 层负责精确检索（Jamba、Zamba 等均为此配方）—— 用最小的二次方成本买回随机访问能力。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>评测视角：架构差异如何体现在能力剖面上</h2>
+
+  <p>对做 evaluation 的研究者，本模块的意义不是"会写 RoPE"，而是建立一个归因直觉：
+  <strong>架构选择会在能力剖面（capability profile）上留下可预测的指纹</strong>。两个总 loss 相同的模型，能力分布可以截然不同：</p>
+
+  <ul>
+    <li><strong>MoE：知识容量 vs 推理深度的错位。</strong>知识密集型任务（闭卷 QA、长尾事实）主要受益于<em>总参数</em>——
+    MoE 用便宜的 FLOPs 买到了大容量，这类 benchmark 上常超越同激活算力的稠密模型；
+    而多步推理类能力更多跟随<em>激活算力</em>，MoE 的优势明显收窄。
+    评测时若只报 MMLU 一个数，会系统性高估 MoE 相对稠密模型的"综合智能"。</li>
+    <li><strong>SSM：吞吐换精确召回。</strong>固定状态的有损压缩直接预言了它的弱项：
+    <span class="term">needle-in-a-haystack</span>（长文中植入一句话要求精确复述）、长 in-context 列表的逐项召回、phone-book 式查询。
+    这类探针必须随上下文位置/长度扫描（哪个深度、哪个距离开始丢），单点准确率会掩盖系统性衰减。
+    混合架构的表现则随 attention 层占比平滑插值 —— 探针结果可以反过来"诊断"架构配比。</li>
+    <li><strong>RoPE 缩放：困惑度平滑 ≠ 检索完好。</strong>第 2 节已述 —— 长上下文宣称必须用检索型评测交叉验证。</li>
+    <li><strong>GQA：基本质量中性，但非零成本。</strong>uptrain 充分时多数 benchmark 无感；
+    若要找差异，去长上下文检索和需要细粒度注意力分布的任务上找。评测推理引擎时还要记住：
+    GQA 模型显存省 8 倍意味着 serving 配置（batch、并发）完全不同，吞吐对比必须控制这一变量。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  方法论结论：<strong>不存在"一个数字"的模型能力。</strong>评测套件应当按"架构敏感轴"组织 ——
+  精确召回、长程检索、知识容量、多步推理分开测量并分开报告；
+  看到一个新架构的宣传数字时，第一反应是问"它的架构性短板对应的探针测了吗"。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>Hybrid 的最优配比是多少？</strong>attention 层与 SSM 层的比例、摆放位置（均匀间插 vs 集中在深层）目前纯靠经验。
+    评测视角：需要能随配比平滑变化的召回探针族，把"买回多少随机访问能力"做成可测量的函数。</li>
+    <li><strong>长度泛化仍无第一性理论。</strong>RoPE 底数怎么选、NTK/YaRN 何时失效，基本是经验法则。
+    开放问题：能否从频谱覆盖角度预测某个 $(b, T_{train})$ 组合的外推上限，而不是事后测 needle 曲线。</li>
+    <li><strong>MoE 的路由可解释性与专家分工。</strong>专家是否形成可命名的功能分工（语言/领域/语法）证据混杂。
+    路由分布本身正在成为一种评测信号：分布漂移可用于检测分布外输入与微调损伤。</li>
+    <li><strong>架构改动与 scaling law 的交互。</strong>多数架构对比在 ≤7B 完成，结论是否随规模保持（MoE 的均衡难度、SSM 的召回缺口会放大还是弥合）
+    缺乏公开的大规模 iso-FLOPs 对照 —— 这是模块 05 方法论在架构研究上的直接应用。</li>
+    <li><strong>推理时代的重新洗牌。</strong>当算力从训练转向 test-time（长思维链），每 token 推理成本的权重陡增 ——
+    这恰恰是 SSM/hybrid 与 GQA/MLA 类 KV 压缩的主场。架构竞争的记分牌正在从"训练 loss per FLOP"换成"能力 per 推理成本"。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>写出 RoPE 的旋转构造，并证明 $\langle R_m q, R_n k\rangle$ 只依赖 $n-m$。<code>rope_theta</code> 调大解决什么问题？</li>
+      <li>给定 $L, n_{head}, n_{kv}, d_{head}, T$，算出 MHA→GQA 的 KV cache 缩减倍数；Llama-2-70B 的配置是什么？</li>
+      <li>MoE 如何解耦参数量与 FLOPs？写出负载均衡损失 $\alpha E\sum f_i P_i$ 并说明为什么均匀分配时最小。</li>
+      <li>SSM 为什么推理是 $O(1)$/token？它的架构性短板是什么，用什么评测探针能暴露出来？</li>
+    </ol>
+  </div>
+
+  <div class="card" style="text-align:center">
+    <strong>🎉 恭喜完成《LLM 内核》全部 8 个模块！</strong>
+    <p style="margin:8px 0 0">从 tokenizer 的第一个 merge，到亲手训练 mini-GPT、推导 scaling laws、给 KV cache 记账，再到本章的现代架构 ——
+    你已经具备从第一性原理拆解任何一个 LLM 技术报告的能力。<br>
+    回到 <a href="../index.html">课程主页</a> 查看全课总结与后续学习路线。</p>
+  </div>
+
+  <div class="pager">
+    <a href="../06_kv_cache_inference/06_讲解.html"><div class="dir">← 上一章</div><div class="t">06 · KV Cache 与高效推理</div></a>
+    <a class="next" href="../index.html"><div class="dir">下一章 →</div><div class="t">课程主页 · 结课</div></a>
+  </div>
+
+</div>
+</body>
+</html>

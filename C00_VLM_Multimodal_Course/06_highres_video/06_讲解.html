@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · 高分辨率、任意分辨率与视频</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 06 / 10</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>06 · 高分辨率、任意分辨率与视频</h1>
+  <p class="subtitle">High-Resolution, Any-Resolution &amp; Video —— 让 VLM 真正"看清"文档、图表、小字，并把单图能力延伸到时间轴</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">ViT / patch 化（模块 01）、connector 与视觉 token（模块 03/04）、RoPE 位置编码基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge gpu">GPU</span><span class="badge cpu">CPU部分可跑</span> 06_highres_video.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">LLaVA-NeXT (2024)、NaViT (2023)、Qwen2-VL (2024)、InternVL 1.5、Video-LLaVA</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#bottleneck">固定分辨率瓶颈：为什么"看不清"常常不是 LLM 的错</a></li>
+      <li><a href="#anyres">AnyRes / 切片 tiling：LLaVA-NeXT 的工程解法</a></li>
+      <li><a href="#navit">NaViT / Patch n' Pack：保留长宽比的高效训练</a></li>
+      <li><a href="#qwen2vl">原生动态分辨率与 M-RoPE：Qwen2-VL 统一图像与视频</a></li>
+      <li><a href="#compress">token 压缩：pixel shuffle / pooling / resampler 的三角权衡</a></li>
+      <li><a href="#video">视频理解：帧采样、时序建模与长视频的 token 预算爆炸</a></li>
+      <li><a href="#eval">评测视角：高分辨率 / 视频 benchmark 与 token 预算的成本账</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bottleneck"><span class="num">1</span>固定分辨率瓶颈：为什么"看不清"常常不是 LLM 的错</h2>
+
+  <p>做 VLM 评测时一个反复出现的失败模式是：模型在自然图像 VQA 上表现尚可，一遇到文档、表格、图表、屏幕截图、票据上的小字就崩。
+  很多人第一反应是"LLM 推理弱"，但更常见的根因在<strong>视觉编码器的输入分辨率</strong>。</p>
+
+  <p>原因要回到模块 01/02：主流视觉编码器（<span class="term">CLIP</span> / <span class="term">SigLIP</span>）几乎都在固定低分辨率上预训练 ——
+  CLIP ViT-L/14 是 <strong>224 或 336</strong>，SigLIP 多为 <strong>224 / 384</strong>。把一张 2000×3000 的扫描合同硬塞进 336×336，
+  意味着每个字符可能只剩下不到一两个像素。<strong>编码器在第一步就把信息丢光了，后面再强的 LLM 也救不回来。</strong></p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>把高清图缩到 336，就像把一页 A4 文件拍成 9×9 的马赛克再让人读。
+      不是读的人笨，是图根本没把字送进来。要让模型"看清"，第一要务是<strong>把更多像素送进编码器</strong>，
+      而不是去调 LLM 的 prompt。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设编码器原生分辨率 $R{=}336$、patch 大小 $P{=}14$，则每张图固定产出 $N{=}(R/P)^2{=}576$ 个视觉 token。
+      对一张原始分辨率为 $H\times W$ 的文档，有效像素采样率被压到 $336^2/(HW)$。当目标内容的笔画宽度小于一个 patch 的物理覆盖范围时，
+      该细节在 patch embedding 阶段被低通滤除，信息论上不可逆 —— <strong>不是下游推理问题，而是前端采样问题。</strong></p>
+    </div>
+  </div>
+
+  <div class="ascii">
+   同一张 1500×2000 的发票，喂给两种前端：
+
+   ┌─────────────────────────┐        ┌─────────────────────────┐
+   │  缩放到 336×336          │        │  AnyRes 切成 4 块 + 全局   │
+   │  ──────────────         │        │  ──────────────         │
+   │  576 个视觉 token        │        │  5×576 ≈ 2880 token      │
+   │  每字符 < 1 px           │        │  每字符 5~8 px           │
+   │  OCR / 小字 → ✗ 读不出   │        │  OCR / 小字 → ✓ 可读      │
+   └─────────────────────────┘        └─────────────────────────┘
+        省 token，丢细节                   细节回来了，但 token 暴涨
+                          ↑ 本章的核心权衡 ↑
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>评测归因技巧</strong>：怀疑某条 DocVQA / ChartQA 失败时，先把同一张图放大裁剪到只含目标区域再喂一次。
+  若放大后答对，说明瓶颈是<strong>分辨率/视觉前端</strong>而非 LLM 推理 —— 这个简单的"放大重测"是定位视觉短板最快的诊断手段（模块 07/08 会系统化）。</div>
+
+  <p>本章讲的所有技术 —— AnyRes 切片、NaViT 打包、Qwen2-VL 原生动态分辨率、token 压缩、视频帧采样 ——
+  本质上都在同一条权衡线上博弈：<strong>视觉 token 数 ↔ 细节保真 ↔ 上下文 / 延迟 / 成本</strong>。带着这条主线读下去。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="anyres"><span class="num">2</span>AnyRes / 切片 tiling：LLaVA-NeXT 的工程解法</h2>
+
+  <p><span class="term">AnyRes</span>（Any-Resolution）是 <strong>LLaVA-NeXT</strong> [Liu 2024] 给固定分辨率瓶颈的一个不改编码器、零额外预训练的工程解法。
+  思路朴素而有效：<strong>既然编码器只吃 336，那就把高清图切成若干 336 的子图（tile）分别过编码器，再额外过一张缩略全局图，最后把所有 token 拼起来送进 LLM。</strong></p>
+
+  <div class="ascii">
+   原图 672×672                        AnyRes 切片 (LLaVA-NeXT)
+   ┌───────────┐
+   │           │   ① 选网格 2×2        ┌────┬────┐  局部子图 (high-res)
+   │   高清图   │   (从候选 {2x2,1x3,   │tile│tile│  每块 resize→336
+   │           │    3x1,2x3,...} 选最   ├────┼────┤  各自过 ViT
+   └───────────┘    贴合长宽比的)       │tile│tile│  → 4 × 576 token
+                                        └────┴────┘
+                    ② 另存一张          ┌─────────┐  全局缩略图 (global)
+                       整图缩略         │  整图    │  resize→336
+                       → 全局上下文      │  336×336 │  过 ViT → 576 token
+                                        └─────────┘
+                    ③ 拼接 → (4+1)×576 = 2880 个视觉 token → 投影 → LLM
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  为什么还要那张<strong>全局缩略图</strong>？因为切片后每个 tile 只看到局部，丢失了"这是一整页发票"的全局布局信息。
+  全局图提供<em>整体语义与版面</em>，局部 tile 提供<em>细节与小字</em>，两者拼接让 LLM 同时拥有"远景"和"特写"。
+  <span class="term">InternVL 1.5</span> [Chen 2024] 的动态高分辨率切片用的是同一思想，并把候选网格做得更密（最多 40 个 tile）。</div>
+
+  <p><strong>token 数随分辨率的增长是这套方案的命门。</strong>切成 $m\times n$ 网格、外加一张全局图，patch 大小为 $P$、每个 tile 边长 $R$：</p>
+
+  <div class="math-block">
+  $$ N_{\text{tokens}} = \underbrace{(mn)\cdot\left(\frac{R}{P}\right)^2}_{\text{局部 tiles}} \;+\; \underbrace{\left(\frac{R}{P}\right)^2}_{\text{全局缩略}} = (mn+1)\left(\frac{R}{P}\right)^2 $$
+  </div>
+
+  <p>关键点：当你为了"看清"而沿长宽两个方向各加倍分辨率时，tile 数 $mn$ 随面积<strong>二次增长</strong>，token 数也二次增长。
+  这正是 notebook 里要画出来的那条曲线 —— 也是后面 token 压缩存在的根本理由。</p>
+
+  <table>
+    <thead><tr><th>有效分辨率</th><th>网格 (含全局)</th><th>视觉 token 数 (P=14, R=336)</th><th>相对 336 单图</th></tr></thead>
+    <tbody>
+      <tr><td>336²</td><td>1×1 (仅全局)</td><td>576</td><td>1×</td></tr>
+      <tr><td>672²</td><td>2×2 + 全局</td><td>2880</td><td>5×</td></tr>
+      <tr><td>1008²</td><td>3×3 + 全局</td><td>5760</td><td>10×</td></tr>
+      <tr><td>1344²</td><td>4×4 + 全局</td><td>9792</td><td>17×</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  AnyRes 的代价是<strong>视觉 token 吃满 LLM 上下文</strong>。一张高清图就能占掉数千 token，多图或带长文 prompt 时极易顶到上下文上限，
+  且 self-attention 是 $O(L^2)$，token 翻 5 倍、attention 计算约翻 25 倍。这就是为什么"调高分辨率"在生产里从来不是免费的。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="navit"><span class="num">3</span>NaViT / Patch n' Pack：保留长宽比的高效训练</h2>
+
+  <p>AnyRes 解决的是<em>推理时</em>怎么喂高清图，但它有两个隐患：① 切片在 tile 边界处人为割裂了内容（一个字被切成两半）；
+  ② 强行 resize 到方形 tile 会扭曲长宽比。<strong>NaViT</strong>（Patch n' Pack）[Dehghani 2023] 从<em>训练</em>层面给出更优雅的答案。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>传统训练要求一个 batch 里所有图都是同一尺寸，于是只能粗暴 resize。NaViT 不再强求统一尺寸：
+      把不同分辨率图像切出的 patch <strong>像拼图一样塞进同一个长序列</strong>，塞满为止，再用一个 mask 告诉 attention "哪些 patch 属于同一张图、别跨图乱看"。
+      这样每张图都按原始长宽比进来，还不浪费算力去 padding。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>NaViT 借鉴 NLP 的 <em>example packing</em>：把多张不同 $(H_i,W_i)$ 图像的可变数量 patch 序列拼接成定长 token 序列，
+      用 <strong>block-diagonal attention mask</strong> 阻断跨样本注意力，并用 factorized / fractional position embedding 编码每个 patch 在其原图中的相对位置。
+      配合 <em>token dropping</em>(随机丢弃部分 patch) 可进一步提升训练吞吐。结果：同等算力下训练更快、且推理时天然支持任意分辨率与长宽比。</p>
+    </div>
+  </div>
+
+  <div class="ascii">
+   Patch n' Pack (NaViT) —— 一个 packed 序列里塞了 3 张不同分辨率的图
+
+   图A (小, 长宽比 1:1)   图B (宽图)            图C (高图)
+   ┌──┬──┐               ┌──┬──┬──┬──┐         ┌──┐
+   │a1│a2│               │b1│b2│b3│b4│         │c1│
+   ├──┼──┤               └──┴──┴──┴──┘         ├──┤
+   │a3│a4│                                     │c2│
+   └──┴──┘                                     └──┘
+
+   packed sequence:  [a1 a2 a3 a4 | b1 b2 b3 b4 | c1 c2 | <pad>]
+                      └───图A────┘ └───图B────┘ └图C┘
+   attention mask:    block-diagonal —— A 只看 A、B 只看 B、C 只看 C，互不串扰
+  </div>
+
+  <div class="callout paper"><span class="label"></span>
+  NaViT 是 <strong>原生分辨率（native resolution）</strong> 路线的奠基工作，直接影响了后来的 SigLIP 2、Idefics2 以及 Qwen2-VL 的设计。
+  它的核心遗产是两点：<strong>(1) 保留长宽比</strong>，<strong>(2) 序列打包以高效利用变长输入</strong>。下一节的 Qwen2-VL 把这套思想做成了端到端可推理的产品级方案。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="qwen2vl"><span class="num">4</span>原生动态分辨率与 M-RoPE：Qwen2-VL 统一图像与视频</h2>
+
+  <p><strong>Qwen2-VL</strong> [Wang 2024] 把"原生分辨率"落地成 <span class="term">Naive Dynamic Resolution</span>：
+  <strong>不缩放到固定尺寸，而是按图像原始分辨率决定产生多少个视觉 token</strong>，再用一层 MLP 把相邻 2×2 patch 合并以控制 token 总量。
+  大图自然产生更多 token、小图更少 —— token 预算<strong>自适应于内容</strong>，这正是 notebook 里要观察的 <code>image_grid_thw</code> 的含义。</p>
+
+  <div class="ascii">
+   Qwen2-VL Naive Dynamic Resolution
+
+   原图 (H, W) 任意           ① ViT (patch=14) 按原分辨率切 patch
+        │                        → grid 高 = H/14, grid 宽 = W/14
+        ▼                    ② MLP merger: 相邻 2×2 patch 合并成 1 token
+   image_grid_thw = (T, H', W')    → token 数 = T · (H'/2) · (W'/2)
+        │                    ③ token 数随图大小动态变化（不再是固定 576）
+        ▼
+   视频: 多帧堆叠 → T>1，时间维进入同一张 grid 表
+  </div>
+
+  <h3>M-RoPE：把位置编码拆成 时间 / 高 / 宽 三维</h3>
+
+  <p>统一图像与视频的关键创新是 <span class="term">M-RoPE</span>（Multimodal Rotary Position Embedding）。
+  回忆标准 <span class="term">RoPE</span>：给位置 $m$ 的 query/key 乘上旋转矩阵 $R_{\Theta,m}$，使注意力得分只依赖<em>相对</em>位置 $m-n$。
+  文本是 1D 的，所以 $m$ 是一个标量。但图像是 2D、视频是 3D（时间+空间），用 1D 位置硬编码会丢失空间结构。</p>
+
+  <p>M-RoPE 把每个 token 的位置拆成三元组 $(t,h,w)$，并把旋转编码的频率维度<strong>切成三段</strong>，分别注入时间、高、宽：</p>
+
+  <div class="math-block">
+  $$ \text{pos}(token) = (t,\,h,\,w),\qquad
+     \mathrm{M\text{-}RoPE}(x,\,t,h,w) = R^{(\text{temporal})}_{t}\,R^{(\text{height})}_{h}\,R^{(\text{width})}_{w}\;x $$
+  </div>
+
+  <p>具体地，把 head 维度的旋转频率集合 $\Theta$ 划分为三个不相交子集 $\Theta_t,\Theta_h,\Theta_w$，
+  每个子集只对相应坐标做旋转。这样同一套机制既能表达"文本第几个字"，也能表达"图像第几行第几列"、"视频第几帧"：</p>
+
+  <div class="math-block">
+  $$ \text{文本 token}:\;(t,h,w){=}(i,i,i)\quad\text{（退化为 1D RoPE）}\\[4pt]
+     \text{图像 token}:\;t\ \text{固定},\;(h,w)\ \text{遍历 grid}\\[4pt]
+     \text{视频 token}:\;t\ \text{随帧递增},\;(h,w)\ \text{遍历每帧 grid} $$
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  M-RoPE 的妙处：<strong>图像就是"只有一帧的视频"</strong>。当 $T{=}1$，视频公式自然退化为图像；当只有文本，三维坐标取相同值就退化为普通 1D RoPE。
+  于是同一个模型、同一套位置编码，无缝处理 文本 / 图像 / 视频，不需要为视频单独设计架构。这是 Qwen2-VL 能"一统"多模态输入的结构性原因。</div>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>Qwen2-VL</strong> [Wang 2024, arXiv:2409.12191] 报告：原生动态分辨率 + M-RoPE 在 DocVQA、ChartQA、MTVQA、视频理解上显著领先固定分辨率方案。
+  后续 <strong>Qwen2.5-VL</strong> [Bai 2025] 进一步把时间维与<em>绝对时间</em>（秒）对齐，改进长视频的时间定位。视频处理在实践中通过 <code>qwen-vl-utils</code> 的 <code>process_vision_info</code> 完成帧采样与张量打包。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="compress"><span class="num">5</span>token 压缩：pixel shuffle / pooling / resampler 的三角权衡</h2>
+
+  <p>前面几节把 token 数越推越高，第 5 节就是"刹车"：如何在不严重损失细节的前提下<strong>减少每张图占用的视觉 token 数</strong>。
+  主流有三类做法，本质都是在 ViT 输出的 $N\times d$ 特征上做某种<em>降采样 / 重采样</em>。</p>
+
+  <table>
+    <thead><tr><th>方法</th><th>代表</th><th>机制</th><th>压缩比 / 特点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Pixel Shuffle</strong><br>(space-to-depth)</td><td>InternVL、Qwen2-VL merger</td><td>把空间相邻的 $2\times2$ patch 在通道维拼接，$N$ 减为 $N/4$、$d$ 增为 $4d$，再过线性层</td><td>4×压缩，无参/少参，<strong>信息无损搬移</strong>（只是重排），细节保留好</td></tr>
+      <tr><td><strong>Spatial Pooling</strong><br>(平均/最大池化)</td><td>很多视频 VLM 的帧内压缩</td><td>对 patch 网格做 $k\times k$ 平均池化</td><td>简单粗暴，会平滑掉高频细节，<strong>有损</strong></td></tr>
+      <tr><td><strong>Perceiver Resampler</strong><br>/ Q-Former</td><td>Flamingo、BLIP-2、Idefics</td><td>用固定数量可学习 query 经 cross-attention "问"出固定 token 数</td><td>压到固定预算（如 64/256），与输入分辨率解耦，但需训练、可能丢长尾细节</td></tr>
+    </tbody>
+  </table>
+
+  <div class="ascii">
+   Pixel Shuffle (space-to-depth) —— Qwen2-VL / InternVL 的主力压缩
+
+      ViT patch 网格 (H'×W', 每格 d 维)        合并后 (H'/2 × W'/2, 每格 4d 维)
+      ┌──┬──┬──┬──┐                            ┌─────┬─────┐
+      │ a│ b│ e│ f│      把每个 2×2 块的        │ abcd│ efgh│   token 数 ÷4
+      ├──┼──┼──┼──┤  ──► 4 个 d 维向量 ──►       ├─────┼─────┤   通道数 ×4
+      │ c│ d│ g│ h│      拼接成 1 个 4d 向量     │ ijkl│ mnop│   → 线性投影回 d
+      ├──┼──┼──┼──┤                            └─────┴─────┘
+      │ i│ j│ m│ n│                            细节没丢，只是从"空间"
+      ├──┼──┼──┼──┤                            搬到了"通道"，再交给投影层
+      │ k│ l│ o│ p│
+      └──┴──┴──┴──┘
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>三角权衡（贯穿全课）</strong>：<em>视觉 token 数 ↔ 细节保真 ↔ 上下文 / 延迟 / 成本</em>。
+  压得越狠越省钱越快，但 OCR / 计数 / 密集文档类任务最先掉分；压得越少细节越全，但上下文和延迟成本飙升。
+  做评测时务必<strong>把 token 预算当成一个可调超参一起报告</strong> —— 同一模型在不同 max tiles / 不同压缩比下的分数可能差出十几个点。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="video"><span class="num">6</span>视频理解：帧采样、时序建模与长视频的 token 预算爆炸</h2>
+
+  <p>视频 = 图像 × 时间。最朴素的做法是"把视频当成一叠图"，但这立刻撞上 token 预算的墙：
+  一张图几百到几千 token，乘以帧数，<strong>token 数随时长线性甚至超线性爆炸</strong>。视频 VLM 的全部工程都围绕"如何在固定 token 预算下塞进足够的时间信息"。</p>
+
+  <h3>① 帧采样策略 Frame Sampling</h3>
+  <ul>
+    <li><strong>均匀采样 uniform</strong>：每隔固定间隔取一帧（如全片均匀取 8/16/32 帧）。简单、无偏，但可能错过关键瞬间。绝大多数视频 benchmark 的默认协议。</li>
+    <li><strong>关键帧 / 自适应采样</strong>：按场景切换、运动量或与问题的相关性挑帧。信息密度更高，但引入采样器本身的偏差，且难复现。</li>
+    <li><strong>fps 采样</strong>：按固定每秒帧率取帧，Qwen2-VL 系常用，并把帧率信息通过 M-RoPE 时间维注入，让模型感知"真实时间间隔"。</li>
+  </ul>
+
+  <h3>② 时序建模 Temporal Modeling</h3>
+  <ul>
+    <li><strong>帧内编码 + 拼接</strong>：每帧独立过 ViT，token 按时间顺序拼接，靠 LLM 自身的注意力 + M-RoPE 时间维建模时序（Qwen2-VL 路线）。</li>
+    <li><strong>时序聚合模块</strong>：在送入 LLM 前用 temporal attention / pooling 跨帧聚合（Video-LLaMA [Zhang 2023] 的 video Q-Former）。</li>
+    <li><strong>联合图文视频训练</strong>：Video-LLaVA [Lin 2023] 把图像与视频投到同一对齐空间联合训练，让单图能力迁移到视频。</li>
+  </ul>
+
+  <div class="ascii">
+   长视频的 token 预算爆炸（以每帧压缩到 256 token 为例）
+
+   时长     采样      帧数      视觉 token        能否塞进 32K 上下文?
+   ───────────────────────────────────────────────────────────────
+   10 秒    1 fps     10        2,560             ✓ 轻松
+   1 分钟   1 fps     60        15,360            ✓ 勉强
+   10 分钟  1 fps     600       153,600           ✗ 远超 → 必须更狠压缩
+   1 小时   1 fps     3600      921,600           ✗✗ 不可能直喂
+
+   应对：① 更狠的 token 压缩(每帧降到 16~64 token)
+        ② 降采样帧数 / 自适应选帧
+        ③ 分段处理 + 记忆 (segment & memory / streaming)
+        ④ 检索式: 先粗采样定位相关片段，再对片段精采样
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>长视频是当前最硬的瓶颈之一。</strong>token 预算与 self-attention 的 $O(L^2)$ 成本让"直接把整片喂进去"在小时级视频上不可行。
+  评测长视频 VLM 时，必须同时记录<strong>采样帧数、每帧 token、总 token、上下文上限</strong> —— 很多"长视频能力强"的宣称，换一个采样配置就站不住。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>评测视角：高分辨率 / 视频 benchmark 与 token 预算的成本账</h2>
+
+  <p>作为做 model evaluation 的研究科学家，本章最该带走的是：<strong>分辨率与 token 预算不是实现细节，而是直接决定基准分数与推理成本的一等变量。</strong></p>
+
+  <h3>专门考验分辨率 / 视频的基准</h3>
+  <table>
+    <thead><tr><th>基准</th><th>考什么</th><th>为何吃分辨率 / 帧数</th></tr></thead>
+    <tbody>
+      <tr><td><strong>DocVQA</strong></td><td>文档图像问答（扫描件、表单）</td><td>答案藏在小字里，336 单图几乎必挂，强依赖 AnyRes / 高分辨率</td></tr>
+      <tr><td><strong>ChartQA</strong></td><td>图表数值读取与推理</td><td>需要看清坐标轴刻度、图例、数据标签等细粒度元素</td></tr>
+      <tr><td><strong>TextVQA / OCRBench</strong></td><td>场景文字识别与问答</td><td>小字 OCR，分辨率直接决定字符是否可辨</td></tr>
+      <tr><td><strong>InfographicVQA</strong></td><td>超高分辨率信息图</td><td>极端长宽比 + 海量小元素，最考验任意分辨率能力</td></tr>
+      <tr><td><strong>Video-MME / MVBench / VideoQA</strong></td><td>视频理解与时序推理</td><td>分数随采样帧数变化巨大，需在固定 token 预算下报告</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>token 预算如何变成钱与延迟</strong>：视觉 token 既进 prefill（按输入 token 计费/计时），又抬高每一步 decode 的 KV-cache 与 attention 成本。
+  一张高分辨率文档 ≈ 数千 token，一段视频 ≈ 数万 token。<strong>同一模型把 max tiles 从 4 调到 12，DocVQA 可能涨几分，但单次推理成本和延迟可能翻倍以上。</strong>
+  评测报告若只给准确率、不给 token / 延迟，就是不完整的 —— 生产选型看的是<em>准确率-成本</em>的 Pareto 前沿。</div>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>常见评测陷阱</strong>：(1) 不同方法用不同分辨率/采样配置直接比分数，是不公平的；(2) 高分辨率方案在小图任务上可能因 token 冗余反而<em>掉点</em>或变慢；
+  (3) 视频分数对"取了哪几帧"极度敏感，关键帧恰好被均匀采样命中与否能决定对错。复现实验时，<strong>分辨率与采样协议必须逐字记录。</strong></div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>更高效的 token 表示</strong>：能否用远少于当前的 token 表达一张高分辨率图而不掉细节？方向包括可学习的自适应 token 数、内容感知的可变压缩比、token 剪枝/合并（如 ToMe 思想迁移到 VLM）。评测视角：在固定 token 预算下比拼 DocVQA / ChartQA 的 Pareto 前沿。</li>
+    <li><strong>原生任意分辨率统一图像与视频</strong>：M-RoPE 已把图像视为单帧视频，但"真正统一"仍未完成 —— 如何让同一模型在 224 的小图、4K 文档、1 小时视频上都以接近最优的 token 预算工作？</li>
+    <li><strong>长视频的记忆与流式处理</strong>：小时级视频无法一次性进上下文。流式（streaming）VLM、外部记忆、检索式定位（先粗后精）是热点，但缺乏统一、防作弊的长视频评测协议。</li>
+    <li><strong>分辨率 / 采样作为可控变量的标准化评测</strong>：当前论文常用各自最优配置报告 SOTA，导致横向比较失真。社区需要"固定 token 预算 / 固定帧数"的受控评测协议，把<em>准确率-成本</em>权衡显式化。</li>
+    <li><strong>细节保真的失败归因</strong>：当 VLM 答错一道 ChartQA，是分辨率不够、压缩丢了细节、还是 LLM 读数推理弱？建立能把失败<em>归因到前端 vs 后端</em>的诊断方法，是评测科学化的关键缺口（衔接模块 07/08）。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>为什么很多文档 / 图表 / 小字任务的失败根因是视觉编码器分辨率，而非 LLM 推理？如何用"放大重测"快速归因？</li>
+      <li>LLaVA-NeXT 的 AnyRes 切片是怎么工作的？为什么还要一张全局缩略图？token 数为何随分辨率二次增长？</li>
+      <li>Qwen2-VL 的原生动态分辨率 + M-RoPE 如何用同一套机制统一文本 / 图像 / 视频？写出 M-RoPE 的三维位置思想。</li>
+      <li>pixel shuffle / pooling / resampler 三类压缩各自的代价是什么？为什么评测时必须把 token 预算当成一等变量一起报告？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../05_instruction_tuning/05_讲解.html"><div class="dir">← 上一章</div><div class="t">05 · 视觉指令微调与对齐</div></a>
+    <a class="next" href="../07_evaluation/07_讲解.html"><div class="dir">下一章 →</div><div class="t">07 · VLM 评测体系</div></a>
+  </div>
+
+</div>
+</body>
+</html>

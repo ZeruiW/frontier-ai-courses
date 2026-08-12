@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 无监督学习：PCA、K-means、GMM/EM</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 7</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 无监督学习：PCA、K-means、GMM/EM</h1>
+  <p class="subtitle">没有标签时怎么发现结构——降维、硬聚类、软聚类，三个算法在真实手写数字与红酒数据上从零手写。这一章的 SVD 与 EM 直觉，会在 C6 的 SAE、对比学习、OOD 检测里反复出现。</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">线代（特征值/特征向量/SVD）、模块 02（似然、EM 用到对数似然）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_unsupervised_learning.ipynb（UCI optdigits 手写数字 + UCI Wine）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Bishop <em>PRML</em> ch.9（EM）, ch.12（PCA）；Dempster et al. 1977；Arthur &amp; Vassilvitskii 2007</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 75 分钟 + 跑 70 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">无监督在评测里的真实位置</a></li>
+      <li><a href="#pca">PCA：最大方差 = 最小重构误差</a></li>
+      <li><a href="#svd">PCA 与 SVD 的数值关系</a></li>
+      <li><a href="#kmeans">K-means：Lloyd 迭代与局部最优</a></li>
+      <li><a href="#gmm">GMM：软聚类与 responsibility</a></li>
+      <li><a href="#em">EM 算法：为什么它一定单调上升</a></li>
+      <li><a href="#eval">无监督怎么评估（以及怎么自欺）</a></li>
+      <li><a href="#frontier">研究前沿：表示学习与可解释性</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>无监督在评测里的真实位置</h2>
+
+  <p>很多人以为无监督学习是「没有标签所以没什么用」的二等公民。恰恰相反——评测科学家几乎天天在用它，只是不一定叫它「无监督」。当你<strong>给海量 prompt 或模型激活做聚类来发现失败模式</strong>，那是 k-means/GMM；当你<strong>把高维模型表示降到二维画图看结构</strong>，那是 PCA；当你<strong>检测一条输入是否偏离训练分布（OOD）、监控数据漂移</strong>，背后是密度估计与降维。C6 可解释性里的稀疏自编码器（SAE）、激活聚类，本质都是本章三个算法的现代延伸。</p>
+
+  <p>无监督的难点也正是它的迷人之处：<strong>没有标准答案</strong>。监督学习有 $y$ 当裁判，对错分明；无监督要从数据自身的几何结构里「发现」点什么，而「发现的结构是真的还是错觉」往往很难判定。这让无监督既是强大的探索工具，也是最容易自欺的领域——第 7 节会专门讲这个陷阱。把本章学扎实，你既能用它探索，也能识破别人（和自己）用它编造的「发现」。</p>
+
+  <p>从优化的视角看，本章三个算法有一条隐藏的共同主线：<strong>它们都在优化某个「数据被自己的低维/聚类结构解释得有多好」的目标</strong>。PCA 最小化重构误差，k-means 最小化簇内平方和，GMM 最大化混合分布下的似然。这三个目标都没有用到标签，全靠数据自身的几何或概率结构。理解了这条主线，你会发现无监督并不神秘——它和监督学习共享同一个 ERM 骨架（模块 03），只是把「预测 $y$ 准不准」换成了「描述数据自身准不准」。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  三个算法一句话：<strong>PCA 找「数据变化最大的几个方向」并把数据压到这些方向上；k-means 把点硬性分成 $k$ 堆；GMM 给出「每个点属于每一堆的概率」。</strong>PCA 干的是降维，后两个干的是聚类——k-means 是硬分配（非此即彼），GMM 是软分配（带概率）。三者都不用标签，都只看数据的几何。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="pca"><span class="num">2</span>PCA：最大方差 = 最小重构误差</h2>
+
+  <p><span class="term">主成分分析</span>（PCA）要找一组正交方向，使数据投影到这些方向后<strong>方差最大</strong>。为什么追求最大方差？因为方差大的方向承载了数据里最多的「变化/信息」，方差极小的方向几乎是常数、丢掉也不可惜。这就是降维：用少数几个高方差方向（主成分）近似描述原本高维的数据。</p>
+
+  <p>这里有一个深刻而优美的等价：<strong>「投影后方差最大」与「重构误差最小」是同一件事</strong>。如果你想用一个 $k$ 维子空间去近似原数据、使所有点到子空间的投影距离平方和最小，得到的最优子空间恰好就是前 $k$ 个主成分张成的空间。这个结论叫 <span class="term">Eckart–Young 定理</span>。所以 PCA 既可以理解成「找最大方差方向」，也可以理解成「找最佳低维重构」——两个看似不同的目标导出同一组方向。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白说</h4>
+      <p>想象一团斜着拉长的橄榄球状点云。PCA 找到它最长的那个方向当「新 x 轴」，次长的当「新 y 轴」，依次类推。只保留前几个最长的方向，就能用很少几个数字描述大部分形状——把一个三维橄榄球压成一条线还能认出它，就是降维的力量。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨说</h4>
+      <p>PCA 的优化目标 $\max_{\|v\|=1}\mathrm{Var}(Xv)=v^\top\Sigma v$（$\Sigma$ 是协方差矩阵）。用拉格朗日乘子法，最优 $v$ 满足 $\Sigma v=\lambda v$——即 $v$ 是 $\Sigma$ 的<strong>特征向量</strong>，对应特征值 $\lambda$ 就是该方向上的方差。第一主成分是最大特征值的特征向量，第二主成分是次大且与第一正交，依此类推。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>必背微例：第一主成分是协方差的最大特征向量。</strong>要最大化 $v^\top\Sigma v$ 在约束 $\|v\|=1$ 下的值，写拉格朗日量 $L=v^\top\Sigma v-\lambda(v^\top v-1)$，对 $v$ 求导置零得 $2\Sigma v-2\lambda v=0$，即 $\Sigma v=\lambda v$。代回目标 $v^\top\Sigma v=\lambda$，所以要让方差最大就取最大特征值 $\lambda_1$ 对应的特征向量。这道两行的推导是面试常考的「PCA 为什么和特征分解有关」。</div>
+
+  <p><span class="term">解释方差比</span>（explained variance ratio）$=\lambda_k/\sum_j\lambda_j$ 告诉你第 $k$ 个成分抓住了总方差的百分之几。把它们从大到小累加画成曲线（碎石图 scree plot），就能看出「前几个成分够不够用」。notebook 里你会看到 64 维的手写数字（optdigits 8×8），前约 10 个主成分就解释了大部分方差，仅取前 2 维投影到平面，不同数字已经明显成簇——这就是为什么 PCA 是高维数据可视化的第一工具。</p>
+
+  <p>但 PCA 有它的根本局限，理解它能避免误用。第一，它<strong>只捕捉线性结构</strong>：如果数据躺在一个弯曲的流形上（如瑞士卷），最大方差方向并不对应有意义的坐标，这时要用 t-SNE、UMAP 等非线性降维。第二，<strong>方差大不等于信息有用</strong>：PCA 假设「变化大的方向就重要」，但如果你的判别信息恰好藏在一个低方差方向里（比如被一个高方差的无关噪声方向盖过），PCA 反而会把它当噪声丢掉——这正是 C6 linear probe 模块讨论的「各向异性」陷阱。第三，主成分是所有原始特征的线性组合，<strong>通常不可解释</strong>（「0.3×酒精 − 0.5×酸度 + …」说不清是什么意思）。这三条局限直接催生了本章末尾的现代后裔：非线性的自编码器、带稀疏约束的 SAE，正是为了同时解决「非线性」和「可解释」。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="svd"><span class="num">3</span>PCA 与 SVD 的数值关系</h2>
+
+  <p>理论上 PCA = 对协方差矩阵 $\Sigma=\frac1n X_c^\top X_c$（$X_c$ 是中心化后的数据）做特征分解。但实践中<strong>几乎从不显式构造 $\Sigma$ 再分解</strong>，而是直接对中心化数据做<span class="term">奇异值分解</span>（SVD）：</p>
+
+  <div class="math-block">
+  $$ X_c = U\Sigma_{\text{svd}} V^\top,\qquad \text{主成分方向} = V\text{ 的列},\qquad \text{第 }k\text{ 个方差} \propto \sigma_k^2 $$
+  </div>
+
+  <p>这两条路殊途同归：$X_c$ 的右奇异向量 $V$ 就是 $X_c^\top X_c$（即协方差）的特征向量，而奇异值的平方 $\sigma_k^2$ 正比于对应的特征值（方差）。为什么宁可走 SVD？因为<strong>数值稳定性</strong>：显式算 $X_c^\top X_c$ 会把矩阵的条件数<em>平方</em>，让本来就接近病态的问题雪上加霜（小奇异值被淹没在浮点误差里）。SVD 直接作用在 $X_c$ 上，避开了这次平方，精度高得多。这也是 <code>sklearn</code> 的 PCA 内部用 SVD 实现的原因。</p>
+
+  <p>SVD 还有一个超越 PCA 的视角：它给出任意矩阵的<strong>最优低秩近似</strong>。截断 SVD（只保留前 $k$ 个奇异值）得到的 $X_k=U_k\Sigma_k V_k^\top$，在所有秩不超过 $k$ 的矩阵里 Frobenius 误差最小（又是 Eckart–Young）。这正是 PCA「最佳低维重构」的矩阵版本，也是无数应用的内核：推荐系统的矩阵分解、潜在语义分析（LSA）、图像压缩、乃至大模型权重的低秩适配（LoRA）——它们都在用「用少数几个奇异方向近似一个大矩阵」这同一个想法。学透 SVD，你拿到的不只是 PCA，而是一把通用的降维与压缩钥匙。notebook 里你会亲手用 <code>np.linalg.svd</code> 实现 PCA，并对比它和直接特征分解协方差在数值上的差异。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  PCA <strong>必须先中心化</strong>（每个特征减去其均值），否则第一主成分会被「数据离原点多远」这个无关方向带偏，指向数据的整体位置而不是它的变化方向。此外，当特征<strong>量纲差异巨大</strong>时（如红酒数据里酒精度 vs 脯氨酸含量，数值范围差几个数量级），还要先标准化（除以标准差），否则大量纲特征会仅因数值大就霸占主成分。中心化是必须，标准化看情况——这是 PCA 最常被忽视的两个前处理。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="kmeans"><span class="num">4</span>K-means：Lloyd 迭代与局部最优</h2>
+
+  <p>k-means 是最简单的硬聚类，目标是最小化<strong>簇内平方和</strong>（<span class="term">inertia</span>）$\sum_i\|x_i-\mu_{c_i}\|^2$——每个点到它所属簇中心的距离平方之和。直接对这个目标全局优化是 NP-hard，但有一个简单到惊人的交替算法（<span class="term">Lloyd 算法</span>），实践中又快又好用：</p>
+
+  <div class="ascii">
+   初始化 k 个簇中心（随机或 k-means++）
+   重复直到分配不再变化：
+     E 步（分配）: 把每个点归到离它最近的那个中心
+     M 步（更新）: 每个中心 ← 它当前那一簇所有点的均值
+  </div>
+
+  <p>为什么它一定收敛？因为<strong>两步都不会增加 inertia</strong>：E 步把每个点重分到最近中心，逐点降低（或不变）距离；M 步把中心移到簇均值，而均值正是「到簇内所有点距离平方和最小」的点（对平方距离求导置零就得均值）。inertia 单调下降且有下界（非负），必然收敛。这个「两步交替、每步都不让目标变差、所以单调收敛」的证明结构，和下一节 EM 的收敛性论证一模一样——事实上 k-means 可以严格看成 EM 的硬分配版本，第 5、6 节会把这层关系讲透。</p>
+
+  <p>但这里有个关键的「但是」——<strong>它只保证收敛到局部最优，不是全局最优</strong>。最终结果强烈依赖初始中心的选取，运气不好会卡在很差的划分上。更深一层，k-means 的目标函数本身是<strong>非凸</strong>的（簇分配是离散的，目标曲面有很多坑），所以没有任何「一次就到全局最优」的多项式算法（这是 NP-hard 的）。这与模块 03 的逻辑回归/SVM 形成鲜明对比——后者是凸的、解唯一、可复现；k-means 不凸、解依赖初始化、必须多跑。把「凸 vs 非凸」这条线索串起来，你就理解了为什么有些算法（probe、SVM）适合当可复现的测量仪器，而有些（聚类、深度网络）的结论必须报告对随机性的稳定性。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  随机初始化的 k-means 经常给出糟糕的局部最优（比如两个真实簇被合并、一个真实簇被劈开）。补救有两条：① <span class="term">k-means++</span> 初始化——按「离已选中心越远的点越可能被选为下一个中心」的概率播种，让初始中心尽量分散，理论上还能给出近似最优保证；② <strong>多次重启取 inertia 最小的那次</strong>。报告聚类结果时若只跑一次随机初始化，几乎一定不可复现——这是无监督最常见的工程疏忽。如何选簇数 $k$ 则用<strong>肘部法</strong>（inertia 随 $k$ 的下降在「肘部」放缓）或 silhouette 系数。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="gmm"><span class="num">5</span>GMM：软聚类与 responsibility</h2>
+
+  <p>k-means 是硬分配——一个点要么属于 A 簇要么属于 B 簇，没有中间地带。但现实中边界上的点常常「有点像 A 也有点像 B」。<span class="term">高斯混合模型</span>（GMM）假设数据由 $K$ 个高斯分布按混合系数 $\pi_k$（$\sum_k\pi_k=1$）混合生成，于是能给出<strong>软分配</strong>：每个点属于每个簇的<em>概率</em>，称为 <span class="term">responsibility</span> $\gamma_{ik}$。</p>
+
+  <div class="math-block">
+  $$ p(x)=\sum_{k=1}^K \pi_k\,\mathcal N(x\mid\mu_k,\Sigma_k),\qquad \gamma_{ik}=\frac{\pi_k\,\mathcal N(x_i\mid\mu_k,\Sigma_k)}{\sum_{j}\pi_j\,\mathcal N(x_i\mid\mu_j,\Sigma_j)} $$
+  </div>
+
+  <p>$\gamma_{ik}$ 就是「在已知所有高斯参数的前提下，点 $x_i$ 来自第 $k$ 个高斯的后验概率」——这是一次贝叶斯推断（模块 02 的后验）：分子是先验 $\pi_k$ 乘似然 $\mathcal N(x_i\mid\mu_k,\Sigma_k)$，分母是归一化的全概率。GMM 比 k-means 表达力更强：它能拟合<strong>椭圆形、不同大小、不同朝向</strong>的簇（通过协方差 $\Sigma_k$），而 k-means 隐含假设簇是各向同性的球。两者的关系很优雅：<strong>k-means 是 GMM 的特例</strong>——当所有协方差 $\Sigma_k\to\sigma^2 I$ 且 $\sigma\to0$ 时，软分配的 responsibility 退化成硬的 0/1 分配（最近的中心 responsibility 趋于 1），GMM 就变回了 k-means。这个极限关系是面试常考点：它说明 k-means 不只是个启发式，而是一个有明确概率模型背景的算法。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  软 vs 硬的实际意义：当你给模型的失败案例聚类时，很多案例是「跨类别」的（既触发了拒答又触发了幻觉）。硬聚类逼你二选一、丢信息；GMM 的软分配保留「这个案例 60% 像簇 A、40% 像簇 B」，对分析更诚实。代价是 GMM 参数更多、更易过拟合、对初始化更敏感，且要拟合协方差矩阵在高维时数值棘手（常加正则或限制成对角协方差）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="em"><span class="num">6</span>EM 算法：为什么它一定单调上升</h2>
+
+  <p>拟合 GMM 用 <span class="term">EM 算法</span>（期望最大化）。它和 Lloyd 算法长得一模一样——两步交替——但每一步都有坚实的概率含义：</p>
+
+  <div class="math-block">
+  $$
+  \begin{aligned}
+  \text{E 步}:\;& \gamma_{ik}=\frac{\pi_k\,\mathcal N(x_i\mid\mu_k,\Sigma_k)}{\sum_j\pi_j\,\mathcal N(x_i\mid\mu_j,\Sigma_j)} \quad(\text{用当前参数算软分配})\\[4pt]
+  \text{M 步}:\;& \mu_k=\frac{\sum_i\gamma_{ik}x_i}{\sum_i\gamma_{ik}},\quad \pi_k=\frac1n\sum_i\gamma_{ik},\quad \Sigma_k=\frac{\sum_i\gamma_{ik}(x_i-\mu_k)(x_i-\mu_k)^\top}{\sum_i\gamma_{ik}}
+  \end{aligned}
+  $$
+  </div>
+
+  <p>EM 的核心保证是：<strong>每一轮迭代都不会降低数据的（边际）对数似然</strong>。直觉上它用了一个巧妙的代理——因为直接优化含隐变量的对数似然 $\log\sum_k\pi_k\mathcal N(\cdot)$（log 套在求和外，无法拆开）很难，EM 转而优化一个 <span class="term">ELBO</span>（evidence lower bound，证据下界）。由 Jensen 不等式（$\log$ 是凹函数，$\log\mathbb E\ge\mathbb E\log$），这个下界永远 $\le$ 真对数似然；E 步把下界顶到与当前似然相切（让界尽量紧），M 步沿这个界往上爬。两步交替，真似然被「托着」单调上升。但和 k-means 一样，EM <strong>只保证收敛到局部最优</strong>，初始化依然重要——实践常用 k-means 的结果给 GMM 做初始化，正是利用了两者的亲缘关系。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  EM 的一句话直觉是个鸡生蛋问题：<strong>知道每个点属哪簇，就能算簇参数（M 步）；知道簇参数，就能算每个点属哪簇（E 步）。</strong>两者都不知道，那就交替猜——固定一个、更新另一个，每轮都让数据更「可能」，直到稳定。EM 远不止用于 GMM——它是隐变量模型的通用引擎，HMM（Baum–Welch）、主题模型 LDA、半监督学习、缺失数据填补全都用它。把 GMM 的 EM 推一遍，你就掌握了一整类算法的骨架。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>无监督怎么评估（以及怎么自欺）</h2>
+
+  <p>没有标签，「聚类得好不好」怎么量？分两种情形：</p>
+
+  <table>
+    <thead><tr><th>情形</th><th>指标</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>有外部标签（如 digits 已知数字）</td><td><span class="term">cluster purity</span> / ARI / NMI</td><td>把聚类结果对照真实类别打分（purity = 每簇取众数类别的正确率）</td></tr>
+      <tr><td>无任何标签</td><td>inertia 肘部法 / silhouette 系数</td><td>纯靠几何：簇内紧、簇间分得开</td></tr>
+      <tr><td>降维质量</td><td>解释方差比 / 重构误差 / 下游任务表现</td><td>保留了多少信息、压缩后还能不能用</td></tr>
+    </tbody>
+  </table>
+
+  <p>有外部标签时（本课的 digits 和 Wine 都有真实类别可对照），用 purity、ARI（adjusted Rand index）、NMI（normalized mutual information）衡量聚类与真值的吻合度。这里要特别注意 purity 的一个陷阱：<strong>它会随簇数增多而单调上升</strong>——极端地，给每个点单独一个簇，purity 必然是 1，却毫无意义。所以 purity 不能用来选 $k$；ARI 和 NMI 因为做了「随机分配的期望」校正，对簇数更鲁棒，是更可信的对照指标。完全没标签时只能靠几何指标：silhouette 系数衡量「每个点离本簇有多近、离最近邻簇有多远」（范围 $[-1,1]$，越大越好），肘部法看 inertia 下降的拐点选 $k$。但这些几何指标都没有「正确答案」做锚，且肘部往往并不明显，解读时要格外小心。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>聚类指标极易自欺</strong>，这是无监督最危险的陷阱。换一个 $k$、换一次随机初始化，「发现的结构」就可能完全不同；而人眼又特别擅长在随机里看出模式（pareidolia）。一个常见的学术不端是：跑很多次、挑一次「看起来最有故事」的结果当成发现汇报——这和评测里 cherry-pick 一次好 run、隐瞒其余失败，是同一种病。<strong>报告聚类结果必须报多次运行的稳定性</strong>（不同种子下簇是否一致、ARI 的方差多大），否则你「发现的结构」可能只是噪声里的幻觉。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿：表示学习与可解释性</h2>
+
+  <p>本章三个经典算法看似古老，但它们的现代后裔正是 AI 前沿的核心。今天无监督的主战场是<strong>表示学习</strong>（representation learning）——不再是简单聚类，而是学一个能把原始数据映射到「有用、可解释、可迁移」表示的函数。</p>
+
+  <ul>
+    <li><strong>PCA → 自编码器 → SAE</strong>：PCA 是最古老的<em>线性</em>表示学习（线性降维 + 线性重构）。把编码器/解码器换成神经网络就是自编码器（非线性 PCA）。再加上稀疏约束，就是 C6 可解释性的明星——<span class="term">稀疏自编码器</span>（SAE），用来从 LLM 激活里拆出单义的、可解释的特征方向。可以说 SAE ≈「带稀疏约束的非线性 PCA」，本章的方差/重构直觉直接迁移过去。</li>
+    <li><strong>对比学习</strong>：CLIP、SimCLR 等不用重构、而用「拉近正样本对、推远负样本对」学表示，在图文对齐上极为成功（见 C0）。它和聚类的边界正在模糊——好的表示天然让同类样本聚在一起。</li>
+    <li><strong>聚类用于可解释性与评测</strong>：对模型激活或失败案例做聚类，是发现「模型在用哪些概念」「在哪类输入上系统性出错」的实用手段。但第 7 节的自欺陷阱在这里加倍危险——聚类出的「概念」是真的机制，还是分析者强加的叙事？这是当前可解释性方法论的核心争论。</li>
+    <li><strong>密度估计与 OOD 检测</strong>：GMM 是最简单的密度模型——它直接给出 $p(x)$，低密度区的点就是异常/分布外候选。现代用归一化流、扩散模型估计更复杂的数据密度，进而检测分布外输入。可靠的 OOD 检测是部署安全的前置（模型遇到训练时没见过的输入该「知道自己不知道」），至今远未解决，是连接本章密度估计与模型可靠性的活跃方向。</li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  Pearson 1901 / Hotelling 1933（PCA 起源）；Eckart &amp; Young 1936（最优低秩近似）；
+  Dempster, Laird &amp; Rubin 1977 <em>Maximum Likelihood from Incomplete Data via the EM Algorithm</em>（EM 奠基）；
+  Arthur &amp; Vassilvitskii 2007 <em>k-means++</em>；Bishop <em>PRML</em> ch.9 &amp; 12 是 EM 与 PCA 的标准推导。详见 <a href="../references.md">论文清单</a>。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  学完本章，你应该能：用拉格朗日乘子证明第一主成分是协方差的最大特征向量、说清 PCA 用 SVD 而非显式协方差分解的数值理由、手写 k-means 的 Lloyd 迭代并解释它为何只到局部最优、写出 GMM 的 responsibility 与 EM 两步并说明 EM 为何单调上升（ELBO/Jensen）、解释 k-means 是 GMM 的极限特例、并对「聚类发现了结构」给出「报多次运行稳定性」的怀疑性追问。下面去真实手写数字与红酒数据上把三个算法全部手写一遍。</div>
+
+  <div class="pager">
+    <a href="../03_supervised_learning_scratch/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 经典监督学习</div></a>
+    <a class="next" href="04_unsupervised_learning.ipynb"><div class="dir">Notebook →</div><div class="t">打开配套练习</div></a>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 排序学习</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 排序学习</h1>
+  <p class="subtitle">精排的核心方法论 —— 推荐/搜索的本质是排对顺序而非预测准评分；pointwise/pairwise/listwise 三范式、BPR、RankNet、不可导的 nDCG 怎么优化（LambdaRank）、nDCG/MAP 指标，从零写 BPR/pairwise 排序并评 nDCG</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00/02/03、sigmoid/交叉熵、MF 打分、Top-N 评估</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_learning_to_rank.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Rendle 2009 (BPR)、Järvelin 2002 (nDCG)、Burges 2005/2010 (RankNet/Lambda)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#idea">从评分预测到排序学习</a></li>
+      <li><a href="#paradigms">三大范式 pointwise/pairwise/listwise</a></li>
+      <li><a href="#bpr">BPR：隐式反馈排序奠基</a></li>
+      <li><a href="#ranknet">RankNet 与不可导指标难题</a></li>
+      <li><a href="#ndcg">nDCG：排序质量黄金指标</a></li>
+      <li><a href="#metrics">MAP / MRR 与其他指标</a></li>
+      <li><a href="#features">排序特征与工业精排</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="idea"><span class="num">1</span>从评分预测到排序学习</h2>
+  <p>召回（模块 01/03）把候选从十亿压到几百，接下来<strong>精排</strong>要把这几百个排出最好的顺序。这就是<span class="term">learning to rank, LTR</span>（排序学习）的舞台——推荐和搜索共享的核心方法论。LTR 的关键认知转变是：<strong>推荐/搜索的本质不是「预测准评分」，而是「排对顺序」</strong>。</p>  <p>为什么这个区别要紧？想象两个模型：A 把所有评分都低估 1 分（4 星预测成 3 星），B 评分预测很准但偶尔把第 1 名和第 5 名排反。按 RMSE，A 很差、B 很好；但按<strong>用户体验</strong>，A 完美（顺序全对，用户只看顺序）、B 反而有问题。用户<strong>永远只看排在前面的几个</strong>，绝对评分值毫无意义——重要的只有<strong>相对顺序</strong>。LTR 就是直接优化这个相对顺序，而非评分的绝对值。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：开餐厅给菜排菜单顺序，你不需要精确预测每道菜「值几分」，只需要知道<strong>哪道该放最前面</strong>。顾客点的几乎都是前几道，第 20 道排第 19 还是第 21 根本无所谓。LTR 把全部精力花在「把好的排前面」，而不浪费在「精确估每道菜的分」上。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，LTR 学一个打分函数 $s(x)$（$x$ 是 query-item 或 user-item 的特征），目标是让<strong>相关物品的分高于不相关物品</strong>，使得按 $s$ 降序排列时，相关的尽量靠前。按损失<strong>作用的范围</strong>，LTR 分三大范式：<strong>pointwise</strong>（看单点）、<strong>pairwise</strong>（看物品对）、<strong>listwise</strong>（看整个列表）——这是本模块的主线。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话点明 LTR 的精神：<strong>排序是相对的，所以损失也该是相对的</strong>。pointwise 把每个候选独立打分（损失看单点），丢掉了「相对」；pairwise 看「谁该在谁前面」（损失看物品对），抓住了相对；listwise 直接对整个排列建损失（损失看全列表），最贴合目标但最难。从 pointwise 到 listwise，是<em>越来越直接地优化排序本身</em>的过程。理解这个递进，你就理解了整个 LTR 领域。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="paradigms"><span class="num">2</span>三大范式 pointwise/pairwise/listwise</h2>
+  <h3>三大范式：pointwise / pairwise / listwise</h3>  <table>
+    <thead><tr><th>范式</th><th>损失看什么</th><th>做法</th><th>代表方法</th><th>优缺点</th></tr></thead>
+    <tbody>
+      <tr><td>pointwise 逐点</td><td>单个候选</td><td>把排序当回归/分类：独立预测每个候选的分（如 CTR）</td><td>LR、GBDT 回归、深度 CTR</td><td>简单、可复用监督学习；但忽略「相对」</td></tr>
+      <tr><td>pairwise 成对</td><td>一对候选</td><td>学相对顺序：让正例分 > 负例分</td><td><strong>BPR</strong>、RankNet、LambdaRank</td><td>直接优化相对顺序，最常用；对 list 全局非最优</td></tr>
+      <tr><td>listwise 列表</td><td>整个列表</td><td>直接对整个排列的质量建损失</td><td>ListNet、ListMLE、LambdaMART</td><td>理论最贴合 nDCG；实现复杂、训练贵</td></tr>
+    </tbody>
+  </table>  <p><strong>pointwise</strong>最简单：把每个 (user, item) 当独立样本，预测一个分（点击概率、评分），按分排序。它把排序问题<em>降维</em>成了普通的回归/分类，所以可以直接套用所有监督学习工具（这也是为什么 CTR 预估——模块 05——大量用 pointwise）。代价是：它优化的是「每个点的分准不准」，而非「顺序对不对」，二者并不完全一致。</p>  <p><strong>pairwise</strong>抓住了排序的相对性：它不关心绝对分，只要求<strong>正例的分比负例高</strong>。对每个 (用户, 正例 $i$, 负例 $j$) 三元组，损失鼓励 $s(u,i)>s(u,j)$。这与「用户喜欢 $i$ 胜过 $j$」的偏好语义完全对齐，是隐式反馈推荐的主流（BPR），也是搜索排序的经典（RankNet）。本模块 worked 重点实现它。</p>  <p><strong>listwise</strong>最彻底：直接把「整个列表排得好不好」（如 nDCG）作为优化目标。问题是 nDCG 这类指标<strong>对分数不可导</strong>（排序是离散操作），没法直接梯度下降。listwise 方法或者用可导的排列概率（ListNet/ListMLE），或者用巧妙的梯度近似（LambdaRank 把 nDCG 变化塞进 pairwise 梯度）。下一节细讲这个「不可导」难题。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="bpr"><span class="num">3</span>BPR：隐式反馈排序奠基</h2>
+  <h3>BPR：隐式反馈排序的奠基</h3>  <p><span class="term">BPR (Bayesian Personalized Ranking)</span>（Rendle 2009）是隐式反馈推荐的<strong>奠基损失</strong>。它的出发点正是模块 00 讲的隐式反馈难题：只有正例，怎么学排序？BPR 的回答优雅：<strong>对每个用户，他交互过的物品 $i$，应该排在他没交互的物品 $j$ 前面</strong>。把这个偏好写成三元组 $(u, i, j)$，$i$ 是正例、$j$ 是采样的负例。</p>  <p>BPR 最大化「$i$ 排在 $j$ 前」的概率。设 $\hat x_{uij}=s(u,i)-s(u,j)$ 是分差，用 sigmoid 建模偏好概率 $\sigma(\hat x_{uij})$，目标是最大化对数似然（等价于最小化负对数）：</p>  <div class="math-block">\[\mathcal{L}_{\text{BPR}} = -\sum_{(u,i,j)} \ln \sigma\big(s(u,i) - s(u,j)\big) + \lambda\,\|\Theta\|^2\]</div>  <p>梯度有干净的形式。记 $\sigma' = \sigma(\hat x_{uij})$，则对参数 $\theta$：$\frac{\partial \mathcal{L}}{\partial\theta} = -(1-\sigma')\cdot\frac{\partial \hat x_{uij}}{\partial\theta}$。若打分用 MF（$s(u,i)=p_u\cdot q_i$），则 $\frac{\partial \hat x_{uij}}{\partial p_u}=q_i-q_j$、$\frac{\partial \hat x_{uij}}{\partial q_i}=p_u$、$\frac{\partial \hat x_{uij}}{\partial q_j}=-p_u$。直觉：$(1-\sigma')$ 是「排错的程度」——当 $i$ 已经远排在 $j$ 前（$\hat x$ 大、$\sigma'\to1$）时梯度趋 0（不用管了），当排反时梯度大（使劲修）。这是一种<strong>自动的难例聚焦</strong>。</p>  <div class="ascii">BPR 训练一步：抽 (用户u, 正例i, 负例j)
+
+  s(u,i) ──┐
+           ├──&gt; 分差 x = s(u,i) - s(u,j) ──&gt; σ(x) = P(i 排在 j 前)
+  s(u,j) ──┘                                    │
+                                                ▼
+  目标: 最大化 ln σ(x)  &lt;=&gt;  把 p_u 推向 (q_i - q_j)
+  梯度权重 (1-σ(x)): 排得越错权重越大(难例聚焦), 排对了权重→0</div>  <p>把「难例聚焦」用数字坐实。考虑两个三元组：(甲) 模型已经把正例排得远高于负例，分差 $\hat x=3$；(乙) 模型把它们排反了，分差 $\hat x=-2$。梯度权重是 $1-\sigma(\hat x)$：对甲，$\sigma(3)\approx0.953$，权重 $\approx0.047$（几乎不更新——这对已经排好了，别瞎动）；对乙，$\sigma(-2)\approx0.119$，权重 $\approx0.881$（用力修——这对排反了，重点抓）。<strong>同一个损失，自动给「排反的难例」近 19 倍于「排好的易例」的梯度</strong>。这就是为什么 BPR 不需要手工设难例权重：sigmoid 的形状天然实现了「排得越错、修得越狠；排对了、就放手」。理解这一点，你也就看懂了它和模块 03 in-batch softmax「对角领先越多、梯度越小」是同一种自适应聚焦。</p>  <p>BPR 里<strong>负例怎么采</strong>是个关键细节。最简单是<strong>均匀负采样</strong>（从全库随机抽一个用户没交互过的物品当 $j$），这是 worked 的做法。但 Rendle 2009 也指出均匀采样的局限：随机负例大多「太容易」（明显不相关），模型很快就把它们排好、梯度趋 0，学不到精细的区分。改进是<strong>难负例采样</strong>（按流行度采、或采当前模型打分高的负例），让模型多练「难分的对」。这和模块 03 双塔的难负例是同一个主题——<strong>负例的质量决定排序的上限</strong>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>BPR 和模块 03 的 in-batch softmax 是<strong>近亲</strong>：都在做对比学习（拉近正例、推远负例）。区别在 BPR 是<strong>pairwise</strong>（一次比一个负例，用 sigmoid），softmax 是<strong>listwise-ish</strong>（一次比一批负例，用 softmax 归一）。实践中：负例少时 BPR 简单够用；负例多（in-batch 几千个）时 softmax 收敛更快更好。两者都是隐式推荐的主力，理解了 BPR 再看 softmax 损失会很顺。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ranknet"><span class="num">4</span>RankNet 与不可导指标难题</h2>
+  <h3>RankNet 与不可导指标的难题</h3>  <p><span class="term">RankNet</span>（Burges 2005）是 pairwise 神经排序的奠基，思想和 BPR 几乎一样（早 4 年），来自搜索排序。对一对文档 $(i, j)$（$i$ 比 $j$ 更相关），RankNet 用交叉熵建模「$i$ 排在 $j$ 前」的概率 $P_{ij}=\sigma(s_i-s_j)$，目标标签为 1：</p>  <div class="math-block">\[\mathcal{L}_{\text{RankNet}} = -\sum_{(i,j):\, i \succ j} \log \sigma(s_i - s_j)\]</div>  <p>这和 BPR 的损失<strong>形式完全一致</strong>（只是术语不同：BPR 说「用户偏好」，RankNet 说「文档相关性」）。它们是同一思想在推荐和搜索两个社区的平行发现。RankNet 后来演化出 LambdaRank、LambdaMART，长期统治搜索排序竞赛。</p>  <p>但 pairwise 有个根本局限，引出 LTR 最深刻的难题——<strong>我们真正想优化的指标（nDCG）是不可导的</strong>。nDCG 依赖物品的<strong>排名位置</strong>，而排名是把分数<em>排序</em>得到的，排序是离散操作，分数的微小变化通常不改变排名（梯度处处为 0），偶尔跨过某个边界又突变（不连续）。没法直接对 nDCG 求梯度下降。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>难题一句话：<strong>我们想优化 nDCG（关心位置），但 nDCG 对分数不可导（排序是离散的）</strong>。pairwise 损失（BPR/RankNet）是个可导的<em>代理</em>，但它平等对待所有错排对——把第 1、2 名排反 和 把第 99、100 名排反，pairwise 损失一样大，可对 nDCG 的伤害天差地别（前者灾难、后者无所谓）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>LambdaRank</strong>（Burges）的天才解法：不直接定义损失，而是直接定义<strong>梯度</strong>——把 RankNet 的 pairwise 梯度<strong>乘以「交换这对会带来多大 nDCG 变化」$|\Delta\text{nDCG}_{ij}|$</strong>。于是「修正头部错排」的梯度被放大、「修正尾部错排」的梯度被缩小，模型自动把力气花在对 nDCG 影响大的地方。这个 $\lambda$ 梯度就是 LambdaRank 名字的由来，落到 GBDT 上就是统治竞赛多年的 LambdaMART。</p></div>
+  </div>  <p>还有一条路是 <strong>listwise</strong>：ListNet 用「排列概率分布」的交叉熵（把分数转成 top-1 概率分布，匹配理想分布），ListMLE 最大化理想排列的似然。它们直接在列表层面优化，理论上最贴合排序目标，但计算复杂、对噪声敏感，工程上不如 LambdaMART/pairwise 普及。</p>  <p>回头看上一节那个手算：头部排错让 nDCG 掉 0.31、尾部只掉 0.12——而朴素 pairwise 损失对这两种错排给的梯度<strong>一样大</strong>。LambdaRank 的 $|\Delta\text{nDCG}_{ij}|$ 权重正是要修这个错配：它把每对的梯度乘上「交换这对会带来多大 nDCG 变化」，于是头部那对的梯度被放大约 $0.31/0.12\approx2.5$ 倍，尾部那对被相应缩小。模型因此<strong>自动把训练力气投向对最终指标影响最大的头部错排</strong>，而不是平均用力。这就是为什么 LambdaRank/LambdaMART 在 nDCG 上常显著优于朴素 pairwise——它让「优化的代理」和「真正在意的指标」对齐了。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="ndcg"><span class="num">5</span>nDCG：排序质量黄金指标</h2>
+  <h3>nDCG：排序质量的黄金指标</h3>  <p>既然排序这么重要，怎么量化「排得好不好」？最常用的是 <span class="term">nDCG (normalized Discounted Cumulative Gain)</span>（Järvelin 2002）。它有两个核心思想：<strong>位置折损</strong>和<strong>归一化</strong>。</p>  <p><strong>DCG（折损累计增益）</strong>：把每个位置的相关性增益按位置<strong>对数折损</strong>后累加——排得越靠后，贡献越小（因为用户越不可能看到）：</p>  <div class="math-block">\[\text{DCG}@k = \sum_{i=1}^{k} \frac{2^{rel_i}-1}{\log_2(i+1)}\]</div>  <p>其中 $rel_i$ 是排在第 $i$ 位物品的相关性（隐式反馈里常是 0/1：命中=1）。分子 $2^{rel_i}-1$ 让高相关性物品的增益指数级更大；分母 $\log_2(i+1)$ 是<strong>位置折损</strong>——第 1 位除以 $\log_2 2=1$、第 2 位除以 $\log_2 3\approx1.58$、第 3 位除以 2…… 越靠后折损越狠。这精准建模了「用户只看前几个」。</p>  <p><strong>归一化</strong>：DCG 的绝对值不可比（相关物品多的 query 天然 DCG 高）。除以<strong>理想 DCG（IDCG）</strong>——把所有相关物品按相关性降序排得到的最大可能 DCG——归一到 $[0,1]$：</p>  <div class="math-block">\[\text{nDCG}@k = \frac{\text{DCG}@k}{\text{IDCG}@k}\]</div>  <p>nDCG=1 表示完美排序（相关的全排最前），nDCG=0 表示前 k 个全不相关。它<strong>奖励「把最相关的排最前」</strong>（位置折损）、且<strong>跨 query 可比</strong>（归一化），是排序的事实标准指标。notebook worked 会从零实现 DCG/IDCG/nDCG，并验证「完美排序 nDCG=1、把头部排错比尾部排错掉得更多」。</p>  <p>手算一个 nDCG@4 把「位置折损」的威力看清。设前 4 位的二值相关性序列（1=命中）。<strong>理想排序</strong> $[1,1,0,0]$：$\text{DCG}=\frac{1}{\log_2 2}+\frac{1}{\log_2 3}=1+0.631=1.631$，这也是 IDCG，故 $\text{nDCG}=1.0$。现在比较两种「错一个位置」的排序：<strong>头部排错</strong> $[0,1,1,0]$（把一个命中从第 1 位挤到第 3 位）：$\text{DCG}=\frac{1}{\log_2 3}+\frac{1}{\log_2 4}=0.631+0.5=1.131$，$\text{nDCG}=1.131/1.631\approx0.693$；<strong>尾部排错</strong> $[1,0,0,1]$（把第 2 个命中挪到第 4 位）：$\text{DCG}=\frac{1}{\log_2 2}+\frac{1}{\log_2 5}=1+0.431=1.431$，$\text{nDCG}=1.431/1.631\approx0.878$。<strong>同样是「错一位」，头部排错让 nDCG 掉到 0.69，尾部排错只掉到 0.88</strong>——前者的伤害是后者的两倍多。这正是 $1/\log_2(i+1)$ 折损的设计意图：它把惩罚的重量压在用户真正会看的头部。把这组数当成 notebook nDCG 实现的对拍标准，任何把位置折损写错的代码都会在这里露馅。</p>  <div class="callout warn"><span class="label"></span>
+    <p>nDCG 的几个实战细节：① <strong>k 的选择</strong>（nDCG@10 关注前 10）影响结论，要和业务场景一致；② 相关性<strong>分级</strong>（0/1 还是 1-5 星）改变 $2^{rel}-1$ 的效果；③ nDCG 是<strong>离线</strong>指标，和线上点击/时长未必一致（模块 05 的离线-在线鸿沟）；④ 和 MAP/MRR 对比：nDCG 用位置折损更平滑，MAP 看 precision、MRR 只看第一个命中——按场景选。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="metrics"><span class="num">6</span>MAP / MRR 与其他指标</h2>
+  <h3>MAP、MRR 与其他排序指标</h3>  <p>nDCG 之外，还有几个常用排序指标，各有侧重：</p>  <ul>
+    <li><strong>MAP (Mean Average Precision)</strong>：对每个 query 算 Average Precision（在每个命中位置算 precision 再平均），再对所有 query 平均。强调「相关物品整体靠前」，对二值相关性常用。</li>
+    <li><strong>MRR (Mean Reciprocal Rank)</strong>：取第一个相关结果排名的倒数（排第 1 得 1，第 2 得 1/2…），再平均。只关心<strong>第一个命中</strong>，适合「找到一个就行」的场景（问答、导航搜索）。</li>
+    <li><strong>Recall@K / Hit@K</strong>（模块 00）：Top-K 命中比例 / 是否至少命中。召回层最看重 Recall，排序层更看 nDCG/MAP。</li>
+    <li><strong>Precision@K</strong>：Top-K 里相关物品占比。和 Recall 是一对（查准 vs 查全）。</li>
+  </ul>  <p>怎么选指标？看<strong>场景的「相关物品有几个、用户看几个」</strong>：找一个答案就够（导航、问答）→ MRR；要把一批相关物品都排好（推荐流、商品列表）→ nDCG/MAP；只关心召回不漏 → Recall@K。工业上常<strong>同时报告多个</strong>，并最终以线上 A/B 为准。</p>  <p>一个统一的视角：所有这些指标都在回答「<strong>把相关物品排到前面</strong>」这件事，只是<em>对「前面」的定义和对「相关」的加权不同</em>。理解了 nDCG 的「位置折损 + 归一化」思想，其余指标都是它的变体或简化。本模块 notebook 会实现 nDCG 和 MAP 并对比，让你对「同一个排序，不同指标给出不同分数」有直观体感。</p>  <div class="callout danger"><span class="label">离线≠线上</span>
+    <p>一个工业上反复踩的坑：<strong>离线 nDCG 提升 ≠ 线上收益</strong>。原因有三：① 离线评估用的是<em>有偏的历史日志</em>（只有曝光过的物品有标签，未曝光的当负例其实未必）；② 单一指标（nDCG）无法代表真实业务目标（点击、时长、留存、GMV、多样性常常冲突）；③ 离线评估假设「展示什么用户都一样看」，忽略了位置偏置（模块 05）。所以工业铁律是：<strong>离线指标只用来筛掉明显差的、缩小实验范围，最终一切以线上 A/B 测试为准</strong>。把离线 nDCG 当成终极目标去刷，常常刷出一个线上更差的模型。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="features"><span class="num">7</span>排序特征与工业精排</h2>
+  <h3>排序特征与工业精排</h3>  <p>到目前为止打分函数 $s(u,i)$ 我们都用 MF 内积。工业精排的 $s$ 要丰富得多——它吃<strong>大量特征</strong>，因为精排候选已经少（几百个），可以用重模型：</p>  <table>
+    <thead><tr><th>特征类别</th><th>例子</th></tr></thead>
+    <tbody>
+      <tr><td>用户特征</td><td>人口属性、历史行为统计、长短期兴趣 embedding（接模块 05 序列）</td></tr>
+      <tr><td>物品特征</td><td>类别、价格、内容 embedding（文本/图像）、统计 CTR/时长</td></tr>
+      <tr><td>交叉特征</td><td>用户×物品的匹配（品类偏好命中、历史共现）——FM/DNN 自动学（模块 05）</td></tr>
+      <tr><td>上下文特征</td><td>时间、设备、场景、当前 session 行为</td></tr>
+      <tr><td>召回侧特征</td><td>该候选由哪路召回来的、召回分多少</td></tr>
+    </tbody>
+  </table>  <p>精排模型把这些特征喂进 GBDT（LambdaMART）或深度网络（Wide&Deep、DeepFM、DLRM，模块 05），用 LTR 损失（pairwise/listwise）或多目标（CTR + 时长 + 转化）训练。关键区别于召回：精排<strong>可以让用户和物品特征充分交叉</strong>（cross 结构，模块 03 讲的），因为候选少、算得起。这也是精排比召回准的根本原因。</p>  <p>一个值得记住的工业事实：精排层是<strong>整个推荐系统算力消耗最大的地方</strong>。召回要快（双塔 + ANN），重排是轻量规则，而精排用最重的模型对几百个候选逐个精算多目标分——GPU 时间、迭代精力、A/B 实验大多砸在这里。所以精排的每个百分点提升都极其值钱，也是算法工程师的主战场。这也是为什么 LTR（本模块）+ CTR/FM（模块 05）这两块，是推荐岗位面试与实战的<strong>绝对重点</strong>。</p>  <p>本模块 notebook 聚焦 LTR 的<strong>方法论核心</strong>——用 MF 当打分器，从零实现 BPR/pairwise 训练，看它如何提升 nDCG，对比 pairwise vs pointwise。特征工程的细节（怎么把这些特征喂进模型、怎么自动学交叉）留给模块 05（CTR/FM）。学完这两块，你就完整掌握了精排——从损失到模型。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>直接优化 nDCG</strong>：LambdaRank 是梯度近似，能否真正可导地优化 nDCG？SoftRank、可微排序（differentiable sorting，如 NeuralSort、SoftSort）是活跃方向。</li>
+    <li><strong>无偏 LTR</strong>：训练数据的点击有位置偏置（模块 05），用有偏点击学排序会学偏。Unbiased LTR（Joachims 2017）用 IPW 去偏，是工业排序的重要前沿。</li>
+    <li><strong>多目标排序</strong>：精排要同时优化点击、时长、转化、多样性、商业价值，如何在一个排序里平衡多个（常冲突的）目标，是工业核心难题（Pareto、ESMM、MMoE）。</li>
+    <li><strong>listwise 的复兴</strong>：随着算力提升，直接的 listwise/set-wise 排序（一次看整个候选集，用 Transformer 建模候选间交互，如 PRM、SetRank）重新受关注。</li>
+    <li><strong>LTR 与 LLM</strong>：用大模型做 zero-shot 排序、生成式排序、用 LLM 当 reranker，是新兴方向。能否取代传统 LTR 仍是开放问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Rendle 2009（BPR，隐式排序奠基）、Järvelin 2002（nDCG）、Burges 2010（RankNet→LambdaRank→LambdaMART 综述）。进阶：Cao 2007（ListNet，listwise）、Joachims 2017（无偏 LTR）、Liu 2009（LTR 专著）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_two_tower_retrieval/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 双塔召回</div></a>
+    <a class="next" href="../05_ctr_sequential/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · CTR 与序列推荐</div></a>
+  </div>
+
+</div>
+</body>
+</html>

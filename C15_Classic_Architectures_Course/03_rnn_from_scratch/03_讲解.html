@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · RNN 与 BPTT</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · RNN 与 BPTT</h1>
+  <p class="subtitle">循环结构如何把「参数共享」搬到时间维 —— 从 RNN cell 前向、时间展开，到完整推导 BPTT、看穿梯度消失/爆炸的雅可比连乘根源，并用梯度裁剪稳住训练</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00（数值梯度检验）、链式法则、矩阵求导、特征值/谱半径</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_rnn_from_scratch.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Bengio 1994、Pascanu 2013、Werbos 1990（BPTT）、Hochreiter 1997（LSTM 预告）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">序列数据与循环的动机</a></li>
+      <li><a href="#cell">RNN cell 前向</a></li>
+      <li><a href="#unroll">时间展开与计算图</a></li>
+      <li><a href="#bptt">BPTT 推导：权重共享 ⇒ 梯度求和</a></li>
+      <li><a href="#vanish">梯度消失与爆炸：雅可比连乘</a></li>
+      <li><a href="#clip">梯度裁剪</a></li>
+      <li><a href="#truncate">截断 BPTT 与训练实践</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>序列数据与循环的动机</h2>
+  <p>前两个模块的 CNN 处理的是<strong>网格数据</strong>——图像的像素排在固定大小的二维格子里。但世界上还有一大类数据天生是<strong>序列</strong>：一句话是词的序列、一段语音是采样点的序列、一支股票是日收盘价的序列。序列数据有两个 CNN 不便处理的特点：<strong>变长</strong>（句子有长有短）与<strong>时序因果</strong>（第 5 个词依赖前 4 个词，顺序一换意思全变）。</p>  <p>一个最朴素的想法是「把序列摊平喂给 MLP」，但它当场失败：MLP 的输入维度是固定的，处理不了变长；就算补齐到定长，它也<em>不知道</em>相邻位置有时序关系——把「我爱你」和「你爱我」喂进去，在 MLP 眼里只是两个无关的定长向量。我们需要一种结构，能<strong>逐个吞入序列元素、把已读内容压缩进一个不断更新的记忆里</strong>。这就是 <span class="term">recurrent neural network</span>（RNN，循环神经网络）。</p>  <p>为什么不能像 CNN 那样「滑窗」处理序列？CNN 的卷积窗口是<strong>固定大小</strong>的——它只能看到窗口内的局部，要建模「第 1 个词影响第 50 个词」这种长程依赖，得堆很多层把感受野撑大。而语言里的依赖距离<em>天然变化无常</em>（有时邻接，有时隔半句），用固定窗口很别扭。RNN 换了个思路：不靠扩大窗口，而靠一个<strong>随时间滚动、能携带任意远历史</strong>的隐藏状态。理论上 $h_t$ 能编码从 $x_1$ 到 $x_t$ 的全部信息——这正是它的野心，也是它后来力不从心（梯度消失）的根源。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>RNN 像一个<strong>一边读一边做笔记的人</strong>：每读一个词，就根据「手上的笔记 + 这个新词」更新笔记。读到句末时，笔记里浓缩了整句话的信息。关键是——他<strong>用同一套记笔记的规则</strong>处理每一个词，不管句子多长。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：RNN 维护一个<strong>隐藏状态</strong> $h_t$（the hidden state，那份「笔记」），按 $h_t = f(x_t, h_{t-1})$ 逐步更新，其中 $f$ 的参数<strong>在所有时间步共享</strong>。这正是 CNN「参数共享」思想在<em>时间维</em>上的翻版：CNN 让同一个卷积核扫过所有空间位置，RNN 让同一组权重作用于所有时间步。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把握住这条贯穿全课的主线——<strong>归纳偏置</strong>。CNN 把「局部性 + 平移等变」写进结构；RNN 把「时序因果 + 时间维参数共享」写进结构。参数共享带来三个好处：参数量与序列长度<em>无关</em>（无论句子多长，只有那一组权重）、能处理<strong>任意变长</strong>输入、且天然假设「规则不随时刻改变」（第 3 个词和第 30 个词用同一套更新规则）。这套偏置契合语言的统计规律，正是 RNN 在 2014–2017 年主宰 NLP 的原因。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cell"><span class="num">2</span>RNN cell 前向</h2>
+  <p>把抽象的 $f$ 落成具体公式。最经典的 <span class="term">vanilla RNN</span>（Elman 网络）cell 是：给定当前输入 $x_t \in \mathbb{R}^D$ 与上一隐藏态 $h_{t-1} \in \mathbb{R}^H$，</p>  <div class="math-block">\[a_t = W_x x_t + W_h h_{t-1} + b, \qquad h_t = \tanh(a_t)\]</div>  <p>其中 $W_x \in \mathbb{R}^{H\times D}$ 把输入投到隐藏空间、$W_h \in \mathbb{R}^{H\times H}$ 把旧记忆投到新记忆、$b \in \mathbb{R}^H$ 是偏置，$\tanh$ 逐元素施加非线性。初始 $h_0$ 通常取零向量。注意三个权重 <code>Wx, Wh, b</code> 是<strong>唯一</strong>的可学习参数，它们<em>不带时间下标</em>——每个时间步都用同一套。整个 RNN 的「智能」全压在这一小组矩阵里。</p>  <p>为什么是 $\tanh$ 而不是 ReLU？历史与现实都有原因。$\tanh$ 把状态压在 $[-1,1]$，防止隐藏态在反复自乘 $W_h$ 时数值发散；它的输出以零为中心，比 sigmoid 更利于优化。代价是 $\tanh$ 在两端饱和（导数趋零），这恰恰埋下了第 5 节<strong>梯度消失</strong>的祸根——一个我们后面要正面解决的核心难题。</p>  <table>
+    <thead><tr><th>符号</th><th>形状</th><th>含义</th><th>PyTorch 对应</th></tr></thead>
+    <tbody>
+      <tr><td><code>x_t</code></td><td>$(D,)$</td><td>第 t 步输入（如一个词向量）</td><td>input[t]</td></tr>
+      <tr><td><code>h_t</code></td><td>$(H,)$</td><td>第 t 步隐藏状态（记忆）</td><td>hidden state</td></tr>
+      <tr><td><code>Wx</code></td><td>$(H,D)$</td><td>输入→隐藏 权重</td><td>weight_ih</td></tr>
+      <tr><td><code>Wh</code></td><td>$(H,H)$</td><td>隐藏→隐藏 权重（循环核心）</td><td>weight_hh</td></tr>
+      <tr><td><code>b</code></td><td>$(H,)$</td><td>偏置</td><td>bias</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>一个实现上极易错的点：<strong>分清「时间步」与「层」</strong>。单层 RNN 在所有时间步共享<em>同一套</em> <code>Wx,Wh,b</code>；只有堆叠多层 RNN 时，不同<em>层</em>才有各自的权重。本课先吃透单层——把时间维彻底搞懂，多层只是再套一层循环。另一个常见 bug：忘了 $h_t$ 同时是「本步输出」和「下一步输入」的双重身份，反向时它会从两个方向收到梯度（见第 4 节）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="unroll"><span class="num">3</span>时间展开与计算图</h2>
+  <p>RNN 的「循环」二字容易让人以为它是个新奇的、和前馈网络不同的东西。其实只要把循环按时间<strong>展开</strong>（unroll / unfold），它就变成一个<em>很深但权重共享</em>的普通前馈网络——这个视角是理解训练的钥匙。</p>  <p>展开的意思是：把 $t=1,2,\dots,T$ 每一步画成一个<strong>独立的层</strong>，前一步的 $h_{t-1}$ 作为后一步的输入，从左到右串成一条链。唯一的特殊之处是——所有这些「层」用的是<strong>同一份权重</strong> $W_x, W_h, b$（图里画成多个框，但它们绑在一起）：</p>  <div class="ascii">RNN 按时间展开（unrolling through time）—— 同一套权重在每步复用
+
+   x_1        x_2        x_3              x_T
+    │          │          │                │
+    ▼          ▼          ▼                ▼
+  ┌────┐     ┌────┐     ┌────┐           ┌────┐
+h0│cell│─h1─▶│cell│─h2─▶│cell│─h3─ ... ─▶│cell│─hT─▶
+  └────┘     └────┘     └────┘           └────┘
+    │          │          │                │
+    ▼          ▼          ▼                ▼
+   y_1        y_2        y_3              y_T   （可选：每步输出）
+
+  关键：所有 cell 框是【同一组 Wx,Wh,b】，不是 T 套不同权重！</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>展开后，RNN 不再神秘：它就是一个深度为 $T$ 的前馈网络，只不过每层完全一样。「记忆」沿着 $h_0\to h_1\to\dots\to h_T$ 这条横向链传递，这条链就是信息（与梯度）在时间上的高速路——也是它后来堵车（梯度消失）的地方。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>根据<strong>输入/输出的对应关系</strong>，RNN 有几种经典用法：<em>多对一</em>（读整句、末态分类，如情感分析）、<em>多对多等长</em>（每步都输出，如序列标注）、<em>多对多不等长</em>（先读完再生成，即模块 05 的 seq2seq）。本模块聚焦最基础的「多对一」与「等长多对多」，把时间维的前向与反向彻底打穿。</p></div>
+  </div>  <p>一旦接受「展开 = 深度前馈网」这个视角，训练 RNN 就<strong>不需要任何新的微分理论</strong>——标准反向传播（链式法则）直接适用，只是要沿着这条时间链从后往前传梯度。这个「在展开图上跑反向传播」的过程有个专名：<span class="term">backpropagation through time</span>（BPTT），下一节完整推导它。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="bptt"><span class="num">4</span>BPTT 推导：权重共享 ⇒ 梯度求和</h2>
+  <p>现在推导 <span class="term">BPTT</span>。设每步有损失 $\ell_t$（如分类交叉熵），总损失 $L = \sum_{t=1}^{T} \ell_t$。我们要算 $L$ 对三个共享参数 $W_x, W_h, b$ 的梯度。核心难点在于：<strong>由于权重在每步复用，每个权重的总梯度是它在所有时间步贡献之和</strong>。这是 BPTT 与普通反向传播唯一的、也是最容易写错的区别。</p>  <p>先沿时间链反传，定义对隐藏态的梯度 $\delta_t \equiv \partial L / \partial h_t$。关键观察：$h_t$ 在前向里<strong>流向两个地方</strong>——直接产生本步输出 $y_t$（贡献 $\partial \ell_t/\partial h_t$），又作为下一步的输入参与 $a_{t+1}=W_x x_{t+1}+W_h h_t + b$（贡献来自未来）。因此它的梯度是这两路之和：</p>  <div class="math-block">\[\delta_t = \frac{\partial \ell_t}{\partial h_t} \;+\; W_h^\top\, \big(\delta_{t+1} \odot (1 - h_{t+1}^2)\big)\]</div>  <p>式中 $(1-h_{t+1}^2)$ 是 $\tanh$ 的导数（因为 $\tanh'(a)=1-\tanh^2(a)=1-h^2$）。从 $t=T$ 往前递推（$\delta_{T+1}=0$），即可得到每个 $\delta_t$。拿到 $\delta_t$ 后，令 $da_t = \delta_t \odot (1-h_t^2)$（梯度穿过 $\tanh$ 到达 $a_t$），三个参数的梯度按<strong>所有时间步累加</strong>：</p>  <div class="math-block">\[\frac{\partial L}{\partial W_x}=\sum_{t=1}^{T} da_t\, x_t^\top,\quad \frac{\partial L}{\partial W_h}=\sum_{t=1}^{T} da_t\, h_{t-1}^\top,\quad \frac{\partial L}{\partial b}=\sum_{t=1}^{T} da_t\]</div>  <div class="callout danger"><span class="label">头号 BPTT 陷阱</span>
+    <p>这三个 $\sum_{t=1}^{T}$ 是 BPTT 的灵魂，也是从零实现时<strong>头号 bug 来源</strong>。新手常写成「只用最后一步的梯度」或「每步覆盖而非累加」，结果梯度数值检验过不了。记死一句话：<strong>权重共享 ⇒ 梯度求和</strong>。代码里务必是 <code>dWh += np.outer(da_t, h_prev)</code> 的<em>累加</em>（+=），在反向循环外把 dWx/dWh/db 初始化为零，循环内逐步累加。notebook 第 2–3 节会用数值梯度把这一点焊死。</p>
+  </div>  <p>反向的实现就是把前向反着走一遍：前向时缓存每步的 $(x_t, h_{t-1}, h_t)$；反向从 $t=T$ 到 $t=1$，维护一个「来自未来的梯度」$dh_{\text{next}}$，每步把它与本步直接损失相加得 $\delta_t$，穿过 $\tanh$ 得 $da_t$，累加三个权重梯度，再算出传给上一步的 $dh_{\text{next}}=W_h^\top da_t$ 与传给输入的 $dx_t = W_x^\top da_t$。notebook 把这套逐行实现，并对每个梯度做<strong>数值梯度检验（相对误差 &lt; 1e-5）</strong>——这是「我真的推对了」的唯一硬证据。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="vanish"><span class="num">5</span>梯度消失与爆炸：雅可比连乘</h2>
+  <p>BPTT 在原理上无懈可击，但在长序列上会遭遇 RNN 的<strong>致命弱点</strong>：<span class="term">vanishing gradient</span>（梯度消失）与 <span class="term">exploding gradient</span>（梯度爆炸）。这不是实现 bug，而是<strong>结构性的数学必然</strong>，由 Bengio 等 1994 与 Pascanu 等 2013 严格刻画。理解它，是理解为什么后来要发明 LSTM（模块 04）的前提。</p>  <p>根源在第 4 节那条递推里反复出现的 $W_h^\top$。把 $\delta_t$ 展开，从远处的第 $T$ 步传到第 $t$ 步，梯度要穿过 $(T-t)$ 个时间步，每步都乘一次循环雅可比 $J = \partial h_{k}/\partial h_{k-1}=\mathrm{diag}(1-h_k^2)\,W_h$。于是远距离梯度正比于这些雅可比的<strong>连乘</strong>：</p>  <div class="math-block">\[\frac{\partial h_T}{\partial h_t}=\prod_{k=t+1}^{T} \frac{\partial h_k}{\partial h_{k-1}}=\prod_{k=t+1}^{T}\mathrm{diag}(1-h_k^2)\,W_h\]</div>  <p>矩阵连乘的行为由其<strong>谱半径</strong>（最大特征值绝对值）$\rho$ 主导。粗略地，连乘 $n$ 次的范数 $\sim \rho^{\,n}$：若 $\rho<1$，梯度随距离<strong>指数衰减</strong>→ 远处的输入对当前几乎无梯度，学不到长依赖（消失）；若 $\rho>1$，梯度<strong>指数增长</strong>→ 数值爆炸成 NaN、参数巨幅跳变（爆炸）。$\tanh$ 导数 $\le 1$ 还会进一步把谱往下压，使消失成为<em>常态</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：梯度是一句要从句末传回句首的「悄悄话」，每经过一个时间步就被乘一个小于 1 的系数。传 5 步还听得见，传 50 步声音就衰减到零——RNN 因此「记不住」很久以前的信息。爆炸则相反：系数大于 1，悄悄话越传越响，最后变成震耳欲聋的噪声（NaN）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格表述见 Pascanu 2013：设 $\gamma$ 为 $\tanh'$ 的上界（=1），$\|W_h\|$ 的最大奇异值为 $\sigma$，则雅可比范数 $\le \gamma\sigma$。当 $\gamma\sigma<1$ 时梯度必然消失（充分条件）。这说明消失/爆炸由 $W_h$ 的谱与激活导数共同决定，是<strong>由结构决定的</strong>，换更好的优化器治标不治本——必须改结构（LSTM 的加性 cell state）才能根治。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话记住：<strong>梯度消失/爆炸 = 循环雅可比的连乘 ≈ 谱半径的指数次幂</strong>。这把「RNN 记不住长依赖」从一句模糊的经验，变成一个<em>可计算、可预测</em>的数学事实。notebook 第 4 节会用 <code>np.linalg.eigvals</code> 把 $W_h$ 的谱半径算出来，再实测梯度范数沿时间的衰减/增长曲线，验证它<strong>逐位吻合</strong> $\rho^{\,n}$ 的几何级数——亲眼看到理论与实验对上，这一节的核心就拿下了。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="clip"><span class="num">6</span>梯度裁剪</h2>
+  <p>爆炸比消失<strong>好治</strong>：既然问题是梯度偶尔变得过大、导致参数巨幅跳变，那就在更新前给梯度<strong>设一个上限</strong>。这就是 <span class="term">gradient clipping</span>（梯度裁剪），Pascanu 等 2013 提出的、至今仍是训练 RNN（乃至 Transformer）的标准稳定手段。</p>  <p>最常用的是<strong>按范数裁剪</strong>（clip-by-norm）：把所有参数梯度拼成一个大向量 $g$，计算其 L2 范数 $\|g\|$；若超过阈值 $\tau$，就把整个梯度等比例缩小到范数恰好为 $\tau$：</p>  <div class="math-block">\[g \;\leftarrow\; g \cdot \min\!\Big(1,\ \frac{\tau}{\|g\|}\Big)\]</div>  <p>这个公式有两个优美的性质，缺一不可。其一，<strong>方向不变</strong>：因为是整体<em>等比例</em>缩放，梯度向量的方向（各分量的相对比例）完全保留——我们只想限制「步子迈多大」，不想改「往哪个方向走」。其二，<strong>只在必要时生效</strong>：当 $\|g\|\le\tau$ 时 $\min(\cdot)=1$，梯度原样通过，平时完全不干扰正常训练；只有梯度突然暴涨的那几步才把它拽回来。</p>  <p>为什么方向不变这么重要？想象损失曲面上有一道<strong>陡峭的悬崖</strong>（RNN 的损失曲面充满这种悬崖，正是爆炸的几何成因）。梯度方向通常是对的——指向谷底；问题只是在悬崖处梯度<em>数值</em>突然巨大，一步迈出去会冲过谷底、飞到曲面很远的地方，把之前的训练全毁掉。裁剪做的事是：<strong>沿着同一个（正确的）下坡方向，把这一步的步长摁回安全范围</strong>。它不纠正方向（方向本就对），只防止「正确方向上迈了灾难性的一大步」。这就是 Pascanu 2013 用「悬崖 + 裁剪把球轻轻推下而非弹飞」这个图景解释裁剪有效性的精髓。</p>  <table>
+    <thead><tr><th>裁剪方式</th><th>做法</th><th>方向</th><th>适用</th></tr></thead>
+    <tbody>
+      <tr><td>clip-by-norm（推荐）</td><td>整体梯度按 L2 范数等比缩放</td><td><strong>保持</strong> ✅</td><td>RNN/Transformer 通用首选</td></tr>
+      <tr><td>clip-by-value</td><td>逐元素裁到 $[-c, c]$</td><td><strong>改变</strong> ❌</td><td>简单粗暴，可能扭曲方向</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>两个实践要点。其一：阈值 $\tau$ 是超参数（常取 1.0、5.0），<em>太小</em>会拖慢学习（连正常梯度都被砍），<em>太大</em>形同虚设；通常看训练初期梯度范数的分布来定。其二：裁剪只治<strong>爆炸</strong>，对<strong>消失</strong>毫无办法——你不能把一个接近零的梯度「放大回来」（那会放大噪声）。消失必须靠改结构（LSTM/GRU 的门控）解决，这正是下一模块的主题。notebook 第 5 节会实现 clip-by-norm 并验证「裁剪后范数 ≤ 阈值」且「方向余弦 = 1」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="truncate"><span class="num">7</span>截断 BPTT 与训练实践</h2>
+  <p>最后是把 RNN 训起来的几个工程现实。第一个是<strong>内存与算力</strong>：完整 BPTT 要缓存所有 $T$ 步的中间状态，序列越长内存越吃紧；而且超长链上的梯度连乘也更容易出问题。解法是 <span class="term">truncated BPTT</span>（截断 BPTT）：</p>  <p>把长序列切成固定长度（如 35 步）的小块，前向时<strong>状态 $h$ 跨块连续传递</strong>（保留长期记忆的近似），但反向时<strong>梯度只在块内回传、不跨块</strong>。这样内存与计算被限制在窗口大小内，也顺带缓解了梯度爆炸（连乘的步数被截短）。代价是模型学不到<em>超过窗口长度</em>的依赖——这是用「能训练」换「记忆长度」的务实折中。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>截断 BPTT 像<strong>分段读一本长篇小说做笔记</strong>：你一章一章读（状态/笔记接着上一章往下记，所以剧情连贯），但每读完一章就「结一次账」更新理解，不会为了一个细节翻回 200 页之前重新推导。记忆是连续的，但「反思」是分段的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第二个现实是序列生成模型（模块 05 的 seq2seq）的训练技巧 <span class="term">teacher forcing</span>（教师强制）：训练时把<strong>真实的</strong>上一步目标词（而非模型自己的预测）喂给下一步。这让训练快速且稳定（每步输入都正确，梯度信号干净），但带来 <span class="term">exposure bias</span>（暴露偏差）：推理时模型只能喂自己的预测，一旦某步出错，错误会沿序列累积放大——而它在训练中<strong>从未见过自己的错误输入</strong>。这个训练/推理的分布鸿沟，模块 05 会专门讨论。</p></div>
+  </div>  <p>第三个是初始化与学习率。RNN 对 $W_h$ 的初始化尤其敏感（它直接决定初始谱半径，进而决定起步时梯度消失还是爆炸）；常用正交初始化让 $W_h$ 初始谱半径接近 1。配合梯度裁剪与适当学习率，朴素 RNN 在<em>短序列</em>上其实能训得不错——它的真正困境只在<strong>长依赖</strong>时才暴露，而那正是 LSTM/GRU 登场的舞台。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块的三件武器串起来看：<strong>BPTT</strong>是「怎么算梯度」（沿时间累加），<strong>梯度裁剪</strong>是「怎么不让梯度爆炸」（限制范数），<strong>截断 BPTT</strong>是「怎么在长序列上算得起」（限制回传步数）。这三者解决的都是<em>训练的可行性</em>问题。但有一个问题它们都解决不了——<strong>梯度消失</strong>（截断只是回避它，没有根治）。要让信息真正能跨越几十上百步流动，必须从<em>结构</em>上动手，给梯度修一条不经过反复连乘的「旁路」。这就是下一模块 LSTM 的 cell state 要做的事，它和模块 02 ResNet 的残差连接，本质是同一个洞见在时间维与深度维的两次应用。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>RNN 看似是「上一代」技术，但它的核心问题与思想在前沿持续发酵：</p>  <ul>
+    <li><strong>门控是对梯度消失的直接回应</strong>：LSTM（1997）与 GRU（2014）用<em>加性</em>的记忆更新替代朴素 RNN 的乘性递推，为梯度开一条「高速公路」（cell state），是模块 04 的主题。理解了本模块的「连乘导致消失」，你就懂了 LSTM 为什么要那样设计。</li>
+    <li><strong>注意力绕过了循环瓶颈</strong>：既然信息沿时间链传递会衰减，那就让每一步<em>直接</em>访问所有历史状态——这就是注意力（模块 05）的动机，也是 Transformer 彻底抛弃循环的理由。RNN 的弱点，恰恰定义了它的继任者。</li>
+    <li><strong>状态空间模型（SSM）与 Mamba 让 RNN 复兴</strong>：S4（2021）、Mamba（2023）用结构化的线性递推 + 选择性门控，既保留 RNN「推理时 O(1) 状态、线性长度」的优势，又用<span class="term">parallel scan</span>（并行扫描）解决「必须串行」的训练痛点，在长序列上挑战 Transformer。循环结构正在以新形态回归。</li>
+    <li><strong>并行化的根本张力</strong>：RNN 天生串行（$h_t$ 依赖 $h_{t-1}$），难以充分利用 GPU 并行——这是它败给 Transformer 的工程主因之一。如何让带状态的递推可并行（线性注意力、并行扫描、分块递推），是当前长序列建模的核心研究方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Bengio 1994（长依赖为何难，梯度消失的理论奠基）、Pascanu 2013（梯度爆炸/消失的完整分析 + 梯度裁剪）、Werbos 1990（BPTT 经典阐述）；动手前看 Karpathy《The Unreasonable Effectiveness of RNNs》建立直觉。下一模块的 LSTM 见 Hochreiter & Schmidhuber 1997。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_cnn_architectures/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · CNN 架构演化</div></a>
+    <a class="next" href="../04_lstm_gru/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · LSTM 与 GRU</div></a>
+  </div>
+
+</div>
+</body>
+</html>

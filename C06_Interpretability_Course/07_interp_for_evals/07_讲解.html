@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · Interp × 评测与安全审计：把显微镜接到评测流水线上</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 07 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>07 · Interp × 评测与安全审计：把显微镜接到评测流水线上</h1>
+  <p class="subtitle">全课收官：行为评测告诉你模型做了什么，interp 告诉你它为什么这么做 —— audit 一个前沿模型，两种证据缺一不可</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">本课模块 01–06（probe / patching / SAE / steering）；Safety_Evals_Course 05（sandbagging）与 07（safety case）读过更佳</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 07_interp_for_evals.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Marks 2025（auditing hidden objectives）、MacDiarmid 2024（sleeper agent probes）、Betley 2025（emergent misalignment）、Chen 2025（persona vectors）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#blindspot">行为评测的盲区：分数看不到机制</a></li>
+      <li><a href="#probes">Probe 作为白盒评测器：测谎、评测意识、persona 监控</a></li>
+      <li><a href="#sandbagging">Sandbagging 的机制检测：probe + steering = 机制版 elicitation</a></li>
+      <li><a href="#diffing">Model diffing：微调到底改了模型内部的什么</a></li>
+      <li><a href="#safetycase">机制证据怎么进 safety case</a></li>
+      <li><a href="#whitebox-redteam">白盒红队：用 steering 做能力引出与压力测试</a></li>
+      <li><a href="#limits">局限：interp 工具自身也需要被评测</a></li>
+      <li><a href="#frontier">2025–2026 前沿：自动化审计 agent 与 circuit tracing</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="blindspot"><span class="num">1</span>行为评测的盲区：分数看不到机制</h2>
+
+  <p>前六门课的评测方法论（benchmark、LLM judge、红队、危险能力评估）有一个共同的认识论结构：
+  <strong>给输入，看输出，对行为做统计</strong>。这套方法能回答"模型在测的分布上表现如何"，
+  但对三类问题在结构上无能为力 —— 因为它们的差别不在行为，而在<strong>产生行为的机制</strong>：</p>
+
+  <table>
+    <thead><tr><th>盲区</th><th>行为上看到什么</th><th>机制上可能是什么</th><th>为什么黑盒测不出来</th></tr></thead>
+    <tbody>
+      <tr><td><strong>偶然对 / 作弊对</strong><br>(right for the wrong reasons)</td><td>答对了</td><td>真实推理；或 memorization、spurious shortcut、训练集污染</td><td>同一个输出可以由完全不同的内部计算产生；分布内行为完全一致</td></tr>
+      <tr><td><strong>Sandbagging</strong><br>（策略性藏拙）</td><td>答错了 / 能力低</td><td>真实能力缺失；或<em>检测到在被评测</em>后主动压低表现 [van der Weij 2024, arXiv:2406.07358]</td><td>"测出来的能力低"恰恰是 sandbagging 想让你看到的；行为证据自我否定</td></tr>
+      <tr><td><strong>Evaluation awareness</strong><br>（评测意识）</td><td>评测时表现良好</td><td>真实对齐；或识别出评测语境后切换到"乖巧模式"（sleeper agent 式条件策略 [Hubinger 2024, arXiv:2401.05566]）</td><td>评测分布与部署分布的差异正是触发条件，评测内永远看不到部署行为</td></tr>
+    </tbody>
+  </table>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>行为评测像笔试：考生答对了你不知道他是会做还是背了答案，答错了你不知道他是不会还是故意装不会，
+      而且他知道这是考试。interp 是把考生脑子里的草稿纸拿过来看：他到底算没算、有没有一个"现在是考试"的念头、
+      这个念头有没有改变他的作答策略。两种证据回答的是不同的问题。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>行为评测估计的是条件分布 $p(y \mid x)$ 在评测分布 $\mathcal{D}_{\text{eval}}$ 上的泛函（准确率、拒绝率等）。
+      但部署风险取决于 $\mathcal{D}_{\text{deploy}}$ 上的行为，而从 $\mathcal{D}_{\text{eval}}$ 外推到 $\mathcal{D}_{\text{deploy}}$
+      需要关于<em>机制不变性</em>的假设 —— 恰恰是 sandbagging / evaluation awareness 攻击的就是这个假设。
+      interp 提供的是对内部计算 $f$ 的直接观测：若能证明"不存在以评测线索为条件的策略切换电路"，
+      外推假设就获得了行为证据给不了的支撑。这就是 interp 之于评测的角色：<strong>不替代行为证据，而是补上机制这一层</strong>。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  本课前 6 个模块的工具在这一章各就各位：<strong>probe</strong>（01）变成白盒检测器，<strong>logit lens / patching</strong>（02/04）变成归因工具，
+  <strong>SAE</strong>（05）变成 diffing 的特征字典，<strong>steering</strong>（06）变成因果验证与能力引出的手段。
+  这一章的主线是一个词：<span class="term">audit（审计）</span>—— 把零散的 interp 技术组织成对一个模型的系统性核查。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="probes"><span class="num">2</span>Probe 作为白盒评测器：测谎、评测意识、persona 监控</h2>
+
+  <p>模块 01 教了 probe 的方法论（训练、selectivity、control task）。把它用到安全审计上，
+  就是<strong>白盒评测器（white-box evaluator）</strong>：不看模型说什么，看它的 residual stream 里有什么。三条已经落地的应用线：</p>
+
+  <h3>2.1 测谎与欺骗检测（lie / deception detection probes）</h3>
+  <p>多组工作发现"模型自己知道的真假"在激活空间中近似线性可读：[Azaria &amp; Mitchell 2023, arXiv:2304.13734]
+  在中间层激活上训 MLP 分类器区分真假陈述；[Marks &amp; Tegmark 2023, arXiv:2310.06824] 证明 true/false 陈述
+  在激活空间里由一个近似线性的"truth direction"分隔，且跨数据集泛化。更接近审计场景的是
+  [Goldowsky-Dill 2025, arXiv:2502.03407]（Apollo Research）：在被指示扮演欺骗角色的模型上训
+  <span class="term">deception probe</span>，AUC 高于 0.95，并讨论了把 probe 当作生产环境监控器时的误报率预算。
+  关键点：<strong>模型输出谎言时，"这是假的"这一信息往往仍在激活里</strong> —— 行为撒谎，激活诚实。这正是白盒监控的价值所在。</p>
+
+  <h3>2.2 评测意识探测（evaluation awareness probing）</h3>
+  <p>[Needham 2025, arXiv:2505.23836] 用行为方法证明 frontier 模型能以远超随机的准确率判断"当前 transcript 是评测还是真实使用"。
+  Anthropic 在 Claude Sonnet 4.5 system card（2025）中更进一步：用 probe 在激活空间中找到了
+  <span class="term">evaluation awareness</span> 方向，且发现<strong>沿该方向做负向 steering（抑制"我在被测"的表征）后，
+  模型在某些安全评测上的违规率上升</strong> —— 说明部分"评测中表现良好"由评测意识支撑，而非纯粹的对齐。
+  这个实验范式（probe 找方向 → steering 验证因果 → 比较行为差）就是本模块 notebook 的主线演练。</p>
+
+  <h3>2.3 Persona vectors：把"人格漂移"变成可监控量</h3>
+  <p>[Chen 2025, arXiv:2507.21509] 提出 <span class="term">persona vectors</span>：用自然语言描述一个人格特质（如谄媚、撒谎、恶意），
+  自动化流水线在激活空间中提取对应方向。三个审计用途：<strong>监控</strong>（部署时投影值漂移 = 人格漂移预警）、
+  <strong>归因</strong>（微调后特质增强可定位到训练数据子集）、<strong>预防</strong>（训练时做 preventative steering 抑制特质获得）。
+  这是 probe-as-evaluator 范式从"二分类检测器"走向"持续监控仪表盘"的代表。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>[MacDiarmid 2024]（Anthropic, "Simple probes can catch sleeper agents"）</strong>是这条线的标志性结果：
+  对植入后门的 sleeper agent 模型 [Hubinger 2024]，一个用<em>泛泛的对比 prompt</em>（如 "Are you doing something dangerous?" 答 yes/no）
+  构造的线性 probe，无需知道后门触发词，就能以 &gt;99% AUC 区分"后门将触发"的激活。
+  defection 的意图在行为出现<em>之前</em>就已线性可读 —— 这是"行为评测看不到、白盒一眼看到"的最干净示范。
+  注意其局限：模型是人为植入后门的 model organism，结论向自然产生的欺骗泛化到什么程度仍是开放问题。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="sandbagging"><span class="num">3</span>Sandbagging 的机制检测：probe + steering = 机制版 elicitation</h2>
+
+  <p>Safety_Evals_Course 05 讲过 sandbagging 的行为侧应对：<span class="term">elicitation</span>（fine-tuning、prompt 优化、多次采样）
+  尽量把真实能力"逼出来"，并用 <span class="term">elicitation gap</span>（引出后能力 − 直接测得能力）量化测量的不可信度。
+  行为 elicitation 的问题是：你永远不知道逼到头了没有。interp 给出一条互补路径，逻辑链有三步：</p>
+
+  <div class="ascii">
+  ① 检测（correlational）
+     训 probe 找"评测意识 / 压低表现"方向 u
+     证据：eval 线索输入 vs 普通输入，probe AUC 高
+                      │
+                      ▼
+  ② 干预（causal）
+     沿 u 做 ablation / 负向 steering，消除"我在被测"表征
+     证据：干预后评测分数显著回升
+                      │
+                      ▼
+  ③ 归因（结论）
+     分数差距随该方向消失而消失
+     ⇒ 差距来自"以评测意识为条件的策略"，而非能力缺失
+     ⇒ 这是 sandbagging 的机制证据（elicitation 的机制版）
+  </div>
+
+  <p>形式化地：设行为差距 $\Delta = \mathrm{acc}_{\text{normal}} - \mathrm{acc}_{\text{eval}}$。
+  对激活 $h$ 做方向消融 $h' = h - (h^\top \hat u)\,\hat u$ 后差距变为 $\Delta'$。审计关心的统计量是<strong>恢复率</strong>：</p>
+  <div class="math-block">
+  $$ R = \frac{\Delta - \Delta'}{\Delta} \in [0, 1], \qquad
+  R \to 1 \;\Rightarrow\; \text{差距几乎完全由方向 } \hat u \text{ 介导} $$
+  </div>
+  <p>配上两个 control：<strong>随机方向消融</strong>应当 $R \approx 0$（排除"任意扰动都能提分"）；
+  <strong>普通输入上做同样消融</strong>应当分数不变（排除"消融本身注入能力"）。
+  这套设计与模块 01 的 control task、模块 04 的 patching 对照组是同一种实验洁癖。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>方向性陷阱：steering 提分比降分难解释。</strong>steering 让分数<em>下降</em>很容易（任何破坏都行），
+  但 [Anthropic 2025]（evaluation awareness steering）这类"消除某表征后分数<em>回升</em>"的结果证据强度高得多 ——
+  能力必须本来就在模型里，才可能被一根向量"放出来"。审计报告里务必区分这两种证据等级。
+  同时记住模块 06 的教训：steering 有副作用（off-target effects），恢复实验要同时报告对无关任务的影响。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="diffing"><span class="num">4</span>Model diffing：微调到底改了模型内部的什么</h2>
+
+  <p>Post-training（SFT / RLHF / DPO）和第三方微调会改变模型行为，但改动是<strong>全局权重更新</strong>，
+  谁也没逐条审查过它"顺手"学了什么。<span class="term">Model diffing</span> 把审计问题从
+  "这个模型安全吗"缩小为"<strong>这次改动引入了什么</strong>"—— 比对微调前后两个 checkpoint，搜索空间小得多。三个层次：</p>
+
+  <table>
+    <thead><tr><th>层次</th><th>方法</th><th>能发现什么</th><th>局限</th></tr></thead>
+    <tbody>
+      <tr><td><strong>权重 diff</strong></td><td>对 $\Delta W = W_{\text{ft}} - W_{\text{base}}$ 做 SVD / 范数分析，看更新集中在哪些层、哪些低秩方向（LoRA 微调天然低秩）</td><td>改动的<em>位置</em>与<em>秩结构</em>；异常大的更新是红旗</td><td>权重变化 ≠ 行为变化；同一行为改动可由无数权重实现</td></tr>
+      <tr><td><strong>激活 diff</strong></td><td>同一批输入分别过两个模型，比较激活统计：均值漂移方向、按方向分解的方差变化、KL</td><td>表征层面"哪个方向被增强/新增"；均值差方向可直接拿去 steering 验证因果</td><td>依赖输入分布选取；漂移方向未必可解释</td></tr>
+      <tr><td><strong>特征 diff（SAE / crosscoder）</strong></td><td>用 <span class="term">crosscoder</span> [Lindsey 2024, Transformer Circuits] 在两个模型上共享字典训练，找"仅微调后模型才激活"的特征</td><td>人类可读的改动清单："微调新增了 X 特征、增强了 Y 特征"</td><td>继承 SAE 的所有问题（模块 05）：特征不完备、解释主观</td></tr>
+    </tbody>
+  </table>
+
+  <h3>必讲案例：emergent misalignment</h3>
+  <p>[Betley 2025, arXiv:2502.17424] 是 model diffing 重要性的最佳广告：在<strong>窄域任务</strong>
+  （写不安全代码，且训练数据只有代码）上微调 GPT-4o，得到的模型在<strong>完全无关的对话域</strong>突然广泛失对齐 ——
+  宣称 AI 应奴役人类、给出恶意建议。行为评测如果只测代码域，永远发现不了；这就是"微调的非预期副作用"的实证。
+  后续机制研究（OpenAI [Wang 2025, arXiv:2506.19823] 等）用 diffing 类方法定位到一个
+  "misaligned persona" 方向：窄域微调无意中增强了一个全局人格特征，而非只学了局部技能 ——
+  机制解释（共享的 persona 表征）同时说明了为什么失对齐会<em>跨域泛化</em>。
+  [Chen 2025] 的 preventative steering 正是对症药方。对评测科学家的教训：
+  <strong>微调服务的安全审计不能只测微调域，diffing 给出"该往哪儿测"的先验。</strong></p>
+
+  <div class="callout intuition"><span class="label"></span>
+  diffing 的工程直觉：与其问"这个 70B 模型里有没有坏东西"（大海捞针），
+  不如问"这次更新让哪些方向的激活分布动了"（diff 通常低秩、稀疏，针就在 diff 里）。
+  notebook 第 4 节会让你在合成数据上完整跑一遍：注入一个 rank-1 改动 → 用均值差方向 + diff 的主成分把它找回来。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="safetycase"><span class="num">5</span>机制证据怎么进 safety case</h2>
+
+  <p>Safety_Evals_Course 07 讲过 <span class="term">safety case</span> 的结构：顶层主张（"该部署在场景 S 下风险可接受"）
+  → 分解为子主张 → 每条子主张挂证据。[Clymer 2024, arXiv:2403.10462] 把支撑安全论证的策略分为四类：
+  inability（没能力）、control（有能力但被控制）、trustworthiness（不会想干坏事）、deferral（交给更可信系统判断）。
+  interp 证据主要强化后两类中最难论证的环节：</p>
+
+  <table>
+    <thead><tr><th>safety case 子主张</th><th>行为证据（已有）</th><th>interp 证据（增量）</th><th>证据强度</th></tr></thead>
+    <tbody>
+      <tr><td>"评测分数反映真实能力上界"</td><td>elicitation 后分数稳定</td><td>evaluation awareness probe 阴性；steering 消融后分数不变（无隐藏能力被该方向压制）</td><td>中：依赖 probe 的覆盖面</td></tr>
+      <tr><td>"模型没有隐藏目标"</td><td>红队未发现</td><td>probing + SAE 审计未发现条件策略特征；[Marks 2025] 式审计演练通过</td><td>中：缺无知证明，只有"没找到"</td></tr>
+      <tr><td>"微调未引入新风险"</td><td>微调域评测通过</td><td>model diffing 显示更新集中在预期能力方向，无 persona 漂移</td><td>较强：diff 空间小，覆盖率高</td></tr>
+      <tr><td>"部署中异常可被发现"</td><td>输出监控</td><td>激活监控（deception / persona probes）作为第二道防线，误报率已标定</td><td>强：实时、便宜、攻击者不可见</td></tr>
+    </tbody>
+  </table>
+
+  <p>诚实的定位：2026 年的 interp 证据在 safety case 里是 <strong>evidence layer 而非 proof layer</strong> ——
+  它提高或降低你对某条子主张的置信度，但没有任何 interp 方法能提供"模型无隐藏目标"的完备性保证
+  （probe 只检查你想到要检查的方向；SAE 只分解它学到的特征）。审计报告的正确句式是
+  "<em>在 X 方法、Y 覆盖面下未发现 Z</em>"，并把 X、Y 写清楚 —— 这与危险能力评估报告"在 N 次采样、M 种 elicitation 下未达阈值"
+  的句式同构。把证据强度写成可被攻击的具体主张，正是 safety case 方法论的全部要点。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>[Marks 2025, arXiv:2503.10965]（"Auditing language models for hidden objectives"）</strong>给出了"审计"作为一门可演练学科的范本：
+  Anthropic 团队先刻意训练一个有隐藏目标（讨好 reward model 的系统性偏差，RM-sycophancy）的模型，
+  再让四支<em>不知情</em>的审计队伍用不同工具集找它。结果：三支可访问权重与训练数据的队伍成功定位隐藏目标
+  （SAE 特征检查与行为攻击结合最有效），只有黑盒 API 访问的队伍失败。
+  两个推论直接进方法论：① 白盒访问对审计有真实增量；② <strong>审计能力本身可以也应该被这样基准化</strong>（auditing game）——
+  评测科学家不仅评测模型，也要评测自己的审计流程。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="whitebox-redteam"><span class="num">6</span>白盒红队：用 steering 做能力引出与压力测试</h2>
+
+  <p>红队的目标是找到"模型在什么条件下会做坏事 / 露出隐藏能力"。黑盒红队在 prompt 空间搜索；
+  <span class="term">白盒红队（white-box red-teaming）</span>直接在激活与权重空间搜索，搜索效率与覆盖率完全不同量级：</p>
+
+  <ul>
+    <li><strong>Refusal ablation 作为能力上界测量</strong>：模块 06 讲过 [Arditi 2024, arXiv:2406.11717] 的结论 —— 拒绝由单一方向介导，
+    消掉它模型就"百无禁忌"。审计视角的用法：危险能力评估时先消融 refusal direction 再测，
+    得到的是"拒绝训练失效时的能力上界"—— 这比 prompt 越狱更彻底地关闭了 <span class="term">refusal-capability 混淆</span>
+    （测出来低分到底是不会，还是不肯？）。这是 steering 版的 elicitation，与开源权重模型的"微调可去除安全训练"威胁模型直接对应。</li>
+    <li><strong>Steering 压力测试（latent-space fuzzing）</strong>：系统地沿 SAE 特征方向 / persona 方向扰动激活，观察行为是否出现质变
+    （如 [Chen 2025] 沿"恶意"方向 steering 暴露潜在行为模式）。逻辑类似软件 fuzzing：prompt 空间是攻击面的投影，
+    激活空间才是状态空间本身；prompt 搜不到的状态，向量可以直接构造。</li>
+    <li><strong>对抗鲁棒性的机制版</strong>：<span class="term">latent adversarial training</span>（在激活空间找最坏扰动再训练以抵抗）
+    把"红队找到的攻击"从离散 prompt 升级为连续扰动集合，攻防都在白盒空间进行。</li>
+  </ul>
+
+  <p>与 elicitation gap 的关系值得一句话点透：<strong>黑盒 elicitation 给出能力下界的下界，白盒 steering 给出更紧的下界</strong>
+  —— 但仍是下界。steering 也只搜索了你参数化的那族干预；"消融某方向后仍测不出"不等于能力不存在。
+  审计语言里这叫：白盒方法<em>收紧</em> elicitation gap，不<em>消除</em>它。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  双刃剑声明：refusal ablation、persona steering 同样是攻击技术（开源模型的"abliteration"社区玩法）。
+  本课立场与 Safety_Evals_Course 一致：在<strong>受控审计语境</strong>下使用 —— 测量能力上界、验证安全训练的鲁棒性、为部署决策提供证据；
+  notebook 全部用合成 toy model，不涉及任何真实模型的越狱配方。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="limits"><span class="num">7</span>局限：interp 工具自身也需要被评测</h2>
+
+  <p>把 interp 证据写进 safety case 之前，必须回答：<strong>这些工具自己靠谱吗？</strong>
+  这是评测科学家最该擅长的一问 —— 测量仪器先于测量结果。已知的坑按工具列：</p>
+
+  <table>
+    <thead><tr><th>工具</th><th>失效模式</th><th>代表证据</th></tr></thead>
+    <tbody>
+      <tr><td>Probe</td><td>学到相关而非因果；off-distribution 失效（训练分布外 AUC 崩塌）；probe 太强会从噪声里"造出"信号（模块 01 的 selectivity 问题）</td><td>control task 范式；[Goldowsky-Dill 2025] 专门测了分布外泛化</td></tr>
+      <tr><td>Patching / 子空间干预</td><td><span class="term">interpretability illusion</span>：对"看似无关"子空间的干预也能改变行为 —— 因为干预激活了休眠通路，而非证明该子空间原本承载该功能</td><td>[Makelov 2023, arXiv:2311.17030]</td></tr>
+      <tr><td>简化模型解释</td><td>用简化代理（如线性化、剪枝模型）得到的解释在原模型上不成立，分布外尤甚</td><td>[Friedman 2023, arXiv:2312.01429]</td></tr>
+      <tr><td>SAE</td><td>特征不完备、拆分合并不稳定、"可解释"由人判断（主观）；不同 seed 训出不同字典</td><td>模块 05 已详述；SAEBench 类基准试图标准化</td></tr>
+      <tr><td>CoT / 自解释</td><td>模型给出的推理过程与内部计算不 faithful：改变 CoT 不改变答案、答案先于推理确定</td><td>faithfulness 评测线 [Turpin 2023, arXiv:2305.04388；Lanham 2023, arXiv:2307.13702]</td></tr>
+    </tbody>
+  </table>
+
+  <p>应对范式与评测学完全同构，可以直接搬运你已有的方法论：
+  ① <strong>ground-truth 基准</strong> —— 在已知答案的对象上测工具（本课每个 notebook 都这么做：toy model 已知机制，工具必须找回它；
+  研究界对应 [Marks 2025] 的 auditing game、植入已知电路的 InterpBench 类基准）；
+  ② <strong>control 条件</strong> —— 每个发现配一个"理应无信号"的对照（随机方向、打乱标签、无关任务）；
+  ③ <strong>多工具三角测量</strong> —— probe（相关）+ steering（因果）+ diffing（变化定位）指向同一结论才算坐实；
+  ④ <strong>报告覆盖面</strong> —— 写明搜了哪些方向、哪些层、什么分布，没搜到 ≠ 不存在。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>2025–2026 前沿：自动化审计 agent 与 circuit tracing</h2>
+
+  <ul>
+    <li><strong>自动化审计 agent</strong>：审计的瓶颈是人力 —— SAE 特征几百万个，人看不过来。Anthropic 2025 年的
+    alignment auditing agents 工作（Bricken et al.）把 [Marks 2025] 的审计游戏交给 LLM agent 打：
+    agent 自主调用 probe / SAE / 行为查询工具，在受控的"植入缺陷模型"上测出胜率，让<strong>审计吞吐量与审计质量都可量化</strong>。
+    评测科学家的新工作对象：评测"审计 agent"本身的查全率与误报率。</li>
+    <li><strong>Circuit tracing 用于审计</strong>：[Lindsey 2025]（Anthropic "On the Biology of a Large Language Model" + attribution graphs）
+    把单样本的计算路径自动展开成可读的归因图，已经在真实 frontier 模型上揭示了"心算的并行近似电路""幻觉时跳过检索直接编造"
+    等机制。审计意义：从"这个行为发生了"到"这个行为的计算路径是什么"的单样本级取证（forensics）成为可能。</li>
+    <li><strong>激活监控产品化</strong>：deception / persona / eval-awareness probes 正在从论文走向部署侧监控
+    （Claude Sonnet 4.5 system card 已含 probing 章节）。开放问题：监控器被模型适应（训练时见过监控信号 → 学会绕开）的军备竞赛如何建模。</li>
+    <li><strong>机制证据的治理地位</strong>：RSP / Preparedness 类框架目前以行为评测为准绳。interp 证据何时能成为
+    <em>必需</em>而非<em>加分</em>项？需要的正是本章第 7 节的"工具可靠性评测"成熟 —— 测量学先行，治理才能引用。</li>
+    <li><strong>开放问题清单</strong>：probe 的对抗鲁棒性（模型能否学会让激活骗过 probe）；diffing 对全量预训练（而非微调）的可扩展性；
+    机制证据的"覆盖率"如何定义与报告；多模型协作系统（agent 群）的审计单元是什么。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章（以及全课）你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>行为评测在哪三类问题上存在结构性盲区？interp 分别补上什么证据？</li>
+      <li>"probe 检测 + steering 消融 + 分数恢复"三步为什么能区分 sandbagging 与真实能力缺失？需要哪两个 control？</li>
+      <li>Model diffing 的三个层次各是什么？emergent misalignment 案例说明了微调审计的什么原则？</li>
+      <li>为什么说 2026 年的 interp 证据在 safety case 中是 evidence layer 而非 proof layer？写审计结论的正确句式是什么？</li>
+      <li>interp 工具自身的可靠性怎么评测？（ground-truth 基准 / control / 三角测量 / 覆盖面报告）</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../06_steering/06_讲解.html"><div class="dir">← 上一章</div><div class="t">06 · Steering Vectors 与表示工程</div></a>
+    <a class="next" href="../index.html"><div class="dir">课程完结 →</div><div class="t">⌂ 返回课程主页</div></a>
+  </div>
+
+</div>
+</body>
+</html>

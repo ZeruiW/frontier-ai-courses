@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 测试时计算 scaling</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 测试时计算 scaling</h1>
+  <p class="subtitle">TTC scaling 律、compute-optimal 预算分配、难度路由、小模型+TTC vs 大模型的帕累托前沿 —— 把推理算力当成一个可优化的旋钮，按题施策地花在刀刃上</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 04（BoN/pass@k/搜索）、概率、约束优化直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_ttc_scaling.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Snell TTC scaling · Large Language Monkeys · Wu inference scaling · o1</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">讲解 45 分钟 + notebook 75 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#ttc">测试时计算：一个新维度</a></li>
+      <li><a href="#law">TTC scaling 律</a></li>
+      <li><a href="#optimal">compute-optimal 分配</a></li>
+      <li><a href="#routing">难度路由</a></li>
+      <li><a href="#pareto">小模型+TTC vs 大模型：帕累托</a></li>
+      <li><a href="#seqpar">串行 vs 并行与实践</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ttc"><span class="num">1</span>测试时计算：一个新维度</h2>
+  <p>上一模块我们学会了一堆把推理时算力换成准确率的工具（BoN、投票、beam）。这一模块站到更高处问一个<strong>资源分配</strong>问题：<strong>到底该花多少测试时计算？怎么分配最划算？</strong>这就是 <span class="term">test-time compute scaling</span>（测试时计算 scaling）——把推理算力当成一个<strong>可优化的旋钮</strong>，而非固定的「一次前向」。</p>  <p>这是 o1/R1 范式带来的<strong>根本性新维度</strong>。在它之前，一个模型回答一个问题的算力基本是固定的（一次前向，token 数大致定）；提升性能只能靠<em>训练更大的模型</em>。在它之后，OpenAI o1 博客点出：<strong>准确率不仅随训练计算 scaling，还随测试时计算 scaling</strong>——同一个模型，多想（更长 CoT、更多采样、更深搜索）就更准，且这条曲线常常很陡。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：以前买算力像买一台马力固定的车——想跑更快只能换更大的发动机（更大模型，很贵）。现在多了个「<strong>油门</strong>」——同一台车，踩深油门（多花推理算力）就能跑更快。于是问题从「买多大的车」变成了「<strong>买多大的车 + 平时踩多深油门</strong>」的联合优化——而且对不同路况（题目难度），最优油门还不一样。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，推理模型有了<strong>两个</strong>可投入算力的轴：<strong>训练时计算</strong> $C_{\text{train}}$（决定模型基础能力 $p$）与<strong>测试时计算</strong> $C_{\text{test}}$（每题多想，把 $p$ 放大成实际准确率）。本模块的核心问题是：给定<em>总</em>预算，怎么在两轴之间、以及测试时计算的内部（采样数 vs 搜索宽度 vs CoT 长度、并行 vs 串行）分配，使准确率最大化——这就是 <span class="term">compute-optimal allocation</span>（Snell 2024）。</p></div>
+  </div>  <p>为什么这个「新维度」如此重要，值得从<strong>经济学</strong>角度再说一层。预训练是一次性的<em>固定成本</em>（训一次，所有推理共享），而测试时计算是<em>可变成本</em>（每道题、每次推理都要重新花）。这带来一个深刻的灵活性：测试时计算可以<strong>按需投放</strong>——只在难题上多花、易题上少花（难度路由，第 4 节），甚至按用户、按场景动态调整。一个固定的大模型做不到这种弹性（它对每道题都用同样的算力）。所以推理模型的范式不只是「多了一个旋钮」，而是把<strong>「能力」从「固定资产」变成了「可弹性调配的服务」</strong>——这也是为什么它同时改变了模型训练<em>和</em>推理服务（C24）的经济学。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>测试时计算是一个可优化的旋钮——准确率随它 scaling，且最优的『花法』取决于题目难度</strong>。最反直觉也最重要的结论（Snell 2024）：<strong>在等算力预算下，一个小模型 + 大量测试时计算，可以胜过一个大得多的模型 + 少量测试时计算</strong>。这意味着「把算力全砸进更大的预训练」未必最优——留一部分给推理时，可能更划算。本模块用 numpy 把这条曲线和分配策略亲手算出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="law"><span class="num">2</span>TTC scaling 律</h2>
+  <h3>TTC scaling 律：准确率随算力怎么涨</h3>  <p>先量化「多想就更准」这条曲线。最干净的例子是<strong>完美 verifier 下的 best-of-N</strong>：单样本正确率 $p$，采 $N$ 个、完美挑出对的，则准确率（覆盖率）是：</p>  <div class="math-block">\[\text{acc}(N)=\text{pass@}N=1-(1-p)^N\]</div>  <p>这条曲线有个关键形状：<strong>误差按 $(1-p)^N$ 指数衰减</strong>，即 $\log(\text{误差})=N\log(1-p)$——<strong>误差的对数随 $N$ 线性下降</strong>。这就是为什么 TTC scaling 常画成「准确率 vs $\log(\text{计算})$」近似直线（或误差 vs 计算在 log-log 上近似直线）。每翻倍算力，误差按固定比例缩小——但<strong>收益递减</strong>（绝对提升越来越小）。</p>  <table>
+    <thead><tr><th>N（采样数）</th><th>pass@N（p=0.3）</th><th>相比上一档的提升</th><th>边际收益</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>0.30</td><td>—</td><td>—</td></tr>
+      <tr><td>2</td><td>0.51</td><td>+0.21</td><td><strong>高</strong></td></tr>
+      <tr><td>4</td><td>0.76</td><td>+0.25</td><td>高</td></tr>
+      <tr><td>8</td><td>0.94</td><td>+0.18</td><td>中</td></tr>
+      <tr><td>16</td><td>0.997</td><td>+0.057</td><td><strong>低（饱和）</strong></td></tr>
+    </tbody>
+  </table>  <p>真实的 TTC scaling 比这个理想公式复杂（verifier 不完美、投票有上限、串行修订有其曲线），但<strong>定性规律稳健</strong>：准确率随测试时计算单调上升、近似对数线性、且<strong>有收益递减</strong>。实证上（Snell 2024、Wu 2024 等）这些曲线可以拟合出来，从而能<strong>外推</strong>「再加一倍算力值不值」、并和「训练更大模型」的 scaling 律放在同一张图上比较。</p>  <h4>一个手算例子：小模型多想 vs 大模型少想</h4>  <p>用上面的 $\text{pass@}N=1-(1-p)^N$ 把「小模型+TTC vs 大模型」的直觉算成数字。设<strong>小模型</strong>单样本正确率 $p_S=0.4$、<strong>大模型</strong> $p_L=0.7$（大模型基础能力强得多）。大模型只采 1 次：准确率 $0.7$。小模型采 $N$ 次 + 完美挑选：$N=2$ 得 $1-0.6^2=0.64$（还差）；$N=3$ 得 $1-0.6^3=0.784$（<strong>已反超大模型的 0.7</strong>）；$N=4$ 得 $0.87$。也就是说，<strong>小模型多花 3–4 倍推理算力，就能在准确率上盖过一个单次推理的大模型</strong>——只要那 3–4 次采样的总成本仍低于「把模型从 $p=0.4$ 训到 $p=0.7$ 再推理一次」的成本，这笔买卖就划算。这正是 Snell「小模型+大量 TTC 可胜过大模型」的算术内核。但<strong>注意前提</strong>：这里假设了完美挑选（pass@N）和「解在小模型分布里」；若换成不完美 verifier、或难到小模型 pass@∞ 都接近 0 的题，这个反超就不成立——伏笔留给第 5 节。</p>  <p>把 TTC scaling 律和<strong>预训练 scaling 律</strong>并置，是这套理论最有力的地方。预训练 scaling 律（Kaplan/Chinchilla）告诉你「准确率随<em>训练</em>算力怎么涨」；TTC scaling 律告诉你「随<em>测试时</em>算力怎么涨」。把两条曲线画在同一张「准确率 vs 算力」图上，就能回答那个价值千金的问题：<strong>下一块钱该花在训练还是推理？</strong>——哪条曲线在当前算力点更陡，就往哪投。这正是下一节 compute-optimal 的全部精神：把算力当成可在多个维度间自由调配的资源，沿<em>边际收益最高</em>的方向投放。值得强调的是这条曲线的<strong>形状</strong>比绝对值更重要：因为收益递减，TTC 的优势在「中等算力区」最明显——算力极少时（连一次都跑不完）谈不上 scaling，算力极多时早已饱和；中间那段陡峭的上升，才是 TTC 大放异彩、也是 compute-optimal 最有油水的地方。</p>  <div class="callout warn"><span class="label"></span>
+    <p>收益递减是 TTC 的<strong>根本约束</strong>：$N$ 从 1→2 可能 +20%，从 64→128 也许只 +0.5%。所以「无脑加大 $N$」很快不划算。更糟的是，用<em>不完美</em>的 verifier 时（上一模块），$N$ 过大还会因 verifier hacking 让性能<strong>掉头向下</strong>——TTC 曲线先升后平甚至先升后降。<strong>这正是为什么需要 compute-optimal：不是『花越多越好』，而是『花在边际收益最高的地方、花到该停就停』</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="optimal"><span class="num">3</span>compute-optimal 分配</h2>
+  <h3>compute-optimal：把算力花在刀刃上</h3>  <p>既然收益递减、且不同「花法」曲线不同，就有一个<strong>最优分配</strong>问题。最经典的形式（Snell 2024）：给定<strong>固定的测试时算力预算</strong>（比如总共能生成 $B$ 个 token 或 $B$ 个样本），怎么分配以最大化准确率？分配的维度有几个：</p>  <ul>
+    <li><strong>采样数 N（并行）</strong>：多采几个独立解，靠 BoN/投票聚合。</li>
+    <li><strong>搜索宽度/深度</strong>：beam 宽度、MCTS 模拟次数——更系统但每单位更贵。</li>
+    <li><strong>CoT 长度</strong>：让单条推理更长（更多反思/检查）。</li>
+    <li><strong>串行修订（sequential）</strong>：在一条链里反复 self-refine，而非独立重采。</li>
+  </ul>  <p>Snell 2024 的关键发现是这些维度的最优配比<strong>依赖问题难度</strong>：<strong>简单题</strong>上，串行修订（顺着一条思路改进）往往更有效——因为模型基本在正轨上，只需微调；<strong>难题</strong>上，并行采样（多条独立尝试）更有效——因为需要探索<em>不同</em>的解法路径，串行容易在一条死路上越改越歪。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>用「找路」打比方：简单迷宫（你大致知道方向）→ 沿一条路走、走错就回退微调（串行修订）最快。复杂迷宫（方向都不确定）→ 派多支队伍走不同路（并行采样）更可能有一支走通。<strong>难度决定该『深挖一条』还是『广撒网』</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，compute-optimal 是一个约束优化：$\max_{\text{allocation}}\ \text{acc}(\text{allocation})\ \text{s.t.}\ \text{cost}(\text{allocation})\le B$。因为不同方法的 acc-cost 曲线不同（且随难度变），最优解通常是<strong>难度相关的混合策略</strong>。Snell 2024 实证：用 compute-optimal 分配，可比「固定一种策略」省<strong>约 4 倍</strong>算力达到同等准确率。</p></div>
+  </div>  <p>具体怎么求这个最优分配？原理是经济学的<strong>等边际原理</strong>：在最优点，每多一单位算力<em>花在任何维度/任何题上的边际收益都相等</em>。若某处边际收益更高（如某难题还在 scaling 陡升段），就该把算力从边际低处（如已饱和的易题）挪过来；不断挪到处处边际相等，就到了最优。这给出一个可操作的贪心算法：<strong>每次把下一单位算力投到当前边际收益最高的地方，直到预算耗尽或边际归零</strong>。notebook 会用暴力搜索求出两难度场景的最优分配，并验证它确实满足「难题分得多、易题分得少」。</p>  <h4>一个直观例子</h4>  <p>设 100 道易题（单样本正确率 $p=0.7$）+ 100 道难题（$p=0.15$），总预算「每题平均 8 个样本」。<strong>均分</strong>（每题都 8）下：易题 pass@8 已 $\approx 0.9999$（早就饱和，第 8 个样本的边际几乎为 0），难题 pass@8 $\approx 0.73$（还在陡升）。显然把易题的算力<em>浪费</em>在饱和段了。<strong>compute-optimal</strong>会把易题降到比如每题 2（pass@2 仍 $\approx 0.91$，几乎不掉），把省下的算力全堆给难题（升到每题 14，pass@14 $\approx 0.90$）。结果：易题几乎不掉、难题大幅提升，总答对数明显高于均分——<strong>同样的总算力，因为按边际收益重新分配，多解出了一批难题</strong>。这就是 Snell 报告「compute-optimal 比固定策略省约 4 倍算力」的微观来源。</p>  <p>这给出一个极实用的原则：<strong>别对所有题用同一种 TTC 策略和同样的预算</strong>。一个会看难度、会选「深挖 vs 广撒」、会在边际收益归零时停手的分配器，能把同样的算力发挥出数倍价值。这正是下一节「难度路由」的动机。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="routing"><span class="num">4</span>难度路由</h2>
+  <h3>难度路由：按难度分配算力</h3>  <p>compute-optimal 最直接的落地是<strong>难度路由</strong>（difficulty routing）：<strong>不给所有题一样的算力，而是按题目难度分配</strong>——易题少花（甚至一次就够）、难题多花（多采样/深搜索）。直觉显然：把省下来的易题算力，挪给真正需要的难题。</p>  <div class="ascii">难度路由：把固定预算按难度重新分配
+
+  一刀切(每题都采 N=8):
+    易题×100: 8 each (浪费, 1 次就对)   难题×100: 8 each (不够, 需更多)
+
+  难度路由(同样总预算):
+    易题×100: 2 each (省下 600)  ──┐
+    难题×100: 14 each ◀───────────┘ (把省下的全给难题)
+  =&gt; 易题几乎不掉准确率, 难题大幅提升 =&gt; 总准确率更高</div>  <p>难度路由的前提是<strong>能估计题目难度</strong>。怎么估？有几种不需要真答案的代理：①<strong>采样一致性</strong>——先采几个，若答案高度一致（投票集中）说明易、分散说明难；②<strong>verifier 分数分布</strong>——分数普遍高且集中说明易；③<strong>一个轻量难度预测器</strong>。估出难度后，按难度查一张「难度→预算」表分配。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>难度路由像<strong>医院分诊</strong>：不是每个病人都做全套检查（浪费），也不是都只量体温（漏诊）。先快速分诊（估难度），轻症少查、重症多查。把昂贵的检查资源集中给真正需要的人，整体疗效最好。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：设题目难度 $d$，分配预算 $B(d)$ 使总预算 $\sum_d B(d)\cdot n(d)\le B_{\text{total}}$，最大化期望准确率 $\sum_d n(d)\cdot\text{acc}(d, B(d))$。因为易题的 acc 早已饱和（再加预算边际≈0）、难题的 acc 还在陡升段（边际高），最优解必然是<strong>把预算从饱和的易题移向未饱和的难题</strong>，直到各题边际收益相等（经济学的等边际原理）。notebook 会让你解出这个分配并验证它跑赢一刀切。</p></div>
+  </div>  <p>难度路由还有一个<strong>微妙的边界</strong>要注意：它假设「难题多花算力就能救」，但模块 04 的教训告诉我们这<em>不总成立</em>。对于<strong>超出模型能力</strong>的题（pass@∞ 都接近 0，解根本不在采样分布里），再多 TTC 也是浪费——这种题该被识别出来<strong>直接放弃或转交更强的模型</strong>，而非无底洞地砸算力。所以一个成熟的难度路由其实要分三档而非两档：<em>易题</em>（少花，已饱和）、<em>中等难题</em>（多花，TTC 边际高、最值得投）、<em>超难题</em>（别花，TTC 救不了）。真正 compute-optimal 的系统会把宝贵算力集中在<strong>「中等难度、TTC 边际最高」的甜区</strong>——这是把 Snell 的 compute-optimal 思想用到极致的形态。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>难度路由的本质是<strong>等边际原理</strong>：最优分配下，每多一单位算力，花在任何题上的边际收益都相等。易题边际早归零（别再花），难题边际还很高（多花）。直观判据：<strong>把算力从『已经做对/几乎必对』的题，移到『差一点就能对』的题</strong>。这条原理不止用于难度路由，也是 compute-optimal 一切分配的统一逻辑。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pareto"><span class="num">5</span>小模型+TTC vs 大模型：帕累托</h2>
+  <h3>小模型 + TTC vs 大模型：帕累托前沿</h3>  <p>现在回到本模块开篇最震撼的问题：给定总算力，该<strong>买更大的模型</strong>，还是<strong>用更小的模型 + 更多测试时计算</strong>？这是 Snell 2024 的核心命题，答案颠覆直觉：<strong>很多情况下，小模型 + 大量 TTC 在等算力下胜过大模型</strong>。</p>  <p>要严谨地比较，需要<span class="term">Pareto frontier</span>（帕累托前沿）这个工具。在「准确率 vs 总算力」平面上，每种方案（模型大小 × TTC 策略 × 预算）是一个点。一个方案被<strong>支配</strong>，如果存在另一个方案<em>准确率更高且算力更省</em>。<strong>不被任何方案支配的点构成帕累托前沿</strong>——它代表「给定算力能达到的最好准确率」。比较两类方案，就看谁的点更靠<strong>左上</strong>（更省算力、更高准确率）、谁定义了前沿。</p>  <div class="ascii">准确率 vs 总算力 的帕累托前沿
+
+  准确率
+   │        ●小模型+大量TTC          ← 在中算力区, 小模型+TTC 可能更靠左上
+   │      ╱   ○大模型+少量TTC
+   │    ╱  ○
+   │  ╱○                            前沿 = 各算力下能达到的最高准确率
+   │╱○                              (被支配的点在前沿右下方)
+   └──────────────────────▶ 总算力(log)
+   关键: 谁定义了前沿(更靠左上)取决于算力预算区间与任务难度</div>  <p>为什么会出现「小模型+TTC 反超」这种反直觉的现象？根子在于<strong>两条 scaling 曲线的陡峭程度不同</strong>。把模型从 $p=0.4$ 训到 $p=0.7$ 需要<em>成倍</em>的预训练算力（预训练 scaling 律相当平缓，边际收益递减得厉害）；而对一个 $p=0.4$ 的小模型，TTC 在「中等算力区」的曲线却很陡（前几次采样每次都把误差按 $(1-p)$ 比例砍掉）。于是在某个算力区间内，<em>同样一块钱</em>花在「多采几次」上买到的准确率提升，<strong>超过</strong>花在「把模型训得更大」上买到的。帕累托前沿正是这两条曲线的<strong>上包络</strong>——在不同算力区间，定义前沿的「赢家」会换人：算力极少时大模型的单次推理更值（小模型采样不够多）、中等算力区小模型+TTC 接管、算力极多时又可能因 TTC 饱和而回到拼模型。<strong>没有永远的赢家，只有「这个算力区间里更陡的那条曲线」</strong>。</p>  <p>但这不是无条件的——Snell 2024 把边界划清楚了：①<strong>在算力预算适中、题目在模型能力范围内</strong>时，小模型 + TTC 常胜（因为 TTC 的 scaling 比模型放大更陡）；②<strong>但对超出小模型能力的最难题</strong>（小模型 pass@∞ 都接近 0，再多采样也没用——解根本不在它的分布里），<strong>大模型不可替代</strong>（TTC 救不了根本不会的题）。所以结论是<strong>有条件的</strong>：TTC 能放大<em>已有</em>的能力，但变不出<em>没有</em>的能力。</p>  <div class="callout danger"><span class="label">TTC 放大能力≠创造能力</span>
+    <p>一个必须澄清的误区：<strong>TTC 不是万能的，它放大能力但不创造能力</strong>。如果一道题的解<em>根本不在</em>小模型的采样分布里（pass@N 怎么加 $N$ 都接近 0），那再多测试时计算也无济于事——这时只能靠更强的模型（更好的训练）。所以「小模型+TTC vs 大模型」不是非此即彼，而是<strong>互补</strong>：训练决定<em>能力上界</em>（解在不在分布里），TTC 决定<em>能多大程度榨出这个上界</em>。最优系统两者兼顾——这也呼应模块 04「搜索 vs 训练可互相替代但各有边界」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="seqpar"><span class="num">6</span>串行 vs 并行与实践</h2>
+  <h3>串行 vs 并行与实践要点</h3>  <p>把 TTC 的「怎么花」再细化。测试时计算大体两类，<strong>二者的最优配比随难度变</strong>——这是本节的核心：</p>  <table>
+    <thead><tr><th>维度</th><th>并行 TTC（parallel）</th><th>串行 TTC（sequential）</th></tr></thead>
+    <tbody>
+      <tr><td>做法</td><td>独立采样多条 + 聚合（BoN/投票）</td><td>一条链里反复修订（self-refine/revision）</td></tr>
+      <tr><td>探索</td><td>覆盖<strong>不同</strong>解法路径（广）</td><td>深挖<strong>一条</strong>思路、逐步改进（深）</td></tr>
+      <tr><td>强项</td><td>多样化尝试、找到罕见的对解</td><td>在已有草稿上稳步纠错改进</td></tr>
+      <tr><td>失败模式</td><td>答案分散难聚合 / 投票被错误淹没</td><td>在一条死路上越改越歪</td></tr>
+      <tr><td>可并行性</td><td>天然可并行（低延迟）</td><td>串行依赖（高延迟）</td></tr>
+    </tbody>
+  </table>  <p>Snell 2024 的核心实证：<strong>最优的并行/串行配比随难度系统性变化，且二者混合的最优点优于纯用任一种</strong>。至于<em>哪种在易/难题上更优，取决于具体的聚合/搜索方式</em>——这是个微妙但重要的点：当并行用的是<strong>verifier 引导搜索</strong>（Snell 的设定）时，难题受益于它的系统化探索；而当并行退化为<strong>朴素多数投票</strong>时（本模块 notebook 的诚实玩具），它在<em>模型本就可靠的易题</em>上很强、却在难题（单样本正确率 < 0.5）上<strong>失效</strong>（错误答案会淹没投票），此时反而是串行修订更能救场。</p>  <p>无论哪个方向，结论一致且实用：<strong>没有一种 TTC 方式通吃所有难度，必须按题施策</strong>。这正是 notebook 让你亲手验证的——同一组方法，赢家随难度改变；一个会按难度在并行/串行（及其混合）间切换的系统，胜过任何「一刀切」。</p>  <p>落到工程，还有几条要点：①<strong>TTC 有真实成本</strong>（延迟、显存、$）——串行修订延迟高（必须等上一版），并行采样可批处理但占显存；②<strong>KV-cache 复用</strong>让并行采样的多条解能共享 prompt 的计算，大幅降本（这是推理服务 C24 的主题）；③<strong>早停</strong>——监控（如投票是否已收敛、verifier 分是否已足够高）来动态决定停不停，避免在已经笃定的题上浪费。</p>  <p>把整个模块收束成一句工程判断：<strong>TTC 是一个要『按题施策』地优化的资源——估难度、选并行/串行、分配预算、边际归零就停</strong>。一个会这么做的系统，能在同样算力下显著超过「对所有题一刀切」的朴素做法。这也是为什么 compute-optimal 推理是当前把推理模型<em>用好</em>（而非仅仅<em>训好</em>）的关键工程能力。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <p>测试时计算 scaling 是推理模型最年轻也最火的研究方向之一，开放问题密集：</p>  <ul>
+    <li><strong>TTC scaling 律的精确形式</strong>。准确率随测试时计算到底是对数线性、幂律还是别的？不同任务/方法的指数是多少？能否像预训练 scaling 律那样精确外推？Wu 2024 等在做，但远未定论。</li>
+    <li><strong>训练 vs 推理算力的最优分配</strong>。给定总算力（训练+推理一辈子），怎么分？训练越强、推理越省（能力内化）；但推理算力可按需、可只花在难题上。这个跨训练-推理的联合优化是大问题。</li>
+    <li><strong>难度估计</strong>。compute-optimal 高度依赖准确估计题目难度，但「不看答案怎么知道题有多难」本身就难。采样一致性、verifier 分布、轻量预测器各有局限，是活跃方向。</li>
+    <li><strong>把搜索内化进模型</strong>。R1 的一个洞察是：很多搜索能力可以通过 RL「训进」模型，使它推理时不需复杂外部搜索（一条长 CoT 内部就完成了探索/回溯）。「该外部搜索还是内化」的边界在移动。</li>
+    <li><strong>verifier 的可扩展性</strong>。TTC 的天花板常是 verifier（模块 04）。随测试时计算放大，verifier 的 hacking、标定、与策略的匹配会成为瓶颈——TTC scaling 的尽头可能是「verifier scaling」。</li>
+  </ul>  <p>站在全课的终点回望，测试时计算 scaling 带来的最深刻转变，是把「智能」从一个<strong>静态属性</strong>（模型有多大、训得多好）变成了一个<strong>动态过程</strong>（针对每个问题，花多少算力、怎么花）。这呼应了一个朴素却深刻的直觉：<em>人类解难题也是这样——简单的脱口而出，难的反复推敲、多方验证、必要时换个思路从头来</em>。o1/R1 范式让模型第一次有了这种「按需思考」的能力，而 compute-optimal 则是教会系统<strong>把这份思考用在最值钱的地方</strong>。理解这一点，你就不只是学会了几个 TTC 技巧，而是抓住了推理模型时代一个根本的范式：<strong>算力不再是预先固定的资产，而是一种要在训练与推理、易题与难题之间精打细算地调配的资源</strong>——这正是把前沿推理模型<em>用好</em>（而非仅仅<em>训好</em>）的核心能力。</p>  <div class="callout paper"><span class="label"></span>
+    <p>奠基与前沿：<strong>Snell 2024《Scaling LLM Test-Time Compute Optimally》</strong>（compute-optimal、串/并行、小模型+TTC vs 大模型——本模块主线）、<strong>Brown 2024《Large Language Monkeys》</strong>（重复采样的 scaling 与覆盖率）、<strong>Wu 2024</strong>（compute-optimal inference 的经验律）、<strong>OpenAI o1 博客</strong>（测试时计算 scaling 的范式宣告）。至此你走完了推理模型 RL 的全程：从结果奖励涌现长 CoT、GRPO 训练、PRM 过程奖励、verifier 搜索，到测试时计算的最优分配。回看 <code>index.html</code> 的课程地图，每一块都已亲手实现并对拍。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_verifier_search/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · Verifier 引导搜索</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

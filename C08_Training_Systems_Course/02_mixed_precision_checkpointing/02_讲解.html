@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 混合精度与重计算</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 07</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 混合精度与重计算</h1>
+  <p class="subtitle">fp16 / bf16 / fp8 各省多少、为什么 fp16 要 loss scaling、梯度累积怎么模拟大 batch、重计算怎么用算力换显存——四个技巧都是在“显存 / 算力 / 精度”间做交易。</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（显存四块账、算术强度）、浮点数表示常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_mixed_precision_checkpointing.ipynb（真实数据）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Micikevicius et al. 2018（Mixed Precision）；Chen et al. 2016（√L 重计算）；Micikevicius et al. 2022（FP8）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#fmt">浮点格式：fp32 / fp16 / bf16 / fp8</a></li>
+      <li><a href="#bf16">为什么现代训练偏爱 bf16</a></li>
+      <li><a href="#loss">Loss scaling：救 fp16 的下溢</a></li>
+      <li><a href="#bits">位级账例：同一个数 fp16 vs bf16</a></li>
+      <li><a href="#accum">梯度累积：用时间换 batch</a></li>
+      <li><a href="#ckpt">重计算与 √L 推导：用算力换显存</a></li>
+      <li><a href="#drill">三角权衡对比表 + 面试 drill</a></li>
+      <li><a href="#frontier">fp8、组合配方与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fmt"><span class="num">1</span>浮点格式：fp32 / fp16 / bf16 / fp8</h2>
+  <p>模块 01 反复出现“fp16=2 字节、fp32=4 字节”。这一章把浮点数本身拆开，才能理解为什么训练要混合着用好几种精度。一个浮点数 = <strong>符号位</strong> + <strong>指数位（决定范围）</strong> + <strong>尾数位（决定精度）</strong>。指数位多 → 能表示的数横跨更多数量级；尾数位多 → 同一个数能记得更准。</p>
+  <table>
+    <thead><tr><th>格式</th><th>位数</th><th>指数 / 尾数</th><th>动态范围</th><th>典型用途</th></tr></thead>
+    <tbody>
+      <tr><td>fp32</td><td>32</td><td>8 / 23</td><td>~1e±38</td><td>主权重、优化器状态</td></tr>
+      <tr><td>fp16</td><td>16</td><td>5 / 10</td><td>~6e±4（窄！）</td><td>计算，需 loss scaling</td></tr>
+      <tr><td>bf16</td><td>16</td><td>8 / 7</td><td>~1e±38（同 fp32）</td><td>计算，现代训练首选</td></tr>
+      <tr><td>fp8 (E4M3)</td><td>8</td><td>4 / 3</td><td>~448</td><td>前沿，H100 起</td></tr>
+    </tbody>
+  </table>
+  <p>核心洞见：<strong>fp16 和 bf16 都是 16 位、都省一半显存，但分位方式完全不同</strong>。fp16 把 5 位给指数、10 位给尾数（量程短、刻度密）；bf16 把 8 位给指数（和 fp32 一样宽）、只留 7 位给尾数（量程长、刻度粗）。fp8 再砍到 8 位，范围只到约 448，必须配精细的 per-tensor scaling 才训得稳（见前沿节）。</p>
+  <p>为什么少几位指数 / 尾数会让数字“记不准”或“够不着”？因为浮点数是<strong>用科学计数法存的</strong>：尾数记有效数字、指数记小数点挪到哪。指数位每多 1 位，可表示的数量级范围大致翻倍；尾数位每多 1 位，相邻两个可表示数之间的相对间隙减半。fp32 的 23 位尾数让它相对精度约 $10^{-7}$、8 位指数让它够到 $10^{\pm38}$；fp16 砍到 10 位尾数、5 位指数，于是精度尚可但量程一下缩到 $\pm6\times10^4$。这就是后面所有数值问题的根源。</p>
+  <div class="callout intuition"><span class="label"></span>
+    <p>把精度想成尺子：<strong>指数位 = 量程，尾数位 = 刻度密度</strong>。fp16 是“刻度密但量程短”的尺子，量程外的数非爆即归零；bf16 是“量程和 fp32 一样长、刻度粗一点”的尺子。训练里梯度跨好几个数量级，宁要量程够也不要刻度细——这一句话就预告了下一节的结论：现代训练几乎一律选 bf16。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bf16"><span class="num">2</span>为什么现代训练偏爱 bf16</h2>
+  <p>为什么现代训练几乎清一色用 bf16，而不是更“精确”的 fp16？答案是<strong>范围比精度重要</strong>。训练里的梯度天生跨越好几个数量级，量程不够会直接出灾难性的下溢 / 溢出，而刻度粗一点最多让收敛略糙。</p>
+  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>fp16 像一把刻度极密但量程很短的尺子——量程外的大数直接“爆表”（溢出成 inf），极小的数直接“归零”（下溢成 0）。bf16 量程和 fp32 一样长，只是刻度粗了点。训练宁可“偶尔读不准小数点后几位”，也不能“整个梯度归零导致参数不更新”。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>fp16 最大正规数 ≈ 65504，最小正规数 ≈ 6e-5。训练中梯度常落在 1e-7 量级 → 下溢为 0 → 该参数得不到更新。bf16 的 8 位指数使其动态范围 ≈ fp32（最小正规数约 1e-38），几乎不会下溢，因此<strong>不需要 loss scaling</strong>——这正是它在现代训练栈里取代 fp16 的主因。</p></div>
+  </div>
+  <p>注意一个常被混淆的点：<strong>即便用 bf16 计算，主权重和优化器状态仍保 fp32</strong>。原因是参数更新 $w \mathrel{+}= -\eta\, g$ 里，$\eta g$ 往往比 $w$ 小好几个数量级，若在 bf16（7 位尾数）上累加，微小更新会被舍入“吃掉”，等于没更新。这就是模块 01 那 4 字节 fp32 主权重的由来。</p>
+  <p>举个具体的“吞更新”场景：设 $w=1.0$、单步更新 $\eta g = 0.0003$。在 bf16 上，$1.0$ 的下一个可表示数大约是 $1.0078$（相对间隙约 $2^{-7}$），而 $0.0003$ 远小于这个间隙，于是 $1.0 + 0.0003$ 被舍回 $1.0$——更新<strong>整个被丢掉</strong>。积累上万步后，本该缓慢漂移的权重纹丝不动。fp32 主权重的相对间隙是 $2^{-23}$，能稳稳吃下这种微小更新，等更新累到一定幅度再把 fp32 主权重舍成 bf16 副本去做下一轮前向。这就是“bf16 算、fp32 攒”这套配方的精确含义。</p>
+  <div class="callout warn"><span class="label"></span>
+    <p>常见误区：“bf16 比 fp16 更先进所以更准”。错——<strong>bf16 精度其实更差</strong>（尾数 7 位 vs fp16 的 10 位）。bf16 胜出靠的是<em>范围</em>，不是精度。选型口诀：有 bf16 硬件（A100/H100/TPU）就用 bf16、免 loss scaling；只有老硬件（V100 仅 fp16）才退回 fp16 + loss scaling。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="loss"><span class="num">3</span>Loss scaling：救 fp16 的下溢</h2>
+  <p>如果硬件只有 fp16（比如 V100），就必须用 <span class="term">loss scaling</span> 把梯度从下溢区救回来。思路极简：反向传播之前，把 loss 乘一个大常数 $s$，让<strong>整条梯度</strong>等比放大到 fp16 能表示的范围；等梯度安全转回 fp32 后，更新前再除回 $s$。</p>
+  <div class="math-block">\[g_{\text{fp16}}=\nabla(s\cdot L)=s\cdot\nabla L\ \Longrightarrow\ \text{真实梯度}=g_{\text{fp16}}/s\]</div>
+  <p>为什么乘一个常数就能救？因为乘法对加法是<strong>线性</strong>的：把 loss 整体放大 $s$ 倍，反向传播每一步的梯度都按链式法则同步放大 $s$ 倍，相对大小完全不变，只是整体平移到了 fp16 表示得了的区间。更新前除回 $s$，数学上和没缩放完全等价，只是中途避开了下溢。</p>
+  <h4>动态 loss scaling 的状态机</h4>
+  <p><span class="term">dynamic loss scaling</span> 不需要手调 $s$：从一个很大的 $s$（如 $2^{16}$）开始，按规则自适应——</p>
+  <ol>
+    <li>正常一步：梯度无 inf/nan → 照常用 $g/s$ 更新；连续若干步（如 2000 步）都正常 → 把 $s$ 翻倍，试探更大的安全缩放。</li>
+    <li>溢出一步：梯度出现 inf/nan → 说明 $s$ 太大，把 $s$ 减半、并<strong>跳过这一步更新</strong>（这步梯度作废）。</li>
+  </ol>
+  <p>为什么不直接把 $s$ 设到一个超大固定值一劳永逸？因为缩放是<strong>双刃</strong>的：$s$ 太小救不回小梯度（仍下溢），$s$ 太大又会把大梯度顶出 fp16 上限（溢出成 inf）。理想的 $s$ 要让<strong>最大的那个梯度刚好贴着 65504 而不越界</strong>——但梯度幅度在训练中不断变化，没有一个固定值能始终最优，所以才需要动态调整去“贴着天花板走”。</p>
+  <div class="callout danger"><span class="label"></span>
+    <p>worked 例：某权重梯度真实值 ≈ <code>1e-8</code>，在 fp16 下小于最小正规数 6e-5 → 下溢为 0 → 参数永远不更新。取 loss scale <code>s=1024≈2^{10}</code>，梯度被抬到 <code>≈1.0e-5</code>，落入 fp16 可表示区间，更新前再 ÷1024 还原。<strong>漏掉 loss scaling，这个参数在整个训练里都是死的</strong>，而你从 loss 曲线上几乎看不出来——这是 fp16 训练最隐蔽的坑。这也是为什么 bf16 一出现就迅速取代 fp16：它根本不需要这套精巧又易错的缩放机制。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bits"><span class="num">4</span>位级账例：同一个数 fp16 vs bf16</h2>
+  <p>同一个数在 fp16 和 bf16 下的行为差异，是理解上一节的关键。这里把它摆成具体数字。</p>
+  <table>
+    <thead><tr><th>数值</th><th>fp16（5e/10m）</th><th>bf16（8e/7m）</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>1e-8（小梯度）</td><td>下溢为 0</td><td>可表示（约 2 位有效数）</td><td>fp16 量程不够 → 归零；bf16 量程同 fp32 → 安全</td></tr>
+      <tr><td>1e-8 经 s=1024 缩放</td><td>≈1.0e-5，可表示</td><td>无需缩放</td><td>loss scaling 专为 fp16 而生</td></tr>
+      <tr><td>3.14159（普通数）</td><td>≈3.1406（误差约 3e-4）</td><td>≈3.141（误差约 2e-3）</td><td>fp16 尾数更长 → 这里更准；bf16 更粗</td></tr>
+      <tr><td>70000（大激活）</td><td>溢出为 inf</td><td>可表示</td><td>fp16 上限 65504</td></tr>
+    </tbody>
+  </table>
+  <p>把这张表读成一句话：<strong>fp16 在它够得着的区间内更准，但够得着的区间太窄</strong>；bf16 牺牲了刻度密度，换来和 fp32 一样宽的量程。训练里梯度有时小到 1e-8、激活有时大到上万，量程比那点小数点后的精度重要得多——所以现代训练选 bf16。</p>
+  <div class="callout intuition"><span class="label"></span>
+    <p>一句话记牢：<strong>fp16 怕太小（下溢）和太大（溢出），bf16 不怕量程只怕精度</strong>。loss scaling 是给 fp16 打的“量程补丁”，bf16 因为量程本来就够，根本不需要这块补丁。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="accum"><span class="num">5</span>梯度累积：用时间换 batch</h2>
+  <p>第三个技巧解决另一个矛盾：<strong>想用大 batch（稳定、利用率高），但显存放不下</strong>。<span class="term">gradient accumulation</span>（梯度累积）用<strong>时间换 batch</strong>：把一个大 batch 拆成 $k$ 个 <span class="term">micro-batch</span>，逐个前向 + 反向、<strong>把梯度累加进同一个缓冲但不更新</strong>，攒满 $k$ 个再更新一次。</p>
+  <div class="math-block">\[g=\frac1{kB}\sum_{i=1}^{k}\sum_{j\in\text{micro}_i}\nabla\ell_j \quad(\text{等价于 batch size}=kB)\]</div>
+  <p>为什么严格等价于一个 $kB$ 的大 batch？因为梯度对样本是<strong>可加的（线性）</strong>：一个 $kB$ 大 batch 的平均梯度，等于把 $kB$ 个样本的梯度求和再除以 $kB$；而梯度累积正是把这 $kB$ 个样本分 $k$ 批求和、最后除以 $kB$——求和顺序不影响结果，逐元素完全相等。代价仅仅是多花了 $k$ 倍的前向反向时间；峰值 activation 只需容纳一个 micro-batch（$B$ 而非 $kB$），显存就省下来了。</p>
+  <p>要强调“严格等价”是有边界的：它对 loss 与梯度的<strong>线性</strong>部分成立，但对一切<strong>跨样本统计</strong>的算子不成立。最典型的是 BatchNorm——它在一个 batch 内算均值方差，micro-batch 只看到 $B$ 个样本的统计，与真正 $kB$ 个样本的统计不同，于是梯度累积<strong>不能</strong>无损模拟带 BN 的大 batch。所幸现代 Transformer 用的是 LayerNorm / RMSNorm（逐样本归一化，不跨 batch），所以梯度累积在 LLM 训练里才是严格无损的。这也是面试里一个能立刻区分深浅的追问点。</p>
+  <p>一个具体数字感受省了多少：想要等效 batch 256，但单卡 activation 只放得下 batch 32。取 $k=8$ 个 micro-batch（$8\times32=256$），峰值 activation 只按 32 计——只占大 batch 直接跑所需 activation 的 $1/8$，而梯度逐元素等于那个放不下的 256 大 batch。代价是这一步的墙钟时间约为 8 倍（要跑 8 次前向反向）。这就是“用时间换显存”最干净的一个例子：显存峰值降 8 倍，吞吐降 8 倍，数学结果分毫不差。</p>
+  <div class="callout warn"><span class="label"></span>
+    <p><strong>最常见、最隐蔽的 bug：忘记按总样本数归一化。</strong>梯度必须除以总样本数 $kB$：要么每个 micro-batch 的 loss 先除以 $k$ 再反向，要么累加完梯度后整体除以 $k$。漏了这步，累加出来的梯度是真梯度的 $k$ 倍 → <strong>等效学习率被悄悄放大 $k$ 倍</strong>，训练要么发散要么诡异不收敛。notebook 里你会逐元素验证“累积梯度 == 真大 batch 梯度”，亲眼看到漏归一时差出的那个 $k$ 倍因子。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ckpt"><span class="num">6</span>重计算与 √L 推导：用算力换显存</h2>
+  <p>最后一个、也是省 activation 最狠的技巧：<span class="term">activation checkpointing</span>（重计算）。模块 01 说 activation 随层数线性涨、长上下文先爆——重计算直接把它从 $O(L)$ 压到 $O(\sqrt{L})$，代价是反向时多做一次前向（算力约 +33%）。</p>
+  <h4>为什么是 √L</h4>
+  <p>把 $L$ 层切成约 $\sqrt{L}$ 段、每段约 $\sqrt{L}$ 层。前向时<strong>只保存每段边界处的 activation（checkpoint）</strong>、丢掉段内所有中间 activation。反向走到某一段时，从该段左边界的 checkpoint<strong>重新前向算一遍这段内部</strong>、拿到所需的中间 activation 再做反向。</p>
+  <div class="math-block">\[\text{显存}:\ \underbrace{\sqrt{L}}_{\text{存的 checkpoint 数}}+\underbrace{\sqrt{L}}_{\text{当前段内重算的临时}}=O(\sqrt{L}),\qquad \text{算力}\approx 1\times\text{前向}+\underbrace{1\times}_{\text{重算}}\Rightarrow \approx 1.33\times\]</div>
+  <p>额外算力为什么只 +33% 而不是翻倍？因为一次完整训练 = 1 次前向 + 约 2 次前向当量的反向（反向比前向贵约一倍），共约 3 份前向当量；重计算只是把段内前向<strong>再算一遍</strong>，多出约 1 份，于是 $4/3 ≈ 1.33$。</p>
+  <p>为什么是 $\sqrt L$ 这个分段数最优、而不是 2 段或 $L$ 段？这是一道一元优化题：设分成 $g$ 段，则要存的段边界 checkpoint 数约 $g$，反向时每次重算一段、段内临时 activation 约 $L/g$，峰值显存约 $g + L/g$。对 $g$ 求极小，$g=\sqrt L$ 时取最小值 $2\sqrt L$。段太少（如 $g=2$）则段内重算的临时 activation 太多（$L/2$）；段太多（如 $g=L$，每层一个 checkpoint）则 checkpoint 本身又占满。$\sqrt L$ 是这两股压力的平衡点——这也是为什么经典结论写成 $O(\sqrt L)$ 而非别的幂次。</p>
+  <div class="ascii"> 普通：    存所有层 activation        -&gt; 显存 O(L)，反向不重算
+ 重计算：  只存 √L 个段边界 checkpoint -&gt; 显存 O(√L)，反向多一次前向（算力 +~33%）
+ ──────────────────────────────────────────────────────────
+ 经典权衡：activation 显存 O(L) → O(√L)，代价 ~1.33× 前向算力</div>
+  <table>
+    <thead><tr><th>层数 $L$</th><th>不重计算（存 $L$ 份）</th><th>$\sqrt L$ 重计算峰值（约 $2\sqrt L$ 份）</th><th>降幅</th></tr></thead>
+    <tbody>
+      <tr><td>24（pythia-6.9b）</td><td>24 份</td><td>约 10 份</td><td>约 2.4×</td></tr>
+      <tr><td>48（约 12b 规模）</td><td>48 份</td><td>约 14 份</td><td>约 3.4×</td></tr>
+      <tr><td>96（超深）</td><td>96 份</td><td>约 20 份</td><td>约 4.8×</td></tr>
+    </tbody>
+  </table>
+  <p>注意降幅随 $L$ 变大而变大（$L/2\sqrt L=\sqrt L/2$）——<strong>模型越深，重计算越划算</strong>。这也解释了为什么它几乎是深层 / 长上下文训练的标配：付出固定的约 +33% 算力，换来随深度增长的显存收益。</p>
+  <div class="callout intuition"><span class="label"></span>
+    <p>worked：$L=48$ 层（约 pythia-12b 规模）。不开重计算要存 48 层的 activation；开了之后峰值只约 <code>2√48 ≈ 14</code> 份（约 7 个段边界 checkpoint + 段内重算的临时），activation 显存降约 3 倍，而总算力只多约三分之一。这就是为什么超长上下文 / 超深模型训练几乎必开重计算。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="drill"><span class="num">7</span>三角权衡对比表 + 面试 drill</h2>
+  <p>这一章四个技巧本质都是<strong>在“显存 / 算力 / 精度”三者间做交易</strong>。系统优化的全部艺术，就是认清你手里哪种资源最紧、然后用最不紧的那种去换它。把这张权衡表和高频面试题背熟，就能临场组合出可行配方——而不是看到 OOM 就只会“加卡”。</p>
+  <table>
+    <thead><tr><th>技巧</th><th>换什么</th><th>省什么</th><th>代价 / 风险</th></tr></thead>
+    <tbody>
+      <tr><td>混合精度（bf16/fp16）</td><td>用精度</td><td>省一半权重 + 激活显存、提速</td><td>精度略降；fp16 需 loss scaling</td></tr>
+      <tr><td>loss scaling</td><td>用一点计算</td><td>保住 fp16 下的小梯度不下溢</td><td>只为 fp16；调度不当会反复跳步</td></tr>
+      <tr><td>梯度累积</td><td>用时间（$k$ 倍前反向）</td><td>用小显存模拟大 batch</td><td>漏归一 → 等效 lr 放大 $k$ 倍</td></tr>
+      <tr><td>activation 重计算</td><td>用算力（+约 33%）</td><td>activation 显存 $O(L)$→$O(\sqrt L)$</td><td>训练变慢约三分之一</td></tr>
+    </tbody>
+  </table>
+  <h4>面试 drill</h4>
+  <ol>
+    <li><strong>“fp16 还是 bf16？”</strong> 有 bf16 硬件就 bf16（免 loss scaling）；只有 fp16 硬件才退回 fp16 + 动态 loss scaling。</li>
+    <li><strong>“为什么 bf16 不需要 loss scaling？”</strong> 8 位指数 → 动态范围 ≈ fp32 → 梯度几乎不下溢，自然不用把它抬上去。</li>
+    <li><strong>“梯度累积忘了归一会怎样？”</strong> 梯度变 $k$ 倍，等效学习率被放大 $k$ 倍，训练发散或诡异不收敛。</li>
+    <li><strong>“重计算代价多少？”</strong> 显存 $O(L)$→$O(\sqrt L)$，算力约 +33%（多一次段内前向）。</li>
+  </ol>
+  <p>把这四个技巧串成一个真实决策场景：你要在一张 80GB A100 上全量微调一个 7B 模型、且要长上下文。先上 <strong>bf16</strong>（免 loss scaling）把权重 + 激活砍半；activation 仍然爆，开 <strong>重计算</strong>把它压一个数量级（接受 +33% 算力）；想要等效大 batch 但显存不够，再叠 <strong>梯度累积</strong>用时间换 batch。三招叠完还放不下，才轮到下一章的多卡并行。<strong>这套“先单卡榨干、再考虑多卡”的顺序</strong>，就是工程师面对 OOM 时该有的条件反射，也是这两章合起来要教给你的核心判断。</p>
+  <div class="callout danger"><span class="label"></span>
+    <p>四个高频陷阱：①<strong>fp16 必须配 loss scaling</strong>，直接用必下溢；②<strong>梯度累积漏归一 → lr 被放大 k 倍</strong>；③重计算<strong>不是免费的，约 +33% 算力</strong>；④<strong>fp8 需要精细的 per-tensor scaling</strong>，范围只到约 448，不能像 bf16 那样无脑切换。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>fp8、组合配方与开放问题</h2>
+  <p>前沿在两个方向上继续压这本账：<strong>更低精度</strong>和<strong>更聪明的重计算</strong>；而真实大模型训练则是把本章四个技巧<strong>叠在一起</strong>用。</p>
+  <p>低精度的总趋势是<strong>每砍一半位宽，显存和带宽各省一半</strong>，但代价是数值越来越脆。fp32 → bf16 是免费午餐（范围不变、精度够用）；bf16 → fp8 就开始要工程（per-tensor scaling）；再往下 fp4 / int4 基本只敢用在<strong>推理</strong>（模块 05 量化），训练侧仍是开放难题。为什么训练比推理更怕低精度？因为训练要靠微小梯度的长期累积，精度噪声会被反复放大；推理是一次性前向，单次舍入误差不累积。这条“训练保精度、推理可激进”的不对称，是贯穿全课的一条暗线。</p>
+  <h4>fp8 训练与组合配方</h4>
+  <ul>
+    <li><strong>fp8 训练</strong>（H100 Transformer Engine）：前向 / 反向用 fp8（E4M3/E5M2），配<span class="term">per-tensor scaling</span>（每个张量单独缩放）把数值压进 fp8 那约 448 的窄范围，再省一半显存与带宽。前沿但对数值极敏感。</li>
+    <li><strong>组合使用</strong>：真实配方常是 <code>bf16 计算 + fp32 主权重 + 梯度累积 + 全量重计算 + ZeRO 分片（模块 03）</code> 一起上，把显存账压到目标卡装得下。</li>
+    <li><strong>selective recomputation</strong>（Korthikanti et al. 2022）：不无脑全量重计算，而是<strong>只重算便宜的算子</strong>（如注意力里的 softmax / dropout），保留贵的 matmul 结果，在“省显存”和“少加算力”之间取更优点。</li>
+    <li><strong>对评测的意义</strong>：推理常用 fp16/bf16，量化（模块 05）再降到 int8/int4。你要能判断某精度下“省了多少、可能损失什么”。</li>
+  </ul>
+  <h4>开放问题</h4>
+  <ul>
+    <li>fp8 乃至 fp4 训练的稳定边界在哪？哪些层 / 算子可以低精度、哪些必须保高精度，目前仍多靠经验与逐张量 scaling。</li>
+    <li>重计算策略的最优解是个组合优化问题（哪些层设 checkpoint、哪些算子重算），自动搜索（基于显存 / 算力预算的求解器）尚未标准化。</li>
+    <li>低精度训练 + 量化推理叠加后，评测分数的下降到底归因于哪一环，缺乏可分解、可复现的归因方法。</li>
+  </ul>
+  <div class="callout paper"><span class="label"></span>
+    <p>本章三篇地基论文：</p>
+  <ul>
+    <li>Micikevicius et al. 2018 — <em>Mixed Precision Training</em>（fp16 + fp32 主权重 + loss scaling 的原始配方）。</li>
+    <li>Chen et al. 2016 — <em>Training Deep Nets with Sublinear Memory Cost</em>（$O(\sqrt L)$ 重计算）。</li>
+    <li>Micikevicius et al. 2022 — <em>FP8 Formats for Deep Learning</em>（E4M3/E5M2 与 per-tensor scaling）。</li>
+  </ul>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_memory_roofline/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 显存解剖与 Roofline</div></a>
+    <a class="next" href="02_mixed_precision_checkpointing.ipynb"><div class="dir">下一模块 →</div><div class="t">打开配套练习</div></a>
+  </div>
+
+</div>
+</body>
+</html>

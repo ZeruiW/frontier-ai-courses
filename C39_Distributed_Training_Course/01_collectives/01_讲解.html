@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 集合通信原语</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 集合通信原语</h1>
+  <p class="subtitle">all-reduce / all-gather / reduce-scatter / broadcast / all-to-all 的语义、带宽最优的 ring all-reduce 算法、α-β 成本模型 —— 一切并行共用的通信积木</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、矩阵/向量、一点点网络带宽/延迟常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_collectives.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Patarasuk & Yuan 2009（ring all-reduce）、Thakur 2005（collective 算法）、NCCL 文档</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么是集合通信</a></li>
+      <li><a href="#prims">五个核心原语：语义先于实现</a></li>
+      <li><a href="#naive">朴素 all-reduce 为什么不够好</a></li>
+      <li><a href="#ring">Ring all-reduce：带宽最优算法</a></li>
+      <li><a href="#cost">通信成本模型：α-β 模型</a></li>
+      <li><a href="#others">其余原语与它们的用武之地</a></li>
+      <li><a href="#run">把它跑起来：从语义到可验证实现</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么是集合通信</h2>
+  <p>分布式训练里，单卡之内的计算我们已经会了（C36 讲单卡内核、C08 讲单卡成本）。多卡之间唯一新增的东西，是<strong>通信</strong>——卡与卡之间交换、聚合数据。而几乎所有分布式训练的通信，都不是任意的点对点收发，而是一小撮<strong>结构化的、一组进程共同参与</strong>的模式，叫 <span class="term">collective communication</span>（集合通信）。把这几个原语吃透，上层所有并行（数据并行、张量并行、FSDP）就只是它们的不同组合。</p>  <p>为什么是「集合」而不是逐对收发？因为深度学习的通信天生是<em>全体一起做同一件事</em>：所有 rank 的梯度要一起求平均、所有 rank 的参数分片要一起拼成完整权重。把这些固化成少数几个原语，好处有三：一是<strong>语义清晰</strong>（一行 <code>all_reduce</code> 胜过手写一堆 send/recv）；二是<strong>可被高度优化</strong>（NCCL 能针对每个原语选最优算法与拓扑）；三是<strong>可被成本建模</strong>（每个原语的通信量有清晰公式，是你预测扩展性的依据）。本模块就讲清这几个原语的<strong>语义</strong>、最重要的 <strong>ring all-reduce 算法</strong>、以及它们的<strong>带宽-延迟成本模型</strong>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>分布式训练的通信 = 几个集合原语的组合，而每个原语都有确定的语义和确定的成本</strong>。学完你看任何并行策略，都能一眼拆出「它用了哪些 collective、各搬多少字节」——这正是判断一个并行策略能不能扩、扩到几张卡开始划不来的硬标尺。</p>
+  </div>  <p>再换个角度看为什么通信是唯一的新东西：单卡训练里，前向、反向、参数更新都在一块芯片的内存里完成，数据从不离开这张卡。一旦上多卡，每一步都会冒出一个新问题——<em>我需要的数据在别的卡上</em>。数据并行里，我算出的梯度只是基于我那份数据的，要得到全局梯度必须把所有卡的梯度<strong>加起来</strong>；FSDP 里，我要用的那层参数被切走了大半，前向前必须先把它<strong>拼回来</strong>。这些「把散在各卡的数据聚合/搬运到位」的动作，无一例外都落在那几个集合原语上。所以掌握分布式训练，本质上就是掌握：<strong>我这一步需要哪些不在本地的数据、该用哪个 collective 把它弄到手、代价多大</strong>。</p>  <p>本课用 numpy 把每个 rank 模拟成<strong>一个列表元素</strong>（第 r 个元素 = 第 r 个 rank 的张量）。于是每个集合原语都成了一个对列表的纯函数：我们既能验证它的<em>语义正确</em>（与单进程参考对拍），又能数出它的<em>通信量</em>（搬了多少字节、几步）。真实世界里这些操作跨网络并发发生、由 NCCL 用 ring/tree 算法实现；我们把它们摊在一个进程里串行跑出来，结构与账完全一致——你在 numpy 里确认「梯度求和没少除一个 W」「分片拼回来没错位」，换到 NCCL 上这些逻辑就是对的，剩下的只是把「串行 + 单进程」换成「并发 + 跨网络」，而那部分框架替你包办。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="prims"><span class="num">2</span>五个核心原语：语义先于实现</h2>
+  <h3>五个核心原语：语义先于实现</h3>  <p>先建立<strong>语义</strong>（每个原语做什么、输入输出是什么形状），实现与成本随后。下表是分布式训练最常用的五个，配本课的 numpy 模拟与真实 API：</p>  <table>
+    <thead><tr><th>原语</th><th>语义（W 个 rank，每 rank 一个张量）</th><th>本课 numpy 模拟</th><th>torch.distributed</th></tr></thead>
+    <tbody>
+      <tr><td><strong>broadcast</strong></td><td>把 root 的张量复制到所有 rank</td><td>把一个数组拷给列表每个元素</td><td>dist.broadcast</td></tr>
+      <tr><td><strong>reduce</strong></td><td>把所有 rank 的张量聚合（如求和）到 root</td><td>列表求和，只给 root</td><td>dist.reduce</td></tr>
+      <tr><td><strong>all-reduce</strong></td><td>聚合后<em>每个</em> rank 都拿到结果</td><td>列表求和后广播回每个元素</td><td>dist.all_reduce</td></tr>
+      <tr><td><strong>all-gather</strong></td><td>每 rank 贡献一片，每 rank 都拿到拼好的全体</td><td>把各元素拼成大数组发给每个</td><td>dist.all_gather</td></tr>
+      <tr><td><strong>reduce-scatter</strong></td><td>聚合后把结果切片，每 rank 只拿自己那片</td><td>求和后切片，第 r 个拿第 r 片</td><td>dist.reduce_scatter</td></tr>
+      <tr><td><strong>all-to-all</strong></td><td>每 rank 把数据按目标切块、彼此交换</td><td>矩阵转置式的块重排</td><td>dist.all_to_all</td></tr>
+    </tbody>
+  </table>  <p>这里有一组<strong>对偶关系</strong>值得记牢，它是后面一切的钥匙：<span class="term">all-gather</span> 与 <span class="term">reduce-scatter</span> 互为对偶（一个把片拼成整体、一个把整体的聚合切成片），而它们<strong>接力组合恰好等于</strong> <span class="term">all-reduce</span>：先 reduce-scatter（每 rank 得到自己那片的全局聚合），再 all-gather（把各片拼回每 rank 都有的完整聚合）。</p>  <div class="math-block">\[\textbf{all-reduce} \;=\; \textbf{reduce-scatter} \;\circ\; \textbf{all-gather}\]</div>  <p>理解这些原语时，有两个维度帮你快速定位：<strong>一是「聚合还是搬运」</strong>——reduce/all-reduce/reduce-scatter 会对数据做<em>算子运算</em>（求和、求最大），而 broadcast/gather/all-gather/all-to-all 只<em>搬运</em>数据不做运算；<strong>二是「结果给谁」</strong>——带 all- 的给所有 rank，不带的只给 root。把一个原语放进这张 2×2 的网格，它的语义就一目了然了。比如 reduce-scatter = 「做聚合 + 结果切片分给所有 rank」，all-gather = 「不做运算 + 拼好给所有 rank」，二者一聚合一搬运、却都「给所有 rank」，互为对偶正源于此。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么要拆 all-reduce？因为这个分解既是 <strong>ring all-reduce 的实现骨架</strong>（下一节），又是 <strong>ZeRO/FSDP 的工作原理</strong>（模块 02）：ZeRO 让每个 rank 只对自己负责的那片参数做更新，正好用 reduce-scatter 拿到自己那片的梯度聚合、更新后再 all-gather 拼回完整参数。一个恒等式，串起本课两个模块——这就是为什么我们如此强调它。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="naive"><span class="num">3</span>朴素 all-reduce 为什么不够好</h2>
+  <h3>朴素 all-reduce 为什么不够好</h3>  <p>最直观的 all-reduce 实现是<strong>汇聚-广播</strong>：所有 rank 把张量发给 rank0，rank0 求和，再把结果广播回所有 rank。它对，但有两个致命问题。</p>  <p>第一，<strong>rank0 成为瓶颈</strong>：所有数据都涌向一个节点，它的入口带宽被 W−1 份数据挤爆，出口又要发 W−1 份。总搬运量是 <code>2(W−1)S</code>（S 为张量大小），且全压在一条链路上。第二，<strong>其余节点的带宽闲置</strong>：通信时只有 rank0 在忙，其他节点的网卡大部分时间空着。在一个有 W 条高速链路的集群上，这等于只用了其中一两条。</p>  <div class="ascii">朴素 all-reduce（汇聚到 rank0 再广播）：rank0 是热点
+
+  rank1 ─┐                         ┌─&gt; rank1
+  rank2 ─┼─&gt; [rank0 求和] ─广播──┼─&gt; rank2     rank0 收 W-1 份、发 W-1 份
+  rank3 ─┘     ↑瓶颈              └─&gt; rank3     其余节点链路大多闲置
+
+  总搬运量 2(W-1)·S，且集中在 rank0 的链路上 -&gt; 不随 W 摊薄</div>  <p>更要命的是<strong>可扩展性</strong>：朴素版的总搬运量 <code>2(W−1)S</code> 随 W<em>线性增长</em>，而这些字节全要挤过 rank0 那一条链路。把卡数从 8 加到 800，rank0 要收发的数据多了 100 倍，它的链路成了死结——这意味着朴素 all-reduce<strong>根本扩不动</strong>，加卡反而更慢。深度学习要在成百上千张卡上做数据并行，绝不能让通信成本随卡数这样膨胀；我们需要的是<em>每张卡的通信量与卡数几乎无关</em>的算法。</p>  <p>我们想要的是一个<strong>没有热点、把所有链路都用满、且每个 rank 的收发量不随 W 爆炸</strong>的算法。答案是把 rank 排成一个<strong>环</strong>，让每个 rank 只和左右邻居通信、<em>同时收同时发</em>（双向链路全用上），数据像击鼓传花一样绕环流动、边传边累加——这就是 <span class="term">ring all-reduce</span>，NCCL 在大张量上的默认选择。它的精妙之处在于：把一次大规模聚合，拆成大量「只和邻居换一小片」的本地通信，从而既消灭了热点，又让每张卡的负担封顶。</p>  <div class="callout warn"><span class="label"></span>
+    <p>不要把「朴素 all-reduce」一棍子打死。在<strong>张量很小</strong>时，决定耗时的是<em>延迟（步数）</em>而非带宽，这时步数少的 tree/递归倍增反而更快。ring 是<strong>带宽最优</strong>（大张量好），tree 是<strong>延迟最优</strong>（小张量好）。NCCL 会按消息大小自动切换——这正是下一节成本模型要量化的取舍。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ring"><span class="num">4</span>Ring all-reduce：带宽最优算法</h2>
+  <h3>Ring all-reduce：带宽最优的环形算法</h3>  <p>把 W 个 rank 排成逻辑环：rank r 的右邻是 <code>(r+1) % W</code>，左邻是 <code>(r-1) % W</code>。把每个 rank 的张量切成 <strong>W 个等份</strong>（chunk）。算法分两个阶段，各 <code>W−1</code> 步，每步每个 rank 只发一个 chunk给右邻、从左邻收一个 chunk。</p>  <p><strong>阶段一：reduce-scatter</strong>（W−1 步）。第 k 步，rank r 把自己当前持有的某个 chunk 发给右邻、并把从左邻收到的 chunk<em>加到</em>自己对应的 chunk 上。精心安排发送顺序后，W−1 步结束时，每个 rank r 恰好持有<strong>第 r 个 chunk 的全局总和</strong>（其它 chunk 是部分和）。这正是 reduce-scatter 的语义：聚合后每人拿一片。</p>  <p><strong>阶段二：all-gather</strong>（W−1 步）。现在每个 rank 手里有一个<em>已完成</em>的 chunk（全局和）。再绕环传 W−1 步，每步把手里完整的 chunk 传给右邻、收下左邻的完整 chunk，W−1 步后每个 rank 就集齐了所有 W 个完整 chunk——拼起来就是完整的全局和。这正是 all-gather。两阶段合起来 = all-reduce，呼应上一节的恒等式。</p>  <div class="ascii">Ring all-reduce（W=4，张量切成 4 个 chunk）
+
+  逻辑环:  rank0 -&gt; rank1 -&gt; rank2 -&gt; rank3 -&gt; (回到 rank0)
+
+  阶段一 reduce-scatter (3 步): 每步发1个chunk给右邻并累加左邻来的
+     3 步后: rank_r 持有 chunk_r 的全局总和（其余是部分和）
+  阶段二 all-gather (3 步): 把完成的 chunk 绕环传一圈
+     3 步后: 每个 rank 都集齐 4 个完整 chunk = 完整全局和
+
+  每个 rank 每步只发 S/W 字节，共 2(W-1) 步 -&gt; 收发 2(W-1)/W·S ≈ 2S</div>  <div class="math-block">\[\text{每 rank 收发字节} \;=\; 2\,(W-1)\cdot\frac{S}{W} \;=\; 2\,S\,\frac{W-1}{W} \;\xrightarrow{W\to\infty}\; 2S\]</div>  <div class="callout intuition"><span class="label"></span>
+    <p>ring 的魔力全在这条公式：<strong>每个 rank 的收发量是 2S(W−1)/W，上界 2S，与 W 几乎无关</strong>。把卡数从 8 加到 8000，每张卡的通信量几乎不变（都接近 2 倍张量大小）！这就是为什么数据并行能扩到成千上万张卡——梯度 all-reduce 的<em>每卡</em>成本不爆炸。代价是步数 2(W−1) 随 W 线性增长（延迟敏感），所以小张量时 ring 不划算——又回到「带宽最优 vs 延迟最优」的取舍。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost"><span class="num">5</span>通信成本模型：α-β 模型</h2>
+  <h3>通信成本模型：α-β 模型</h3>  <p>要预测一个 collective 要花多久、一个并行策略能不能扩，需要一个简单的成本模型。经典的是 <span class="term">α-β 模型</span>（也叫 latency-bandwidth 模型）：传一条 n 字节的消息耗时</p>  <div class="math-block">\[T(n) \;=\; \alpha \;+\; \beta \, n\]</div>  <p>其中 <strong>α 是延迟</strong>（latency，每条消息的固定开销：建立连接、发起传输的微秒级成本），<strong>β 是每字节传输时间</strong>（= 1/带宽）。一次通信的总耗时 ≈ <strong>步数 × α + 总字节 × β</strong>。这两项分别主导两个极端：消息小则 α（步数）说了算，消息大则 β（字节）说了算。</p>  <p>用它比较两种 all-reduce 就一目了然。设张量 S 字节、W 个 rank：</p>  <table>
+    <thead><tr><th>算法</th><th>步数（→ α 项）</th><th>每 rank 字节（→ β 项）</th><th>总耗时（α-β）</th><th>适合</th></tr></thead>
+    <tbody>
+      <tr><td>朴素汇聚-广播</td><td>2（但热点串行）</td><td>≈ 2(W−1)S（压在 root）</td><td>受 root 链路限制</td><td>几乎不用</td></tr>
+      <tr><td><strong>ring</strong></td><td>2(W−1)</td><td>2S(W−1)/W ≈ 2S</td><td>2(W−1)α + 2Sβ</td><td><strong>大张量</strong>（β 主导）</td></tr>
+      <tr><td>recursive doubling / tree</td><td>2·log₂W</td><td>≈ 2S</td><td>2log₂W·α + 2Sβ</td><td><strong>小张量</strong>（α 主导）</td></tr>
+    </tbody>
+  </table>  <p>结论很清晰：<strong>大张量用 ring</strong>（步数项 2(W−1)α 被巨大的 2Sβ 淹没，而 ring 的 β 项最优），<strong>小张量用 tree</strong>（2log₂W 步比 2(W−1) 步少得多，省下大量 α）。NCCL 正是据此按消息大小自动选算法——你不必手选，但<em>理解这个取舍</em>能帮你判断：为什么把很多小梯度<strong>攒成大 bucket</strong>再 all-reduce 会更快（把通信从 α 主导推到 β 主导，并摊薄固定开销），这正是 DDP 梯度分桶（模块 02）的理论依据。</p>  <div class="callout danger"><span class="label">带宽不是均匀的</span>
+    <p>一个常被忽略的现实修正：上面的 β（带宽）<strong>在跨节点时远小于节点内</strong>。节点内 NVLink 可达几百 GB/s，跨节点 InfiniBand 通常低一个量级且 α 更大。所以同样的 collective，放在节点内还是跨节点，成本差很多。这直接决定了 3D 并行的布局法则（模块 03）：<strong>通信最密的张量并行放进节点内 NVLink，通信最稀的流水并行才跨节点</strong>。成本模型不是纸上谈兵，它直接画出并行策略的物理边界。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="others"><span class="num">6</span>其余原语与它们的用武之地</h2>
+  <h3>其余原语与它们的用武之地</h3>  <p>除了 all-reduce，另外几个原语在本课后面各有关键角色，这里先建立「谁在哪用」的索引：</p>  <ul>
+    <li><strong>all-gather</strong>：FSDP/ZeRO-3 前向时把分片的参数拼回完整权重（模块 02）；张量并行收集列并行的输出（模块 03）。</li>
+    <li><strong>reduce-scatter</strong>：ZeRO-2/3 同步梯度时，让每个 rank 只拿到自己负责那片参数的梯度聚合（模块 02），省去存完整梯度。</li>
+    <li><strong>broadcast</strong>：训练开始时把 rank0 的初始参数同步给所有 rank，保证起点完全一致（否则各 rank 模型不同，梯度平均就没意义）。</li>
+    <li><strong>all-to-all</strong>：MoE 把每个 token 路由到其 expert 所在的 rank（expert 并行）；序列并行在不同切分布局间重排激活。</li>
+    <li><strong>barrier</strong>：对齐 checkpoint（所有 rank 存同一步，模块 04）、计时、调试时确认所有 rank 都到达某点。</li>
+  </ul>  <p><strong>all-to-all</strong> 值得单独多看一眼，因为它是这里面<em>最贵</em>的：每个 rank 都要给其它每个 rank 发一块数据，总通信量随 W 增长，且是<strong>全互联</strong>模式。它就像 N 个人交换名片——每人要和其他所有人各换一次。MoE 训练之所以通信压力大，正因为每一层都要做两次 all-to-all（路由去、结果回）。理解它的成本，是理解 MoE 为什么难扩的关键。</p>  <p>还有一组容易被忽略但很有用的区分：<strong>「all-」前缀</strong>的原语（all-reduce、all-gather）让<em>每个</em> rank 都拿到结果，而无前缀的版本（reduce、gather）只让 root 拿到。选择哪个取决于<em>接下来谁要用这份数据</em>：如果所有 rank 下一步都要用全局梯度去更新各自的模型副本（数据并行），就用 all-reduce；如果只是想把指标汇总到 rank0 打印日志，用 reduce 就够、还省一半通信。这种「按需选最省的原语」的意识，是写高效分布式代码的基本功——很多新手代码慢，就慢在到处用 all-reduce，哪怕只有一个 rank 需要结果。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把这些原语想成一套<strong>乐高积木</strong>：上层的每种并行策略，都是用这几块积木拼出来的。你不需要为每种并行重新发明通信，只要选对积木、算清各搬多少。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式地说，这些原语构成了分布式深度学习的<strong>通信原语集（communication primitive set）</strong>。MPI 在上世纪就标准化了它们，NCCL 在 GPU 上高效实现了它们，所有框架（PyTorch、JAX、Megatron）都在它们之上构建。本课把每个原语的语义、成本、用武之地讲清，你就握住了读懂任何并行系统源码的钥匙。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>用集合原语有一条铁律：<strong>所有参与的 rank 必须以一致的顺序、一致的形状调用同一个 collective</strong>。如果有的 rank 进了某个 all-reduce、有的因为一个 <code>if</code> 分支没进，或者两个 rank 对同一 collective 传了不同形状，就会 <strong>hang（死锁）</strong>——所有 rank 互相等到 NCCL 超时。这是分布式最常见、最难查的 bug，模块 05 专门讲怎么定位它。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="run"><span class="num">7</span>把它跑起来：从语义到可验证实现</h2>
+  <h3>把它跑起来：从语义到可验证的实现</h3>  <p>本模块的 notebook 会把上面每个概念变成可运行、可对拍的 numpy 代码。核心是<strong>先写单进程参考、再写「分布式」实现、立刻对拍</strong>：</p>  <ul>
+    <li><strong>语义验证</strong>：实现 all-reduce/all-gather/reduce-scatter，与「直接求和/拼接/切片」的参考对拍到 1e-12。</li>
+    <li><strong>恒等式验证</strong>：实现 reduce-scatter 后接 all-gather，断言它逐位等于 all-reduce——亲手确认本模块的核心恒等式。</li>
+    <li><strong>ring 分步验证</strong>：把 ring all-reduce 的两阶段 W−1 步<em>逐步</em>模拟出来（真的绕环传 chunk、真的累加），断言最终结果等于直接求和——确认这个看似复杂的算法真的对。</li>
+    <li><strong>成本验证</strong>：用代码数出 ring 每 rank 的收发字节，断言它等于 2S(W−1)/W、且不随 W 爆炸；对比朴素版的线性增长。</li>
+  </ul>  <p>为什么要把 ring all-reduce<strong>逐步</strong>写出来，而不是直接 <code>sum</code>？因为「直接求和」只验证了<em>结果对</em>，而逐步模拟验证了<em>算法对</em>——你会亲手确认：每一步只传 S/W 字节、只和邻居通信、W−1 步后每个 rank 恰好持有自己那片的全局和。这正是真实 NCCL 内部发生的事，只是它跨网络并发、我们在一个进程里串行。把它写对一次，你就真正<strong>理解</strong>了 ring all-reduce，而不只是会调 <code>dist.all_reduce</code>。</p>  <div class="callout paper"><span class="label"></span>
+    <p>配套实现参考：Patarasuk & Yuan 2009（ring all-reduce 带宽最优性证明）、Thakur 2005（各 collective 的算法与 α-β 分析）、NCCL 文档（真实实现与拓扑选择）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>拓扑感知集合通信</strong>：真实集群的链路不是均匀的（节点内 NVLink、节点间多层交换机）。如何让 collective 算法<em>感知物理拓扑</em>（hierarchical/2D ring、NVLS in-network reduction）以逼近硬件上限，是 NCCL 等库持续演进的方向。</li>
+    <li><strong>通信压缩与量化</strong>：把梯度量化到 fp8/int8 甚至 1-bit 再 all-reduce，用精度换通信量。难点是压缩误差对收敛的影响与压缩/解压的开销是否抵消收益。</li>
+    <li><strong>通信-计算重叠</strong>：把 collective 拆细、与计算交错，把通信时间藏到计算之下。编译器（如 GSPMD、torch.compile）自动插入并重排 collective 是活跃方向。</li>
+    <li><strong>在网计算（in-network computing）</strong>：让交换机本身参与规约（SHARP），数据在网络里就被加好，减少端点负担。是带宽墙之外的新维度。</li>
+    <li><strong>去中心化 / 异步通信</strong>：彻底放弃全局 all-reduce 的同步屏障，用 gossip/local-SGD 等让节点只和部分邻居通信，换取对 straggler 和慢链路的鲁棒性——以收敛性的理论代价（模块 05 前沿再述）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Patarasuk & Yuan 2009（ring all-reduce）、Thakur 2005（collective 算法全景与 α-β 模型）、NCCL 文档（生产实现）。深入可读 Horovod（Sergeev 2018，把 ring all-reduce 引入深度学习）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_data_parallel_fsdp/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 数据并行与 FSDP</div></a>
+  </div>
+
+</div>
+</body>
+</html>

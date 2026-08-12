@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 离线强化学习</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 离线强化学习</h1>
+  <p class="subtitle">只给一个固定数据集、不许再交互 —— 分布偏移与外推误差为何让标准 Q-learning 崩坏、BC 的天花板、CQL 保守压低 OOD 的 Q、IQL 用 expectile 绕开 OOD 查询；BC vs CQL/IQL 对比</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（Q-learning/过估计）、模块 02（策略抽取）、监督学习基础、分位数/expectile 概念</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_offline_rl.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Levine 2020 (综述)、Kumar 2020 (CQL)、Kostrikov 2021 (IQL)、Fujimoto 2019 (BCQ)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what">离线 RL：不许试错，只给一份数据</a></li>
+      <li><a href="#shift">分布偏移与外推误差：把杀手看清楚</a></li>
+      <li><a href="#bc">最朴素的基线：行为克隆 BC</a></li>
+      <li><a href="#cql">CQL：保守 Q 学习</a></li>
+      <li><a href="#iql">IQL：隐式 Q 学习（不查 OOD）</a></li>
+      <li><a href="#compare">三种方法的统一视角与权衡</a></li>
+      <li><a href="#practice">离线到在线，与实践要点</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what"><span class="num">1</span>离线 RL：不许试错，只给一份数据</h2>
+  <p>到目前为止（模块 01/02），所有算法都<strong>能与环境交互</strong>：DQN 用 $\varepsilon$-贪婪边探索边学、PPO/SAC 不断采新轨迹。但现实里有一大类问题<strong>根本不许试错</strong>：训一个医疗决策策略，你不能拿真实病人做 $\varepsilon$-贪婪实验；训自动驾驶，你不能让车随机打方向看会不会撞。你手里只有<strong>一份别人采好的、固定的历史数据集</strong>，必须从它里面榨出一个尽可能好的策略，而且<strong>训练全程不许再碰环境</strong>。这就是<span class="term">offline RL</span>（离线 / 批量 RL）。</p>  <p>听起来像监督学习——给定数据、学个函数。但它<strong>远比监督学习凶险</strong>，凶险全在一个词：<span class="term">distribution shift</span>（分布偏移）。监督学习里训练分布≈测试分布，学到的函数只在见过的数据附近用。而 RL 的目标是<strong>找一个比数据更好的策略</strong>——这个更好的策略<em>必然</em>想做一些数据里<strong>没怎么出现过的动作</strong>（否则它不会比采数据的策略更好）。一旦它这么做，你就进入了数据没覆盖的区域，而在那里你的值估计<strong>无从校验</strong>。</p>  <p>更糟的是 Q-learning 的 $\max_{a'}$ 会<strong>主动追逐</strong>这些没覆盖的动作。回忆模块 01 的过估计：$\max$ 偏爱被高估的动作。在线时这无所谓——你会去试它、收到真实回报、被纠正；但离线时你<strong>永远不会去试</strong>，那个高估的幻觉值就一直留在目标里、被自举不断放大，最终让整个 Q 函数崩坏、策略追着幻觉走向灾难。<strong>这是离线 RL 的头号杀手</strong>，本模块的三个算法（BC、CQL、IQL）都是来对付它的。</p>  <div class="callout danger"><span class="label">离线 RL 的核心矛盾</span>
+    <p>一句话点破离线 RL 的核心矛盾：<strong>你想要的「比数据更好的策略」，恰恰要求它偏离数据；而偏离数据，正是值估计失控的根源</strong>。所以离线 RL 的全部艺术，是在<strong>「改进」与「别走太远」</strong>之间走钢丝——要么约束策略别离行为策略太远（policy constraint），要么让值函数对没覆盖的动作<strong>保守</strong>（CQL），要么干脆<strong>不查询</strong>没覆盖的动作（IQL）。三条路，本模块各走一遍。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="shift"><span class="num">2</span>分布偏移与外推误差：把杀手看清楚</h2>
+  <h3>分布偏移与外推误差：把杀手看清楚</h3>  <p>把杀手拆成两个互相咬合的概念。<span class="term">distribution shift</span>：学到的策略 $\pi$ 想访问的状态-动作分布，偏离了数据集里<span class="term">behavior policy</span> $\pi_\beta$ 的分布。<span class="term">extrapolation error</span>：在数据没覆盖的 $(s,a)$ 上，Q 网络只能<strong>外推</strong>，而那里<strong>没有任何真实回报来纠正它</strong>——网络爱报什么是什么。</p>  <p>两者的恶性循环是这样转起来的：</p>  <div class="ascii">① 网络在 OOD 动作 (s,a_ood) 上随意外推 -&gt; 偶然给出高 Q
+        │
+        ▼
+② Q-learning 目标 y = r + γ·max_a' Q(s',a') 的 max 专挑这个高估
+        │
+        ▼
+③ 回归把 Q(s,·) 拉向这个虚高目标；策略 argmax 也开始偏爱 a_ood
+        │
+        ▼
+④ 离线！永远不会真去执行 a_ood、收不到现实反驳 -&gt; 高估永不修正
+        │
+        └──────► 自举把幻觉值越滚越大 -&gt; Q 崩坏、策略追着幻觉走</div>  <p>注意第④步是离线特有的死结。<strong>在线 RL 里这个循环会自愈</strong>：策略一旦偏爱 $a_{\text{ood}}$ 就会去执行它，环境立刻用真实的低回报打脸，高估被拉回。离线 RL 抽掉了「去执行、被打脸」这一环，于是循环失去了唯一的纠错机制，只能任由幻觉发酵。你会在 notebook 里<strong>亲眼看到</strong>：给一个 OOD 动作初始化一个虚高的 Q，朴素离线 FQI 不但不修正它，还让它把周围所有状态的 Q 都顶起来。</p>  <p>为什么不能「只在数据覆盖的 $(s,a)$ 上更新、对 OOD 视而不见」就完事？因为麻烦不在<em>更新</em>哪些 $(s,a)$，而在<strong>目标里的 $\max_{a'}$ 要『查询』哪些 $(s',a')$</strong>。即使你只对数据内的 $(s,a)$ 做回归，那条 TD 目标 $r+\gamma\max_{a'}Q(s',a')$ 仍然<strong>枚举了 $s'$ 下的所有动作</strong>——包括 OOD 的。只要其中一个被外推得虚高，$\max$ 就会选它，污染就从「查询」这一步渗进来。这正是为什么后面 IQL 的核心妙招是<strong>把目标里的 $\max$ 换成一个『只看数据内动作』的近似</strong>——从源头掐断 OOD 进入目标的通道。看清「污染从 $\max$ 的查询进来」，是理解三种解药的关键。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个关键澄清：离线 RL 的难不在「数据少」，而在<strong>「数据的分布」</strong>。即便给你<em>海量</em>数据，只要它来自一个固定的行为策略、没覆盖你想要的好动作，分布偏移依旧致命。反过来，数据<strong>覆盖</strong>得好（行为策略足够多样、探索充分）时，离线 RL 会容易很多。所以离线 RL 论文里数据集分 random/medium/expert/混合等质量等级（见 D4RL），不同覆盖度下算法表现天差地别。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bc"><span class="num">3</span>最朴素的基线：行为克隆 BC</h2>
+  <h3>最朴素的基线：行为克隆（BC）</h3>  <p>既然偏离数据这么危险，最保守的做法就是<strong>干脆不偏离</strong>——直接<strong>模仿</strong>数据里的动作。这就是<span class="term">behavior cloning</span>（行为克隆，BC）：把离线数据当监督学习，训一个策略 $\pi(a|s)$ 去拟合数据中 $(s,a)$ 对的动作映射。</p>  <div class="math-block">\[\mathcal{L}_{\text{BC}}(\theta) = -\mathbb{E}_{(s,a)\sim\mathcal{D}}\big[\log \pi_\theta(a|s)\big]\]</div>  <p>BC 的优点是<strong>极致的简单与稳健</strong>：没有自举、没有 $\max$、没有分布偏移——它只在数据覆盖的地方做预测，与普通分类/回归无异。如果你的数据来自一个<strong>专家</strong>（如人类司机的优质驾驶记录），BC 往往是个出奇强的基线，甚至能打败设计复杂的离线 RL 算法——这也是为什么任何离线 RL 论文都必须把 BC 列为对照。</p>  <p>但 BC 有两个根本天花板：</p>  <ul>
+    <li><strong>无法超过示范者</strong>：BC 的目标就是复刻数据里的行为，所以它的水平<strong>上限就是采数据那个策略的平均水平</strong>。数据是中等水平，BC 就是中等；它学不会「比老师更好」。</li>
+    <li><strong>不会拼接（no stitching）</strong>：假设数据里有两条次优轨迹——A 把你从起点带到中点、B 把你从中点带到终点，但没有一条完整的好轨迹。一个会「<span class="term">trajectory stitching</span>（轨迹拼接）」的值方法能把 A 的前半 + B 的后半缝成一条最优路径；BC 不会，它只会模仿见过的整条（次优）轨迹。</li>
+  </ul>  <p>这两个天花板正是<strong>值方法（CQL/IQL）相对 BC 的价值所在</strong>：它们通过学 Q/V 做动态规划，能够<em>从次优数据里组合出超越数据的策略</em>——代价是要直面分布偏移。所以离线 RL 的真正战场，是「如何既享受值方法的拼接能力、又不被分布偏移反噬」。下面两节就是两种答卷。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这个对照：<strong>BC 安全但平庸（学不会超过数据），值方法强大但危险（能拼接出更优策略，但会被 OOD 高估反噬）</strong>。离线 RL 的 CQL/IQL，本质都是<strong>「给值方法装上对付 OOD 的安全阀，让它在不崩的前提下保留拼接能力」</strong>。notebook 会让你看到：在需要拼接的数据上，朴素值方法崩、BC 平庸、而 CQL/IQL 既不崩又超过 BC。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cql"><span class="num">4</span>CQL：保守 Q 学习</h2>
+  <h3>CQL：保守 Q 学习</h3>  <p><span class="term">CQL</span>（保守 Q 学习，Kumar 2020）的思路直击要害：既然问题是 OOD 动作的 Q 被高估，那就<strong>在训练时主动把它们压低</strong>。具体地，在标准 TD 损失之外，加一个<strong>保守正则项</strong>——压低<em>所有</em>动作的 Q（尤其网络想抬高的那些），同时<strong>抬高数据里真实出现过的动作</strong>的 Q：</p>  <div class="math-block">\[\mathcal{L}_{\text{CQL}} = \underbrace{\mathbb{E}\big[(Q_\theta(s,a)-y)^2\big]}_{\text{标准 TD}} + \alpha\,\underbrace{\mathbb{E}_s\Big[\log\!\sum_{a'} e^{Q_\theta(s,a')} - \mathbb{E}_{a\sim\mathcal{D}}\,Q_\theta(s,a)\Big]}_{\text{保守正则}}\]</div>  <p>拆解那个保守项。$\log\sum_{a'}e^{Q(s,a')}$ 是 <span class="term">LogSumExp</span>，一个软的 $\max$——它对<strong>当前 Q 最高的动作</strong>（往往正是被高估的 OOD 动作）施加最大的下压力；减去 $\mathbb E_{a\sim\mathcal D}Q(s,a)$（数据内动作的 Q）则把数据覆盖的动作往上托。两者相减、乘以权重 $\alpha$ 一起最小化，效果就是：</p>  <ul>
+    <li><strong>OOD 动作的 Q 被系统性压低</strong>（它们贡献了大部分 LogSumExp，却不在数据里被托起来）；</li>
+    <li><strong>数据内动作的 Q 被相对抬高</strong>（被第二项保护）；</li>
+    <li>于是 $\max_{a'}Q$ 不再追逐 OOD 幻觉——它们的 Q 已经被压到数据内动作之下了。</li>
+  </ul>  <p>CQL 可以证明它学到的是真实 $Q^\pi$ 的一个<strong>下界</strong>（lower bound）：宁可保守地低估，也不冒进地高估。这正是离线 RL 想要的安全性——<em>低估顶多让你错过一些好动作（保守），高估却会让你追逐灾难性的幻觉动作</em>。$\alpha$ 控制保守程度：太小压不住 OOD、太大则过度保守、退化得接近 BC。它是 CQL 最重要的超参。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>CQL 的直觉像<strong>给一个爱吹牛的估值师套上『对没见过的东西一律往低了报』的纪律</strong>：凡是数据里没真正成交过的动作，它的估值都被主动调低；只有数据里反复出现、有据可查的动作，估值才被保住。于是『挑估值最高的动作』时，那些靠吹牛(外推)虚高的 OOD 动作早被压下去了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，CQL 在 $\mathbb E_s[\log\sum_{a'}e^{Q(s,a')} - \mathbb E_{a\sim\mathcal D}Q(s,a)]$ 上最小化：第一项 LogSumExp 是软 $\max$，对当前 Q 最高的动作梯度最大(压得最狠)；第二项保护数据内动作。可证它给出 $Q^\pi$ 的一个<strong>下界</strong>，且 $\alpha$ 越大下界越保守。这是『悲观面对不确定』在值函数上的精确实现。</p></div>
+  </div>  <p>从数据流的角度看 CQL 的精妙：它<strong>不改变</strong>标准 TD 的结构（还是 $\max$ 自举），而是<strong>额外塑形 Q 地形</strong>，让 OOD 动作在被 $\max$ 选中之前就已经被压到谷底。换句话说，CQL 承认「$\max$ 会去查 OOD」这件事改不了，于是<em>提前把 OOD 的坑填平</em>——等 $\max$ 去查时，那些 OOD 动作的 Q 已经低于数据内动作，自然不会被选。这与 IQL「干脆不让 $\max$ 查 OOD」是两种哲学：<strong>CQL 改造地形、IQL 改造查询</strong>。两者都能让最终的 $\arg\max$ 落在数据支撑内，殊途同归。</p>  <div class="callout paper"><span class="label"></span>
+    <p>CQL 是离线 RL 最有影响力的算法之一，思想可加在任何基于 Q 的方法（DQN/SAC）上，只需多一个正则项。notebook 会让你<strong>亲手实现这个保守惩罚</strong>，并验证它把一个虚高的 OOD 动作 Q 从 +5 压到负值。详见 references 的 Kumar 2020。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="iql"><span class="num">5</span>IQL：隐式 Q 学习（不查 OOD）</h2>
+  <h3>IQL：隐式 Q 学习（连 OOD 都不查询）</h3>  <p>CQL 是「查询 OOD 动作、但惩罚它们」。<span class="term">IQL</span>（隐式 Q 学习，Kostrikov 2021）更釜底抽薪：<strong>压根不查询 OOD 动作的 Q</strong>。它的洞察是——离线 RL 的麻烦全来自目标里那个 $\max_{a'}Q(s',a')$（要枚举包括 OOD 在内的所有动作）。如果能<strong>只用数据里出现过的动作</strong>来近似这个 $\max$，OOD 问题就从源头消失了。</p>  <p>IQL 用<span class="term">expectile regression</span>（expectile 回归）实现这一点。expectile 是分位数的「平方损失版」——一个<strong>非对称</strong>的 L2 损失，权重 $\tau$ 偏向高估侧：</p>  <div class="math-block">\[L_2^\tau(u) = |\tau - \mathbb{1}(u<0)|\cdot u^2, \qquad u = \text{target} - \text{pred}\]</div>  <p>当 $\tau\to1$ 时，expectile 回归的解<strong>逼近被拟合那组数的最大值</strong>（而 $\tau=0.5$ 退化为普通均值回归）。IQL 用一个高 $\tau$（如 0.7~0.9）的 expectile 来学状态值 $V(s)$，使 $V(s)$ 近似<strong>数据内动作中</strong>的最大 $Q$——这就在<em>不显式枚举任何动作（更不碰 OOD）</em>的前提下，得到了一个「数据内的最优」估计。Q 与 V 的训练相互配合：</p>  <table>
+    <thead><tr><th>IQL 的三步</th><th>做什么</th><th>为什么避开 OOD</th></tr></thead>
+    <tbody>
+      <tr><td>① 学 $V$（expectile）</td><td>$V(s)\leftarrow$ 高-$\tau$ expectile 回归拟合 $Q(s,a_{\text{data}})$</td><td>只用数据内动作 $a_{\text{data}}$，$\tau\to1$ 近似其中的 max</td></tr>
+      <tr><td>② 学 $Q$（标准 TD）</td><td>$Q(s,a)\leftarrow r+\gamma V(s')$</td><td>目标用 $V(s')$ 而非 $\max_a Q(s',a)$——<strong>没有 max、没有 OOD 查询</strong></td></tr>
+      <tr><td>③ 抽策略（AWR）</td><td>优势加权回归 $\exp(A/\beta)$ 加权的 BC</td><td>在数据动作上做加权模仿，永不输出 OOD 动作</td></tr>
+    </tbody>
+  </table>  <p>为什么 expectile 能在「只看数据内动作」时近似 max？直觉是：普通均值回归（$\tau=0.5$）会被低值样本拉低，得到的是数据内动作的<em>平均</em> Q；而把 $\tau$ 调高（偏向高估侧），损失对「目标高于预测」的样本惩罚更重、对「目标低于预测」的样本惩罚更轻，于是拟合出的 $V$ 被<strong>往上推、贴近那批数据内动作里最高的那个 Q</strong>。$\tau\to1$ 时它就逼近这批值的最大值——但全程<strong>只用到了数据里真实出现的动作的 Q</strong>，从未枚举、更未查询任何 OOD 动作。这就是 IQL 的核心戏法：用一个回归的非对称性，换来了「数据内的 max」而不付「查询 OOD」的代价。</p>  <p>第③步的<span class="term">advantage-weighted regression</span>（AWR/AWAC）很巧妙：它是一个<strong>加权的行为克隆</strong>——多模仿那些优势 $A(s,a)=Q(s,a)-V(s)$ 高的数据动作、少模仿优势低的。这样抽出的策略<strong>天然只在数据支撑内</strong>（它只会输出数据里见过的动作），却因为偏向高优势动作而<strong>超过了无差别模仿的 BC</strong>。整个 IQL 因此<strong>完全不查询任何 OOD 动作的 Q</strong>——分布偏移被结构性地绕开，而非像 CQL 那样事后惩罚。这让 IQL 实现简单、超参不敏感，是当今离线 RL 的强基线。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>CQL vs IQL 的一句话区别：<strong>CQL「看了 OOD 动作但把它们打压下去」；IQL「干脆不看 OOD 动作，用 expectile 在数据内偷偷近似 max」</strong>。两条路殊途同归——都让最终策略待在数据支撑内，从而避开外推误差。notebook 会让你实现 expectile 回归，看它如何随 $\tau\to1$ 从均值滑向最大值。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="compare"><span class="num">6</span>三种方法的统一视角与权衡</h2>
+  <h3>三种方法的统一视角与权衡</h3>  <p>把本模块三种方法（加上提过的 policy constraint 一类）放进一张图，会看到它们都在回答同一个问题——<strong>如何让最终策略不偏离数据支撑太远</strong>，只是切入点不同：</p>  <table>
+    <thead><tr><th>方法</th><th>怎么对付分布偏移</th><th>优点</th><th>代价 / 风险</th></tr></thead>
+    <tbody>
+      <tr><td><strong>BC</strong> 行为克隆</td><td>完全不偏离（直接模仿）</td><td>极简、稳健、专家数据下很强</td><td>学不会超过数据、不会拼接</td></tr>
+      <tr><td><strong>policy constraint</strong>（BCQ/TD3+BC）</td><td>显式约束 $\pi$ 接近 $\pi_\beta$（KL/BC 正则）</td><td>直觉直接、可加在任何 actor 上</td><td>约束强度难调；约束太紧≈BC</td></tr>
+      <tr><td><strong>CQL</strong> 保守 Q</td><td>惩罚/压低 OOD 动作的 Q（学下界）</td><td>强、思想通用、可加于 DQN/SAC</td><td>$\alpha$ 难调；过度保守损性能</td></tr>
+      <tr><td><strong>IQL</strong> 隐式 Q</td><td>用 expectile 在数据内近似 max，不查 OOD</td><td>实现简单、超参稳健、强基线</td><td>expectile $\tau$ 需调；拼接能力略弱于显式 DP</td></tr>
+    </tbody>
+  </table>  <p>选型经验：<strong>数据接近专家</strong> → BC 或 IQL（简单够用）；<strong>数据是混合/次优、需要拼接</strong> → CQL 或 IQL（值方法的拼接力）；想要最稳的强基线、不想精调超参 → IQL 常是首选。这些方法也并非互斥——TD3+BC 就是「值方法 + BC 约束」的极简组合，说明<strong>「别离数据太远」这一条原则</strong>可以用各种方式注入。</p>  <p>还有一条实践上极重要却常被忽略的轴：<strong>策略约束 vs 值正则</strong>的施加位置不同。policy constraint（如 TD3+BC）把约束加在<strong>策略</strong>上（直接拉策略靠近 $\pi_\beta$）；CQL 把约束加在<strong>值函数</strong>上（塑形 Q）；IQL 则把约束<strong>内建进训练目标的结构</strong>（用 expectile + AWR 让 OOD 无从进入）。施加位置越靠「下游」（越接近最终策略），通常越直接但越粗暴；越靠「上游」（改训练目标本身），通常越优雅但越需要想清楚机制。理解这条轴，你能预测一个新离线算法大概会有什么样的优缺点。</p>  <p>一个更深的统一视角：离线 RL 的所有方法，本质都是在原始 RL 目标上加一个<strong>「悲观」或「保守」</strong>的偏置——对不确定（没覆盖）的地方<em>假设最坏</em>而非最好。这与在线 RL 的探索哲学（对不确定的地方<em>乐观</em>、去试试看）恰好相反。<strong>在线乐观探索、离线悲观保守</strong>——因为在线能用试错纠错，离线不能。把这条对立轴记住，你就抓住了离线 RL 区别于在线 RL 的灵魂。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="practice"><span class="num">7</span>离线到在线，与实践要点</h2>
+  <h3>离线到在线，与实践要点</h3>  <p>纯离线之外，还有几个重要的实践变体与衔接，值得知道：</p>  <ul>
+    <li><strong>offline-to-online 微调</strong>：先离线学一个不错的策略（省真实交互），再放到环境里少量在线微调突破数据天花板。是工业界常用的折中——离线打底、在线冲顶。</li>
+    <li><strong>数据集质量决定一切</strong>：同一算法在 expert 数据上可能完胜、在 random 数据上可能完败。报告离线结果必须带数据集质量（D4RL 的分层就是为此）。</li>
+    <li><strong>评估的难题</strong>：离线训练时<strong>没有环境可测真实回报</strong>，怎么知道哪个 checkpoint 好？off-policy evaluation（OPE）是个独立的难问题——这也是为什么离线 RL 落地比看起来难。</li>
+    <li><strong>序列建模路线</strong>：Decision Transformer（模块 05）把离线 RL 重铸成「给定目标回报的序列预测」，是完全不同的一条技术路线，用监督学习绕开了 Q 学习的分布偏移（但也牺牲了部分拼接能力）。</li>
+  </ul>  <p>把本模块放进全课地图：模块 01/02 是<strong>在线深度 RL</strong>（能交互），本模块是<strong>纯离线</strong>（不能交互）。下一模块（基于模型）则从另一个角度省真实交互——<strong>学一个模型来代替真实环境</strong>，在模型里规划/想象。离线 RL 与基于模型 RL 常常结合（如在离线数据上学模型、再在模型里保守地规划，如 MOPO/COMBO），是当前样本高效 RL 的两大支柱。</p>  <div class="callout warn"><span class="label"></span>
+    <p>最后一个实践提醒：离线 RL 的论文分数对<strong>实现细节、归一化、数据预处理</strong>极度敏感（和 PPO 一样，见模块 02）。同一个 CQL/IQL，不同代码库的分数能差很多。所以读离线 RL 结果时，比起「哪个算法分高」，更该关注「它在什么数据质量、用了哪些技巧、评估是否可信」。本课的 toy 实现重在让你看懂<strong>机制</strong>，真实分数请以标准库（CORL、d3rlpy）为准。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>悲观的正确剂量</strong>：CQL 的 $\alpha$、IQL 的 $\tau$ 都在调「多保守」。太保守损性能、太冒进崩坏，最优点依数据质量而变，且没有可靠的离线方法来选它（因为不能在线验证）。自适应保守度是开放课题。</li>
+    <li><strong>离线 RL 的评估（OPE）</strong>：不与环境交互如何可信地估计一个策略的回报？重要性采样类、模型类、FQE 各有偏差与方差问题。没有好的 OPE，离线 RL 的模型选择就是盲选。</li>
+    <li><strong>数据覆盖的理论刻画</strong>：到底需要怎样的数据覆盖（concentrability）才能保证离线 RL 学到近优策略？理论界有一系列 coverage 假设与下界，但与实践的差距仍大。</li>
+    <li><strong>离线 + 基于模型</strong>：在离线数据上学动态模型、再保守地在模型里规划（MOPO、COMBO），把模型的样本效率与离线的安全结合，是当前 SOTA 方向之一。</li>
+    <li><strong>大规模与基础模型化</strong>：把海量离线轨迹当成「决策的预训练语料」，训通用决策模型（Decision Transformer、Gato 一脉）。RL 能否像 LLM 那样靠规模 + 离线数据涌现通用能力，是激动人心的开放问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Levine 2020（离线 RL 综述，建立全景）、Kumar 2020（CQL）、Kostrikov 2021（IQL）；延伸 Fujimoto 2019（BCQ，外推误差奠基）、Fujimoto 2021（TD3+BC，极简）、Fu 2020（D4RL 基准）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_ppo_sac/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 策略优化：PPO 与 SAC</div></a>
+    <a class="next" href="../04_model_based_world/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 基于模型与世界模型</div></a>
+  </div>
+
+</div>
+</body>
+</html>

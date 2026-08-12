@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 测试时计算 Scaling Laws：算力怎么花最划算</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 测试时计算 Scaling Laws：算力怎么花最划算</h1>
+  <p class="subtitle">同一笔 FLOPs，可以买更大的模型、更长的思维链、或更多的采样 —— compute-optimal 的答案取决于题目有多难</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（self-consistency / pass@k）、模块 03（verifier）、模块 04（搜索）；训练时 scaling laws（LLM_Internals_Course 模块 05）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_ttc_scaling_laws.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Brown 2024、Snell 2024、Wu 2024、Muennighoff 2025 (s1)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#paradigm">从训练时到测试时：scaling 范式的扩展</a></li>
+      <li><a href="#monkeys">Large Language Monkeys：coverage 的幂律</a></li>
+      <li><a href="#snell">Compute-optimal TTC：最优策略依赖题目难度</a></li>
+      <li><a href="#exchange">小模型 + 多 TTC vs 大模型 + 少 TTC：交换比</a></li>
+      <li><a href="#unified">统一框架：inference scaling laws</a></li>
+      <li><a href="#seqpar">Sequential vs Parallel scaling：两条路线的数学</a></li>
+      <li><a href="#flops">FLOPs 会计：把每一笔算力算清楚</a></li>
+      <li><a href="#eval">对评测的意义：预算固定才有可比性</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="paradigm"><span class="num">1</span>从训练时到测试时：scaling 范式的扩展</h2>
+
+  <p>先回顾训练时 scaling 的基本结论（详见本仓库 LLM_Internals_Course 模块 05）。
+  <span class="term">Chinchilla</span> [Hoffmann 2022, arXiv:2203.15556] 把预训练损失建模为参数量 $N$ 与数据量 $D$ 的可加幂律：</p>
+
+  <div class="math-block">
+  $$ L(N, D) = E + \frac{A}{N^{\alpha}} + \frac{B}{D^{\beta}}, \qquad
+     C \approx 6ND \;\;\Rightarrow\;\; N^* \propto C^{0.5},\; D^* \propto C^{0.5} $$
+  </div>
+
+  <p>给定训练预算 $C$，存在唯一的 compute-optimal 配置（经验上约 20 tokens/参数）。这套框架隐含一个假设：
+  <strong>算力只在训练时花，推理是"免费的一次前向"</strong>。2024 年起，这个假设被系统性打破 ——
+  推理时也可以投入可变的算力（采更多样本、搜更深的树、想更长的链），且收益同样服从可预测的规律。
+  于是 scaling 的自变量从 $(N, D)$ 扩展为 $(N, D, C_{\text{inference}})$：</p>
+
+  <div class="ascii">
+  训练时 scaling（2020–2023）          测试时 scaling（2024–）
+  ┌──────────────────────┐            ┌────────────────────────────────┐
+  │  loss = f(N, D)      │            │  accuracy = f(N, D, TTC 策略,   │
+  │  预算 C = 6ND        │     ───►   │              每题推理预算 b)    │
+  │  一次回答 = 一次前向  │            │  预算 C = 6ND + 2N·(推理 tokens)│
+  └──────────────────────┘            └────────────────────────────────┘
+        问题：训练算力怎么分？                问题：训练 vs 推理怎么分？
+                                            同样的推理预算，怎么花？
+  </div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>过去的问题是"这笔钱训多大的模型、喂多少数据"。现在多了一个选项：模型可以训小一点，
+      把省下的钱留到答题时花 —— 多采几条、多想几步、配个验证器挑答案。这三种花法的"汇率"不一样，
+      而且对不同难度的题汇率还会变。本章的全部内容就是把这张汇率表算清楚。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设单题推理预算 $b$（以 FLOPs 或 tokens 计）、TTC 策略 $\theta \in \Theta$（best-of-N、beam search、revision、长 CoT……）。
+      compute-optimal test-time scaling 求的是
+      $\theta^*(b \mid x) = \arg\max_{\theta} \; \mathbb{E}\big[\mathbb{1}_{\text{correct}} \mid x, \theta, b\big]$ ——
+      注意它是 <em>per-prompt</em> 的：[Snell 2024] 的核心发现正是 $\theta^*$ 强烈依赖输入 $x$ 的难度（第 3 节）。
+      更外层还有训练/推理的联合分配：固定总预算 $C_{\text{total}}$，在"更大的 $N$"与"更大的 $b$"之间求最优（第 4 节）。</p>
+    </div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="monkeys"><span class="num">2</span>Large Language Monkeys：coverage 的幂律 [Brown 2024]</h2>
+
+  <p>[Brown 2024, arXiv:2407.21787] 做了最朴素的实验：对每道题独立采 $k$ 条样本（temperature 采样），看
+  <span class="term">coverage</span>（至少一条正确的题目比例，即 pass@k）随 $k$ 怎么涨。单题层面这是初等概率：</p>
+
+  <div class="math-block">
+  $$ \text{coverage}(k) = \mathbb{E}_{i \sim \text{tasks}}\big[\, 1 - (1 - q_i)^k \,\big], \qquad
+     q_i = \text{单样本解出第 } i \text{ 题的概率} $$
+  </div>
+
+  <p>单题曲线 $1-(1-q_i)^k$ 是饱和的 S 形，<em>不是</em>幂律。但聚合到整个题集后，实验观察到惊人的规律性：
+  <strong>coverage 随 $k$ 在 4 个数量级上（$k$ 从 1 到 10{,}000）近似服从幂律</strong>，log-log 图上接近直线
+  （Brown 用 exponentiated power law $c \approx \exp(a k^b)$ 拟合）。SWE-bench Lite 上 DeepSeek-Coder-V2-Instruct
+  的解题率从 $k{=}1$ 的 15.9% 涨到 $k{=}250$ 的 56% —— 超过当时任何单样本 SOTA。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  为什么"饱和曲线的平均"会变成幂律？关键在 $q_i$ 的<strong>重尾分布</strong>：题集中总有一批 $q_i$ 很小但非零的题。
+  $k$ 每翻一倍，就有一批新的"$q_i \sim 1/k$ 量级"的题从不可解变为大概率可解。不同饱和点的 S 曲线叠加，
+  包络线近似幂律 —— 和"单个神经元学习曲线饱和、聚合 loss 呈幂律"是同一类现象。notebook 第 5 节会复现：
+  单题曲线饱和、聚合曲线在 log-log 上近似线性。</div>
+
+  <p>两个直接推论：① <strong>repeated sampling 是被严重低估的算力放大器</strong> —— 便宜小模型采样几百次，
+  在固定预算下 coverage 可超过强模型的单次采样；② coverage 只是上界 ——
+  没有 verifier 把正确样本<em>挑出来</em>，coverage 兑换不成 accuracy。数学题有自动判分还好；
+  没有 ground truth 时，majority voting（模块 02）和 reward model（模块 03）在 $k$ 大时都会饱和甚至回落，
+  <strong>verifier 的质量成为新瓶颈</strong>。这是 Brown 论文后半部分的核心警告。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="snell"><span class="num">3</span>Compute-optimal TTC：最优策略依赖题目难度 [Snell 2024]</h2>
+
+  <p>[Snell 2024, arXiv:2408.03314] 是本章的核心论文。它系统比较了两类 TTC 机制 ——
+  <strong>修订</strong>（sequential：模型迭代修改自己的答案）与<strong>搜索</strong>（parallel：PRM verifier 引导的 best-of-N / beam / lookahead），
+  并提出按<strong>难度分层</strong>选策略的 compute-optimal 框架。做法：用模型自身的 pass@1 估计（model-predicted difficulty）
+  把 MATH 题分成 5 个难度桶，逐桶比较各策略在不同预算下的 accuracy。结论可以总结成一张表：</p>
+
+  <table>
+    <thead><tr><th>题目难度</th><th>compute-optimal 策略</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>简单</strong>（pass@1 已较高）</td><td>纯采样 / 少量 sequential 修订即可，verifier 搜索反而浪费</td><td>$q$ 大 ⇒ $1-(1-q)^N$ 几步就饱和；初始答案大方向对，修订做局部精化最划算</td></tr>
+      <tr><td><strong>中等</strong></td><td>verifier 引导的搜索（beam / lookahead）收益最大</td><td>$q$ 不大不小，独立重采有效但低效；PRM 在中间步骤剪枝，把算力集中到有希望的分支</td></tr>
+      <tr><td><strong>超难</strong>（pass@1 ≈ 0）</td><td><strong>TTC 救不了</strong>，只能加预训练算力</td><td>$q \approx 0$ 时 $1-(1-q)^N \approx Nq \approx 0$，$N$ 再大也没用；模型缺的是能力不是机会</td></tr>
+    </tbody>
+  </table>
+
+  <p>把"按难度自适应选策略 + 分配预算"打包成 compute-optimal 策略后，
+  <strong>达到同等 accuracy 所需的测试时算力比固定 best-of-N 基线少约 4 倍</strong>。
+  这给评测人的启示是：任何单一 TTC 策略的全局比较都掩盖了难度维度上的结构 ——
+  两个策略的优劣排序可能在不同难度桶上完全反转（notebook 第 2 节复现这个反转）。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>难度估计本身要花算力。</strong>model-predicted difficulty 需要先采样若干次估 pass@1 ——
+  这笔"探路"开销在 Snell 的会计里被单独处理（用 oracle difficulty 做上界分析）。
+  实践中常用便宜的 proxy（题目长度、checker 通过率、小模型 pass@1），但 proxy 与真难度的错位会吃掉自适应收益。
+  notebook 的练习 2 用 oracle $q_i$ 做贪心分配，正是这个理想上界。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="exchange"><span class="num">4</span>小模型 + 多 TTC vs 大模型 + 少 TTC：交换比</h2>
+
+  <p>TTC 能否替代模型参数？Snell 比较了"小模型 + compute-optimal TTC"与"约 14 倍大的模型 greedy 一次"在
+  <span class="term">FLOPs-matched</span> 条件下的胜负，引入关键变量 $R$ = 推理 token 数 / 预训练 token 数：</p>
+
+  <ul>
+    <li><strong>$R \ll 1$</strong>（模型部署后只回答少量请求，或单题预算可以很大）：
+    <strong>简单与中等难度上，小模型 + TTC 赢</strong> —— 用测试时算力换参数是划算的；</li>
+    <li><strong>$R \gg 1$</strong>（海量请求摊薄，每题预算必须小）或<strong>题目很难</strong>：
+    <strong>预训练大模型赢</strong> —— TTC 的边际收益撑不起差距。</li>
+  </ul>
+
+  <p>形式化地，notebook 用参数化模型 $q(d, M)$（难度 $d$、模型规模 $M$）画
+  <span class="term">iso-accuracy 等高线</span>：在 $(\log M, \log N)$ 平面上，达到同一平均 accuracy 的组合连成曲线，
+  曲线的斜率就是"参数换采样"的局部交换比：</p>
+
+  <div class="math-block">
+  $$ \text{acc}(M, N) = \mathbb{E}_d\big[ 1 - (1 - q(d, M))^N \big], \qquad
+     \left.\frac{\partial \log N}{\partial \log M}\right|_{\text{acc}=\text{const}} = -\,\frac{\partial \text{acc}/\partial \log M}{\partial \text{acc}/\partial \log N} $$
+  </div>
+
+  <p>叠加 iso-FLOPs 线（推理成本 $\propto M \cdot N$，log-log 平面上是斜率 $-1$ 的直线）后，
+  最优组合出现在 iso-accuracy 与 iso-FLOPs 相切处。目标 accuracy 低 ⇒ 切点偏向小 $M$ 大 $N$；
+  目标 accuracy 高 ⇒ 等高线在 $N$ 方向变得近乎垂直（采样救不动），切点被迫滑向大 $M$。
+  <strong>交叉区域的存在意味着：不报告推理预算的"模型 A 优于模型 B"是不完整的陈述。</strong></p>
+
+  <!-- ========================================================= -->
+  <h2 id="unified"><span class="num">5</span>统一框架：inference scaling laws [Wu 2024]</h2>
+
+  <p>[Wu 2024, arXiv:2408.00724] 把上面的散点观察整合成统一的 <span class="term">inference scaling laws</span>：
+  对模型族（Pythia / Llemma，70M–34B）× 推理策略（greedy、majority voting、best-of-N、weighted voting、tree search）
+  的笛卡尔积，逐一测出 accuracy–FLOPs 曲线，然后取<strong>上包络</strong> —— 任意推理预算下，最优的 (模型规模, 策略) 组合是什么。三个结论：</p>
+
+  <ul>
+    <li><strong>compute-optimal 前沿上小模型占了很长一段</strong>：数学题上 Llemma-7B + 加权多数投票在 FLOPs-matched 条件下击败 Llemma-34B + greedy；</li>
+    <li><strong>每种策略都有饱和点</strong>：majority voting 最先饱和，weighted voting / tree search 能把幂律段延长，但没有策略能无限延伸 —— 与第 3 节"超难题 TTC 救不了"一致；</li>
+    <li><strong>模型规模与策略收益交互</strong>：小模型从复杂策略（树搜索）获益更多；大模型单样本已接近其 coverage 上限，复杂策略的边际收益小。</li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  三篇论文的关系：[Brown 2024] 给出<em>单一策略</em>（repeated sampling）的 scaling 形态（coverage 幂律）；
+  [Snell 2024] 给出<em>固定模型</em>下策略间的 compute-optimal 选择（难度依赖）；
+  [Wu 2024] 把<em>模型规模</em>也纳入自变量，给出全平面的 accuracy-per-FLOP 前沿。
+  三者合起来，"测试时算力怎么花"第一次有了和 Chinchilla 同等地位的定量答案。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="seqpar"><span class="num">6</span>Sequential vs Parallel scaling：两条路线的数学</h2>
+
+  <p>TTC 的两种基本形态，数学结构完全不同：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>Parallel（更多采样）</th><th>Sequential（更长思维链）</th></tr></thead>
+    <tbody>
+      <tr><td>形式</td><td>$N$ 条<strong>独立</strong>样本 + 选择机制</td><td>一条链内 token 间<strong>全程相互依赖</strong>（self-attention 条件于全部前文）</td></tr>
+      <tr><td>收益曲线</td><td>$1-(1-q)^N$：由<em>固定的</em> $q$ 决定，只能"多买彩票"，不能提高单张中奖率</td><td>延长推理本身改变 $q(L)$：回溯、验证、修正在链内发生，相当于内化的搜索</td></tr>
+      <tr><td>失败模式</td><td>$q \approx 0$ 时彻底无效；verifier 饱和后 accuracy 不再跟随 coverage</td><td>overthinking（模块 06）；错误前提在链内自我强化，无独立重启机会</td></tr>
+      <tr><td>获得方式</td><td>免训练，任何模型即插即用</td><td>需训练获得：o1 / DeepSeek-R1 用 RL 让模型学会自发延长推理（RL 内化路线）</td></tr>
+      <tr><td>预算控制</td><td>显式：$N$ 就是旋钮</td><td>困难：链长由模型自己决定 —— 这正是 s1 budget forcing 要解决的</td></tr>
+    </tbody>
+  </table>
+
+  <p><span class="term">Budget forcing</span> [Muennighoff 2025, arXiv:2501.19393] 是最简的 sequential 预算控制：
+  在 1000 条精选样本上 SFT（s1K），解码时若模型想停就强行追加 "Wait" 让它继续想，想太久就强制截断输出答案。
+  这个朴素干预把"思考 token 数"变成可控旋钮，并展示出干净的 sequential scaling 曲线 ——
+  s1-32B 的 accuracy 随被迫延长的思考预算单调上升（AIME24 上从 50% 提到 57%）。
+  s1 论文同时给出测试时 scaling 方法的评价指标：control（预算可控性）、scaling（曲线斜率）、performance（上限）。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  两者是<strong>互补</strong>而非互斥：sequential 提高单条链的 $q$，parallel 在提高后的 $q$ 上做 $1-(1-q)^N$ 放大 ——
+  R1 报告里的 cons@64（64 条长链做多数投票）就是两者叠加。开放问题（第 9 节）：固定总 token 预算 $T = L \times N$，
+  最优的 $(L, N)$ 划分是什么？现有证据：难题偏向更长的 $L$，verifier 强则偏向更大的 $N$。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="flops"><span class="num">7</span>FLOPs 会计：把每一笔算力算清楚</h2>
+
+  <p>所有"compute-optimal"结论都建立在统一的算力度量上。标准近似（dense Transformer，忽略 attention 二次项）：</p>
+
+  <div class="math-block">
+  $$ \text{一次前向} \approx 2 N_{\text{params}} \cdot n_{\text{tokens}}, \qquad
+     \text{训练} \approx 6 N_{\text{params}} \cdot D_{\text{tokens}} \;\;(\text{前向} 2ND + \text{反向} 4ND) $$
+  </div>
+
+  <p>用它算一笔典型账。基线：模型 $M$（$N_{\text{params}} = 7\text{B}$），每题生成 $L = 1000$ tokens：</p>
+
+  <table>
+    <thead><tr><th>方案</th><th>一次性成本</th><th>每题推理成本</th><th>盈亏平衡</th></tr></thead>
+    <tbody>
+      <tr><td>A：换 10 倍大的模型（70B，Chinchilla 配比重训）</td><td>训练 $6 \times 70\text{B} \times 1.4\text{T} \approx 5.9 \times 10^{23}$ FLOPs</td><td>$2 \times 70\text{B} \times 1000 = 1.4 \times 10^{14}$</td><td rowspan="2">每题推理成本相同（$10\times$ 参数 $\equiv$ $100\times$ 采样 $\div 10$）；差别全在一次性训练成本与 accuracy 收益曲线的形状</td></tr>
+      <tr><td>B：7B 模型每题采 100 条</td><td>0</td><td>$2 \times 7\text{B} \times 1000 \times 100 = 1.4 \times 10^{15}$</td></tr>
+    </tbody>
+  </table>
+
+  <p>方案 B 的每题成本是换大模型后单次推理的 10 倍，但省下了 $\sim 6 \times 10^{23}$ FLOPs 的训练投入 ——
+  只要总请求量 $Q$ 满足 $Q \times 1.26 \times 10^{15} &lt; 5.9 \times 10^{23}$（约 $Q &lt; 5$ 亿题），采样方案的总账更便宜。
+  这就是第 4 节 $R$（推理/训练 token 比）的具体化：<strong>低流量场景偏向 TTC，高流量场景偏向预训练</strong>。
+  notebook 第 4 节用代码复算这笔账。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  会计细则容易踩的坑：① sequential 长链是<strong>一条</strong> $L$ 很大的生成，KV cache 让每 token 成本仍近似 $2N$，
+  但 attention 二次项在 $L \gtrsim 10^4$ 后不可忽略；② 搜索类策略要把<strong>被剪枝分支</strong>与 <strong>verifier/PRM 的前向</strong>都计入；
+  ③ 修订类策略每轮要重读历史，成本是累加的前缀长度。报告 TTC 实验时应给出"每题总 token 数"或 FLOPs，而非只给 $N$。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">8</span>对评测的意义：预算固定才有可比性</h2>
+
+  <p>本课程是评测视角的课程，这一节是全章的落点。测试时 scaling 的存在，使"模型能力"不再是一个标量 ——
+  它是一条 <strong>accuracy-per-FLOP 曲线</strong>。由此推出评测协议的三条铁律：</p>
+
+  <p><strong>① 单点 accuracy 必须附带算力口径。</strong>同一个模型，pass@1（greedy）、pass@1（温度采样平均 64 次）、
+  cons@64（64 样本多数投票）可以差出 10 个点以上 —— DeepSeek-R1 论文同时报告 pass@1 与 cons@64（AIME24：79.8 → 86.7），
+  正是因为两者口径不同。leaderboard 上若 A 模型报 cons@64、B 模型报 pass@1，比较毫无意义。
+  跨模型比较的正确姿势是<strong>固定每题推理预算</strong>（token 数或 FLOPs），或直接画出整条曲线比包络。</p>
+
+  <p><strong>② 成本必须成为评测的显式轴。</strong>2024 年 12 月 OpenAI o3 在 ARC-AGI 半私有集上拿到 87.5%（high-compute 配置），
+  但每题成本数千美元、单次评测总算力花费六位数美元；low-compute 配置（75.7%）每题也要约 20 美元。
+  ARC-AGI 官方随后把"效率"列为榜单维度，要求报告 cost-per-task。
+  这是评测史的分水岭：<strong>没有成本轴的 capability 排名，会被"无限堆推理算力"刷穿</strong> ——
+  正如 [Brown 2024] 所示，coverage 可以用钱买，曲线又是可预测的幂律，谁的预算大谁就"更强"。</p>
+
+  <p><strong>③ 方差与可复现性。</strong>TTC 结果是采样分布的函数：报告 pass@1 的温度采样估计时应给出采样次数与置信区间
+  （AIME 只有 30 题，单次运行的方差极大）；报告 best-of-N 时必须说明 verifier 是什么（oracle 判分 ≠ reward model 选择）；
+  报告"compute-optimal"曲线时应说明难度分桶是 oracle 还是 model-predicted。模块 07 将把这些落成完整的评测协议清单。</p>
+
+  <div class="card">
+    <strong>评测人 checklist（拿到一份 TTC 实验报告先问）：</strong>
+    <ol style="margin:8px 0 0">
+      <li>每题花了多少 token / FLOPs / 美元？包含被剪枝分支与 verifier 开销吗？</li>
+      <li>报的是 coverage（pass@k，有 oracle 判分）还是 accuracy（需自动选择）？verifier 是什么？</li>
+      <li>口径是 pass@1、avg@k 还是 cons@k？温度、top-p、采样次数？置信区间？</li>
+      <li>对照组的推理预算和实验组相同吗（FLOPs-matched）？</li>
+      <li>结论在不同难度桶上方向一致吗，还是只是平均后的假象？</li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>sequential × parallel 的最优划分</strong>：固定总 token 预算 $T = L \times N$，最优 $(L, N)$ 如何随难度、verifier 质量、模型规模变化？目前只有零散的经验点，没有统一的定律。</li>
+    <li><strong>难度的在线估计</strong>：compute-optimal 分配依赖 $q_i$，但 $q_i$ 要花样本去估。探索-利用式的 adaptive sampling（边采边估边停）理论上可逼近 oracle 分配，工程上如何低开销实现？</li>
+    <li><strong>verifier 饱和</strong>：coverage 幂律可以延伸 4 个数量级，但 reward model 选择的 accuracy 往往在 $k \sim 10^2$ 就饱和。verifier 的 scaling law（verifier 算力 vs 可兑换的 coverage）是缺失的一块。</li>
+    <li><strong>RL 内化与显式 TTC 的关系</strong>：R1 式 RL 把搜索内化进单链，是否等价于在训练时"预付"了测试时算力？蒸馏长链能力到小模型（R1-Distill）改变了 iso-accuracy 平面的形状，第 4 节的交换比需要重新测绘。</li>
+    <li><strong>评测基础设施</strong>：accuracy-per-FLOP 曲线需要标准化的 FLOPs 计量与上报格式（类似 MLPerf 之于训练）。在 API 模型只暴露 token 计数、且 reasoning token 不可见或计价不同的现实下，第三方评测如何审计算力口径？</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>单题 coverage 曲线是饱和的 S 形，为什么聚合后的 coverage 随 $k$ 近似幂律？</li>
+      <li>Snell 2024 的难度依赖结论是什么？为什么超难题加再多测试时算力也没用？</li>
+      <li>什么条件下"小模型 + 多采样"在 FLOPs-matched 下击败大模型？$R$（推理/训练 token 比）扮演什么角色？</li>
+      <li>一次前向的 FLOPs 怎么估？"训练大 10 倍的模型" vs "推理采 100 条"的账怎么算？</li>
+      <li>为什么评测协议必须固定推理预算？pass@1 与 cons@64 混报会导致什么问题？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../04_search_mcts/04_讲解.html"><div class="dir">← 上一章</div><div class="t">04 · 推理即搜索：beam / ToT / MCTS</div></a>
+    <a class="next" href="../06_efficient_reasoning/06_讲解.html"><div class="dir">下一章 →</div><div class="t">06 · Overthinking 与预算控制</div></a>
+  </div>
+
+</div>
+</body>
+</html>

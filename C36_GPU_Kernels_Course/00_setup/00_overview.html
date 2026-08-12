@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>00 · 课程总览与环境</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 00 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>00 · 课程总览与环境</h1>
+  <p class="subtitle">性能工程的世界观 —— 算力远超带宽、大多数算子访存受限；用 numpy 模拟 GPU 编程模型、对拍参考实现，把 GPU 内核的并行结构学到手</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">Python/numpy、矩阵乘、注意力数学（C01）、一点点缓存/内存常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 00_environment_check.ipynb</div></div>
+    <div class="item"><div class="k">课程模块</div><div class="v">6 个模块 · 纯 numpy 模拟 GPU + Triton 伪代码</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">总览 25 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what">这门课讲什么</a></li>
+      <li><a href="#bottleneck">世界观：三类瓶颈与「算力 ≫ 带宽」</a></li>
+      <li><a href="#map">课程地图：从单线程到 FlashAttention</a></li>
+      <li><a href="#method">方法论：用 numpy 模拟 GPU 并对拍</a></li>
+      <li><a href="#env">环境与运行</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what"><span class="num">1</span>这门课讲什么</h2>
+  <p>欢迎来到 <strong>GPU 内核与性能工程</strong>。这门课只追求一件事：<strong>让你从「会调用 FlashAttention」变成「会写 FlashAttention」</strong>。</p>  <p>绝大多数人和 GPU 的关系止于 <code>model.cuda()</code> 和 <code>F.scaled_dot_product_attention(...)</code>。这门课要往下钻一层：当你写 <code>a @ b</code> 时，GPU 上成千上万个线程是<em>怎么</em>协作算出这个矩阵乘的？为什么同样的 FLOPs，一种写法比另一种快十倍？为什么注意力在长序列上会爆显存，而 FlashAttention 不会——它<strong>少算了吗</strong>？（剧透：没有，它算得甚至更多，却快好几倍。）</p>  <p>这些问题的答案不在任何 API 文档里，而在<strong>硬件的物理约束</strong>和<strong>算法对这些约束的回应</strong>之中。一块 GPU 给你的，本质上是两样东西：海量的并行算力，和一个金字塔形的内存层级（越靠上越快越小）。几乎所有 GPU 性能工程，归根结底都是在回答同一个问题——<em>如何把数据搬到尽量靠上的层级、并尽量多地复用它，从而少碰那个又慢又远的主显存</em>。本课就是沿着这条主线，把五个核心内核（执行模型、合并访问、分块矩阵乘、规约/softmax、FlashAttention）从零拆开、亲手重建。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>学完你应当能回答这类问题（也是 GPU/推理岗位的高频面试题）：<strong>GPU 的 thread/warp/block 到底怎么映射到我的数据？什么叫合并访问，不合并会慢多少？分块矩阵乘把什么指标提上去了，为什么这就够快？online softmax 凭什么能一遍流式算出归一化？FlashAttention 显存为什么是 O(n) 而不是 O(n²)？</strong>——并且能在 numpy 里把这五样东西都从零实现、和朴素版对拍到 1e-10。</p>
+  </div>  <p>一句方法论上的话先说在前面：本课的价值不在「我们没有 GPU 也能学」这个妥协，而在它<strong>逼你只关注真正难的部分</strong>——并行结构与正确性。API 语法、寄存器分配、指令选择，这些有了正确结构之后都是机械活，且各架构不同、年年在变；而「怎么把一个问题切成能并行、能复用、数值还正确的块」是<em>不随硬件过时</em>的硬功夫。把它练扎实，换到任何 DSL（Triton、CUTLASS、甚至下一代工具）都立刻能上手。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="bottleneck"><span class="num">2</span>世界观：三类瓶颈与「算力 ≫ 带宽」</h2>
+  <p>贯穿全课的世界观来自一句话（Horace He 的名篇标题）：<strong>让深度学习跑得飞快，要先分清瓶颈在哪</strong>。性能瓶颈基本只有三类：</p>  <table>
+    <thead><tr><th>瓶颈类型</th><th>意思</th><th>典型算子</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>算力受限</strong> compute-bound</td><td>算术单元打满，等的是计算</td><td>大矩阵乘、卷积</td><td>用 Tensor Core、提高算力利用率</td></tr>
+      <tr><td><strong>访存受限</strong> memory-bound</td><td>算得快但数据喂不上，等的是 HBM</td><td>逐元素、softmax、LayerNorm、注意力</td><td>合并访问、<strong>分块复用</strong>、<strong>算子融合</strong></td></tr>
+      <tr><td><strong>开销受限</strong> overhead-bound</td><td>真正干活的时间被调度/启动/python 淹没</td><td>大量小内核、动态形状</td><td>融合成大内核、用 CUDA Graph</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">算力 ≫ 带宽</span>
+    <p>最反直觉、也最重要的一条：<strong>现代硬件的算力增长远快于内存带宽增长</strong>。H100 的 FP16 算力以近 1000 TFLOP/s 计，而 HBM 带宽约 3 TB/s——意味着每从显存搬 1 个字节，硬件<em>有空算几百个浮点运算</em>。这个比值（脊点算术强度）几十年来只增不减：算力大约每两年翻倍，带宽却慢得多。结果是深度学习里<strong>大多数算子是访存受限的</strong>，优化的主旋律不是「少算」，而是「少搬数据」。这正是 tiling 与 FlashAttention 的灵魂。</p>
+  </div>  <p>把这三类瓶颈分清楚，是做任何性能优化的<strong>第一步且最容易被跳过的一步</strong>。新手最常犯的错是凭直觉乱优化——给一个访存受限的算子换更快的数学库（没用，瓶颈在搬数据），或给一个开销受限的程序优化内层循环（没用，时间花在 python 和内核启动上）。<em>先测量、先归类，再对症下药</em>：访存受限就想办法复用数据与融合算子，算力受限就提高算力利用率（用 Tensor Core、改精度），开销受限就把小内核合并、减少启动次数。</p>  <p>记住这张三分表，本课每个模块都在打其中一类瓶颈：模块 02 合并访问、模块 03 分块、模块 04/05 融合，全是<strong>访存受限</strong>这一栏的解药——因为这是深度学习里最普遍、最值钱的一类瓶颈。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="map"><span class="num">3</span>课程地图：从单线程到 FlashAttention</h2>
+  <h3>课程地图：从单个线程到 FlashAttention</h3>  <div class="ascii">硬件给你的：海量线程 + 一个金字塔形内存层级（越上越快越小）
+
+  模块 01  执行模型     thread → warp(32) → block → grid；SIMT、occupancy、延迟隐藏
+     │                  「我的数据怎么映射到这成千上万个线程？」
+     ▼
+  模块 02  内存与合并   register / shared / global(HBM) 三级；合并访问、bank conflict
+     │                  「怎么搬数据才不浪费带宽？」
+     ▼
+  模块 03  分块矩阵乘   shared-memory tiling 把算术强度从 O(1) 提到 O(tile)；roofline
+     │                  「复用数据 = 把访存受限推成算力受限」
+     ▼
+  模块 04  规约 + softmax  树形规约 O(log n)、warp shuffle、数值稳定 / online softmax
+     │                  「怎么并行地求和/求最大？怎么一遍算完 softmax？」
+     ▼
+  模块 05  FlashAttention  分块 + online softmax 拼成一个内核，永不存 n×n 的 S
+                          「把前四块拼起来 = 显存 O(n²)→O(n) 的精确注意力」</div>  <p>注意这不是松散的专题集合，而是一条<strong>严格递进的依赖链</strong>：FlashAttention（05）= 分块（03）+ online softmax（04）运行在执行模型（01）与内存层级（02）之上。读到最后一模块，你会发现它没有一个新概念——全是前四模块零件的组装。这也是本课刻意的编排：把一个看似高深的前沿内核，还原成几个朴素零件的乐高拼装，让你确信「我也能写出它」。</p>  <p>每一级台阶都对应一个<strong>可独立验证的能力</strong>：跑完模块 01 你能算占用率、量化分支发散的代价；模块 02 你能判断一段访问是否合并、为什么 bank 冲突；模块 03 你手写的分块 GEMM 会逐位等于 <code>A@B</code>，并能用 roofline 解释它为何更快；模块 04 你的 online softmax 会与朴素 softmax 对拍一致；模块 05 你拼出的 FlashAttention 会与朴素注意力对拍到 1e-10，且显存只用 O(n)。每一步都有 <code>assert</code> 兜底，绝不靠「感觉对了」。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="method"><span class="num">4</span>方法论：用 numpy 模拟 GPU 并对拍</h2>
+  <h3>方法论：没有 GPU，怎么学写 GPU 内核？</h3>  <p>本环境<strong>没有 GPU、不装 CUDA/Triton</strong>。但 GPU 内核的难点从来不是 API 语法，而是<strong>并行结构</strong>：怎么把数据切块、怎么映射线程、怎么组织规约、怎么让 softmax 增量更新。这些结构<em>用 numpy 在 CPU 上也能精确地表达和验证</em>。</p>  <p>打个比方：学下棋不一定要有红木棋盘。GPU 内核的「棋理」是<strong>数据如何分块、线程如何协作、中间状态如何在片上增量维护</strong>；这些都是和硬件型号无关的算法结构。一个真实 CUDA 内核里那行 <code>c[idx] = a[idx] + b[idx]</code>，描述的是「单个线程做什么」；硬件并行地把它在所有 idx 上跑一遍。我们在 numpy 里就用一个<strong>显式的循环</strong>枚举所有 idx——这恰恰是硬件并行执行的那同一组操作，只是我们让它串行跑出来、好观察、好验证。结构一模一样，只差「同时」二字。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>我们把 GPU 的每个机制翻译成 numpy 里看得见摸得着的东西：一个 block 就是一段循环，shared memory 就是一个临时小数组，warp shuffle 就是数组切片相加，online softmax 就是几个流式更新的标量。你写的是<strong>结构</strong>，不是性能。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>关键纪律是<strong>对拍（differential testing）</strong>：每个「内核」都和一个朴素参考实现比对，要求 <code>np.allclose(kernel_out, naive_out, atol=1e-10)</code>。分块 GEMM 必须逐位等于 <code>A@B</code>，FlashAttention 必须逐位等于朴素 softmax 注意力。结构正确 → 数值一致；数值一致 → 你的分块/规约逻辑可以原样搬到 Triton。</p></div>
+  </div>  <table>
+    <thead><tr><th>GPU 概念</th><th>本课的 numpy 模拟</th><th>对应真实工具</th></tr></thead>
+    <tbody>
+      <tr><td>block / grid 遍历</td><td>嵌套 for 循环遍历块下标</td><td>blockIdx / program_id</td></tr>
+      <tr><td>shared memory tile</td><td>切一个小 numpy 子数组</td><td>__shared__ / tl.load 到 SRAM</td></tr>
+      <tr><td>warp 内规约</td><td>对长度 32 的切片做树形/累加</td><td>__shfl_down</td></tr>
+      <tr><td>online softmax 状态</td><td>运行标量 m, l 与输出累加器</td><td>FlashAttention 的 m_i, l_i, O_i</td></tr>
+      <tr><td>内核正确性</td><td>np.allclose 对拍朴素实现</td><td>单元测试 / 与 PyTorch 对拍</td></tr>
+    </tbody>
+  </table>  <p>为什么把<strong>对拍</strong>提到方法论的高度？因为 GPU 内核的 bug 极其阴险：并行竞态、漏写同步、边界越界、数值溢出，往往不会报错，只是悄悄给出<em>看起来差不多但其实错了</em>的结果。在真实 GPU 上这种 bug 要靠 printf 大海捞针；而在 numpy 模拟里，我们有一个<strong>绝对可信的朴素参考</strong>（直接 <code>A@B</code>、直接朴素 softmax），任何偏差都会被 <code>np.allclose</code> 当场抓住。本课每个内核都先写参考、再写「优化版」、立刻对拍——这套「先有 ground truth，再优化」的纪律，正是真实 kernel 开发（与 PyTorch 对拍）的核心工作流，只是我们在更干净的环境里把它练成肌肉记忆。</p>  <div class="callout warn"><span class="label"></span>
+    <p>务必清楚本课<strong>不教</strong>什么：不教 CUDA 语法细节、不测真实 GPU 时延、不调寄存器分配、不写真正并发的代码。这些在你有了正确的并行结构后，是<em>第二步</em>（references 里的 CUTLASS、Triton 教程、Nsight 接手）。本课负责把<strong>第一步——结构与正确性</strong>夯死；这一步搞定，第二步才有意义。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="env"><span class="num">5</span>环境与运行</h2>
+  <h3>环境与运行</h3>  <p>环境极简：<strong>只需 numpy</strong>（画 roofline 图可选 matplotlib）。全课 CPU 秒级运行，无需 GPU、CUDA、Triton、torch。</p>  <pre><code>conda create -n gpu-kernels python=3.11 -y &amp;&amp; conda activate gpu-kernels
+pip install numpy            # 必需
+pip install matplotlib       # 可选，仅用于画 roofline / 带宽曲线
+jupyter lab</code></pre>  <p>每个模块配一个 notebook，结构统一：先用 numpy 把机制<strong>从零实现并对拍</strong>（5–6 个 worked 小节，每节都跑出可打印的验证与 <code>assert</code>），再做 3–4 道带 <code>assert</code> 判分的 ✏️ 练习（先给骨架，自己填，再对照 📖 参考答案），最后一个<strong>真实数据胶囊</strong>（用真实 GPU 的硬件参数或真实模型形状算一笔账，把纸面知识接到现实）。每个 notebook 里都附<strong>Triton 伪代码</strong>，让你看清 numpy 模拟与真实内核的逐行对应——学完照着把验证过的逻辑写成 <code>@triton.jit</code> 是最自然的下一步。</p>  <p>建议的学习节奏：<strong>先读完整章 HTML 建立直觉与理论框架，再打开 notebook 亲手实现</strong>。读和做缺一不可——只读会觉得「好像懂了」，真正动手写分块循环、调维度、让 assert 通过时，才会发现魔鬼藏在哪些细节里（边界、转置、数值稳定、校正因子）。这门课的深度正是为「动手」服务的。</p>  <div class="callout paper"><span class="label"></span>
+    <p>配套先读：Horace He《Making Deep Learning Go Brrrr》建立瓶颈三分直觉；CUDA C++ Programming Guide 当字典查执行模型术语；FlashAttention（Dao 2022）是终点站。完整清单见 <code>references.md</code>。</p>
+  </div>  <div class="card"><strong>✅ 学完整门课，你应该能：</strong>  <ol>
+    <li>把一个算子归类为算力/访存/开销受限，并说出该优化什么；</li>
+    <li>解释 thread/warp/block/grid 如何映射数据，算出一个内核的 occupancy 上限；</li>
+    <li>判断一段访存是否合并、一段 shared 访问是否 bank 冲突，并给出修法；</li>
+    <li>从零写出 shared-memory 分块矩阵乘（对拍 <code>A@B</code>），并用 roofline 论证它为何更快；</li>
+    <li>推导并实现 online softmax（一遍流式、对拍稳定 softmax）；</li>
+    <li>把以上拼成 FlashAttention（对拍朴素注意力到 1e-10），讲清它显存 O(n)、IO O(n²d²/M) 的来龙去脉；</li>
+    <li>把验证过的 numpy 分块逻辑映射到 Triton 伪代码，知道下一步怎么写真内核。</li>
+  </ol></div>
+
+  <div class="pager">
+    <span></span>
+    <a class="next" href="../01_execution_model/01_讲解.html"><div class="dir">下一模块 →</div><div class="t">01 · GPU 执行模型</div></a>
+  </div>
+
+</div>
+</body>
+</html>

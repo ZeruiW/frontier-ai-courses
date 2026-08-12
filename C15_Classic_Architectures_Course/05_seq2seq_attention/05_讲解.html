@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · seq2seq 与注意力</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · seq2seq 与注意力</h1>
+  <p class="subtitle">把两个 RNN 用一根向量首尾相接做序列翻译，撞上定长瓶颈，再用注意力动态回看源序列打破它 —— 注意力是 Transformer 的直接前身，本课的终点与 C1 的起点</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 03（RNN/BPTT）、模块 04（LSTM/GRU）、softmax 与交叉熵</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_seq2seq_attention.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Sutskever 2014（seq2seq）、Bahdanau 2014（注意力）、Luong 2015、Vaswani 2017（Transformer）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">seq2seq 动机：一个序列映到另一个序列</a></li>
+      <li><a href="#encdec">encoder-decoder 结构</a></li>
+      <li><a href="#bottleneck">定长瓶颈：注意力的动机</a></li>
+      <li><a href="#bahdanau">Bahdanau 加性注意力</a></li>
+      <li><a href="#luong">Luong 乘性注意力与打分函数</a></li>
+      <li><a href="#align">对齐矩阵与可视化</a></li>
+      <li><a href="#decode">teacher forcing 与解码</a></li>
+      <li><a href="#frontier">研究前沿 · 通向 Transformer</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>seq2seq 动机：一个序列映到另一个序列</h2>
+  <p>到这里，我们的 RNN/LSTM/GRU（模块 03/04）都只会做一件事：读入一个序列，吐出一个<strong>等长</strong>的标签序列，或一个<strong>单一</strong>的分类/回归结果。但现实里最迷人的序列问题不是这个形状——<strong>机器翻译</strong>要把一个长度为 5 的英文句子映成长度为 7 的中文句子；<strong>文本摘要</strong>要把上千字压成几十字；对话、语音识别、代码生成，全都是<em>一个序列进、另一个不等长的序列出</em>。源和目标长度不同、对应关系还可能交叉（语序不同），朴素 RNN 那种「逐位输出」的结构根本套不上。</p>  <p><span class="term">sequence-to-sequence</span>（seq2seq，序列到序列）正是为这类问题设计的框架，由 Sutskever、Vinyals 与 Le 在 2014 年提出。它的想法朴素得近乎大胆：<strong>用一个 RNN 把整个输入序列「读完、消化成一个向量」，再用另一个 RNN 从这个向量「生成」整个输出序列</strong>。前者叫 <span class="term">encoder</span>（编码器），后者叫 <span class="term">decoder</span>（解码器）。两个 RNN 之间唯一的桥梁，就是 encoder 读完最后一个词时的隐藏状态——一个固定维度的<span class="term">context vector</span>（上下文向量）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：encoder 像一个同声传译的「听」的阶段——把整句外语听完、在脑子里形成一个完整的「意思」；decoder 是「说」的阶段——根据这个「意思」，一个词一个词地组织出译文。中间那个「脑子里的意思」就是 context vector。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：encoder 把源序列 $x_{1:T}$ 通过 RNN 压成末态 $h_T$，记为上下文 $c = h_T \in \mathbb{R}^d$。decoder 是一个<strong>以 $c$ 为初始状态、自回归地</strong>生成目标序列 $y_{1:T'}$ 的 RNN：每步用上一步的输出词与当前隐藏状态，预测下一个词的概率分布 $p(y_t \mid y_{<t}, c)$。整个模型最大化目标序列的条件似然 $\prod_t p(y_t\mid y_{<t}, c)$。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住 seq2seq 的精髓：<strong>「读」和「写」解耦</strong>。encoder 专心理解源、decoder 专心生成目标，二者长度互不绑定。这个「编码-解码」的分工是本模块的地基，而它唯一的、也是致命的薄弱环节——<em>那根细细的 context vector 桥</em>——正是第 3 节注意力要来加固的地方。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="encdec"><span class="num">2</span>encoder-decoder 结构</h2>
+  <p>把 seq2seq 拆开看，它就是<strong>两个 RNN 用一根向量首尾相接</strong>。我们用模块 03/04 学过的 RNN/LSTM cell 当积木，结构如下：</p>  <div class="ascii">源序列  x1   x2   x3   &lt;eos&gt;            目标序列  &lt;bos&gt;  y1   y2   &lt;eos&gt;
+         │    │    │     │                         │     │    │
+        ┌▼┐  ┌▼┐  ┌▼┐   ┌▼┐                       ┌▼┐   ┌▼┐  ┌▼┐
+ ENCODER│ │→ │ │→ │ │→  │ │═════ c (context) ════&gt;│ │ → │ │→ │ │  DECODER
+        └─┘  └─┘  └─┘   └┬┘    = encoder 末态 h_T  └┬┘   └┬┘  └┬┘
+                                                    ▼     ▼    ▼
+                                                   y1    y2   &lt;eos&gt;   (每步 softmax 选词)
+
+  encoder：读完整个源，只把【最后一个】隐藏状态 c 交给 decoder
+  decoder：以 c 为初值，自回归生成——上一步输出当下一步输入，直到吐出 &lt;eos&gt;</div>  <p>几个工程细节决定它能否跑通。<strong>特殊符号</strong>：序列两端要加 <code>&lt;bos&gt;</code>（begin of sequence，给 decoder 第一步一个起始输入）和 <code>&lt;eos&gt;</code>（end of sequence，让模型学会「何时停」）。decoder 第一步吃 <code>&lt;bos&gt;</code> 与上下文 $c$，产出 $y_1$；第二步吃 $y_1$ 与新状态，产出 $y_2$；如此<strong>自回归</strong>直到生成 <code>&lt;eos&gt;</code> 或达到最大长度。</p>  <p>两个 RNN 的<strong>权重完全独立</strong>：encoder 有自己的 $W_x^{enc}, W_h^{enc}$，decoder 有自己的一套，外加一个把隐藏状态映到词表概率的输出层 $W_{out}$。训练时整个模型是一张大计算图——源序列经 encoder、context 经 decoder、每步输出经 softmax 与交叉熵——梯度用 BPTT（模块 03）沿这张图一路回传到两个 RNN 的所有共享权重。所以 seq2seq 本质上就是<em>把两个你已经会从零训练的 RNN 串起来、共同优化目标序列的条件似然</em>，没有任何新的训练机制，只是结构上的拼接。</p>  <p>Sutskever 等还发现一个反直觉的小技巧：<strong>把源序列反转再喂给 encoder</strong>（输入 $x_T, \dots, x_1$）能显著提分。直觉是这样拉近了源句开头与译文开头的距离，让早期的对应关系梯度路径更短、更易学。这个「小窍门能涨好几个 BLEU」的现象，恰恰<em>暴露了定长瓶颈的存在</em>——如果 context 能无损携带整句信息，词序根本不该有这么大影响。这是第 3 节的伏笔。</p>  <div class="callout warn"><span class="label"></span>
+    <p>decoder 是<strong>自回归</strong>的，这带来训练与推理的一个根本差异：训练时我们<em>知道</em>完整的目标序列（可以并行地把每步的「正确上一词」喂进去），推理时却只能<em>一步步生成</em>、把模型自己的输出接回输入。这个差异就是第 7 节 <span class="term">teacher forcing</span> 与 <span class="term">exposure bias</span> 的来源，先记住这根刺。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bottleneck"><span class="num">3</span>定长瓶颈：注意力的动机</h2>
+  <p>seq2seq 的优雅里藏着一个结构性的死穴：<strong>无论源句多长，它都被压进同一个固定维度的 context vector $c$</strong>。翻译一个 5 词短句，$c$ 绰绰有余；翻译一个 50 词的长句，$c$ 还是那么大——这就像要求你把一篇文章和一条短信都<em>塞进同一个信封</em>。信息论上，固定维度的向量只能携带有限信息；源句越长，被迫丢弃的细节越多。这叫 <span class="term">fixed-length bottleneck</span>（定长瓶颈）。</p>  <p>经验证据非常清楚：无注意力的 seq2seq，翻译质量（BLEU）随源句长度增加而<strong>显著下滑</strong>，长句尤其惨。Bahdanau 等 2014 年正是用这条「长句性能悬崖」曲线，论证了定长瓶颈的危害，并据此提出注意力。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>问题的本质：decoder 在生成每一个目标词时，需要的源信息是<strong>不一样的</strong>。生成译文第一个词时最该看源句开头，生成最后一个词时最该看源句结尾。但定长 $c$ 是<em>一锤子买卖</em>——encoder 读完就冻结，decoder 每一步都只能反复咀嚼这同一个被压缩过的 $c$，看不到源句的原始细节。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>注意力的核心洞察一句话：<strong>不要把源压成一个向量再扔掉中间状态；把 encoder 每一步的隐藏状态 $h_1,\dots,h_T$ 全都留着，让 decoder 在生成每个目标词时，按当前需要去「回看」并加权聚合它们</strong>。于是 context 不再是固定的 $c$，而是<em>随解码步动态变化</em>的 $c_t$——这就从根上拆掉了瓶颈。</p></div>
+  </div>  <div class="callout danger"><span class="label">为什么不能靠调大 c 解决</span>
+    <p>定长瓶颈不是实现 bug，而是<strong>架构的信息论极限</strong>：你没法靠把 $c$ 调大到 4096 维「蒙混过去」——总有更长的句子撑爆它，且过大的 $c$ 又会过拟合、难训。真正的解法必须是<strong>结构性</strong>的：让信息通路的容量随源长度增长。注意力正是这样一个解法，下一节展开。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bahdanau"><span class="num">4</span>Bahdanau 加性注意力</h2>
+  <p><span class="term">attention</span>（注意力）的机制可以拆成三步，每个 decoder 步都做一遍：<strong>打分 → 归一化 → 加权求和</strong>。Bahdanau、Cho 与 Bengio 2014 给出第一个版本，称 <span class="term">additive attention</span>（加性注意力）。</p>  <p>设 decoder 在第 $t$ 步、生成上一词后的隐藏状态为 $s_t$（也叫 query），encoder 留下的全部隐藏状态为 $h_1,\dots,h_T$（key=value）。第一步，对每个源位置 $j$ 算一个<strong>打分（能量）</strong> $e_{tj}$，衡量「生成第 $t$ 个目标词时，第 $j$ 个源位置有多相关」：</p>  <div class="math-block">\[e_{tj} = v^{\top}\tanh\!\big(W_s\, s_t + W_h\, h_j\big)\]</div>  <p>这是一个<strong>单隐层小前馈网络</strong>：把 $s_t$ 与 $h_j$ 各过一个线性层、相加、tanh 非线性、再用向量 $v$ 投到标量。第二步，对一行打分做 <span class="term">softmax</span> 得到<strong>注意力权重</strong>（一个源位置上的概率分布）；第三步，用权重对 encoder 状态<strong>加权求和</strong>得到这一步专属的动态上下文 $c_t$：</p>  <div class="math-block">\[\alpha_{tj} = \frac{\exp(e_{tj})}{\sum_{k=1}^{T}\exp(e_{tk})}, \qquad c_t = \sum_{j=1}^{T}\alpha_{tj}\, h_j\]</div>  <p>decoder 随后把这个 $c_t$ 与 $s_t$（或上一词嵌入）拼起来，预测第 $t$ 个目标词。注意 $c_t$ <strong>每一步都重算</strong>：生成不同目标词时，$\alpha$ 分布不同，关注的源位置就不同——这正是打破定长瓶颈的关键。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把它想成「带重点的查字典」：decoder 当前的状态 $s_t$ 是你的「问题」，encoder 的每个 $h_j$ 是字典里的一个「词条」。注意力先给每个词条打一个「跟我的问题多相关」的分，再按分数高低加权摘抄，拼成这一步真正要用的「答案」$c_t$。每问一个新问题，摘抄的重点就不同。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么叫<strong>加性</strong>？因为打分函数里 $s_t$ 与 $h_j$ 是先各自线性变换再<em>相加</em>（在 tanh 内部）。这让 query 与 key 的维度可以不同（$W_s, W_h$ 分别适配），代价是每对 $(t,j)$ 都要过一遍小网络，计算量较大。下一节的乘性注意力用点积替掉这个小网络，更高效。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>注意力最深刻的一点：$\alpha_{tj}$ 是<strong>软的、可微的</strong>权重，不是硬选某一个源位置。这意味着整个「回看」操作可以端到端用梯度训练——模型<em>自己学会</em>在每个解码步该看哪里，无需任何对齐标注。softmax 把「选择」变成了「加权」，把离散的注意变成了连续可优化的——这是它能 work 的数学根基，notebook 里你会亲手验证它对打分可微。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="luong"><span class="num">5</span>Luong 乘性注意力与打分函数</h2>
+  <p>Bahdanau 之后一年，Luong、Pham 与 Manning 2015 系统化了注意力，提出更简洁的 <span class="term">multiplicative attention</span>（乘性注意力）：用<strong>点积</strong>代替那个小前馈网络来打分。三种常见打分函数：</p>  <table>
+    <thead><tr><th>打分函数</th><th>公式 $\text{score}(s_t, h_j)$</th><th>可学习参数</th><th>约束 / 特点</th></tr></thead>
+    <tbody>
+      <tr><td>dot（点积）</td><td>$s_t^{\top} h_j$</td><td>无</td><td>最简；要求 query 与 key 同维</td></tr>
+      <tr><td>general（双线性）</td><td>$s_t^{\top} W\, h_j$</td><td>矩阵 $W$</td><td>允许 query/key 异维；Luong 推荐</td></tr>
+      <tr><td>additive（加性，Bahdanau）</td><td>$v^{\top}\tanh(W_s s_t + W_h h_j)$</td><td>$v, W_s, W_h$</td><td>表达力强但每对都过小网络，慢</td></tr>
+    </tbody>
+  </table>  <p>乘性注意力为什么重要？因为点积可以写成一次<strong>矩阵乘法</strong>：把所有 decoder query 堆成矩阵 $S\,(T'\times d)$、所有 encoder key 堆成 $H\,(T\times d)$，则全部打分 $E = S H^{\top}$ 一步算完——这对并行硬件（GPU）极其友好，也是它后来胜出的工程原因。<strong>Transformer 的缩放点积注意力，正是 Luong 的 dot 形式再除以 $\sqrt{d}$</strong>：</p>  <div class="math-block">\[\text{Attention}(Q,K,V) = \mathrm{softmax}\!\Big(\frac{QK^{\top}}{\sqrt{d_k}}\Big)V\]</div>  <p>那个 $\sqrt{d_k}$ 的除法是 Luong→Transformer 路上唯一的实质新增：当维度 $d_k$ 大时，点积的方差会随 $d_k$ 线性增长，把 softmax 推到饱和区（梯度趋零）。除以 $\sqrt{d_k}$ 把方差拉回 $O(1)$，让训练稳定。这个小细节是 notebook 练习里会量化的。</p>  <div class="callout paper"><span class="label"></span>
+    <p>从 Bahdanau（加性，2014）到 Luong（乘性，2015）再到 Vaswani（缩放点积 + 多头 + 自注意力，2017），是一条<strong>清晰可见的演化链</strong>。你现在从零实现的加性/乘性打分，就是 Transformer 注意力的<em>直系祖先</em>——只差「自注意力（query/key/value 都来自同一序列）」「多头」「缩放」这几步包装。详见 <code>references.md</code> 的 Bahdanau / Luong / Vaswani 三条。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="align"><span class="num">6</span>对齐矩阵与可视化</h2>
+  <p>注意力还白送了一份<strong>可解释性大礼</strong>：把每个解码步的注意力权重行 $\alpha_{t,:}$ 按 $t$ 堆起来，就得到一个 <span class="term">alignment matrix</span>（对齐矩阵）——行是目标位置、列是源位置、每个格子 $\alpha_{tj}$ 是「生成第 $t$ 个目标词时看第 $j$ 个源词的程度」。每一行是一个概率分布（<strong>行和恒为 1</strong>，因为来自 softmax）。</p>  <div class="ascii">对齐矩阵（亮=权重大）—— 单调对齐（如英→英复制、同语序翻译）呈对角线
+          源:  the   cat   sat   &lt;eos&gt;
+  目标 le   [ ██     ·     ·     ·  ]   行和=1
+       chat [ ·     ██     ·     ·  ]
+       assis[ ·      ·    ██     ·  ]
+       &lt;eos&gt;[ ·      ·     ·    ██  ]
+
+  反转任务(输出=源逆序)则呈【反对角线】；语序不同的真实翻译呈【交叉/块状】对齐</div>  <p>对齐矩阵的形状会<strong>泄露模型学到的结构</strong>：复制任务或同语序翻译呈<em>主对角线</em>；序列反转任务呈<em>反对角线</em>；真实的英↔法翻译里，形容词-名词语序不同的地方会出现<em>局部交叉</em>。Bahdanau 论文里那张英法对齐热图，第一次让人<strong>看见</strong>了神经网络在「想什么」，是深度学习可解释性的早期里程碑。</p>  <p>这也给了我们一个<strong>绝佳的调试与验证手段</strong>：在一个我们<em>知道正确对齐</em>的玩具任务（如复制：目标=源）上训练注意力，如果模型学对了，对齐矩阵就该收敛出清晰的对角线。notebook 的真实数据胶囊正是这样做的——用对齐矩阵的对角性当作「注意力是否学到对齐」的客观指标，而不是靠肉眼感觉。</p>  <p>再补一个常被忽略的细节：对齐矩阵是<strong>软对齐（soft alignment）</strong>。它不像传统统计机器翻译里那种「源词 $j$ 硬性对到目标词 $t$」的离散对齐，而是一行连续的概率分布——一个目标词可以<em>部分地</em>对齐到多个源词。这既是优点（可微、可端到端学、能表达「这个译词综合了好几个源词」），也是它后来被质疑的根源：<strong>注意力权重高 ≠ 该源词对输出最重要</strong>。权重只反映了 softmax 打分的相对大小，未必等同于因果贡献——这个「注意力是不是解释」的争论，会一直延续到 Transformer 时代（第 8 节）。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住对齐矩阵的两条铁律：<strong>① 每一行（一个解码步）和为 1</strong>（softmax 的直接后果，是 notebook 自测的核心 assert）；② 它的<strong>形状编码了源-目标的对应结构</strong>。这两条让对齐矩阵既是可解释性工具，又是验证注意力实现是否正确的「探针」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="decode"><span class="num">7</span>teacher forcing 与解码</h2>
+  <p>回到第 2 节埋的刺：decoder 自回归生成，训练和推理的输入来源不同。<strong>训练</strong>时我们有完整的目标序列，最自然的做法是 <span class="term">teacher forcing</span>（教师强制）——每一步都把<strong>真实的上一个目标词</strong>（而非模型自己的预测）喂给下一步。这样每步的输入都是干净正确的，训练信号清晰、收敛快，还能并行展开。</p>  <p>但推理时没有「真实上一词」可用——只能把<strong>模型自己上一步的输出</strong>接回输入（自由运行 / free-running）。于是出现 <span class="term">exposure bias</span>（暴露偏差）：模型训练时从没见过自己的（可能有错的）输出当输入，一旦推理早期出一个错词，错误会沿序列<strong>累积放大</strong>，把后续越带越偏——模型从未学过如何从自己的错误中恢复。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>teacher forcing 像「学骑车时家长一直扶着」：学得快，但一松手（推理）就容易摔，因为你没练过自己纠偏。缓解办法有 scheduled sampling（训练中按概率混入模型自己的输出，逐渐松手）等，但都有各自的代价。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，teacher forcing 优化的是 $\prod_t p(y_t\mid y^{*}_{<t}, x)$（条件在<em>真实</em>前缀 $y^*$ 上），而推理算的是 $\prod_t p(y_t\mid \hat y_{<t}, x)$（条件在<em>生成</em>前缀 $\hat y$ 上）。两个分布的差异就是 exposure bias 的数学来源。</p></div>
+  </div>  <p>推理阶段怎么把每步的概率分布变成实际的词序列？最简单是 <span class="term">greedy decoding</span>（贪心解码）：每步选概率最大的词、喂回去、直到 <code>&lt;eos&gt;</code> 或最大长度。贪心快但短视——局部最优未必全局最优。<span class="term">beam search</span>（束搜索）则同时保留 top-$k$ 条候选序列、逐步扩展并按累计对数概率剪枝，在贪心与穷举之间取平衡，是序列生成的常用近似最优解码。notebook 会实现贪心，并讨论它与 beam 的差别。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见实现陷阱：贪心解码的循环<strong>一定要有停止条件</strong>（遇到 <code>&lt;eos&gt;</code> 或达到 <code>max_len</code>），否则会无限生成。另一个：teacher forcing 下算 loss 时，输入是 <code>[&lt;bos&gt;, y1, ..., y_{T-1}]</code>、标签是 <code>[y1, ..., yT, &lt;eos&gt;]</code>——<strong>错位一格</strong>，对齐错了 loss 就全错。notebook 里会把这个错位关系显式写清楚。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿 · 通向 Transformer</h2>
+  <p>注意力解决了定长瓶颈，但带注意力的 seq2seq 仍<strong>背着 RNN 的两个包袱</strong>：① encoder/decoder 仍是循环的，必须<em>串行</em>逐步计算，无法在序列维度并行，长序列训练慢；② 信息仍要先经 RNN 沿时间逐步搬运，远距离依赖依旧要走很多步。一个大胆的问题随之而来：<strong>既然注意力本身就能让任意两个位置直接交互，我们还需要 RNN 吗？</strong></p>  <p>2017 年 Vaswani 等的回答是石破天惊的「不需要」——<strong>Attention Is All You Need</strong>。Transformer 把循环彻底删掉，只留注意力：</p>  <ul>
+    <li><strong>自注意力（self-attention）</strong>：本课的注意力是 decoder「跨序列」看 encoder；Transformer 让序列<em>自己看自己</em>（query/key/value 都来自同一序列），一层之内任意两位置直接交互，路径长度 $O(1)$。这就是「模块 05 注意力的自指版」。</li>
+    <li><strong>多头（multi-head）</strong>：并行跑多组注意力，每组关注不同子空间（语法的、语义的……），再拼接。</li>
+    <li><strong>缩放点积</strong>：就是第 5 节 Luong 的 dot 形式除以 $\sqrt{d_k}$。</li>
+    <li><strong>残差 + LayerNorm</strong>：每个子层都套 $x + \text{Sublayer}(x)$ 再归一化——这正是<strong>模块 02 的残差连接</strong>与<strong>模块 02/04 衔接的层归一化</strong>，老朋友原样登场。</li>
+    <li><strong>位置编码</strong>：因为丢了循环，模型不再天然知道词序，需显式注入位置信息。</li>
+  </ul>  <p>于是本课的脉络在这里<strong>闭环</strong>：你从零写过的注意力（模块 05）、残差（模块 02）、归一化（模块 02/04），被 Vaswani 重新组装成了 Transformer。你带着「这些零件我都亲手实现并对拍过」的底气走进 C1，会发现 Transformer 不是天书，而是<em>熟悉积木的新搭法</em>。</p>  <ul>
+    <li><strong>开放问题 · 长序列</strong>：自注意力是 $O(T^2)$ 的，长序列代价高。这反过来<em>复兴了线性/循环结构</em>——状态空间模型（SSM/Mamba）某种意义上是「带选择性门控的现代 RNN」，与本课模块 03/04 遥相呼应。</li>
+    <li><strong>开放问题 · exposure bias</strong>：自回归生成的训练-推理鸿沟至今未被彻底解决，序列级训练（minimum risk、RL/RLHF）是活跃方向。</li>
+    <li><strong>开放问题 · 注意力的可解释性</strong>：对齐矩阵直观，但「注意力权重 = 模型依据」这个解读已被质疑（注意力未必等于重要性），是可解释性的持续争论。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读三连构成本课到 Transformer 的桥：Sutskever 2014（seq2seq 框架）、Bahdanau 2014（注意力的诞生）、Vaswani 2017（注意力的终极形态）。把它们按时间顺序读一遍，你会看清「定长瓶颈 → 注意力 → 丢掉 RNN」这条因果链。完整清单见 <code>references.md</code>。<strong>学完本课，你已为 C1 Transformer 备齐全部零件。</strong></p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_lstm_gru/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · LSTM 与 GRU</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 语音 LLM 与流式</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 语音 LLM 与流式</h1>
+  <p class="subtitle">把声音纳入下一个 token 预测 —— 离散音频 token、语音语言模型、文本对齐/交错、流式块状生成：从零把音频 token 化、训玩具离散语音 LM（困惑度 < 均匀基线）、验证流式分块无损，全课闭环</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–04（特征/对齐/token 化/声码器）、语言建模与困惑度、Transformer/自回归（C01）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_speech_llms.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Borsos 2022 (AudioLM)、Wang 2023 (VALL-E)、Défossez 2024 (Moshi)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#intro">把声音当成一种语言</a></li>
+      <li><a href="#tokenize">音频 token 化：语音 LM 的词表</a></li>
+      <li><a href="#lm">离散语音 LM：下一个 token 预测</a></li>
+      <li><a href="#align">文本与音频对齐：塞进一个序列</a></li>
+      <li><a href="#stream">流式生成：实时对话的硬约束</a></li>
+      <li><a href="#bigpic">拼起来：端到端语音系统</a></li>
+      <li><a href="#roadmap">从零实现的路线图</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="intro"><span class="num">1</span>把声音当成一种语言</h2>
+  <p>到这里，前四个模块已经备齐了所有零件：模块 01 把波形变成特征，模块 02 把语音对齐成文字，模块 03 把波形压成<strong>离散 token</strong>，模块 04 把特征/token 还原成波形。本模块把它们<strong>组装成一个统一范式</strong>——<span class="term">speech / audio language model</span>（语音/音频语言模型）：<strong>把声音当成一种『语言』，用『预测下一个 token』来理解和生成它</strong>。</p>  <p>这是 2022 年后语音 AI 最重要的范式转移。它的核心洞察朴素到惊人：<strong>既然模块 03 已经能把音频变成离散整数 token 序列，那就可以原封不动地套用文本大模型的全套机器</strong>——同样的 Transformer、同样的『下一个 token 预测』、同样的交叉熵、采样、KV-cache。AudioLM、VALL-E、MusicLM、Moshi 全都建立在这一个想法上。语音建模因此与 NLP<strong>彻底打通</strong>：识别是『音频 token → 文本 token』，合成是『文本 token → 音频 token』，对话是『听到的 token → 说出的 token』——都是序列到序列的 token 预测。</p>  <p>本模块讲清这套范式的四个要件：<span class="term">audio tokenization</span>（音频 token 化，承接模块 03）、<strong>离散语音 LM</strong>（在 token 上做自回归，本课用玩具 n-gram 实现）、<strong>文本与音频对齐/交错</strong>（多模态怎么塞进一个序列）、<span class="term">streaming / online generation</span>（流式生成，实时对话的硬要求）。notebook 会从零把音频 token 化、训一个玩具离散语音 LM（对拍困惑度优于均匀基线）、做流式分块。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>把声音变成整数序列（模块 03），就能像写文章一样『写声音』</strong>——用语言模型预测下一个音频 token，再用声码器/解码器（模块 04）变回波形。识别、合成、对话，全都统一成『预测下一个 token』。这是把整门课的零件拼成一个系统的最后一步。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tokenize"><span class="num">2</span>音频 token 化：语音 LM 的词表</h2>
+  <h3>音频 token 化：语音 LM 的『词表』从哪来</h3>  <p>文本 LM 的词表是天然离散的（字、词、subword）；音频是连续的，所以语音 LM 的第一步是 <span class="term">audio tokenization</span>——把波形变成 <span class="term">discrete token</span>（离散整数序列）。这正是模块 03 的输出：用神经编解码（EnCodec/SoundStream）的 RVQ，把每帧音频量化成 $N$ 个码本下标。</p>  <p>但这里有个<strong>关键的二分</strong>，是理解所有语音 LM 架构的钥匙——音频 token 有两种，刻画的东西不同：</p>  <table>
+    <thead><tr><th>token 类型</th><th>来自</th><th>刻画什么</th><th>特点</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">semantic token</span> 语义</td><td>自监督模型(HuBERT/w2v-BERT)量化</td><td>语言内容、语义、长程结构</td><td>紧凑、序列短、丢声学细节</td></tr>
+      <tr><td><span class="term">acoustic token</span> 声学</td><td>神经编解码(EnCodec)RVQ</td><td>音色、声学环境、波形细节</td><td>保真、序列长、缺语义结构</td></tr>
+    </tbody>
+  </table>  <p>为什么要两种？因为单一 token 顾此失彼：声学 token 保真但<em>缺乏语义结构</em>（直接拿它做语言建模，模型学不到长程的『说什么』，只会学到局部的『听起来像』）；语义 token 有内容但<em>丢了音色细节</em>（还原不出具体是谁的声音）。<span class="term">AudioLM</span> 的核心设计正是<strong>分而治之</strong>：先用语义 token 建模长程结构（说什么），再用声学 token 补全细节（怎么发声）——『语义→声学』两段式生成，既连贯又高保真。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：语义 token 像剧本（说什么内容、什么逻辑），声学 token 像演员的具体演绎（音色、语气、口音）。只有剧本，声音是干巴巴的机器音；只有演绎细节而无剧本，声音是连贯的胡言乱语。AudioLM 先写剧本（语义）、再配演绎（声学），两者都要。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：语义 token $s_{1:T}$ 捕捉 $p(\text{内容})$ 的长程依赖；声学 token $a_{1:T}^{(1:N)}$（RVQ 的 $N$ 级）捕捉细节。AudioLM 分阶段建模 $p(s)\to p(a^{(1)}\mid s)\to p(a^{(2:N)}\mid s,a^{(1)})$。这把一个『又长又要保真又要连贯』的难题，分解成几个各自可控的子问题——又一次『分解 + 分层』的工程智慧，呼应模块 03 的 RVQ 分级。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="lm"><span class="num">3</span>离散语音 LM：下一个 token 预测</h2>
+  <h3>离散语音 LM：在 token 上做下一个预测</h3>  <p>有了离散 token，<strong>语言建模</strong>就完全是文本 LM 那一套。给定 token 序列 $u_{1:T}$，自回归地分解联合概率、用交叉熵训练：</p>  <div class="math-block">\[p(u_{1:T}) = \prod_{t=1}^{T} p(u_t \mid u_{<t}),\qquad \mathcal{L} = -\frac{1}{T}\sum_{t=1}^{T}\log p(u_t\mid u_{<t})\]</div>  <p>真实系统里 $p(u_t\mid u_{<t})$ 是个 Transformer（C01 的知识直接复用：自注意力、因果掩码、KV-cache）。本课用最朴素的 <span class="term">n-gram language model</span>（n 元模型）替代——用前 $n-1$ 个 token 的频次估计下一个 token 的概率。它虽简单，却能让你<strong>亲手把『音频建模』和『文本 LM』彻底打通</strong>：同样的计数、同样的条件概率、同样的困惑度、同样的采样生成，只是 token 来自音频而非文本。</p>  <p>怎么知道语音 LM『学到了东西』？看 <strong>困惑度（perplexity）</strong> $=\exp(\mathcal{L})$——它衡量模型平均在多少个 token 里『纠结』。一个<strong>均匀随机基线</strong>的困惑度等于词表大小 $K$（完全没学到结构）；只要模型学到了 token 间的任何规律（音频 token 远非均匀——相邻帧高度相关、有重复模式），困惑度就会<strong>显著低于 $K$</strong>。这正是 notebook 要对拍的不变量：<strong>玩具语音 LM 的困惑度 &lt; 均匀基线</strong>，证明它确实捕捉到了音频 token 的结构。</p>  <div class="callout intuition"><span class="label"></span>
+    <p><strong>worked 微例（困惑度到底在数什么）</strong>：设词表 $K=4$。<strong>均匀基线</strong>对每个 token 都给 $1/4$ 概率，交叉熵 $\mathcal{L}=-\log(1/4)=\log 4\approx1.386$，困惑度 $=\exp(1.386)=4=K$——『平均在 4 个里瞎猜』。现在假设音频 token 高度重复、有可学的结构。一个学到这点的模型在留出序列上，比方说<em>70% 的步</em>把概率押对（真实 token 拿到 $0.7$）、<em>30% 的步</em>押偏（真实 token 只有 $0.1$）。那么 $\mathcal{L}=-[0.7\log0.7+0.3\log0.1]\approx-[0.7\times(-0.357)+0.3\times(-2.303)]\approx0.94$，困惑度 $\approx\exp(0.94)\approx2.6$。$2.6<4$——<strong>『有效只在约 2.6 个里纠结』</strong>，比瞎猜的 4 个少了。这就是 notebook 里 <code>perplexity &lt; K</code> 那个 assert 的全部含义：困惑度从 $K$ 往下掉多少，量化了模型从音频 token 的冗余结构里<em>榨出了多少可预测性</em>。把 $K$ 换成真实编解码的 $1024$，道理一字不差。</p>
+  </div>  <div class="ascii">波形 ──(模块03)──► 音频 token 序列 u_{1:T}  (整数, 词表 K)
+   │
+   │  训练: 数 n-gram 频次, 估 p(u_t | u_{t-n+1..t-1})
+   ▼
+离散语音 LM  p(下一个token | 历史)
+   │
+   ├─ 评估: 困惑度 exp(交叉熵) &lt; K (均匀基线) ──► 学到了结构  ★
+   │
+   └─ 生成: 自回归采样 token ──(模块04解码器)──► 续写的波形</div>  <p>用 n-gram 而非真 Transformer，是<strong>刻意的教学选择</strong>，值得说清它教到了什么、又简化了什么。它<strong>如实保留</strong>的，是语音 LM 的全部<em>概念骨架</em>：自回归分解、条件概率、交叉熵、困惑度、采样生成——这些在 n-gram 和 Transformer 里<strong>形式完全一致</strong>，只是后者用神经网络而非计数来估计 $p(u_t\mid u_{<t})$。它<strong>简化掉</strong>的，是『如何从有限数据泛化到长程依赖』：n-gram 只看固定的前 $n-1$ 个 token、且靠硬计数（数据稀疏时退化），而 Transformer 用注意力看全部历史、用参数共享泛化。所以本课的玩具 LM 让你<em>亲手验证范式可行（音频 token 能建模、困惑度能下降）</em>，而把『规模化的泛化能力』留给真实的 Transformer 语音 LM。这正是『理解机制』与『追求性能』的恰当分工——先确信原理，再谈放大。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>困惑度是语音 LM 的『体温计』：<strong>均匀瞎猜 = K，学到结构 &lt; K，学得越好越低</strong>。本课玩具 n-gram 的意义不在性能，而在让你确信——<em>音频 token 序列和文本 token 序列没有本质区别</em>，文本 LM 的一切（n-gram、Transformer、困惑度、采样）原样适用。这就是『语音 LLM』之所以可能的全部秘密。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="align"><span class="num">4</span>文本与音频对齐：塞进一个序列</h2>
+  <h3>文本与音频对齐：多模态塞进一个序列</h3>  <p>语音 LM 常要<strong>同时处理文本和音频</strong>（如 ASR=音频→文本、TTS=文本→音频、语音对话=两者交替）。怎么让一个自回归模型同时建模两种 token？关键技巧是 <span class="term">interleaving / alignment</span>（交错/对齐）——把不同模态/不同流的 token 按某种规则排进<strong>同一个序列</strong>，模型照常做下一个 token 预测。</p>  <p>几种典型排法：</p>  <ul>
+    <li><strong>拼接（concatenation）</strong>：文本 token 全放前面、音频 token 全放后面（VALL-E 的 TTS：先文本提示，再生成音频 token）。简单，但跨模态的时间对齐弱。</li>
+    <li><strong>交错（interleaving）</strong>：文本与音频 token 按时间细粒度交替（一段文本、对应一段音频、再一段……）。对齐强，适合流式与对话。</li>
+    <li><strong>多流（multi-stream）</strong>：RVQ 的多级 token、或『语义流 + 声学流 + 文本流』并行，在每个时间步同时预测多个流（Moshi 的做法）。能建模全双工（同时听说）。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把多模态塞进一个序列，就像把双语字幕排进一行字：可以『先全英文再全中文』（拼接），可以『一句英一句中交替』（交错），也可以『上下两行同时滚动』（多流）。排法决定了模型能多紧地把两种信息对齐——对话要实时呼应，就得交错或多流。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这又是模块 02『对齐』主题的延续：那里是音频帧↔字符的对齐（CTC/注意力），这里是文本 token↔音频 token 的对齐（交错/多流）。Moshi 用<strong>多流 + 时间对齐</strong>让文本与多级音频 token 在每个时间步并行预测，从而实现 <span class="term">full-duplex</span>（全双工，能同时听和说）——这是把『对齐』推到极致的工程成果。本质上，从 CTC 到 Moshi，都是在回答同一个问题：<em>不同长度/模态的序列，如何在一个模型里协同</em>。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>VALL-E（Wang 2023）用拼接做零样本 TTS（3 秒音色克隆）；AudioLM（Borsos 2022）用语义/声学分层；Moshi（Défossez 2024）用多流实现全双工对话。均见 <code>references.md</code>。它们的差异主要在<strong>token 怎么排、几个流、谁条件谁</strong>——核心都是『离散 token + 下一个预测』。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="stream"><span class="num">5</span>流式生成：实时对话的硬约束</h2>
+  <h3>流式生成：实时对话的硬约束</h3>  <p>语音对话和 ASR 有一个文本任务没有的<strong>硬约束</strong>：<strong>延迟</strong>。人类对话的自然节奏要求端到端 <span class="term">latency</span> 低于约 200–300 ms，否则就有明显的『卡顿感』。这逼出了 <span class="term">streaming / online generation</span>（流式/在线生成）——<strong>不能等整段输入到齐再处理，必须边收边算边出</strong>。</p>  <p>流式的核心是 <span class="term">chunk / lookahead</span>（块/前瞻）：把音频切成小 <strong>块</strong>（chunk），来一块处理一块；为提精度可允许多看少量未来帧（<strong>前瞻</strong>）。这带来一个根本权衡：</p>  <table>
+    <thead><tr><th>块大小 / 前瞻</th><th>延迟</th><th>上下文 / 精度</th><th>适用</th></tr></thead>
+    <tbody>
+      <tr><td>小块、无前瞻</td><td>低</td><td>上下文少、精度略降</td><td>实时对话、同传</td></tr>
+      <tr><td>大块、有前瞻</td><td>高</td><td>上下文多、精度高</td><td>离线转写、字幕</td></tr>
+      <tr><td>整段（非流式）</td><td>最高（等全部）</td><td>最高</td><td>批处理</td></tr>
+    </tbody>
+  </table>  <p>流式对模型结构提出要求：注意力必须是<strong>因果的或受限窗口的</strong>（不能看未来，或只看有限未来），编解码必须是<strong>因果卷积</strong>（模块 03 的 EnCodec 有流式版，Mimi 专为低延迟设计）。回忆模块 02：CTC 天然流式（逐帧出），而 Whisper 式自回归 seq2seq 流式更难（要等前一个 token）——这个权衡在语音 LM 里再次出现，且更尖锐（既要听又要说）。<span class="term">Moshi</span>/<span class="term">Mimi</span> 把帧率压到很低（如 12.5 Hz）、用流式编解码 + 多流 LM，做到了低延迟的全双工对话。</p>  <p>再把延迟<strong>拆开算一笔账</strong>，体会为何低帧率 token 对实时如此关键。端到端延迟大致由三块构成：<strong>算法延迟</strong>（攒够一个 chunk + 前瞻才能出第一个结果）+ <strong>计算延迟</strong>（模型前向耗时）+ <strong>声码器延迟</strong>（token → 波形）。其中算法延迟正比于 chunk 时长——而一个 chunk 含多少 token 又取决于帧率。EnCodec 的 75 Hz 意味着每个 token 只覆盖 13 ms，要攒一个像样的 chunk 得不少 token；Mimi 的 12.5 Hz 让每个 token 覆盖 80 ms，更少的 token 就能构成一个有意义的处理单元、且自回归步数大减（同样时长的音频，token 数少 6 倍 → 模型要预测的步数少 6 倍）。这就是为什么 Moshi 不惜在编解码上下功夫把帧率压到 12.5 Hz：<strong>低帧率 token 同时缩短了算法延迟和自回归长度</strong>，是实时全双工的前提。把这笔账记住，你就懂了『为什么实时语音 LM 都在卷低帧率 tokenizer』。</p>  <p>本课 notebook 会模拟流式处理：把一个 token 序列分块、逐块用语音 LM 预测、维护跨块的状态（历史 token），验证<strong>分块流式的结果与一次性处理整段一致</strong>（因为 n-gram 只依赖固定长度历史，分块只要保留足够的边界 token 即可无损）。这把『流式』这个抽象概念，变成一个你能 assert 的等价性命题。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="bigpic"><span class="num">6</span>拼起来：端到端语音系统</h2>
+  <h3>把整门课拼起来：一个端到端语音系统</h3>  <p>本模块是<strong>全课的收束</strong>。退一步看，五个模块拼成的正是一个完整的现代语音系统：</p>  <div class="ascii">             ┌─────────────── 统一范式: 下一个 token 预测 ───────────────┐
+输入语音 ──(01 特征/03 编码)──► 音频 token ──┐
+文本提示 ──(tokenize)──────────► 文本 token ──┤
+                                              ├─► 语音 LM (05) ──► 输出 token
+                  (02 的对齐思想: 交错/多流)──┘         │
+                                                        ▼
+                              输出 token ──(03 解码/04 声码器)──► 输出波形
+
+  识别 = 音频token→文本token   合成 = 文本token→音频token   对话 = 听token→说token</div>  <p>这张图里每个箭头都是前面某个模块：特征前端（01）、CTC/对齐（02）、token 化（03）、声码器/解码器（04）、token 预测（05）。所谓『语音大模型』<strong>没有一个全新的概念</strong>——它是把前四模块的零件，按『离散 token + 下一个预测』这一条主线重新组装。这也是本课从第一模块就埋下的伏笔：每一步都在为『把声音变成模型能学的 token』做准备，本模块则把这些 token 喂进语言模型，闭环。</p>  <p>一个值得记住的历史视角：语音 AI 经历了从<strong>专用流水线</strong>（HMM-GMM、信号处理专家手工设计每一环）到<strong>端到端深度模型</strong>（CTC/seq2seq 各管一个任务）再到<strong>统一的 token 语言模型</strong>（一个模型、一种范式、多个任务）的演进。这与 NLP 从专用模型到 GPT 式通用模型的轨迹<em>惊人地平行</em>——而把它们统一起来的，正是『离散 token + 自回归预测』这个朴素而强大的想法。你学完这门课，就站在了这个统一范式的内部。</p>  <p>最后留一个<strong>批判性的思考</strong>，免得把『token 语言模型』当成万能解。这套范式有它的<strong>代价与争议</strong>：离散化是<em>有损</em>的（量化误差不可逆，音质天花板受 tokenizer 限制）；自回归逐 token 生成在长音频上<em>慢且会累积误差</em>；声学 token 的多级（RVQ）让『一步一个 token』变成『一步多个流』，建模复杂度陡增。正因如此，<strong>连续</strong>路线（扩散/流模型直接生成波形或连续 latent，绕开离散化损失）在音质上常有优势，是与 token-LM 并行的活跃方向。两条路线各有胜场：要<em>和文本 LLM 统一、要可组合可编辑</em>，离散 token 更顺；要<em>极致音质、不在乎 LLM 范式</em>，连续生成可能更好。把这层张力放在心里——你学到的不是『token LM 是终极答案』，而是<strong>『离散化让音频接入了语言模型，但这是一个有代价的选择，边界仍在演进』</strong>。带着这种判断力去读前沿论文，比记住任何单一结论都重要。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="roadmap"><span class="num">7</span>从零实现的路线图</h2>
+  <h3>从零实现的路线图</h3>  <p>notebook 会把本模块拆成可验证的几块，对拍可信参考与不变量：</p>  <div class="ascii">波形 (合成)
+  │
+  ├─ tokenize_audio(): 特征 + VQ → 整数 token 序列 ──对拍── token 在 [0,K)
+  │
+  ├─ n-gram 语音 LM: 计数 → p(下一个|历史) ──对拍── 概率归一  
+  │
+  ├─ 困惑度 &lt; 词表大小 K ──验证── 学到了 token 结构  ★
+  │
+  ├─ 流式分块: 分块预测 == 整段预测 ──验证── 流式无损  ★
+  │
+  └─ 自回归采样: 用 LM 生成新 token 序列 ──对拍── 生成的 token 合法</div>  <p>两个<strong>关键验证</strong>：(1) <strong>困惑度 &lt; K</strong>——把音频 token 化、训 n-gram LM、在留出序列上算困惑度，它必须显著低于均匀基线 $K$（证明 LM 捕捉到了音频 token 的结构，而非瞎猜）；(2) <strong>流式 == 整段</strong>——把序列分块、逐块预测并维护历史，结果与一次性处理整段<strong>逐位相等</strong>（证明你的流式实现无损、状态维护正确）。这两个一过，你就完整理解了语音 LM 的训练（计数/困惑度）与部署（流式）。</p>  <p>这套『玩具实现 + 不变量验证』再次体现本课方法论：我们不追求 SOTA 的语音 LM（那要海量数据与算力），而是用最小可跑的 n-gram，把『音频 = 可建模的 token 序列』『困惑度衡量学到多少』『流式 = 分块等价』这几个<em>不随规模变化的核心概念</em>夯死。理解了它们，你再看 AudioLM/Moshi 的论文，看到的就不是黑魔法，而是同一套思想在 Transformer + 海量数据上的放大。</p>  <p>最后点明<strong>流式无损那个等价性测试</strong>的深意，它不只是个 numpy 练习。流式系统最隐蔽的 bug，是<strong>跨块的状态维护出错</strong>——边界处该带的历史 token 漏了、或带多了、或顺序错了，导致<em>块边界附近的预测与整段处理不一致</em>。在真实流式 ASR/语音对话里，这种 bug 表现为『每隔一个 chunk 就吐错一个字』，极难定位（因为大部分输出是对的）。本课把它变成一个干净的命题：<code>流式分块预测 == 整段预测（逐位相等）</code>。对 n-gram，只要每块带足前 $n-1$ 个边界 token 就能严格无损；对 Transformer，对应的是『KV-cache 跨块正确传递』。你在玩具上验证过这个等价性，就建立了<em>检验任何流式实现正确性的标准动作</em>——拿流式输出和整段输出对拍，一票否决。这正是把『从零 + 对拍』方法论用到部署正确性上的范例。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>语义/声学的统一 tokenizer</strong>：分层（语义→声学）有效但复杂。能否用单一 tokenizer 同时编码语义与声学（如 Mimi）、让语音 LM 更简洁，是当前热点。</li>
+    <li><strong>低延迟全双工</strong>：Moshi 把延迟压到对话级别，但全双工（同时听说、自然插话）的建模仍不成熟。多流对齐、流式编解码、超低帧率 token 是关键方向。</li>
+    <li><strong>文本-语音的深度融合</strong>：是把语音 token 加进文本 LLM 的词表（统一一个模型），还是分开建模再对齐？语音-文本基础模型（speech-text foundation model）的最佳架构仍在探索。</li>
+    <li><strong>音频 token 的『可懂性』</strong>：文本 token 人类可读，音频 token 是黑盒整数。如何让音频 token 更可解释、可编辑、可控制（指定音色/情感），关系到可用性与安全。</li>
+    <li><strong>评测与安全</strong>：语音生成的评测（自然度、可懂度、说话人相似度）缺统一标准；而零样本音色克隆（VALL-E）带来深度伪造（deepfake）风险——水印、检测、滥用防范是必须面对的（与 C04/C05 的安全主题相连）。</li>
+  </ul>  <div class="card"><strong>✅ 本章你应该能回答：</strong>  <ol>
+    <li>为什么离散 token 是语音 LM 的前提？语义 token 与声学 token 各刻画什么、为何要两种？</li>
+    <li>写出语音 LM 的自回归分解与交叉熵；困惑度怎么定义？均匀基线的困惑度是多少？</li>
+    <li>为什么困惑度 < 词表大小 K 就证明 LM 学到了结构？</li>
+    <li>文本与音频 token 有哪几种排法（拼接/交错/多流）？它们如何连接到对齐主题与全双工？</li>
+    <li>流式生成的核心权衡是什么？为什么 n-gram 的分块流式可以无损等价于整段处理？</li>
+  </ol></div>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读（详见 <code>references.md</code>）：Borsos 2022（AudioLM，本模块核心范式）、Wang 2023（VALL-E，token TTS）、Défossez 2024（Moshi，全双工流式）、Agostinelli 2023（MusicLM）、Hsu 2021（HuBERT，语义 token 来源）、Lakhotia 2021（GSLM，无文本语音 LM 先驱）。至此全课闭环：从波形到特征到 token 到语言模型，你已掌握现代语音系统的完整骨架。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_tts/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · TTS 与声码器</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

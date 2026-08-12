@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · Agentic 评测方法论</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 06 / 9</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>06 · Agentic 评测方法论</h1>
+  <p class="subtitle">Agentic Evaluation Methodology —— 从 pass@k 到 time horizon：把"agent 能不能干活"变成一门可测量的科学</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（agent 循环）、模块 03（harness / 轨迹）、基础统计（二项分布、logistic 回归）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 06_agentic_evals.ipynb（全程模拟，离线可跑）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Kwa 2025 (time horizon)、Wijk 2024 (RE-Bench)、Yao 2024 (τ-bench)、Kapoor 2024</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 90 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#diff">Agentic 评测与静态评测的本质差异（及统计后果）</a></li>
+      <li><a href="#suite">任务套件设计：task family、人类基线与 RE-Bench 的课</a></li>
+      <li><a href="#passk">可靠性指标：pass@k vs pass^k</a></li>
+      <li><a href="#horizon">Time horizon 方法论 [Kwa 2025]</a></li>
+      <li><a href="#partial">部分分 partial credit：里程碑 vs 二值结果</a></li>
+      <li><a href="#cost">成本感知报告：成功率-成本 Pareto 前沿 [Kapoor 2024]</a></li>
+      <li><a href="#pitfalls">评测工程陷阱大表</a></li>
+      <li><a href="#claims">从评测到声明：推断距离与 under-elicitation</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="diff"><span class="num">1</span>Agentic 评测与静态评测的本质差异（及统计后果）</h2>
+
+  <p>静态评测（MMLU、HumanEval 一类）的对象是<strong>一次前向</strong>：固定输入、模型输出、对照参考答案判分。
+  <span class="term">agentic 评测</span>的对象是<strong>一个闭环系统在环境中的多步轨迹</strong>：模型 + scaffold + 工具 + 环境一起被测。
+  这不是"难度更高的同一件事"，而是<strong>统计性质完全不同的另一件事</strong>。每一条差异都有明确的统计后果：</p>
+
+  <table>
+    <thead><tr><th>差异维度</th><th>静态评测</th><th>agentic 评测</th><th>统计后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>环境交互</strong></td><td>输入固定、输出即答案</td><td>输入由环境状态动态生成，判分对象是<em>环境终态</em>而非输出文本（τ-bench 比对数据库终态 [Yao 2024]）</td><td>string match 失效；判分器本身成为误差源，grader 错误与模型错误混杂，必须单独审计</td></tr>
+      <tr><td><strong>多步执行</strong></td><td>单轮</td><td>数十到数百步，错误会复利累积</td><td>成功率随任务长度近似指数衰减（见下式）；单一平均分掩盖长度维度，必须按时长/步数<em>分层报告</em></td></tr>
+      <tr><td><strong>非确定性</strong></td><td>greedy 解码可复现</td><td>采样解码 × 工具返回波动 × 环境随机性三重叠加</td><td>单次运行只是一个样本；n=1 的榜单数字没有标准误，必须多 trial + 报方差</td></tr>
+      <tr><td><strong>开放结果</strong></td><td>唯一参考答案</td><td>同一目标有多条合法解法路径与多种合法终态</td><td>exact match 系统性低估能力；需要 outcome-based 判分函数或连续评分（§5），但这又引入判分方差</td></tr>
+      <tr><td><strong>成本巨大</strong></td><td>每条样本 &lt; $0.001、毫秒级</td><td>每 trial 数美元到数百美元、分钟到小时级</td><td>样本量天然小 → 置信区间宽 → 模型间差异常常不显著；催生成本感知设计（§6）与试次分配问题（§9）</td></tr>
+    </tbody>
+  </table>
+
+  <p>"错误复利"是 agentic 评测一切长度效应的根源。最粗糙的模型：设每步独立成功率 $p$，任务需 $T$ 步全部正确：</p>
+
+  <div class="math-block">
+  $$ P(\text{轨迹成功}) = p^{T} \qquad\Rightarrow\qquad p=0.99,\ T=100:\ \ 0.99^{100}\approx 36.6\%;\qquad p=0.95:\ \ 0.95^{100}\approx 0.6\% $$
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  真实 agent 不是纯几何衰减——它能发现错误并<strong>恢复</strong>（重试、回滚、换路），这正是 scaffold 的价值（模块 02 的 Reflexion）。
+  但经验上"成功率随任务人类时长指数下降"这个形状在 [Kwa 2025] 的数据里近似成立（恒定 hazard rate），这是 §4 用 logistic-in-log-time 拟合 horizon 的经验基础。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>你测的从来不是"模型"，而是"模型 × scaffold × 工具 × 环境配置"这个系统。</strong>换一个 scaffold，同一模型的成功率可以差几倍。
+  所以任何 agentic 评测数字不绑定 scaffold 版本与预算口径就没有意义——本章 §7、§8 会反复回到这一点。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="suite"><span class="num">2</span>任务套件设计：task family、人类基线与 RE-Bench 的课</h2>
+
+  <h3>2.1 METR 风格的 task family</h3>
+  <p>METR 的工程实践（Task Standard，模块 03）把任务组织成<span class="term">任务族（task family）</span>：
+  同族任务共享环境搭建代码与判分逻辑，用参数生成不同实例与难度层级。这带来三个直接好处：</p>
+  <ul>
+    <li><strong>难度内插</strong>：同族内从"2 分钟版"到"8 小时版"连续铺开，正是 horizon 拟合（§4）需要的难度梯度；</li>
+    <li><strong>成本摊薄</strong>：环境与判分器的开发成本（往往远超任务本身）被多个实例分摊；</li>
+    <li><strong>抗记忆污染</strong>：实例可参数化再生成，泄漏进训练集的旧实例可以作废重抽。</li>
+  </ul>
+
+  <h3>2.2 人类基线时长标定：horizon 的"尺"</h3>
+  <p>time horizon 的整个方法论建立在一个前提上：<strong>每个任务都标定了"有相关技能的人类完成它需要多久"</strong>（记 $t_i$，单位分钟）。
+  这把异构任务投影到了一个统一的、有外部含义的难度轴上。标定方式按可信度排序：雇佣 contractor 在同一 harness 内<em>实际计时</em>完成（METR 的 HCAST 做法，失败尝试也计入统计）&gt; 多位专家独立估计取中位 &gt; 作者拍脑袋。
+  基线噪声不是随机误差——contractor 技能不匹配、激励不对（按时计费 vs 按完成计费）会造成<em>系统性</em>偏移，直接平移 horizon 轴。</p>
+
+  <div class="ascii">
+  任务族 task family           人类基线标定              agent 运行                  统计层
+ ┌────────────────┐      ┌────────────────┐      ┌─────────────────────┐      ┌────────────────────┐
+ │ 参数化任务生成    │      │ contractor      │      │ harness (模块03)     │      │ pass@k / pass^k    │
+ │ 族内难度分层      │ ───► │ 实际计时 t_i     │ ───► │ 每任务 N trials      │ ───► │ horizon 拟合 + CI   │
+ │ 确定性判分函数    │      │ (分钟, 含失败)   │      │ 轨迹 + 终态 + 成本    │      │ 成本-成功率 Pareto   │
+ └────────────────┘      └────────────────┘      └─────────────────────┘      └────────────────────┘
+        ▲                                                   │
+        └────────────── 参考解先过一遍判分器（任务健康检查, §7）◄┘
+  </div>
+
+  <h3>2.3 RE-Bench 的设计课 [Wijk 2024]</h3>
+  <p><strong>RE-Bench</strong>（METR）是 7 个开放式 ML 研究工程环境（优化 GPU kernel、在固定算力预算内降低训练 loss、修复 scaling 实验等），
+  配 71 次、每次 8 小时的人类专家基线尝试（61 位专家）。它把任务套件设计的核心矛盾摆上了台面：</p>
+  <ul>
+    <li><strong>环境真实性 vs 可控性</strong>：任务越接近真实研究工作，越难做到确定性判分、固定硬件、可复现环境。RE-Bench 的解法是"真实的目标 + 人造的封闭世界"：目标是真 ML 工程，但评分函数连续、自动、确定（如最终 loss / kernel 耗时），硬件锁死。</li>
+    <li><strong>连续评分、上不封顶</strong>：分数归一化为 $s_{\text{norm}} = (s - s_{\text{start}})/(s_{\text{human}} - s_{\text{start}})$（0 = 初始解，1 = 人类专家参考水平），既给了 partial credit（§5），又允许比较<em>超人</em>表现——二值判分做不到。</li>
+    <li><strong>预算-分数曲线，而非单点</strong>：关键发现——agent 在 2 小时预算下靠 best-of-k 采样得分超过人类，但人类在 32 小时预算下反超。<strong>同一对(人, agent)在不同预算下排名反转</strong>，所以报告必须给整条 budget-score 曲线。</li>
+  </ul>
+
+  <p>主流 agentic benchmark 在这些设计维度上的取舍：</p>
+
+  <table>
+    <thead><tr><th>Benchmark</th><th>环境形态</th><th>判分方式</th><th>核心指标</th><th>设计取舍</th></tr></thead>
+    <tbody>
+      <tr><td>GAIA [Mialon 2023]</td><td>真实世界助手问题（466 题 / 3 难度级，需要浏览/工具/多模态）</td><td>唯一短答案 exact match</td><td>accuracy</td><td>牺牲开放性换取零歧义自动判分；"人类 92% vs GPT-4+插件 15%"的设计哲学：对人简单、对 AI 难</td></tr>
+      <tr><td>AgentBench [Liu 2023]</td><td>8 个异构环境（OS、DB、KG、卡牌、web 购物/浏览等）</td><td>各环境自定义</td><td>多环境综合分</td><td>覆盖广但深度浅、各环境口径不一，跨环境平均分的含义模糊</td></tr>
+      <tr><td>τ-bench [Yao 2024]</td><td>工具-agent-用户三方对话（零售/航司客服），LLM 模拟用户</td><td>数据库终态比对 + 必答信息</td><td><strong>pass^k</strong></td><td>引入模拟用户增真实性、但用户模拟器本身引入方差；首个把可靠性（而非能力）作为头号指标的 agent benchmark</td></tr>
+      <tr><td>SWE-bench（模块 04）</td><td>真实 GitHub issue + 仓库</td><td>fail-to-pass 测试</td><td>% resolved</td><td>真实性极高，但任务分布偏 Python/补丁型，且公开后污染快</td></tr>
+      <tr><td>HCAST + RE-Bench [Kwa 2025; Wijk 2024]</td><td>带人类时长标定的多领域任务 + 开放式 ML 研究环境</td><td>确定性判分 / 连续评分函数</td><td><strong>time horizon</strong> / budget-score 曲线</td><td>标定成本极高（雇人实测），换来唯一能跨年代、跨模型比较的"绝对难度轴"</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="passk"><span class="num">3</span>可靠性指标：pass@k vs pass^k</h2>
+
+  <p>非确定性（§1）意味着每个任务要跑多个 trial。多 trial 之后报什么数？两个长得很像、含义相反的指标：</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p><strong>pass@k</strong> 问的是："给它 k 次机会，至少蒙对一次的概率"——衡量<em>能力上限</em>，越多机会数字越好看。
+      <strong>pass^k</strong> 问的是："连做 k 次，每次都做对的概率"——衡量<em>部署可靠性</em>，越多次数字越难看。
+      同一个 agent，k=8 时 pass@k 可能 95%、pass^k 可能 20%。给投资人看前者，给上线决策看后者。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设任务 $\tau$ 上单 trial 成功概率为 $p_\tau$（trial 间独立同分布）。则
+      $\text{pass@}k(\tau)=1-(1-p_\tau)^k$ 是 $k$ 次独立重试至少一次成功的概率，刻画 best-of-$k$ <span class="term">elicitation</span> 下的能力；
+      $\text{pass}^k(\tau)=p_\tau^k$ 是 $k$ 次全部成功的概率，刻画"每次遇到同类任务都得做对"的部署语义 [Yao 2024]。
+      两者在 $k=1$ 处重合于 $p_\tau$，随 $k$ 向相反方向单调发散。</p>
+    </div>
+  </div>
+
+  <div class="math-block">
+  $$ \text{pass@}k \;=\; \mathbb{E}_{\tau}\!\left[\,1-(1-p_\tau)^k\,\right] \;\nearrow\; 1
+     \qquad\qquad
+     \text{pass}^k \;=\; \mathbb{E}_{\tau}\!\left[\,p_\tau^{\,k}\,\right] \;\searrow\; 0
+     \qquad (k\uparrow,\ 0<p_\tau<1) $$
+  </div>
+
+  <p>单调性一行可证：$1-(1-p)^k$ 对 $k$ 的差分为 $(1-p)^k p \ge 0$（单调升），$p^k$ 的差分为 $-p^k(1-p)\le 0$（单调降）。
+  两者的缺口 $\big[1-(1-p)^k\big]-p^k \to 1$（$k\to\infty$）：<strong>k 越大，"能力视角"与"可靠性视角"对同一系统的描述差得越远</strong>。
+  实测中 τ-bench 报告 GPT-4o 在零售域 pass^1 约 61%，到 pass^8 跌破 25% [Yao 2024]——客服 agent 要"每次都对"，这个数字才是产品现实。</p>
+
+  <p>从有限数据估计：任务 $\tau$ 跑 $n$ 次、成功 $c$ 次，无偏估计量为（HumanEval 传统的组合数技巧，及其 pass^k 对偶）：</p>
+
+  <div class="math-block">
+  $$ \widehat{\text{pass@}k} \;=\; 1-\frac{\binom{n-c}{k}}{\binom{n}{k}}
+     \qquad\qquad
+     \widehat{\text{pass}^k} \;=\; \frac{\binom{c}{k}}{\binom{n}{k}}
+     \qquad (k\le n) $$
+  </div>
+
+  <p>直觉：从 $n$ 个 trial 里无放回抽 $k$ 个，"全是失败"的概率估计 $(1-p)^k$，"全是成功"的概率估计 $p^k$。
+  朴素 plug-in $(c/n)^k$ 是有偏的（对 $p^k$ 偏高：$\binom{c}{k}/\binom{n}{k}=\prod_{i=0}^{k-1}\frac{c-i}{n-i}\le (c/n)^k$）——notebook 练习 1 让你亲手实现并验证。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>任务异质性的 Jensen 效应。</strong>$x\mapsto x^k$ 是凸函数，故 $\mathbb{E}_\tau[p_\tau^k]\ \ge\ (\mathbb{E}_\tau[p_\tau])^k$。
+  含义：聚合 pass^k 的衰减比"把平均成功率自乘 k 次"<em>慢</em>——它被少数 $p_\tau\approx 1$ 的"稳态任务"撑住。
+  读 pass^k 曲线时要意识到：曲线尾部的高度主要反映"有多少任务被可靠掌握"，而非"平均水平有多稳"。</div>
+
+  <table>
+    <thead><tr><th></th><th>pass@k（至少 1 次成功）</th><th>pass^k（k 次全部成功）</th></tr></thead>
+    <tbody>
+      <tr><td>视角</td><td>能力 / elicitation 上界</td><td>部署可靠性 / 工程下界</td></tr>
+      <tr><td>随 k</td><td>单调升 → 1</td><td>单调降 → 0</td></tr>
+      <tr><td>支持的声明</td><td>"模型<em>能够</em>做到 X"（存在性）</td><td>"模型<em>每次都能</em>做到 X"（普遍性）</td></tr>
+      <tr><td>适用场景</td><td>危险能力评估（保守原则取上界）、研究潜力</td><td>产品上线门槛、SLA、自动化替代决策</td></tr>
+      <tr><td>代表 benchmark</td><td>HumanEval 系、多数 coding 榜单</td><td>τ-bench [Yao 2024]</td></tr>
+      <tr><td>被滥用的方式</td><td>不报 k 与采样成本，冒充单次能力（§6）</td><td>k 次重复假设 i.i.d.，忽略任务实例间相关性</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="horizon"><span class="num">4</span>Time horizon 方法论 [Kwa 2025]</h2>
+
+  <p>不同 benchmark 的分数不可比，同一 benchmark 又会饱和。METR 在 <em>Measuring AI Ability to Complete Long Tasks</em> [Kwa 2025]
+  中提出的 <span class="term">time horizon</span> 给出了一个跨年代、跨任务集的绝对量纲：<strong>"模型能以 50% 成功率完成的任务，对应人类需要多长时间"</strong>。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>把每个任务标上"人类要花几分钟"，让 agent 都做一遍。你会发现：人类 2 分钟的任务它几乎全对，人类 8 小时的任务它几乎全错，中间有一条下坡曲线。
+      这条曲线掉到 50% 的那个位置——比如"59 分钟"——就是这个 agent 的 P50 horizon：它大致顶得上一个人类干一小时的活。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>对任务 $i$（人类时长 $t_i$）上的成败观测 $y_{ij}\in\{0,1\}$，拟合以 $\log_2 t$ 为协变量的 logistic 模型，
+      horizon 定义为预测成功率等于目标水平 $\alpha$ 的时长。这是心理测量学 IRT（item response theory）的单参数化变体：
+      $\log_2 t_i$ 充当任务"难度"，模型的 horizon 充当"能力"，两者在同一轴上可比。</p>
+    </div>
+  </div>
+
+  <div class="math-block">
+  $$ P(\text{success}\mid t) = \sigma\!\big(\beta_0 + \beta_1 \log_2 t\big),\quad \beta_1 < 0
+     \qquad\Rightarrow\qquad
+     h_{\alpha} = 2^{\,\big(\operatorname{logit}(\alpha)-\beta_0\big)/\beta_1},
+     \qquad h_{50} = 2^{-\beta_0/\beta_1} $$
+  </div>
+
+  <p>完整操作流程（notebook 全程复现）：</p>
+  <ol>
+    <li><strong>任务集</strong>：约 170 个任务（HCAST 97 + RE-Bench 7 + SWAA 66 个"秒级原子操作"），人类时长从几秒到 8 小时，跨多个数量级——难度轴必须铺满，否则 logistic 斜率不可辨识；</li>
+    <li><strong>标定</strong>：人类基线按 §2.2 实测计时；</li>
+    <li><strong>运行</strong>：每个(模型, 任务)跑多 trial 得成功率；</li>
+    <li><strong>拟合</strong>：logistic 回归 success ~ $\log_2 t$，读出 $h_{50}$（与 $h_{80}$）；</li>
+    <li><strong>不确定性</strong>：对<em>任务维度</em>做 bootstrap 重采样（任务是主要方差来源，不是 trial）——练习 3。</li>
+  </ol>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>[Kwa 2025] 的两个头条结果：</strong>①2025 年初的前沿模型（如 Claude 3.7 Sonnet）P50 horizon ≈ 59 分钟；
+  ②2019–2025 六年间 horizon 指数增长，<strong>倍增周期约 7 个月</strong>。按外推，2020s 末模型将能完成人类月级的任务——但这是经验回归外推，不是自然定律（§9）。
+  另一个常被忽略的数字：<strong>P80 horizon 大约只有 P50 的 1/5</strong>——把可靠性门槛从 50% 提到 80%，"能干的活"瞬间缩水五倍。</div>
+
+  <p><strong>Agentic 场景的具体陷阱：</strong></p>
+  <ul>
+    <li><strong>任务分布敏感</strong>：horizon 是"该任务分布上的 horizon"。HCAST 任务干净、自包含、自动判分；真实工作 messy（需求模糊、上下文缺失、协作依赖）。[Kwa 2025] 自测发现任务"messiness"越高，模型相对人类的表现越差——换分布，horizon 平移甚至变形。</li>
+    <li><strong>scaffold 依赖</strong>：horizon 是 agent 系统（模型 × scaffold × 工具 × token 预算）的属性。scaffold 升级可以在模型不变时显著抬高 horizon——纵向比较必须冻结 scaffold，或者明确声明测的是"当年最佳已知 scaffold"（METR 的口径）。</li>
+    <li><strong>$\alpha$ 的选择改变故事</strong>：P50 适合追踪能力趋势（统计上最稳，logistic 曲线在中点附近斜率最大、估计方差最小）；P80/P95 才接近部署语义。报告只给 P50 而声明用于可靠性场景，是口径偷换。</li>
+    <li><strong>失败原因没有分解</strong>：超时失败、环境故障、判分误判都会被压进"失败"，拉低 horizon（§7）。拟合前必须先做失败归因。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="partial"><span class="num">5</span>部分分 partial credit：里程碑 vs 二值结果</h2>
+
+  <p>二值结果分（成/败）干净、无可争议，但在长任务上<strong>信息量极低</strong>：一个 8 小时任务，模型 A 卡在第 5 分钟、模型 B 死在最后一步验证，二值分都是 0。
+  当 $p$ 很小时，$N$ 个 trial 的二值估计方差 $p(1-p)/N$ 相对信号 $p$ 巨大——你需要海量 trial 才能把两个弱模型分开，而 agentic trial 恰恰最贵（§1）。</p>
+
+  <p>两条出路：</p>
+  <ul>
+    <li><strong>里程碑式评分（milestone scoring）</strong>：把任务分解为 $M$ 个<em>客观可验证的环境状态检查点</em>（依赖装好了、中间产物存在、测试通过），得分 = 达成数 / $M$。同样的 trial 数下，估计量方差更小、对弱模型有区分度。</li>
+    <li><strong>连续评分函数</strong>：RE-Bench 式 [Wijk 2024]——任务本身有自然的连续目标（loss、耗时、吞吐），归一化后直接当分数。这是 partial credit 的理想形态：客观、自动、上不封顶。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>过程分的主观性风险。</strong>partial credit 的危险形态是"过程评分"：让人或 LLM judge 看轨迹打"思路分"。三个失败模式：
+  ①<strong>奖励表演</strong>——啰嗦、列计划、装模作样的轨迹得分更高，与最终能力脱钩；
+  ②<strong>路径霸权</strong>——里程碑顺序隐含了"标准解法"，走另一条合法路径的 agent 被判低分（开放结果，§1）；
+  ③<strong>judge 可被博弈</strong>——agent 学会在轨迹里写讨好 judge 的内容。
+  纪律：<strong>里程碑必须锚定环境状态（文件存在、测试通过、数据库行数），绝不锚定轨迹的文本观感</strong>；过程分只用于诊断分析，不进榜单。</div>
+
+  <p>注意一个统计细节：里程碑分与二值分<strong>回答不同的问题</strong>。里程碑均值高不代表完成率高（一个总是完成 2/3 的 agent，里程碑分 0.67、二值分 0）。
+  报告时两者并列，里程碑分管"区分度与诊断"，二值/连续结果分管"结论"。notebook 会用最难任务演示：两个二值分都≈0 的模型代际，被里程碑分清晰拉开。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="cost"><span class="num">6</span>成本感知报告：成功率-成本 Pareto 前沿 [Kapoor 2024]</h2>
+
+  <p><em>AI Agents That Matter</em> [Kapoor 2024] 对 2024 年的 agent 榜单文化做了一次系统拆台，核心论点：<strong>只报准确率、不报成本的榜单，会被"过度采样 + 复杂 scaffold"系统性刷爆，并误导整个领域的方法研究。</strong>三个实证发现：</p>
+  <ul>
+    <li>在 HotPotQA、HumanEval 等基准上，<strong>简单 baseline（重试、self-consistency、模型升级）能以低得多的成本达到与复杂 agent 架构相当的精度</strong>——很多"架构创新"的增益在控制成本后消失；</li>
+    <li>pass@k 式指标在不报 $k$ 与采样成本时，等价于允许无上限的推理预算——榜单激励 $k=100$ 采样 + verifier 筛选，而这与任何真实部署的成本约束无关；</li>
+    <li>评测应该报告<strong>(成本, 成功率) 二维点，比较看 Pareto 前沿</strong>：一个系统只有在"同成本更准 或 同准更便宜"时才真正占优。</li>
+  </ul>
+
+  <p>成本核算的两个基本公式。重试到成功为止（几何分布）与截断在 $k$ 次预算内：</p>
+
+  <div class="math-block">
+  $$ \mathbb{E}[\text{cost-to-success}] = \frac{\bar{c}}{p}
+     \qquad\qquad
+     \mathbb{E}[\text{attempts} \mid \text{budget } k] = \frac{1-(1-p)^k}{p}
+     \qquad (\bar{c} = \text{单次 trial 平均成本}) $$
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  Pareto 视角会改变结论的形状：notebook 里你会看到，<strong>旧一代模型 × 8 次重试预算</strong>在"成功率/美元"上可以压过<strong>新一代模型 × 1 次</strong>——
+  如果任务有廉价的自动验证器（能从 k 次尝试里挑出对的），"旧模型+重试"就是真实可部署的占优策略；如果没有验证器，pass@k 的成功率根本拿不到手，比较又变了。
+  <strong>成本报告必须连同"验证成本"一起算</strong>，这是 [Kapoor 2024] 最容易被忽视的脚注。</div>
+
+  <p>报告规范（本课程作业的硬性要求）：①每个数字附带 (模型版本, scaffold 版本, $n$, $k$, 温度, token/时间预算)；②准确率与美元成本（或 token 数）成对出现；③榜单图用 Pareto 前沿图替代单轴柱状图。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="pitfalls"><span class="num">7</span>评测工程陷阱大表</h2>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>Agentic 评测的大部分错误结论不是统计错误，而是工程错误。</strong>环境、判分器、超时、重试口径——任何一处工程瑕疵都会被"成功率"这个单一数字无差别吞掉，
+  然后以科学结论的面目出现在报告里。METR 的实践是对失败轨迹做<strong>人工抽查归因</strong>：在确认"这是模型的失败"之前，先假设是你的评测的失败。</div>
+
+  <table>
+    <thead><tr><th>陷阱</th><th>典型症状</th><th>被污染的结论</th><th>防御</th></tr></thead>
+    <tbody>
+      <tr><td><strong>环境 bug 记为模型失败</strong></td><td>依赖缺失、镜像版本漂移、网络抖动导致任务根本不可完成</td><td>能力被低估；不同模型受影响不均时连排名都错</td><td>每个任务先用<em>参考解</em>跑通判分器（任务健康检查）；失败轨迹人工抽查归因；环境故障的 trial 作废重跑而非记 0</td></tr>
+      <tr><td><strong>observation 泄答案</strong></td><td>报错信息、文件列表、测试源码里直接含期望输出</td><td>能力被高估，且高估幅度随模型"读题能力"变化，扭曲排名</td><td>对任务做信息审计；跑 <em>no-op / trivial baseline</em>（不干活只读环境的 agent），其得分应≈0，否则任务漏了底</td></tr>
+      <tr><td><strong>超时设置剪断长尾</strong></td><td>wall-clock / token 预算小于任务实际需要；长任务失败原因全是 timeout</td><td>长任务成功率人为压低 → horizon 低估、logistic 斜率变陡，"模型做不了长任务"成为评测的自我实现</td><td>失败原因分类报告（timeout 占比单列）；预算作为自变量做敏感性分析；预算本身按人类时长比例设定</td></tr>
+      <tr><td><strong>重试口径不一致</strong></td><td>A 报 5 次平均、B 报 best-of-8 且不注明；temperature 各用各的</td><td>跨系统数字根本不可比，榜单名次是口径的函数</td><td>报告强制注明 $(n, k, \text{temp}, \text{scaffold})$；同榜单统一口径；pass@k 与 pass^k 分列（§3）</td></tr>
+      <tr><td><strong>非确定环境的方差未报告</strong></td><td>单 seed 单 trial 出榜；两次复跑名次互换</td><td>噪声被解读为真实差异；"提升 2%"的论文结论在方差面前不显著</td><td>每任务 ≥5 trials；报告任务维度 bootstrap CI（练习 3）；模型间比较用任务配对差分而非边际均值</td></tr>
+      <tr><td><strong>判分器被 agent 钻空子</strong></td><td>agent 改测试文件、覆写判分脚本、伪造输出文件</td><td>虚假成功；越强的模型"作弊"越多，排名反向失真</td><td>判分在 agent 不可写的隔离侧执行（模块 03 的沙箱边界）；判分输入只取受保护路径的环境终态</td></tr>
+      <tr><td><strong>记忆污染</strong></td><td>公开 benchmark 任务出现在训练集；模型"一步到位"复现已知解</td><td>能力被高估且无法用行为区分</td><td>私有 holdout；task family 参数化再生成实例（§2.1）；对比公开/私有任务成功率差作为污染探针</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="claims"><span class="num">8</span>从评测到声明：推断距离与 under-elicitation</h2>
+
+  <p>评测产出的是一个<strong>受限测量</strong>："在 scaffold $S$、任务分布 $D$、预算 $B$、口径 $(n,k)$ 下，P50 horizon = 59 分钟"。
+  而报告、媒体与决策者消费的是一个<strong>能力声明</strong>："模型能自主完成一小时的软件工程工作"。两者之间隔着一串各自引入不确定性的推断步骤：</p>
+
+  <div class="ascii">
+  测量:  "model M + scaffold S, 任务分布 D, 预算 B, 口径 (n,k) 下 P50 = 59 min"
+    │
+    │ ① scaffold 泛化 —— 别的 scaffold 会不会显著更高？(under-elicitation → 测量只是下界)
+    │ ② 分布泛化 ——— D 是干净、自包含、自动判分的 benchmark 任务，≠ 真实 messy 工作
+    │ ③ 预算泛化 ——— 预算放大后曲线形状如何？(RE-Bench: 预算改变人机排名 [Wijk 2024])
+    │ ④ 指标语义 ——— P50 ≠ 可部署；可靠性声明需要 P80/pass^k (§3, §4)
+    ▼
+  声明:  "模型能自主完成人类 1 小时的工作"      ← 每往下一步，置信度都应该打折
+  </div>
+
+  <p>这里有一个根本的<strong>不对称性</strong>，做能力评测（尤其是安全相关的危险能力评测）必须刻在脑子里：</p>
+  <ul>
+    <li><strong>成功是能力存在的证明（下界）</strong>：agent 在评测里做到了 X ⇒ 它确实能做到 X（在该条件下）。</li>
+    <li><strong>失败不是能力不存在的证明</strong>：<span class="term">under-elicitation</span>——更强的 prompt、更好的工具、微调、更大的预算都可能解锁"测不出来"的能力。今天 horizon 59 分钟的模型，换一代 scaffold 可能直接翻倍，<em>模型权重一个字节没变</em>。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  这正是《评测科学》课模块 06 的 <strong>elicitation gap</strong> 在 agentic 场景的放大版：agent 的表现对 scaffold 极度敏感（§4），所以"没尽力测"与"测不出来"几乎不可区分。
+  安全评测的纪律因此是：<strong>主动投入 elicitation（最佳已知 scaffold、提示工程、必要时微调），并在报告中披露 elicitation 投入了多少</strong>——
+  否则"模型不具备危险能力 X"的结论只是"我们没找到让它展示 X 的方法"的弱化表述。被动一面则是模块 08 的 sandbagging：模型可能<em>策略性地</em>在评测中藏拙。</div>
+
+  <p>反方向同样成立：产品声明不能拿能力视角的数字背书。"pass@8 = 95%"支持的是"它做得到"，不支持"上线后它每次都做得到"（那是 pass^8 的事，§3）。
+  把声明类型与指标类型一一对齐，是 agentic 评测报告的最低职业标准。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>horizon 的外部效度</strong>：benchmark 任务干净、自包含、可自动判分，真实工作 messy。[Kwa 2025] 的 messiness 分析只是开始——如何系统性地构造"messy 但仍可确定判分"的任务族？真实分布上的 horizon 与 benchmark horizon 的换算关系是否稳定？</li>
+    <li><strong>评测的统计功效与试次分配</strong>：每个 trial 都贵（§1），固定预算下应该把 trial 投给哪些任务？adaptive / sequential 评测（边跑边决定下一个 trial）能把 horizon CI 收窄多少？目前几乎没有 agentic 评测使用最优实验设计。</li>
+    <li><strong>人类基线的自动化</strong>：RE-Bench 烧掉 71 人次 × 8 小时 [Wijk 2024]，标定成本是 horizon 方法论扩张的最大瓶颈。能否用模型预测任务的人类时长、再用少量实测做校准？预测误差会如何传播进 horizon？</li>
+    <li><strong>评测的版本化与时效</strong>：scaffold 月月更新、模型季季更新，horizon 数字的"保质期"是多久？如何定义评测结果的失效条件、何时必须重跑？目前的榜单文化基本假装这个问题不存在。</li>
+    <li><strong>反身性与 Goodhart</strong>：一旦 time horizon 成为行业 KPI，训练就会直接 hill-climb 这个任务分布，7 个月倍增律将部分变成"对该分布的过拟合速度"。私有任务集 + 参数化再生成（§2.1）能撑多久？评测机构与被评测者之间需要怎样的制度隔离？</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>写出 pass@k 与 pass^k 的定义和无偏估计量，说明两者随 k 的发散方向，以及各自能支持什么类型的声明。</li>
+      <li>给定一组带人类时长标定的任务和成败矩阵，完整描述 P50 horizon 的拟合流程；P50 与 P80 的差别为什么在部署语境下是关键？</li>
+      <li>RE-Bench 在"环境真实性 vs 可控性"上做了哪些具体取舍？为什么"预算-分数曲线"比单点分数更有信息量？</li>
+      <li>列出至少四个 agentic 评测工程陷阱及对应防御；解释为什么不报成本与方差的榜单会系统性误导方法研究。</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../05_computer_use/05_讲解.html"><div class="dir">← 上一章</div><div class="t">05 · Computer Use：截图→动作</div></a>
+    <a class="next" href="../07_orchestration/07_讲解.html"><div class="dir">下一章 →</div><div class="t">07 · 多智能体与编排</div></a>
+  </div>
+
+</div>
+</body>
+</html>

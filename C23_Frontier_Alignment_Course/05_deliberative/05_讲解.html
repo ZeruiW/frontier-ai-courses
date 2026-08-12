@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · Deliberative Alignment 与规范遵循</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · Deliberative Alignment 与规范遵循</h1>
+  <p class="subtitle">让模型在回答前显式检索、推理一份明文安全规范（spec），引用条款做决策；规范一致性评分、拒绝校准、越界（jailbreak）检测 —— 把对齐从「隐式记忆规则」升级成「显式推理规则」，换来稳健、可审计、可更新，新风险是推理可能不忠实</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–04、对越狱/安全对齐的基本认识、思维链(CoT)概念</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_deliberative.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Guan et al. 2024（deliberative alignment）、OpenAI Model Spec、Mu 2024、Wei 2023</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">从隐式记忆到显式推理规范</a></li>
+      <li><a href="#spec">什么是 spec：明文规范</a></li>
+      <li><a href="#following">推理时的 spec-following</a></li>
+      <li><a href="#calibration">拒绝校准：拒得对也别乱拒</a></li>
+      <li><a href="#jailbreak">抗越狱：为何显式推理更稳健</a></li>
+      <li><a href="#consistency">spec 一致性：推理是真的吗</a></li>
+      <li><a href="#numpy">把概念落进 numpy：玩具实现</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>从隐式记忆到显式推理规范</h2>
+  <p>到目前为止，本课的对齐方法有一个共同特点：它们都把对齐<strong>烘焙进了模型权重</strong>。RLHF/CAI 用偏好数据训练，让模型<em>隐式地、统计地</em>学会「这样回答更好」；w2s 让强模型从弱标签里泛化。模型最终<strong>「知道」该怎么做</strong>，但它的知识是隐式的——藏在权重里，说不清、改不动、也无法在回答时<em>显式地引用</em>某条规则。</p>  <p>这带来两个痛点。其一，<strong>脆弱</strong>：隐式学到的安全行为容易被越狱（jailbreak）绕过——用角色扮演、假设、编码等伪装，就能诱出本应被拒绝的输出，因为模型没有在「显式地核对这个请求是否违规」，只是在<em>模式匹配</em>训练时见过的拒绝场景。其二，<strong>不可审计</strong>：当模型拒绝（或不拒绝）一个请求时，你无法问它「依据哪条规则」，因为它自己也只是<em>感觉</em>该这么做。</p>  <p>Guan et al. 2024（OpenAI）的 <span class="term">deliberative alignment</span>（审议式对齐）提出一个直接的对策：<strong>让模型在回答前，显式地用思维链推理一份明文的安全规范（spec）</strong>——先回忆/检索相关条款，再据此判断请求是否越界、该如何回应，最后才下笔。把安全从「隐式记忆」变成「<strong>显式推理</strong>」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：CAI 像让员工通过大量案例<em>熏陶</em>出合规直觉；deliberative alignment 则像要求员工在做每个决定前，先<strong>翻开员工手册、找到相关条款、写下「根据第几条，这件事应该……」</strong>。前者快但容易在没见过的情形或被话术绕晕时出错；后者慢一点，但每个决定都<em>有据可查、能解释、手册一改行为就跟着改</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：deliberative alignment 训练模型把策略 <code>π(y|x)</code> 扩展成 <code>π(y, cot | x, spec)</code>——在给出答复 <code>y</code> 前先生成一段关于 spec 的推理 <code>cot</code>。训练时不仅监督最终答复是否合规，还监督这段推理是否<strong>正确地引用并应用了相关 spec 条款</strong>。安全规则从<em>训练分布里的隐式统计</em>变成了<em>推理时可被检索、引用、核对的显式文本</em>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>本模块一句话：<strong>把对齐从「隐式记住规则」升级成「回答前显式推理规则」</strong>。这呼应了模块 01 CAI 的 critique（也是一种显式中间推理）和模块 03 debate 的论证，但推得更彻底——不只在训练时用推理，而是让<em>部署时每次回答都先推理一遍规范</em>。好处是稳健、可审计、可更新；新风险是：模型可能<strong>表面引用规范、实则另有打算</strong>（不忠实的推理）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="spec"><span class="num">2</span>什么是 spec：明文规范</h2>
+  <h3>什么是 spec：从隐式偏好到明文规范</h3>  <p>deliberative alignment 推理的对象是一份 <span class="term">specification</span>（规范，spec）——一份写明<strong>目标、规则、默认行为、边界、以及指令优先级</strong>的明文文档。OpenAI 公开的 Model Spec 就是真实例子，它不是训练数据，而是一份<em>可以直接给模型读、让模型在推理时引用</em>的政策文件。</p>  <p>spec 与前几个模块的监督信号有本质区别：</p>  <table>
+    <thead><tr><th>监督形态</th><th>出现在</th><th>可审计？</th><th>可更新？</th><th>模型如何用它</th></tr></thead>
+    <tbody>
+      <tr><td>人类偏好对</td><td>RLHF（模块 02）</td><td>低（藏在数据里）</td><td>难（要重训）</td><td>隐式：从统计中学</td></tr>
+      <tr><td>宪法原则</td><td>CAI（模块 01）</td><td>中（明文，但用于训练）</td><td>中（改原则需重跑 CAI）</td><td>训练时执行，推理时隐式</td></tr>
+      <tr><td><strong>spec（规范）</strong></td><td><strong>deliberative（本模块）</strong></td><td><strong>高（明文政策）</strong></td><td><strong>高（改 spec 即改行为）</strong></td><td><strong>推理时显式检索、引用、应用</strong></td></tr>
+    </tbody>
+  </table>  <p>注意 spec 通常还包含 <span class="term">instruction hierarchy</span>（指令层级）：不同来源的指令有优先级（系统 > 开发者 > 用户）。当用户指令与系统规则冲突时（典型的注入式越狱「忽略你之前的所有指令」），明确的层级让模型知道<em>该听谁的</em>。这是 spec 相比一锅炖的偏好数据的一大优势——冲突处理被<strong>显式规定</strong>而非靠模型瞎猜。</p>  <p>spec 的明文性带来一个深远的好处：<strong>对齐的「价值判断」与「执行机制」解耦了</strong>。想改变模型在某类请求上的行为，不必重新收集偏好、重新训练，只需<em>修改 spec 的相应条款</em>（再让模型据此推理）。这让对齐变得像<em>改配置</em>而非<em>重新编译</em>——更快、更可控、更透明。当然前提是模型能可靠地理解并执行 spec，这把要求压到了模型的推理能力上。</p>  <p>值得对照本课的演进来看 spec 的位置。模块 01 的宪法已经是<em>明文</em>的一大步，但它主要在<strong>训练时</strong>被执行（critique-revise、AI 标偏好都发生在训练阶段），部署时模型靠的还是训练沉淀下来的隐式行为。deliberative alignment 把明文规则<strong>一路带到了推理时</strong>——模型在<em>每一次回答</em>都现场读 spec、推理、引用。这一步之所以关键，是因为它让对齐<strong>从「一次性烤进权重」变成「每次现场可查」</strong>：权重可能在某些分布外情形失灵，但一份现场被阅读、被推理的明文规范，给了模型一个<em>不依赖「恰好训练过这种情形」的</em>判断依据。代价是推理时的算力开销和对「推理是否忠实」的新依赖。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="following"><span class="num">3</span>推理时的 spec-following</h2>
+  <h3>推理时的 spec-following：检索、推理、决策</h3>  <p>deliberative alignment 在部署时的回答流程，是一个<strong>先推理后回答</strong>的三步：</p>  <div class="ascii">  用户请求 x
+    │
+    ① 检索: 从 spec 里找出与 x 最相关的条款(可能多条)
+    │      「这个请求涉及武器? 隐私? 还是正常的教育/编程帮助?」
+    ▼
+    ② 推理(CoT): 据检索到的条款判断 x 是否越界、该帮还是该拒、边界如何
+    │      「第3条说不提供武器制造细节; 但用户问的是化学史, 属教育 → 应帮」
+    ▼
+    ③ 决策: 据推理给出最终答复 y(拒绝/帮助/有条件帮助), 并可附上依据的条款</div>  <p>第一步<strong>检索</strong>把抽象的「这个请求安全吗」具体化为「它命中 spec 的哪几条」。第二步<strong>推理</strong>在检索到的条款上做权衡——尤其在边界情形（双重用途知识、看似无害实则有害的组合请求），单条规则不够，需要<em>综合多条、考虑意图</em>。第三步<strong>决策</strong>输出答复，理想情况下还<em>引用所依据的条款</em>，使决定可追溯。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：模型不再「凭感觉」回答，而是先当一回「查手册的合规员」——这个请求归哪条管？那条怎么说？据此我该怎么做？把这套推理走完，再开口。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨说：这把单步的条件生成 <code>y ~ π(·|x)</code> 变成了带显式中间变量的 <code>y ~ π(·|x, retrieve(x, spec), reason(...))</code>。关键收益是<strong>把分布外的安全判断，归约成对明文条款的检索与应用</strong>——即便请求的<em>表面形式</em>是训练时没见过的（新越狱话术），只要其<em>底层意图</em>命中某条 spec，推理就能抓住它。这正是下一节 spec-following 比表面模式匹配更抗越狱的根源。</p></div>
+  </div>  <p>本模块 notebook 用一个<strong>玩具 spec-following 系统</strong>把这三步做出来：spec 是若干条带「关键词 + 裁决（allow/refuse）」的规则，检索按请求与条款的关键词重叠找最相关条款，决策据其裁决。它当然不是真的语言推理，但<strong>逻辑结构与真实 deliberative alignment 一致</strong>：检索相关条款 → 据条款决策 → 可追溯到具体规则。你会用 <code>assert</code> 验证它在有害请求上拒绝、在正常请求上帮助（拒绝校准），并在下一节验证它比表面匹配更抗越狱。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="calibration"><span class="num">4</span>拒绝校准：拒得对也别乱拒</h2>
+  <h3>拒绝校准：既要拒得对，也要别乱拒</h3>  <p>对齐一个看似简单实则微妙的目标是 <span class="term">refusal calibration</span>（拒绝校准）：模型应当<strong>在真正有害的请求上稳健拒绝，同时在正常请求上别乱拒</strong>。这两个方向同样重要，却常常相互拉扯。</p>  <p>只追求<strong>无害性</strong>（一律从严）会导致 <span class="term">over-refusal</span>（过度拒绝）：拒绝解释化学常识（怕涉及危险品）、拒绝讨论历史暴力事件（怕「宣扬暴力」）、拒绝帮忙写一个正常的安全测试脚本（怕「黑客工具」）。过度拒绝严重损害有用性，让模型变成一个<em>谁也帮不上的安全摆设</em>。反过来，只追求有用性则会在有害请求上失守。好的校准是在这两类错误之间找平衡：</p>  <table>
+    <thead><tr><th>请求类型</th><th>理想行为</th><th>失败模式</th><th>对应错误</th></tr></thead>
+    <tbody>
+      <tr><td>真正有害（造武器、要隐私）</td><td><strong>拒绝</strong></td><td>照做了</td><td>漏拒（under-refusal）</td></tr>
+      <tr><td>正常无害（编程、教育）</td><td><strong>帮助</strong></td><td>拒绝了</td><td>过度拒绝（over-refusal）</td></tr>
+      <tr><td>边界 / 双重用途（化学知识）</td><td><strong>有条件帮助</strong></td><td>一刀切拒绝或一刀切照做</td><td>校准失败</td></tr>
+    </tbody>
+  </table>  <p>deliberative alignment 的卖点正在这里：因为它<strong>显式推理请求的真实意图</strong>，而非匹配表面关键词，所以能更细地区分「问化学反应原理（教育，该帮）」和「问怎么用化学品造炸弹（有害，该拒）」——即便两者表面都含「化学」。Guan et al. 报告 deliberative alignment 同时<strong>提升了抗越狱的拒绝</strong>和<strong>降低了过度拒绝</strong>，打破了「越安全就越没用」的惯常权衡。这是显式推理相比隐式记忆的实质优势：<em>它能在边界情形做出有理由的、细粒度的判断</em>。</p>  <p>用混淆矩阵的语言说最精确：表面方法只有一个阈值旋钮，它只能在「漏拒（FN）」和「过度拒绝（FP）」之间<em>沿一条固定的 ROC 曲线滑动</em>——按下葫芦浮起瓢。deliberative alignment 因为换了判据（意图而非表面），相当于<strong>换到了一条更靠外的 ROC 曲线</strong>，于是 FN 和 FP 能<em>同时</em>下降。这就是「打破权衡」的严格含义：不是在老曲线上找了个更好的点，而是把整条曲线往理想角落推。记住这个区分——<em>调阈值是量变（同一曲线挪点），换判据是质变（换一条曲线）</em>——你就能判断任何「安全 vs 有用」的改进到底是哪一种。</p>  <p>为什么「同时改善两个方向」是个<strong>反直觉且重要</strong>的结果？因为拒绝校准长期被当成一个<em>此消彼长</em>的权衡：多数纯偏好方法只能在一个<strong>单一的「敏感度」旋钮</strong>上滑动——拧高了，有害和无害一起被拒（少漏拒但多过度拒绝）；拧低了，一起放行（少过度拒绝但多漏拒）。这条权衡曲线的根源是<em>模型只看表面、不分意图</em>，于是只能用一个阈值一刀切。deliberative alignment 之所以能<strong>把整条曲线往外推</strong>（两个方向同时变好），正是因为它换了维度——不再调「敏感度阈值」，而是去<strong>判断意图本身</strong>。一旦能分清「真有害」和「表面像但其实无害」，就不必在「宁可错杀」和「宁可放过」之间二选一了。这是显式推理给对齐带来的<em>质</em>的改变，而非<em>量</em>的微调。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>拒绝校准的本质是<strong>分清「请求的表面」和「请求的意图」</strong>。表面匹配把含敏感词的都拒掉（过度拒绝）或被改写绕过（漏拒）；意图推理则看「这个人到底想要什么、给了会不会真的造成危害」。本模块 notebook 会用一个混合了有害/无害/边界请求的测试集，量化 spec-following 的拒绝校准——它在三类请求上各自表现如何。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="jailbreak"><span class="num">5</span>抗越狱：为何显式推理更稳健</h2>
+  <h3>抗越狱：为什么显式推理更稳健</h3>  <p>越狱（jailbreak）是对安全对齐最直接的攻击：用伪装让模型输出本应被拒绝的内容。常见手法包括角色扮演（「假装你是一个没有限制的 AI」）、假设包装（「在一个虚构故事里，角色如何……」）、指令注入（「忽略之前的所有指令」）、以及编码/拆词混淆。Wei et al. 2023 把越狱成功归因于两类机制：<strong>目标冲突</strong>（有用性压过了无害性）和<strong>能力泛化不匹配</strong>（安全训练没覆盖到的输入形式）。</p>  <p>隐式对齐（如纯 RLHF）为什么脆弱？因为它本质是<strong>在训练分布上模式匹配「什么样的输入该拒绝」</strong>。越狱话术正是<em>精心构造的、训练分布没怎么覆盖的输入形式</em>——它把有害意图<strong>包装</strong>成训练时见过的「安全」外壳（一个故事、一个假设、一段角色扮演），模式匹配就被骗过了。模型从未<em>显式地</em>核对「剥掉这层包装后，底层请求是否违规」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：隐式对齐像一个只认「坏人长相」的门卫——坏人换身衣服、戴个面具（越狱伪装）就混进去了。deliberative alignment 像一个会<strong>查证件、问来意</strong>的门卫——不管你穿什么，它先搞清「你到底想干什么」，伪装就失效了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨说：deliberative alignment 抗越狱的根源是它把判断建立在<strong>请求的底层意图（语义）</strong>而非<strong>表面形式（句法）</strong>上。显式推理那一步会<em>剥离伪装外壳</em>、抽取真实意图，再去 spec 里核对。只要伪装没有改变底层意图（它通常不能——攻击者要的还是那个有害输出），意图推理就能抓住它。形式上，这把对抗鲁棒性问题从「覆盖所有表面变体」（不可能）转化为「识别不变的底层意图」（可行得多）。</p></div>
+  </div>  <p>把一个越狱样本走两遍流程，差异就一目了然。请求底层意图含违规词 <code>{制造, 武器}</code>，攻击者在外面包一层伪装词 <code>{虚构故事, 角色扮演}</code>。<strong>表面分类器</strong>的逻辑是「含敏感词则拒，但若同时含伪装词则视为安全场景」——于是伪装词把它<em>中和</em>了，它放行（被骗）。<strong>spec-推理器</strong>多了「<em>先剥离伪装词</em>」这一步：它把 <code>{虚构故事, 角色扮演}</code> 当作与裁决无关的外壳<strong>删掉</strong>，剩下 <code>{制造, 武器}</code> 去 spec 里检索，命中「禁武器」条款，<strong>拒绝</strong>。同一请求，一个被骗一个守住，差别<em>全在「剥壳看意图」这一步</em>。notebook 里你对一批「裸有害 / 伪装有害 / 裸无害」请求各跑两器，会得到一张拒绝率对比表：表面分类器在<em>伪装有害</em>这一列拒绝率崩塌，而 spec-推理器三列都稳——<code>assert</code> 这个差距，就把「显式推理抗越狱」量化坐实了。</p>  <p>本模块 notebook 会把这个对比做成一个<strong>可量化的实验</strong>：一个<em>表面分类器</em>（只看请求是否含敏感词、且被「故事/假设」等伪装词中和）vs 一个<em>spec-推理器</em>（先剥离伪装词、再核对底层意图）。在<strong>加了伪装的越狱请求</strong>上，你会看到表面分类器被骗（拒绝率暴跌），而 spec-推理器<strong>仍然拒绝</strong>——亲手验证「显式推理底层意图」为何比「表面模式匹配」更抗越狱。</p>  <div class="callout warn"><span class="label">不是终结者</span>
+    <p>但别把 deliberative alignment 当成越狱的终结者。它把攻击面从「表面话术」转移到了<strong>「能否操纵模型的推理本身」</strong>：如果攻击者能诱导模型<em>在推理时就误判意图</em>（比如说服它「这个请求其实属于教育例外」），或诱导出<strong>不忠实的推理</strong>（表面引用 spec 说该拒、实则照做），越狱依然可能。显式推理提高了门槛、改变了战场，但攻防仍在继续——这是下一节的开放问题。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="consistency"><span class="num">6</span>spec 一致性：推理是真的吗</h2>
+  <h3>spec 一致性：推理是真的吗？</h3>  <p>deliberative alignment 的全部好处——可审计、抗越狱——都建立在一个前提上：<strong>模型的推理是「忠实的」</strong>，即它<em>真的</em>按它所陈述的 spec 条款在决策，而非<em>先决定了答案、再编一段引用 spec 的推理来粉饰</em>。后者叫 <span class="term">unfaithful CoT</span>（不忠实的思维链），是 deliberative alignment 最深的隐患。</p>  <p>怎么度量推理是否忠实？一个可操作的维度是 <span class="term">spec consistency</span>（规范一致性）：检查模型<strong>引用的条款</strong>是否<strong>真的是管辖这个请求的条款</strong>，以及它的<strong>最终决策</strong>是否<strong>与所引条款一致</strong>。如果模型说「根据第 3 条（武器）我拒绝」，但请求其实归第 5 条（隐私）管，或者它引用了正确条款却做出了相反决策，一致性就低——这是推理不忠实的信号。</p>  <div class="math-block">\[\text{consistency}(x) = \mathbb{1}\big[\text{cited\_rule}(x) = \text{governing\_rule}(x)\big]\cdot \mathbb{1}\big[\text{decision}(x) = \text{verdict of cited\_rule}\big]\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：检查模型「说的」和「做的」对不对得上、引的条款对不对。一个忠实的合规员，引用的条款应该正好是管这件事的那条，而且他的决定要和那条说的一致。引错条款、或引对了却反着做，都说明他的「推理」是装样子的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨说：spec consistency 只是忠实性的<em>必要非充分</em>条件——模型可能引对条款、做对决策，但内部其实走的是另一条捷径（推理只是事后合理化）。真正验证忠实性需要因果干预（改 spec 条款看决策是否随之改变、扰动推理看输出是否随之改变），这与模块 03 的 self-critique 忠实性、可解释性课的 faithfulness 研究相通。一致性是<strong>最低门槛</strong>：连说做都对不上，推理一定不忠实。</p></div>
+  </div>  <p>用这个公式判几个样本，你就懂它能抓什么、抓不到什么。请求归「隐私」条款（裁决：拒）。<strong>情形 A</strong>：模型引「隐私」条、决策「拒」——两个指示函数都为 1，consistency=1（自洽，通过最低门槛）。<strong>情形 B</strong>：模型引「武器」条、决策「拒」——决策碰巧对了，但<em>引错了管辖条款</em>，第一个指示函数为 0，consistency=0（抓到：它的「理由」是编的）。<strong>情形 C</strong>：引「隐私」条（该拒）却决策「帮」——第二个指示函数为 0，consistency=0（抓到：说做不一致）。<strong>但要命的情形 D</strong>：模型<em>先决定帮忙</em>，再倒着挑一条「教育例外」条款来正当化，引对了、决策也与所引条款一致——consistency=1，<strong>却仍是不忠实的事后合理化</strong>。这正是为什么一致性只是<em>必要非充分</em>：它能逮住 B、C 这类<strong>露馅</strong>的不忠实，却逮不住 D 这种<strong>圆得过去</strong>的合理化，后者要靠因果干预（改条款看决策是否真的跟着变）才能揭穿。</p>  <p>本模块 notebook 会实现一个 spec-consistency 评分器：给定请求、模型引用的条款、模型的决策，判断三者是否自洽。你会用它区分「真按规范推理」（引对条款 + 决策一致）和「嘴上说说」（引错条款或决策矛盾），并在练习里把它扩展成对一批回应的批量忠实性审计。这把「推理是否可信」从<em>玄学</em>变成了一个<strong>可计算、可 assert 的分数</strong>——尽管它只是忠实性的第一道关卡。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="numpy"><span class="num">7</span>把概念落进 numpy：玩具实现</h2>
+  <h3>把概念落进 numpy：本模块的玩具实现</h3>  <p>配套 notebook 全程纯 numpy，构造一个<strong>我们知道每条 spec 与每个请求真实归属</strong>的 spec-following 沙盒：</p>  <ul>
+    <li><strong>spec（规范）</strong> = 若干条规则，每条 = {名字, 裁决 allow/refuse, 触发关键词集合}。</li>
+    <li><strong>请求</strong> = 一个关键词集合（代表其底层意图）。</li>
+    <li><strong>检索</strong> = 按请求与各条款的关键词重叠，找最相关的条款。</li>
+    <li><strong>决策</strong> = 据检索到的条款裁决（无匹配则默认 allow，保有用性）。</li>
+    <li><strong>越狱伪装</strong> = 在有害请求里掺入「故事/角色扮演/假设」等伪装词。</li>
+    <li><strong>spec 一致性</strong> = 检查引用条款 == 管辖条款，且决策与所引条款一致。</li>
+  </ul>  <p>你会在 worked 小节里：实现 spec 检索 + 决策、量化<strong>拒绝校准</strong>（有害请求拒、正常请求帮、边界请求有条件）、对比<strong>表面分类器 vs spec-推理器在越狱上的差异</strong>（spec 更抗越狱）、实现<strong>spec 一致性评分</strong>区分忠实/不忠实推理；然后在练习里自己实现条款检索匹配、一致性判分、拒绝校准的指标、以及越界（jailbreak）检测器。每一步都有 <code>assert</code> 对照埋入的真相。</p>  <div class="callout warn"><span class="label"></span>
+    <p>玩具实现的边界要诚实说清：真实 deliberative alignment 的检索、推理、意图抽取全靠语言模型，我们用「关键词集合 + 重叠检索」<em>近似</em>它，只为暴露<strong>逻辑骨架</strong>（检索相关条款 → 据条款决策 → 推理底层意图抗越狱 → 一致性查忠实）。一个要点上玩具是<em>简化</em>的：我们假设能干净地抽取「底层意图关键词」，而真实越狱的难点恰恰在于<em>意图抽取本身可能被攻击</em>。骨架对了，换成真模型就是把「关键词检索」换成「让 LLM 检索并推理 spec」、把「剥离伪装词」换成「LLM 识别真实意图」。spec-following、拒绝校准、抗越狱、一致性这些<em>现象与权衡</em>在两种规模下同构。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>推理的忠实性</strong>：deliberative alignment 的全部好处依赖模型「真按它陈述的 spec 推理」。但模型可能产出不忠实的 CoT（表面引用、实则另有打算）。如何度量并保证推理忠实，是头号开放问题（与可解释性的 faithfulness 研究相通）。</li>
+    <li><strong>对推理的越狱</strong>：显式推理把攻击面从「表面话术」转移到「操纵推理本身」——诱导模型误判意图、或自我说服「这属于例外」。针对推理过程的越狱与防御，是新战场（Wei 2023、GCG 类攻击的延伸）。</li>
+    <li><strong>spec 的完备性与冲突</strong>：明文 spec 再详尽也无法覆盖所有情形，且条款间会冲突。模型在 spec 未覆盖/冲突处如何推理、指令层级如何裁断，仍需大量打磨（Model Spec 的迭代）。</li>
+    <li><strong>推理成本</strong>：回答前先推理整份 spec 增加了显著的推理时计算开销。如何在「推理多深」与「响应多快」间权衡、哪些请求需要深推理哪些可走捷径，是工程与安全的双重问题。</li>
+    <li><strong>与训练时方法的关系</strong>：deliberative alignment 是推理时方法，但它本身要靠训练教会模型「如何推理 spec」。它与 CAI（训练时执行原则）、RLHF（训练偏好）如何最优组合，谁负责哪一层，尚无定论（Guan 2024、Mu 2024 的 rule-based rewards）。</li>
+    <li><strong>规范的来源与治理</strong>：和 CAI 的宪法一样，spec 编码价值判断——谁来写、如何代表多元价值、如何更新。spec 的显式性让这些治理问题更尖锐也更可处理。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Guan et al. 2024《Deliberative Alignment》（本模块的根）；OpenAI《Model Spec》（真实 spec 长什么样）；Mu et al. 2024《Rule-Based Rewards》（把规则变成奖励的互补路线）；Wei et al. 2023《Jailbroken》（越狱机制分析）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_weak_to_strong/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · Weak-to-Strong 泛化</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

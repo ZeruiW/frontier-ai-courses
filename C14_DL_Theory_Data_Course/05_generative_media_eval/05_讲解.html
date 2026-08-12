@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 生成媒体评测</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 生成媒体评测</h1>
+  <p class="subtitle">FID（Fréchet 距离）、Inception Score、improved precision-recall、保真-多样权衡、人评 —— 在玩具高斯特征上从零算 FID/IS/PR，看清每个指标量什么、能被怎样钻空子，以及为何保真与多样必须分开看</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、线性代数（协方差/特征分解/矩阵平方根）、概率（高斯/KL/熵）、模块 04（保真 vs 多样）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_generative_media_eval.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Heusel 2017、Salimans 2016、Kynkäänniemi 2019、Theis 2016、Hessel 2021</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">生成评测：保真与多样两个维度</a></li>
+      <li><a href="#fidmath">FID 一：Fréchet 距离的数学</a></li>
+      <li><a href="#fidimpl">FID 二：矩阵平方根与实现</a></li>
+      <li><a href="#is">Inception Score：无参考但有缺陷</a></li>
+      <li><a href="#pr">Precision-Recall：掰开保真与多样</a></li>
+      <li><a href="#tradeoff">保真-多样权衡与指标取舍</a></li>
+      <li><a href="#human">人评、CLIPScore 与没有银弹</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>生成评测：保真与多样两个维度</h2>
+  <p>前一模块结尾立下一个 flag：<strong>评估生成质量，永远至少要分「保真」和「多样」两个维度</strong>。这一模块把这两个维度做成可计算的指标——这就是 <span class="term">generative media evaluation</span>（生成媒体评测）：如何给图像、音频、视频等生成结果打分。它是生成模型研究的<strong>罗盘</strong>，也是本课所有「度量决定结论」教训的集大成。</p>  <p>生成评测难在哪？分类任务有 ground truth（标签对就是对），但生成任务<strong>没有唯一正确答案</strong>——一张生成的猫图，没有「标准猫图」可比对。我们真正想问的是分布层面的问题：<strong>生成分布 $p_g$ 像不像真实分布 $p_r$？</strong>而「像」至少包含两件独立的事：</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>① <strong>保真度（fidelity）</strong>：生成的每个样本，像不像真的？（生成的猫，是不是一只像样的猫，而非四不像）② <strong>多样性（diversity）</strong>：生成的样本，覆不覆盖真实的全部花样？（是只会生成橘猫，还是各种品种都有）这两件事<em>互相独立</em>：可以保真高多样低（只会画一种完美的猫），也可以多样高保真低（画各种四不像）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：好的生成要求 $p_g\approx p_r$。这个「约」至少要在两个意义上成立——<strong>支撑集匹配</strong>（$p_g$ 的质量都落在 $p_r$ 的支撑内 = 保真）与<strong>覆盖匹配</strong>（$p_r$ 的所有区域都被 $p_g$ 覆盖 = 多样）。这恰好对应 precision 与 recall。<strong>任何把生成质量压成单个标量的指标，都在某种程度上把这两个维度混在了一起</strong>——这是理解所有生成指标优劣的总钥匙。</p></div>
+  </div>  <p>本模块从零实现三大主力指标——<strong>FID</strong>（一个混合标量）、<strong>IS</strong>（不需真实图、有缺陷）、<strong>precision-recall</strong>（显式拆分保真与多样）——并讲清每个<em>到底在量什么、能被怎样钻空子</em>。全部在玩具高斯特征上手算，让你看清公式而非调库。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>这一模块给评测科学家的核心装备：<strong>拿到任何生成指标，先问三件事——它量的是保真、多样、还是两者混合？它需不需要真实样本做参考？它能被怎样操纵（刷高分但实际更差）？</strong>本模块会让你对 FID/IS/PR 都能答出这三问。这正是 <span class="term">Goodhart's law</span>（度量成了目标就不再是好度量）在生成评测里的实操。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fidmath"><span class="num">2</span>FID 一：Fréchet 距离的数学</h2>
+  <h3>FID 之一：Fréchet 距离的数学</h3>  <p>最广泛使用的图像生成指标是 <span class="term">FID</span>（Fréchet Inception Distance）[Heusel 2017]。它的思路分两步：① 把真实图和生成图各自送进一个预训练网络（Inception）取<strong>特征向量</strong>（不直接比像素，比语义特征）；② 假设两组特征各自服从<strong>高斯分布</strong>，计算这两个高斯之间的 <span class="term">Fréchet distance</span>（即 2-Wasserstein 距离）。</p>  <p>两个高斯 $\mathcal{N}(\mu_1,\Sigma_1)$ 与 $\mathcal{N}(\mu_2,\Sigma_2)$ 之间的 Fréchet 距离有闭式：</p>  <div class="math-block">\[\mathrm{FID} = \underbrace{\|\mu_1-\mu_2\|^2}_{\text{均值差}}+\underbrace{\mathrm{Tr}\!\Big(\Sigma_1+\Sigma_2-2(\Sigma_1\Sigma_2)^{1/2}\Big)}_{\text{协方差差}}\]</div>  <p>这个公式的两项恰好对应本课反复强调的两个维度：<strong>第一项 $\|\mu_1-\mu_2\|^2$ 惩罚均值差异</strong>（生成特征的中心偏离真实，主要反映<em>保真度</em>——整体像不像）；<strong>第二项惩罚协方差差异</strong>（生成特征的分散结构偏离真实，主要反映<em>多样性与结构</em>——花样齐不齐、相关性对不对）。<strong>FID 越低越好</strong>，0 表示两分布的一二阶矩完全一致。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>FID 就是「把真实图和生成图各自的特征摊成一团高斯云，量这两团云的中心差多远（保真）、形状差多少（多样/结构）」。两团云完全重合，FID=0；中心偏了或形状瘪了，FID 就升高。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：Fréchet 距离是两个分布间 2-Wasserstein 距离，对高斯有上面的闭式。它只依赖一阶矩（均值）和二阶矩（协方差），所以隐含了<strong>高斯假设</strong>——真实特征若非高斯（多峰、重尾），FID 会漏掉高阶差异。这是 FID 的一个根本局限，但实践中它对很多失真（模糊、噪声、模式丢失）仍相当敏感。</p></div>
+  </div>  <p>为什么是 Inception 特征、而不直接比像素？因为<strong>像素级距离与人类感知严重不符</strong>——把一张图整体平移一个像素，像素 MSE 巨大，但人眼觉得几乎没变；反之两张语义完全不同的图可能像素距离不大。Inception 网络在大规模分类上学到的特征，把图像映射到一个<em>语义</em>空间，在那里「距离近」更接近「人觉得像」。这也埋下了 FID 的一个根本依赖：<strong>它的结论高度依赖特征提取器的选择</strong>。换一个特征网络（或它的某一层），FID 的绝对值甚至模型排名都可能变（Stein 2023 系统检验过这点）。所以 FID 是一个<em>相对</em>指标——只在固定特征提取器下、同条件比较才有意义，不存在「绝对的好 FID 值」。</p>  <div class="callout warn"><span class="label"></span>
+    <p>FID 的一个易忽略陷阱：它是<strong>有偏估计</strong>，且偏差随样本数变化——用 1k 样本和 50k 样本算出的 FID 不可直接比较，样本少时 FID 系统性偏高。比较不同模型的 FID 必须<strong>用相同的样本数、相同的特征提取器</strong>。KID（Kernel Inception Distance）是它的无偏替代。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fidimpl"><span class="num">3</span>FID 二：矩阵平方根与实现</h2>
+  <h3>FID 之二：矩阵平方根与从零实现</h3>  <p>FID 公式里唯一的技术难点是 $(\Sigma_1\Sigma_2)^{1/2}$——一个<strong>矩阵平方根</strong>。注意这不是逐元素开方，而是满足 $S^2=M$ 的矩阵 $S=M^{1/2}$。对<strong>对称半正定</strong>矩阵，可以用特征分解优雅地算：</p>  <div class="math-block">\[M = V\Lambda V^\top \;\Rightarrow\; M^{1/2}=V\,\Lambda^{1/2}\,V^\top \quad(\Lambda^{1/2}=\mathrm{diag}(\sqrt{\lambda_i}))\]</div>  <p>即：对 $M$ 做特征分解得到特征值 $\lambda_i$ 和特征向量 $V$，把特征值开方、重新组装，就得到矩阵平方根。验证很简单——$S^2=V\Lambda^{1/2}V^\top V\Lambda^{1/2}V^\top=V\Lambda V^\top=M$（用了 $V^\top V=I$）。</p>  <p>实现上有两个<strong>必须处理的数值细节</strong>：① $\Sigma_1\Sigma_2$ 理论上对称半正定，但浮点误差会让它略微<em>不对称</em>，要先对称化 $\frac{1}{2}(M+M^\top)$；② 浮点误差可能产生<em>微小的负特征值</em>，要 <code>clip</code> 到 0 再开方（否则 $\sqrt{\text{负数}}$ 出 nan）。处理好这两点，几行 numpy 就能从零算出 FID。</p>  <div class="ascii">从零算 FID 的流程:
+  真实特征 X(n×d) ──▶ μ1=mean(X), Σ1=cov(X)
+  生成特征 Y(m×d) ──▶ μ2=mean(Y), Σ2=cov(Y)
+                          │
+  matrix_sqrt(Σ1@Σ2):    │  特征分解 -&gt; 对称化 -&gt; clip 负特征值 -&gt; 开方重组
+                          ▼
+  FID = ||μ1-μ2||² + Tr(Σ1 + Σ2 - 2·(Σ1Σ2)^½)
+
+  自检: FID(X, X) = 0 ;  分布越远 FID 越大 ;  sqrt(M)² == M</div>  <p>notebook 会从零实现 <code>matrix_sqrt</code> 与 <code>fid</code>，并 <code>assert</code> 三件事：① $S^2=M$（矩阵平方根正确）；② FID(X,X)=0（自反性）；③ 均值偏移、方差收缩都让 FID 增大（敏感性）。你会亲眼验证 FID 对<strong>均值偏移</strong>（保真下降）和<strong>方差收缩</strong>（多样性下降，正是 model collapse 的特征）都敏感——这把它和上一模块的坍塌直接连上：坍塌会推高 FID 的协方差项。</p>  <div class="callout paper"><span class="label"></span>
+    <p>奠基必读：Heusel et al. 2017《GANs Trained by a Two Time-Scale Update Rule...》（FID 原始论文）。它证明 FID 比早期的 IS 更好地反映分布距离、对失真和模式丢失更敏感、且与人类判断更相关。见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="is"><span class="num">4</span>Inception Score：无参考但有缺陷</h2>
+  <h3>Inception Score：不需真实图，但有缺陷</h3>  <p>比 FID 更早的指标是 <span class="term">Inception Score</span>（IS）[Salimans 2016]。它的巧妙之处是<strong>不需要真实图像</strong>——只看生成图本身，用一个预训练分类器给每张生成图输出类别概率 $p(y\mid x)$，再综合成一个分数：</p>  <div class="math-block">\[\mathrm{IS}=\exp\Big(\mathbb{E}_{x\sim p_g}\,\mathrm{KL}\big(p(y\mid x)\,\|\,p(y)\big)\Big),\qquad p(y)=\mathbb{E}_x\,p(y\mid x)\]</div>  <p>拆开看 IS 在奖励什么。KL 散度 $\mathrm{KL}(p(y\mid x)\|p(y))$ 大，需要两件事同时成立：</p>  <ul>
+    <li><strong>每张图分类置信（保真）</strong>：$p(y\mid x)$ 要<strong>尖锐</strong>（低熵）——分类器能确信这是只猫，说明图像清晰、像个真东西。模糊/四不像的图分类器会犹豫（高熵），KL 小。</li>
+    <li><strong>整体类别均匀（多样）</strong>：边际分布 $p(y)$（所有生成图的平均类别分布）要<strong>均匀</strong>（高熵）——生成图覆盖各种类别，而非全是猫。若只生成猫，$p(y)$ 尖锐，KL 小。</li>
+  </ul>  <p>所以 IS 高 ⟺ <strong>每张图都清晰可辨（保真）且整体类别丰富（多样）</strong>。它把保真和多样巧妙地编码进「条件熵低 + 边际熵高」。IS 越高越好（上界约等于类别数）。但 IS 有<strong>致命缺陷</strong>：① 它<em>根本不看真实图像</em>，所以无法发现「生成分布偏离真实分布」（只要清晰且类别均匀，哪怕和真实数据毫无关系也能高分）；② 它依赖分类器的类别体系，对没有对应类别的领域失效；③ 易被<strong>钻空子</strong>——每个类别精心生成一张超清晰图就能刷高 IS，哪怕多样性其实很差。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>IS 像让一个「猫狗鸟分类器」给生成图打分：每张图它都能斩钉截铁说出是什么（清晰），而且各种动物都有（丰富），分就高。问题是这个裁判<strong>从没见过真实照片长啥样</strong>——你给它一堆清晰但诡异的图，它照样给高分。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：IS 是 <span class="term">reference-free metric</span>（无参考指标），便利但脆弱。它度量的是 $p(y\mid x)$ 的尖锐度与 $p(y)$ 的均匀度，<strong>完全不涉及 $p_r$</strong>。这是它与 FID 的根本区别：FID 比较生成与真实，IS 只自评生成。现代实践 IS 已大体被 FID/PR 取代，但理解它的奖励机制是生成评测的基本功。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>IS 的故事是 <strong>Goodhart 定律的经典案例</strong>：一旦 IS 成为优化目标，模型会学会「生成少数几张每类的完美图」来刷分，而真实多样性下降。这警示我们：<strong>任何单一自动指标都可能被针对性优化而背离真实质量</strong>——必须多指标交叉 + 人评兜底。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pr"><span class="num">5</span>Precision-Recall：掰开保真与多样</h2>
+  <h3>Improved Precision-Recall：把保真和多样掰开</h3>  <p>FID 把保真和多样混成一个数，IS 不看真实分布。<span class="term">improved precision-recall</span> [Kynkäänniemi 2019] 直面这个问题：<strong>用两个独立的数，分别量保真（precision）和多样（recall）</strong>。这是把本课中心思想做到极致的指标。</p>  <p>核心是用 <span class="term">k-NN</span> 估计每个分布的<strong>支撑集（流形）</strong>：把每个真实样本点，连同它到第 $k$ 近邻的距离，画一个球；所有这些球的并集，就近似真实数据的<strong>流形</strong>。生成分布同理。然后：</p>  <ul>
+    <li><strong>Precision（保真）</strong> = 落在<strong>真实流形内</strong>的生成样本比例。生成点若落在某个真实球里，说明它「像真的」。precision 低 = 生成了很多<em>不像真实</em>的样本（off-manifold）。</li>
+    <li><strong>Recall（多样）</strong> = 落在<strong>生成流形内</strong>的真实样本比例。真实点若落在某个生成球里，说明它「被生成覆盖」。recall 低 = 真实分布有大片区域<em>没被生成覆盖</em>（mode dropping）。</li>
+  </ul>  <div class="ascii">precision-recall via k-NN 流形:
+  真实流形(真实点的k-NN球并集)   生成流形(生成点的k-NN球并集)
+        ╭───────╮                      ╭───╮
+        │ ● ● ● │ &lt;真实             gen │ ○ │
+        │ ●●●●● │      ○ off-manifold  ╰───╯
+        ╰───────╯                  (只覆盖一小块)
+  Precision = 生成点 ○ 落在真实流形里的比例 (保真)
+  Recall    = 真实点 ● 落在生成流形里的比例 (多样/覆盖)</div>  <p>这套度量的威力在于它能<strong>分别诊断两种失败</strong>（FID 做不到）：<strong>mode collapse</strong>（生成只覆盖真实的一小块）表现为 <strong>precision 高、recall 低</strong>（生成的都很真，但漏了大量模式）；<strong>生成跑偏 / 噪声大</strong>表现为 <strong>precision 低、recall 高或低</strong>（生成的不像真的）。notebook 会从零实现 PR 并构造这两种反例——一个方差收缩的生成器（recall 崩、precision 不变）和一个均值偏移的生成器（precision 崩）——把「FID 一个数看不出、PR 两个数看得清」演示得明明白白。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把 PR 和前一模块连起来：<strong>model collapse 在 PR 上的指纹就是 recall 崩塌而 precision 不变</strong>。这正是为什么坍塌隐蔽——它不伤 precision（单样本质量），只伤 recall（多样性）。盯住 recall，就能在坍塌早期抓住它。PR 是监测坍塌的理想仪表盘。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">6</span>保真-多样权衡与指标取舍</h2>
+  <h3>保真-多样权衡与指标的取舍</h3>  <p>有了 precision-recall，本课反复出现的 <strong>质量-多样性权衡</strong> 终于有了精确的语言。生成模型常常无法同时最大化两者，而是沿一条<strong>precision-recall 权衡曲线</strong>移动：</p>  <table>
+    <thead><tr><th>调节手段</th><th>效果</th><th>precision</th><th>recall</th></tr></thead>
+    <tbody>
+      <tr><td>降低采样温度 / truncation</td><td>只采高概率区域</td><td><strong>↑</strong>（更真）</td><td><strong>↓</strong>（漏长尾）</td></tr>
+      <tr><td>提高温度 / 加噪</td><td>采更广区域</td><td><strong>↓</strong>（更杂）</td><td><strong>↑</strong>（更全）</td></tr>
+      <tr><td>过度过滤合成数据</td><td>只留高质量</td><td><strong>↑</strong></td><td><strong>↓</strong>（坍塌前兆）</td></tr>
+      <tr><td>mode collapse</td><td>塌向少数模式</td><td>≈不变</td><td><strong>↓↓</strong></td></tr>
+    </tbody>
+  </table>  <p>这条权衡解释了很多实践现象：扩散模型的 <span class="term">classifier-free guidance</span> 调大 → 图更精致（precision↑）但更同质（recall↓）；GAN 的 truncation trick 同理。<strong>没有免费的午餐</strong>——把保真推高，多样性往往要付代价，反之亦然。一个只报「FID 降了」的结果，可能是在权衡曲线上偷偷牺牲了 recall 换 precision，必须看 PR 才知道真相。</p>  <p>这条权衡也给「比较两个生成模型」立了规矩：<strong>只看一个数说「A 比 B 好」往往站不住</strong>。A 的 FID 比 B 低，可能是 A 在 precision 上赢、recall 上输（更精致但更同质），也可能反过来——一个标量把这两种截然不同的情况压成了同一个「更好」。正确的比较是把两个模型画在 precision-recall 平面上：如果 A 在两个维度都不差于 B（帕累托占优），才能说 A 更好；若各擅胜场（A 保真高、B 多样高），则「谁更好」取决于你的应用更看重哪一维。<em>生成模型的比较本质是多目标的，强行标量化会丢失关键信息</em>。</p>  <p>那么实践中该用哪个指标？没有银弹，要<strong>组合使用</strong>：</p>  <table>
+    <thead><tr><th>指标</th><th>量什么</th><th>需要真实图</th><th>主要短板</th><th>建议用途</th></tr></thead>
+    <tbody>
+      <tr><td><strong>FID</strong></td><td>保真+多样（混合）</td><td>需要</td><td>高斯假设、有偏、单标量</td><td>主指标、横向比较（同样本数）</td></tr>
+      <tr><td><strong>IS</strong></td><td>保真+多样（自评）</td><td>不需要</td><td>不看真实、易钻空、限类别</td><td>辅助、历史对照</td></tr>
+      <tr><td><strong>Precision/Recall</strong></td><td>保真、多样（分开）</td><td>需要</td><td>依赖 k、计算较重</td><td>诊断坍塌、分析权衡</td></tr>
+      <tr><td><strong>人评</strong></td><td>综合主观质量</td><td>可对照</td><td>贵、慢、主观、难复现</td><td>最终校准、自动指标兜底</td></tr>
+    </tbody>
+  </table>  <div class="callout paper"><span class="label"></span>
+    <p>延伸（见 <code>references.md</code>）：Kynkäänniemi 2019（improved P-R）、Sajjadi 2018（P-R 框架源头）、Bińkowski 2018（KID，FID 的无偏替代）、Theis 2016（似然/样本质量/用途三者可不一致的经典警示）、Stein 2023（系统检验各指标与人评的相关性）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="human"><span class="num">7</span>人评、CLIPScore 与没有银弹</h2>
+  <h3>人评、CLIPScore 与「没有银弹」</h3>  <p>自动指标再精巧，最终都要回答一个问题：<strong>它和人类的判断一致吗？</strong> <span class="term">human evaluation</span>（人评）是所有自动指标的<strong>最终校准基准</strong>——常见形式有 side-by-side 偏好比较、Likert 打分、Elo 排名。人评直接测「人觉得好不好」，但<strong>贵、慢、主观、难复现</strong>，且会受标注者疲劳、文化差异、提示设计影响。所以实践是：用自动指标做大规模快速筛选，用人评在关键节点校准与拍板。</p>  <p>文生图时代还出现了一类重要指标：<span class="term">CLIPScore</span> [Hessel 2021]，用 CLIP 的图文嵌入算「生成图与文本提示」的余弦相似度，评估<strong>对齐</strong>（生成的图符不符合要求）。它也是<strong>无参考</strong>的（不需要参考图），便利，但同样脆弱——它继承 CLIP 的偏见，且容易被「字面匹配但语义错」的图骗过。</p>  <p>退一步看整个生成评测领域，最该内化的一条来自 Theis 2016 的经典警示：<strong>似然、样本质量、下游用途，这三件事可以互不一致</strong>——一个似然高的模型样本可能很差，一个样本惊艳的模型可能下游没用。<strong>不存在单一指标能代表「生成得好」</strong>。这与本课从第一模块就贯穿的主线完全一致：度量的选择决定你看到的结论，没有哪个度量是全知的。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>评生成模型就像评一个厨师：顾客打分（人评）最权威但贵又慢；用「摆盘机器」打分（FID/IS）快但可能错过味道；看「按菜谱做对没」（CLIPScore）测的是对齐不是好吃。没有一个数能说清「这厨师行不行」，得几个角度一起看，最后靠人尝。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：每个指标都是真实质量的一个<em>有偏投影</em>。FID 投影到一二阶矩、IS 投影到分类置信与类别分布、CLIPScore 投影到 CLIP 嵌入对齐、人评投影到标注者的主观偏好。<strong>没有任何单一投影等于真实质量</strong>；可信的评测是多个互补投影 + 人评锚定的三角测量。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>整个模块、乃至整门课的终极一句话：<strong>永远不要用单一指标下「生成得好/能力涌现了/模型更强了」的结论</strong>。先拆维度（保真 vs 多样）、再多指标交叉、最后人评兜底。这套纪律——<em>对任何度量都先问「它量什么、能被怎样骗」</em>——是评测科学家最核心、最不可替代的素养。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>超越高斯假设</strong>：FID 的高斯假设会漏掉高阶分布差异。KID、precision-recall、以及基于神经网络的分布距离试图改进，但「既敏感、又稳健、又与人评相关、又难被操纵」的理想指标仍未出现。</li>
+    <li><strong>特征提取器的依赖</strong>：FID/PR 高度依赖 Inception 特征，对扩散模型等可能不公平（Stein 2023）。用什么特征空间评测、是否该用任务相关的特征，是开放问题。</li>
+    <li><strong>多模态与对齐评测</strong>：文生图/视频的评测要同时管保真、多样、与提示的对齐、以及时序一致性（视频）。CLIPScore 等只覆盖一部分；统一的多模态生成评测框架仍在探索。</li>
+    <li><strong>与人评的对齐及自动化</strong>：能否让自动指标可靠预测人类偏好、甚至用模型模拟人评（LLM-as-judge），同时避免自我强化的循环偏差（呼应模块 04），是评测自动化的前沿与风险所在。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读清单（详见 <code>references.md</code>）：Heusel 2017（FID）、Salimans 2016（IS）、Kynkäänniemi 2019（P-R）、Theis 2016（没有单一指标的经典警示）、Stein 2023（指标缺陷的现代检验）。至此本课五个内容模块讲完——从双下降、grokking/涌现，到数据流水线、合成数据坍塌，再到生成评测：贯穿始终的是同一条纪律——<strong>面对反常曲线先归类、用最小模型验证机制、对任何度量都先问它量什么、能被怎样骗</strong>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_synthetic_data/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 合成数据与模型坍塌</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

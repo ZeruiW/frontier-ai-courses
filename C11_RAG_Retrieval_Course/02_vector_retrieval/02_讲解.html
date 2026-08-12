@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 向量检索</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 07</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 向量检索</h1>
+  <p class="subtitle">从暴力 kNN 到近似最近邻：IVF 倒排分桶、HNSW 图导航、PQ 乘积量化，以及召回-延迟-内存的不可能三角 —— 让亿级语料实时可检索</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（向量/余弦/归一化）、k-means 聚类直觉、一点点复杂度分析</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_vector_retrieval.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Johnson 2019 (FAISS)、Malkov 2018 (HNSW)、Jégou 2011 (PQ)、Aumüller 2020 (ANN-Benchmarks)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#scale">规模的诅咒：为什么需要近似最近邻</a></li>
+      <li><a href="#exact">基线：暴力 kNN 与召回率</a></li>
+      <li><a href="#ivf">IVF：聚类分桶，只搜几桶</a></li>
+      <li><a href="#hnsw">HNSW：近邻图上的贪心导航</a></li>
+      <li><a href="#pq">PQ：把向量压成字节并查表算距离</a></li>
+      <li><a href="#tradeoff">召回-延迟-内存的不可能三角</a></li>
+      <li><a href="#engineering">工程现实：建库、检索、增删</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="scale"><span class="num">1</span>规模的诅咒：为什么需要近似最近邻</h2>
+  <p>上一模块我们把检索化归成了一个几何问题：归一化所有向量后，检索就是「给查询找余弦最大的库向量」，一次矩阵乘 <code>D @ q</code> 加一次 <code>argsort</code> 即可。这在库不大时快得很。但 RAG 的真实语料动辄百万、千万、上亿条向量，而<strong>暴力检索是 $O(Nd)$</strong>：库翻 10 倍，每次查询就慢 10 倍。当 $N=10^8$、$d=768$ 时，单次查询要算约 $10^{11}$ 次乘加——在线服务根本扛不住。</p>  <p>本模块就来解决这个<strong>规模</strong>问题。核心思想叫 <span class="term">ANN</span>（Approximate Nearest Neighbor，近似最近邻）：<strong>放弃『保证找到精确 top-k』，换取数量级的加速</strong>。我们不再扫描全库，而是用一个聪明的<strong>索引</strong>只检查库向量的一小部分——但要让这一小部分大概率包含真正的近邻。这就引出了贯穿本模块的根本张力：<strong>召回率 vs 延迟 vs 内存</strong>的三角权衡。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>暴力检索像在一座没有目录的图书馆里找一本书：把每一本都翻一遍，保证找到，但书越多越慢。ANN 索引像给图书馆建了分区与索引牌：你直奔最可能的那几个书架，几秒钟找到，偶尔会漏掉一本恰好放错区的——但快了千百倍。RAG 在亿级语料上能实时检索，全靠这套『不保证但够好』的索引。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：暴力 NNS 返回精确的 $\text{top-}k=\arg\text{top-k}_{d}\,\text{sim}(q,d)$；ANN 返回一个近似集 $\hat{S}$，其质量用 <strong>召回率</strong> $\text{recall@}k=\frac{|\hat{S}\cap\text{top-}k|}{k}$ 衡量。目标是在给定延迟/内存预算下最大化召回。算法靠两类手段达成：<strong>减少要比较的向量数</strong>（IVF/HNSW，少看）与<strong>加速单次比较</strong>（PQ 量化，看得快）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话定调本模块：<strong>ANN = 用一点点召回率，换几个数量级的速度与内存</strong>。三种主力技术对应两条降本路径——IVF（倒排分桶）和 HNSW（图导航）让你<em>少看几个向量</em>，PQ（乘积量化）让你<em>每个向量看得更快、存得更小</em>。它们正交，真实系统（如 FAISS 的 IVF-PQ）常组合使用。本模块从零实现这三者，并用对拍暴力 kNN 的召回率验证每一个。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="exact"><span class="num">2</span>基线：暴力 kNN 与召回率</h2>
+  <h3>基线：暴力 kNN 与召回率的定义</h3>  <p>一切近似都要有个<strong>精确参照物</strong>。暴力 kNN（brute-force / exact search）逐一比对所有库向量，返回真正的 top-k，召回率恒为 100%。它慢，但它是<strong>金标准</strong>——我们用它来量化任何近似索引『丢了多少』。</p>  <pre><code># 暴力 kNN（归一化后，余弦 = 点积）
+def knn_exact(D, q, k):
+    scores = D @ q            # (N,) 全部余弦，O(Nd)
+    return np.argsort(-scores)[:k]</code></pre>  <p>近似索引的质量，几乎总是用 <span class="term">recall@k</span> 来量化——注意这里的 recall 与模块 05 的检索召回率含义不同：</p>  <div class="math-block">\[\text{recall@}k=\frac{|\,\hat{S}_k\cap S_k^{\star}\,|}{k}\quad\text{其中 }S_k^{\star}\text{ 是暴力 top-k，}\hat{S}_k\text{ 是 ANN 返回的 top-k}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>ANN 的召回率回答的是：「我这个走捷径的索引，找回来的 top-k 里有几个是『真·top-k』？」recall@10 = 0.9 意思是暴力会返回的 10 个最近邻里，我的索引找到了 9 个，漏了 1 个。这是衡量近似『准不准』的尺子。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：这是<strong>索引层面</strong>的召回，ground truth 是暴力检索的结果（不是人工相关性标注）。它专门衡量「近似 vs 精确」的差距。模块 05 的 recall@k 则是「检索结果 vs 人工相关性」的差距——两个 recall 同名但参照物不同，务必分清。</p></div>
+  </div>  <p>有了这把尺子，评一个 ANN 索引就有了客观协议：固定库与查询集，先用暴力算出每个查询的精确 top-k 当 ground truth，再让索引检索、算平均 recall@k，同时记录延迟与内存。把不同参数（IVF 的 nprobe、HNSW 的 ef）下的 (召回, 延迟) 点画出来，就是著名的<strong>召回-延迟权衡曲线</strong>（ANN-Benchmarks 的标准图）。本模块的每个索引都会这样被对拍与度量。</p>  <p>为什么用 recall 而不是别的指标来评 ANN？因为 ANN 的承诺很具体：「我会尽量返回真正的最近邻」。一个返回了 top-10 里 9 个真近邻、只漏 1 个的索引，对下游几乎无损（漏掉的那个往往排第 10、贡献本就小）；而召回掉到 0.5 就危险了——一半的『最该出现的文档』没出现。还要注意 recall@k 里的 $k$ 要和<strong>实际使用的 k</strong>一致：你下游只取 top-5 喂给重排，就评 recall@5；取 top-100 当候选池，就评 recall@100。评测的 $k$ 与使用的 $k$ 脱节，是一个常见却隐蔽的错误——recall@100 很高不代表 recall@5 也高（近似索引可能找回了一堆次近邻却漏了最近的几个）。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把这两个 recall 钉死在脑子里：本模块的 recall@k 量的是<strong>近似 vs 精确</strong>（索引偷懒丢了多少真近邻，ground truth 是暴力检索）；模块 05 的 recall@k 量的是<strong>检索 vs 相关性</strong>（系统漏了多少人工认定相关的文档，ground truth 是人工标注）。一个评『索引准不准』，一个评『系统找得全不全』，串了会得出完全错误的结论。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ivf"><span class="num">3</span>IVF：聚类分桶，只搜几桶</h2>
+  <h3>IVF：先聚类分桶，只搜最近的几桶</h3>  <p>第一个降本思路朴素得惊人：<strong>既然不可能比对全库，那就把库预先分成若干桶，查询时只搜『最可能命中』的那几桶</strong>。这就是 <span class="term">IVF</span>（Inverted File Index，倒排文件索引）。</p>  <p>建库（离线）：用 k-means 把全部库向量聚成 <code>nlist</code> 个簇（如 $\sqrt{N}$ 个），每个簇有一个<strong>质心（centroid）</strong>。每个库向量归入离它最近的质心所在的桶。这就把向量空间切成了 <code>nlist</code> 个 <span class="term">Voronoi cell</span>（每个质心管辖离它最近的那片区域）。</p>  <p>检索（在线）：① 把查询与 <code>nlist</code> 个质心比，找出最近的 <code>nprobe</code> 个桶（粗筛，只算 nlist 次）；② 只在这 <code>nprobe</code> 个桶里的向量中做精确比对（细搜）。于是要比较的向量数从 $N$ 降到约 <code>N × nprobe / nlist</code>：</p>  <div class="ascii">IVF 检索（nlist=4 个桶，nprobe=1 只搜最近的桶）
+
+  库向量按质心分桶:   [桶0]  [桶1]  [桶2]  [桶3]
+  查询 q ─┬─ 比 4 个质心(粗筛) ─▶ 最近是 桶2
+          └─ 只在 桶2 内部精确比对(细搜) ─▶ top-k
+
+  比较次数: nlist(粗筛) + |桶2|(细搜) ≈ nlist + N/nlist  ≪  N</div>  <p><span class="term">nprobe</span> 是 IVF 的命门旋钮——它直接调节召回-延迟权衡：</p>  <table>
+    <thead><tr><th>nprobe</th><th>搜索的桶数</th><th>召回率</th><th>延迟</th><th>极端情形</th></tr></thead>
+    <tbody>
+      <tr><td><code>1</code></td><td>只搜最近 1 桶</td><td>较低（近邻可能落在隔壁桶）</td><td>最快</td><td>—</td></tr>
+      <tr><td><code>nlist</code></td><td>搜所有桶</td><td><strong>100%</strong>（退化为暴力）</td><td>最慢</td><td>= 暴力 kNN</td></tr>
+      <tr><td>中间值</td><td>搜最近若干桶</td><td>随 nprobe 升而升</td><td>随 nprobe 升而增</td><td>实践甜点区</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>IVF 的致命伤是<strong>边界问题</strong>：查询恰好落在两个 Voronoi cell 的交界处时，它真正的最近邻可能在隔壁桶里，而 <code>nprobe=1</code> 只搜了本桶——于是漏掉。这就是为什么 nprobe 要 > 1：多搜几个邻桶，把『近邻落在隔壁』的概率压下去。nprobe 是你为召回率付的『多看几桶』的费用。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hnsw"><span class="num">4</span>HNSW：近邻图上的贪心导航</h2>
+  <h3>HNSW：在近邻图上贪心导航</h3>  <p>IVF 靠『分区』降本，另一条思路靠『<strong>造一张能快速导航的图</strong>』。<span class="term">HNSW</span>（Hierarchical Navigable Small World，分层可导航小世界图，Malkov 2018）是当下最流行的内存 ANN，思想优雅得像在玩跳棋。</p>  <p>核心观察：如果把每个向量连到它的若干近邻，形成一张<strong>近邻图</strong>，那么找最近邻就变成了<strong>图上的导航</strong>——从任意一点出发，每步走到『邻居里离查询更近的那个』，像水往低处流，很快就滑到查询附近。这叫 <span class="term">greedy graph traversal</span>（贪心导航）。</p>  <p>但单层近邻图有个问题：起点离目标远时，每步只能挪一小步，要走很多步。HNSW 的妙招是<strong>分层</strong>——建一个多层图，像高速公路网：</p>  <div class="ascii">HNSW 多层图：上层稀疏(长跳)，下层稠密(精搜)
+
+  Layer 2 (最稀疏):   A ─────────────▶ F          长程高速，几跳跨越全图
+                      │                │
+  Layer 1:        A─B─C ──────── E─F─G            中程
+                  │ │ │          │ │ │
+  Layer 0 (最稠密): A B C D E F G H I ...          局部精搜，含全部点
+
+  查询: 顶层贪心找到本层最近点 ─▶ 降到下一层继续 ─▶ ... ─▶ Layer0 精搜出 top-k</div>  <p>查询从顶层（最稀疏）的入口点开始贪心导航，在本层走到局部最近点后<strong>降一层</strong>、以该点为新起点继续，逐层精化，直到最底层（含全部点）搜出 top-k。上层的『长跳』让你几步就跨越大半张图逼近目标区，下层的『稠密连接』保证局部精度。平均查询只需 <strong>$O(\log N)$</strong> 跳，却能拿到很高的召回。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>HNSW 像查地图找路：先看全国地图（顶层）大致定位到城市，再看城市地图（中层）找到区，最后看街道图（底层）找到门牌。每一层只做粗细不同的导航，合起来又快又准。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>HNSW 的召回-延迟旋钮是 <span class="term">ef</span>（efSearch）：贪心导航时维护的候选集大小。<code>ef</code> 越大，每层探索得越广（不只盯着当前最优，还留一批次优候选继续扩展），越不容易卡在局部最优、召回越高，但越慢。它是 HNSW 版的 nprobe。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>IVF 与 HNSW 的分工直觉：<strong>IVF 把空间切块、只搜几块（适合超大库 + 可配合量化压内存）</strong>；<strong>HNSW 建图、顺着图滑到近邻（召回-延迟前沿最好，但图本身占内存）</strong>。真实系统按规模与内存预算选型，甚至组合（IVF 粗筛 + 图精搜）。本模块用 numpy 把两者的核心逻辑都从零实现，你会看到它们殊途同归地把『扫全库』变成了『看一小部分』。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pq"><span class="num">5</span>PQ：把向量压成字节并查表算距离</h2>
+  <h3>PQ：把向量压成几十字节并查表算距离</h3>  <p>IVF 和 HNSW 解决『少看几个向量』，但还有另一个瓶颈：<strong>内存</strong>。一亿个 768 维 float32 向量要 <code>1e8 × 768 × 4 ≈ 307 GB</code>——单机放不下。<span class="term">PQ</span>（Product Quantization，乘积量化，Jégou 2011）专治这个：把每个向量<strong>压缩到几十字节</strong>，还能直接在压缩域算近似距离。</p>  <p>PQ 的核心是<strong>分而治之的量化</strong>：把 $d$ 维向量切成 $m$ 段子向量（如 768 维切成 8 段、每段 96 维），<strong>每段独立</strong>用 k-means 学一个有 $K$ 个质心的小<span class="term">codebook</span>（码本，典型 $K=256$）。然后把每段子向量替换成『它最近的质心的编号』——一个 0–255 的整数，正好 1 字节。</p>  <div class="math-block">\[x=[\,x^{(1)},\dots,x^{(m)}\,]\ \xrightarrow{\text{量化}}\ \text{code}(x)=[\,c_1,\dots,c_m\,],\quad c_j=\arg\min_{i}\|x^{(j)}-C_j[i]\|\]</div>  <p>于是一个 768 维 float32 向量（3072 字节）被压成 $m=8$ 个字节——<strong>压缩 384 倍</strong>！更妙的是距离计算：查询<strong>不量化</strong>，而是预先算出查询每一段到该段码本所有 $K$ 个质心的距离，存成一张 $m\times K$ 的<strong>距离查找表</strong>。库向量的近似距离 = 按它的 $m$ 个码字<strong>查表求和</strong>，全程只有查表加法，没有乘法。这叫 <span class="term">ADC</span>（Asymmetric Distance Computation，非对称距离计算）：</p>  <div class="ascii">PQ + ADC 近似距离（m=4 段，每段码本 256 质心）
+
+  查询 q 切 4 段 → 预算距离表 LUT[j][i] = ‖q^(j) - C_j[i]‖²   (4×256 一次性算好)
+
+  库向量 x 已存为码字 code(x)=[c1,c2,c3,c4]   (仅 4 字节!)
+  近似距离²(q,x) ≈ LUT[0][c1]+LUT[1][c2]+LUT[2][c3]+LUT[3][c4]   (4 次查表+加)
+
+  全库距离: 每个向量只需 m 次查表加 → 极快，且向量本身只占 m 字节</div>  <p>PQ 的代价是<strong>精度损失</strong>：把子向量近似成最近质心丢了信息，距离是<em>近似</em>的，召回率会降。$m$（段数）越大、$K$（每段质心数）越多，越精确但越占内存/越慢——又一个权衡旋钮。实践中 PQ 极少单用，而是<strong>和 IVF 组合</strong>成 FAISS 的招牌 <code>IVF-PQ</code>：IVF 分桶减少候选数，PQ 压缩向量并加速桶内的距离计算——一个少看、一个看得快又省内存，正交叠加。</p>  <div class="callout danger"><span class="label">量化误差陷阱</span>
+    <p>PQ 的量化误差是<strong>悄无声息</strong>的：它不会报错，只会让近似距离系统性偏离真值，于是召回率默默下降。更隐蔽的是它对<strong>数据分布</strong>极度敏感——PQ 假设各子空间能被少量质心很好地覆盖（真实 embedding 因聚团而成立），但若向量近乎均匀分布（高维随机数据），码本根本学不到结构，PQ 召回会崩到接近随机。本模块 notebook 会亲眼演示：同样的 PQ 代码，在聚团数据上召回尚可、在纯随机高斯数据上几乎为零。<strong>用 PQ 前务必在自己的真实向量上对拍暴力 kNN 的召回，别假设它默认能用</strong>。</p>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>PQ 出自 Jégou 2011，是 FAISS（Johnson 2019）十亿级检索的内存基石。理解它你就懂了为什么向量库能在单机服务亿级语料：不是把所有 float 都留着，而是<strong>用码本把向量压成字节、用查表把距离算快</strong>。延伸的 OPQ（先旋转再量化）、ScaNN（为内积目标设计量化损失）都是它的进化。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">6</span>召回-延迟-内存的不可能三角</h2>
+  <h3>召回-延迟-内存：ANN 的不可能三角</h3>  <p>把三种技术放在一起看，ANN 的全部艺术就是在一个<strong>三角</strong>里取舍：<strong>召回率（找得准）、延迟（找得快）、内存（存得下）</strong>。你几乎不可能三者全要，调参就是在给定两个约束下把第三个推到最优。</p>  <table>
+    <thead><tr><th>技术</th><th>主要降的成本</th><th>召回旋钮</th><th>代价</th><th>典型组合</th></tr></thead>
+    <tbody>
+      <tr><td><strong>暴力</strong></td><td>—（基线）</td><td>—（恒 100%）</td><td>$O(Nd)$ 慢、$O(Nd)$ 内存</td><td>小库 / ground truth</td></tr>
+      <tr><td><strong>IVF</strong></td><td>比较次数（少看桶）</td><td><code>nprobe</code>↑→召回↑延迟↑</td><td>边界漏检；需训练质心</td><td>IVF-PQ / IVF-Flat</td></tr>
+      <tr><td><strong>HNSW</strong></td><td>比较次数（图导航）</td><td><code>ef</code>↑→召回↑延迟↑</td><td>图占内存大；构建慢</td><td>纯内存高召回场景</td></tr>
+      <tr><td><strong>PQ</strong></td><td>内存 + 单次比较</td><td>$m,K$↑→召回↑内存↑</td><td>量化误差降召回</td><td>IVF-PQ（与 IVF 叠加）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>没有免费的午餐：想召回高，就得多看（慢）或多存（内存）；想省内存，就得压缩（降召回）；想快，就得少看（可能漏）。真实工程是先定预算——『我有多少内存、能容忍多少延迟』——再在这个盒子里把召回率调到最高。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，这条权衡前沿（Pareto frontier）由数据分布、维度、索引类型共同决定。ANN-Benchmarks（Aumüller 2020）正是把各算法的 (recall, QPS) 点画在同一张图上做标准化对比。选索引 = 在你的延迟/内存预算的垂线上，挑召回最高的那条曲线。</p></div>
+  </div>  <p>一个常被忽略但极其重要的现实是：<strong>ANN 的召回损失会向下游传播</strong>。检索召回掉 5%，意味着 5% 的查询其真正最相关的文档没进候选，后面的重排再强也救不回（巧妇难为无米之炊），最终 RAG 答案质量就受损。所以 ANN 调参不是孤立的工程优化，而要看<strong>端到端</strong>：召回率要高到『不成为整个 RAG 系统的瓶颈』为止，再在此前提下追求速度与省内存。这也呼应模块 04——检索召回是 RAG 失败最常见的根因。</p>  <p>维度也在悄悄影响这个三角，这就是著名的<strong>维度诅咒</strong>（curse of dimensionality）：维度越高，所有点对之间的距离越趋于接近，「最近邻」与「次近邻」的距离差被压缩，近邻的概念本身变模糊，ANN 也越难在『只看一小部分』的同时保持高召回。这解释了两个实践现象：① 高维向量（如 1536 维）的索引往往需要更大的 nprobe/ef 才能达到同样召回；② 降维（PCA、Matryoshka 截断）有时反而能在省算力的同时<em>提升</em>检索质量——因为它去掉了噪声维、让近邻结构更清晰。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句话：维度高了，『谁离我最近』这件事本身就变得模糊，索引想抄近路就更容易抄错。这也是为什么真实 embedding 常先降到几百维——既省钱，近邻还可能更准。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：在许多高维分布下，最近邻距离与平均距离之比趋于 1（Beyer 1999 的『近邻不稳定』结论）。这削弱了基于距离划分（IVF）或图邻接（HNSW）的有效性，是 ANN 在超高维上变难的根本原因，也是量化（PQ）误差更易伤害召回的背景。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="engineering"><span class="num">7</span>工程现实：建库、检索、增删</h2>
+  <h3>把它落地：建库、检索、增删的工程现实</h3>  <p>理论之外，向量检索在工程上还有几件绕不开的事，值得在动手前心里有数：</p>  <ul>
+    <li><strong>训练 vs 检索两阶段</strong>：IVF 的质心、PQ 的码本都要先在（采样的）数据上<strong>训练</strong>好，再用来索引全库。这意味着 ANN 索引不是『即插即用』——加入大量新数据后，旧质心/码本可能不再贴合数据分布，需要<em>重训重建</em>。</li>
+    <li><strong>增量更新的痛</strong>：HNSW 支持较好的增量插入（在图里加点连边），但删除麻烦（要维护图连通性）；IVF 加点容易（归桶即可）但桶会失衡。生产中常用『定期全量重建 + 增量缓冲』的折中。</li>
+    <li><strong>度量的选择</strong>：库内部常用 L2 距离实现。要做余弦检索，就靠上一模块的结论——<strong>先 L2 归一化，余弦检索即化归为 L2 最近邻</strong>。这也是为什么几乎所有向量库都要求或建议你存归一化向量。</li>
+    <li><strong>候选数与重排的接力</strong>：ANN 返回的 top-N 是交给下一模块重排的候选集。N 要足够大（让真正相关的文档大概率进来），又不能太大（重排变贵）——召回与精排在这里交棒。</li>
+  </ul>  <p>本模块的 notebook 会把 IVF、HNSW（简化的单层/多层贪心）、PQ 都用纯 numpy 从零实现，并在一个玩具库上：① 对拍暴力 kNN 算每个索引的召回率；② 扫 nprobe / ef / PQ 段数，亲手画出召回随旋钮变化的曲线；③ 把 IVF 与 PQ 组合成 IVF-PQ，验证『少看 + 看得快』正交叠加。你会亲眼确认：这些看似高深的索引，内核都是『聪明地只看一小部分向量』这一句话的不同实现。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话收束：<strong>ANN 不是魔法，是『有组织地偷懒』</strong>——用预先建好的结构（桶/图/码本）把『必须看全库』变成『只看最可能的那一小撮』，再用召回率诚实地度量这份偷懒丢了多少。理解这一点，FAISS/HNSWlib/ScaNN 的几十个参数你都能对号入座。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>学习式索引与端到端检索</strong>：让索引结构（如量化码本）<em>为检索目标</em>而学，而非泛泛压缩。ScaNN 的各向异性量化、可学习的分桶/路由，把『索引』从固定数据结构变成可训练组件。</li>
+    <li><strong>磁盘/分层 ANN（DiskANN）</strong>：当向量多到内存放不下，如何把图/索引放 SSD、用少量内存缓存做到接近内存级延迟。是把 ANN 推向单机十亿级的关键方向。</li>
+    <li><strong>GPU 与硬件加速</strong>：FAISS-GPU、向量检索专用加速器把暴力/IVF/PQ 的吞吐推高几个数量级，模糊了『暴力 vs 近似』的边界（小库直接 GPU 暴力反而最简单）。</li>
+    <li><strong>过滤检索（filtered ANN）</strong>：真实场景常需『在满足元数据约束（时间、权限、标签）的子集里』做近邻——把布尔过滤与向量检索高效结合，仍是活跃难题。</li>
+    <li><strong>动态与流式索引</strong>：数据持续增删时如何维持高召回而不频繁全量重建，是生产 RAG 的长期痛点（涉及图维护、码本漂移、桶再平衡）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Johnson 2019（FAISS，工业级系统）、Malkov 2018（HNSW 图索引）、Jégou 2011（PQ 量化）、Aumüller 2020（ANN-Benchmarks，召回-延迟前沿）。清单见 <code>../references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_embeddings_semantic_search/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 嵌入与语义搜索</div></a>
+    <a class="next" href="../03_reranking/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 重排</div></a>
+  </div>
+
+</div>
+</body>
+</html>

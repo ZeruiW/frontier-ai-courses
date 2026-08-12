@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · Classifier-Free Guidance</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · Classifier-Free Guidance</h1>
+  <p class="subtitle">无需额外分类器就放大条件信号 —— 条件/无条件预测的外推、引导强度 w 对保真-多样的权衡、负 prompt、过饱和与动态 CFG，几乎一切可控生成的默认开关</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–03、扩散采样、score 视角（ε∝−score）、贝叶斯公式</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_guidance.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Ho & Salimans 2022 (CFG)、Dhariwal & Nichol 2021、Lin 2024、Karras 2024</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">动机：条件太弱，需要放大</a></li>
+      <li><a href="#mechanism">核心机制：一个网络，两种预测</a></li>
+      <li><a href="#classifier">为什么等价于一个分类器</a></li>
+      <li><a href="#scale">引导强度 w：保真 vs 多样</a></li>
+      <li><a href="#negative">负向提示：换掉基线</a></li>
+      <li><a href="#saturation">过饱和与缓解</a></li>
+      <li><a href="#toy">把玩具跑起来：CFG 强度扫描</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>动机：条件太弱，需要放大</h2>
+  <p>到这里，我们的生成模型已经能从噪声采样出像样的图（模块 01–03），但有个<strong>致命的实用问题</strong>：<em>它生成得太「自由」了</em>。你给它 prompt「一只戴帽子的猫」，普通条件采样确实会朝这个方向走，但条件信号往往<strong>太弱</strong>——生成的图可能是只猫，帽子却若有若无，或者构图飘忽、不够贴合描述。原因在于：条件 <code>c</code> 只是去噪网络众多输入之一，它对最终输出的影响被海量的「怎么画都行」的自由度稀释了。我们需要一个旋钮，能<strong>主动放大条件的话语权</strong>。</p>  <p>最早的解法是 <span class="term">classifier guidance</span>（Dhariwal & Nichol 2021）：另训一个能<em>在带噪图上</em>分类的分类器，用它的梯度 <code>∇ₓ log p(c|x)</code> 在每步采样里把图往「更像类别 c」的方向推。这有效，但代价很重：你得<strong>额外训练一个噪声鲁棒的分类器</strong>，而且它和扩散模型是两套东西、要分别维护、还容易被对抗梯度带偏。能不能<strong>不要这个外挂分类器</strong>？</p>  <p>Ho & Salimans 2022 的 <span class="term">classifier-free guidance (CFG)</span> 给出了一个惊人简洁的答案：<strong>让同一个去噪网络同时学会「带条件」和「不带条件」两种预测，采样时把两者的差外推放大，就等价于隐式地用了一个分类器——却一个分类器都不用训</strong>。这个想法如此好用，以至于<em>今天几乎每一个文生图模型的采样都默认开着 CFG</em>；那个让你调「prompt 贴合度」的强度滑块，背后就是它。</p>  <p>为什么「条件太弱」是扩散特有的、而非随便就能靠加大条件权重解决的问题？因为扩散的训练目标（预测噪声的 MSE）是一个<strong>逐样本的回归</strong>，它只要求网络对每个带噪样本给出无偏的噪声估计——它<em>不直接优化「生成的图有多贴合条件」</em>这件事。换句话说，模型学到的是 <code>p(x|c)</code> 的一个<strong>忠实但温和</strong>的近似：忠实意味着它不会乱来，温和意味着它不会刻意夸大条件。对追求「图必须明确符合 prompt」的实用场景，这种温和恰恰不够——我们需要一种<em>采样时</em>的手段，在不重训模型的前提下，把条件的影响<strong>人为放大</strong>。CFG 正是这样一个纯采样时的技巧：训练只多做一件小事（随机丢条件），放大全在采样时发生。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住 CFG：<strong>先问模型「随便画一张」（无条件），再问「按这个 prompt 画一张」（有条件），两者之差就是「这个 prompt 到底要我往哪改」——然后沿这个方向多走几步</strong>。多走的倍数就是引导强度。不需要任何额外分类器，因为「条件 vs 无条件之差」本身就编码了条件的方向。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mechanism"><span class="num">2</span>核心机制：一个网络，两种预测</h2>
+  <h3>核心机制：一个网络，两种预测</h3>  <p>CFG 的第一步在<strong>训练</strong>时就埋下了：让<em>同一个</em>去噪网络 <code>εθ</code> 既能做条件预测，又能做无条件预测。做法朴素得出奇——<strong>训练时以一定概率（典型 10%~20%）把条件丢掉</strong>，换成一个特殊的「空条件」<code>∅</code>（null token / 空 prompt / 可学习的 null embedding）：</p>  <div class="ascii">训练一步（带条件丢弃）：
+  1. 取 (图 x, 条件 c)，编码、采 t、采噪声 ε，闭式加噪得 x_t
+  2. 掷骰子：以概率 p_drop≈0.1 把 c 替换成空条件 ∅
+  3. 网络预测：ε̂ = εθ(x_t, t, c 或 ∅)
+  4. 损失 ‖ε − ε̂‖²，反传
+  =&gt; 网络同时见过「带 c」和「带 ∅」的样本，学会了两种模式</div>  <p>于是一个网络身兼两职：喂真条件 <code>c</code> 得到<strong>条件预测</strong> <code>ε_c = εθ(x_t,t,c)</code>；喂空条件 <code>∅</code> 得到<strong>无条件预测</strong> <code>ε_∅ = εθ(x_t,t,∅)</code>。采样时<strong>两个都算一遍</strong>（所以 CFG 的采样要跑两次网络，算力翻倍——这是它的主要代价），再做关键的外推：</p>  <div class="math-block">\[\tilde\epsilon \;=\; \epsilon_\varnothing \;+\; w\,\big(\epsilon_c - \epsilon_\varnothing\big)\]</div>  <p>把这个 <code>ε̃</code> 当作「被引导过的去噪预测」喂进采样器（DDPM/DDIM/flow 都行）。<strong>本课全程用这个约定</strong>：<code>w</code> 是引导强度。注意三个可直接验证的事实——<code>w=0</code> 时 <code>ε̃=ε_∅</code>（纯无条件，prompt 被忽略）；<code>w=1</code> 时 <code>ε̃=ε_c</code>（普通条件采样，不放大）；<code>w&gt;1</code> 时把预测沿 <code>ε_∅→ε_c</code> 的方向<strong>外推到 ε_c 之外</strong>，即「比模型自己以为的还要更贴合条件」。</p>  <p>这里有个值得停下来体会的设计精妙之处：<strong>训练时随机丢条件，竟一举两得</strong>。它既让网络获得了无条件生成能力（喂 <code>∅</code> 时就是个无条件模型），又<em>没有</em>损害条件生成能力（90% 的时间仍在学带条件）。一个网络、一次训练，同时学会了两种模式，采样时随取随用。相比之下，classifier guidance 要维护两个独立模型（扩散 + 分类器），CFG 把它们<strong>合二为一</strong>——这种「用一点训练时的随机性换来采样时的巨大灵活性」的思路，是值得记住的设计模式。</p>  <div class="callout warn"><span class="label"></span>
+    <p>注意 CFG 是<strong>外推（extrapolation）</strong>而非插值。<code>w</code> 在 0 与 1 之间是插值（在两个合理预测之间），但实用 <code>w</code> 通常是 7~12，远大于 1——这把预测推到了<code>ε_c</code>之外、两个预测都没覆盖的区域。外推天然有风险（推出数据流形），这正是后面「过饱和」的根源。记住：<strong>CFG 的威力和它的副作用同源，都来自外推</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="classifier"><span class="num">3</span>为什么等价于一个分类器</h2>
+  <h3>为什么这等价于一个分类器</h3>  <p>CFG 最漂亮的地方，是它<strong>数学上确实等价于 classifier guidance</strong>——却不用训分类器。推导只需一个桥梁：扩散网络预测的噪声 <code>ε</code> 正比于数据分布的<strong>分数（score）</strong>的负方向，<code>ε(x_t,t) ∝ −∇ₓ log p(x_t)</code>（这是 score-based 视角，C16 讲过）。</p>  <p>于是条件与无条件预测之差，恰好是条件似然的梯度：</p>  <div class="math-block">\[\epsilon_c - \epsilon_\varnothing \;\propto\; -\nabla_x\big[\log p(x_t\mid c) - \log p(x_t)\big] \;=\; -\nabla_x \log p(c\mid x_t)\]</div>  <p>最后一步用了贝叶斯：<code>log p(x|c) − log p(x) = log p(c|x) − log p(c)</code>，而 <code>log p(c)</code> 不含 <code>x</code>、梯度为零。所以 <strong>「条件预测减无条件预测」就是「那个本来要外训的分类器的梯度」</strong>！CFG 用一个网络的两次前向，免费得到了 classifier guidance 要靠外挂分类器才能拿到的东西。代入外推式可见，CFG 实际是在从一个<strong>被指数加权过的分布</strong>里采样：</p>  <div class="math-block">\[\tilde p(x\mid c) \;\propto\; p(x)\,\big[p(c\mid x)\big]^{\,w}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>通俗讲：<code>p(c|x)^w</code> 里的 <code>w</code> 是个「放大镜」。<code>w</code> 越大，分布越偏向「分类器极度确信是 c」的那些 <code>x</code>——也就是最典型、最无歧义的样本。代价是：那些虽然也符合 c、但不那么典型的样本被压制了，多样性随之下降。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地：<code>w&gt;1</code> 把条件似然 <code>p(c|x)</code> 指数锐化，等价于把采样温度调低。这解释了 CFG 的核心权衡——<strong>锐化分布提升了「样本符合条件」的概率（保真），却削减了分布的支撑集（多样性）</strong>。两者此消彼长，由 <code>w</code> 单调控制。</p></div>
+  </div>  <p>这个等价还解释了一个实践疑问：为什么 CFG 比它的前身 classifier guidance 好用那么多？classifier guidance 要的那个外挂分类器，必须<strong>在带噪图上</strong>训练（因为采样的每一步都作用在不同噪声级别的 <code>x_t</code> 上），这本身就难——一个在干净图上训好的分类器，面对半是噪声的图会彻底失灵。而 CFG 把这个分类器<em>免费地、隐式地</em>藏在了去噪网络里：去噪网络本来就见过所有噪声级别的样本，它的「条件减无条件」自然就是一个<strong>各噪声级别都正确的隐式分类器梯度</strong>。一举消除了「另训噪声鲁棒分类器」这个最大的工程负担——这才是 CFG 真正的胜利。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把这层等价关系记牢，胜过记公式：<strong>CFG = 用模型自己当分类器</strong>。它问模型两个问题（带条件、不带条件），用回答之差当作「条件指明的方向」，再放大。所以 CFG 的质量天然受限于模型自己对条件的理解——模型没学好的条件，CFG 放大的也是错的方向。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="scale"><span class="num">4</span>引导强度 w：保真 vs 多样</h2>
+  <h3>引导强度 w：保真 vs 多样的旋钮</h3>  <p><code>w</code> 是 CFG 唯一也是最重要的旋钮，它在<strong>两个互相拉扯的目标</strong>之间滑动：</p>  <table>
+    <thead><tr><th>引导强度 w</th><th>效果</th><th>保真度 (CLIP/对齐)</th><th>多样性</th><th>典型问题</th></tr></thead>
+    <tbody>
+      <tr><td><code>w=0</code></td><td>纯无条件，忽略 prompt</td><td>最低</td><td>最高</td><td>图和 prompt 无关</td></tr>
+      <tr><td><code>w=1</code></td><td>普通条件采样</td><td>中</td><td>高</td><td>条件信号偏弱</td></tr>
+      <tr><td><strong>w=3~8</strong>（常用区）</td><td>放大条件</td><td><strong>高</strong>（甜点）</td><td>中</td><td>—— 平衡点 ——</td></tr>
+      <tr><td><code>w&gt;12</code></td><td>过度引导</td><td>看似更贴但失真</td><td>低</td><td><strong>过饱和</strong>、伪影</td></tr>
+    </tbody>
+  </table>  <p>这条权衡是 CFG 的全部精髓，也是你在任何文生图 UI 里调那个滑块时实际在做的事。<strong>调高 w</strong>：图越来越紧扣 prompt（CLIP score 上升）、越来越「典型」，但也越来越<em>千篇一律</em>——同一 prompt 不同种子生成的图越来越像。<strong>调低 w</strong>：图更多样、更有惊喜，但可能离 prompt 越来越远。Ho & Salimans 的原论文就用 FID（衡量整体质量/多样性）和 IS（衡量类别清晰度）画出了这条权衡曲线：<strong>存在一个中间的 w 让两者达到最佳折中</strong>，两头都不是最优。</p>  <p>一个常被忽略的细节：<strong>最优 w 依赖模型、数据集、采样器、甚至 prompt</strong>。条件信号本身强（如清晰的类别标签）时，小 w 就够；条件弱或抽象（如复杂长文本）时，往往要更大的 w 才推得动。这也是为什么不同模型推荐的默认 w 差别很大（见本模块胶囊），以及为什么没有「万能的最佳 w」。</p>  <p>还要理解 CFG 与<strong>评测指标</strong>的微妙关系，否则容易被带偏。调高 <code>w</code> 几乎总能让 <span class="term">CLIP score</span>（图文对齐度）上升，于是看起来「更好」；但 <span class="term">FID</span>（衡量与真实分布的接近程度、隐含多样性）往往先降后升——存在一个让 FID 最优的中等 <code>w</code>，再往上 FID 反而变差（因为多样性塌缩、且过饱和让图偏离真实分布）。所以<strong>单看 CLIP score 选 w 会系统性地把 w 选得过大</strong>。这是评测扩散模型的一个经典陷阱：两个指标指向不同的 <code>w</code>，真实的「好」在它们的折中处，而非任何单一指标的极值。</p>  <div class="callout danger"><span class="label">CFG 拉满 = 翻车</span>
+    <p>最反直觉、也最该牢记的一点：<strong>w 不是越大越好，更大的 w ≠ 更好的图</strong>。超过某个阈值后，CFG 的外推把去噪预测推出了真实数据流形，结果是<em>颜色过饱和、对比过强、细节崩坏、出现不自然的高频伪影</em>。新手最常见的错误就是「prompt 不够贴就一路把 CFG 拉满」，结果得到一张「很努力但很丑」的图。<strong>正确做法是找那个甜点 w，而非最大化它</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="negative"><span class="num">5</span>负向提示：换掉基线</h2>
+  <h3>负向提示：把无条件基线换成「不想要的」</h3>  <p>CFG 的外推式里，<code>ε_∅</code> 扮演「基线/参照系」的角色——我们沿「从基线指向条件」的方向放大。<span class="term">negative prompt</span>（负向提示）是一个聪明的推广：<strong>把这个基线从「空条件」换成「你明确不想要的内容」的条件预测</strong> <code>ε_neg</code>：</p>  <div class="math-block">\[\tilde\epsilon \;=\; \epsilon_{\text{neg}} \;+\; w\,\big(\epsilon_c - \epsilon_{\text{neg}}\big)\]</div>  <p>现在外推方向变成「从『不想要的』指向『想要的』」，放大它就等于<strong>既朝想要的靠近，又主动远离不想要的</strong>。比如正 prompt 写「一张人像」，负 prompt 写「<code>blurry, lowres, extra fingers</code>」，模型就会被推离模糊、低清、多手指这些常见缺陷。这是实践中极其常用的可控手段——很多「质量提升咒语」本质就是塞进负 prompt 的。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>通俗讲：普通 CFG 是「朝目标走」，负 prompt 是「朝目标走、同时背对雷区」。把参照系从「中立的空白」换成「明确的反例」，外推这条线就同时具备了「吸引」和「排斥」两个作用。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地：负 prompt 把采样分布变成 <code>p(x)·[p(c|x)/p(c_neg|x)]^w</code> 的形态——既放大目标条件似然，又压制负条件似然。它仍是同一套外推机制，只是<strong>把基线预测从 ε_∅ 替换为 ε_neg</strong>，无需任何训练改动，纯采样时的技巧。</p></div>
+  </div>  <p>实践中负 prompt 极其常用，且有一些反复出现的套路值得知道。最常见的是塞入<strong>质量负词</strong>（<code>blurry, lowres, jpeg artifacts, bad anatomy</code> 等），把生成推离这些常见缺陷——很多社区流传的「画质提升咒语」本质就是一串负 prompt。还有<strong>内容排除</strong>（不想要某物体/风格时写进负 prompt）。但也要警惕：负 prompt 同样受 <code>w</code> 放大，写得过激或过多会和正 prompt 互相拉扯、把图推向奇怪的方向。它和正 prompt 是<em>一对方向相反的力</em>，配平才好用——这也再次印证了 CFG「一切都是外推、基线决定远离什么」的统一视角。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>负 prompt 揭示了 CFG 的一个深层视角：<strong>引导的本质是「在两个预测之间外推」，基线选什么，就决定了你在远离什么</strong>。空条件 ∅ 是「远离平庸/无条件」，负 prompt 是「远离指定的坏内容」。理解了这点，你就能自由设计各种引导（如风格引导、构图引导）——它们都是同一个外推式的不同基线。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="saturation"><span class="num">6</span>过饱和与缓解</h2>
+  <h3>过饱和与缓解：让外推别跑太远</h3>  <p>先把<strong>过饱和</strong>这个现象说清楚。当 <code>w</code> 过大，生成的图会出现一组典型病征：<em>颜色过浓过艳、明暗对比拉到极端、边缘出现不自然的硬光晕、细节区域崩成奇怪的高频噪点</em>。数值上，这对应去噪预测 <code>ε̃</code> 的<strong>幅度（方差）被外推放大</strong>了——外推把预测推到了真实噪声分布的尺度之外，于是每一步去噪都「用力过猛」，累积下来就把图推离了自然图像的流形。理解了「过饱和 = 外推导致的幅度膨胀 + 流形偏离」，下面的缓解方法就都顺理成章了。</p>  <p>既然 CFG 的副作用来自<strong>外推跑出数据流形</strong>，缓解思路就两类：<em>要么把跑出去的拉回来，要么别让它跑那么久</em>。三种主流方法：</p>  <ol>
+    <li><strong>CFG rescale</strong>（Lin 2024）：外推会让预测的<em>方差膨胀</em>（这正是过饱和的数值表现）。解法是引导后把 <code>ε̃</code> 的标准差<strong>重新缩回</strong>条件预测 <code>ε_c</code> 的水平：<code>ε̃ ← ε̃ · (std(ε_c)/std(ε̃))</code>（再与原 <code>ε̃</code> 按系数混合）。保留方向、压住幅度。</li>
+    <li><strong>动态 / 调度 CFG</strong>：让 <code>w</code> 随去噪步<strong>变化</strong>而非全程恒定。常见策略是「早期强、后期弱」——早期需要强引导来确定构图与语义，后期细节阶段强引导只会添乱、引发伪影。这能在对齐和自然之间取得更好平衡。</li>
+    <li><strong>限定区间引导</strong>：干脆只在中间一段时间步施加引导，最开始（纯噪声、引导无意义）和最后（细节、引导有害）都关掉。Karras 等的实验表明这能显著减少伪影。</li>
+  </ol>  <p>这些方法有个共同的认识：<strong>恒定的大 w 是一种粗糙的全局手段</strong>，而过饱和往往是「在不该强引导的时间/位置强引导」造成的。所以更精细的做法是让引导<em>在合适的时候、合适的强度</em>起作用。前沿模型（如 SD3、Flux）大多内置了某种形式的引导调度，而非让用户面对一个生硬的全局 <code>w</code>。</p>  <p>为什么「早期强、后期弱」的调度几乎总是有益？这背后有个清晰的直觉，和扩散采样的阶段性有关。采样早期（高噪）决定的是<strong>全局结构</strong>——构图、主体、语义骨架，此时强引导能确保图朝 prompt 的方向立住；采样后期（低噪）处理的是<strong>局部细节</strong>——纹理、边缘、微调，此时图的内容已基本定下，强引导不仅帮不上忙，反而会把已经合理的细节往「极端典型」推，正是过饱和与伪影的高发区。所以让引导<em>在该用力时用力、该松手时松手</em>，比全程一个生硬的大 <code>w</code> 自然得多。这也呼应了模块 03 的视角：采样是一条轨迹，轨迹的不同阶段有不同的需求。</p>  <p>还有一条更激进的路线和模块 05 相通：<strong>引导蒸馏</strong>。CFG 要跑两次网络（条件 + 无条件），算力翻倍。可以把「带 CFG 的两次前向」蒸馏进一个<strong>单次前向就内置了引导</strong>的学生网络——Flux schnell、SDXL-Turbo 等少步模型常把 CFG 一并蒸馏掉，既快又省。这是「把采样开销压到极致」的一环，详见下一模块。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个实用提醒：上面这些缓解技巧不是「越多越好」地叠加。它们各自针对过饱和的不同侧面（幅度、时机、区间），<strong>通常选一两个针对你观察到的具体伪影即可</strong>。盲目全开可能互相干扰、甚至损失本该有的引导效果。先看图诊断问题，再对症下药——这和调 w 本身是同一种克制的智慧。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="toy"><span class="num">7</span>把玩具跑起来：CFG 强度扫描</h2>
+  <h3>把玩具跑起来：CFG 与强度扫描</h3>  <p>配套 notebook 用纯 numpy 在一个<strong>带条件的 2D 玩具</strong>上把 CFG 跑通：</p>  <ol>
+    <li><strong>条件玩具数据</strong>：两个分得很开的高斯团当作两个「类别」（条件 <code>c∈{0,1}</code>）；全体数据的混合当作「无条件」分布。</li>
+    <li><strong>玩具去噪器</strong>：用闭式后验均值构造每个类别的条件去噪器 <code>ε_c</code> 与混合的无条件去噪器 <code>ε_∅</code>（沿用模块 01 的 optimal_eps 思路）。</li>
+    <li><strong>CFG 外推</strong>：实现 <code>cfg_predict(ε_c, ε_∅, w)=ε_∅+w(ε_c−ε_∅)</code>，验证 <code>w=0→ε_∅</code>、<code>w=1→ε_c</code> 两个精确等式。</li>
+    <li><strong>强度扫描</strong>：对 <code>w∈{0,1,2,4,8}</code> 各采一大批样本，测「落在目标类别附近的比例」——会看到它<strong>随 w 单调上升</strong>（保真↑），同时样本方差<strong>随 w 下降</strong>（多样性↓）。</li>
+    <li><strong>负引导</strong>：把基线换成另一类，验证生成的均值被<strong>推离</strong>那个负类别。</li>
+  </ol>  <p>通过这个玩具，你会<strong>亲眼量化</strong>本模块的每个论点：CFG 的两个边界等式精确成立、<strong>w 越大越扣条件但越不多样</strong>（保真-多样权衡的数字证据）、以及负引导确实把分布推离指定内容。维度小到能画散点、能 print 比例，但 <code>ε̃=ε_∅+w(ε_c−ε_∅)</code> 这条外推式与真实 SD 采样里那一行 CFG 代码逐字对应。</p>  <div class="callout paper"><span class="label"></span>
+    <p>notebook 的去噪器是闭式玩具（不训练），但 CFG 外推、负引导、动态 w 的逻辑与真实实现完全一致。想深入直接看 Ho & Salimans 2022 (CFG) 原论文，以及 diffusers 库采样循环里的 <code>noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)</code> 那一行。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>更好的引导，更少的副作用</strong>：CFG 的外推本质就会牺牲多样性、引入伪影。autoguidance（Karras 2024）用一个<em>更弱的同族模型</em>当基线（而非无条件预测），被证明能更干净地提质——引导研究正在寻找比「条件减无条件」更好的方向。</li>
+    <li><strong>引导强度的自动化</strong>：最优 <code>w</code> 依赖模型/prompt/步数，目前靠手调或固定默认值。如何<em>逐样本、逐步、逐 prompt 自适应</em>地选 w（甚至让模型自己学出引导强度），是活跃方向。</li>
+    <li><strong>免引导生成</strong>：CFG 要两次前向、算力翻倍。能否训出<strong>不需要 CFG 就自带强条件对齐</strong>的模型？引导蒸馏（把 CFG 蒸进单次前向）和一些新训练目标正朝这个方向走（与模块 05 相通）。</li>
+    <li><strong>过饱和的根本理解</strong>：过饱和与流形偏离的精确关系、为什么某些时间步/区域更敏感，仍缺乏完整理论。CFG rescale、区间引导都是经验补丁，更原理性的解法在探索中。</li>
+    <li><strong>引导用于可控编辑</strong>：把「在两个预测间外推」推广到风格、构图、属性的精细控制（如不同区域用不同引导、不同 token 用不同强度），是连接 CFG 与可控生成、图像编辑（如 prompt-to-prompt、注意力控制）的前沿交叉点，也是把「一个全局 w」拆成「细粒度引导场」的方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Ho & Salimans 2022《Classifier-Free Diffusion Guidance》（CFG 原始论文）；前身 Dhariwal & Nichol 2021（classifier guidance）；进阶看 Lin 2024（CFG rescale / 过饱和修复）、Karras 2024（autoguidance）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_flow_matching/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · Flow Matching 与 Rectified Flow</div></a>
+    <a class="next" href="../05_consistency/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 一致性模型与少步采样</div></a>
+  </div>
+
+</div>
+</body>
+</html>

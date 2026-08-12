@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · Trainer 与 TrainingArguments</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · Trainer 与 TrainingArguments</h1>
+  <p class="subtitle">Trainer 内部的训练循环骨架 · 有效 batch 的三个乘数与梯度累积等价性 · 调度器与总步数 · checkpoint 存了什么恢复了什么 · 十个高频坑与一个配置校验器</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–02；C07 的优化器概念；C49 模块 03 的微调配方</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_trainer.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">transformers 文档（Trainer / TrainingArguments / Callbacks）、Trainer 源码 <code>inner_training_loop</code></div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#inside">Trainer 内部到底跑了什么</a></li>
+      <li><a href="#effective">有效 batch：三个数相乘才是你关心的那个量</a></li>
+      <li><a href="#args">TrainingArguments：按「你会遇到的问题」重排</a></li>
+      <li><a href="#metrics">compute_metrics 与 Callback：两个扩展点</a></li>
+      <li><a href="#checkpoint">checkpoint 与断点续训：存了什么、恢复了什么</a></li>
+      <li><a href="#pitfalls">十个高频坑（附症状）</a></li>
+      <li><a href="#ledger">算一笔账：训练时长与 checkpoint 磁盘</a></li>
+      <li><a href="#frontier">生态动态与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="inside"><span class="num">1</span>Trainer 内部到底跑了什么</h2>
+  <p><code>Trainer</code> 常被当成黑箱，但它其实就是一个<strong>写得很仔细的训练循环</strong>。把它的骨架看清，你才知道出问题时该往哪儿看、以及什么时候该弃用它自己写。</p>  <div class="ascii">trainer.train() 的骨架（省略了分布式与日志细节）
+
+  ① 准备
+     DataLoader(train_dataset, collate_fn=data_collator,
+                batch_size=per_device_train_batch_size,
+                sampler=按 group_by_length / seed 构造)
+     optimizer = AdamW(参数分两组：weight_decay 组 与 no_decay 组)
+     scheduler = get_scheduler(lr_scheduler_type, warmup_steps, total_steps)
+     ⚠️ total_steps = ceil(len(loader) / grad_accum) * num_train_epochs
+        （max_steps 若 &gt;0 则覆盖它）
+
+  ② for epoch in range(epochs):
+       for step, batch in enumerate(loader):
+           ③ loss = model(**batch).loss              # 模型内部算 loss
+           ④ loss = loss / grad_accum               # ← 关键：先除再回传
+           ⑤ loss.backward()                        # 累积梯度
+           if (step + 1) % grad_accum == 0:
+               ⑥ clip_grad_norm_(params, max_grad_norm)   # 默认 1.0
+               ⑦ optimizer.step(); scheduler.step(); optimizer.zero_grad()
+               ⑧ global_step += 1                   # ← **优化步**，不是 batch 数
+               ⑨ 到点则：log / evaluate / save_checkpoint
+
+  ⑩ 结束：load_best_model_at_end 则回载最佳 checkpoint</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>看清第 ⑧ 步就解开了一个常见困惑：<strong><code>logging_steps</code> / <code>eval_steps</code> / <code>save_steps</code> 数的是<em>优化步</em>（global_step），不是 batch 数</strong>。<code>grad_accum=8</code> 时，跑了 800 个 batch 才是 100 个 global_step。<em>这就是为什么「我设了 <code>logging_steps=10</code> 但半天不打日志」——因为你的 <code>grad_accum</code> 很大。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第 ④ 步也值得注意：<strong>loss 在 backward 之前被除以 <code>grad_accum</code></strong>。这是为了让累积 N 个 micro-batch 的梯度<em>等价于</em>一个 N 倍大 batch 的梯度（因为 loss 默认是 batch 内均值）。如果你自己写循环忘了这一步，有效学习率会被放大 N 倍——<em>症状是「梯度累积一开就发散」</em>。反过来，如果你的 loss 是 <code>reduction='sum'</code>，就<strong>不</strong>该除。这个细节在自定义 <code>compute_loss</code> 时特别容易搞错。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>什么时候该弃用 <code>Trainer</code> 自己写循环？判据是：<strong>当你需要在一个训练步内做「非标准」的事情时</strong>——比如多个模型交替更新（GAN、RLHF 的 actor-critic）、需要在 backward 之间插入自定义操作、或者每步的数据依赖上一步的输出（on-policy 采样）。<em>反过来，只要你的训练是「取一个 batch、算一个 loss、更新一次」，<code>Trainer</code> 就够用，而且它处理好的边角（断点续训、分布式、日志、混合精度）你自己写要花很久才能同样可靠。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="effective"><span class="num">2</span>有效 batch：三个数相乘才是你关心的那个量</h2>
+  <div class="math-block">\[B_{eff} = \texttt{per\_device\_train\_batch\_size} \times \texttt{gradient\_accumulation\_steps} \times n_{devices}\]</div>  <p>这是 <code>TrainingArguments</code> 里<strong>最常被搞混的一组参数</strong>。三个数的组合决定了：优化器看到的实际 batch、显存占用、以及吞吐。</p>  <table>
+    <thead><tr><th>组合</th><th>有效 batch</th><th>显存</th><th>吞吐</th><th>何时选</th></tr></thead>
+    <tbody>
+      <tr><td><code>bs=32, accum=1, dev=1</code></td><td>32</td><td>高</td><td><strong>最高</strong></td><td>显存够时的首选</td></tr>
+      <tr><td><code>bs=8, accum=4, dev=1</code></td><td>32</td><td>低</td><td>略低</td><td><strong>显存不够时的标准换法</strong></td></tr>
+      <tr><td><code>bs=1, accum=32, dev=1</code></td><td>32</td><td><strong>最低</strong></td><td>低（GPU 利用率差）</td><td>极端显存受限</td></tr>
+      <tr><td><code>bs=8, accum=1, dev=4</code></td><td>32</td><td>每卡低</td><td><strong>最高</strong>（并行）</td><td>有多卡时</td></tr>
+    </tbody>
+  </table>  <p>四行的<strong>有效 batch 完全相同</strong>（都是 32），数学上等价（对 Transformer 而言——用 BatchNorm 的模型不等价，但 Transformer 用 LayerNorm，无此问题）。选哪一行只看显存与吞吐。</p>  <div class="callout warn"><span class="label"></span>
+    <p>但有三个<strong>真实的不等价之处</strong>要知道：<strong>①dropout 的随机性</strong>——micro-batch 拆分改变了 dropout mask 的分布，理论上有微小差异（实践中可忽略）。<strong>②<code>eval_accumulation_steps</code> 与评估显存</strong>——评估时默认把所有预测攒在 GPU 上再算指标，大数据集会 OOM；设了它才会分批搬到 CPU。<strong>③日志里的 loss 是 micro-batch 的均值</strong>，不是有效 batch 的——所以梯度累积下日志 loss 的方差会更大，看起来更抖，但这不代表训练不稳。</p>
+  </div>  <h3>学习率与有效 batch 的关系</h3>  <p>有效 batch 变了，学习率通常要跟着变。两条经验规则：</p>  <ul>
+    <li><strong>线性缩放</strong>：<code>lr ∝ B_eff</code>。来自 SGD 的理论（Goyal et al. 2017 的 ImageNet in 1 Hour），在<em>大 batch 训练</em>时用得多。</li>
+    <li><strong>平方根缩放</strong>：<code>lr ∝ √B_eff</code>。对 Adam 类自适应优化器更常见，因为 Adam 已经对梯度做了归一化。<em>微调场景通常用这条，或者干脆不调</em>（微调的 batch 范围变化不大）。</li>
+  </ul>  <p>实践建议：<strong>微调时先固定 <code>lr=2e-5</code> 这类常用值，只在有效 batch 变化超过 4 倍时才按 √ 规则调</strong>。把学习率与 batch 一起扫是个昂贵且常常不必要的做法（C40 有关于实验设计的系统讨论）。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="args"><span class="num">3</span>TrainingArguments：按「你会遇到的问题」重排</h2>
+  <p><code>TrainingArguments</code> 有一百多个参数。文档按字母排，这里按<strong>你会遇到的问题</strong>排。</p>  <table>
+    <thead><tr><th>你的问题</th><th>相关参数</th><th>要点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>显存不够</strong></td><td><code>per_device_train_batch_size</code> ↓ + <code>gradient_accumulation_steps</code> ↑<br><code>gradient_checkpointing=True</code><br><code>bf16=True</code><br><code>optim="adamw_torch_fused"</code> / <code>"adafactor"</code> / <code>"paged_adamw_8bit"</code></td><td>checkpointing 省激活显存但慢 20–30%；8bit 优化器省 3/4 的优化器状态</td></tr>
+      <tr><td><strong>训练太慢</strong></td><td><code>bf16=True</code>、<code>group_by_length=True</code>、<code>dataloader_num_workers</code>、<code>torch_compile=True</code></td><td>先确认瓶颈在 GPU 还是数据加载（看 GPU 利用率）</td></tr>
+      <tr><td><strong>loss 变 nan</strong></td><td><code>bf16</code> 替代 <code>fp16</code>、<code>max_grad_norm</code>、<code>learning_rate</code> ↓、<code>warmup_ratio</code> ↑</td><td><strong>fp16→bf16 是第一反应</strong>（动态范围问题）</td></tr>
+      <tr><td><strong>过拟合</strong></td><td><code>num_train_epochs</code> ↓、<code>weight_decay</code>、<code>label_smoothing_factor</code>、<code>load_best_model_at_end</code>+<code>EarlyStoppingCallback</code></td><td>微调 2–4 epoch 通常够（C49 模块 03）</td></tr>
+      <tr><td><strong>要断点续训</strong></td><td><code>save_steps</code>、<code>save_total_limit</code>、<code>resume_from_checkpoint</code></td><td>checkpoint 含优化器与调度器状态，比只存权重大 3–4 倍</td></tr>
+      <tr><td><strong>要选最好的 checkpoint</strong></td><td><code>load_best_model_at_end=True</code>、<code>metric_for_best_model</code>、<code>greater_is_better</code></td><td><strong>必须同时设 <code>eval_strategy</code> 与 <code>save_strategy</code> 且两者一致</strong></td></tr>
+      <tr><td><strong>可复现</strong></td><td><code>seed</code>、<code>data_seed</code>、<code>full_determinism=True</code></td><td>完全确定性会明显变慢；通常只在排查 bug 时开</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">配置错误三连</span>
+    <p><strong>三个高频配置错误</strong>：<strong>①<code>load_best_model_at_end=True</code> 但 <code>eval_strategy="no"</code></strong>——没有评估就没有「最佳」，会报错或静默不生效。<strong>②<code>metric_for_best_model="loss"</code> 但忘了 <code>greater_is_better=False</code></strong>——库会去选 loss <em>最大</em> 的 checkpoint，也就是最差的那个。<em>（注：对以 <code>loss</code> 结尾的指标名，新版本会自动推断方向，但显式写出来永远更安全。）</em><strong>③<code>save_total_limit</code> 太小配上 <code>load_best_model_at_end</code></strong>——最佳 checkpoint 可能已被删掉；库会尽力保留它，但设成 1 仍可能出问题，建议至少 2。</p>
+  </div>  <h3>学习率调度：三个参数的交互</h3>  <pre><code>TrainingArguments(
+    learning_rate=2e-5,
+    lr_scheduler_type="cosine",   # linear / cosine / constant_with_warmup / ...
+    warmup_ratio=0.06,            # 占总步数的比例（与 warmup_steps 二选一）
+    # warmup_steps=500,           # 绝对步数；**同时设两个时 warmup_steps 优先**
+    num_train_epochs=3,
+    # max_steps=-1,               # &gt;0 时覆盖 num_train_epochs
+)</code></pre>  <p>要注意 <strong>总步数的计算</strong>：<code>total = ceil(len(dataloader) / grad_accum) × epochs</code>。调度器按总步数规划衰减曲线，所以<em>如果你中途改了 <code>grad_accum</code> 或数据量，衰减曲线就变了</em>——这是「同样的超参换个机器结果不一样」的一个隐蔽来源（不同卡数 → 不同 <code>len(dataloader)</code> → 不同总步数）。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="metrics"><span class="num">4</span>compute_metrics 与 Callback：两个扩展点</h2>
+  <h3>compute_metrics 的签名与陷阱</h3>  <pre><code>def compute_metrics(eval_pred):
+    logits, labels = eval_pred            # 都是 numpy array（已从 GPU 搬回）
+    preds = logits.argmax(-1)
+    # ⚠️ token 分类要先过滤 -100
+    mask = labels != -100
+    return {"accuracy": (preds[mask] == labels[mask]).mean()}
+
+trainer = Trainer(..., compute_metrics=compute_metrics)</code></pre>  <table>
+    <thead><tr><th>陷阱</th><th>症状</th><th>解法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>忘了过滤 <code>-100</code></strong></td><td>指标异常低（把 padding 也算进去了）</td><td><code>mask = labels != -100</code></td></tr>
+      <tr><td><strong>模型返回 tuple 而非单个 logits</strong></td><td><code>logits</code> 是个 tuple，argmax 报错</td><td>用 <code>preprocess_logits_for_metrics</code> 提前收缩，或在函数里解包</td></tr>
+      <tr><td><strong>评估时 OOM</strong></td><td>评估阶段崩溃（训练正常）</td><td><code>eval_accumulation_steps=N</code> 分批搬到 CPU</td></tr>
+      <tr><td><strong>生成式任务用 argmax</strong></td><td>指标毫无意义（BLEU/ROUGE 需要生成的文本）</td><td><code>Seq2SeqTrainer</code> + <code>predict_with_generate=True</code></td></tr>
+    </tbody>
+  </table>  <h3>Callback：在训练循环的钩子上挂东西</h3>  <p><code>TrainerCallback</code> 提供了十几个钩子（<code>on_train_begin</code>、<code>on_step_end</code>、<code>on_evaluate</code>、<code>on_save</code>…）。它<strong>能读状态、能改控制流，但不能改梯度或权重</strong>——那些要靠子类化 <code>Trainer</code> 覆盖 <code>compute_loss</code> / <code>training_step</code>。</p>  <ul>
+    <li><strong>典型用途</strong>：早停（<code>EarlyStoppingCallback</code>）、自定义日志、按条件调整超参、在评估后跑一段自定义分析、把指标推到外部系统。</li>
+    <li><strong>控制流</strong>：通过修改 <code>control.should_training_stop</code> / <code>should_evaluate</code> / <code>should_save</code> 来干预。</li>
+    <li><strong>边界</strong>：想改 loss 的计算方式 → 覆盖 <code>compute_loss</code>；想改优化器 → 覆盖 <code>create_optimizer</code>；想在 backward 前后插东西 → 覆盖 <code>training_step</code>。<em>Callback 不是万能的扩展点，搞清边界能省很多时间。</em></li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>关于 <code>EarlyStoppingCallback</code> 有一个必须知道的依赖：<strong>它需要 <code>load_best_model_at_end=True</code> 才有意义</strong>，否则你停在了「连续 N 次没进步」的那个点，而不是最好的那个点。三个参数要配套出现：<code>eval_strategy="steps"</code>（或 epoch）、<code>load_best_model_at_end=True</code>、<code>metric_for_best_model</code>。<em>缺一个，早停就变成了「提前结束在一个较差的点」。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="checkpoint"><span class="num">5</span>checkpoint 与断点续训：存了什么、恢复了什么</h2>
+  <div class="ascii">checkpoint-500/
+├── model.safetensors            模型权重（fp16 时约 N×2 字节）
+├── optimizer.pt                 **优化器状态**（Adam 的 m 与 v，约 N×8 字节）← 最大的一块
+├── scheduler.pt                 调度器状态（当前 step）
+├── rng_state.pth                随机数状态（Python/numpy/torch/CUDA）
+├── trainer_state.json           global_step / epoch / 日志历史 / best_metric
+├── training_args.bin            当次训练的全部参数
+└── (可选) scaler.pt              fp16 的 GradScaler 状态
+
+⚠️ 所以一个 checkpoint 约是权重大小的 **3-5 倍**。7B 模型 fp16 全量训练的
+   单个 checkpoint 约 14(权重) + 56(优化器) = 70 GB。save_total_limit 不设会撑爆磁盘。
+
+resume_from_checkpoint 恢复的是**全部**上述状态 -&gt; 训练可以逐 step 复现；
+只加载 model.safetensors（from_pretrained）则**丢掉优化器动量与调度器进度**
+-&gt; 「继续训练」实际上是「用一个新的优化器重新开始」，曲线会有明显跳变。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这个区别在实践中很重要。<strong>「我想在别人的 checkpoint 上继续训练」有两种完全不同的含义</strong>：如果你要<em>接着他的训练进度往下跑</em>，必须有完整的 checkpoint 目录（含 <code>optimizer.pt</code>）；如果你只是要<em>在他的权重上做一次新的微调</em>，那 <code>from_pretrained</code> 就够了，而且你<strong>应该</strong>用新的优化器（旧动量对新任务是噪声）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个容易忽略的点：<strong>恢复训练要求数据顺序也能恢复</strong>。<code>Trainer</code> 通过保存 <code>rng_state</code> 与 <code>global_step</code> 来跳过已消费的 batch，但这依赖 <code>Dataset</code> 支持索引与确定性采样。<em>流式数据集（<code>IterableDataset</code>）的精确恢复要复杂得多</em>——需要数据集本身支持「从第 N 个样本继续」，这在 <code>datasets</code> 的流式实现里支持有限（Mosaic StreamingDataset 在这方面做得更完善，C43 有讨论）。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一条实用的磁盘纪律：<strong><code>save_total_limit=2</code> + <code>save_steps</code> 设得别太密</strong>。见过太多次「训练跑了两天，磁盘满了，最后一个 checkpoint 写坏了」。另外如果你只需要最终权重（不需要续训），可以在训练后手动删掉各 checkpoint 里的 <code>optimizer.pt</code>——能省掉 2/3 的空间。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pitfalls"><span class="num">6</span>十个高频坑（附症状）</h2>
+  <table>
+    <thead><tr><th>#</th><th>坑</th><th>症状</th><th>解法</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><code>logging_steps</code> 数的是优化步不是 batch</td><td>「设了 10 但半天不打日志」</td><td>除以 <code>grad_accum</code> 来理解</td></tr>
+      <tr><td>2</td><td>自定义 <code>compute_loss</code> 忘了除 <code>grad_accum</code></td><td>梯度累积一开就发散</td><td><code>loss / self.args.gradient_accumulation_steps</code>（或用 <code>return_outputs</code> 约定）</td></tr>
+      <tr><td>3</td><td><code>remove_unused_columns=True</code>（默认）吃掉了你的自定义列</td><td>自定义 collator 收不到某个字段</td><td>设 <code>remove_unused_columns=False</code></td></tr>
+      <tr><td>4</td><td><code>labels</code> 列名不叫 <code>labels</code></td><td>loss 是 None，训练不动</td><td>重命名列，或在模型 forward 里接受你的名字</td></tr>
+      <tr><td>5</td><td>评估阶段 OOM（训练正常）</td><td>跑到第一次 eval 就崩</td><td><code>eval_accumulation_steps</code> + <code>per_device_eval_batch_size</code> ↓</td></tr>
+      <tr><td>6</td><td><code>fp16</code> 下 loss nan</td><td>训练几百步后变 nan</td><td>换 <code>bf16</code>；或降 lr、加 warmup</td></tr>
+      <tr><td>7</td><td><code>load_best_model_at_end</code> 没配套 <code>eval_strategy</code></td><td>报错或不生效</td><td>三个参数配套出现</td></tr>
+      <tr><td>8</td><td><code>gradient_checkpointing</code> 与 <code>use_cache</code> 冲突</td><td>警告 + 变慢或报错</td><td><code>model.config.use_cache=False</code></td></tr>
+      <tr><td>9</td><td>多卡下 <code>per_device</code> 被误当成总 batch</td><td>有效 batch 是预期的 N 倍</td><td>记住要乘卡数</td></tr>
+      <tr><td>10</td><td><code>Trainer</code> 会把模型移到 GPU，但你的自定义模块没跟着</td><td>device mismatch 报错</td><td>所有子模块都注册为 <code>nn.Module</code> 的属性</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>这十个坑里有个共同规律：<strong>它们大多来自「参数之间的隐式依赖」</strong>——<code>logging_steps</code> 依赖 <code>grad_accum</code>、<code>load_best_model_at_end</code> 依赖 <code>eval_strategy</code>、<code>gradient_checkpointing</code> 依赖 <code>use_cache</code>。<em>所以本模块最实用的产出是一个「配置校验函数」</em>：把这些依赖写成断言，在 <code>Trainer</code> 构造之前跑一遍。notebook 会让你实现它。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">7</span>算一笔账：训练时长与 checkpoint 磁盘</h2>
+  <div class="math-block">\[\text{总优化步} = \left\lceil \frac{N_{samples}}{B_{eff}} \right\rceil \times E, \qquad T \approx \text{总优化步} \times \frac{B_{eff}}{\text{吞吐(样本/秒)}}\]</div>  <table>
+    <thead><tr><th>配置</th><th>N</th><th>B_eff</th><th>epochs</th><th>总优化步</th><th>checkpoint 数（save_steps=500）</th></tr></thead>
+    <tbody>
+      <tr><td>小数据微调</td><td>5,000</td><td>32</td><td>3</td><td>≈ 471</td><td>0（跑不到 500 步！）</td></tr>
+      <tr><td>中等微调</td><td>50,000</td><td>32</td><td>3</td><td>≈ 4,689</td><td>9</td></tr>
+      <tr><td>大规模 SFT</td><td>500,000</td><td>128</td><td>2</td><td>≈ 7,813</td><td>15</td></tr>
+    </tbody>
+  </table>  <p>第一行揭示了一个很常见的困惑：<strong><code>save_steps=500</code> 但训练只有 471 步 → 一个 checkpoint 都不会存</strong>（除非 <code>save_strategy="epoch"</code>）。同理 <code>eval_steps=500</code> 会导致「从头到尾没有评估」，进而让 <code>load_best_model_at_end</code> 失效。<em>小数据集上应该用 <code>save_strategy="epoch"</code> 而不是 steps。</em></p>  <p>磁盘账：</p>  <div class="math-block">\[\text{单 checkpoint} \approx N_{params}\times b_{w} + N_{trainable}\times(b_{w} + 8), \qquad \text{总磁盘} = \text{单个} \times \texttt{save\_total\_limit}\]</div>  <table>
+    <thead><tr><th>模型</th><th>训练方式</th><th>单 checkpoint</th><th><code>save_total_limit=3</code></th></tr></thead>
+    <tbody>
+      <tr><td>BERT-base (110M)</td><td>全量 fp16</td><td>≈ 1.3 GB</td><td>≈ 4 GB</td></tr>
+      <tr><td>Llama-8B</td><td>全量 bf16</td><td>≈ 96 GB</td><td><strong>≈ 288 GB</strong></td></tr>
+      <tr><td>Llama-8B</td><td>LoRA (r=16)</td><td>≈ 0.2 GB</td><td>≈ 0.6 GB</td></tr>
+    </tbody>
+  </table>  <p>这张表解释了 LoRA 在工程上的另一个巨大好处（除了显存）：<strong>checkpoint 从 96 GB 变成 0.2 GB</strong>。这让「保存二十个不同实验的 checkpoint」从不可能变成毫无压力，直接改变了实验迭代的方式。模块 04 会详细讲。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句话：<strong><code>Trainer</code> 的复杂度不在任何单个参数，而在参数之间的<em>乘法关系</em>与<em>隐式依赖</em></strong>。乘法关系（有效 batch = 三个数相乘、总步数 = 样本数 ÷ 有效 batch × epochs）决定了训练的实际规模；隐式依赖（logging 依赖 accum、best model 依赖 eval）决定了配置对不对。<em>写一个配置校验函数把这些关系显式化，是本模块最值钱的产出。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>生态动态与开放问题</h2>
+  <ul>
+    <li><strong>Trainer 与更底层框架的分层</strong>：<code>Trainer</code> 之下是 <code>accelerate</code>（模块 05），旁边有 <code>lightning</code>、<code>composer</code>、以及各家自研循环。抽象边界仍在移动——比如 FSDP/DeepSpeed 的配置到底该在哪一层表达，目前分散在 <code>TrainingArguments</code>、<code>accelerate config</code> 与 JSON 配置文件里，是实际的痛点。</li>
+    <li><strong>优化器的显存创新</strong>：8-bit Adam、Adafactor、Lion、以及 GaLore / LoMo 这类「低秩梯度投影」方法都在压缩优化器状态。哪些在什么规模下无损，缺乏系统对比；<code>optim=</code> 的选项还在增加。</li>
+    <li><strong>确定性与可复现的代价</strong>：<code>full_determinism=True</code> 会关掉一批快速 kernel、显著变慢。在多卡+混合精度下做到逐 bit 复现基本不现实（浮点归约顺序不定）。<em>「可复现」在实践中只能是「统计上可复现」</em>，这与 C40 强调的实验纪律有张力，尚无好答案。</li>
+    <li><strong>流式数据的精确恢复</strong>：断点续训要能「从第 N 个样本继续」，这对内存映射数据集容易、对流式数据集很难。规范尚未统一，各家实现语义不同。</li>
+    <li><strong>训练过程的可观测性</strong>：现在的日志主要是 loss 与 lr，但真正有诊断价值的是梯度范数分布、各层更新幅度、激活统计、以及 token 级的 loss 分布。这些需要自己写 Callback 采集，缺少开箱方案（C37 的实验追踪与此互补）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：transformers 文档的 <em>Trainer</em>、<em>TrainingArguments</em>（通读一遍参数名，不用记住）、<em>Callbacks</em> 三篇；源码上强烈建议读 <code>trainer.py</code> 的 <code>_inner_training_loop</code>——它就是讲解第一节那个骨架，读一遍胜过读十篇教程。原理侧：C07（优化器）、C21（大规模训练的稳定性）、C49 模块 03（微调配方与种子方差）、C37（实验追踪与 CI 门禁）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_tokenizers_datasets/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · tokenizers 与 datasets</div></a>
+    <a class="next" href="../04_peft_trl/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · PEFT 与 TRL</div></a>
+  </div>
+
+</div>
+</body>
+</html>

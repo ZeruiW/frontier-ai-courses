@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 特征 Steering</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 特征 Steering</h1>
+  <p class="subtitle">从读懂到控得动 —— activation addition、SAE 特征 clamp、difference-of-means/CAA、强度扫描的有效窗口、off-target 副作用度量、refusal 方向与组合干预；在合成数据上从零做 steering 并量化 on-target/off-target 权衡</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01/02（SAE 与特征）、模块 00（线性表示假设/方向）、线代（投影/内积）、一点点 logistic 读出</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_steering.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Turner 2023(ActAdd)、Rimsky 2023(CAA)、Templeton 2024(Golden Gate/feature steering)、Arditi 2024(refusal direction)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">从读懂到控得动：什么是 steering</a></li>
+      <li><a href="#actadd">最简 steering：Activation Addition</a></li>
+      <li><a href="#clamp">SAE 特征 Steering：钳制单义特征</a></li>
+      <li><a href="#caa">强基线：Difference-of-Means / CAA</a></li>
+      <li><a href="#dose">强度扫描：steering 的有效窗口</a></li>
+      <li><a href="#offtarget">副作用：off-target 与权衡</a></li>
+      <li><a href="#refusal">案例与组合：refusal 方向与多特征干预</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>从读懂到控得动：什么是 steering</h2>
+  <p>前三个模块把模型内部<strong>读懂</strong>了：SAE 把叠加的激活拆成单义特征（01/02），attribution 把这些特征/组件连成因果电路（03）。本模块迈出下一步——<strong>控得动</strong>：在推理时直接改写模型的内部激活，定向地改变它的行为，<strong>完全不重训</strong>。这件事叫 <span class="term">steering</span>（引导 / 操控）。</p>  <p>为什么 steering 是 interp 的自然延续？因为它是<strong>可解释性的「因果检验」与「实用出口」二合一</strong>。如果你声称「特征 F 表示金门大桥」，最硬的验证不是看激活样本，而是<strong>把 F 调大、看模型是不是真的开始满嘴金门大桥</strong>——这正是 Anthropic 的 Golden Gate Claude 做的事。同时，steering 给了我们一个<strong>不用微调就能调模型行为</strong>的旋钮：增强诚实、抑制谄媚、绕过或加固拒绝，都可以是部署时一个向量加法的事。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把模型的某一层激活想成一辆车的「行驶状态」。steering 就是在不换发动机（不重训）的前提下，在方向盘上轻轻加一个力——往「多谈某主题」「更愿意拒绝」的方向推。推得恰当，车听话地拐弯；推得太猛，车就失控（语无伦次）。本模块就是研究这个「力」怎么加、加多大、有什么副作用。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，所有 steering 都是对某层 residual stream 激活 <code>h</code> 的一次<strong>加性或投影性干预</strong>：加一个方向 <code>h ← h + α v</code>（activation addition）、把某 SAE 特征钳到目标值再解码、或把某方向投影消除 <code>h ← h - (v̂ᵀh)v̂</code>（ablation）。关键问题永远是三个：<strong>方向 v 从哪来、强度 α 多大、对无关行为的副作用多大</strong>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话定位本模块：<strong>steering = 在激活空间里加一个向量，把行为往想要的方向推</strong>。它既是「这个特征真的因果地控制了这个行为吗」的最强证据，也是「不重训就改行为」的最轻量手段。难点不在加向量（一行代码），而在<strong>加对方向、加准强度、不伤及无辜</strong>——这三件事是本模块的全部。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="actadd"><span class="num">2</span>最简 steering：Activation Addition</h2>
+  <h3>最简 steering：Activation Addition（ActAdd）</h3>  <p>最朴素的 steering 是 <span class="term">activation addition</span>（ActAdd，Turner et al. 2023）：在某层激活上直接加一个<strong>概念方向</strong>向量，乘以一个强度系数：</p>  <div class="math-block">\[h \;\leftarrow\; h + \alpha\, v, \qquad v\in\mathbb{R}^d,\; \alpha\in\mathbb{R}\]</div>  <p>就这么简单。问题全在 <code>v</code> 从哪来。ActAdd 的原始做法是<strong>对比 prompt 的激活差</strong>：取一对只在目标概念上不同的提示（如「我爱你」vs「我恨你」），在某层取它们的激活，相减得到一个「爱 − 恨」的方向，把它加到任意输入的激活上，模型输出就明显更「爱」。这套「用对比对提方向」的思想，是后面 difference-of-means / CAA 的雏形。</p>  <p>ActAdd 揭示了一个深刻的事实——<strong>许多高层行为在激活空间里近似是「可加的方向」</strong>。这正是模块 00 讲的<span class="term">linear representation hypothesis</span>在干预侧的体现：概念不只是<em>可读</em>的方向（probe），还是<em>可写</em>的方向（steering）。能往激活里<strong>加</strong>一个方向就改变行为，是 LRH 最强的因果证据形式——比 probe 的「读得到」强得多，因为「读得到」可能只是伴生相关，而「加上去就改行为」是直接的因果操控。</p>  <p>还有两个实现细节决定 ActAdd 成败。其一是<strong>加在哪一层、哪些 token 位置</strong>：太浅的层概念还没成形、太深的层已来不及影响下游，通常中间层效果最好；位置上常对<em>所有</em> token 位置或从某位置起持续注入。其二是<strong>强度的尺度</strong>要与该层激活的自然范数匹配——同样的 <code>α</code> 在范数大的层是「轻推」、在范数小的层可能已是「猛击」，所以实践中常按激活范数归一化后再调 <code>α</code>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>ActAdd 的 <code>v</code> 来自原始激活，因此<strong>可能不纯</strong>：对比 prompt 除了目标概念，还可能在长度、话题、风格上系统性不同，这些都混进了 <code>v</code>。于是加 <code>v</code> 不只改目标行为，也带来<strong>副作用</strong>（第 6 节）。后面的 SAE 特征 steering 与 difference-of-means 正是为「让方向更纯」而生。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="clamp"><span class="num">3</span>SAE 特征 Steering：钳制单义特征</h2>
+  <h3>SAE 特征 Steering：钳制单义特征</h3>  <p>ActAdd 加的是一个<em>原始空间</em>里的方向，可能混了多个概念。SAE 给了更精细的旋钮——直接操作<strong>单义特征</strong>。这就是 <span class="term">feature steering</span>（特征引导）/ <span class="term">clamping</span>（钳制），也是 Templeton 2024 的 Golden Gate Claude 用的方法：<strong>把某个 SAE 特征的激活值强行设到一个目标值，再解码回激活</strong>。</p>  <div class="math-block">\[f = \mathrm{Enc}(h),\quad f_i \leftarrow c\ \ (\text{钳到目标值}\ c),\quad h' = \mathrm{Dec}(f) = W_d f + b_d\]</div>  <p>流程三步：编码得到特征激活 <code>f</code>、把目标特征 <code>f_i</code> 钳到目标值 <code>c</code>（远高于自然值 → 放大该概念；设为 0 → 移除该概念）、再解码回激活 <code>h'</code> 接着往下传。Golden Gate Claude 就是把「金门大桥」特征钳到极高，于是模型在聊任何话题时都强行扯到金门大桥。</p>  <p>它和 ActAdd 的关键区别在于<strong>精度</strong>：</p>  <table>
+    <thead><tr><th></th><th>ActAdd（加原始方向）</th><th>SAE 特征 clamp</th></tr></thead>
+    <tbody>
+      <tr><td>操作空间</td><td>原始激活空间</td><td>SAE 特征空间（单义）</td></tr>
+      <tr><td>方向纯度</td><td>可能混多个概念</td><td><strong>单义特征，更纯</strong></td></tr>
+      <tr><td>语义</td><td>「往这个方向推」</td><td><strong>「把这个概念设到这么强」</strong></td></tr>
+      <tr><td>可解释性</td><td>v 不一定有名字</td><td><strong>特征通常有 auto-interp 解释</strong></td></tr>
+      <tr><td>副作用</td><td>较高（混入无关）</td><td><strong>通常较低（但仍有，第 6 节）</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>ActAdd 像往一锅汤里直接加「某种说不清的调料」——有效，但可能带进杂味。SAE 特征 clamp 像先把汤里的每种味道分离成独立旋钮，再精确地把「金门大桥味」调到最大——目标更准、杂味更少。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>注意 clamp 与「加解码器列方向」并不等价：clamp 是在<strong>特征空间</strong>设值后<strong>整体重解码</strong>，会顺带把其它特征的重建也一起写回（相当于先把 <code>h</code> 投影到 SAE 的字典张成的子空间）。因此 clamp 既改了目标特征，也隐含地做了一次「SAE 重建」——这点在度量副作用时要记住：clamp 的副作用一部分来自钳制本身，一部分来自重建误差。</p></div>
+  </div>  <p>clamp 有几种<strong>变体</strong>，对应不同的语义。最常见的是<strong>绝对钳制</strong>（把 <code>f_i</code> 设为固定值 <code>c</code>，如「最大激活的 5~10 倍」）；也可以做<strong>相对放大</strong>（<code>f_i ← f_i × k</code>，保留原激活的样本间差异）、或<strong>条件钳制</strong>（仅在该特征<em>本就激活</em>时才放大，避免在无关输入上凭空制造该概念）。Golden Gate Claude 用的是绝对钳制到极高值，所以模型<em>无论聊什么</em>都强行扯到金门大桥——这正是「无条件、绝对钳制」的特征：彻底盖过自然激活。</p>  <p>一个关键且常被忽略的工程点是上一段 dual 提到的<strong>重建残差</strong>。朴素 clamp 用 <code>h' = Dec(Enc(h))</code> 重解码，等于把 SAE 没能重建的成分（残差）<em>全丢了</em>——模型其实很在乎这些被丢掉的信息，于是即使你只想动一个特征，也会因为「顺便做了一次有损 SAE 重建」而误伤通用能力。正确做法是 <strong>error-preserving clamp</strong>：<code>h' = Dec(clamp(Enc(h))) + (h − Dec(Enc(h)))</code>，只把<em>目标特征的改动</em>写回、把重建残差原样加回去。notebook 练习 1 会让你实现它，并验证「钳到原值时恒等还原」。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="caa"><span class="num">4</span>强基线：Difference-of-Means / CAA</h2>
+  <h3>强基线：Difference-of-Means / CAA</h3>  <p>提取 steering 方向的另一条主流路线是 <span class="term">difference-of-means</span>（均值差），系统化版本叫 <span class="term">CAA</span>（Contrastive Activation Addition，Rimsky et al. 2023）：取「有目标属性」与「无目标属性」两组样本的激活，求<strong>均值差</strong>作为方向：</p>  <div class="math-block">\[v_{\text{md}} = \frac{1}{|P|}\sum_{x\in P} h(x) \;-\; \frac{1}{|N|}\sum_{x\in N} h(x)\]</div>  <p>其中 <code>P</code>（positive）是有该属性的样本、<code>N</code>（negative）是没有的。这就是模块 00 提过的 mass-mean / difference-of-means 方向，简单、稳健、几乎零成本，是 steering 的<strong>强基线</strong>——任何更复杂的方法都该先打过它。</p>  <p>那 SAE 特征 steering 和 difference-of-means 谁更好？答案是<strong>看目的</strong>，这也是 steering 文献反复出现的张力：</p>  <ul>
+    <li><strong>要精准操控一个「有名字」的概念</strong>（如「金门大桥」「代码漏洞」）：SAE 特征更合适——它是单义的、可解释的、能被 auto-interp 命名。</li>
+    <li><strong>要稳健地推动一个「行为」</strong>（如拒绝、谄媚、诚实）：difference-of-means 往往<strong>更好用</strong>——它直接捕捉「这个行为开/关时激活怎么变」，不依赖 SAE 是否恰好学到了对应特征，且不受 SAE 重建误差污染。</li>
+    <li><strong>覆盖与漏检</strong>：SAE 可能<em>根本没学到</em>你要的概念特征（feature absorption/splitting，模块 02），这时只能退回 difference-of-means。</li>
+  </ul>  <p>为什么 difference-of-means 这么稳？因为它直接估计「目标行为开 vs 关」两组激活<strong>均值的差</strong>，在「两组协方差相近」的常见情形下，这个差向量就近似指向<em>最能区分两组的判别方向</em>（与模块 00 讲的 mass-mean / LDA 同源）。它不需要训练、不需要选超参、只要两组对比样本，因而几乎不会「训坏」。代价是它给的是一个<em>纠缠</em>的方向（可能混入两组间一切系统性差异），不像 SAE 特征那样保证单义——但用于「推动一个行为」时，这种纠缠往往无伤大雅，甚至有益（它捕捉了行为的<em>全部</em>相关变化）。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话：<strong>SAE 特征 steering 精在「单义可解释」，difference-of-means 强在「稳健不挑、捕捉真行为」</strong>。前沿实践常<em>两者并用、互相验证</em>：difference-of-means 给你一个稳的 baseline 效果，SAE 特征告诉你「这个方向到底对应什么概念」。notebook 会在玩具上对拍两者，你会看到二者方向余弦极高、效果几乎一致——这也是一个健康的 sanity check：若 SAE 特征方向与 difference-of-means 方向南辕北辙，多半是 SAE 没学好或你选错了特征。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dose"><span class="num">5</span>强度扫描：steering 的有效窗口</h2>
+  <h3>强度扫描：steering 的「有效窗口」</h3>  <p>加多大？强度 <code>α</code>（或 clamp 值 <code>c</code>）是 steering 最关键的旋钮，存在一个<strong>有效窗口</strong>：太小没效果，太大<strong>破坏模型的流畅度与通用能力</strong>（激活被推出训练分布，下游层「看不懂」，输出变成语无伦次的重复）。</p>  <div class="ascii">行为效果 / 流畅度
+  |        效果 ↑↑↑                     流畅度 ↓↓↓
+  |      ╱──────────●───────              (over-steer: 崩坏)
+  |    ╱            ┊        ╲___
+  |  ╱   有效窗口   ┊            ╲___ 流畅度
+  |╱_______________┊________________╲____
+  +----------------┊--------------------→  steering 强度 α
+   没效果        最佳点 α*           太猛</div>  <p>所以 steering 永远要做<strong>剂量-反应扫描</strong>（dose-response sweep）：从 0 开始逐步加大 <code>α</code>，同时监控两条曲线——<strong>on-target 效果</strong>（目标行为有没有按预期变）与一个<strong>流畅度 / 连贯性代理</strong>（如输出困惑度、激活范数是否爆炸、通用任务准确率是否塌）。最佳点是「效果够强、流畅度还没崩」的那个 <code>α*</code>。</p>  <p>一个常用的<strong>崩坏早期信号</strong>是激活范数：随 <code>α</code> 线性增大的 steering 项会让 <code>‖h‖</code> 一路膨胀，远超自然激活的范数尺度时，模型基本就崩了。更贴近真实的代理是<strong>困惑度 / KL 散度</strong>（steering 后模型对正常文本的预测分布偏离原模型多少）——它直接量化「通用能力被破坏了多少」。notebook 会用激活范数与一个 readout 一起刻画这条 dose-response 曲线。</p>  <p>为什么 over-steer 会崩？因为下游各层是在<strong>自然激活的分布</strong>上训练的，它们只在那个范数尺度、那种方向组合上「见过世面」。把激活推到一个范数大十倍、方向被单一概念主导的点，等于把它扔进了训练时<em>从未出现</em>的区域（out-of-distribution）——后续层的权重在那里没有任何保证，输出退化成重复、乱码或一根筋地复读目标概念。所以 over-steer 不是「概念太强」，而是「把激活推出了模型认识的世界」。这也解释了为什么 error-preserving、按范数归一化、只在该特征本应激活时干预等技巧能扩大有效窗口：它们都在<em>尽量让 steering 后的激活仍像自然激活</em>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>不报强度扫描的 steering 结果几乎没有意义：<strong>任何方向，强度够大都能改变输出（靠破坏模型）</strong>。「steering 有效」必须是「在不显著损害流畅度的强度下有效」。把 on-target 效果与流畅度代价<strong>画在同一张图</strong>上，才是诚实的汇报方式。notebook 第 5 节会让你亲眼看到效果饱和与范数爆炸同时发生。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="offtarget"><span class="num">6</span>副作用：off-target 与权衡</h2>
+  <h3>副作用：off-target 与 on-target 的权衡</h3>  <p>steering 的成败不只看「目标行为变了没」，更要看<strong>有没有伤及无辜</strong>——这叫 <span class="term">off-target effect</span>（脱靶 / 副作用）：在改变目标行为的同时，对<strong>无关</strong>能力造成的损害。</p>  <p>怎么量化？标准做法是准备一组<strong>与目标无关的探针 / 行为</strong>，测量 steering 前后它们的变化：</p>  <div class="math-block">\[\text{off-target} = \frac{1}{|U|}\sum_{u\in U}\big|\,\text{readout}_u(h')-\text{readout}_u(h)\,\big|\]</div>  <p>其中 <code>U</code> 是一组无关行为 / 探针。理想的 steering 是<strong>on-target 大、off-target 小</strong>——精准命中目标、不动其它。这天然又是一条<strong>权衡曲线</strong>：把 on-target 效果当横轴、off-target 副作用当纵轴，扫强度画出来，<strong>越靠右下（效果大、副作用小）的方法越好</strong>——和模块 01 比 SAE 的帕累托前沿完全同构。</p>  <p>这正是<strong>方向纯度</strong>在干预侧的回报：一个<em>干净单义</em>的方向（如恢复良好的 SAE 特征、或排除了表面相关的 difference-of-means），加强它主要动目标行为；一个<em>混杂</em>的方向（如未净化的对比方向、混进话题/长度的 ActAdd 向量），加强它会连带推动一堆无关行为，off-target 高。notebook 会对拍：在同等 on-target 效果下，<strong>干净方向的 off-target 明显低于混杂方向</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>好的 steering 像精准制导导弹——只炸目标；差的 steering 像地毯式轰炸——目标炸了，周围也夷为平地。off-target 度量就是在数「附带损伤」有多大，是判断一次干预「干不干净」的核心指标。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一类特殊的 off-target 来自<strong>clamp 的重建路径</strong>：SAE 特征 clamp 要先把 <code>h</code> 投影进字典子空间再解码，重建误差本身就是一种副作用（把 SAE 没学好的成分丢掉了）。因此严谨的 clamp 实现常用<strong>error-preserving 重建</strong>：<code>h' = Dec(clamp(Enc(h))) + (h - Dec(Enc(h)))</code>，即只改目标特征、把 SAE 的重建残差原样保留，避免重建误差冒充成 steering 副作用。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="refusal"><span class="num">7</span>案例与组合：refusal 方向与多特征干预</h2>
+  <h3>案例与组合：refusal direction 与多特征干预</h3>  <p>steering 最著名的案例之一是 <span class="term">refusal direction</span>（拒绝方向，Arditi et al. 2024）：研究发现，LLM「拒绝有害请求」这一复杂行为，竟由 residual stream 中<strong>单个方向</strong>中介——</p>  <ul>
+    <li><strong>加强</strong>这个方向 → 模型对<em>无害</em>请求也开始拒绝（over-refusal）；</li>
+    <li><strong>消融</strong>（投影消除）这个方向 → 模型对<em>有害</em>请求也不再拒绝（即一种<strong>越狱</strong>）。</li>
+  </ul>  <p>它同时是<strong>最干净的因果证据</strong>（单方向中介复杂行为）和<strong>最尖锐的双刃剑</strong>：同一套 interp 技术，既能用来理解、加固安全行为，也能用来<strong>绕过</strong>它。这把 steering 直接顶到了安全的最前沿（模块 05 会接着讲白盒攻防）。</p>  <p>干预还能<strong>组合</strong>。既然行为对应方向、特征是独立旋钮，就可以<strong>同时钳制多个特征</strong>（如「+诚实 且 −谄媚」）、或在不同层叠加干预。但组合不是无脑相加：方向之间可能<em>不正交</em>（互相干扰，加强一个会顺带动另一个）、副作用会<em>叠加</em>（两个各自小副作用合起来可能很大）、且各自的强度窗口<em>不一样</em>（同一个 <code>α</code> 对一个恰好、对另一个已 over-steer）。实践中常先<em>正交化</em>多个 steering 方向、再分别标定强度，并把组合后的副作用与崩坏一起监控。组合干预的剂量标定与副作用控制，是把 steering 从「单概念演示」推向「实用对齐工具」的关键工程。</p>  <p>把 steering 放回本课的脉络：它是「读懂→控得动」链条的终点，也是检验前四模块的<strong>试金石</strong>。你用 SAE 拆出的特征（01/02）、用 attribution 定位的因果节点（03），如果是<em>真的</em>，那么 steering 它们就应当可预测地改变行为；如果 steering 不动、或只能靠破坏模型才动，那多半说明你「读懂」的那一步出了问题（特征不单义、归因不因果）。正因如此，steering 既是干预工具，也是<strong>可解释性自身的验证回路</strong>——这条回路直接通向下一模块：把读懂+控得动用于<strong>安全</strong>（检测后门、审计模型、写进 safety case）。</p>  <div class="callout danger"><span class="label"></span>
+    <p>refusal direction 的故事是 interp 双重用途的缩影：<strong>能精准操控的能力，本身是中性的——用于加固还是绕过，取决于谁在用</strong>。这也是为什么把 interp 用于安全（模块 05）必须正视：你的监控/防御方向，对手可能正用同一套方法来定位和绕过。steering 越强，攻防两端的赌注都越大。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>steering 的可靠性与泛化</strong>：玩具上漂亮的 steering，到真模型常<em>脆</em>——换个 prompt 分布、换个强度就失效或崩坏。如何让 steering 在分布外稳健、可预测，仍是开放问题。</li>
+    <li><strong>SAE 特征 steering vs 简单基线</strong>：多项研究发现 SAE 特征 steering 并不总是稳胜 difference-of-means / 提示工程，有时还更差、更贵。SAE 在 steering 上的<em>真实增量价值</em>正被严肃审视。</li>
+    <li><strong>最优干预的几何</strong>：clamp、加法、投影、仿射……哪种干预形式对哪类行为最干净？error-preserving 重建、条件化 steering（只在该特征本应激活时干预）等更精细的方案是热点。</li>
+    <li><strong>组合与可控性</strong>：同时控制多个属性、跨层协同干预的剂量标定与副作用控制，缺乏系统理论，目前高度依赖逐例扫描。</li>
+    <li><strong>安全双刃</strong>：refusal 消融式越狱说明同一套技术可攻可防。steering 监控的对抗鲁棒性、以及「能否训练出抗 steering-越狱的模型」是与 AI safety 直接相关的前沿（接模块 05）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Turner 2023（ActAdd）、Rimsky 2023（CAA / difference-of-means）、Templeton 2024（SAE 特征 steering / Golden Gate Claude）、Arditi 2024（refusal direction 单方向中介）。对 SAE steering 增量价值的批评性评估也务必读。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_circuits/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 电路与 Attribution</div></a>
+    <a class="next" href="../05_interp_safety/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 可解释性用于安全</div></a>
+  </div>
+
+</div>
+</body>
+</html>

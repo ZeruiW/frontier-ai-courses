@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 策略梯度与 REINFORCE</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 策略梯度与 REINFORCE</h1>
+  <p class="subtitle">直接对策略求梯度：log-derivative trick（环境梯度消失）、策略梯度定理完整推导、REINFORCE、baseline 为何不引入偏差却降方差（E[score]=0）、回报标准化与熵正则 —— 现代深度 RL 与 RLHF 的主干，从地基拆起</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–02、梯度上升、softmax、对数似然、期望与方差</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_policy_gradient.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Williams 1992、Sutton 2000、Schulman 2015/2017、Sutton & Barto 第 13 章</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么要直接优化策略</a></li>
+      <li><a href="#logtrick">log-derivative trick</a></li>
+      <li><a href="#theorem">策略梯度定理与 REINFORCE</a></li>
+      <li><a href="#baseline">baseline：降方差不引入偏差</a></li>
+      <li><a href="#entropy">熵正则：鼓励探索</a></li>
+      <li><a href="#run">toy chain 上的 REINFORCE</a></li>
+      <li><a href="#pitfalls">策略梯度的实践陷阱</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么要直接优化策略</h2>
+  <p>前两个模块都走「<strong>价值路线</strong>」：学一个价值函数（$V$ 或 $Q$），再对它贪心导出策略。这条路很成功，但有几个<strong>结构性局限</strong>。</p>  <ul>
+    <li><strong>贪心是不连续的</strong>：$\arg\max_a Q(s,a)$ 对 $Q$ 的微小变化可能突然跳到另一个动作。这种不连续让价值方法在函数逼近下难以稳定，也无法表达「以某概率选某动作」的随机策略。</li>
+    <li><strong>连续动作难办</strong>：动作是连续的（机器人关节角度、方向盘转角）时，$\arg\max_a Q(s,a)$ 是一个连续优化子问题，每步都要解，代价高昂。</li>
+    <li><strong>有时最优策略本就是随机的</strong>：在部分可观测、或对手存在博弈的环境里，确定性策略会被利用（如石头剪刀布的最优策略是均匀随机）；价值方法导出的确定性贪心策略表达不了这个。</li>
+  </ul>  <p>于是有了第二条路：<strong>策略路线</strong>——把策略本身参数化为 $\pi_\theta(a\mid s)$，<strong>直接对它求梯度、做梯度上升</strong>，绕开价值函数。这就是<span class="term">policy gradient</span>（策略梯度）。它是现代深度 RL 的主干：PPO、TRPO、A2C/A3C、乃至大模型的 RLHF（C22）全是策略梯度的变体。本模块从最基础的 REINFORCE 讲起，把这条路的地基——log-derivative trick、策略梯度定理、方差缩减——一一夯实。</p>  <p>我们要优化的目标 $J(\theta)$ 是策略的期望回报：</p>  <div class="math-block">\[J(\theta) = \mathbb{E}_{\tau\sim\pi_\theta}\!\left[\,R(\tau)\,\right] = \mathbb{E}_{\tau\sim\pi_\theta}\!\left[\textstyle\sum_t \gamma^t r_t\right], \qquad \tau = (s_0,a_0,s_1,a_1,\dots)\]</div>  <p>其中 $\tau$ 是一条轨迹，由策略 $\pi_\theta$ 与环境共同生成。要做梯度上升 $\theta\leftarrow\theta+\eta\nabla_\theta J$，必须先算出 $\nabla_\theta J$。难点在于：轨迹分布 $p_\theta(\tau)$ <strong>依赖 $\theta$</strong>（策略变了，走出的轨迹分布就变了），而且它还包含我们<strong>不知道的环境动力学</strong> $P(s'\mid s,a)$。怎么对一个「分布依赖参数、且分布部分未知」的期望求梯度？下一节的 log-derivative trick 是钥匙。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>价值方法与策略方法的分野，可以这样记：<strong>价值方法学「每个状态/动作有多好」，再间接选动作；策略方法直接学「在每个状态该怎么做」</strong>。前者像背一本「棋谱评分表」再据此走子，后者像直接训练「下棋的手感」。两者各有所长，而模块 04 的 actor-critic 会把它们<em>结合</em>起来——用价值方法（critic）去帮策略方法（actor）降方差，取两家之长。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="logtrick"><span class="num">2</span>log-derivative trick</h2>
+  <h3>log-derivative trick：策略梯度的钥匙</h3>  <p>直接算 $\nabla_\theta J=\nabla_\theta\int p_\theta(\tau)R(\tau)\,d\tau=\int\nabla_\theta p_\theta(\tau)\,R(\tau)\,d\tau$ 卡住了：$\nabla_\theta p_\theta(\tau)$ 不是一个期望（不能直接采样估计），而且 $p_\theta(\tau)$ 含未知的 $P$。解围的是一个简单恒等式——<span class="term">log-derivative trick</span>（对数导数技巧，也叫似然比/score function 技巧）：</p>  <div class="math-block">\[\nabla_\theta p_\theta(\tau) = p_\theta(\tau)\,\frac{\nabla_\theta p_\theta(\tau)}{p_\theta(\tau)} = p_\theta(\tau)\,\nabla_\theta \log p_\theta(\tau)\]</div>  <p>它把「对概率的梯度」改写成「概率 × 对数概率的梯度」。代回去，积分立刻<strong>变回一个期望</strong>（可以采样估计了）：</p>  <div class="math-block">\[\nabla_\theta J = \int p_\theta(\tau)\,\nabla_\theta \log p_\theta(\tau)\,R(\tau)\,d\tau = \mathbb{E}_{\tau\sim\pi_\theta}\!\left[\,\nabla_\theta \log p_\theta(\tau)\cdot R(\tau)\,\right]\]</div>  <p>现在处理 $\nabla_\theta\log p_\theta(\tau)$。一条轨迹的概率是 $p_\theta(\tau)=p(s_0)\prod_t\pi_\theta(a_t\mid s_t)P(s_{t+1}\mid s_t,a_t)$，取对数变成求和，再对 $\theta$ 求梯度——关键来了：<strong>初始分布 $p(s_0)$ 和环境转移 $P$ 都不含 $\theta$，求梯度后全部消失</strong>！只剩策略项：</p>  <div class="math-block">\[\nabla_\theta \log p_\theta(\tau) = \sum_t \nabla_\theta \log \pi_\theta(a_t\mid s_t)\]</div>  <div class="callout danger"><span class="label">环境梯度消失</span>
+    <p>这是策略梯度<strong>最深刻、最关键</strong>的一步，务必想透：环境动力学 $\nabla_\theta P$ 因为不依赖 $\theta$ 而<strong>彻底消失</strong>了。这意味着——<strong>我们不需要知道、也不需要对环境模型求导，就能估计策略梯度</strong>！这正是策略梯度能用于未知环境（无模型）、甚至不可微环境（环境是个黑盒模拟器、真实世界）的根本原因。对比深度学习里的反向传播需要对整个计算图求导，策略梯度只需要对<em>策略</em>求导、对环境只需<em>采样</em>——这个性质让它成为 RL 的主力。</p>
+  </div>  <p>把 $\nabla_\theta\log\pi_\theta(a\mid s)$ 单独拎出来，叫 <span class="term">score function</span>（得分函数）。它是「让动作 $a$ 在状态 $s$ 更可能发生的参数移动方向」。整个策略梯度就是沿这些 score function、按回报加权地推。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="theorem"><span class="num">3</span>策略梯度定理与 REINFORCE</h2>
+  <h3>策略梯度定理与 REINFORCE</h3>  <p>把上面拼起来，得到 <span class="term">policy gradient theorem</span>（策略梯度定理，Sutton 2000 / Williams 1992）最常用的形式：</p>  <div class="math-block">\[\nabla_\theta J(\theta) = \mathbb{E}_{\tau\sim\pi_\theta}\!\left[\,\sum_t \nabla_\theta \log \pi_\theta(a_t\mid s_t)\cdot G_t\,\right]\]</div>  <p>逐项解读：对轨迹里每一步 $(s_t,a_t)$，计算它的 score function $\nabla_\theta\log\pi_\theta(a_t\mid s_t)$，用从这一步起的回报 $G_t$ 加权，求和、取期望。（这里用 $G_t$ 而非整条轨迹回报 $R(\tau)$，依据是「<strong>因果性</strong>」：时刻 $t$ 的动作只能影响 $t$ 之后的奖励，之前的奖励与它无关、加进去只增方差不增信息——这点 notebook 会数值验证。）</p>  <p>这个式子的<strong>直觉</strong>极其优美：$\nabla_\theta\log\pi_\theta(a\mid s)$ 指向「让 $a$ 更可能」的方向，$G_t$ 是这个动作（及之后）带来的回报。于是更新 $\theta\leftarrow\theta+\eta\,\nabla\log\pi\cdot G$ 在做一件<strong>符合直觉的事</strong>：<em>如果一个动作带来了高回报，就调整参数让它在那个状态更可能被选；带来低（或负）回报，就让它更不可能</em>。这就是「试错学习」最朴素的数学化——好的行为强化，坏的行为弱化。</p>  <p><span class="term">REINFORCE</span>（Williams 1992）就是这个定理的最直接实现：用蒙特卡洛回报 $G_t$（跑完整条回合算出的真实折扣回报）作为加权。算法如下：</p>  <div class="ascii">REINFORCE（蒙特卡洛策略梯度）
+  初始化策略参数 θ
+  for each episode:
+      用 π_θ 采样一条完整轨迹 τ = (s_0,a_0,r_1, ..., s_T)
+      计算每步回报 G_t = Σ_{k≥t} γ^{k-t} r_{k+1}
+      for t = 0 ... T-1:
+          θ ← θ + η · γ^t · G_t · ∇_θ log π_θ(a_t | s_t)
+
+  「跑一回合 → 看每步带来多少回报 → 按回报加权地推高/压低该动作的概率」</div>  <div class="callout intuition"><span class="label"></span>
+    <p>REINFORCE 是<strong>无偏</strong>的（$G_t$ 是 $Q^\pi$ 的无偏样本），这是它相对于自举方法（TD）的优点——不依赖任何价值估计的准确性。但它有一个<strong>致命缺点：方差极大</strong>。$G_t$ 是整条（剩余）轨迹随机性的累积，回合越长、环境越随机，$G_t$ 抖动越剧烈，梯度估计噪声大、学得慢、不稳定。下一节的 baseline 就是为治这个病而生的——它是策略梯度从「玩具」走向「实用」的第一道关键工程。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="baseline"><span class="num">4</span>baseline：降方差不引入偏差</h2>
+  <h3>baseline：不引入偏差地降方差</h3>  <p>REINFORCE 的方差问题有一个<strong>惊人简单又深刻</strong>的解法：从回报里<strong>减去一个不依赖动作的 baseline $b(s)$</strong>：</p>  <div class="math-block">\[\nabla_\theta J = \mathbb{E}\!\left[\,\sum_t \nabla_\theta \log \pi_\theta(a_t\mid s_t)\,\big(G_t - b(s_t)\big)\,\right]\]</div>  <p>最神奇的是：<strong>减去 $b(s)$ 不改变梯度的期望（不引入偏差），却能大幅降低方差</strong>。这听起来像免费的午餐，但它有严格证明。无偏性来自一个漂亮的事实——<strong>score function 在策略下的期望为零</strong>：</p>  <div class="math-block">\[\mathbb{E}_{a\sim\pi_\theta}\!\left[\nabla_\theta \log \pi_\theta(a\mid s)\right] = \sum_a \pi_\theta(a\mid s)\frac{\nabla_\theta\pi_\theta(a\mid s)}{\pi_\theta(a\mid s)} = \nabla_\theta\sum_a \pi_\theta(a\mid s) = \nabla_\theta 1 = 0\]</div>  <p>因此对任何只依赖状态、不依赖动作的 $b(s)$，有 $\mathbb{E}[\nabla\log\pi\cdot b(s)]=b(s)\,\mathbb{E}[\nabla\log\pi]=b(s)\cdot 0=0$——减它，期望纹丝不动。（最后一行 $\nabla_\theta 1=0$ 是关键：概率之和恒为 1，对参数求导自然是 0。）notebook 会<strong>数值验证到机器精度</strong>这个零期望事实。</p>  <p>但方差为什么降了？直觉是：$G_t$ 本身可能整体很大（比如所有动作回报都在 +100 附近），此时 $\nabla\log\pi\cdot G_t$ 的尺度被这个大基数撑得很大、抖动也大。减去 $b(s)\approx V^\pi(s)$（该状态的平均回报）后，加权用的是<strong>「这个动作比平均好多少」</strong>——也就是 advantage $A=G-V$，它围绕 0 波动、尺度小得多，梯度估计自然更稳。最优 baseline（理论上最小化方差的那个）略不同于 $V$，但 $V^\pi(s)$ 是个又简单又接近最优的选择，实践中几乎总用它。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 baseline 想成「打分要看相对水平」。考试考了 80 分是好是坏？取决于<strong>班级平均</strong>。若平均 60，你超常发挥（advantage = +20，强化）；若平均 90，你失常（advantage = −10，弱化）。直接用绝对分 80 当信号会被「这次考试整体难易」干扰；用「比平均高多少」才是干净的信号。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，baseline 是一种<strong>控制变量</strong>（control variate）——统计学里降方差的经典技巧：构造一个与估计量相关、但期望已知（这里是 0）的量减掉它。用 $b(s)=V^\pi(s)$ 时，$G_t-V^\pi(s_t)$ 正是 advantage $A^\pi(s_t,a_t)$ 的蒙特卡洛估计。这就自然过渡到模块 04——用一个学出来的 critic $V_\phi$ 当 baseline，并用更精巧的方式估 advantage（GAE）。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个微妙但重要的实操点：<strong>回报标准化</strong>（return normalization，把一个 batch 的 $G_t$ 或 advantage 减均值除标准差）和 baseline 是<em>不同</em>的东西，常被混淆。减均值 ≈ 一个<em>常数</em> baseline（无偏）；但<strong>除以标准差</strong>严格说会引入偏差（它依赖整批数据、相当于自适应地缩放学习率）。它工程上极其有用（稳定不同回合间的梯度尺度），几乎是 PPO 等的标配，但要知道它不是「免费」的，而是用一点偏差换稳定性。notebook 会同时实现 baseline 与标准化，并讲清两者区别。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="entropy"><span class="num">5</span>熵正则：鼓励探索</h2>
+  <h3>熵正则：鼓励探索、防止过早收敛</h3>  <p>策略梯度有个失败模式：策略可能<strong>过早地塌缩到一个确定性的次优策略</strong>。一旦某个动作的概率被推到接近 1，score function 变得很小，其他动作几乎不再被采样、永无翻身之日——agent 停止探索、卡在局部最优。这在确定性环境 + 贪婪更新下尤其危险。</p>  <p>治法是 <span class="term">entropy regularization</span>（熵正则）：在目标里加一项策略的<strong>熵</strong>奖励，鼓励策略保持「不那么确定」：</p>  <div class="math-block">\[J_{\text{ent}}(\theta) = J(\theta) + \beta\,\mathbb{E}_s\!\left[\,\mathcal{H}\big(\pi_\theta(\cdot\mid s)\big)\,\right], \qquad \mathcal{H}(\pi) = -\sum_a \pi(a)\log\pi(a)\]</div>  <p>熵 $\mathcal{H}$ 在均匀分布时最大（最不确定）、在 one-hot 分布时为 0（完全确定）。加上 $\beta\mathcal{H}$ 这一项，相当于在「追求回报」之外，额外<strong>奖励策略保持随机</strong>——于是策略不会急着塌缩，会保留足够探索，直到真的确信某个动作更好。$\beta$ 控制这个力度：太大策略太随机（学不到东西），太小则失去防塌缩作用。实践中常让 $\beta$ 随训练衰减（早期多探索，后期收敛）。</p>  <p>熵正则在现代算法里无处不在：A3C/A2C（模块 04）标配它防塌缩，SAC（C41）把它推到极致——<strong>最大熵 RL</strong>，目标直接变成「最大化回报 + 熵」，让 agent 在所有同样好的策略里选最随机的那个（最鲁棒、最可迁移）。甚至在 RLHF（C22）里，KL 正则（约束新策略别偏离原模型太远）扮演着类似的「别塌缩、别走极端」的角色。理解熵正则是理解这一大类方法的起点。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>熵正则与模块 02 的 ε-greedy 都是<strong>探索机制</strong>，但哲学不同：ε-greedy 是「在确定性策略外硬加随机」（外挂式探索），熵正则是「让策略本身倾向于保持随机」（内生式探索）。后者更优雅——探索程度成了策略的一部分、可被梯度优化、能随状态自适应（在没把握的状态自动更随机）。这是策略梯度方法相对价值方法在探索上的一个天然优势。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="run"><span class="num">6</span>toy chain 上的 REINFORCE</h2>
+  <h3>把它跑起来：toy chain 上的 REINFORCE</h3>  <p>notebook 会在一个<strong>玩具链环境</strong>（chain MDP）上跑通全套：$N$ 个状态排成一条线，起点在最左、目标在最右（+1，终止），每步小惩罚，动作是左/右。策略用<strong>每状态一组 softmax logits</strong>参数化——这是表格版的策略网络，足够小到能解析验证、又足够真实地展示策略梯度的全部机制。</p>  <p>我们会做这几件事，每件都有可复现的验证：</p>  <ul>
+    <li><strong>score function 对拍有限差分</strong>：softmax 策略的 $\nabla_\theta\log\pi(a\mid s)=\mathbb{1}[\cdot=a]-\pi$，用数值微分验证解析梯度正确（这是后面一切的基础，错了全错）。</li>
+    <li><strong>REINFORCE 收敛</strong>：从零训练，验证学到的策略在每个状态都偏好「向右」（朝目标），回报曲线上升到接近最优。</li>
+    <li><strong>baseline 不引入偏差</strong>：数值验证 $\mathbb{E}[\nabla\log\pi]=0$ 到机器精度，从而 $\mathbb{E}[\nabla\log\pi\cdot(G-b)]=\mathbb{E}[\nabla\log\pi\cdot G]$——加 baseline 梯度期望不变。</li>
+    <li><strong>baseline 大幅降方差</strong>：在同一策略下，采样大量梯度估计，对比「带 baseline」与「不带」的梯度方差——你会看到<strong>方差降一个数量级以上</strong>（实测约 18×），这是 baseline 价值的铁证。</li>
+  </ul>  <p>链环境虽小，却完整呈现了策略梯度的灵魂：<strong>用采样的回报、通过 score function、去塑造一个概率策略</strong>。把这套在表格 softmax 上练熟，换到 C41 的神经网络策略（actor 网络）只是把「每状态一组 logits」换成「网络输出 logits」、把手写梯度换成自动微分——算法骨架一模一样。这正是本课作为地基的意义。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="pitfalls"><span class="num">7</span>策略梯度的实践陷阱</h2>
+  <h3>策略梯度的实践陷阱</h3>  <p>策略梯度好用，但坑也多。把它们列出来，既是 notebook 练习的背景，也是你未来调 PPO/RLHF 时的 checklist：</p>  <table>
+    <thead><tr><th>陷阱</th><th>症状</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>方差过大</strong></td><td>回报曲线剧烈震荡、学不动</td><td>baseline / advantage（模块04 GAE）、回报标准化、更大 batch</td></tr>
+      <tr><td><strong>过早塌缩</strong></td><td>策略迅速变确定、卡在次优、熵骤降</td><td>熵正则、限制更新步长（PPO 裁剪）、学习率别太大</td></tr>
+      <tr><td><strong>学习率敏感</strong></td><td>稍大就发散、稍小就极慢</td><td>归一化优势、自然梯度 / 信赖域（TRPO/PPO）</td></tr>
+      <tr><td><strong>回报尺度</strong></td><td>不同环境回报量级差异巨大、超参不可迁移</td><td>标准化优势、reward clipping</td></tr>
+      <tr><td><strong>样本低效</strong></td><td>每条数据用一次就丢、交互昂贵</td><td>重要性采样复用数据（PPO 的多 epoch）、actor-critic</td></tr>
+    </tbody>
+  </table>  <p>这些陷阱解释了为什么「朴素 REINFORCE」几乎不直接用于复杂任务，而是层层加固成 A2C（加 critic 降方差）、TRPO/PPO（限制更新步长防塌缩与发散）、SAC（最大熵）。但<strong>它们的内核全是本模块的策略梯度定理</strong>——PPO 不过是「REINFORCE + GAE advantage + 用裁剪限制每次更新幅度」。你把 REINFORCE、baseline、熵正则这三块地基理解透，再看 PPO 的论文就会发现：它没有任何新的「原理」，只是把这些已知零件用更稳的方式组装。甚至大模型的 RLHF（C22）——用人类偏好训练的 reward model 给回复打分，再用 PPO 优化语言模型——本质就是把「动作」换成「生成的 token/回复」、把「环境奖励」换成「reward model 打分」的策略梯度。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一个值得内化的视角：策略梯度的所有「高级」改进，都在回答同一个问题——<strong>怎么用同样（甚至更少）的样本，得到方差更小、更新更稳的梯度估计</strong>。baseline、advantage、GAE 降方差；裁剪、信赖域、KL 正则稳更新；重要性采样提样本效率。把它们都挂到这棵「降方差 + 稳更新 + 提效率」的树上，纷繁的算法名词就有了清晰的归类。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>信赖域与近端方法</strong>：TRPO（Schulman 2015）用 KL 约束限制每次策略更新的幅度，保证单调改进；PPO（Schulman 2017）用裁剪近似它，简单又强大，是当今最主流的策略梯度算法（也是 RLHF 的默认选择）。它们都在解「步长敏感 + 过早塌缩」这个核心病。</li>
+    <li><strong>自然策略梯度</strong>：普通梯度在参数空间里走直线，但参数空间的几何与策略空间不一致。自然梯度（Kakade 2002）用 Fisher 信息度量，在「策略分布空间」里走最速方向，理论更优、是 TRPO 的理论基础。</li>
+    <li><strong>方差缩减的前沿</strong>：除 baseline/GAE 外，还有控制变量的更复杂构造、Stein 控制变量、以及把 score function 估计换成可微分的重参数化（pathwise）梯度（SAC、连续控制里用）。方差仍是策略梯度样本效率的主瓶颈。</li>
+    <li><strong>从 RL 到 RLHF</strong>：大模型对齐把策略梯度搬到了语言生成（C22）。新挑战包括：reward model 本身不完美（reward hacking）、KL 正则的作用、以及 GRPO（DeepSeek）这类去掉 critic、用组内相对回报当 advantage 的变体——它本质是「REINFORCE + 组内 baseline」，是本模块思想在 LLM 时代的直接回响。</li>
+    <li><strong>信用分配的根本难题</strong>：策略梯度用 $G_t$ 把延迟回报粗暴地归给所有在先动作，长视界下信号被稀释。更精细的信用分配（如 RUDDER、hindsight、因果方法）仍是开放问题，直接关系到 RL 能否扩展到极长视界任务。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Williams 1992（REINFORCE 与 baseline 奠基）；Sutton 2000（策略梯度定理）；Schulman 2015/2017（TRPO/PPO）。Sutton & Barto 第 13 章是最好的同步教材。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_q_learning_td/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 时序差分与 Q-learning</div></a>
+    <a class="next" href="../04_actor_critic_gae/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · Actor-Critic 与 GAE</div></a>
+  </div>
+
+</div>
+</body>
+</html>

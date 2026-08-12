@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 注意力变体 MHA→GQA→MLA</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 注意力变体 MHA→GQA→MLA</h1>
+  <p class="subtitle">KV cache 是自回归推理的真正瓶颈 —— 沿着 MHA→MQA→GQA→MLA 一路压缩，从零实现并算清显存账</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">缩放点积注意力、KV cache（C1）、RoPE（本课 01）、低秩分解</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_attention_variants.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Shazeer 2019、Ainslie 2023 (GQA)、DeepSeek-V2 2024 (MLA)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">KV cache：推理的真正瓶颈</a></li>
+      <li><a href="#mha">MHA 与 KV cache 字节账</a></li>
+      <li><a href="#mqa">MQA：共享一组 K/V</a></li>
+      <li><a href="#gqa">GQA 与 repeat_kv</a></li>
+      <li><a href="#tradeoff">为什么 GQA 几乎无损</a></li>
+      <li><a href="#mla">MLA：低秩潜向量压缩</a></li>
+      <li><a href="#decouple">MLA 的解耦 RoPE</a></li>
+      <li><a href="#choose">选型小结与正交优化</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>KV cache：推理的真正瓶颈</h2>
+  <p>训练时，注意力的瓶颈是<strong>算力（FLOPs）</strong>——<code>QK^T</code> 是 <code>O(T²d)</code> 的大矩阵乘。但到了<strong>自回归推理（逐 token 生成）</strong>，瓶颈悄悄换成了<strong>显存带宽</strong>：每生成一个新 token，模型都要读取前面所有 token 的 Key 和 Value（即 <span class="term">KV Cache</span>），与当前 query 算注意力。序列越长，KV cache 越大，每步要从显存（HBM）搬运到计算单元的数据就越多——而搬运比计算慢得多。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：query 是你此刻要问的问题，KV cache 是一整面写满历史的黑板。每生成一个新字，你都得把整面黑板从头到尾扫一遍才能决定下一个字。黑板越大（上下文越长），扫一遍越慢——而慢的不是你“思考”（计算），是你“读黑板”（访存）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，解码阶段的<span class="term">Arithmetic Intensity</span>（算术强度，每读一字节做多少次浮点运算）极低：每个权重、每个 KV 元素只参与一两次乘加就被丢弃，计算单元大量空转等数据。于是优化目标从“减少 FLOPs”彻底变成了“减少要搬运的 KV 字节数”。这正是 MQA / GQA / MLA 这一整条进化链的共同动机。</p></div>
+  </div>  <p>把这件事的因果链彻底想清楚很重要，因为它解释了本模块所有设计的“为什么”：解码是<strong>内存带宽受限</strong>（memory-bound）的，GPU 的算力（TFLOPs）远超它的显存带宽（TB/s）能喂饱的数据量。在这种状态下，少搬一半 KV ≈ 快一倍，而省一半 FLOPs 可能毫无感觉（计算单元本来就闲着）。这与“训练是算力受限”形成鲜明对照，也是为什么同一个注意力，训练和推理的优化方向会南辕北辙——训练想的是“怎么少算”，推理想的是“怎么少搬”。把这条区别刻进脑子，本模块乃至 C24 的很多设计你都能自己推出来。</p>  <div class="ascii">一条压缩 KV cache 的进化链（▣=独立 KV 头, ▢=共享/压缩）：
+  MHA   q1 q2 q3 q4 ... q_h      每个 q 头配一份独立 K/V   KV: h 份  (基准)
+        ▣  ▣  ▣  ▣      ▣
+  GQA   q1 q2 | q3 q4 | ...      每 g 组共享一份 K/V       KV: g 份  (~1/4)
+        ▢▢   |  ▢▢   |
+  MQA   q1 q2 q3 q4 ... q_h      所有 q 头共享同一份 K/V   KV: 1 份  (1/h)
+        └──────▢──────┘
+  MLA   q1 ... q_h               缓存低秩潜向量 c, 用时展开 KV: d_c   (最省)
+        └─ c=xW_DKV → 展开多头 K/V</div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话记住本模块：<strong>MHA → MQA → GQA → MLA 是一条不断压缩 KV cache 的进化链</strong>，每一步都在“省显存带宽”与“保住质量”之间寻找新的平衡点。读完你应能回答：GQA 相比 MHA 省了多少 KV？为什么它几乎不掉点？MLA 又凭什么比 GQA 还省、还更接近 MHA 的质量？</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mha"><span class="num">2</span>MHA 与 KV cache 字节账</h2>
+  <p>先把原版 <span class="term">MHA</span>（Multi-Head Attention）的账算清楚——这是后面一切压缩的基准线。设模型维度 <code>d_model</code>、头数 <code>h</code>、每头维度 <code>d_h=d_model/h</code>、层数 <code>L</code>、序列长 <code>T</code>，每个数用 <code>b</code> 字节存（fp16 时 b=2）。每层、每个 token 要缓存一份 K 和一份 V，每份有 <code>h·d_h=d_model</code> 个数：</p>  <div class="math-block">\[\text{KV cache 字节} = 2 \times L \times T \times h \times d_h \times b = 2\,L\,T\,d_{\text{model}}\,b\]</div>  <p>代入 Llama-2-7B（L=32, d_model=4096, fp16）、上下文 T=4096：约 <strong>4 GB</strong>。注意这是<em>每一个序列</em>的开销，batch 一大就线性翻倍——KV cache 经常比模型权重本身还占地方，是长上下文 + 高并发服务的头号显存杀手。</p>  <h3>为什么解码是“带宽瓶颈”而非“算力瓶颈”</h3>  <p>把账算得再细一点。生成第 <code>t</code> 个 token 时，注意力部分的计算量约 <code>O(t·d)</code>（当前 query 与 t 个历史 key 各做一次点积），而要从显存读入的 KV 数据量也约 <code>O(t·d)</code>。两者<strong>同阶</strong>，意味着算术强度（读一个字节做几次浮点运算）接近一个很低的常数。GPU 的算力远远喂不饱——计算单元大量空转、等着 KV 从 HBM 搬过来，瓶颈是<em>搬运</em>，不是计算。</p>  <p>这条逻辑链还顺带解释了两件事，都贯穿 C24 推理服务：其一，所有注意力变体都在压 KV 字节数而非压 FLOPs——因为在带宽受限区，前者才有效；其二，<span class="term">Batching</span>（把多个请求摊到同一次权重读取上）能显著提吞吐——它把“读一次权重只服务一个 token”变成“服务一批 token”，直接抬高了算术强度，把解码从带宽受限往算力受限推。</p>  <div class="callout warn"><span class="label"></span>
+    <p>KV cache 的大小与<strong>批大小、上下文长度</strong>成正比，与模型权重无关。它直接决定你能塞下多大的 batch、同时服务多少并发用户。所以“压 KV”不只是省显存，更是<strong>提高服务吞吐与降低单 token 成本</strong>的核心杠杆（详见 C24）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mqa"><span class="num">3</span>MQA：共享一组 K/V</h2>
+  <p><span class="term">MQA</span>（Multi-Query Attention，Shazeer 2019）的想法极端而简单：<strong>所有 query 头共享同一组 K/V</strong>。原来 h 个头各有一份 K、一份 V，现在 K、V 各只剩 1 份，所有 query 头都拿这同一份去算注意力。于是 KV cache 直接缩小 h 倍：</p>  <div class="math-block">\[\text{KV cache}_{\text{MQA}} = 2\,L\,T\,d_h\,b \quad(\text{比 MHA 小 } h \text{ 倍})\]</div>  <p>Llama-2-7B 的 h=32，MQA 把 4 GB 的 KV cache 砍到约 128 MB（小 32 倍），解码吞吐大幅提升——这对吞吐优先的服务极有吸引力。但代价是<strong>表达力下降</strong>：所有 query 头被迫看同一套 K/V，相当于把“可被检索的内容视角”从 32 种压到 1 种，质量略降；而且实践中大规模训练 MQA 更容易不稳定（共享 KV 头承受了所有 query 头回传的梯度，方差大），需要更小心的初始化与学习率调度。</p>  <p>从实现上看，MQA 与 MHA 的差别只有一处：K、V 的投影矩阵从 <code>(d_model, d_model)</code> 缩成 <code>(d_model, d_h)</code>（只产出一个头），算注意力时把这唯一的 K/V 广播给所有 query 头。代码改动很小，但显存收益巨大——这种“小改动、大收益”正是 MQA 一度流行的原因。</p>  <p>MQA 揭示了一个关键洞察，是理解后面 GQA 的钥匙：<strong>query 头和 KV 头的作用并不对称</strong>。query 头是“不同的提问方式”，多多益善且互不冲突；而 KV 头提供的是“被检索内容的多样性”，砍到只剩一种就出现了信息瓶颈，质量与训练稳定性都受损。MQA 砍得太狠（直接到 1），于是有了在中间留几份的折中方案 GQA——这就是下一节的主角。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="gqa"><span class="num">4</span>GQA 与 repeat_kv</h2>
+  <p><span class="term">GQA</span>（Grouped-Query Attention，Ainslie 2023）是 MHA 与 MQA 之间的连续插值：把 h 个 query 头分成 <code>g</code> 组，<strong>每组内的 query 头共享一份 K/V</strong>。于是 KV 头数从 h（MHA）降到 g。<code>g=h</code> 退化为 MHA，<code>g=1</code> 退化为 MQA。Llama-2/3、Qwen 普遍用 g=8。</p>  <h3>实现关键：repeat_kv</h3>  <p>注意力计算要求 query 头和 K/V 头一一对应，所以算之前要把 g 份 K/V 各复制 <code>h/g</code> 次、扩回 h 份，再逐头算注意力。这一步就是工程里随处可见的 <code>repeat_kv</code>：</p>  <pre><code>def repeat_kv(kv, n_rep):       # kv: (g, T, d_h)
+    return np.repeat(kv, n_rep, axis=0)  # -&gt; (g*n_rep, T, d_h) = (h, T, d_h)</code></pre>  <p>注意 <code>repeat_kv</code> 只在<em>计算时</em>临时把 K/V 扩开，<strong>缓存里存的仍是 g 份</strong>——这正是省显存的来源。换句话说，GQA 用“算时多复制几次”（廉价，反正算力有余）换“缓存少存几份”（昂贵的显存带宽），与解码带宽受限的本质完美契合。<code>np.repeat</code> 在真实 kernel 里甚至常被优化成“逻辑上广播、物理上不复制”，连那点拷贝开销都省掉。</p>  <p>把 g 当成一个连续旋钮来理解整条谱系会更通透：<code>g=h</code> 时每个 query 头独享 K/V，就是 MHA（KV 最多、质量最好）；<code>g=1</code> 时全员共享，就是 MQA（KV 最少、质量略降）；中间任意 g 都是合法配置。<strong>GQA 不是一个孤立的新方法，而是把 MHA 和 MQA 这两端连起来的一整条连续光谱</strong>，工程上只需调一个超参 <code>num_key_value_heads</code>。这也是为什么现代框架几乎都用 GQA 的代码路径统一实现这三者——MHA 和 MQA 只是它的两个端点。</p>  <table>
+    <thead><tr><th>方案</th><th>KV 头数</th><th>KV cache 相对 MHA</th><th>质量</th><th>代表模型</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">MHA</span></td><td>h</td><td>1×</td><td>最好</td><td>GPT-3、原版</td></tr>
+      <tr><td><span class="term">GQA</span></td><td>g (如 8)</td><td>g/h（如 1/4）</td><td>几乎无损</td><td>Llama-2/3、Qwen</td></tr>
+      <tr><td><span class="term">MQA</span></td><td>1</td><td>1/h</td><td>略降</td><td>PaLM、Falcon</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">5</span>为什么 GQA 几乎无损</h2>
+  <p>为什么 GQA 几乎无损、而 MQA 会略降？接着上一节的洞察深入：<strong>KV 头提供的是“被检索内容的多样性”</strong>。query 头多没关系（它们只是不同的提问角度，彼此独立）；但如果可被检索的 K/V 视角太少（MQA 只剩 1 种），不同的提问都只能从同一份内容里捞，信息瓶颈就显现了。GQA 保留少数几种 K/V 视角（如 8 种），经验上就足够覆盖大部分检索需求。</p>  <p>这给了一个清晰的工程旋钮：<em>g 往大调，质量升、KV cache 涨；往小调，省显存、质量降</em>。多数前沿模型停在 g=8 附近，这不是拍脑袋，而是大量消融实验找到的“质量几乎不掉、KV 已砍数倍”的甜点。理解了这个旋钮，你看任何模型的配置表，扫一眼 <code>num_key_value_heads</code> 与 <code>num_attention_heads</code> 的比值，就知道它在 KV 上做了多激进的取舍——比值 1 是 MHA，比值越大越靠近 MQA。</p>  <p>一个值得记住的非对称背后的更深原因：注意力本质是“用 query 去检索 K/V 库”。query 的多样性决定“能从多少角度提问”，而 K/V 的多样性决定“库里有多少种可被检索的视角”。一个内容丰富的库（足够多 KV 头）即便被很多不同的 query 头反复检索也游刃有余；但库本身太单薄（MQA 只 1 个 KV 头），再多提问角度也捞不出更多信息。GQA 正是抓住了这一点——<strong>把投入留给真正稀缺的资源（KV 多样性的下限），而非冗余的资源（query 头数）</strong>。</p>  <p>还有一个常被忽视、却极具工程价值的细节：从一个已经训好的 MHA 模型<strong>改造（uptrain）成 GQA</strong>时，不是随机初始化那 g 个 KV 头，而是把原来同组的多个 KV 头做<em>平均池化</em>得到共享头，再用少量额外训练微调。Ainslie 的 GQA 论文正是这样用约 <strong>5% 的原训练量</strong>就把 MHA 模型转成 GQA，几乎不掉点——这让 GQA 近乎“免费的午餐”，也是它被业界迅速普及的根本原因。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记忆口诀：<strong>query 头要多样（提问方式多），KV 头可以少（被检索的内容视角够用即可）</strong>。GQA 砍的恰是后者、保的是前者，所以它省得多、掉得少。这条“非对称”直觉，是把 MQA/GQA/MLA 串成一条线的主轴。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mla"><span class="num">6</span>MLA：低秩潜向量压缩</h2>
+  <p>能不能比 GQA 更省、还几乎无损？DeepSeek-V2 的 <span class="term">MLA</span>（Multi-head Latent Attention）给出了一条新思路：<strong>不缓存多头 K/V，而是缓存一个低秩潜向量</strong>，用时再现场展开。它把“缓存什么”和“注意力用什么”这两件事彻底解耦。</p>  <h3>低秩压缩 KV</h3>  <p>用一个下投影矩阵把每个 token 的输入压成一个低维潜向量 <code>c = x·W_DKV</code>（维度 <code>d_c</code> 远小于 <code>d_model</code>），<strong>只把这个 c 放进 KV cache</strong>。真正算注意力时，再用上投影 <code>W_UK, W_UV</code> 把 c 还原成各头的 K、V：</p>  <div class="math-block">\[c_t = x_t W_{DKV}\in\mathbb{R}^{d_c},\quad K_t = c_t W_{UK},\; V_t = c_t W_{UV}\]</div>  <p>缓存量从 MHA 的 <code>2·d_model</code>（每 token）降到 <code>d_c</code>（DeepSeek-V2 取 d_c≈512），比 GQA 还小。而质量为什么能接近 MHA？因为 K/V 仍然是“多头、满秩还原”的——压缩只发生在缓存这一环，注意力看到的依然是丰富的多头表示，信息瓶颈被这次“现场展开”绕过了。</p>  <p>对比一下 GQA 与 MLA 在“怎么省”上的本质差异，能加深理解：GQA 是<strong>减少 KV 头的数量</strong>（少存几份完整的头），MLA 是<strong>降低每份 KV 的秩</strong>（每份都存，但存的是低维投影）。前者在“头维度”上做减法，后者在“特征维度”上做压缩——这是两个正交的方向，理论上甚至可以叠加。MLA 之所以能在更省的同时质量更好，是因为低秩压缩保留了<em>所有头的信息（只是压进了共享的低维子空间）</em>，而 GQA 是直接让多个头共用同一份、丢掉了头间的差异。</p>  <p>更妙的是推理时的 <span class="term">Matrix Absorption</span>（矩阵吸收）：上投影矩阵 <code>W_UK</code> 可以预先“吸收”进 query 投影 <code>W_Q</code>、<code>W_UV</code> 吸收进输出投影，于是推理时<em>根本不必显式展开 K/V</em>，直接在潜空间里算，进一步省算力。这把 MLA 从“省显存但多算”优化成“省显存且不怎么多算”。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>MLA 的精髓是<strong>把“缓存什么”和“注意力用什么”解耦</strong>：缓存一个小潜向量，用时再现场展开成多头 K/V。省的是显存带宽，名义代价是多一次上投影的计算——但配合矩阵吸收，连这点计算都能省掉。而推理本就带宽受限、算力有余，这笔买卖极其划算。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="decouple"><span class="num">7</span>MLA 的解耦 RoPE</h2>
+  <p>MLA 有一个棘手的细节，正好把模块 01 的 <span class="term">RoPE</span> 牵扯进来。RoPE 要把位置旋转加到 K 上，但 MLA 缓存的是<em>压缩前的潜向量 c</em>、K 是用时才从 c 展开的——旋转既没法“事先”加进缓存的 c（旋转与低秩投影不可交换），也不能在展开后才加（那样每步都要重算所有历史的旋转，失去缓存意义）。DeepSeek 的解法是<strong>解耦 RoPE（decoupled RoPE）</strong>：</p>  <ul>
+    <li>把 K 拆成两部分：一部分从潜向量 c 上投影得到（<em>不加 RoPE，承载内容，可低秩压缩</em>），另一部分用单独的小投影专门承载位置（<em>加 RoPE，维度很小，单独缓存</em>），两部分在算注意力时拼接。</li>
+    <li>于是“可压缩的内容”与“必须带位置的部分”被分开处理：内容部分享受低秩压缩省显存，位置部分保住相对位置信息。两者各取所需、互不干扰。</li>
+  </ul>  <div class="ascii">MLA 的 K：内容部分（可压缩）⊕ 位置部分（带 RoPE）
+  x ──W_DKV──► c (低秩, 进缓存) ──W_UK──► K_content   (不加 RoPE)
+    └─W_KR──► k_rope (小维度, 进缓存) ──RoPE──► K_pos  (加 RoPE)
+  注意力用的 K = concat(K_content, K_pos)</div>  <p>这是“架构组件互相牵制”的教科书级案例：仅仅因为换了注意力的<em>缓存方式</em>（低秩潜向量），就被迫<em>重新设计位置编码怎么接进去</em>。它也回扣了模块 01 末尾的伏笔——位置编码从来不是能孤立设计的模块。理解 RoPE 的频率谱与“施加时机”，是看懂解耦 RoPE 的前提；反过来，看懂了 MLA，你也就真正理解了模块 01 为什么强调“何时加 RoPE、缓存里存什么”。</p>  <div class="callout warn"><span class="label"></span>
+    <p>解耦 RoPE 是 MLA 实现远比 GQA 复杂的主要原因之一。如果你要复现 MLA，<strong>位置维与内容维的拆分、各自的缓存与拼接</strong>是最容易出错的地方，建议先把模块 01 的 RoPE 不变量测试和本模块的 KV 账都跑通，再动手。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="choose"><span class="num">8</span>选型小结与正交优化</h2>
+  <h3>选型小结</h3>  <p>把四种方案放在一起，按“你的处境”给出推荐——这张表是本模块的实用结晶：</p>  <table>
+    <thead><tr><th>你的处境</th><th>推荐</th><th>理由</th></tr></thead>
+    <tbody>
+      <tr><td>短上下文、追求极致质量</td><td><span class="term">MHA</span></td><td>KV cache 还不是瓶颈，没必要压</td></tr>
+      <tr><td>主流 LLM、质量与成本兼顾</td><td><span class="term">GQA</span> g≈8</td><td>几乎无损、KV 砍数倍，生态最成熟</td></tr>
+      <tr><td>极端吞吐、可接受质量微降</td><td><span class="term">MQA</span></td><td>KV 最小、解码最快</td></tr>
+      <tr><td>超长上下文 + 高并发</td><td><span class="term">MLA</span></td><td>KV cache 最省、质量接近 MHA，但实现最复杂</td></tr>
+    </tbody>
+  </table>  <p>怎么用这张表？先问“我是不是真的被 KV cache 卡住了”——短上下文、低并发时，KV 可能根本不是瓶颈，强行上 MLA 只是徒增实现复杂度与 bug 风险。一旦确认 KV 是瓶颈（长上下文、高并发、显存吃紧），再沿“质量优先→成本优先”的方向在 GQA/MQA/MLA 间选。<strong>绝大多数团队的正确默认是 GQA-8</strong>：它生态成熟、几乎无损、收益已经很大；只有当 GQA 仍不够、且团队有能力维护复杂实现时，才上 MLA。</p>  <p>要强调的是，注意力变体只是压 KV 的<strong>第一道闸门</strong>，而且与后续手段<em>正交</em>——可以叠加：</p>  <ul>
+    <li>把缓存的 K/V<strong>量化</strong>成 int8/fp8（<span class="term">KV Cache Quantization</span>，C27），在 GQA/MLA 之上再省一半带宽；</li>
+    <li><span class="term">PagedAttention</span>（vLLM，C24）：像操作系统管内存一样<strong>分页管理</strong> KV cache，消除碎片、提升并发；</li>
+    <li>KV 驱逐 / 压缩（C25）：丢弃或合并不重要的历史 KV，进一步缩小缓存。</li>
+  </ul>  <p>一个把这些层次串起来的算例：Llama-2-70B 在 8K 上下文下，MHA 等价物的 KV cache 约几十 GB/序列，光这一项就让单卡放不下几个并发请求；换成 GQA-8 砍到约 1/8，再叠 fp8 量化砍一半、PagedAttention 消除碎片，最终能把单卡并发从“个位数”抬到“几十”。每一层都是乘法关系，这就是为什么真实推理系统总是把它们<strong>叠在一起</strong>用。</p>  <div class="callout warn"><span class="label"></span>
+    <p>不要把注意力变体当成“压 KV 的全部”。真实系统是<strong>变体（GQA/MLA）× 量化 × 分页 × 驱逐</strong>层层相乘的结果。本模块教你打好第一层、也是最影响质量的一层地基；C24/C25/C27 教你把剩下几层垒上去。先把 KV 字节账算清楚，后面每一层省了多少你都能心里有数。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>注意力变体是当前最活跃的工程方向之一，仍有不少开放问题：</p>  <ul>
+    <li><span class="term">MLA</span> 的低秩瓶颈到底损失了什么、在哪些任务上会暴露？目前主要是经验结论，缺乏对“低秩压缩何时安全”的理论刻画。</li>
+    <li>GQA 的最优分组数 g 是否随模型规模、上下文长度、任务类型而变化，仍缺理论；g=8 是经验甜点而非定律。</li>
+    <li>注意力变体与<span class="term">Attention Sink</span>、长度外推、KV 量化的相互作用是活跃方向——压缩 + 量化 + 外推叠加时，误差如何累积尚不清楚。</li>
+    <li>更激进的路线：线性注意力 / SSM（模块 05）<strong>干脆绕开 KV cache</strong>，用固定大小的状态取代线性增长的缓存——这是另一条根本不同的解法，也是混合架构的动机。</li>
+  </ul>  <p>把这些问题放回本模块的主线看：从 MHA 到 MLA，我们一直在“压缩一个随序列线性增长的缓存”；而模块 05 的 SSM 直接质疑了一个更根本的前提——“<em>为什么缓存非要随序列增长</em>”。SSM 用固定大小的状态取代了线性增长的 KV，两条线在长上下文这个战场上正面交汇。这正是当下架构研究最前沿的张力：是把注意力的缓存压到极致（MLA 这条路），还是换一种根本不需要大缓存的序列模型（Mamba 那条路），抑或两者混合？</p>  <p>回顾整个模块，你会发现一条清晰的认知脉络：<strong>先认清瓶颈（解码是带宽受限）、再算清账（KV 字节公式）、然后沿着“非对称地砍 KV 头”这一主轴理解 MQA/GQA、最后用“解耦缓存与计算”理解 MLA</strong>。这套“先找瓶颈、再算账、再沿一条主轴推演变体”的方法，也适用于本课其它所有模块。</p>  <div class="callout paper"><span class="label"></span>
+    <p>必读：GQA（Ainslie 2023）、MQA（Shazeer 2019）、DeepSeek-V2/V3 技术报告（MLA + 解耦 RoPE + 矩阵吸收）。延伸看 StreamingLLM（注意力 sink）。它们各自“解决了什么问题、为何值得读”见 <code>references.md</code> 的注意力变体一节。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_rope/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">RoPE 旋转位置编码</div></a>
+    <a class="next" href="../03_moe/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">MoE 与 SwiGLU</div></a>
+  </div>
+
+</div>
+</body>
+</html>

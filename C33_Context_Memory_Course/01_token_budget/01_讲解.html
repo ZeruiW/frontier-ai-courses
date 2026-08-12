@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · Token 预算与截断</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · Token 预算与截断</h1>
+  <p class="subtitle">把上下文窗口当有限预算来管 —— token 计数、预算分配与输出预留、头/尾/中间与优先级截断、消息钉住；从零写一个 token 预算器 + 截断器，对接 MockLLM 端到端，无需 API key</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、Python 列表/字典、对「LLM 有窗口上限、输入输出共享窗口」的基本认识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_token_budget.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Lost in the Middle (Liu 2023)、Anthropic Token counting / Messages API 文档</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么 token 预算是上下文工程的地基</a></li>
+      <li><a href="#count">先学会数：token 计数</a></li>
+      <li><a href="#allocate">再学会分：预算分配与输出预留</a></li>
+      <li><a href="#positional">超支了砍谁（一）：头/尾/中间截断</a></li>
+      <li><a href="#priority">超支了砍谁（二）：优先级截断与消息保留</a></li>
+      <li><a href="#walkthru">把它跑起来：一次完整的预算-截断走查</a></li>
+      <li><a href="#realapi">真实接口对照：从 MockLLM 到 Messages API</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么 token 预算是上下文工程的地基</h2>
+  <p>一个 agent 跑久了，最先撞上的不是「逻辑不对」，而是<strong>「东西塞不进窗口了」</strong>。模型一次前向只能看到 <span class="term">context window</span> 那么多 token（比如 200K）；系统提示、工具定义、对话历史、检索结果、记忆——所有要影响这一步输出的信息，都得挤进这同一块有限空间。于是上下文工程的第一性问题就是：<strong>怎么数清楚占了多少、怎么把预算分给各部分、超了又先丢谁</strong>。这一模块就是把这件最基础、也最容易被忽视的事做扎实。</p>  <p>为什么说它是<strong>地基</strong>？因为后面三个更聪明的腾挪——compaction（把历史压成摘要）、文件记忆（把东西移出窗口）、检索（按预算拉进知识）——全都建立在「我能精确地数 token、能按预算裁剪」之上。不会数 token，你就不知道何时该压缩；不会按优先级裁剪，你压缩出来的空间也会被乱塞掉。<em>先学会管账，再谈理财</em>。</p>  <p>这件事看似只是「数数字、切数组」，魔鬼全在细节里：<strong>给输出留没留空间？系统提示会不会被当成最旧的历史误删？该保的关键事实保住了吗？</strong>。一个常见且致命的 bug 是把窗口塞满输入、忘了给模型生成留额度，结果回答被腰斩（<code>stop_reason='max_tokens'</code>）；另一个是粗暴地「丢最旧的」，连带把开头的系统指令一起丢了，agent 当场「人格分裂」。本模块的全部工程，就是把这些坑一个个用 <code>assert</code> 堵死。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>上下文窗口是一个固定大小的预算，截断是「超支时先砍谁」的决策</strong>。好的截断不是「丢最旧的」这么简单，而是<em>先扣掉给输出的预留、先钉死必保项（系统提示/关键事实），再在剩余额度里按优先级从最不重要的开始砍</em>——砍到刚好塞得下为止。难点不在切数组，而在「保住该保的」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="count"><span class="num">2</span>先学会数：token 计数</h2>
+  <h3>先学会数：token 计数</h3>  <p>一切从计数开始。<strong>token</strong> 是模型处理文本的最小单位，介于字符与单词之间。关键事实：决定「塞不塞得下」「花多少钱」的是 <em>token 数</em>，而不是字符数或字数。英文大约 1 token≈4 字符，中文常常 1 字≈1–2 token，代码、标点、空白又各不相同——所以<strong>不能靠肉眼估、更不能用错工具数</strong>。</p>  <div class="callout danger"><span class="label">绝不要用别家 tokenizer 数 Claude</span>
+    <p>真实工程里最该记死的一条：<strong>数 Claude 的 token，必须用 Claude 自己的 tokenizer（即 </strong><code>messages.count_tokens</code><strong>）</strong>。用别家的分词器（如 OpenAI 的 <code>tiktoken</code>）去估 Claude，会系统性偏差 15–20% 甚至更多，代码与非英文文本上更离谱。估少了你以为塞得下、实际爆窗；估多了你过早压缩、白丢信息。<em>token 计数错，后面所有预算决策都建立在沙子上</em>。</p>
+  </div>  <p>本课在 notebook 里用一个<strong>确定性的近似计数器</strong>（按空白切词、长词按字符折算），目的是让计数<em>可重复、可断言</em>——这样我们能把注意力放在「计数 → 预算 → 裁剪」这条控制流的正确性上，而不是纠结某段文本到底是 37 还是 39 个 token。等你把控制流练对了，把近似计数换成真实的 <code>count_tokens</code> 就是一行替换。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>数 token 就像称行李。航空公司认的是<strong>公斤</strong>（token），不是你箱子的体积或件数。你得用<strong>它家的秤</strong>（目标模型的 tokenizer）称，用自己家的体重秤估一估，到了柜台超重被拦下就晚了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，计数有两层：单段文本的 token 数，以及一组 <code>messages</code> 的总 token 数（后者要<strong>额外计入每条消息的固定开销</strong>——角色标记、分隔符等，真实 API 里每条消息有几个 token 的结构性成本）。本课的 <code>count_messages</code> 就给每条消息加一个固定开销再求和，逼近真实形状。</p></div>
+  </div>  <p>一个值得建立的习惯：<strong>把「数」做成一个独立、可信、可替换的函数</strong>。预算、截断、压缩触发、缓存核算全都依赖它。计数函数一旦写对并固定下来，上层逻辑就有了可靠的标尺；反过来，如果每个地方各估各的，整个系统的 token 账永远对不齐。</p>  <p>还有一个真实系统里绕不开的工程权衡：<strong>精确计数本身是有成本的</strong>。<code>messages.count_tokens</code> 是一次 API 调用——如果在 agent 的每一步、对完整历史都调一次，既增加延迟又产生费用。所以实践中常用<strong>「近似估 + 关键点精确校准」</strong>的混合策略：平时用本地近似计数器（像本课这个）快速估算、驱动预算决策；只在<em>接近窗口上限、一个错误就会爆窗的临界点</em>才调一次真实 <code>count_tokens</code> 精确确认。这也从另一个角度说明了为什么本课要先把「近似计数 → 预算 → 裁剪」这条控制流练扎实——它才是每一步都在跑的主干，精确计数只是临界点上的一次校准。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="allocate"><span class="num">3</span>再学会分：预算分配与输出预留</h2>
+  <h3>再学会分：预算分配与输出预留</h3>  <p>有了标尺，下一步是<strong>把窗口这块总预算切给各部分</strong>。一次请求的窗口里，住着性质很不一样的几类住户：</p>  <ul>
+    <li><strong>系统提示 / 工具定义</strong>：通常固定、必须保留——它们是 agent 的「宪法」，丢了就乱套。</li>
+    <li><strong>对话历史</strong>：会随轮数<em>无限增长</em>，是最大、最危险的占用源（模块 02 专治它）。</li>
+    <li><strong>召回的记忆 / 检索结果</strong>：按需注入<em>少量</em>，受各自的注入预算约束（模块 03、04）。</li>
+    <li><strong>本轮用户输入</strong>：每轮都变，必须在场。</li>
+    <li><strong>给输出预留的额度</strong>（即 <code>max_tokens</code>）：模型生成也要占窗口！</li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <p>最常被忘记、后果最直接的一条：<strong>输入 token + max_tokens ≤ 窗口</strong>。窗口是<em>输入和输出共享</em>的。如果你把窗口几乎塞满输入、只给输出留几十个 token，模型刚说半句就被 <code>stop_reason='max_tokens'</code> 掐断。所以预算分配的<strong>第一步永远是先扣掉输出预留</strong>，剩下的才是「可放输入」的预算。本模块 notebook 的预算器把这一步写死在最前面。</p>
+  </div>  <div class="math-block">\[\underbrace{T_{\text{sys}}+T_{\text{tools}}+T_{\text{mem}}+T_{\text{retr}}+T_{\text{hist}}+T_{\text{input}}}_{\text{输入总和}}\;\le\;\underbrace{W}_{\text{窗口}}-\underbrace{R_{\text{out}}}_{\text{输出预留}}\]</div>  <p>分配策略直接决定「优先保住什么」。一种稳健的做法是<strong>分层预算</strong>：先把窗口减去输出预留得到「可放输入」的总额；再从中扣掉必保的系统/工具；剩下的额度才在历史、记忆、检索之间分配——而且通常<em>近期历史优先于远期、相关检索优先于泛泛记忆</em>。当某一类（几乎总是历史）超出它分到的额度时，就触发截断或压缩。</p>  <p>分层预算还有一个实务问题：剩余额度在历史、检索、记忆之间<strong>按什么比例切</strong>？没有放之四海皆准的数，但有一条好原则——<strong>按「对当前这一步的边际价值」分配，而非平均分</strong>。一个正在密集来回讨论的对话，历史的价值高、就多给历史；一个一问一答的知识查询，检索结果的价值高、就多给检索。更稳的做法是给每类设一个<em>软上限</em>（如检索最多占可放输入的 20%），既保证它有一席之地、又不让它无限挤占。本模块 notebook 的练习会让你实现「把剩余额度按给定比例切给历史与检索、且不丢额度」——你会看到，连「怎么分」都得显式写成规则、用 assert 守住，才不会在某个边界悄悄漏掉几百个 token。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>像分工资：先扣掉必须交的房租（输出预留）和水电（系统提示），剩下的可支配收入再分给吃饭（近期历史）、社交（检索）、储蓄（记忆）。永远不能因为想多吃几顿就把房租挪用了——那是会「爆」的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，预算器接收各部分的 token 估计与窗口、输出预留，先判断<strong>是否塞得下</strong>，再在超出时按既定的分配/优先级决定<strong>裁哪一部分、裁多少</strong>。把分配规则显式化（而非散落在各处的 if），是让 token 账可控、可测的关键——这正是本模块要你从零写出来的东西。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="positional"><span class="num">4</span>超支了砍谁（一）：头/尾/中间截断</h2>
+  <h3>超支了砍谁（一）：头/尾/中间截断</h3>  <p>当输入超出可放预算，就必须<strong>截断</strong>——丢掉一部分以塞进窗口。问题只有一个，但极其重要：<strong>丢哪些、保哪些</strong>。最朴素的三种按位置截断：</p>  <div class="ascii">  原始历史 (从旧到新):  [m0][m1][m2][m3][m4][m5][m6][m7]   ← 超预算
+  ───────────────────────────────────────────────────────
+  头部截断 (丢最旧):    ╳   ╳   ╳  [m3][m4][m5][m6][m7]   ← 常见默认
+  尾部截断 (丢最新):   [m0][m1][m2][m3][m4]  ╳   ╳   ╳    ← 一般不可取
+  中间截断 (保两端):   [m0][m1]    ╳   ╳   ╳   [m6][m7]    ← 对齐注意力</div>  <p><strong>头部截断</strong>（丢最旧）是最常见的默认：对话里最旧的往往最不相关，「丢头保尾」通常合理。<strong>但有个致命陷阱</strong>——系统提示也在最前面！如果天真地「丢最前面 N 条」，第一个被丢的就是系统提示。所以头部截断的前提是<em>先把系统提示等钉住项从可丢区域里排除</em>（见下一节）。</p>  <p><strong>尾部截断</strong>（丢最新）一般不可取——最新消息通常与当前任务最相关，丢了就等于没看用户刚说的话。它只在少数「必须保住开头设定、宁可不看新内容」的特殊场景出现。</p>  <div class="callout paper"><span class="label"></span>
+    <p><strong>中间截断</strong>（保留两端、裁掉中段）背后有坚实的实证。Liu 等 2023 的 <em>Lost in the Middle</em> 系统发现：模型对长上下文的利用率呈 <strong>U 形</strong>——放在<strong>开头或结尾</strong>的关键信息被用得最好，埋在<strong>中段</strong>的则显著被忽视，且上下文越长这条曲线越陡。这给了一条反直觉但有效的策略：<em>把最重要的信息放在窗口两端，必要时优先裁掉中段</em>——因为中段本来就是模型最不上心的地方。详见 <code>references.md</code>。</p>
+  </div>  <p>中间截断在实现上比头尾稍微讲究：要保住<em>开头多少、结尾多少</em>，两端的配额怎么分。一个常见做法是把可放历史的额度按比例切给两端（如开头 30%、结尾 70%，因为结尾通常更相关），再从中间往外丢，直到塞下。本模块 notebook 会让你实现一个「保头 $a$ 条 + 保尾 $b$ 条、裁中间」的截断，并验证它确实保住了两端、且总量达标——你会顺带体会到：哪怕是「保两端」这种听起来简单的策略，边界（$a+b$ 已经超预算怎么办、奇偶怎么取）也得想清楚。</p>  <p>但纯按位置截断有个根本局限：<strong>它假设「位置=重要性」</strong>（越旧越该丢）。现实里并非如此——第 3 轮用户立下的一条硬约束，可能比第 30 轮的闲聊重要得多。要真正做对，得让重要性脱离位置，这就引出下一节的优先级截断。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="priority"><span class="num">5</span>超支了砍谁（二）：优先级截断与消息保留</h2>
+  <h3>超支了砍谁（二）：优先级截断与消息保留</h3>  <p>更鲁棒的办法是<strong>给每条消息打一个优先级</strong>，超预算时<strong>从最低优先级开始丢</strong>，丢一条算一次预算、丢到刚好塞得下为止。一种常见的优先级阶梯：</p>  <table>
+    <thead><tr><th>优先级</th><th>内容</th><th>处置</th></tr></thead>
+    <tbody>
+      <tr><td><strong>最高·钉住</strong></td><td>系统提示、工具定义、用户的硬性约束</td><td><em>永不丢弃</em>（pinned）</td></tr>
+      <tr><td><strong>高</strong></td><td>当前任务相关、近期几轮</td><td>尽量保留</td></tr>
+      <tr><td><strong>中</strong></td><td>较早但可能有用的历史</td><td>预算紧张时先于低优先级保留</td></tr>
+      <tr><td><strong>低·可弃</strong></td><td>寒暄、已完成且无后续的子任务、冗余确认</td><td>最先丢弃</td></tr>
+    </tbody>
+  </table>  <p>核心机制叫 <span class="term">message pinning</span>（消息钉住）：把某些消息标记为「永不丢弃」。<strong>截断器必须先保住所有钉住项，再在剩余预算里裁其余</strong>。系统提示是天然的钉住项；用户说的「记住：预算上限是 5000 元」这类硬约束也应钉住——否则几十轮后它被当成「旧历史」丢掉，agent 就会做出违背约束的事。</p>  <div class="callout danger"><span class="label"></span>
+    <p>一个真实而隐蔽的事故链：用户在第 2 轮说「<em>所有金额都用美元</em>」，没被钉住；聊到第 40 轮触发头部截断，这条被当作最旧历史丢掉；第 41 轮 agent 报价时改用了人民币，且<strong>毫无察觉</strong>。错误不报、缓慢累积、极难排查——这正是「截断丢了关键约束」的典型后果。<strong>凡是「之后每一步都要遵守」的信息，都必须钉住或写进记忆</strong>（模块 03），绝不能让它随历史被裁掉。</p>
+  </div>  <p>优先级截断的实现要点有三：<strong>①</strong> 先无条件保留所有钉住项并从它们算起占用；<strong>②</strong> 把可丢消息按优先级（同优先级再按新旧）排序；<strong>③</strong> 从最低优先级开始<em>逐条尝试加入</em>，直到再加就超预算为止——而非「一刀切丢掉前 N 条」。这样既保住了该保的，又尽可能多地利用了剩余空间。本模块 notebook 让你把这个逻辑从零写出来，并用 <code>assert</code> 验证「钉住项一定在、总 token 一定 ≤ 预算、且没有可再塞下的消息被白白丢弃」。</p>  <p>优先级从哪来，也值得一提：它可以是<strong>静态规则</strong>（系统提示=最高、寒暄=最低，按消息类型查表）、可以来自<strong>模型自己的判断</strong>（让模型给每条历史标个重要性分），也可以是<em>两者结合</em>（规则定底线、模型微调相对次序）。本课用静态规则演示——它确定、可断言、不依赖模型，最适合把「按优先级裁剪」这条控制流练对；真实系统再在其上叠加更聪明的打分。无论分从哪来，截断器消费它的逻辑是一样的：<strong>钉住项无条件保留，其余按分从低到高丢到塞下为止</strong>。</p>  <p>还有一个值得记住的工程取舍：<strong>截断是「丢弃」，是有损的</strong>。它快、简单、零额外成本，但丢掉的信息就真没了。当被丢的历史其实仍有价值时，更好的办法不是丢、而是<em>压缩</em>（把旧历史摘要成一小块留着）——那是下一模块 compaction 的主题。截断与压缩是一对：<strong>能压则压，压不动或不值得压的才丢</strong>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="walkthru"><span class="num">6</span>把它跑起来：一次完整的预算-截断走查</h2>
+  <h3>把它跑起来：一次完整的预算-截断走查</h3>  <p>把前面几节拼起来，看一次真实的决策流程长什么样。假设窗口 8000、给输出预留 1000，于是「可放输入」是 7000。当前要组装的上下文：</p>  <div class="ascii">  ┌── 可放输入预算 = 窗口8000 − 输出预留1000 = 7000 tokens ──┐
+  │ 系统提示(钉住)        600                                │
+  │ 工具定义(钉住)        900   ← 钉住项合计 1500, 必保      │
+  │ 历史 m0..m9          6200   ← 远超剩余 7000−1500=5500   │
+  │ 本轮输入             300    ← 也必保                     │
+  └──────────────────────────────────────────────────────┘
+   决策: 钉住1500 + 输入300 = 1800 必保; 留给历史 7000−1800 = 5200
+         历史6200 &gt; 5200 → 按优先级从最旧/最低开始丢, 丢到 ≤5200 为止</div>  <p>走查的顺序是固定的、可复现的：<strong>先扣输出预留 → 再扣钉住项与本轮输入 → 算出留给历史的额度 → 历史超额则按优先级截断到额度内 → 最后断言总输入 ≤ 可放预算</strong>。注意这条流水线把「必保的」和「可裁的」清清楚楚分开了：钉住项和当前输入从不参与裁剪，被裁的永远只是「可丢历史」。</p>  <p>这套走查正是把模块 00 那张「上下文窗口=预算」的图变成了可执行、可断言的代码。它也是后面所有模块的<strong>组装骨架</strong>——模块 02 会在「历史超额」这一步把<em>丢弃换成压缩</em>；模块 03、04 会在「留给历史的额度」里再切出记忆与检索的份额；模块 05 会给这整条流水线<em>加上缓存</em>让它变便宜。骨架不变，只是往里填更聪明的零件。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这条不变量，它是本模块的「验收标准」：<strong>截断之后，① 所有钉住项都在；② 总输入 token ≤ 窗口减输出预留；③ 在不违反前两条的前提下，没有可丢消息被白白丢掉（空间被尽量用满）</strong>。三条同时成立，你的预算-截断逻辑就是对的，可以原样搬到真实模型上——把近似计数换成 <code>count_tokens</code>、把组装结果发给 <code>client.messages.create</code> 即可。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="realapi"><span class="num">7</span>真实接口对照：从 MockLLM 到 Messages API</h2>
+  <h3>真实接口对照：从 MockLLM 到 Messages API</h3>  <p>本模块在 MockLLM 上验证的预算-截断 scaffold，换到真实 Anthropic Messages API 几乎是一行替换。对照关系如下：</p>  <table>
+    <thead><tr><th>本课（标准库 + MockLLM）</th><th>真实 Anthropic 接口</th></tr></thead>
+    <tbody>
+      <tr><td>近似 <code>count_tokens(text)</code></td><td><code>client.messages.count_tokens(model=..., messages=...)</code></td></tr>
+      <tr><td>组装好的 <code>system + messages</code> 数组</td><td>Messages API 的 <code>system</code> 字段 + <code>messages</code></td></tr>
+      <tr><td>预算里的「输出预留」</td><td>请求参数 <code>max_tokens</code></td></tr>
+      <tr><td>「钉住系统提示」</td><td><code>system</code> 字段天然在最前、不参与历史裁剪</td></tr>
+      <tr><td>截断后发请求</td><td><code>client.messages.create(model='claude-sonnet-4-6', ...)</code></td></tr>
+      <tr><td>回答被截断的检测</td><td>响应 <code>stop_reason == 'max_tokens'</code></td></tr>
+    </tbody>
+  </table>  <pre><code># 真实形状(伪代码, 需 ANTHROPIC_API_KEY; 无 key 时本课自动回退 MockLLM)
+import anthropic
+client = anthropic.Anthropic()
+# 1) 先用真实 tokenizer 数: 决定要不要截断
+n = client.messages.count_tokens(model='claude-sonnet-4-6',
+                                 system=SYSTEM, messages=history).input_tokens
+# 2) 若 n + max_tokens 超窗口, 用本课的优先级截断器裁 history
+history = truncate_by_priority(history, budget=WINDOW - MAX_OUT - n_pinned)
+# 3) 发请求; system 字段天然钉在最前、不会被当历史裁掉
+resp = client.messages.create(model='claude-sonnet-4-6', max_tokens=MAX_OUT,
+                              system=SYSTEM, messages=history)
+if resp.stop_reason == 'max_tokens':
+    ...  # 输出被截断: 说明 max_tokens 留少了, 或该流式输出</code></pre>  <p>这就是「scaffold 可迁移」的含义：<strong>你写的预算、截断、钉住逻辑一字不改</strong>，只是把假计数换成真计数、把假模型换成真请求。本课每个 notebook 都自带一个「<strong>有 key 用真实 Claude、无 key 自动回退 MockLLM</strong>」的适配段，所以无论你手上有没有密钥，整本都能一路跑到底——验证逻辑用 Mock，迁移真实只差一个环境变量。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>超越「越旧越该丢」</strong>：位置不等于重要性。如何自动给消息打<em>重要性分</em>（用模型自己评、用注意力回看、用下游是否被引用），让截断真正按价值而非按位置，是活跃方向——本质上是把 compaction、记忆、检索的「相关性」判断前移到截断里。</li>
+    <li><strong>截断 vs 压缩 vs 外置的统一策略</strong>：丢弃（本模块）、摘要（02）、写入记忆（03）、靠检索召回（04）其实是同一道题的四种解。一个理想的 scaffold 应当能<em>自动选择</em>对每段历史用哪种——目前多是人手定规则。</li>
+    <li><strong>中间迷失的对抗</strong>：Liu 2023 之后，如何在长上下文里<em>摆放</em>信息（重排、关键信息复述到结尾、显式编号）以抵消 U 形利用率，是 prompt 结构设计的持续课题；模型侧也在用训练缓解，但远未消除。</li>
+    <li><strong>token 计数的代价与近似</strong>：真实 <code>count_tokens</code> 要一次（轻量）请求，海量历史频繁计数有成本。如何用增量计数、缓存计数结果、或可靠的本地近似来省这笔开销，是工程优化点。</li>
+    <li><strong>窗口变大是否让这一切过时？</strong>：窗口在涨（已有百万级）。但「有效上下文」并不随窗口线性增长（context rot、中间迷失），且更长上下文更贵更慢。所以<em>即便窗口很大，仍要做预算与截断</em>——把它当无限大去塞，几乎总会更差更贵。这正是上下文工程长期成立的根因。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Liu 2023 _Lost in the Middle_（两端高中间低，本模块中间截断与信息摆放的依据）、Anthropic _Token counting_ 文档（用 <code>count_tokens</code>、勿用别家 tokenizer）、Anthropic _Context windows_ 与 _Messages API_ 文档（窗口硬约束、<code>max_tokens</code>、<code>stop_reason</code>）、Anthropic _Effective context engineering_（为什么窗口大也要管理）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_compaction/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · Compaction 与摘要</div></a>
+  </div>
+
+</div>
+</body>
+</html>

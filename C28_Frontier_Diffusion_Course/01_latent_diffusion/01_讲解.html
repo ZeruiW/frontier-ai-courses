@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · Latent Diffusion 与 Stable Diffusion</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · Latent Diffusion 与 Stable Diffusion</h1>
+  <p class="subtitle">先用 VAE 把图像压到低维 latent 再在 latent 上扩散 —— 感知压缩 vs 语义生成的两阶段分工、为何省两个数量级算力、Stable Diffusion 的完整架构</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">扩散基础（C16：闭式加噪/DDPM/采样）、VAE、卷积网络</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_latent_diffusion.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Rombach 2022 (LDM/SD)、Kingma 2014 (VAE)、Esser 2021 (VQGAN)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">像素空间太贵：latent 的动机</a></li>
+      <li><a href="#twostage">两阶段分工：感知压缩 vs 语义生成</a></li>
+      <li><a href="#vae">VAE：把图像压进 latent</a></li>
+      <li><a href="#latentdiff">在 latent 上做扩散</a></li>
+      <li><a href="#sd">Stable Diffusion 完整架构</a></li>
+      <li><a href="#tradeoff">为什么是 latent：算力账与权衡</a></li>
+      <li><a href="#toy">把玩具跑起来：最小实现</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>像素空间太贵：latent 的动机</h2>
+  <p>扩散模型的第一版（DDPM）直接在<strong>像素空间</strong>操作：一张 512×512 的 RGB 图就是 <code>512×512×3 ≈ 786432</code> 维的向量。去噪网络要在这个百万维空间里，一步步把噪声雕成图像，而且采样要跑几十上百步、每步都过一遍大网络。结果是<strong>又慢又贵</strong>：训练要海量算力，推理在消费级显卡上慢到难以接受。这是 2021 年扩散虽然质量惊艳、却难以普及的根本瓶颈。</p>  <p>Rombach 等人 2022 年的 <span class="term">Latent Diffusion (LDM)</span> 给出了一个简单而深刻的解法，它也是 <span class="term">Stable Diffusion</span> 的核心：<strong>不要在像素上扩散，先把图像压到一个低维的 latent 空间，在那里扩散，最后再解码回像素</strong>。一张图先经 VAE 编码成 <code>64×64×4 ≈ 16384</code> 维的 latent，扩散只在这个小了约 <strong>48 倍</strong> 的空间里发生。同样的网络、同样的步数，算力直接降一两个数量级——高分辨率开源生成由此成为可能。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：要给一篇万字长文「换个说法」，没必要逐字母改，先把它压成一份要点提纲（latent），在提纲层面改写，再展开成完整文章。图像的像素里有大量人眼根本不在意的冗余（相邻像素几乎一样、高频纹理可后补），先把这些冗余压掉，扩散就只需操心<strong>真正承载语义的少量信息</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：设 VAE 编码器 <code>E</code>、解码器 <code>D</code>，图像 <code>x</code> 的 latent 为 <code>z=E(x)</code>。LDM 把扩散的全部前向/反向过程从 <code>x</code> 空间搬到 <code>z</code> 空间：在 <code>z</code> 上加噪、训去噪网络、采样出 <code>ẑ</code>，最后 <code>x̂=D(ẑ)</code> 一次性解码。扩散的维度从 <code>dim(x)</code> 降到 <code>dim(z)</code>，而后者小一两个数量级。</p></div>
+  </div>  <p>值得强调，这个想法之所以「深刻」，在于它揭示了一个被忽视的事实：<strong>扩散把绝大部分算力浪费在了人眼根本不在意的地方</strong>。Ho 的原版 DDPM 在像素上逐步去噪，意味着网络要花同样的力气去雕琢「这片天空的第 10001 个像素该是哪个蓝」——可这种微观细节既不影响「图里是什么」，又完全可以由一个解码器在最后一步批量补出。把这些<em>感知冗余</em>从扩散的工作清单里划掉，剩下的语义内容只需在一个小了几十倍的空间里生成，质量却几乎不损——这就是 latent 扩散用一个简单结构换来巨大效率的根本原因，也是它从 2022 年起统治开源生成的理由。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住 LDM：<strong>把「压缩」和「生成」拆成两件事，各用最擅长的工具</strong>。压缩交给自编码器（一次性、确定性、擅长去冗余），生成交给扩散（迭代、随机、擅长建模分布）。下一节会看到，这个拆分不只是省算力，还在概念上更干净。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="twostage"><span class="num">2</span>两阶段分工：感知压缩 vs 语义生成</h2>
+  <h3>两阶段分工：感知压缩 vs 语义扩散</h3>  <p>LDM 最重要的思想，是把图像生成显式拆成<strong>两个职责不同的阶段</strong>：</p>  <table>
+    <thead><tr><th>阶段</th><th>由谁负责</th><th>做什么</th><th>性质</th></tr></thead>
+    <tbody>
+      <tr><td>① <strong>感知压缩</strong></td><td>VAE（<code>E</code>/<code>D</code>）</td><td>去掉人眼不敏感的高频冗余，把图压成规整的低维 latent，并能高保真还原</td><td>确定性、一次性、只训一次</td></tr>
+      <tr><td>② <strong>语义生成</strong></td><td>扩散网络</td><td>在 latent 空间建模数据分布，从噪声采样出有意义的 latent</td><td>随机、迭代、表达力强</td></tr>
+    </tbody>
+  </table>  <p>为什么这个拆分是对的？因为图像信息天然分两层。Rombach 画过一条「率失真」曲线：图像的比特绝大多数花在<strong>感知细节</strong>（纹理、噪点、细微梯度）上，而这些对「图里是什么」几乎无贡献。VAE 负责把这部分<em>感知冗余</em>压掉（perceptual compression），剩下的 latent 主要承载<strong>语义结构</strong>（构图、物体、关系）。于是扩散——这个昂贵但强大的生成器——只需在语义层面工作，不必浪费算力去逐像素生成那些本可由解码器补出的细节。</p>  <p>这个拆分还有一个<strong>概念上的好处</strong>，常被效率叙事盖过：它让两个阶段各自的「目标」变得纯粹。若在像素上端到端训扩散，网络既要学语义（这是只猫）又要学渲染（猫毛的微观质感），两个目标耦合、互相牵制。拆开后，VAE 用确定性的重建/感知损失把「渲染」学到极致，扩散用概率目标把「语义分布」学到极致——<em>每个网络只做自己最擅长、最容易优化的事</em>。这也是为什么 latent 扩散不仅更快，往往<strong>同等算力下质量还更高</strong>：不是因为信息更多，而是因为分工让每部分都学得更好。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>通俗讲：VAE 像一个「画框 + 笔触引擎」，它学会了「好图长什么质感」；扩散则像「构图师」，只负责决定画面里有什么、怎么布局。构图师不需要亲手画每一根头发丝——他给出 latent，笔触引擎（解码器）自动渲染出逼真的细节。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地：两阶段是<strong>解耦训练</strong>的。先单独训 VAE（自编码重建损失 + 感知损失 + 轻微对抗损失 + KL 正则），训好后<strong>冻结</strong>；再在其 latent 上训扩散。这样扩散面对的是一个固定、规整、低维的 latent 分布，训练目标干净、收敛稳定。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>两阶段也带来一个<strong>根本约束</strong>：扩散生成质量的上限被 VAE 的重建质量卡死。VAE 还原不出的细节（如清晰小字、规则纹理），扩散再强也变不出来——它只在 latent 空间工作，最后那一步解码不归它管。这就是为什么 SD3/Flux 都在反复升级 VAE（更多 latent 通道、更好的重建），以及为什么早期 SD 画文字总是糊的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="vae"><span class="num">3</span>VAE：把图像压进 latent</h2>
+  <h3>VAE：把图像压进 latent</h3>  <p>LDM 的压缩器是一个 <span class="term">VAE</span>（变分自编码器），但用法和经典 VAE 略有不同——它不追求 latent 严格服从标准高斯，只要求 latent<strong>规整、低维、可高保真解码</strong>。其结构是：</p>  <ul>
+    <li><code>E: x → (μ, σ)</code>：编码器（卷积下采样）把图像压成 latent 的均值与方差。SD 用下采样因子 <code>f=8</code>：<code>512×512×3 → 64×64×4</code>。</li>
+    <li><code>z = μ + σ⊙ε</code>：重参数化采样一个 latent（<code>ε∼N(0,I)</code>），训练时引入随机性，推理时常直接取 <code>μ</code>。</li>
+    <li><code>D: z → x̂</code>：解码器（卷积上采样）把 latent 还原成图像。</li>
+  </ul>  <p>训练目标是几项之和：<strong>重建损失</strong>（<code>‖x-x̂‖</code> 让还原准）、<strong>感知损失</strong>（用预训练网络的特征比对，让还原<em>看起来</em>对而非逐像素对）、轻微的<strong>对抗损失</strong>（一个判别器逼解码器产生锐利真实的纹理）、以及一个<strong>很弱的 KL 正则</strong>（<code>KL(N(μ,σ)‖N(0,I))</code> 防止 latent 方差爆炸、保持空间规整）。其中感知 + 对抗损失是关键——正是它们让 VAE 能在很高的压缩比下还原出锐利逼真的图，而不是经典 VAE 那种模糊的平均脸。</p>  <div class="math-block">\[\mathcal{L}_{\text{VAE}}=\underbrace{\|x-\mathcal{D}(z)\|_1}_{\text{重建}}+\lambda_{\text{perc}}\,\mathcal{L}_{\text{LPIPS}}(x,\hat x)+\lambda_{\text{adv}}\,\mathcal{L}_{\text{GAN}}+\beta\,\mathrm{KL}\big(\mathcal{N}(\mu,\sigma)\,\|\,\mathcal{N}(0,I)\big)\]</div>  <p>还有一个看似琐碎、实则致命的工程细节：<strong>latent 缩放</strong>。VAE 输出的 latent 方差未必是 1，而扩散假设加的是单位方差噪声。SD 实测出一个常数（约 <code>0.18215</code>），把 latent 乘上它使方差≈1，再喂给扩散。<em>不做这步缩放，扩散训练会直接发散</em>。notebook 里我们会在玩具上复现「不缩放就训不动」这个现象。</p>  <p>一个自然的疑问：既然只是想降维，为什么不直接把图缩小（resize 到 64×64）就好？因为简单缩小是<strong>不可逆的硬丢弃</strong>——丢掉的高频细节再也回不来，解码出的图必然糊。VAE 的高明在于它学的是一个<em>可逆的、内容自适应的</em>压缩：哪些细节能丢、哪些必须留，由数据驱动地学出来；而且解码器记住了「这类图的细节长什么样」，能在还原时<strong>合成</strong>出合理的高频纹理，而非简单插值。这就是为什么 VAE 的 latent 虽小，解码却能锐利——它不是在「放大模糊的小图」，而是在「从语义编码渲染细节」。这一点也预示了它的软肋：解码器没见过的细节（如特定字体的小字）它编不出来，于是糊。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把 VAE 想成「学过的有损压缩」（像 JPEG，但为生成而生）。JPEG 用固定的 DCT 变换；VAE 用神经网络学一个<strong>为后续扩散量身定制</strong>的压缩——既要压得狠（省算力），又要还原得真（保质量），还要 latent 空间规整（利于扩散建模）。这三个目标的平衡，就是为什么 VAE 要那么多损失项。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="latentdiff"><span class="num">4</span>在 latent 上做扩散</h2>
+  <h3>在 latent 上做扩散：和像素扩散一模一样</h3>  <p>一旦有了冻结的 VAE，latent 扩散的训练<strong>和普通扩散没有任何区别</strong>——只是把所有 <code>x</code> 换成 <code>z=E(x)</code>。这正是 LDM 优雅的地方：它不改扩散的数学，只换了扩散发生的空间。整个训练循环是：</p>  <div class="ascii">训练一步（latent 扩散）：
+  1. 取一张图 x，编码：z0 = E(x) * scale          # 进入 latent 空间（一次性）
+  2. 采时间步 t ~ U(1..T)，采噪声 ε ~ N(0, I)
+  3. 闭式加噪：z_t = √ᾱ_t · z0 + √(1-ᾱ_t) · ε     # 和像素扩散同一公式，只是对象是 z
+  4. 网络预测噪声：ε̂ = εθ(z_t, t, c)              # c = 条件(文本/类别)，下一节讲
+  5. 损失：‖ε - ε̂‖²，反传更新 εθ                 # 经典 DDPM 目标
+  （VAE 全程冻结，不参与训练）</div>  <p>采样也一样，只是终点不同：从纯噪声 <code>z_T∼N(0,I)</code> 出发，用任意采样器（DDPM/DDIM/DPM-Solver）在 latent 空间逐步去噪得到 <code>ẑ_0</code>，最后<strong>只在最末尾解码一次</strong>：<code>x̂ = D(ẑ_0 / scale)</code>。注意解码只发生一次（在所有去噪步之后），所以解码器的开销可忽略——昂贵的是 latent 空间里那几十步去噪，而它们现在便宜了 48 倍。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以学过基础扩散（C16）的你，已经会了 latent 扩散的 90%。唯一的新东西就是头尾各加一次 VAE 编/解码，中间的「加噪—去噪」完全照搬。这也是为什么本课把它放第一个模块——它是从「基础」迈向「前沿」最平滑的一步。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>一个值得注意的推论：latent 扩散的 SNR、噪声表设计、loss 加权，原则上都该<strong>针对 latent 的统计重新调</strong>（latent 的尺度、各通道方差与像素不同）。实践中 SD 直接复用了像素扩散的线性噪声表（配合 latent 缩放），但后续工作（如 zero-terminal-SNR、EDM 风格噪声表）指出这并非最优——这是模块 03/04 会再触及的细节。</p></div>
+  </div>  <div class="callout danger"><span class="label">降维≠降质</span>
+    <p>一个常见误解：以为 latent 扩散「降维了所以信息变少、质量必然下降」。<strong>不对</strong>。降的是<em>人眼冗余</em>，语义信息几乎无损地保留在 latent 里；质量瓶颈在 VAE 的重建能力，而非扩散在低维空间「看不全」。事实上同等算力下，latent 扩散因为不必浪费在像素细节上，整体质量反而更高——这正是它成为主流的原因。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sd"><span class="num">5</span>Stable Diffusion 完整架构</h2>
+  <h3>Stable Diffusion 的完整架构</h3>  <p>把前面拼起来，再加上「文本条件」，就是完整的 <span class="term">Stable Diffusion</span>。它由三大件组成：</p>  <table>
+    <thead><tr><th>组件</th><th>作用</th><th>SD1/2 用什么</th><th>SD3/Flux 升级为</th></tr></thead>
+    <tbody>
+      <tr><td><strong>VAE</strong>（<code>E/D</code>）</td><td>图像 ↔ latent 的感知压缩</td><td>KL-VAE, f=8, 4 通道</td><td>更多通道(16)、更好重建</td></tr>
+      <tr><td><strong>去噪骨干</strong></td><td>在 latent 上预测噪声/速度</td><td>U-Net + cross-attention</td><td><strong>DiT / MM-DiT</strong>（模块 02）</td></tr>
+      <tr><td><strong>文本编码器</strong></td><td>把 prompt 编码成条件向量</td><td>CLIP text encoder</td><td>CLIP + <strong>T5-XXL</strong></td></tr>
+    </tbody>
+  </table>  <p>文本如何注入？SD1/2 的 U-Net 用 <span class="term">cross-attention</span>：每个图像位置（query）去「查阅」所有文本 token（key/value），从而把 prompt 的语义渗透到生成的每一处。时间步 <code>t</code> 则通过正弦嵌入 + MLP 注入。<strong>整条管线</strong>是：prompt → 文本编码器 → 条件向量 <code>c</code>；噪声 <code>z_T</code> + <code>c</code> + <code>t</code> → 去噪骨干迭代 → <code>ẑ_0</code> → VAE 解码 → 图像。</p>  <div class="ascii">Stable Diffusion 推理全景：
+  prompt ──► [文本编码器 CLIP/T5] ──► 条件向量 c ─────────┐
+                                                          ▼
+  z_T ~ N(0,I) ──► [去噪骨干 (UNet/DiT)]  ◄── t (时间步嵌入)
+   (latent)          │  重复 N 步：z_t → z_{t-1}（每步用 c 引导，CFG 见模块04）
+                     ▼
+                   ẑ_0 (干净 latent) ──► [VAE 解码 D] ──► 512×512 图像
+                                          （只解码一次）</div>  <p>理解了这张图，你就理解了<strong>当代几乎所有文生图模型的骨架</strong>。SD3、Flux、甚至视频模型 SoRA，都是在替换其中的某个组件：把 U-Net 换成 DiT（模块 02），把扩散目标换成 flow matching（模块 03），把采样压成少步（模块 05）。<em>但「VAE 压缩 + latent 去噪 + 条件注入 + 解码」这个两阶段 + 条件的骨架始终不变</em>。本课后面的模块，本质都是在升级这张图里的某个方框。</p>  <p>再点出一个采样视角的细节，为模块 03/05 埋伏笔：上图中「重复 N 步」的去噪，既可以用随机的 DDPM，也可以用<strong>确定性的 DDIM</strong>。DDIM 把反向过程写成一个常微分方程（ODE）的离散化——给定同一个初始噪声 <code>z_T</code>，它每次都生成<em>同一张</em>图，且可以大步跳、几十步甚至更少就出图。这个「扩散其实可以是一个确定性 ODE」的洞察，正是模块 03（flow matching 把生成直接定义成 ODE）和模块 05（consistency 把 ODE 压成一步）的起点。所以你在这里看到的 latent 去噪循环，不是终点，而是后面所有「更快采样」故事的开篇。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么 SD3/Flux 要叠加 T5-XXL 文本编码器？因为 CLIP 的文本理解偏「看图说话」式的浅层对齐，对长 prompt、拼写、计数、空间关系理解弱。T5 是强语言模型，能解析更复杂的指令。这印证了一个趋势：<strong>生成质量的瓶颈正从「画得真」转向「听得懂」</strong>——文本编码器越来越重要。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">6</span>为什么是 latent：算力账与权衡</h2>
+  <h3>为什么是 latent：算力账与权衡</h3>  <p>把 latent 扩散省的算力<strong>算一笔账</strong>。扩散每步的计算量大致正比于其操作空间的元素数。像素空间 <code>512×512×3≈7.9e5</code>，latent 空间 <code>64×64×4≈1.6e4</code>，比值约 <strong>48 倍</strong>。也就是说，latent 扩散的每一步去噪，理论上比像素扩散省约 48 倍的计算——而采样要跑几十步，这个节省被<strong>逐步放大</strong>。训练同理：能在相同算力下处理多得多的图、迭代更多步。</p>  <div class="math-block">\[\frac{\text{像素空间维度}}{\text{latent 空间维度}}=\frac{H\cdot W\cdot 3}{(H/f)(W/f)\cdot c}=\frac{3f^2}{c}\overset{f=8,c=4}{=}\;48\]</div>  <p>但下采样因子 <code>f</code> 不是越大越好，它是一个<strong>核心权衡</strong>：</p>  <table>
+    <thead><tr><th>f 取值</th><th>latent 大小</th><th>扩散算力</th><th>重建质量</th></tr></thead>
+    <tbody>
+      <tr><td><code>f=4</code></td><td>128×128（大）</td><td>省得少</td><td>细节保留好</td></tr>
+      <tr><td><strong>f=8</strong>（SD 选择）</td><td>64×64（适中）</td><td>省约 48×</td><td>甜点：质量/算力平衡</td></tr>
+      <tr><td><code>f=16/32</code></td><td>32×32（很小）</td><td>省得多</td><td>细节丢失、解码模糊</td></tr>
+    </tbody>
+  </table>  <p>Rombach 实验发现 <code>f=4~8</code> 是甜点：<code>f</code> 太小（如 1，即像素扩散）几乎不省算力；<code>f</code> 太大（16/32）则 VAE 压得太狠、丢失细节、解码变糊，扩散学得再好也救不回。SD 选 <code>f=8</code> 正是这个平衡点。这也解释了一个现象：<strong>提高生成分辨率，往往是加大 latent（或换更强 VAE），而非简单放大像素</strong>——因为算力账要在 latent 空间算。</p>  <p>这笔账还有一个常被忽略的维度：注意力的成本。去噪骨干里若含自注意力（U-Net 的中段、DiT 的全程，见模块 02），其计算量正比于 token 数的<strong>平方</strong>。在像素空间，token 数 ∝ 像素数，注意力成本爆炸；搬进 latent 后 token 数降为原来的 <code>1/f²</code>，注意力成本降 <code>f⁴</code> 倍（<code>f=8</code> 即约 4096 倍）。所以 latent 化对「Transformer 骨干」的意义<em>远比</em>对卷积骨干更大——这正是为什么 DiT 这种纯注意力骨干几乎只在 latent 空间用，也是 latent 扩散与模块 02 的 DiT 天然互补的深层原因。</p>  <div class="callout warn"><span class="label"></span>
+    <p>还有个隐藏成本常被忽略：VAE 本身要先训练好，而训一个高质量 VAE（感知 + 对抗损失、防止伪影、各通道均衡）相当不平凡。latent 扩散把「生成」的难度降低了，却把一部分难度转移到了「训练好压缩器」上。SD3 论文里关于 16 通道 VAE 的讨论，正是这部分隐藏工作量的体现。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="toy"><span class="num">7</span>把玩具跑起来：最小实现</h2>
+  <h3>把玩具跑起来：latent 扩散的最小实现</h3>  <p>配套 notebook 不加载真实 SD（保持纯 numpy、CPU 秒级），而是搭一个<strong>能完整跑通两阶段的玩具</strong>：</p>  <ol>
+    <li><strong>玩具数据</strong>：把若干「小图」（其实是几十维向量，可视作展平的小 patch）作为我们的「图像」，它们其实活在一个低维子空间里（有冗余可压）。</li>
+    <li><strong>玩具 VAE</strong>：用 PCA / 线性投影当编码器 <code>E</code>（降到 latent 维度），其转置当解码器 <code>D</code>。验证 <code>D(E(x))≈x</code>（重建），且 latent 维度远小于原维度（压缩）。</li>
+    <li><strong>latent DDPM</strong>：在 latent 上实现闭式加噪、一个小去噪网络（甚至闭式最优去噪）、DDPM 采样。验证采样出的 latent 解码后落在数据流形附近。</li>
+  </ol>  <p>通过这个玩具，你会亲手确认本模块的每个论点：<strong>VAE 往返近似恒等</strong>（重建对拍）、<strong>latent 维度远小于像素</strong>（压缩比）、<strong>latent 加噪 == 像素加噪同一公式</strong>（闭式对拍）、<strong>不做 latent 缩放扩散就训不动</strong>（数值现象）、以及<strong>在 latent 上采样 + 解码能还原数据分布</strong>（端到端）。维度小到能 print、能画散点，但每一步都和真实 SD 的逻辑一一对应。</p>  <div class="callout paper"><span class="label"></span>
+    <p>notebook 的玩具 VAE 用线性投影（PCA），真实 SD 用深度卷积 + 感知/对抗损失——结构更复杂，但「编码到低维、解码还原、扩散只在 latent 上」的骨架完全相同。读完想深入，直接看 Rombach 2022 (LDM) 与 diffusers 库的 <code>AutoencoderKL</code> 实现。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>更好的 latent 空间</strong>：VAE 的重建上限直接卡死生成质量。SD3 用 16 通道 VAE 提升细节，但「latent 该多大、几通道、是否该为 DiT/flow 量身设计」仍是开放问题。也有工作探索完全去掉 VAE 的端到端像素 DiT。</li>
+    <li><strong>latent 与扩散的协同设计</strong>：目前 VAE 与扩散分开训、latent 统计被动接受。能否联合优化、或让 VAE 产出「更适合扩散建模」的 latent（如各向同性、流形更平），是活跃方向。</li>
+    <li><strong>单步 / 端到端</strong>：latent 扩散仍需多步采样。把它与少步蒸馏（模块 05）、对抗目标结合，做到「latent + 单步」是实时生成的关键（SDXL-Turbo、LCM 走的就是这条路）。</li>
+    <li><strong>视频与 3D 的 latent</strong>：视频/3D 的冗余更大、压缩潜力更高，但时空一致的 VAE 远比图像难。SoRA 用时空 latent，但高质量视频 VAE 仍是瓶颈。</li>
+    <li><strong>latent 的可解释与可编辑</strong>：latent 空间的几何（插值是否语义连续、方向是否对应概念）尚未被充分理解，直接关系到可控编辑、风格迁移等下游应用。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Rombach 2022《High-Resolution Image Synthesis with Latent Diffusion Models》（LDM/SD 原始论文）；进阶看 SDXL（工程化）、SD3（16 通道 VAE + DiT + flow）、VQGAN（VAE 的感知/对抗训练前身）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_dit/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · Diffusion Transformer (DiT)</div></a>
+  </div>
+
+</div>
+</body>
+</html>

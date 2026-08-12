@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 隐式偏置</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 隐式偏置</h1>
+  <p class="subtitle">可分数据上 GD 的 max-margin 偏置 · 最小范数解 · 平坦极小 · batch/步长的隐式正则——实测过参数 logistic 收敛到 max-margin、GD-from-0 找最小范数</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">线性代数（行空间/零空间、投影、SVD）、SVM 与 logistic 直觉、模块 02 的 GD、模块 03</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_讲解.ipynb（GD→max-margin、GD-from-0→最小范数、平坦度度量、隐式正则）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Soudry 等 2018、Gunasekar 等 2017/2018、Lyu &amp; Li 2020、Woodworth 等 2020、Bartlett 等 2020</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#puzzle">过参数化的核心谜题：那么多零损失解，GD 挑哪个？</a></li>
+      <li><a href="#logistic-margin">可分数据上 GD 的 max-margin 偏置</a></li>
+      <li><a href="#min-norm">最小二乘的最小范数偏置与 GD-from-0</a></li>
+      <li><a href="#flatness-noise">平坦极小与 SGD 的隐式正则</a></li>
+      <li><a href="#regularization-path">把隐式偏置和显式正则、early stopping 连起来</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="puzzle"><span class="num">1</span>过参数化的核心谜题：那么多零损失解，GD 挑哪个？</h2>
+  <p>模块 01 说容量大就该过拟合，模块 05 会展示深度网络<em>确实</em>能拟合随机标签（容量满格）。可它们在真实数据上偏偏泛化得好。模块 03 用 NTK 给了一个答案（宽网络=核回归），但 NTK 只在惰性区精确。本模块给出另一个、更普适的答案：<strong>过参数化下零训练损失的解有无穷多个，但优化算法（GD/SGD）并非随机挑一个——它系统性地偏好其中『简单』的那个。</strong>这种与显式正则项无关的偏好，就是<span class="term">implicit bias</span>（隐式偏置）。</p>
+  <p>这把泛化之谜重新定位：泛化好不好，不只取决于假设类有多大（模块 01），更取决于<strong>优化算法在解集中挑了谁</strong>。算法、损失、参数化共同决定了这个隐式偏好——这是经典「先优化再谈泛化」的二分法彻底失效之处。</p>
+  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：训练集像一道有无穷多组答案的方程。一个学生（GD）总是从『空白』（零初始化）出发、一小步一小步逼近，最后<em>自然而然</em>停在那个『最省力 / 最平滑 / 最对称』的答案上——哪怕没人要求他这样。这个『最省力』的隐含倾向，往往恰好就是泛化好的那个解。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：设零训练损失的解集为 $\mathcal S=\{w:\hat R_n(w)=0\}$（过参数化下是一个高维流形）。GD 从 $w_0$ 出发收敛到的 $w_\infty\in\mathcal S$ 不是任意的——对不同损失/参数化，它收敛到 $\mathcal S$ 中某个特定范数（$\ell_2$、$\ell_1$、核范数……）最小的点，或某个 margin 最大的方向。刻画这个『某个』，就是隐式偏置理论的全部内容。</p></div>
+  </div>
+  <p>为什么这件事如此重要，值得专门一个模块？因为它改写了我们对『正则化』的理解。传统观点里，要让模型泛化必须<strong>主动</strong>加约束：$\ell_2$ 罚项、dropout、数据增强——都是工程师写进损失函数或训练流程的<em>显式</em>手段。隐式偏置说的是：即使你<strong>什么正则都不加</strong>，光是『用 GD 从小初始化出发、训到收敛』这套最朴素的流程，本身就在悄悄施加一种强力正则。换句话说，现代深度学习能在参数远多于数据时仍泛化，很大程度上靠的是这种<em>免费的、自带的</em>正则，而不是我们以为的那些显式技巧。理解它，才能理解为什么『把网络做得更大』常常不仅不过拟合反而更好。</p>
+  <p>还要强调一个常被混淆的点：隐式偏置<strong>不是</strong>某种玄学，它是确定性的、可推导的、可实测的。给定损失函数、优化算法、参数化和初始化，GD 收敛到哪个解是<em>唯一确定</em>的——本章的两个核心结论（max-margin 与最小范数）都有严格证明，且在 notebook 里用 cosine 相似度逼近 1 钉死。它之所以叫『隐式』，只是因为这个偏好没有写在损失函数里，而是从优化<em>动力学</em>里涌现出来的。</p>
+  <div class="callout intuition"><span class="label"></span>
+    <p>本章两个最干净、可证明、可实测的结论：<strong>(1) 可分数据 + logistic/指数损失，GD 方向收敛到 max-margin（hard-SVM）解；(2) 最小二乘 + 从零初始化，GD 收敛到最小 $\ell_2$ 范数插值解。</strong>两者都把『GD 挑了谁』钉成了一个确定的、有几何意义的答案。notebook 会实测 cosine 相似度 → 1，把它们钉死。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="logistic-margin"><span class="num">2</span>可分数据上 GD 的 max-margin 偏置</h2>
+  <p>考虑线性可分数据 + logistic 损失 $\ell(w)=\frac1n\sum_i\log(1+e^{-y_i w^\top x_i})$。可分意味着存在 $w$ 让所有 $y_i w^\top x_i>0$，于是把 $w$ <em>放大</em>损失就更小（永远不到 0）——GD 会让 $\|w_t\|\to\infty$。关键问题是：它沿<strong>哪个方向</strong>发散？</p>
+  <p>[Soudry, Hoffer, Nacson, Gunasekar &amp; Srebro 2018] 的定理：GD（任意正步长）的<strong>方向</strong>收敛到<span class="term">max-margin solution</span>（hard-margin SVM 解）：</p>
+  <div class="math-block">\[\frac{w_t}{\lVert w_t\rVert}\;\xrightarrow{t\to\infty}\;\frac{\hat w}{\lVert\hat w\rVert},\qquad \hat w=\arg\min_{w}\lVert w\rVert_2\ \ \text{s.t.}\ \ y_i\,w^\top x_i\ge 1\ \forall i\]</div>
+  <p>即<strong>把两类分得最开</strong>的那个方向——尽管 logistic 损失里没有任何「最大化间隔」的显式项！更精细的刻画：$w_t=\hat w\log t+O(1)$，所以方向收敛<strong>极慢</strong>（$\|w_t\|$ 增长但归一化误差只以 $1/\log t$ 缩小）。notebook 第 1 节实测：跑足够多步 GD，$\cos(w_t/\|w_t\|,\hat w)\to 0.9997$，与 SVM 方向几乎重合。</p>
+  <h3>为什么是 max-margin？指数尾巴的拔河</h3>  <p>直觉的关键在 logistic（或指数）损失的<strong>尾部形状</strong>。当 $w$ 已经把所有点分对、且范数变大时，$\log(1+e^{-z})\approx e^{-z}$，于是总损失 $\approx\sum_i e^{-y_i w^\top x_i}=\sum_i e^{-\|w\|\cdot\gamma_i}$，其中 $\gamma_i=y_i(w^\top x_i)/\|w\|$ 是第 $i$ 点的归一化间隔。由于是<em>指数</em>，间隔最小的那个点（$\min_i\gamma_i$）的项<strong>压倒性地</strong>主导整个和——其它点的损失相比之下可忽略。GD 为了继续降损失，几乎所有『努力』都花在把这个<em>最难分的点</em>推得更开上。</p>
+  <p>这正是 max-margin 的定义：最大化最小间隔。所以 GD 的极限方向必然让最小间隔尽可能大——即 hard-margin SVM 解。更妙的是，最终只有那几个<strong>恰好取到最小间隔的点</strong>（即<em>支持向量</em>）决定方向，其余点的损失早已指数级地小到不影响梯度。这与 SVM 的 KKT 条件完全吻合：最优解只由支持向量的线性组合张成。于是『一个没有间隔项的损失 + 朴素 GD』和『一个显式最大化间隔的二次规划』给出<em>同一个方向</em>——这是隐式偏置最优雅的范例之一。</p>
+  <div class="ascii">为什么是 max-margin？指数损失的直觉：
+  损失 ≈ sum_i exp(-y_i w.x_i)  (大间隔时)
+  归一化 w 后, 损失被 margin 最小的点主导
+  GD 为继续降损失, 必须把『最难分的点』推得更开
+  极限 = 让最小 margin 最大化 = max-margin 解
+  (KKT: 只有支持向量决定方向, 同 hard-SVM)</div>
+  <div class="callout paper"><span class="label"></span>
+    <p>这个偏置不止线性。[Lyu &amp; Li 2020] 证明同质（含 ReLU）深度网络的 GD 也最大化某种 margin；[Ji &amp; Telgarsky 2019] 把它推到非可分数据与深线性网络，并给出层间对齐现象。[Gunasekar 2018] 进一步发现：<strong>参数化改变隐式范数</strong>——对角线性网络偏好 $\ell_1$、矩阵分解偏好核范数。见 references 的 Soudry 2018（必读）、Gunasekar 2017/2018、Lyu &amp; Li 2020。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="min-norm"><span class="num">3</span>最小二乘的最小范数偏置与 GD-from-0</h2>
+  <p>第二个干净结论在回归侧。过参数化最小二乘（$n<d$，无穷多插值解）：</p>
+  <div class="math-block">\[\min_w \tfrac12\lVert Xw-y\rVert^2,\qquad X\in\mathbb R^{n\times d},\ n<d\]</div>
+  <p>解集是一个仿射子空间 $\{w_0^{LS}+v:v\in\ker X\}$。其中范数最小的解有闭式（<span class="term">min-norm interpolation</span>）：</p>
+  <div class="math-block">\[w_{\min}=X^\top(XX^\top)^{-1}y\;=\;\arg\min_{w:Xw=y}\lVert w\rVert_2\]</div>
+  <p>关键事实：<strong>从零初始化的 GD（及梯度流）恰好收敛到 $w_{\min}$</strong>。原因优雅——GD 的每步更新 $w_{t+1}=w_t-\eta X^\top(Xw_t-y)$ 都在 $X^\top$ 的列空间（=$\ker X$ 的正交补）里，从 $w_0=0$ 出发，迭代<strong>永远停留在行空间</strong>，于是收敛到行空间内的唯一插值解，正是 $w_{\min}$。notebook 第 2 节实测：GD-from-0 与 $w_{\min}$ 的 cosine = 1.0000、范数相等。</p>
+  <p>把这个『停留在行空间』的论证再说透一点，因为它是隐式偏置里最干净的一个机制。梯度 $\nabla\mathcal L(w)=X^\top(Xw-y)$ <strong>永远是 $X$ 各行的线性组合</strong>（$X^\top$ 乘任意向量都落在行空间里）。所以无论走多少步，$w_t-w_0$ 始终是行空间里的向量。当 $w_0=0$ 时，$w_t$ 本身就一直在行空间中。而插值约束 $Xw=y$ 的解集是一条仿射直线，它与行空间<em>恰好交于一点</em>——那一点就是 $w_{\min}$。GD 既被损失逼着走向插值（约束满足），又被动力学锁在行空间里，两者一交，唯一答案就是最小范数解。notebook 第 3 节会直接验证 GD 解在零空间上的投影分量 $\approx 0$，把这个机制钉死。</p>
+  <p>这个结论对<strong>损失函数的形状</strong>其实很宽容：它不要求平方损失，任何只依赖 $Xw$ 的损失（梯度都含 $X^\top$ 因子）在 GD-from-0 下都会停留在行空间。变的是『沿行空间走到哪』——平方损失走到最小 $\ell_2$ 范数插值，logistic/可分情形走到 max-margin 方向（第 2 节），而这两个看似不同的结论其实是同一原理（行空间约束 + 损失尾部形状）的两种体现。理解这点，你就能预判：换损失、换参数化，隐式偏置的『范数』也跟着换——这正是 [Gunasekar 2018] 的核心。</p>
+  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>几何图像：所有插值解排成一条（高维）直线，$w_{\min}$ 是这条线上离原点最近的点（垂足）。GD 从原点出发，因为它只会沿『数据告诉它的方向』（行空间）移动、从不碰『数据没约束的方向』（零空间），所以它笔直走向那个垂足——天然的最小范数。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这解释了过参数化为何能良性：最小范数解是『最平滑 / 最不极端』的插值器。[Bartlett 2020] 的 benign overfitting 精确刻画了线性回归里何时最小范数插值<em>含噪</em>数据仍泛化好（当数据协方差谱『又长又平』，噪声被分散到许多低方差方向）。这把模块 01 的『插值=过拟合』修正成『插值<em>可以</em>良性』。</p></div>
+  </div>
+  <div class="callout warn"><span class="label"></span>
+    <p>初始化位置很重要：上述结论靠 $w_0=0$（或在行空间里）。从一般 $w_0$ 出发，GD 收敛到的是『$w_0$ 在解仿射空间上的投影』，隐式偏置变成『最接近 $w_0$ 的插值解』。这也是为什么初始化尺度能在核区（小位移、最小 RKHS 范数）与富区（特征学习）之间切换（[Woodworth 2020]，模块 03）。隐式偏置 = 算法 + 损失 + 参数化 + 初始化 的联合产物，不是单一因素。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="flatness-noise"><span class="num">4</span>平坦极小与 SGD 的隐式正则</h2>
+  <p>除了范数与 margin，还有一个被广泛认为与泛化相关的几何量：<span class="term">flat minima</span>（平坦极小）——损失地形中曲率小、周围一大片都接近最优的极小点（对比尖锐极小：稍微一动损失就暴涨）。</p>
+  <p>经验规律（[Keskar 2017, Hochreiter &amp; Schmidhuber 1997]）：<strong>平坦极小泛化更好</strong>。直觉有二：(1) 平坦解对参数扰动鲁棒，而测试分布相对训练分布就是一种『扰动』；(2) 平坦 ↔ 描述该解需要的精度低 ↔ 最小描述长度 / PAC-Bayes 复杂度低（模块 05 会把这个直觉形式化）。平坦度常用 Hessian 最大特征值 $\lambda_{\max}(\nabla^2\hat R)$ 或损失对随机扰动的敏感度来度量。</p>
+  <p>SGD 的噪声被认为隐式地<strong>偏向平坦极小</strong>：</p>
+  <ul>
+    <li><strong>大学习率 / 小 batch → 更平坦</strong>：SGD 的梯度噪声方差 $\propto\eta^2/B$（步长平方 / batch 大小）。噪声大时，尖锐极小（窄）『盛不住』在飞的迭代，SGD 被『甩』向更宽的盆地。这是 batch size 影响泛化的一种解释。</li>
+    <li><strong>噪声结构匹配 Hessian</strong>：[Mandt 2017] 把 SGD 看成一个 Ornstein–Uhlenbeck 过程，其稳态分布偏好 Hessian 小（平坦）的区域；[Smith 2021] 推出 SGD 隐式地在损失上加了一个 $\propto\eta\|\nabla\hat R\|^2$ 的梯度惩罚。</li>
+    <li><strong>线性稳定性</strong>：[Wu 2018] 用动力系统稳定性论证：步长 $\eta$ 下 SGD 只能<em>稳定停留</em>在 $\lambda_{\max}\lesssim 2/\eta$ 的极小处，自动排除了过于尖锐的解。</li>
+  </ul>
+  <p>把『平坦极小为何泛化好』和模块 05 的 PAC-Bayes 连起来，能看到它<strong>不只是经验直觉、而有理论根</strong>。PAC-Bayes 界（模块 05）形如 $\text{测试风险}\le\text{训练风险}+\sqrt{\mathrm{KL}(Q\|P)/2n}$，其中 $Q$ 是围绕解的一个分布。平坦极小意味着：可以在解周围放一个<em>很宽</em>的 $Q$（参数扰动大）而训练风险几乎不变——宽 $Q$ 让 $\mathrm{KL}(Q\|P)$ 变小（后验贴近先验），于是界更紧。换句话说，<strong>平坦 = 解能被低精度描述 = 最小描述长度小 = PAC-Bayes 复杂度小</strong>，三者是同一件事的不同语言。这把『平坦泛化好』从口头直觉升级成了可计算的泛化界——正是 [Dziugaite &amp; Roy 2017] 拿到非平凡界的关键，模块 05 会动手算。</p>
+  <p>噪声方差 $\propto\eta^2/B$ 这个公式值得单独拎出来记，因为它把两个工程旋钮（学习率 $\eta$、batch 大小 $B$）和泛化直接挂钩。它解释了一个广为人知的经验现象：<strong>大 batch 训练常泛化更差</strong>——$B$ 变大使噪声方差变小，SGD 更容易掉进尖锐极小。它也预测了『线性缩放规则』：同时放大 $\eta$ 和 $B$（保持 $\eta/B$ 或 $\eta^2/B$ 某种组合不变）能在改 batch 时大致保住泛化行为。这是隐式偏置理论少有的、能直接指导调参的定量推论之一。</p>
+  <p>notebook 第 3 节用一个可控的双井损失实测：从同一点出发，<strong>大噪声 SGD 更常停在平坦井</strong>、小噪声 SGD 更易困在尖锐井，并用『损失对随机扰动的平均涨幅』把『平坦度』量成数字。</p>
+  <div class="callout danger"><span class="label"></span>
+    <p>一个重要的<strong>警告</strong>：『平坦』不是参数化无关的！[Dinh 2017, <em>Sharp minima can generalize</em>] 指出：通过重参数化（如对 ReLU 网络逐层缩放 $w\to\alpha w,\ w'\to w'/\alpha$，函数不变）可以把任意平坦极小变得任意尖锐。所以朴素的 Hessian 谱平坦度<em>不能</em>单独解释泛化——必须用尺度不变的度量（如 PAC-Bayes 里相对于参数尺度归一化的平坦度）。这是『平坦=好』直觉的真实边界，研究中仍在打磨正确的度量。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="regularization-path"><span class="num">5</span>把隐式偏置和显式正则、early stopping 连起来</h2>
+  <p>隐式偏置不是孤立现象，它和我们熟悉的显式正则有深刻对应：</p>
+  <table>
+    <thead><tr><th>机制</th><th>效果</th><th>对应的隐式偏置</th></tr></thead>
+    <tbody>
+      <tr><td>显式 $\ell_2$ 正则（weight decay）</td><td>解集变唯一，偏好小 $\ell_2$ 范数</td><td>= GD-from-0 在最小二乘上的极限偏好</td></tr>
+      <tr><td>early stopping（早停）</td><td>训练不到收敛就停</td><td>≈ $\ell_2$ 正则（沿 GD 轨迹范数随 $t$ 增长，早停 = 限制范数）</td></tr>
+      <tr><td>大学习率 / 小 batch</td><td>更大梯度噪声</td><td>偏向平坦极小（隐式平坦正则）</td></tr>
+      <tr><td>参数化（架构）选择</td><td>改变可达解的几何</td><td>改变隐式范数（对角网络→$\ell_1$，矩阵分解→核范数）</td></tr>
+      <tr><td>归一化层 / 重缩放对称</td><td>改变损失地形几何</td><td>改变『平坦』的尺度与有效学习率</td></tr>
+    </tbody>
+  </table>
+  <p>特别值得记的是 <span class="term">early stopping</span> ↔ $\ell_2$ 的对应：在最小二乘上，GD 第 $t$ 步的解恰好等于岭回归在某个 $\lambda(t)\propto1/(\eta t)$ 下的解（沿『正则化路径』移动）。训练越久 ↔ $\lambda$ 越小 ↔ 范数越大 ↔ 越接近插值。早停 = 在路径上停在一个非零 $\lambda$ 处 = 隐式的 $\ell_2$ 正则。这把『训练多久』直接翻译成『正则多强』，是隐式偏置最实用的一个推论。</p>
+  <p>这个对应可以从特征值的角度看得更具体。把数据做奇异值分解，GD 在第 $k$ 个特征方向上的收敛速度正比于该方向的特征值 $\sigma_k^2$：大特征值（信号强）的方向<strong>很快</strong>就被学到，小特征值（常是噪声）的方向<strong>很慢</strong>。训练第 $t$ 步时，只有 $\sigma_k^2\gtrsim1/(\eta t)$ 的方向被充分拟合，其余方向还几乎是初始值（0）——这正是岭回归 $\lambda\approx1/(\eta t)$ 的<em>滤波</em>效果：保留大特征值方向、压制小特征值方向。于是早停『天然地先学信号、后学噪声』，停在恰当时刻就等于做了恰当强度的 $\ell_2$ 正则。这也和 C14 的 grokking、本课模块 03 的 NTK 谱偏置（大特征值方向先收敛）是同一个『谱滤波』直觉。</p>
+  <p>退一步看，本节这张对应表传递的核心信息是：<strong>『正则化』在现代深度学习里不再只是损失函数里的一项，而是弥散在整个训练流程中的。</strong>学习率、batch 大小、训练时长、初始化尺度、网络架构——每一个看似只关乎『怎么训』的选择，其实都在<em>暗中</em>决定『最终挑哪个解』，因而都在影响泛化。这解释了为什么深度学习的调参如此微妙：你调的从来不只是优化效率，而是隐式正则的强度与方向。把这些隐式旋钮显式地理解出来，正是隐式偏置这个领域的实践价值所在。</p>
+  <div class="callout intuition"><span class="label"></span>
+    <p>把模块 03 和 04 合起来看深度泛化的两条解释线：(1) <strong>NTK 线</strong>（模块 03）：宽网络 = 固定核回归，泛化由 NTK 的 RKHS 范数控制；(2) <strong>隐式偏置线</strong>（本模块）：GD 在解集中挑最小范数 / max-margin / 平坦解。两条线在 lazy 区其实一致（核回归解 = 最小 RKHS 范数插值）；在富区（特征学习）只剩隐式偏置线有效。所以隐式偏置是更普适的视角，模块 05 的 margin 界与 PAC-Bayes 界正是想把它<em>量化</em>成泛化界。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">6</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>深度非线性网络的隐式偏置</strong>：线性 / 同质网络的隐式偏置已较清楚，但一般深度 ReLU 网络收敛到的解的<em>精确</em>刻画仍开放。什么范数 / 复杂度被隐式最小化？[Vardi 2023] 综述了已知与未知。</li>
+    <li><strong>SGD 噪声的精确作用</strong>：噪声偏向平坦极小的『偏好』有多强、与 batch/步长的定量关系、以及它何时<em>有害</em>（如标签噪声记忆），仍在研究。SDE 近似 [Li 2017] 与其有效性边界是热点。</li>
+    <li><strong>正确的平坦度度量</strong>：在 [Dinh 2017] 的重参数化反例下，寻找尺度不变、与泛化真正因果相关的平坦度度量（sharpness-aware minimization / SAM [Foret 2021] 直接优化它，效果好但理论不全）是活跃方向。</li>
+    <li><strong>隐式偏置 ↔ 泛化界的桥</strong>：知道 GD 挑最小范数解，能否<em>直接</em>代入范数依赖的泛化界（模块 05）得到非平凡保证？对线性 / 核情形可以，对深度网络这座桥还没完全搭通。</li>
+    <li><strong>超越梯度的偏置</strong>：Adam、带动量、带 weight decay 的优化器各自的隐式偏置不同（[Wang 2021]），且常与 SGD 不同——这可能部分解释优化器选择对泛化的影响。</li>
+  </ul>
+  <div class="card"><strong>✅ 本章你应该能回答：</strong>  <ol>
+    <li>过参数化下为什么『能拟合训练集』不足以谈泛化？隐式偏置把问题重新定位成什么？</li>
+    <li>可分数据 + logistic 损失，GD 的方向收敛到什么解？为什么（指数损失被最小 margin 点主导）？收敛多慢？</li>
+    <li>最小二乘 + 从零 GD 收敛到哪个解？为什么（迭代停留在行空间）？写出最小范数解的闭式。</li>
+    <li>为什么平坦极小被认为泛化好？SGD 如何隐式偏向平坦解？[Dinh 2017] 的警告是什么？</li>
+    <li>early stopping 为什么 ≈ $\ell_2$ 正则？隐式偏置和 NTK 视角（模块 03）在 lazy / 富区如何关联？</li>
+  </ol></div>
+
+  <div class="pager">
+    <a class="prev" href="../03_ntk_infinite_width/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · NTK 与无限宽</div></a>
+    <a class="next" href="../05_generalization_deep/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 深度泛化</div></a>
+  </div>
+
+</div>
+</body>
+</html>

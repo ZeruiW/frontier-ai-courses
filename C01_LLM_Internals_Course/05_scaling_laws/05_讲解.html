@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · Scaling Laws：亲手拟合</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · Scaling Laws：亲手拟合</h1>
+  <p class="subtitle">Scaling Laws —— 训练大模型之前，先在小模型上把那条直线画出来</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 03 的 mini-GPT 训练循环、幂函数与对数、最小二乘拟合</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_scaling_laws.ipynb（真跑 8 个小模型，约 5 分钟）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Kaplan 2020、Hoffmann 2022 (Chinchilla)、Muennighoff 2023</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 20 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#thermo">LLM 时代的"热力学"：投入产出可预测</a></li>
+      <li><a href="#kaplan">Kaplan 2020 三定律：L(N)、L(D)、L(C)</a></li>
+      <li><a href="#flops">FLOPs 记账：C ≈ 6ND 的推导</a></li>
+      <li><a href="#chinchilla">Chinchilla 修正：联合定律与 D/N ≈ 20</a></li>
+      <li><a href="#overtrain">"过训练"的经济学：训练最优 ≠ 推理最优</a></li>
+      <li><a href="#data-constrained">数据受限 scaling：重复 epoch 的边际衰减</a></li>
+      <li><a href="#eval">评测视角：下游能力的 scaling 不平滑</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="thermo"><span class="num">1</span>LLM 时代的"热力学"：投入产出可预测</h2>
+
+  <p>训练一个 frontier 模型要花数千万到数亿美元的算力。在按下"训练"键之前，你必须能回答：
+  <strong>"花这么多算力，loss 能降到多少？"</strong>
+  <span class="term">Scaling laws</span>（缩放定律）给出的答案是：语言模型的测试损失随参数量、数据量、算力的增长，
+  遵循<strong>平滑、可外推的幂律</strong>。这意味着你可以先训一批便宜的小模型，把规律拟合出来，
+  再外推预测大模型的表现 —— 这正是 GPT-4 技术报告里"用万分之一算力的小模型预测最终 loss"的做法，
+  也是本模块 notebook 里你要亲手复刻的实验。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>把模型放大一倍、数据加一倍、算力加一倍，loss 会降多少？scaling law 说：这不是玄学，
+      是一条在 log-log 坐标下笔直的线。小模型上量出这条线的斜率，就能预测大模型落在哪里。
+      它不告诉你<em>为什么</em>模型会变好，只告诉你<em>会变好多少</em> —— 像热力学不解释分子细节，
+      却能精确预言宏观行为。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设交叉熵测试损失为 $L$，非嵌入参数量为 $N$，训练 token 数为 $D$，训练算力为 $C$（FLOPs）。
+      经验上，在各自不成为瓶颈的区间内，$L$ 关于 $N$、$D$、$C$ 分别近似服从幂律
+      $L(x) \propto x^{-\alpha}$（外加不可约项），且该规律横跨多个数量级保持稳定 [Kaplan 2020]。
+      幂律的尺度不变性使得小尺度测量可以外推到大尺度。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>为什么这件事重要到值得单独一个模块？</strong>三个理由：
+  ① 它是大模型<strong>预算决策</strong>的物理定律 —— 给定算力，参数和数据怎么分（§4）；
+  ② 它是<strong>能力预测</strong>的基础 —— 评测科学家用它回答"下一代模型会有多强"（§7）；
+  ③ 它的失效处恰恰是研究前沿 —— 下游能力的"涌现"争论、数据墙、推理时算力（§7–8）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="kaplan"><span class="num">2</span>Kaplan 2020 三定律：L(N)、L(D)、L(C)</h2>
+
+  <p>[Kaplan 2020] 系统地训练了一批从 768 参数到 1.5B 参数的 Transformer 语言模型，
+  发现当其他因素不构成瓶颈时，损失关于单一变量服从幂律：</p>
+
+  <div class="math-block">
+  $$ L(N) = \left(\frac{N_c}{N}\right)^{\alpha_N}, \qquad
+     L(D) = \left(\frac{D_c}{D}\right)^{\alpha_D}, \qquad
+     L(C_{\min}) = \left(\frac{C_c}{C_{\min}}\right)^{\alpha_C} $$
+  </div>
+
+  <p>三个定律各自的适用条件与测得的指数：</p>
+
+  <table>
+    <thead><tr><th>定律</th><th>固定/不设限的条件</th><th>Kaplan 测得指数</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>$L(N)$</td><td>数据无限、训到收敛</td><td>$\alpha_N \approx 0.076$</td><td>参数量翻 10 倍，loss 乘以 $10^{-0.076}\approx 0.84$</td></tr>
+      <tr><td>$L(D)$</td><td>模型足够大、用 early stopping</td><td>$\alpha_D \approx 0.095$</td><td>数据翻 10 倍，loss 乘以 $\approx 0.80$</td></tr>
+      <tr><td>$L(C_{\min})$</td><td>算力固定，N/D/步数自由调到最优</td><td>$\alpha_C \approx 0.050$</td><td>算力翻 10 倍，loss 乘以 $\approx 0.89$</td></tr>
+    </tbody>
+  </table>
+
+  <h3>幂律为什么在 log-log 图上是直线？</h3>
+
+  <p>对 $L = A\,N^{-\alpha}$ 两边取对数：</p>
+
+  <div class="math-block">
+  $$ \log L = \log A - \alpha \log N $$
+  </div>
+
+  <p>即 $\log L$ 是 $\log N$ 的线性函数：<strong>斜率 $=-\alpha$，截距 $=\log A$</strong>。
+  这就是为什么 scaling law 论文里清一色 log-log 图 —— 幂律变直线，斜率一眼可读，外推就是延长直线。
+  反过来，<strong>"log-log 下近似直线"也是判断一组实验是否服从幂律的第一道目测检验</strong>。
+  注意指数律 $L=e^{-kN}$ 在 log-log 下是下凹曲线而非直线，两者不可混淆。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  实际拟合时损失通常写成 $L(N) = A N^{-\alpha} + E$，带一个<strong>不可约损失</strong>（irreducible loss）$E$
+  —— 语言本身的熵决定了 loss 不可能降到 0。带 $E$ 之后 log-log 图在大 $N$ 端会<strong>弯向水平渐近线</strong>，
+  不再是纯直线。拟合时若忽略 $E$，会系统性低估 $\alpha$。notebook 里我们用
+  <code>curve_fit</code> 直接拟合三参数形式。</div>
+
+  <div class="callout paper"><span class="label"></span>
+  [Kaplan 2020] 还有两个常被引用的结论：① 在他们的设定下，<strong>模型形状（深宽比、头数）影响远小于总参数量</strong>
+  —— 同样的 $N$，瘦高与矮胖差别不大；② 大模型<strong>样本效率更高</strong>：达到同样 loss，
+  大模型需要的数据与步数更少 —— 由此他们建议"算力增长时主要加参数、少加数据"。
+  这个建议后来被 Chinchilla 推翻，见 §4。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="flops"><span class="num">3</span>FLOPs 记账：C ≈ 6ND 的推导</h2>
+
+  <p>要谈"算力怎么分"，先得会算"训练花了多少算力"。整个 scaling law 文献用同一个记账近似：
+  <strong>训练总算力 $C \approx 6ND$ FLOPs</strong>（$N$ 个参数、$D$ 个训练 token）。来源拆解如下。</p>
+
+  <h3>前向：每 token 每参数 ≈ 2 FLOPs</h3>
+
+  <p>Transformer 的计算量几乎全部来自<strong>矩阵乘法</strong>。一个 $d_{in}\times d_{out}$ 的权重矩阵
+  对单个 token 做一次前向，要做 $d_{in}\cdot d_{out}$ 次乘法和 $d_{in}\cdot d_{out}$ 次加法
+  —— 每个参数贡献 1 乘 + 1 加 = <strong>2 FLOPs</strong>。把所有矩阵加起来，每 token 前向
+  $\approx 2N$ FLOPs。逐项验证（单层、隐藏维 $d$，MLP 放大 4 倍）：</p>
+
+  <table>
+    <thead><tr><th>组件</th><th>参数量</th><th>每 token 前向 FLOPs</th></tr></thead>
+    <tbody>
+      <tr><td>QKV 投影</td><td>$3d^2$</td><td>$6d^2$</td></tr>
+      <tr><td>输出投影 $W_O$</td><td>$d^2$</td><td>$2d^2$</td></tr>
+      <tr><td>MLP 上/下投影</td><td>$8d^2$</td><td>$16d^2$</td></tr>
+      <tr><td><strong>合计（每层）</strong></td><td>$12d^2$</td><td>$24d^2 = 2\times(12d^2)$ ✓</td></tr>
+    </tbody>
+  </table>
+
+  <p>注意被这个近似<strong>忽略</strong>的部分：attention 分数 $QK^\top$ 与加权和 $\mathrm{softmax}\cdot V$
+  的计算量是每层每 token $\approx 4Td$（$T$ 为上下文长），不含参数，故不计入 $2N$。
+  当 $T \ll 6d$ 时忽略是安全的；长上下文（$T$ 上十万）时这项不可忽略，记账要修正。</p>
+
+  <h3>反向：≈ 2 倍前向，即每 token 每参数 ≈ 4 FLOPs</h3>
+
+  <p>反向传播对每个矩阵乘法 $y = Wx$ 要算<strong>两个</strong>梯度，每个都是一次同规模的矩阵乘法：</p>
+
+  <div class="math-block">
+  $$ \underbrace{\frac{\partial \mathcal{L}}{\partial x} = W^\top \frac{\partial \mathcal{L}}{\partial y}}_{\text{传给下一层，}\approx 2N \text{ FLOPs}} \qquad
+     \underbrace{\frac{\partial \mathcal{L}}{\partial W} = \frac{\partial \mathcal{L}}{\partial y}\, x^\top}_{\text{更新权重用，}\approx 2N \text{ FLOPs}} $$
+  </div>
+
+  <p>所以反向 $\approx 4N$，前向 + 反向每 token $\approx 6N$，乘上 $D$ 个 token：</p>
+
+  <div class="math-block">
+  $$ C \;\approx\; \underbrace{2ND}_{\text{forward}} + \underbrace{4ND}_{\text{backward}} \;=\; 6ND $$
+  </div>
+
+  <div class="ascii">
+  每个参数 w，每个训练 token 的"账单"：
+
+   forward   y = Wx          1 乘 + 1 加          = 2 FLOPs
+   backward  ∂L/∂x = Wᵀ·∂L/∂y   1 乘 + 1 加       = 2 FLOPs
+   backward  ∂L/∂W = ∂L/∂y·xᵀ   1 乘 + 1 加       = 2 FLOPs
+   ─────────────────────────────────────────────────────────
+   合计                                            6 FLOPs / param / token
+   总账：C ≈ 6 · N (参数) · D (token)
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>量级直觉值得背下来</strong>：$N=10^9$（1B 参数）、$D=2\times 10^{10}$（20B token）
+  $\Rightarrow C = 6\times 10^9 \times 2\times 10^{10} = 1.2\times 10^{20}$ FLOPs。
+  一块持续 $10^{14}$ FLOP/s（100 TFLOP/s 有效吞吐）的 GPU 要跑 $1.2\times10^6$ 秒 ≈ 14 天。
+  notebook 练习 1 就是把这套记账写成函数并 assert 量级。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="chinchilla"><span class="num">4</span>Chinchilla 修正：联合定律与 D/N ≈ 20</h2>
+
+  <h3>Kaplan 的偏差从哪来</h3>
+
+  <p>Kaplan 的结论"算力增长时几乎只加参数"导致了 GPT-3（175B 参数、仅 300B token）这类
+  "大而欠训"的模型。[Hoffmann 2022] 重做实验后发现 Kaplan 的配比有系统性偏差，主要来源是
+  <strong>learning rate schedule 没有对齐</strong>：Kaplan 对所有训练时长复用同一条（按固定总步数设计的）
+  cosine 衰减曲线，并读取<strong>中间步</strong>的 loss 当作"训练 $D'$ 个 token 的结果"。
+  但 cosine schedule 只有在<strong>衰减周期恰好等于实际训练长度</strong>时才发挥全部效果 ——
+  中间截读的 loss 系统性偏高，且对小 $D$ 偏差更大，这使"小数据预算"的点显得比真实更差，
+  拟合出的最优配比被推向"重参数、轻数据"。Hoffmann 为每个 (N, D) 组合单独设置与训练长度匹配的
+  schedule，偏差消除后结论反转。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  这是一节<strong>实验方法论课</strong>：两篇顶级论文用几乎相同的方法得出相反的资源分配结论，
+  根因只是一个超参 schedule 的混杂变量。做评测/做 scaling 实验时，<strong>任何随"被扫描变量"
+  本应调整的超参（lr schedule、warmup、batch size）若没有对齐，外推结论都可能整体歪掉</strong>。</div>
+
+  <h3>联合定律 L(N, D)</h3>
+
+  <p>Hoffmann 用三种方法（固定 N 扫 D、iso-FLOP 曲线、参数化拟合）交叉验证。第三种方法把损失
+  参数化为：</p>
+
+  <div class="math-block">
+  $$ L(N, D) \;=\; E \;+\; \frac{A}{N^{\alpha}} \;+\; \frac{B}{D^{\beta}} $$
+  </div>
+
+  <p>三项各有清晰语义：$E$ 是数据分布的不可约熵；$A/N^\alpha$ 是<strong>模型容量不足</strong>带来的损失
+  （参数有限，无法完美逼近真实分布）；$B/D^\beta$ 是<strong>数据/优化不足</strong>带来的损失
+  （样本有限，没训到该容量的极限）。Hoffmann 拟合得
+  $E=1.69,\ A=406.4,\ B=410.7,\ \alpha=0.34,\ \beta=0.28$。</p>
+
+  <h3>Compute-optimal 配比的完整推导</h3>
+
+  <p>问题：给定算力预算 $C = 6ND$，如何分配 $N$ 和 $D$ 使 $L(N,D)$ 最小？
+  <strong>代入法</strong>：用约束消去 $D = C/(6N)$，对 $N$ 求导：</p>
+
+  <div class="math-block">
+  $$ L(N) = E + A N^{-\alpha} + B\left(\frac{6N}{C}\right)^{\beta}, \qquad
+     \frac{dL}{dN} = -\alpha A N^{-\alpha-1} + \beta B \left(\frac{6}{C}\right)^{\beta} N^{\beta-1} \overset{!}{=} 0 $$
+  </div>
+
+  <p>整理得 $\alpha A N^{-\alpha} = \beta B (6N/C)^{\beta} = \beta B D^{-\beta}$，
+  也就是最优点处<strong>两个损失项的"边际贡献"相等</strong>（这正是拉格朗日条件
+  $\nabla L = \lambda \nabla (6ND)$ 消去 $\lambda$ 后的结果）。解出：</p>
+
+  <div class="math-block">
+  $$ N^*(C) = G \left(\frac{C}{6}\right)^{\frac{\beta}{\alpha+\beta}}, \qquad
+     D^*(C) = G^{-1} \left(\frac{C}{6}\right)^{\frac{\alpha}{\alpha+\beta}}, \qquad
+     G = \left(\frac{\alpha A}{\beta B}\right)^{\frac{1}{\alpha+\beta}} $$
+  </div>
+
+  <p>代入 $\alpha=0.34,\ \beta=0.28$：$\frac{\beta}{\alpha+\beta}\approx 0.45$、
+  $\frac{\alpha}{\alpha+\beta}\approx 0.55$ —— 两个指数都接近 $0.5$，即
+  <strong>算力翻 10 倍时，参数和数据都应各翻约 $\sqrt{10}\approx 3.2$ 倍，等比例增长</strong>。
+  这推翻了 Kaplan 的"参数优先"（Kaplan 等效于 $N \propto C^{0.73},\ D \propto C^{0.27}$）。</p>
+
+  <table>
+    <thead><tr><th></th><th>Kaplan 2020</th><th>Hoffmann 2022 (Chinchilla)</th></tr></thead>
+    <tbody>
+      <tr><td>$N^* \propto$</td><td>$C^{0.73}$</td><td>$C^{\approx 0.5}$</td></tr>
+      <tr><td>$D^* \propto$</td><td>$C^{0.27}$</td><td>$C^{\approx 0.5}$</td></tr>
+      <tr><td>口号</td><td>"加算力 ≈ 加参数"</td><td>"参数与数据等比例增长"</td></tr>
+      <tr><td>代表产物</td><td>GPT-3：175B 参数 / 300B token</td><td>Chinchilla：70B 参数 / 1.4T token</td></tr>
+    </tbody>
+  </table>
+
+  <p>iso-FLOP 法（方法 2）给出的经验规则是著名的 <strong>$D^*/N^* \approx 20$</strong>：
+  Chinchilla 用与 Gopher（280B）相同的算力 $C \approx 5.76\times 10^{23}$ 训了 70B 参数 × 1.4T token
+  （恰好 $1.4\times10^{12} / 7\times10^{10} = 20$），全面超过 Gopher。
+  注意从联合定律推出的 $D^*/N^* = G^{-2} (C/6)^{(\alpha-\beta)/(\alpha+\beta)}$ 只有在
+  $\alpha=\beta$ 时才是与 $C$ 无关的常数 —— "每参数 20 token"是 iso-FLOP 谷底连线给出的
+  <strong>经验法则</strong>，与参数化拟合版本（用公布常数算出的比值更大、且随 $C$ 缓慢变化）并不严格一致。
+  Hoffmann 论文内部三种方法本身就有这种量级一致、细节分歧的特征，后续复现工作也确认了
+  公布常数与"≈20"之间的张力。notebook 的 Chinchilla 计算器会让你两个版本各算一遍，亲眼看到差异。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="overtrain"><span class="num">5</span>"过训练"的经济学：训练最优 ≠ 推理最优</h2>
+
+  <p>读 Chinchilla 时最容易犯的错误，是把"compute-optimal"理解成"应该这么训"。准确表述是：
+  <strong>Chinchilla 最优只在"给定训练算力、最小化 loss"这个目标下成立 ——
+  它没有把推理成本计入目标函数。</strong></p>
+
+  <p>推理阶段每生成一个 token 的成本 $\approx 2N$ FLOPs（只有前向），与训练数据量 $D$ 无关。
+  一个要服务数亿用户、生命周期内生成 $D_{inf}$ 个 token 的模型，总成本是：</p>
+
+  <div class="math-block">
+  $$ C_{total} \;\approx\; \underbrace{6ND}_{\text{一次性训练}} \;+\; \underbrace{2N D_{inf}}_{\text{持续推理}} $$
+  </div>
+
+  <p>当 $D_{inf}$ 很大时，$N$ 的权重远超训练阶段 —— <strong>最优解向"更小的 N、更大的 D"移动</strong>：
+  多花训练算力把小模型"过训练"（<span class="term">over-training</span>，即 $D/N \gg 20$），
+  换取生命周期内每次推理都更便宜。这正是 Llama 系列的逻辑：Llama-1 7B 训了 1T token（$D/N\approx 140$），
+  Llama 3 8B 训到 15T token（$D/N\approx 1875$，约 Chinchilla 配比的 90 倍）——
+  按 Chinchilla 标准严重"浪费"训练算力，按总成本核算却非常划算，
+  且 loss 仍在沿 $L(D)$ 幂律缓慢下降，远未饱和。</p>
+
+  <table>
+    <thead><tr><th>模型</th><th>N</th><th>D</th><th>D/N</th><th>优化目标</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-3</td><td>175B</td><td>0.3T</td><td>≈1.7</td><td>Kaplan 配比（欠训练）</td></tr>
+      <tr><td>Chinchilla</td><td>70B</td><td>1.4T</td><td>20</td><td>训练算力最优</td></tr>
+      <tr><td>Llama 3 8B</td><td>8B</td><td>15T</td><td>≈1875</td><td>训练+推理总成本（过训练）</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  一句话总结资源分配的演化：<strong>Kaplan 说"加参数"，Chinchilla 说"参数数据各一半"，
+  推理经济学说"小模型往死里训"</strong>。三者没有对错之分，只是目标函数不同 ——
+  看到任何"最优配比"结论，先问它的目标函数和约束是什么。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="data-constrained"><span class="num">6</span>数据受限 scaling：重复 epoch 的边际衰减</h2>
+
+  <p>Chinchilla 配比外加过训练潮流，使数据需求爆炸式增长 —— 高质量文本总量却有限（"数据墙"）。
+  当<strong>独特数据量 $U$ 固定、算力还有富余</strong>时怎么办？[Muennighoff 2023] 系统研究了
+  "重复数据训多个 epoch"的收益曲线，把联合定律推广为<strong>数据受限 scaling law</strong>：
+  重复的 token 不再等价于新 token，其有效价值随重复次数指数衰减。有效数据量可写成：</p>
+
+  <div class="math-block">
+  $$ D_{e\!f\!f} \;=\; U \;+\; U\, R^*\left(1 - e^{-R/R^*}\right), \qquad R = \text{重复 epoch 数}, \;\; R^* \approx 15 $$
+  </div>
+
+  <p>即第 1 个 epoch 价值是满的；之后每个 epoch 的边际价值按 $e^{-R/R^*}$ 衰减，
+  总有效数据被上界 $U(1+R^*)$ 封顶 —— <strong>重复再多，也榨不出超过约 16 倍独特数据的价值</strong>。
+  两个可直接用于训练决策的经验结论：</p>
+
+  <ul>
+    <li><strong>约 4 个 epoch 以内，重复数据几乎与新数据等价</strong>（loss 差异可忽略）；</li>
+    <li><strong>到约 16 个 epoch 后，追加重复的边际价值趋近于零</strong> —— 继续堆算力应转投参数或数据工程（过滤、混配），而不是更多 epoch。</li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  [Muennighoff 2023] 的另一个反直觉发现：数据受限时，compute-optimal 解会偏离 Chinchilla ——
+  与其按 $D/N\approx20$ 配一个更大的模型，不如<strong>用比 Chinchilla 更小的模型多跑几个 epoch</strong>；
+  且在数据极度受限时，把一部分预算换成代码等"另类数据"或做困惑度过滤，比硬重复更有效。
+  这条定律是当下"合成数据 / 数据配方"研究热潮的定量背景。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>评测视角：下游能力的 scaling 不平滑</h2>
+
+  <p>前面所有定律的因变量都是<strong>预训练 loss</strong>。但评测科学家真正关心的是下游能力：
+  数学、代码、多步推理、危险能力。坏消息是：<strong>loss 平滑可预测 ≠ 下游分数平滑可预测</strong>。</p>
+
+  <h3>Emergent abilities 之争：度量 artifact 还是真涌现？</h3>
+
+  <p><span class="term">Emergent abilities</span>（涌现能力）的原始主张（Wei et al. 2022,
+  <em>Emergent Abilities of Large Language Models</em>）：某些任务（多位数算术、多步推理等）的准确率
+  在小模型上贴着随机水平，跨过某个规模后突然跃升 —— 不可由小模型外推预测。
+  反方（Schaeffer et al. 2023, <em>Are Emergent Abilities of Large Language Models a Mirage?</em>）指出
+  这很大程度是<strong>度量选择的 artifact</strong>：</p>
+
+  <ul>
+    <li>exact-match / 多选准确率是对底层连续能力的<strong>非线性、不连续变换</strong>：
+    一道 5 位数加法要求每个 token 都对，单 token 正确率 $p$ 平滑上升时，全对概率 $\approx p^{k}$
+    在阈值附近表现为陡峭跃升；</li>
+    <li>换成连续度量（target 序列的 log-likelihood、token 级编辑距离），同样的模型族曲线立刻变得平滑、可外推；</li>
+    <li>小模型区间的分数贴在随机基线（floor）上，本身就把幂律信号压没了。</li>
+  </ul>
+
+  <p>目前的共识大致是：<strong>许多"涌现"在连续度量下消失，但这不等于跃变不重要</strong> ——
+  部署世界里 exact-match 才是用户体验（代码要能跑、算术要全对），离散度量下的真实跃变依然是
+  安全评测必须面对的现象；且少数能力（如某些 in-context 技巧）即使换度量也难以完全平滑化。
+  这场争论本身就是"度量选择决定科学结论"的最佳教材。</p>
+
+  <h3>用小模型预测大模型分数：实践与陷阱</h3>
+
+  <p>能力预测（capability forecasting）的标准做法：训练/收集一族不同规模的模型，在目标 benchmark 上测分，
+  拟合"分数 vs 算力（或 loss）"曲线后外推。GPT-4 技术报告对 HumanEval 的预测、
+  各 frontier lab 的训前安全评估（以及 METR 这类评测组织的危险能力预测）都依赖这套方法。常见陷阱：</p>
+
+  <table>
+    <thead><tr><th>陷阱</th><th>机制</th><th>缓解</th></tr></thead>
+    <tbody>
+      <tr><td>floor/ceiling 压缩</td><td>分数贴着随机基线或 100% 时，拟合无信号</td><td>减去随机基线、用 logit 变换或连续度量</td></tr>
+      <tr><td>度量不连续</td><td>exact-match 把平滑能力变成阶跃</td><td>改用 log-likelihood / pass@k 连续代理，再映射回离散分数</td></tr>
+      <tr><td>外推距离过远</td><td>幂律只在测量区间内可信，机制切换（如工具使用）会破坏外推</td><td>报告预测区间；多锚点交叉验证</td></tr>
+      <tr><td>数据污染</td><td>大模型见过测试集，分数虚高且随规模系统性放大</td><td>污染检测 + 留出新鲜测试集</td></tr>
+      <tr><td>post-training 干扰</td><td>RLHF/蒸馏改变 loss→能力 的映射，预训练 scaling 外推失效</td><td>对齐前后分开建模</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger"><span class="label"></span>
+  对安全评测而言，<strong>"不可预测"本身就是风险</strong>：如果危险能力（自主复制、说服、网络攻击）
+  像离散度量下的涌现那样跃升，训前预测就会系统性漏报。这也是为什么前沿实验室的 responsible scaling
+  政策要求在训练<strong>过程中</strong>设置评测检查点，而不是只在训前外推一次。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>推理时间 scaling（inference-time / test-time compute）</strong>：在固定权重上花更多推理算力
+    （长思维链、多采样+验证、搜索）也呈现自己的 scaling 曲线，且与训练算力之间存在可交换区间 ——
+    "小模型 + 多想几步"在某些任务上等价于"大模型一步答"。训练/推理算力的联合最优分配是开放问题；
+    对评测的冲击：<strong>能力不再由权重唯一决定，报告分数必须同时报告推理预算</strong>。</li>
+    <li><strong>数据质量 vs 数量</strong>：scaling law 的常数项（$A$、$B$、$E$）依赖数据分布 ——
+    更好的过滤/混配/合成数据等价于把整条曲线下移。"用 1/10 的精选数据达到同样 loss"类的结果不断出现，
+    数据工程正在从工程实践变成有定量定律的研究方向（§6 是其起点）。</li>
+    <li><strong>Scaling 实验的可复现性</strong>：Chinchilla 公布常数与其自身经验法则的张力（§4）、
+    不同 tokenizer/数据分布下指数是否可迁移，仍缺乏标准化的报告规范 —— scaling 实验本身需要"评测科学"。</li>
+    <li><strong>下游能力的可预测性边界</strong>：哪些能力类（知识检索 vs 多步规划）在什么度量下可由
+    小模型外推？能否为"外推可信半径"给出统计保证？这是能力预测作为安全工具能否成立的核心。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>从矩阵乘法出发推导 $C\approx 6ND$：前向的 2 和反向的 4 各来自哪里？哪些计算被这个近似忽略了？</li>
+      <li>写出 Chinchilla 联合定律 $L(N,D)$，并用代入法完整推出 $N^*(C)$、$D^*(C)$ 与 $G$ 的表达式。</li>
+      <li>Kaplan 与 Hoffmann 的配比结论为何相反？这个偏差对你设计 scaling/评测实验有什么方法论启示？</li>
+      <li>为什么 Llama 系列故意违反 Chinchilla 配比？为什么 emergent abilities 可能是度量选择的 artifact？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../04_decoding/04_讲解.html"><div class="dir">← 上一章</div><div class="t">04 · 解码策略全手写</div></a>
+    <a class="next" href="../06_kv_cache_inference/06_讲解.html"><div class="dir">下一章 →</div><div class="t">06 · KV Cache 与高效推理</div></a>
+  </div>
+
+</div>
+</body>
+</html>

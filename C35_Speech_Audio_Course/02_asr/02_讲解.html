@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · ASR 与 Whisper</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · ASR 与 Whisper</h1>
+  <p class="subtitle">把语音对齐成文字 —— CTC 的 blank/折叠/前向算法、贪心与束搜索解码、Whisper 的 encoder–decoder：两条绕开显式对齐的现代路线，从零实现 CTC 前向并对拍暴力枚举</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（特征）、动态规划、注意力/Transformer（C01）、log 空间数值技巧</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_asr.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Graves 2006 (CTC)、Radford 2022 (Whisper)、Graves 2012 (RNN-T)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#intro">ASR 的核心矛盾：长帧 ↔ 短文字</a></li>
+      <li><a href="#blank">CTC 的核心装置：blank 与折叠规则</a></li>
+      <li><a href="#forward">CTC 前向算法：对指数多条路径求和</a></li>
+      <li><a href="#decode">解码：从逐帧分布到文字</a></li>
+      <li><a href="#whisper">Whisper：注意力 seq2seq 路线</a></li>
+      <li><a href="#bigpic">大图景：对齐是反复出现的主题</a></li>
+      <li><a href="#roadmap">从零实现的路线图</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="intro"><span class="num">1</span>ASR 的核心矛盾：长帧 ↔ 短文字</h2>
+  <p>自动语音识别（<span class="term">ASR (Automatic Speech Recognition)</span>）的任务一句话就能说清：<strong>把语音波形转写成文字</strong>。但它的难点也一句话就能说清——<strong>输入和输出长度严重不齐、且没有对齐</strong>。</p>  <p>具体说：模块 01 把一段话变成了成百上千<strong>帧</strong>（一秒 100 帧，一句话轻松上千帧）；而对应的文字只有几十个字符。更麻烦的是我们<strong>不知道哪几帧对应哪个字</strong>——人说话时长短不一、有停顿、有拖音，「你好」可能占 8 帧也可能占 30 帧。传统方案（HMM-GMM）要先用复杂的对齐流程标出「这 5 帧是 n、那 3 帧是 i」，再训练。这套对齐既麻烦又脆弱。</p>  <p>本模块讲两条<strong>绕开显式对齐</strong>的现代路线。第一条是 <span class="term">CTC (Connectionist Temporal Classification)</span>（连接时序分类）：它引入一个巧妙的<strong>空白符 + 折叠规则</strong>，让模型逐帧自由输出，再把所有<em>能折叠成目标文字</em>的对齐路径概率全部加起来——于是无需任何人工对齐就能训练。第二条是 <span class="term">seq2seq / encoder–decoder</span> 注意力架构，以 <span class="term">Whisper</span> 为代表：编码器把语音编成隐表示，解码器像写字一样自回归地生成文字，用注意力<em>软对齐</em>到语音。本模块的 notebook 会从零实现 CTC 的前向算法（并与暴力枚举所有路径对拍）、贪心与束搜索解码，并概览 Whisper 的结构。</p>  <p>在深入两条路线前，先确立一个<strong>视角</strong>：ASR 本质是一个<strong>条件序列生成</strong>问题——给定声学观测 $X$（模块 01 的 log-mel 帧序列），求最可能的文本 $Y$，即 $\arg\max_Y p(Y\mid X)$。难点全在于 $X$ 与 $Y$<strong>长度不等且未对齐</strong>：$|X|$ 可能是 $|Y|$ 的几十倍，且没有给出『第 $t$ 帧对应第几个字符』的标注。历史上人们尝试过各种办法硬造对齐（强制对齐、HMM 状态绑定），但都繁琐易错。CTC 与注意力 seq2seq 的革命性在于：它们让模型<strong>在训练中自己学会对齐</strong>——CTC 通过『对所有可能对齐求和』把对齐边缘化掉，注意力通过『软对齐权重』隐式学出对应关系。理解这一点，就抓住了现代 ASR 的精神内核。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>抓住本模块的核心矛盾：<strong>一千帧音频 ↔ 几十个字符，且不知道谁对谁</strong>。CTC 的回答是「让模型逐帧乱说、但把所有能说对的方式加起来」；Whisper 的回答是「让解码器一个字一个字写、每写一个字就用注意力回看整段音频」。两条路线都<strong>把『对齐』从硬标注变成了模型内部自动处理</strong>——这正是端到端 ASR 战胜传统流水线的关键。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="blank"><span class="num">2</span>CTC 的核心装置：blank 与折叠规则</h2>
+  <h3>CTC 的核心装置：blank 与折叠规则</h3>  <p>CTC 要解决「逐帧输出（长）→ 文字（短）」的坍缩。它引入一个特殊符号 <span class="term">blank token</span> $\epsilon$，含义是「<strong>这一帧不输出新字符</strong>」。模型在每一帧对词表 ∪ {$\epsilon$} 输出一个概率分布；把每帧的选择连起来得到一条<span class="term">alignment / path</span>（对齐路径），再经两步<span class="term">collapse rule</span>（折叠规则）变成最终文字：</p>  <ol>
+    <li>第一步，<strong>合并连续相同字符</strong>：<code>a a a → a</code>；</li>
+    <li>第二步，<strong>删除所有 blank</strong>：<code>a ε ε b → a b</code>。</li>
+  </ol>  <p>这两步的顺序和 blank 的存在缺一不可。关键作用是：blank 既能表示<strong>停顿/静音</strong>（这一帧没说新东西），又能<strong>隔开本应重复的字符</strong>——比如要输出 <code>hello</code> 里的两个 l，路径必须写成 <code>...l ε l...</code>，否则两个连续的 l 会被第一步合并成一个。</p>  <table>
+    <thead><tr><th>对齐路径（逐帧）</th><th>→ 合并重复</th><th>→ 删 blank</th><th>最终文字</th></tr></thead>
+    <tbody>
+      <tr><td><code>c ε a a ε t</code></td><td><code>c ε a ε t</code></td><td><code>c a t</code></td><td><strong>cat</strong></td></tr>
+      <tr><td><code>ε c c ε a t t</code></td><td><code>ε c ε a t</code></td><td><code>c a t</code></td><td><strong>cat</strong></td></tr>
+      <tr><td><code>h e l ε l o</code></td><td><code>h e l ε l o</code></td><td><code>h e l l o</code></td><td><strong>hello</strong></td></tr>
+      <tr><td><code>h e l l o</code></td><td><code>h e l o</code></td><td><code>h e l o</code></td><td><em>helo（错！）</em></td></tr>
+    </tbody>
+  </table>  <p>看最后两行的对比：要正确输出 <strong>hello</strong>，两个 l 之间<strong>必须</strong>有一个 blank；否则就被合并成 <em>helo</em>。这就是 blank 的第二个、也更微妙的作用。理解了这一点，你就理解了 CTC 前向算法里那条「<em>只有当前字符与隔一个的字符不同时，才允许跳过 blank</em>」的转移规则从何而来——下一节就推它。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话记住 blank：<strong>它是 CTC 的『空格键』兼『按住不放的间隔』</strong>——既让模型可以『这帧先不说』，又强制重复字符之间留出间隔。没有它，长度坍缩就会把重复字符吃掉。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="forward"><span class="num">3</span>CTC 前向算法：对指数多条路径求和</h2>
+  <h3>CTC 前向算法：对指数多条路径求和</h3>  <p>一个目标文字对应<strong>指数多条</strong>对齐路径（不同的 blank 位置、不同的重复次数）。CTC 的训练目标是这些路径的<strong>概率之和</strong>——即给定语音、产生目标文字的总概率：</p>  <div class="math-block">\[p(\text{文字}\mid X)=\sum_{\pi \in \mathcal{B}^{-1}(\text{文字})} \prod_{t=1}^{T} p_t(\pi_t)\]</div>  <p>其中 $\pi$ 是一条逐帧路径，$\mathcal{B}$ 是折叠映射，$\mathcal{B}^{-1}(\text{文字})$ 是所有折叠后等于目标文字的路径集合。直接枚举这个集合是指数级的、不可行。CTC 的关键贡献是用<strong>动态规划（前向算法）</strong>在 $O(T\cdot S)$ 内算出这个和（$S$ 是扩展标签长度）。</p>  <p>技巧是构造<strong>扩展标签序列</strong> $\ell'$：在目标文字的每个字符之间、以及首尾都插入 blank。如目标 <code>cat</code> 扩展为 <code>ε c ε a ε t ε</code>（长度 $S=2|\text{文字}|+1=7$）。定义前向变量 $\alpha_t(s)$ = 「前 $t$ 帧、且路径走到扩展标签第 $s$ 个位置」的所有路径概率和。它满足递推：</p>  <div class="math-block">\[\alpha_t(s)=\big(\alpha_{t-1}(s)+\alpha_{t-1}(s-1)+[\,\ell'_s\neq\epsilon \;\wedge\; \ell'_s\neq \ell'_{s-2}\,]\,\alpha_{t-1}(s-2)\big)\cdot p_t(\ell'_s)\]</div>  <p>三项转移的含义：(1) <strong>停在原地</strong>（$s$ 不动，比如重复当前符号或又一个 blank）；(2) <strong>从前一个位置来</strong>（$s-1$，正常前进一格）；(3) <strong>跳过一个 blank</strong>（$s-2$）——但<strong>仅当</strong>当前是非 blank 字符、且它与隔一个的字符<em>不同</em>时才允许（否则会把本应分开的重复字符并掉，正是上一节 hello 的教训）。最终概率 $=\alpha_T(S)+\alpha_T(S-1)$（路径可结束在最后一个真字符或其后的 blank）。</p>  <div class="callout intuition"><span class="label"></span>
+    <p><strong>worked 微例（手算对齐条数，对拍前向）</strong>：目标 <code>a</code>、$T=3$ 帧、词表 $\{\epsilon,a\}$。扩展标签 $\ell'=[\epsilon,a,\epsilon]$（$S=3$）。先<em>枚举</em>所有折叠成 <code>a</code> 的 3 帧路径：要恰好出现一段 $a$、其余是 blank，合法路径有 $a\epsilon\epsilon,\ \epsilon a\epsilon,\ \epsilon\epsilon a,\ aa\epsilon,\ \epsilon aa,\ aaa$——共 <strong>6 条</strong>（$a\epsilon a$ 会折叠成 $aa\neq a$，排除）。再<em>用前向变量数</em>（把每帧每符号概率都设成 1、只数路径条数）：$\alpha_1=[1,1,0]$（首帧可在 $\epsilon$ 或 $a$）；$\alpha_2(s)=\sum$ 合法来路，得 $\alpha_2=[1,2,1]$；$\alpha_3=[1,3,3]$。总数 $=\alpha_3(S)+\alpha_3(S{-}1)=3+3=<strong>6</strong>$——与手数的 6 条<strong>一致</strong>。这就是 notebook 里『前向 DP 对拍暴力枚举』在最小例子上的样子：DP 的右下两格之和，恰好等于穷举出的路径条数（把『数概率』退化成『数条数』时）。一旦你把概率换回真实值，同一张表算出的就是 $p(\text{文字}\mid X)$。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>前向算法就是填一张表：行是帧（时间），列是「扩展标签」上的位置。每个格子问『有多少种走法能在这一帧正好走到这个标签位置』，答案 = 上一帧能合法走到这里的三种来路之和，再乘上『这一帧输出这个符号』的概率。从左上填到右下，右下角两格之和就是总概率。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>数值上必须在 <strong>对数空间</strong>做：概率连乘会迅速下溢到 0。用 $\log\alpha$ 与 <code>logaddexp</code>（$\log(e^a+e^b)$，带 max 平移防溢出）替代乘加。本课 notebook 用 log 空间实现前向算法，并与<strong>暴力枚举所有 $V^T$ 条路径</strong>、把折叠后等于目标的概率直接相加<em>逐位对拍</em>——这是验证 DP 正确性的黄金标准。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="decode"><span class="num">4</span>解码：从逐帧分布到文字</h2>
+  <h3>解码：从逐帧分布到文字</h3>  <p>训练用前向算法算似然；<strong>推理</strong>时则要反过来——给定每帧分布，找出最可能的文字。有两条常用路线：</p>  <h4>贪心解码（greedy / best-path）</h4>  <p><span class="term">greedy decoding</span>：每帧直接取概率最大的符号，得到一条路径，再折叠成文字。<strong>快、简单，但次优</strong>——因为它找的是最可能的<em>单条路径</em>，而非最可能的<em>文字</em>（后者要对所有折叠到同一文字的路径求和）。一个文字可能由许多条中等概率的路径支撑，其总和超过那条单一最高路径，贪心会错过它。</p>  <h4>束搜索解码（beam search）</h4>  <p><span class="term">beam search decoding</span>：维护若干条最优的<strong>文字前缀</strong>假设（束宽 $B$），逐帧扩展，并把折叠后相同的前缀概率<strong>合并</strong>（这一步是 CTC 束搜索区别于普通束搜索的关键——要在前缀层面合并、并分别累计「以 blank 结尾」与「以非 blank 结尾」的概率）。它近似的是「最可能的文字」，通常显著优于贪心，是 CTC 的实用解码。还可在扩展时融合一个外部语言模型分数，进一步降低 WER。</p>  <div class="ascii">每帧分布 (T, V)
+   │
+   ├── 贪心：每帧 argmax → 一条路径 → 折叠 → 文字     [快, 次优]
+   │
+   └── 束搜索：维护 B 条前缀, 逐帧扩展+合并同前缀     [慢, 更优]
+                  └─(可选) + 语言模型分数 → 更低 WER</div>  <p>评测 ASR 用 <span class="term">WER (Word Error Rate)</span>（词错误率）：把识别结果对齐到参考文本，统计 (替换+删除+插入)/参考词数。它本身是一个编辑距离问题——和 CTC 的对齐思想异曲同工。本课 notebook 会从零实现贪心解码与折叠，并实现一个简化的前缀束搜索，验证它在构造的例子上<strong>优于或等于</strong>贪心。</p>  <p>贪心与束搜索的差距，本质是<strong>『最优路径』与『最优文字』之争</strong>，值得用一个具体直觉钉死。设两帧、词表 $\{\epsilon,a,b\}$，每帧 $p(a)=0.4,p(b)=0.35,p(\epsilon)=0.25$。贪心每帧都选 $a$（最大），得路径 $aa$，折叠成文字 $a$。但文字 $b$ 的总概率要把<em>所有折叠成 b 的路径</em>（$bb$、$b\epsilon$、$\epsilon b$）加起来，可能反超只由单条 $aa$ 支撑的文字 $a$。贪心只盯着<strong>一条</strong>概率最高的路径，看不见『许多条中等路径之和』；束搜索在<strong>文字前缀</strong>层面累加，才逼近真正最可能的文字。这也是为什么 CTC 束搜索必须在前缀处合并、还要分别记『以 blank 结尾』与『以非 blank 结尾』——因为这两种结尾在下一步扩展时<em>行为不同</em>（前者加同字符会延长、后者加同字符会被折叠合并）。notebook 会构造这样的反例，让你<em>亲眼看到</em>贪心选了次优文字。</p>  <div class="callout warn"><span class="label"></span>
+    <p>贪心解码有个隐蔽陷阱：它对<strong>峰化（peaky）</strong>的 CTC 输出表现尚可，但 CTC 训练出的分布常常极度峰化（大部分帧几乎确定是 blank），这既是 CTC 能用贪心的原因，也带来了<em>时间戳不准</em>等副作用。需要精确对齐（如字幕时间轴）时，要用前向-后向的后验占据概率，而非贪心路径。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="whisper"><span class="num">5</span>Whisper：注意力 seq2seq 路线</h2>
+  <h3>Whisper：另一条路线——注意力 seq2seq</h3>  <p>CTC 假设输出<strong>条件独立</strong>（每帧的输出只依赖该帧附近的声学，不显式建模字符间的语言依赖），这是它简单的代价。另一条路线 <span class="term">seq2seq / encoder–decoder</span> 用注意力解决：解码器<strong>自回归</strong>地生成文字，每生成一个 token 都依赖<em>已生成的全部文字</em>（自带语言模型）+ 通过<strong>交叉注意力</strong>回看整段语音编码。<span class="term">Whisper</span> 是这条路线的集大成者。</p>  <p>一个澄清：CTC 的『条件独立』假设具体指什么？它是说，给定声学输入 $X$，各帧的输出在概率上<strong>互不依赖</strong>——$p(\pi\mid X)=\prod_t p(\pi_t\mid X)$。这让前向算法的 DP 极其干净（每帧的概率可独立查表、再按转移聚合），是 CTC 高效的根源；但代价是 CTC <em>本身不建模语言</em>（它不知道『q 后面大概率跟 u』这种字符间规律）。所以纯 CTC 常要外接一个语言模型（解码时融合 LM 分数）来补语言约束。seq2seq 则相反——解码器每步都条件于<em>已生成的全部文字</em>，自带强语言模型，但也因此更容易在音频模糊时被语言先验带偏（幻觉）。这个『要不要把语言知识塞进模型本身』的分歧，是两条路线一切权衡的源头。</p>  <p>Whisper（Radford 2022）的结构其实就是一个标准 Transformer encoder–decoder（C01 的知识直接复用），<strong>朴素得令人惊讶</strong>——它的威力几乎全部来自<strong>规模与数据</strong>：</p>  <ul>
+    <li><strong>输入</strong>：模块 01 讲的 80 维 log-mel 谱（16 kHz、25 ms 窗、10 ms 帧移），固定切成 30 秒一段（3000 帧）；</li>
+    <li><strong>编码器</strong>：几层卷积下采样 + Transformer，把 log-mel 编成声学隐表示；</li>
+    <li><strong>解码器</strong>：自回归 Transformer，用交叉注意力看编码器输出，逐 token 生成文字；</li>
+    <li><strong>多任务</strong>：用特殊 token 把『转写/翻译/语种识别/带时间戳』统一成一个序列预测任务——同一个模型，换提示 token 就切换任务；</li>
+    <li><strong>数据</strong>：68 万小时弱监督（网络音频 + 字幕）多语数据。规模带来强鲁棒性与零样本能力，几乎不需要针对性微调。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>Whisper 像一个『边听边写』的速记员：它先把整段录音听一遍记成脑内印象（编码器），然后一个字一个字往外写（解码器），每写一个字都会瞄一眼脑内印象里相关的部分（交叉注意力），同时记得自己前面写了什么（自注意力）。它不需要别人告诉它『第几帧对应第几个字』——注意力自己学会了软对齐。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>CTC vs seq2seq 的核心权衡：CTC 输出条件独立、<strong>天然适合流式</strong>（逐帧出，低延迟），但需外接语言模型补语言约束；seq2seq 自带强语言模型、精度高，但<strong>自回归解码</strong>（要等前一个 token）使流式更难、且可能产生『幻觉』（语言模型太强，音频不清时『编』出通顺但错误的文字）。RNN-Transducer（RNN-T）试图取两者之长，是手机端流式听写的主流。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>Whisper 论文（Radford 2022，见 <code>references.md</code>）的核心 takeaway 不是架构创新，而是<strong>『大规模弱监督 + 朴素 seq2seq』就能逼近甚至超过精心设计的有监督系统</strong>。这呼应了整个领域的趋势：把归纳偏置让位给数据与规模。CTC 的奠基则见 Graves 2006。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bigpic"><span class="num">6</span>大图景：对齐是反复出现的主题</h2>
+  <h3>把识别放进大图景：对齐是反复出现的主题</h3>  <p>退一步看，本模块的两条路线都在解同一个问题——<strong>不等长序列之间的对齐</strong>——而这个问题在语音里<em>无处不在</em>：</p>  <table>
+    <thead><tr><th>场景</th><th>要对齐什么</th><th>用的工具</th></tr></thead>
+    <tbody>
+      <tr><td>ASR 训练</td><td>音频帧 ↔ 字符</td><td>CTC 前向（对所有对齐求和）/ 注意力软对齐</td></tr>
+      <tr><td>ASR 解码</td><td>逐帧分布 ↔ 最可能文字</td><td>贪心 / 束搜索</td></tr>
+      <tr><td>字幕时间戳</td><td>字符 ↔ 具体时间</td><td>CTC 前向-后向后验 / Whisper 时间戳 token</td></tr>
+      <tr><td>TTS（模块 04）</td><td>文本 ↔ 声学帧时长</td><td>时长预测 / 注意力对齐</td></tr>
+      <tr><td>语音 LM（模块 05）</td><td>文本 token ↔ 音频 token</td><td>交错 / 对齐</td></tr>
+    </tbody>
+  </table>  <p>所以 CTC 的「对所有对齐求和」与注意力的「软对齐」不是孤立技巧，而是<strong>贯穿语音建模的核心思想</strong>。你在本模块 notebook 里手写的前向算法 DP，和 TTS 里对齐文本与声学帧、语音 LM 里交错文本与音频 token，本质是同一类问题的不同变体。把这个 DP 吃透，后面的对齐问题都会有似曾相识之感。</p>  <p>还有一个常被忽视的连接：CTC 前向算法和 <strong>隐马尔可夫模型（HMM）的前向算法、以及序列比对的 Needleman-Wunsch</strong> 是同一个 DP 家族——都是『在一张 (序列 A × 序列 B) 的网格上，对所有合法路径求和或求最优』。学会 CTC 的递推，你其实学到的是一整类动态规划的模板，它在生物信息（基因比对）、NLP（编辑距离）里反复出现。</p>  <p>把这个『DP 家族』的共性再点透一层：它们都有<strong>三个共同要素</strong>——一张二维（或更高维）的状态网格、一组<strong>局部转移规则</strong>（从哪些前驱格子能到达当前格子）、以及一个<strong>聚合算子</strong>（求和给出『所有路径的总概率』，求最大给出『最优路径』）。CTC 前向用的是<em>求和</em>（要边缘化掉所有对齐，得到文字的似然）；如果把求和换成<em>求最大</em>，就得到 CTC 的『最优对齐』（Viterbi 版，用于强制对齐、估时间戳）。HMM 的前向-后向、DTW（动态时间规整）、编辑距离，全是同一张网格上换不同转移规则与聚合算子的变体。所以你在 notebook 里手写的那张 $T\times S$ 的 $\alpha$ 表，不是一个孤立技巧，而是<strong>一把能开很多锁的钥匙</strong>——理解了它的『网格 + 转移 + 聚合』结构，再遇到任何『两个不等长序列如何对应』的问题，你都知道该怎么搭 DP。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="roadmap"><span class="num">7</span>从零实现的路线图</h2>
+  <h3>从零实现的路线图</h3>  <p>notebook 会把本模块拆成可独立验证的几块，每块对拍一个绝对可信的参考：</p>  <div class="ascii">逐帧 log 概率 (T, V),  目标标签序列
+   │
+   ├─ collapse(path): 合并重复 + 删 blank ──对拍── 手算小例子
+   │
+   ├─ ctc_forward(): log 空间 DP 求 p(文字|X) ──对拍── 暴力枚举所有 V^T 路径之和  ★关键
+   │
+   ├─ greedy_decode(): 每帧 argmax + collapse ──对拍── 手算
+   │
+   └─ beam_search(): 维护前缀+合并 ──验证── ≥ greedy 的路径概率</div>  <p>其中<strong>最关键的对拍</strong>是：在一个足够小的例子（如 $T=4$、词表 3、目标 2 字符）上，用 <code>itertools.product</code> 枚举所有 $V^T$ 条路径、把折叠后等于目标的路径概率直接相加，得到<strong>绝对正确</strong>的 $p(\text{文字}\mid X)$；再让你的 $O(T\cdot S)$ 前向算法去逼近它——两者必须<strong>逐位相等</strong>（误差 $<10^{-9}$）。这一步通过，你就能确信你的 DP 递推（尤其那个 $s-2$ 转移的条件）写对了。</p>  <p>这套「小规模暴力枚举当 ground truth、再验证高效算法」的方法，是验证一切动态规划/采样算法的通法。它比『看输出像不像对的』可靠一万倍——CTC 递推里漏一个转移项、或 $s-2$ 的条件写错，输出往往<em>看起来很合理</em>但其实算错，只有对拍暴力枚举才能当场抓住。</p>  <p>再多说一句这套方法为何在 CTC 上<strong>尤其有效</strong>：CTC 前向算法有几个<em>极易写错却不报错</em>的细节——扩展标签 $\ell'$ 的首尾 blank、初始化只允许起于前两个位置、$s-2$ 转移的『非 blank 且不等于隔一个字符』双重条件、结束时取最后两格之和。这些写错任何一个，对随机输入算出的概率往往仍<em>落在合理区间</em>（是个 0 到 1 的数），肉眼根本看不出问题；可一旦与暴力枚举对拍，差异会在小数点后第几位立刻暴露。所以本课坚持让你<strong>先写暴力枚举、再写 DP、强制两者逐位相等</strong>——这不是多此一举，而是把『我以为对了』变成『我证明对了』。把这个习惯带到真实工作中（与 PyTorch 的 CTCLoss 对拍小例子），能省下无数 debug 时间。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>流式 vs 精度</strong>：CTC/RNN-T 天然流式但精度略逊，Whisper 式 seq2seq 精度高但流式难。低延迟 + 高精度 + 自带语言模型的统一架构仍是活跃方向（如流式 Transducer、chunk-wise attention）。</li>
+    <li><strong>幻觉与鲁棒性</strong>：强语言模型的 seq2seq 在音频不清/静音段会『编』出通顺但错误的文字（hallucination）。如何让模型『不确定时老实说不确定』是开放问题，与 C04/C05 的诚实性/校准直接相关。</li>
+    <li><strong>长音频与上下文</strong>：Whisper 固定 30 秒窗，跨窗的上下文（说话人、话题）丢失。长上下文 ASR（C25 的语音版）、说话人日志（diarization）与识别的联合建模仍未成熟。</li>
+    <li><strong>低资源与多语</strong>：绝大多数语言缺标注数据。自监督预训练（wav2vec 2.0、HuBERT）+ 少量微调、以及 Whisper 式弱监督是主流解，但对真正的长尾语言仍力不从心。</li>
+    <li><strong>识别与生成的统一</strong>：模块 05 的语音 LLM 把识别、合成、对话纳入同一个 token 预测框架。ASR 是否会从『专门的模型』变成『大语音模型的一种提示』？这正在发生（Whisper 的多任务 token 已是雏形）。</li>
+  </ul>  <div class="card"><strong>✅ 本章你应该能回答：</strong>  <ol>
+    <li>ASR 的核心难点是什么？CTC 和 seq2seq 各自如何绕开显式对齐？</li>
+    <li>CTC 的 blank 有哪两个作用？写出折叠规则；为什么 hello 的两个 l 之间必须有 blank？</li>
+    <li>写出 CTC 前向变量的递推；三项转移分别是什么？$s-2$ 转移的条件为何？</li>
+    <li>贪心解码为什么次优？束搜索好在哪？为什么 CTC 束搜索要在『前缀』层面合并？</li>
+    <li>Whisper 的威力主要来自架构还是数据/规模？CTC 与 seq2seq 在流式/幻觉上的权衡是什么？</li>
+  </ol></div>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读（详见 <code>references.md</code>）：Graves 2006（CTC 奠基，本模块前向算法的来源）、Radford 2022（Whisper）、Graves & Jaitly 2014（端到端 CTC ASR）、Chan 2015（LAS，注意力 seq2seq）、Graves 2012（RNN-T，流式）。下一模块换个方向：不把语音变成文字，而是把波形压成离散 token。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_signals_features/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 信号与特征</div></a>
+    <a class="next" href="../03_codecs/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 神经音频编解码</div></a>
+  </div>
+
+</div>
+</body>
+</html>

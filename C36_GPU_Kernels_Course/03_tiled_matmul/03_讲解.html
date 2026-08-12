@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 分块矩阵乘</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 分块矩阵乘</h1>
+  <p class="subtitle">朴素 GEMM 为何带宽受限；shared-memory tiling 把算术强度从 O(1) 提到 O(tile)；用 roofline 解释为什么分块就够快 —— 从零写出分块矩阵乘并对拍 A@B</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01/02（执行模型、内存层级、合并访问）、矩阵乘、一点点缓存复用直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_tiled_matmul.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Williams 2009 (Roofline)、PMPP 第 5–6 章、CUTLASS、Horace He «Brrrr»</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#naive">朴素 GEMM 为何带宽受限</a></li>
+      <li><a href="#ai">复盘算术强度</a></li>
+      <li><a href="#tiling">核心思想：shared-memory tiling</a></li>
+      <li><a href="#algo">分块 GEMM 算法逐步拆解</a></li>
+      <li><a href="#roofline">Roofline：把「快多少」量化</a></li>
+      <li><a href="#tilesize">选 tile 尺寸：复用 vs 占用率</a></li>
+      <li><a href="#real">真实 GEMM：多级分块与 CUTLASS</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="naive"><span class="num">1</span>朴素 GEMM 为何带宽受限</h2>
+  <p>矩阵乘 <code>C = A @ B</code> 是深度学习算力的绝对主体：线性层、注意力里的 <code>QKᵀ</code> 与 <code>AV</code>、卷积（im2col 之后）——本质都是 GEMM。所以「把 GEMM 写快」几乎等价于「把深度学习训练/推理写快」。本模块要回答一个看似矛盾的问题：<strong>朴素矩阵乘的 FLOPs 一点不多，为什么却跑不满 GPU 算力？</strong>答案不在算力，而在<strong>带宽</strong>。</p>  <p>先把朴素映射摆出来。最自然的 GPU 内核是：<strong>每个线程负责输出矩阵 C 的一个元素</strong> <code>C[i,j]</code>。要算这一个元素，线程得读 A 的整行（第 i 行，K 个数）和 B 的整列（第 j 列，K 个数），做 K 次乘加（FMA）。于是每个线程从<strong>慢速 global memory</strong>读了 2K 个浮点数，只换来 2K 次浮点运算（K 乘 + K 加）。</p>  <div class="math-block">\[\text{每元素算术强度}=\frac{2K \ \text{FLOPs}}{2K \times 4 \ \text{bytes}}=\frac{1}{4}\ \text{FLOP/byte}\]</div>  <p>注意这个比值<strong>与 K 无关、恒等于 0.25 FLOP/byte</strong>——矩阵再大也救不了它。回忆模块 00：现代 GPU 的脊点算术强度高达几十到几百 FLOP/byte。0.25 远远落在脊点的左侧，意味着朴素 GEMM 是<strong>彻底的访存受限</strong>：算术单元绝大部分时间在干等 A、B 的数据从显存爬过来。你买的那块价值连城的 Tensor Core 算力，几乎全程闲置。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>朴素写法的浪费在哪？想想相邻的两个输出 <code>C[i,0]</code> 和 <code>C[i,1]</code>：它们都要读<strong>同一行 A[i]</strong>。但在朴素内核里，负责这两个元素的两个线程<em>各读各的</em>，把 A[i] 从显存里搬了两遍。整个 C 有 N 列，于是 A 的每一行被白白重读了 N 遍。复用率为零，就是病根。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说：朴素 GEMM 对 A 的每个元素读取 N 次（C 的每一列各一次）、对 B 的每个元素读取 M 次。总的 global 访问量是 <code>O(MNK)</code> 量级，而有用计算也是 <code>O(MNK)</code>，二者同阶 → 算术强度被钉死在 O(1)。要破局，必须让<strong>一次读进来的数据被复用多次</strong>，这正是 tiling 的全部动机。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>GEMM 的 FLOPs 是定数（2MNK），优化的唯一空间是分母——少从 HBM 搬字节</strong>。朴素写法每个数搬一次只用一次；分块让每个数搬一次<em>用很多次</em>。算术强度 = 计算量 ÷ 搬运量，分子不变、分母骤降，强度就从 0.25 一路爬过脊点，内核从访存受限变成算力受限——这就是「分块为什么快」的全部秘密。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ai"><span class="num">2</span>复盘算术强度</h2>
+  <h3>复盘算术强度：性能工程的中心标尺</h3>  <p>模块 00 引入过<span class="term">arithmetic intensity</span>（算术强度，AI）：<strong>每从内存搬运一个字节，所执行的浮点运算数</strong>，单位 FLOP/byte。它是判断内核「该优化算还是优化搬」的唯一标尺，也是下一节 roofline 模型的横轴。</p>  <div class="math-block">\[\text{AI}=\frac{\text{有用浮点运算总数 (FLOPs)}}{\text{从 HBM 搬运的字节数 (bytes)}}\]</div>  <p>对一个 <code>M×K</code> 乘 <code>K×N</code> 的 GEMM，分子是固定的：每个输出元素 K 次乘加，共 MN 个输出，故 <strong>FLOPs = 2MNK</strong>（乘、加各算一次）。<strong>分子动不了</strong>——这是数学规定的工作量（先不谈 Strassen 类快速算法，工程上极少用）。所以提升 AI 的全部文章都在<strong>分母</strong>：尽量减少从 HBM 搬运的字节。</p>  <table>
+    <thead><tr><th>写法</th><th>A 被读次数</th><th>B 被读次数</th><th>HBM 字节 (≈)</th><th>算术强度</th><th>瓶颈</th></tr></thead>
+    <tbody>
+      <tr><td>朴素（无复用）</td><td>N 次</td><td>M 次</td><td><code>4·2MNK</code></td><td>0.25 FLOP/byte</td><td><strong>访存受限</strong></td></tr>
+      <tr><td>分块 TILE×TILE</td><td><code>N/TILE</code> 次</td><td><code>M/TILE</code> 次</td><td><code>≈4·2MNK/TILE</code></td><td>≈ TILE/4 FLOP/byte</td><td>随 TILE 趋向算力受限</td></tr>
+      <tr><td>理想（全在片上）</td><td>1 次</td><td>1 次</td><td><code>4(MK+KN+MN)</code></td><td>很高</td><td><strong>算力受限</strong></td></tr>
+    </tbody>
+  </table>  <p>看中间一行：分块把每个操作数的读取次数从「整条边」降到「整条边 ÷ TILE」，于是 HBM 字节缩小约 TILE 倍、算术强度放大约 TILE 倍。<strong>TILE 就是把 AI 推过脊点的旋钮</strong>。第 4 节给出精确计数，第 5 节用 roofline 把它翻译成「快多少」。</p>  <p>精度也会动算术强度的分母。把 FP32 换成 FP16/BF16，每个数从 4 字节变 2 字节，搬运量直接减半、<strong>算术强度翻倍</strong>；再叠 Tensor Core 把峰值算力抬高一个数量级，脊点右移——这就是为什么混合精度不只是「省显存」，更是把内核往算力受限方向推的杠杆（第 8 节展开）。所以提升 AI 的工具箱有三件：<strong>分块复用</strong>（降搬运次数）、<strong>低精度</strong>（降每数字节）、<strong>融合</strong>（消中间张量的往返），后两者在模块 02、04、05 反复出现。</p>  <div class="callout warn"><span class="label"></span>
+    <p>别把「算术强度」和「计算复杂度」搞混。两种 GEMM 写法的<strong>计算复杂度完全一样</strong>（都是 Θ(MNK) 次 FMA），FlashAttention 甚至比朴素注意力<em>多算</em>一点。它们的差异在<strong>访存复杂度</strong>——搬了多少字节。GPU 时代，决定速度的常常是后者而非前者，这是贯穿全课最反直觉、也最值钱的一课。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tiling"><span class="num">3</span>核心思想：shared-memory tiling</h2>
+  <h3>核心思想：shared-memory tiling（分块复用）</h3>  <p>既然病根是「读进来的数据没被复用」，药方就是：<strong>把一小块 A 和一小块 B 先搬进快速的 shared memory，让整个 block 的线程在那里反复使用它们，再换下一块</strong>。回忆模块 01/02：shared memory 是 block 内共享的片上高速存储，延迟比 global 低一两个数量级。它就是为这种「搬一次、众人复用」的协作而生的。</p>  <p>把输出矩阵 C 切成 <code>TILE×TILE</code> 的小块，让<strong>一个 block 负责算一个 C 的小块</strong>。block 内每个线程对应小块里的一个元素 <code>C[i,j]</code>。关键在于：算这个小块需要的，是 A 的对应若干<em>行带</em>与 B 的对应若干<em>列带</em>——而<strong>同一个 C 小块里的所有元素，共享同一批 A 行和 B 列</strong>。把它们搬进 shared 一次，block 内 TILE² 个线程就都能复用。</p>  <div class="ascii">            B 的列带 (K × TILE)
+            ┌──────┐
+            │b_tile│  ← 搬进 shared，被这一列 block 的所有线程复用
+            └──────┘
+   A 的行带   ┌──────┐   C 的一个小块
+  (TILE × K) │a_tile│→ ┌──────┐
+             └──────┘   │ acc  │  block 内 TILE² 个线程各算一个元素
+                        └──────┘
+  沿 K 方向：把行带/列带再切成 TILE 段，逐段搬入 shared、累加，扫完 K</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：朴素写法像每个学生各自跑图书馆借同一本书、看一页、还回去，N 个学生把这本书借还了 N 趟。分块写法像<strong>把书借到自习室（shared memory）一次，全自习室的人轮流翻</strong>，看完再还。借还（HBM 访问）次数除以了自习室人数。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说：把数据搬进 shared 后，它被 block 内的线程<strong>复用了 TILE 次</strong>（每个 a_tile 的元素参与 TILE 个输出元素的点积）。于是每搬 1 个字节做的有用计算从「常数」变成「正比于 TILE」，算术强度从 O(1) 提升到 <strong>O(TILE)</strong>。这是 tiling 的数学本质，与具体语言无关。</p></div>
+  </div>  <p>注意这里<strong>block 是协作的单位</strong>（呼应模块 01 的「能协作的边界恰好是 block」）：a_tile/b_tile 放在 block 私有的 shared memory 里，block 内线程靠 <code>__syncthreads()</code> 协调「都搬完了再开始算、都算完了再搬下一段」。跨 block 无法共享这块 shared——这也是为什么把工作切成「一个 block 一个 C 小块」是天然的划分。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="algo"><span class="num">4</span>分块 GEMM 算法逐步拆解</h2>
+  <h3>分块 GEMM 算法逐步拆解</h3>  <p>把上面的思想写成精确的循环。设 block 负责 C 的某个 <code>TILE×TILE</code> 小块，沿 K 维分成若干段，逐段把 a_tile、b_tile 搬进 shared 并累加：</p>  <pre><code># CUDA 风格伪代码：一个 block 算 C 的一个 TILE×TILE 小块
+__shared__ float a_tile[TILE][TILE];
+__shared__ float b_tile[TILE][TILE];
+float acc = 0.0f;                       // 每个线程一个累加器（在寄存器里）
+for (int k0 = 0; k0 &lt; K; k0 += TILE) {  // 沿 K 方向逐段
+    a_tile[ty][tx] = A[row][k0 + tx];   // 协作搬运：每线程搬一个 A 元素
+    b_tile[ty][tx] = B[k0 + ty][col];   // 每线程搬一个 B 元素
+    __syncthreads();                    // 等全 block 搬完，才能开始用
+    for (int k = 0; k &lt; TILE; k++)      // 在 shared 里做这一段的点积
+        acc += a_tile[ty][k] * b_tile[k][tx];
+    __syncthreads();                    // 等全 block 用完，才能覆盖搬下一段
+}
+C[row][col] = acc;                      // 整行 K 扫完，落一次 global</code></pre>  <p>两道 <code>__syncthreads()</code> 是<strong>正确性的命脉</strong>。第一道保证「读 shared 前，数据已被全 block 写好」；第二道保证「下一轮覆盖 shared 前，本轮所有线程都用完了」。本课的 numpy 模拟里，这两道屏障对应「先整块切片、再整块计算」的顺序——串行执行天然满足，但真实 GPU 上必须显式写出来。</p>  <div class="callout danger"><span class="label">并行正确性陷阱</span>
+    <p>漏掉任一道 <code>__syncthreads()</code> 就会有线程读到上一段的残留、或尚未写入的垃圾——这是 GPU 上最典型的<span class="term">race condition</span>（竞态）。它最可怕之处在于<strong>不报错、不崩溃，只是结果悄悄错掉</strong>，且错得有随机性（依赖线程调度顺序），单测时偶尔还能蒙混过关。更隐蔽的是：把 <code>__syncthreads()</code> 写进了<strong>分支</strong>里（只有部分线程到达），会导致<strong>死锁</strong>。这正是本课死磕「对拍 ground truth」的理由——并行正确性靠肉眼读代码是保不住的，必须靠 <code>np.allclose</code> 这样的自动判据兜底。</p>
+  </div>  <h3>复用计数：到底省了多少 HBM 访问</h3>  <p>算一笔账。朴素写法里 A 的每个元素被读 N 次；分块写法里，A 的某个元素只在它所在的「行带」被需要，而一条行带服务于 C 的一<em>行小块</em>，即 <code>N/TILE</code> 个输出小块——所以 A 总共被读 <code>N/TILE</code> 次，省了 TILE 倍。B 同理省 TILE 倍。</p>  <table>
+    <thead><tr><th>矩阵</th><th>朴素读取次数</th><th>分块读取次数</th><th>倍数</th></tr></thead>
+    <tbody>
+      <tr><td>A 的每个元素</td><td>N</td><td><code>N/TILE</code></td><td>↓ TILE</td></tr>
+      <tr><td>B 的每个元素</td><td>M</td><td><code>M/TILE</code></td><td>↓ TILE</td></tr>
+      <tr><td>HBM 总字节</td><td><code>≈8MNK</code></td><td><code>≈8MNK/TILE</code></td><td>↓ TILE</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>TILE=32 时，HBM 访问量降到约 1/32，算术强度从 0.25 升到约 8 FLOP/byte——整整放大了 32 倍。这是<strong>巨大</strong>的进步（朴素写法的 32 倍），但还不够：现代 GPU 的脊点高达上百 FLOP/byte（下一节算）。要真正跨过脊点，还得叠 register tiling、用 FP16（字节减半再翻倍 AI）——这正是第 6、7 节与真实 cuBLAS 的工作。下一节用 roofline 精确量化「这 8 FLOP/byte 离峰值算力还有多远」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="roofline"><span class="num">5</span>Roofline：把「快多少」量化</h2>
+  <h3>Roofline 模型：把「快多少」量化</h3>  <p><span class="term">roofline model</span>（Williams 2009）是性能工程最重要的一张图。它把<strong>可达性能的上限</strong>画成两段折线，横轴是算术强度 AI、纵轴是性能（FLOP/s）：</p>  <div class="math-block">\[\text{可达 FLOP/s} = \min\big(\underbrace{P_{\text{peak}}}_{\text{算力天花板}},\ \underbrace{\text{AI}\times BW}_{\text{带宽斜坡}}\big)\]</div>  <p>低算术强度区（左侧）：性能被带宽锁死，沿斜线 <code>AI × 带宽</code> 上升——你每秒能搬的字节有限，AI 越低能喂给算术单元的工作就越少。高算术强度区（右侧）：性能被峰值算力锁死，是一条水平天花板——再高的 AI 也不会更快，因为算术单元已打满。两段的交点叫<span class="term">ridge point</span>（脊点）：</p>  <div class="math-block">\[\text{AI}^{*}=\frac{P_{\text{peak}}}{BW}\quad(\text{脊点：恰好打满算力所需的最低算术强度})\]</div>  <div class="ascii">性能 (FLOP/s)
+  P_peak ┤            ┌────────────── 算力天花板（compute-bound）
+         │           ╱
+         │          ╱ ← 斜率 = 带宽
+         │         ╱
+         │        ╱  ↑脊点 AI* = P_peak / BW
+         │   ····╱····
+         │   ╱       朴素GEMM(0.25)  分块TILE=32(~8)
+         └───┴────────┴──────────────────→ 算术强度 (FLOP/byte)
+           访存受限区          算力受限区</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>脊点就是一条「分水岭」：算术强度在它左边，你的内核被带宽卡着，再强的 GPU 算力也用不上，该想办法<strong>复用数据</strong>；在它右边，带宽够用了，瓶颈转到算力，该想办法<strong>用 Tensor Core、提精度利用率</strong>。tiling 做的事，就是把 GEMM 这个点从脊点左边推到右边。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>以 A100 为例：FP16 峰值约 <code>312 TFLOP/s</code>、HBM 带宽约 <code>2.04 TB/s</code>，脊点 AI* ≈ <code>312e12/2.04e12 ≈ 153 FLOP/byte</code>。朴素 GEMM 的 0.25 离它差了近三个数量级（性能上限 ≈ <code>0.25×2.04e12 ≈ 0.5 TFLOP/s</code>，不到峰值的 0.2%！）。单层分块能把 AI 抬到几十，已是几十倍的飞跃；要真正贴到那条算力天花板，还需 register tiling 与 FP16 把 AI 进一步推到上百，第 6、7 节展开。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>脊点 AI* 高达 ~150 FLOP/byte，这解释了模块 00 的论断：<strong>现代 GPU 上，绝大多数算子天然落在脊点左侧（访存受限）</strong>。逐元素算子 AI≈O(1)、softmax/LayerNorm 也只有个位数——它们<em>不可能</em>靠提算力变快，只能靠融合减少 HBM 往返。这是 FlashAttention（模块 05）的出发点。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tilesize"><span class="num">6</span>选 tile 尺寸：复用 vs 占用率</h2>
+  <h3>选 tile 尺寸：复用与占用率的拉锯</h3>  <p>既然 TILE 越大 AI 越高，那直接开超大 tile 不就好了？没那么简单。回忆模块 01 的木桶占用率：<strong>tile 越大，shared memory 与寄存器用得越多，一个 SM 能并存的 block 就越少，占用率下降</strong>，可能反而藏不住延迟。这是 GEMM 调优的核心拉锯——<strong>复用（要大 tile）对抗占用率（要小 tile）</strong>。</p>  <table>
+    <thead><tr><th>TILE</th><th>算术强度</th><th>shared 用量</th><th>占用率</th><th>综合</th></tr></thead>
+    <tbody>
+      <tr><td>小（8）</td><td>低（≈2）</td><td>小</td><td>高</td><td>AI 不够，仍偏访存受限</td></tr>
+      <tr><td>中（32）</td><td>中（≈8）</td><td>中</td><td>中</td><td>常见甜点区</td></tr>
+      <tr><td>大（128）</td><td>高（≈32）</td><td>大</td><td>低</td><td>AI 够但 block 太少，可能藏不住延迟</td></tr>
+    </tbody>
+  </table>  <p>更进一步：光靠 shared 分块，算术强度还不够顶。真实高性能 GEMM 还会做<span class="term">register tiling</span>（也叫 thread coarsening / 线程粗化）——让<strong>一个线程负责输出的一个小微块</strong>（如 <code>4×4</code> 共 16 个元素），而不是单个元素。这样从 shared 读进寄存器的每个 A/B 操作数，又能在这 16 个输出间复用一轮，把 AI 在 shared 复用之上再放大一截。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>可以理解成「分块套分块」：先把数据从 global 搬到 shared（block 级复用），再从 shared 搬到寄存器（thread 级复用）。每多一级、靠上一级的快内存，数据就被多榨一轮，算术强度层层抬高。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>register tiling 让一个线程的累加器从 1 个变成 <code>Cm×Cn</code> 个，每段内层循环里一次读入 Cm 个 A 值、Cn 个 B 值，却做 <code>Cm×Cn</code> 次 FMA——操作数复用率从 1 提到 <code>min(Cm,Cn)</code> 量级。代价是每线程寄存器需求暴涨，又咬回占用率。处处是权衡。</p></div>
+  </div>  <h4>一笔占用率账：tile 多大会卡住 SM</h4>  <p>把拉锯算成数字。一个 <code>TILE×TILE</code> 的分块 GEMM，每 block 要两块 shared（a_tile、b_tile），FP32 下用 <code>2×TILE²×4</code> 字节。设 SM 有 100 KB shared：TILE=16 时每 block 用 <code>2 KB</code>，shared 可容 ~50 个 block（占用率充裕，但 AI 仅 ~4）；TILE=32 时每 block 用 <code>8 KB</code>，可容 ~12 个 block（AI ~8，甜点）；TILE=64 时每 block 用 <code>32 KB</code>，只容 ~3 个 block——<strong>AI 升到 ~16 了，但同时在飞的 block 太少，可能藏不住延迟，反而变慢</strong>。这就是「复用要大 tile、占用率要小 tile」的拉锯被算成了具体的 block 数。</p>  <p>更微妙的是<strong>尾部效应（quantization / tail effect）</strong>：若 TILE 太大、输出小块数少于 SM 数，就有 SM 整个闲着；若小块数不是 SM 数的整数倍，最后一轮也有 SM 提前空转。所以 tile 尺寸不只受 shared/寄存器约束，还要让<em>输出小块数足够多且尽量整除 SM 数</em>——这又把我们引回模块 01「grid 要足够大、覆盖所有 SM」的经验法则。性能工程里，所有旋钮最终都在同一张约束网里互相牵制。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这条层级递进：<strong>global → shared（block 复用）→ register（thread 复用）→ Tensor Core</strong>。每一级都在重复同一个动作——把数据搬到更快更小的存储、在那里尽量多复用。这正是模块 00 说的「把数据搬到尽量靠上的层级并尽量复用」的具体落地，也是下一节真实 GEMM 多级分块的骨架。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="real"><span class="num">7</span>真实 GEMM：多级分块与 CUTLASS</h2>
+  <h3>真实 GEMM：多级分块与 cuBLAS / CUTLASS</h3>  <p>本课的玩具分块只有一层；工业级 GEMM（cuBLAS、<span class="term">CUTLASS</span>）把同一个套路叠成<strong>四到五级</strong>，每级对应硬件的一层存储或执行单元：</p>  <table>
+    <thead><tr><th>层级</th><th>tile 落在哪</th><th>复用谁</th><th>对应硬件</th></tr></thead>
+    <tbody>
+      <tr><td>threadblock tile</td><td>shared memory</td><td>block 内所有 warp</td><td>SM 的 shared/L1</td></tr>
+      <tr><td>warp tile</td><td>寄存器（warp 协作）</td><td>warp 内 32 线程</td><td>warp 调度</td></tr>
+      <tr><td>thread / register tile</td><td>寄存器</td><td>单线程的多个累加器</td><td>CUDA core</td></tr>
+      <tr><td>instruction tile</td><td>Tensor Core 输入</td><td>硬件 MMA 单元</td><td><strong>Tensor Core</strong></td></tr>
+    </tbody>
+  </table>  <p>除了多级分块，真实内核还叠了一层<span class="term">double buffering</span>（双缓冲 / 软件流水）：在用当前这段 tile 做计算的同时，<strong>异步预取下一段 tile</strong>进 shared，用计算时间掩盖搬运延迟（呼应模块 01 的延迟隐藏）。FlashAttention-3 在 Hopper 上更进一步用异步拷贝（TMA）和 warp 专门化把这条流水做到极致。</p>  <p><span class="term">CUTLASS</span> 把这些层级抽象成可组合的 C++ 模板，让你像搭积木一样指定每一级的 tile 形状、数据类型、流水深度，编译出逼近 cuBLAS 的内核。理解了本模块的「一层分块 + 复用 + roofline」，你就握住了 CUTLASS 那套庞大模板的主线——它只是把同一个动作沿存储层级重复了几遍，再加上异步流水。</p>  <div class="callout warn"><span class="label"></span>
+    <p>这也是为什么「手写 GEMM 打败 cuBLAS」极难：cuBLAS/CUTLASS 把多级分块、双缓冲、Tensor Core 编排、bank-conflict-free 的 shared 布局都打磨到了极致。本课的目标不是替代它们，而是让你<strong>读懂它们的设计、看懂 profiler 的瓶颈、并能为它们覆盖不到的新算子（如带掩码的注意力变体）手写专用内核</strong>——后者正是 FlashAttention 诞生的契机。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>Tensor Core 与混合精度</strong>：现代 GEMM 的算力来自 Tensor Core（FP16/BF16/FP8 的小矩阵 MMA）。这改写了 roofline 的算术：算力 P_peak 暴涨（脊点右移），且低精度让每字节搬运的「有效数」翻倍。如何在 FP8 下保持数值精度（缩放、误差补偿）是活跃方向（见 FlashAttention-3）。</li>
+    <li><strong>自动调优与代码生成</strong>：最优 tile 尺寸依赖形状与硬件，靠 <code>@triton.autotune</code> 实测搜参，或由 <code>torch.compile</code> / TVM / CUTLASS profiler 自动生成内核。「编译器能否稳定逼近专家手写」仍是开放课题。</li>
+    <li><strong>工作划分：split-K 与 stream-K</strong>：当 M、N 小而 K 大时，按输出小块切给 block 会让 block 太少、SM 闲置。split-K 把 K 维也切开、多个 block 算部分和再规约；stream-K 进一步做<em>负载均衡的持久内核</em>（persistent kernel），让每个 SM 拿到均匀的工作量，消除 tail effect。</li>
+    <li><strong>超越稠密 GEMM</strong>：稀疏（2:4 结构化稀疏）、低秩、量化（INT8/INT4）GEMM 各自改变了 AI 与访存模式，是把模型做小做快的前沿；它们的内核设计仍在快速演化。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Williams 2009（roofline 原始论文）、PMPP 教材第 5–6 章（tiled GEMM 的标准推导）、CUTLASS 文档与源码（多级分块的工业实现）、Horace He《Making Deep Learning Go Brrrr》（瓶颈三分与 AI 直觉）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_memory_coalescing/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 内存层级与合并访问</div></a>
+    <a class="next" href="../04_reductions_softmax/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 并行规约与融合 softmax</div></a>
+  </div>
+
+</div>
+</body>
+</html>

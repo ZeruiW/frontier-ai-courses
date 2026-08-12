@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · transformers 核心抽象</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · transformers 核心抽象</h1>
+  <p class="subtitle">config/model/tokenizer 三件套与同源铁律 · from_pretrained 的六步与键名匹配 · dtype 与显存账 · labels 右移的两个不对称 · generate() 的参数生效条件与左 padding</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00；C01/C49 的模型结构概念</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_transformers_core.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">transformers 文档（Auto Classes / Model Loading / Generation Strategies）、safetensors 规范</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#triple">三件套：config / model / tokenizer</a></li>
+      <li><a href="#frompretrained">from_pretrained 的六步：这一行到底做了什么</a></li>
+      <li><a href="#dtype">dtype 与设备放置：三个最常混的参数</a></li>
+      <li><a href="#heads">任务头：AutoModelFor* 家族</a></li>
+      <li><a href="#generate">generate()：参数全解与最常见的误用</a></li>
+      <li><a href="#ledger">算一笔账：显存与上下文预算</a></li>
+      <li><a href="#frontier">生态动态与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="triple"><span class="num">1</span>三件套：config / model / tokenizer</h2>
+  <p><code>transformers</code> 的全部设计围绕一个三元组。理解这个三元组的<strong>职责边界</strong>，库就不再是黑箱。</p>  <table>
+    <thead><tr><th>组件</th><th>是什么</th><th>存成什么文件</th><th>谁决定它</th></tr></thead>
+    <tbody>
+      <tr><td><strong>config</strong></td><td>纯数据：层数、维度、头数、词表大小、激活函数、特殊 token id……</td><td><code>config.json</code></td><td>模型作者；<code>model_type</code> 字段是 <code>Auto*</code> 分发的依据</td></tr>
+      <tr><td><strong>model</strong></td><td>计算图 + 权重</td><td><code>model.safetensors</code>（或旧的 <code>pytorch_model.bin</code>）</td><td>由 config 完全确定结构；权重从文件加载</td></tr>
+      <tr><td><strong>tokenizer</strong></td><td>文本 ↔ token id 的双向映射 + 特殊 token 规则</td><td><code>tokenizer.json</code> / <code>vocab.txt</code> / <code>tokenizer_config.json</code></td><td>与模型<strong>强绑定</strong>——换 tokenizer 等于换语言</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">tokenizer 与 model 必须同源</span>
+    <p>三件套里最容易犯的错、后果也最严重的一个：<strong>tokenizer 与 model 不匹配</strong>。用 <code>bert-base-uncased</code> 的 tokenizer 去喂 <code>roberta-base</code> 的模型，代码<em>完全不会报错</em>——两者词表大小相近，id 都在合法范围内，前向能跑、loss 能降。但每个 id 在两个词表里对应<strong>完全不同的词</strong>，模型看到的是彻底的乱码。<em>症状是「训练正常但效果差得莫名其妙」，且极难排查</em>。铁律：<strong>tokenizer 与 model 必须从同一个 checkpoint 名字加载</strong>，把这个名字写成一个变量，绝不手写两遍。</p>
+  </div>  <p>三件套的另一个重要性质是<strong>config 完全决定结构</strong>。这意味着你可以：</p>  <pre><code>from transformers import AutoConfig, AutoModel
+
+cfg = AutoConfig.from_pretrained("bert-base-uncased")
+cfg.num_hidden_layers = 4          # 只要 4 层
+model = AutoModel.from_config(cfg)  # 得到一个 4 层的随机初始化 BERT
+
+# 或者：加载预训练权重但改掉分类头的类别数
+from transformers import AutoModelForSequenceClassification
+m = AutoModelForSequenceClassification.from_pretrained(
+        "bert-base-uncased",
+        num_labels=5,                       # 覆盖 config
+        ignore_mismatched_sizes=True)       # 头的形状不匹配 -&gt; 重新随机初始化头</code></pre>  <p><code>ignore_mismatched_sizes=True</code> 这个参数值得记住：<strong>它允许「主干加载预训练权重、头随机初始化」</strong>，这正是微调的标准情形。不加它，加载一个 <code>num_labels</code> 不同的分类模型会直接报错。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frompretrained"><span class="num">2</span>from_pretrained 的六步：这一行到底做了什么</h2>
+  <div class="ascii">AutoModelForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=3)
+
+  ① 解析来源
+     是本地目录？是 Hub repo id？带 revision（分支/tag/commit）吗？
+     -&gt; 决定去 HF_HOME 缓存里找，还是走网络下载
+
+  ② 下载/命中缓存
+     config.json → 解析出 model_type="bert"
+     缓存路径 ~/.cache/huggingface/hub/models--bert-base-uncased/snapshots/&lt;sha&gt;/
+     ⚠️ 缓存按 **commit sha** 分目录，所以 revision 变了会重新下载
+
+  ③ 分发到具体类
+     MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING["bert"] -&gt; BertForSequenceClassification
+
+  ④ 按 config 构建结构（此时权重是随机的）
+     kwargs 里的 num_labels=3 覆盖 config 中的值
+
+  ⑤ 加载权重文件并做 **键名匹配**
+     model.safetensors 里的 state_dict 与模型的 named_parameters() 对齐
+     ├─ missing_keys      : 模型要但文件里没有 → **随机初始化**（分类头就在这里）
+     ├─ unexpected_keys   : 文件里有但模型不要 → 丢弃（如预训练的 MLM 头）
+     └─ mismatched_keys   : 名字对但形状不对 → 报错，除非 ignore_mismatched_sizes=True
+
+  ⑥ 后处理
+     tie_weights（嵌入与输出层共享）/ dtype 转换 / device_map 放置 / eval() 模式</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第 ⑤ 步是<strong>整个加载过程里唯一会静默出问题的地方</strong>，必须学会读它的输出。<code>transformers</code> 会打印一段警告，告诉你哪些键 missing、哪些 unexpected。<em>微调时看到「分类头被随机初始化」的警告是<strong>正常且期望</strong>的</em>；但如果看到大量主干权重 missing（比如所有 <code>encoder.layer.*</code>），说明键名对不上——通常是模型类选错了或 checkpoint 结构不同，<strong>这时模型基本等于随机初始化</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>怎么显式检查而不依赖读日志？用 <code>output_loading_info=True</code>：<code>model, info = AutoModel.from_pretrained(..., output_loading_info=True)</code>，<code>info</code> 是一个含 <code>missing_keys / unexpected_keys / mismatched_keys / error_msgs</code> 的字典。<strong>把它写进你的加载函数里做断言</strong>——比如「missing_keys 里只允许出现 <code>classifier</code>」。这一个 assert 能挡住一整类难查的 bug。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>关于安全的一条硬规矩：<strong>优先用 <code>safetensors</code>，避免 <code>.bin</code></strong>。PyTorch 的 <code>.bin</code> 是 pickle 格式，<em>加载时会执行任意代码</em>——从不可信来源加载 <code>.bin</code> 等于运行陌生人的脚本。<code>safetensors</code> 是纯数据格式（header JSON + 张量字节），零拷贝、可 mmap、不执行代码。现代 <code>transformers</code> 默认优先选 safetensors；若必须加载 <code>.bin</code>，至少确认来源可信。另外 <code>trust_remote_code=True</code> 同理——它会执行 repo 里的 Python 代码，只对可信 repo 使用。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dtype"><span class="num">3</span>dtype 与设备放置：三个最常混的参数</h2>
+  <table>
+    <thead><tr><th>参数</th><th>作用</th><th>常见值</th><th>坑</th></tr></thead>
+    <tbody>
+      <tr><td><code>torch_dtype</code></td><td>权重的数值精度</td><td><code>torch.float16</code> / <code>bfloat16</code> / <code>"auto"</code></td><td><code>"auto"</code> 读 config 里的 <code>torch_dtype</code>；不指定则一律 fp32（显存 ×2）</td></tr>
+      <tr><td><code>device_map</code></td><td>把层分配到哪些设备</td><td><code>"auto"</code> / <code>"cuda:0"</code> / 字典</td><td><code>"auto"</code> 需要 <code>accelerate</code>；会做跨 GPU/CPU/磁盘的自动切分</td></tr>
+      <tr><td><code>low_cpu_mem_usage</code></td><td>边加载边放置，不先在 CPU 建整个模型</td><td><code>True</code></td><td>加载 70B 时几乎必需；否则先吃 140GB 内存</td></tr>
+      <tr><td><code>attn_implementation</code></td><td>选注意力 kernel</td><td><code>"sdpa"</code> / <code>"flash_attention_2"</code> / <code>"eager"</code></td><td>FA2 需要额外安装且只支持部分 dtype/架构</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>fp16 vs bf16</strong> 是最该搞清的一对。两者都是 16 位，但指数位/尾数位分配不同：fp16 有 10 位尾数、5 位指数（精度高、<em>动态范围小</em>），bf16 有 7 位尾数、8 位指数（精度低、<em>动态范围与 fp32 相同</em>）。<strong>训练时 bf16 明显更稳</strong>（不需要 loss scaling，不容易溢出为 inf）；推理时两者差别不大，但要看硬件支持（bf16 需要 Ampere 及以上）。<em>如果你在 fp16 训练里遇到 loss 变 nan，第一反应应该是换 bf16。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong><code>device_map="auto"</code> 的行为值得知道细节</strong>：它按层顺序贪心地填满第一个设备、再填下一个，超出所有 GPU 就放 CPU（<code>offload</code>），再超出就放磁盘。这让你能在小卡上跑大模型，但<em>跨设备的层间传输会让推理慢好几倍</em>。所以它是「跑得起来」的手段，不是「跑得快」的手段。真要快就得靠张量并行（C39）或换更小的模型/量化（C27）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>显存的粗算公式值得背下来：<strong>推理显存 ≈ 参数量 × 每参数字节数 × 1.2</strong>（那 20% 是激活与碎片）。7B 模型 fp16 = 7e9 × 2 × 1.2 ≈ 17 GB；int4 量化 ≈ 4.2 GB。<strong>训练显存 ≈ 参数 × (2 权重 + 2 梯度 + 8 优化器状态) = 参数 × 12 字节</strong>（Adam fp32 状态），7B 训练要 84 GB——这就是为什么全量微调 7B 需要多卡，而 LoRA 只需一张卡（模块 04）。notebook 会把这个公式实现成工具。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="heads"><span class="num">4</span>任务头：AutoModelFor* 家族</h2>
+  <p>同一个主干可以接不同的头，<code>transformers</code> 用 <code>AutoModelFor&lt;Task&gt;</code> 系列表达这件事。选错头是新手最常见的错误之一。</p>  <table>
+    <thead><tr><th>类</th><th>输出</th><th>对应 C49 的范式</th><th>labels 的形状</th></tr></thead>
+    <tbody>
+      <tr><td><code>AutoModel</code></td><td>隐状态 <code>(B, L, H)</code>，<strong>无头</strong></td><td>—（自己接头）</td><td>不接受 labels</td></tr>
+      <tr><td><code>AutoModelForSequenceClassification</code></td><td><code>(B, C)</code></td><td>序列分类（模块 03①）</td><td><code>(B,)</code> 类别 id，或 <code>(B,C)</code> 多标签</td></tr>
+      <tr><td><code>AutoModelForTokenClassification</code></td><td><code>(B, L, K)</code></td><td>token 分类（模块 03②）</td><td><code>(B, L)</code>，忽略位置填 <code>-100</code></td></tr>
+      <tr><td><code>AutoModelForQuestionAnswering</code></td><td>两个 <code>(B, L)</code></td><td>span 抽取（模块 03③）</td><td><code>start_positions</code> + <code>end_positions</code></td></tr>
+      <tr><td><code>AutoModelForMaskedLM</code></td><td><code>(B, L, V)</code></td><td>MLM（C49 模块 01）</td><td><code>(B, L)</code>，未掩位置填 <code>-100</code></td></tr>
+      <tr><td><code>AutoModelForCausalLM</code></td><td><code>(B, L, V)</code></td><td>CLM / 生成</td><td><code>(B, L)</code>，<strong>内部自动右移</strong></td></tr>
+      <tr><td><code>AutoModelForSeq2SeqLM</code></td><td><code>(B, L_tgt, V)</code></td><td>encoder-decoder（C49 模块 04）</td><td><code>(B, L_tgt)</code>，内部生成 <code>decoder_input_ids</code></td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">labels 的右移到底谁做</span>
+    <p><strong><code>AutoModelForCausalLM</code> 的 labels 会被内部自动右移</strong>——你传 <code>labels = input_ids</code>，库内部会做 <code>logits[..., :-1, :]</code> 对 <code>labels[..., 1:]</code>。<em>如果你自己先右移一遍再传进去，就等于移了两位，模型学的是「预测下下个 token」</em>。这个错误的症状是：loss 能降但生成完全不通顺。<strong>反过来，<code>AutoModelForSeq2SeqLM</code> 的 <code>labels</code> 不需要你右移</strong>（库会据它生成 <code>decoder_input_ids</code>），但如果你手动传了 <code>decoder_input_ids</code>，库就<em>不</em>再帮你移。这两个不对称是最容易踩的实现坑之一，notebook 会用 assert 把它钉死。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="generate"><span class="num">5</span>generate()：参数全解与最常见的误用</h2>
+  <p><code>model.generate()</code> 是一个参数极多的方法，但它们分成几个正交的组：</p>  <table>
+    <thead><tr><th>组</th><th>参数</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>长度</strong></td><td><code>max_new_tokens</code> / <code>min_new_tokens</code></td><td><strong>用 <code>max_new_tokens</code> 而不是 <code>max_length</code></strong>——后者包含 prompt，会随输入变化</td></tr>
+      <tr><td><strong>解码策略</strong></td><td><code>do_sample</code> / <code>num_beams</code></td><td><code>do_sample=False, num_beams=1</code> 是贪心；<code>num_beams&gt;1</code> 是 beam search；<code>do_sample=True</code> 是采样</td></tr>
+      <tr><td><strong>采样形状</strong></td><td><code>temperature</code> / <code>top_k</code> / <code>top_p</code> / <code>min_p</code></td><td><strong>只在 <code>do_sample=True</code> 时生效</strong>——这是最高频的误用</td></tr>
+      <tr><td><strong>重复控制</strong></td><td><code>repetition_penalty</code> / <code>no_repeat_ngram_size</code></td><td>缓解退化（C49 模块 04）</td></tr>
+      <tr><td><strong>停止</strong></td><td><code>eos_token_id</code> / <code>stop_strings</code></td><td>多个 eos 可传列表；<code>stop_strings</code> 需要传 tokenizer</td></tr>
+      <tr><td><strong>beam 相关</strong></td><td><code>length_penalty</code> / <code>early_stopping</code></td><td>只在 <code>num_beams&gt;1</code> 时有意义</td></tr>
+      <tr><td><strong>输出</strong></td><td><code>return_dict_in_generate</code> / <code>output_scores</code></td><td>要 logprob 或注意力时必须开</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <strong>头号误用：设了 <code>temperature=0.7</code> 但没设 <code>do_sample=True</code></strong>。此时 <code>temperature</code> 被完全忽略，你得到的是贪心解码——但代码不报错，你会以为「temperature 没什么用」。新版本 <code>transformers</code> 会给警告，旧版本静默忽略。<em>反过来，<code>temperature=0</code> 在 <code>generate</code> 里是非法的（除零），要确定性输出应该用 <code>do_sample=False</code></em>。这与 OpenAI API 的 <code>temperature=0</code> 语义不同（那里是服务端把它翻译成贪心），是自建服务与 API 之间的一个常见混淆点。
+  </div>  <h3>三个还需要知道的细节</h3>  <ul>
+    <li><strong>batch 生成必须左 padding</strong>。decoder-only 模型生成时从序列末尾续写，如果用右 padding，pad token 会夹在 prompt 和生成之间。所以批量生成前要 <code>tokenizer.padding_side = 'left'</code>。<em>这个坑的症状是「单条生成正常、批量生成变差」</em>——极其常见。</li>
+    <li><strong><code>attention_mask</code> 必须传</strong>。padding 位置若不 mask，模型会去注意 pad token。<code>tokenizer(...)</code> 返回的字典里已经有它了，直接 <code>**inputs</code> 展开传进去就行——手写参数时容易漏。</li>
+    <li><strong>Llama 系没有 pad token</strong>。它们的 tokenizer 里 <code>pad_token</code> 是 <code>None</code>，批量处理会报错。标准做法是 <code>tokenizer.pad_token = tokenizer.eos_token</code>。<em>但注意：如果同时把 eos 当 pad 又要在 labels 里忽略 pad，就必须小心不要把真正的 eos 也忽略掉</em>（模块 03 会处理这个）。</li>
+  </ul>  <pre><code># 一段可直接用的批量生成骨架
+tok.padding_side = "left"                       # ① decoder-only 批量生成必须左 padding
+if tok.pad_token is None:
+    tok.pad_token = tok.eos_token               # ② Llama 系没有 pad token
+
+inputs = tok(prompts, return_tensors="pt", padding=True, truncation=True,
+             max_length=1024).to(model.device)  # ③ attention_mask 在返回的字典里
+
+out = model.generate(
+    **inputs,                                   # ④ 一定要展开传，别只传 input_ids
+    max_new_tokens=256,                         # ⑤ 不用 max_length
+    do_sample=True, temperature=0.7, top_p=0.9, # ⑥ 采样参数只在 do_sample=True 时生效
+    repetition_penalty=1.05,
+    pad_token_id=tok.pad_token_id,
+)
+# ⑦ 只解码新生成的部分（切掉 prompt）
+gen = out[:, inputs["input_ids"].shape[1]:]
+texts = tok.batch_decode(gen, skip_special_tokens=True)</code></pre>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">6</span>算一笔账：显存与上下文预算</h2>
+  <p>把本模块的参数变成两个必须会算的数字。</p>  <div class="math-block">\[\text{推理显存} \approx N_{params} \times b_{dtype} \times 1.2 + \underbrace{2 \cdot n_{layers} \cdot n_{kv} \cdot d_{head} \cdot L \cdot b_{dtype}}_{\text{KV 缓存}}\]</div>  <table>
+    <thead><tr><th>模型</th><th>dtype</th><th>权重</th><th>KV(L=4096, B=1)</th><th>合计（约）</th></tr></thead>
+    <tbody>
+      <tr><td>Llama-3-8B</td><td>fp16</td><td>16.0 GB</td><td>0.5 GB（GQA 8 组）</td><td>≈ 20 GB</td></tr>
+      <tr><td>Llama-3-8B</td><td>int4</td><td>4.5 GB</td><td>0.5 GB</td><td>≈ 6 GB</td></tr>
+      <tr><td>Llama-3-70B</td><td>fp16</td><td>140 GB</td><td>1.3 GB</td><td>≈ 170 GB（多卡）</td></tr>
+      <tr><td>Llama-3-70B</td><td>int4</td><td>35 GB</td><td>1.3 GB</td><td>≈ 44 GB（单 A100 80G 可跑）</td></tr>
+    </tbody>
+  </table>  <p>训练侧的账更重要，因为它决定你能不能在手上的卡上训：</p>  <div class="math-block">\[\text{训练显存} \approx N_{params}\times\underbrace{2}_{\text{fp16权重}} + N_{params}\times\underbrace{2}_{\text{梯度}} + N_{trainable}\times\underbrace{8}_{\text{Adam fp32 状态}} + \text{激活}\]</div>  <p>注意第三项用的是 <code>N_trainable</code> 而不是 <code>N_params</code>——<strong>这正是 LoRA 省显存的根本原因</strong>：全量微调 7B 的优化器状态是 56 GB，LoRA（可训练参数 0.1%）只有 56 MB。模块 04 会把这个对比算完整。</p>  <p>第二个必须会算的是<strong>上下文预算</strong>。它经常被忽略，直到线上出现「长输入被静默截断」的 bug：</p>  <div class="math-block">\[L_{prompt}^{max} = \underbrace{L_{model}}_{\text{模型上限}} - \underbrace{n_{special}}_{\text{特殊token}} - \underbrace{L_{gen}}_{\text{生成预留}}\]</div>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句话：<strong><code>transformers</code> 的复杂度几乎全在「加载」与「生成」这两个动作的参数上，而它们的坑几乎全是「静默失败」——不报错、能跑、结果错</strong>。tokenizer 不匹配不报错、权重没加载上只给个警告、<code>temperature</code> 不生效只是被忽略、右 padding 批量生成只是变差一点。<em>所以本模块最该带走的不是参数表，而是一套显式检查的习惯</em>：加载后断言 <code>missing_keys</code>、生成前断言 <code>padding_side</code>、始终从同一个变量取 checkpoint 名字。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>生态动态与开放问题</h2>
+  <ul>
+    <li><strong>加载与量化的融合</strong>：<code>from_pretrained</code> 正在吸收越来越多的量化后端（bitsandbytes、GPTQ、AWQ、FP8、torchao），通过 <code>quantization_config</code> 统一接口。但不同后端支持的架构、dtype、是否可训练差异很大，「哪个量化在我的场景可用」目前只能靠试。</li>
+    <li><strong><code>generate</code> 的可组合性</strong>：解码策略从少数几种膨胀到几十种（对比解码、投机解码、DoLa、约束解码、结构化输出）。<code>LogitsProcessor</code> 与 <code>StoppingCriteria</code> 提供了扩展点，但组合多个策略时的交互（谁先谁后、是否互斥）缺乏统一规范。</li>
+    <li><strong>结构化输出与约束解码</strong>：让模型必须输出合法 JSON/正则/语法，做法有 grammar-constrained decoding、outlines/xgrammar 类库、以及服务端的 JSON mode。哪种在质量-速度上最优、约束是否会损害推理能力，仍在讨论。</li>
+    <li><strong>模型代码的分发方式</strong>：<code>trust_remote_code</code> 让新架构无需等库更新即可发布，但它是个真实的安全面。社区正在探索更安全的中间形态（声明式 config、受限执行环境），尚无定论。</li>
+    <li><strong>版本兼容与可复现</strong>：<code>transformers</code> 迭代极快，默认行为（如 <code>generate</code> 的默认参数、tokenizer 的特殊 token 处理）会变。<em>钉死版本 + 记录 revision commit sha</em> 是目前唯一可靠的复现手段（C40 有系统讨论）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：transformers 文档的 <em>Auto Classes</em>、<em>Models（from_pretrained 的完整参数）</em>、<em>Generation Strategies</em> 与 <em>GenerationConfig</em> 四篇；safetensors 的格式规范（理解为什么它比 pickle 安全）；PyTorch 的 <em>Automatic Mixed Precision</em> 文档（fp16 vs bf16 的数值细节）。源码上建议读 <code>modeling_utils.py</code> 的 <code>_load_pretrained_model</code>（第 ⑤ 步的键名匹配全在那里）与 <code>generation/utils.py</code> 的 <code>_sample</code>。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_tokenizers_datasets/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · tokenizers 与 datasets</div></a>
+  </div>
+
+</div>
+</body>
+</html>

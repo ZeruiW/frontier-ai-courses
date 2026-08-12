@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 值函数逼近与 DQN</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 值函数逼近与 DQN</h1>
+  <p class="subtitle">用神经网络逼近 Q —— 致命三要素为何发散、experience replay 打破相关性、target network 稳住目标、Double 修过估计、Dueling 分解 V/A；从零手写 numpy DQN</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">C13 模块 02（Q-learning/TD）、模块 00（致命三要素 numpy 实验）、MLP 与反向传播、Bellman 最优方程</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_dqn.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Mnih 2015 (DQN)、van Hasselt 2016 (Double)、Wang 2016 (Dueling)、Hessel 2018 (Rainbow)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#approx">从表格 Q 到 Q 网络：回归形式与陷阱</a></li>
+      <li><a href="#triad">致命三要素在 DQN 里的具体面孔</a></li>
+      <li><a href="#replay">武器一：经验回放</a></li>
+      <li><a href="#target">武器二：目标网络</a></li>
+      <li><a href="#loop">拼成 DQN：完整训练循环</a></li>
+      <li><a href="#double">过估计与 Double DQN</a></li>
+      <li><a href="#dueling">Dueling 架构与其它改进</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="approx"><span class="num">1</span>从表格 Q 到 Q 网络：回归形式与陷阱</h2>
+  <p>C13 里你学的 Q-learning 是<strong>表格</strong>的：一张 $|S|\times|A|$ 的表，每个 $(s,a)$ 存一个数，更新规则 <code>Q[s,a] += α(r + γ max_a' Q[s',a'] − Q[s,a])</code> 只动一个格子，互不干扰，且贝尔曼最优算子是压缩映射，保证收敛。但当状态是一帧 84×84 的图像、或连续的机器人传感器读数时，这张表<strong>根本写不下，也填不满</strong>——你永远见不到同一个状态两次。</p>  <p>唯一的出路是<strong>函数逼近</strong>：用一个带参数 $\theta$ 的函数 $Q_\theta(s,a)$ 代替表格，让它从见过的状态<em>泛化</em>到没见过的状态。本课用一个<strong>小 MLP</strong>：输入状态特征，输出每个动作的 Q 值。训练目标看起来只是把表格更新搬成回归——拟合 TD 目标 $y=r+\gamma\max_{a'}Q_\theta(s',a')$：</p>  <div class="math-block">\[\mathcal{L}(\theta) = \mathbb{E}_{(s,a,r,s')\sim\mathcal{D}}\Big[\big(Q_\theta(s,a) - \underbrace{(r + \gamma \max_{a'} Q_{\theta}(s',a'))}_{\text{TD 目标 } y}\big)^2\Big]\]</div>  <p>但这个「看起来像监督学习」的式子藏着两个致命陷阱。第一，目标 $y$ 里<strong>也含 $\theta$</strong>——你在追一个<em>自己一动就会动</em>的靶子（这叫<span class="term">semi-gradient</span>：我们只对 $Q_\theta(s,a)$ 求梯度，把目标当常数，它不是任何固定损失的真梯度）。第二，连续交互产生的样本<strong>高度时间相关</strong>，远非监督学习假设的 i.i.d.。这两点叠加函数逼近，就是上一模块见过的<strong>致命三要素</strong>。本模块就是讲 DQN 用哪两件武器把它驯服。</p>  <p>还有一个容易被忽略却很关键的区别：表格 Q-learning 的更新是<strong>局部</strong>的——动 $Q[s,a]$ 这一格，绝不碰别的格子。而 Q 网络的一次梯度更新会改变<strong>所有</strong>参数，从而<em>同时</em>改变它对<strong>每一个</strong>状态-动作对的预测。这是泛化的来源（没见过的状态也能给合理估计），也是<strong>干扰</strong>的来源：为了在状态 $s$ 上把 $Q(s,a)$ 拟合到目标，网络可能<em>无意中破坏</em>了它在另一个不相关状态 $s''$ 上本已学好的值。表格法里「学这里不忘那里」是免费的，函数逼近里它得靠足够多样的数据与小步更新去<em>维持</em>——这条直觉贯穿本模块所有稳定化设计。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>DQN = 把 Q-learning 写成回归，再用两个技巧（经验回放 + 目标网络）让这个回归在「目标会动 + 数据相关 + 网络泛化」的三重恶劣条件下不发散</strong>。学完你会从零手写一个 numpy DQN，在 toy 环境里把回报从随机水平显著拉起来，并亲手加上 Double（修过估计）与 Dueling（分解 V/A）两项经典改进。注意 DQN 处理的是<strong>离散动作</strong>（输出层每个动作一个 Q，取 argmax 即可）；连续动作下 $\max_a$ 无法枚举，那是下一模块策略方法登场的地方。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="triad"><span class="num">2</span>致命三要素在 DQN 里的具体面孔</h2>
+  <h3>致命三要素在 DQN 里的具体面孔</h3>  <p>回顾致命三要素：<strong>自举 + 离策略 + 函数逼近</strong>三者同时出现可能发散。DQN<strong>三样全占</strong>，我们逐一点名：</p>  <table>
+    <thead><tr><th>要素</th><th>在 DQN 里是什么</th><th>为什么危险</th></tr></thead>
+    <tbody>
+      <tr><td><strong>自举</strong> bootstrapping</td><td>目标 $y=r+\gamma\max_{a'}Q_\theta(s',a')$ 用自己的估计当未来</td><td>目标随 $\theta$ 漂移，形成正反馈：高估→目标更高→更高估</td></tr>
+      <tr><td><strong>离策略</strong> off-policy</td><td>从 replay 里采历史数据（旧策略产生的）训当前 Q</td><td>更新的状态分布 ≠ 当前贪婪策略会访问的分布，投影误差不再受控</td></tr>
+      <tr><td><strong>函数逼近</strong> approximation</td><td>用 MLP，一次更新牵动相似状态</td><td>在一个状态上拟合目标，可能<em>破坏</em>另一个状态——泛化是双刃剑</td></tr>
+    </tbody>
+  </table>  <p>把三者放一起，发散的机制是这样一条<strong>正反馈环</strong>：网络偶然高估了某个 $Q(s',a')$ → max 把这个高估选进目标 $y$ → 回归让 $Q(s,a)$ 也升高 → 由于参数共享，相似状态的 Q 跟着升高 → 下一次它们的 max 又喂进目标……估计像滚雪球一样爆炸。上一模块的 numpy 实验里你已经亲眼看到一个线性 Q 的权重指数发散——那不是 bug，是致命三要素的<strong>教科书行为</strong>。</p>  <p>为什么偏偏是这三者<em>一起</em>才致命？可以这样拆解：<strong>自举</strong>让误差能<em>传播</em>（目标依赖别处的估计，错误会顺着自举链扩散）；<strong>函数逼近</strong>让误差能<em>放大</em>（参数共享使一处的抬升带动一片）；<strong>离策略</strong>则<em>解除了纠错机制</em>——同策略时，你高估了某个动作就会更常去走它、于是很快收到真实回报把估计拉回来；离策略时你在用 replay 里的旧数据训练，高估的那些 $(s',a')$ 可能<strong>再也不会被实际访问、收不到现实的反驳</strong>，幻觉值就一直留在目标里循环放大。三者各补上发散所需的一环，缺一环则环路断裂。</p>  <div class="callout danger"><span class="label">武器是缓解非根治</span>
+    <p>关键认知：DQN 的稳定化技巧<strong>不是消除致命三要素，而是削弱它的两条致命环路</strong>。经验回放<strong>打散离策略数据的时间相关性</strong>（让回归更接近 i.i.d. 监督学习）；目标网络<strong>冻结自举目标</strong>（让靶子在一段时间内不动，掐断正反馈）。三要素本质还在（DQN 仍是自举 + 离策略 + 逼近），但被这两件武器压到了<em>实践中能稳定训练</em>的程度。这也是为什么 DQN 仍可能在某些任务上不稳——武器是缓解，不是定理级保证。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="replay"><span class="num">3</span>武器一：经验回放</h2>
+  <h3>武器一：经验回放（experience replay）</h3>  <p><span class="term">experience replay</span>：把每次交互产生的转移 $(s,a,r,s',\text{done})$ 存进一个大缓冲区 $\mathcal D$（典型容量 $10^5\sim10^6$），训练时从中<strong>随机均匀采样</strong>一个小批量来算损失、更新网络。它一次解决两个问题：</p>  <ul>
+    <li><strong>打破时间相关性</strong>：连续几步的状态高度相似（你在迷宫里相邻两步只差一格），直接拿连续样本做 SGD 会让梯度高度相关、估计有偏。随机采样把它们打散，逼近监督学习要的 i.i.d.。</li>
+    <li><strong>提高数据复用</strong>：真实交互昂贵（尤其机器人），每个转移只用一次太浪费。replay 让一条经验被采样多次、跨多轮更新反复利用，大幅提升<strong>样本效率</strong>。</li>
+  </ul>  <div class="ascii">交互产生流式相关数据             replay buffer (容量 N)            随机小批量
+  s0-&gt;s1-&gt;s2-&gt;s3-&gt;...    ──存入──►  [..., (s,a,r,s'), ...]   ──采样──►  打散的 (s,a,r,s') 批
+  (相邻样本高度相关)                  (FIFO, 满了丢最旧)            (近似 i.i.d. -&gt; 稳定回归)</div>  <p>实现上极简：一个固定容量的 <code>deque</code>（满了自动丢最旧的），<code>push</code> 存转移、<code>sample(batch)</code> 随机取一批堆成 numpy 数组。注意 done 标志要一起存——它决定目标是 $r$（终止，没有未来）还是 $r+\gamma\max Q$（继续）。这个细节错了，智能体会在终点附近学出离谱的值。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见进阶是<span class="term">prioritized experience replay</span>（PER, Schaul 2016）：按 TD 误差大小给样本分配采样概率，多学「意外」的转移，并用重要性权重纠偏。它能提升效率，但引入了新的超参与偏差。本模块先实现<strong>均匀回放</strong>（DQN 原版），把核心机制吃透；PER 留作延伸（见 references）。记住次序：先让朴素版稳定 work，再上花哨改进。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="target"><span class="num">4</span>武器二：目标网络</h2>
+  <h3>武器二：目标网络（target network）</h3>  <p>回归的对象 $y=r+\gamma\max_{a'}Q_\theta(s',a')$ 里含 $\theta$，每更新一步靶子就动一下——你在追自己的尾巴。<span class="term">target network</span>的解法朴素而有效：<strong>再维护一份 Q 网络的参数副本 $\bar\theta$，专门用来算目标，并让它「慢半拍」更新</strong>。损失变成：</p>  <div class="math-block">\[\mathcal{L}(\theta) = \mathbb{E}\Big[\big(Q_\theta(s,a) - (r + \gamma \max_{a'} Q_{\bar\theta}(s',a'))\big)^2\Big]\]</div>  <p>注意目标里是 $\bar\theta$ 不是 $\theta$。$\bar\theta$ 有两种更新方式：</p>  <ul>
+    <li><strong>硬更新（hard update）</strong>：每隔 $C$ 步（如 DQN 原版的 10000 步）把 $\bar\theta\leftarrow\theta$ 整体拷贝一次，期间冻结。</li>
+    <li><strong>软更新（Polyak / soft update）</strong>：每步让 $\bar\theta\leftarrow\tau\theta+(1-\tau)\bar\theta$，$\tau\ll1$（如 0.005）。更平滑，SAC/DDPG 偏好。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把目标网络想成「一个慢半拍的裁判」：在线网络 $\theta$ 拼命学，但它的考卷答案（目标）由一个<strong>一段时间内不改主意</strong>的旧版本给出。靶子不动了，追靶就稳了——上一模块你已亲眼验证：冻结目标后那个发散的线性 Q 立刻不爆炸了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>数学上，目标网络把「半梯度自举」近似成了一串<strong>分段固定目标的监督回归</strong>：在 $\bar\theta$ 冻结的那段时间里，目标是常数，损失是真正的回归损失、梯度是真梯度、收敛性可控；每隔 $C$ 步换一次目标，相当于做了一次「拟合迭代」（fitted Q iteration 的在线版）。这就把不受控的自举，拆成了一串受控的监督问题。</p></div>
+  </div>  <p>两件武器是<strong>正交且互补</strong>的：经验回放管「数据维度」（打散相关性、复用样本），目标网络管「目标维度」（冻结靶子、掐断正反馈）。DQN 的稳定，是这两者<strong>合力</strong>的结果——缺一个都明显更容易崩。notebook 里你会先单独看每个技巧的作用，再合起来训练完整 DQN。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="loop"><span class="num">5</span>拼成 DQN：完整训练循环</h2>
+  <h3>把它拼成 DQN：完整训练循环</h3>  <p>有了 Q 网络（小 MLP）、replay buffer、target network，DQN 的训练循环就是把它们串起来：</p>  <pre><code>初始化 Q 网络 θ；目标网络 θ̄ ← θ；空 replay buffer D；ε ← 1
+for 每个回合:
+    s ← env.reset()
+    while not done:
+        # —— 与环境交互（ε-贪婪探索）——
+        a ← random 动作  with prob ε  else  argmax_a Qθ(s,a)
+        s', r, done ← env.step(a)
+        D.push(s, a, r, s', done)         # 存经验
+        s ← s'
+        # —— 学习（从 replay 采一批做一次回归更新）——
+        if len(D) ≥ batch:
+            (s,a,r,s',done) ← D.sample(batch)
+            y ← r + (1-done) · γ · max_a' Q_θ̄(s',a')   # 目标用 θ̄！终止则 y=r
+            loss ← Huber( Qθ(s,a) − y )
+            θ ← θ − lr · ∇θ loss              # 半梯度：不回传 y 的梯度
+        每 C 步:  θ̄ ← θ                       # 同步目标网络
+    ε ← max(ε_min, ε · decay)                 # 退火探索</code></pre>  <p>几个<strong>实现细节</strong>决定成败：① 目标 $y$ 一定用 $\bar\theta$、且对终止转移用 $(1-\text{done})$ 屏蔽未来；② 损失常用 <span class="term">Huber loss</span>（小误差平方、大误差线性，梯度有界）抗离群 TD 误差；③ 反向传播时<strong>只对 $Q_\theta(s,a)$ 选中那个动作的输出求梯度</strong>（其余动作不参与该样本的损失）；④ $\varepsilon$ 从 1 线性退火到 ~0.05，前期多探索、后期多利用。</p>  <p>还有一对常被混淆的频率要分清：<strong>交互频率</strong>（每走一步存一条经验）与<strong>学习频率</strong>（每隔几步从 replay 采一批更新）通常<em>不是</em>一比一。DQN 原版每 4 个环境步才做一次梯度更新——因为相邻几步的经验高度冗余，频繁更新既浪费算力又加剧相关性。而<strong>目标同步频率</strong>（每 $C$ 步刷新 $\bar\theta$）又是另一个独立的、慢得多的时钟。三个时钟（交互、学习、同步）层层放慢，是 off-policy 深度 RL 调得稳的常见结构——本课 toy 版为简洁让交互与学习同频，但你应记住真实系统里它们是分开的旋钮。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一个能帮你 debug 的心智图：DQN 在做的，是<strong>反复地『用稍旧的自己估计未来、把当下回归到这个估计、隔段时间把估计刷新』</strong>。如果训练发散，先查三处：目标是不是误用了 $\theta$（应是 $\bar\theta$）、done 有没有屏蔽未来、学习率/同步频率是不是太激进。这三处覆盖了新手 90% 的 DQN 翻车。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="double"><span class="num">6</span>过估计与 Double DQN</h2>
+  <h3>过估计与 Double DQN</h3>  <p>即便稳住了，DQN 还有一个<strong>系统性偏差</strong>：<span class="term">overestimation bias</span>。根源在目标里的 $\max_{a'}$：它对一组<strong>带噪声</strong>的 Q 估计取最大值，而「取最大」会系统性地选中那些<em>恰好被噪声向上偏</em>的动作。即使每个 $Q(s',a')$ 的噪声均值为零，$\mathbb E[\max_a(Q+\text{noise})]\ge\max_a Q$——max 把随机正向波动当成了真实价值。</p>  <div class="math-block">\[\mathbb{E}\big[\max_{a'} (Q^*(s',a') + \epsilon_{a'})\big] \;\ge\; \max_{a'} Q^*(s',a'), \qquad \mathbb{E}[\epsilon_{a'}]=0\]</div>  <p>这个高估会<strong>被自举不断传播放大</strong>，在很多任务上系统性拉高值估计、损害策略。<span class="term">Double DQN</span>（van Hasselt 2016）的修法极简且几乎零成本：把目标里的「<strong>选动作</strong>」和「<strong>评估该动作的值</strong>」用<strong>两个不同网络</strong>解耦——用在线网络 $\theta$ 选 argmax 动作，用目标网络 $\bar\theta$ 评估它的值：</p>  <table>
+    <thead><tr><th></th><th>标准 DQN 目标</th><th>Double DQN 目标</th></tr></thead>
+    <tbody>
+      <tr><td>公式</td><td>$r+\gamma\,Q_{\bar\theta}(s',\arg\max_{a'}Q_{\bar\theta}(s',a'))$</td><td>$r+\gamma\,Q_{\bar\theta}(s',\arg\max_{a'}Q_{\theta}(s',a'))$</td></tr>
+      <tr><td>选动作用</td><td>$\bar\theta$（同一个网）</td><td>$\theta$（在线网）</td></tr>
+      <tr><td>评估值用</td><td>$\bar\theta$</td><td>$\bar\theta$（目标网）</td></tr>
+      <tr><td>效果</td><td>选与评同源，噪声同向 → 高估</td><td>选与评异源，噪声去相关 → 削高估</td></tr>
+    </tbody>
+  </table>  <p>直觉：标准 DQN 里「谁看起来最大就信谁最大」，看走眼时高估自我强化；Double DQN 让<strong>一个网推荐、另一个网背书</strong>——若某动作只是被在线网的噪声捧高，目标网未必给它高分，高估被打掉一截。代价仅仅是 argmax 改用在线网，几行代码。notebook 练习会让你实现它并对比。</p>  <div class="callout paper"><span class="label"></span>
+    <p>Double DQN 是<strong>最高性价比</strong>的 DQN 改进之一：几行代码、几乎零额外算力，却能稳定削弱过估计、在多数 Atari 上提升分数。它和下一节的 Dueling、以及 PER/多步/分布式一起被集成进 <span class="term">Rainbow</span>（Hessel 2018）——这些改进大体<strong>正交可叠加</strong>。详见 references 的 van Hasselt 2016 与 Hessel 2018。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dueling"><span class="num">7</span>Dueling 架构与其它改进</h2>
+  <h3>Dueling 架构与其它改进</h3>  <p><span class="term">Dueling network</span>（Wang 2016）改的不是目标或数据，而是<strong>网络结构</strong>。它把 Q 网络在最后分成两支——一支估<strong>状态值 $V(s)$</strong>（这个状态整体多好），一支估<strong>各动作的优势 $A(s,a)$</strong>（每个动作比平均好多少）——再合并：</p>  <div class="math-block">\[Q(s,a) = V(s) + \Big(A(s,a) - \frac{1}{|\mathcal{A}|}\sum_{a'} A(s,a')\Big)\]</div>  <p>减去优势均值是为了<strong>可辨识性</strong>（identifiability）：否则 $V$ 加常数、$A$ 减常数得到同一个 $Q$，两支无法分开学。减均值钉住了分解的唯一性。</p>  <p>为什么有用？在很多状态下，<strong>选哪个动作无关紧要</strong>（比如赛车直道上方向微调没差别），此时重要的是把 $V(s)$ 学准。Dueling 让 $V$ 这一支<strong>从所有动作的样本里共同获益</strong>地学 $V$，而不必为每个动作分别经由 $Q(s,a)$ 间接学一遍。在动作多、且多数动作影响小的任务上，它学得更快更稳。</p>  <p>一个值得玩味的点：Dueling 不改训练目标、不改数据流，<strong>只改最后两层的连接方式</strong>，却能稳定提升。这体现了深度 RL 里一类常被低估的杠杆——<strong>把领域结构编码进网络架构</strong>（这里是「状态有一个整体好坏 + 各动作的相对增益」这一先验）。它和 Double（改目标）、replay/target（改数据与目标的时序）<em>作用在完全不同的维度</em>，因此可以无冲突地叠加。理解「一个改进到底动了 RL 流程的哪一环（数据 / 目标 / 结构 / 探索 / 优化）」，比记住它叫什么名字重要得多——这也是读懂 Rainbow 这类集成工作的正确姿势。</p>  <p>DQN 家族还有一串正交改进，值得知道名字与用途（细节见 references）：</p>  <ul>
+    <li><span class="term">prioritized replay</span>（PER）：按 TD 误差采样，多学意外样本；</li>
+    <li><strong>multi-step / n-step return</strong>：目标用 $n$ 步真实奖励再自举，偏差-方差更好的折中；</li>
+    <li><strong>distributional RL</strong>（C51, Bellemare 2017）：学 Q 的<em>整个分布</em>而非期望，信息更丰富；</li>
+    <li><strong>noisy nets</strong>：把探索做进网络权重的可学噪声里，替代 $\varepsilon$-贪婪；</li>
+    <li><span class="term">Rainbow</span>（Hessel 2018）：把上述六项 + Double + Dueling 集成，验证它们<strong>可叠加</strong>。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>记住 DQN 家族的<strong>模块化哲学</strong>：稳定性（replay + target）、偏差（Double）、结构（Dueling）、数据效率（PER、n-step）、表达（distributional）、探索（noisy）——每个改进打一个独立的痛点，大多可自由组合。本模块吃透前四个（replay、target、Double、Dueling），你就握住了值方法深度化的主干，其余是锦上添花。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>致命三要素的理论</strong>：什么条件下 off-policy + 逼近 + 自举一定收敛/发散，至今没有完整刻画。Gradient TD、Emphatic TD 等给出有收敛保证的替代，但实践中 DQN 式的「工程缓解」仍是主流——理论与实践有缺口。</li>
+    <li><strong>过估计 vs 低估</strong>：Double DQN 削高估，但有时会矫枉过正成低估；Maxmin Q、截断双 Q（TD3/SAC 用 min 取两 Q 较小者）等在「估计偏差」这条轴上各有取舍，最优点依任务而异。</li>
+    <li><strong>样本效率</strong>：DQN 玩 Atari 要上亿帧，远超人类。EfficientZero、数据增强（DrQ）、自监督辅助任务等把样本效率提升一两个数量级，但离人类的几分钟上手仍很远。</li>
+    <li><strong>连续动作</strong>：DQN 的 $\max_a$ 在连续动作上不可解（无法枚举）。出路是确定性策略梯度（DDPG/TD3）或随机策略（SAC）——这正是下一模块的主题，值方法与策略方法在此交汇。</li>
+    <li><strong>离线 DQN</strong>：把 DQN 直接用在固定数据集上会因 OOD 动作的 max 而严重高估、崩溃——这是模块 03 离线 RL 的核心难题，CQL 等专门来救它。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Mnih 2015（DQN 原版，replay + target）、van Hasselt 2016（Double DQN，过估计）、Wang 2016（Dueling）、Hessel 2018（Rainbow 集成）。Sutton & Barto 第 11 章是致命三要素的理论底座。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_ppo_sac/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 策略优化：PPO 与 SAC</div></a>
+  </div>
+
+</div>
+</body>
+</html>

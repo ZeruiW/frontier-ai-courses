@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 工具系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 工具系统</h1>
+  <p class="subtitle">工具注册表、JSON Schema 声明参数、调用分发、结果回灌、并行工具、错误隔离（坏调用变可反馈错误而非崩溃）—— 从零搭一个能注册、校验、分发的工具系统，用 MockLLM 端到端验证</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（agent 循环、dispatch 占位）、Python 字典/装饰器/异常、一点点 JSON</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_tool_system.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Anthropic tool use overview、Toolformer (Schick 2023)、«Building effective agents»</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么需要工具系统</a></li>
+      <li><a href="#anatomy">工具的解剖：名字+说明书+函数</a></li>
+      <li><a href="#registry">注册表：名字到函数的映射</a></li>
+      <li><a href="#schema">JSON Schema：告诉模型怎么填参数</a></li>
+      <li><a href="#dispatch">分发：调用落实成执行</a></li>
+      <li><a href="#parallel">并行工具调用</a></li>
+      <li><a href="#real">接真实 Claude 的工具协议</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么需要工具系统</h2>
+  <p>模块 01 把循环做对了，但循环里有一行我们一笔带过：<code>dispatch(tools, call)</code>——执行模型想调的那个工具。这一行背后，是 agent 的「手脚」系统，本模块把它从零造出来。没有工具，LLM 只能<strong>说</strong>，不能<strong>做</strong>：它能告诉你「北京天气大概是晴」（凭训练记忆，可能过时或编造），但不能<em>真的去查</em>；能写出一段计算过程，但不能<em>真的去算</em>（还常算错）。工具系统就是把模型从「只会说」变成「能做」的那座桥。</p>  <p>先想清楚一个根本问题：<strong>一个只会输出文本的模型，怎么可能『调用』一个函数？</strong>答案是——它<em>不能</em>，至少不能直接调用。真正发生的是一场<strong>约定好的接力</strong>：模型输出一段结构化的文本，意思是「我想调用名为 search、参数为 {q:'北京天气'} 的工具」；你的 harness 解析这段文本，在一个<strong>注册表</strong>里按名字找到对应的真实 Python 函数，校验参数、调用它、拿到返回值，再把返回值<em>说给模型听</em>。模型自始至终只是在「说」，所有「做」都是 harness 替它做的。</p>  <p>所以「工具系统」要解决四个环环相扣的问题：(1) <strong>注册</strong>——怎么把一个 Python 函数声明成「模型可用的工具」？(2) <strong>声明</strong>——怎么用模型看得懂的方式告诉它「这个工具叫什么、做什么、参数怎么填」（JSON Schema）？(3) <strong>分发</strong>——拿到模型的工具调用，怎么找到、校验、执行对应的函数？(4) <strong>回灌与容错</strong>——怎么把结果（或错误）变成模型能继续推理的观察？本模块逐一攻破。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>工具系统 = 一张『名字→(函数+说明书)』的注册表 + 一个『按调用找函数、校验、执行、包装结果』的分发器</strong>。模型靠「说明书」（schema）知道有哪些工具、怎么用；harness 靠「注册表」把模型的话落实成真实执行。全部难点在于：说明书写得让模型看得懂（schema 与 description），以及执行时<em>坏调用不能崩掉整个 agent</em>（错误隔离）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="anatomy"><span class="num">2</span>工具的解剖：名字+说明书+函数</h2>
+  <h3>工具的解剖：名字 + 说明书 + 函数</h3>  <p>一个工具，无论在哪个框架里，都由三部分构成。理解这三部分各自<strong>给谁看、起什么作用</strong>，是设计工具系统的地基：</p>  <table>
+    <thead><tr><th>部分</th><th>是什么</th><th>给谁看</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>name</strong> 名字</td><td>工具的唯一标识，如 <code>get_weather</code></td><td>模型 + harness</td><td>模型用它指定要调谁；harness 用它在注册表里查函数</td></tr>
+      <tr><td><strong>description</strong> 描述</td><td>自然语言说明：做什么、何时用</td><td><strong>模型</strong></td><td>模型据此决定『要不要用、什么时候用』——常比模型本身更影响调用质量</td></tr>
+      <tr><td><strong>input_schema</strong> 参数模式</td><td>JSON Schema：参数的类型/必填/范围</td><td>模型 + harness</td><td>模型据此知道『怎么填参数』；harness 据此『校验参数合法性』</td></tr>
+      <tr><td><strong>函数体</strong> (implementation)</td><td>真正执行的 Python 函数</td><td><strong>harness</strong></td><td>拿到合法参数后真正干活、返回结果</td></tr>
+    </tbody>
+  </table>  <p>一个关键的认知：前三部分（name/description/schema）是给<strong>模型</strong>看的「契约」，最后一部分（函数体）是<strong>harness</strong>执行的「实现」。模型只看契约、永远碰不到实现——它不知道 <code>get_weather</code> 内部是调了某个 API 还是返回了固定值，它只知道「有这么个工具，这样调，会得到天气」。这种<strong>契约与实现分离</strong>正是工具系统的精髓：你能随意改 <code>get_weather</code> 的内部（换数据源、加缓存），只要契约不变，模型完全无感。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：工具的 name/description/schema 就像餐厅<strong>菜单</strong>上的「菜名 + 介绍 + 备注（忌口/份量选项）」，函数体则是<strong>后厨</strong>。顾客（模型）只看菜单点菜，从不进后厨；后厨怎么做、换没换厨师，顾客不关心，只要端上来的是菜单承诺的那道菜。菜单写得好不好（description 清不清楚），直接决定顾客点不点得对菜。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，一个工具是一个三元组的契约 <code>(name, description, input_schema)</code> 加一个可调用对象 <code>fn</code>。注册表是 <code>name → (schema, fn)</code> 的映射；「暴露给模型的工具列表」只含契约部分（schema），<strong>函数体绝不发给模型</strong>。这也是为什么模型再「聪明」也无法绕过你执行任意代码——它能调的，只有你注册过的那几个函数。</p></div>
+  </div>  <p>本模块的 notebook 会让你用一个 <code>@tool</code> 装饰器把这三部分<em>一次性</em>声明出来：写一个普通 Python 函数，加个装饰器，它就自动带上 name（函数名）、description（docstring）、并被登记进注册表。这正是 Claude SDK 的 <code>@beta_tool</code>、LangChain 的 <code>@tool</code> 在做的事——把「声明工具」这件事变得像写个带文档的普通函数一样自然。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="registry"><span class="num">3</span>注册表：名字到函数的映射</h2>
+  <h3>注册表：名字到函数的映射</h3>  <p><span class="term">tool registry</span>（工具注册表）是工具系统的心脏，本质朴素到极点——一个字典：<code>name → (schema, function)</code>。「注册一个工具」= 往这个字典里加一项；「分发一个调用」= 拿调用里的工具名去这个字典里查。所有 agent 框架的工具系统，剥到底都是这张表。</p>  <p>但围绕这张表，有几个设计决策值得想清楚：</p>  <ul>
+    <li><strong>注册的接口</strong>：最朴素是 <code>registry.register(name, schema, fn)</code>；更优雅是装饰器 <code>@registry.tool</code> 自动从函数提取 name 与 docstring。后者让工具定义<em>贴着函数本身</em>，不易遗漏、不易写错。</li>
+    <li><strong>schema 从哪来</strong>：可以手写 JSON Schema（最灵活、最啰嗦），也可以从函数的类型注解<em>自动生成</em>（最省事，但表达力有限）。工业框架两者都支持；本课先手写以看清结构，再演示从注解生成。</li>
+    <li><strong>暴露给模型的视图</strong>：注册表对内存着 (schema, fn)，但<strong>发给模型的只有 schema 列表</strong>（一个 <code>export()</code> 方法）。这是安全边界——函数体永不出网。</li>
+  </ul>  <div class="ascii">  工具注册表 (registry)
+  ┌─────────────────────────────────────────────────┐
+  │ 'get_weather' → (schema_w, fn_get_weather)        │
+  │ 'calculator'  → (schema_c, fn_calculator)         │
+  │ 'search'      → (schema_s, fn_search)             │
+  └─────────────────────────────────────────────────┘
+        │ export()                    │ dispatch(call)
+        ▼ 只发 schema 列表            ▼ 用 call['name'] 查 fn
+   [给模型看的工具清单]          找到函数 → 校验 → 执行 → 包装结果
+   (绝不含函数体!)</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>注册表就像公司的<strong>通讯录</strong>：「名字 → 这个人 + 他的职责说明」。要找人办事（分发），按名字一查就找到；对外公布的（给模型的）只是「有哪些人、各管什么」（职责说明），而不是每个人的私人电话和家庭住址（函数实现）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从工程看，注册表把工具系统变成一个<strong>单一事实来源</strong>（single source of truth）：工具只在一处登记，「发给模型的清单」与「分发时查的函数」用的是<em>同一张表</em>，天然保证一致——模型看到的工具，就是 harness 能执行的工具，绝不会出现「模型以为有但其实没有」或「有但没告诉模型」的错位。</p></div>
+  </div>  <p>一个容易被忽视但重要的不变式：<strong>export() 给模型的工具名集合，必须恰好等于 dispatch 能找到的工具名集合</strong>。破坏它会导致两类 bug：告诉了模型某工具但分发时找不到（KeyError），或注册了某工具但忘了告诉模型（模型永远不会用它）。本模块 notebook 会把这个不变式写成一条 assert，守住它。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="schema"><span class="num">4</span>JSON Schema：告诉模型怎么填参数</h2>
+  <h3>JSON Schema：怎么告诉模型「参数怎么填」</h3>  <p>模型怎么知道 <code>get_weather</code> 需要一个叫 <code>city</code> 的字符串参数、而 <code>calculator</code> 需要一个表达式？靠 <span class="term">JSON Schema</span>——一段用 JSON 描述「参数长什么样」的标准声明。它是模型与工具之间的<strong>参数契约</strong>。</p>  <pre><code># get_weather 工具的完整声明（Claude / OpenAI 通用的形态）
+{
+  "name": "get_weather",
+  "description": "查询某城市的当前天气。当用户询问天气、气温、是否下雨时使用。",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "city": {"type": "string", "description": "城市名，如 北京、上海"},
+      "unit": {"type": "string", "enum": ["c", "f"], "description": "温标，默认摄氏"}
+    },
+    "required": ["city"]
+  }
+}</code></pre>  <p>逐项看这段 schema 的作用：<code>type:object</code> 说「参数是一组键值对」；<code>properties</code> 列出每个参数的类型与说明；<code>enum</code> 限定取值（unit 只能是 c 或 f）；<code>required</code> 标出哪些必填（city 必填、unit 可省）。每个参数的 <code>description</code> 同样关键——它告诉模型「这个参数该填什么」（如 city 要填城市名而非邮编）。</p>  <p>schema 身兼<strong>两个角色</strong>，这是理解它的钥匙：对<strong>模型</strong>，它是「使用说明」——模型读它来决定怎么填参数；对<strong>harness</strong>，它是「校验规则」——执行前据它检查模型填的参数对不对（类型对吗？必填项齐吗？enum 越界吗？）。同一份 schema，既引导模型正确生成，又让 harness 在执行前拦截非法输入。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一个反复被验证的经验：<strong>description 写得好不好，常常比模型本身更影响工具调用质量</strong>。Anthropic 的建议是把 description 写得<em>像给一个新同事的文档</em>——讲清这工具做什么、什么时候该用（甚至什么时候不该用）、每个参数什么含义、边界条件。一个含糊的 description（如 <code>"搜索"</code>）会让模型乱用或不用；一个清楚的（如「当需要查训练数据之外的实时信息时使用网页搜索」）能让调用质量天差地别。这是 agent 工程里<strong>性价比最高</strong>的一处投入。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dispatch"><span class="num">5</span>分发：调用落实成执行</h2>
+  <h3>分发：把一次调用落实成一次执行</h3>  <p><span class="term">dispatch</span>（分发）是工具系统的执行中枢，把模型的一个抽象调用 <code>(name, input)</code> 落实成一次真实执行。它是一条有固定步骤的流水线：</p>  <ol>
+    <li><strong>查找</strong>：用 <code>call['name']</code> 在注册表里找对应函数。找不到 → 这是个<em>幻觉工具</em>（模型编了个不存在的名字），返回结构化错误。</li>
+    <li><strong>校验</strong>：按 schema 检查 <code>call['input']</code>——必填项齐吗？类型对吗？enum 越界吗？不合法 → 返回结构化错误（让模型改），<strong>不执行</strong>。</li>
+    <li><strong>执行</strong>：参数合法，调用函数。这一步可能抛异常（函数内部出错、外部 API 挂了）——必须<strong>捕获</strong>，不能让它冒泡崩掉 agent。</li>
+    <li><strong>包装</strong>：把返回值（或捕获到的错误）包装成一个带 <code>tool_use_id</code> 的 observation/tool_result，回灌给模型。</li>
+  </ol>  <pre><code>def dispatch(registry, call):
+    name, args = call['name'], call['input']
+    # 1) 查找
+    if name not in registry:
+        return _err(call, f'无此工具 {name}，可用: {list(registry)}')   # 幻觉工具
+    schema, fn = registry[name]
+    # 2) 校验
+    ok, why = validate(args, schema)
+    if not ok:
+        return _err(call, f'参数非法: {why}')                          # 不执行
+    # 3) 执行（隔离异常）
+    try:
+        result = fn(**args)
+    except Exception as e:
+        return _err(call, f'工具执行出错: {type(e).__name__}: {e}')
+    # 4) 包装
+    return {'tool_use_id': call['id'], 'content': str(result), 'is_error': False}</code></pre>  <p>注意这条流水线的每一步都有一个<strong>失败出口</strong>，且所有失败出口都通向<em>同一种东西</em>——一个带 <code>is_error=True</code> 的结构化结果，而非一个抛出的异常。这是工具系统健壮性的关键设计：<strong>无论是幻觉工具、非法参数、还是函数内部崩溃，对 agent 循环来说都只是『一个失败的观察』</strong>，模型看到它、知道哪儿错了、可以换个法子重试。循环本身一行容错都不用写。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把分发想成餐厅的<strong>传菜流程</strong>：服务员（dispatch）拿到点单，先看菜单上有没有这道菜（查找）、份量选项填没填对（校验），再交给后厨做（执行）。万一后厨把菜烧糊了（异常），服务员不会当场掀桌（崩溃），而是回来跟顾客说「这道菜出了点问题，您要不要换一个」（结构化错误）——顾客（模型）据此重新点。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从契约角度，dispatch 保证了一个强不变式：<strong>它永远返回一个合法的 tool_result，从不抛异常</strong>。这把「容错」这件事<em>收口</em>在工具系统内部，让上层的 agent 循环可以假设「dispatch 一定给我一个结果」，从而保持简洁。模块 04 会在此基础上再叠重试、超时等更强的鲁棒手段。</p></div>
+  </div>  <p>这里有个微妙的设计选择：<strong>校验失败和执行出错，都返回 is_error 让模型重试，而不是直接终止 agent</strong>。为什么？因为模型常常能从错误里<em>学到</em>并改正——「参数 city 缺失」让它补上 city，「无此工具 foo，可用 [...]」让它改用正确的工具。把错误当成<em>可反馈的信号</em>而非<em>终止信号</em>，是让 agent 鲁棒的核心思路（贯穿模块 04）。当然，反复同样的错误就该靠循环检测止损了。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="parallel"><span class="num">6</span>并行工具调用</h2>
+  <h3>并行工具调用：一次调多个</h3>  <p>有时模型在一轮里想<strong>同时</strong>调用多个互相独立的工具——比如「同时查北京和上海的天气」。现代模型（含 Claude）原生支持在一条助手消息里返回<strong>多个</strong> <code>tool_use</code> 块，这叫 <span class="term">parallel tool calls</span>（并行工具调用）。它能减少往返、提速。</p>  <p>处理并行调用有两条必须遵守的规则，错了 agent 就会出问题：</p>  <ul>
+    <li><strong>可以并行执行，但要全部执行</strong>：这些调用彼此独立，你可以并发跑（线程池）以提速；但无论如何，模型给的<em>每一个</em> tool_use 都必须有一个对应的 tool_result——少回一个，模型就会困惑「我那个调用怎么没结果」。</li>
+    <li><strong>所有结果放进同一条 user 消息回传</strong>：把这一轮所有的 tool_result 放进<strong>一条</strong> user 消息里一起回传，而<em>不要</em>拆成多条消息。拆开回传会让模型误以为「并行调用没成功」，下次就不敢再并行了（这是 Anthropic 文档明确警示的坑）。</li>
+    <li><strong>靠 tool_use_id 对位</strong>：并行时多个结果回传，必须靠每个 tool_result 里的 <code>tool_use_id</code> 对回它来自哪个调用。<strong>绝不能按顺序硬对</strong>——顺序可能因并发执行而乱，对错位 = 把上海的天气安到北京头上。</li>
+  </ul>  <div class="ascii">  模型一轮返回多个 tool_use:
+    assistant: [tool_use(id=A, get_weather, 北京),
+                tool_use(id=B, get_weather, 上海)]
+        │ harness 可并发执行 A、B
+        ▼
+  全部结果放进【一条】user 消息回传，靠 id 对位:
+    user: [tool_result(id=A, '北京 晴'),
+           tool_result(id=B, '上海 雨')]   ← 不要拆成两条消息!</div>  <div class="callout warn"><span class="label"></span>
+    <p>一个隐蔽但常见的 bug：并行执行时<strong>用执行完成的顺序、而非 tool_use_id 来配对结果</strong>。并发下「上海」可能先返回、「北京」后返回，若按返回顺序硬塞，就会把结果对错位。<strong>永远用 tool_use_id 把结果对回它的调用</strong>——这和模块 01 强调的「状态要对」一脉相承：agent 的每一处对位（id、角色、顺序）错了，模型就会被你喂的错误信息带偏。</p>
+  </div>  <p>并行也带来一个<strong>正确性 vs 简单性</strong>的取舍。串行执行（一个个跑）最简单、最易调试，对大多数场景够用；并行执行更快，但要处理并发（线程安全、异常各自捕获、结果对位）。本课的最小 agent 默认串行（清晰为先），但 notebook 会让你把分发器扩展成支持并行的版本，并验证「无论串行还是并行，每个调用都拿到正确对位的结果」——理解这一点，你就懂了真实 agent 框架为什么要费力支持并行。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="real"><span class="num">7</span>接真实 Claude 的工具协议</h2>
+  <h3>接真实 Claude：工具系统如何对接 Messages API</h3>  <p>本课的工具系统刻意设计得与 Claude Messages API 的工具协议<strong>同构</strong>，所以接真实模型几乎只是格式翻译。对照一下两边：</p>  <table>
+    <thead><tr><th>本课内部</th><th>Claude Messages API</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>registry.export()</td><td><code>tools=[{name, description, input_schema}]</code></td><td>工具清单格式几乎一致</td></tr>
+      <tr><td>resp['tool_calls']</td><td><code>content</code> 里的 <code>tool_use</code> 块</td><td>模型的工具调用意图</td></tr>
+      <tr><td>call['id']</td><td><code>tool_use.id</code></td><td>调用的唯一标识</td></tr>
+      <tr><td>dispatch 返回的 result</td><td><code>tool_result</code> 块（放进 user 消息）</td><td>回灌的观察</td></tr>
+      <tr><td>result['is_error']</td><td><code>tool_result.is_error</code></td><td>标记这次调用失败了</td></tr>
+      <tr><td>resp['stop_reason']</td><td><code>stop_reason=="tool_use"</code></td><td>模型想调工具的信号</td></tr>
+    </tbody>
+  </table>  <p>具体流程：你把 <code>registry.export()</code> 作为 <code>tools</code> 传给 <code>client.messages.create</code>；模型若想调工具，返回的 <code>content</code> 里会有 <code>tool_use</code> 块、<code>stop_reason=="tool_use"</code>；你遍历这些块、用本课的 <code>dispatch</code> 执行，把每个结果包成 <code>tool_result</code> 块、全部放进<strong>一条</strong> user 消息回传；再调一次 <code>messages.create</code>，模型据结果继续。这正是模块 01 的循环 + 本模块的工具系统，接到真实 API 上。</p>  <p>Anthropic SDK 还提供了一个 <span class="term">tool runner</span> 帮你自动跑这整个循环：用 <code>@beta_tool</code> 装饰函数（自动从签名和 docstring 生成 schema）、<code>client.beta.messages.tool_runner(...)</code> 自动「调 API→执行工具→回灌→再调」直到完成。它等于<strong>官方版的 agent loop + 工具系统</strong>——本课先让你手写这两样（彻底理解），再让你看官方现成版（知道生产里怎么用、以及它替你做了什么）。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>理解了这层同构，你就懂了本课的深层用意：<strong>我们用 MockLLM 验证的工具系统，和接真实 Claude 用的工具系统，是同一套代码</strong>。MockLLM 返回的 <code>tool_calls</code> 和真实 Claude 返回的 <code>tool_use</code> 块结构一致；本课的 <code>dispatch</code> 不在乎调用来自 mock 还是真模型。所以你在零成本的 MockLLM 上把工具系统打磨到正确，换上真实 Claude 时它立刻就能用——这就是『同构设计』的回报。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>工具检索（tool search）</strong>：当工具有成百上千个时，把全部 schema 塞进上下文既贵又让模型选困难。前沿做法是让模型先<em>检索</em>出与当前任务相关的少数工具、只加载它们的 schema（Anthropic 的 tool search）。如何高效、准确地检索是活跃方向。</li>
+    <li><strong>程序化工具调用（programmatic tool calling）</strong>：与其一次调一个工具、把每个中间结果都塞回上下文，不如让模型<em>写一段代码</em>在沙箱里把多个工具像函数一样串起来调用，只把最终结果返回。能大幅减少 token 与往返，是工具调用的新范式。</li>
+    <li><strong>有副作用工具的安全</strong>：读类工具（搜索、计算）重试无害；但写类工具（发邮件、删数据、转账）一旦模型调错或被诱导，后果严重。如何对不可逆动作做<em>确认门控、权限策略、幂等保证</em>，是 agent 安全的核心前沿（Anthropic 的 permission policy、人在回路确认）。</li>
+    <li><strong>schema 自动生成与校验严格性</strong>：从类型注解自动生成 schema 方便但表达力有限（难表达复杂约束）；strict 模式能保证模型输出严格符合 schema，但牺牲一点灵活。在「省事」「严格」「灵活」间取舍，仍在演化。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Anthropic 的 tool use overview（工具协议权威）、Toolformer（Schick 2023，工具调用奠基）、Anthropic «Building effective agents»（工具设计原则）。进阶：tool search、programmatic tool calling 文档。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_agent_loop/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · Agent 循环</div></a>
+    <a class="next" href="../03_llm_adapter/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · LLM 适配器</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · 校准与不确定性</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 06 / 08</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>06 · 校准与不确定性</h1>
+  <p class="subtitle">准确率对了还不够，置信度也要诚实 —— 可靠性图、ECE/MCE、为什么现代网络过度自信、温度缩放(只调校准不改 argmax)、Brier 分数与可靠性/分辨率/不确定性三分解、选择性预测</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、softmax 与交叉熵、概率（条件概率、期望）、一点点优化</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 06_calibration_uncertainty.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Guo 等 2017（温度缩放）、Naeini 2015（ECE）、Murphy 1973（Brier 分解）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what">校准 vs 准确率：置信度说话算数吗</a></li>
+      <li><a href="#reliability">可靠性图：把校准画出来</a></li>
+      <li><a href="#ece">ECE 与 MCE：把校准压成一个数</a></li>
+      <li><a href="#overconf">现代神经网络为什么过度自信</a></li>
+      <li><a href="#temp">温度缩放：一个标量修好校准</a></li>
+      <li><a href="#brier">Brier 分数与它的三分解</a></li>
+      <li><a href="#selective">置信区间与选择性预测</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what"><span class="num">1</span>校准 vs 准确率：置信度说话算数吗</h2>
+  <p>到目前为止，我们评测的几乎都是<strong>模型答得对不对</strong>——accuracy、κ、BLEU、胜率。但一个模型给出的不只是答案，还有它对这个答案的<strong>置信度</strong>（softmax 的最大概率、log-prob、或它自己说的「我有 90% 把握」）。这一模块要问一个被长期忽视、却在高风险部署里性命攸关的问题：<strong>模型的置信度，说话算数吗？</strong></p>  <p>一个<span class="term">calibration</span>（校准）良好的模型，满足一个朴素到近乎天真的性质：在它声称<em>自信 70%</em>的所有预测里，应当<em>约有 70%</em>真的正确。如果它说 70% 把握、实际只对了一半，它就是<strong>过度自信</strong>（overconfident）；如果它说 70%、实际对了 90%，则是<strong>不足自信</strong>。校准衡量的不是「答得准不准」，而是「它对自己准不准的判断，准不准」——这是一个<strong>元层面</strong>的、关于不确定性的诚实度问题。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>校准与准确率<strong>正交</strong>（互相独立）：一个永远预测「下雨概率 = 历史平均降雨频率」的天气预报，准确率可能不高，却完美校准；一个准确率 95% 但对所有预测都喊「99.9% 确定」的分类器，准得很却烂校准。<strong>准确率问对了多少，校准问你该多信它说的每一个「我确定」</strong>。两者都要测，缺一不可。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：一个总说「这题我有九成把握」、结果只对六成的学生，和一个同样说九成、真对九成的学生，卷面分可能一样，但你对他们的<strong>信任</strong>应当天差地别。后者的「我有把握」是可以拿来做决策的（比如让他去做高风险的题），前者的则是噪声。校准就是在量化「我有把握」这句话的含金量。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，设模型对样本输出预测类别 $\hat y$ 与置信度 $\hat p$。完美校准要求对任意置信水平 $q$：$\;P(\hat y = y \mid \hat p = q) = q$。这是一个关于<em>条件概率</em>的陈述：在「自报置信度为 $q$」这个子总体里，真实正确率恰好等于 $q$。本模块的所有度量（ECE、可靠性图、Brier）都是在用不同方式<em>逼近并检验</em>这个条件等式。</p></div>
+  </div>  <p>为什么这在大模型时代尤其紧迫？因为下游决策越来越依赖置信度：<strong>选择性预测</strong>（没把握就弃答或转人工）、<strong>主动学习</strong>（挑模型最不确定的样本去标）、<strong>级联与路由</strong>（小模型有把握就直接答、没把握才调大模型）、<strong>RAG 与工具调用</strong>（不确定就去检索）。这些机制全都建立在「置信度可信」之上。一个过度自信的模型会让所有这些机制失灵——它从不弃答（因为它从不觉得自己没把握），于是把错误一路带到生产环境。校准是把「不确定性」从一句空话变成可用信号的前提。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="reliability"><span class="num">2</span>可靠性图：把校准画出来</h2>
+  <h3>可靠性图：把校准画出来</h3>  <p>检验校准最直观的工具是<span class="term">reliability diagram</span>（可靠性图）。想法很简单：我们没法对每个单独的置信度值都统计「实际对了多少」（每个值样本太少），于是把预测按置信度<strong>分箱</strong>（比如 [0,0.1), [0.1,0.2), …, [0.9,1.0] 共 10 个箱），在每个箱里算两个数——<strong>箱内平均置信度</strong>和<strong>箱内真实准确率</strong>，然后把它们画成一条曲线。</p>  <div class="ascii">可靠性图（每个箱一个点：x=平均置信度, y=真实准确率）
+
+ 准确率 1.0 ┤                                    ╱  ← 对角线 y=x = 完美校准
+           ┤                              ╱   ●
+           ┤                        ╱  ●          实际曲线在对角线
+           ┤                  ╱  ●                下方 = 过度自信
+           ┤            ╱  ●                      (置信度 &gt; 真实准确率)
+       0.5 ┤      ╱  ●
+           ┤   ●╱
+           └──┴────┴────┴────┴────┴────┴────→ 平均置信度
+          0.5                            1.0</div>  <p>解读规则一句话记牢：<strong>点落在对角线上 = 完美校准；落在对角线下方 = 过度自信；上方 = 不足自信</strong>。对角线 $y=x$ 表示「箱内置信度 = 箱内准确率」，正是校准的定义。现代深度网络的可靠性图几乎总是<strong>整体压在对角线下方</strong>——尤其在高置信端，模型喊着 0.99，实际只对 0.90。</p>  <p>可靠性图比任何单一数字都信息更丰富，因为它告诉你校准在<em>哪个置信区间</em>出问题。有的模型整体过度自信、有的只在高置信端崩坏、有的呈 S 形（低置信端不足自信、高置信端过度自信）。这些定性差异决定了你该怎么修：整体偏移用温度缩放就够，复杂形状可能要 isotonic 回归。<strong>先画图，再选药</strong>——这与模块 01「先估噪声再下结论」的纪律一脉相承。</p>  <p>为什么要分箱、而不直接对每个置信度值统计准确率？因为「准确率」本质是一个<strong>条件期望</strong> $\mathbb{E}[\,\text{correct}\mid \hat p\,]$，而我们手里每个具体的 $\hat p$ 值往往只有一两个样本，估不出这个期望。分箱是一种<strong>非参数估计</strong>：把邻近的置信度归到一起，用箱内频率近似条件概率。这立刻暴露了一个<strong>偏差-方差权衡</strong>（又是它）：箱越多越细，每个箱越能反映局部校准（偏差小），但每箱样本越少、估计越抖（方差大）；箱越少越粗，估计越稳但越掩盖细节。典型取 10–15 个箱是个折中。这个权衡也正是下一节 ECE「对分箱敏感」的根源——同一份预测，分箱不同，画出的图、算出的 ECE 都不同。</p>  <div class="callout warn"><span class="label"></span>
+    <p>可靠性图有一个隐藏的自由度：<strong>分箱方式</strong>。等宽分箱（按置信度均匀切）在高置信端可能挤了 90% 的样本进最后一两个箱，让低置信端的箱因样本太少而剧烈抖动、看起来「不校准」其实只是噪声。等频分箱（每箱样本数相同）能缓解，但箱边界变得不直观。看可靠性图时务必同时看<em>每个箱的样本数</em>，别把空箱的抖动当成校准问题。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ece"><span class="num">3</span>ECE 与 MCE：把校准压成一个数</h2>
+  <h3>ECE 与 MCE：把校准压成一个数</h3>  <p>可靠性图是一幅图，但论文和排行榜需要一个<strong>数字</strong>。最常用的是 <span class="term">ECE</span>（Expected Calibration Error，期望校准误差）：把可靠性图里每个箱的「置信度与准确率的差距」按箱内样本数加权平均：</p>  <div class="math-block">\[\mathrm{ECE} = \sum_{b=1}^{B} \frac{n_b}{N}\,\bigl|\,\mathrm{acc}(b) - \mathrm{conf}(b)\,\bigr|\]</div>  <p>其中 $n_b$ 是第 $b$ 个箱的样本数、$\mathrm{acc}(b)$ 与 $\mathrm{conf}(b)$ 分别是箱内真实准确率与平均置信度。直观说，ECE 就是可靠性图的曲线到对角线的<strong>平均垂直距离</strong>（按样本加权）。完美校准 ECE = 0；ECE 越大越不校准。它的姊妹指标 <span class="term">MCE</span>（Maximum Calibration Error）取的是<strong>最坏的那个箱</strong>：$\mathrm{MCE} = \max_b |\mathrm{acc}(b)-\mathrm{conf}(b)|$，关注「最离谱的置信区间错得有多离谱」——在风险敏感场景（医疗、自动驾驶）比 ECE 更该看它。</p>  <table>
+    <thead><tr><th>指标</th><th>聚合方式</th><th>回答的问题</th><th>适用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>ECE</strong></td><td>各箱差距按样本加权<strong>平均</strong></td><td>平均而言置信度偏离真实多少</td><td>总体校准、最常报告</td></tr>
+      <tr><td><strong>MCE</strong></td><td>各箱差距取<strong>最大</strong></td><td>最坏的置信区间错多少</td><td>风险敏感、安全关键</td></tr>
+      <tr><td>Brier</td><td>逐样本概率均方误差</td><td>校准+区分度的综合得分</td><td>综合评分、可分解（见第 6 节）</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">ECE 的陷阱</span>
+    <p>ECE 是个<strong>有缺陷</strong>的指标，务必带着警惕用它（Nixon 2019）：① 它对<strong>分箱方式高度敏感</strong>——箱数、等宽/等频会给出不同的 ECE，甚至能通过调箱数把 ECE 刷低；② 它<strong>掩盖箱内异质</strong>：一个箱里如果一半样本过度自信、一半不足自信，平均下来差距为零，ECE 显示「完美」，实则两头都错；③ 多分类下只看 max-prob（top-label ECE）会忽略其它类的概率是否校准。<em>ECE 是一个有用的粗略信号，不是校准的最终裁判</em>——配合可靠性图、换几种分箱、必要时报 Brier。</p>
+  </div>  <p>还有一个常被忽略的区分：<strong>confidence calibration</strong>（只校准 top-1 的最大概率）vs <strong>classwise calibration</strong>（要求每一类的预测概率都校准）。前者宽松、好测，是 ECE 的默认对象；后者严格、更接近「整个概率向量都可信」的理想，但样本需求大得多。本模块聚焦前者（够用且标准），但要知道后者的存在——当你下游要用的是<em>整个概率分布</em>（如 top-k 检索、概率阈值路由）而不只是最大那个，confidence calibration 的「合格」可能并不够。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="overconf"><span class="num">4</span>现代神经网络为什么过度自信</h2>
+  <h3>现代神经网络为什么过度自信</h3>  <p>Guo 等 2017 的经典发现震动了领域：<strong>现代神经网络系统性地过度自信</strong>，而且比老式的浅模型更严重。一个在 CIFAR-100 上 accuracy 70% 的 ResNet，其平均置信度可能高达 95%——它对几乎所有预测都喊着「我很确定」，哪怕错了。更反直觉的是：<em>模型越大、训练越久、accuracy 越高，往往校准越差</em>。能力和诚实，在这里背道而驰。</p>  <p>根源在哪？几股力量合谋：<strong>交叉熵损失</strong>在训练数据上鼓励把正确类的概率推向 1（log-loss 只有在 $p\to1$ 时才趋于 0），于是高容量模型会一路把训练样本的置信度顶到天花板、并外推到测试样本上；<strong>过参数化</strong>让模型几乎能记住训练集（训练准确率 ~100%），于是「训练时见到的置信度」全是 1，没给模型留下「我可能错」的概念；<strong>BatchNorm、权重衰减、标签平滑的缺失</strong>等训练选择也都会推高置信度。</p>  <p>这件事的实际危害比「数字不好看」严重得多。一个过度自信的模型会让所有<strong>依赖不确定性的下游机制集体失灵</strong>：选择性预测形同虚设（它从不觉得自己该弃答，于是把错误全answered出去）；主动学习挑不出真正该标的样本（它对错样本也喊高置信）；级联路由永远不把难题上交给大模型（小模型自我感觉良好）；人类操作员被它的「99% 确定」误导而放松警惕。在医疗、金融、自动驾驶里，这种「自信地出错」比「坦诚地不确定」危险得多——后者至少会触发人工复核。<strong>校准差不是审美问题，是安全问题</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：交叉熵像一个只奖励「斩钉截铁说对」的老师。学生为了拿满分，学会了对什么都斩钉截铁——包括它其实没把握的题。于是它在考场（测试集）上也改不掉这个习惯：明明只有六成把握，嘴上还是九成。<strong>过度自信不是 bug，是交叉熵训练的自然产物</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨说：最小化交叉熵 $-\sum_i \log p_{y_i}$ 的全局最优是把训练样本的预测概率推成 one-hot。在可分（过参数化）情形下模型能逼近这个最优，导致 logits 的尺度（temperature）被推得过大、softmax 过尖。关键洞察是：<strong>这主要扭曲了 logits 的尺度，而非它们的相对顺序</strong>——argmax（即预测的类别、即 accuracy）几乎没受影响，受损的只是概率的「锐度」。这就为下一节的解法埋下伏笔。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>过度自信「主要是尺度问题、不是排序问题」这一洞察，是温度缩放为何如此有效的全部理由：如果病根只是 logits 被整体放大了，那只要把它们<strong>整体除以一个数</strong>缩回去就行——不用重训、不用改预测、几乎零成本。一个深刻的问题，一个一行代码的解法。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="temp"><span class="num">5</span>温度缩放：一个标量修好校准</h2>
+  <h3>温度缩放：一个标量修好校准</h3>  <p>既然过度自信主要是 logits 尺度过大，最自然的修法就是<strong>把尺度调回来</strong>。<span class="term">temperature scaling</span>（温度缩放，Guo 2017）就这么干：在 softmax 前用一个<strong>单一标量</strong> $T$（温度）去除所有 logits：</p>  <div class="math-block">\[\hat p_k = \mathrm{softmax}\!\left(\frac{z_k}{T}\right) = \frac{\exp(z_k/T)}{\sum_j \exp(z_j/T)}\]</div>  <p>$T>1$ 把 softmax 变<em>平</em>（降低置信度，治过度自信）；$T<1$ 变<em>尖</em>（提高置信度）；$T=1$ 不变。它的两个性质让它近乎完美地契合上一节的诊断：① <strong>不改变 argmax</strong>——所有 logits 同除一个正数，相对大小不变，所以<strong>预测的类别、accuracy 完全不动</strong>，只动概率；② <strong>只有一个参数</strong>，在一个小验证集上就能稳健拟合，几乎不会过拟合。</p>  <p>怎么拟合 $T$？在一个<strong>留出的验证集</strong>上，选使<strong>负对数似然</strong>（NLL，等价于交叉熵）最小的 $T$：<code>T* = argmin_T  −Σ log softmax(z/T)[y]</code>。这是一个一维优化，网格搜索或一维梯度下降几秒搞定。注意它必须在<strong>验证集</strong>（而非训练集）上拟合——训练集上模型已经过拟合到置信度全是 1，没有校准信号可学。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：模型的「音量」开太大了（什么都喊得震天响）。温度缩放就是一个<strong>音量旋钮</strong>，在验证集上找到那个让「喊的音量」与「真实把握」匹配的刻度，然后拧上。歌还是那首歌（预测不变），只是音量正常了（概率可信了）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨说：温度缩放是 <span class="term">Platt scaling</span> 的单参数特例（Platt 用逻辑回归的两参数 $a,b$ 映射分数）。它是一个<em>保序</em>（order-preserving）变换，所以保持 AUC、accuracy、排序类指标不变，只重标概率的绝对值。代价是它只能做<strong>全局、单调</strong>的校正——若可靠性图是复杂的非单调形状，单个 $T$ 修不了，需要 isotonic 回归等更灵活（但更易过拟合）的方法。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>温度缩放的局限要诚实交代：它假设错校准是一个<strong>全局尺度问题</strong>。当不同区域过度/不足自信程度不同（非单调可靠性图）、或分布发生偏移（验证集与测试集不同分布）时，单个 $T$ 不够。它也不会让一个<em>不准</em>的模型变准——它只调诚实度，不调能力。但作为<strong>第一道、零成本、不伤 accuracy</strong>的校准手段，它几乎总该先试，且常常已经够好。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="brier"><span class="num">6</span>Brier 分数与它的三分解</h2>
+  <h3>Brier 分数与它的三分解</h3>  <p>ECE 只看 top-1 置信度、且依赖分箱。有没有一个<strong>逐样本、无需分箱</strong>的概率评测？有——<span class="term">Brier score</span>（布里耶分数，源自 1950 年的天气预报），就是概率预测的<strong>均方误差</strong>：</p>  <div class="math-block">\[\mathrm{Brier} = \frac{1}{N}\sum_{i=1}^{N}\sum_{k=1}^{K}\bigl(\hat p_{ik} - \mathbb{1}[y_i=k]\bigr)^2\]</div>  <p>它衡量预测概率向量与 one-hot 真值的平方距离，越小越好。Brier 是一个 <span class="term">proper scoring rule</span>（恰当评分规则）：<strong>当且仅当你报告真实概率时，期望得分最优</strong>。这个性质至关重要——它意味着<em>诚实地报告不确定性是最优策略</em>，你没法靠虚报置信度刷分（虚报会被平方惩罚），这正是 accuracy 所缺的（accuracy 下，说 51% 和说 99% 只要 argmax 对就一样）。</p>  <p>Brier 最漂亮的地方是它能被<strong>精确分解</strong>（Murphy 1973）成三个有意义的部分。把预测按置信度分箱后：</p>  <div class="math-block">\[\mathrm{Brier} = \underbrace{\mathrm{reliability}}_{\text{校准差，越小越好}} - \underbrace{\mathrm{resolution}}_{\text{区分度，越大越好}} + \underbrace{\mathrm{uncertainty}}_{\text{任务固有难度}}\]</div>  <table>
+    <thead><tr><th>分量</th><th>公式（分箱）</th><th>含义</th><th>想要</th></tr></thead>
+    <tbody>
+      <tr><td><strong>reliability</strong> 可靠性</td><td>Σ (n_b/N)(conf_b − acc_b)²</td><td>校准误差：箱内置信度偏离准确率多少</td><td>越小越好（=0 完美校准）</td></tr>
+      <tr><td><strong>resolution</strong> 分辨率</td><td>Σ (n_b/N)(acc_b − acc̄)²</td><td>区分度：不同箱的准确率分得开吗</td><td><strong>越大越好</strong>（能区分难易）</td></tr>
+      <tr><td><strong>uncertainty</strong> 不确定性</td><td>acc̄·(1−acc̄)</td><td>任务基率固有难度，与模型无关</td><td>（不可控，由数据定）</td></tr>
+    </tbody>
+  </table>  <p>这个分解让一个数字<strong>会说话</strong>：reliability 高 → 校准有问题（温度缩放能帮上）；resolution 低 → 模型区分不开难易（这是能力问题，校准修不了）；uncertainty 是数据本身的熵，谁也改不了。<strong>校准（reliability）和区分度（resolution）是两件独立的事</strong>——一个模型可以完美校准却毫无区分度（永远预测基率），也可以区分度极高却烂校准（过度自信）。<em>一个理想的模型要 reliability 趋零、resolution 趋高</em>。notebook 会从零实现这个分解，并验证三项相加（精确）等于分箱后的 Brier。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这条等式的精神：<strong>Brier = 校准差 − 区分度 + 固有难度</strong>。它把「这个概率预测好不好」拆成了「它诚不诚实（reliability）」和「它有没有信息量（resolution）」两个正交的问题。下次有人只报一个 Brier 或 ECE，你该追问的是：是校准的问题，还是区分度的问题？——因为这两者的药方完全不同。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="selective"><span class="num">7</span>置信区间与选择性预测</h2>
+  <h3>置信区间与选择性预测：把校准用起来</h3>  <p>校准本身是个估计量，也有<strong>方差</strong>——ECE 是在有限测试集上算的，换一批数据会不一样。所以（一以贯之地）<strong>ECE 也要报置信区间</strong>。标准做法是 <span class="term">bootstrap</span>：对测试集有放回重采样很多次、每次重算 ECE，用这些值的分位数给出 95% CI。尤其当你用 ECE 比较两个模型「谁更校准」时，CI 重叠就意味着<strong>区分不开</strong>——别把 0.03 vs 0.035 的 ECE 差当成真实差异，它很可能在噪声里。</p>  <p>校准最直接的回报是<span class="term">selective prediction</span>（选择性预测，又称弃答 abstention）：<strong>允许模型在没把握时拒答</strong>，把不确定的样本转人工或返回「我不知道」。前提正是置信度可信——只有校准的置信度才能拿来当弃答的阈值。评测它的工具是 <span class="term">risk-coverage</span>（风险-覆盖）曲线：</p>  <div class="ascii">risk-coverage 曲线：按置信度从高到低作答，覆盖率 ↑ 时风险如何变化
+
+  风险(错误率) ┤                                    ●  ← 全部作答(coverage=1)
+             ┤                              ●          风险=整体错误率
+             ┤                        ●
+             ┤                  ●
+             ┤            ●
+             ┤      ●  ← 只答最有把握的少数，风险很低
+             └──┴────┴────┴────┴────┴────┴──→ 覆盖率(作答比例)
+            0.2                            1.0
+  好的弃答策略：曲线整体压低 —— 同样覆盖率下风险更小</div>  <p>理想的曲线应当<strong>单调上升且整体压低</strong>：只答最有把握的样本（低覆盖率）时风险应当很小，随着覆盖率提高（被迫答没把握的题）风险逐渐升到整体错误率。一个校准良好的模型的 risk-coverage 曲线在低覆盖端会很低（它确实知道哪些题它会对）；一个过度自信的模型则压不下来（它的「高置信」里混着大量错误）。这条曲线下的面积（或在固定覆盖率下的风险）是衡量「不确定性是否可用」的实战指标——比 ECE 更贴近下游价值。</p>  <div class="callout paper"><span class="label"></span>
+    <p>把校准接到 model eval 的实践清单：① 报 accuracy 的同时永远报一个校准数字（ECE/Brier）+ 可靠性图；② ECE 配 bootstrap CI；③ 部署前在验证集上做温度缩放（零成本、不伤 accuracy）；④ 高风险场景看 MCE 与 risk-coverage、上选择性预测。理论基础见 Guo 2017（温度缩放）、Naeini 2015（ECE）、Murphy 1973（Brier 分解），清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <p>校准是个老问题，但在大模型与生成式 AI 的语境下，它的几个前沿恰恰最棘手，也最关乎你能否信任模型说的「我确定」：</p>  <ul>
+    <li><strong>分布外与协变量偏移下的校准</strong>：温度缩放只在与验证集同分布时有效。一旦测试数据偏移（新领域、对抗、时间漂移），校准会迅速崩坏。如何做出对分布偏移鲁棒的校准，是部署里最现实的难题——你的验证集校准好，不代表线上校准好。</li>
+    <li><strong>共形预测（conformal prediction）</strong>：与其修正概率，不如给出带<strong>覆盖保证</strong>的预测集合。split conformal 在很弱的假设（可交换性）下保证「真值以 1−α 概率落在预测集内」，是分布无关的不确定性量化，正成为校准的有力替代/补充（Angelopoulos & Bates 2021）。</li>
+    <li><strong>生成式模型的不确定性</strong>：对自由文本生成，「置信度」是什么都不清楚——一个序列的 log-prob 受长度、措辞影响巨大。语义熵（Kuhn 2023）把语义等价的不同表述聚到一起再算熵，用来检测幻觉，是把校准从分类推广到生成的前沿尝试。</li>
+    <li><strong>LLM 自报置信度（verbalized confidence）</strong>：直接让模型用语言说「我有 80% 把握」。这既方便又危险——这些自报数字往往严重过度自信、且可被提示词操纵。如何评测并校准 LLM 的自报不确定性、区分「它真的知道」与「它只是听起来确定」，是当下最热也最未解的问题之一。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Guo 等 2017（现代网络过度自信 + 温度缩放，本模块核心）、Naeini 2015（ECE）、Nixon 2019（ECE 的缺陷与更稳健做法）、Angelopoulos & Bates 2021（共形预测入门）、Kuhn 2023（语义熵/幻觉）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../05_psychometrics_irt/05_讲解.html"><div class="dir">← 上一模块</div><div class="t">05 · 心理测量与 IRT</div></a>
+    <a class="next" href="../07_online_ab_eval/07_讲解.html"><div class="dir">下一模块 →</div><div class="t">07 · 在线 A/B 评测</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 信号与特征</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 信号与特征</h1>
+  <p class="subtitle">从波形到 log-mel/MFCC —— 采样、分帧加窗、STFT、梅尔滤波器组、MFCC：把又长又连续、频率隐式的一维波形，变成又短又结构化、频率显式的二维特征，语音建模的通用前端</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">复数与正弦、numpy；一点点傅里叶变换直觉（不熟也能边学边补）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_signals_features.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Oppenheim DSP、Davis &amp; Mermelstein 1980 (MFCC)、Stevens 1937 (梅尔)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#intro">为什么要把波形变成特征</a></li>
+      <li><a href="#sample">采样与量化：从连续声压到一串整数</a></li>
+      <li><a href="#frame">分帧与加窗：为什么不能整段做 FFT</a></li>
+      <li><a href="#stft">STFT 与谱图：时间×频率的二维表示</a></li>
+      <li><a href="#mel">梅尔滤波器组：线性频率→听觉频率</a></li>
+      <li><a href="#mfcc">MFCC：用 DCT 去相关、再压一刀</a></li>
+      <li><a href="#pipeline">把它串起来：完整特征流水线</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="intro"><span class="num">1</span>为什么要把波形变成特征</h2>
+  <p>一段录音在硬盘里就是一个一维数组：<strong>随时间排列的振幅采样</strong>。这看似简单的表示，藏着语音建模的第一个根本张力——<strong>它太长、太冗余、且把『频率』这个对人耳最重要的信息埋在了时域里</strong>。16 kHz 下一秒钟就是 16000 个数，一句话上万维；而人耳真正关心的「这是什么音、什么调」是<em>频率</em>层面的，在原始波形里完全看不出来。所以语音建模的第一步，几乎永远是把波形变到<strong>频域</strong>。</p>  <p>但语音不是一个静止的频谱——它的频率内容<strong>随时间不断变化</strong>（这才有了音节、语调）。直接对整段做一次傅里叶变换会把所有时刻的频率糊成一团，丢掉「什么时候发什么音」。解决办法是<strong>短时分析</strong>：把信号切成许多 20–40 ms 的小帧，假设<em>每帧内频率近似不变</em>（短时平稳），对每帧单独做傅里叶变换，于是得到一张「时间×频率」的二维图——这就是<span class="term">STFT</span>与谱图。本课模块 01 就从采样讲到 MFCC，一步步把这个<strong>语音建模的通用前端</strong>从零搭出来。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把一段录音想成一条心电图：横轴是时间，纵轴是瞬时振幅。你一眼能看出「这里响那里静」，但看不出「这里是 a 那里是 i」——因为音色是频率层面的事。STFT 做的就是：每隔 10 ms 切一小段，问「这一小段里都有哪些频率、各有多强」，把答案竖着画成一列，连成一张随时间流动的频率热图。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：原始波形 $x[n]\in\mathbb{R}^L$ 信息完整但维度高、且频率信息隐式。短时傅里叶变换把它映为复矩阵 $X[t,k]\in\mathbb{C}^{T\times F}$（$T$ 帧、$F$ 频点），其模 $|X[t,k]|$ 即幅度谱。再经梅尔滤波器组压成 $M$ 个感知频带、取对数、（可选）DCT，得到 log-mel 或 MFCC——这一串变换是 Whisper 的输入前端、声码器的重建目标、几乎一切语音模型的公共起点。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>把又长又连续、频率隐式的一维波形，变成又短又结构化、频率显式的二维特征</strong>。这条流水线 <code>波形 → 分帧加窗 → STFT → 幅度谱 → 梅尔滤波器组 → log → DCT → MFCC</code> 是语音工程的「Hello World」，后面每个模块都站在它肩上：模块 02 的 Whisper 吃 log-mel，模块 04 的声码器要还原谱图，模块 03 的编解码也在谱域算损失。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sample"><span class="num">2</span>采样与量化：从连续声压到一串整数</h2>
+  <h3>采样与量化：从连续声压到一串整数</h3>  <p>声音本是空气中连续的声压波。要进计算机，得在<strong>时间</strong>和<strong>幅度</strong>两个轴上都离散化。时间轴上的离散叫<span class="term">sampling</span>（采样）：每隔 $1/f_s$ 秒记一个值，$f_s$ 即<span class="term">sampling rate</span>。幅度轴上的离散叫<span class="term">quantization</span>（量化）：把连续幅度近似到有限个电平，如 16 bit = 65536 级。</p>  <p>采样率不是越高越好，它由<strong>奈奎斯特采样定理</strong>约束：要无失真地表示频率为 $f$ 的成分，采样率必须 $f_s > 2f$。反过来，给定 $f_s$，能表示的最高频率是 <span class="term">Nyquist frequency</span> $f_s/2$；超过它的频率会<strong>混叠（aliasing）</strong>成低频假象、无法还原（所以采样前要低通滤波）。这条定理直接解释了工程取值：</p>  <table>
+    <thead><tr><th>采样率</th><th>奈奎斯特</th><th>典型用途</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td>8 kHz</td><td>4 kHz</td><td>传统电话</td><td>人声可懂度主要在 4 kHz 以下</td></tr>
+      <tr><td>16 kHz</td><td>8 kHz</td><td>语音识别 / 大多数语音模型</td><td>人声能量几乎都在 8 kHz 以下，省一半数据</td></tr>
+      <tr><td>24 kHz</td><td>12 kHz</td><td>TTS / 部分神经编解码</td><td>兼顾自然度与算力</td></tr>
+      <tr><td>44.1 kHz</td><td>22.05 kHz</td><td>CD / 音乐</td><td>保留到 ~20 kHz 的高频泛音（人耳上限）</td></tr>
+    </tbody>
+  </table>  <p>量化的精度由<strong>位深（bit depth）</strong>决定：每多 1 bit，动态范围约增 6 dB。16 bit（约 96 dB）足以让量化噪声低于听觉门限，是语音/CD 的标配。深度模型里我们通常把整数采样归一化到 $[-1,1]$ 的浮点再处理——本课所有合成信号都直接在浮点域生成，但你要记得真实音频文件（如 WAV）存的是整数，读入后要除以 $2^{15}$ 之类的量程。</p>  <p>这里值得停下来体会一个数字的冲击：16 kHz 单声道、16 bit，一秒钟就是 16000 个数、32 KB；一分钟近 2 MB；模型若要<em>逐采样点</em>建模（模块 04 的 WaveNet 正是如此），就是在一条长达数十万的序列上做自回归——这正是为什么语音建模<strong>几乎必须先降维</strong>：要么变到时频域把帧率降到每秒 100（本模块），要么离散成每秒几十个 token（模块 03）。「原始波形太长」不是一句空话，它是后面所有表示设计的<strong>根本动机</strong>——你可以把整门课看成『与波形的长度作斗争』的一系列招法。</p>  <div class="callout warn"><span class="label"></span>
+    <p>混叠是采样最危险的陷阱：一旦发生就<strong>不可逆</strong>。一个 6 kHz 的音以 8 kHz 采样（奈奎斯特仅 4 kHz），会被错误地记成 $8000-6000=2000$ Hz——而且事后无法区分它到底是真的 2 kHz 还是混叠来的。所以正确的采样链路里，A/D 转换前必有抗混叠低通滤波器。本课 notebook 会用合成信号<em>亲眼看到</em>一个超过奈奎斯特的正弦如何「折叠」到错误频率。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frame"><span class="num">3</span>分帧与加窗：为什么不能整段做 FFT</h2>
+  <h3>分帧与加窗：为什么不能整段做一次 FFT</h3>  <p>语音的频率内容随时间变化，所以不能对整段做一次傅里叶变换（那会把所有时刻糊在一起）。正确做法是<strong>分帧</strong>：以帧长 $N$（如 25 ms）、帧移 $H$（如 10 ms）把信号切成许多<strong>重叠</strong>的短帧。帧长与帧移之差就是重叠量；帧移决定特征的时间帧率（10 ms 帧移 = 每秒 100 帧）。</p>  <p>帧长的选择是一个无法回避的<strong>时频分辨率权衡</strong>（本质是傅里叶的不确定性原理）：帧越长，频率分得越细（频率分辨率 $=f_s/N$ 越小），但时间上越糊（一帧跨越更长时间，无法定位快速变化）；帧越短反之。语音常取 25 ms 左右，是「能分辨相邻谐波」与「能跟上音节变化」之间的经验折中。这个权衡贯穿全课——模块 04 的声码器、模块 05 的流式都要直面它。</p>  <div class="math-block">\[\text{帧率} = \frac{f_s}{H},\qquad \text{频率分辨率} = \frac{f_s}{N},\qquad \text{第 }t\text{ 帧} = x[tH : tH+N]\]</div>  <p>切完帧还不能直接做 FFT，必须先<strong>加窗</strong>。原因是：截取一帧等于把信号乘了一个<strong>矩形窗</strong>，而矩形窗的频谱有很高的旁瓣，会导致<span class="term">spectral leakage</span>——一个纯频率的能量「泄漏」到邻近频点，形成难看的拖尾、淹没弱成分。解决办法是乘一个两端平滑渐弱的<strong>窗函数</strong>（如 <span class="term">Hann / Hamming window</span>），它主瓣略宽但旁瓣低得多，大幅减少泄漏。代价是帧边缘的样本被压低——所以才需要帧间<strong>重叠</strong>，让被窗压低的部分在相邻帧里得到补偿。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>分帧加窗就像用一个柔边的取景框，每隔 10 ms 框住 25 ms 的声音去看它的频率。柔边（窗函数）是为了不让取景框的硬边缘自己制造出假的频率纹理（泄漏）；框与框重叠，是为了不漏掉被柔边压暗的边角。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>Hann 窗 $w[n]=0.5-0.5\cos(2\pi n/N)$。加窗后第 $t$ 帧的 STFT 为 $X[t,k]=\sum_{n=0}^{N-1} x[tH+n]\,w[n]\,e^{-i2\pi kn/N}$。窗的选择影响主瓣宽度（频率分辨率）与旁瓣高度（泄漏抑制）的权衡；重叠 + 合适的窗还要满足 COLA（constant overlap-add）条件，才能在模块 04 无失真地 iSTFT 回时域。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="stft"><span class="num">4</span>STFT 与谱图：时间×频率的二维表示</h2>
+  <h3>STFT 与谱图：时间×频率的二维表示</h3>  <p>把上面两步合起来——对每个加窗帧做一次 <span class="term">DFT (Discrete Fourier Transform)</span>——就得到 <span class="term">STFT</span>。DFT 本身的定义是把长度 $N$ 的序列分解成 $N$ 个复指数（频率）成分：</p>  <div class="math-block">\[X[k]=\sum_{n=0}^{N-1} x[n]\,e^{-i 2\pi kn/N},\qquad k=0,1,\dots,N-1\]</div>  <p>第 $k$ 个系数 $X[k]$ 是信号在频率 $k\cdot f_s/N$ 上的复振幅，其模 $|X[k]|$ 是幅度、辐角是相位。对<strong>实信号</strong>，DFT 有共轭对称性 $X[N-k]=\overline{X[k]}$，所以只需保留前 $N/2+1$ 个频点（$0$ 到 Nyquist）——这就是 <span class="term">rfft / real FFT</span>，语音特征几乎都用它，省一半计算与存储。把每帧的 $|X[t,\cdot]|$（或功率 $|X[t,\cdot]|^2$）竖着排、随帧横向铺开，就是<span class="term">spectrogram</span>（谱图）：一张「时间×频率」的热图，语音分析最常用的视图。</p>  <p>这里要强调一个<strong>贯穿全课的取舍</strong>：谱图通常<strong>只保留幅度、丢掉相位</strong>。如前所述，人耳对相位不敏感，丢相位的特征更紧凑、更稳定、更易学；但代价是——<em>从谱图变回波形时，相位必须重新「造」出来</em>（模块 04 的 Griffin-Lim 与神经声码器的全部使命）。所以「丢相位」不是免费的，它把难度从分析端推到了生成端。</p>  <p>再补一个<strong>频点 ↔ 赫兹</strong>的换算，它在读谱图、定位共振峰时天天用到：第 $k$ 个 DFT 频点对应的物理频率是 $f_k=k\cdot f_s/N$（赫兹）。所以频率分辨率（相邻频点间隔）就是 $f_s/N$——这再次点明了第 3 节的时频权衡：要更细的频率分辨率（更小的 $f_s/N$），就得增大帧长 $N$，但帧长一大，时间上就糊了。举例：16 kHz、$N=400$（25 ms）时，频率分辨率是 40 Hz/频点——刚好够分辨语音的相邻谐波（基频 100–300 Hz 的人声，谐波间隔就是基频）。这不是巧合，正是 25 ms 这个经验帧长的由来：<em>它落在『能分辨谐波』与『能跟上音节』的甜区</em>。notebook 的 <code>np.fft.rfftfreq</code> 会帮你把频点下标换成赫兹，亲手验证这套对应。</p>  <div class="callout intuition"><span class="label"></span>
+    <p><strong>worked 微例（一个纯音落在哪个频点）</strong>：设 $f_s=16000$ Hz、$N=400$，频率分辨率 $f_s/N=40$ Hz。喂一个 $1000$ Hz 的纯正弦进去，它应落在第 $k=f/(f_s/N)=1000/40=25$ 个频点（$f_{25}=25\times40=1000$ Hz，正中）。若改喂 $1010$ Hz，则 $k=1010/40=25.25$——<em>落在两个频点之间</em>，能量会『泄漏』到第 25、26 两点附近（即 <span class="term">spectral leakage</span>，第 3 节加窗就是为了压它）。再看 rfft 的尺寸：$N=400$ 个时域点 → 复谱只需前 $N/2+1=201$ 个频点（$0,40,80,\dots,8000$ Hz，最后一点正是 Nyquist）。这就是『$N$ 个实数进、$201$ 个复数出』的由来，notebook 会用 <code>np.fft.rfft</code> 当场点亮第 25 个频点验证。</p>
+  </div>  <p>把帧数也算一笔账，免得 notebook 里被<strong>边界约定</strong>绊住。一段 $L$ 个采样的信号，用帧长 $N$、帧移 $H$ 切分，能切出的帧数取决于是否补零（padding）与是否居中（center）。最常见的『不补零、只取完整帧』约定下，帧数 $T=\lfloor (L-N)/H\rfloor+1$。代入 1 秒、16 kHz（$L=16000$）、$N=400$、$H=160$（10 ms 帧移）：$T=\lfloor(16000-400)/160\rfloor+1=\lfloor 97.5\rfloor+1=98$ 帧——约等于『每秒 100 帧』那个常被引用的数（差异正来自边界帧）。而 librosa 默认 <code>center=True</code>（首尾各补 $N/2$）下帧数会多几帧、约为 $\lceil L/H\rceil$。<em>这个『98 还是 101』的差别看似琐碎，却是你对拍真实库时数值对不上的头号嫌疑</em>——notebook 会两种约定都算给你看。</p>  <div class="callout paper"><span class="label"></span>
+    <p>DFT/FFT/STFT 的严格理论见 Oppenheim & Schafer《Discrete-Time Signal Processing》。FFT（Cooley–Tukey）只是计算 DFT 的快速算法，结果与朴素 $O(N^2)$ 定义<strong>完全相同</strong>——本课 notebook 会从零写出 DFT 矩阵并与 <code>np.fft</code> 逐位对拍，验证这一点；再把它扩展成完整的 STFT。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mel"><span class="num">5</span>梅尔滤波器组：线性频率→听觉频率</h2>
+  <h3>梅尔滤波器组：把线性频率压成听觉频率</h3>  <p>STFT 的频率轴是<strong>线性</strong>的（频点等间隔），但人耳对音高的感知是<strong>非线性</strong>的——低频处分辨力强（200 Hz 和 300 Hz 听得出差别），高频处分辨力弱（8000 Hz 和 8100 Hz 几乎一样）。为贴合听感、同时压缩维度，我们用 <span class="term">mel scale</span>（梅尔刻度）重新划分频率轴。最常用的换算是：</p>  <div class="math-block">\[m = 2595\,\log_{10}\!\Big(1+\frac{f}{700}\Big),\qquad f = 700\,\big(10^{m/2595}-1\big)\]</div>  <p>梅尔刻度上<strong>等间隔</strong>的点，映回赫兹是<strong>低频密、高频疏</strong>的。在这些点上架起一组<strong>三角形带通滤波器</strong>，就是 <span class="term">mel filterbank</span>（梅尔滤波器组）：每个三角滤波器把一段连续频点的功率加权求和成一个梅尔频带能量。于是 $F\approx N/2$ 个线性频点被压成 $M$ 个（如 40 或 80 个）梅尔频带——一个 $(M\times F)$ 的矩阵乘就完成。</p>  <div class="callout intuition"><span class="label"></span>
+    <p><strong>worked 微例（梅尔刻度的『低频密、高频疏』）</strong>：用 $m=2595\log_{10}(1+f/700)$ 算两段同样宽 $1000$ Hz 的频率区间各占多少梅尔。低频段 $0\to1000$ Hz：$m(1000)=2595\log_{10}(1+1000/700)=2595\times\log_{10}(2.43)\approx 2595\times0.386\approx 1000$ 梅尔。高频段 $7000\to8000$ Hz：$m(8000)-m(7000)=2595[\log_{10}(12.43)-\log_{10}(11.0)]\approx 2595\times0.0532\approx 138$ 梅尔。同样 $1000$ Hz 的物理带宽，在低频占了约 $1000$ 梅尔、在高频只占约 $138$ 梅尔——<strong>差了约 7 倍</strong>。这就是为什么梅尔滤波器在低频又密又窄、在高频又疏又宽：它把『人耳分得细』的低频留细、把『人耳分得粗』的高频并粗。notebook 会把这组三角滤波器的中心频率打印出来，你会亲眼看到它们<em>低频挤、高频散</em>。</p>
+  </div>  <p>再对梅尔能量取<strong>对数</strong>（<span class="term">log-mel</span>），模拟人耳对响度的对数感知、压缩动态范围。<strong>log-mel 谱就是当今语音模型最主流的输入</strong>——Whisper 吃的就是 80 维 log-mel，神经声码器要还原的也常是它。深度模型常直接用 log-mel（即 <span class="term">fbank / filterbank features</span>），把进一步的去相关交给网络自己学。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>梅尔滤波器组像一台「按人耳习惯重新分频的均衡器」：它不平均地看每个赫兹，而是把人耳分得细的低频留细、分得粗的高频并粗，最后只报告几十个频带的能量。这样既贴近你真正听到的，又把上百维的谱压到几十维。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第 $m$ 个三角滤波器 $H_m[k]$ 在梅尔等距点 $f_{m-1}<f_m<f_{m+1}$ 之间线性上升再下降，其余为零；梅尔能量 $E[m]=\sum_k H_m[k]\,|X[k]|^2$，写成矩阵即 $E = P\,W^\top$（$P$ 功率谱、$W$ 滤波器组）。log-mel $=\log(E+\varepsilon)$，$\varepsilon$ 防 $\log 0$。滤波器中心点的取整（落到最近的 DFT 频点）是常见实现差异来源，本课 notebook 会显式处理并对拍。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mfcc"><span class="num">6</span>MFCC：用 DCT 去相关、再压一刀</h2>
+  <h3>MFCC：用 DCT 去相关、再压一刀</h3>  <p>log-mel 各频带之间仍<strong>高度相关</strong>（相邻三角滤波器重叠、相邻频带能量同涨同落）。在深度学习之前，主流做法是再做一次<strong>去相关 + 降维</strong>：对 log-mel 谱沿频带方向做 <span class="term">DCT (Discrete Cosine Transform)</span>（离散余弦变换），只保留前若干个（常 13 个）系数——这就是 <span class="term">MFCC (Mel-Frequency Cepstral Coefficients)</span>。</p>  <div class="math-block">\[c[i]=\sum_{m=0}^{M-1}\log E[m]\;\cos\!\Big[\frac{\pi\,i\,(2m+1)}{2M}\Big],\qquad i=0,1,\dots\]</div>  <p>为什么是 DCT？因为对自然信号 DCT 有极强的<strong>能量集中（去相关）</strong>性质——大部分信息挤进前几个系数，后面的近似为零可丢弃。这在数学上近似 log-mel 协方差矩阵的特征分解（PCA），却无需估计协方差、且基固定可复用。MFCC 的另一个名字 <span class="term">cepstrum</span>（倒谱）揭示了它的深意：对「谱的对数」再做一次变换，能把<strong>声源（基频谐波，快变）</strong>与<strong>声道（共振峰包络，慢变）</strong>在倒谱域分开——低阶倒谱系数主要刻画声道（音色/共振峰），正是识别音素最有用的部分。</p>  <p>MFCC 统治了语音识别二十年，至今仍是<strong>极强的轻量基线</strong>。深度学习时代，趋势是<em>少做手工变换</em>：很多模型直接吃 log-mel 甚至原始波形，把「去相关、提共振峰」这些 DCT 干的活交给网络端到端地学（网络容量足够时，固定的 DCT 反而可能丢信息）。但理解 MFCC 仍然必要——它是听觉特征工程思想的集大成者，也是你读懂老系统、做强基线的钥匙。</p>  <p>还有两个<strong>锦上添花的特征</strong>值得一提，它们在经典 ASR 里几乎标配。其一是<strong>差分特征（delta / delta-delta）</strong>：对 MFCC 沿时间求一阶、二阶差分，显式编码『特征怎么变』——因为静态的一帧 MFCC 不含动态信息，而语音的辨义很大程度在<em>变化</em>里（如爆破音的骤变）。其二是<strong>能量项与倒谱均值归一（CMN）</strong>：补一维帧能量，并减去每条语音的倒谱均值以抵消信道/麦克风的固定染色（一种简单的鲁棒化）。深度模型时代这些大多被网络隐式学到、不再手工加，但它们体现了一个不过时的洞见——<strong>『变化量』和『相对量』往往比『绝对量』更稳健、更有辨义力</strong>。这个直觉在后面模块（如 online softmax 的相对缩放、流式的相对状态）会以不同面目反复出现。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话串起 log-mel 与 MFCC 的取舍：<strong>log-mel 保留更多信息、适合喂给大模型自己学；MFCC 更紧凑、更去相关、适合轻量模型与经典方法</strong>。两者只差一个 DCT。本课 notebook 会从零实现 DCT-II，对拍 <code>scipy.fftpack.dct</code>（缺失则跳过），并<em>亲眼验证</em>DCT 把 log-mel 的能量集中到前几个系数（去相关）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">7</span>把它串起来：完整特征流水线</h2>
+  <h3>把它串起来：一条完整的特征流水线</h3>  <p>现在可以把模块 01 的全部零件接成一条<strong>端到端的特征流水线</strong>，这也是 notebook 最后要完整跑通、并与 `librosa`/`torchaudio`（若可用）对拍的目标：</p>  <div class="ascii">波形 x[n]            一维、长、频率隐式
+   │  分帧 + 加窗 (N=25ms, H=10ms, Hann)
+   ▼
+帧矩阵 (T, N)        每行一帧、已加窗
+   │  逐帧 rfft
+   ▼
+STFT X[t,k] (T, F)   复数；取 |·|² 得功率谱 P
+   │  × 梅尔滤波器组 Wᵀ  (F, M)
+   ▼
+梅尔能量 E (T, M)    贴合听觉、维度压缩
+   │  log(E+ε)
+   ▼
+log-mel (T, M)  ─────────────────►  现代语音模型的输入（Whisper、声码器目标）
+   │  DCT-II, 取前 13
+   ▼
+MFCC (T, 13)         去相关、最紧凑 ──►  经典 ASR 特征、强轻量基线</div>  <p>这条流水线的每一段都对应一个可独立验证的 numpy 函数，notebook 会逐段实现、逐段对拍：分帧（对拍帧数与重叠）、加窗（对拍泄漏减少）、STFT（对拍 <code>np.fft</code>）、梅尔（对拍滤波器形状与行和）、MFCC（对拍 <code>scipy</code> 的 DCT、并验证能量集中）。把它们组装好，你就拥有了一个<strong>完全透明、可逐位检查的语音前端</strong>——这正是读懂 torchaudio 一行 <code>MelSpectrogram(...)</code> 背后到底发生了什么的最好方式。</p>  <p>最后提醒一个常被忽视的工程细节：真实库（librosa vs torchaudio vs Kaldi）在<strong>默认参数与约定</strong>上彼此不同——窗是否居中（center）、是否做功率谱、梅尔滤波器是否做面积归一（Slaney vs HTK）、DCT 是否正交归一、是否加预加重（pre-emphasis）。这些差异会让同一段音频在不同库里算出<em>数值不同但都「对」</em>的特征。理解了从零实现，你才能在对拍真实库时<strong>精确对齐这些约定</strong>，而不是盲目调参。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个真实会咬人的坑：把训练时用的特征前端，和推理/部署时用的前端<strong>用了不同的约定</strong>（比如训练用 Slaney 归一化的梅尔、部署用 HTK 的；或训练 center=True、流式推理 center=False）。模型对<em>输入分布</em>极其敏感，这种前端不一致往往不报错，只是让准确率莫名其妙地掉一截，且极难排查。教训：<strong>把特征前端当成模型的一部分严格固定下来</strong>，训练与部署逐参数对齐——而要做到这一点，你必须先像本课这样把每个参数的含义吃透。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>学特征 vs 手工特征</strong>：从 MFCC（全手工）到 log-mel（半手工）到原始波形端到端（wav2vec 2.0、Whisper 的 log-mel 仍保留）。何时手工前端帮忙、何时成为信息瓶颈，仍无定论——数据/算力越多，越倾向少做手工变换。</li>
+    <li><strong>可学习的前端</strong>：SincNet、LEAF 等把滤波器组本身变成可训练参数，让网络自己学出「最优梅尔」。它们在某些任务上超过固定梅尔，但稳定性与可解释性是开放问题。</li>
+    <li><strong>时频分辨率的自适应</strong>：固定帧长在「分辨低频谐波」与「跟上爆破音」之间总要妥协。多分辨率 STFT、可变窗、小波等试图自适应，但增加复杂度，尚未成为主流默认。</li>
+    <li><strong>相位的回归</strong>：丢相位是几十年的默认，但 complex spectrogram、相位感知特征、以及直接建模波形的趋势在重新审视它——尤其在生成（模块 04）与增强任务中，相位其实有用。</li>
+    <li><strong>为大模型重新设计前端</strong>：当下游是巨大的 Transformer 或语音 LLM（模块 02/05），最优前端可能不再是为人耳设计的梅尔，而是为「便于离散化、便于语言建模」设计的表示（模块 03 的神经编解码 token 即一种答案）。前端设计正从『贴合听觉』转向『贴合下游模型』。</li>
+  </ul>  <div class="card"><strong>✅ 本章你应该能回答：</strong>  <ol>
+    <li>采样定理是什么？给定采样率，能表示的最高频率是多少？混叠为什么不可逆？</li>
+    <li>为什么要分帧加窗、不能整段做一次 FFT？帧长如何影响时频分辨率？加窗解决什么问题？</li>
+    <li>写出 DFT 的定义；rfft 为什么只需 $N/2+1$ 个频点？FFT 与 DFT 的结果有何关系？</li>
+    <li>梅尔刻度在做什么？梅尔滤波器组如何把功率谱压成梅尔能量？log-mel 为什么取对数？</li>
+    <li>MFCC 比 log-mel 多了哪一步、为什么用 DCT？log-mel 与 MFCC 各自适合什么场景？</li>
+  </ol></div>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读（详见 <code>references.md</code>）：Oppenheim & Schafer《Discrete-Time Signal Processing》（DSP 圣经）、Davis & Mermelstein 1980（MFCC 奠基）、Stevens 1937（梅尔刻度的心理声学起源）、Rabiner & Schafer《Digital Speech Processing》（语音特征的母体）。下一模块用这里的 log-mel 喂给 Whisper、用 STFT 思想理解 CTC 的逐帧输出。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_asr/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · ASR 与 Whisper</div></a>
+  </div>
+
+</div>
+</body>
+</html>

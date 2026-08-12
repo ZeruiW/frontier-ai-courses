@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · RMSNorm 与稳定性</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · RMSNorm 与稳定性</h1>
+  <p class="subtitle">现代 LLM 的归一化与稳定性工具箱 —— RMSNorm 凭什么够用、Pre-LN 残差增长、QK-Norm 与 z-loss，全部手写并数值校验</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">LayerNorm、反向传播、softmax（C1/C7）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_normalization.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Zhang 2019 (RMSNorm)、Xiong 2020、Chowdhery 2022 (PaLM)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">归一化为何是训深的关键</a></li>
+      <li><a href="#ln">LayerNorm 回顾</a></li>
+      <li><a href="#rms">RMSNorm：去掉减均值与 bias</a></li>
+      <li><a href="#bwd">反向传播与开销对比</a></li>
+      <li><a href="#prepost">Pre-LN vs Post-LN 与残差增长</a></li>
+      <li><a href="#qknorm">QK-Norm 抑制 logit 爆炸</a></li>
+      <li><a href="#zloss">z-loss</a></li>
+      <li><a href="#frontier">稳定性前沿</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>归一化为何是训深的关键</h2>
+  <p>深网络难训的核心顽疾之一是<strong>激活/梯度的尺度漂移</strong>：往深里堆层，数值要么逐层放大到爆炸、要么逐层缩小到消失，两者都让训练发散或停滞。<span class="term">LayerNorm</span> 通过把每个 token 的特征重新标准化（零均值、单位方差）来稳住尺度，是 Transformer 能训到几十上百层的关键基础设施。本模块讲清现代 LLM 为何普遍把它换成更省的 <span class="term">RMSNorm</span>，以及 Pre-LN、QK-Norm、z-loss 这一整套稳定性工具箱。</p>  <p>为什么会漂移？每一层的输出分布取决于上一层的参数，而参数在训练中不断变化——下游层永远在追一个<em>移动的目标</em>（这一现象常被称作 internal covariate shift，尽管后续研究对这个解释有争议，但“尺度会漂”这个现象是确凿的）。更要命的是，残差连接让每层的输出<strong>累加</strong>进同一条残差流，范数会随深度累积；不加约束，深层的 logits 可能大到 softmax 饱和（梯度趋零）、或激活溢出，训练直接发散。</p>  <p>归一化的作用就是在每个子层的入口或出口，把激活的尺度强行拉回一个可控区间，斩断这种<strong>逐层链式放大</strong>。可以把它想成给信号通路装了一连串“稳压器”：无论上游送来的电压（激活尺度）怎么波动，每个稳压器后面都是熟悉的标称电压，后续的线性层、非线性、softmax 才能在它们被设计/初始化时假设的“工作区”里正常运转。现代稳定性工程则把这个“到处装稳压器”的思想，从激活推广到了注意力分数（QK-Norm）和输出 logits（z-loss）。</p>  <p>还有一个常被忽略但很重要的作用：归一化让模型对<strong>权重初始化和学习率</strong>不那么敏感。没有归一化时，激活尺度在前向里逐层漂移，初始化稍有不当（方差偏大或偏小）就会在几十层后放大成灾难，调参极其脆弱；有了归一化，每层入口的尺度被钉住，初始化的影响被“截断”、不会无限累积，于是可用的学习率范围更宽、训练更鲁棒。这也是为什么深 Transformer 几乎离不开归一化——它不只是“让数值不爆”，更是<em>让整个训练过程变得可控、可复现</em>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>归一化的本质是给每层一个<strong>尺度重置</strong>：无论上游送来多大或多小的激活，归一化后都回到可控范围。本模块的主线就是<strong>“到处给尺度上软约束”</strong>——RMSNorm 管激活、QK-Norm 管注意力分数、z-loss 管输出 logits。读完你应能回答：RMSNorm 凭什么能省掉 LayerNorm 的减均值？Pre-LN 为什么能堆那么深、代价是什么？大模型训练时那些“loss 尖刺”是怎么被这套工具压下去的？</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ln"><span class="num">2</span>LayerNorm 回顾</h2>
+  <p>先把基线 <span class="term">LayerNorm</span> 写清楚。对一个 d 维向量 x，它做三步：</p>  <div class="math-block">\[\mu=\tfrac1d\sum_i x_i,\quad \sigma^2=\tfrac1d\sum_i (x_i-\mu)^2,\quad \text{LN}(x)=\frac{x-\mu}{\sqrt{\sigma^2+\epsilon}}\odot \gamma + \beta\]</div>  <p>分解来看：① <strong>减均值</strong>（去掉直流分量、居中）；② <strong>除标准差</strong>（把尺度归一化到 1）；③ <strong>仿射 γ, β</strong>（用可学习的缩放和偏置恢复表达力，免得归一化抹掉了有用的尺度信息）。其中第 ① 步的减均值和第 ③ 步里的 <code>β</code> 偏置是否<em>真的必要</em>，正是 RMSNorm 要质疑的对象。</p>  <p>注意 LayerNorm 是沿<strong>特征维</strong>（每个 token 自己的 d 个特征）归一化的，与 batch、序列长度无关——这让它天然适合变长序列和自回归生成（不像 BatchNorm 依赖 batch 统计、在小 batch 或推理时麻烦）。这也是 Transformer 选 LayerNorm 而非 BatchNorm 的根本原因，理解这点才知道为什么 NLP 里归一化几乎都沿特征维做。</p>  <p>那个不起眼的 <code>ε</code>（典型 <code>1e-5</code> 或 <code>1e-6</code>）也不能省：它防止当某个 token 的特征方差/均方接近 0 时除以零或除以极小数导致数值爆炸。它放在根号<em>里面</em>（<code>√(σ²+ε)</code>）而非外面，是为了保证被开方的量恒为正。这种“给分母加个小常数兜底”的细节在归一化、Adam 优化器等处反复出现，是数值稳定的标准操作，实现时千万别漏。</p>  <p>可学习的 <code>γ</code>（gain）也别误解成“可有可无的装饰”。归一化把每个特征的尺度都压成 1，但不同特征本就该有不同的重要性/尺度，硬压成一样会丢信息；<code>γ</code> 让模型为每一维学回一个合适的缩放，把“归一化抹掉的尺度自由度”有选择地还回来。所以归一化层的标准范式永远是<strong>“先归一化、再仿射”</strong>——前半句保证稳定，后半句保住表达力。这个范式你会在 RMSNorm、QK-Norm 里反复见到。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="rms"><span class="num">3</span>RMSNorm：去掉减均值与 bias</h2>
+  <p><span class="term">RMSNorm</span>（Zhang & Sennrich 2019）的主张大胆而简洁：<strong>去掉减均值、去掉 bias，只保留按均方根（RMS）的缩放</strong>：</p>  <div class="math-block">\[\text{RMS}(x)=\sqrt{\tfrac1d\sum_i x_i^2+\epsilon},\quad \text{RMSNorm}(x)=\frac{x}{\text{RMS}(x)}\odot \gamma\]</div>  <p>它背后的假设是：<em>对 Transformer 真正重要的是尺度不变性（re-scaling invariance），而不是零均值（re-centering invariance）</em>。换句话说，把激活除以它的“能量”（RMS）这一步带来了主要的稳定收益，而减均值那一步贡献有限、却要多算一遍均值。实践广泛证明：在 Transformer 里 RMSNorm 与 LayerNorm 效果相当，却更省——于是 Llama、T5、Gemma、Qwen 等几乎全线采用。</p>  <p>从代码上看差别极小（少算一个均值、少一组 bias 参数），但它体现了一种深刻的工程审美：<strong>敢于质疑“祖传组件”里每一步是否都必要</strong>。LayerNorm 用了很多年，大家默认三步都得有；RMSNorm 做了消融，发现砍掉两步几乎不掉点，于是省下的计算在千亿规模上累积成可观的收益。这种“逐项审视、砍掉冗余”的思路，与模块 02 的 GQA（砍冗余的 KV 头）、模块 03 的 MoE（只激活需要的专家）一脉相承。</p>  <p>再点透“尺度不变 vs 居中不变”这对概念。LayerNorm 同时提供两种不变性：对输入整体<em>平移</em>不变（减均值带来）和对输入整体<em>缩放</em>不变（除标准差带来）。RMSNorm 只保留后者（缩放不变），放弃前者（平移不变）。Zhang & Sennrich 的核心论证是：在 Transformer 这种结构里，真正帮助稳定训练的是<strong>缩放不变性</strong>——它让每层的输入“能量”被钉住、梯度尺度稳定；而平移不变性的贡献小到可以忽略。这是一个用消融实验支撑的、关于“哪一种不变性才重要”的精确判断，而非凭感觉砍东西。</p>  <div class="callout warn"><span class="label"></span>
+    <p>RMSNorm 不去均值，所以它对“激活的直流分量（DC offset）”不敏感——这通常没问题，但在某些任务/位置（如序列的第一个 token、或某些极端激活）上，它的行为可能与 LayerNorm 有细微差别。绝大多数场景下这个差别可忽略，但若你在做需要精确复现 LayerNorm 行为的迁移，要心里有数。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bwd"><span class="num">4</span>反向传播与开销对比</h2>
+  <p>实现归一化算子必须会算它的<strong>反向传播</strong>（notebook 会用数值梯度逐元素校验你的公式）。设 <code>r=RMS(x)</code>、<code>y_i=γ_i·x_i/r</code>，给定上游梯度 <code>dy</code>，对输入的梯度是：</p>  <div class="math-block">\[\frac{\partial \mathcal L}{\partial x_j}=\frac{1}{r}\Big(\gamma_j\,dy_j-\frac{x_j}{d\,r^2}\sum_i \gamma_i\,dy_i\,x_i\Big)\]</div>  <p>怎么读这个公式？第一项 <code>γ_j·dy_j/r</code> 是“直通”的梯度；第二项是一个<strong>减去 x 方向投影</strong>的修正——它确保梯度不会改变 x 的整体尺度。这背后的几何含义是：因为 RMSNorm 对输入的任意正缩放都不变（<code>RMSNorm(c·x)=RMSNorm(x)</code>），所以“沿 x 方向放大”这个扰动对输出没有影响，对应的梯度分量必须被减掉。理解了这一点，你不仅记得住公式，还能自己推出来。</p>  <p>这条“梯度里出现一个减投影项”的结构，其实是所有<em>带归约的归一化算子</em>（LayerNorm、RMSNorm、softmax 反向都有类似形态）的共同指纹：因为前向里有一个“沿某维求和/求均”的操作，反向时这个归约就会把所有分量耦合起来，产生一个“当前分量减去整体某种平均”的项。一旦你认出这个模式，再推 LayerNorm、softmax 的反向就有了套路，不必每次从头硬算。</p>  <table>
+    <thead><tr><th></th><th>减均值</th><th>bias</th><th>缩放依据</th><th>沿 d 的归约次数</th><th>相对开销</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">LayerNorm</span></td><td>有</td><td>有 (β)</td><td>标准差</td><td>2（均值 + 方差）</td><td>基准</td></tr>
+      <tr><td><span class="term">RMSNorm</span></td><td>无</td><td>无</td><td>均方根</td><td>1（只均方）</td><td>更省</td></tr>
+    </tbody>
+  </table>  <p>对比 LayerNorm 的反向，RMSNorm 少了与“减均值”相关的那一项，所以前向少算一次沿特征维的归约（均值）、反向也更简单。单看一层省的不多，但归一化在 Transformer 里出现得极频繁（每层至少两次），在大规模训练里累积起来就是实实在在的吞吐与显存收益。</p>  <p>为什么本模块要让你亲手推导并<strong>数值校验</strong>反向公式，而不是直接调框架的 autograd？因为归一化类算子是<em>自定义 CUDA/Triton kernel 的高频对象</em>（为了把前向反向融合、省显存带宽，工程上常手写它们，见 C36）。一旦手写，autograd 就帮不了你，必须自己写对反向、再用有限差分 <code>(f(x+ε)−f(x−ε))/(2ε)</code> 逐元素核对。把这套“写解析梯度 + 数值校验”的流程练熟，是从“会调 API”到“能实现底层算子”的分水岭——notebook 的练习 2 正是这个训练。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="prepost"><span class="num">5</span>Pre-LN vs Post-LN 与残差增长</h2>
+  <p>归一化<strong>放在哪</strong>和它本身一样关键。<span class="term">Post-LN</span>（原版 Transformer）把归一化放在残差相加<em>之后</em>：<code>LN(x + Sublayer(x))</code>；<span class="term">Pre-LN</span> 放在子层<em>之前</em>：<code>x + Sublayer(LN(x))</code>。一个字的位置差异，带来训练难度的天壤之别。</p>  <div class="ascii">Post-LN:  x ──►(+)──► LN ──►   归一化挡在残差主干上
+            ▲    │            梯度反传要穿过每层 LN -&gt; 深层易爆/消，需 warmup
+            └─ Sublayer ◄┘
+
+Pre-LN:   x ──────────►(+)──►  残差是一条“干净的高速公路”
+            │            ▲     梯度沿主干近似恒等直达顶层 -&gt; 稳、可堆很深
+            └─ LN ─ Sublayer ┘</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>Post-LN 表达力略强但难训——深层时残差路径被反复归一化，梯度容易爆或消，必须用小心的 learning-rate warmup 和保守的学习率才能起步。Pre-LN 让残差有一条“干净的高速公路”直达顶层，梯度稳、能堆很深，几乎所有现代大模型都用它。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>Pre-LN 的代价是：残差流范数随深度<strong>单调累积增长</strong>（每层都往里加东西、又不被归一化“拉回”），后期层的相对贡献可能被淹没。需配合合理初始化、有时加一个最终 LN（final norm）或 LayerScale 来温和地控制。</p></div>
+  </div>  <p>从梯度角度看（Xiong 2020 的分析）：Post-LN 里归一化挡在残差路径上，反向传播时梯度要穿过每一层的 LN，深层梯度量级随深度指数漂移，必须用 warmup 才能避免训练初期崩掉；Pre-LN 把 LN 移到旁路，残差主干上是一条<strong>近似恒等的梯度高速路</strong>，梯度量级随深度近似不变，于是可以去掉 warmup、用更大学习率、稳定堆到上百层。这就是几乎所有现代大模型选 Pre-LN 的根本原因，notebook 会用一个深残差模拟把两者的范数曲线画出来让你亲眼看到。</p>  <p>为什么 warmup 在 Post-LN 里几乎是必需的？因为训练最初几步，权重还是随机的、各层 LN 的统计还没稳定，此时若直接上大学习率，穿过多层 LN 的梯度会把权重一步推到发散。warmup 用很小的学习率“热身”几百到几千步，等各层尺度稳定下来再升到目标学习率。Pre-LN 因为有恒等高速路、初期梯度本就温和，往往可以省掉这道工序——<strong>“能不能去掉 warmup”几乎成了判断一个架构是不是 Pre-LN 的经验信号</strong>。这也提醒你：归一化的位置不是孤立选择，它和学习率调度、初始化是一整套要协同设计的东西。</p>  <div class="callout warn"><span class="label"></span>
+    <p>Pre-LN 的副作用值得专门记住：残差范数随深度增长，会稀释末层不同子层的“相对发言权”。常见对策是在最后再加一个归一化（final norm，Llama/Gemma 都有），或用 <span class="term">LayerScale</span> 给每个子层一个可学习的小初值、温和地控制它写入残差流的幅度。看到模型配置里有 final norm 或 layer scale，别奇怪——它们正是在补 Pre-LN 这个副作用。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="qknorm"><span class="num">6</span>QK-Norm 抑制 logit 爆炸</h2>
+  <p>超大模型训练还会遇到一个具体的数值病：<strong>attention logit 爆炸</strong>。<code>QK^T/√d</code> 里的某些分数会变得极大，导致 softmax 饱和（几乎全押在一个 key 上）、梯度消失、loss 突然尖刺。<span class="term">QK-Norm</span>（在算注意力前，对 Q、K 各做一次归一化）把 logit 的尺度钉住，是 ViT-22B 和一些大 LLM 的稳定性标配。</p>  <p>直觉很清楚：注意力分数本质是 query 和 key 的方向相似度，但点积同时被它们的<em>模长</em>放大。如果某些维度的激活在训练中悄悄变大，模长随之膨胀，点积就可能爆掉。先把 Q、K 归一化到单位尺度（再乘一个可学习的温度），分数就只反映方向、落在可控区间，无论激活怎么漂都不会让 logit 失控。notebook 会用一个小实验展示：把激活尺度放大 10 倍，原始 logit 的标准差跟着暴涨，而 QK-Norm 后的分数标准差几乎不变。</p>  <p>为什么 logit 爆炸专门偏爱<em>超大</em>模型？因为模型越大、训练越久，越有“余地”让某些注意力头走向极端（把几乎所有注意力押在一两个 token 上，对应极大的 logit）；而 <code>√d</code> 这个固定的缩放因子是按“随机初始化时分数方差为 1”设计的，一旦训练把分数推离这个假设，它就压不住了。这就是为什么 QK-Norm 在小模型上常常可有可无、到了 ViT-22B 这种规模却成了<strong>不加就训不稳</strong>的必需品。规模会放大平时看不见的数值隐患——这是大模型工程反复出现的主题。</p>  <p>一个常见的实现疑问：QK-Norm 用 LayerNorm 还是 RMSNorm？两者都有人用，关键是<strong>归一化沿头维（每个头的 d_h 维）做</strong>、而非整个 d_model，且通常会保留一个可学习的缩放（相当于可学习的“温度”），让模型自己决定注意力分数该有多“尖锐”。归一化把尺度钉死、可学习缩放把表达力还回来——又是“归一化 + 仿射”这个老搭配，只不过这次作用在 Q、K 上。</p>  <p>把 QK-Norm 放回本模块主线看，它就是“尺度软约束”思想从<em>激活</em>向<em>注意力分数</em>的自然延伸：RMSNorm 钉住的是进入每个子层的激活尺度，QK-Norm 钉住的是注意力内部那个最容易爆的中间量（<code>QK^T</code> 的 logits）。同一个思想，换一个作用对象。理解了这种“同一招数、不同位置”的模式，你就能预判：下一个数值病出现在哪个量上，多半就会有人发明一个“给那个量做归一化”的 trick。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="zloss"><span class="num">7</span>z-loss</h2>
+  <p><span class="term">z-loss</span>（PaLM）是稳定性工具箱里的另一味药，专治输出端的 logit 漂移。它给最终 softmax 的归一化项 <code>Z=Σexp(logit)</code> 加一个小惩罚 <code>α·(log Z)²</code>：</p>  <div class="math-block">\[\mathcal L_{\text{z}} = \alpha\,(\log Z)^2,\qquad Z=\sum_i \exp(\text{logit}_i)\]</div>  <p>它防止 logits 整体漂移到很大（<code>log Z</code> 失控），等价于温和地把输出分布往“数值健康”的区域拉。为什么这有用？softmax 对 logits 的<em>绝对大小</em>不敏感（只看相对差，<code>softmax(x)=softmax(x+c)</code>），所以训练可能在完全不影响 loss 的情况下让 logits 整体越漂越大，直到某一步数值溢出、loss 突然尖刺。z-loss 给这种“无意义但有害”的漂移上了一个软约束，代价极小（一个标量惩罚项），却能显著减少大规模训练里的尖刺，也让混合精度（fp16/bf16）训练更安全。</p>  <p>注意 z-loss 与 <code>log Z</code> 的渊源还有一层巧合之美：<code>log Z</code> 正是交叉熵损失里的配分函数项，本就要算，所以 z-loss 几乎是“顺手”加的、不增加额外的前向开销。这种“复用已有中间量做正则”的设计很优雅。同族的还有 Gemma-2 的 <span class="term">Logit Soft-cap</span>（用 <code>tanh</code> 把 logits 硬性压进有界区间），思路一致——都是不让输出端的数值放飞。</p>  <p>z-loss 也常被同时用在<strong>两个地方</strong>：输出层（防最终 logits 漂移，PaLM）和 MoE 路由器（防路由 logits 漂移，叫 router z-loss，模块 03 提过）。同一个“惩罚 log-sum-exp 过大”的配方，套在网络里任何一个有 softmax 的地方都成立——这再次印证了本模块的元规律：稳定性手段往往是<em>一个通用配方、多处套用</em>。学会识别“这里有个 softmax、它的 logits 会不会漂”，你就能预判该不该在那里加一个 z-loss。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把三味药放一起看，本模块的主旋律就完整了：<strong>RMSNorm 管激活、QK-Norm 管注意力分数、z-loss 管输出 logits</strong>——每一处都是同一句叮嘱：<em>别让某个量悄悄涨到失控</em>。它们作用在网络的不同位置，但出发点完全一致。记住这条主线，你看到任何新的“稳定性 trick”，多半也能归到“给某个量上软约束”这一类。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>稳定性前沿</h2>
+  <p>训练稳定性是大模型工程里“不出事时没人注意、一出事就要命”的领域，前沿仍在快速演化：</p>  <ul>
+    <li><strong>残差/初始化层面</strong>：DeepNorm（让 Post-LN 也能稳定堆到上千层）、σReparam、<span class="term">LayerScale</span>（给子层可学习小初值）——都在更精细地控制残差流的增长。</li>
+    <li><strong>小模型代理</strong>（Wortsman 2023）：用小模型低成本复现大模型的不稳定性（logit 增长、attention 坍塌、loss 尖刺），在小规模上找到药方再放大，省去昂贵的大模型试错。</li>
+    <li><strong>归一化的位置与形式</strong>仍在演化：sandwich norm（子层前后各一次）、QK-Norm 的普及、是否需要 final norm、<span class="term">Logit Soft-cap</span>（Gemma-2 用 tanh 把 logits 压到有界区间）等。</li>
+    <li><strong>理论缺口</strong>：为什么某些配置稳、某些不稳，很大程度仍是经验科学。归一化、初始化、学习率、数据三者如何共同决定稳定性，缺乏可预测的统一理论。</li>
+  </ul>  <p>还有一类常被低估的稳定性问题来自<strong>混合精度训练</strong>（bf16/fp16）。低精度的动态范围有限，激活或 logits 稍微一大就溢出成 inf/nan，一步污染整个训练。本模块的几乎每个手段——RMSNorm 钉住激活、QK-Norm 钉住注意力分数、z-loss/soft-cap 钉住输出——在低精度下都额外重要：它们把各处数值压在低精度能安全表示的范围内。可以说，正是大模型转向低精度训练，让这套“处处上软约束”的工具箱从“锦上添花”变成了“不可或缺”。</p>  <p>回顾整门课，你会发现“稳定性”是贯穿始终的暗线：RoPE 的远程衰减让注意力不易发散、GQA/MLA 在压 KV 时要保住质量、MoE 的均衡损失防路由坍塌、本模块的归一化与软约束防数值爆炸。<strong>能力决定模型上限，稳定性决定你能不能把模型训出来</strong>——后者常常才是真正的瓶颈。把本模块这套“到处上软约束”的直觉带走，它会在你读任何大模型技术报告时反复派上用场。</p>  <div class="callout paper"><span class="label"></span>
+    <p>必读：RMSNorm（Zhang & Sennrich 2019）、On Layer Normalization in the Transformer（Xiong 2020，Pre/Post-LN 梯度分析）、PaLM（Chowdhery 2022，z-loss）、ViT-22B（QK-Norm）、Small-scale proxies（Wortsman 2023）。见 <code>references.md</code> 的归一化与稳定性一节。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_moe/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">MoE 与 SwiGLU</div></a>
+    <a class="next" href="../05_ssm_mamba/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">SSM 与 Mamba</div></a>
+  </div>
+
+</div>
+</body>
+</html>

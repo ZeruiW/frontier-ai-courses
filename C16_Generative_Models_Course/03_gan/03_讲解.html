@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 生成对抗网络 GAN</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 生成对抗网络 GAN</h1>
+  <p class="subtitle">minimax 目标、最优判别器与 JS 散度视角、生成器/判别器交替更新、模式坍塌与训练不稳定及其稳定技巧 —— 放弃似然、用对抗换取锐利样本的隐式生成模型</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02、二分类交叉熵、博弈/鞍点概念、反向传播（梯度穿过另一个网络）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_gan.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Goodfellow et al. 2014、Arjovsky et al. 2017（WGAN）、Radford et al. 2015（DCGAN）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#idea">GAN 的思想：用对抗代替似然</a></li>
+      <li><a href="#minimax">Minimax 目标</a></li>
+      <li><a href="#optimal-d">最优判别器与 JS 散度</a></li>
+      <li><a href="#build">从零搭建 G、D 与两套损失</a></li>
+      <li><a href="#alternate">交替训练逼近目标分布</a></li>
+      <li><a href="#failures">模式坍塌与训练不稳定</a></li>
+      <li><a href="#vs-vae">GAN vs VAE：两种生成哲学</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="idea"><span class="num">1</span>GAN 的思想：用对抗代替似然</h2>
+  <p>VAE 给了我们一个能采样的生成模型，但它的样本天生偏<strong>模糊</strong>——上一模块我们看清了根源：高斯似然假设 + 有限隐信息预算，让 VAE 倾向于「覆盖所有模式但每个都画不锐」。生成对抗网络（GAN，Goodfellow 等 2014）走了一条<strong>截然相反</strong>的路：它<strong>彻底放弃写出似然</strong>，转而用一个「鉴别真假」的对手来定义「像不像真的」，用这种对抗压力换来惊人锐利的样本。</p>  <p>GAN 的设定是一场<strong>两人博弈</strong>。<strong>生成器</strong> <code>G</code> 把一团先验噪声 <code>z\sim p(z)</code> 映成假样本 <code>G(z)</code>，目标是骗过对手；<strong>判别器</strong> <code>D</code> 接收一个样本、输出它是<em>真实数据</em>的概率 <code>D(x)\in(0,1)</code>，目标是把真假分开。二者交替训练、此消彼长：<code>D</code> 越来越会鉴别，逼得 <code>G</code> 越来越会造假，直到 <code>G</code> 生成的分布逼真到 <code>D</code> 也分不出真假（处处输出 <code>1/2</code>）。那一刻，生成分布就等于了真实分布。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>经典比喻：<code>G</code> 是<strong>造假币的</strong>，<code>D</code> 是<strong>验钞的警察</strong>。造假币的不断改进工艺想骗过警察，警察不断提升火眼金睛想抓住破绽。两者在对抗中共同进步，最终假币逼真到警察只能瞎猜（50% 对错）——这时假币和真币已无法区分。整个过程<strong>没人需要写出「真钞长什么样」的公式</strong>，只需要一个会越来越严的鉴别者。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：GAN 是<strong>隐式生成模型</strong>——它只给你一个采样器 <code>x=G(z)</code>，从不写出密度 <code>p_g(x)</code>。这是它与 VAE/流/扩散（都显式或隐式地处理似然）的根本分野。放弃似然的代价是<strong>没有一个可下降的单一损失</strong>来衡量进度（对抗目标是个鞍点而非极小点），好处是<strong>不受似然假设束缚</strong>，能学出极其锐利、贴合数据流形的样本。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住 GAN 与 VAE 的对立：<strong>VAE 显式最大化（下界的）似然，用「重建得多像」当目标；GAN 放弃似然，用「一个对手判得出判不出」当目标</strong>。前者给你稳定训练 + 模糊样本，后者给你锐利样本 + 不稳定训练。这组「保真度 vs 训练稳定性」的取舍，是理解这两族模型一切差异的总钥匙——也解释了为什么后来扩散模型（模块 04）能同时拿到两者的好处而成为新王。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="minimax"><span class="num">2</span>Minimax 目标</h2>
+  <h3>Minimax 目标：一个值函数，两个相反的诉求</h3>  <p>GAN 的博弈可以写成一个<strong>极小极大（minimax）</strong>目标——同一个值函数 <code>V(D,G)</code>，判别器想最大化它、生成器想最小化它：</p>  <div class="math-block">\[\min_G\max_D\ V(D,G)=\mathbb{E}_{x\sim p_{data}}\big[\log D(x)\big]+\mathbb{E}_{z\sim p(z)}\big[\log\big(1-D(G(z))\big)\big]\]</div>  <p>逐项读懂它：第一项 <code>\mathbb{E}_{x\sim p_{data}}[\log D(x)]</code> 是<strong>判别器把真实样本判为真</strong>的对数概率——<code>D</code> 想把它推高（对真数据输出接近 1）。第二项 <code>\mathbb{E}_z[\log(1-D(G(z)))]</code> 是<strong>判别器把生成样本判为假</strong>的对数概率——<code>D</code> 想把它推高（对假数据 <code>D(G(z))</code> 接近 0），而 <code>G</code> 想把它压低（让 <code>D(G(z))</code> 接近 1，即骗过 <code>D</code>）。</p>  <p>所以这是个<strong>二人零和博弈</strong>：<code>D</code> 和 <code>G</code> 在同一个 <code>V</code> 上拔河，一个往上、一个往下。它不像普通监督学习有一个统一往下降的损失，而是在找一个<strong>鞍点（saddle point）</strong>——对 <code>D</code> 是极大、对 <code>G</code> 是极小。这个结构上的差异是 GAN 一切训练难题的根源（第 6 节展开）：没有单调下降的标量意味着你不能靠「loss 在降」判断训练是否顺利，必须直接看生成样本质量。</p>  <p>值得对照一下这与监督学习的根本不同。监督学习是<strong>一个模型对着一个固定的目标</strong>下降——损失曲线一路向下，到底了就收敛。GAN 是<strong>两个模型互为对方的目标，且这个目标一直在动</strong>。当 <code>G</code> 进步时，<code>D</code> 面对的「假样本分布」变了，它的最优解随之移动；当 <code>D</code> 进步时，<code>G</code> 要骗的对象又变强了。双方在追逐一个不断移动的均衡点，谁也没有一条单调下降的损失。这就是为什么后面会反复强调「<strong>GAN 的损失值不可信</strong>」——它根本不该单调下降，振荡才是常态。理解这个结构性差异，是接受 GAN 一切「反常」训练行为的前提。</p>  <div class="callout warn"><span class="label"></span>
+    <p>初学最大的困惑往往是：<strong>到底在最小化什么、最大化什么？</strong>记住口诀——<strong>D 想让 V 大（真判真、假判假都对），G 想让 V 小（让假被判成真）</strong>。实现时分两步：固定 <code>G</code> 对 <code>D</code> 做<em>梯度上升</em>（最大化 <code>V</code>），固定 <code>D</code> 对 <code>G</code> 做<em>梯度下降</em>（最小化 <code>V</code> 中与 <code>G</code> 有关的项）。两套梯度、两个优化器、交替更新——notebook 会把这套交替从零写出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="optimal-d"><span class="num">3</span>最优判别器与 JS 散度</h2>
+  <h3>最优判别器与 JS 散度：GAN 在优化什么</h3>  <p>GAN 看起来只是个对抗游戏，但 Goodfellow 的论文证明了它背后有精确的数学目标。关键一步是：<strong>固定生成器 </strong><code>G</code><strong>，求最优判别器 </strong><code>D^*</code>。对值函数关于 <code>D(x)</code> 逐点求导置零，得到一个漂亮的闭式：</p>  <div class="math-block">\[D^*(x)=\frac{p_{data}(x)}{p_{data}(x)+p_g(x)}\]</div>  <p>这个 <code>D^*</code> 直觉上完全合理：在某点真实密度远大于生成密度处，<code>D^*\to 1</code>（这八成是真的）；反之 <code>D^*\to 0</code>；在两者相等处 <code>D^*=1/2</code>（真假各半，只能瞎猜）。判别器学的本质是<strong>真假密度比</strong>——这也带来一个深刻洞察：<strong>一个训练好的判别器隐式地编码了关于「真实数据在哪里更密」的信息</strong>，它给生成器的梯度，本质是在说「往真实密度更高、生成密度更低的方向挪」。GAN 之所以能不写出 <code>p_{data}</code> 也学到它，秘密全在这个密度比里。</p>  <p>用一个一行就能心算的<strong>微例</strong>把这个公式坐实。设在某个点 <code>x</code> 处真实密度 <code>p_{data}(x)=0.9</code>、当前生成密度 <code>p_g(x)=0.1</code>，那么最优判别器在该点的输出就是 <code>D^*(x)=0.9/(0.9+0.1)=0.9</code>——它有九成把握这是真的，完全符合「真多假少则判真」的直觉。再看生成器进步后：若 <code>G</code> 学会在该点多产样本、把 <code>p_g(x)</code> 抬到 <code>0.9</code>（与真实持平），则 <code>D^*(x)=0.9/(0.9+0.9)=0.5</code>——判别器在这一点被彻底骗懵。<strong>「生成分布逼近真实分布」与「判别器输出趋于 1/2」是同一件事的两种观测</strong>，这个 0.9→0.5 的小算例把抽象的纳什均衡变成了你能用手指算出来的数。notebook 里我们正是用「训练后判别器对真假样本的平均输出是否都接近 0.5」来判断 GAN 是否收敛——而不是看损失值。</p>  <p>把 <code>D^*</code> 代回值函数 <code>V</code> 并整理，会得到一个深刻的结果——此时生成器要最小化的，恰好是真实分布与生成分布的 <strong>Jensen–Shannon 散度</strong>（差一个常数）：</p>  <div class="math-block">\[V(D^*,G)=2\,\mathrm{JSD}(p_{data}\,\|\,p_g)-2\log 2\]</div>  <p>于是 GAN 的全局图景清晰了：<strong>在判别器最优的前提下，训练生成器 = 最小化 </strong><code>p_{data}</code><strong> 与 </strong><code>p_g</code><strong> 的 JS 散度</strong>。JS 散度在两分布相等时取最小值 <code>0</code>，对应 <code>p_g=p_{data}</code>（生成器完美还原数据）、此时 <code>D^*\equiv 1/2</code>（判别器彻底懵了）。这就是 GAN 的<strong>全局最优解</strong>，也是那个理想的纳什均衡。</p>  <div class="callout paper"><span class="label"></span>
+    <p>但这个 JS 散度视角也<strong>埋下了 GAN 不稳定的病根</strong>：当 <code>p_{data}</code> 与 <code>p_g</code> 的支撑集<em>几乎不重叠</em>时（训练初期生成分布离真实分布很远，这在高维下几乎必然），JS 散度饱和为常数 <code>\log 2</code>、<strong>梯度几乎为零</strong>，生成器收不到有用信号。这正是 WGAN（Arjovsky 2017）用 Wasserstein 距离替代 JS 的动机——后者即便不重叠也给出有意义的梯度。第 6 节会回到这个问题。详见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="build"><span class="num">4</span>从零搭建 G、D 与两套损失</h2>
+  <h3>从零搭建：生成器、判别器与两套损失</h3>  <p>把 GAN 落到 numpy。两个小网络：生成器 <code>G:\ z\mapsto x</code>（噪声到数据），判别器 <code>D:\ x\mapsto(0,1)</code>（数据到真伪概率，输出层用 sigmoid）。它们各有各的损失：</p>  <pre><code># 判别器损失（要最小化，= 最大化 V 的负）：二分类交叉熵
+# L_D = -[ mean log D(x_real) + mean log(1 - D(G(z))) ]
+#       让真样本 D-&gt;1、假样本 D-&gt;0
+
+# 生成器损失（非饱和版，见下）：
+# L_G = -mean log D(G(z))
+#       让假样本被判成真 D(G(z))-&gt;1</code></pre>  <p>注意生成器损失这里用的是<strong>非饱和（non-saturating）</strong>形式 <code>L_G=-\mathbb{E}[\log D(G(z))]</code>，而非原始 minimax 的 <code>\mathbb{E}[\log(1-D(G(z)))]</code>。两者优化方向一致（都让 <code>D(G(z))\to 1</code>），但训练初期<strong>梯度行为天差地别</strong>：</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>训练初期 <code>G</code> 很烂，<code>D</code> 轻松识破假样本（<code>D(G(z))\approx 0</code>）。此时原始损失 <code>\log(1-D(G(z)))</code> 在 <code>D(G(z))=0</code> 附近<strong>梯度趋近零</strong>（饱和），<code>G</code> 几乎学不动——越烂越没法改进，恶性循环。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>非饱和损失 <code>-\log D(G(z))</code> 在 <code>D(G(z))=0</code> 附近<strong>梯度反而很大</strong>（<code>-\log</code> 在 0 处陡峭），给烂生成器最强的改进信号。这是 Goodfellow 原论文就提出、几乎所有实现都采用的标准做法。<em>数学上同向，数值上救命</em>——一个绝佳的「损失形式很重要」的例子。</p></div>
+  </div>  <p>反向传播有个关键结构：<strong>训练 </strong><code>G</code><strong> 时，梯度要穿过 </strong><code>D</code><strong> 再传回 </strong><code>G</code>。因为 <code>L_G</code> 依赖 <code>D(G(z))</code>，求 <code>\partial L_G/\partial\theta_G</code> 必须先经过 <code>D</code> 的网络（但<em>不更新</em> <code>D</code> 的参数，只借它的梯度通路）。这是 GAN 实现里最容易写错的地方——notebook 会把「梯度穿过 D、只更新 G」这条链显式写出并验证。</p>  <div class="callout warn"><span class="label"></span>
+    <p>两个高频实现 bug：① 更新 <code>G</code> 时不小心也更新了 <code>D</code>（或反之）——必须严格分离两套参数的更新；② 判别器训练用的真假标签搞反，或交叉熵符号错。守护手段还是<strong>数值梯度检验</strong>：分别对 <code>L_D</code>（固定 <code>G</code>）和 <code>L_G</code>（固定 <code>D</code>）做 gradient check，确保两套梯度都对，再交替训练。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="alternate"><span class="num">5</span>交替训练逼近目标分布</h2>
+  <h3>交替训练：在博弈中逼近目标分布</h3>  <p>有了两套损失，训练就是<strong>交替</strong>进行的循环。一个典型的迭代：</p>  <ol>
+    <li>从真实数据抽一批 <code>x_{real}</code>，从先验抽一批噪声 <code>z</code>、生成假样本 <code>x_{fake}=G(z)</code>；</li>
+    <li><strong>更新 D</strong>：固定 <code>G</code>，对 <code>L_D</code> 下降一步（让 <code>D</code> 更会分真假）；</li>
+    <li><strong>更新 G</strong>：固定 <code>D</code>，重采一批 <code>z</code>、对 <code>L_G</code> 下降一步（让 <code>G</code> 更会骗 <code>D</code>，梯度穿过 <code>D</code>）；</li>
+    <li>重复，直到生成分布逼近真实分布。</li>
+  </ol>  <p>一个实践要点是<strong>两者的更新节奏要平衡</strong>。如果 <code>D</code> 学得太快、太强，它会把假样本判得死死的（<code>D(G(z))\approx 0</code>），<code>G</code> 的梯度被掐断（即便用非饱和损失，极端时也乏力）；反过来 <code>D</code> 太弱，它给的「真假」信号没有区分度，<code>G</code> 学不到方向。常见做法是每轮 <code>G</code> 更新前先更新 <code>D</code> 若干步（或反之），并把学习率、网络容量调得让两者势均力敌。<strong>维持博弈双方的均势，是 GAN 调参的核心艺术</strong>。</p>  <p>还有一个实务细节：更新 <code>G</code> 那一步要<strong>重新采一批噪声</strong> <code>z</code>（而非复用更新 <code>D</code> 时的那批）。这保证 <code>G</code> 不是只学会骗过 <code>D</code> 在某几个特定 <code>z</code> 上的判断，而是在整个噪声分布上都能生成逼真样本。同样地，每步都从真实数据里<em>重抽</em>一个 minibatch——这些看似琐碎的「每步重采」习惯，对 GAN 的稳定收敛其实很重要，是 notebook 实现里特意强调的点。</p>  <p>本模块 notebook 会在一个<strong>1D 玩具分布</strong>（双峰高斯）上从零跑通这套交替，并用分布统计（均值、标准差、双峰谷底密度、两峰覆盖比例）验证生成分布确实收敛到了目标双峰、且<em>均衡地</em>覆盖两个峰（没有坍塌到单峰）。你会亲眼看到生成样本如何从一团初始噪声，在对抗中一步步<em>长出</em>目标分布的两个峰，并看到训练后判别器对真假样本的输出都趋近 <code>0.5</code>（被骗懵）。这个过程没有重建损失、没有似然，全靠 <code>D</code> 的真假信号牵引——这正是 GAN 神奇又脆弱之处。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把交替训练想成两个人<strong>互相当陪练</strong>：<code>D</code> 给 <code>G</code> 当陪练（指出哪里不像真的），<code>G</code> 也给 <code>D</code> 当陪练（不断提供更难的假样本逼 <code>D</code> 进步）。他们必须<em>水平相当</em>才能共同成长——一方碾压另一方，训练就崩了。这与监督学习「一个模型对着固定目标下降」的体验完全不同：GAN 的「目标」（最优 <code>D</code>）本身在随 <code>G</code> 不断移动，是个<strong>移动靶</strong>。理解这一点，就理解了 GAN 为何既强大又难驯。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="failures"><span class="num">6</span>模式坍塌与训练不稳定</h2>
+  <h3>模式坍塌与训练不稳定：GAN 的两大顽疾</h3>  <p>GAN 的锐利样本是有代价的，代价就是<strong>出了名的难训</strong>。两大顽疾必须正面认识：</p>  <p><strong>① 模式坍塌（mode collapse）</strong>：生成器发现只要稳定产出真实分布的<em>某几个</em>（甚至<em>单一</em>）模式，就能骗过当前的 <code>D</code>，于是干脆放弃多样性、反复生成那几个样本。表现是：目标分布有多个峰，生成样本却全挤在一个峰上。根源在 minimax 目标不直接惩罚「漏掉某些模式」——<code>G</code> 只要骗过 <code>D</code> 就行，而骗过 <code>D</code> 不要求覆盖全部模式。这与 VAE 恰好相反（VAE 倾向覆盖所有模式但糊），是「保真 vs 覆盖」权衡的又一面。</p>  <p><strong>② 训练不稳定（instability）</strong>：因为目标是鞍点而非极小点，<code>D</code> 和 <code>G</code> 的损失会<strong>此起彼伏地振荡</strong>，没有单调下降的曲线可看；稍有不平衡（一方太强）就可能发散，或陷入 <code>D</code> 完美、<code>G</code> 梯度消失的僵局。第 3 节的 JS 散度视角解释了部分原因：分布不重叠时梯度饱和。</p>  <p>把模式坍塌的逻辑用一个<strong>具体小情景</strong>讲透，你就再也不会觉得它神秘。设真实数据是一个左右对称的双峰分布（比如手写数字里既有 3 也有 8）。假设此刻 <code>G</code> 只会画 3、完全不画 8。这<em>当然</em>是个坏生成器（漏了一半模式），但从 minimax 目标的角度看，它一点也不亏：只要 <code>G</code> 画的 3 足够逼真，判别器面对一个「是真 3 还是假 3」的样本时<strong>真的分不出来</strong>（<code>D(G(z))\approx 0.5</code>），<code>L_G</code> 就已经很低了。目标函数里<strong>根本没有一项在问「你覆盖了几个模式」</strong>——它只问「你骗没骗过 <code>D</code>」。于是 <code>G</code> 发现：与其费劲学会画两种数字、还可能两种都画不好，不如把全部火力压在一种上、画到以假乱真。<strong>「只产单一逼真模式」在 minimax 下是个划算的局部解</strong>，这就是坍塌的内在动机。更糟的是它常和 <code>D</code> 玩「打地鼠」：<code>D</code> 一旦学会识别「这批全是 3」，<code>G</code> 就整体切换去只画 8，<code>D</code> 再去抓 8、<code>G</code> 又切回 3……两者绕圈而非收敛，这正是不稳定与坍塌交织的典型病灶。</p>  <table>
+    <thead><tr><th>顽疾</th><th>表现</th><th>常见对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>模式坍塌</strong></td><td>生成样本缺乏多样性、挤在少数模式</td><td>minibatch discrimination、unrolled GAN、WGAN</td></tr>
+      <tr><td><strong>训练不稳定</strong></td><td>损失振荡、发散、梯度消失</td><td><strong>非饱和损失</strong>、谱归一化、WGAN-GP、平衡 D/G</td></tr>
+      <tr><td><strong>评估困难</strong></td><td>没有可信的单一标量衡量进度</td><td>FID/IS、直接看样本、看分布覆盖</td></tr>
+    </tbody>
+  </table>  <p>稳定 GAN 是一整条研究线。关键里程碑包括：<strong>DCGAN</strong>（架构经验法则）、<strong>WGAN/WGAN-GP</strong>（换 Wasserstein 距离 + 约束判别器 Lipschitz，给出处处有意义的梯度）、<strong>谱归一化 SN-GAN</strong>（简单有效地约束 <code>D</code> 的 Lipschitz 常数）。它们的共同精神是<em>别让判别器太「陡」</em>——一个梯度爆炸或饱和的 <code>D</code> 会给 <code>G</code> 错误或空洞的信号。notebook 会复现模式坍塌现象（在多峰目标上看生成只覆盖部分峰），并演示一两个简单稳定技巧的效果。</p>  <div class="callout danger"><span class="label"></span>
+    <p>最重要的纪律（与 VAE 的「别只看 ELBO」、模块 01 的「别只看重建」一脉相承）：<strong>GAN 的损失值几乎不可信</strong>。<code>L_D</code> 降不代表 <code>G</code> 变好，<code>L_G</code> 降也可能是 <code>D</code> 变弱所致。判断 GAN 训得好不好，<strong>必须直接看生成样本的质量与多样性</strong>（玩具数据看分布覆盖、真实数据看 FID + 肉眼）。把对抗损失当成监督损失来盯，是 GAN 调试的头号误区。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="vs-vae"><span class="num">7</span>GAN vs VAE：两种生成哲学</h2>
+  <h3>GAN vs VAE：两种生成哲学的对照</h3>  <p>学到这里，正好把前两族模型放在一起对照，看清生成模型的核心权衡。它们解决同一个问题（从数据学一个可采样的分布），却走了对立的两条路：</p>  <table>
+    <thead><tr><th>维度</th><th>VAE（模块 02）</th><th>GAN（本模块）</th></tr></thead>
+    <tbody>
+      <tr><td>是否用似然</td><td>显式优化 ELBO（似然下界）</td><td><strong>放弃似然</strong>，隐式（只有采样器）</td></tr>
+      <tr><td>训练目标</td><td>最大化 ELBO（重建 − KL）</td><td>minimax 鞍点（≈最小化 JS 散度）</td></tr>
+      <tr><td>训练稳定性</td><td><strong>稳定</strong>（单一损失下降）</td><td><strong>不稳定</strong>（振荡、易坍塌）</td></tr>
+      <tr><td>样本质量</td><td>偏模糊（覆盖广）</td><td><strong>锐利</strong>（但易丢模式）</td></tr>
+      <tr><td>模式覆盖</td><td>好（倾向覆盖所有模式）</td><td>差（易模式坍塌）</td></tr>
+      <tr><td>能否算似然</td><td>能（下界）</td><td>不能</td></tr>
+      <tr><td>隐空间</td><td>有结构、可插值、可推断</td><td>通常无显式推断（需额外编码器）</td></tr>
+    </tbody>
+  </table>  <p>这张表浓缩了一个深刻的对立：<strong>VAE 用「均值寻求」的 KL 与似然，倾向于「不漏掉任何模式」但代价是糊；GAN 用「模式寻求」的对抗，倾向于「每个样本都逼真」但代价是可能漏模式、且难训</strong>。它们各自的优缺点几乎是镜像的——这不是巧合，而是「保真度」与「模式覆盖/稳定性」之间一个根本的张力在两族模型上的不同投影。</p>  <p>既然已经学到第三族，不妨把眼光放远，提前把全课<strong>五大生成族</strong>摆在同一张表里横向对照。后两族（扩散、流匹配）的细节会在模块 04/05 展开，但先建立这个全景能让你读后面时心里有谱——看清每一族在「用不用似然、训练稳不稳、采样快不快、覆盖好不好」这几个轴上各占什么位置：</p>  <table>
+    <thead><tr><th>模型族</th><th>核心机制</th><th>用似然</th><th>训练稳定性</th><th>样本质量</th><th>采样速度</th><th>模式覆盖</th></tr></thead>
+    <tbody>
+      <tr><td><strong>AE</strong>（01）</td><td>压缩-重建</td><td>否（不建模分布）</td><td>稳</td><td>—（不能生成）</td><td>—</td><td>—</td></tr>
+      <tr><td><strong>VAE</strong>（02）</td><td>变分下界 ELBO</td><td>显式（下界）</td><td><strong>稳</strong></td><td>偏模糊</td><td>快（一次前向）</td><td>好</td></tr>
+      <tr><td><strong>GAN</strong>（03）</td><td>对抗 minimax</td><td><strong>放弃</strong>（隐式）</td><td><strong>不稳</strong>（易坍塌）</td><td><strong>锐利</strong></td><td><strong>快</strong>（一次前向）</td><td>差（易丢模式）</td></tr>
+      <tr><td><strong>扩散</strong>（04）</td><td>多步去噪</td><td>变分界（隐式）</td><td>稳（监督回归）</td><td>锐利</td><td><strong>慢</strong>（多步）</td><td>好</td></tr>
+      <tr><td><strong>流匹配</strong>（05）</td><td>回归速度场 + ODE</td><td>否（ODE 定义）</td><td>稳（监督回归）</td><td>锐利</td><td>较快（可少步）</td><td>好</td></tr>
+    </tbody>
+  </table>  <p>横着读这张表，整门课的逻辑主线就跳出来了：<strong>没有一族在所有轴上全胜</strong>。GAN 一栏全是极端值（最锐、最快、却最不稳、覆盖最差），VAE 是它的镜像（稳而全、却糊），而扩散与流匹配像是「取两者之长」的后来者——稳定性向 VAE 看齐、锐度向 GAN 看齐，代价转移到了采样速度（扩散慢）这个新维度上，而流匹配又专门来补这个速度短板。把这张表记在脑子里，你读模块 04/05 时就会不断对照、印证，而不是把每族当成孤立的新东西。</p>  <p>也别因此就觉得 GAN 过时了。在<strong>单一域、追求极致清晰、且要求采样极快</strong>的场景，GAN 至今仍有独到价值——StyleGAN 的人脸生成质量与一次前向的采样速度，是扩散模型（动辄几十步采样）难以企及的。前沿甚至反过来用 GAN 的对抗损失给扩散模型<strong>蒸馏</strong>出一步采样器（第 8 节）。所以更准确的说法是：<em>GAN 与扩散各擅胜场，且正在融合</em>，而非简单的新旧替代。</p>  <p>理解了这组对立，你就能体会为什么<strong>扩散模型（下一模块）会成为新的主流</strong>：它用「把生成拆成许多步小去噪」的方式，奇迹般地<em>同时</em>拿到了两边的好处——像 VAE 一样有稳定的训练目标（一个简单的去噪 MSE，没有对抗博弈、没有移动靶），又像 GAN 一样能生成锐利、覆盖良好的样本。扩散某种意义上是「调和 VAE 与 GAN 这组矛盾」的答案：它把 VAE 那个「一步到位、信息受限所以糊」的解码，拆成了「许多步、每步只做一点点、累积起来既锐又全」的渐进生成。带着这个对照去读模块 04，你会更懂它为何重要。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <p>GAN 是一个<strong>方法成熟但理论仍不完整</strong>的领域。它在实践中能产出惊艳样本，但「为什么会坍塌、何时会收敛、怎样可靠地评估」这些根本问题至今没有完全令人满意的答案。下面几条是仍然活跃的方向：</p>  <ul>
+    <li><strong>更好的散度与稳定训练</strong>：WGAN（Wasserstein）、WGAN-GP（梯度惩罚）、SN-GAN（谱归一化）通过换距离或约束 <code>D</code> 的 Lipschitz 来稳定训练。如何在理论保证下既稳又不牺牲质量，仍是活跃方向。</li>
+    <li><strong>大规模高保真 GAN</strong>：BigGAN、StyleGAN 系列把 GAN 推到了照片级人脸/物体生成的高度，靠精巧的架构（风格调制、渐进增长）与正则。它们证明 GAN 在「单一域、追求极致清晰」上仍有独到优势。</li>
+    <li><strong>模式坍塌的度量与缓解</strong>：如何可靠地度量「生成是否覆盖了所有模式」（precision/recall for generative models）、以及从机制上避免坍塌，至今没有完全令人满意的答案。</li>
+    <li><strong>GAN 在扩散时代的位置</strong>：扩散模型在多样性和训练稳定性上超过 GAN，但 GAN 采样<em>快</em>（一次前向）。前沿的一个方向是用 GAN 的对抗损失给扩散<strong>蒸馏</strong>出一步/几步采样器（如对抗扩散蒸馏 ADD），让 GAN 的「快」与扩散的「好」结合。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Goodfellow et al. 2014（GAN 奠基，重点读最优判别器与 JS 散度的定理 1）、Arjovsky et al. 2017（WGAN，诊断不稳定根源）、Radford et al. 2015（DCGAN）、Salimans et al. 2016（稳定技巧 + Inception Score）。清单见 <code>references.md</code>。下一模块扩散会展示一条<strong>既稳又锐</strong>的新路：不用对抗、不写似然密度，而是把生成拆成几十上百步「预测噪声」，训练稳如监督学习，样本却能锐利且多样。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_vae/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 变分自编码器 VAE</div></a>
+    <a class="next" href="../04_diffusion/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 扩散模型 DDPM</div></a>
+  </div>
+
+</div>
+</body>
+</html>

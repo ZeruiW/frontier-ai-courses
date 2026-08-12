@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 一致性模型与少步采样</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 一致性模型与少步采样</h1>
+  <p class="subtitle">学一个把 ODE 轨迹上任意点直接映到终点的自洽函数 —— 自洽性约束、边界条件、一致性蒸馏、单步/少步采样、与扩散的质量-步数权衡，实时生成的关键</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01/03（latent、probability flow ODE）、扩散采样（C16）、EMA/target network</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_consistency.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Song 2023 (Consistency Models)、Luo 2023 (LCM)、Salimans & Ho 2022 (渐进蒸馏)、Karras 2022 (EDM)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">上百步太慢：直达终点的想法</a></li>
+      <li><a href="#selfcons">自洽性：CM 的核心约束</a></li>
+      <li><a href="#boundary">边界条件：终点钉在数据上</a></li>
+      <li><a href="#distill">蒸馏 vs 从零训练</a></li>
+      <li><a href="#sampling">少步采样：单步与多步精修</a></li>
+      <li><a href="#lcm">落地：LCM 与少步生态</a></li>
+      <li><a href="#toy">把玩具跑起来：单步 CM</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>上百步太慢：直达终点的想法</h2>
+  <p>前四个模块把生成模型做得又好又可控，但留下了一个<strong>致命的实用短板</strong>：慢。扩散（模块 01）也好、flow matching（模块 03）也罢，生成一张图都要从噪声出发，沿着轨迹一小步一小步地走——典型要<strong>几十甚至上百次</strong>网络前向（NFE，number of function evaluations）。对实时应用（交互式作画、视频、设备端生成）这是不可接受的：用户点一下要等好几秒，而视频每一帧都要这样一遍、设备端还没有强 GPU。这正是 2023 年以来最热的工程问题——<strong>能不能把上百步压成几步、甚至一步，让生成快到「实时」？</strong></p>  <p>Song 等人 2023 年的 <span class="term">consistency model (CM)</span> 给出了一个极优雅的答案。回忆模块 03：扩散/flow 的采样本质是沿一条 <span class="term">probability flow ODE</span> 轨迹，从噪声积分到数据。多步采样慢，是因为我们<em>一小步一小步地数值积分这条轨迹</em>。CM 的想法是：<strong>与其一步步走完整条轨迹，不如直接学一个函数，把轨迹上的任意一点「一跳」映到轨迹的终点（干净数据）</strong>。如果学到了这个函数，那么从噪声（轨迹起点）出发，<strong>一次前向就能跳到数据</strong>——单步生成。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：扩散采样像沿着一条山路从山顶（噪声）慢慢走到山脚（数据），每一步只敢挪一点，怕走错。consistency model 则像装了一部<strong>缆车</strong>：不管你现在在山路的哪个位置，缆车都能<em>一趟</em>把你直接送到山脚。而且因为「山脚」对同一条路上的所有点都是同一个，这部缆车的目标是自洽的、好学的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：设 ODE 轨迹 <code>{x_t}</code> 从数据 <code>x_0</code>（<code>t→0</code>）连到噪声 <code>x_T</code>（<code>t=T</code>）。CM 学一个 <span class="term">consistency function</span> <code>f(x_t, t)</code>，要求它把同一条轨迹上的<strong>任意</strong> <code>x_t</code> 都映到该轨迹的起点 <code>x_0</code>。采样：<code>x_0 ≈ f(x_T, T)</code>，<strong>一次前向</strong>。这就是单步生成。</p></div>
+  </div>  <p>为什么这件事原则上可行？因为模块 03 已经告诉我们：扩散/flow 的采样本质是一条<strong>确定性</strong>的 probability flow ODE——给定一个噪声 <code>x_T</code>，它<em>唯一确定</em>地对应一个数据点 <code>x_0</code>（沿轨迹积分的终点）。也就是说，「噪声→数据」本身就是一个良定义的确定性映射，只是我们一直用「逐步积分」这种昂贵方式去求它。CM 的洞察是：<strong>既然这个映射是确定的，为什么不直接用一个网络去逼近它</strong>？把「求解 ODE」变成「查一张学好的表」——这就是从「多步积分」到「单步直达」的根本转变。注意这与单纯把扩散采样器的步子调大（DDIM、DPM-Solver）不同：那仍在走轨迹，CM 是<em>学一个绕过走轨迹的捷径函数</em>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住 CM：<strong>学「直达终点」的函数，而非「下一小步」的函数</strong>。扩散/flow 学的是局部的速度/噪声（只告诉你下一小步往哪挪），所以要走很多步；CM 学的是全局的「终点在哪」（一步到位）。代价是这个函数更难学（要对整条轨迹自洽），但学成了就能少步甚至单步——这是质量与速度的一次重新权衡。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="selfcons"><span class="num">2</span>自洽性：CM 的核心约束</h2>
+  <h3>自洽性：CM 的核心约束</h3>  <p>怎么学这个「直达终点」的函数 <code>f</code>？关键是 <span class="term">self-consistency</span>（自洽性）这个约束。它说：<strong>同一条 ODE 轨迹上的任意两点，经 </strong><code>f</code><strong> 必须映到同一个输出</strong>（都是轨迹起点）：</p>  <div class="math-block">\[f(x_t, t) = f(x_{t'}, t') \quad \text{对同一条轨迹上的任意 } t, t'\]</div>  <p>这个约束<strong>自带训练信号</strong>，不需要知道「正确答案」是什么。具体做法：在一条轨迹上取<strong>相邻</strong>的两个时刻 <code>t_n</code> 和 <code>t_{n+1}</code>（对应轨迹上相邻两点 <code>x_{t_n}</code>、<code>x_{t_{n+1}}</code>），要求 <code>f</code> 在这两点的输出尽量一致——最小化它们的距离：</p>  <div class="math-block">\[\mathcal{L}_{\text{CM}} = \mathbb{E}\Big[\, d\big(f_\theta(x_{t_{n+1}}, t_{n+1}),\; f_{\theta^-}(x_{t_n}, t_n)\big) \Big]\]</div>  <p>这里有个微妙但关键的设计：右边用的是 <code>f_{θ⁻}</code>——一个<strong>不回传梯度的目标网络</strong>（通常是 <code>θ</code> 的 EMA 滑动平均，类似强化学习里的 target network）。若两边都是同一个 <code>θ</code> 且都回传梯度，网络会找到「把所有输入都映到同一个常数」这种<strong>平凡解</strong>（确实自洽，但毫无用处）。用一个滞后的、不回传的目标网络当「锚」，逼 <code>θ</code> 向它靠拢而非互相塌缩，是避免平凡解、让训练稳定的要点。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>通俗讲：自洽性就像要求「无论从山路哪一段坐缆车，都得到同一个山脚」。我们没法直接告诉缆车「山脚在哪」（那需要先跑完扩散），但我们能要求「相邻两站坐缆车的结果一致」——一站一站传递下去，只要每对相邻站一致，整条路就都指向同一个终点。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地：自洽损失只约束<em>相邻</em>时刻一致，但配合<strong>边界条件</strong>（下一节，<code>f(x,0)=x</code>）就够了——边界把 <code>t=0</code> 处的输出钉死为数据本身，自洽性再把这个「正确答案」沿轨迹逐站传播到所有 <code>t</code>。没有边界条件，自洽性会塌成常数；有了边界，它传播的是真正的终点。</p></div>
+  </div>  <div class="callout danger"><span class="label">平凡解陷阱</span>
+    <p>平凡解是 CM 训练的头号陷阱。<code>f≡常数</code> 完美满足自洽性（任意两点输出都相等），却什么也没学到。三件事共同避免它：① 目标网络 <code>θ⁻</code> 不回传梯度（打破对称塌缩）；② 边界条件把 <code>t=0</code> 钉死；③ 合理的时间步与权重设计。Song & Dhariwal 2024（iCT）的大半篇幅就在调这些，让从零训练（CT）也能稳定——可见这个陷阱有多顽固。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="boundary"><span class="num">3</span>边界条件：终点钉在数据上</h2>
+  <h3>边界条件：让终点钉在数据上</h3>  <p>自洽性传播的是「终点」，但终点必须先被锚定——这就是 <span class="term">boundary condition</span>（边界条件）的作用：</p>  <div class="math-block">\[f(x, 0) = x \qquad (\text{在 } t=0\text{，无噪声，}f \text{ 是恒等映射})\]</div>  <p>含义很直白：在 <code>t=0</code> 处样本就是干净数据本身，无需任何变换，所以 <code>f</code> 必须是恒等。这给整条轨迹的「终点」提供了一个<strong>确定的真值</strong>，自洽性才有东西可传播。</p>  <p>没有边界条件会怎样？回到上一节的平凡解：自洽性只说「相邻点输出一致」，它本身<strong>不在乎那个一致的值是什么</strong>——把所有点都映到同一个任意常数（甚至 0）也完美满足。边界条件 <code>f(x,0)=x</code> 是<strong>打破这种简并的锚</strong>：它在 <code>t=0</code> 处强行规定输出必须是数据本身，于是自洽性沿轨迹传播的不再是「随便某个常数」，而是「真正的数据终点」。可以说，自洽性提供「传播规则」，边界条件提供「初始真值」，二者相乘才得到一个有用的 <code>f</code>。</p>  <p>怎么<strong>保证</strong>网络一定满足这个边界？不是靠 loss 软约束，而是靠<strong>参数化</strong>硬保证。CM 用一个 skip-connection 形式（沿用 EDM 的预条件）：</p>  <div class="math-block">\[f_\theta(x, t) = c_{\text{skip}}(t)\,x + c_{\text{out}}(t)\,F_\theta(x, t),\qquad c_{\text{skip}}(0)=1,\; c_{\text{out}}(0)=0\]</div>  <p>其中 <code>F_θ</code> 是真正的神经网络，<code>c_skip</code>、<code>c_out</code> 是随 <code>t</code> 变化的系数。关键在它们的边界取值：<code>c_skip(0)=1</code>、<code>c_out(0)=0</code>，于是 <code>f(x,0)=1·x + 0·F=x</code>——<strong>不管网络 </strong><code>F_θ</code><strong> 输出什么，边界条件自动严格成立</strong>。这和模块 02 的 adaLN-zero 是同一种智慧：<em>用参数化把关键约束变成结构性保证，而非训练目标</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>通俗讲：边界条件像给缆车一个「靠站即停」的硬规则——到了山脚（t=0）就是山脚，不许再动。这个规则不靠「训练它学会停」，而是写死在缆车的机械结构里，绝不会错。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地：随 <code>t</code> 增大，<code>c_skip(t)</code> 递减、<code>c_out(t)</code> 递增，让网络在高噪时主导（需要大改）、低噪时近恒等（只需微调）。这与扩散去噪在不同噪声级别的行为一致，也让 <code>F_θ</code> 的学习目标在各 <code>t</code> 上尺度均衡、更好训。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把「自洽性 + 边界条件」连起来看：边界条件在 <code>t=0</code> 处<strong>钉一个真值桩</strong>，自洽性是一条<strong>把真值从桩沿轨迹传到远处每一点</strong>的链条。两者缺一不可：只有自洽性会塌成常数；只有边界条件管不到 <code>t&gt;0</code>。合起来，<code>f</code> 在整条轨迹上都正确地指向数据终点。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="distill"><span class="num">4</span>蒸馏 vs 从零训练</h2>
+  <h3>怎么得到 CM：蒸馏 vs 从零训练</h3>  <p>自洽损失里需要「同一条轨迹上的相邻点」<code>(x_{t_n}, x_{t_{n+1}})</code>。怎么造出它们？这里分出 CM 的两条路线：</p>  <table>
+    <thead><tr><th>路线</th><th>怎么造相邻点</th><th>需要什么</th><th>特点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>一致性蒸馏 CD</strong>（consistency distillation）</td><td>用一个<strong>预训练扩散模型</strong>当老师，从 <code>x_{t_{n+1}}</code> 走一步 ODE/DDIM 得到 <code>x_{t_n}</code></td><td>一个训好的扩散模型</td><td>稳、质量高，是主流</td></tr>
+      <tr><td><strong>一致性训练 CT</strong>（consistency training）</td><td>用<strong>无偏的 score 估计</strong>直接造相邻点，不需要老师</td><td>只需数据</td><td>省一个模型，但更难调</td></tr>
+    </tbody>
+  </table>  <p><span class="term">consistency distillation (CD)</span> 是最常用的：你已经有一个会生成、但慢（要几十步）的扩散模型，用它沿 ODE 走一小步，就能为任意 <code>x_{t_{n+1}}</code> 造出轨迹上的相邻点 <code>x_{t_n}</code>，再训 CM 学生满足自洽。本质是<strong>把多步老师的「知识」压进单步学生</strong>——这是一种蒸馏，用质量换速度。它也呼应了一个更早的前身：<span class="term">progressive distillation</span>（Salimans & Ho 2022），那是反复把一个 <code>N</code> 步采样器蒸馏成 <code>N/2</code> 步、迭代减半；CM 可以看作把这个「减半」一步做到底（直达终点）。</p>  <p><span class="term">consistency training (CT)</span> 则更进一步：连老师都不要，用一个对 score 的无偏估计来构造相邻点，从零直接训出 CM。好处是省掉「先训一个扩散模型」的步骤，坏处是训练信号噪声大、更难稳定（Song & Dhariwal 2024 的 iCT 专门攻这个）。两条路线的存在，体现了少步生成研究的活跃——既想要质量，又想省掉对老师的依赖。</p>  <p>从更高处看，CM 属于一个更大的家族——<strong>把「慢但好的老师」压成「快的学生」</strong>。这个家族里，最早的是 <span class="term">progressive distillation</span>（一次砍一半步数），CM/LCM 是「一步砍到底」，还有用对抗损失的 SDXL-Turbo、用分布匹配的 DMD。它们共享同一个<strong>蒸馏哲学</strong>：先有一个能生成高质量样本的多步老师（它定义了「好」的标准），再训一个学生用更少的前向逼近老师的输出分布。这也解释了为什么少步生成几乎总是<em>后于</em>高质量多步模型出现——你得先有好老师，才能蒸出好学生。本课前四个模块造出的，正是这样的好老师。</p>  <div class="callout warn"><span class="label"></span>
+    <p>别把 CM 和「采样器加速」（DDIM、DPM-Solver）搞混。后者是在<em>不重训模型</em>的前提下，用更聪明的数值积分把扩散的步数从上百降到二三十——仍是<strong>走轨迹</strong>，只是步子大些。CM 是<strong>重新训练一个新模型</strong>（或蒸馏），目标从「走下一步」变成「直达终点」，从而把步数压到 1~4。前者改求解器，后者改模型——这是两类不同的加速。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sampling"><span class="num">5</span>少步采样：单步与多步精修</h2>
+  <h3>少步采样：单步与多步精修</h3>  <p>有了训好的 <code>f</code>，采样极简。<strong>单步生成</strong>就一行：从噪声采一个 <code>x_T∼N(0,σ_T²I)</code>，直接 <code>x_0 = f(x_T, T)</code>。一次前向，出图。</p>  <p>但单步质量可能不够（一跳跨度太大、细节糙）。CM 支持<strong>多步精修</strong>（multi-step sampling），在质量和速度间滑动——交替做「<strong>加噪回中途</strong> → <strong>再跳回终点</strong>」：</p>  <div class="ascii">CM 多步采样（few-step sampling）：
+  x ← f(x_T, T)                      # 第 1 步：从噪声直跳到数据估计
+  for τ in [τ_1, τ_2, ...]:          # 选几个中间噪声级别（步数=NFE）
+      x ← x + √(τ²-ε²)·z             # 把当前估计「加噪」回噪声级别 τ
+      x ← f(x, τ)                    # 再用 f 跳回数据终点（精修一次）
+  return x                           # 步数越多，质量越高（但越慢）</div>  <p>直觉：单步是「一眼估计」，可能不准；多步是「估计→打回去重看→再估计」的反复修正，每轮都让结果更贴近真实数据分布。这给了一个<strong>连续的质量-速度旋钮</strong>：1 步最快但最糙，2~4 步质量明显提升、仍远快于扩散的几十步。这正是 CM 实用的精髓——<em>不是固定单步，而是让你按需在 1~4 步间选</em>。</p>  <p>为什么单步会「糙」、多步能补救？因为单步要求 <code>f</code> 在最远的点（纯噪声 <code>t=T</code>）一跳跨越整条轨迹，这是它最难、误差最大的地方——训练中高噪区的监督信号最弱、自洽链条传得最远，学到的 <code>f(·,T)</code> 难免有偏。多步精修的妙处在于：第一步的粗估计被「加噪回中段」后，后续的 <code>f(·,τ)</code> 是在<em>噪声更小、&lt;code&gt;f&lt;/code&gt; 更准</em>的区域工作，于是每轮都在 <code>f</code> 更可靠的地方做修正，误差逐步收敛。这也解释了为何收益递减：越往后噪声越小、<code>f</code> 本就越准，能补的也越少——通常 3~4 步就接近多步扩散的质量了。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>通俗讲：单步像凭第一印象下判断；多步像「下判断→退一步重新审视→再下判断」，多看几轮自然更准。CM 让你自己决定看几轮——赶时间就一眼，求质量就多看两眼。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地：每次「加噪回 τ」是把确定性估计重新注入随机性、回到轨迹中段；再 <code>f(·,τ)</code> 跳回终点。这一来一回纠正单步的系统偏差，让样本分布逐步逼近数据分布。步数与质量单调相关，但收益递减——3~4 步通常已接近多步扩散的质量。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>和扩散对比看权衡：扩散是<strong>几十步、每步小、质量高</strong>；CM 是<strong>1~4 步、每步大、质量略低但接近</strong>。对很多实时场景，CM 用「快 10~50 倍」换「质量损失一点点」是极划算的——这就是为什么 SDXL-Turbo、LCM 能做到「打字即出图」的交互体验。质量-步数权衡，是这个模块的核心。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="lcm"><span class="num">6</span>落地：LCM 与少步生态</h2>
+  <h3>落地：LCM 与少步生成生态</h3>  <p>把 CM 用到真实 Stable Diffusion，就是 <span class="term">LCM</span>（Latent Consistency Model，Luo 2023）。它做了两件接地气的事，让 CM 真正可用：</p>  <ol>
+    <li><strong>在 latent 空间做 CM</strong>：直接在 SD 的 VAE latent（模块 01）上训一致性函数，而非像素空间——省算力、复用 SD 的 VAE。</li>
+    <li><strong>把 CFG 一并蒸馏掉</strong>：模块 04 的 classifier-free guidance 要跑两次网络（条件 + 无条件）。LCM 在蒸馏时把引导<em>烤进</em>学生，使采样时单次前向就自带引导效果，又省一半算力。</li>
+  </ol>  <p>结果是 SD 能 <strong>4 步出图</strong>（对比原来的 25~50 步），质量接近。更妙的是 <span class="term">LCM-LoRA</span>：把「少步能力」打包成一个 LoRA 适配器，<strong>插到任意现成 SD 模型上</strong>就立刻获得少步采样，不必重训整个模型——这让少步能力的普及成本极低，是工程落地的典范。</p>  <p>LCM-LoRA 这个「插件式少步」尤其值得玩味：它说明<strong>「少步能力」可以和「生成什么内容」解耦</strong>。一个 LoRA 适配器（几十 MB）就能把任意一个几十步的 SD 模型变成 4 步——无论那个模型是画动漫的、画写实的、还是某个微调版。这种<em>可组合、可迁移</em>的工程形态，是少步研究从「论文」走向「人人可用」的关键一跃，也提示了一个趋势：未来的生成栈可能是「一个高质量基模 + 可插拔的加速/控制适配器」，而非每个用途都从头训一个少步模型。</p>  <p>CM/LCM 只是少步生成大家庭的一支。并列的还有<strong>对抗蒸馏</strong>（SDXL-Turbo 的 ADD、DMD：用 GAN/分布匹配损失做 1~4 步生成）、以及把少步直接做进 flow matching（模块 03）的工作（shortcut models、mean flow：学「跳一大步」的速度场）。它们路线不同，但目标一致：<strong>把生成的 NFE 从几十压到个位数</strong>，让实时、设备端、视频生成成为可能。这是当前最白热化的方向之一。</p>  <div class="callout paper"><span class="label"></span>
+    <p>少步生成是<strong>把前四个模块的成果「提速交付」</strong>的关键一环：latent（01）、DiT 骨干（02）、flow（03）、CFG（04）解决了「生成得好、可控」，CM/LCM/对抗蒸馏解决「生成得快」。一个现代实时模型（如 Flux schnell）往往是这几样的合体。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="toy"><span class="num">7</span>把玩具跑起来：单步 CM</h2>
+  <h3>把玩具跑起来：一个能单步生成的 CM</h3>  <p>配套 notebook 用纯 numpy 把 CM 的核心从零搭出来。为了让 ODE 轨迹有<strong>已知闭式</strong>（便于验证），我们借用模块 03 的直线轨迹：</p>  <ol>
+    <li><strong>已知轨迹</strong>：数据 <code>x1</code>、噪声 <code>x0</code> 的直线 <code>x_t=(1-t)·x1+t·x0</code>，<code>t∈[0,1]</code>。轨迹「终点（数据）」闭式可得：<code>x1=(x_t-t·x0)/(1-t)</code>。</li>
+    <li><strong>边界条件</strong>：用 skip 参数化 <code>f=c_skip(t)·x+c_out(t)·F(x,t)</code>，验证 <strong>f(x,0)=x 严格成立</strong>（不论 F 是什么）——这是最关键的可验证事实。</li>
+    <li><strong>自洽损失</strong>：在同一轨迹上取相邻 <code>t,t'</code>，验证「自洽损失=0 当且仅当 f 沿轨迹输出一致」；并训一个小 <code>F</code> 让自洽损失下降。</li>
+    <li><strong>单步 / 多步采样</strong>：从噪声单步 <code>f(x_T,T)</code> 生成，验证落在数据附近；多步精修验证「步数越多、离数据越近」。</li>
+  </ol>  <p>一个值得提前说明的玩具简化：为了让单步生成在 numpy 里<strong>良定义且可学</strong>，我们把数据造成噪声的一个确定性函数 <code>x1=g(x0)</code>（于是「从噪声预测数据」是个明确的回归问题）。真实 CM 里这个「噪声↔数据」的确定性对应不是人为指定的，而是由预训练扩散的 probability flow ODE<em>隐式给出</em>（蒸馏时用老师走 ODE 来体现）。玩具用显式 <code>g</code> 替代这个隐式 ODE，是为了聚焦验证「自洽 + 边界 → 单步」这条逻辑链，而不被「先训一个扩散老师」的复杂度淹没——机制完全一致，只是把老师换成了已知闭式。</p>  <p>通过这个玩具你会亲手确认本模块每个论点：<strong>边界条件由参数化硬保证</strong>（恒等性 atol 级精确）、<strong>自洽性是可优化的训练信号</strong>（损失可降）、<strong>单步即可生成</strong>（一次前向落在数据流形）、以及<strong>多步精修提质</strong>（到数据距离不增）。维度小到能 print，但逻辑与真实 CM/LCM 一一对应。</p>  <div class="callout paper"><span class="label"></span>
+    <p>notebook 的 <code>F</code> 是玩具实现（小网络/最小二乘），但 skip 参数化、自洽损失、单步/多步采样的逻辑与真实 CM 逐行对应。想深入直接读 Song 2023 (Consistency Models) 与 Luo 2023 (LCM) 及其官方代码。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>从零训练的稳定性</strong>：CT（无老师）比 CD（有老师）省事，但更难训。iCT 等工作大幅改善，但「不靠蒸馏、直接训出 SOTA 少步模型」仍未完全解决。</li>
+    <li><strong>单步 vs 少步的质量上限</strong>：单步永远略逊于多步。1~2 步能否逼近完整扩散的质量、理论上限在哪，是核心问题。对抗损失（Turbo）、更好的轨迹（rectified flow + CM）都在逼近它。</li>
+    <li><strong>少步与 flow 的融合</strong>：把少步直接做进 flow matching（shortcut、mean flow）省掉「先扩散再蒸馏」两段式。这条「原生少步」路线可能比 CM 更简洁，是模块 03/05 的交汇前沿。</li>
+    <li><strong>少步生成的可控性</strong>：CFG（模块 04）被蒸馏进单步后，引导强度还能不能自由调？负 prompt、动态引导在少步设定下如何保留，是落地的实际难题。</li>
+    <li><strong>视频与大模型的少步</strong>：视频生成 NFE 成本更高，少步化收益更大但更难（时间一致性 + 少步）。把 CM/对抗蒸馏扩到视频 DiT，是实时视频生成的关键一步。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Song 2023《Consistency Models》（自洽性 + 边界条件 + 单步/少步）；进阶看 Luo 2023《Latent Consistency Models》(LCM/LCM-LoRA)、Song & Dhariwal 2024 (iCT)、Salimans & Ho 2022 (progressive distillation)、SDXL-Turbo/DMD（对抗蒸馏）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_guidance/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · Classifier-Free Guidance</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

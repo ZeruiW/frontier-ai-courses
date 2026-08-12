@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · Arena、time-horizon 与评测报告</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 08 / 9</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>08 · Arena、time-horizon 与评测报告</h1>
+  <p class="subtitle">Arena, Time Horizons &amp; Eval Reporting —— 当静态基准失效时，前沿评测在测什么、怎么报</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（bootstrap / CI）、模块 04（偏好评测的偏置）、模块 06（能力引出）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 08_arena_horizon.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Chiang 2024 (Arena)、Kwa 2025 (time horizon)、Singh 2025、Bradley &amp; Terry 1952</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#beyond">静态基准之外：偏好评测与时程评测两条前沿线</a></li>
+      <li><a href="#bt">Bradley-Terry 模型：从成对比较到全局排名</a></li>
+      <li><a href="#arena">Chatbot Arena 方法论与它的裂缝</a></li>
+      <li><a href="#horizon">METR time-horizon 深读：用"人类时长"丈量 agentic 能力</a></li>
+      <li><a href="#horizon-stats">horizon 指标的统计细节</a></li>
+      <li><a href="#reporting">评测报告规范：eval card、预注册与负结果</a></li>
+      <li><a href="#checklist">全课收束：一张严谨评测 checklist</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="beyond"><span class="num">1</span>静态基准之外：偏好评测与时程评测两条前沿线</h2>
+
+  <p>前 7 个模块的主线是<strong>静态基准</strong>：固定题目、固定答案、算准确率、配上误差棒。但模块 05 已经证明这条路有天花板——
+  题目会泄漏（污染）、会被刷爆（饱和）、且单点准确率对"模型到底能干多大的活"几乎不提供刻度。
+  前沿评测于是分出两条互补的路线，恰好对应两类不同的问题：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>偏好评测（Arena 线）</th><th>时程评测（Horizon 线）</th></tr></thead>
+    <tbody>
+      <tr><td>回答的问题</td><td>"用户更喜欢哪个模型的输出？"</td><td>"模型能自主完成多长（多难）的任务？"</td></tr>
+      <tr><td>代表工作</td><td>Chatbot Arena [Chiang 2024]</td><td>METR time horizon [Kwa 2025]</td></tr>
+      <tr><td>数据形态</td><td>海量成对人类投票（A vs B）</td><td>带人类完成时长标签的任务套件 + 模型逐任务成败</td></tr>
+      <tr><td>核心统计模型</td><td><span class="term">Bradley-Terry</span> / Elo + bootstrap CI</td><td>logistic 回归 success ~ log(human_time)</td></tr>
+      <tr><td>输出刻度</td><td>相对强度 θ（排名 + 区间）</td><td>P50 horizon：一个<strong>有物理单位（分钟）</strong>的能力刻度</td></tr>
+      <tr><td>天然抗污染？</td><td>是：prompt 来自真实用户、持续更新</td><td>部分：任务可私有，但套件本身会过时</td></tr>
+      <tr><td>主要失效模式</td><td>风格偏置、投票者分布、刷榜 [Singh 2025]</td><td>任务分布敏感、外推争议</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  两条线的共同点：<strong>都放弃了"固定题目 + 标准答案"的范式</strong>。Arena 把"题目"外包给真实用户、把"判分"外包给人类偏好；
+  horizon 把"分数"从无量纲的准确率换成有单位的人类时长。代价是统计模型更重——这正是本模块要拆解的部分。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="bt"><span class="num">2</span>Bradley-Terry 模型：从成对比较到全局排名</h2>
+
+  <p>成对比较的聚合问题早在 LLM 出现前 70 年就被解决了 [Bradley &amp; Terry 1952]。
+  设每个模型 $i$ 有一个潜在强度参数 $\theta_i\in\mathbb{R}$，<span class="term">Bradley-Terry (BT) 模型</span>假设 $i$ 击败 $j$ 的概率只取决于强度差：</p>
+
+  <div class="math-block">
+  $$ P(i \succ j) \;=\; \frac{e^{\theta_i}}{e^{\theta_i}+e^{\theta_j}} \;=\; \sigma(\theta_i-\theta_j),
+     \qquad \sigma(x)=\frac{1}{1+e^{-x}} $$
+  </div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>给每个模型发一个"实力分"。两个模型对战时，赢面只看分差：分差为 0 就五五开，分差越大赢面越接近 1。
+      拿到一堆对战记录后，反过来问：<strong>哪组实力分最能解释这些胜负？</strong>这就是最大似然估计。
+      Elo 则是同一件事的"边打边更新"版本：每打一场，按"实际得分 − 预期得分"微调双方分数。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>BT 模型把成对比较建模为以强度差为 logit 的 Bernoulli 试验，等价于以"对战指示向量"为特征、无截距的 logistic 回归。
+      $\theta$ 仅在平移意义下可辨识（identifiable up to an additive constant），故需固定某个 $\theta_k=0$ 或约束 $\sum_i\theta_i=0$。
+      在比较图（comparison graph）连通的条件下，MLE 存在且唯一（模平移）。</p>
+    </div>
+  </div>
+
+  <h3>MLE 拟合</h3>
+  <p>给定对战集 $\mathcal{D}=\{(w_m, l_m)\}_{m=1}^{M}$（第 $m$ 场 $w_m$ 胜 $l_m$），负对数似然为：</p>
+
+  <div class="math-block">
+  $$ \mathcal{L}(\theta) \;=\; -\sum_{m=1}^{M} \log \sigma\!\left(\theta_{w_m}-\theta_{l_m}\right) $$
+  </div>
+
+  <p>这是 $\theta$ 的凸函数，用任意二阶/拟牛顿优化器（notebook 用 <code>scipy.optimize.minimize</code>）即可求全局最优。对 $\theta_i$ 求梯度：</p>
+
+  <div class="math-block">
+  $$ \frac{\partial \mathcal{L}}{\partial \theta_i}
+     \;=\; -\sum_{m:\,w_m=i}\Big(1-\sigma(\theta_i-\theta_{l_m})\Big)
+           \;+\;\sum_{m:\,l_m=i}\sigma(\theta_{w_m}-\theta_i)
+     \;=\; -\big(\underbrace{\#\text{实际赢}}_{\text{观测}}-\underbrace{\textstyle\sum \text{预期赢}}_{\text{模型}}\big)_i $$
+  </div>
+
+  <p>即 MLE 的一阶条件是"<strong>每个模型的实际胜场数 = 模型预测的期望胜场数</strong>"——一个非常直觉的矩匹配条件。</p>
+
+  <h3>Elo：BT 的在线随机近似</h3>
+  <p><span class="term">Elo</span> 评分（国际象棋传统，base-10 / 400 刻度）对每场对战做增量更新：</p>
+
+  <div class="math-block">
+  $$ R_a \leftarrow R_a + K\,(S_a - E_a), \qquad
+     E_a = \frac{1}{1+10^{(R_b-R_a)/400}}, \quad S_a\in\{0,\tfrac12,1\} $$
+  </div>
+
+  <p>注意 $E_a$ 正是 BT 胜率（换底数：$\theta = R\cdot\ln 10/400$），而 $(S_a-E_a)$ 正是上面单场对战对数似然的负梯度。
+  所以 <strong>Elo = 对 BT 对数损失做学习率为 $K$ 的在线 SGD</strong>。由此立即得到 K 因子的全部权衡：</p>
+
+  <ul>
+    <li><strong>K 大</strong>：适应快（适合棋手——实力随时间变化），但稳态方差大，排名抖动；</li>
+    <li><strong>K 小</strong>：收敛慢，但稳态估计更稳；</li>
+    <li><strong>顺序依赖</strong>：Elo 的最终评分依赖对战<em>顺序</em>——同一批数据打乱重放会得到不同评分。SGD 不取平均就不会精确收敛到 MLE。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>LLM 评测应该用 BT MLE 而不是在线 Elo。</strong>一个固定 checkpoint 的模型强度是常数，不存在"棋手状态起伏"，
+  在线更新的顺序依赖与稳态方差是纯害无利的噪声。Chatbot Arena 早期用 Elo，后来正式切换为 BT MLE + bootstrap [Chiang 2024]。
+  notebook 里你会在同一份合成数据上直接对比两者的估计精度。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="arena"><span class="num">3</span>Chatbot Arena 方法论与它的裂缝</h2>
+
+  <p><span class="term">Chatbot Arena</span> [Chiang 2024] 是偏好评测的标杆实现：真实用户提交任意 prompt，
+  系统随机抽两个<strong>匿名</strong>模型并排作答，用户投票（A 胜 / B 胜 / 平 / 都差），累计百万级投票后拟合 BT 排名。</p>
+
+  <div class="ascii">
+  用户 prompt ──► ┌─────────────────────────┐
+                 │  随机抽取模型对 (i, j)    │ ◄── 主动采样：优先抽
+                 │  双盲并排生成            │     排名不确定的模型对
+                 └────────────┬────────────┘
+                              ▼
+                 用户投票 (A / B / tie / both-bad)
+                              │  去噪：异常投票者检测、
+                              │  泄漏模型身份的对话剔除
+                              ▼
+                 ┌─────────────────────────┐
+                 │  BT MLE 拟合 θ̂           │
+                 │  bootstrap 重采样投票     │──► 排名 + 95% CI
+                 └─────────────────────────┘     （CI 重叠 ⇒ 名次并列）
+  </div>
+
+  <p>方法论上的三个关键设计：</p>
+  <ul>
+    <li><strong>匿名对战</strong>：投票时不显示模型身份（投完才揭示），阻断品牌效应；模型自报身份的对话会被剔除。</li>
+    <li><strong>投票去噪</strong>：检测异常投票者（如永远投同一边、投票速度异常），并用加权 BT 缓解模型对采样不均。</li>
+    <li><strong>bootstrap 排名 CI</strong>：对投票记录有放回重采样、重新拟合 BT，得到每个模型 θ 与名次的置信区间——
+    榜单上"第 2 名"和"第 3 名"的 CI 经常重叠，此时名次差异<strong>无统计意义</strong>（模块 02 的教训在此重现）。</li>
+  </ul>
+
+  <h3>裂缝：The Leaderboard Illusion</h3>
+
+  <p>[Singh 2025] 对 Arena 生态做了系统审计，结论是榜单排名与真实能力之间存在多重系统性扭曲：</p>
+
+  <table>
+    <thead><tr><th>缺陷</th><th>机制</th><th>后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>风格偏好</strong></td><td>投票者系统性偏爱更长、格式更漂亮（markdown、列表、emoji）的回答，而非更正确的回答</td><td>θ 混入"风格分"；style-control 回归后排名显著变动（呼应模块 04 的 judge 偏置）</td></tr>
+      <tr><td><strong>投票者分布</strong></td><td>Arena 用户 ≠ 目标用户群：prompt 分布偏向闲聊/创作/英文，专业任务占比低</td><td>排名只代表"这群投票者在这类 prompt 上的偏好"，外推到编码/科研场景无依据</td></tr>
+      <tr><td><strong>私测刷榜</strong></td><td>大厂可私下匿名测试 N 个变体、只公开发布最高分的那个（best-of-N 选择偏差）；且专有模型获得更多对战采样、更多 arena 数据用于调优</td><td>公开分数是 $\max$ 统计量而非无偏估计，系统性高估；对 arena 分布过拟合</td></tr>
+      <tr><td><strong>退场不对称</strong></td><td>开源模型被更频繁地静默下架，比较图随时间断裂</td><td>跨时段分数不可比，历史排名漂移</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>Leaderboard illusion 的本质是 Goodhart：当榜单成为目标，榜单就不再测量能力。</strong>
+  私测 best-of-N 在统计上等价于模块 02 警告过的多重比较不校正——抽 10 个变体取最大，期望排名提升是"免费"的。
+  作为评测科学家，读 arena 榜单时要问三件事：CI 是否重叠？是否做了 style control？该模型上榜前测过几个私有变体？</div>
+
+  <!-- ========================================================= -->
+  <h2 id="horizon"><span class="num">4</span>METR time-horizon 深读：用"人类时长"丈量 agentic 能力</h2>
+
+  <p>静态基准给出的准确率是<strong>无量纲</strong>的：SWE-bench 38% 和 45% 之间差多少"能力"？说不清。
+  [Kwa 2025]（METR）提出把模型能力投影到一个有物理意义的轴上：<strong>模型能以给定可靠性完成的任务，对应人类专家需要多长时间</strong>。</p>
+
+  <h3>方法四步</h3>
+  <div class="ascii">
+  ① 任务套件 (HCAST / RE-Bench / SWAA 等)
+     每个任务 k 带标签 t_k = 人类专家完成时长 (经 baseline 实测, 秒~小时跨度)
+                 │
+  ② 模型以 agent 脚手架逐任务运行 ──► 成败 y_k ∈ {0,1}   (模块 06: 引出要做足!)
+                 │
+  ③ logistic 回归:  P(success) = σ( α + β·log t_k ),  β < 0
+                 │
+  ④ 反解 P50 horizon:  h₅₀ = exp(−α/β)   ← 预测成功率恰为 50% 的人类时长
+  </div>
+
+  <p>第 ③ 步的模型假设是：<strong>任务对模型的"难度"主要由人类完成时长的对数刻画</strong>，成功率随 $\log t$ 单调下降。
+  拟合出 $\alpha,\beta$ 后令 $\sigma(\alpha+\beta\log h)=\tfrac12$，得：</p>
+
+  <div class="math-block">
+  $$ \alpha + \beta\log h_{50} = 0 \;\Longrightarrow\; h_{50} = \exp\!\left(-\frac{\alpha}{\beta}\right) $$
+  </div>
+
+  <h3>为什么比单点准确率更能刻画 agentic 能力</h3>
+  <ul>
+    <li><strong>跨基准可比</strong>：准确率依赖具体题目集，38% 在不同套件间不可比；horizon 的单位是"人类分钟"，把异构任务投影到同一根轴上。</li>
+    <li><strong>对饱和免疫的刻度</strong>：基准饱和时准确率挤在 95%+ 失去分辨率（模块 05），而 horizon 轴可以无限延伸——只要不断补充更长的任务。</li>
+    <li><strong>直接对应部署语义</strong>："P50 horizon ≈ 1 小时"可以直接翻译成"哪类工作流可以交给它"，这是 risk assessment 真正需要的量。</li>
+    <li><strong>利用了全部任务的信息</strong>：logistic 拟合把每个任务的成败按其时长加权汇入两个参数，而非对任意挑选的题目集合取平均。</li>
+  </ul>
+
+  <h3>核心发现与争议</h3>
+  <div class="callout paper"><span class="label"></span>
+  [Kwa 2025] 对 2019–2025 的前沿模型测量 P50 horizon，发现其随发布时间<strong>指数增长，倍增期约 7 个月</strong>
+  （GPT-2 几秒 → GPT-4 约几分钟 → Claude 3.7 Sonnet 约 1 小时量级）。若外推成立，5 年内 horizon 达到"人类一个月"量级。
+  这是目前最被广泛引用的 AI 能力增长定量刻画之一。</div>
+
+  <p>主要争议（论文自己也部分承认）：</p>
+  <ul>
+    <li><strong>任务"干净度"</strong>：套件任务自动可判分、目标明确、无真实世界的模糊性（messiness）。论文发现任务越"messy"，模型相对人类越差——真实工作的 horizon 可能系统性低于测量值。</li>
+    <li><strong>外推合法性</strong>：用 ~6 年、十几个模型的点外推未来 5 年，假设增长机制（算力、算法、数据）不变；倍增期本身在 2024 后疑似变短，趋势并非铁律。</li>
+    <li><strong>人类基线的定义</strong>：$t_k$ 是"有相关背景的专家、无该任务具体经验"的实测时长，换一群 baseliner 会平移整根轴。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="horizon-stats"><span class="num">5</span>horizon 指标的统计细节</h2>
+
+  <h3>5.1 任务分布敏感性</h3>
+  <p>horizon 不是模型的内禀属性，而是<strong>模型 × 任务分布</strong>的函数。logistic 拟合对 $\log t$ 轴上任务的<em>覆盖范围与密度</em>敏感：
+  若套件里 1 小时以上的任务很少，$h_{50}$ 超过 1 小时的模型的估计本质上是外推，CI 会急剧变宽。
+  更隐蔽的是：任务时长与任务<em>类型</em>混杂（长任务多为软件工程类），horizon 差异可能部分反映领域差异而非时长本身。
+  [Kwa 2025] 用不同任务子集重算 horizon 做敏感性分析——这是你复用该方法时必须照搬的步骤。</p>
+
+  <h3>5.2 logistic 拟合的置信区间</h3>
+  <p>正确的不确定性来源是<strong>任务层级</strong>的：30 个任务只有 30 个独立观测（同一任务跑多次是聚类数据——模块 02 的 clustered SE 再次登场）。
+  标准做法是对<strong>任务</strong>做 bootstrap 重采样、每次重拟合 logistic、收集 $h_{50}$ 的分布取分位数。
+  注意 $h_{50}=\exp(-\alpha/\beta)$ 是参数的非线性函数，delta method 在小样本下偏差大，bootstrap 是更稳妥的选择。
+  小套件下还可能出现完全分离（separation）使 MLE 发散——加弱正则或 Firth 校正（notebook 的牛顿法实现带 ridge）。</p>
+
+  <h3>5.3 P50 vs P80：可靠性刻度</h3>
+  <p>对任意目标成功率 $p$，反解 logistic 得：</p>
+
+  <div class="math-block">
+  $$ h_p = \exp\!\left(\frac{\mathrm{logit}(p)-\alpha}{\beta}\right), \qquad
+     \log h_{80} - \log h_{50} = \frac{\mathrm{logit}(0.8)}{\beta} = \frac{\ln 4}{\beta} \;(<0\ \text{当}\ \beta<0) $$
+  </div>
+
+  <p>两个要点：①$h_{80} &lt; h_{50}$ 恒成立，且两者比值<strong>只由斜率 $\beta$ 决定</strong>——$|\beta|$ 越小（成功率随时长衰减越平缓），
+  $h_{80}/h_{50}$ 越小。[Kwa 2025] 实测 P80 horizon 通常比 P50 <strong>低一个数量级左右</strong>；
+  ②语义完全不同：P50 回答"模型半数情况下能搞定多大的活"（能力上界视角），P80 回答"要 80% 可靠性时只能交给它多大的活"（部署/安全视角）。
+  风险评估应使用高可靠性分位点，宣传材料偏爱 P50——读报告时先看清是哪一个。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="reporting"><span class="num">6</span>评测报告规范：eval card、预注册与负结果</h2>
+
+  <p>本课反复出现同一类事故：分数对 prompt 格式敏感（03）、judge 有偏（04）、数据被污染（05）、引出不充分（06）、
+  榜单被刷（本章）。这些事故的共同放大器是<strong>报告不透明</strong>——读者无法判断分数的生成过程。解法是把"模型卡"的思想搬到评测上：</p>
+
+  <h3>Eval card：一次评测的完整披露清单</h3>
+  <table>
+    <thead><tr><th>板块</th><th>必须披露</th><th>对应模块</th></tr></thead>
+    <tbody>
+      <tr><td>配置</td><td>模型精确版本/checkpoint、采样参数（temperature、top-p、max tokens）、prompt 模板全文、few-shot 样例、agent 脚手架与工具、随机种子</td><td>03 / 06 / 07</td></tr>
+      <tr><td>数据</td><td>基准版本与 split、题目数、污染检查方法与结果、任务来源与许可</td><td>01 / 05</td></tr>
+      <tr><td>判分</td><td>答案抽取规则（正则/judge）、judge 模型与 prompt、judge 与人工标注的一致性</td><td>03 / 04</td></tr>
+      <tr><td>统计</td><td>n、点估计 + CI、配对比较用配对检验、多重比较校正、bootstrap 细节（重采样单位！）</td><td>02</td></tr>
+      <tr><td>局限</td><td>已知失效模式、任务分布外推边界、与既有报告数字不可比的原因</td><td>全部</td></tr>
+    </tbody>
+  </table>
+
+  <ul>
+    <li><strong>预注册（pre-registration）思想</strong>：跑评测<em>之前</em>写下假设、指标、模型清单与判读标准。
+    这直接封死两类操作：跑完再挑对自己有利的基准子集报告（cherry-picking），以及私测 N 取 1 [Singh 2025]。
+    内部评测同样适用——决定"哪个 checkpoint 上线"前先冻结评测协议。</li>
+    <li><strong>负结果披露</strong>：报告"试了 CoT 没有提升""在重述版基准上分数跌了 15 分"与报告正结果同等重要——
+    负结果是社区校准 elicitation gap 与污染严重度的唯一数据来源。发布偏差（publication bias）在评测领域的代价是系统性高估全行业能力。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  一个实用检验：<strong>拿着你的报告，一个没跟你说过话的同事能否独立复现出 ±1 个标准误内的数字？</strong>
+  不能，就还不是合格的 eval card。模块 07 的 harness 把配置序列化成 manifest，正是为了让这件事自动成立。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="checklist"><span class="num">7</span>全课收束：一张严谨评测 checklist</h2>
+
+  <p>九个模块走完，把全部教训压缩成一张从立项到发布的 checklist。每一行都对应一个真实事故模式——任何一行偷懒，都有一个具体的论文案例在等你。</p>
+
+  <table>
+    <thead><tr><th>阶段</th><th>检查项</th><th>失误的代价</th><th>模块</th></tr></thead>
+    <tbody>
+      <tr><td>任务选择</td><td>明确测的是能力还是对齐？基准是否饱和/过时？难度梯度是否覆盖目标区间？</td><td>测了个寂寞：分数挤在天花板，无分辨率</td><td><a href="../01_benchmark_landscape/01_讲解.html">01</a></td></tr>
+      <tr><td>统计设计</td><td>n 是否够（功效分析）？报 CI；模型间比较用配对检验；多模型多基准做多重比较校正</td><td>把噪声当成"超越 SOTA"</td><td><a href="../02_statistics/02_讲解.html">02</a></td></tr>
+      <tr><td>Prompt 与抽取</td><td>抽取器经过审计？对格式扰动（选项顺序、模板措辞）做过敏感性分析？</td><td>分差 = 抽取 bug + 模板运气</td><td><a href="../03_prompt_sensitivity/03_讲解.html">03</a></td></tr>
+      <tr><td>判分器</td><td>用 judge 时校验过位置/长度/自偏好偏置？与人工标注对齐率达标？</td><td>排行榜测的是"谁更会讨好 judge"</td><td><a href="../04_llm_judge/04_讲解.html">04</a></td></tr>
+      <tr><td>污染控制</td><td>跑过 n-gram / canary / no-input 基线检查？优先用 contamination-free 动态基准？</td><td>测的是记忆不是能力</td><td><a href="../05_contamination/05_讲解.html">05</a></td></tr>
+      <tr><td>能力引出</td><td>引出做足（CoT/工具/脚手架/重试）？pass@k 用无偏估计？报告 elicitation 投入</td><td>低估能力 → 安全评估失效</td><td><a href="../06_elicitation/06_讲解.html">06</a></td></tr>
+      <tr><td>工程实现</td><td>配置全部序列化、版本锁定、日志留痕、能一键复跑？</td><td>"我这边跑出来不一样"</td><td><a href="../07_harness/07_讲解.html">07</a></td></tr>
+      <tr><td>排名与刻度</td><td>偏好排名用 BT + bootstrap CI 并做 style control；agentic 能力报 horizon 时给任务分布与 P50/P80</td><td>leaderboard illusion；无量纲分数无法支撑决策</td><td>08</td></tr>
+      <tr><td>报告发布</td><td>eval card 五板块齐全；协议预注册；负结果照报</td><td>分数无法解读，社区被发布偏差污染</td><td>08</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  这张表的正确用法不是"发布前过一遍"，而是<strong>立项时就当成实验设计协议</strong>——
+  其中一半的项目（功效分析、预注册、污染控制）在跑完之后才想起来就已经无法补救了。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>抗操纵的偏好评测</strong>：在 [Singh 2025] 揭示的激励结构下，如何设计机制（限制私测、强制披露变体数、style control 默认开启）让 arena 排名重新可信？开放问题：能否对"刷榜"做统计检测——例如检验某模型的对战胜率分布是否与 best-of-N 选择一致？</li>
+    <li><strong>horizon 的外部效度</strong>：messy、目标模糊、需要与人协作的真实任务上，horizon 衰减多少？如何给"messiness"本身建立可测量的刻度并纳入回归？</li>
+    <li><strong>时长之外的难度轴</strong>：log(human_time) 是一维投影。任务对模型的难度显然还有正交维度（反馈回路长度、上下文获取成本、容错率）。多维 IRT 式的 horizon 推广是自然的下一步——但参数越多，对任务样本量的要求越苛刻。</li>
+    <li><strong>评测的评测（meta-evaluation）</strong>：eval card、预注册在学术圈尚无强制力。什么样的基础设施（类似 ML 会议的 reproducibility checklist、或 arena 的实时审计面板）能让"严谨"成为默认而非美德？</li>
+    <li><strong>评测视角的统一</strong>：Arena 测偏好、horizon 测自主能力、静态基准测知识——三者对"模型变强"的判断经常不一致（风格分↑、horizon 不变）。给定一个具体决策（部署/管控/采购），如何加权三类证据？这本质上是评测科学的决策论化，目前几乎空白。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>写出 BT 模型的似然函数，说明 Elo 在什么意义上是它的在线近似，以及为什么固定 checkpoint 的 LLM 排名应该用 MLE 而非在线 Elo。</li>
+      <li>Chatbot Arena 用什么机制对抗投票噪声与身份泄漏？[Singh 2025] 指出的三类系统性扭曲分别破坏了哪个统计假设？</li>
+      <li>完整复述 time-horizon 的四步方法，并从 $\alpha,\beta$ 解析写出 $h_{50}$ 与 $h_{80}$；解释两者语义差异及比值由什么决定。</li>
+      <li>一份合格的 eval card 要披露哪五个板块？预注册分别封死了哪两类常见操作？</li>
+    </ol>
+  </div>
+
+  <div class="card" style="text-align:center">
+    🎉 <strong>恭喜完成《LLM 评测科学》全部 9 个模块！</strong>从误差棒到 eval harness 再到 time horizon，你已经具备研究科学家级的评测工具箱。
+    回 <a href="../index.html">课程主页</a> 查看全课地图与延伸阅读。
+  </div>
+
+  <div class="pager">
+    <a href="../07_harness/07_讲解.html"><div class="dir">← 上一章</div><div class="t">07 · 从零搭建 eval harness</div></a>
+    <a class="next" href="../index.html"><div class="dir">下一章 →</div><div class="t">课程主页 · 结课</div></a>
+  </div>
+
+</div>
+</body>
+</html>

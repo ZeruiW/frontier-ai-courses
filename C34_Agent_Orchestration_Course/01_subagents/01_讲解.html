@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 子 Agent（Subagents）</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 子 Agent（Subagents）</h1>
+  <p class="subtitle">父 agent 雇来的、有独立工作台的临时工 —— 派生、上下文隔离、结构化结果回传、并行扇出与失败隔离、成本预算；从零写 spawn + collect，用多个隔离上下文分担一个超窗口的任务</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、单 agent / ReAct 回路、Python 函数与异常、可变对象与引用</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_subagents.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Anthropic multi-agent research system、Building effective agents、AutoGen (Wu 2023)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么需要 subagent：扩展上下文</a></li>
+      <li><a href="#anatomy">subagent 解剖：四个必备要素</a></li>
+      <li><a href="#isolation">上下文隔离：为什么、怎么验证</a></li>
+      <li><a href="#handoff">结果回传：只交结论不交草稿</a></li>
+      <li><a href="#fanout">并行扇出：同时派一群 subagent</a></li>
+      <li><a href="#failure">失败隔离与超时</a></li>
+      <li><a href="#cost">成本与上下文预算</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么需要 subagent：扩展上下文</h2>
+  <p>上一门课你学会了写<strong>一个</strong>agent：一个 LLM 在 ReAct 回路里看观察、想、调工具、看结果。这门课的第一步，是学会让一个 agent<strong>派生出另一个 agent</strong>替它干一部分活。这个被派生出来、专做某个子任务的 agent，就叫 <span class="term">subagent</span>（子 agent）。</p>  <p>为什么需要它？回想单 agent 的第一道墙：<strong>上下文窗口</strong>。一个真实的研究任务——「调研三家公司的最新财报并对比」——光把三份财报、若干新闻、分析资料全塞进一个 agent 的上下文，可能就爆窗了；就算不爆，几万 token 的资料堆在一起，模型的注意力也被稀释、容易丢三落四。<strong>subagent 的核心价值，是用多个隔离的上下文窗口分担一个超出单窗口的任务</strong>：派三个 subagent，各自只读一家公司的资料、各自在自己干净的上下文里深挖、只把<em>精炼结论</em>交回来。父 agent 的上下文里于是只留下三份结论，而非三堆原始资料。</p>  <p>这正是 Anthropic 的 multi-agent research system 的基石：一个 lead agent 把研究任务分解，派生多个 subagent<strong>并行</strong>检索，每个 subagent<strong>隔离上下文</strong>、跑完<strong>回传结构化结果</strong>，lead agent 再合成。本模块就把 subagent 这个零件从零造出来：怎么<strong>派生（spawn）</strong>一个 subagent、怎么保证它的上下文<strong>隔离</strong>、怎么把结果<strong>回传（collect）</strong>、以及怎么<strong>并行扇出（fan-out）</strong>多个 subagent 后汇总。</p>  <p>先把一个常被混淆的概念分清楚：subagent<strong>不是</strong>「把一个长提示拆成几段」那么轻巧。它是一个<em>有自己独立上下文、独立工具子集、独立运行轨迹的完整 agent</em>——父 agent 给它一份任务说明就撒手，它自己在隔离的世界里跑完，只把结论交回来。这种「派出去、隔离地跑、收回结论」的模式，才是多 agent 能扩展、能并行、能局部容错的根本。理解这层独立性，是读懂后面每一节的前提。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>subagent = 父 agent 雇来的、有独立工作台的临时工</strong>。父 agent 给它一张工单（任务说明），它在自己的工作台（隔离上下文）上干完，把成品（结构化结果）交回来——而不是挤在父 agent 的工作台上添乱。本模块的全部工程，都是在让这套「派工单—独立干—交成品」的流程<em>上下文真隔离、结果可回传、能并行、单个失败不连累全局</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="anatomy"><span class="num">2</span>subagent 解剖：四个必备要素</h2>
+  <h3>subagent 的解剖：四个必备要素</h3>  <p>一个能用的 subagent，派生时必须带齐四样东西，缺一不可：</p>  <table>
+    <thead><tr><th>要素</th><th>是什么</th><th>为什么必需</th></tr></thead>
+    <tbody>
+      <tr><td><strong>任务说明 task</strong></td><td>给这个 subagent 的明确目标 + 边界 + 期望输出格式</td><td>说明越清楚，subagent 跑偏的概率越低；模糊的委派是失败之源</td></tr>
+      <tr><td><strong>隔离上下文 context</strong></td><td>它自己独立的对话历史 / 输入，与父和兄弟互不污染</td><td>隔离才能并行、才能不让子任务的噪声挤占父的上下文</td></tr>
+      <tr><td><strong>工具子集 tools</strong></td><td>它能用的工具的一个子集（通常比父的更小）</td><td>最小权限：检索 subagent 不该有写 / 删权限（与模块 03 相通）</td></tr>
+      <tr><td><strong>结果契约 result schema</strong></td><td>约定好回传结果的字段（如 result / status / cost）</td><td>结构化才便于父 agent 程序化汇总、校验、归因</td></tr>
+    </tbody>
+  </table>  <p>注意第二项<strong>隔离上下文</strong>是 subagent 区别于「子函数」的关键。一个普通函数调用共享调用者的变量；而一个 subagent 拥有自己的对话历史——父 agent 看不到 subagent 内部的中间推理，subagent 也看不到父和兄弟的上下文。这种隔离不是限制，而是<strong>特性</strong>：它让三个 subagent 可以同时跑（互不干扰），让一个 subagent 读了一万 token 资料的「脏」上下文不会回流到父 agent，也让一个 subagent 崩了不至于污染全局。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把派生一个 subagent 想成「外包一个子项目」：你得写清需求文档（任务说明）、给它一间独立办公室（隔离上下文）、配它该用的工具权限（工具子集）、并约定交付物格式（结果契约）。需求含糊、办公室和你混用、权限给太大、交付物乱七八糟——这外包项目多半要砸。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，subagent 是一个把（task, isolated_context, tools, result_schema）封装起来的可调用单元。最小实现是一个函数 <code>run_subagent(id, task, llm, tools) -&gt; result_dict</code>：它内部新建一份独立的 messages、用给定 llm 与 tools 跑一个（可能多步的）回路、最后返回一个符合契约的结果字典。本模块 notebook 从这个最小形态起步，逐步加上扇出与容错。</p></div>
+  </div>  <p>还有一个设计抉择值得点出：subagent 内部<strong>自己也是一个 agent</strong>——它内部可以是一个完整的 ReAct 回路（多步调工具）、甚至可以再派生它自己的 subagent（形成层级）。但实践中<strong>层级别太深</strong>：Anthropic 的经验是一层 orchestrator + 一层 subagent 已能覆盖绝大多数任务，深层嵌套会让 token 消耗、协调难度、调试成本指数上升。本课聚焦<strong>一层派生</strong>——父 agent 派 subagent、subagent 回传——把这一层做扎实，深层只是它的递归。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="isolation"><span class="num">3</span>上下文隔离：为什么、怎么验证</h2>
+  <h3>上下文隔离：为什么、怎么验证</h3>  <p>上下文隔离是 subagent 的命脉，值得单独讲透。<strong>隔离</strong>的字面意思是：每个 subagent 有自己独立的对话历史 / 状态，对一个 subagent 上下文的修改，<em>不会</em>影响另一个 subagent 或父 agent。听起来理所当然，但在代码里它是个<strong>容易出错的不变量</strong>——一不小心就把同一个列表 / 字典共享给了多个 subagent，导致它们的历史互相串味。</p>  <p>隔离带来三个关键收益：</p>  <ul>
+    <li><strong>可并行</strong>：互不依赖、互不污染的上下文，才能同时跑。共享上下文的 agent 没法真正并行——它们会争抢、覆盖同一份历史。</li>
+    <li><strong>上下文不爆窗</strong>：subagent 读进来的大量原始资料留在它自己的隔离上下文里，只有精炼结论回流父 agent。父 agent 的上下文因此只随「结论数」增长，而非随「原始资料量」增长。</li>
+    <li><strong>失败可局部隔离</strong>：一个 subagent 的上下文被注入污染、或它崩了，影响被圈在它自己那份隔离上下文里，不会扩散到父和兄弟。</li>
+  </ul>  <p>怎么在代码里<strong>保证</strong>隔离、并<strong>验证</strong>它？核心是：每个 subagent<strong>各自新建</strong>自己的可变状态（messages 列表、本地变量），<em>绝不共享同一个可变对象</em>。一个经典的坑是用可变默认参数（<code>def run(messages=[])</code>）——Python 里默认参数只在定义时创建一次，于是所有调用共享同一个列表，隔离当场失效。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>隔离就像给每个外包团队一间上锁的独立办公室、各发一套独立的文件柜。如果两个团队共用一个文件柜，A 改的东西 B 也看得到、还可能被覆盖——这就是上下文串味。给每人一套自己的柜子，才谈得上让他们同时、互不干扰地工作。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>验证隔离的不变量很简单：派两个 subagent A、B，让 A 往它的上下文里写点东西，然后断言 B 的上下文里<strong>看不到</strong>A 写的东西、且 B 自己的内容完好。再断言两者的上下文是<strong>不同的对象</strong>（<code>a_ctx is not b_ctx</code>）。本模块 notebook 会专门写这个隔离测试——它看着琐碎，却是多 agent 正确性的地基。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个真实的隐蔽 bug：把工具表、记忆、或 messages 列表当作<strong>共享单例</strong>传给所有 subagent，图省事。结果一个 subagent 调工具改了共享状态，另一个 subagent 莫名其妙看到了被改过的状态——隔离破了，且<em>不报错</em>，只表现为「偶尔结果诡异、难复现」。<strong>凡是 subagent 要写的状态，一律各建一份</strong>；凡是 subagent 只读的配置（如不变的工具 schema），可以共享但要保证只读。把「谁可变、谁共享」想清楚，是写对多 agent 的第一道功课。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="handoff"><span class="num">4</span>结果回传：只交结论不交草稿</h2>
+  <h3>结果回传：只交结论，别交一整箱草稿</h3>  <p>subagent 跑完，要把结果交回父 agent。这一步叫 <span class="term">result handoff</span>（结果回传 / collect）。一个新手常犯的错是：把 subagent 的<strong>整段对话历史</strong>原样塞回父 agent。这会立刻引爆上下文——你刚用隔离省下来的空间，又因为回传整箱草稿而吐回去了。</p>  <p>正确做法是<strong>只回传精炼的结构化结果</strong>：subagent 在隔离上下文里读了一万 token、推理了十步，但交回父 agent 的只是一个约定字段的结果对象，比如：</p>  <pre><code># subagent 回传的结构化结果（契约）
+{
+  "subagent_id": "researcher-2",
+  "task": "调研 B 公司最新财报",
+  "status": "ok",            # ok / failed / partial
+  "result": "B 公司 Q3 营收同比 +12%，净利率 18%……（200 字结论）",
+  "sources": ["...url1...", "...url2..."],   # 可选：可追溯
+  "tokens": 8400,            # 它消耗了多少（供成本聚合，与模块 04 相通）
+  "n_steps": 6               # 它跑了几步
+}</code></pre>  <p>这个契约有三层讲究。<strong>①</strong> 只回传<em>结论而非过程</em>——父 agent 要的是「B 公司营收 +12%」，不是 subagent 怎么一步步查出来的；过程留在 subagent 的隔离上下文里（需要时可从 trace 回看，模块 04）。<strong>②</strong> 带<em>状态字段</em>——ok / failed / partial，让父 agent 能程序化判断该不该用这个结果、要不要重试。<strong>③</strong> 带<em>成本字段</em>——这个 subagent 花了多少 token / 多少步，父 agent 据此聚合总成本、也能发现某个 subagent 异常烧钱。</p>  <p>为什么强调「结构化」而非「自由文本」？因为父 agent 接下来要<strong>程序化地处理</strong>这些结果：按 status 过滤掉失败的、把成功的合成成最终答案、把 tokens 加总。如果 subagent 交回的是一段自由散文，父 agent 就得再调一次 LLM 去解析它——又慢又贵又不可靠。<strong>结构化结果是父 agent 能高效、可靠地汇总的前提</strong>，也是整个编排可被 assert 验证的前提。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>回传的设计哲学：<strong>subagent 是『读得多、说得少』的专家</strong>。它在自己的上下文里吞下海量资料（读得多），但只向父 agent 吐出一句话结论 + 几个状态字段（说得少）。这一进一出的不对称，正是多 agent 能用「多个上下文窗口」分担超大任务、而父 agent 上下文不爆的关键。<em>让每个 subagent 当好『信息漏斗』，编排才扩展得动</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fanout"><span class="num">5</span>并行扇出：同时派一群 subagent</h2>
+  <h3>并行扇出：同时派一群 subagent</h3>  <p>subagent 真正的提速威力来自<strong>并行扇出（fan-out）</strong>：当多个子任务<em>互不依赖</em>时，orchestrator 同时派生多个 subagent，让它们并行跑，再<strong>扇入（gather）</strong>收集全部结果。串行做十个子任务要等十倍时间，并行做（理想情况下）只等一个最慢的。</p>  <div class="ascii">  串行（慢）：                          并行扇出（快）：
+  ┌──┐                                 ┌──┐ ┌──┐ ┌──┐
+  │S1│→等→┌──┐                         │S1│ │S2│ │S3│   ← 同时派出
+  └──┘    │S2│→等→┌──┐                 └──┘ └──┘ └──┘
+          └──┘    │S3│                   ╲   │   ╱
+                  └──┘                    gather (等全部完成)
+  总时间 ≈ T1+T2+T3                       总时间 ≈ max(T1,T2,T3)</div>  <p>处理 fan-out 有两条<strong>铁律</strong>，和工具调用里的并行如出一辙：<strong>①</strong> 子任务必须<em>互不依赖</em>才能并行——「先查用户 id、再用 id 查订单」有依赖，必须串行；「同时查三家公司财报」无依赖，可并行。<strong>②</strong> 收集时<em>结果数必须等于派出的 subagent 数</em>，<strong>部分失败也一个不少</strong>——三个里一个崩了，要收回三个结果（崩的那个带 failed 状态），漏掉它父 agent 就会以为它从没发生，汇总逻辑就乱了。</p>  <p>本课用<strong>顺序执行模拟并行</strong>（逻辑完全相同，只是不真正并发），原因是确定性——真正的线程 / 异步会引入时序不确定，难以 assert。真实系统里，fan-out 用线程池 / asyncio / 多进程 / 多机实现；但<em>派任务、收结果、对齐、容错</em>的逻辑与本课一字不差。这正是「在干净环境里把控制流练对，再换成真并发只是替换执行器」的体现。</p>  <p>扇入时还有一个常被忽视的细节：<strong>结果要能和子任务对上号</strong>。如果三个 subagent 的结果乱序回来，父 agent 得知道哪个结果对应哪个子任务——靠 subagent_id / task 字段对齐（就像工具调用靠 tool_use_id 对齐）。所以回传契约里的 <code>subagent_id</code> / <code>task</code> 不是装饰，而是<strong>扇入对齐的钩子</strong>：即使结果乱序、即使有的成功有的失败，父 agent 也能<em>对号入座</em>地汇总。本模块 notebook 的扇出实现会验证「结果数 == 子任务数」且「按 id 可对齐」。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="failure"><span class="num">6</span>失败隔离与超时</h2>
+  <h3>失败隔离与超时：一个 subagent 崩了，别拖垮全局</h3>  <p>subagent 会失败：它内部的工具报错、它跑偏陷入死循环、它的任务本身无解。多 agent 系统的鲁棒性，很大程度上取决于<strong>单个 subagent 的失败能否被隔离</strong>——一个崩了，整个编排不该跟着崩。</p>  <p>失败隔离的核心做法是：在 orchestrator 调用每个 subagent 的地方<strong>捕获异常、包成一个 failed 结果回传</strong>，而不是让异常向上冒泡中断整个 fan-out。这与模块 00 的 fan-out 不变量一脉相承——<em>失败也是一种结果，要被收集，而非被抛出</em>。</p>  <pre><code># 失败隔离的扇出（每个 subagent 的异常被本地捕获）
+def fan_out_safe(subtasks, run_one):
+    results = []
+    for st in subtasks:
+        try:
+            results.append({"task": st, "status": "ok",
+                            "result": run_one(st)})
+        except Exception as e:
+            results.append({"task": st, "status": "failed",   # 失败 -&gt; 一个 failed 结果
+                            "error": f"{type(e).__name__}: {e}"})
+    return results            # 结果数恒等于子任务数</code></pre>  <p>除了崩溃，subagent 还可能<strong>跑太久</strong>——陷在无效循环里、等一个永远回不来的工具。所以每个 subagent 要有<strong>超时 / 步数上限</strong>：跑过 N 步或超过 T 秒还没完成，就强制终止、回传一个 partial / timeout 结果。这与单 agent 循环里「max_steps 兜底」是同一条铁律，只是在多 agent 里它更重要——一个不设上限的 subagent 能拖住整个 gather（扇入要等所有 subagent，一个不回来就全卡住）。</p>  <p>失败之后做什么，是 orchestrator 的决策（模块 02 展开），但本模块要建立的原则是：<strong>subagent 这一层只负责『干净地失败』——把失败变成一个带状态的结果交回去，绝不让它炸到上层</strong>。有了「干净地失败」这个保证，上层才有腾挪空间：可以重试这一个 subagent、可以跳过它用其余结果合成、可以换个 subagent 重派。<em>先保证失败可控，再谈失败后的智能</em>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个真实场景：fan-out 派了 5 个检索 subagent，其中 1 个因为目标网站超时卡住。如果没有超时 + 失败隔离，整个 gather 会被这一个拖到永远不返回，用户干等。正确的设计让那个 subagent 在超时后回传 <code>{status: 'timeout'}</code>，orchestrator 拿着 4 个成功 + 1 个超时的结果，照样能合成一个（标注了不完整的）答案。<strong>一个 subagent 的失败，最多让结果『缺一块』，而不该让整个任务『全崩』</strong>——这是多 agent 容错的底线。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost"><span class="num">7</span>成本与上下文预算</h2>
+  <h3>成本与上下文预算：多 agent 不是免费午餐</h3>  <p>subagent 强大，但<strong>贵</strong>。每派一个 subagent，就多一份完整的上下文（它的任务说明 + 它读进来的资料 + 它的推理），就多若干次 LLM 调用。Anthropic 报告多 agent 系统的 token 消耗可达单 agent 的<strong>十几倍</strong>。本模块的最后一块，是建立对这笔账的工程感觉。</p>  <p>成本从哪来？拆开看一次 fan-out：</p>  <ul>
+    <li><strong>orchestrator 的分解</strong>：一次 LLM 调用把大任务拆成子任务。</li>
+    <li><strong>每个 subagent 的运行</strong>：N 个 subagent × 各自的（任务 + 资料 + 多步推理）token。这是大头，且随 N 线性增长。</li>
+    <li><strong>orchestrator 的合成</strong>：一次 LLM 调用把 N 份结果合成最终答案——它的输入是 N 份结论，所以也随 N 增长。</li>
+  </ul>  <p>所以多 agent 的成本控制有两个抓手。<strong>① 控派生数 N</strong>——不是子任务越多越好，每多派一个 subagent 都在加钱；只在子任务<em>真正互不依赖、且各自信息量大</em>时才派。<strong>② 控每个 subagent 的预算</strong>——给每个 subagent 一个 token / 步数上限（<span class="term">token budget</span>），按子任务难度分配；一个简单子任务不该被允许烧掉和复杂子任务一样多的预算。</p>  <p>这也回扣模块 00 的工程判断：<strong>多 agent 是『在对的任务上才划算』的重武器</strong>。如果一个任务用单 agent 顺着做就行（强耦合、信息量不大），硬拆成多 agent 只会多花十几倍的钱、还更难调试。本模块教你把 subagent 造出来，但每次动手前都该先问：<em>这个任务真的需要派 subagent 吗？派几个？每个给多少预算？</em>把成本意识刻进设计，是从「会写多 agent」到「会用好多 agent」的分水岭。</p>  <p>最后，成本和<strong>可观测</strong>天然相连：要控成本，先得能<em>量</em>成本。所以每个 subagent 的回传结果里带 <code>tokens</code> / <code>n_steps</code> 字段，orchestrator 把它们<strong>聚合</strong>成一次运行的总账——这正是模块 04（trace / span 树 + 成本聚合）要系统化的事。本模块先在 subagent 回传契约里埋下成本字段这颗种子，模块 04 再把它长成一棵完整的成本树。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>何时该派 subagent、派几个</strong>：让 orchestrator 自己决定分解粒度（派 3 个还是 8 个 subagent）仍是开放问题——分太细则 token 爆炸、协调成本高，分太粗则失去并行收益。Anthropic 的经验是按任务复杂度动态定，但缺乏通用判据。</li>
+    <li><strong>subagent 间的通信</strong>：本课的 subagent 完全隔离、只在最后向父汇总。但有些任务里 subagent 之间需要<em>中途共享发现</em>（一个查到的线索能帮另一个）。如何在「保持隔离的并行收益」与「允许必要的横向通信」之间取舍，是多 agent 框架（AutoGen 的 group chat、Swarm 的 handoff）正在探索的。</li>
+    <li><strong>层级深度与递归派生</strong>：subagent 能否再派生 subagent、该派几层？深层嵌套带来表达力，也带来指数级的 token 与调试成本。实践中几乎都压在一两层，但「自适应地决定层级」尚无好方法。</li>
+    <li><strong>结果合成的可靠性</strong>：把 N 份 subagent 结论合成一个连贯答案，本身是个易错环节——合成 agent 可能丢信息、可能被某份污染的结论带偏、可能产生矛盾。如何让合成既忠实于各子结果、又能发现并处理它们之间的冲突，是质量瓶颈（与模块 02 的 evaluator-optimizer、模块 03 的注入防御相通）。</li>
+    <li><strong>成本-质量的帕累托前沿</strong>：多 agent 用十几倍 token 换来多少质量提升？在哪些任务上这笔交易划算？把「多 agent 的边际收益 vs 边际成本」量化出来，是决定要不要上多 agent 的根本依据，目前还多靠经验拍板。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Anthropic《How we built our multi-agent research system》（subagent 派生 / 隔离 / 扇出 / 合成 / 成本的真实工程）、《Building effective agents》（何时多 agent、orchestrator-workers 模式）、AutoGen（Wu 2023，多 agent 对话与角色）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_orchestration/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 编排模式（Orchestration）</div></a>
+  </div>
+
+</div>
+</body>
+</html>

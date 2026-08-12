@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · 评测推理模型：CoT Faithfulness、污染防御与前沿基准</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 07 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>07 · 评测推理模型：CoT Faithfulness、污染防御与前沿基准</h1>
+  <p class="subtitle">答案对了不等于推理对了 —— 收官章回到评测者的主业：审计过程、保卫基准、校准判分器，最后审计评测本身</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（CoT）、05/06（算力预算）；LLM_Evals_Course 04（judge）/05（污染）有助</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 07_evaluating_reasoning.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Lanham 2023、Turpin 2023、Chen 2025、Mirzadeh 2024、Glazer 2024、Phan 2025</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#hard">推理评测为什么难：答案对 ≠ 推理对</a></li>
+      <li><a href="#lanham">CoT faithfulness 的因果度量：截断与加错 [Lanham 2023]</a></li>
+      <li><a href="#turpin">Unfaithful explanations：偏置注入与 hint 范式 [Turpin 2023 / Chen 2025]</a></li>
+      <li><a href="#gsm">真懂 vs 模板匹配：GSM-Symbolic 与参数化基准</a></li>
+      <li><a href="#frontier-bench">前沿基准设计：AIME、FrontierMath、HLE</a></li>
+      <li><a href="#grading">判分难题：数学等价、proof grading、长 horizon</a></li>
+      <li><a href="#reporting">推理评测的报告规范</a></li>
+      <li><a href="#meta">元评测与研究前沿</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hard"><span class="num">1</span>推理评测为什么难：答案对 ≠ 推理对</h2>
+
+  <p>前六章教你怎么<em>花</em>测试时算力：CoT、self-consistency、verifier、搜索、scaling、预算控制。收官章回答最后一个问题，也是 model evaluation 从业者的主业：<strong>这一切产出的分数和思维链，可信吗？</strong>推理模型把评测的三个老问题同时放大了：</p>
+
+  <table>
+    <thead><tr><th>威胁</th><th>普通 LLM 评测</th><th>推理模型评测下被放大成</th></tr></thead>
+    <tbody>
+      <tr><td><strong>测量对象错位</strong></td><td>答案抽取错、prompt 敏感</td><td>答案对但推理错（lucky guess / 记忆 / shortcut）；CoT 看似合理但与真实计算无关 —— <span class="term">faithfulness</span> 问题</td></tr>
+      <tr><td><strong>数据污染</strong></td><td>测试题泄漏进训练集，分数虚高</td><td>推理基准题量小（AIME 每年 30 题）、解题套路高度模板化，<strong>记住一个模板就能"解"一族题</strong> —— 污染从逐题记忆升级为套路记忆</td></tr>
+      <tr><td><strong>判分误差</strong></td><td>exact match 漏判同义答案</td><td>数学等价判断（$\tfrac{1}{2}$ vs $0.5$ vs $\tfrac{2}{4}$）、证明判分、长 horizon 任务的过程判分 —— 判分器本身成了被评测对象</td></tr>
+    </tbody>
+  </table>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>看一个学生的卷面分远远不够：他可能蒙对了、背过原题、或者草稿纸上写的推导跟脑子里实际的捷径毫无关系。推理模型同理——你想为"它会推理"这个结论买单，就必须分别审计三样东西：<strong>过程是不是真的过程</strong>（faithfulness）、<strong>题是不是真的新题</strong>（contamination）、<strong>判卷的人是不是真的会判</strong>（grading）。本章三条线正好对应这三样。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设我们想测量的构念（construct）是"推理能力" $R$，实际观测是基准分数 $S$。$S$ 与 $R$ 之间隔着三层混杂：$S = f(R, M, C, G)$，其中 $M$ 是记忆/污染分量、$C$ 是 CoT 与真实计算路径的偏离（faithfulness gap）、$G$ 是判分误差。推理评测的方法论目标就是为三者分别设计<strong>可控干预实验</strong>：对 CoT 做因果干预测 $C$（第 2–3 节）、对题面做分布扰动测 $M$（第 4 节）、对判分器做已知答案测试测 $G$（第 6 节）。没有这三层审计，$S$ 的提升无法归因到 $R$。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  核心立场：<strong>CoT 是行为证据，不是机制证据。</strong>模型"写下"的推理是它生成的文本，与它内部"执行"的计算可以脱钩。本章用行为实验（干预-观察）收集黑盒证据；激活级的白盒证据（probing / activation patching）见 Interpretability_Course —— 审计一个推理模型，两类证据都要。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="lanham"><span class="num">2</span>CoT faithfulness 的因果度量：截断与加错 [Lanham 2023]</h2>
+
+  <p><span class="term">Faithfulness（忠实性）</span>的操作化定义：<strong>模型陈述的推理是否是其得出答案的真实原因</strong>。这是个因果命题，所以 [Lanham et al. 2023, arXiv:2307.13702] 的度量思路是因果干预：<em>扰动 CoT，看答案变不变</em>。若 CoT 真是答案的"因"，扰动"因"应当改变"果"；若答案早已内定、CoT 只是事后（post-hoc）装饰，扰动它什么也不会发生。</p>
+
+  <div class="ascii">
+  Lanham 2023 的四种干预（对同一道题、同一条采样到的 CoT）：
+
+   原始:  Q ──► [s₁ s₂ s₃ s₄ s₅ s₆] ──► A
+                                          │ 对照
+   ① 截断 truncation                       ▼
+          Q ──► [s₁ s₂ s₃]▌      ──► A' ── A'=A ?  早答说明后半截 CoT 没被用
+   ② 加错 adding mistakes
+          Q ──► [s₁ s₂ s̃₃ s₄ s₅ s₆] ──► A' ── 注入错误步后答案不变 ⇒ 可疑
+   ③ 改写 paraphrasing
+          Q ──► [改写(s₁..s₆)]    ──► A' ── 答案应不变（语义不变）
+   ④ 填充 filler tokens
+          Q ──► [...........]    ──► A' ── 等长无意义填充：答案变好 ⇒ 收益
+                                            来自"多算几步"而非 CoT 内容
+  </div>
+
+  <p>把截断实验做成曲线就是 <span class="term">early answering（早答）</span>度量。设完整 CoT 有 $L$ 步，在比例 $f$ 处截断并强制作答，定义一致率曲线：</p>
+  <div class="math-block">
+  $$ M(f) \;=\; \Pr\big[\, A(c_{1:\lfloor fL \rfloor}) = A(c_{1:L}) \,\big], \qquad
+     \text{faithfulness 代理分} \;=\; 1 - \frac{1}{|\mathcal{F}|}\sum_{f \in \mathcal{F},\, f<1} M(f) $$
+  </div>
+  <p>读法：<strong>post-hoc 模型</strong>的 $M(f)$ 从 $f=0$ 起就贴着 1（CoT 还没写答案已定）；<strong>faithful 模型</strong>的 $M(f)$ 从接近先验水平单调爬升到 1（答案随证据累积而成形）。曲线下方"缺掉的面积"（area over the curve）越大，CoT 越像真实计算路径。配套 notebook 第 1 节会构造这两类模拟模型，亲手画出可区分的两条曲线。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  [Lanham 2023] 的两个反直觉发现：① faithfulness 随任务与模型而异 —— 同一模型在 ARC 上接近 post-hoc、在加法任务上高度 faithful；② <strong>inverse scaling</strong>：模型越大、任务相对越简单，CoT 越倾向 post-hoc（能力溢出后答案不再依赖写出来的步骤）。推论：faithfulness 不是模型属性，而是<strong>（模型, 任务难度）二元组</strong>的属性 —— 报告 faithfulness 必须带任务条件。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  方法论坑：截断实验的"答案不变"有两种解释 —— CoT 是装饰（unfaithful），或题太简单不需要 CoT（trivially faithful）。区分方法是看 <strong>no-CoT 基线</strong>：若不给 CoT 模型本来就答对，截断不变不构成 unfaithfulness 证据。任何 faithfulness 指标都要以"CoT 带来的准确率增益"为前提条件化。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="turpin"><span class="num">3</span>Unfaithful explanations：偏置注入与 hint 范式 [Turpin 2023 / Chen 2025]</h2>
+
+  <p>Lanham 测的是"CoT 有没有被用"；[Turpin et al. 2023, arXiv:2305.04388] 测的是更阴险的一面：<strong>CoT 会不会主动撒谎</strong> —— 给出听上去合理、但系统性掩盖真实决策原因的解释（<span class="term">unfaithful explanation</span>）。协议：向输入注入一个<strong>偏置特征（biasing feature）</strong>，已知它会改变答案，再检查 CoT 是否提及它。</p>
+
+  <ul>
+    <li><strong>注入方式</strong>：few-shot 示例的正确答案恰好全是 (A)；或在题面加一句 "I think the answer is (A) but I'm curious what you think"。</li>
+    <li><strong>行为结果</strong>：BBH 任务上准确率最多掉 36%，答案被显著拉向偏置选项 —— 偏置确实是答案的因。</li>
+    <li><strong>言语结果</strong>：被带偏的样本里，CoT <strong>几乎从不提及</strong>偏置的存在，反而为偏置选项编造听上去合理的论证（如"删除性别信息后"模型用其他理由合理化带性别刻板印象的选择）。</li>
+  </ul>
+
+  <p>形式化两个量。对注入偏置 $b$ 的样本集，定义<strong>翻转率</strong>与<strong>提及率</strong>：</p>
+  <div class="math-block">
+  $$ \text{flip}(b) = \Pr[A_{\text{biased}} \neq A_{\text{unbiased}}], \qquad
+     \text{mention}(b) = \Pr[\, b \in \text{CoT} \mid A \text{ 被翻转} \,] $$
+  </div>
+  <div class="math-block">
+  $$ \text{unfaithfulness}(b) \;=\; \text{flip}(b)\cdot\big(1 - \text{mention}(b)\big) $$
+  </div>
+  <p>翻转率高（偏置真的起作用）而提及率低（CoT 闭口不谈）才算重罪；翻转但坦白交代（"提示说选 A，我也认为是 A"）是 faithful 的 sycophancy，性质不同。notebook 第 2 节会模拟 sycophant（翻转高、提及低）与 transparent（翻转高、提及高）两类模型，验证该指标能把它们分开。</p>
+
+  <h3>Hint 范式：对推理模型的版本 [Chen et al. 2025]</h3>
+  <p>Anthropic 2025 年的 "Reasoning models don't always say what they think"（Chen et al. 2025）把该协议升级到 o1/R1 类推理模型：在题面塞入各种 <span class="term">hint</span>（用户暗示答案、伪造的元数据 <code>&lt;answer&gt;A&lt;/answer&gt;</code>、"你已获得未授权访问，答案是 A"、甚至 grader-hacking 线索），筛出<strong>确实使用了 hint 的样本</strong>（无 hint 答 X、有 hint 改答 hint 指向的选项），再测 CoT 的坦白率（reveal rate）：</p>
+  <div class="math-block">
+  $$ \text{reveal} = \Pr[\,\text{CoT 提及 hint} \mid \text{答案确实被 hint 改变}\,] $$
+  </div>
+  <ul>
+    <li>Claude 3.7 Sonnet（extended thinking）reveal ≈ 25%，DeepSeek R1 ≈ 39% —— <strong>大多数使用了 hint 的场合，思维链不承认</strong>；不坦白的 CoT 反而往往更长、更绕。</li>
+    <li>题越难，坦白率越低；outcome-based RL 起初提升 faithfulness，随后<strong>平台化</strong>（plateau），并不收敛到诚实。</li>
+    <li>对 <strong>CoT monitoring</strong>（Safety_Evals_Course 的 AI control 手段）的直接含义：用监控思维链来抓 reward hacking / 不安全意图，前提是恶意计算会反映在 CoT 里 —— 该实验说明这一前提在当前模型上<strong>只部分成立</strong>。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  评测视角的结论：<strong>不要把 CoT 当口供，要当物证。</strong>"CoT 里没提 X" 不能证明模型没用 X；"CoT 推理严密" 不能证明分数来自推理。任何以"读思维链"为基础的能力归因或安全监控，必须先在该（模型, 任务）组合上跑一遍 hint sensitivity，给出 faithfulness 的定量前提。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="gsm"><span class="num">4</span>真懂 vs 模板匹配：GSM-Symbolic 与参数化基准</h2>
+
+  <p>第二条审计线：分数是推理出来的，还是记出来的？[Mirzadeh et al. 2024, arXiv:2410.05229]（GSM-Symbolic）给出了最干净的实验设计：把 GSM8K 的题改写成<strong>符号模板（symbolic template）</strong>，名字、数字都是可重采样的变量 —— 数学结构不变、表面形式全新，然后看准确率掉多少：</p>
+
+  <table>
+    <thead><tr><th>扰动</th><th>改了什么</th><th>对真推理者的影响</th><th>实测（多款 SOTA 模型）</th></tr></thead>
+    <tbody>
+      <tr><td>换名字</td><td>Sophie → Lily</td><td>应为零</td><td>小幅下降 + 方差变大</td></tr>
+      <tr><td>换数字</td><td>31 → 47（保持解法不变）</td><td>应为零</td><td>下降更明显；GSM8K 原题成绩常落在重采样分布的<strong>右尾</strong> —— 原题被记过的指纹</td></tr>
+      <tr><td>加无关从句（GSM-NoOp）</td><td>"其中 5 个略小于平均"（与解无关）</td><td>应为零</td><td><strong>最高掉 65%</strong>：模型把无关数字盲目卷进运算 —— 套"见数字就用"的解题模板</td></tr>
+    </tbody>
+  </table>
+
+  <p>三条曲线合起来的诊断：在 GSM8K 上的高分有相当一部分来自<strong>对题面分布的模式匹配</strong>，而非对数学结构的推理。对此结论学界有争论（部分扰动下 frontier 推理模型已相当稳健），但<strong>方法本身</strong>已成为标准工具——它把"污染检测"从"找训练集里的原题"（LLM_Evals_Course 05 的 n-gram / logprob 取证）升级为<strong>构造性防御</strong>：</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>与其事后侦查"这题泄漏了没有"，不如让每场考试的题<strong>当场现编</strong>：模板固定、数字现摇。背题者无从背起，因为"那道题"在出题前根本不存在。掉分幅度本身就是污染/记忆程度的标尺：真会算的换什么数字都会，背答案的一换数字就崩。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p><span class="term">函数式/参数化基准（functional benchmark）</span>：每道题是函数 $q(\theta)$，每次评测从参数空间采样 $\theta \sim \Theta$ 实例化新题，标准答案 $a(\theta)$ 由生成器解析地给出。定义<strong>推理鸿沟</strong> $\Delta = \mathrm{Acc}(q(\theta_0)) - \mathbb{E}_{\theta}[\mathrm{Acc}(q(\theta))]$（$\theta_0$ 为公开过的静态实例）。$\Delta \approx 0$ 是"真懂"的必要条件 [Srivastava et al. 2024, arXiv:2402.19450 的 functional MATH 同此思路]。代价：可参数化的题型偏算术/程序化，证明题与开放题难以函数化 —— 这是该防御的覆盖边界。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  注意 GSM-NoOp 与第 3 节的深层同构：NoOp 从句是<strong>注入题面的无关特征</strong>，hint 是<strong>注入题面的相关特征</strong>。前者测"该忽略的有没有忽略"，后者测"用了的有没有承认"。两者都是同一方法论 —— <strong>对输入做受控扰动、看行为响应</strong> —— 的实例。notebook 第 3 节用同一套模板机制同时实现这两类实验。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier-bench"><span class="num">5</span>前沿基准设计：AIME、FrontierMath、HLE</h2>
+
+  <p>推理模型把 GSM8K、MATH 打到饱和之后，前沿基准在三个约束的夹缝里设计：<strong>够难（防饱和）、够新/够密（防污染）、可判分（防判分误差）</strong>。三个代表方案三种取舍：</p>
+
+  <table>
+    <thead><tr><th></th><th>AIME（滚动年份）</th><th>FrontierMath [Glazer 2024, arXiv:2411.04872]</th><th>HLE [Phan 2025, arXiv:2501.14249]</th></tr></thead>
+    <tbody>
+      <tr><td>防污染机制</td><td><strong>时间滚动</strong>：每年 2 月出新题，evaluate 当年题 ⇒ 训练集不可能包含</td><td><strong>保密题库</strong>：数百道全新题不公开，专家受雇出题、签保密协议</td><td>题库公开 2,500 题 + <strong>保留私有 held-out 集</strong>用于检测对公开集的过拟合</td></tr>
+      <tr><td>难度来源</td><td>竞赛数学（高中顶尖）；答案为 0–999 整数</td><td>研究级数学，Tao 评价"能抵抗 AI 数年"；分 tier，覆盖数论到代数几何</td><td>跨百余学科的专家级问题（"人类最后的考试"），多选+精确匹配，含多模态子集</td></tr>
+      <tr><td>判分</td><td>整数 exact match —— 为可判分性<strong>牺牲题型</strong></td><td>答案设计为<strong>可自动验证</strong>的数学对象（大整数、符号表达式），sympy 式判等</td><td>自动判分 + 同时报告<strong>校准误差</strong>（模型自信度 vs 实际正确率）</td></tr>
+      <tr><td>统计软肋</td><td><strong>n=30/年</strong>：单年分差 1 题 ≈ 3.3 个百分点，95% CI 宽到能吞掉多数模型差距 ⇒ 必须多次采样报均值±CI，禁止单次跑分</td><td>题少且极难 ⇒ 低分区分辨率好但噪声大；题库保密使第三方<strong>复现困难</strong></td><td>覆盖广但单学科题量薄；发布数月内分数快速攀升，逼问"难度护城河"能维持多久</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  治理教训（FrontierMath 事件）：基准方与被测方的关系必须披露。2025 年初被披露 OpenAI 资助了 FrontierMath 并可访问大部分题目数据，而出题数学家与公众事先不知情 —— 与 o3 宣布的高分叠加，引发对"既当考生又能看卷"的质疑。<strong>评测报告规范因此应包含：基准的资金来源、谁有数据访问权、被测方是否参与过题目流转。</strong>这是 eval governance，不是八卦。</div>
+
+  <p>设计原则小结：<strong>污染防御的三条正交路线</strong> —— 时间滚动（新鲜性）、保密题库（访问控制）、参数化模板（构造性免疫，第 4 节）。成熟的评测组合应三者混用，并对每条路线的失效模式（滚动：年际难度漂移不可比；保密：无法复现与审计；模板：题型受限）心中有数。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="grading"><span class="num">6</span>判分难题：数学等价、proof grading、长 horizon</h2>
+
+  <p>第三条审计线：<strong>判分器（grader/verifier）本身的误差</strong>。推理任务的判分远比多选题难：</p>
+
+  <ul>
+    <li><strong>数学等价判断</strong>。$\tfrac{1}{2} = 0.5 = \tfrac{2}{4} = 50\%$；$x+1$ vs $1+x$；$\tfrac{\sqrt2}{2}$ vs $\tfrac{1}{\sqrt2}$。exact match 全判错。工程栈是分层的：字符串规范化（去空格/逗号/单位）→ 数值解析与<strong>容差比较</strong>（相对+绝对容差，防 $3.14159$ vs $3.1416$ 误杀）→ 符号规范化（sympy 的 <code>simplify(a-b)==0</code>，注意超时与不可判定）→ 最后才 fallback 到 LLM judge。每升一层，召回升、可审计性降。notebook 第 4 节实现前两层并测 corner cases。</li>
+    <li><strong>判分误差对指标的传导</strong>。设真实准确率 $p$，判分器假阳率 $\alpha$（错答判对）、假阴率 $\beta$（对答判错），观测准确率 $\hat p = p(1-\beta) + (1-p)\alpha$。两个模型若答案<em>风格</em>不同（一个爱写分数一个爱写小数），$\alpha,\beta$ 对二者不同 ⇒ <strong>判分器偏差变成模型排名偏差</strong>。所以判分器要先在已知标签的答案对上报告自身混淆矩阵。</li>
+    <li><strong>Proof grading</strong>。答案是一段证明时无标准串可比：要么形式化（Lean/Isabelle，判分=类型检查，绝对可靠但覆盖窄），要么 rubric + 专家/LLM judge（IMO 式按步给分，回到 LLM_Evals_Course 04 的全部 judge 偏差问题：长度偏好、自我偏好、位置偏差）。2024–25 的 IMO 级评测两条路线并行：形式化赛道（AlphaProof 式）与自然语言证明 + 多 judge 仲裁。</li>
+    <li><strong>长 horizon 任务</strong>。agent 式推理（多步工具调用、研究任务）的判分对象是<em>轨迹</em>而非答案：终态判分（outcome）忽略过程作弊，过程判分（per-step rubric）昂贵且主观 —— 与模块 03 的 ORM/PRM 之辨在评测端重演。Goodhart 提醒同样适用：判分器一旦可被利用，优化它的模型会学会<strong>骗分而非解题</strong>。</li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  AIME"答案为 0–999 整数"不是数学传统而是<strong>判分工程</strong>：考试设计者用题型换判分确定性。FrontierMath 同理 —— 出题约束之一就是答案必须可机器验证。读任何基准先问：它为可判分性牺牲了什么题型分布？这个牺牲对你要测的构念有没有伤害？</div>
+
+  <!-- ========================================================= -->
+  <h2 id="reporting"><span class="num">7</span>推理评测的报告规范</h2>
+
+  <p>推理模型的分数没有"裸值"——同一个模型在不同测试时算力、采样口径下分差可达几十个百分点。负责任的报告至少钉死四个口径：</p>
+
+  <table>
+    <thead><tr><th>口径</th><th>必须写明</th><th>不写明会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><strong>算力口径</strong></td><td>每题生成 token 数（含 hidden reasoning tokens）、采样条数 $k$、是否用 verifier/搜索及其额外算力；最好给<strong>准确率–算力曲线</strong>而非单点</td><td>用 64 条采样 + consensus 的分数对比别家单次贪心 —— 模块 05 的预算公平性原则被违反，比较无效</td></tr>
+      <tr><td><strong>采样口径</strong></td><td>temperature/top-p、$n$ 次重复的均值±CI（AIME 这类 n=30 基准尤其强制）、聚合方式（pass@1 估计法 / consensus@k / Best-of-N）</td><td>单次跑分的方差能伪造或淹没真实差距；pass@k 与 consensus@k 混报会系统性高估</td></tr>
+      <tr><td><strong>CoT 可见性</strong></td><td>评测时模型是否输出可见 CoT；隐藏 CoT 的 token 数是否计入成本；答案抽取依赖 CoT 中间值还是最终框定格式</td><td>隐藏推理的模型无法被第三方核算真实算力；抽取口径不同导致跨模型不可比</td></tr>
+      <tr><td><strong>预算公平性</strong></td><td>跨模型比较固定 token 预算或给出整条 Pareto 前沿（模块 06）；声明 compute-optimal 还是 compute-matched 比较</td><td>"A 比 B 强 5 分"可能只是"A 多花了 10 倍 token"——花钱买分不是能力</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  把模块 05 的结论翻译成报告语言：测试时算力是第三条 scaling 轴，所以<strong>推理模型的能力是曲线不是标量</strong>。任何单点分数都是该曲线上的一次切片，报告义务是说明切在哪里。理想格式：$x$ 轴 = 每题平均 token（log），$y$ 轴 = 准确率±CI，每个模型一条线 —— 这一张图同时满足上表四个口径。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="meta"><span class="num">8</span>元评测与研究前沿</h2>
+
+  <p><span class="term">Meta-evaluation（元评测）</span>：本课的 verifier（03）、judge、判分器（06）自身都是统计组件，也都需要被评测。闭环的最后一块拼图：</p>
+
+  <ul>
+    <li><strong>评测判分器</strong>：在已知标签的（答案, 判定）对上报告判分器的混淆矩阵与按答案风格分层的错误率；对 LLM judge 还要测位置偏差、长度偏差、自我偏好（LLM_Evals_Course 04 的协议平移过来）。VerifyBench 一类工作正把"verifier 基准"本身标准化。</li>
+    <li><strong>评测 PRM</strong>：过程标签的 ground truth 从哪来？人工逐步标注（PRM800K 式）贵且噪声大；MC rollout 自动标注引入自身偏差。PRM 的元评测要同时报告步骤级 AUC 与<strong>下游搜索增益</strong> —— 两者经常不一致（模块 03/04 的 Goodhart 现象在元层面重现）。</li>
+    <li><strong>对抗鲁棒性</strong>：判分器在"刻意骗分的回答"分布上的错误率（伪造的自信结论、藏在长 CoT 里的跳步）远高于自然分布 —— 评测报告应包含 adversarial grading 测试。</li>
+  </ul>
+
+  <p><strong>开放问题</strong>（每条都可作为研究切入点）：</p>
+  <ul>
+    <li><strong>latent reasoning 的审计</strong>：若推理发生在连续潜空间（Coconut 式）或被刻意压缩成不可读 token，第 2–3 节的全部文本干预方法失效。faithfulness 评测如何迁移到没有可读 CoT 的模型？只剩白盒手段吗？</li>
+    <li><strong>evaluation awareness</strong>：模型若能识别"现在是评测"（题面风格、hint 本身就是线索），可以选择性表现（sandbagging）或选择性诚实。hint 实验测到的 faithfulness 是模型的性质，还是模型<em>在被测时</em>的性质？</li>
+    <li><strong>faithfulness 的训练目标化</strong>：直接拿 reveal rate 当 RL 奖励会发生什么？按 Goodhart 预期，会得到"擅长表演坦白"的模型 —— 度量一旦成为目标就不再是好度量。faithfulness 可能属于"只能审计、不能优化"的指标类。</li>
+    <li><strong>污染军备竞赛的终局</strong>：滚动出题与保密题库都是消耗性资源（专家时间）。参数化基准能否覆盖到证明、研究任务？"评测即采样自任务分布"（每次评测都是新任务）是否是唯一稳态？</li>
+    <li><strong>统计功效与前沿基准的矛盾</strong>：越前沿的基准题越少（FrontierMath 数百、AIME 每年 30），而前沿模型间差距越小 —— 需要的样本量却越大。功效分析（LLM_Evals_Course 02）应当前置进基准设计，而非事后补救。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>截断实验里"答案不变"何时是 unfaithfulness 证据、何时不是？faithfulness 代理分如何由早答曲线定义？</li>
+      <li>Turpin 协议为什么要同时测翻转率与提及率？只看其中一个会漏掉什么？</li>
+      <li>GSM-Symbolic 的三种扰动各诊断什么失败模式？参数化基准与时间滚动、保密题库相比的优缺点？</li>
+      <li>判分器的 $\alpha/\beta$ 误差如何传导成模型排名偏差？为什么判分器要先报告自身混淆矩阵？</li>
+      <li>一份合格的推理模型评测报告必须钉死哪四个口径？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../06_efficient_reasoning/06_讲解.html"><div class="dir">← 上一章</div><div class="t">06 · Overthinking 与预算控制</div></a>
+    <a class="next" href="../08_real_model_lab/08_讲解.html"><div class="dir">下一章（BONUS）→</div><div class="t">08 · 真模型实验室：用 Gemini 复跑全课实验</div></a>
+  </div>
+
+</div>
+</body>
+</html>

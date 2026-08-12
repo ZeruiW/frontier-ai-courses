@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · MoE 与 SwiGLU</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · MoE 与 SwiGLU</h1>
+  <p class="subtitle">稀疏激活把参数量与计算量解耦 —— top-k 路由、负载均衡、SwiGLU 门控 FFN，手写一个会统计专家利用率的玩具 MoE</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">FFN、softmax、梯度（C1/C7）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_moe.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Shazeer 2017、Fedus 2021 (Switch)、Jiang 2024 (Mixtral)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">解耦参数量与计算量</a></li>
+      <li><a href="#struct">MoE 层结构</a></li>
+      <li><a href="#route">top-k 路由与路由坍塌</a></li>
+      <li><a href="#balance">负载均衡损失</a></li>
+      <li><a href="#capacity">专家容量与 token dropping</a></li>
+      <li><a href="#swiglu">SwiGLU 门控前馈</a></li>
+      <li><a href="#eng">MoE 的分布式工程</a></li>
+      <li><a href="#frontier">研究前沿</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>解耦参数量与计算量</h2>
+  <p>一个朴素却深刻的事实：模型能力大致随<strong>参数量</strong>增长，但推理成本随<strong>每个 token 实际参与计算的参数量</strong>增长。在稠密（dense）模型里这两者相等——参数越多越贵，没有商量余地。<span class="term">MoE</span>（Mixture of Experts，专家混合）打破了这个绑定，让你可以“拥有很多参数”却“每次只用一小部分”。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>MoE 就像一家有很多专科医生的大医院：每位病人（token）只挂 1–2 个最对口的科室（专家），而不是让全院所有医生都来会诊一遍。医院的规模（总参数）可以非常大，但每位病人的接诊成本（激活参数）很小——大而不贵。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>MoE 把一层稠密 FFN 替换成 N 个并行的专家 FFN + 一个路由器。每个 token 只激活 top-k 个专家（k 远小于 N）。于是<strong>总参数 ∝ N</strong>（容量大、知识多），而<strong>每 token FLOPs ∝ k</strong>（推理便宜）。Mixtral-8×7B：约 47B 总参数，但每 token 仅激活约 13B——容量按 47B 算，成本按 13B 算。</p></div>
+  </div>  <p>把这个解耦说得更透一点：稠密模型里“增加容量”和“增加每 token 成本”是同一件事的两面，你想让模型更聪明就只能让它更贵。MoE 把这两件事<strong>拆开</strong>了——容量由专家总数 N 决定、成本由激活数 k 决定，二者可以独立调。这就是为什么前沿大模型（Mixtral、DeepSeek-V3、Switch）纷纷转向 MoE：它是目前已知“在固定推理预算下塞进更多知识”的最有效手段之一。</p>  <p>从 scaling law 的视角看（C1/C8），MoE 改变的是“参数-计算-数据”三角的形状：它让你能在<em>不增加每 token 计算</em>的前提下大幅增加参数，于是在“计算预算固定”这条最现实的约束下，MoE 模型能比同等计算的稠密模型容纳更多知识、达到更低的 loss。代价是显存、通信和训练稳定性的额外复杂度——MoE 不是免费午餐，而是“用工程复杂度换 scaling 效率”的一笔交易。是否值得，取决于你的瓶颈是算力还是显存/工程。</p>  <p>一个常见的误解需要澄清：MoE<strong>不是“多个小模型投票集成”</strong>。集成是多个完整模型各自给出预测再综合；MoE 是<em>一个模型内部的一层</em>把前馈拆成多个专家、每个 token 只走其中几个，专家之间共享同一套注意力、同一个残差流、同一次反向传播。它更像“一层 FFN 内部的条件计算（conditional computation）”，而非模型层面的集成。把这两者分清，才不会对 MoE 的能力和成本产生错误预期。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一个反直觉但极其关键的点：MoE 省的是<strong>计算（FLOPs）</strong>，并<em>不省</em><strong>显存</strong>——所有专家的权重都得常驻显存（或可快速取用），只是每个 token 只<em>用</em>其中几个。所以 MoE 的本质是“用显存换算力”：你需要能放下巨量参数的显存，但每 token 的计算与延迟很低。这正是它适合<em>吞吐优先</em>的服务场景、却给单卡部署出难题的根本原因（专家卸载/量化见 C24/C27）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="struct"><span class="num">2</span>MoE 层结构</h2>
+  <h3>MoE 层的结构</h3>  <p>把一个 MoE 层拆开看，它由两件东西组成：一个<strong>路由器（router）</strong>决定 token 去哪几个专家，和 N 个<strong>专家 FFN</strong>实际处理。数据流如下：</p>  <div class="ascii">token x  (d_model)
+   │
+   ▼  router: logits = x · W_r   (d_model -&gt; N)
+  softmax -&gt; 取 top-k 专家 + 归一化门控 g
+   │
+   ├─ 专家 e1: FFN_e1(x)  ─┐
+   ├─ 专家 e2: FFN_e2(x)  ─┤  按门控加权求和
+   └─ (其余 N-k 个专家不算) ┘
+   ▼
+y = Σ_j g_j · FFN_{e_j}(x)</div>  <p>每个专家就是一个普通的 FFN（现代实现里通常是 SwiGLU，见第 6 节）。路由器是一层线性 + softmax，是整个 MoE 里<em>唯一</em>决定“哪些专家被激活”的部件，因此它的质量直接决定 MoE 的好坏。注意一个容易忽略的点：被激活的专家是<strong>逐 token</strong>不同的——同一句话里相邻的两个词，完全可能走向完全不同的专家组合。</p>  <p>门控权重的两种取法也要心里有数：<strong>softmax 门控</strong>（在选中专家上重新归一化，最常见）和<strong>sigmoid 门控</strong>（每个专家独立打分、不互相竞争，DeepSeek-V3 等采用）。前者强调“专家间竞争”，后者让“一个 token 可以同时强烈需要多个专家”。本课用 softmax 这条主线，但读到 sigmoid 门控时不必惊讶——它只是把“竞争式归一化”换成了“独立式打分”。</p>  <p>还要分清两种粒度的 MoE：<strong>token-level</strong>（每个 token 独立路由，本课与多数 LLM 采用）与 <strong>expert-choice</strong>（让专家反过来挑 token）。前者直观但需要额外手段防止负载失衡（下两节），后者天然均衡但改变了因果性、实现更绕。理解了 token-level 这条主线，其它变体都是在它上面打补丁。</p>  <p>MoE 在 Transformer 里的摆放也有讲究：通常是<strong>把部分层的 FFN 替换成 MoE 层</strong>，而非每一层都换（有的模型隔层一换、有的只在中间若干层换）。原因是 MoE 层显存开销大、且并非每一层都从稀疏化中同等受益。注意力子层一般<em>不</em>做 MoE（KV cache 压缩是另一条线，见模块 02）——MoE 主攻的是前馈这一块，因为 FFN 占了 Transformer 大头的参数量。把“MoE 替的是 FFN、压的是前馈参数”记牢，就不会把它和注意力变体混为一谈。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="route"><span class="num">3</span>top-k 路由与路由坍塌</h2>
+  <p><span class="term">Top-k Routing</span>：路由 softmax 之后取分数最高的 k 个专家，门控权重在这 k 个上重新归一化（让它们和为 1）。k=1（Switch Transformer）最省，k=2（Mixtral）质量更好、成本翻倍。k 是“质量↔成本”的又一个旋钮。</p>  <p>门控权重为什么要在选中的 k 个上<em>重新归一化</em>（而非直接用原始 softmax 值）？因为原始 softmax 是在全部 N 个专家上归一化的，选出 top-k 后这 k 个的概率和小于 1，直接用会让 MoE 层的整体输出尺度偏小、且随“被选专家有多突出”而漂移。重新归一化让这 k 个门控和恒为 1，保证输出尺度稳定——这是个小细节，但漏了会让训练更难。</p>  <p>难点在于 top-k 选择是<strong>离散、不可微</strong>的——“选哪几个专家”这个动作没有梯度，梯度只能流过<em>被选中</em>的那 k 个专家。这带来两个深远的后果：① 路由器只能靠“被选中专家回传的梯度”间接学习，学得慢且信号弱；② 一旦某些专家在训练早期偶然占优，就会被反复选中、获得更多梯度、变得更强、于是更容易被选中——形成正反馈，这正是下面坍塌的种子。</p>  <div class="callout warn"><span class="label"></span>
+    <p>这个正反馈的失控形态叫<strong>路由坍塌（routing collapse）</strong>：少数几个专家被挤爆、吃掉绝大多数 token，而大多数专家几乎从不被激活、长期得不到训练、形同虚设。坍塌会让 MoE 的“大容量”名存实亡——你以为有 N 个专家，实际只有几个在干活。这是 MoE 训练的头号敌人，下一节的负载均衡损失就是为它而生。</p>
+  </div>  <p>为什么不可微这么麻烦？回想普通神经网络，每个参数都能从损失拿到明确的梯度信号。但“离散地选 top-k”像是在网络中间插了一道<code>argmax</code>闸门，梯度过不去。这迫使整个 MoE 领域发展出一套<em>围绕“如何在不可微选择下还能训出好路由”</em>的技术——软化、加噪、辅助损失、可学习偏置等等，都是这个核心困难的不同应对。</p>  <p>一个常用的缓解技巧是给路由 logits<strong>加噪声</strong>（noisy top-k，Shazeer 2017）：在 softmax 前给每个专家的 logit 加一点可学习方差的高斯噪声，让“边缘 token”有机会被路由到次优专家、获得探索机会，从而打破“热门专家通吃”的正反馈。这与强化学习里的探索-利用权衡同源——路由器在“利用已知好专家”和“探索其它专家”之间需要平衡。把 top-k 路由理解成“一个需要持续探索的离散决策问题”，许多 MoE 训练技巧就有了统一的解释框架。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="balance"><span class="num">4</span>负载均衡损失</h2>
+  <p>对付坍塌的标准武器是<span class="term">Load Balancing Loss</span>（负载均衡辅助损失，Switch Transformer）。设 N 个专家，在一个 batch 里定义两个量：<code>f_i</code> = 被路由到专家 i 的 token 占比（“硬”分配），<code>P_i</code> = 路由器给专家 i 的平均 softmax 概率（“软”概率）。辅助损失为：</p>  <div class="math-block">\[\mathcal{L}_{\text{aux}} = \alpha \cdot N \cdot \sum_{i=1}^{N} f_i \, P_i\]</div>  <p>它在 <code>f</code> 与 <code>P</code> 都均匀（都等于 1/N）时取最小。直觉上：<code>f_i</code> 是不可微的硬计数（提供“谁被挤爆了”的信号），<code>P_i</code> 是可微的软概率（梯度的载体）；两者相乘再求和，就把“惩罚”精准地<strong>通过可微的 P 施加到那些既被高概率偏爱、又被大量分配的“赢家”专家上</strong>，推动路由器把 token 从它们身上匀走。这是一个巧妙的“用可微量替不可微量背锅”的设计。</p>  <p>举个手算的例子把公式坐实：N=4 个专家，某 batch 路由占比 <code>f=[0.7,0.1,0.1,0.1]</code>（专家 0 被挤爆），平均概率 <code>P=[0.6,0.15,0.15,0.1]</code>。则 <code>L=α·4·(0.7·0.6+0.1·0.15+0.1·0.15+0.1·0.1)=α·4·0.475≈1.9α</code>；而完全均匀时 <code>f=P=[0.25,…]</code>，<code>L=α·4·4·0.0625=α</code>。失衡把辅助损失从 α 顶到约 1.9α，梯度便推动路由器纠偏。notebook 会让你亲手算出这条曲线，看坍塌越严重、损失越大。</p>  <p>为什么不直接惩罚 <code>f</code> 的方差、非要用 <code>f·P</code> 这个乘积形式？关键在可微性：<code>f</code>（硬计数）对路由器参数<em>没有梯度</em>（它来自不可微的 top-k），你没法直接用它训练。而 <code>P</code>（软概率）是可微的。<code>f·P</code> 的妙处是用不可微的 <code>f</code> 当“权重/指示器”指出“哪个专家超载了”，再让可微的 <code>P</code> 承接梯度去纠正——相当于<strong>把惩罚的“方向”交给 f、把惩罚的“梯度通道”交给 P</strong>。这是处理不可微目标的一个通用范式，值得记住。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么要乘 N 又乘 α？乘 N 让损失在均匀时恰好约等于 α（与专家数 N 无关，于是同一个 α 能跨不同配置复用）；α（典型 0.01）控制“均衡”与“主任务”的权衡——太大会强行均匀、伤害主任务质量（逼着 token 去不合适的专家），太小则压不住坍塌。<strong>α 是 MoE 训练里最重要、最需要调的超参之一</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="capacity"><span class="num">5</span>专家容量与 token dropping</h2>
+  <p>即使有了均衡损失，硬件上还要再定一个<span class="term">Expert Capacity</span>（专家容量）：每个专家每批最多处理 <code>C = capacity_factor · (tokens/N)</code> 个 token。为什么需要它？因为 GPU 上每个专家的计算要<strong>预分配固定大小的缓冲区</strong>（静态形状才能高效并行），不能让某个专家无限接收 token。超出容量的 token 怎么办？被<strong>丢弃（token dropping）</strong>或溢出到下一个专家——被丢的 token 这一层就只走残差连接、相当于没过 FFN。</p>  <table>
+    <thead><tr><th>容量因子</th><th>效果</th></tr></thead>
+    <tbody>
+      <tr><td>= 1.0</td><td>刚好等于平均，路由稍有不均就大量丢 token</td></tr>
+      <tr><td>1.25 – 2.0</td><td>留出缓冲，丢得少，但显存/计算开销上涨</td></tr>
+      <tr><td>训练 vs 推理</td><td>训练常用较大容量保质量，推理可调小省显存</td></tr>
+    </tbody>
+  </table>  <p>容量因子是又一个<em>吞吐 vs 质量</em>的工程旋钮，而且它和负载均衡损失是<strong>配合关系</strong>：均衡损失把分配尽量推匀（从源头减少溢出），容量因子则给残余的不均留缓冲（事后兜底）。两者一软一硬、一个治本一个治标，共同决定 MoE 训练稳不稳、跑得快不快、丢多少 token。把它们想成“一个尽量别让人挤到同一个窗口，一个给每个窗口多备几个号”，配合起来才不至于又挤又浪费。</p>  <p>为什么不能干脆“按需分配、不设容量”？因为 GPU 上的高效计算依赖<strong>静态、规整的张量形状</strong>——如果每个专家接收的 token 数动态变化，就要么频繁重新分配内存（慢），要么用变长/稀疏算子（在当前硬件上效率低）。固定容量 + 丢弃，是把“动态路由”塞进“静态计算图”的工程妥协。理解这一点，就理解了为什么 MoE 的很多设计看起来“不优雅”——它们是硬件现实倒逼出来的。这也呼应了模块 02 的主题：架构设计永远在和硬件特性博弈。</p>  <div class="callout warn"><span class="label"></span>
+    <p>token dropping 是 MoE 一个反直觉的“特性而非 bug”：训练时丢掉一小部分 token 通常无伤大雅（甚至有正则化效果），但<strong>推理时丢 token 会直接损害对应位置的输出质量</strong>。所以推理常把容量调大或改用不丢 token 的实现。调 MoE 时务必分清“训练容量”和“推理容量”，它们的最优值不同。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="swiglu"><span class="num">6</span>SwiGLU 门控前馈</h2>
+  <p>现代专家 FFN 几乎都用 <span class="term">SwiGLU</span>（Shazeer 2020），它是 <span class="term">GLU</span>（Gated Linear Unit，门控线性单元）的一个变体。普通 FFN 是 <code>W2·act(W1·x)</code>（一条路）；GLU 引入<strong>第二条“门”分支</strong>来逐元素调制第一条分支的输出，让 FFN 具备乘性交互：</p>  <div class="math-block">\[\text{SwiGLU}(x) = \big(\text{Swish}(xW_{\text{gate}}) \odot (xW_{\text{up}})\big)W_{\text{down}},\quad \text{Swish}(z)=z\,\sigma(z)\]</div>  <p>两条分支：一条过 Swish 激活当“门”（决定让多少信号通过），一条线性当“值”（要被调制的内容），逐元素相乘后再下投影。普通 ReLU FFN 只有“加性 + 截断”的表达力，而门控带来了<strong>乘性交互</strong>——一个维度可以动态地放大或关闭另一个维度，表达力在等参数下更强。这就是 Llama、PaLM、Mixtral 的专家都用 SwiGLU 的原因。</p>  <p>Swish（也叫 SiLU）<code>z·σ(z)</code> 相比 ReLU 的好处是<em>平滑且非单调</em>：它在负区不是硬截断为 0，而是有一个小的负响应再平滑回升，梯度更友好、不易“死神经元”。门控 + 平滑激活，是 SwiGLU 把两个改良叠在一起的结果。</p>  <table>
+    <thead><tr><th>前馈层</th><th>公式（略）</th><th>交互</th><th>矩阵数</th><th>代表</th></tr></thead>
+    <tbody>
+      <tr><td>ReLU FFN</td><td>W2·ReLU(W1·x)</td><td>仅加性 + 截断</td><td>2</td><td>原版 Transformer</td></tr>
+      <tr><td>GELU FFN</td><td>W2·GELU(W1·x)</td><td>加性 + 平滑</td><td>2</td><td>GPT、BERT</td></tr>
+      <tr><td>GeGLU</td><td>(GELU(xWg)⊙xWu)Wd</td><td>乘性门控</td><td>3</td><td>部分编码器</td></tr>
+      <tr><td><strong>SwiGLU</strong></td><td>(Swish(xWg)⊙xWu)Wd</td><td>乘性门控 + 平滑</td><td>3</td><td>Llama/PaLM/Mixtral</td></tr>
+    </tbody>
+  </table>  <p>Shazeer 2020 的对照实验里，GLU 家族（含 SwiGLU/GeGLU）在等参数下系统性地优于非门控 FFN——这是一个少见的“几乎免费的改进”，所以被现代 LLM 几乎一致采用。论文作者半开玩笑地把效果归因于“神之恩典”，但更实在的解释就是乘性门控带来的额外表达力与更平滑的优化景观。</p>  <div class="callout warn"><span class="label"></span>
+    <p>SwiGLU 有<strong>三个权重矩阵</strong>（gate / up / down）而非普通 FFN 的两个。为保持参数量与 <code>4·d_model</code> 的普通 FFN 相当，SwiGLU 的隐藏维度通常取 <code>8/3·d_model</code> 而非 4·d_model（解 <code>3·d·h = 2·d·4d</code> 得 <code>h=8d/3</code>）。这个 8/3 的系数是读 Llama 配置时常见的“魔数”，模块练习 3 会让你亲手推出它。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eng"><span class="num">7</span>MoE 的分布式工程</h2>
+  <p>到这里我们讲清了 MoE 的“算法心脏”（路由、均衡、容量、门控 FFN），它们在单机玩具上就能完整复现。但 MoE 真正落地大模型时，最硬的骨头其实在<strong>分布式</strong>——这也是它和稠密模型在工程上分道扬镳的地方。</p>  <p>专家数量大、每个又是完整 FFN，单卡放不下，于是专家通常被分散到不同 GPU 上（<span class="term">Expert Parallelism</span>，专家并行）。这就带来一个稠密模型完全没有的通信模式：</p>  <div class="ascii">专家并行的两次 all-to-all（4 卡示意，每卡放 2 个专家）：
+  GPU0  GPU1  GPU2  GPU3   各卡持有本地 token
+    │     │     │     │
+    └──── all-to-all ────┘  ① 按路由把 token 发往专家所在卡
+  [算专家] [算专家] ...      各卡并行算自己的专家 FFN
+    ┌──── all-to-all ────┐  ② 把结果发回 token 原来的卡
+  GPU0  GPU1  GPU2  GPU3</div>  <p>路由决定每个 token 该去哪个专家后，token 要被 <strong>all-to-all 通信</strong>发送到对应专家所在的那张卡，算完再 all-to-all 发回原位（上图）。这两次 all-to-all 是 MoE 分布式的标志性开销——它随设备数增长、对网络带宽敏感，且一旦负载不均（某卡的专家被挤爆），整个 batch 就要等那张卡，木桶效应严重。所以“负载均衡”在分布式语境下不只关乎质量，更直接关乎<strong>吞吐</strong>——这是它比稠密模型多出来的一重压力。</p>  <p>通信开销、负载不均、容量丢弃，三者共同决定了 MoE 的真实加速比往往低于“激活参数比”暗示的理想值——纸面上 47B 总参数只激活 13B，但实际吞吐还要打通信的折扣。这部分在 C8（并行策略）与 C39（分布式训练工程）展开。本模块聚焦单机就能看懂的核心：路由、均衡、容量、门控 FFN——把这些吃透，分布式那层才有意义。</p>  <p>一个把单机概念和分布式现实连起来的关键认识：本模块讲的“负载均衡损失”和“专家容量”，在单机玩具里只关乎“质量”和“丢多少 token”，但在真实分布式系统里，它们直接决定<strong>通信是否高效、各卡是否同步等待</strong>。负载越均匀，all-to-all 的数据量越规整、各卡越不需要互相等；容量设得越准，缓冲区越不浪费。所以这两个看似“训练技巧”的东西，本质是<em>为分布式效率服务的</em>——这也是为什么 MoE 的论文总把它们当头等大事。学完单机原理后，带着“这对通信意味着什么”的问题去读 C8/C39，会顺畅得多。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿</h2>
+  <p>MoE 是当前大模型最热的方向之一——从 Switch、Mixtral 到 DeepSeek-V3，几乎每个新的开源旗舰都用它，前沿进展也因此异常密集。下面这几条是把 MoE 推向工业级的关键演进，每一条都在修补本模块讲过的某个核心痛点：</p>  <ul>
+    <li><span class="term">DeepSeekMoE</span>：<strong>细粒度专家 + 共享专家</strong>——把每个专家切得更小、同时增多专家数与激活数（提升专家组合的表达力），再额外留几个<em>所有 token 都过</em>的共享专家承载通用知识，让路由专家专注差异化技能。</li>
+    <li>无辅助损失均衡（DeepSeek-V3）：用一个<strong>可学习的路由偏置</strong>替代负载均衡损失——直接给冷门专家的 logits 加正偏置、热门专家加负偏置来纠偏，避免辅助损失对主任务质量的干扰。</li>
+    <li>专家选择路由（Expert Choice）：反过来让<em>专家挑 token</em>（每个专家选它最想要的若干 token），天然均衡、无需容量丢弃，代价是打破了 token 间的独立性。</li>
+    <li>推理时的专家卸载/缓存：总参数巨大时，如何在有限显存上高效服务（按需把专家从 CPU/SSD 换入显存），与 C24 推理服务深度交叉。</li>
+  </ul>  <p>把这些前沿放回主线看，它们都在解决本模块讲的两个核心矛盾：<strong>路由的不可微/不均衡</strong>（无辅助损失、专家选择是新解法）和<strong>大容量与有限显存的冲突</strong>（细粒度、卸载是新解法）。理解了 top-k 路由、均衡损失、容量这三块地基，再看任何 MoE 新论文，都能迅速定位它在改哪一块。</p>  <p>最后给一个学习建议：MoE 的论文常常把“路由策略、均衡手段、容量处理、专家结构、分布式实现”混在一起讲，初读容易迷失。带着本模块的<strong>分解框架</strong>去读——先问“它的路由是 token-choice 还是 expert-choice？均衡靠损失还是靠偏置？专家是粗是细、有无共享专家？”——你会发现再花哨的 MoE 也不过是在这几个轴上做选择。这种“先建坐标轴、再定位新方法”的读法，是把前沿论文读薄的通用技巧。</p>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Shazeer 2017（稀疏门控 MoE 奠基）、Switch Transformer（Fedus 2021，均衡损失）、Mixtral（2024，top-2 开源代表）、GLU Variants（Shazeer 2020，SwiGLU）、DeepSeekMoE / DeepSeek-V3（细粒度 + 共享 + 无辅助损失）。见 <code>references.md</code> 的 MoE 一节。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_attention_variants/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">注意力变体 MHA→GQA→MLA</div></a>
+    <a class="next" href="../04_normalization/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">RMSNorm 与稳定性</div></a>
+  </div>
+
+</div>
+</body>
+</html>

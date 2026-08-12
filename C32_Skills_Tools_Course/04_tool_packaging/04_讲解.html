@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 工具打包与插件</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 工具打包与插件</h1>
+  <p class="subtitle">把 skill / 命令 / MCP 工具打包成可分发的盒子 —— manifest 清单、发现与加载、命名空间隔离、semver 版本与依赖、分发；不依赖框架，从零写一个插件系统</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–03、JSON、markdown、对版本号与依赖的基本认识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_tool_packaging.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Claude Code Plugins 文档、Semantic Versioning 2.0.0 (semver.org)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么需要插件：能力的分发层</a></li>
+      <li><a href="#manifest">manifest：身份证 + 货物清单</a></li>
+      <li><a href="#loadflow">发现与加载：从磁盘到接入的能力</a></li>
+      <li><a href="#namespace">命名空间隔离：让插件互不打架</a></li>
+      <li><a href="#semver">semver：版本与依赖约束</a></li>
+      <li><a href="#distribute">分发：从一个插件到一个生态</a></li>
+      <li><a href="#assemble">把四块零件装进一个盒子</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么需要插件：能力的分发层</h2>
+  <p>到上一模块为止，我们已经能从零造出三种「能力」了：<strong>skill</strong>（模块 01，按需加载的指令）、<strong>slash 命令</strong>（模块 02，用户显式触发的工作流）、以及 <strong>MCP 工具</strong>（模块 03，经开放协议接入的外部操作）。但有一个现实问题一直被回避：<strong>这些能力是怎么打包、分发、安装、共存的</strong>？</p>  <p>设想你写好了一套「Python 项目助手」：3 个 skill（怎么写 docstring、怎么组织测试、怎么写 commit）、2 个 slash 命令（`/test`、`/lint`）、1 个连本地文件系统的 MCP server。你想把这一整套<em>一次性</em>分享给同事，让他们<em>一条命令装上、一条命令卸下</em>，而不是手动把六七个文件拷到各自的 `.claude/` 目录里。这就是 <span class="term">plugin</span>（插件）要解决的问题：<strong>把一组相关能力打包成一个可分发、可安装、可启停的单元</strong>。</p>  <p>插件不是又一种新能力，而是<strong>前几个模块所有能力的「分发层」</strong>。一个 Claude Code 插件用一份 <span class="term">manifest</span>（清单，`.claude-plugin/plugin.json`）声明：我叫什么、什么版本、提供哪些 skills / commands / agents / MCP servers、依赖谁。安装器读这份 manifest，就知道该把哪些 skill 注册进 skill 注册表、哪些命令注册进命令路由、哪些 MCP server 配置接入——<em>插件加载，本质就是「把声明的能力逐一接入对应注册表」这一个动作</em>。</p>  <p>本模块的目标是<strong>从零写出一个插件系统的完整骨架</strong>：manifest 怎么解析与校验、插件怎么被发现、加载时怎么把能力接入、<strong>多个插件重名时怎么靠命名空间隔离避免互相覆盖</strong>、以及怎么用 <span class="term">semver</span>（语义化版本）检查「插件 A 依赖插件 B >=1.2.0」这类约束并排出加载顺序。全程<strong>纯 Python 标准库</strong>——连 `packaging` 这样的版本库都不用，semver 比较器我们亲手写——因为本课的立场就是「不依赖框架，亲手造一遍才真懂」。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>插件 = 一份 manifest（声明我提供什么、依赖什么）+ 一套加载逻辑（把声明的能力接入注册表，并避免冲突）</strong>。前几个模块造的是「一件能力」，本模块造的是「一盒能力」以及「怎么把很多盒能力装进同一个 agent 而不打架」。难点不在打包本身，而在<em>命名空间隔离</em>（多盒共存）与<em>版本依赖</em>（盒与盒的兼容）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="manifest"><span class="num">2</span>manifest：身份证 + 货物清单</h2>
+  <h3>manifest：插件的「身份证 + 货物清单」</h3>  <p>一个插件的一切都从它的 <span class="term">manifest</span> 开始。manifest 是一份结构化文件（Claude Code 用 JSON：`.claude-plugin/plugin.json`），加载器<strong>先读 manifest、再决定怎么装</strong>——就像海关先看报关单、再决定怎么处理货物。一份典型 manifest 声明这几类信息：</p>  <table>
+    <thead><tr><th>字段</th><th>作用</th><th>举例</th></tr></thead>
+    <tbody>
+      <tr><td><code>name</code></td><td>插件的唯一标识，也是命名空间前缀的来源</td><td><code>py-helper</code></td></tr>
+      <tr><td><code>version</code></td><td>插件自身版本（semver），供别人声明依赖</td><td><code>1.3.0</code></td></tr>
+      <tr><td><code>description</code></td><td>一句话说明，给人/给市场看</td><td>Python 项目助手</td></tr>
+      <tr><td><code>skills</code></td><td>本插件提供的 skill 列表（名字/路径）</td><td><code>["docstring", "tests"]</code></td></tr>
+      <tr><td><code>commands</code></td><td>本插件提供的 slash 命令</td><td><code>["test", "lint"]</code></td></tr>
+      <tr><td><code>mcpServers</code></td><td>本插件携带的 MCP server 配置</td><td><code>{"fs": {...}}</code></td></tr>
+      <tr><td><code>dependencies</code></td><td>依赖的其它插件及版本约束</td><td><code>{"core": "&gt;=1.0.0"}</code></td></tr>
+    </tbody>
+  </table>  <p>注意 manifest 的两重身份：对<strong>加载器</strong>它是「货物清单」（我提供哪些能力，请挨个接入）；对<strong>其它插件</strong>它是「身份证」（我叫 py-helper、版本 1.3.0，你可以声明依赖我）。正是这份声明把「一堆散落的能力文件」收敛成「一个有名有版本、可被依赖的单元」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 manifest 想成搬家公司的物品清单：每个箱子（插件）外面贴一张纸，写明箱主是谁（name）、第几版打包（version）、里面装了哪些东西（skills/commands）、要先搬哪个箱子才能搬这个（dependencies）。搬运工（加载器）只看清单就知道怎么搬、按什么顺序搬，不用拆开每个箱子翻。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，解析 manifest 就是把一段 JSON 反序列化成一个结构，并做<strong>最小校验</strong>：必填字段（`name`、`version`）在不在？`version` 是不是合法 semver？各能力列表是不是数组/对象？校验不过应当<em>明确报错并指出哪个字段不对</em>，而不是把残缺 manifest 装进系统留下隐患。本模块 notebook 第 1 节就从零写这个解析+校验器。</p></div>
+  </div>  <p>一个常被忽视的设计取舍：<strong>manifest 只声明「有什么」，不声明「怎么实现」</strong>。它列出 skill 的名字，但 skill 的正文在另外的文件里；它列出命令，但命令模板是独立的 markdown。这种「声明与实现分离」让加载器可以<em>只读 manifest 就建立起完整的能力目录</em>（轻量、快），真正用到某个能力时才去读它的实现（重、按需）——你会发现这正是模块 00 立下的<strong>渐进披露</strong>原则，在插件这一层的又一次体现。</p>  <p>还要强调 manifest 校验的一条纪律：<strong>宁可在加载时严格拒绝，也不要把残缺 manifest 放进系统</strong>。一份缺了 `name` 的 manifest、或把 `version` 写成 `1.0`（少一段）的 manifest，若被宽松地放行，问题会推迟到<em>更难排查的时刻</em>才爆发——比如某个依赖它的插件加载到一半才发现版本号无法比较、或两个匿名插件的能力撞在一起无法溯源。校验器的价值正在于<strong>把错误挡在最早、信息最全的那一刻</strong>：解析 manifest 时就能精确指出「是哪个插件的哪个字段不对」，这与模块 01 的 frontmatter 校验、模块 03 的 JSON-RPC 错误码是同一种工程素养——<em>让失败尽早且可读</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="loadflow"><span class="num">3</span>发现与加载：从磁盘到接入的能力</h2>
+  <h3>发现与加载：从「磁盘上的插件」到「接入的能力」</h3>  <p>有了 manifest 的概念，看插件怎么从磁盘进到 agent 里。这分两步，和模块 01 的 skill 发现/加载同构，只是单位更大（一个插件含多种能力）：</p>  <div class="ascii">  插件目录                  ①发现 discover            ②加载 load
+  ┌───────────────┐                              ┌──────────────────────┐
+  │ py-helper/    │   读每个 plugin.json          │  skill 注册表         │
+  │   plugin.json │ ─────────────────►  manifest  │  ├─ py-helper:docstring│
+  │ git-pro/      │   建「可安装清单」    列表     │  命令路由             │
+  │   plugin.json │ ─────────────────►            │  ├─ /py-helper:test    │
+  │ ...           │   (只读 manifest, 轻量)        │  工具注册表           │
+  └───────────────┘                              │  ├─ git-pro:status     │
+                                                 └──────────────────────┘
+           『有哪些插件可装』          →          『把选中插件的能力逐一接入』</div>  <p><strong>发现（discovery）</strong>：扫描插件目录、读每个插件的 manifest、建一张「插件名 → manifest」的可安装清单。发现只读 manifest（轻量），不加载任何能力的实现——这让你能<em>先看清有哪些插件可装、各是什么版本</em>，再决定装哪些。</p>  <p><strong>加载（loading）</strong>：对选中的插件，按它 manifest 里的声明，把每个 skill 注册进 skill 注册表、每个命令注册进命令路由、每个 MCP server 配置接入。加载是「把插件的能力真正接进 agent」的动作。本模块用模块 01/02/03 已经造好的注册表概念——插件加载器不过是<em>一个把 manifest 翻译成「对各注册表的一串 register 调用」的翻译器</em>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把发现和加载分开，是任何可扩展系统（包管理器、浏览器扩展、IDE 插件）的共同骨架：<strong>先建目录、再按需安装</strong>。发现回答「有什么可用」，加载回答「把要用的接进来」。分开的好处是：你可以列出 100 个插件的清单（廉价），却只加载用到的 5 个（省内存、省启动时间、省上下文）——又是渐进披露。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="namespace"><span class="num">4</span>命名空间隔离：让插件互不打架</h2>
+  <h3>命名空间隔离：让一百个插件互不打架</h3>  <p>一旦支持多个插件，一个尖锐的问题立刻出现：<strong>两个插件都提供一个叫 format 的命令怎么办</strong>？若不处理，后加载的会<em>悄悄覆盖</em>先加载的——用户打 `/format` 时，到底跑哪个？这种<strong>命名冲突</strong>是多插件共存的头号障碍。</p>  <p>解法是 <span class="term">namespace isolation</span>（命名空间隔离）：<strong>给每个插件的能力都加上「插件名:」前缀</strong>。py-helper 的 format 变成 `py-helper:format`，git-pro 的 format 变成 `git-pro:format`，两者井水不犯河水。这和 Python 用模块名区分 `os.path` 与 `posixpath` 是<em>同一种思想</em>——用命名空间把同名符号分到不同「房间」里。</p>  <pre><code># 命名空间隔离的核心：注册时带前缀，冲突时报错而非静默覆盖
+def register_namespaced(registry, plugin_name, cap_name, value):
+    key = f'{plugin_name}:{cap_name}'      # 加插件名前缀
+    if key in registry:                    # 同一插件内重名 -&gt; 真冲突, 报错
+        raise ValueError(f'命名冲突: {key} 已存在')
+    registry[key] = value
+    return key</code></pre>  <p>注意这里有两层冲突要区分，处理方式不同：<strong>跨插件同名</strong>（py-helper 和 git-pro 都有 format）——加前缀后<em>根本不再冲突</em>，自然共存；<strong>同一插件内同名</strong>（py-helper 自己声明了两个 format）——这是<em>真正的错误</em>，应当在加载时报错拒绝，因为前缀也救不了它。一个好的隔离器要<strong>让前者无痛共存、让后者明确失败</strong>。</p>  <div class="callout danger"><span class="label">静默覆盖 = 能力被掉包</span>
+    <p>一个隐蔽而危险的反模式是<strong>「后加载静默覆盖先加载」</strong>。假设两个插件都注册了名为 `delete_all` 的工具，加载器若不加命名空间、又不报冲突，用户以为在调 A 插件那个「带确认的安全删除」，实际跑的却是 B 插件那个「直接删库」的同名工具——<em>能力被悄悄掉包，且不报任何错</em>。命名空间隔离不是锦上添花，而是<strong>多插件系统的安全底线</strong>：宁可加载时吵闹地报冲突，也不要运行时安静地调错能力。</p>
+  </div>  <p>命名空间还带来一个工程上的好处：<strong>可溯源</strong>。当一个 agent 装了十几个插件、出了问题，`py-helper:format` 这样的带前缀名字一眼就能看出「这个能力来自哪个插件」，调试和审计都简单得多。真实 Claude Code 正是用这种 `插件名:能力名` 的命名空间来组织插件提供的命令与技能。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="semver"><span class="num">5</span>semver：版本与依赖约束</h2>
+  <h3>semver：插件之间怎么表达「我需要你这个版本」</h3>  <p>插件不是孤岛——一个「Python 测试助手」插件可能依赖一个「core 工具库」插件。但依赖不能只说「我需要 core」，得说清<strong>需要哪个版本</strong>：core 1.0 和 core 2.0 的接口可能完全不同。表达版本依赖的通用语言是 <span class="term">semantic versioning</span>（语义化版本，semver）。</p>  <p>semver 把版本号定为 <code>MAJOR.MINOR.PATCH</code> 三段，每段的递增有明确含义：</p>  <table>
+    <thead><tr><th>段</th><th>什么时候 +1</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><strong>MAJOR</strong></td><td>做了不兼容的改动</td><td>升级可能弄坏依赖方，要当心</td></tr>
+      <tr><td><strong>MINOR</strong></td><td>向后兼容地加了新功能</td><td>升级安全，老用法仍可用</td></tr>
+      <tr><td><strong>PATCH</strong></td><td>向后兼容地修了 bug</td><td>升级最安全，只是修复</td></tr>
+    </tbody>
+  </table>  <p>依赖方用<strong>版本约束</strong>表达「我能接受哪些版本」。常见运算符及其含义：</p>  <table>
+    <thead><tr><th>约束</th><th>读作</th><th>匹配的版本</th></tr></thead>
+    <tbody>
+      <tr><td><code>1.2.3</code></td><td>正好等于</td><td>只有 1.2.3</td></tr>
+      <tr><td><code>&gt;=1.2.0</code></td><td>不低于</td><td>1.2.0、1.5.0、2.0.0 …</td></tr>
+      <tr><td><code>^1.2.3</code></td><td>兼容 1.x（MAJOR 不变）</td><td>1.2.3 ~ 1.9.9，但不含 2.0.0</td></tr>
+      <tr><td><code>~1.2.3</code></td><td>兼容 1.2.x（MINOR 不变）</td><td>1.2.3 ~ 1.2.9，但不含 1.3.0</td></tr>
+    </tbody>
+  </table>  <p>其中 <code>^</code>（caret）与 <code>~</code>（tilde）最体现 semver 的精神：<code>^1.2.3</code> 说「我依赖 1.2.3 的特性，但 1.x 后续的兼容升级我都接受」（因为 MINOR/PATCH 保证向后兼容）；<code>~1.2.3</code> 更保守，「只接受 1.2.x 的补丁」。理解它们，就理解了 semver 为什么能让生态<em>既能各自升级、又不轻易崩</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 semver 想成「电器的兼容标注」：MAJOR 像插头制式（换了就插不上，必须当心）、MINOR 像新增的功能档位（多了个档，老档照用）、PATCH 像修了个小毛病。约束 `^1.2.3` 就像说「我要 1 号制式、至少带到 1.2.3 那批的功能，之后的同制式升级我都收」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，一个 semver 比较器要做两件事：<strong>解析</strong>（把 `1.2.3` 拆成 `(1,2,3)` 三元组）与<strong>比较/匹配</strong>（判断某个版本是否满足某条约束）。比较三元组用字典序：先比 MAJOR，相等再比 MINOR，再比 PATCH。`^`/`~` 则转成一个「下界 + 上界」区间来判断。本模块 notebook 从零写这个解析+匹配器，对标 semver.org 的核心子集（暂不处理预发布与构建元数据）。</p></div>
+  </div>  <p>有了版本约束，还要做<strong>依赖解析</strong>：给定一批插件各自的依赖声明，确定<em>加载顺序</em>（被依赖的先加载）、检查每个依赖的版本是否被满足、并发现「缺失依赖」或「版本冲突」。加载顺序本质是一个<strong>拓扑排序</strong>（依赖图的有向无环排序），版本满足则是把上面的匹配器逐条套用。本模块实现一个最小但正确的依赖解析器。</p>  <p>为什么加载顺序非排不可？因为一个插件被加载时，可能要用到它依赖的插件已经接入的能力——<em>被依赖者必须先就位</em>。这正是拓扑排序的用武之地：把「A 依赖 B」看成一条有向边 B→A，拓扑序保证「指向你的人都排在你前面」。顺带，拓扑排序还能<strong>检测出依赖成环</strong>（A 依赖 B、B 又依赖 A）——这是一种无法满足的依赖，必须报错而非死循环。一个值得记住的对比：版本检查回答「<em>能不能</em>一起用」（兼容性），拓扑排序回答「<em>按什么顺序</em>用」（先后），两者合起来才是完整的依赖解析。真实的包管理器（npm、pip）在此之上还要做版本求解与冲突回溯，但内核就是这两件事。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="distribute"><span class="num">6</span>分发：从一个插件到一个生态</h2>
+  <h3>分发：从一个插件到一个生态</h3>  <p>造好了打包（manifest）、发现、加载、隔离、版本，最后一块拼图是<strong>分发</strong>：插件怎么从作者到达使用者？单机自己写自己用不算生态；<strong>能被别人发现、安装、信任、升级</strong>才算。</p>  <p>真实世界里这靠 <span class="term">marketplace</span>（插件市场/索引）：一个集中的清单，列出有哪些插件、各自的版本、来源、下载方式。它和单机的「插件发现」是同一个模式放大到网络规模——<em>先有目录，再按目录索取</em>。Claude Code 用 plugin marketplace 来分发插件；npm、VS Code 扩展市场、浏览器扩展商店都是同一思想的不同实例。</p>  <p>分发一旦跨越「自己人」，就带来三个新问题，它们也是真实插件生态的核心挑战：</p>  <ul>
+    <li><strong>可发现性</strong>：用户怎么知道有这个插件、它能干什么？靠 marketplace 的索引与每个插件 manifest 里的 `description`。</li>
+    <li><strong>可信任</strong>：装一个别人的插件，等于把它声明的能力接进自己的 agent——它的工具会进你的上下文、可能执行动作。来源签名、权限声明、沙箱是真实系统要解决的（本课只做逻辑隔离，点到为止）。</li>
+    <li><strong>可升级</strong>：插件出了新版本，依赖它的人怎么平滑升级而不崩？靠的正是上一节的 semver——约束让升级有章可循。</li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <p>分发把模块 03 提过的「server 返回值是新攻击面」放大成了<strong>「整个插件都是新攻击面」</strong>。一个恶意或被攻破的插件，可以声明一个看似无害、实则危险的工具，或在 skill 正文里埋入提示注入。所以「装一个插件」在生产里<em>从来不是无成本的便利</em>：来源是否可信、它要哪些权限、能否隔离它的影响，都得想清楚。本课的命名空间隔离是<strong>逻辑隔离</strong>（防同名打架），真实生态还需要<strong>权限与进程隔离</strong>（防越权与攻击）——后者是把插件系统从「能用」推向「敢装别人的」的关键。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="assemble"><span class="num">7</span>把四块零件装进一个盒子</h2>
+  <h3>把四块零件装进一个盒子</h3>  <p>回到模块 00 那条「发现→选择→注入/调用」的流水线，本模块的位置很特殊：它不是流水线上的某一段，而是<strong>给整条流水线供货的「分发层」</strong>。skill（01）、命令（02）、MCP 工具（03）是流水线处理的「货物」；插件（04）是把这些货物<em>打包、运输、入库</em>的机制。一个插件被加载，等于往三个注册表里一次性补了一批货：</p>  <table>
+    <thead><tr><th>插件 manifest 声明的</th><th>加载后接入的注册表</th><th>对应模块</th></tr></thead>
+    <tbody>
+      <tr><td><code>skills</code></td><td>skill 注册表（描述常驻、正文按需）</td><td>模块 01</td></tr>
+      <tr><td><code>commands</code></td><td>命令路由（带命名空间前缀）</td><td>模块 02</td></tr>
+      <tr><td><code>mcpServers</code></td><td>MCP 连接配置（host 据此连 server）</td><td>模块 03</td></tr>
+      <tr><td><code>dependencies</code></td><td>依赖图（决定加载顺序与版本满足）</td><td>本模块</td></tr>
+    </tbody>
+  </table>  <p>这就是为什么本模块排在 03 之后、05 之前：<strong>先有了三种能力（01/02/03），才谈得上把它们打包分发（04）；打包好了，下一模块（05）才能把它们组装成一个完整运转的 skills 系统</strong>。你在本模块写的插件加载器，到模块 05 会成为「系统初始化」的一部分——开机时扫描插件、加载、建好三大注册表，然后 agent 循环就能用上这些能力了。</p>  <p>一个值得带走的整体直觉：<strong>可扩展性是分层的</strong>。最底层是「一件能力」（一个 skill、一个工具）；中间层是「一盒能力」（一个插件，含 manifest、命名空间、版本）；最上层是「一个生态」（marketplace，含分发、信任、升级）。本课从模块 01 到 04 正是<em>沿着这三层从下往上爬</em>——而每一层你都用纯标准库亲手实现过，没有借助任何框架。这正是「不依赖框架」的价值：你不仅会用插件，更知道插件系统每一层<em>为什么这样设计、边界在哪、出错时怎么办</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>依赖地狱与版本求解</strong>：当插件数量与依赖关系变多，「找到一组都互相满足的版本」会变成一个真正困难的约束求解问题（SAT 级别）。npm、pip 的依赖求解器都为此演进多年。本课的拓扑序 + 逐条匹配是最小可用版，真实求解器要处理回溯、冲突诊断、最小化升级。</li>
+    <li><strong>信任与供应链安全</strong>：装别人的插件 = 把别人的代码/能力接进你的 agent。如何验证来源（签名）、声明与限制权限（这个插件能调网络吗？能删文件吗？）、隔离被攻破插件的影响，是把插件生态推向生产的核心难题，与模块 03/05 的注入与权限相通。</li>
+    <li><strong>逻辑隔离 vs 真隔离</strong>：本课的命名空间是逻辑隔离（防同名）。真实系统要的是进程/能力级隔离——一个插件崩了不拖垮 agent、一个插件越权访问不了它无权的资源。轻量逻辑隔离与重量真隔离之间的取舍，没有定论。</li>
+    <li><strong>能力发现的规模化</strong>：当一个 agent 装了几十个插件、上千个能力，全列进上下文既贵又乱。如何让模型按需检索能力（呼应模块 04 旁注的 tool search / 渐进披露），而非一次塞满，是插件生态长大的必答题。</li>
+    <li><strong>版本与能力的协同演进</strong>：插件升级了，依赖它的 skill / 命令 / 工具的行为也可能变。如何在 manifest 里表达「我提供的这个能力的契约」、并在升级时检测契约破坏（不只是版本号），是让升级真正安全的前沿方向。</li>
+    <li><strong>跨生态互操作</strong>：MCP 让工具跨厂商可复用；插件能不能也跨框架（不只 Claude Code）互操作？一个中立的插件/能力打包标准，是否会像 MCP 之于工具那样出现，值得关注。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Anthropic Claude Code Plugins 文档（manifest / 安装 / 命名空间的权威设计）、Claude Code Plugin marketplaces 文档（分发）、Semantic Versioning 2.0.0 规范（semver.org，版本与约束）、以及贯穿全课的渐进披露原则（插件层的发现/加载也遵循它）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_mcp_server/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 从零造 MCP Server</div></a>
+    <a class="next" href="../05_skills_system/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 完整 Skills 系统</div></a>
+  </div>
+
+</div>
+</body>
+</html>

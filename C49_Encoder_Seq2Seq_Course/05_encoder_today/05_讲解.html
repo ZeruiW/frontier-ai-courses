@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 今天还要不要 encoder</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 今天还要不要 encoder</h1>
+  <p class="subtitle">推理成本的千倍差距 · 知识蒸馏与 T² 因子 · LLM 造标注→蒸馏到 encoder · 句嵌入的各向异性与对比学习 · 双塔召回 + 交叉精排的成本-精度前沿 · 一棵可执行的选型决策树</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–04；C24/C27 的推理与压缩概念有帮助但不必需</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_encoder_today.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Hinton et al. 2015（蒸馏）、Sanh et al. 2019（DistilBERT）、Reimers & Gurevych 2019（SBERT）、Karpukhin et al. 2020（DPR）、Nogueira & Cho 2019（BERT reranker）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#question">正面回答这个问题</a></li>
+      <li><a href="#cost">推理成本：把差距算成数字</a></li>
+      <li><a href="#distill">蒸馏：把 LLM 的能力搬进小模型</a></li>
+      <li><a href="#retrieval">检索：双塔与交叉编码的成本-精度前沿</a></li>
+      <li><a href="#when">选型决策：一棵可执行的树</a></li>
+      <li><a href="#ledger">算一笔账：一个真实的选型决策</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="question"><span class="num">1</span>正面回答这个问题</h2>
+  <p>学到这里，一个诚实的问题必须被正面回答：<strong>2026 年了，做一个文本分类任务，我到底该用 BERT 微调还是直接调 LLM</strong>？</p>  <p>网上的答案通常是两个极端——「LLM 什么都能做，别折腾小模型了」或者「BERT 又快又准，别用大炮打蚊子」。<strong>两个都是坏答案，因为它们都没有给出判据</strong>。本模块要做的是把这个决策变成一个可以计算的问题。</p>  <p>先把三种方案摆出来，看它们各自在什么维度上占优：</p>  <table>
+    <thead><tr><th>方案</th><th>精度（有标注数据时）</th><th>推理成本</th><th>冷启动（无标注数据）</th><th>可控性</th></tr></thead>
+    <tbody>
+      <tr><td><strong>encoder 微调</strong>（BERT/DeBERTa）</td><td>★★★★★ 通常最高</td><td>★★★★★ 1 次前向、110M 参数</td><td>★ 需要几百到几千条标注</td><td>★★★★★ 输出空间受约束</td></tr>
+      <tr><td><strong>LLM few-shot / zero-shot</strong></td><td>★★★ 中等，取决于任务</td><td>★ 7B+ 参数、要生成</td><td>★★★★★ <strong>零标注即可用</strong></td><td>★★ 可能输出格式外的东西</td></tr>
+      <tr><td><strong>LLM 微调</strong>（LoRA 等）</td><td>★★★★★ 与 encoder 相当或略高</td><td>★★ 仍是大模型</td><td>★★ 需要标注（比 encoder 少些）</td><td>★★★ 好一些</td></tr>
+      <tr><td><strong>LLM 蒸馏到 encoder</strong></td><td>★★★★ 接近 encoder 微调</td><td>★★★★★ 同 encoder</td><td>★★★★ <strong>用 LLM 造标注</strong></td><td>★★★★★ 同 encoder</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后一行是当今工业界最实用、也最被低估的答案：<strong>用 LLM 生成标注，用这些标注微调一个小 encoder，线上跑小的</strong>。它同时拿到了 LLM 的零标注启动能力和 encoder 的推理经济性。整个流程可以在几天内完成，成本是「几百美元的 LLM 调用 + 几小时的微调」，换来的是一个便宜三个数量级的线上服务。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么便宜这么多？因为两件事叠乘：<strong>①参数量差 60 倍</strong>（110M vs 7B）；<strong>②前向次数差几十倍</strong>（encoder 1 次 vs LLM 生成 20 个 token 要 20 次 decode + 1 次 prefill）。<em>60 × 20 = 1200 倍</em>——这还没算 LLM 需要 GPU 而 encoder 可以跑 CPU。本模块的 notebook 会把这笔账精确算出来，你会看到从 <code>$X/百万次调用</code> 到 <code>$X/1000</code> 的差距。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>但要公平：<strong>有三类情况 encoder 明确不适用</strong>。①输出是自由文本（改写、摘要、对话）——encoder 生成不了；②任务需要世界知识或复杂推理（「这段代码有什么安全隐患」）——小 encoder 没有这些能力；③需求变化极快、来不及标注和重训——LLM 改个 prompt 就上线了。<em>选型的第一个问题不是「哪个更准」，而是「我的任务落在哪一类」</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost"><span class="num">2</span>推理成本：把差距算成数字</h2>
+  <p>这一节把「便宜」变成可验证的数字。任务：对一段 128 token 的文本做二分类。</p>  <div class="math-block">\[\text{FLOPs} \approx 2 \times N_{params} \times N_{tokens\_processed}\]</div>  <p>这个经验公式（每个参数每个 token 约 2 次浮点运算，前向）足够做量级比较。关键在 <code>N_tokens_processed</code>——它对两种方案完全不同：</p>  <table>
+    <thead><tr><th>方案</th><th>参数量</th><th>处理的 token 数</th><th>前向 FLOPs</th><th>相对</th></tr></thead>
+    <tbody>
+      <tr><td>BERT-base 分类</td><td>110M</td><td>128（一次编码）</td><td>≈ 2.8×10¹⁰</td><td><strong>1×</strong></td></tr>
+      <tr><td>DeBERTa-v3-base</td><td>184M</td><td>128</td><td>≈ 4.7×10¹⁰</td><td>1.7×</td></tr>
+      <tr><td>DistilBERT（6 层）</td><td>66M</td><td>128</td><td>≈ 1.7×10¹⁰</td><td><strong>0.6×</strong></td></tr>
+      <tr><td>Llama-8B zero-shot（输出 5 token）</td><td>8B</td><td>128 prefill + 5 decode</td><td>≈ 2.1×10¹² + 生成</td><td><strong>≈ 75×</strong></td></tr>
+      <tr><td>Llama-8B 输出 100 token（带解释）</td><td>8B</td><td>128 + 100</td><td>≈ 3.6×10¹²</td><td><strong>≈ 130×</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>FLOPs 只是一半的故事，<strong>另一半是内存带宽</strong>。LLM 的 decode 阶段是 memory-bound 的——每生成一个 token 都要把全部权重从显存读一遍。8B 模型 fp16 是 16 GB，即使在 2 TB/s 带宽的卡上，理论上每步至少 8 ms。生成 100 个 token 就是 0.8 秒起。<em>而 BERT-base 的一次前向在同一张卡上是毫秒级</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个更实际的维度：<strong>能不能跑在 CPU 上</strong>。BERT-base 在现代 CPU 上单条推理约 20–50 ms，完全可以在没有 GPU 的服务器上部署；量化后（INT8）可以到 10 ms 以内。8B LLM 在 CPU 上是几秒一个 token，实用性为零。<em>「不需要 GPU」这件事本身就是巨大的成本与运维差异</em>——这是 C48 模块 03/05 讨论的整个 GPU 调度与成本问题都可以跳过。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个必须诚实标注的边界：<strong>上面的对比是「同样做二分类」的场景</strong>。如果任务本身需要 LLM 的能力（推理、世界知识、生成），这个对比就不成立——不是 encoder 便宜 100 倍，而是 encoder <em>做不了</em>。<strong>成本比较只在「两者都能达到可接受精度」的前提下有意义</strong>。所以正确的顺序是：先确认 encoder 能不能达到精度要求（跑一个实验），能，再谈成本；不能，成本再低也没用。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="distill"><span class="num">3</span>蒸馏：把 LLM 的能力搬进小模型</h2>
+  <p>既然大模型准、小模型快，自然的想法是<strong>让小模型学大模型</strong>。这就是 <span class="term">knowledge distillation</span>（知识蒸馏，Hinton et al. 2015）。</p>  <h3>为什么软标签比硬标签好</h3>  <p>蒸馏的核心不是「用大模型的预测当标签」，而是<strong>用大模型的完整概率分布当标签</strong>。区别很大：</p>  <div class="ascii">一张图片/一段文本，教师模型的输出分布:
+
+  硬标签 (one-hot):     [0, 1, 0, 0]           ← 只告诉你「是猫」
+  软标签 (soft):        [0.02, 0.85, 0.12, 0.01]
+                          狗    猫    虎   汽车
+                                     ↑
+                        「有点像虎」——这条信息在硬标签里完全丢失！
+
+软标签携带的是**类间相似结构**（dark knowledge）：
+  · 猫和虎相似，和汽车不相似
+  · 这个样本有多典型（0.85 vs 0.99）
+一个 4 类问题，硬标签给 log2(4)=2 bit，软标签给的信息多得多。</div>  <div class="math-block">\[\mathcal{L} = \alpha \underbrace{\text{CE}(y_{true}, p_{student})}_{\text{硬标签}} + (1-\alpha) \underbrace{T^2 \cdot \text{KL}\big(p^{T}_{teacher} \,\|\, p^{T}_{student}\big)}_{\text{软标签，温度 } T}\]</div>  <table>
+    <thead><tr><th>超参</th><th>作用</th><th>典型值</th><th>注意</th></tr></thead>
+    <tbody>
+      <tr><td><strong>温度 T</strong></td><td><code>softmax(logits/T)</code>，T 越大分布越平滑、暴露越多类间结构</td><td>2 – 5</td><td>T=1 退化为普通概率；T→∞ 趋于均匀</td></tr>
+      <tr><td><strong><code>T²</code> 缩放</strong></td><td>补偿软标签梯度随 <code>1/T²</code> 衰减</td><td>必须有</td><td>忘了它，蒸馏项的梯度会随 T 增大而消失</td></tr>
+      <tr><td><strong>α</strong></td><td>硬标签与软标签的权重</td><td>0.1 – 0.5</td><td>有真标签时保留一点硬标签通常更稳</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><code>T²</code> 这个因子是最容易被漏掉的细节。软标签交叉熵对 student logits 的梯度里带一个 <code>1/T</code>，而 teacher 分布本身的平滑又贡献一个 <code>1/T</code>，合起来梯度按 <code>1/T²</code> 衰减。所以要乘 <code>T²</code> 把它补回来，否则 <code>T=4</code> 时蒸馏项的梯度只有硬标签项的 1/16，等于没做蒸馏。<em>notebook 会把这个梯度尺度直接测出来。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>除了 logit 蒸馏，还有两类常用做法：<strong>①中间层蒸馏</strong>（让 student 的隐状态/注意力矩阵去拟合 teacher 的对应层，如 TinyBERT）——信号更密集但需要处理层数不匹配与维度对齐；<strong>②数据蒸馏</strong>（用 teacher 在<em>无标注数据</em>上打标签，然后当成普通监督数据训 student）——最简单、最工程友好，且<em>可以跨架构</em>（用 LLM 蒸馏到 encoder 就属于这类，因为二者的 logit 空间根本对不上）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>对「LLM → encoder」这个具体场景，<strong>只有数据蒸馏可行</strong>，因为两者的输出空间完全不同（LLM 输出的是 token 分布，encoder 输出的是类别分布）。但这反而简化了工程：<em>你只需要让 LLM 输出标签（甚至可以让它输出置信度当作软标签），然后当成普通标注数据用</em>。DistilBERT 那种同架构 logit 蒸馏是另一回事——它适用于「BERT → 小 BERT」，收益是 40% 更小、60% 更快、保留 97% 的 GLUE 性能。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="retrieval"><span class="num">4</span>检索：双塔与交叉编码的成本-精度前沿</h2>
+  <p>这是 encoder 今天<strong>最不可替代</strong>的战场。检索/语义搜索/RAG 的召回环节，几乎全部由 encoder 承担。原因就在模块 03 提过的那个二分：</p>  <div class="ascii">任务: 从 100 万个文档里找出与查询最相关的 10 个
+
+方案 A: cross-encoder（交叉编码）
+  对每个 (查询, 文档) 对拼在一起过模型 → 一个相关性分数
+  ┌──────────────────────────────────┐
+  │ [CLS] query [SEP] document [SEP] │──▶ BERT ──▶ score
+  └──────────────────────────────────┘
+  精度: ★★★★★（query 与 doc 的每个 token 都能互相注意）
+  成本: **100 万次前向 / 每个查询**  ← 完全不可行
+
+方案 B: bi-encoder（双塔）
+  两边分别编码成向量，用点积/余弦打分
+  query ──▶ BERT ──▶ q (768,)          ┐
+  doc   ──▶ BERT ──▶ d (768,)          ┘──▶ score = q·d
+  精度: ★★★（两边没有交互）
+  成本: **文档向量离线预计算一次**；在线只编码 query（1 次）+ 向量检索（ANN，毫秒级）
+
+方案 C: 两阶段（工业标准）
+  ① bi-encoder 召回 top-100    （1 次前向 + ANN 检索）
+  ② cross-encoder 精排 top-100 （100 次前向）
+  精度: ★★★★☆   成本: 101 次前向 —— 可行！</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>两阶段架构不是妥协，而是<strong>在成本-精度前沿上的正确取点</strong>。它利用了一个关键的不对称：<em>召回阶段只需要「不漏掉」（高 recall），不需要精确排序；精排阶段只需要处理很少的候选</em>。把「贵而准」的模型用在已经缩小到 100 个的候选集上，成本就从 100 万次降到 100 次。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>定量地看：设召回 <code>k</code> 个候选，双塔的 recall@k 是 <code>R(k)</code>，交叉编码在候选集内的精度是 <code>P</code>。端到端质量约为 <code>R(k) × P</code>，成本约为 <code>C_bi + k·C_cross</code>。<code>R(k)</code> 随 <code>k</code> 快速饱和（k=10→100 提升明显，100→1000 提升很小），而成本随 <code>k</code> 线性增长。<strong>所以最优 <code>k</code> 落在 <code>R(k)</code> 曲线的拐点附近</strong>，通常是 50–200。notebook 会把这条前沿画出来并求最优 k。</p></div>
+  </div>  <h3>句嵌入：为什么不能直接用 BERT 的 [CLS]</h3>  <p>模块 01 和 03 都提过这一点，这里给出完整的原因与解法。<strong>直接拿预训练 BERT 的 <code>[CLS]</code>（或 mean pooling）做句向量，效果比 GloVe 词向量平均还差</strong>（Reimers &amp; Gurevych 2019 的著名发现）。三个原因：</p>  <ul>
+    <li><strong><code>[CLS]</code> 没有被训练过</strong>（去掉 NSP 后尤其如此）——模块 01 已论证。</li>
+    <li><strong>各向异性（anisotropy）</strong>：BERT 的表示集中在一个狭窄锥体里，任意两句的余弦相似度都在 0.7+，失去区分度。</li>
+    <li><strong>训练目标错配</strong>：MLM 优化的是「从上下文恢复词」，不是「相似句子的向量应该接近」。这两个目标并不天然一致。</li>
+  </ul>  <p>解法是<strong>用对比学习专门训练句嵌入</strong>：SBERT 用有监督的 NLI 数据（蕴含对为正例、矛盾对为负例），SimCSE 用无监督的 dropout 作为数据增强（同一句过两次 dropout 得到正例对，batch 内其他句为负例）。核心损失是 <span class="term">InfoNCE</span>：</p>  <div class="math-block">\[\mathcal{L} = -\log \frac{\exp(\text{sim}(q, d^+)/\tau)}{\exp(\text{sim}(q, d^+)/\tau) + \sum_{d^-} \exp(\text{sim}(q, d^-)/\tau)}\]</div>  <div class="callout danger"><span class="label">负例设计再次决定一切</span>
+    <p>对比学习有个决定成败的因素：<strong>负例的质量与数量</strong>。用 batch 内随机句子当负例（in-batch negatives）最简单，但这些负例太容易区分（主题都不同），模型学不到细粒度。<strong>hard negatives</strong>（用当前模型检索出来的、排名靠前但实际不相关的文档）能大幅提升效果，DPR 与后续工作都强调这一点。<em>这又回到了模块 01 的那条方法论：负例设计决定任务难度，也决定学到什么</em>——NSP 的失败、SOP 的成功、对比学习的 hard negative，是同一条原理的三次体现。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="when"><span class="num">5</span>选型决策：一棵可执行的树</h2>
+  <div class="ascii">① 你的输出是什么？
+   ├─ 自由文本（改写/摘要/对话/代码）
+   │    └─▶ 生成式。短输入长输出 → decoder-only LLM
+   │                 长输入短输出 → enc-dec（T5/BART 系）或 LLM，算 KV 账（模块 04）
+   │
+   └─ 标签 / 片段 / 向量  →  进入 ②
+
+② 有多少标注数据？
+   ├─ 0 条，且需求可能天天变
+   │    └─▶ LLM zero/few-shot。**先上线，再看要不要优化**
+   │
+   ├─ 0 条，但需求稳定、量大
+   │    └─▶ **LLM 造标注 → 蒸馏到 encoder**  ← 最被低估的方案
+   │
+   └─ 几百条以上  →  进入 ③
+
+③ 推理量有多大？
+   ├─ 小（每天几千次）
+   │    └─▶ 怎么方便怎么来。工程时间比算力贵。
+   │
+   └─ 大（每天百万次 / 需要低延迟 / 要跑 CPU）
+        └─▶ **encoder 微调**（DeBERTa-v3 起步，不是 bert-base）
+             ├─ 还要更快 → 蒸馏 + INT8 量化（C27）
+             └─ 是检索任务 → 双塔召回 + 交叉编码精排两阶段</div>  <p>这棵树里有几个判断值得单独强调，因为它们与「直觉」相反：</p>  <table>
+    <thead><tr><th>常见直觉</th><th>更准确的说法</th></tr></thead>
+    <tbody>
+      <tr><td>「LLM 更强，所以精度更高」</td><td><strong>有足够标注数据时，微调过的 encoder 在<em>封闭标签集</em>任务上通常不输甚至更好</strong>。LLM 的优势是零样本与泛化，不是「在这个特定任务上更准」</td></tr>
+      <tr><td>「小模型是过渡方案，早晚被淘汰」</td><td><strong>单位经济的差距是 100–1000 倍，不会因模型进步而消失</strong>。只要还存在「高频、简单、封闭」的任务，小模型就有位置</td></tr>
+      <tr><td>「用 BERT 就够了」</td><td><strong><code>bert-base-uncased</code> 是 2018 年的技术</strong>。同等成本下 DeBERTa-v3 或现代化 encoder 明显更好（模块 02）</td></tr>
+      <tr><td>「LLM 蒸馏很复杂」</td><td><strong>数据蒸馏就是「让 LLM 打标签，再当普通监督数据用」</strong>，几百行代码、几百美元、几天时间</td></tr>
+      <tr><td>「检索用 LLM embedding 更好」</td><td>取决于任务与预算。<strong>专门训练的小嵌入模型在很多检索基准上不输大模型 embedding，而且便宜几十倍</strong>；但跨语言/长文档场景大模型 embedding 有优势</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>还有一个纯工程的考量常被忽略：<strong>可控性与可测试性</strong>。encoder 分类器的输出必然落在预定义的标签集里，你可以为它写单元测试、算精确的混淆矩阵、设置阈值、做校准（C10）。LLM 输出的是自由文本，即使要求它「只输出 A 或 B」，也存在小概率输出别的东西——你必须写解析与兜底逻辑。<em>在需要严格 SLA 的生产环境里，「输出空间受约束」本身就是一个有价值的性质</em>，它不体现在任何 benchmark 分数上。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">6</span>算一笔账：一个真实的选型决策</h2>
+  <p>场景：内容审核，判断一段用户评论是否违规。每天 200 万次调用，延迟要求 P95 &lt; 100 ms，已有 5000 条人工标注。</p>  <table>
+    <thead><tr><th>方案</th><th>精度（假设）</th><th>单次成本</th><th>日成本</th><th>P95 延迟</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>Llama-8B zero-shot</td><td>0.86</td><td>$0.00012</td><td><strong>$240</strong></td><td>~800 ms</td><td>❌ 延迟超标</td></tr>
+      <tr><td>Llama-8B + LoRA 微调</td><td>0.93</td><td>$0.00012</td><td>$240</td><td>~800 ms</td><td>❌ 延迟超标</td></tr>
+      <tr><td>DeBERTa-v3-base 微调</td><td>0.94</td><td>$0.0000018</td><td><strong>$3.6</strong></td><td>~35 ms</td><td>✅ <strong>推荐</strong></td></tr>
+      <tr><td>DistilBERT 蒸馏 + INT8</td><td>0.92</td><td>$0.0000004</td><td><strong>$0.8</strong></td><td>~12 ms</td><td>✅ 极端成本敏感时</td></tr>
+    </tbody>
+  </table>  <p>这张表里最刺眼的数字是 <strong>$240 vs $3.6</strong>——<em>67 倍</em>，一年是 8.6 万美元 vs 1300 美元。而精度差异是 0.93 vs 0.94（encoder 反而略高，因为有 5000 条领域内标注）。</p>  <p>但表格没说的部分同样重要，必须诚实列出：</p>  <ul>
+    <li><strong>如果只有 0 条标注</strong>，LLM zero-shot 的 0.86 就是你能立刻拿到的；encoder 需要先标注或先蒸馏。<em>「立刻可用」有真实的商业价值。</em></li>
+    <li><strong>如果违规类型每周都在变</strong>（新的规避手段），LLM 改 prompt 即可，encoder 要重新标注+重训。<em>迭代速度可能比成本更重要。</em></li>
+    <li><strong>如果需要给出违规理由</strong>（给运营看的解释），encoder 给不了。这时可能需要「encoder 判断 + LLM 只对判为违规的少数样本生成解释」的混合方案——<em>又是一个两阶段架构。</em></li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>把整门课浓缩成一句话：<strong>三种 Transformer 形态不是「进化的三个阶段」，而是「注意力掩码的三种画法」，各自在不同的任务形状上占优；今天的正确做法不是选一个，而是把它们组合成两阶段/混合架构，让贵的模型只处理少量真正需要它的样本</strong>。双塔召回 + 交叉精排是这样，LLM 造标注 + encoder 上线是这样，encoder 判断 + LLM 解释也是这样。<em>「用便宜的模型过滤，用贵的模型处理剩下的」是这个领域最通用、最被低估的架构模式。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>encoder 与 decoder 的能力边界</strong>：随着 decoder-only 规模增长，双向表示的优势在很多基准上被抹平。<em>在什么任务、什么规模下双向仍有不可替代的优势</em>，缺乏系统的实证刻画。有工作发现在需要精细 token 级理解的任务（NER、抽取）上 encoder 仍占优，但边界不清晰。</li>
+    <li><strong>LLM 作为标注器的可靠性</strong>：数据蒸馏的质量上限由 teacher 决定。LLM 标注的系统性偏差（位置偏好、长度偏好、对模糊样本的过度自信）会被 student 完整继承甚至放大。如何检测与校正这些偏差、以及需要多少人工标注来锚定，是活跃的实践问题（与 C03/C10 的 LLM-judge 研究同源）。</li>
+    <li><strong>嵌入模型的统一评估</strong>：MTEB 等基准推动了嵌入模型的发展，但也带来「刷榜」问题——针对基准优化的模型未必在真实检索中更好。检索质量与下游 RAG 效果之间的关系也不是单调的（更好的召回不一定带来更好的生成）。</li>
+    <li><strong>两阶段架构的联合优化</strong>：召回与精排通常分别训练，但它们的目标并不一致（召回要 recall，精排要 precision）。端到端联合训练、或让精排的信号回流指导召回（如 distillation from cross-encoder to bi-encoder）是有效但尚未标准化的方向。</li>
+    <li><strong>encoder 的现代化与规模化</strong>：把现代组件装进 encoder 已被证明有效（模块 02），但 encoder 的缩放律、以及「大 encoder」（10B+）是否有价值，几乎无人系统研究。<em>这可能是一个被规模化叙事掩盖的机会</em>。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Hinton, Vinyals &amp; Dean 2015 <em>Distilling the Knowledge in a Neural Network</em>（软标签与温度的原始推导，注意 <code>T²</code> 因子的来源）、Sanh et al. 2019 <em>DistilBERT</em>（同架构蒸馏的标准配方）、Reimers &amp; Gurevych 2019 <em>Sentence-BERT</em>（为什么原始 BERT 的句向量不能用，以及怎么修）、Gao et al. 2021 <em>SimCSE</em>（无监督对比学习与各向异性分析）、Karpukhin et al. 2020 <em>DPR</em>（双塔检索与 hard negatives）、Nogueira &amp; Cho 2019 <em>Passage Re-ranking with BERT</em>（交叉编码精排）、Muennighoff et al. 2023 <em>MTEB</em>（嵌入模型的统一评估）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_encoder_decoder/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · Encoder-Decoder</div></a>
+  </div>
+
+</div>
+</body>
+</html>

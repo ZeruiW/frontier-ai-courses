@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · GAT 与 GraphSAGE</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · GAT 与 GraphSAGE</h1>
+  <p class="subtitle">对 GCN 两条硬伤的两台手术 —— GAT 用注意力让边权可学、看人下菜碟（多头稳定）；GraphSAGE 用邻居采样 + 可学聚合器，把 GNN 从直推推向归纳、从小图推向大图</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（GCN、MPNN、对称归一化）、注意力机制（query/key/value/softmax，C15）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_gat_sage.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Veličković 2018 (GAT)、Hamilton 2017 (GraphSAGE)、Brody 2022 (GATv2)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">两台手术：GAT 修权重、SAGE 修直推</a></li>
+      <li><a href="#gat">GAT 注意力：逐边打分、邻域归一</a></li>
+      <li><a href="#heads">多头注意力</a></li>
+      <li><a href="#sage">GraphSAGE：从直推到归纳</a></li>
+      <li><a href="#agg">聚合器：mean / pool / LSTM</a></li>
+      <li><a href="#sample">邻居采样：扩展到大图</a></li>
+      <li><a href="#compare">GCN/GAT/SAGE 对照</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>两台手术：GAT 修权重、SAGE 修直推</h2>
+  <p>上一模块的 GCN 极简极强，但我们也看清了它的两条硬伤：<strong>聚合权重固定</strong>（由度数决定、不可学，无法表达「这个邻居更重要」），以及<strong>直推</strong>（在整张固定图上训练，难以泛化到新节点）。这一模块就是对这两条硬伤的<strong>两台精准手术</strong>——<span class="term">GAT</span>（图注意力网络，Veličković 2018）修「固定权重」，<span class="term">GraphSAGE</span>（Hamilton 2017）修「直推」。它们都仍是消息传递的实例，只是把 MPNN 的某个零件换成了更聪明的版本。</p>  <p>先看 GAT 要解决的问题。GCN 聚合邻居时，边 $(i,j)$ 的权重恒为 $\hat A_{ij}=1/\sqrt{\tilde d_i\tilde d_j}$——<strong>纯由度数决定，与节点特征无关</strong>。但现实里，不是所有邻居都同等重要：在引文网里，一篇综述被几百篇论文引用，但只有少数几篇真正决定它的主题；在社交网络里，你的某个朋友比另一个更能代表你的兴趣。GCN 没法表达这种「<em>我应该多听谁的</em>」。GAT 的答案是：<strong>让边权由一个注意力机制学出来</strong>，而且这个权重依赖于<em>两端节点当前的特征</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 GCN 想成「无论朋友是谁，都按人头平摊地听」；GAT 则是「先快速判断每个朋友这次说的话有多相关，再按相关度加权地听」。权重不再写死在图结构里，而是<strong>看人下菜、看内容下菜</strong>、并且随训练学得越来越准。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这正是把 Transformer 的注意力（C15）搬到图上：query-key 打分、softmax 归一、value 加权和。区别在于<strong>GAT 的注意力只在邻域内算</strong>（每个节点只关注它的邻居，而非全图）——这保留了图的局部结构先验，也是它与下一模块「全局」图 Transformer 的分界。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>用 MPNN 三问定位 GAT：<strong>消息</strong> = 邻居特征经 $W$ 变换后的 value；<strong>聚合</strong> = 按<em>学出来的注意力系数</em> $\alpha_{ij}$ 加权求和（仍是置换不变的，因为 softmax 在集合上）；<strong>更新</strong> = 非线性。和 GCN 唯一的本质差别，就是聚合权重从「固定的 $\hat A_{ij}$」变成了「可学的 $\alpha_{ij}$」。一句话：<strong>GAT = 把 GCN 的固定边权换成注意力</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="gat"><span class="num">2</span>GAT 注意力：逐边打分、邻域归一</h2>
+  <h3>GAT 的注意力机制：逐边打分、邻域归一</h3>  <p>GAT 一层的计算分四步，每一步都值得拆开看。设节点 $i$ 的输入特征 $h_i\in\mathbb{R}^F$，可学习的线性变换 $W\in\mathbb{R}^{F'\times F}$、注意力向量 $a\in\mathbb{R}^{2F'}$：</p>  <ol>
+    <li><strong>线性变换</strong>：$z_i=Wh_i$（把每个节点特征投到 $F'$ 维，和 GCN 的 $W$ 一样）；</li>
+    <li><strong>逐边打分</strong>：对每条边 $(i,j)$，把两端变换后的特征拼接，过一个单层网络 + LeakyReLU 得到原始分数 $e_{ij}=\text{LeakyReLU}(a^\top[z_i\,\Vert\,z_j])$；</li>
+    <li><strong>邻域内 softmax 归一化</strong>：$\alpha_{ij}=\dfrac{\exp(e_{ij})}{\sum_{k\in\mathcal N(i)}\exp(e_{ik})}$——注意分母只对 $i$ 的邻居求和，使 $\{\alpha_{ij}\}_j$ 成为 $i$ 邻域上的一个概率分布；</li>
+    <li><strong>加权聚合 + 非线性</strong>：$h_i'=\sigma\Big(\sum_{j\in\mathcal N(i)}\alpha_{ij}z_j\Big)$。</li>
+  </ol>  <div class="math-block">\[\alpha_{ij}=\frac{\exp\big(\text{LeakyReLU}(a^\top[Wh_i\,\Vert\,Wh_j])\big)}{\sum_{k\in\mathcal N(i)}\exp\big(\text{LeakyReLU}(a^\top[Wh_i\,\Vert\,Wh_k])\big)},\qquad h_i'=\sigma\Big(\sum_{j\in\mathcal N(i)}\alpha_{ij}\,Wh_j\Big)\]</div>  <p>第 3 步的<strong>邻域内归一化</strong>是 GAT 的灵魂，也是最容易实现错的地方。注意力分数 $\{\alpha_{ij}\}$ 必须在<em>每个中心节点 $i$ 自己的邻居集合上</em>归一化（每行和为 1），而不是在全图所有节点上、也不是在所有边上。直觉上：节点 $i$ 在「分配它的注意力预算」给自己的邻居们，预算总和为 1。notebook 会专门验证<strong>每个节点的注意力系数之和恰为 1</strong>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>两个常见实现陷阱：其一，GAT 通常也<strong>加自环</strong>（让节点关注自己），否则节点更新时完全不含自身信息；其二，非邻居之间<strong>不打分</strong>（$\alpha_{ij}$ 只在边上有定义），实现时要用图结构做掩码（mask），把非邻居的分数设为 $-\infty$ 再 softmax——这和 Transformer 里的注意力掩码一模一样。漏掉掩码会让 GAT 退化成全连接注意力，丢掉图结构。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>算一个 α</h4>  <p>设中心节点 $i$ 有两个邻居 $j,k$（含自环则三个），打分得到原始 $e_{ij}=2.0,\ e_{ik}=0.0$。softmax：$\alpha_{ij}=\dfrac{e^{2}}{e^{2}+e^{0}}\approx\dfrac{7.39}{8.39}\approx 0.88$、$\alpha_{ik}\approx 0.12$，二者<strong>和为 1</strong>。于是聚合 $h_i'=\sigma(0.88\,z_j+0.12\,z_k)$——节点 $j$ 被"听"得多得多。换成 GCN，两条边权只由度决定、与内容无关，给不出这种"偏听"。</p></div>
+    <div class="formal"><h4>注意力的梯度去哪了</h4>  <p>注意力系数 $\alpha_{ij}$ 是 $h_i,h_j$ 与参数 $a,W$ 的可微函数，所以训练时梯度<strong>同时</strong>流向"该听谁"（经 $\alpha$）和"邻居特征本身"（经 $z_j$）。这正是 GAT 比 GCN 多出的学习能力：它不只学"如何变换特征"，还学"如何分配注意力"。代价是每条边都要存一个标量分数、反传也更重——稀疏图上仍是 $O(|E|)$，但常数比 GCN 大。notebook 会对一个 toy 邻域手算 $\alpha$ 并与实现对拍。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="heads"><span class="num">3</span>多头注意力</h2>
+  <h3>多头注意力：稳定训练、捕捉多种关系</h3>  <p>单个注意力头容易<strong>不稳定</strong>（一次随机初始化可能学偏）且<strong>表达力有限</strong>（只能捕捉一种「相关性」）。GAT 沿用 Transformer 的解法——<strong>多头注意力（multi-head attention）</strong>：并行跑 $K$ 个独立的注意力头（各有自己的 $W^{(k)},a^{(k)}$），再把结果合并。</p>  <p>合并方式在 GAT 里有讲究，分两种情形：</p>  <table>
+    <thead><tr><th>位置</th><th>合并方式</th><th>输出维度</th><th>原因</th></tr></thead>
+    <tbody>
+      <tr><td>中间层</td><td><strong>拼接</strong> concat：$h_i'=\Vert_{k=1}^{K}\sigma(\sum_j\alpha_{ij}^{(k)}z_j^{(k)})$</td><td><code>K × F'</code></td><td>保留每个头的不同视角，喂给下一层</td></tr>
+      <tr><td>最后一层</td><td><strong>平均</strong> average：$h_i'=\sigma(\frac1K\sum_k\sum_j\alpha_{ij}^{(k)}z_j^{(k)})$</td><td><code>F'</code></td><td>输出维度要对齐类别数，不能拼接膨胀</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>多头就像「多个评委独立打分」：每个评委（头）有自己的偏好和关注点，综合多个评委的意见比只听一个更稳、更全面。中间层把所有评委的打分都留着（拼接）给后续参考；最后一层则取平均给出最终结论。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，$K$ 个头让模型能在<strong>不同的表示子空间</strong>里分别学注意力——一个头可能关注「主题相似的邻居」，另一个关注「高被引的权威邻居」。这与 Transformer 多头的动机完全一致，也是 GAT 比 GCN 表达力更强的来源之一。notebook 会实现多头并验证拼接后的维度与各头的独立性。</p></div>
+  </div>  <p>GAT 相对 GCN 的代价是<strong>计算量与参数增加</strong>（每条边要算分数、每个头独立参数），但换来三个好处：<strong>自适应的邻居权重</strong>（核心）、<strong>对噪声边更鲁棒</strong>（不相关的邻居会被自动降权）、以及<strong>天然处理异配的潜力</strong>（理论上注意力可以学会「不听邻居的」，尽管实践中仍需专门设计）。</p>  <div class="callout danger"><span class="label">静态注意力的陷阱</span>
+    <p>一个反直觉但重要的发现（Brody 2022, GATv2）：原始 GAT 的注意力其实是<strong>「静态」</strong>的——因为打分式 $\text{LeakyReLU}(a^\top[Wh_i\Vert Wh_j])$ 把 $a$ 拆成 $[a_1\Vert a_2]$ 后等于 $a_1^\top Wh_i + a_2^\top Wh_j$，<em>第一项对固定的中心 $i$ 是常数</em>，于是邻居的<strong>排序与中心节点无关</strong>：无论谁当中心，总是同一个邻居得分最高。这违背了注意力的本意（"对不同 query 该有不同偏好"）。GATv2 只把顺序改成 $a^\top\text{LeakyReLU}(W[h_i\Vert h_j])$（先非线性、后投影），就恢复了<strong>「动态」注意力</strong>——表达力严格更强，且改动几乎零成本。这是"魔鬼在公式细节里"的经典案例，notebook 会对比两种打分的排序行为。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sage"><span class="num">4</span>GraphSAGE：从直推到归纳</h2>
+  <h3>GraphSAGE：从直推到归纳</h3>  <p>现在转向第二台手术。标准 GCN 是<strong>直推（transductive）</strong>的：它在<em>整张固定图</em>上训练，$\hat A$ 是全图的归一化邻接；一旦来了训练时没见过的新节点（社交网络每天新增用户、推荐系统新上架商品），就得把新节点拼进图、重算 $\hat A$、甚至重训——这在动态大图上完全不可行。<strong>GraphSAGE</strong>（SAmple and aggreGatE）的洞察是：<strong>不要学「每个节点的嵌入」，而要学「如何从邻居聚合出嵌入」的函数</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直推像「背答案」：模型记住了图里每个具体节点该是什么表示，换一张图或加个新点就傻了。归纳（inductive）像「学方法」：模型学的是「给我一个节点和它的邻居，我能算出它的表示」这套<strong>可复用的规则</strong>——这套规则对新节点、甚至全新的图都适用。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>关键转变：把 GCN 的「<em>整图传播 $\hat A H W$</em>」换成「<em>对每个节点，采样固定数目邻居，用一个可学习的聚合器把它们的表示聚成一个，再和自己拼接、变换</em>」。因为聚合器（mean/pool/LSTM 等）和变换权重是<strong>跨节点共享</strong>的，它们一旦学好，遇到新节点照样能用。</p></div>
+  </div>  <p>GraphSAGE 一层对节点 $v$ 的计算是：</p>  <div class="math-block">\[h_{\mathcal N(v)}^{(l)}=\text{AGG}\big(\{h_u^{(l-1)}:u\in\mathcal S(v)\}\big),\qquad h_v^{(l)}=\sigma\Big(W\cdot\big[h_v^{(l-1)}\,\Vert\,h_{\mathcal N(v)}^{(l)}\big]\Big)\]</div>  <p>注意两个与 GCN 的关键区别：其一，$\mathcal S(v)$ 是从 $v$ 的邻居里<strong>随机采样的固定数目子集</strong>（不是全部邻居），这把计算从「随度数爆炸」压成「每节点固定开销」；其二，$h_v$ 自身是<strong>显式拼接</strong>进去的（$[h_v\Vert h_{\mathcal N(v)}]$），而不是像 GCN 那样靠自环隐式混入——这让「自己」和「邻域」的信息分开变换，表达力更强。标准 SAGE 还会对每层输出做 L2 归一化，进一步稳定尺度。</p>  <p>为什么<strong>显式拼接</strong>比 GCN 的「自环隐式混入」更好？因为拼接 $[h_v\Vert h_{\mathcal N(v)}]$ 让权重矩阵 $W$ 能<strong>对「自己」和「邻域」学不同的变换</strong>——前 $F$ 列处理自身、后 $F$ 列处理邻域，模型可以学会「我自己的特征该信几分、邻居的平均该信几分」。GCN 把自己当成一个普通邻居加进去，自身与邻域共享同一套权重、被迫等同对待。这个看似细小的设计差别，在异配或自身特征很重要的任务上能带来明显差异，也是 GraphSAGE 即便用最简单的 mean 聚合也常常不输 GCN 的原因之一。</p>  <p>至于<strong>L2 归一化</strong>（每层输出除以其范数），它解决的是采样带来的尺度漂移：不同节点采到的邻居数虽固定但内容不同，聚合结果的尺度会波动；把每个节点的表示投到单位球面上，使后续层和分类器面对的输入尺度一致，训练更稳。这与 Transformer 里的 LayerNorm 异曲同工——都是在为深层网络<em>稳住数值尺度</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="agg"><span class="num">5</span>聚合器：mean / pool / LSTM</h2>
+  <h3>聚合器：mean / pool / LSTM</h3>  <p>GraphSAGE 把「如何把一组邻居表示汇成一个向量」抽象成可替换的<strong>聚合器（aggregator）</strong>。聚合器的选择直接决定模型能区分多少种邻域结构——这正是模块 05 表达力讨论（GIN）的前奏。三种经典聚合器：</p>  <ul>
+    <li><strong>mean 聚合</strong>：$\text{AGG}=\frac{1}{|\mathcal S|}\sum_{u\in\mathcal S}h_u$。最简单，近似于（行归一化的）GCN 聚合，但 SAGE 把它和自身拼接而非相加。计算最省，是常用默认。</li>
+    <li><strong>pool 聚合</strong>：$\text{AGG}=\max_{u\in\mathcal S}\big(\sigma(W_{\text{pool}}h_u+b)\big)$（逐元素 max）。先把每个邻居过一个小 MLP，再逐维取最大。比 mean 更有表达力——能捕捉「邻域里有没有某种特征」而不只是「平均水平」。</li>
+    <li><strong>LSTM 聚合</strong>：把邻居<em>随机排序</em>后喂进一个 LSTM。表达力最强，但破坏了置换不变（靠随机排序近似补偿），且最慢。原论文报告它常常效果最好，但实用中 mean/pool 更受欢迎。</li>
+  </ul>  <p>一个微妙但重要的点：<strong>除了 LSTM，聚合器都必须置换不变</strong>——这是图模型的硬约束。mean 和 max 天然满足；LSTM 不满足，所以 SAGE 用「每次随机打乱邻居顺序」来<em>近似</em>地抹掉顺序依赖（训练时见过足够多种顺序）。这也预示了模块 05 的一个深刻结论（GIN）：聚合器的<strong>单射性（injectivity）</strong>决定了 GNN 的表达力上界——mean 会把「邻居全是 A」和「邻居一半 A 一半 A」混淆，max 会丢失重数，只有 sum + MLP 能达到 1-WL 的判别力。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>怎么选聚合器？<strong>默认 mean（省、稳），需要更强表达力时上 pool，追求极致且不在乎置换不变性时试 LSTM</strong>。但记住一条贯穿全课的原则：聚合是 GNN 信息汇聚的咽喉，它的表达力（能区分哪些邻域多重集）往往比「加多少层」更决定模型能力。notebook 会实现 mean 与 pool 两种聚合器并对比它们能区分的邻域结构。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sample"><span class="num">6</span>邻居采样：扩展到大图</h2>
+  <h3>邻居采样：让 GNN 扩展到大图</h3>  <p>GraphSAGE 的第二个核心贡献是<strong>邻居采样（neighbor sampling）</strong>，它解决的是<strong>大图的计算爆炸</strong>问题。在大图上，朴素的全邻域聚合有个致命的「邻域爆炸」：算一个 2 层 GNN 对某节点的输出，要它所有邻居的 1 层表示，而每个邻居又要它们各自所有邻居的输入……$L$ 层下来，感受野是<strong>度数的 $L$ 次方</strong>——在高度数图上，一个节点的 2 跳邻域就可能覆盖大半张图。</p>  <p>采样的做法极简：<strong>每层为每个节点只随机采样固定数目（如第 1 层 25 个、第 2 层 10 个）邻居参与聚合</strong>。这把每个节点每层的计算从 $O(\text{度数})$ 压成 $O(\text{采样数})$，$L$ 层的感受野从「度数的 $L$ 次方」压成「采样数的乘积」（如 $25\times 10=250$）这个<em>固定的、可控的</em>数目。于是 GNN 终于能做<strong>mini-batch 训练</strong>：每个 batch 只需采样目标节点及其 $L$-跳采样邻域构成的小子图，放进显存。</p>  <div class="ascii">邻域爆炸 vs 采样（2 层 GNN，平均度数 d）：
+  全邻域：目标节点 -&gt; d 个 1跳 -&gt; d^2 个 2跳   感受野 ~ d^2（大图上爆炸）
+  采样  ：目标节点 -&gt; 采 s1 个 -&gt; 各采 s2 个   感受野 ~ s1*s2（固定可控）
+
+  例：d=100 -&gt; 全邻域 10000；采样 s1=25,s2=10 -&gt; 250（小 40 倍且与度无关）</div>  <p>采样引入了<strong>方差</strong>（每次采到的邻居不同，聚合结果有随机性），但这反而起到了类似 dropout 的正则作用，且训练时多个 epoch 见过足够多的采样组合、期望上无偏（mean 聚合下）。推理时可以采样多次取平均、或干脆用全邻域以求稳定。采样是后续一系列大图训练方法（GraphSAINT 的子图采样、Cluster-GCN 的分块）的思想源头——这些都是模块 05 的话题。notebook 会从零实现邻居采样并验证「采样子图的聚合是全邻域聚合的无偏估计」（mean 聚合下，多次采样的均值收敛到全邻域均值）。</p>  <div class="callout warn"><span class="label">无偏的前提与例外</span>
+    <p>"采样无偏"这句话有个<strong>容易被忽略的前提：只有 mean 聚合才严格无偏</strong>。对一个均匀采样的子集取平均，期望恰等于全邻域平均（这是样本均值的基本性质）。但换成 <strong>sum 聚合就有偏了</strong>——采 25 个邻居求和，期望只有全邻域和的 $25/d$ 倍，必须乘 $d/25$ 这个度相关因子修正回来；<strong>max 聚合更糟</strong>——采样子集的最大值系统性地<em>低估</em>全邻域最大值（采得越少偏得越多），且这个偏差无法用简单缩放消除。这正是 GraphSAINT 要引入"归一化系数"逐节点/逐边修偏的根本原因。一句话记牢：<strong>采样 + mean 天然无偏，采样 + sum/max 需要专门修正</strong>——这个区分在模块 05 的可扩展训练里会再次出现。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="compare"><span class="num">7</span>GCN/GAT/SAGE 对照</h2>
+  <h3>GAT vs GraphSAGE vs GCN：一张对照表</h3>  <p>三个模型都是消息传递的实例，但各自针对 GCN 的不同短板。把它们放在一起对照，整张「主力 GNN」地图就清晰了：</p>  <table>
+    <thead><tr><th>维度</th><th>GCN</th><th>GAT</th><th>GraphSAGE</th></tr></thead>
+    <tbody>
+      <tr><td>边权</td><td>固定（度归一化 $\hat A_{ij}$）</td><td><strong>可学注意力</strong> $\alpha_{ij}$</td><td>固定（聚合器内）</td></tr>
+      <tr><td>聚合</td><td>对称归一化加权和</td><td>注意力加权和（多头）</td><td><strong>可换聚合器</strong>（mean/pool/LSTM）</td></tr>
+      <tr><td>自身信息</td><td>靠自环隐式混入</td><td>靠自环（关注自己）</td><td><strong>显式拼接</strong> $[h_v\Vert h_{\mathcal N}]$</td></tr>
+      <tr><td>邻域</td><td>全邻域</td><td>全邻域</td><td><strong>采样固定数目</strong>邻居</td></tr>
+      <tr><td>归纳能力</td><td>直推为主</td><td>直推/归纳皆可</td><td><strong>天生归纳</strong>（学聚合函数）</td></tr>
+      <tr><td>主要解决</td><td>（基线）</td><td><strong>固定权重</strong>→自适应</td><td><strong>直推+大图</strong>→归纳+可扩展</td></tr>
+      <tr><td>代价</td><td>最省</td><td>注意力计算+参数</td><td>采样方差</td></tr>
+    </tbody>
+  </table>  <p>一个常见误解需要澄清：这三者<strong>不是互斥的「三选一」</strong>，而是可以<strong>组合</strong>的。比如可以用 GAT 的注意力当聚合器、配 GraphSAGE 的采样与拼接，得到一个「可学权重 + 归纳 + 可扩展」的模型；PyG/DGL 里这些都是可拼装的模块。理解每个零件<em>解决什么问题</em>，比记住某个具体模型的名字重要得多——这也是本课从零拆解的目的。</p>  <p>给一条实用的选型直觉，把这张表压成几句话：<strong>图小、要解释"模型在听谁" → GAT</strong>（注意力权重可视化，天然带可解释性）；<strong>图大、要上新节点 / mini-batch → GraphSAGE</strong>（采样 + 归纳是为大图量身定做）；<strong>图中等、同配、求简单稳健的基线 → GCN</strong>（最少参数、最快，常常已经够好）。一个常被忽视的事实是：在许多标准节点分类基准上，<em>调好的 GCN 与 GAT 的差距其实不大</em>——注意力的收益高度依赖任务是否真有"邻居不等权"的结构。所以别一上来就堆最复杂的模型，<strong>先用 GCN 立基线，再按瓶颈对症升级</strong>，这才是工程上正确的姿势。</p>  <p>到这里，「主力消息传递 GNN」的版图已经完整：GCN（基线）、GAT（可学权重）、GraphSAGE（归纳+采样）。但它们<strong>共享同一个根本局限</strong>——都是<em>局部</em>的，信息只能逐跳传播。当任务需要<strong>长程依赖</strong>（相距很远的两个节点必须交互）时，消息要穿过许多跳、经过图的瓶颈，会发生严重失真——这就是下一模块要正面处理的<strong>过挤压（over-squashing）</strong>，也是图 Transformer 登场的理由。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>注意力到底有没有用？</strong>：有研究（如某些 benchmark 上）发现 GAT 的注意力相比 GCN 的固定权重提升有限，甚至「注意力学到的近似均匀」。「图上注意力何时真正有益、学到了什么」仍有争议，催生了对注意力可解释性的研究。</li>
+    <li><strong>更强的图注意力</strong>：GATv2（Brody 2022）指出原始 GAT 的注意力是「静态」的（某些情形下排序与中心节点无关），改进 $a$ 与 LeakyReLU 的顺序得到「动态」注意力，表达力更强。注意力机制的设计仍在演进。</li>
+    <li><strong>归纳学习的边界</strong>：GraphSAGE 开启了归纳 GNN，但「跨图泛化」（在一组图上训、到全新结构的图上测）仍很难，尤其当图的统计分布差异大时。图上的迁移学习/预训练（如 GNN pretraining、图基础模型）是热点。</li>
+    <li><strong>采样的方差与偏差</strong>：邻居采样省算力但引入方差，且某些聚合器下有偏。方差缩减的采样（GraphSAINT 的归一化、重要性采样）、以及采样与收敛的理论分析，是大图训练的活跃方向。</li>
+    <li><strong>聚合器的表达力</strong>：mean/max 会丢失邻域多重集信息（GIN 的核心洞察）。「什么聚合器在表达力、计算、稳定性间最优」没有定论；超越 1-WL 的聚合（如加入结构特征）是模块 05 的延伸。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Veličković 2018（GAT 原始）、Hamilton 2017（GraphSAGE 原始）、Brody 2022（GATv2）、Hamilton 2020《Graph Representation Learning》第 5–6 章。下一模块的图 Transformer 会用「全局注意力」绕开本模块所有模型共有的「局部性」局限。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_message_passing/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 消息传递与 GCN</div></a>
+    <a class="next" href="../04_graph_transformer/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 图 Transformer</div></a>
+  </div>
+
+</div>
+</body>
+</html>

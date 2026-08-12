@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · RoPE Scaling 与 YaRN</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · RoPE Scaling 与 YaRN</h1>
+  <p class="subtitle">位置墙：训练 4k、推理 128k，RoPE 外推为何崩？Position Interpolation 等比压回、NTK-aware 改 base 护高频、YaRN 分频段 ramp + 注意力温度——三种缩放从零实现并用波长/外推误差量化</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、RoPE 基础（C20）、注意力数学、三角与指数</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_rope_scaling.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Su 2021 (RoPE)、Chen 2023 (PI)、Peng 2023 (YaRN)、bloc97 (NTK)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#wall">位置墙：RoPE 与它为何外推就崩</a></li>
+      <li><a href="#pi">Position Interpolation 位置插值</a></li>
+      <li><a href="#ntk">NTK-aware scaling：改一个 base</a></li>
+      <li><a href="#yarn">YaRN 的分频段 ramp</a></li>
+      <li><a href="#temp">YaRN 的注意力温度</a></li>
+      <li><a href="#eval">长度泛化怎么度量</a></li>
+      <li><a href="#config">真实框架里的 rope_scaling</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="wall"><span class="num">1</span>位置墙：RoPE 与它为何外推就崩</h2>
+  <p>长上下文的第一道墙是<strong>位置墙</strong>。要理解它，先回顾位置编码要解决的问题：注意力机制本身是<strong>置换不变</strong>的——打乱 token 顺序，注意力的输出只是跟着打乱，它分不清「猫追狗」和「狗追猫」。所以必须额外注入「谁在第几位」的信息。</p>  <p>当今主流 LLM（LLaMA、Qwen、Mistral……）用的是 <span class="term">RoPE</span>（旋转位置编码，Su et al. 2021）。它的巧妙之处在于：不把位置<em>加</em>到向量上，而是把 query/key 向量按维度成对、按位置<em>旋转</em>一个角度，使得两个向量的点积<strong>只依赖它们的相对位置</strong>。本课不重复 RoPE 的完整推导（见 C20），只取外推所需的核心：</p>  <div class="math-block">\[\theta_i = \text{base}^{-2i/d},\qquad \text{位置 } m \text{ 处第 } i \text{ 对维度的旋转角} = m\cdot\theta_i\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把每两个相邻维度看成平面上的一个点，RoPE 就是按位置把这个点转一个角度。不同维度对转的快慢不同：<strong>低维转得快（高频）、高维转得慢（低频）</strong>。位置越靠后，所有点转得越多。两个 token 的点积只看它们转角之差，于是天然编码了相对距离。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>频率 <code>θ_i = base^(−2i/d)</code> 随维度 <code>i</code> 指数衰减（<code>base</code> 常取 10000）。第 <code>i</code> 对维度的<strong>波长</strong> <code>λ_i = 2π/θ_i = 2π·base^(2i/d)</code>，即转满一圈所需的位置跨度。高维的波长可能<em>远超训练长度</em>——这些维度在训练中从未转满过一圈。这个事实是理解一切外推方法的钥匙。</p></div>
+  </div>  <p>现在揭示<strong>位置墙</strong>的本质：模型在训练时只见过位置 <code>0 ~ L_train</code>（比如 4096）。对每一对维度，它只见过旋转角落在 <code>[0, L_train·θ_i]</code> 这个区间里的样子。一旦推理长度超过 <code>L_train</code>，高频维度的旋转角会绕很多很多圈（虽然每个角度本身都见过），而<strong>低频维度的旋转角会第一次进入训练时从未出现的区间</strong>——模型对这些「陌生角度」的行为没有任何训练信号，注意力分数因此变得混乱，困惑度爆炸。这就是朴素外推会崩的原因。</p>  <p>为什么偏偏是<strong>低频维度</strong>出事，而不是高频？因为高频维度波长短，在训练长度内就转了成百上千圈，<code>[0, 2π]</code> 这个完整的角度区间被它反复扫过无数遍——任何外推位置的角度（取模 2π 后）都落在训练见过的范围里。而低频维度波长极长（可能是训练长度的几十倍），在训练时连一圈都没转完，只见过 <code>[0, 某个小角度]</code> 这一小段。外推时它继续往前转，立刻踏入<strong>纯粹的未知区</strong>。这就是「位置墙」的精确含义：<em>不是所有维度一起崩，而是低频维度率先踏空</em>——而后面所有外推方法，都是围绕「如何安顿这些低频维度」展开的。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="pi"><span class="num">2</span>Position Interpolation 位置插值</h2>
+  <h3>最朴素的修复：Position Interpolation（位置插值）</h3>  <p>Chen et al. 2023 的洞察直截了当：既然模型只在 <code>[0, L_train]</code> 的旋转角上训练过，那就别让位置超出这个角度范围——把<strong>更长的位置等比例压缩回训练区间</strong>。这就是 <span class="term">Position Interpolation</span>（PI）。</p>  <div class="math-block">\[m' = m\cdot\frac{L_\text{train}}{L_\text{target}},\qquad \text{即把缩放因子 } s=\frac{L_\text{target}}{L_\text{train}},\ \ \theta_i^{\text{PI}} = \theta_i / s\]</div>  <p>举例：训练 4k、想要 8k，则 <code>s=2</code>，把所有位置除以 2 再做 RoPE。原来位置 8000 的旋转角，现在等于位置 4000 的旋转角——<strong>落回了训练见过的范围</strong>。等价地，把每个频率 <code>θ_i</code> 都除以 <code>s</code>（波长拉长 <code>s</code> 倍）。</p>  <p>「分辨率变粗」不是空话，用最高频维度量化一下就触目惊心。<code>i=0</code> 时 <code>θ_0=1</code>（弧度/位置），相邻两个位置的旋转角差就是 1 弧度——模型靠这 1 弧度的差来区分「第 m 位」和「第 m+1 位」。PI 把它除以 <code>s=2</code> 后，相邻位置只差 0.5 弧度；若 <code>s=8</code>（4k→32k），只剩 0.125 弧度。<strong>缩放倍数越大，相邻 token 在最高频维度上的「角度间距」就越被压扁，模型分辨「紧邻」与「隔一个」的余地越小</strong>——这就是纯 PI 在大倍数下必须配微调、且高频局部分辨率受损的根因，也直接说明了为什么 NTK/YaRN 要费力把高频维度放过不动。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>PI 像把一把尺子的刻度均匀拉长：原来 1 厘米一格，现在 2 厘米一格，于是同样长的尺子能标更大的数。代价是<strong>分辨率变粗</strong>——相邻两个位置的旋转角差变小了，模型区分「相邻」和「隔一个」的能力下降。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>PI 的问题在于它<strong>均匀</strong>压缩了<em>所有</em>频率，包括本来就转得很快、根本不需要插值的高频维度。高频维度负责编码<strong>局部、精细</strong>的位置关系；把它们也压扁，会损害模型对近距离 token 的分辨。所以纯 PI 通常<strong>需要少量微调</strong>才能恢复性能。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住 PI 的一句话：<strong>把长位置等比压回训练范围，简单有效，但「一刀切」地压扁所有频率会牺牲高频的局部分辨率</strong>。它是所有外推方法的起点——后面的 NTK 和 YaRN，本质都是在回答同一个问题：<em>怎么只压该压的低频，放过不该压的高频？</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ntk"><span class="num">3</span>NTK-aware scaling：改一个 base</h2>
+  <h3>更聪明的修复：NTK-aware scaling</h3>  <p>NTK-aware scaling（来自社区 bloc97 2023，受神经正切核理论启发）抓住了 PI 的痛点：<strong>不该对所有频率一视同仁</strong>。它的策略是——<strong>高频维度几乎不动，低频维度才插值</strong>，且过渡是平滑的。</p>  <p>实现上有个漂亮的技巧：不去逐个频率调整，而是只改一个 <code>base</code>。把 <code>base</code> 放大到 <code>base'</code>：</p>  <div class="math-block">\[\text{base}' = \text{base}\cdot s^{\,d/(d-2)},\qquad \theta_i' = (\text{base}')^{-2i/d}\]</div>  <p>为什么改一个 base 就能实现「高频不动、低频插值」？因为 <code>θ_i = base^(−2i/d)</code> 对 base 的敏感度随 <code>i</code> 变化：<strong>最高频（i=0）的 θ_0=1 完全不受 base 影响；最低频（i 最大）受 base 影响最大</strong>。放大 base，几乎只拉长了低频维度的波长（对它们做了插值），而高频维度纹丝不动。那个 <code>s^{d/(d-2)}</code> 的指数是精心选的，使最低频维度恰好被插值了 <code>s</code> 倍——与 PI 在低频端对齐。</p>  <p>用一个具体数字把这件事坐实。取 <code>d=128</code>、原始 <code>base=10000</code>、想外推 <code>s=4</code> 倍。指数 <code>d/(d-2)=128/126≈1.016</code>，于是 <code>base' = 10000·4^{1.016} ≈ 10000·4.09 ≈ 40900</code>。现在比较两端维度的波长变化：<strong>最高频 i=0</strong>，<code>θ_0=base^0=1</code> 无论 base 多大都恒等于 1——波长完全不变，局部分辨率分毫无损；<strong>最低频 i=63</strong>（<code>2i/d=126/128≈0.984</code>），<code>θ_63=base^{−0.984}</code>，把 base 从 10000 换成 40900，波长 <code>λ=2π/θ</code> 拉长了 <code>(40900/10000)^{0.984}≈3.98≈4</code> 倍——恰好等于 <code>s</code>，与 PI 在最低频端一致。中间维度则被插值了介于 1 和 4 之间的一个倍数，且越靠低频倍数越大。<strong>一个标量 base，自动实现了「高频 0 插值、低频 s 倍插值、中间单调过渡」的整条曲线</strong>——这正是 NTK 的优雅所在。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>NTK 像一个聪明的尺子：高频刻度（量小距离）保持原样不动，只把低频刻度（量大距离）拉长。这样既能标更大的数，又不损失测量小距离的精度。代价是它在<strong>极长</strong>外推时仍会退化——因为单靠一个 base 的曲线不够灵活，顾不周全所有频段。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>一个关键优点：NTK-aware 常常<strong>不需要微调</strong>就能直接外推一定倍数（这是它比 PI 受欢迎的原因）。但纯 NTK 在很大的 <code>s</code> 下，中间频段的处理仍不理想——这正是 YaRN 用「分频段 + 显式 ramp」进一步改进的地方。</p></div>
+  </div>  <p>再点出一个易被忽略但深刻的对比，把 PI 和 NTK 的差别钉死：两者在<strong>低频端</strong>做的事其实一样（都把最长波长插值了 <code>s</code> 倍），区别全在<strong>高频端</strong>——PI 把高频也压了 <code>s</code> 倍（伤局部分辨率），NTK 让高频几乎不动（保住局部分辨率）。所以可以说 NTK 是「<em>低频对齐 PI、高频对齐原始 RoPE</em>」的一条折中曲线。这个视角直接通向 YaRN：既然 NTK 用一条 base 曲线隐式插值这条折中，YaRN 干脆把「高频不动、低频按 PI、中间过渡」写成显式的分段规则，控制得更精确。</p>  <div class="callout warn"><span class="label"></span>
+    <p>别把 NTK-aware（改 base，免微调外推）和 NTK-by-parts（按波长分三段处理，YaRN 的基础）搞混。前者是一个简洁的 base 技巧；后者是更细致的分频段策略。还有 <strong>dynamic NTK</strong>：推理时按当前实际长度动态调 <code>s</code>（短输入不缩放、超长才缩放），避免对短序列的无谓精度损失，是很多开源实现的默认。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="yarn"><span class="num">4</span>YaRN 的分频段 ramp</h2>
+  <h3>集大成：YaRN 的分频段 ramp</h3>  <p><span class="term">YaRN</span>（Peng et al. 2023，Yet another RoPE extensioN）是当前免/少微调外推效果最好的方法之一。它由两部分组成：<strong>(A) 按波长分频段插值（NTK-by-parts）</strong> 和 <strong>(B) 一个注意力温度</strong>。先讲 A。</p>  <p>YaRN 把每一对维度按它的<strong>波长相对训练长度的比例</strong>分成三类，区别对待：</p>  <ul>
+    <li><strong>高频（波长 ≪ 训练长度）</strong>：在训练长度内已转过很多圈，信息充分，<strong>完全不插值</strong>（保留原频率 θ_i）。</li>
+    <li><strong>低频（波长 ≫ 训练长度）</strong>：在训练长度内还没转满一圈，外推必崩，<strong>完全插值</strong>（θ_i / s，等同 PI）。</li>
+    <li><strong>中频（之间）</strong>：在两者之间<strong>平滑过渡</strong>——用一个 ramp 函数按比例混合「原频率」与「插值频率」。</li>
+  </ul>  <p>具体地，定义每一对维度的「转圈数」<code>r_i = L_train / λ_i = L_train·θ_i/(2π)</code>（它在训练长度内转了几圈）。用两个阈值 <code>α, β</code>（YaRN 默认 <code>α=1, β=32</code>）把 <code>r_i</code> 映射成一个 ramp 权重 <code>γ_i ∈ [0,1]</code>：</p>  <div class="math-block">\[\gamma_i = \mathrm{clip}\!\left(\frac{r_i - \alpha}{\beta - \alpha},\ 0,\ 1\right),\qquad \theta_i^{\text{YaRN}} = \gamma_i\,\theta_i + (1-\gamma_i)\,\frac{\theta_i}{s}\]</div>  <p>解读：<code>r_i ≤ α</code>（转不到 1 圈，低频）→ <code>γ_i=0</code> → 完全插值；<code>r_i ≥ β</code>（转过 32 圈以上，高频）→ <code>γ_i=1</code> → 完全不动；中间线性过渡。这就把 PI 的「一刀切」换成了<strong>按频段量身定制</strong>，既救了低频外推、又保住了高频局部分辨率。</p>  <p>把至此的四种方法用同一套「频率怎么被改」的语言并排，三节的逻辑就被钉成一张表——这正是 notebook 里画 <code>θ_i</code> 对比曲线时该有的心智模型：</p>  <table>
+    <thead><tr><th>方法</th><th>对频率 θ_i 做什么</th><th>高频 (i 小)</th><th>低频 (i 大)</th><th>需要微调？</th></tr></thead>
+    <tbody>
+      <tr><td>朴素外推</td><td>什么都不改，直接外推位置</td><td>不变</td><td>不变（→ 踏空崩）</td><td>—（直接崩）</td></tr>
+      <tr><td>PI（linear）</td><td>所有 θ 一律 ÷s</td><td>÷s（伤局部）</td><td>÷s</td><td>通常要少量</td></tr>
+      <tr><td>NTK-aware</td><td>放大 base，隐式分频</td><td>≈不变</td><td>≈÷s</td><td>常可免</td></tr>
+      <tr><td>YaRN</td><td>按转圈数 r_i 显式 ramp 混合</td><td>γ=1：不变</td><td>γ=0：÷s</td><td>免/少量最佳</td></tr>
+    </tbody>
+  </table>  <p>读这张表的窍门：<strong>所有方法在低频端做的事趋同（都把最长波长 ÷s 以避免踏空），差异全在高频端怎么处理</strong>。PI 误伤了高频，NTK 与 YaRN 都护住了高频；NTK 用一个 base 隐式控制过渡曲线的形状，YaRN 用 <code>α,β</code> 两个旋钮显式控制——这就是 YaRN 在大倍数外推下更稳的全部原因。</p>  <div class="ascii">YaRN ramp：按维度的「转圈数 r_i」决定插值程度 γ_i
+
+  γ_i
+  1 ┤██████████████████▔▔▔▔╲                高频：不动（保留 θ_i）
+    │                       ╲ 平滑过渡(中频)
+    │                        ╲
+  0 ┤                         ╲▁▁▁▁▁▁▁▁▁▁▁  低频：完全插值（θ_i/s, 同 PI）
+    └──┬──────────────────┬───┬──────────→ 维度 i（频率从高到低）
+     r_i≥β=32          r_i 在     r_i≤α=1
+   (转&gt;32圈,高频)    (α,β)之间   (转&lt;1圈,低频)</div>  <div class="callout intuition"><span class="label"></span>
+    <p>YaRN 的 ramp 是这门课最值得亲手实现的一段。它把前面三种思路统一了：<strong>高频段 = 不动（朴素 RoPE）、低频段 = PI、中间 = 平滑混合</strong>。理解了 ramp，你就理解了「外推的核心矛盾——压低频以敢看远，护高频以看得清——以及 YaRN 如何用一条平滑曲线同时满足两者」。notebook 里你会画出 <code>γ_i</code> 随维度的曲线，亲眼看到这条「高频→低频」的过渡。</p>
+  </div>  <p>和前面方法对照着看，YaRN 的进步就很清楚：<strong>PI 是 γ_i≡0（全部插值），朴素 RoPE 是 γ_i≡1（全部不动），YaRN 是一条从 1 平滑降到 0 的曲线</strong>。NTK-aware 也实现了类似的「高频少动、低频多动」，但它是<em>通过一个 base 隐式地</em>做到的，曲线形状被 base 这一个参数锁死；YaRN 则用 <code>α, β</code> 两个阈值<strong>显式地控制过渡带的起止</strong>，更灵活、可调，这是它在大倍数外推下胜过纯 NTK 的原因。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="temp"><span class="num">5</span>YaRN 的注意力温度</h2>
+  <h3>YaRN 的第二件武器：注意力温度</h3>  <p>光做分频段插值还不够。Peng et al. 观察到：<strong>插值会改变注意力 logits 的尺度，进而改变 softmax 的熵</strong>。直觉是——把位置压缩后，远处 token 的旋转角差变小，它们的注意力分数分布被压平了，softmax 变得更「平均」（熵升高），模型变得犹豫。</p>  <p>YaRN 的修正简洁得惊人：给注意力 logits 整体乘一个<strong>温度</strong> <code>1/t</code>（等价于把缩放因子从 <code>1/√d</code> 改成 <code>1/(t√d)</code>），把分布的「锐度」校正回训练时的水平：</p>  <div class="math-block">\[\text{attn} = \mathrm{softmax}\!\left(\frac{QK^\top}{t\sqrt{d}}\right)V,\qquad \sqrt{1/t} \approx 0.1\ln s + 1\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>温度像给注意力的「对比度」做校正。插值把对比度调低了（什么都看一点、不够专注），乘上 <code>1/t</code> 这个 <code>t&gt;1</code> 的温度，相当于把对比度调回去，让模型重新变得专注。这个 <code>0.1·ln s + 1</code> 的经验公式，是 Peng et al. 在多个长度上拟合出来的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>关键工程细节：温度 <code>t</code> 是个<strong>与位置无关的标量</strong>，所以它可以被<em>吸收进</em> <code>cos/sin</code> 的预计算里——给 RoPE 的旋转系数统一乘 <code>√(1/t)</code>，推理时<strong>零额外开销</strong>。这是 YaRN 能被各大推理框架直接采纳的实用原因。</p></div>
+  </div>  <p>值得强调温度修正背后的统计直觉，因为它揭示了一个容易被忽视的事实：<strong>外推不只是「位置对不对」的问题，还是「注意力分布形状对不对」的问题</strong>。softmax 的输出分布有一个「锐度」，模型在训练时已经习惯了某个锐度（某个熵水平）。插值在不改变 softmax 公式的情况下，悄悄把输入 logits 的尺度改小了，于是分布被抹平、熵升高，模型面对一个<em>它从没在训练里见过的、过于平均的注意力分布</em>。温度 <code>1/t</code> 正是把这个尺度乘回去，让分布的锐度回到训练分布。这也解释了为什么温度公式只依赖缩放倍数 <code>s</code>——因为熵的偏移量正是由插值倍数决定的。</p>  <div class="callout danger"><span class="label"></span>
+    <p>一个常见误解：以为 YaRN = NTK + 温度就完事了。其实三者层层递进、缺一不可：<strong>PI 解决「敢不敢看远」、分频段 ramp 解决「看远的同时看不看得清近」、温度解决「看的时候够不够专注」</strong>。三个旋钮对应三种失效模式。本模块 notebook 会让你分别测量：去掉 ramp（退化成 PI）会怎样、去掉温度（熵失配）会怎样——亲手看到每件武器各自补的是哪个洞。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">6</span>长度泛化怎么度量</h2>
+  <h3>怎么知道外推成功了？长度泛化的度量</h3>  <p>有了三种缩放方法，必须能<strong>量化比较</strong>它们。理想的度量当然是「在长序列上的困惑度/任务准确率」，但本课没有大模型。我们用两个更基础、更直接的代理指标，它们能在 numpy 玩具规模上精确算出，且抓住了外推质量的核心：</p>  <table>
+    <thead><tr><th>度量</th><th>怎么算</th><th>看什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>波长 / 转圈数</strong></td><td>λ_i = 2π/θ_i；r_i = L_train/λ_i</td><td>哪些维度在训练长度内没转满圈（外推风险区）</td></tr>
+      <tr><td><strong>外推角度误差</strong></td><td>对比缩放前后，超长位置的旋转角是否落回训练见过的区间</td><td>缩放有没有真的把「陌生角度」拉回「熟悉角度」</td></tr>
+      <tr><td><strong>相对位置点积</strong></td><td>用缩放后的 RoPE 算两个相距 Δ 的 token 的 q·k，看它随 Δ 的衰减是否平滑单调</td><td>位置信息是否还能被注意力正确读出（崩 = 抖动/不单调）</td></tr>
+    </tbody>
+  </table>  <p>第三个指标尤其有用：一个健康的位置编码，应当让<strong>相对距离 Δ 越大、query-key 点积的某种期望越平滑地变化</strong>（这样注意力才能据此判断远近）。外推崩坏时，这条曲线会出现剧烈抖动或非单调——位置信息「读不出来了」。notebook 会对朴素外推、PI、NTK、YaRN 分别画这条曲线，你能直接看到：朴素外推在超过训练长度处剧烈抖动，而 YaRN 平滑得多。</p>  <div class="callout warn"><span class="label"></span>
+    <p>这些代理指标的<strong>局限</strong>要诚实说明：它们衡量的是「位置信息在数学上是否被保住」，不能替代真实的下游评测（困惑度、NIAH、RULER——见模块 05）。一个外推方法可能波长曲线很漂亮，却在真实长上下文任务上仍然检索不到中间的信息。所以完整的外推评估永远是<strong>两层</strong>：先用这些代理指标快速筛掉明显崩坏的，再用模块 05 的长基准做最终判定。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="config"><span class="num">7</span>真实框架里的 rope_scaling</h2>
+  <h3>把它用起来：真实框架里的 rope_scaling</h3>  <p>以上三种方法，在 HuggingFace transformers 里就是模型 config 的一个 <code>rope_scaling</code> 字段。理解了原理，这些配置就一目了然：</p>  <pre><code># transformers config 里的 rope_scaling（示意）
+"rope_scaling": {
+    "type": "linear",   # = Position Interpolation (PI)
+    "factor": 4.0       # s = L_target / L_train，把 4k 扩到 16k
+}
+# 或 NTK-aware（改 base 实现）:
+"rope_scaling": {"type": "dynamic", "factor": 4.0}   # dynamic NTK
+# 或 YaRN:
+"rope_scaling": {"type": "yarn", "factor": 4.0,
+                 "original_max_position_embeddings": 4096,
+                 "beta_fast": 32, "beta_slow": 1}   # ramp 的两个阈值
+</code></pre>  <p>注意 YaRN 配置里的 <code>beta_fast=32, beta_slow=1</code> 正是讲解第 4 节里 ramp 的两个阈值 <code>β, α</code>（命名不同但是同一对参数）：<code>beta_fast</code> 是「转过多少圈以上算高频、不插值」，<code>beta_slow</code> 是「转不到多少圈算低频、完全插值」。你在 notebook 里实现的 ramp，和真实框架里的这两个旋钮一一对应。</p>  <p>实践中的选择经验：<strong>小幅外推（2× 内）</strong>用 dynamic NTK 往往免微调就够；<strong>大幅外推（4× 以上）</strong>用 YaRN，且配一点长序列微调效果最佳；<strong>追求极简、可控</strong>用 PI（linear）加微调。它们都是「免/少训练」地扩窗，区别只在对高频局部分辨率的保护程度——而这正是你这一模块亲手实现并测量过的东西。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把这一模块收束成一句可操作的话：<strong>外推就是在「敢看远」和「看得清」之间找平衡，而 RoPE 的频率结构恰好给了你一个分频段调节的旋钮</strong>。低频维度管「远」、高频维度管「近」；PI 牺牲近换远，NTK/YaRN 用频段区分保住近的同时换来远的。下次你在 config 里填 <code>rope_scaling</code> 时，填的不再是玄学参数，而是这个权衡的具体坐标。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>外推 vs 微调的边界</strong>：免微调方法（YaRN/NTK）能撑多大倍数？哪些能力（局部 vs 全局、检索 vs 推理）在外推下先退化？「扩窗后必须用长数据微调多少」仍缺乏好的理论。</li>
+    <li><strong>位置编码的根本设计</strong>：RoPE 是否最优？ALiBi、可学习的相对偏置、无位置编码（NoPE，靠因果掩码隐式编码位置）等路线各有支持者，长上下文下谁更好仍在争论。</li>
+    <li><strong>有效上下文 ≠ 窗口大小</strong>：即便位置编码外推成功（PPL 不崩），模型对中间信息的利用仍可能很差（lost-in-the-middle，模块 05）。位置编码只是「能看见」的必要条件，不是充分条件。</li>
+    <li><strong>训练时长上下文</strong>：与其外推，不如直接在长数据上训练（如分阶段扩窗 continual pretraining）。但长数据稀缺且训练昂贵，「外推 + 少量长微调」仍是性价比之选——两条路线的最优配比是开放问题。</li>
+    <li><strong>超长（1M+）的位置编码</strong>：在百万级长度上，连低频维度也开始绕圈，YaRN 式的分频段是否仍够用？面向 1M+ 的新位置方案是活跃方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Su et al. 2021（RoPE 原始）、Chen et al. 2023（Position Interpolation，本模块第一种缩放）、Peng et al. 2023（YaRN，本模块核心）、bloc97 2023（NTK-aware/by-parts）、Press et al. 2021（ALiBi，另一条外推路线）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_flash_attention/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · FlashAttention 与 IO 复杂度</div></a>
+  </div>
+
+</div>
+</body>
+</html>

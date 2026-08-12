@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 推理模型与 RLVR/GRPO</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 推理模型与 RLVR/GRPO</h1>
+  <p class="subtitle">Reasoning Models &amp; RLVR/GRPO —— 当奖励信号从"人类觉得好"变成"程序判定对"，RL 的玩法被彻底改写</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（奖励模型）、模块 03（PPO 与 KL 正则）、policy gradient 基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_rlvr_grpo.ipynb（纯 PyTorch，手写 GRPO 全循环）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">DeepSeekMath/GRPO (2024)、DeepSeek-R1 (2025)、Tülu 3 (2024)、Let's Verify Step by Step (2023)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#rlvr">范式转变：从"学人类偏好"到"学可验证正确"（RLVR）</a></li>
+      <li><a href="#grpo">GRPO 推导：用"组内相对"替掉 value network</a></li>
+      <li><a href="#r1">R1 训练故事：纯 RL 的 aha moment 与多阶段配方</a></li>
+      <li><a href="#reward-design">Reward 设计细节：二值、部分分与 format reward</a></li>
+      <li><a href="#prm-orm">PRM vs ORM：过程监督的得与失</a></li>
+      <li><a href="#side-effects">推理 RL 的副作用：评测者必修课</a></li>
+      <li><a href="#data">数据与课程：难度筛选与拒绝采样基线</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rlvr"><span class="num">1</span>范式转变：从"学人类偏好"到"学可验证正确"（RLVR）</h2>
+
+  <p>前四个模块的主线是<strong>偏好对齐</strong>：人类标注"哪个回答更好"→ 训 reward model（或直接 DPO）→ 优化策略。
+  这条线有一个挥之不去的软肋（模块 02 的 Goodhart 之痛）：<strong>RM 只是人类偏好的有损代理</strong>，
+  策略优化得越狠，越容易学会讨好 RM 而非真正变好 [Gao 2022]。</p>
+
+  <p>但有一类任务根本不需要"人类觉得好"这个代理——数学题有标准答案、代码有单元测试、逻辑谜题有唯一解。
+  对这些任务，可以直接写一个<strong>程序化验证器</strong>判定对错。这就是
+  <span class="term">RLVR</span>（Reinforcement Learning with Verifiable Rewards），由 Tülu 3 [Lambert 2024] 正式命名并系统化：
+  <strong>把 reward model 换成 verifier，对了给 1，错了给 0，然后照常跑 RL。</strong></p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>RLHF 是"请一个品味不错但会被忽悠的评委打分"；RLVR 是"直接对答案"。
+      评委可以被花言巧语骗过，但 <code>assert answer == 42</code> 骗不过。
+      代价是：只有数学/代码/逻辑这类"答案可机器判定"的任务才能这么玩，
+      "写一封得体的拒绝信"这种任务没有 verifier 可写。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>RLHF 优化 $\mathbb{E}_{y\sim\pi_\theta}[r_\phi(x,y)]$，其中 $r_\phi$ 是从有限偏好数据拟合的参数化代理，
+      存在可被利用的泛化误差（reward hacking 面）。RLVR 优化
+      $\mathbb{E}_{y\sim\pi_\theta}[v(x,y)]$，$v$ 是确定性程序（如答案精确匹配、测试通过率），
+      值域通常为 $\{0,1\}$。$v$ 不是统计估计量，没有"被分布外样本骗高分"的失效模式——
+      它的失效面退化为<em>规约错误</em>（verifier 写错、可被钻空子的判定规则），这是更小且可审计的攻击面。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>为什么 RLVR 恰好引爆了"推理模型"？</strong>因为 0/1 的稀疏奖励逼着模型自己找提高命中率的办法，
+  而最有效的办法就是<strong>多想几步再回答</strong>——展开长 chain-of-thought、自我检查、回溯重算。
+  这些行为不是被监督数据教出来的，而是被"答对才有分"的压力<em>激励</em>出来的（R1 论文标题里的 "Incentivizing"）。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  RLVR 并没有消灭 reward hacking，只是把它换成了更可控的形态：verifier 写得糙（比如只用字符串包含判定），
+  模型会学着把所有候选答案都列一遍；测试用例覆盖不全，代码模型会学着<em>硬编码测试输出</em>。
+  <strong>verifier 本身就是一段需要被评测的代码。</strong></div>
+
+  <!-- ========================================================= -->
+  <h2 id="grpo"><span class="num">2</span>GRPO 推导：用"组内相对"替掉 value network</h2>
+
+  <p>奖励变成 0/1 后，PPO（模块 03）当然还能用，但它有个昂贵的组件显得越来越多余：<span class="term">value network</span>（critic）。
+  回忆 PPO 里 critic 的职责：估计状态价值 $V(s_t)$，用 GAE 算出逐 token 的 advantage，给策略梯度降方差。
+  问题是：</p>
+  <ul>
+    <li>critic 通常与 policy 同规模 —— <strong>显存和算力直接翻倍</strong>；</li>
+    <li>奖励是序列末端的 0/1，中间 token 没有真实价值信号，critic 学得本来就差；</li>
+    <li>critic 训不准时，advantage 的偏差反而拖累 policy。</li>
+  </ul>
+
+  <p><strong>GRPO</strong>（Group Relative Policy Optimization）[Shao 2024, DeepSeekMath] 的解法：
+  <strong>不学价值函数，用"同一道题多采几个答案、互相当 baseline"来估计 advantage。</strong>
+  对每道题 $q$，从旧策略采样一组 $G$ 个回答 $\{o_1,\dots,o_G\}$，verifier 给出奖励 $\{r_1,\dots,r_G\}$，则：</p>
+
+  <div class="math-block">
+  $$ \hat{A}_i \;=\; \frac{r_i - \mathrm{mean}(r_1,\dots,r_G)}{\mathrm{std}(r_1,\dots,r_G)} $$
+  </div>
+
+  <p>这个组内标准化的 $\hat{A}_i$ 赋给回答 $o_i$ 的<em>所有</em> token，代入 PPO 式的 clip 目标：</p>
+
+  <div class="math-block">
+  $$ \mathcal{J}_{\text{GRPO}}(\theta) = \mathbb{E}\Bigg[ \frac{1}{G}\sum_{i=1}^{G} \frac{1}{|o_i|}\sum_{t=1}^{|o_i|}
+     \Big( \min\big( \rho_{i,t}\,\hat{A}_i,\;\; \mathrm{clip}(\rho_{i,t},\,1\!-\!\varepsilon,\,1\!+\!\varepsilon)\,\hat{A}_i \big)
+     - \beta\, \mathbb{D}_{KL}\!\left[\pi_\theta \,\|\, \pi_{\text{ref}}\right] \Big) \Bigg],
+     \qquad \rho_{i,t} = \frac{\pi_\theta(o_{i,t}\mid q, o_{i,&lt;t})}{\pi_{\theta_{\text{old}}}(o_{i,t}\mid q, o_{i,&lt;t})} $$
+  </div>
+
+  <p>两个与 PPO 不同的工程细节值得记住：</p>
+  <ul>
+    <li><strong>KL 不进 reward、直接进 loss</strong>：PPO 惯例是把 $-\beta\,\mathrm{KL}$ 混进每步 reward 再让 GAE 传播；GRPO 把 KL 作为独立正则项加在目标函数上，advantage 保持"纯 verifier 信号"。</li>
+    <li><strong>KL 用无偏低方差估计器</strong>（Schulman 的 $k_3$）：
+    $\;\mathbb{D}_{KL}\approx \frac{\pi_{\text{ref}}(o_{i,t}|\cdot)}{\pi_\theta(o_{i,t}|\cdot)} - \log\frac{\pi_{\text{ref}}(o_{i,t}|\cdot)}{\pi_\theta(o_{i,t}|\cdot)} - 1 \;\ge 0$，逐采样 token 计算，无需遍历词表。</li>
+  </ul>
+
+  <div class="ascii">
+                          ┌─ o_1 ──► verifier ──► r_1 = 1 ─┐
+   题目 q ──► π_old ──┤   o_2 ──► verifier ──► r_2 = 0   ├──► 组内标准化
+   (采样 G 个回答)     │   …                              │    Â_i = (r_i − mean)/std
+                          └─ o_G ──► verifier ──► r_G = 0 ─┘         │
+                                                                     ▼
+        π_ref（冻结）──── KL 正则 ────►  L = −Σ ρ·Â  + β·KL  ──► 更新 π_θ
+                                          （无 critic！）
+  </div>
+
+  <p>与 PPO 的逐项对比：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>PPO（模块 03）</th><th>GRPO</th></tr></thead>
+    <tbody>
+      <tr><td>advantage 来源</td><td>critic + GAE（逐 token）</td><td>组内相对标准化（逐序列，广播到 token）</td></tr>
+      <tr><td>需要的模型</td><td>policy + critic + RM + ref（4 份）</td><td>policy + verifier(程序) + ref（约省一半显存）</td></tr>
+      <tr><td>baseline 的偏差/方差</td><td>critic 有偏（学不准时偏差大），方差低</td><td>组均值无偏，方差随 $G$ 增大而降（$G$ 常取 8–64）</td></tr>
+      <tr><td>信用分配 credit assignment</td><td>逐 token（理论上可定位"哪步想错了"）</td><td>整条序列共享一个 $\hat{A}_i$，无逐步定位</td></tr>
+      <tr><td>每题采样数</td><td>1 条 rollout 即可</td><td>必须 $G$ 条（采样开销 ×G，但可并行）</td></tr>
+      <tr><td>KL 处理</td><td>混入 reward，经 GAE 传播</td><td>独立 loss 项（$k_3$ 估计器）</td></tr>
+      <tr><td>失效模式</td><td>critic 崩 → advantage 全错</td><td>组内全对/全错 → std=0，梯度消失（见 §4 与 notebook）</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>GRPO 的本质是把 baseline 从"学出来的 $V(s)$"换成"蒙特卡洛的组均值"。</strong>
+  统计上这就是经典的 leave-one-out / control variate 降方差技巧；它能赢 PPO 不是因为更聪明，
+  而是因为在"序列级稀疏 0/1 奖励"这个设定下，critic 没有可学的中间信号，组均值反而是更诚实的 baseline。
+  这也解释了它的适用边界：奖励越稠密、越逐步，critic 的优势就越回来。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>除以 std 是有争议的。</strong>它让"接近全对/全错的组"（std 小）被放大梯度，
+  等于隐式上调了太难和太简单题目的权重——后续工作（如 Dr. GRPO）指出这会引入难度偏置与长度偏置，
+  主张去掉 std 只减均值。notebook 里你会亲手观察 std=0 的退化并比较处理策略。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="r1"><span class="num">3</span>R1 训练故事：纯 RL 的 aha moment 与多阶段配方</h2>
+
+  <p>DeepSeek-R1 [DeepSeek-AI 2025] 是 RLVR+GRPO 路线的标志性公开成果。论文其实讲了两个模型的故事，对比着读最有营养。</p>
+
+  <h3>R1-Zero：不要 SFT，直接 RL</h3>
+  <p>在 DeepSeek-V3 <em>base</em> 模型上（没有任何 SFT 冷启动），只用两类<strong>规则奖励</strong>跑 GRPO：</p>
+  <ul>
+    <li><strong>accuracy reward</strong>：数学题答案放在指定格式里精确比对；代码题跑测试用例。</li>
+    <li><strong>format reward</strong>：思考过程必须包在 <code>&lt;think&gt;…&lt;/think&gt;</code> 标签里。</li>
+  </ul>
+  <p>刻意<strong>不用神经 reward model</strong>——团队明确说原因是大规模 RL 中神经 RM 会被 hack，而且训练流程更复杂（呼应 §5 对 PRM 的取舍）。
+  训练中出现了两个被广泛引用的现象：</p>
+  <ul>
+    <li><strong>响应长度随训练自发增长</strong>：没有任何长度奖励，模型自己学会"多想"，因为想得久命中率高；</li>
+    <li><strong>"aha moment"</strong>：训练中段模型自发出现拟人化的回溯——"Wait, wait. Wait. That's an aha moment…"，重新检查刚才的步骤。这是<em>激励</em>出来的搜索行为，不是模仿出来的。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  但 R1-Zero 不可交付：<strong>可读性差、中英文混杂</strong>（语言混杂是 RL 只奖励"对"不奖励"像人话"的直接后果），
+  CoT 经常是对人类毫无组织的意识流。能力上去了，产品性掉了——这正是"verifier 只验证了你想验证的东西"的活例。</div>
+
+  <h3>R1：冷启动 + 四阶段配方</h3>
+  <div class="ascii">
+   阶段 1  冷启动 SFT     数千条高质量长 CoT（人工整理、格式统一、可读）
+      │                  └─ 目的：给 RL 一个"会说人话"的起点，避免 R1-Zero 的可读性坑
+      ▼
+   阶段 2  推理 RL(GRPO)  accuracy + format + 语言一致性奖励（治语言混杂，代价是分数略降）
+      ▼
+   阶段 3  拒绝采样→SFT   用阶段2模型采样、筛对的+可读的 ≈600k 推理数据，
+      │                  混合 ≈200k 通用数据，重训 base
+      ▼
+   阶段 4  全场景 RL      推理题继续规则奖励；通用对话/无害性用 reward model
+                          └─ RLVR 与 RLHF 在同一配方里分工并存
+  </div>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>蒸馏番外篇（对评测者极重要）</strong>：R1 团队用 R1 的 80 万条输出直接 SFT 蒸馏 Qwen/Llama 小模型，
+  效果<strong>显著好于</strong>在同款小模型上直接跑大规模 RL（论文对比了 Qwen-32B：蒸馏版 ≫ RL 版）。
+  结论：推理能力的"发现"需要大模型 + RL，但"传递"用 SFT 就够。小模型推理强 ≠ 它经历过 RL。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="reward-design"><span class="num">4</span>Reward 设计细节：二值、部分分与 format reward</h2>
+
+  <p>RLVR 里没有 reward model 可调，<strong>reward 设计 = verifier 设计 + 奖励组合设计</strong>。几个反复出现的实务问题：</p>
+
+  <table>
+    <thead><tr><th>设计选择</th><th>做法</th><th>收益</th><th>风险</th></tr></thead>
+    <tbody>
+      <tr><td>二值奖励</td><td>对=1，错=0</td><td>无法被部分讨好，最抗 hack</td><td>稀疏：组内全错时零梯度，难题冷启动慢</td></tr>
+      <tr><td>部分分 partial credit</td><td>代码按测试通过率给分；数学按中间量给分</td><td>稠密信号，缓解冷启动</td><td>打开 hack 面：只刷容易的测试点、堆砌中间步骤骗分</td></tr>
+      <tr><td>format reward</td><td>答案必须 <code>\boxed{}</code>/指定标签，否则扣分或判 0</td><td>让 verifier 可解析；稳定训练早期</td><td>权重过大时模型先学格式后学内容（也可视为收益，见下）</td></tr>
+      <tr><td>语言一致性奖励</td><td>CoT 目标语言占比作为奖励项</td><td>治语言混杂</td><td>R1 报告与推理分数有轻微 trade-off</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>format reward 的真正作用</strong>常被低估：二值 accuracy 奖励的前提是<em>答案能被提取</em>。
+  模型明明算对了但没写 <code>\boxed{42}</code>，verifier 判 0 —— 这不是模型错，是<strong>奖励通道被格式噪声污染</strong>。
+  先用小权重 format reward 把"答案放在哪"教会，accuracy 信号的信噪比立刻上升。
+  notebook 会复现这条经典的<strong>两阶段曲线</strong>：format 准确率先饱和，answer 准确率随后起飞。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>副作用清单</strong>（设计 reward 时逐条自查）：
+  ① 只奖励"对"→ 输出长度无约束膨胀（想得久=命中高，但简单题也想很久，见 §6）；
+  ② 不奖励语言 → 多语模型 CoT 语言混杂；
+  ③ 部分分给得太密 → 模型在中间步骤上表演而非求解；
+  ④ verifier 用宽松匹配（如子串包含）→ 模型学会罗列所有候选答案。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="prm-orm"><span class="num">5</span>PRM vs ORM：过程监督的得与失</h2>
+
+  <p>在 RLVR 流行之前，让模型"做对数学题"的主流监督路线是训一个验证打分器，有两种粒度
+  [Lightman 2023, Let's Verify Step by Step]：</p>
+  <ul>
+    <li><span class="term">ORM</span>（Outcome Reward Model）：只看最终答案对不对，给整条解答一个分；</li>
+    <li><span class="term">PRM</span>（Process Reward Model）：给<strong>每一步推理</strong>单独打分（正确/错误/存疑）。</li>
+  </ul>
+
+  <p>Lightman 等人在 MATH 数据集上的核心实证：以 best-of-N 选择器身份比较，
+  <strong>PRM 显著优于 ORM</strong>（N=1860 时解题率 78.2% vs ~72%），且优势随 N 增大而扩大。
+  直觉：ORM 会把"过程全错但答案蒙对"的解标成正样本（假阳性污染），PRM 的逐步标注直接规避了这一点，
+  并且能精确指出<em>第一步错在哪</em>——理论上是更好的信用分配。代价同样直白：
+  PRM800K 花了大量人力逐步标注 80 万个步骤，<strong>标注成本比 outcome 标签高一个量级</strong>，且"步骤"在自由文本里如何切分本身就是个不适定问题。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>PRM 怎么被 hack</strong>：PRM 终究是个神经网络，打分的是"这步<em>看起来</em>对不对"。
+  RL 压力下模型会学会生成<em>步步规范、措辞自信、实则空转</em>的推理——每步局部无可指摘，整体不通向答案；
+  或者把一步实质性跳跃拆成十步废话，骗取逐步累计的高分。
+  这正是 R1 团队放弃 PRM、退回规则 verifier 的两条理由之一（另一条：步骤切分与逐步标注在大规模下不可维护）。
+  <strong>评测视角的格言：过程监督的"过程"也是一个可被 Goodhart 的指标。</strong></div>
+
+  <div class="callout intuition"><span class="label"></span>
+  PRM 与 RLVR 不是对立而是互补的两极：RLVR 用<em>最稀疏但最硬</em>的信号（结局可验证），
+  PRM 用<em>最稠密但最软</em>的信号（逐步可信度）。当前前沿（§8）的一个方向就是自动构造"硬的过程信号"，
+  例如用蒙特卡洛 rollout 估计每个中间状态的"从这里继续能做对的概率"，把人工逐步标注换成程序化估计。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="side-effects"><span class="num">6</span>推理 RL 的副作用：评测者必修课</h2>
+
+  <p>本课程的受众做 model evaluation，这一节是全章对你的工作影响最大的部分。推理 RL 改变了"分数"的语义。</p>
+
+  <h3>6.1 过度思考 overthinking</h3>
+  <p>RLVR 只奖励对错，不计成本，于是模型对 <code>2+3=?</code> 也展开数百 token 的自查回溯。
+  长度在训练中单调膨胀（R1-Zero 曲线），但<strong>边际收益递减</strong>：难题多想确实涨分，简单题多想纯属烧钱。
+  notebook 用一个"长度有成本"的玩具实验展示：一旦给奖励加上长度成本项，策略会主动缩短到边际收益=边际成本的均衡点。</p>
+
+  <h3>6.2 test-time compute 与分数的混淆</h3>
+  <div class="callout danger"><span class="label"></span>
+  <strong>评测推理模型必须报告 token 预算。</strong>"模型 A 比模型 B 高 5 分"在 A 每题花 10 倍推理 token 时是一句没有意义的话——
+  你比较的不是两个模型，是两个<em>计算预算</em>。规范做法：
+  ① 报告 accuracy–vs–推理 token 数的<strong>曲线</strong>而非单点；
+  ② 固定预算对比（同 token 上限/同延迟）；
+  ③ 报告截断率（多少样本因超预算被砍掉 CoT——截断会系统性压低推理模型分数）；
+  ④ pass@k 与多数投票（cons@k）分开报，它们度量的能力不同。
+  任何不写 token 预算的推理模型榜单，默认不可比。</div>
+
+  <h3>6.3 能力来源之辨：蒸馏 vs RL</h3>
+  <p>§3 的蒸馏结果给评测者一个重要提醒：一个小模型在 AIME 上的高分，可能来自<strong>模仿大模型的推理轨迹</strong>（蒸馏），
+  而非自身通过 RL 获得的搜索能力。两者在分布内得分相近，但行为特征不同——蒸馏模型倾向复刻教师的解题模式，
+  在分布外的新题型上更脆；RL 模型的策略是自己"长"出来的。
+  做能力归因时，至少检查：训练配方（有无 RL 阶段）、CoT 风格与教师模型的相似度、对题型扰动的鲁棒性差异。</p>
+
+  <h3>6.4 污染的新形态</h3>
+  <p>RLVR 训练集本身是公开题库（MATH、竞赛题、LeetCode），与评测集的重叠从"预训练见过题面"升级成
+  "<strong>RL 阶段针对这道题优化过策略</strong>"。后者影响远大于前者——评测前先做训练集–评测集去重审计。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="data"><span class="num">7</span>数据与课程：难度筛选与拒绝采样基线</h2>
+
+  <p>RLVR 的数据工程核心是<strong>难度管理</strong>。回看 GRPO 的 advantage 公式：组内<em>全对</em>或<em>全错</em>时
+  $\mathrm{std}=0$，$\hat{A}_i\equiv 0$，这道题贡献零梯度。所以：</p>
+  <ul>
+    <li><strong>太简单的题（pass rate ≈ 1）和太难的题（pass rate ≈ 0）都是无效算力</strong>。实务上先用当前模型对题库做 $k$ 次采样，按通过率筛掉两端，只留"会与不会之间"的题；</li>
+    <li>随着训练推进，原来的难题变成简单题——<strong>难度课程</strong>（curriculum）就是周期性重估通过率、滚动换题；</li>
+    <li>这也是 std=0 问题的数据侧解法（算法侧的 ε / skip 处理见 notebook）。</li>
+  </ul>
+
+  <p><strong>永远先跑的简单基线：拒绝采样微调</strong>（rejection sampling fine-tuning，亦即 best-of-N + SFT，STaR 一系）：
+  对每道题采 $N$ 个答案，verifier 筛出对的，拿正样本做 SFT，迭代数轮。它就是"只用正样本、不用负样本、不在线更新"的退化版 RLVR：</p>
+
+  <table>
+    <thead><tr><th></th><th>拒绝采样 FT</th><th>GRPO/RLVR</th></tr></thead>
+    <tbody>
+      <tr><td>用到的信号</td><td>只有正样本</td><td>正负样本（负 advantage 压低错误答案）</td></tr>
+      <tr><td>on/off-policy</td><td>批式离线，实现≈SFT 管线</td><td>在线（或近在线），需要 RL 基建</td></tr>
+      <tr><td>样本效率</td><td>低（错误样本全部丢弃）</td><td>更高（notebook 有同任务对比曲线）</td></tr>
+      <tr><td>稳定性/调参</td><td>极稳，几乎无超参</td><td>KL 系数、clip、组大小都要调</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  R1 配方的阶段 3 正是拒绝采样：它不只是"穷人的 RL"，更是 RL 之后<strong>固化与清洗能力</strong>的工序。
+  评审任何 RLVR 论文时的第一问应该是："比过拒绝采样基线吗？同算力下赢多少？"——
+  相当多"RL 提升"在对齐算力后会缩水。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>多领域 verifier</strong>：数学/代码之外，什么任务能"可验证化"？形式化证明（Lean）、科学计算、智能体任务的环境结果（订到票=1）都在推进；而"证明一段开放论述正确"的通用 verifier 至今没有。评测视角：verifier 覆盖面 = RLVR 能力提升的边界，榜单设计者要警惕"只在可验证域进步"的能力剖面失衡。</li>
+    <li><strong>过程奖励自动化</strong>：用 MC rollout 估计每步的"续算成功率"来自动生成过程标签，替代 PRM800K 式人工标注。开放问题：自动过程信号是否继承（甚至放大）结果信号的 hack 面？</li>
+    <li><strong>RL scaling</strong>：预训练 scaling law 已成熟，RL 阶段的算力—能力曲线还没有公认形态。RL 究竟是在"注入新能力"还是"放大 base model 已有的低概率行为"（pass@k 视角：大 k 下 base 模型常常追平 RL 模型）？这直接决定推理能力的天花板在 base 还是在 RL。</li>
+    <li><strong>长度与效率</strong>：overthinking 的系统性解法（长度惩罚、难度自适应预算、可中断推理）刚起步；"按难度分配思考预算"可能成为下一代配方的标配，也将进一步加大评测的预算控制难度。</li>
+    <li><strong>entropy collapse 与多样性</strong>：RLVR 训练后期策略熵骤降、答案模式单一化，pass@k 随 k 的增益变平——探索与利用的平衡在序列级稀疏奖励下尤其脆弱。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>RLVR 与 RLHF 的奖励信号在"可被 hack 性"上有什么本质区别？RLVR 的 hack 面转移到了哪里？</li>
+      <li>写出 GRPO 的组内相对 advantage 公式与目标函数；说明去掉 value network 换来了什么、付出了什么，以及组内全对/全错时会发生什么。</li>
+      <li>R1 相比 R1-Zero 多了哪些阶段？分别解决什么问题？format reward 和 accuracy reward 各起什么作用？</li>
+      <li>评测一个推理模型时，为什么必须报告 token 预算？至少列出三条规范做法。</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../04_dpo_family/04_讲解.html"><div class="dir">← 上一章</div><div class="t">04 · DPO 家族</div></a>
+    <a class="next" href="../06_alignment_evals/06_讲解.html"><div class="dir">下一章 →</div><div class="t">06 · 对齐的评测</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 马尔可夫链蒙特卡洛</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 马尔可夫链蒙特卡洛</h1>
+  <p class="subtitle">用一条以后验为平稳分布的马尔可夫链『采样』后验、只需未归一化密度（归一化常数被约掉）—— Metropolis-Hastings 的接受率由细致平衡反解而来、Gibbs 轮流采完全条件、burn-in/thinning 的处理、以及不可省略的收敛诊断 R-hat/ESS/自相关</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（后验/未归一化密度）、条件概率、一点马尔可夫链直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_mcmc.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Neal 1993、Neal 2011 (HMC)、Gelman & Rubin 1992、Vehtari et al. 2021</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么需要采样：攻克无闭式后验</a></li>
+      <li><a href="#stationary">平稳分布与细致平衡</a></li>
+      <li><a href="#mh">Metropolis-Hastings：最通用的采样器</a></li>
+      <li><a href="#gibbs">Gibbs 采样：轮流采完全条件</a></li>
+      <li><a href="#burnin">burn-in 与 thinning</a></li>
+      <li><a href="#diagnostics">收敛诊断：R-hat / ESS / 自相关</a></li>
+      <li><a href="#landscape">采样器全景：从 MH 到 HMC/NUTS</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么需要采样：攻克无闭式后验</h2>
+  <p>上一模块的共轭世界很美好——后验有闭式解、求均值求区间都是套公式。但它是<strong>例外而非常态</strong>。一旦模型稍微复杂（分层、非共轭似然、几十个相关参数），那个归一化积分 $p(D)=\int p(D\mid\theta)p(\theta)d\theta$ 就再也算不出来了。这一模块和下一模块，就是攻克「后验没有闭式解」这个贝叶斯计算的核心难关。</p>  <p>先想清楚我们<strong>到底要后验的什么</strong>。绝大多数时候，我们不需要后验密度的解析表达式，只需要从后验里算一些<strong>期望</strong>：后验均值 $\mathbb{E}[\theta\mid D]$、后验方差、可信区间（分位）、后验预测 $\int p(\tilde x\mid\theta)p(\theta\mid D)d\theta$。这些全都是 $\mathbb{E}_{p(\theta\mid D)}[f(\theta)]$ 形式的积分。</p>  <p>而上一模块的热身已经埋下钥匙——<strong>蒙特卡洛</strong>：只要能从后验<em>采样</em>，期望就能用样本均值近似 $\mathbb{E}[f]\approx\frac1N\sum f(\theta_i)$，误差按 $O(1/\sqrt N)$ 下降、<strong>与维度无关</strong>。问题归结为一句话：</p>  <div class="callout intuition"><span class="label"></span>
+    <p><strong>如何从一个我们只知道「未归一化密度」（似然 × 先验）、却不知道归一化常数的分布里采样？</strong> 这正是 MCMC 解决的问题。它的魔力在于：<strong>采样根本不需要归一化常数</strong>——而归一化常数恰恰是那个算不出来的积分。MCMC 把「算一个高维积分」转化为「让一个粒子在参数空间里按特定规则游走」，游走足够久后，它停留各处的频率自动正比于后验密度。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：你想知道一片山脉的「质量分布」（哪里土多哪里土少），但没法称量整座山。MCMC 的办法是放一个<strong>会爬山的醉汉</strong>：他倾向往高处走、偶尔也下坡，在山上随机游荡很久。最后统计他在每个位置停留的时间——停留越久的地方，海拔（后验密度）越高。你从没量过整座山的总质量（归一化常数），却还原出了它的形状。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：我们要构造一条<span class="term">Markov chain</span>（马尔可夫链），其<span class="term">stationary distribution</span>（平稳分布）恰好是目标后验 $\pi(\theta)=p(\theta\mid D)$。马尔可夫性指「下一步只依赖当前位置」$p(\theta_{t+1}\mid\theta_t,\dots,\theta_0)=p(\theta_{t+1}\mid\theta_t)$。若转移核 $T(\theta\to\theta')$ 设计得当，链跑久后样本 $\{\theta_t\}$ 的分布会收敛到 $\pi$，于是这些（相关的）样本就能用来估计后验期望。本模块就讲怎么设计这个 $T$、怎么判断「跑久了」。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="stationary"><span class="num">2</span>平稳分布与细致平衡</h2>
+  <p>MCMC 的正确性建立在两块基石上：<strong>平稳性</strong>（链最终服从目标分布）与<strong>遍历性</strong>（链能跑遍整个空间、不卡在某处）。我们重点讲平稳性，因为它给出了构造采样器的<strong>可操作判据</strong>。</p>  <p>一个分布 $\pi$ 是转移核 $T$ 的平稳分布，意味着：如果当前样本服从 $\pi$，走一步后<em>仍然</em>服从 $\pi$。写成方程（离散情形）：</p>  <div class="math-block">\[\pi(\theta') = \sum_\theta \pi(\theta)\, T(\theta\to\theta') \qquad\text{（平稳性，全局平衡）}\]</div>  <p>直接验证这个方程很难（要对所有 $\theta$ 求和）。幸运的是有一个<strong>更强但更易满足</strong>的充分条件—— <span class="term">detailed balance</span>（细致平衡）：</p>  <div class="math-block">\[\boxed{\;\pi(\theta)\, T(\theta\to\theta') = \pi(\theta')\, T(\theta'\to\theta)\;}\qquad\text{（细致平衡）}\]</div>  <p>它说的是：在平稳态下，「从 $\theta$ 流向 $\theta'$ 的概率流」恰好等于「从 $\theta'$ 流回 $\theta$ 的概率流」——每一对状态之间<strong>收支平衡</strong>。这样的链称为<strong>可逆的</strong>（reversible）。容易证明细致平衡 ⟹ 平稳性（把细致平衡对 $\theta$ 求和即得全局平衡方程）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>细致平衡是个<strong>局部</strong>条件：只需检查每一对状态间的双向流量相等，不必考虑全局。这把「设计一个平稳分布正确的链」从一个全局难题，变成了「让每对状态收支平衡」的局部可操作任务——Metropolis-Hastings 的接受率公式正是为强行满足它而<em>解</em>出来的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>关键洞察：细致平衡方程里<strong>只出现 $\pi$ 的比值</strong> $\pi(\theta')/\pi(\theta)$。而后验的比值 $\frac{p(\theta'\mid D)}{p(\theta\mid D)}=\frac{p(D\mid\theta')p(\theta')}{p(D\mid\theta)p(\theta)}$ 里，那个算不出来的归一化常数 $p(D)$ <strong>被约掉了</strong>！这就是 MCMC 只需未归一化密度的根本原因——也是它能攻克贝叶斯计算的关键。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>平稳性只保证「链最终服从 $\pi$」，不保证「多久能到」。一条理论上正确的链可能<strong>混合极慢</strong>——在后验的某个峰里困几百万步出不来。所以 MCMC 实践里，「采样器正确」（细致平衡）和「采样器有用」（混合快、ESS 高）是两个独立的问题：前者靠数学保证，后者靠诊断（第 6 节）和调参，常常更难。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mh"><span class="num">3</span>Metropolis-Hastings：最通用的采样器</h2>
+  <p><span class="term">Metropolis-Hastings</span>（MH）是最通用的 MCMC 算法，几乎所有采样器都是它的特例或推广。它的构造极其巧妙：先随便提一个候选，再用一个精心设计的概率决定接不接受，使得整条链恰好满足细致平衡。</p>  <h4>算法（一步）</h4>  <p>当前在 $\theta$，目标未归一化密度 $\tilde\pi(\theta)=p(D\mid\theta)p(\theta)$：</p>  <ol>
+    <li><strong>提议</strong>：从提议分布 $q(\theta'\mid\theta)$ 采一个候选 $\theta'$（最常用以当前点为中心的高斯，$\theta'=\theta+\mathcal N(0,s^2)$，称 random-walk MH）；</li>
+    <li><strong>算接受率</strong>：  <div class="math-block">\[\alpha = \min\!\left(1,\ \frac{\tilde\pi(\theta')\,q(\theta\mid\theta')}{\tilde\pi(\theta)\,q(\theta'\mid\theta)}\right)\]</div></li>
+    <li><strong>接受/拒绝</strong>：以概率 $\alpha$ 移动到 $\theta'$（$\theta_{t+1}=\theta'$），否则<strong>留在原地</strong>（$\theta_{t+1}=\theta$，注意：拒绝时要把当前点<em>再记一次</em>）。</li>
+  </ol>  <p>当提议<strong>对称</strong>（$q(\theta'\mid\theta)=q(\theta\mid\theta')$，如高斯随机游走）时，$q$ 约掉，接受率退化为原始 Metropolis 形式 $\alpha=\min(1,\tilde\pi(\theta')/\tilde\pi(\theta))$——<strong>候选更好（密度更高）就一定接受；更差就以正比于「差多少」的概率接受</strong>。偶尔接受更差的候选，正是链能爬出局部、探索整个后验的关键。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么这个接受率能保证细致平衡？把 $T(\theta\to\theta')=q(\theta'\mid\theta)\alpha(\theta,\theta')$ 代入细致平衡方程验证即可：接受率里的 $\min$ 结构恰好让 $\pi(\theta)T(\theta\to\theta')=\pi(\theta')T(\theta'\to\theta)$ 自动成立（两边都等于 $\min(\tilde\pi(\theta)q(\theta'\mid\theta),\ \tilde\pi(\theta')q(\theta\mid\theta'))$）。<strong>Hastings 在 1970 年正是反解细致平衡方程，凑出了这个接受率</strong>。所以 MH 不是启发式，而是细致平衡的一个解。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>MH 像在黑暗山地里找高地的策略：随机迈一步（提议），如果脚下更高就走过去；如果更低，也<strong>不是绝对不去</strong>——按高度差打个折扣偶尔下去，免得永远困在一个小山包上。久而久之，你停留在各处的时间正比于那里的「海拔」（后验密度）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>步长 $s$ 是<strong>唯一也是最关键</strong>的旋钮，存在 Goldilocks 困境：$s$ 太小 → 每步挪一点点、接受率高但探索极慢（强自相关）；$s$ 太大 → 总跳到密度极低处、几乎全被拒绝、链卡住不动。理论结果（Roberts 等）：随机游走 MH 的<strong>最优接受率约 0.234</strong>（高维）/ 0.44（一维）。实践中调 $s$ 使接受率落在 0.2–0.5 区间。notebook 会扫描 $s$ 复现这个权衡。</p></div>
+  </div>  <p>MH 的伟大之处在于<strong>通用</strong>：只要能算出未归一化后验（似然 × 先验，几乎总能算），就能采样<em>任何</em>后验，无需共轭、无需可微、无需任何结构。代价是它<strong>不用任何关于后验形状的信息</strong>（纯随机游走），高维或强相关后验下混合很慢——这正是 HMC（用梯度）和下一模块变分推断（用优化）要改进的地方。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="gibbs"><span class="num">4</span>Gibbs 采样：轮流采完全条件</h2>
+  <p><span class="term">Gibbs sampling</span>（Gibbs 采样）是 MH 的一个特例，但在合适的模型上效率极高、且<strong>无需调步长、接受率恒为 1</strong>（永不拒绝）。它的思想是：与其在高维空间里整体提议（容易被拒），不如<strong>一次只更新一个变量</strong>，且直接从它的精确条件分布采样。</p>  <h4>算法</h4>  <p>对参数 $\theta=(\theta_1,\dots,\theta_d)$，轮流地，对每个 $i$：</p>  <div class="math-block">\[\theta_i^{(t+1)} \sim p\big(\theta_i \,\big|\, \theta_{-i}, D\big) \qquad\text{（从第 } i \text{ 个变量的『完全条件』采样）}\]</div>  <p>其中 $\theta_{-i}$ 表示「除 $\theta_i$ 外所有变量的当前值」。<span class="term">full conditional</span>（完全条件分布）$p(\theta_i\mid\theta_{-i},D)$ 是固定其他所有变量后、单个变量的一维分布——通常远比联合后验简单，常因局部共轭而能<strong>解析采样</strong>。扫完所有 $d$ 个变量算一次完整迭代。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>Gibbs 像填一张相互关联的表格：你不知道整张表的联合分布，但知道「固定其他所有格子后，这一格该填什么分布」。于是你逐格地、按当前其他格的值重填每一格，一轮轮扫下去。神奇的是，这样扫足够多轮后，整张表的联合分布就收敛到了目标后验。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么接受率是 1？因为 Gibbs 可以看成提议分布<strong>恰好就是完全条件</strong>的 MH——代入接受率公式，分子分母完全相等，$\alpha\equiv1$。所以 Gibbs 是「永不浪费提议」的 MH。推导完全条件有个万能技巧：写出联合后验（似然 × 先验），<strong>只保留含 $\theta_i$ 的因子，其余全当常数</strong>，剩下的核就是 $\theta_i$ 的完全条件——常常一眼认出是某个标准分布（高斯、Gamma、Beta）。</p></div>
+  </div>  <p>Gibbs 在<strong>分层贝叶斯模型</strong>上是主力：这类模型每层都共轭，每个变量的完全条件都是标准分布、能直接采。典型例子是高斯均值方差联合推断（均值的完全条件是高斯、精度的完全条件是 Gamma，交替采），notebook 会完整实现并对拍解析后验。</p>  <div class="callout warn"><span class="label"></span>
+    <p>Gibbs 的阿喀琉斯之踵是<strong>强相关变量</strong>。当两个参数高度相关时（后验是一条窄斜椭圆），Gibbs 只能<strong>沿坐标轴方向</strong>走「之」字形小步，要很久才能沿椭圆长轴遍历——混合极慢。此外它还要求完全条件<strong>可采样</strong>（解析或易数值采样），非共轭模型里这常常做不到，只能退回 MH 或用 Metropolis-within-Gibbs（对采不了的变量用 MH 步）。这两条局限正是 HMC 与变分推断的用武之地。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="burnin"><span class="num">5</span>burn-in 与 thinning</h2>
+  <p>从一条 MCMC 链拿到样本后，不能直接全部拿去估计——有两个实践处理：<strong>burn-in</strong>（预烧）和 <strong>thinning</strong>（稀释）。理解它们要先认清 MCMC 样本与独立同分布样本的两点本质区别。</p>  <h3>5.1 burn-in：丢掉没收敛的开头</h3>  <p>链从一个<strong>任意初值</strong>出发，初值通常不在后验的高密度区。链需要一段时间「走到」后验集中的地方——这段时间的样本带着初值偏差、还不服从目标分布，必须<strong>丢弃</strong>。这段叫 <span class="term">burn-in</span>（或 warm-up）。</p>  <div class="ascii">一条链的轨迹（某参数随迭代 t）
+  值
+   │   初值很离谱
+   │  ╱╲    ← burn-in：从初值『漂移』到后验区（丢弃）
+   │ ╱  ╲__╱╲_╱╲__╱╲_╱╲__  ← 进入平稳：在后验众数附近震荡（保留）
+   │╱                        
+   └──┼──────────────────────▶ 迭代 t
+      burn-in 结束</div>  <p>burn-in 该丢多长？<strong>没有理论公式</strong>，只能靠收敛诊断（下一节的 $\hat R$、看 trace plot 是否「忘记」了初值）。常见做法是丢掉前 10–50%。判据是：丢掉 burn-in 后，从不同初值出发的多条链应当<strong>无法区分</strong>。</p>  <h3>5.2 thinning：每隔 k 个取一个</h3>  <p>MCMC 样本是<strong>自相关</strong>的——相邻样本很像（尤其拒绝率高、步长小时），不是独立的。<span class="term">thinning</span>（稀释）指每隔 $k$ 步保留一个，试图降低自相关、让保留的样本更「独立」。</p>  <div class="callout warn"><span class="label"></span>
+    <p>现代观点：<strong>除非内存/存储受限，thinning 通常得不偿失</strong>。原因是 thinning 丢弃了信息——用全部相关样本估计期望，方差<em>总是</em>不大于稀释后的（Geyer 的结论）。换句话说，1000 个自相关样本的估计，优于从中抽出的 100 个「较独立」样本。thinning 的真正价值是<strong>概念性的</strong>：它逼你正视「样本不独立」这件事，并引出真正的精度货币——有效样本量（下一节）。除非存不下，否则保留全部样本、报告 ESS 才是正道。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="diagnostics"><span class="num">6</span>收敛诊断：R-hat / ESS / 自相关</h2>
+  <p>这是 MCMC 实践中<strong>最重要也最容易被忽视</strong>的一节。一条链跑出来一堆样本，你怎么知道它<strong>真的收敛到后验了</strong>、而不是困在某处或还在漂移？没有诊断的 MCMC 结果，等于没有结果——因为错误的链照样吐出看似合理的样本。三个标准工具：</p>  <h3>6.1 自相关函数 ACF</h3>  <p>链中相隔 lag $k$ 的样本的相关系数 $\rho_k=\mathrm{Corr}(\theta_t,\theta_{t+k})$。混合好的链 $\rho_k$ 随 $k$ <strong>快速衰减到 0</strong>（样本很快「忘记」过去）；混合差的链 $\rho_k$ 衰减极慢（长期记忆，每个新样本几乎没带来新信息）。ACF 曲线是混合好坏最直观的体检图。</p>  <h3>6.2 有效样本量 ESS</h3>  <p><span class="term">effective sample size</span>（ESS，有效样本量）把「$N$ 个相关样本相当于多少个独立样本」量化出来：</p>  <div class="math-block">\[\mathrm{ESS} = \frac{N}{1 + 2\sum_{k=1}^{\infty}\rho_k}\]</div>  <p>分母 $1+2\sum_k\rho_k$ 叫<strong>积分自相关时间</strong>（integrated autocorrelation time），是「每个有效独立样本要花多少个 MCMC 步」。后验期望的蒙特卡洛标准误是 $\sqrt{\mathrm{Var}[f]/\mathrm{ESS}}$——<strong>分母是 ESS 而非 N</strong>。这意味着 5000 个高自相关样本可能 ESS 只有 50，估计精度只相当于 50 个独立样本。<strong>ESS 才是 MCMC 估计精度的真实货币</strong>。</p>  <h3>6.3 R-hat（Gelman-Rubin）</h3>  <p>单条链可能整条都困在一个峰里、看起来很「收敛」（自相关低）却完全错了。$\hat R$ 用<strong>多条独立初值的链</strong>互相检验来抓这种问题：跑 $m$ 条链各 $n$ 步，比较<strong>链间方差 $B$</strong>与<strong>链内方差 $W$</strong>：</p>  <div class="math-block">\[\widehat{\mathrm{Var}}^+ = \frac{n-1}{n}W + \frac{1}{n}B,\qquad \hat R = \sqrt{\frac{\widehat{\mathrm{Var}}^+}{W}}\]</div>  <p>直觉：若所有链都收敛到同一个后验，它们应当<strong>无法区分</strong>——链间方差 $B$ 不会超过链内方差 $W$，于是 $\hat R\to1$。若各链还困在不同区域，$B\gg W$，$\hat R$ 显著大于 1。经验阈值：<strong>$\hat R&lt;1.01$ 才算收敛</strong>（旧标准 1.1 已被认为太松）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>$\hat R$ 的精神是「群众的眼睛」：一条链自己看自己永远觉得没问题；让好几条从天南海北出发的链来对质，如果它们最终描述的后验长得一样（链间≈链内），才可信。任何一条掉队（困在别处），$\hat R$ 立刻报警。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>现代实践（Vehtari 2021）还会用 rank-normalized $\hat R$、folded $\hat R$（同时查均值与方差的收敛）、并要求每个参数 ESS 足够大（如 > 400）。黄金法则：<strong>跑多条链 + 看每个参数的 $\hat R$ 和 ESS + 画 trace plot</strong>，三者都过关才报告结果。本课 notebook 会从零实现 $\hat R$ 与 ESS 并在已知答案的高斯目标上验证。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>MCMC 最危险的失败模式是<strong>沉默地错</strong>：一条没收敛的链不会报错，它照样给你后验均值、可信区间，只是<em>全是错的</em>。尤其是<strong>多峰后验</strong>——链可能永远困在一个峰里，给出一个自信但片面的后验，所有单链诊断都显示「正常」。这正是 $\hat R$（多链）不可省略的原因。把「跑了 MCMC」和「MCMC 收敛了」当成两件事——后者必须用诊断证明，绝不能假设。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="landscape"><span class="num">7</span>采样器全景：从 MH 到 HMC/NUTS</h2>
+  <p>把本模块的采样器和它们的改进放进一张全景图，理解各自的取舍：</p>  <table>
+    <thead><tr><th>采样器</th><th>核心思想</th><th>优点</th><th>局限</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Random-walk MH</strong></td><td>随机提议 + 接受/拒绝</td><td>极通用，只需未归一化密度</td><td>高维/强相关混合慢，需调步长</td></tr>
+      <tr><td><strong>Gibbs</strong></td><td>轮流采完全条件</td><td>无需调参、接受率 1</td><td>需完全条件可采、强相关时慢</td></tr>
+      <tr><td><strong>Metropolis-within-Gibbs</strong></td><td>对采不了的变量用 MH 步</td><td>兼顾 Gibbs 结构与通用性</td><td>仍受相关性拖累</td></tr>
+      <tr><td><strong>HMC</strong></td><td>用梯度模拟哈密顿动力学</td><td>远距离高接受率、自相关极低</td><td>需可微、需调步长/轨迹长度</td></tr>
+      <tr><td><strong>NUTS</strong></td><td>HMC 的自动调参版</td><td>几乎免调参，Stan/PyMC 默认</td><td>实现复杂、仍需可微</td></tr>
+    </tbody>
+  </table>  <p><strong>Random-walk MH 的根本弱点</strong>是它「盲走」——完全不用后验的形状信息，靠运气撞高密度区，高维下命中率指数下降。<span class="term">Hamiltonian Monte Carlo</span>（HMC）的突破在于用<strong>梯度</strong> $\nabla\log\pi$ 引路：把采样想象成一个粒子在「势能 = 负对数后验」的地形上做物理运动，沿着地形滑行能一步走很远、且接受率极高（因为哈密顿动力学近似守恒能量）。这让 HMC 的自相关比随机游走低几个数量级，是高维后验的实用王者。</p>  <p>HMC 需要手调步长与轨迹长度，调不好会很糟。<span class="term">No-U-Turn Sampler</span>（NUTS）自动决定轨迹长度（走到「要掉头」为止），把 HMC 变成几乎免调参——这就是为什么 Stan、PyMC、NumPyro 默认用 NUTS。理解了本模块的 MH 与细致平衡、ESS 诊断，你就握住了读懂 HMC/NUTS 的钥匙：它们改进的是<strong>提议机制</strong>（用梯度而非乱走），但正确性依据（细致平衡的推广）和诊断手段（$\hat R$、ESS）完全一脉相承。</p>  <div class="callout paper"><span class="label"></span>
+    <p>本模块的 numpy 采样器是教学版（玩具规模、纯 random-walk/Gibbs）。生产中请用 Stan/PyMC/NumPyro 的 NUTS——它们把梯度（自动微分）、自适应步长、高效诊断都工程化了。但内核完全是本模块讲的东西，见 <code>../references.md</code> 的 Neal 2011（HMC）、Hoffman & Gelman 2014（NUTS）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>MCMC 是 1953 年（Metropolis）的算法，却至今活跃在研究前沿，因为「从复杂分布采样」是个永不过时的难题：</p>  <ul>
+    <li><strong>梯度型采样器</strong>：HMC/NUTS 之后，Riemannian HMC（用后验的局部曲率/Fisher 信息自适应几何）、以及把 MCMC 与随机梯度结合的 SG-MCMC（SGLD、SGHMC）让 MCMC 能用 mini-batch 扩展到大数据，是贝叶斯深度学习的活跃方向。</li>
+    <li><strong>多峰与困难几何</strong>：并行回火（parallel tempering）、嵌套采样（nested sampling）、序贯蒙特卡洛（SMC）专攻多峰后验与边际似然估计——单链 MCMC 在多峰上的失败催生了这一整支。</li>
+    <li><strong>收敛诊断的理论化</strong>：$\hat R$/ESS 是启发式，何时「真的收敛」缺乏一般理论保证。rank-normalized $\hat R$（Vehtari 2021）、基于最优传输的诊断等仍在演进。</li>
+    <li><strong>与变分推断的融合</strong>：用 VI 的近似当 MCMC 的提议或初值、用 normalizing flow 学一个好提议分布（如 NeuTra）、MCMC 步嵌进变分目标——下一模块的 VI 与本模块的 MCMC 正在彼此借力，而非互相替代。</li>
+    <li><strong>无似然 / 模拟推断</strong>：当似然都写不出、只能模拟数据时（ABC、SBI），如何采样后验是计算统计的前沿，把 MCMC 推广到了「连密度都没有」的情形。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读（见 <code>../references.md</code>）：Neal 1993（MCMC 奠基综述）、Neal 2011（HMC 权威讲解）、Gelman & Rubin 1992（$\hat R$ 原始论文）、Vehtari 2021（现代 $\hat R$/ESS）。下一模块换一条完全不同的路——不再采样，而是把推断变成优化：变分推断。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_bayesian_inference/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 贝叶斯推断与共轭</div></a>
+    <a class="next" href="../03_variational_inference/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 变分推断</div></a>
+  </div>
+
+</div>
+</body>
+</html>

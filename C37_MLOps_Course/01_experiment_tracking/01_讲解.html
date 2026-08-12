@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 实验追踪</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 实验追踪</h1>
+  <p class="subtitle">从零写一个实验追踪器 —— 把每次训练的参数/指标/产物结构化记录、可检索、可比较、可复现；这是 MLOps 一切的地基</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00；Python 字典/JSON、一点点训练循环的概念</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_experiment_tracking.ipynb（从零 Tracker + sqlite 查询胶囊）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Sculley 2015（配置债）、MLflow、NeurIPS Reproducibility Checklist</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">动机：三周后没人记得 v17 是哪组超参</a></li>
+      <li><a href="#model">数据模型：run 是一等公民</a></li>
+      <li><a href="#immut">落盘、不可变性与参数/指标/产物三分</a></li>
+      <li><a href="#repro">可复现性的三个层次</a></li>
+      <li><a href="#confighash">config hash：复现性的廉价校验</a></li>
+      <li><a href="#compare">比较：从一堆 run 里选最优</a></li>
+      <li><a href="#query">查询：把记录变成可回答的问题</a></li>
+      <li><a href="#practice">接进训练循环 · 前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>动机：三周后没人记得 v17 是哪组超参</h2>
+  <p>假设你训练了 40 个模型变体——不同学习率、不同层数、不同数据切分、不同随机种子。三周后老板问：<strong>「上线的那个是哪组超参？换台机器能复现吗？为什么 v17 比 v23 好？」</strong>如果你的实验记录是一堆乱命名的文件夹 <code>model_final_v2_really_final/</code> 和散落在终端里的 <code>print(acc)</code>，你答不上来。<strong>这就是实验追踪要解决的问题。</strong></p>  <p>实验追踪（experiment tracking）是 MLOps 最基础、回报也最立竿见影的一块。它的工作只有一句话：<strong>把每一次训练的「输入、输出、产物、环境」结构化地记录下来，使得任意一次实验都可被检索、被比较、被复现</strong>。听起来平平无奇，但它是后面一切的地基——没有可复现的实验，版本控制（模块 02）无从谈起，门禁（模块 03）无可比较，重训（模块 05）无法追溯。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把追踪器想成实验室的「实验记录本」：每做一次实验，你在本子上记下——用了什么试剂（参数）、测出什么读数（指标）、产出什么样品（产物/模型文件）、当天的温湿度（环境/代码版本）。本子的价值不在某一页，而在你能<strong>翻回去对照任意两次实验</strong>、并照着记录<strong>把任意一次重做一遍</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，一次实验是一个映射 <code>run: config → (metrics, artifacts)</code>。追踪器要持久化这个映射的全部信息：<strong>参数</strong>（config，训练期不变的输入）、<strong>指标</strong>（metrics，可随 step 演化的输出测量）、<strong>产物</strong>（artifacts，输出文件及其内容哈希）、<strong>元数据</strong>（tags：代码 commit、数据版本、时间、负责人）。这恰是 MLflow 的 experiment ⊃ run 数据模型，本模块从零把它实现出来。</p></div>
+  </div>  <p>值得强调它和你可能上过的「评测课」（如 C34）的分工：评测课教你<strong>如何把一个模型评准</strong>（指标怎么定义、测试集怎么切、置信区间怎么算）；实验追踪管的是<strong>当你评了几十上百次之后，这些结果怎么不丢、不乱、可复查</strong>。前者关心<em>一次</em>评测的质量，后者关心<em>一组</em>实验的可管理性。两者正交：评得再准，记不下来、复现不了，三周后照样抓瞎。本模块就是把「评测结果」升级成「可治理的实验资产」。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一个判别「参数 vs 指标」的简单准则：<strong>训练开始前你能写下的，是参数；训练跑完才知道的，是指标。</strong>学习率、种子、层数是参数；loss、accuracy、AUC 是指标。把两者分开存不是洁癖——比较 run 时你按<em>参数</em>分组、看<em>指标</em>差异，这个结构让「哪个超参更好」变成一句可执行的查询。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="model"><span class="num">2</span>数据模型：run 是一等公民</h2>
+  <p>追踪器的核心数据结构是 <strong>run</strong>——一次训练的完整记录。一个最小但完备的 run 长这样：</p>  <pre><code>run = {
+  'run_id':   'a3f9c1...',        # 唯一主键（随机或内容哈希）
+  'status':   'finished',          # running / finished / failed
+  'params':   {'lr': 0.01, 'layers': 3, 'seed': 42, 'data': 'v1'},
+  'metrics':  {'val_acc': 0.913, 'val_loss': 0.21},   # 最终值
+  'history':  {'val_acc': [(0,0.7),(1,0.85),(2,0.913)]},  # 带 step 的曲线
+  'artifacts':{'model.npz': 'sha256:7d2a...'},        # 文件 -&gt; 内容哈希
+  'tags':     {'git': 'c1d4e', 'owner': 'zerui'},
+  'start_ts': 1719500000.0, 'end_ts': 1719500125.0,
+}</code></pre>  <p>几个设计决定值得讲清楚。其一，<strong>run_id 必须唯一且稳定</strong>：它是把 params/metrics/artifacts/日志串起来的外键。其二，<strong>metrics 同时存「最终值」与「历史曲线」</strong>——最终值用于排序选优，曲线用于诊断（是否过拟合、是否还没收敛）。其三，<strong>status 是状态机</strong>：<code>running→finished</code> 或 <code>running→failed</code>；一个崩了的 run 不能被当成有效结果纳入比较，否则你会拿一个训练到一半的模型上线。</p>  <p>为什么 metrics 一定要存「曲线」而不只是「终值」？看一个微例：两个 run 的 <code>val_acc</code> 终值都是 0.90，单看终值它们一样好。但 A 的曲线是 <code>0.6→0.8→0.90</code>（还在涨，欠训练，再训几轮可能到 0.93），B 的曲线是 <code>0.95→0.92→0.90</code>（在跌，过拟合了，最优其实在第 1 轮的 0.95）。只存终值，这两种截然不同的故事被压成同一个数；存了曲线，你一眼看出「A 该多训、B 该早停」。<strong>终值回答「现在多好」，曲线回答「为什么这么好、接下来该怎么办」</strong>——后者才是调参时真正驱动决策的信息。这也是为什么 <code>log_metric</code> 必须带 <code>step</code>：它把一次训练从「一个点」升级成「一条轨迹」。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="immut"><span class="num">3</span>落盘、不可变性与参数/指标/产物三分</h2>
+  <p>本模块把每个 run 存成一个 JSON 文件（<code>runs/&lt;run_id&gt;.json</code>），整个 experiment 是一个目录。这个朴素方案有几个不起眼但关键的性质：<strong>可读</strong>（出事能直接 <code>cat</code> 看）、<strong>可 diff</strong>（两个 run 的 JSON 直接比对）、<strong>append-only</strong>（新 run 只新增文件，绝不改旧文件——这正是可复现与可审计的前提）。MLflow 的本地后端本质就是这样一棵文件树，加了个数据库做索引。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个真实世界的陷阱：<strong>不要原地覆盖一个已完成 run 的记录</strong>。如果你「重跑一下 v17 顺便更新它的指标」，你就销毁了历史——三个月后没人知道当初上线的 v17 到底是哪个数。正确做法是<em>永远新建一个 run</em>（哪怕配置完全一样），让记录不可变。本模块的 tracker 在 <code>log_metric</code> 到一个已 finished 的 run 时会直接报错，把这条纪律编码进 API。</p>
+  </div>  <p>初学者常把所有东西塞进一个扁平字典。但 params/metrics/artifacts 三者的<strong>生命周期与用途完全不同</strong>，混在一起会让后续的查询、比较、去重全部失效。<strong>params 在训练前确定、训练中不变</strong>，是实验的「自变量」，比较时按它分组；<strong>metrics 在训练中产生、可随 step 演化</strong>，是「因变量」，比较时看它的差异；<strong>artifacts 是产出的二进制文件</strong>，太大不能直接进数据库，只存它的内容哈希与路径（真实文件交给模块 02 的内容寻址存储）。</p>  <p>这个三分法直接决定了数据库 schema：params 与 metrics 可以索引进关系表的列（<code>WHERE params.lr=0.01 ORDER BY metrics.acc</code>），artifacts 则进对象存储。本模块的胶囊会用 <code>sqlite3</code> 把 params/metrics 索引成表、跑真正的 SQL 选优，让你亲眼看到这个架构。<strong>先把概念分清，写出来的工具才不会在规模变大时崩盘。</strong></p>
+
+  <!-- ========================================================= -->
+  <h2 id="repro"><span class="num">4</span>可复现性的三个层次</h2>
+  <p>「可复现」不是一个布尔值，而是一道光谱。从弱到强：</p>  <p>「可复现」不是一个布尔值，而是一道光谱。从弱到强：</p>  <table>
+    <thead><tr><th>层次</th><th>固定了什么</th><th>能复现什么</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L1 配置可复现</strong></td><td>记录全部 params + 数据版本 + 代码 commit</td><td>知道「当初用了什么」，能照着重搭实验</td><td>几乎为零（只是记录）</td></tr>
+      <tr><td><strong>L2 种子可复现</strong></td><td>L1 + 固定随机种子（数据洗牌、初始化、dropout）</td><td>同机同库下，结果数值接近甚至一致</td><td>记一个 seed</td></tr>
+      <tr><td><strong>L3 字节级确定</strong></td><td>L2 + 锁定库版本、运算顺序、关非确定算子</td><td>任意机器上字节级相同的模型</td><td>高（性能/灵活性折损）</td></tr>
+    </tbody>
+  </table>  <p>大多数团队的现实目标是 <strong>L2</strong>：记全配置 + 固定种子。<strong>L3 的字节级确定性</strong>代价很高（GPU 上某些算子天然非确定、并行归约顺序不定），通常只在合规/审计场景才追求。本模块的 tracker 强制记录 seed 与一个 <span class="term">config hash</span>，把你至少钉在 L1–L2。</p>  <p>为什么不是越严越好？因为可复现性和<strong>性能/灵活性</strong>天然冲突。要 L3，你得关掉非确定的 GPU 算子（更慢）、固定运算顺序（放弃某些并行优化）、锁死库版本（无法升级到更快的新版）。所以正确的工程判断不是「永远追求最高级别」，而是<strong>按场景选档</strong>：日常调参 L1–L2 足够（你要的是「知道用了什么」和「大致能重来」）；要把模型作为证据提交监管、或要精确归因一次线上事故时，才付出 L3 的代价。<strong>可复现性是一种可按需调节的投资，不是非黑即白的开关</strong>——能清楚说出「我的实验在第几级、为什么停在这级」，本身就是成熟度的标志。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="confighash"><span class="num">5</span>config hash：复现性的廉价校验</h2>
+  <p>给一次实验的全部配置（params + 数据版本 + 代码版本）做一个内容哈希，得到一个指纹 <code>config_hash</code>。它有两个妙用：<strong>去重</strong>（两个 run 的 config_hash 相同 ⇒ 配置完全一致，重复实验可被发现）、<strong>复现校验</strong>（你声称复现了某 run，先比 config_hash，不同就根本没在复现同一个东西）。</p>  <div class="math-block">\[\text{config\_hash} = \mathrm{SHA256}\big(\,\mathrm{canonical\_json}(\text{params} \cup \text{data\_ver} \cup \text{code\_ver})\,\big)\]</div>  <p>关键细节是 <strong>canonical（规范化）</strong>：JSON 序列化时必须 <code>sort_keys=True</code>，否则 <code>{"lr":0.01,"seed":42}</code> 和 <code>{"seed":42,"lr":0.01}</code> 会得到不同哈希——内容相同却指纹不同，去重就失效了。这个「内容寻址要先规范化」的思想，模块 02 会大用特用。</p>  <pre><code># 同一份配置，键序不同 —— 不规范化就炸
+import json, hashlib
+def h(d, canonical):
+    s = json.dumps(d, sort_keys=canonical)   # canonical=是否排序键
+    return hashlib.sha256(s.encode()).hexdigest()[:12]
+a = {'lr': 0.01, 'seed': 42}
+b = {'seed': 42, 'lr': 0.01}          # 内容完全相同，只是键序不同
+print(h(a, False), h(b, False))       # 2 个不同的哈希 —— 去重失效！
+print(h(a, True),  h(b, True))        # 同一个哈希 —— 规范化救场</code></pre>  <p>跑一下就会看到：不排序时 <code>a</code> 和 <code>b</code> 给出两个不同指纹，于是「明明是同一组配置的两次重复实验」被当成两个不同实验，去重彻底失灵；加上 <code>sort_keys=True</code> 后两者归一。规范化不只是排序键——浮点也要统一精度（<code>0.1</code> 与 <code>0.10</code> 的字符串不同）、集合要先排序。这几行就是模块 02 整个内容寻址版本系统的最小种子。</p>  <p>为什么规范化这么关键，值得再钉一遍：<strong>内容寻址的全部信任都建立在「相同内容 ⇒ 相同指纹」上</strong>。一旦键序、浮点格式（<code>0.1</code> vs <code>0.10</code>）、或集合元素顺序的不确定让同一份配置产生不同哈希，去重会漏判、复现校验会误报「你没复现」。所以序列化必须是<em>确定的、规范的</em>：键排序、浮点统一精度、集合先排序。这一条看似琐碎，却是模块 02 整个版本系统能成立的同一块基石——那里我们对<em>数据本身</em>做内容寻址，规范化的要求只会更严。</p>  <div class="callout danger"><span class="label"></span>
+    <p>可复现性最常见的杀手不是没记 seed，而是 <strong>隐藏状态</strong>：全局随机数发生器（没传 seed 的 <code>np.random</code>）、依赖系统时间、依赖文件遍历顺序（不同 OS 下 <code>os.listdir</code> 顺序不同）、依赖未固定的库版本。这些不会出现在你的 params 里，却悄悄决定结果。<strong>可复现性的第一纪律：让一切随机性都经过一个显式的、被记录的 seed。</strong>本模块用 <code>np.random.default_rng(seed)</code> 而非全局 <code>np.random</code>，就是为此。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="compare"><span class="num">6</span>比较：从一堆 run 里选最优</h2>
+  <p>追踪的终极目的是<strong>决策</strong>：在几十个 run 里挑出该上线的那个。这一步看似简单（按 val_acc 排序取最高），实则全是坑——这些坑几乎全部源自一个根因：<strong>比较只有在「其他条件相同」时才有意义</strong>。换句话说，run 之间要可比，必须控制住除「你想研究的那个变量」之外的一切。下面几条都是这条原则的具体落地：</p>  <ul>
+    <li><strong>比较口径要统一</strong>：所有 run 必须在<em>同一个测试集、同一个指标定义</em>下评测。拿 run A 在测试集 v1 的 acc 和 run B 在测试集 v2 的 acc 比，是无意义的——这是新手最常踩的「苹果比橘子」。</li>
+    <li><strong>只比 finished 的 run</strong>：failed 或 running 的 run 的指标不可信，必须先过滤。</li>
+    <li><strong>单指标排序会骗人</strong>：最高 acc 的模型可能延迟爆炸、或在某个子群体上很差。生产选型常是多目标（acc × 延迟 × 公平性）的折中，至少要把候选指标都摆出来看。</li>
+    <li><strong>最高分 ≠ 显著更好</strong>：第一名比第二名高 0.2%，可能纯属测试集采样噪声。「这个提升是真的吗」是模块 03 门禁的核心问题，这里先埋个伏笔。</li>
+  </ul>  <p>把「苹果比橘子」的坑用一个具体数字钉死：run A 在测试集 v1（1000 条）上 <code>acc=0.92</code>，run B 在测试集 v2（清洗掉了 200 条难样本、只剩 800 条）上 <code>acc=0.94</code>。粗看 B 赢了 2 个点，于是你上线 B。但 B 的「赢」全部来自<em>测试集变简单了</em>，而非模型变好了——把 B 放回 v1 上重评，很可能只有 0.90，反而比 A 差。<strong>这就是为什么追踪器必须把「测试集版本」当成一等的、要记录的字段</strong>（它本身就是模块 02 要版本化的资产）：只有锁定同一个测试集，两个 acc 才构成可比的数；测试集一变，比较就失去意义。一个好的 tracker 会在比较接口里强制检查两个 run 的测试集版本一致，不一致直接拒绝比较——把「可比性」这条纪律编码进 API，而不是寄望使用者每次都记得手动核对。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="query"><span class="num">7</span>查询：把记录变成可回答的问题</h2>
+  <p>一旦 run 结构化落盘，「实验管理」就变成了「数据查询」。本模块的 tracker 提供一个最小查询层：按 tag 过滤（<code>owner='zerui'</code>）、按 param 过滤（<code>layers=3</code>）、按 metric 排序取 top-k。在玩具规模我们用 Python 字典推导；在生产规模这就是 MLflow 背后的 SQL（<code>SELECT ... WHERE params.layers=3 ORDER BY metrics.val_acc DESC</code>）。本模块的胶囊会用真正的 <code>sqlite3</code> 把这套查询跑一遍，让你看清「JSON 文件树 + 索引数据库」这个真实架构。</p>  <div class="ascii">experiment: tune_classifier
+  ├─ run a3f9  lr=0.01 layers=3 seed=42   val_acc=0.913  [finished]
+  ├─ run b1c2  lr=0.05 layers=3 seed=42   val_acc=0.901  [finished]
+  ├─ run 7d2a  lr=0.01 layers=5 seed=42   val_acc=0.918  [finished]  &lt;- best
+  ├─ run e4f5  lr=0.10 layers=3 seed=42   val_acc=0.642  [failed  ]  &lt;- 排除
+  └─ run 9a8b  lr=0.01 layers=5 seed=99   val_acc=0.915  [finished]
+
+查询：finished 中按 val_acc 取最优 -&gt; 7d2a；它与 9a8b 仅差 seed，差 0.003（噪声？见模块03）</div>  <p>把查询能力再往前推一步，就是<strong>超参重要性分析</strong>：与其逐个看 run，不如问「<em>把 layers 从 3 调到 5，平均带来多少 acc 提升？</em>」——按某个 param 分组、比较组间指标均值。这正是本模块胶囊练习用一句 SQL <code>AVG(val_acc) ... GROUP BY layers</code> 做的事的雏形。规模再大（成百上千 run），它会长成贝叶斯优化与 AutoML 的「代理模型」：用已有 run 拟合「超参→指标」的曲面，指导下一步该往哪搜。<strong>追踪不只是记账，它让实验组合本身成为可分析、可优化的对象。</strong></p>  <div class="callout intuition"><span class="label"></span>
+    <p>好的追踪器让这类问题变成<strong>一行查询而非一下午考古</strong>：「哪组超参在测试集上最好？」「layers=5 是不是普遍优于 layers=3？」「上线模型对应的数据版本是哪个？」当你能秒答这些，你就从「跑实验的人」升级成了「管理实验组合的人」——这是 MLOps 给个人最直接的杠杆。</p>
+  </div>  <p>把本模块从零写的玩具组件对应到生产工具，你会发现自己造的不是「教学简化版」，而是真实系统的内核——只是少了规模化与多人协作的工程外壳：</p>  <table>
+    <thead><tr><th>本模块从零实现</th><th>它的本质</th><th>生产工具对应</th></tr></thead>
+    <tbody>
+      <tr><td>JSON 文件树 <code>runs/&lt;id&gt;.json</code></td><td>append-only 的 run 存储</td><td>MLflow 本地后端、W&B 的 run 目录</td></tr>
+      <tr><td><code>sqlite3</code> 索引 + SQL 查询</td><td>params/metrics 的关系型索引</td><td>MLflow Tracking Server（背后是 SQL DB）</td></tr>
+      <tr><td><code>config_hash</code></td><td>配置的内容指纹</td><td>MLflow run 的 params 哈希、Hydra 配置快照</td></tr>
+      <tr><td><code>log_artifact</code> + 内容哈希</td><td>产物的内容寻址</td><td>MLflow artifact store（S3/本地）、接模块 02 的 DVC</td></tr>
+      <tr><td><code>start_run/end_run</code> 薄壳</td><td>低侵入的追踪边界</td><td><code>with mlflow.start_run():</code>、框架回调</td></tr>
+    </tbody>
+  </table>  <p>这张表是本课的一条暗线：<strong>你不是在学某个平台的按钮，而是在学这些平台共同的底层抽象</strong>。明白了「MLflow 不过是一棵 append-only 文件树加一个 SQL 索引」，你换到 W&B、Comet、或公司自研的追踪系统时，问的问题永远是同一批——run 怎么存、params 怎么索引、产物怎么寻址、追踪怎么不侵入训练。工具会换，抽象不变。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="practice"><span class="num">8</span>接进训练循环 · 前沿与开放问题</h2>
+  <p>理论讲完，看它在真实训练里怎么用。一个常被忽视的实践问题是<strong>追踪代码该侵入训练代码多深</strong>。理想是<em>近乎零侵入</em>：训练逻辑只管训练，追踪只在边界处插几行（开 run、每个 epoch 记一次、结束封存）。如果你发现追踪逻辑和模型逻辑缠成一团（CACE 的又一例），说明抽象漏了——真实工具用上下文管理器（<code>with mlflow.start_run():</code>）和回调（callback）把追踪与训练解耦，本模块的 <code>start_run/end_run</code> 也刻意做成可包在训练循环外的薄壳。模式永远是「<strong>开 run → 记参数 → 训练中记指标 → 记产物 → 关 run</strong>」：</p>  <pre><code>tracker = Tracker(root='./mlruns', experiment='tune_classifier')
+run = tracker.start_run(params={'lr': 0.01, 'layers': 5, 'seed': 42, 'data': 'v1'})
+for step in range(n_epochs):
+    train_one_epoch(...)
+    acc = evaluate(...)
+    tracker.log_metric(run, 'val_acc', acc, step=step)   # 记曲线
+tracker.log_artifact(run, 'model.npz', model_bytes)      # 记产物 + 内容哈希
+tracker.end_run(run, status='finished')                  # 封存，不可再改
+
+best = tracker.best_run('val_acc', mode='max')           # 选优
+assert best['params']['seed'] == 42                      # 可复现：seed 被记下</code></pre>  <p>注意这套 API 的纪律：<code>log_metric</code> 带 <strong>step</strong>（存曲线不只存终值）；<code>log_artifact</code> 顺手算<strong>内容哈希</strong>（产物可校验、可去重，接模块 02）；<code>end_run</code> 之后该 run <strong>冻结</strong>（再 log 会报错，保证记录不可变）。这三条把前面讲的复现性纪律落进了代码——<strong>好的工具不是「能记」，而是把正确做法变成唯一好走的路、把错误做法堵死在 API 层</strong>。这正是从「写脚本」到「造基础设施」的思维跃迁：你设计的不是一段会跑的代码，而是一套<em>别人（包括三个月后的你）想做错都难</em>的约束。</p>  <ul>
+    <li><strong>追踪的「完整性」边界</strong>：要复现一个 LLM 微调，你得记下数据、代码、超参、随机种子——还有基础模型版本、tokenizer 版本、甚至硬件（不同 GPU 数值不同）。「记到多细才够复现」没有公认答案，且记得越全成本越高。这是 reproducibility 研究的活跃前沿（见 references 的 NeurIPS Reproducibility Checklist）。</li>
+    <li><strong>大产物的追踪</strong>：记一个 100GB 的模型权重的「内容哈希」很便宜，但存它的每个版本很贵。如何在「可复现」与「存储成本」间取舍，催生了内容寻址 + 去重的版本系统（模块 02 的 DVC）。</li>
+    <li><strong>追踪即实验设计</strong>：当 run 成千上万（超参搜索、自动化训练），人工看 leaderboard 失效，需要自动化的实验分析——哪个超参最重要？该往哪个方向继续搜？这把追踪与 AutoML/贝叶斯优化接上。</li>
+    <li><strong>分布式与协作的一致性</strong>：多人多机同时写一个 experiment，如何保证 run_id 不冲突、记录不丢、并发读一致？这是从「玩具 JSON 树」到「生产追踪服务」的真正难点，也是 MLflow/W&B 的核心工程。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读：MLflow 论文与文档（看 experiment/run 数据模型的生产形态）、NeurIPS Reproducibility Checklist（把「可复现」变成可勾选项）、Sculley 2015 的「配置债」一节（为什么散乱的配置是最隐蔽的债）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_versioning/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 数据与模型版本</div></a>
+  </div>
+
+</div>
+</body>
+</html>

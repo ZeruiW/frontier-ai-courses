@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 鲁棒性</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 鲁棒性</h1>
+  <p class="subtitle">超时/重试/指数退避、输出截断、幻觉工具名处理、无限循环检测、token/成本追踪与预算熔断、可观测 trace —— 把脆弱的 demo 变成能跑的系统，用 MockLLM 注入故障逐一验证每道防线</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–03（循环、工具系统、LLM 适配器与 usage）、Python 异常处理、一点点系统可靠性常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_robustness.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Amazon «Backoff & Jitter»、Google SRE Book（过载/级联失败）、handling-stop-reasons 文档</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#gap">从『能跑』到『能用』的鸿沟</a></li>
+      <li><a href="#failmap">失败地图：会在哪出错</a></li>
+      <li><a href="#retry">重试与退避：应对瞬时故障</a></li>
+      <li><a href="#timeout">超时：给每步设时限</a></li>
+      <li><a href="#loop">循环检测：发现原地打转</a></li>
+      <li><a href="#cost">成本追踪与预算熔断</a></li>
+      <li><a href="#wrapper">组装：鲁棒的 agent wrapper</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="gap"><span class="num">1</span>从『能跑』到『能用』的鸿沟</h2>
+  <p>到这里，你已经能造一个<strong>能跑</strong>的 agent：循环（01）+ 工具（02）跑在统一的 LLM 接口（03）之上。但「能跑」和「能用」之间，隔着一道叫<strong>鲁棒性</strong>的鸿沟——而这道鸿沟，正是「写了个 demo」和「做出了能上线的系统」的分水岭。本模块就是跨越它。</p>  <p>一个残酷的事实：<strong>在真实世界里，几乎每一步都可能出错</strong>。LLM 调用会被限流（429）、会撞上服务端临时故障（5xx）、会因网络抖动而超时；模型会调用不存在的工具、会陷入「调同一个工具→看结果→再调」的死循环、会因为困惑而永远不收尾；工具内部会抛异常、会卡住。前几个模块为了讲清主干，对这些大多一笔带过（dispatch 隔离了工具异常，是唯一的例外）。本模块把它们<strong>系统地</strong>处理掉。</p>  <p>鲁棒性不是给 agent 加一堆 try/except 那么简单，它是一套有结构的<strong>防御体系</strong>，每一层应对一类失败：<strong>重试</strong>应对瞬时故障（限流、5xx、超时——等一下再试就好）；<strong>超时</strong>应对卡死（给每步设时限，绝不无限等）；<strong>循环检测</strong>应对无进展（发现 agent 在原地打转就止损）；<strong>成本追踪与预算熔断</strong>应对失控烧钱（实时算账，超预算就停）；<strong>可观测</strong>贯穿全部（记录每一步，让你事后能复盘「它为什么这样、钱花哪了」）。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>鲁棒性 = 给 agent 的每一类失败配一个明确的应对——能重试的重试、会卡的设超时、原地打转的止损、要烧钱的熔断、出了事能复盘</strong>。核心心法有两条：(1) <em>区分『该重试的』和『重试也没用的』</em>（瞬时 vs 永久错误）；(2) <em>给每个可能无限的东西设硬上限</em>（时间、步数、预算）。把这两条做到位，你的 agent 就从『demo』变成了『系统』。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="failmap"><span class="num">2</span>失败地图：会在哪出错</h2>
+  <h3>失败地图：agent 会在哪些地方出错</h3>  <p>做防御前，先把「敌人」列清楚。一个 agent 运行时，失败可能来自四个层面，每层有不同的性质与应对：</p>  <table>
+    <thead><tr><th>失败层面</th><th>典型表现</th><th>性质</th><th>应对手段</th></tr></thead>
+    <tbody>
+      <tr><td><strong>LLM 调用</strong></td><td>429 限流 / 5xx / 网络超时 / refusal</td><td>多为瞬时(可重试)</td><td>退避重试 + 超时</td></tr>
+      <tr><td><strong>模型决策</strong></td><td>调用幻觉工具 / 填错参数 / 永不收尾</td><td>逻辑错误</td><td>错误隔离(模块02) + 循环检测 + max-steps</td></tr>
+      <tr><td><strong>工具执行</strong></td><td>函数抛异常 / 外部 API 挂 / 卡死</td><td>混合(部分可重试)</td><td>错误隔离 + 超时 + (幂等的)重试</td></tr>
+      <tr><td><strong>资源耗尽</strong></td><td>token/成本超预算 / 上下文撑爆</td><td>累积性</td><td>成本追踪 + 预算熔断 + 上下文管理</td></tr>
+    </tbody>
+  </table>  <p>这张表透露一个关键洞见：<strong>不同失败需要根本不同的应对，不能一概而论</strong>。对瞬时故障（429、5xx），重试是对的——等一下，服务恢复了就成功了；但对永久错误（400 参数非法、401 认证失败），重试是<em>有害</em>的——它永远不会成功，重试只是浪费时间和钱。对工具异常，隔离成可反馈错误让模型改是对的；但对模型「永不收尾」，再多隔离也没用，只能靠 max-steps 强制止损。<strong>分清每种失败的性质，是对症下药的前提</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>可以把这张失败地图想成给 agent 做<strong>体检</strong>：先列出它可能得的每种「病」（限流、卡死、打转、烧钱），再对每种病开对应的「药」（重试、超时、循环检测、熔断）。新手最常犯的错是<em>用一种药治所有病</em>——比如对一切错误都重试（结果对永久错误白白重试到死），或对一切都直接崩（结果一个瞬时抖动就让整个 agent 失败）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从系统视角，这正是 SRE（站点可靠性工程）的经典议题在 agent 语境的重演：超时、重试、降级、熔断如何<strong>协同</strong>防止「一个慢调用拖垮整条链路」。Google SRE Book、《Release It!》里的稳定性模式（Circuit Breaker、Timeout、Bulkhead）讲的就是这些——agent 只是把它们用在了「LLM + 工具」这条新链路上。</p></div>
+  </div>  <p>本模块会逐一为这张地图上的每类失败造防御，并最终把它们组装成一个<strong>鲁棒 wrapper</strong>——一个包裹住 agent 的外壳，让原本脆弱的循环获得重试、超时、循环检测、成本追踪、可观测的全套能力，而<em>不必改动循环本身一行代码</em>。这种「用一层包装增强而不侵入核心」的设计，本身也是值得学的工程手法。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="retry"><span class="num">3</span>重试与退避：应对瞬时故障</h2>
+  <h3>重试与退避：应对瞬时故障</h3>  <p>最常见的失败是<strong>瞬时</strong>的：LLM 服务被限流（429）、临时过载（5xx）、网络抖动导致超时。这类故障的共同点是——<em>它不是你的错，而且等一下再试很可能就好了</em>。对它们，正确的应对是 <span class="term">retry with backoff</span>（退避重试）。</p>  <p>但「重试」有讲究，三个要点缺一不可：</p>  <ul>
+    <li><strong>只重试该重试的</strong>：429（限流）、5xx（服务端错误）、超时——重试有望成功。400（参数非法）、401（认证失败）——重试永远不会成功，应立刻上报。<strong>区分瞬时与永久错误是重试的前提</strong>，盲目重试一切是反模式。</li>
+    <li><strong>指数退避</strong>：每次重试前等待的时间随失败次数<em>指数增长</em>（如 1s、2s、4s、8s）。为什么不固定间隔？因为服务正过载时，固定间隔的密集重试只会雪上加霜；指数退避给服务越来越多的恢复时间。</li>
+    <li><strong>加随机抖动（jitter）</strong>：在退避时间上加一个小随机量。为什么？想象一千个客户端同时被限流、又都按相同的退避节奏重试——它们会在同一时刻<em>同步</em>重试，形成新的洪峰（重试风暴）。抖动把这些重试时刻打散，避免同步。</li>
+  </ul>  <div class="math-block">\[\text{第 } n \text{ 次重试前等待} \approx \text{base}\times 2^{\,n} + \text{random jitter}\]</div>  <div class="ascii">  调用 LLM
+   │ 失败?
+   ├─ 永久错误(400/401) ──► 立刻上报(重试无用)
+   └─ 瞬时错误(429/5xx/超时)
+        │ 还有重试次数?
+        ├─否─► 上报(重试耗尽)
+        └─是─► 等 base*2^n + jitter 秒 ──► 再试一次</div>  <p>怎么落地「区分瞬时与永久」？看 HTTP 状态码就够了——它是服务端告诉你「这次为什么失败、值不值得再试」的标准语言：</p>  <table>
+    <thead><tr><th>状态码</th><th>含义</th><th>可重试?</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td><code>429</code></td><td>rate_limit 限流</td><td><strong>是</strong></td><td>你发太快了，等一下配额恢复就好（看 retry-after 头）</td></tr>
+      <tr><td><code>500/503</code></td><td>服务端错误/过载</td><td><strong>是</strong></td><td>服务端临时抽风，重试很可能赶上它恢复</td></tr>
+      <tr><td>超时 / 连接错误</td><td>网络层故障</td><td><strong>是</strong></td><td>网络抖动，再试一次常能通</td></tr>
+      <tr><td><code>400</code></td><td>invalid_request 参数非法</td><td><strong>否</strong></td><td>你的请求本身错了，重试一万次还是错——立刻修请求</td></tr>
+      <tr><td><code>401/403</code></td><td>认证/权限失败</td><td><strong>否</strong></td><td>key 不对或没权限，重试无用——去查配置</td></tr>
+    </tbody>
+  </table>  <p>Anthropic SDK 已<strong>内置</strong>了对 429 与 5xx 的指数退避重试（<code>max_retries</code> 默认 2），所以你不必从零手写底层重试逻辑——但你必须<em>理解</em>它（才能配对参数、才知道它没覆盖什么），并在它之上叠 agent 级的重试与降级（如真实调用彻底失败后回退 MockLLM，见模块 03）。本模块 notebook 会让你从零写一遍退避重试，看清这层魔法，再对照 SDK 的现成版。</p>  <div class="callout warn"><span class="label"></span>
+    <p>重试有一个<strong>隐藏的陷阱：幂等性</strong>。重试一个读类操作（查天气、搜索）无害——多查一次没关系。但重试一个有副作用的写类操作（发邮件、转账、删数据）可能<strong>重复执行</strong>——网络超时时，可能上一次其实成功了、你却以为失败而重发。所以重试有副作用的工具时要么保证<span class="term">idempotency</span>（幂等：执行多次效果同执行一次，如用唯一请求 id 去重），要么干脆不自动重试它。LLM 调用本身是幂等的（重试只是再生成一次），但 agent 调的工具未必。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="timeout"><span class="num">4</span>超时：给每步设时限</h2>
+  <h3>超时：给每一步设时限</h3>  <p>第二类失败是<strong>卡死</strong>——某个操作既不成功也不失败，就那么<em>永远</em>挂着。一个卡住的 LLM 调用（服务端无响应）或一个卡住的工具（外部 API 不返回），能让整个 agent<strong>永久挂起</strong>，比报错更糟（报错你还能处理，挂起你连知道都不知道）。</p>  <p>解药是 <span class="term">timeout</span>（超时）：给每个可能阻塞的操作设一个时间上限，超过即放弃、按失败处理（然后可触发重试或降级）。原则很简单但常被忘记——<strong>任何会等待外部的操作，都必须有超时</strong>：LLM 调用要有、工具执行要有、整个 agent 的总运行时间也最好有。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>超时就像给每件事设一个<strong>闹钟</strong>：「这事最多给你 30 秒，到点还没好就算它黄了」。没有闹钟的等待是无底洞——你永远不知道是「快好了」还是「永远不会好」。设了闹钟，最坏情况也是「30 秒后我知道它黄了，可以重试或换路」，而非无限期地干等。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从工程看，超时把「不确定何时返回」的外部依赖，转化成「最多 T 秒内必有结果（成功或超时失败）」的有界操作。这让上层能做出可靠的时间预算——一个 agent 跑多步、每步有超时，总时间就有上界，不会失控。注意超时与重试的配合：超时把「卡死」变成「失败」，重试再决定「这个失败要不要再试」——两者一起，卡死的调用也能被自动恢复。</p></div>
+  </div>  <p>超时与重试是<strong>天生的搭档</strong>：超时负责「把无限期的卡死，变成一个有界的失败」；重试负责「拿到这个失败后，决定要不要再试一次」。两者一接，连卡死的调用也能被自动恢复——超时 T 秒后判定失败，重试等一会儿再发一个新请求，新请求往往就通了。缺了超时，重试无从触发（请求永远挂着，既不成功也不失败，重试逻辑根本没机会介入）；缺了重试，超时只能把失败如实上报。<strong>生产 agent 的每个外部调用，都该同时裹上超时与重试</strong>。</p>  <p>本课的 notebook 用纯标准库模拟超时（用一个「最多尝试 N 次模拟时钟滴答」的玩具机制），不依赖真实计时——目的是让你看清<strong>超时的逻辑结构</strong>（设限、检测超限、按失败处理），而非纠缠于具体计时 API。真实里超时通常由 SDK 或 HTTP 客户端提供（如 Anthropic SDK 的 <code>timeout</code> 参数、<code>client.with_options(timeout=...)</code> 做单次覆盖），你要做的是<em>用对它们、并对超时失败做正确的后续处理</em>——别只设了超时却不处理超时异常，那等于没设。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="loop"><span class="num">5</span>循环检测：发现原地打转</h2>
+  <h3>循环检测：发现 agent 在原地打转</h3>  <p>第三类失败最有 agent 特色：<strong>无限循环</strong>。模型可能陷入「调用 search('北京天气') → 看到结果 → 又调用 search('北京天气') → ……」的死循环——每一步<em>单独看都合法</em>（不是错误、不会被隔离捕获），但合起来<strong>毫无进展</strong>。max-steps 能兜底（到上限就停），但它太钝——可能白白烧掉十几步的钱才停。更聪明的做法是 <span class="term">loop detection</span>（循环检测）：发现重复就提前止损。</p>  <p>循环检测的核心是给每一步的动作算一个<strong>指纹</strong>（通常是 <code>(工具名, 参数)</code> 的某种归一化表示），记录近几步的指纹，发现重复就警告或中止：</p>  <pre><code>def make_fingerprint(call):
+    # 把(工具名, 参数)归一化成一个可比较的指纹
+    return (call['name'], json.dumps(call['input'], sort_keys=True))
+
+# 在循环里维护近 N 步的指纹
+recent = []
+fp = make_fingerprint(call)
+if recent.count(fp) &gt;= 2:          # 同一动作出现 &gt;=3 次
+    return {'status': 'loop_detected', ...}   # 提前止损
+recent.append(fp)
+recent = recent[-N:]               # 只看最近 N 步</code></pre>  <p>「重复多少次算死循环」是个<strong>取舍</strong>：阈值太小（如重复 2 次就停）会误伤——有些任务正当地需要多次调同一工具（如分页翻取数据，每页参数略不同其实指纹不同；但参数完全相同地重复就可疑）；阈值太大则止损不及时、多烧钱。实践中常用「连续/近窗口内完全相同的 <code>(name, input)</code> 重复 3 次」作为信号，再结合 max-steps 兜底。<strong>循环检测是『精准止损』，max-steps 是『最终兜底』，二者互补</strong>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>循环检测呼应了模块 01 强调的不变式：<strong>agent 每一步应当『有进展』——history 在增长、且包含新信息</strong>。死循环正是这个不变式被打破的表现：动作在重复、没有新信息进来。（还记得模块 01 那个『忘了把模型决策追加回 history』的 bug 吗？它导致模型失忆、反复做同一决定——那就是一种由状态管理失误引发的死循环，循环检测能把它当场抓住。）所以循环检测既是安全阀，也是一种『agent 是否健康』的体检指标。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost"><span class="num">6</span>成本追踪与预算熔断</h2>
+  <h3>成本追踪与预算熔断：别让 agent 烧穿钱包</h3>  <p>第四类失败是<strong>失控烧钱</strong>。这是 agent 特有的、也最让人肉疼的风险：一个多步 agent，每步都是一次真实的、要计费的 LLM 调用；若它陷入低效循环或处理超长上下文，账单能悄无声息地飙升。Claude Opus 4.8 约 <code>$5/百万输入</code>、<code>$25/百万输出</code> token——单看很便宜，但一个失控的 agent 跑上几百步、每步带着越来越长的 history，钱就这么烧没了。</p>  <p>两道防线：<strong>成本追踪</strong>（实时算账）和 <strong>预算熔断</strong>（超了就停）。它们都建立在模块 03 那个统一接口返回的 <code>usage</code> 上——这就是为什么我们一开始就把 usage 放进统一格式：</p>  <ul>
+    <li><strong>成本追踪</strong>：每次 LLM 调用后，把 <code>usage</code>（输入/输出 token）按模型单价换算成钱、累加。跑完一看，就知道这次运行花了多少、钱主要花在哪几步。是事后复盘和优化的依据。</li>
+    <li><strong>预算熔断</strong>：在每次调用<em>前后</em>检查累计成本，一旦超过预设预算（如 $0.50），立刻停止 agent、返回 <code>budget_exceeded</code> 状态。它是成本维度的硬上限，与 max-steps（步数维度）、超时（时间维度）三者构成 agent 的「三道保险丝」。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>成本追踪 + 预算熔断就像给 agent 装一个<strong>带上限的电表</strong>：实时显示用了多少电（成本追踪），到达你设的额度就自动拉闸（预算熔断）。没有它，agent 就像一个没有电表、不会自己关的电器——大多数时候没事，但一旦卡在某个耗电状态，能把你的账单烧到失控。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从工程看，这是把「资源消耗」变成一个<strong>可观测、可限制的量</strong>。预算熔断的逻辑与 max-steps 完全同构（累加一个量、超阈值就停），只是量从「步数」换成了「美元」。更精细的做法是<em>预测性熔断</em>：在调用前估算「这次调用大概要花多少」（据 history 长度 × 单价），若加上去会超预算就提前停，而非等花超了才发现。</p></div>
+  </div>  <p>成本追踪也是 <span class="term">observability</span>（可观测）的一部分——而可观测是把这四类防御<strong>串起来</strong>的底座。一个生产级 agent 应当把每一步的 thought/action/observation、token 用量、耗时、发生的错误与重试都记录成一条 <span class="term">trace</span>（轨迹）。出问题时，这份 trace 让你能回答「它第几步开始跑偏的、为什么、花了多少钱」——没有它，调试 agent 就像盲人摸象。本模块 notebook 会让你给鲁棒 wrapper 加上结构化的 trace 记录。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="wrapper"><span class="num">7</span>组装：鲁棒的 agent wrapper</h2>
+  <h3>组装：一个鲁棒的 agent wrapper</h3>  <p>把前面四类防御组装成一个<strong>鲁棒 wrapper</strong>——它包裹住模块 03 那个朴素的 agent 循环，给它叠上重试、超时、循环检测、成本追踪、可观测，而<em>不修改循环本身</em>。这种「装饰而非侵入」的结构，让核心逻辑保持简洁、让鲁棒性成为可叠加的关注点：</p>  <pre><code>class RobustAgent:
+    def __init__(self, llm, tools, max_steps=15, max_cost=0.5,
+                 max_retries=3, loop_window=4):
+        self.llm, self.tools = llm, tools
+        self.max_steps, self.max_cost = max_steps, max_cost
+        self.max_retries, self.loop_window = max_retries, loop_window
+    def run(self, task):
+        history = [{'role':'user','content':task}]
+        cost, recent, trace = 0.0, [], []
+        for step in range(self.max_steps):              # 保险丝1: 步数
+            d = self._call_with_retry(history)          # 重试+超时(隔离瞬时故障)
+            cost += estimate_cost(d['usage'])
+            trace.append({'step':step, 'decision':d, 'cost':cost})
+            if cost &gt; self.max_cost:                     # 保险丝2: 预算
+                return self._stop('budget_exceeded', trace, cost)
+            history.append({'role':'assistant', ...})
+            if d['stop_reason'] == 'end_turn':
+                return self._stop('done', trace, cost, answer=d['text'])
+            for call in d['tool_calls']:
+                fp = make_fingerprint(call)
+                if recent.count(fp) &gt;= 2:               # 保险丝3: 循环检测
+                    return self._stop('loop_detected', trace, cost)
+                recent = (recent + [fp])[-self.loop_window:]
+            results = [dispatch(self.tools, c) for c in d['tool_calls']]  # 错误隔离(模块02)
+            history.append({'role':'user', 'content':results})
+        return self._stop('max_steps', trace, cost)</code></pre>  <p>数一数这个 wrapper 给朴素循环加了多少防御：<code>_call_with_retry</code> 包住了重试与超时（瞬时故障自愈）；<code>cost &gt; max_cost</code> 是预算熔断；<code>recent.count(fp) &gt;= 2</code> 是循环检测；<code>dispatch</code> 自带工具错误隔离（模块 02）；<code>trace</code> 记录每一步（可观测）；每个 <code>return</code> 都带明确的终止状态。而它包裹的那个核心循环，结构与模块 03 的 <code>run_agent</code> 几乎一样——<strong>鲁棒性是『加』上去的，不是『改』进去的</strong>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>回看这个 wrapper，它印证了本课一以贯之的祛魅：<strong>一个『生产级 agent』和一个『玩具 agent』的差距，不在那行调模型的代码，而在围绕它的这一圈防御</strong>。玩具版假设「一切顺利」；生产版假设「什么都可能出错」，并为每种出错备好了应对。这一圈防御没有一行是『AI』——全是重试、计数、超时、记录这些朴素工程。把它们做扎实，你的 agent 才真正『能用』，而非『能 demo』。本模块 notebook 会让你把这个 wrapper 从零组装、用 MockLLM 注入各种故障验证每道防线都生效。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>从『不崩』到『自愈』</strong>：本模块的防御让 agent 不崩、不失控；更高目标是让它从失败中<em>学习并恢复</em>——Reflexion（失败后用自然语言反思、改进下次）、自我修正（看到错误自动换策略）。如何让 agent 可靠地从复杂失败里爬出来，仍是活跃方向。</li>
+    <li><strong>有副作用动作的安全</strong>：重试、自动执行对读类操作安全，但对写类（发邮件、改数据、转账）危险。如何对不可逆动作做<em>确认门控（人在回路）、权限策略、幂等保证、回滚</em>，是 agent 安全的核心前沿（Anthropic 的 permission policy、tool confirmation）。</li>
+    <li><strong>成本-质量的动态权衡</strong>：固定模型、固定 effort 不是最优。前沿做法是<em>动态路由</em>（简单步用便宜模型/低 effort、难步用强模型）、prompt caching（缓存稳定前缀省钱）、上下文压缩（控制 history 增长）。如何在线地平衡成本与质量，仍在演进。</li>
+    <li><strong>长程 agent 的可观测与调试</strong>：一个跑几百步的 agent，trace 极长，人工复盘困难。如何对 agent 轨迹做自动分析、异常检测、可视化（哪一步开始跑偏、哪类错误高发），是把 agent 投入生产绕不开的工程难题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Amazon «Exponential Backoff And Jitter»（退避重试的经典）、Google SRE Book 的 Handling Overload / Cascading Failures 章（超时/重试/降级/熔断如何协同）、Anthropic 的 handling-stop-reasons 与 error 文档（瞬时 vs 永久错误的判据）。进阶：Reflexion、《Release It!》稳定性模式。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_llm_adapter/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · LLM 适配器</div></a>
+    <a class="next" href="../05_minimal_agent/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 最小可用 Agent</div></a>
+  </div>
+
+</div>
+</body>
+</html>

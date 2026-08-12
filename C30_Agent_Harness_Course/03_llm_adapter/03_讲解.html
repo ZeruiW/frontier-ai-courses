@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · LLM 适配器</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · LLM 适配器</h1>
+  <p class="subtitle">统一的 LLMClient 接口、确定性 MockLLM、真实 Claude Messages API 适配（tool_use/tool_result 协议、流式、自适应思考）、无 key 自动回退 —— 让同一个 agent 的『大脑』在 mock 与真实之间一行互换</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01/02（循环、工具系统）、Python 类与继承、对 HTTP/JSON 的基本印象</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_llm_adapter.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Anthropic Messages API & Python SDK、tool use overview、«Building effective agents»</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么需要 LLM 适配器</a></li>
+      <li><a href="#iface">统一接口：agent 只认 complete()</a></li>
+      <li><a href="#mock">MockLLM：确定性假大脑</a></li>
+      <li><a href="#messages">Claude Messages API 协议</a></li>
+      <li><a href="#adapter">写适配器：翻译成统一格式</a></li>
+      <li><a href="#fallback">无 key 自动回退</a></li>
+      <li><a href="#runner">流式、重试与官方 tool runner</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么需要 LLM 适配器</h2>
+  <p>前两个模块里，agent 循环和工具系统都靠一个 <code>llm.complete(history, tools)</code> 拿到模型的决策——但这个 <code>llm</code> 到底是什么、从哪来，我们一直用 MockLLM 占着。本模块把它讲透：<strong>如何设计一个统一的 LLM 接口，让同一个 agent 既能用零成本的 MockLLM 测试、又能一行替换接上真实的 Claude</strong>。</p>  <p>这是 agent 工程里一个<strong>结构性的关键决策</strong>，远不止「调个 API」那么简单。想想看：你的 agent 循环、工具系统、鲁棒层全都要调用「大脑」。如果它们直接调 <code>anthropic.Anthropic().messages.create(...)</code>，那么——测试时怎么办（每跑一次测试都真的调 API、花钱、还不确定）？换个模型提供方怎么办（满代码搜 anthropic 改）？想验证「循环在工具失败时的行为」怎么办（你没法让真实模型乖乖按你要的剧本走）？</p>  <p>答案是经典的软件工程智慧：<strong>在『大脑』前面竖一道统一接口，让上层代码只依赖这个接口、不依赖任何具体实现</strong>。于是「大脑」变成一个可替换的零件：测试时插 MockLLM（确定性、零成本、可断言），上线时插 AnthropicLLM（真实 Claude），将来想换别家也只改一个类。这就是 <span class="term">adapter</span>（适配器）模式——本模块的主角。它让本课前两个模块用 MockLLM 验证过的一切，无缝接到真实模型上。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>给『大脑』定义一个统一接口 LLMClient，让 MockLLM 和真实 Claude 都实现它；agent 只依赖接口、不依赖实现，于是 mock↔真实一行互换</strong>。难点有二：(1) 这个接口的『统一格式』该长什么样（既能装下 mock 的简单脚本、又能映射真实 Claude 的 tool_use/tool_result）；(2) 真实适配器怎么把 Claude Messages API 的响应翻译成这个格式。把这两点做对，本课就从『玩具』真正接通了『现实』。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="iface"><span class="num">2</span>统一接口：agent 只认 complete()</h2>
+  <h3>统一接口：agent 只认 complete()</h3>  <p>先定义那道接口。它要简单到 MockLLM 能轻松实现，又要<strong>足够表达 agent 循环需要的一切</strong>：给模型当前状态（history）和可用工具（tools），它返回一个「决策」——要么调工具、要么给最终答案。</p>  <pre><code>class LLMClient:
+    '''所有『大脑』的统一接口。agent 只依赖这个，不关心背后是 mock 还是真实。'''
+    def complete(self, system, messages, tools):
+        '''输入：系统提示、消息历史、可用工具(schema 列表)。
+           返回统一格式的决策 dict：
+             {'stop_reason': 'tool_use'|'end_turn',
+              'text': str,                       # 模型的文字(思考/答案)
+              'tool_calls': [{'id','name','input'}],  # 想调的工具(可多个)
+              'usage': {'input_tokens','output_tokens'}}  # 用量(成本追踪)
+        '''
+        raise NotImplementedError</code></pre>  <p>这个返回格式不是随便定的——它<strong>刻意与 Claude Messages API 的响应同构</strong>：<code>stop_reason</code> 对应 Claude 的停止原因、<code>tool_calls</code> 对应 Claude 响应里的 <code>tool_use</code> 块、<code>usage</code> 对应 Claude 的 token 用量。为什么要同构？因为这样真实适配器几乎只是<em>格式翻译</em>（把 Claude 的对象拆成这个 dict），而不必做复杂转换；MockLLM 也能轻松「假装」自己是这个格式。<strong>接口设计得贴近真实协议，适配就省力</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>可以把 LLMClient 想成一个<strong>标准电源插座</strong>：agent 是电器，只认插座的形状。MockLLM 是电池（便携、便宜、用来测试），真实 Claude 是市电（强劲、要钱）。电器不在乎插的是电池还是市电，只要插座形状一样，插上就能用——换电源不用改电器一根线。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，这是<strong>依赖倒置原则</strong>（dependency inversion）：高层模块（agent 循环）不依赖低层模块（具体的 Anthropic SDK 调用），二者都依赖抽象（LLMClient 接口）。加上<span class="term">dependency injection</span>（把 llm 当参数传进 agent，而非在内部 new 一个），就得到了可插拔——这正是模块 00/01 里 <code>Agent(llm=...)</code> 那个设计的理论根据。</p></div>
+  </div>  <p>注意接口里多了两个之前 MockLLM 没细究的字段：<code>system</code>（系统提示，定义 agent 的角色与规则）和 <code>usage</code>（token 用量，模块 04 成本追踪要用）。把它们放进统一接口，意味着<strong>无论 mock 还是真实，调用方式完全一致</strong>——你在 MockLLM 上写的成本追踪逻辑，换真实 Claude 时一行不改就能工作，因为两者都按这个格式返回 usage。这就是统一接口的复利。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="mock"><span class="num">3</span>MockLLM：确定性假大脑</h2>
+  <h3>MockLLM：确定性的『假大脑』</h3>  <p>MockLLM 实现 <code>complete</code> 的方式简单到家：<strong>不读 history、不思考，只按预设脚本逐条返回</strong>。但正是这种「不思考」让它无比有用——它的行为<strong>完全可预测</strong>，于是 agent 的整个轨迹可断言。</p>  <pre><code>class MockLLM(LLMClient):
+    def __init__(self, script):
+        self.script = list(script)   # 预设的决策序列
+        self.calls = 0
+    def complete(self, system, messages, tools):
+        resp = self.script[self.calls]  # 真实 LLM 会读 messages 再决定;
+        self.calls += 1                 # mock 直接播放下一条
+        return resp                     # 已是统一格式</code></pre>  <p>MockLLM 能验证的是 agent 的<strong>机制</strong>，不是<strong>智能</strong>——这条分界必须时刻清楚。它能精确验证：循环转得对不对、工具分发对不对、停止判定对不对、错误处理对不对、成本追踪对不对。它<em>不能</em>验证：模型选的工具明不明智、参数填得合不合理、推理对不对。后者属于「智能」，是真实模型的事。本课的分工正是——<strong>用 MockLLM 把 harness 的机制焊死，把智能交给真实 Claude</strong>。</p>  <p>MockLLM 还能精心构造各种<strong>难以用真实模型复现的场景</strong>，这是它另一个无可替代的价值：</p>  <ul>
+    <li><strong>特定的多步轨迹</strong>：让 mock 严格「先调 A、再调 B、最后作答」，验证循环能正确串起多步——真实模型每次跑可能走不同路径，没法这么断言。</li>
+    <li><strong>故意的坏输出</strong>：让 mock 返回幻觉工具名、非法参数、永不收尾，验证 harness 的容错与守卫——你没法可靠地让真实模型「乖乖犯特定的错」。</li>
+    <li><strong>可注入的故障</strong>：让 mock 抛超时、返回限流错误，验证模块 04 的重试/降级——真实故障可遇不可求，mock 让你随时复现。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>MockLLM 的精髓是把「测 agent」变成「测一段确定性程序」。一旦『大脑』确定了，整个 agent 就是确定的，于是你能像测任何普通函数一样测它：<strong>给定输入（脚本），断言输出（轨迹）</strong>。这就是为什么本课每个机制都能用 <code>assert</code> 钉死——不是「看起来对」，是「可证明地对」。这套「用 mock 替换不确定依赖、让系统可测」的思路，是软件工程的通用智慧，agent 只是它的一个应用。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="messages"><span class="num">4</span>Claude Messages API 协议</h2>
+  <h3>Claude Messages API：真实『大脑』的协议</h3>  <p>现在看真实的一边。Claude 通过 <span class="term">Messages API</span> 调用，核心是一个方法：<code>client.messages.create(model, system, messages, tools, max_tokens)</code>。理解它的输入与输出结构，是写适配器的前提。</p>  <pre><code>import anthropic
+client = anthropic.Anthropic()       # 读环境变量 ANTHROPIC_API_KEY
+resp = client.messages.create(
+    model='claude-opus-4-8',          # 当前最强模型, 1M 上下文
+    max_tokens=1024,                  # 单次输出上限
+    system='You are a helpful agent.', # 系统提示(定义角色)
+    messages=[{'role':'user', 'content':'北京天气?'}],
+    tools=[...],                      # 工具 schema 列表(就是模块02的 export())
+)</code></pre>  <p>响应 <code>resp</code> 的关键结构有三处，适配器要从中提取信息：</p>  <table>
+    <thead><tr><th>字段</th><th>是什么</th><th>适配器怎么用</th></tr></thead>
+    <tbody>
+      <tr><td><code>resp.content</code></td><td>内容块列表，每块有 type</td><td>遍历它：<code>text</code> 块取文字、<code>tool_use</code> 块取工具调用</td></tr>
+      <tr><td><code>resp.stop_reason</code></td><td>停止原因：<code>end_turn</code>/<code>tool_use</code>/<code>max_tokens</code>/<code>refusal</code></td><td>映射到统一格式的 stop_reason，驱动 agent 循环</td></tr>
+      <tr><td><code>resp.usage</code></td><td>用量：<code>input_tokens</code>、<code>output_tokens</code></td><td>映射到统一格式的 usage，供成本追踪</td></tr>
+    </tbody>
+  </table>  <p>最关键的一环是 <strong>工具调用协议</strong>，它把 agent 循环和真实 API 接通：当模型想调工具，它返回的 <code>content</code> 里会有一个 <code>tool_use</code> 块（含 <code>id</code>、<code>name</code>、<code>input</code>），且 <code>stop_reason=="tool_use"</code>。你执行后，把结果作为一个 <code>tool_result</code> 块（含对应的 <code>tool_use_id</code> 和 <code>content</code>，失败时加 <code>is_error=True</code>）放进一条 <code>user</code> 消息，回传给下一次 <code>messages.create</code>。模型据此继续。</p>  <div class="callout paper"><span class="label"></span>
+    <p>这套 <code>tool_use → tool_result</code> 的往返，正是模块 01 的 agent 循环 + 模块 02 的工具系统在真实 API 上的体现。本课内部格式刻意与它同构，所以适配器只是翻译。权威细节见 Anthropic 的 tool use overview 与 Messages API 文档（references 有链接）；不确定时可查 claude-api skill。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="adapter"><span class="num">5</span>写适配器：翻译成统一格式</h2>
+  <h3>写适配器：把 Claude 响应翻译成统一格式</h3>  <p>有了两边的格式，适配器就是中间的<strong>翻译层</strong>：把统一格式的输入翻译成 Messages API 的入参、把 Messages API 的响应翻译回统一格式。它实现 LLMClient，于是对 agent 而言和 MockLLM 完全等价。</p>  <div class="ascii">  agent 循环                AnthropicLLM(适配器)              Claude Messages API
+  ──────────               ──────────────────              ───────────────────
+  history(本课格式) ──► _to_api(messages) ─────────────────► messages.create(...)
+  (含工具结果)            把工具结果包成 tool_result 块              │
+                                                                   ▼
+  统一格式决策 ◄──── _from_api(resp) ◄──────────────────────  resp(content 块/
+  (stop_reason/                遍历 content 块:                stop_reason/usage)
+   tool_calls/usage)           text-&gt;text, tool_use-&gt;tool_calls</div>  <pre><code>class AnthropicLLM(LLMClient):
+    def __init__(self, model='claude-opus-4-8', max_tokens=1024):
+        import anthropic
+        self.client = anthropic.Anthropic()
+        self.model, self.max_tokens = model, max_tokens
+    def complete(self, system, messages, tools):
+        resp = self.client.messages.create(
+            model=self.model, max_tokens=self.max_tokens,
+            system=system,
+            messages=self._to_api(messages),   # 翻译: 本课格式 -&gt; API messages
+            tools=tools or [],
+        )
+        return self._from_api(resp)            # 翻译: API 响应 -&gt; 统一格式
+
+    def _from_api(self, resp):
+        text, tool_calls = '', []
+        for blk in resp.content:               # 遍历内容块
+            if blk.type == 'text':
+                text += blk.text
+            elif blk.type == 'tool_use':
+                tool_calls.append({'id':blk.id, 'name':blk.name, 'input':blk.input})
+        return {'stop_reason':resp.stop_reason, 'text':text, 'tool_calls':tool_calls,
+                'usage':{'input_tokens':resp.usage.input_tokens,
+                         'output_tokens':resp.usage.output_tokens}}</code></pre>  <p>适配器的两个方向各做一件事：<code>_to_api</code> 把本课的 history（含工具结果）翻译成 Messages API 的 <code>messages</code>（尤其是把工具结果包成 <code>tool_result</code> 块放进 user 消息）；<code>_from_api</code> 把响应的 <code>content</code> 块按类型拆开、连同 <code>stop_reason</code> 和 <code>usage</code> 组装成统一格式。<strong>一旦这两个翻译写对，AnthropicLLM 和 MockLLM 对 agent 循环就完全可互换</strong>——这就是适配器模式的回报。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>适配器就像<strong>翻译官</strong>：agent 只会说「统一格式」这门语言，Claude API 只会说「Messages API」这门语言，翻译官把两边的话互译。换一个只会说「OpenAI 格式」的模型？再请一个会那门语言的翻译官（写个 OpenAILLM 适配器）即可，agent 一个字不用改——它永远只跟翻译官打交道。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从设计看，适配器把「与某个具体 SDK 耦合」的代码<strong>收口</strong>在一个类里。整个 agent 代码库里，只有 AnthropicLLM 这一个文件 import anthropic、知道 Messages API 的细节。想支持新提供方，加一个新适配器类即可，耦合面是<em>一个类</em>而非散落全代码。这就是为什么工业 agent 框架都有 <code>llms/</code> 或 <code>providers/</code> 这样的适配器目录。</p></div>
+  </div>  <p>一个常被忽略的细节：<strong>Claude 的 input 已经是解析好的 dict</strong>——你不必像纯文本 ReAct 那样正则解析。<code>blk.input</code> 直接就是 <code>{'city': '北京'}</code> 这样的字典（API 保证了它符合你给的 schema）。这正是模块 02 说的：原生工具调用把「解析」这个最脆的环节，从你的代码挪进了模型与 API 的契约里。适配器因此干净——它只搬运结构化数据，不做易错的文本解析。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="fallback"><span class="num">6</span>无 key 自动回退</h2>
+  <h3>无 key 自动回退：本课不可妥协的纪律</h3>  <p>现在把两边合起来，落实本课从头强调的硬纪律：<strong>绝不让缺 API key 阻断 notebook</strong>。做法是一个工厂函数 <code>make_llm()</code>——有 key 就给真实 Claude，没 key 就给 MockLLM，agent 代码对二者一视同仁。</p>  <pre><code>def make_llm(mock_script, model='claude-opus-4-8'):
+    '''有 key 且能 import anthropic -&gt; 真实 Claude; 否则 -&gt; MockLLM。绝不抛异常。'''
+    if os.environ.get('ANTHROPIC_API_KEY'):
+        try:
+            import anthropic   # noqa
+            return AnthropicLLM(model)
+        except ImportError:
+            pass               # 有 key 但没装 SDK -&gt; 也回退
+    return MockLLM(mock_script)
+
+# 用法：两种读者读同一份代码，只差一个环境变量
+agent = Agent(llm=make_llm(MOCK_SCRIPT), tools=registry)</code></pre>  <p>这段「回退」是 <span class="term">graceful degradation</span>（优雅降级）的一个具体实例，也是工程上的体贴：<strong>让『学习 agent 机制』和『有没有 API key、舍不舍得烧钱』彻底解耦</strong>。没有 key 的读者用 MockLLM 把每个机制学透、跑通、过 assert；有 key 的读者把同一份代码接到真实 Claude，亲眼看到真模型在他亲手造的 harness 里多步完成任务。两种路径共用一份代码，正是可插拔接口的价值。</p>  <p>回退逻辑里藏着两个值得注意的容错点：(1) <strong>有 key 但没装 anthropic SDK</strong> 也要回退（捕获 ImportError），而不是崩；(2) 更进一步（模块 04 会做），<strong>有 key、装了 SDK，但真实调用失败</strong>（网络、限流）时，也可以选择回退或重试，而非直接报错。核心原则一致：<strong>缺少『可选的增强』不该让『核心功能』瘫痪</strong>。真实 Claude 是增强，MockLLM 是保底——保底永远在。</p>  <div class="callout warn"><span class="label"></span>
+    <p>回退也有要诚实之处：<strong>MockLLM 的回退能让 notebook『跑通』，但不能替代真实模型的『智能』</strong>。无 key 时你验证的是机制正确（循环、分发、停止、容错都对），而非「这个 agent 在真实任务上聪不聪明」。这没问题——本课的目标就是机制；智能的部分，你接上真实 Claude 时自然会看到。但别把「mock 跑通了」误读成「agent 在真实任务上一定行」，二者是不同维度的保证。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="runner"><span class="num">7</span>流式、重试与官方 tool runner</h2>
+  <h3>流式、重试与官方 tool runner</h3>  <p>真实适配在生产里还要处理三件事，本课点到为止、模块 04 深入鲁棒性，但这里先建立印象，因为它们都与适配层相关：</p>  <ul>
+    <li><strong>流式输出（streaming）</strong>：长输出/高 max_tokens 时，非流式请求可能撞上 HTTP 超时。用 <code>client.messages.stream(...)</code> 边生成边返回（SSE），并用 <code>.get_final_message()</code> 拿到完整响应。适配器可在内部用流式、对外仍返回统一格式——agent 循环无感。</li>
+    <li><strong>自动重试</strong>：Anthropic SDK 默认对 429（限流）和 5xx（服务端错误）做指数退避重试（<code>max_retries</code> 默认 2）。适配器免费获得这层基础鲁棒；模块 04 会在其上再叠 agent 级的重试与降级。</li>
+    <li><strong>自适应思考（adaptive thinking）</strong>：处理复杂多步任务时，可传 <code>thinking={'type':'adaptive'}</code> 让 Claude 自行决定思考深度。它产生的 <code>thinking</code> 块适配器可以记录或忽略——对 agent 循环的工具调用逻辑无影响。</li>
+  </ul>  <p>更进一步，Anthropic SDK 提供了一个 <span class="term">tool runner</span>，把「调 API→执行工具→回灌→再调」这整个 agent 循环<strong>自动跑完</strong>：用 <code>@beta_tool</code> 装饰函数（自动从签名 + docstring 生成 schema）、<code>client.beta.messages.tool_runner(tools=[...], messages=[...])</code> 返回一个 runner，迭代它直到模型不再调工具。</p>  <pre><code>from anthropic import beta_tool
+@beta_tool
+def get_weather(city: str) -&gt; str:
+    '''查询某城市天气。'''
+    return f'{city}: 晴 22°C'
+
+runner = client.beta.messages.tool_runner(
+    model='claude-opus-4-8', max_tokens=1024,
+    tools=[get_weather],
+    messages=[{'role':'user','content':'北京天气?'}])
+for message in runner:    # 自动跑完整个 agent 循环
+    pass</code></pre>  <div class="callout intuition"><span class="label"></span>
+    <p>看到 tool runner，你应该有一种「原来如此」的踏实感：<strong>它就是官方版的『模块 01 循环 + 模块 02 工具系统 + 本模块适配器』</strong>。本课让你先手写这三样、彻底理解每个零件；官方 tool runner 则是把它们打包好的成品。两者不矛盾——理解了手写版，你才知道 tool runner 替你做了什么、它的默认行为合不合你的需求、出问题时该往哪看。这正是「亲手造一遍」的意义：让现成的工具对你不再是黑箱。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>统一抽象 vs 提供方特性</strong>：一个统一的 LLMClient 接口让换提供方变易，但也会<em>抹平</em>各家的独特能力（如 Claude 的 adaptive thinking、prompt caching、某家的特殊工具格式）。如何在「统一」与「不丢失特性」间取舍，是所有多提供方框架（LangChain、LiteLLM）的长期张力。</li>
+    <li><strong>测试不确定的 LLM</strong>：MockLLM 测机制，但「agent 在真实任务上好不好」需要测真实模型——而真实模型不确定、难断言。如何系统评测 agent（任务完成率、轨迹质量、回归测试用快照/LLM-judge），是活跃方向（AgentBench、τ-bench）。</li>
+    <li><strong>适配层的成本与延迟</strong>：每次 complete 都是一次网络往返 + 计费。适配层是做 prompt caching（缓存稳定前缀省钱省时）、做请求合并、做模型路由（简单步用便宜模型、难步用强模型）的天然位置。如何在适配层做这些优化而不破坏抽象，仍在演进。</li>
+    <li><strong>结构化输出与可靠性</strong>：让模型严格按 schema 输出（strict 模式、structured outputs）能让适配更可靠，但牺牲灵活。把「解析的脆弱性」彻底消灭在 API 契约里、做到结构化决策可靠到能放手自动执行，是 agent 可靠性的前沿。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Anthropic Messages API 文档与 Python SDK（真实适配的权威）、tool use overview（工具协议）、«Building effective agents»（何时用 tool runner vs 手写循环）。进阶：streaming、prompt caching、structured outputs 文档。完整清单见 <code>references.md</code>。不确定 API 细节查 claude-api skill。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_tool_system/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 工具系统</div></a>
+    <a class="next" href="../04_robustness/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 鲁棒性</div></a>
+  </div>
+
+</div>
+</body>
+</html>

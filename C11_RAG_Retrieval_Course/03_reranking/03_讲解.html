@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 重排</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 07</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 重排</h1>
+  <p class="subtitle">两段式检索：bi-encoder 召回 + cross-encoder 精排、late interaction 折中谱、MMR 多样性去冗余、RRF 倒数排名融合，以及候选集大小这根接力棒 —— 把对的文档顶到最前</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（嵌入/余弦/混合检索）、模块 02（召回与候选）、一点点排序指标直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_reranking.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Nogueira 2019 (monoBERT)、Khattab 2020 (ColBERT)、Carbonell 1998 (MMR)、Cormack 2009 (RRF)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#twostage">为什么需要重排：两段式检索</a></li>
+      <li><a href="#encoders">bi-encoder vs cross-encoder</a></li>
+      <li><a href="#gain">重排提升了什么：用指标说话</a></li>
+      <li><a href="#colbert">中间地带：late interaction (ColBERT)</a></li>
+      <li><a href="#mmr">多样性：MMR 去冗余</a></li>
+      <li><a href="#rrf">融合多路：RRF 倒数排名融合</a></li>
+      <li><a href="#candidates">接力棒：候选集大小 N 的权衡</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="twostage"><span class="num">1</span>为什么需要重排：两段式检索</h2>
+  <p>上两模块我们把检索做快了：嵌入成向量、用 ANN 索引在亿级语料里毫秒级捞回 top-N 候选。但「快」是有代价的——为了能预先建索引，双编码器（bi-encoder）必须把查询和文档<strong>各自独立</strong>编码成一个向量，二者在编码时<strong>从不照面</strong>。这就像让两个人各自写一段自我介绍，再单凭这两段文字判断他们合不合得来：信息一定有损。</p>  <p>于是工业级检索几乎都采用<strong>两段式（two-stage）</strong>架构：第一段用便宜的 bi-encoder 或 BM25 从全库<strong>广撒网</strong>召回 top-N（N 取几十到几百）；第二段用昂贵但精准的<span class="term">cross-encoder</span>（交叉编码器）只对这 N 个候选<strong>精挑细选</strong>，重新打分排序成最终 top-k（k 取几个）。一广一精，分工明确。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：第一段检索像简历初筛——HR 拿关键词飞快刷掉 99% 不相关的，留下一沓「看起来对路」的；第二段重排像面试——把这沓简历的人请来当面深聊，才能分出谁是真材实料。初筛图快图全，面试图准，缺一不可。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：设全库大小 $N_{\text{全}}$，cross-encoder 单次打分成本为 $c$。若对全库做 cross-encoder，成本 $O(N_{\text{全}}\cdot c)$ 不可承受；两段式把成本降到 $O(N_{\text{全}}\cdot c_{\text{bi}} + N\cdot c)$，其中 $c_{\text{bi}}\ll c$ 且 $N\ll N_{\text{全}}$。用一点召回风险，换回近乎 cross-encoder 全量的精度。</p></div>
+  </div>  <p>为什么不能只靠第一段、把 bi-encoder 调得更好就行？因为 bi-encoder 有一个<strong>结构性的信息瓶颈</strong>：它必须把整个文档压缩进一个固定长度的向量，且这个压缩<em>在见到查询之前</em>就完成了。这意味着无论文档多长、信息多丰富，bi-encoder 都只能保留「平均而言对各种查询都有用」的那部分语义，而丢掉「只对某个特定查询关键」的细节。一个 300 词的段落压成 768 维向量，再丰富的查询-文档对应关系也被抹平了。重排之所以不可替代，正因为它在<strong>看到了具体查询之后</strong>才对文档做精读——同一篇文档，面对不同查询会被读出不同的相关性，这是单向量永远做不到的。</p>  <p>还有一层常被忽略的价值：重排是<strong>纠正第一段系统性偏差</strong>的机会。bi-encoder 可能整体偏向某类文档（如偏好短文本、偏好高频词、对某些领域校准不准），这些偏差会让真正相关的文档系统性地排低。cross-encoder 用一套不同的、更细的判据重新审视候选，往往能把第一段「冤枉」的好文档平反。所以两段式不只是「快+准」的拼接，更是<em>两种互补视角的叠加</em>——这也呼应模块 01 的混合检索思想：多个有不同盲区的判据合起来，比任何单一判据都强。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话定调本模块：<strong>第一段决定『有没有把对的捞进来』(召回)，第二段决定『能不能把对的排到最前』(精排)</strong>。二者是接力赛——召回漏掉的，重排再神也救不回；召回捞回来了，重排负责把它从一堆噪声里顶到第一。本模块把这条接力赛的每一棒都从零拆开。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="encoders"><span class="num">2</span>bi-encoder vs cross-encoder</h2>
+  <h3>两种编码器：bi-encoder vs cross-encoder</h3>  <p>理解重排，先得理解它和召回用的是<strong>两种本质不同的模型</strong>。区别只在一处：查询和文档<strong>在什么时候相遇</strong>。</p>  <table>
+    <thead><tr><th>维度</th><th>bi-encoder（双编码器）</th><th>cross-encoder（交叉编码器）</th></tr></thead>
+    <tbody>
+      <tr><td>输入方式</td><td>查询、文档<strong>各自独立</strong>编码</td><td>查询、文档<strong>拼在一起</strong>送入</td></tr>
+      <tr><td>交互</td><td>无（只在最后比向量）</td><td><strong>每一层都交互</strong>（注意力互看）</td></tr>
+      <tr><td>可否预计算</td><td><strong>可</strong>（文档向量离线建索引）</td><td><strong>不可</strong>（必须在线对每个 pair 跑）</td></tr>
+      <tr><td>成本</td><td>极低（一次向量近邻）</td><td>高（每候选跑一遍模型）</td></tr>
+      <tr><td>精度</td><td>中（信息有损）</td><td><strong>高</strong>（充分交互）</td></tr>
+      <tr><td>用在哪</td><td>第一段召回（全库）</td><td>第二段重排（少量候选）</td></tr>
+    </tbody>
+  </table>  <p>bi-encoder 把文档编成 <code>d_vec = f(doc)</code>、查询编成 <code>q_vec = f(query)</code>，相似度就是 <code>cos(q_vec, d_vec)</code>。因为 <code>d_vec</code> 与查询无关，可以<strong>离线把全库编好、建进 ANN 索引</strong>，在线只需编一次查询、查一次索引——这正是模块 01/02 做的。代价是：查询里「血压」和文档里「hypertension」这种需要<em>两边对照才能看出</em>的关联，bi-encoder 在编码时根本没机会建立。</p>  <p>cross-encoder 反其道而行：把 <code>[query] [SEP] [doc]</code> 拼成一条序列整个送进模型，让查询的每个 token 和文档的每个 token 在<strong>每一层注意力里互相观察</strong>，最后输出一个标量相关性分数。这种<strong>深度交互</strong>让它能捕捉 bi-encoder 丢掉的细粒度匹配（否定、指代、数值、术语对应），精度显著更高。代价是致命的：文档向量<strong>无法预计算</strong>（分数依赖具体查询），只能对每个 (查询, 候选) 实时跑一遍模型——对全库做完全不可行，只能用于重排第一段捞回的少量候选。</p>  <div class="callout paper"><span class="label"></span>
+    <p><span class="term">monoBERT</span>（Nogueira & Cho 2019）是把 BERT 当 cross-encoder 做重排的奠基工作：取 BERT 对 <code>[CLS] query [SEP] doc</code> 的 [CLS] 表示接一个分类头，输出相关概率，对第一段候选重排，大幅刷新了段落排序的 SOTA。「召回 + 重排」从此成为检索的标准范式。详见 <code>../references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="gain"><span class="num">3</span>重排提升了什么：用指标说话</h2>
+  <h3>重排到底提升了什么：用指标说话</h3>  <p>重排不是玄学，它的价值可以被<strong>精确度量</strong>。典型情形是：第一段召回把<em>真正相关</em>的文档捞进了 top-N，但因为 bi-encoder 信息有损，把它排在了第 15、第 20 名（靠后但还在候选里）；cross-encoder 一看就知道它最相关，把它顶到第 1。用户只看前几条，所以「从第 20 提到第 1」是天壤之别。</p>  <p>度量这种「把对的往前提」最常用两个指标（模块 05 会系统展开，这里先用其直觉）：</p>  <ul>
+    <li><strong>MRR（Mean Reciprocal Rank，平均倒数排名）</strong>：第一个相关结果名次的倒数。相关文档从第 20 名（贡献 <code>1/20=0.05</code>）提到第 1 名（贡献 <code>1/1=1.0</code>），MRR 暴涨。它只关心「第一个对的排多前」。</li>
+    <li><strong>nDCG（normalized Discounted Cumulative Gain）</strong>：考虑<strong>所有</strong>相关文档的位置，且名次越靠后增益按 <code>1/log2(rank+1)</code> 折损，再归一到 [0,1]。它奖励「把高相关的尽量排前」，是排序质量最常用的综合指标。</li>
+  </ul>  <div class="math-block">\[\text{DCG@}k=\sum_{i=1}^{k}\frac{2^{\text{rel}_i}-1}{\log_2(i+1)},\qquad \text{nDCG@}k=\frac{\text{DCG@}k}{\text{IDCG@}k}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句话：重排的提升 = 「重排后的 nDCG/MRR」减去「第一段的 nDCG/MRR」。这个差值就是 cross-encoder 这一步<strong>值不值得加</strong>的硬证据——本模块 notebook 会构造一个真实场景，亲手算出这个提升。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：重排<strong>不改变召回率</strong>（候选集没变，相关文档要么在 top-N 里要么不在），只重新排列候选内部的顺序，因此提升的是<em>位置敏感</em>的指标（MRR、nDCG、Precision@小k），而对 Recall@N 无影响。这也提醒：重排的天花板由第一段召回锁死——它进不了候选，重排碰都碰不到。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见误解：「加了重排，召回率会变高」。<strong>不会</strong>。重排只在第一段交来的候选集内部洗牌，候选集里没有的文档，重排永远变不出来。重排提升的是<em>排序质量</em>（对的更靠前），不是<em>召回</em>（捞得更全）。想提召回，得回去改第一段（更大的 N、更好的 embedding、混合检索）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="colbert"><span class="num">4</span>中间地带：late interaction (ColBERT)</h2>
+  <h3>中间地带：late interaction（ColBERT）</h3>  <p>bi-encoder（快但糙）和 cross-encoder（准但贵）是两个极端，中间还有一片连续谱。最有代表性的折中是 <span class="term">late interaction</span>（延迟交互），代表作 <span class="term">ColBERT</span>（Khattab & Zaharia 2020）。</p>  <p>它的想法很巧：不像 bi-encoder 把整个文档压成<strong>一个</strong>向量（信息瓶颈太窄），也不像 cross-encoder 让 query-doc 在<strong>每一层</strong>交互（太贵），而是给查询和文档的<strong>每个 token</strong>各存一个向量，把交互<strong>推迟到最后一步</strong>——用一个轻量的 <span class="term">MaxSim</span> 操作：查询每个 token 去文档所有 token 里找最相似的那个，再把这些最大相似度加起来。</p>  <div class="math-block">\[\text{score}(q,d)=\sum_{i \in q}\max_{j \in d}\ \big(\,E_{q_i}\cdot E_{d_j}\,\big)\]</div>  <p>因为文档的 token 向量<strong>仍可离线预计算</strong>（不依赖查询），ColBERT 保留了 bi-encoder 「可索引」的关键优势；而 token 级的 MaxSim 又比单向量余弦<strong>细粒度得多</strong>，逼近 cross-encoder 的精度。代价是存储：每个文档要存几十上百个 token 向量，索引膨胀。它在「精度 vs 成本」谱系上恰好卡在中间——比 bi-encoder 准、比 cross-encoder 省，是大规模检索里很实用的一档。</p>  <p>MaxSim 这个设计值得多体会一下：它本质是在问「查询的每一个<em>含义片段</em>，在文档里能不能找到一个好的对应？」——查询 token $i$ 去文档所有 token 里挑最匹配的那个（取 max），再把这些「最佳匹配度」加起来当总分。这比「整句对整句比一个余弦」细腻得多：它允许查询的不同部分匹配文档的不同部分，天然处理「答案分散在文档各处」的情形。代价是 token 级存储——一篇文档要存几十上百个向量，索引体积比单向量 bi-encoder 大一两个数量级，这也是 ColBERT 在超大库上要做向量压缩（如残差压缩）的原因。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把三者想成一条光谱：<strong>bi-encoder（一个向量，最省）→ ColBERT（每 token 一个向量 + MaxSim，折中）→ cross-encoder（全交互，最准最贵）</strong>。工程选型就是在这条谱上，按你的延迟预算、库规模、精度要求挑一个点。没有最好，只有最合适——这也是为什么真实系统常是「ANN 召回 + cross-encoder 重排」，把光谱两端各取所长。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mmr"><span class="num">5</span>多样性：MMR 去冗余</h2>
+  <h3>多样性：MMR 去冗余</h3>  <p>到目前为止我们只关心「相关」。但只追求相关会掉进一个陷阱：<strong>top-k 全是几乎一样的内容</strong>。设想查询「特斯拉的自动驾驶」，最相关的 5 篇可能是同一篇新闻被 5 家媒体转载的近重复（near-duplicate）——它们个个高度相关，却<strong>只提供了一份信息</strong>，白白浪费了宝贵的上下文预算。</p>  <p>解药是在排序里显式加入<strong>多样性</strong>。经典方法是 <span class="term">MMR</span>（Maximal Marginal Relevance，最大边际相关，Carbonell & Goldstein 1998）：不再一次性按相关性取 top-k，而是<strong>贪心地逐个挑选</strong>——每一步选「既与查询相关、又与<em>已选结果</em>不相似」的那个文档：</p>  <div class="math-block">\[\text{MMR}=\arg\max_{d_i \in R\setminus S}\Big[\ \lambda\,\text{sim}(q,d_i)\ -\ (1-\lambda)\,\max_{d_j \in S}\text{sim}(d_i,d_j)\ \Big]\]</div>  <p>其中 $S$ 是已选集合，$R$ 是候选集合，$\lambda\in[0,1]$ 是旋钮：<code>λ=1</code> 退化为纯相关性排序（不管冗余），<code>λ=0</code> 只追求多样（不管相关），中间值平衡二者。每选一个文档，就把它对后续候选的「相似度惩罚」纳入考量——于是与已选内容雷同的候选会被压低，新颖的候选浮上来。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句话：MMR 让 top-k 像一支<strong>配置均衡的队伍</strong>，而不是五个一模一样的人。每个新名额都问一句：『你除了相关，还能带来已选结果里<em>没有</em>的东西吗？』</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>MMR 对<strong>多方面问题（multi-aspect）</strong>和<strong>多跳（multi-hop）</strong>尤其重要：这类问题的答案散落在不同子主题里，若 top-k 全挤在一个子主题上，另一些必需的证据就被挤出了上下文。MMR 通过去冗余，让有限的 k 个名额覆盖更广的信息面。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>$\lambda$ 不是越小越好。多样性过头会把<strong>真正最相关</strong>的文档挤出 top-k，反而损害答案质量。实践中 $\lambda$ 常取 0.5–0.7（偏相关性），只在结果明显冗余时才往多样性调。<strong>先保相关，再去冗余</strong>，顺序不能反。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rrf"><span class="num">6</span>融合多路：RRF 倒数排名融合</h2>
+  <h3>融合多路：RRF 倒数排名融合</h3>  <p>真实 RAG 常<strong>同时跑多路检索</strong>——BM25 一路、稠密向量一路，甚至多个不同 embedding 各一路（模块 01 讲过它们盲区互补）。问题来了：<strong>怎么把这几路的排序合并成一个？</strong></p>  <p>一个直觉的做法是<strong>分数加权</strong>：把各路分数归一化后加权求和。但它极其脆弱——BM25 分数无上界、余弦分数在 $[-1,1]$，量纲天差地别；归一化方式（min-max？z-score？）一变，融合结果就剧烈抖动。你在调一个<em>没有正确答案</em>的数值对齐问题。</p>  <p>更稳健的是 <span class="term">RRF</span>（Reciprocal Rank Fusion，倒数排名融合，Cormack et al. 2009）：彻底<strong>抛弃分数，只用名次</strong>。一个文档的融合分是它在各路里名次倒数之和：</p>  <div class="math-block">\[\text{RRF}(d)=\sum_{r \in \text{各路}}\frac{1}{k_{\text{const}}+\text{rank}_r(d)}\]</div>  <p>其中 <code>rank</code> 是该文档在某一路里的名次（从 1 起），<code>k_const</code> 是个小常数（论文用 60，弱化头部名次的悬殊差距）。一个文档<strong>在多路里都排得靠前</strong>，倒数之和就大——而「在多路都靠前」恰恰是「真正相关」的强信号。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>RRF 的精髓是把一个<strong>脆弱的数值问题</strong>（怎么对齐两种不可比的分数）换成了一个<strong>稳健的序问题</strong>（谁排得靠前）。名次天然可比：不管 BM25 给 38.5 还是余弦给 0.81，「它在这一路排第 2」是确定无歧义的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：RRF 对各路分数的<strong>单调变换不变</strong>（只要名次不变，融合结果不变），因此免疫归一化方式的选择、免疫异常分数，几乎零调参就很稳。这是它成为混合检索<strong>默认融合方法</strong>的根本原因——简单、稳健、还常常打赢精心调过的分数加权。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这个对比：<strong>分数加权 = 信任分数的绝对值（脆弱）；RRF = 只信任名次（稳健）</strong>。当你要融合多个来源（多路检索、多个模型）且它们的分数不可比时，先试 RRF——它几乎总是一个又强又省心的基线。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="candidates"><span class="num">7</span>接力棒：候选集大小 N 的权衡</h2>
+  <h3>接力棒：候选集大小 N 的权衡</h3>  <p>两段式的命门，是第一段交给第二段的候选集大小 <strong>N</strong>。它是召回与精排之间的<strong>接力棒</strong>，太小太大都坏事：</p>  <table>
+    <thead><tr><th>N 的取值</th><th>好处</th><th>坏处</th></tr></thead>
+    <tbody>
+      <tr><td>N 太小（如 5）</td><td>重排极快、极省</td><td><strong>真正相关的文档可能没进候选</strong>——重排再强也救不回（天花板被锁死）</td></tr>
+      <tr><td>N 太大（如 1000）</td><td>几乎不漏（召回上限高）</td><td>cross-encoder 要跑 1000 次，<strong>重排变得又慢又贵</strong>；噪声候选也变多</td></tr>
+      <tr><td>N 适中（如 50–200）</td><td><strong>召回够全 + 重排可承受</strong>，实践甜点区</td><td>需按延迟预算与召回曲线调</td></tr>
+    </tbody>
+  </table>  <p>怎么选 N？关键看第一段的<strong>Recall@N 曲线</strong>：N 要大到「真正相关的文档以足够高概率落在 top-N 内」为止（比如 Recall@N≥0.95），再大就只是徒增重排成本而召回几乎不涨了。这正是模块 02 的召回-延迟权衡在系统层面的延续——只不过这里权衡的是「召回 vs 重排成本」。一个实用的标定方法：在带相关性标注的验证集上，把 N 从小到大扫一遍，画出 Recall@N 曲线，找到它<strong>开始变平</strong>的那个拐点（边际召回收益逼近零），就是性价比最高的 N。</p>  <p>更要紧的是建立<strong>端到端视角</strong>：检索系统的最终质量 = 第一段召回 × 第二段重排，是一条<strong>链</strong>。任何一环是瓶颈，优化另一环都收益递减。诊断时要分开看：如果真正相关的文档<em>根本没进 top-N</em>，问题在第一段（召回），调 N、换 embedding、加混合检索；如果它进了 top-N 却<em>排得很靠后</em>，问题在第二段（精排），换更强的 cross-encoder。<strong>先定位瓶颈在哪一棒，再针对性优化</strong>——这是下一模块 RAG 评测要系统化的归因思想。</p>  <div class="callout danger"><span class="label"></span>
+    <p>最常见的工程错误是<strong>只盯着重排调，却忽视第一段的召回天花板</strong>。你把 cross-encoder 换了一个又一个、调到极致，端到端却不动——因为真正相关的文档压根没被第一段捞进来，重排在一堆次优候选里再怎么排都是矮子里拔将军。<strong>永远先确认召回够全，再谈重排好坏</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>LLM 直接当重排器（LLM-as-reranker）</strong>：用 GPT 等大模型对候选做相关性判断，甚至直接<em>生成</em>排好序的列表（RankGPT）。零样本下常超过专门训练的 cross-encoder，但延迟与成本是大问题。</li>
+    <li><strong>listwise / setwise 重排</strong>：传统 cross-encoder 是 pointwise（一次只看一个 query-doc）。listwise 让模型<strong>一次看到整组候选</strong>再排序，能利用候选间的相对信息；setwise 则成对/成组比较，是 LLM 重排的活跃方向。</li>
+    <li><strong>把 cross-encoder 蒸馏进 bi-encoder</strong>：用昂贵的 cross-encoder 当老师，训练便宜的 bi-encoder 学它的打分（知识蒸馏）。让第一段召回本身就更准，减轻对重排的依赖。</li>
+    <li><strong>重排的延迟优化</strong>：cross-encoder 的成本随 N 线性增长，是在线服务的瓶颈。早停（easy 候选早早定序）、级联重排（先弱后强逐级筛）、量化与蒸馏都是降本方向。</li>
+    <li><strong>融合的可学习化</strong>：RRF 零参数虽稳，但天花板有限。如何在保持稳健的同时学习更优的融合权重（query-dependent fusion），仍是开放问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Nogueira & Cho 2019（monoBERT，重排范式奠基）、Khattab & Zaharia 2020（ColBERT，延迟交互折中）、Carbonell & Goldstein 1998（MMR，多样性）、Cormack et al. 2009（RRF，倒数排名融合）。完整清单见 <code>../references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_vector_retrieval/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 向量检索</div></a>
+    <a class="next" href="../04_rag_evaluation/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · RAG 评测</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · SFT 与 loss masking</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · SFT 与 loss masking</h1>
+  <p class="subtitle">Supervised Fine-Tuning —— 从 base model 到 assistant 的第一步：数据形态、chat template、只对回答算 loss</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">Transformer decoder、自回归语言建模损失、PyTorch 基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span><span class="badge gpu">GPU可选</span> 01_sft_loss_masking.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">InstructGPT (2022)、LoRA (2021)、QLoRA (2023)、LIMA (2023)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#bc">从 base model 到 assistant：SFT 的数据形态与目标</a></li>
+      <li><a href="#template">chat template 解剖：role 标记与特殊 token</a></li>
+      <li><a href="#masking">loss masking 核心机制：只对 assistant 段算 loss</a></li>
+      <li><a href="#lima">数据质量 &gt; 数量：LIMA 的实证</a></li>
+      <li><a href="#lora">LoRA 与 QLoRA：低秩适配的数学与工程</a></li>
+      <li><a href="#practice">训练实操：lr、epoch、packing 与灾难性遗忘</a></li>
+      <li><a href="#eval">评测视角：SFT 之后该测什么</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bc"><span class="num">1</span>从 base model 到 assistant：SFT 的数据形态与目标</h2>
+
+  <p>预训练出来的 <span class="term">base model</span> 只会做一件事：给定前缀，预测下一个 token。
+  你问它 "What is the capital of France?"，它很可能续写出更多的问题（因为网页上问题常成列表出现），而不是回答 "Paris"。
+  <strong>它是一个文档补全器，不是一个 assistant。</strong></p>
+
+  <p><span class="term">SFT（Supervised Fine-Tuning，监督微调）</span>是后训练流水线的第一步——对应 InstructGPT 三阶段流水线的 stage 1 [Ouyang 2022]：
+  收集一批高质量的 <strong>instruction-response 对</strong>（人类写的示范回答，demonstrations），
+  把它们格式化成对话，继续用语言建模损失训练模型。</p>
+
+  <div class="ascii">
+  InstructGPT 三阶段（本课程前三个模块的路线图）：
+
+  Stage 1: SFT                Stage 2: RM                  Stage 3: RLHF/PPO
+  ┌──────────────────┐        ┌──────────────────┐         ┌──────────────────┐
+  │ 人写示范回答       │        │ 人比较两个回答优劣  │         │ 用 RM 的分数当奖励  │
+  │ (prompt, response)│ ─────► │ 训练奖励模型 RM     │ ──────► │ 强化学习优化 policy │
+  │ 行为克隆           │        │ Bradley-Terry     │         │ PPO + KL 约束     │
+  └──────────────────┘        └──────────────────┘         └──────────────────┘
+       ★ 本模块                    模块 02                       模块 03
+  </div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>SFT 就是<strong>抄作业学习</strong>的机器版：给模型看几万条"问题 + 标准回答"，
+      让它在"回答"那部分逐 token 地模仿。模型本来就会预测下一个词，SFT 只是把"预测对象"换成了人类示范的回答，
+      让它学会"轮到 assistant 说话时，该说成什么样"。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>SFT 是对专家策略的<span class="term">行为克隆（behavior cloning）</span>：设示范数据
+      $\mathcal{D}=\{(x^{(i)}, y^{(i)})\}$，其中 $x$ 是 prompt（含 system/user 轮），$y$ 是人类示范回答，
+      目标是最大化 $\sum_i \log \pi_\theta(y^{(i)}\mid x^{(i)})$，即把回答按 token 分解后的条件似然。
+      它继承行为克隆的经典局限：只在示范分布上学习，无负样本、无"比较"信号——这正是模块 02/03 要补的课。</p>
+    </div>
+  </div>
+
+  <p>一条典型的 SFT 样本长这样（OpenAI messages 格式，业界事实标准）：</p>
+
+  <div class="ascii">
+  [
+    {"role": "system",    "content": "You are a helpful assistant."},
+    {"role": "user",      "content": "用一句话解释什么是过拟合"},
+    {"role": "assistant", "content": "模型把训练集的噪声当规律背了下来，换新数据就失灵。"}
+  ]
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  注意 SFT 没有引入任何新的损失函数——它<strong>仍然是 next-token prediction</strong>。
+  变化的只有两点：①数据从网页文档换成了结构化对话；②（关键）<strong>只对 assistant 段计算 loss</strong>。
+  第二点就是本模块的主角 loss masking（第 3 节）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="template"><span class="num">2</span>chat template 解剖：role 标记与特殊 token</h2>
+
+  <p>messages 列表是给人看的；模型只认一串 token。<span class="term">chat template</span> 就是把结构化对话
+  序列化成扁平 token 流的确定性规则。以 Qwen / ChatML 风格为例：</p>
+
+  <div class="ascii">
+  &lt;|im_start|&gt;system
+  You are a helpful assistant.&lt;|im_end|&gt;
+  &lt;|im_start|&gt;user
+  用一句话解释什么是过拟合&lt;|im_end|&gt;
+  &lt;|im_start|&gt;assistant
+  模型把训练集的噪声当规律背了下来，换新数据就失灵。&lt;|im_end|&gt;
+  </div>
+
+  <p>三个解剖要点：</p>
+  <ul>
+    <li><strong>role 标记</strong>：<code>&lt;|im_start|&gt;system / user / assistant</code> 告诉模型当前是谁在说话。
+    模型对"轮到 assistant 了"这个信号的全部理解，都来自训练时见过这个 token 模式。</li>
+    <li><strong>特殊 token</strong>：<code>&lt;|im_start|&gt;</code>、<code>&lt;|im_end|&gt;</code> 是词表里的<em>单个</em>保留 token，
+    不会被 BPE 切碎。<code>&lt;|im_end|&gt;</code> 通常兼任 EOS——模型生成它就意味着"我说完了"，推理框架据此停止。
+    SFT 必须让模型学会在回答末尾输出它，否则模型会停不下来。</li>
+    <li><strong>system prompt 的注入位置</strong>：固定在序列最前面，且很多 template 在用户不提供 system 时会自动注入默认值
+    （Qwen 注入 "You are Qwen, created by Alibaba Cloud…"）。训练和推理时 system 的有无/内容不一致，也是一种 template 漂移。</li>
+  </ul>
+
+  <p>推理时还有一个容易忽略的细节：<span class="term">generation prompt</span>。给模型喂完用户消息后，
+  必须追加 <code>&lt;|im_start|&gt;assistant\n</code> 作为"该你说了"的提示（<code>apply_chat_template(..., add_generation_prompt=True)</code>），
+  模型才会以 assistant 身份续写。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>template 不一致是微调失败的头号低级错误。</strong>训练时用模板 A 拼接、推理时用模板 B（或忘了 add_generation_prompt、
+  或多/少一个换行、或 system 默认值不同），模型看到的 token 模式与训练分布错位，轻则格式混乱、答非所问，
+  重则评测分数雪崩——而代码"看上去"没有任何 bug。诊断手段只有一个：<strong>把训练样本和推理 prompt 都打印成 token id 序列逐一对比</strong>。
+  永远用 tokenizer 自带的 <code>apply_chat_template</code>，不要手拼字符串。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="masking"><span class="num">3</span>loss masking 核心机制：只对 assistant 段算 loss</h2>
+
+  <p>把整条对话拼成 token 序列后，并不是每个位置都参与训练。标准做法是
+  <span class="term">completion-only training</span>：<strong>只对 assistant 段的 token 计算交叉熵，
+  prompt 段（system + user + role 标记）的 label 置为 -100</strong>——PyTorch 的
+  <code>F.cross_entropy(ignore_index=-100)</code> 会跳过这些位置。</p>
+
+  <div class="math-block">
+  $$ \mathcal{L}_{\text{SFT}}(\theta)
+     = -\frac{1}{\sum_{t} m_t}\sum_{t=1}^{T} m_t \,\log p_\theta\!\left(y_t \mid y_{&lt;t}\right),
+     \qquad m_t = \mathbb{1}\!\left[\,y_t \in \text{assistant 段}\,\right] $$
+  </div>
+
+  <p>其中 $m_t$ 就是 mask。注意两个实现细节：①自回归模型预测的是"下一个 token"，
+  所以实现里 labels 相对 logits 要<strong>右移一位</strong>（HuggingFace 在模型内部自动做 shift，你只需提供与 input_ids 对齐、prompt 位置为 -100 的 labels）；
+  ②被 mask 的位置<strong>仍然参与前向</strong>——prompt 的信息通过 attention 流入 assistant 段的预测，只是它们自己不产生梯度。</p>
+
+  <div class="ascii">
+  token:   &lt;|im_start|&gt; user \n 用一句话…  &lt;|im_end|&gt; &lt;|im_start|&gt; assistant \n  模型 把 …失灵。 &lt;|im_end|&gt;
+  input:   ────────────────── 全部参与前向（attention 都看得到）──────────────────────────────────►
+  labels:    -100      -100 -100  -100      -100       -100        -100    -100   id  id   id      id
+             └──────────────── prompt 段：label = -100，loss 跳过 ─────────────┘   └─ assistant 段 ─┘
+                                                                                     ▲ 只有这里产生梯度
+                                                                                     ▲ &lt;|im_end|&gt; 也要算 loss
+                                                                                       （否则学不会停！）
+  </div>
+
+  <p><strong>为什么要 mask？</strong>不 mask（对全序列算 loss）有两个代价：</p>
+  <ul>
+    <li><strong>学会"复述问题"</strong>：user 段的 token 也被当成预测目标，模型的容量被花在"建模用户会问什么"上。
+    极端情况下，模型学到的最优策略包含模仿问题的措辞、甚至在回答里重复问题——这不是我们想要的能力。</li>
+    <li><strong>稀释信号</strong>：一条样本里 prompt 往往比回答长（带长文档/few-shot 的场景尤甚）。不 mask 时，
+    梯度大头来自 prompt 段，真正想学的"如何回答"只占小头，相当于把有效学习率打了折。</li>
+  </ul>
+
+  <table>
+    <thead><tr><th>维度</th><th>completion-only（mask prompt）</th><th>全序列训练（不 mask）</th></tr></thead>
+    <tbody>
+      <tr><td>梯度来源</td><td>只有 assistant token</td><td>所有 token（prompt 占大头）</td></tr>
+      <tr><td>学到的行为</td><td>"如何回答"</td><td>"如何回答" + "用户会问什么"</td></tr>
+      <tr><td>典型失败模式</td><td>—</td><td>复述问题、续写出"用户的下一问"</td></tr>
+      <tr><td>prompt 很长时</td><td>不受影响</td><td>回答信号被严重稀释</td></tr>
+      <tr><td>实证结论</td><td colspan="2">指令微调场景下 completion-only 普遍不劣于且常优于全序列；
+        全序列仅在数据极少、需要正则化效应时偶有报告占优——默认选 completion-only</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  工程上最常见的 masking bug：①忘了把 <code>&lt;|im_start|&gt;assistant\n</code> 这段"回答前缀"也置 -100（它属于模板不属于回答）；
+  ②把回答末尾的 <code>&lt;|im_end|&gt;</code> 一起 mask 掉了——模型于是永远学不会停止；
+  ③多轮对话只保留了最后一个 assistant 段的 loss（除非有意为之，每个 assistant 段都应保留）。
+  配套 notebook 会让你逐 token 打印 (id, label) 对照表，亲手避开这三个坑。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="lima"><span class="num">4</span>数据质量 &gt; 数量：LIMA 的实证</h2>
+
+  <p>SFT 需要多少数据？LIMA [Zhou 2023] 给出了一个被反复引用的答案：
+  <strong>仅用 1000 条精心挑选、风格统一的高质量样本</strong>微调 65B base model（无 RLHF），
+  在人评中就能与当时用了数十万示范 + RLHF 的产品级模型打得有来有回；而用百万条爬取的低质指令数据反而更差。</p>
+
+  <p>由此提出 <span class="term">Superficial Alignment Hypothesis（表面对齐假说）</span>：
+  模型的知识和能力几乎全部来自预训练，SFT 学的只是<strong>风格与格式的子分布选择</strong>——
+  "用 assistant 的口吻、按这种结构组织已有知识"。既然学的是分布的"形"，少量但一致的示范就够了；
+  反之，海量但风格互相矛盾的数据会让模型学到一个模糊的平均风格。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>LIMA 的可迁移结论</strong>：①样本间<strong>风格一致性</strong>比绝对数量重要——作者把质量归因于"统一的回答语气与格式"；
+  ②scaling 数据量在质量不变时收益迅速饱和；③但 LIMA 在安全性、复杂推理上明显偏弱——
+  <strong>SFT 调不出预训练里没有的能力</strong>。读它的正确姿势是"质量是数量的前提"，而非"1000 条永远够"：
+  覆盖面（多语言、代码、长对话、拒答边界）仍然需要规模支撑。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  对做评测的人，LIMA 还有一层提醒：SFT 模型在"风格讨喜"上提升极快，人评/LLM-judge 很容易被格式与流畅度俘获
+  （模块 06 的 length/style bias）。看到"1k 样本媲美 GPT"这类结论，先问：评的是能力还是风格？</div>
+
+  <!-- ========================================================= -->
+  <h2 id="lora"><span class="num">5</span>LoRA 与 QLoRA：低秩适配的数学与工程</h2>
+
+  <p>全参微调一个 7B 模型，AdamW 需要参数 + 梯度 + 一二阶矩 ≈ 16 bytes/param ≈ 112 GB 显存，单卡不可行。
+  <span class="term">LoRA（Low-Rank Adaptation）</span> [Hu 2021] 的洞见：微调引起的权重变化 $\Delta W$
+  本征秩很低，不必学满秩矩阵。冻结原权重 $W_0$，只学一对低秩因子：</p>
+
+  <div class="math-block">
+  $$ h = W_0 x + \Delta W x = W_0 x + \frac{\alpha}{r}\, B A\, x,
+     \qquad A\in\mathbb{R}^{r\times d_{in}},\; B\in\mathbb{R}^{d_{out}\times r},\; r \ll \min(d_{in}, d_{out}) $$
+  </div>
+
+  <p>三个设计点，面试和实战都常考：</p>
+  <ul>
+    <li><strong>参数量</strong>：每层从 $d_{out}\times d_{in}$ 降到 $r(d_{in}+d_{out})$。$d=4096, r=8$ 时约为原来的 0.4%。
+    优化器状态同步缩水——这才是省显存的大头。</li>
+    <li><strong>为什么 $B$ 零初始化</strong>：$A$ 随机高斯、$B=0$，则训练开始时 $\Delta W = BA = 0$，
+    模型前向与原模型<strong>严格一致</strong>，微调从"无扰动"出发平滑偏离，不会在第一步就破坏预训练能力。
+    （若 $A,B$ 都随机，初始就注入一个随机扰动；若都置零，则两者梯度均为 0，永远学不动。）</li>
+    <li><strong>可合并推理</strong>：训练完执行 $W' = W_0 + \frac{\alpha}{r}BA$，得到一个普通稠密权重——
+    <strong>推理时延迟严格为零</strong>，这是 LoRA 相对 adapter/prefix-tuning 的决定性工程优势。
+    缩放因子 $\alpha/r$ 使得调 $r$ 时不必重调学习率。</li>
+  </ul>
+
+  <p><span class="term">QLoRA</span> [Dettmers 2023] 更进一步：base 权重以 4-bit 存储、LoRA 分支保持 bf16 训练，
+  把 65B 微调塞进单张 48GB 卡。三件套：</p>
+  <ul>
+    <li><strong>NF4（4-bit NormalFloat）</strong>：量化格点按标准正态分布的分位数放置（而非均匀间隔），
+    对近似高斯分布的神经网络权重是信息论意义上更优的 4-bit 数据类型。前向时反量化回 bf16 计算。</li>
+    <li><strong>双重量化（double quantization）</strong>：量化所需的 per-block 缩放常数本身再量化一次，每参数再省 ~0.37 bit。</li>
+    <li><strong>paged optimizer</strong>：优化器状态放统一内存，显存尖峰（长序列梯度检查点回传时）自动换页到 CPU，防 OOM。</li>
+  </ul>
+
+  <table>
+    <thead><tr><th>维度</th><th>全参微调</th><th>LoRA</th><th>QLoRA</th></tr></thead>
+    <tbody>
+      <tr><td>可训练参数</td><td>100%</td><td>~0.1–1%</td><td>~0.1–1%</td></tr>
+      <tr><td>7B 显存（AdamW，含优化器状态）</td><td>~112 GB</td><td>~16–20 GB</td><td>~6–10 GB</td></tr>
+      <tr><td>base 权重精度</td><td>bf16</td><td>bf16（冻结）</td><td>NF4（冻结）</td></tr>
+      <tr><td>典型学习率</td><td>1e-5 量级</td><td>1e-4 量级</td><td>1e-4 量级</td></tr>
+      <tr><td>推理额外延迟</td><td>无</td><td>合并后无</td><td>合并后无（需反量化合并）</td></tr>
+      <tr><td>效果</td><td>上限最高</td><td>指令微调场景常打平全参</td><td>论文报告打平 16-bit 微调</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="practice"><span class="num">6</span>训练实操：lr、epoch、packing 与灾难性遗忘</h2>
+
+  <ul>
+    <li><strong>学习率差一个量级</strong>：全参 SFT 常用 1e-5～2e-5；LoRA 因为只更新小矩阵且从零扰动出发，
+    常用 1e-4～2e-4。把全参的 lr 套到 LoRA 上是"LoRA 没效果"的最常见原因；反过来则会把模型调坏。
+    配 cosine decay + 3%–10% warmup 是默认配方。</li>
+    <li><strong>epoch 数与过拟合</strong>：SFT 数据小（几千～几十万条），2–4 个 epoch 是常态；
+    但 epoch 一多，模型开始逐字背诵示范、多样性下降、对训练集风格过拟合。
+    判断不要只看 train loss——<strong>留出验证集 loss + 定期抽样生成肉眼看</strong>。</li>
+    <li><strong>packing</strong>：SFT 样本长短不一，padding 浪费算力。packing 把多条样本首尾相接填满 max_len，
+    吞吐可提升数倍。注意两点：①样本边界要用 EOS 分隔；②理想情况下用 block-diagonal attention mask
+    防止跨样本 attention（很多实现图省事不做，实测影响通常很小，但做评测归因时要知道这个混杂因素存在）。</li>
+    <li><strong>灾难性遗忘与回放</strong>：<span class="term">catastrophic forgetting</span>——在窄分布上微调会侵蚀通用能力
+    （MMLU 掉点、代码能力退化）。标准缓解：在 SFT 数据里<strong>回放（replay）</strong>少量预训练数据或通用指令数据
+    （常见配比 1%–5%），以及用 LoRA 本身（冻结 $W_0$ 天然限制偏离幅度）、降低 lr、减少 epoch。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  SFT 的 train loss 几乎总是"看起来很健康"地单调下降——它只是在告诉你模型越来越会模仿这批示范，
+  <strong>不代表对话质量、指令遵循、安全性在变好</strong>。把 loss 曲线当成唯一仪表盘，是 SFT 阶段最隐蔽的自欺。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>评测视角：SFT 之后该测什么</h2>
+
+  <p>SFT 产出的是第一个"能对话"的 checkpoint，评测要回答三个正交的问题：</p>
+
+  <ul>
+    <li><strong>指令遵循（instruction following）</strong>：能否服从可验证的硬约束——
+    IFEval 类基准用"恰好三段"、"不出现字母 e"、"以 JSON 输出"这类<em>程序可判定</em>的指令，
+    绕开 LLM-judge 的主观性。这是 SFT 最直接的目标能力。</li>
+    <li><strong>格式合规</strong>：chat template 是否学瓷实了——会不会按时输出 <code>&lt;|im_end|&gt;</code>（停止行为）、
+    多轮中会不会角色串台、要求 JSON/markdown 时结构是否合法。格式崩坏往往是 template/masking bug 的下游症状，
+    应该最先测、当冒烟测试跑。</li>
+    <li><strong>原能力保持（regression）</strong>：MMLU、GSM8K、HumanEval 等 base 能力基准在 SFT 前后对比，
+    监控灾难性遗忘。注意公平性陷阱：base model 用 few-shot 续写式评测，SFT 模型该用 chat 格式 0-shot 评测，
+    prompt 格式本身就能造成几个点的虚假涨跌——<strong>归因之前先固定评测协议</strong>。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>loss 降不代表对话变好。</strong>验证集 loss 衡量的是"对示范回答的逐 token 似然"，
+  它与人类偏好只是弱相关：一个回答可以 token 级偏离示范却更好（同义改写），也可以 token 级贴近示范却更差（背诵到一半截断）。
+  这个"似然 ≠ 偏好"的裂缝，正是模块 02 引入奖励模型的根本动机。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>SFT 到底学了什么？</strong>表面对齐假说 [Zhou 2023] 认为只是风格选择，但后续工作显示 SFT 也能注入新知识——
+    代价是幻觉率上升（模型学会"自信地说出训练时没见过的事实"这一<em>行为</em>）。知识注入与行为模仿的边界在哪里，
+    缺少干净的测量方法。</li>
+    <li><strong>数据选择的自动化</strong>：LIMA 靠人工精选难以规模化。用模型困惑度、梯度影响函数（influence）、
+    多样性聚类自动选 SFT 子集是活跃方向；评测难点在于"选出的子集好"如何与"选择方法好"解耦。</li>
+    <li><strong>masking 策略的精细化</strong>：多轮对话中早期轮次的 assistant 段要不要降权？
+    工具调用轨迹里，工具返回结果（observation）该 mask 而 action 该训练——agent SFT 的 masking 方案直接决定学到的策略，
+    但各家配方不公开、也缺系统消融。</li>
+    <li><strong>LoRA 的能力边界</strong>：低秩约束下，风格类任务 LoRA ≈ 全参，但大规模新知识/新语言注入时差距拉大。
+    "什么任务需要多大的 $r$"仍以经验法则为主，缺预测性理论。</li>
+    <li><strong>评测开放题</strong>：怎样构造一个对"风格讨好"免疫的 SFT 质量度量？IFEval 式可验证约束覆盖面太窄，
+    LLM-judge 又会被流畅度俘获（模块 06 详述）——可验证性与覆盖面的权衡尚无好解。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>SFT 的损失函数和预训练有什么异同？写出带 mask 的损失公式，并解释 label=-100 的位置在前向和反向中各扮演什么角色。</li>
+      <li>不做 loss masking 会出什么问题？completion-only 与全序列训练的取舍是什么？</li>
+      <li>LoRA 中 $B$ 为什么零初始化？$\alpha/r$ 起什么作用？合并推理为什么零延迟？QLoRA 的 NF4 比均匀 4-bit 好在哪？</li>
+      <li>SFT 之后应该测哪三类东西？为什么验证集 loss 下降不能代表对话质量变好？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../00_setup/00_overview.html"><div class="dir">← 上一章</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_reward_models/02_讲解.html"><div class="dir">下一章 →</div><div class="t">02 · 奖励模型：Bradley-Terry 与 reward hacking</div></a>
+  </div>
+
+</div>
+</body>
+</html>

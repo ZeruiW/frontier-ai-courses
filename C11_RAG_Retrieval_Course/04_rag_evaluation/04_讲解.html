@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · RAG 评测</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 07</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · RAG 评测</h1>
+  <p class="subtitle">RAG 三元组(问题/检索上下文/答案)的分科体检：faithfulness 防幻觉、answer relevance 防跑题、context precision/recall 诊断检索、RAGAS 无参考评测、归因诊断矩阵 —— 把『RAG 好不好』拆成『哪一科几分』</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（相似度/词法）、模块 02-03（检索/重排）、一点点 precision/recall 直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_rag_evaluation.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Es 2023 (RAGAS)、Chen 2023 (RGB)、Saad-Falcon 2023 (ARES)、Manakul 2023 (SelfCheckGPT)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#triple">RAG 为什么难评：三元组与分科体检</a></li>
+      <li><a href="#faithfulness">faithfulness：答案有据吗（防幻觉）</a></li>
+      <li><a href="#relevance">answer relevance：答案切题吗</a></li>
+      <li><a href="#context">context precision &amp; recall：检索段质量</a></li>
+      <li><a href="#ragas">RAGAS：无参考的自动评测</a></li>
+      <li><a href="#hallucination">幻觉检测：忠实度与一致性</a></li>
+      <li><a href="#attribution">端到端评测与归因诊断</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="triple"><span class="num">1</span>RAG 为什么难评：三元组与分科体检</h2>
+  <p>前三个模块我们把 RAG 的检索半边搭了起来：把文本嵌成向量、建索引找近邻、重排精选候选。但 RAG 的全称是 Retrieval-Augmented <strong>Generation</strong>——检索到的上下文最终要喂给一个生成器去<em>作答</em>。于是一个尖锐的问题浮现：<strong>怎么知道这套系统答得好不好？</strong>这就是本模块的主题——RAG 评测，也是把 RAG 从「能跑」推向「可信」的关键一环。</p>  <p>最朴素的想法是：拿一批有标准答案的问题，看系统答对了几道，算个准确率（或 EM / F1）。这在抽取式 QA 上还行，但对开放式、生成式的 RAG 远远不够。原因在于 RAG 是一条<strong>两段流水线</strong>，一个<em>端到端准确率</em>把太多东西揉成了一个数字，掩盖了<strong>失败到底发生在哪一段</strong>。</p>  <p>理解 RAG 评测，要先把它拆成一个<strong>三元组</strong>：<span class="term">question</span>（用户问题 $q$）、<span class="term">retrieved context</span>（检索到的上下文 $c$）、<span class="term">answer</span>（模型生成的答案 $a$）。一次 RAG 调用就是 $q\to c\to a$ 的链条，而评测要分别盯住这条链的每一环与每一对关系：</p>  <div class="ascii">RAG 三元组与它们之间要评的关系
+
+        question (q)
+        │        \
+   context        \  answer relevance: a 切题地回应 q 吗?
+   recall/precision \
+        │            \
+        ▼             ▼
+   context (c) ───▶ answer (a)
+        faithfulness: a 的每个论断都被 c 支持吗(没在编)?
+
+  检索段质量: context precision / recall  |  生成段质量: faithfulness / answer relevance</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 RAG 想成「开卷考试」：检索是「翻书翻到对的页」，生成是「照着翻到的页写答案」。只看最终得分（答对没），你分不清扣分是因为<strong>没翻到对的页</strong>（检索差），还是<strong>翻到了却抄错或自由发挥</strong>（生成差）。要改进系统，必须把这两类错分开诊断——这正是三元组评测的全部动机。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：端到端正确率 $P(a\ \text{correct})$ 是 $P(\text{retrieve good }c)\cdot P(\text{generate good }a\mid c)$ 的混合，单个数字无法解耦两个因子。RAG 评测的核心是把它分解为<strong>检索侧指标</strong>（context precision/recall，第 4 节）与<strong>生成侧指标</strong>（faithfulness/answer relevance，第 2、3 节），从而定位瓶颈、对症下药。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话定调本模块：<strong>好的 RAG 评测不是给系统打一个分，而是给它做一次『分科体检』</strong>——检索这一科考了多少、生成这一科考了多少。本模块从零实现这套体检的四项核心指标（faithfulness、answer relevance、context precision、context recall），并用它们把不同病症的 RAG 案例诊断出来。我们用<strong>规则版</strong>（词重叠/集合包含作蕴含代理）模拟 RAGAS 的 LLM 判官思想，让你看清每个指标<em>在量什么</em>、<em>怎么算</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="faithfulness"><span class="num">2</span>faithfulness：答案有据吗（防幻觉）</h2>
+  <p>先看 RAG 评测里<strong>最核心、最关乎安全</strong>的指标：<span class="term">faithfulness</span>（忠实度，也叫 <span class="term">groundedness</span> 接地度）。它回答一个问题：<strong>答案里说的每一句，都能在检索到的上下文里找到依据吗？</strong>如果答案冒出了上下文根本没提的内容，那就是模型在<strong>编</strong>——也就是<span class="term">hallucination</span>（幻觉）。</p>  <p>这里有一个极其重要、却常被忽略的区分：<strong>faithfulness 与『答案是否正确』是两回事</strong>。一个答案可能<em>恰好正确</em>（与世界事实相符），但如果它的依据不在上下文里、而是模型从自己参数化记忆里掏出来的，那它<strong>仍然是不忠实的</strong>。</p>  <div class="callout danger"><span class="label">忠实 ≠ 正确</span>
+    <p>为什么「恰好正确但不忠实」也要算失败？因为 RAG 的承诺是<strong>可溯源、可控、可更新</strong>：答案应当<em>由你给的知识库</em>支撑，这样你换库就能换知识、能审计每个论断的出处。一个靠参数化记忆「蒙对」的答案，今天对、明天模型一变就可能错，且你无从追查它凭什么这么说。<strong>不忠实的正确答案是侥幸，不是可靠系统</strong>——这正是 faithfulness 必须独立于正确性来度量的原因。</p>
+  </div>  <p>怎么自动算 faithfulness？工业界（如 RAGAS）的做法分两步，本课用规则版模拟其骨架：</p>  <ol>
+    <li><strong>论断分解（claim decomposition）</strong>：把答案这段话拆成若干<em>可独立验证的原子论断</em>。比如「巴黎是法国首都，人口约 200 万」拆成两条：① 巴黎是法国首都；② 巴黎人口约 200 万。</li>
+    <li><strong>逐条蕴含判定（entailment）</strong>：对每条论断，判断它是否被上下文<span class="term">entail</span>（蕴含/支持）。真实 RAGAS 用 LLM 或 NLI 模型判；本课用<strong>词重叠代理</strong>——论断的内容词若足够多地出现在某条上下文里，就算被支持。</li>
+  </ol>  <div class="math-block">\[\text{faithfulness}(a, c)=\frac{\#\{\text{被上下文 }c\text{ 支持的论断}\}}{\#\{a\text{ 中的全部论断}\}}\in[0,1]\]</div>  <p>于是 faithfulness 就是<strong>被支持论断的比例</strong>：全部论断都有依据 → 1.0（完全忠实）；有一条论断在上下文里查无实据 → 分数下降，那条就是疑似幻觉。notebook 会造一个含 1 条捏造论断的答案，亲眼看到 faithfulness 从 1.0 掉下来，并精确定位是哪条论断在编。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>faithfulness 像查作业有没有「抄题目给的资料」：把学生的每句话拿去和发的资料逐句比对，凡是资料里找不到出处的，就标记为「自己瞎写的」。瞎写的越多，忠实度越低。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，这是把「答案是否 grounded」操作化为「论断集合对上下文的可推导比例」。真实系统用 NLI 的三分类（entailment / neutral / contradiction）：被 entail 记忠实，neutral/contradiction 记不忠实。本课的词重叠代理是其廉价近似，抓的是「论断的信息是否出现在上下文中」这一核心。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="relevance"><span class="num">3</span>answer relevance：答案切题吗</h2>
+  <p>第二个生成侧指标是 <span class="term">answer relevance</span>（答案相关性）：<strong>答案切题地回应了问题吗？</strong>它和 faithfulness 是<strong>正交</strong>的两个维度——这一点必须想清楚，否则会把两类完全不同的毛病混为一谈。</p>  <p>看一个具体的对照。问「埃菲尔铁塔有多高？」，上下文是关于埃菲尔铁塔的一段介绍：</p>  <table>
+    <thead><tr><th>答案</th><th>faithfulness（忠实于上下文？）</th><th>answer relevance（切题？）</th><th>诊断</th></tr></thead>
+    <tbody>
+      <tr><td>「埃菲尔铁塔高约 330 米。」</td><td><strong>高</strong>（上下文有此数据）</td><td><strong>高</strong>（正面回答了高度）</td><td>✅ 理想</td></tr>
+      <tr><td>「埃菲尔铁塔在巴黎，建于 1889 年。」</td><td><strong>高</strong>（上下文确有这些）</td><td><strong>低</strong>（答非所问，没说高度）</td><td>❌ 忠实但跑题</td></tr>
+      <tr><td>「埃菲尔铁塔高约 1000 米。」</td><td><strong>低</strong>（上下文无此数，是编的）</td><td><strong>高</strong>（形式上在答高度）</td><td>❌ 切题但幻觉</td></tr>
+    </tbody>
+  </table>  <p>第二行就是 faithfulness 高、answer relevance 低的典型：模型老老实实复述了上下文，但复述的是<em>无关的</em>部分，等于没回答问题。第三行反过来，形式上切题却在编数字。<strong>两个指标各管一边，缺一不可</strong>：faithfulness 防「编」，answer relevance 防「跑题」。</p>  <p>怎么算 answer relevance？一个直接的代理是度量<strong>答案与问题的语义贴合度</strong>（如用上一模块的余弦相似，或答案对问题关键词的覆盖）。RAGAS 用了一个更巧的<strong>反向生成</strong>思路：让 LLM 从答案<em>反推</em>出它最可能在回答的问题，再比较<em>反推出的问题</em>与<em>原问题</em>的相似度——如果答案切题，反推的问题应当和原问题很像。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>answer relevance 像问：「光看这个答案，你能猜出它在回答什么问题吗？猜出来的问题和真问题对得上吗？」一个跑题的答案，反推出的问题会和原问题南辕北辙；一个切题的答案，反推的问题几乎就是原问题。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，反向生成法估计 $\text{relevance}\approx \text{sim}(q,\ \hat{q})$，其中 $\hat q$ 是从答案 $a$ 生成的问题。本课用更简单的 $\text{sim}(q, a)$（问题-答案的词/向量相似度）作代理，核心都是<strong>捕捉『答案是否朝着问题的方向』</strong>，而非答案是否有依据（那是 faithfulness 的事）。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="context"><span class="num">4</span>context precision &amp; recall：检索段质量</h2>
+  <p>把视角转到检索侧。检索段的质量直接决定生成段的上限——<strong>garbage in, garbage out</strong>：检索回来一堆噪声或漏了关键证据，再强的生成器也救不回。检索侧有两个互补的指标：<span class="term">context precision</span> 和 <span class="term">context recall</span>，它们恰好对应「带回来的对不对」和「该带的全不全」。</p>  <p>注意这里的 precision/recall 是<strong>针对一次 RAG 调用的上下文</strong>而言（不同于模块 05 的整体排序指标）：</p>  <table>
+    <thead><tr><th>指标</th><th>定义</th><th>低分意味着</th><th>后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>context precision</strong></td><td>检索到的上下文里，真正与问题相关的比例</td><td>带回了一堆无关片段</td><td>噪声稀释信号、挤占上下文预算、可能误导生成</td></tr>
+      <tr><td><strong>context recall</strong></td><td>回答问题所需的信息，被检索上下文覆盖的比例</td><td>关键证据没被检索到</td><td><strong>生成器巧妇难为无米之炊</strong>——RAG 最常见的失败根因</td></tr>
+    </tbody>
+  </table>  <div class="math-block">\[\text{precision}=\frac{|\text{相关的检索片段}|}{|\text{全部检索片段}|}\qquad \text{recall}=\frac{|\text{被覆盖的所需要点}|}{|\text{回答所需的全部要点}|}\]</div>  <p>两者此消彼长，但<strong>在 RAG 里 recall 往往更致命</strong>。道理很直接：上下文里有点噪声（precision 不满），强生成器通常能<em>忽略</em>无关片段、从相关片段里提炼答案；但如果回答所需的关键事实<strong>压根没被检索到</strong>（recall 不满），生成器要么拒答、要么只能靠参数化记忆瞎编（幻觉）。<strong>漏检比噪声更难补救</strong>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>这给 RAG 调优一条重要启示：<strong>第一段检索（召回阶段）应当偏向高 recall</strong>——宁可多召回一些候选（哪怕带点噪声），也别漏掉关键文档；<em>精度</em>的问题交给后面的<strong>重排</strong>（模块 03）去收拾。这正是「召回求全、重排求精」两段式设计的评测依据：召回阶段的 KPI 是 recall，重排阶段的 KPI 才是 precision/排序质量。</p>
+  </div>  <p>怎么算 context recall？需要一个<strong>ground truth</strong>：回答这个问题<em>到底需要哪些要点</em>（可由标准答案分解得到）。然后看每个要点是否被某条检索上下文覆盖，覆盖比例就是 recall。context precision 则要判断每条检索片段<em>是否与问题相关</em>（同样用词重叠/蕴含代理）。notebook 会把两者都从零实现，并验证「漏检案例 recall 低、噪声案例 precision 低」。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="ragas"><span class="num">5</span>RAGAS：无参考的自动评测</h2>
+  <p>把前面三节的四个指标——faithfulness、answer relevance、context precision、context recall——<strong>合成一套自动化、无需人工标准答案</strong>的评测框架，就是 <span class="term">RAGAS</span>（Es 2023，Retrieval-Augmented Generation Assessment）的核心思想。它是当下 RAG 评测最有影响力的工作之一。</p>  <p>RAGAS 最重要的卖点是 <strong>reference-free</strong>（无参考）：传统评测要为每个问题准备人工写的标准答案，昂贵且难规模化；RAGAS 仅凭 $q$、$c$、$a$ <strong>三者之间的一致性</strong>就能打分，从而能<em>大规模、自动、甚至在线</em>地评测和监控 RAG 系统。它的每一项分都落在前面讲过的某对关系上：</p>  <div class="ascii">RAGAS 四项 = 三元组上的四对一致性
+
+            ┌──────────── answer relevance (q ↔ a) ───────────┐
+            │                                                  │
+  question (q) ──context precision/recall (q ↔ c)──▶ context (c) ──faithfulness (c ↔ a)──▶ answer (a)
+
+  生成侧: faithfulness(c→a 没编) + answer relevance(q→a 切题)
+  检索侧: context precision(c 干净) + context recall(c 全)</div>  <p>RAGAS 用 LLM 充当<strong>判官</strong>来做论断分解与蕴含判定；本课用<strong>规则版</strong>（词重叠、集合包含）替代 LLM，得到的是同构的、可解释、可复现的简化版。这样做有意为之：<strong>先理解每个指标在数学上量的是什么</strong>，再去理解 LLM 判官只是把『判定是否支持/相关』这一步换成了更聪明（但也更贵、更不稳定）的实现。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>RAGAS 像给 RAG 系统配了一个不知疲倦、不用标准答案的「自动阅卷员」：它读问题、读你检索的资料、读你的答案，然后从四个角度打分——资料找全了吗、资料干净吗、答案有据吗、答案切题吗。把这四个分摆在一起，系统哪一环弱一目了然。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，RAGAS 把 RAG 评测从「需要 gold answer 的有参考评测」转为「只需 (q,c,a) 的无参考评测」，代价是依赖 LLM 判官的可靠性（见第 8 节的偏差与校准问题）。本课的规则代理虽不如 LLM 灵活，但<strong>完全确定、零成本、可单元测试</strong>，正适合学清楚指标的定义。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hallucination"><span class="num">6</span>幻觉检测：忠实度与一致性</h2>
+  <p>faithfulness 低，本质就是检测到了 <span class="term">hallucination</span>（幻觉）——生成了无法由上下文支持的内容。值得单独一节，因为幻觉是 RAG（乃至一切生成式 AI）落地的头号风险，而 RAG 对它的关系很微妙：<strong>RAG 抑制幻觉，但不消灭幻觉</strong>。</p>  <p>说 RAG 抑制幻觉，是因为它把真实证据放进了上下文，让模型<em>有据可依</em>、不必硬编。但说它不消灭幻觉，是因为<strong>生成器仍可能『无视上下文』</strong>：上下文里明明有正确信息，模型却用自己参数化记忆里（可能过时或错误）的版本作答；或者上下文不全时，模型用编造来「填空」让答案看起来完整。这两种都是 faithfulness 要抓的。</p>  <div class="callout danger"><span class="label">漏检逼出幻觉</span>
+    <p>一个尤其危险的幻觉模式是<strong>过度自信的填空</strong>：当 context recall 不足（关键信息没检索到），一个「乐于助人」的模型往往不会说「我不知道」，而是<em>流畅地编一个看起来合理的答案</em>。这就是为什么 <strong>context recall 低 + faithfulness 低 经常一起出现</strong>：漏检逼出了幻觉。检测幻觉因此不能只看生成段，还要回头看检索段是不是没喂够料。</p>
+  </div>  <p>除了 faithfulness 这种<strong>基于上下文</strong>的检测，还有一类<strong>无需外部知识</strong>的幻觉检测思路，以 <span class="term">SelfCheckGPT</span>（Manakul 2023）为代表：让模型对同一问题<strong>多次采样</strong>生成多个答案，如果模型是「知道」的，多次回答会彼此一致；如果是在编，多次回答会<em>互相矛盾、东拉西扯</em>。用答案之间的<strong>一致性</strong>（consistency）作为「非幻觉」的代理——矛盾越多，越可能在编。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>两条检测幻觉的路：一条是「对答案」——把答案和发给它的资料逐句核对（faithfulness）；另一条是「对自己」——让它把同一题答好几遍，看几遍说得一不一致（SelfCheckGPT）。前者需要上下文，后者连上下文都不需要，靠的是「真知道的人怎么问都答得一样，瞎编的人每次编得不一样」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>技术底座上，「论断是否被支持」最终是一个 <span class="term">NLI</span>（自然语言推理 / 蕴含）问题：context $\models$ claim 则忠实，context 与 claim 矛盾或无关则可能幻觉。本课用词重叠近似 entailment；真实系统用专门的 NLI 模型或 LLM 判官（见 references 的 Honovich 2022《TRUE》把忠实度统一成 NLI）。notebook 会用『多答案一致性』的玩具模拟体会 SelfCheckGPT 的直觉。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="attribution"><span class="num">7</span>端到端评测与归因诊断</h2>
+  <p>有了四项指标，最后一步是把它们<strong>合起来用</strong>——做端到端评测与<strong>归因</strong>（attribution）：当一个 RAG 系统表现不佳，到底该去修检索还是修生成？这正是开篇说的「分科体检」要回答的问题，也是 RAG 评测真正的实用价值所在。</p>  <p>最有用的工具是一张<strong>二维诊断矩阵</strong>：横轴是检索段好坏（context recall/precision 高不高），纵轴是生成段好坏（faithfulness/answer relevance 高不高）。四个象限对应四种截然不同的病症与处方：</p>  <div class="ascii">RAG 归因诊断矩阵（检索 × 生成）
+
+                  生成好(faithful+relevant)   生成差(不忠实/跑题)
+                ┌────────────────────────┬────────────────────────┐
+  检索好        │  ✅ 理想               │  ⚠ 修生成器             │
+  (recall高)    │  系统健康              │  料给够了却答不好       │
+                │                        │  (换/调LLM, 改prompt)   │
+                ├────────────────────────┼────────────────────────┤
+  检索差        │  ⚠ 修检索器            │  ❌ 两段都要修          │
+  (recall低)    │  答案侥幸对/靠参数记忆 │  漏检逼出幻觉           │
+                │  (改embedding/索引/重排)│  (先救检索, 再看生成)   │
+                └────────────────────────┴────────────────────────┘</div>  <p>这张矩阵把一个模糊的「系统不好」精确化成<strong>可执行的下一步</strong>：左下角（检索差、生成『好』）要警惕——答案可能是靠模型参数化记忆侥幸蒙对的，不可持续，得去补检索；右上角（检索好、生成差）说明料喂够了是生成器的锅，去调 prompt 或换模型；右下角两段全坏，<strong>优先救检索</strong>（因为它是上游、且常是幻觉的根因）。</p>  <p>还有一个细腻的指标值得一提：<span class="term">context utilization</span>（上下文利用率）——答案实际用到了检索上下文中多少有效信息。它能区分一种隐蔽情形：<strong>context recall 高但答案没用上</strong>（证据检索到了却被生成器忽略），这指向生成端而非检索端的问题，是右上角象限的细分诊断。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话收束归因：<strong>不要问『RAG 好不好』，要问『检索这一科几分、生成这一科几分』</strong>。四项指标 + 诊断矩阵把一个不可操作的整体印象，拆成两个可独立优化、可分别问责的子系统。这就是为什么严肃的 RAG 团队从不只看一个端到端准确率——那个数字告诉你『病了』，却不告诉你『病在哪』。notebook 会给四个不同病症的案例，让你用四项分把每个的瓶颈准确诊断出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>RAG 评测是个年轻而活跃的领域，自动化与可信度之间的张力催生了一批前沿问题：</p>  <ul>
+    <li><strong>LLM-as-judge 的偏差与校准</strong>：用 LLM 当判官（RAGAS 的做法）会引入系统性偏差——偏好更长的答案、偏好自己家族模型的风格、对位置/措辞敏感、判定不稳定（同输入多次给不同分）。如何校准、去偏、量化判官本身的可靠性，是把自动评测用于高风险决策前的必答题。</li>
+    <li><strong>有参考 vs 无参考的折中（ARES）</strong>：ARES（Saad-Falcon 2023）用少量人工标注 + LLM 判官构建可校准、带统计置信的评测，试图兼得无参考的规模与有参考的可信。如何用最少的人工标注换最大的评测可信度，是工程上的核心权衡。</li>
+    <li><strong>多跳与复杂 RAG 的评测</strong>：当回答需要串联多处证据、多步推理（multi-hop），单步的 context recall/faithfulness 不够用——要评「推理链的每一跳是否都有据」「中间结论是否正确传递」。复杂 RAG（agentic RAG、迭代检索）的评测仍缺乏成熟范式。</li>
+    <li><strong>对抗鲁棒性与负样本（RGB）</strong>：RGB（Chen 2023）系统地测 RAG 在噪声鲁棒性、负样本拒答（该说不知道时会不会拒答）、信息整合、反事实抵抗四种能力上的表现。真实系统会遇到检索到错误/矛盾/不相关信息的情况，评测必须覆盖这些『坏输入』下的行为。</li>
+    <li><strong>评测的可复现与基准漂移</strong>：LLM 判官随模型版本变化，导致同一套评测在不同时间给出不同结果（基准漂移）；如何让 RAG 评测可复现、可跨时间比较，是个被低估的难题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Es 2023（RAGAS，无参考四项指标，本模块的蓝本）、Chen 2023（RGB，RAG 的四种能力与坏输入鲁棒性）、Saad-Falcon 2023（ARES，可校准的自动评测）、Manakul 2023（SelfCheckGPT，一致性幻觉检测）、Honovich 2022（TRUE，把忠实度统一成 NLI）。完整清单见 <code>../references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_reranking/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 重排</div></a>
+    <a class="next" href="../05_retrieval_metrics/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 检索指标</div></a>
+  </div>
+
+</div>
+</body>
+</html>

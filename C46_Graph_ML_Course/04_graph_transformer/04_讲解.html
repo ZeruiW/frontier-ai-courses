@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 图 Transformer</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 图 Transformer</h1>
+  <p class="subtitle">用全局自注意力一步建立任意距离的依赖，绕开 MPNN 的局部性与过挤压；拉普拉斯特征向量当位置编码（图上的「正弦波」，注意符号歧义），结构/距离编码把拓扑注入注意力——与 MPNN 互补，混合层是事实标准</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（拉普拉斯特征基）、模块 02–03（MPNN、过平滑）、自注意力机制（Q/K/V、多头，C15）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_graph_transformer.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Dwivedi & Bresson 2021、Ying 2021 (Graphormer)、Rampášek 2022 (GraphGPS)、Alon & Yahav 2021 (过挤压)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么图 Transformer：过挤压与全局</a></li>
+      <li><a href="#attn">回顾自注意力：搬上图要补什么</a></li>
+      <li><a href="#lappe">拉普拉斯位置编码 LapPE</a></li>
+      <li><a href="#sign">符号歧义：LapPE 的阿喀琉斯之踵</a></li>
+      <li><a href="#struct">结构编码与距离编码</a></li>
+      <li><a href="#toy">玩具图 Transformer：拼起来</a></li>
+      <li><a href="#compare">MPNN vs 图 Transformer vs 混合</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么图 Transformer：过挤压与全局</h2>
+  <p>前三个模块的 GNN（GCN、GAT、GraphSAGE）有一个<strong>共同的根本局限</strong>：它们都是<strong>局部</strong>的——信息只能沿边<em>逐跳</em>传播，一层只看 1 跳，要让相距 $k$ 跳的两个节点交互，就得堆 $k$ 层。而我们在模块 02 已经看到，堆层会<strong>过平滑</strong>。这一模块引入一个根本不同的范式——<span class="term">图 Transformer</span>（graph transformer）：让<strong>每个节点一步就能关注到图里的任意节点</strong>，用全局自注意力绕开「局部 + 逐跳」的桎梏。</p>  <p>局部消息传递的代价，除了过平滑，还有一个更隐蔽的病——<strong>过挤压（over-squashing）</strong>（Alon & Yahav 2021）。设想信息要从图的一端传到另一端，中间必须穿过一个<strong>瓶颈</strong>（少数几条边连接的两大块，对应模块 01 的小谱隙 $\lambda_2$）。所有要通过的信息都被压进这几条边、压进固定维的节点向量里，就像把一条大河强行灌进一根细管——信息严重失真、相互干扰。这就是为什么 MPNN 在需要<strong>长程依赖</strong>的任务（分子的远端原子相互作用、长链推理）上常常力不从心。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>MPNN 像「口耳相传的小道消息」：一个消息从村东传到村西，要经过一个个人转述，每转一手就失真一点，遇到「消息枢纽」（瓶颈）还会被挤压扭曲。图 Transformer 像「全村大喇叭」：任意两个人一步直连，谁想听谁说话都能直接听到，不必层层转述。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，图 Transformer 把图当成一个<strong>全连接</strong>的 token 集合（每个节点是一个 token），用标准 Transformer 的自注意力让所有节点两两交互——一层就建立了<strong>任意距离</strong>的依赖。代价是：① 计算量 $O(n^2)$；② 全连接意味着<em>丢掉了图结构</em>——所以必须想办法<strong>把图的拓扑重新注入</strong>进去，这就是位置编码与结构编码要解决的核心问题，也是本模块的重头戏。</p></div>
+  </div>  <div class="callout danger"><span class="label">过挤压的一行刻画</span>
+    <p>过挤压可以被<strong>精确量化</strong>，而不只是比喻。衡量"远处输入对当前输出的影响有多大"，就看雅可比 $\left\lVert\partial h_v^{(L)}/\partial x_u\right\rVert$——节点 $u$ 的输入扰动多大程度上能改变 $L$ 层后节点 $v$ 的表示。Topping 2022 证明：这个敏感度被 $\hat A^L$ 在 $(v,u)$ 处的元素<strong>从上界卡死</strong>，而当 $u,v$ 相距 $L$ 跳、且路径要穿过窄瓶颈时，$(\hat A^L)_{vu}$ 随距离<strong>指数级衰减到近乎 0</strong>。换句话说，<em>远处节点对你的影响在数学上被指数压扁了</em>——再训练也学不出来。这就是过挤压的硬核定义：不是"训练不够"，而是<strong>架构本身把长程梯度通道掐断了</strong>。它与谱隙直接挂钩：$\lambda_2$ 越小、瓶颈越窄、衰减越狠。</p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话对比两种范式：<strong>MPNN 把「图结构」当成信息流动的「管道」（沿边走）；图 Transformer 把「图结构」当成喂给全局注意力的「特征/偏置」（编码进输入或注意力分数）</strong>。前者天然带局部归纳偏置但受困于局部性；后者天然全局但需要人为补回结构先验。理解这个「管道 vs 特征」的视角转换，是理解图 Transformer 的钥匙。两者并非取代关系，而是互补——这正是模块末尾混合层的动机。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="attn"><span class="num">2</span>回顾自注意力：搬上图要补什么</h2>
+  <h3>回顾自注意力：搬到图上要补什么</h3>  <p>先快速回顾标准自注意力（C15）。给定节点特征 $H\in\mathbb{R}^{n\times d}$，三个可学习投影得到 query/key/value：$Q=HW_Q,\ K=HW_K,\ V=HW_V$，然后：</p>  <div class="math-block">\[\text{Attn}(H)=\mathrm{softmax}\!\Big(\frac{QK^\top}{\sqrt{d_k}}\Big)V\]</div>  <p>注意一个<strong>致命的事实</strong>：自注意力是<strong>置换不变到完全无视位置</strong>的——它只看 token 之间的<em>内容相似度</em>（$q_i\cdot k_j$），完全不知道 token 的「位置」。在 NLP 里这靠位置编码（正弦/RoPE）补回词序；在图上，「位置」就是<strong>节点在图中的拓扑位置</strong>，而<em>把它编码出来要难得多</em>——图没有自然的「第 1、第 2 个」顺序。</p>  <p>为什么图上的位置编码<strong>比 NLP 难得多</strong>？因为序列有一个天然的全序（第 1 个、第 2 个……），正弦编码只需把这个整数位置映射成不同频率的波即可；而图<strong>没有任何天然的节点顺序</strong>，任意重排节点编号都是同一张图。任何位置编码都必须<strong>只依赖图的结构、不依赖人为编号</strong>（即对节点置换等变），否则换一种编号就得到不同的编码、破坏置换不变性。这条"必须从结构本身导出位置"的约束，正是 LapPE、RWSE 等谱/游走编码登场的根本理由——它们都是从图的内禀算子（拉普拉斯、转移矩阵）算出来的，天然与编号无关。这也是下一节符号歧义问题的深层来源。</p>  <p>这暴露了把 Transformer 搬上图必须补的两样东西：</p>  <ul>
+    <li><strong>位置/结构编码</strong>：告诉注意力「每个节点在图里处于什么位置、周围长什么样」。否则全连接注意力眼里所有节点只是一堆无差别特征向量，图的拓扑荡然无存。这是本模块第 3–5 节的核心。</li>
+    <li><strong>（可选）结构偏置</strong>：把图的距离/连接信息直接加进注意力分数 $QK^\top$（如 Graphormer 的 spatial bias），让「图上更近的节点更容易互相关注」。</li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <p>如果把图 Transformer 实现成「纯自注意力、不加任何位置/结构编码」，它就退化成了一个<strong>对节点集合</strong>的注意力——完全看不到边！两个边结构截然不同、但节点特征相同的图，会得到一模一样的输出。所以<strong>位置/结构编码不是锦上添花，而是图 Transformer 能「看见图」的唯一途径</strong>。这是本模块要反复强调的第一性原则。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="lappe"><span class="num">3</span>拉普拉斯位置编码 LapPE</h2>
+  <h3>拉普拉斯位置编码（LapPE）：图上的「正弦波」</h3>  <p>怎么给图上的节点编码「位置」？最优雅的答案直接来自模块 01——<strong>拉普拉斯特征向量</strong>。回忆：拉普拉斯 $L$ 的特征向量是<strong>图的傅里叶基</strong>，是从「最平滑」到「最震荡」的一组图上的频率模式。在 NLP 里，Transformer 的正弦位置编码本质就是不同频率的波；而<strong>图上对应的「不同频率的波」恰恰就是拉普拉斯特征向量</strong>——这是个深刻而美丽的对应。</p>  <p>做法是：取归一化拉普拉斯最小的 $k$ 个<strong>非平凡</strong>特征向量（跳过对应 $\lambda_1=0$ 的常向量，因为它对所有节点相同、不提供位置信息），把它们<strong>按列拼成每个节点的 $k$ 维「坐标」</strong>，加到（或拼接到）节点的输入特征上：</p>  <div class="math-block">\[L_{\text{sym}}=U\Lambda U^\top,\quad \text{LapPE}(v)=\big[u_2(v),\,u_3(v),\,\dots,\,u_{k+1}(v)\big]\in\mathbb{R}^{k}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直觉：每个特征向量 $u_j$ 给每个节点一个实数（它在该「频率模式」上的取值）。低频特征向量把图分成大块（如模块 01 的 Fiedler 向量区分两个社区），高频的刻画更精细的局部结构。把若干个频率上的坐标拼起来，就给了每个节点一个<strong>反映它在全图拓扑中位置</strong>的指纹。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这正是 Dwivedi & Bresson 2021 的核心贡献。它让全局注意力<strong>「看得见」图结构</strong>：两个节点即便特征相同，只要在图里位置不同，它们的 LapPE 就不同，注意力就能区分。而且 LapPE 是<strong>全局</strong>的位置信息（来自全图的谱），与 MPNN 的局部传播形成天然互补。notebook 会从零算 LapPE 并验证它确实区分了对称/不对称的节点。</p></div>
+  </div>  <p>一个有趣且重要的性质：LapPE 让图 Transformer 能区分一些<strong>MPNN 天生分不开</strong>的结构。模块 03 提过 MPNN 的表达力上界是 1-WL；而拉普拉斯谱携带了<em>超越局部邻域</em>的全局信息，给注意力提供了 1-WL 看不到的判别线索（如两个节点是否处于对称位置）。这是图 Transformer 在某些结构任务上超越 MPNN 的理论来源之一。</p>  <p>取多少个特征向量（$k$）是个需要权衡的超参：$k$ 太小（只取最低几个频率）只能粗分大块（如社区），分辨不了精细位置；$k$ 太大则引入高频噪声、且增加维度与符号歧义的处理成本。实践中常取 $k$ 为 8～20 之间，或取到第一个明显的谱隙处。还要注意，当图很小（节点数 $<k$）或特征值有重数时，LapPE 的取法要特别小心——这些边界情形 notebook 会用断言守住。</p>  <div class="dual">
+    <div class="plain"><h4>看一条链的 LapPE</h4>  <p>取四点链 $1\!-\!2\!-\!3\!-\!4$。它的第一个非平凡特征向量 $u_2$ 形如 $(+,+,-,-)$ 那样从一端单调变到另一端——本质就是一条最低频的"半周期正弦波"。于是 $u_2$ 给每个节点一个沿链的坐标：两端取值正负相反、中间过零。把 $u_2,u_3$ 拼起来，链上对称的两个节点（如 1 和 4）就拿到了<strong>可区分的指纹</strong>。这正是"拉普拉斯特征向量 = 图上的正弦波"最直观的一眼。</p></div>
+    <div class="formal"><h4>为什么它能破对称</h4>  <p>纯结构上节点 1 与 4 在链里是<strong>自同构等价</strong>的（镜像对称），任何只看局部邻域的 MPNN 都给它们相同表示。但 $u_2(1)=-u_2(4)\ne 0$（符号相反），LapPE 因此把这对镜像节点分开——代价正是下一节的符号歧义（既然 $-u_2$ 也合法，"谁正谁负"是任意的）。这个微例同时展示了 LapPE 的<strong>威力（破 1-WL 对称）</strong>与<strong>软肋（符号不定）</strong>，notebook 会在这条链上同时演示两者。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sign"><span class="num">4</span>符号歧义：LapPE 的阿喀琉斯之踵</h2>
+  <h3>符号歧义：LapPE 的阿喀琉斯之踵</h3>  <p>LapPE 有一个绕不开的麻烦——<strong>符号歧义（sign ambiguity）</strong>。特征向量有个数学事实：如果 $u$ 是特征值 $\lambda$ 的特征向量，那么 $-u$ <strong>也是</strong>（$L(-u)=\lambda(-u)$）。特征求解器返回 $u$ 还是 $-u$ 是<em>任意的</em>（取决于数值实现）。于是<strong>同一张图、同一次计算，LapPE 的每一列符号都可能随机翻转</strong>——这对模型是灾难：它会把「同一个节点」的两种符号当成两个不同的位置。</p>  <p>更糟的还有<strong>基歧义（basis ambiguity）</strong>：当某个特征值有重数（多个特征向量对应同一 $\lambda$）时，这个特征子空间里<em>任意正交旋转</em>都是合法的特征基——不只是符号，整组向量都不唯一。</p>  <table>
+    <thead><tr><th>歧义类型</th><th>成因</th><th>后果</th><th>常见对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>符号歧义</strong> sign</td><td>$u$ 与 $-u$ 都是特征向量</td><td>同节点 PE 符号随机翻转</td><td><strong>随机符号翻转增强</strong>（训练时随机给每列乘 ±1）</td></tr>
+      <tr><td><strong>基歧义</strong> basis</td><td>重特征值的子空间可任意旋转</td><td>整组 PE 不唯一</td><td>SignNet / BasisNet（对变换不变的编码）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>符号歧义的工程解法朴素而有效：<strong>训练时每次随机翻转每个特征向量的符号</strong>（数据增强），逼模型学会「无论符号怎样都给出一致的判断」。测试时也可多次随机符号取平均。这让模型对符号<em>鲁棒</em>而非依赖某个特定符号。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更彻底的解法是构造<strong>对符号/基变换不变</strong>的编码。SignNet（Lim 2023）用 $\phi(u)+\phi(-u)$ 这种对 $u\mapsto -u$ 天然不变的形式处理符号歧义、用更复杂的结构处理基歧义。这是「如何把谱信息正确地喂给神经网络」这一开放问题的代表性工作。</p></div>
+  </div>  <div class="callout danger"><span class="label">必踩的坑</span>
+    <p>符号歧义是从零实现 LapPE 时<strong>最容易踩且最隐蔽</strong>的坑：如果你不处理它，模型在训练集上可能看起来正常，但因为它过拟合到了<em>某次特征分解碰巧给出的符号</em>，换一次特征分解（甚至换台机器）结果就崩。务必记住：<strong>用了 LapPE，就必须处理符号歧义（至少做随机符号翻转）</strong>。notebook 会演示这个坑并实现随机符号翻转增强。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="struct"><span class="num">5</span>结构编码与距离编码</h2>
+  <h3>结构编码与距离编码：另一条注入拓扑的路</h3>  <p>LapPE 是用<strong>谱（全局）</strong>信息编位置；还有一类互补的做法用<strong>局部结构</strong>或<strong>节点间距离</strong>编位置——它们往往更直接、更可解释，也是 Graphormer 这类成功模型的核心。</p>  <ul>
+    <li><strong>度编码（degree encoding）</strong>：直接把每个节点的度数（或其嵌入）加进输入。简单却有效——度是最基本的结构特征，Graphormer 用它显著提升了分子图上的表现。</li>
+    <li><strong>随机游走结构编码（RWSE）</strong>：用随机游走 $k$ 步<strong>回到自身</strong>的概率 $[P^1_{vv},P^2_{vv},\dots,P^k_{vv}]$ 作为节点的结构指纹。它编码了节点周围的局部连接模式（如是否在三角形里、环的大小），对区分局部结构非常有力。</li>
+    <li><strong>最短路径距离编码（spatial encoding）</strong>：Graphormer 的核心——把任意两节点的<strong>最短路径距离</strong>映射成一个可学习的标量偏置，<em>加到注意力分数上</em>：$\text{Attn}_{ij}=\frac{q_i k_j^\top}{\sqrt d}+b_{\text{dist}(i,j)}$。这让「图上更近的节点更容易互相关注」，把图的度量直接灌进了全局注意力。</li>
+  </ul>  <p>RWSE 值得多看一眼，因为它和模块 01 的随机游走严丝合缝。$P^k_{vv}$ 是"从 $v$ 出发走 $k$ 步又回到 $v$ 的概率"——它<strong>悄悄编码了 $v$ 周围的环结构</strong>：若 $v$ 在一个三角形里，则 $P^2_{vv}$ 偏大（两步可经邻居折返）；若在更大的环上，回返概率峰值出现在更大的 $k$。于是向量 $[P^1_{vv},\dots,P^k_{vv}]$ 就像 $v$ 局部拓扑的"<strong>指纹频谱</strong>"，能区分出 LapPE 与 1-WL 都未必抓得住的精细环结构（环是分子化学里极重要的子结构，如苯环）。这也解释了为什么 RWSE 在分子任务上常和 LapPE 互补：一个给全局位置、一个给局部环签名。</p>  <p>注意<strong>两种注入方式的区别</strong>：LapPE 和度/RWSE 是<strong>加进节点特征</strong>（影响 $Q,K,V$）；而最短路径距离是<strong>加进注意力分数</strong>（作为 bias 直接改变谁关注谁）。前者改变「每个节点是什么」，后者改变「谁能看见谁、看多清」。Graphormer 同时用了这两类，这也是它能在分子基准上超越 MPNN 的关键——<strong>全局注意力 + 丰富的结构编码</strong>。</p>  <div class="callout paper"><span class="label"></span>
+    <p>Graphormer（Ying 2021）的惊艳结论：一个<strong>几乎是标准 Transformer</strong>（只是加了度编码 + 最短路径空间编码 + 边编码）的模型，在分子图基准（如 OGB-LSC PCQM4M）上<strong>击败了所有专门设计的 MPNN</strong>。它有力地说明：图结构不一定要靠「沿边传播」来利用，把它编码成好的特征/偏置喂给全局注意力，同样（甚至更）有效。见 references。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="toy"><span class="num">6</span>玩具图 Transformer：拼起来</h2>
+  <h3>玩具图 Transformer：把零件拼起来</h3>  <p>现在把零件组装成一个完整的图 Transformer 层。流程是：</p>  <div class="ascii">图 Transformer 一层（最简版）：
+  输入 H (节点特征)  +  LapPE (拉普拉斯位置编码)
+     │
+     ▼  注入位置：H0 = H + Linear(LapPE)   （或拼接）
+  全局多头自注意力：A = softmax(QKᵀ/√d [+ 距离偏置])；  Z = A·V
+     │
+     ▼  残差 + norm + 前馈(FFN) + 残差 + norm   （标准 Transformer block）
+  输出 H' (每个节点融入了全图信息)</div>  <p>和 NLP Transformer 的唯一结构差别，就是<strong>位置编码换成了图的（LapPE/结构编码）</strong>、以及可选的<strong>距离偏置</strong>。其余（多头注意力、残差、LayerNorm、FFN）原封不动。这也说明图 Transformer 的工程门槛不高——难点不在 Transformer 本身，而在<strong>如何把图结构编码好</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>用 MPNN 三问勉强类比图 Transformer：它的「邻居」是<strong>全图所有节点</strong>、「聚合权重」是<strong>注意力（含距离偏置）</strong>、「位置」靠<strong>编码</strong>补回。可以说图 Transformer 是「邻域 = 全图、权重 = 注意力」的极端 GAT，外加位置编码。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>notebook 会从零搭一个玩具图 Transformer：LapPE + 全局多头自注意力 + 残差/FFN，在一个小图上跑通前向，并验证两件事——其一，加了 LapPE 后模型能区分「拓扑不同但特征相同」的节点（不加则不能）；其二，注意力矩阵是合法的（每行和为 1，全连接）。</p></div>
+  </div>  <p>图 Transformer 的代价也要讲清：<strong>$O(n^2)$ 的注意力</strong>让它难以直接用于大图（百万节点）。这催生了一系列<strong>可扩展图 Transformer</strong>，把"全部两两注意力"换成更省的近似：</p>  <table>
+    <thead><tr><th>策略</th><th>怎么省</th><th>复杂度</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td>线性注意力</td><td>核技巧避免显式 $QK^\top$</td><td>$O(n)$</td><td>近似 softmax，精度略降</td></tr>
+      <tr><td>稀疏/局部注意力</td><td>只在 $k$ 跳邻域或采样对上算</td><td>$O(nk)$</td><td>牺牲部分长程直连</td></tr>
+      <tr><td>cluster 内全连接</td><td>先分块，块内全局、块间稀疏</td><td>$O(n\cdot c)$</td><td>跨块长程仍受限</td></tr>
+      <tr><td><strong>虚拟节点</strong></td><td>一个超级节点连所有点</td><td><strong>$O(n)$</strong></td><td>全局通道带宽有限</td></tr>
+    </tbody>
+  </table>  <p>对中小图（尤其分子图，几十个原子），$O(n^2)$ 完全可接受，这也是图 Transformer 最先在分子领域大放异彩的现实原因——几十个 token 的"全连接"成本微不足道，却换来了任意原子对的直接交互。</p>  <p>还有一个常被低估的廉价替身值得一提——<strong>虚拟节点（virtual node）</strong>：给图加一个与所有节点相连的「超级节点」。它让任意两点都能经虚拟节点<em>两跳</em>可达，用 $O(n)$ 的代价提供了一条近似的全局通道，缓解过挤压、也为图级任务提供天然的 readout 锚点。它可以看作「穷人的全局注意力」：不必付 $O(n^2)$，就拿到了大部分全局连通的好处。在大图上，「虚拟节点 + 局部 MPNN」常常是比完整图 Transformer 更划算的选择，notebook 的过挤压胶囊会让你直观体会全局通道的价值。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="compare"><span class="num">7</span>MPNN vs 图 Transformer vs 混合</h2>
+  <h3>MPNN vs 图 Transformer vs 混合：如何选</h3>  <p>把局部消息传递和全局注意力放在一起对照，并给出实践指南：</p>  <table>
+    <thead><tr><th>维度</th><th>MPNN (GCN/GAT/SAGE)</th><th>图 Transformer</th></tr></thead>
+    <tbody>
+      <tr><td>感受野</td><td>逐跳局部（L 层 = L 跳）</td><td><strong>一步全局</strong>（任意距离）</td></tr>
+      <tr><td>图结构利用</td><td>沿边传播（管道）</td><td>编码进特征/偏置（特征）</td></tr>
+      <tr><td>长程依赖</td><td>差（过挤压）</td><td><strong>强</strong>（直连）</td></tr>
+      <tr><td>局部归纳偏置</td><td><strong>强</strong>（天然）</td><td>弱（需结构编码补）</td></tr>
+      <tr><td>计算量</td><td>$O(|E|)$（稀疏，省）</td><td>$O(n^2)$（稠密，贵）</td></tr>
+      <tr><td>过平滑/过挤压</td><td>都有</td><td>都缓解</td></tr>
+      <tr><td>适合</td><td>大图、强局部结构、同配</td><td>中小图、长程依赖、分子</td></tr>
+    </tbody>
+  </table>  <p>结论不是「二选一」，而是<strong>二者互补、最好结合</strong>。当前图 Transformer 的主流范式正是<strong>混合层（hybrid layer）</strong>（GraphGPS, Rampášek 2022）：每一层<strong>同时</strong>跑一支局部消息传递（提供局部归纳偏置）和一支全局注意力（提供长程依赖），再把两者融合。这样<em>既有 MPNN 的局部敏感、又有 Transformer 的全局视野</em>，加上模块化的位置/结构编码，是目前图表示学习的事实标准架构。</p>  <p>一句实践指南收束：<strong>图小且需要长程依赖（典型如分子）→ 图 Transformer / 混合层；图很大且强局部同配（典型如引文网、社交网）→ MPNN 或带采样的混合层</strong>。理解了「局部 vs 全局」「管道 vs 特征」这对张力，你就能为任何图任务选对（或拼出）合适的架构——这比记住某个具体模型重要得多。</p>  <p>最后回到本课的主线把这一模块嵌进去：图 Transformer 并没有抛弃前几模块——它<strong>复用</strong>了模块 01 的拉普拉斯特征向量（作位置编码）、模块 01 的随机游走（作 RWSE 结构编码）、模块 03 的注意力机制（只是把邻域扩到全图），甚至混合层里那一支「局部消息传递」就是模块 02–03 的 GCN/GAT。所以图 Transformer 不是另起炉灶，而是把全课的零件<em>重新组合</em>成一个全局视野的架构。这也再次印证了本课的编排逻辑——所有东西都从那个 $L=D-A$ 长出来。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>最好的图位置编码是什么？</strong>：LapPE（符号/基歧义）、RWSE、最短路径、SignNet…… 没有公认最优。位置编码的表达力、不变性、可扩展性如何统一，是图 Transformer 最核心的开放问题。</li>
+    <li><strong>可扩展的全局注意力</strong>：$O(n^2)$ 限制了图 Transformer 上大图。线性注意力、稀疏/局部全局混合（如只在 cluster 内全连接）、虚拟节点近似全局，是把它推向大图的活跃方向。</li>
+    <li><strong>MPNN 与 Transformer 的统一理论</strong>：两者各自的表达力（1-WL vs 谱可区分性）、何时谁更强、混合层为何有效，理论刻画仍不完整。GraphGPS 等给了经验配方，但「为什么这样配」缺乏深刻理解。</li>
+    <li><strong>图基础模型（graph foundation models）</strong>：能否像 NLP 的预训练大模型一样，训一个能迁移到各种图任务的通用图 Transformer？跨图、跨域的泛化与预训练目标设计是前沿。</li>
+    <li><strong>过挤压的根治</strong>：图 Transformer 用全局注意力绕开过挤压，图重连（Topping 2022 的曲率重连）则改造图结构治本。两条路线的取舍、以及「加全局通道是否真的解决了信息瓶颈」仍在研究。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Dwivedi & Bresson 2021（图 Transformer + LapPE，本模块核心）、Ying 2021（Graphormer，结构编码的力量）、Rampášek 2022（GraphGPS 混合层）、Lim 2023（SignNet，符号/基不变）、Alon & Yahav 2021（过挤压，本模块动机）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_gat_sage/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · GAT 与 GraphSAGE</div></a>
+    <a class="next" href="../05_scalability_apps/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 可扩展与应用</div></a>
+  </div>
+
+</div>
+</body>
+</html>

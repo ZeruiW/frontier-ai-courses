@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 投机解码 Speculative Decoding</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 投机解码 Speculative Decoding</h1>
+  <p class="subtitle">draft 小模型猜、target 大模型一次前向并行验证 —— 用「多算一些大概率白算的草稿」换「少做几次串行前向」，且接受/拒绝采样保证输出分布逐位不变（无损加速）</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块00、自回归解码与采样（softmax/温度）、概率分布基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_speculative.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Leviathan et al. 2023、Chen et al. 2023、Cai et al. 2024 (Medusa)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#bet">decode 串行慢与投机的赌注</a></li>
+      <li><a href="#framework">draft-then-verify 框架</a></li>
+      <li><a href="#rule">接受/拒绝规则与无损证明</a></li>
+      <li><a href="#alpha">接受率与期望确认 token 数</a></li>
+      <li><a href="#speedup">净加速与开销权衡</a></li>
+      <li><a href="#medusa">Medusa 与 EAGLE：免 draft</a></li>
+      <li><a href="#tree">树形投机：一次验多条路径</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bet"><span class="num">1</span>decode 串行慢与投机的赌注</h2>
+  <p>回忆模块 00 的结论：<strong>decode 是带宽受限的，每生成一个 token，GPU 都要把整个模型权重 + 全部 KV 从显存读一遍，却只算出 1 个 token</strong>。更糟的是，自回归解码天然<strong>串行</strong>——第 t 个 token 必须等第 t−1 个出来才能算，无法在序列维度并行。于是一段长度 N 的生成，硬生生要做 N 次这样昂贵又低效的前向。</p>  <p>这就引出一个诱人的问题：既然每次前向都「读了一大堆权重却只产出一个 token」，算力其实大把闲着，<em>能不能让这一次前向顺便多产出几个 token</em>？投机解码（<span class="term">speculative decoding</span>）给出的答案是一个精巧的赌注：用一个<strong>小而快的 draft 模型</strong>先猜出未来的 <code>γ</code> 个 token，再用<strong>大而准的 target 模型</strong>在<strong>一次前向</strong>里<em>并行</em>验证这 <code>γ</code> 个猜测。猜对的部分白赚，猜错的部分丢弃——而最妙的是，整个过程<strong>不改变 target 的输出分布</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：你（target）写字很慢但很准，助手（draft）写字飞快但偶尔出错。让助手先把下一句话草拟出来，你只需<strong>扫一眼</strong>确认——扫一眼（并行验证）比逐字写（自回归）快得多。助手对的地方你直接采用，错的地方你从那里接手重写。最终稿子和你逐字亲写<em>一模一样</em>，但平均下来快了好几倍。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说：target 的一次前向能同时算出 <code>γ+1</code> 个位置的 logits（因为给定 draft 提议的前缀，这些位置的输入都已知，可拼成一个 batch 一次算）。于是<strong>一次 target 前向</strong>（成本与单 token 前向几乎相同，因为 decode 是带宽受限、加几个 token 几乎不增加权重读取）就能确认<em>多个</em> token。这把「N 次串行前向」压缩成「约 N/E 次」，E 是每轮平均确认的 token 数。</p></div>
+  </div>  <div class="callout danger"><span class="label">无损，不是近似</span>
+    <p>最关键、也最反直觉的一点（贯穿本模块）：<strong>投机解码是无损的——加速后的输出分布与直接用 target 自回归采样逐位相同</strong>。它不是近似、不是「用小模型凑合」。draft 只负责<em>提议</em>，target 始终是质量的唯一裁判。这要靠第 3 节那条优雅的接受/拒绝规则来保证。如果你只记住本模块一句话，记住这句：<strong>draft 提议、target 裁决、分布不变</strong>。</p>
+  </div>  <p>这里要厘清一个常见误解：投机解码<strong>不减少 FLOPs，甚至略增</strong>——draft 要算、verify 也要把那些最终被拒绝的 token 算一遍，纯计算量是变多的。它能加速，靠的不是「少算」，而是「<strong>把原本串行的多次前向，压成更少的并行前向</strong>」。在带宽受限的 decode 场景下，一次前向无论带 1 个还是 γ+1 个 token，权重读取几乎一样，所以「并行多验几个」近乎免费。这与模块 00 的世界观完全一致：当瓶颈是带宽而非算力时，<em>多做点计算去换更少的数据搬运 / 更少的串行步数，是划算的</em>。投机解码、量化、大 batch，本质都是这条原理的不同变体。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="framework"><span class="num">2</span>draft-then-verify 框架</h2>
+  <h3>draft-then-verify：一轮投机的解剖</h3>  <p>一轮投机解码分三步走，把它拆清楚是理解后面所有内容的地基。设当前已生成的前缀是 <code>x_{&lt;t}</code>：</p>  <ol>
+    <li><strong>Draft（草稿）</strong>：draft 模型从前缀出发，<strong>自回归地</strong>连续提议 <code>γ</code> 个 token <code>d_1, d_2, ..., d_γ</code>，并记下每步的 draft 概率分布 <code>q_1, ..., q_γ</code>。这一步是串行的，但 draft 小、每步便宜。</li>
+    <li><strong>Verify（验证）</strong>：把前缀 + γ 个 draft token 拼成一个序列，喂给 target 模型做<strong>一次</strong>前向，并行得到 <code>γ+1</code> 个位置的 target 分布 <code>p_1, ..., p_{γ+1}</code>（第 <code>γ+1</code> 个是「若全接受、下一个该是什么」的分布）。</li>
+    <li><strong>Accept/Reject（接受/拒绝）</strong>：从左到右逐位置用接受规则（第 3 节）判定。一旦某位置 <code>d_i</code> 被拒绝，就在该位置用校正分布重采样一个 token、<strong>丢弃其后所有 draft token</strong>，本轮结束；若 γ 个全接受，则用 <code>p_{γ+1}</code> 再免费采一个 token。</li>
+  </ol>  <p>为什么验证能<strong>一次前向并行</strong>完成 γ 个位置？因为做验证时，draft 已经把 <code>d_1..d_γ</code> 都摆好了，于是每个位置的输入前缀都是已知的、固定的，可以像 prefill 那样把它们组成一个长度 γ+1 的序列一次性算完——这正是利用了 prefill 的并行性来加速 decode。<strong>这是投机解码加速的物理来源</strong>。</p>  <div class="ascii">一轮投机（γ=4）：draft 串行猜，target 一次并行验
+
+  前缀: [The cat sat]
+  draft 自回归提议:   on   the   mat   .          (q1 q2 q3 q4)
+  target 一次前向验:  ✓on  ✓the  ✗mat→soft  ✗丢  ✗丢
+                       └─ 接受 on,the；在第3位拒绝 mat，重采样得 'soft'，丢弃其后
+  本轮确认: on the soft  (3 个 token，1 次 target 前向)
+  下一轮从 [The cat sat on the soft] 继续</div>  <div class="callout intuition"><span class="label"></span>
+    <p>注意接受是<strong>从左到右、遇到第一个拒绝即停</strong>的。这很合理：一旦某个 token 被拒、被换成了别的，它之后的 draft token 是基于<em>错误前提</em>猜的，全部作废。所以一轮确认的 token 数 = 「连续接受的前缀长度」+ 1（拒绝处的校正 token，或全接受时的 bonus token）。这个「+1」是投机解码哪怕一个都没接受、也保证至少前进 1 个 token 的原因——所以它<strong>永不退化为负收益的纯浪费</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rule"><span class="num">3</span>接受/拒绝规则与无损证明</h2>
+  <h3>灵魂：接受/拒绝规则与无损证明</h3>  <p>现在讲本模块的数学核心——那条让「加速」与「分布不变」同时成立的接受规则。设某位置 draft 提议了 token <code>x</code>（来自 draft 分布 <code>q</code>），target 在该位置的真实分布是 <code>p</code>。规则是：</p>  <div class="math-block">\[\text{接受 } x \text{ 的概率} = \min\!\left(1,\ \frac{p(x)}{q(x)}\right)\]</div>  <p>若接受，就采用 <code>x</code>；若拒绝（以概率 <code>1 − min(1, p(x)/q(x))</code>），则从<strong>校正分布</strong>（residual / 残差分布）重新采样一个 token：</p>  <div class="math-block">\[p_{\text{resid}}(x) = \frac{\max\!\big(0,\ p(x) - q(x)\big)}{\sum_{x'} \max\!\big(0,\ p(x') - q(x')\big)}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直觉：draft 在某个 token 上<strong>猜得过头</strong>（<code>q(x) &gt; p(x)</code>）时，我们就以一定概率拒绝它，把多给的概率「退」回去；draft 猜得<strong>不够</strong>（某些 token <code>p &gt; q</code>）的地方，就用残差分布把缺的概率「补」上。一退一补，正好把 draft 的分布掰回成 target 的分布。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>校正分布只在 <code>p(x) &gt; q(x)</code> 的 token 上有质量（其余被 <code>max(0, ·)</code> 清零），再归一化。它恰好是「target 想要、但 draft 提议不足」的那部分概率，用来补偿被拒绝时损失的样本。</p></div>
+  </div>  <p>为什么这样就<strong>无损</strong>？我们证明：经过「接受 or 残差重采样」后，最终输出 token 的分布<strong>恰好是 </strong><code>p</code>。考虑任意 token <code>x</code> 成为最终输出的两条互斥路径：</p>  <ol>
+    <li><strong>路径 A（被 draft 提议且被接受）</strong>：draft 以 <code>q(x)</code> 提议 x，再以 <code>min(1, p(x)/q(x))</code> 接受，联合概率 = <code>q(x)·min(1, p(x)/q(x)) = min(q(x), p(x))</code>。</li>
+    <li><strong>路径 B（发生了拒绝、从残差重采样到 x）</strong>：先发生「拒绝」（总概率 = <code>Σ_x' [q(x')−min(q(x'),p(x'))] = 1 − Σ min(q,p)</code>），再从残差分布采到 x，概率 = <code>β · p_resid(x)</code>，其中残差归一化常数恰好等于该拒绝总概率 β。于是这条路径给 x 贡献 <code>max(0, p(x)−q(x))</code>。</li>
+  </ol>  <p>两路相加：<code>min(q(x),p(x)) + max(0, p(x)−q(x)) = p(x)</code>（无论 <code>p(x)</code> 与 <code>q(x)</code> 谁大都成立）。于是最终分布精确等于 <code>p</code>，<strong>与 draft 是谁、猜得好不好完全无关</strong>——draft 只影响<em>速度</em>（接受率），不影响<em>正确性</em>。这就是投机解码无损的全部秘密。</p>  <div class="callout paper"><span class="label"></span>
+    <p>这条规则与证明出自 Leviathan et al. 2023 与 Chen et al. 2023（DeepMind），两篇同期独立提出、互为补充。本模块 notebook 会用 30 万次采样的经验频率直接验证「输出分布逐位等于 target」这条不变量。细节见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="alpha"><span class="num">4</span>接受率与期望确认 token 数</h2>
+  <h3>接受率 α 与期望确认 token 数</h3>  <p>投机解码的加速，全压在一个量上：<span class="term">acceptance rate</span>（接受率）<code>α</code>——target 接受 draft 单个提议的平均概率。它衡量 draft 与 target 分布有多接近：draft 越像 target，α 越高，每轮确认的 token 越多。</p>  <p>假设每个位置独立地以概率 α 被接受（一个常用的简化模型），一轮 γ 个 draft token，则确认 token 数的期望有闭式解：</p>  <div class="math-block">\[\mathbb{E}[\#\text{tokens}] = \frac{1 - \alpha^{\,\gamma+1}}{1 - \alpha}\]</div>  <p>推导直觉：确认数 = 连续接受的前缀长度 + 1。连续接受 <code>i</code> 个的概率是 <code>α^i(1−α)</code>（前 i 个接受、第 i+1 个拒绝），全部 γ 个接受的概率是 <code>α^γ</code>；对「接受数 + 1」求期望并化简，就得到上式。注意这是个<strong>等比级数和</strong>，当 α→1 时趋于 γ+1（几乎全接受），当 α→0 时趋于 1（几乎全靠那个保底的 +1）。</p>  <table>
+    <thead><tr><th>接受率 α</th><th>γ=4 期望确认</th><th>γ=8 期望确认</th><th>解读</th></tr></thead>
+    <tbody>
+      <tr><td>0.5</td><td>1.94</td><td>1.99</td><td>draft 差，每轮约 2 个，加速有限</td></tr>
+      <tr><td>0.7</td><td>2.77</td><td>3.40</td><td>中等，每轮约 3 个</td></tr>
+      <tr><td>0.8</td><td>3.36</td><td>4.66</td><td>好 draft，每轮约 3–5 个</td></tr>
+      <tr><td>0.9</td><td>4.10</td><td>6.46</td><td>极好 draft，接近 γ+1 上限</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>注意上表一个关键现象：<strong>γ 越大，回报越递减</strong>。从 γ=4 到 γ=8，低接受率（α=0.5）几乎没涨（1.94→1.99），只有高接受率才吃得下长草稿。原因是 <code>α^{γ+1}</code> 衰减很快：后段 draft token 要「前面全对」才轮得到验证，概率是 α 的高次幂。这正是下一节「最优 γ」要权衡的——草稿不是越长越好，因为后段大概率白算。</p>
+  </div>  <p>还要强调，α 不是一个固定常数，而<strong>随上下文、随位置、随温度变化</strong>。容易预测的地方（如固定格式、常见搭配、代码缩进）draft 接受率极高，信息量大的地方（如人名、关键数字、创意转折）接受率骤降。这意味着真实系统里每一步的实际接受率是波动的，上面的闭式只是用一个<em>平均</em> α 给出的估计。更精细的系统会据此做<strong>自适应草稿</strong>——在好预测的区段大胆多猜、在难预测处保守，这是第 8 节的开放方向之一。</p>  <p>最后，采样温度也直接左右 α：<strong>贪心解码（温度 0）时 α 通常最高</strong>（target 分布尖锐、draft 容易命中那个峰），高温采样时 target 分布变平、draft 更难恰好命中，α 下降。所以同一对 draft/target，在不同采样设置下加速比可以差很多——评估投机方案时必须连同温度一起报告。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="speedup"><span class="num">5</span>净加速与开销权衡</h2>
+  <h3>净加速：把 draft 的开销算进来</h3>  <p>上一节算的是「每轮确认多少 token」，但 draft 本身也要花时间、verify 是一次完整的 target 前向。要算<strong>净加速</strong>，必须把这些开销都摊进去。建一个简单的成本模型：</p>  <ul>
+    <li>设 target 单步前向成本为 <code>1</code>（归一化单位），draft 单步成本为 <code>c</code>（<code>c ≪ 1</code>，如 1/10）。</li>
+    <li>一轮投机：draft 自回归 γ 步，成本 <code>γ·c</code>；target 验证一次，成本 <code>1</code>。一轮总成本 <code>γ·c + 1</code>。</li>
+    <li>一轮平均确认 <code>E = (1−α^{γ+1})/(1−α)</code> 个 token。</li>
+  </ul>  <div class="math-block">\[\text{每 token 成本} = \frac{\gamma\,c + 1}{E},\qquad \text{加速比} = \frac{1}{\;(\gamma c + 1)/E\;} = \frac{E}{\gamma c + 1}\]</div>  <p>（基线是 target 自回归：每 token 成本 1。）这个式子揭示了投机解码的全部张力：分子 <code>E</code> 想要 γ 大、分母 <code>γc+1</code> 想要 γ 小。存在一个<strong>最优 γ</strong>，太短则 verify 的固定成本摊不开，太长则后段 draft token 大概率被拒、白白付出 <code>γc</code> 的草稿成本。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以投机解码的工程调参就是找这个甜点：在给定 draft 质量（决定 α）与 draft 速度（决定 c）下，扫不同 γ，选每 token 成本最低的那个。好 draft（α、c 都好）能把加速推到 2–3×；差 draft 可能净加速 < 1（还不如不投机）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一层现实约束：上面假设 verify 成本与单 token 前向相同，这只在 decode<strong>带宽受限、batch 不大</strong>时成立。一旦 batch 很大、verify 的 γ+1 个 token × batch 把前向推成算力受限，verify 就不再「几乎免费」，投机收益会下降——这是第 8 节要讲的、投机解码与 continuous batching 的张力。</p></div>
+  </div>  <p>这个 cost model 也解释了为什么投机解码<strong>对延迟敏感的场景特别有吸引力</strong>：它直接缩短单个请求的端到端生成时间（更少的串行步数），而这正是交互式应用（聊天、代码补全）最在乎的 TPOT 体验。一个用户独占一台机器等回答时，GPU 算力大把闲着，投机解码把这些闲置算力变现成更快的响应——几乎是「免费的午餐」。反过来，一个离线批处理任务只在乎总吞吐、且天然能用大 batch 填满 GPU，投机解码的边际收益就小得多。<em>用对场景，比把公式调到最优更重要</em>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话总结取舍：<strong>投机解码用「多算一些大概率白算的 draft 与 verify」换「少做几次串行的 target 前向」</strong>。它在<em>低并发、强 draft</em>时收益最大（此时 target 前向最浪费、draft 最准）；在<em>高并发、弱 draft</em>时收益最小甚至为负。理解这个适用边界，比记住公式更重要。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="medusa"><span class="num">6</span>Medusa 与 EAGLE：免 draft</h2>
+  <h3>免单独 draft：Medusa 与 EAGLE</h3>  <p>普通投机解码要额外维护一个 draft 模型——它要小、要快、还要和 target 分布够像（α 才高），训练和部署都麻烦。一条更优雅的路线是<strong>让 target 模型自己当 draft</strong>（self-speculation），代表是 Medusa 与 EAGLE。</p>  <table>
+    <thead><tr><th>方法</th><th>draft 怎么来</th><th>核心思想</th><th>代价/收益</th></tr></thead>
+    <tbody>
+      <tr><td><strong>普通投机</strong></td><td>独立的小模型</td><td>小模型自回归猜，大模型验</td><td>要训练/部署额外模型；α 受限于小模型质量</td></tr>
+      <tr><td><strong>Medusa</strong></td><td>给 target 加多个解码头</td><td>在 target 最后一层接 γ 个并行<span class="term">decoding head</span>，一次预测未来 γ 个位置</td><td>几乎不增推理成本；头之间独立，α 中等</td></tr>
+      <tr><td><strong>EAGLE</strong></td><td>在特征层自回归</td><td>复用 target 的隐藏特征做一个轻量自回归 draft（在 feature 而非 token 空间）</td><td>α 显著更高（draft 看得到 target 的表示）</td></tr>
+    </tbody>
+  </table>  <p><span class="term">Medusa</span> 的洞察是：与其训一个完整的小模型，不如直接在 target 的最后一层<strong>多接几个预测头</strong>，每个头负责预测「未来第 k 个 token」。这些头与 target 共享主干，几乎不增加前向成本，再配合树形注意力（下一节）一次验证多个头的候选。它工程极简，但因为各头是独立预测、看不到彼此，接受率中等。</p>  <p><span class="term">EAGLE</span> 更进一步：它发现「在 token 层做 draft 信息损失太大」，于是把自回归草稿挪到<strong>特征（feature）层</strong>——让一个轻量模块基于 target 的隐藏状态来预测下一个特征，再映射成 token。因为 draft 直接<em>站在 target 的肩膀上</em>（用了 target 的内部表示），它的提议与 target 高度一致，接受率显著高于普通小 draft，是目前 self-speculation 里最有效的路线之一。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>这一脉络的主线是一句话：<strong>draft 越像 target，加速越大</strong>。所以工程演进就是不断让 draft「更接近 target」——从独立小模型（像得有限），到 Medusa 复用 target 主干（更像），再到 EAGLE 复用 target 的特征（最像）。它们都不改变第 3 节的接受规则，只是把 α 越推越高。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tree"><span class="num">7</span>树形投机：一次验多条路径</h2>
+  <h3>树形投机：一次验证多条路径</h3>  <p>到目前为止，draft 每轮只提议<strong>一条</strong>候选序列（一条链）。但既然 verify 的一次前向能并行算很多位置，何不让 draft 一次提议<strong>多条</strong>候选路径、组成一棵树，在一次前向里把整棵树都验了？这就是 <span class="term">tree attention</span>（树形注意力）/ 树形投机。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>链式投机像只押一注：draft 在每步只猜一个 token，猜错就从那里断掉。树形投机像同时押多注：每步猜<strong>几个</strong>最可能的 token（比如 top-2），它们各自再展开，形成一棵 token 树。一次 target 前向把所有分支都打分，最后选出「被接受的最长一条路径」。候选更多 → 命中更长前缀的机会更大 → 每轮确认的 token 期望更高。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>关键技巧是<strong>树形注意力 mask</strong>：把整棵树的所有节点摊平成一个序列喂给 target，但用一个精心构造的 mask 让每个节点<em>只能看到它在树上的祖先</em>（而非摊平序列里的左边邻居）。这样一次前向就为树里每个节点算出了「给定它那条根到父的路径」下的正确分布，从而能对多条路径同时做接受/拒绝验证。</p></div>
+  </div>  <div class="ascii">树形投机：一次提议多条路径，一次前向全验
+
+            [前缀]
+           /      \
+         on        in        &lt;- 第1步猜 top-2
+        /  \      /  \
+      the  a    the  my      &lt;- 第2步各猜 top-2
+
+  摊平喂给 target，用树形 mask 让每个节点只看自己的祖先；
+  一次前向给每个节点打分 -&gt; 选出被接受的最长路径(如 on-&gt;the)。</div>  <p>树形投机是 <span class="term">SpecInfer</span> 等系统的核心，也被 Medusa 采用（Medusa 的多个头天然产出多个候选，正好组成树）。它的代价是 verify 的序列变长（树有多少节点就多少位置），所以树不能无限大——又是一个「候选越多命中越长，但前向越贵」的权衡，和第 5 节的最优 γ 一脉相承，只是从「一维长度」升级成「二维的树形状」。</p>  <div class="callout warn"><span class="label"></span>
+    <p>树形投机把「接受率 → 期望 token 数」的分析从一维（链长 γ）推广到树结构，闭式解不再是简单的等比级数，而要对树的每条路径按其接受概率加权求和。notebook 的练习会带你在一棵小树上手算这个期望，体会「为什么多押几注能确认更长前缀」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>与 continuous batching 的张力</strong>：投机解码在低并发时收益最大，但生产系统靠大 batch 提吞吐（模块 02）。大 batch 下 verify 的「γ+1 个位置 × batch」会把 decode 推向算力受限，verify 不再几乎免费，投机收益骤降。如何在「投机加速单请求延迟」与「batching 提整体吞吐」间动态权衡，是当前服务系统的热点。</li>
+    <li><strong>动态/自适应 γ</strong>：最优草稿长度随上下文、随接受率实时变化。固定 γ 不是最优——根据近期接受率在线调整 γ（甚至每个请求不同），能再榨出一截加速。</li>
+    <li><strong>draft 的训练与对齐</strong>：draft 与 target 分布越接近，α 越高。如何高效地为一个给定 target 训练/蒸馏出高 α 的 draft（EAGLE、Medusa 的训练目标），是把加速从 2× 推向 3–4× 的关键。</li>
+    <li><strong>与量化、长上下文结合</strong>：把 draft 量化（模块 05）让它更快（c 更小）、把投机用于长上下文 decode（KV 巨大、decode 更慢、更值得投机），以及树形投机与 PagedAttention/KV 共享（模块 01/04）的协同，都是活跃方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Leviathan et al. 2023、Chen et al. 2023（投机采样与无损证明，本模块的源头）；延伸读 Cai et al. 2024（Medusa）、Li et al. 2024（EAGLE）、SpecInfer（树形投机）、Stern 2018（并行解码的早期思想）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_continuous_batching/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · Continuous Batching</div></a>
+    <a class="next" href="../04_prefix_disagg/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · Prefix Cache 与 PD 分离</div></a>
+  </div>
+
+</div>
+</body>
+</html>

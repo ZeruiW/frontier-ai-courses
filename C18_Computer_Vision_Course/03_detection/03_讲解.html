@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 目标检测</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 目标检测</h1>
+  <p class="subtitle">滑窗、IoU、NMS、anchor 匹配、precision-recall、AP/mAP——纯 numpy 从零实现检测的全套评测口径并验证性质</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02 的分类/评估；几何（矩形面积/交集）；numpy</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_detection.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Girshick R-CNN/Fast R-CNN、Ren Faster R-CNN、Redmon YOLO、Lin Focal Loss、PASCAL VOC（mAP）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#task">检测任务：定位 + 分类</a></li>
+      <li><a href="#iou">IoU：检测的度量原子</a></li>
+      <li><a href="#nms">NMS：消除重复检测</a></li>
+      <li><a href="#anchor">Anchor 与候选框：从滑窗到 RPN</a></li>
+      <li><a href="#pr">Precision-Recall：检测的工作曲线</a></li>
+      <li><a href="#map">mAP：检测的总指标</a></li>
+      <li><a href="#arch">检测器架构谱系</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="task"><span class="num">1</span>检测任务：定位 + 分类</h2>
+  <p><span class="term">object detection</span>（目标检测）比分类多了两个根本性的追问：<strong>物体在哪里、一共有几个</strong>。分类只需对整张图吐一个标签，检测却要输出<strong>一组</strong> <code>(边界框, 类别, 置信度)</code>，每一项都同时回答<strong>定位</strong>（框圈在哪）与<strong>分类</strong>（框里是什么）两个问题。难点在于物体的<strong>数量事先未知</strong>（一张图可能 0 个也可能上百个）、物体之间<strong>可以互相重叠遮挡</strong>、尺度从占满整图到几个像素都有——这些不确定性叠加起来，让检测比分类难了整整一个量级，也催生了一整套专门的算法与评测口径。</p>  <p><span class="term">bounding box</span>（边界框）是检测的基本单位，工程上常用两种等价坐标：<code>(x1,y1,x2,y2)</code>（左上角 + 右下角）或 <code>(cx,cy,w,h)</code>（中心点 + 宽高）。两者可以互转，但用途不同——本课统一用前者来算面积与 IoU（角点表示算交集最直接），而 anchor 回归更偏爱后者（预测中心偏移与宽高缩放在数值上更稳定）。理解这一点很重要：检测的全部评测环节——命中判定、重复去除、置信度打分、最终的 mAP——<strong>无一例外都建立在框与框的几何关系上</strong>，所以把框的坐标和运算搞清楚是第一步。</p>  <div class="ascii">检测 = 分类 + 定位，输出一组框：
+  ┌─────────────────┐
+  │   ┌────┐        │   输出:
+  │   │cat │ 0.9    │     (box1, cat, 0.9)
+  │   └────┘ ┌────┐ │     (box2, dog, 0.8)
+  │          │dog │ │     ...
+  │          └────┘ │   每个框: 位置(x1,y1,x2,y2)+类别+置信度
+  └─────────────────┘</div>  <p>本模块的组织线索，就是检测必须解决的四个子问题：<strong>怎么提出候选框、怎么判断一个框对不对、怎么去掉重复框、怎么把所有框打成一个总分</strong>。其中候选框的生成方式（滑窗 → anchor → proposal）随架构演进不断变化，但后三个核心量——IoU、NMS、mAP——<strong>十年来口径几乎未变</strong>，是任何检测论文与评测代码的公共底座。本课正是把这三个量用 numpy 从零写出来、逐条验证其数学性质，让你之后读任何检测器代码都能一眼看穿它在算什么。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把检测拆成四个可独立击破的子问题：<strong>① 候选框从哪来（滑窗 / anchor / region proposal）；② 一个框算不算命中（IoU）；③ 重复框怎么去（NMS）；④ 整个检测器打几分（mAP）</strong>。后三个是本模块从零实现的重点——它们是读懂检测文献、复现检测结果、审查检测评测的硬通货，掌握了它们，检测对你就不再是黑盒。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="iou"><span class="num">2</span>IoU：检测的度量原子</h2>
+  <p><span class="term">IoU (Intersection over Union)</span>（交并比）是检测里最基础、出现频率最高的量——它用一个 [0,1] 的数刻画两个框的重合程度，定义极其简洁：两框的交集面积除以并集面积。它之所以成为检测的度量原子，是因为命中判定、去重、anchor 匹配、最终 mAP 这四件事全都靠它来量化「两个框有多像」。</p>  <div class="math-block">\[\mathrm{IoU}(A,B)=\frac{|A\cap B|}{|A\cup B|}=\frac{|A\cap B|}{|A|+|B|-|A\cap B|}\in[0,1]\]</div>  <p>计算的关键一步是求交集面积。两个轴对齐矩形的交集仍是一个矩形，它的边界由 <code>[max(x1), min(x2)] × [max(y1), min(y2)]</code> 给出——即交集的左边界取两框左边界的较大者、右边界取较小者，纵向同理。<strong>若某一维出现 max(起) ≥ min(止)，说明两框在该方向上根本不重叠，交集面积应记 0</strong>。这个边界条件是新手实现 IoU 时的头号 bug 来源：忘了用 <code>max(0, w) * max(0, h)</code> 夹住宽高，不相交的框会算出负的交集面积，IoU 直接错乱。</p>  <p>IoU 的三条数学性质决定了它为何无处不在：它<strong>对称</strong>（<code>IoU(A,B)=IoU(B,A)</code>，谁是预测谁是真值都行）、<strong>尺度无关</strong>（把两个框同比例放大缩小，IoU 完全不变，所以大物体小物体用同一阈值公平）、且严格<strong>落在 [0,1]</strong>（完全重合为 1、毫不相交为 0、部分重叠在中间）。正是这三条让 IoU 可以当统一的判据。它在本模块有三个用途，下面每一个都会从零实现：</p>  <ul>
+    <li><strong>命中判定</strong>：预测框与某真值框 IoU≥阈值（如 0.5）才算「检测正确」；</li>
+    <li><strong>NMS 去重</strong>：两个预测框 IoU 过高 → 视为重复，删低分的（第 3 节）；</li>
+    <li><strong>anchor 匹配</strong>：训练时把每个 anchor 分给与它 IoU 最高的真值框（第 4 节）。</li>
+  </ul>  <p>还有一个值得知道的局限：当两个框<em>完全不相交</em>时，IoU 恒为 0，无法区分「差一点点」和「差十万八千里」，这让 IoU 作为回归损失时梯度消失。为此后来出现了 <span class="term">GIoU</span>、<span class="term">DIoU</span>、<span class="term">CIoU</span> 等改进，额外考虑最小包围框、中心距离、长宽比，使框回归更平滑——但作为<strong>评测判据</strong>，标准 IoU 至今仍是公认口径。</p>  <div class="callout warn"><span class="label"></span>
+    <p>IoU 的两个高频陷阱务必记牢：① 交集面积忘了夹 <code>max(0, ...)</code> → 不相交时算出负面积、IoU 彻底错乱（这是最常见的实现 bug）；② <strong>IoU 阈值的选择会直接改变结论</strong>——@0.5 是宽松判据、@0.75 严格得多，COCO 干脆在 0.5 到 0.95 上取平均（mAP@[.5:.95]）。因此比较两个检测器时，<strong>必须先说清用的是哪个 IoU 阈值</strong>，否则数字根本不可比。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="nms"><span class="num">3</span>NMS：消除重复检测</h2>
+  <p>检测器（无论滑窗还是 anchor）会对同一个物体吐出<strong>一堆高度重叠的框</strong>。<span class="term">NMS (non-maximum suppression)</span>（非极大抑制）是把它们压成一个的标准后处理。贪心算法极简：</p>  <div class="ascii">NMS(boxes, scores, iou_thresh):
+  ① 按 score 从高到低排序所有框
+  ② 取出当前最高分框 → 加入保留列表
+  ③ 删掉所有与它 IoU &gt; iou_thresh 的框（视为同一物体的重复）
+  ④ 回到 ②，直到没有框剩下
+  返回 保留列表</div>  <p>背后的直觉很朴素：<strong>分数最高的框最可信，先把它留下；任何与它重叠得很厉害的框，多半是在描述同一个物体，属于冗余，删掉</strong>。删完之后从剩下的框里再选最高分，重复这个过程，直到没有框可处理。阈值 <code>iou_thresh</code> 控制「多重才算重复」这个判断的松紧：设得太高（如 0.9）只删几乎完全重合的框，会残留大量重复检测；设得太低（如 0.3）又会把两个真正挨得很近的不同物体误当成重复、删掉一个。实践中常取 0.5 左右，但这是个需要按场景调的超参，密集场景往往要调高。</p>  <p>一个重要变体：<strong>Soft-NMS</strong>不直接删除重叠框，而是按 IoU<em>降低</em>它们的分数（<code>score *= (1-IoU)</code> 或高斯衰减）。这对<strong>密集、互相遮挡的物体</strong>更友好——硬 NMS 会把被遮挡的那个直接删掉。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 NMS 想成开会发言：先让最有把握的人（最高分框）说，然后把和他说同一件事的人（高 IoU 框）请下去，再让下一个最有把握、说不同事的人说。最后每件事只留一个代表。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>NMS 是<strong>逐类进行</strong>的：不同类别的框即使重叠也不互相抑制（一只站在椅子上的猫，cat 框和 chair 框该共存）。且 NMS 是不可微的贪心步骤，这也是后来 DETR 等「无 NMS 检测器」想去掉它、改用集合预测的动机。</p></div>
+  </div>  <p>还有一点常被忽视：NMS 处理的是<strong>检测器输出阶段</strong>的重复框，和模块 01 里 Canny 的「非极大抑制」名字相同、思想相通（都是「只留局部最强、压制邻近的次强」），但作用对象完全不同——一个抑制的是相邻像素的梯度响应，一个抑制的是相互重叠的检测框。看到 NMS 这个词时要分清它在哪个语境。</p>  <div class="callout warn"><span class="label"></span>
+    <p>NMS 实现的三个常见 bug：① 忘了<strong>逐类</strong>进行，把不同类别的重叠框互相删掉（猫框把椅子框删了）；② 删除重叠框后<strong>没有继续从剩余框里取下一个最高分</strong>，导致只保留了一个框；③ 用了写错的 IoU（接上一节的交集陷阱）。notebook 会从零实现贪心 NMS，并用 assert 验证「重复框被正确去掉、不同物体的框被完整保留」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="anchor"><span class="num">4</span>Anchor 与候选框：从滑窗到 RPN</h2>
+  <p>怎么提出候选框？最朴素的是 <span class="term">sliding window</span>（滑动窗口）：用固定大小的窗口在图上密集滑过，每个位置都分类一遍。简单直观，但<strong>代价爆炸</strong>——要枚举所有位置 × 所有尺度 × 所有长宽比，绝大多数窗口是背景，浪费巨大。</p>  <p>现代检测器用 <span class="term">anchor box</span>（锚框）破局：在特征图的每个位置<strong>预先放置</strong>一组形状各异（不同尺度、不同长宽比）的参考框，检测器不再凭空说出框的绝对坐标，而只需对每个 anchor 预测两件事——「<strong>这里有没有物体</strong>」以及「<strong>真实框相对这个 anchor 该怎么微调（中心平移多少、宽高缩放多少）</strong>」。这一步把「在连续坐标空间里从零定位」这个困难的回归问题，转化成「在一堆离散参考框上做分类 + 小幅微调」，学习难度大大降低，也让网络能用卷积一次性密集预测所有位置。</p>  <p>训练时必须给每个 anchor 分配一个标签，依据正是上一节的 <strong>IoU 匹配</strong>：anchor 与某个真值框 <code>IoU ≥ 0.7</code> 就标为正样本（让它去学这个物体的类别与偏移）；<code>IoU &lt; 0.3</code> 标为负样本（背景，只学「这里没东西」）；介于两者之间的 anchor 处境模糊，通常<strong>直接忽略、不参与训练</strong>，以免给出含糊的监督信号。<span class="term">region proposal</span>（候选区域）网络（RPN，Ren 等的 Faster R-CNN）就是把这套 anchor + IoU 匹配做成一个轻量子网络，端到端地生成候选框，彻底取代了 R-CNN 时代又慢又割裂的 selective search 启发式算法——这是检测走向实时的关键一步。</p>  <table>
+    <thead><tr><th>范式</th><th>怎么提候选</th><th>代表</th><th>特点</th></tr></thead>
+    <tbody>
+      <tr><td>滑动窗口</td><td>穷举位置×尺度</td><td>Viola-Jones、HOG+SVM</td><td>简单、慢、冗余多</td></tr>
+      <tr><td>region proposal</td><td>selective search 出候选</td><td>R-CNN / Fast R-CNN</td><td>候选少、需额外算法</td></tr>
+      <tr><td>anchor + RPN</td><td>预设 anchor + 网络回归偏移</td><td>Faster R-CNN / SSD / YOLO</td><td>端到端、快、主流</td></tr>
+      <tr><td>anchor-free / 集合预测</td><td>直接预测点/框集合</td><td>FCOS / DETR</td><td>去掉 anchor 与 NMS 的新方向</td></tr>
+    </tbody>
+  </table>  <p>anchor 也并非没有代价：anchor 的尺度、长宽比、密度都是需要人工设计的超参，设得不好（比如和数据集里物体的真实形状不匹配）会直接拖累召回。这正是后来 <strong>anchor-free</strong> 检测器（如 FCOS 直接预测每个点到框四边的距离、CenterNet 预测物体中心热力图）想要摆脱的负担——它们不再依赖预设框，让设计更简洁。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>anchor 的本质是<strong>把困难的连续回归离散化</strong>：与其让网络凭空说出框的绝对坐标，不如先给它一大堆「参考答案」（anchor），让它做「选哪个 + 微调多少」。这和分类里「先定好类别集合、再从中选一个」是完全同构的思路。notebook 会从零实现 anchor 与真值框的 IoU 匹配，复现「≥0.7 正 / <0.3 负 / 中间忽略」的分配规则。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pr"><span class="num">5</span>Precision-Recall：检测的工作曲线</h2>
+  <p>评估一个检测器，第一步是把它输出的每个预测框判成「对」（TP，true positive）还是「错」（FP，false positive）。判定规则有严格的顺序与占用约定：按 <span class="term">confidence score</span>（置信度）<strong>从高到低</strong>依次处理每个预测框，拿它与<strong>尚未被别的预测框占用</strong>的真值框逐个算 IoU；若最大 IoU 达到阈值，就记一个 TP 并<strong>占住</strong>那个真值框（之后再有框命中它只能算 FP），否则记 FP。全程结束后，没有被任何预测框命中的真值框就是漏检（FN，false negative）。这三个计数 TP/FP/FN 是后面 precision、recall、AP 的唯一原料。</p>  <p>随着置信度阈值从高往低放宽，被纳入考虑的预测框越来越多：能命中的真值框随之增多（<strong>召回率上升</strong>），但混进来的误报也增多（<strong>精确率通常下降</strong>）。把每一个阈值对应的 (recall, precision) 描成一条曲线，就是 <span class="term">precision-recall curve</span>（PR 曲线），它完整刻画了检测器在「查得全」与「查得准」之间的全部工作点：</p>  <div class="math-block">\[\text{precision}=\frac{TP}{TP+FP}\quad(\text{查得准：报出来的有几个是真的}),\qquad \text{recall}=\frac{TP}{TP+FN}\quad(\text{查得全：真物体找回了几成})\]</div>  <p>为什么检测偏爱 PR 曲线而不用分类常见的 ROC 曲线？关键在于检测里<strong>负样本（背景框）的数量近乎无穷</strong>——一张图能切出天文数字个不含物体的框，这让 ROC 横轴的假正率（FP / 所有负样本）分母大到失去意义、曲线被压扁。PR 曲线只关心「查出的物体对不对」和「真物体漏没漏」，分母里没有那个无穷大的背景集，因此更贴合检测的真实关切。实现上的关键技巧是<strong>累积计数</strong>：先把所有预测框按置信度降序排好，然后逐个处理、累加当前的 TP 与 FP，每加入一个框就算出一个 (recall, precision) 点，连起来即得整条曲线。</p>  <div class="callout warn"><span class="label"></span>
+    <p>判 TP/FP 的三条纪律，错一条 PR 曲线和 mAP 就全错：① 每个真值框<strong>最多被匹配一次</strong>——第二个命中它的预测框必须算 FP，这样才能惩罚「对同一物体重复检测」；② 必须<strong>严格按置信度降序</strong>处理，保证高分框优先占据真值框（顺序反了会让本该是 TP 的高分框被低分框抢走真值、错判成 FP）；③ <strong>逐类别分别统计</strong>，不同类的框互不干扰。这套规则看似繁琐，却是 mAP 可复现、可比较的根基，notebook 会一步步实现并验证。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="map"><span class="num">6</span>mAP：检测的总指标</h2>
+  <p><span class="term">AP / mAP</span>（平均精度 / 均值平均精度）把上一节那条 PR 曲线浓缩成一个可比较的标量。定义是：<strong>AP = 某一类别的 PR 曲线下面积</strong>（综合了该类在所有工作点的表现），而 <strong>mAP = 把每个类别的 AP 再求平均</strong>（macro 平均，每类等权）。它是检测领域跨数据集、跨方法的通用总指标，几乎所有检测论文都用它排名——但它的计算口径暗藏不少约定，理解这些约定才能正确比较与复现。</p>  <p>AP 名义上是对 PR 曲线积分，但实际的 PR 曲线是<strong>上下抖动的锯齿</strong>（每命中一个真值框 precision 跳升、每来一个误报 precision 下挫），直接积分既不稳也不公平。为此社区发展出两种主流口径，本课 notebook 会实现更标准的全点插值版：</p>  <ul>
+    <li><strong>11 点插值（VOC 2007）</strong>：在 recall = 0, 0.1, ..., 1.0 共 11 个点上取<strong>该 recall 右侧的最大 precision</strong>，求平均。简单、历史悠久。</li>
+    <li><strong>全点插值（VOC 2010+ / COCO）</strong>：把 precision 做成<strong>单调不增的包络</strong>（每点取其右侧最大 precision），再算曲线下<em>全部</em>面积。更精确，是现行标准。</li>
+  </ul>  <div class="math-block">\[p_{\text{interp}}(r)=\max_{\tilde r\ge r} p(\tilde r),\qquad \mathrm{AP}=\int_0^1 p_{\text{interp}}(r)\,dr\approx\sum_k (r_{k}-r_{k-1})\,p_{\text{interp}}(r_k)\]</div>  <p>「取右侧最大 precision」这步<strong>把锯齿压成单调下降的阶梯</strong>，背后的直觉是：在某召回水平下，我们认为检测器至少能达到「再放宽一点也能拿到的最好精度」。<strong>COCO 的 mAP@[.5:.95]</strong>进一步在 10 个 IoU 阈值（0.5 到 0.95，步长 0.05）上各算一次 mAP 再平均，对定位精度要求更高。本课 notebook 从零实现 AP（单调包络 + 面积）并验证其单调性与边界。</p>  <div class="callout danger"><span class="label"></span>
+    <p>比较两个检测器的 mAP，<strong>必须确认口径完全一致</strong>：IoU 阈值（@0.5 vs @[.5:.95]）、插值方式（11 点 vs 全点）、是否按面积分大中小目标。<strong>不同口径的 mAP 不可直接比较</strong>——这是检测论文阅读最常见的坑，也是评测科学家必须把关的地方。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="arch"><span class="num">7</span>检测器架构谱系</h2>
+  <p>前面六节是检测的「零件」——候选框、IoU、NMS、mAP。本节把它们装进真实的检测器，看看这些零件在不同架构里如何组合。检测器十年的演进主要沿两条主线展开：<strong>一是「候选框怎么来」越来越省（穷举滑窗 → selective search → RPN anchor → anchor-free → 集合预测）</strong>，<strong>二是「后处理」越来越少（直到 DETR 连 NMS 都去掉）</strong>。理解这两条主线的取舍，就把握住了整部检测发展史的骨架。</p>  <table>
+    <thead><tr><th>路线</th><th>代表</th><th>怎么工作</th><th>取舍</th></tr></thead>
+    <tbody>
+      <tr><td>两阶段 two-stage</td><td>R-CNN→Fast→Faster R-CNN</td><td>先 RPN 出候选，再逐候选分类+精修框</td><td>精度高、相对慢</td></tr>
+      <tr><td>一阶段 one-stage</td><td>YOLO / SSD / RetinaNet</td><td>一次前向直接在网格/anchor 上预测框+类</td><td>快、可实时，精度曾略低</td></tr>
+      <tr><td>anchor-free / DETR</td><td>FCOS / CenterNet / DETR</td><td>预测中心点或用 Transformer 做集合预测</td><td>去 anchor/NMS，简化管线</td></tr>
+    </tbody>
+  </table>  <p><strong>两阶段</strong>检测器（Girshick 等的 R-CNN → Fast R-CNN → Ren 等的 Faster R-CNN）精度高：第一阶段用 RPN 快速筛掉绝大多数背景、只留少量候选，第二阶段再对每个候选精细分类并回归框，分工明确、精度领先，代价是速度相对慢。<strong>一阶段</strong>检测器（Redmon 等的 YOLO、SSD）把检测当成一次性的密集回归，一个前向就在网格 / anchor 上同时预测框与类别，快到可实时，但早期精度略逊。<span class="term">Focal Loss</span>（Lin 等的 RetinaNet）一针见血地指出一阶段落后的根因是<strong>正负样本极端不平衡</strong>（一张图里背景 anchor 是前景的成千上万倍），通过降低海量易分背景的损失权重让一阶段精度追平两阶段。而 <strong>DETR</strong> 更激进——用 Transformer 把检测建模成集合预测 + 二分匹配，<em>一举去掉了 anchor 和 NMS 两个手工组件</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>两阶段像「先海选再精挑」：先快速圈出可疑区域，再仔细审每个。一阶段像「一眼扫过去直接报」：快但容易被海量背景干扰。Focal Loss 就是教模型「别把精力浪费在一眼就知道是背景的地方」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>无论哪条路线，本模块的四个量都在：候选（anchor/proposal）、IoU（匹配 + 评估）、NMS（去重，DETR 除外）、mAP（评测）。换句话说，<strong>你在 numpy 里写对的 IoU/NMS/mAP，就是这些检测器评测代码的核心</strong>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>检测演进的主线是<strong>「候选怎么来」越来越省、「后处理」越来越少</strong>：穷举滑窗 → selective search → RPN anchor → anchor-free → 集合预测(无 NMS)。但评测口径（IoU/mAP）十年未变，这正是本课死磕它的原因。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>目标检测虽是成熟领域，但仍有大量活跃的开放问题——它们大多围绕「去掉手工组件」「检测训练时没见过的类别」「把 2D 推广到 3D / 视频」以及「mAP 这个口径本身够不够好」展开。对评测科学家而言，最后一类尤其值得关注：一个 mAP 很高的检测器，在小目标、稀有类别、或真实部署场景里可能远没那么好用。</p>  <ul>
+    <li><strong>无 NMS 检测</strong>：DETR 及后续（Deformable DETR、DINO-DETR）用 Transformer 做集合预测 + 二分匹配损失，去掉手工的 anchor 与 NMS，但训练慢、小目标弱仍待解。</li>
+    <li><strong>开放词表检测</strong>：用图文预训练（GLIP、Grounding DINO）检测训练时没见过的类别，把检测从固定标签集推向「用文本描述任意物体」。</li>
+    <li><strong>3D 与视频检测</strong>：自动驾驶的 3D 框、点云检测、视频里的时序一致检测，IoU/NMS/mAP 都要推广到 3D/时序。</li>
+    <li><strong>评测口径的统一与缺陷</strong>：mAP 对定位与分类错误的耦合、对类别不平衡的处理、与下游实际效用的脱节，持续被讨论；如何设计更贴近应用的检测指标是开放问题。</li>
+    <li><strong>小目标与长尾</strong>：小物体定位、稀有类别检测仍是 mAP 的主要短板，关联到多尺度特征与重采样。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：<strong>Girshick R-CNN/Fast R-CNN</strong>、<strong>Ren Faster R-CNN</strong>（anchor/RPN 之源）、<strong>Redmon YOLO</strong>（一阶段）、<strong>Lin Focal Loss</strong>、以及定义 mAP 的 <strong>PASCAL VOC</strong> 与 COCO 评测协议，详见 <code>references.md</code>。下一模块把粒度从「框」推到「每个像素」——图像分割。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_classification/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 图像分类</div></a>
+    <a class="next" href="../04_segmentation/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 图像分割</div></a>
+  </div>
+
+</div>
+</body>
+</html>

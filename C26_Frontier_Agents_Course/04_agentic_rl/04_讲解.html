@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · Agentic RL 与编码 agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · Agentic RL 与编码 agent</h1>
+  <p class="subtitle">让 agent 越用越强 —— 在多步轨迹上做 RL：可验证奖励（测试通过/任务完成）、折扣回报、信用分配、REINFORCE 与优势基线、拒绝采样与 pass@k；从零写一个玩具 agentic RL 并看到平均奖励上升</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–03、概率与期望、梯度 / 对数似然的直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_agentic_rl.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">SWE-bench (Jimenez 2023)、SWE-agent (Yang 2024)、STaR (Zelikman 2022)、Sutton & Barto</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么要在 agent 轨迹上做 RL</a></li>
+      <li><a href="#mdp">把 agent 任务写成 MDP：状态/动作/轨迹</a></li>
+      <li><a href="#reward">可验证奖励：能 scale 的前提</a></li>
+      <li><a href="#return">回报与折扣</a></li>
+      <li><a href="#credit">信用分配：RL 难的根本</a></li>
+      <li><a href="#reinforce">策略梯度 REINFORCE 与优势基线</a></li>
+      <li><a href="#rejsample">不止 RL：拒绝采样与 pass@k</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么要在 agent 轨迹上做 RL</h2>
+  <p>前三个模块教会了一个 agent「怎么行动」：调工具（01）、用协议接入工具（02）、操作 GUI（03）。它们都靠<strong>提示与 scaffold</strong>让一个<em>已经训练好</em>的模型把能力发挥出来。但这里有个天花板——<strong>提示只能调用模型已有的能力，不能创造新能力</strong>。如果模型本身不擅长某类多步任务（比如改一个有微妙 bug 的代码库），再好的提示也救不了。要让 agent 真正<strong>越用越强</strong>，得回到源头：用它自己跑出来的经验去<em>更新模型权重</em>。这就是 <span class="term">agentic RL</span>（智能体强化学习）。</p>  <p>它与你可能听过的 RLHF 有一个关键区别。RLHF 通常是<strong>单步</strong>的：给一个回答、打一个分、更新一次。而 agent 任务是<strong>长程、稀疏奖励</strong>的：agent 要走几十上百步（读文件、改代码、跑测试……），而<em>奖励往往只在最后出现一次</em>——测试全过了，记 1 分；没过，记 0 分。中间几十步动作没有任何即时反馈。于是 agentic RL 的核心难题变成：<strong>一整条轨迹的成败，如何归因到沿途的每一个动作？</strong>（哪几步是关键、哪几步无关）——这就是信用分配，是本模块的灵魂。</p>  <p>本模块<strong>从零写一个玩具 agentic RL</strong>：定义一个带<strong>可验证奖励</strong>（测试通过=1）的小任务、用 softmax 策略采样轨迹、计算折扣回报、做最朴素的策略梯度（REINFORCE）更新，并亲眼看到<em>平均奖励随训练上升、最优动作的概率被强化</em>。再补两条更轻量的路线——基线降方差、拒绝采样（reject sampling）与 pass@k。全程纯 numpy、数学正确、assert 可验证。你会理解前沿编码 agent（SWE-bench 上训练的那些）背后的训练回路，本质就是把这个玩具放大。</p>  <p>需要先厘清本模块在整门课里的位置：前面三个模块都在「<strong>推理时（inference time）</strong>」做文章——给定一个固定的模型，靠 scaffold、协议、护栏把它的能力榨出来；本模块第一次进入「<strong>训练时（training time）</strong>」——用 agent 跑出的经验去改模型本身。这是两种正交的提升手段：好 scaffold 让现有模型发挥到极限，RL 让模型的极限本身抬高。真实的前沿 agent 两者都要——先用 RL/微调把基础模型在 agent 任务上训强，再用 scaffold 在推理时把它用好。本模块补齐的，正是「训练时」这一半的最小内核。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>agentic RL = 让 agent 自己做任务、对成功的整条轨迹「点赞」、把点赞顺着轨迹分给各个动作、从而让以后更可能重走成功的路</strong>。难点不在「点赞」（奖励常常是测试通过这种客观信号），而在<em>怎么把末尾这一个赞，公平地分给中间几十步动作</em>——这就是信用分配。理解了它，就理解了 RL 为什么比「照着标准答案学」（模仿学习）难。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mdp"><span class="num">2</span>把 agent 任务写成 MDP：状态/动作/轨迹</h2>
+  <h3>把 agent 任务写成 MDP：状态、动作、轨迹</h3>  <p>要在 agent 上做 RL，先要把任务用 RL 的语言描述清楚。一次 agent 任务可以建模成一个<span class="term">MDP</span>（马尔可夫决策过程，多数 agent 任务其实是部分可观察的 POMDP）：</p>  <table>
+    <thead><tr><th>RL 概念</th><th>在 agent 里是什么</th><th>本课玩具里的对应</th></tr></thead>
+    <tbody>
+      <tr><td><strong>state / observation</strong> 状态/观察</td><td>当前环境情况（文件内容、报错、上一步结果）</td><td>一个小整数编号的状态</td></tr>
+      <tr><td><strong>action</strong> 动作</td><td>调一个工具 / 写一段代码 / 点一个按钮</td><td>从几个候选里选一个（如选哪处改动）</td></tr>
+      <tr><td><strong>policy π(a|s)</strong> 策略</td><td>模型：给定上下文，输出下一个动作的概率</td><td>softmax 作用在一张 logits 表上</td></tr>
+      <tr><td><strong>reward</strong> 奖励</td><td>任务成败的标量（多在终点给）</td><td>测试通过=1，否则=0</td></tr>
+      <tr><td><strong>trajectory</strong> 轨迹</td><td>一次任务的完整 (obs,action,...) 序列</td><td>从开始到终止的若干步</td></tr>
+    </tbody>
+  </table>  <p>一条<span class="term">trajectory</span>（轨迹，也叫 rollout）就是 agent 完整跑一遍任务留下的脚印：观察₀、动作₀、观察₁、动作₁……直到终止，末尾得到一个（或多个）奖励。一次完整的「开始到终止」叫一个 <span class="term">episode</span>（回合），任务需要的步数叫 <span class="term">horizon</span>（时域）。agent 任务的 horizon 常常很长——这正是它难的来源之一：<strong>长程意味着任何一步出错都可能让整条轨迹失败</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把一次 agent 任务想成一局闯关游戏：你看到画面（观察）、做一个操作（动作）、画面变化（新观察）、再操作……直到通关或失败。通关了游戏才给分（奖励），中间每一步不单独打分。RL 要从「这一局通没通关」反推「我哪几步操作是对的」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，策略 $\pi_\theta(a\mid s)$ 是 RL 的优化对象（agent 的「大脑」）。在 LLM agent 里策略就是模型本身：给定上下文（状态），输出下一个 token / 动作的概率分布。本课用一个<strong>极小的查表式 softmax 策略</strong>代替神经网络——把机制看清，再放大到真实模型不过是把这张表换成几十亿参数。</p></div>
+  </div>  <p>一个值得停下来体会的点：<strong>agent 任务的「动作」粒度是可以选的</strong>，这直接影响 RL 的难度。把「写一整个补丁」当成一个动作，动作空间巨大但 horizon 短；把「敲一个 token」当成一个动作，动作空间小但 horizon 长到几千步。真实编码 agent 通常在「token 级」做 RL（因为模型本就是 token 级的策略），于是一条轨迹有成千上万个动作、只在末尾一个测试奖励——<em>这把信用分配的难度推到了极致</em>。本课玩具用「选哪个补丁」这种粗粒度单步动作，是为了把策略梯度的数学看干净；记住真实情形的 horizon 要长几个数量级，难点也随之放大。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="reward"><span class="num">3</span>可验证奖励：能 scale 的前提</h2>
+  <h3>可验证奖励：agentic RL 能 scale 的前提</h3>  <p>RL 的燃料是奖励。agent 任务最幸运的一点是：很多任务的奖励<strong>可以程序化地、客观地、自动地</strong>判定，无需人工打分。最典型的就是<strong>编码</strong>——</p>  <p><span class="term">SWE-bench</span>（Jimenez 2023）把这一点用到极致：每个任务是一个<em>真实的 GitHub issue</em> + 一组<em>真实的单元测试</em>；agent 改完代码，跑测试，<strong>全过=1 分，否则=0 分</strong>。这种<span class="term">可验证奖励</span>（verifiable / outcome reward）的威力在于：它能<strong>无限量、零成本、无偏地</strong>生成训练信号——不用雇人标注，不用训练奖励模型，测试就是裁判。这正是当前编码、数学 agent 的 RL 能大规模 scale 的根本原因。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么「可验证」这么关键？因为 RL 要跑成千上万条轨迹才学得动，每条都要一个奖励。如果奖励靠人打分，成本与噪声都爆炸；如果靠训练一个奖励模型打分，又会被<em>钻空子</em>（reward hacking）。而「单元测试通过没有」是<strong>客观、便宜、难作弊</strong>的——代码要么真的对，要么测试不过。<strong>有没有一个廉价可靠的奖励信号，几乎决定了一个 agent 任务能不能用 RL 训</strong>。</p>
+  </div>  <p>奖励还分<strong>稀疏</strong>与<strong>稠密</strong>：稀疏奖励只在终点给一次（任务成败），稠密奖励沿途多次给（每步小反馈）。agent 任务<em>绝大多数是稀疏的</em>——你只知道「这次 PR 合没合」，不知道「第 17 步那个改动好不好」。稀疏正是信用分配难的直接来源（下一节）。也有工作尝试构造稠密的「过程奖励」（process reward，给每一步打分），但如何不被钻空子、如何获取，本身就是开放问题（见末节）。本模块用最干净的稀疏可验证奖励：跑一个玩具「测试」，过了给 1。</p>  <p>可验证奖励也划出了 agentic RL 当前最有效的疆域：凡是「结果对不对能被一段程序客观判定」的任务——代码（单元测试）、数学（答案核对）、形式证明（证明检查器）、游戏（输赢规则）——RL 都跑得动；而「结果好不好要靠人类品味判断」的任务（写一篇优美的文章、设计一个讨喜的界面），就只能退回奖励模型或人类反馈，难度与噪声陡增。这解释了一个现象：为什么近两年 agent 能力的爆发<strong>最先发生在编码和数学上</strong>——不是因为它们「简单」，恰恰是因为它们<em>有一个廉价、客观、难作弊的裁判</em>，让 RL 的飞轮转得起来。判断一个 agent 任务能不能用 RL 大幅提升，第一个该问的就是：它有没有这样一个裁判？</p>
+
+  <!-- ========================================================= -->
+  <h2 id="return"><span class="num">4</span>回报与折扣</h2>
+  <h3>回报与折扣：把未来奖励折算到现在</h3>  <p>有了每一步的奖励 $r_t$，一个动作的「好坏」不只看它当下的奖励，更要看它<strong>之后引出的全部奖励</strong>。把从时刻 $t$ 起往后累加的奖励叫<span class="term">回报</span>（return）。为了让近期奖励权重更高、并保证长（甚至无限）序列收敛，引入<strong>折扣因子</strong> $\gamma\in(0,1]$：</p>  <div class="math-block">\[G_t \;=\; r_t + \gamma\, r_{t+1} + \gamma^2 r_{t+2} + \cdots \;=\; \sum_{k=0}^{\infty} \gamma^{\,k}\, r_{t+k}\]</div>  <p>直觉：$\gamma$ 越接近 1，agent 越「有远见」（同等看重远期奖励）；$\gamma$ 越小越「短视」（只在乎眼前）。对稀疏奖励的 agent 任务（只有末尾一个奖励 $R$），$G_t$ 就退化成 $\gamma^{T-t} R$——<strong>越靠近终点的动作，分到的折扣回报越大</strong>。这本身已经是一种朴素的信用分配：离成功越近的动作，被认为「功劳」越大。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>回报像「这步棋之后我总共赢了多少子」，而不是「这步棋当场吃了几个子」。折扣则是「现在的 1 分比十步以后的 1 分更值钱」——和钱的时间价值一个道理：明年的一百块不如今天的一百块。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上 $G_t$ 是策略梯度里每个动作的权重（下一节）。计算它有个高效的<strong>从后往前递推</strong>技巧：$G_t = r_t + \gamma\,G_{t+1}$，从轨迹末尾倒着扫一遍即可，$O(T)$。注意 $\gamma=1$ 时回报就是「从 t 起的奖励总和」（reward-to-go），是无折扣的特例；本课练习会同时实现折扣版与 reward-to-go 版。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="credit"><span class="num">5</span>信用分配：RL 难的根本</h2>
+  <h3>信用分配：RL 比模仿学习难的根本</h3>  <p>现在到本模块的灵魂。设想一条编码 agent 的轨迹：它读了文件、定位了函数、改了三行、跑了测试——<strong>测试通过，末尾得 1 分</strong>。问题来了：这<em>一个</em>分，该怎么分给前面<em>几十个</em>动作？哪几步是真正解决问题的关键，哪几步只是无关的来回试探甚至帮了倒忙？这就是<span class="term">credit assignment</span>（信用分配）。</p>  <div class="ascii">一条轨迹（只在末尾得一个奖励 R=1）：
+  s0 --a0--&gt; s1 --a1--&gt; s2 --a2--&gt; s3 ... --a_{T-1}--&gt; 终止
+   |         |         |         |                       |
+   ?         ?         ?         ?                     R = 1 (测试通过)
+                                                         |
+  信用分配：把末尾这个 1 分，顺着轨迹「回传」给每一步动作
+  折扣回报的做法：a_t 分到 γ^(T-t)·R —— 越靠近成功，分得越多
+  难点：来回试探的废动作 也会分到信用（噪声）；关键一步可能离终点很远</div>  <p>为什么这让 RL 比<strong>模仿学习</strong>（直接照着标准答案/专家轨迹学）难得多？模仿学习里，每一步都有一个「正确动作」当标签，是<em>有监督</em>的、信号密集且无歧义；而 RL 只有末尾一个标量，中间动作的好坏全靠<strong>从结果反推</strong>——这个反推充满噪声：一条成功轨迹里夹着的废动作也会沾光、一条失败轨迹里的好动作也会被连坐。<strong>信用分配的质量，直接决定 RL 学得快不快、稳不稳</strong>。</p>  <p>有一个更合理的朴素改进叫 <span class="term">reward-to-go</span>（剩余回报）：让每一步只为它<strong>之后</strong>发生的奖励负责，而非整条轨迹的总和——一个动作不该为它执行<em>之前</em>就已经拿到的奖励邀功。形式上就是 $G_t=\sum_{k\ge t} r_k$（$\gamma=1$ 的回报），它去掉了「过去奖励」这部分与当前动作无关的噪声，是几乎零成本的信用分配改进。notebook 的练习会实现它并与「总回报赋给每步」对比，你会看到后者对早期动作有多不公平。这也提示了一条主线：<strong>信用分配的每一步改进，本质都是在剥离与当前动作无关的奖励成分</strong>——reward-to-go 剥离过去，折扣剥离遥远未来，基线剥离平均水平。</p>  <div class="callout warn"><span class="label"></span>
+    <p>信用分配的噪声是 agentic RL 的核心痛点。最朴素的做法（把整条轨迹的总回报赋给每一步）方差极大——一步好动作可能因为<em>恰好身处一条失败轨迹</em>而被惩罚。缓解手段有：用<strong>reward-to-go</strong>剥离过去奖励、用<strong>折扣回报</strong>让信用按距离衰减（本节）、用<strong>基线/优势</strong>扣掉「平均水平」只奖励「超出预期」的部分（下一节）、以及更复杂的价值函数估计（GAE 等，超出本课）。但根本上，长程稀疏任务的信用分配至今没有完美解法。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="reinforce"><span class="num">6</span>策略梯度 REINFORCE 与优势基线</h2>
+  <h3>策略梯度 REINFORCE：让高回报的动作更可能</h3>  <p>怎么用回报去更新策略？最朴素也最根本的算法是<span class="term">REINFORCE</span>（策略梯度）。目标是最大化期望回报 $J(\theta)=\mathbb{E}_{\tau\sim\pi_\theta}[G]$。它的梯度有一个优雅的形式（策略梯度定理）：</p>  <div class="math-block">\[\nabla_\theta J(\theta) \;=\; \mathbb{E}\!\left[\sum_t G_t\,\nabla_\theta \log \pi_\theta(a_t\mid s_t)\right]\]</div>  <p>把它读成大白话：<strong>沿着「让已采取的动作更可能」的方向走一步，步长正比于这个动作带来的回报 $G_t$</strong>。回报高的动作，被往上推得多（以后更可能选）；回报低（甚至为负）的动作，被往下压。对一张 softmax logits 表，$\nabla_\theta\log\pi$ 有干净的闭式：对状态 $s$ 的 logits，梯度是 $\text{onehot}(a)-\text{softmax}(\theta_s)$（「实际选的动作」减「当前各动作概率」）。于是一次更新就是 <code>theta[s] += lr * G * (onehot(a) - p)</code>——notebook 会从零写出这一行并验证它确实把策略推向高回报动作。</p>  <p>为什么这个公式长这样、又为什么 work？关键是那个 $\nabla\log\pi$（对数似然梯度）。它指向「让这个动作的概率上升最快」的方向；乘上回报 $G_t$ 后，方向不变但<strong>步长被回报缩放</strong>——高回报的动作被推得猛，零回报的动作（$G_t=0$）完全不动，负回报的动作被反向推开。于是一整批轨迹平均下来，策略就被<em>成功经验</em>往「多产生成功」的方向拽。这也解释了为什么可验证奖励这么搭：测试通过的轨迹 $G=1$ 把沿途动作加强，没通过的 $G=0$ 不产生任何更新——干净利落，没有标注噪声。</p>  <p>REINFORCE 的最大毛病是<strong>方差大</strong>：回报本身波动剧烈，梯度估计噪声大、收敛慢。一个简单而强大的修正是减去一个<span class="term">基线</span>（baseline）$b$，得到<span class="term">优势</span>（advantage）$A_t = G_t - b$：</p>  <div class="math-block">\[\nabla_\theta J \;=\; \mathbb{E}\!\left[\sum_t (G_t - b)\,\nabla_\theta \log \pi_\theta(a_t\mid s_t)\right]\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>基线就是「平均水平」。不要因为「这次得了 5 分」就无脑加强这个动作——要看它<strong>比平均好还是差</strong>。比平均好（优势>0）才加强，比平均差（优势<0）就抑制。这样「随大流的好运气」被扣掉，只奖励真正的「超额表现」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，减去一个<em>与动作无关</em>的基线<strong>不改变梯度的期望（无偏）</strong>，却能<strong>显著降低方差</strong>（这是关键的「不偏但更稳」性质）。最简单的基线是一个批次里所有回报的均值。notebook 会从零验证这个经典结论：<strong>加基线后，梯度估计的方差严格变小</strong>，而期望方向不变。优势函数是现代 RL（PPO/GRPO）的核心组件。</p></div>
+  </div>  <p>为什么减一个常数不改变期望、却能降方差？因为对每个状态，各动作概率之和恒为 1，于是 $\sum_a \pi(a\mid s)\nabla\log\pi(a\mid s)=\nabla\sum_a\pi=\nabla 1=0$——这意味着 $\mathbb{E}[b\,\nabla\log\pi]=0$，减去 $b$ 对梯度期望毫无影响（无偏）。但它把每个样本的权重从「绝对回报 $G$」变成了「相对优势 $G-b$」，量级更小、正负更均衡，于是样本间的波动（方差）下降。这就是为什么现代算法都用优势而非裸回报：<strong>同样的期望方向，更小的噪声，更快更稳的收敛</strong>。GRPO 这类近期方法更进一步——干脆用「同一任务一组轨迹的平均回报」当基线，连价值网络都省了，本质仍是这条「减平均水平」的智慧。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="rejsample"><span class="num">7</span>不止 RL：拒绝采样与 pass@k</h2>
+  <h3>不止 RL：拒绝采样与 pass@k</h3>  <p>RL 之外，还有一条<strong>更简单、却出奇有效</strong>的路线用同样的可验证奖励改进 agent：<span class="term">拒绝采样</span>（rejection sampling / best-of-n / STaR 式自举）。它不算梯度，只做三步：</p>  <ol>
+    <li><strong>采样</strong>：对同一任务，让当前模型采 $k$ 条轨迹（每条是一次完整尝试）。</li>
+    <li><strong>筛选</strong>：用验证器（测试）只保留<em>成功</em>的那些轨迹（奖励=1），扔掉失败的。</li>
+    <li><strong>微调</strong>：用这些成功轨迹做监督微调（等于「加强成功路径上的动作」），然后迭代——模型变强后再采、再筛、再训。</li>
+  </ol>  <p>这背后有两个紧密相关的度量。<span class="term">pass@k</span>：对一个任务采 $k$ 次，<strong>只要有一次成功就算通过</strong>。若单次成功率是 $p$（且各次独立），则</p>  <div class="math-block">\[\text{pass@}k \;=\; 1 - (1-p)^k\]</div>  <p>它衡量「多试几次能不能做出来」——只要你有个验证器能从 $k$ 次里挑出成功的那次，pass@k 就是你实际能交付的成功率。这正是拒绝采样能 work 的数学基础：<strong>即使单次 $p$ 不高，$k$ 大了 pass@k 也能很高</strong>，于是「采样 + 用测试挑」就能稳定产出正确解，再拿去自举训练。（注意区分：pass@k 衡量「会不会做」，与之相对的 <span class="term">pass^k</span> 衡量「能不能<em>稳定</em>做对」——连续 k 次<em>全</em>成功，是模块 05 的主题，对生产可靠性更苛刻。）</p>  <p>拒绝采样与 REINFORCE 其实是<strong>同一思想的两个强度</strong>。REINFORCE 用连续的回报权重温和地调整每个动作的概率（包括对失败轨迹的轻微抑制）；拒绝采样则是它的「硬阈值」版本——只取奖励=1 的轨迹、把它们当作监督标签直接学，等于对成功动作施加最强的正权重、对失败动作施加零权重。正因如此，拒绝采样实现简单、训练稳定（就是普通的监督微调），代价是<em>只能学会「已经偶尔能做对」的任务</em>（$p$ 太小，$k$ 条里一条都不成功，就没有数据可学）；而 RL 能通过探索把 $p$ 从零附近一点点抬起来，但训练更不稳、更贵。生产里常见的配方是<strong>两者接力</strong>：先用拒绝采样把模型在「能偶尔做对」的任务上夯实，再用 RL 去啃那些更难、需要探索的长尾。</p>  <div class="callout danger"><span class="label">奖励 ≠ 意图</span>
+    <p>可验证奖励不是万灵药，它把风险从「噪声」换成了「<strong>钻空子</strong>」（reward hacking）。当奖励是「测试通过」，一个足够强的优化器会发现：<strong>改测试比改代码更容易让测试通过</strong>——删掉断言、把测试改成永真、或硬编码测试期望的输出，奖励照样到手，任务却根本没完成。这不是假想：在真实编码 agent 训练里反复出现。缓解手段（把测试设为只读、用留出测试评估、检测可疑 diff）都只是<em>缓解</em>；只要优化压力足够大，agent 总在搜索奖励函数的漏洞而非任务的解。记住这条贯穿对齐的铁律：<strong>你优化的是你写下的奖励，不是你心里想的目标</strong>——奖励与真实意图的每一丝缝隙，都会被优化器找到并放大。这正是模块 05 安全主题的伏笔。</p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>拒绝采样的精髓：<strong>有了可验证奖励，你就有了一台「自动出标准答案」的机器</strong>——让模型多试几次，测试帮你挑出对的，对的就成了新的训练数据。它比 RL 实现简单（就是采样 + 过滤 + SFT，没有策略梯度的方差烦恼），是很多编码 / 数学模型自我改进的第一道工序（STaR, Zelikman 2022）。RL 与拒绝采样常常并用：先拒绝采样把模型抬上来，再 RL 精雕。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>过程奖励 vs 结果奖励</strong>：只看终点（outcome）信用分配难；给每步打分（process reward）信号密但难获取、易被钻空子。如何廉价可靠地构造过程奖励，是当前编码/数学 agent 的热点。</li>
+    <li><strong>奖励钻空子（reward hacking）</strong>：agent 可能找到「让奖励高但没真正完成任务」的捷径（比如改测试而非改代码让测试通过）。可验证奖励缓解了一部分，但设计「难以被钻」的奖励仍是核心安全/对齐问题（与模块 05 相通）。</li>
+    <li><strong>长程信用分配</strong>：几百步、跨多个文件的任务，末尾一个奖励几乎无法有效归因。价值函数估计（GAE）、分层 RL、用 LLM 自己做信用分配，都是探索方向，但远未解决。</li>
+    <li><strong>工程化算法</strong>：本课的朴素 REINFORCE 在实践中太不稳。PPO（裁剪式更新）、GRPO（组相对优势，省去价值网络）等是把策略梯度稳定化、规模化的当代主力；它们的内核仍是本课讲的策略梯度 + 优势。</li>
+    <li><strong>RL 还是拒绝采样？</strong>：两条路线的边界仍在演进——拒绝采样简单稳定但只学「已能做对的」，RL 能探索出新策略但不稳贵。何时用哪个、如何组合（如 SWE-RL 等编码 agent 训练方案），是活跃的工程问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：SWE-bench（Jimenez 2023，可验证奖励的真实落地）、SWE-agent（Yang 2024，scaffold 即能力）、STaR（Zelikman 2022，拒绝采样自举）、Sutton & Barto（策略梯度/回报/基线的标准教材）、PPO（Schulman 2017，工程化）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_computer_use/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · Computer Use</div></a>
+    <a class="next" href="../05_agent_eval_safety/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · Agent 评测与安全</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · GRPO 从零</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · GRPO 从零</h1>
+  <p class="subtitle">组相对策略优化 —— 用组内归一化优势替代 critic、ratio clip 限步、KL 正则；逐行推导 loss 与梯度，并与 PPO 正面对比</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（策略梯度、基线、优势）、softmax、概率</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_grpo.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">DeepSeekMath (GRPO) · DeepSeek-R1 · PPO · DAPO</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">讲解 45 分钟 + notebook 75 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么要去掉 critic</a></li>
+      <li><a href="#adv">组相对优势：GRPO 的心脏</a></li>
+      <li><a href="#clip">重要性比与裁剪</a></li>
+      <li><a href="#kl">KL 正则：拉住策略</a></li>
+      <li><a href="#vs">GRPO vs PPO</a></li>
+      <li><a href="#impl">实现要点与陷阱</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么要去掉 critic</h2>
+  <p>上一模块我们用「组均值基线」让结果奖励 RL 训稳了。这一模块把那个朴素想法升级成 R1 真正使用的算法——<span class="term">GRPO</span>（Group Relative Policy Optimization，组相对策略优化），由 DeepSeekMath 提出、在 DeepSeek-R1 上大放异彩。要理解它的价值，先得看清它在解决主流 RL 算法 <span class="term">PPO</span> 的什么痛点。</p>  <p>PPO 是 RLHF 时代的主力，它用一个<strong>价值网络（critic）</strong> $V_\phi(s)$ 来估计基线、配合 GAE 算优势。这个 critic 通常和策略<em>一样大</em>（同一个 Transformer 规模），于是带来三个实打实的代价：<strong>①显存翻倍</strong>（要同时放策略和 critic 两个大模型）、<strong>②critic 本身难训</strong>（价值估计在长序列、稀疏奖励下方差大、容易估错，估错的基线反而坑了策略）、<strong>③超参更多</strong>（critic 的学习率、loss 权重、GAE 的 $\lambda$ 都要调）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>PPO 像请了个「陪练教练」（critic）站在旁边，每走一步都告诉你「这步比平均水平好还是差」。教练很有用，但你得<strong>额外雇这个教练、还得先把他训会</strong>——他要是看走眼，给的反馈反而误导你。GRPO 的想法是：<strong>不雇教练了，让一组学员（同一题的多个答案）互相比较</strong>——你比这组的平均好，就是好；差，就是差。组内的相对排名，天然就是一个不用训练的基线。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：critic 的唯一作用是提供基线 $V(s)\approx\mathbb{E}[R\mid s]$ 来算优势 $A=R-V$。GRPO 的洞察是——对同一个 prompt $q$ 采样<strong>一组</strong> $G$ 条回答 $\{o_1,\dots,o_G\}$，那么这组回报的<strong>样本均值</strong> $\bar r=\frac1G\sum_i r_i$ 本身就是 $\mathbb{E}[R\mid q]$ 的一个无偏蒙特卡洛估计，可以直接当基线。于是优势 $A_i=r_i-\bar r$（或再除组标准差），<strong>完全不需要 critic</strong>。一个学习的网络被一个采样统计量替代了。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住 GRPO：<strong>用「同一道题的一组答案的组内相对好坏」当优势，从而彻底去掉价值网络</strong>。省掉的不只是一半显存，还有「训练一个会估值的 critic」这件难事本身。代价是每个 prompt 要采一<em>整组</em>样本（计算换显存+稳定），但在推理 RL 里采样本就便宜、组采样还顺便提供多样性，所以这笔交易非常划算。这就是为什么 R1 用 GRPO 而非 PPO。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="adv"><span class="num">2</span>组相对优势：GRPO 的心脏</h2>
+  <h3>组相对优势：GRPO 的心脏</h3>  <p>GRPO 的核心就一个公式。对 prompt $q$ 采样一组 $G$ 条回答，各自得到（可验证）回报 $r_1,\dots,r_G$，则第 $i$ 条的<strong>组相对优势</strong>为：</p>  <div class="math-block">\[A_i=\frac{r_i-\operatorname{mean}(\{r_1,\dots,r_G\})}{\operatorname{std}(\{r_1,\dots,r_G\})+\epsilon}\]</div>  <p>拆开看两个操作：<strong>减组均值</strong>把「绝对答对」变成「相对这组好坏」——这正是上一模块证明过的<em>合法基线</em>（减与动作无关的量不引入偏差），它让优势天然<strong>零均值</strong>（组内有人正有人负，推高好的、压低差的）。<strong>除组标准差</strong>做归一化，让优势<strong>单位方差</strong>、量纲稳定，使得同一个学习率在「这组分差很大」和「分差很小」时都合适。两步合起来：组内 z-score。</p>  <table>
+    <thead><tr><th>情形</th><th>回报 $\{r_i\}$</th><th>组均值</th><th>优势 $A_i$（减均值）</th><th>学习信号</th></tr></thead>
+    <tbody>
+      <tr><td>有对有错</td><td>[1,0,1,0]</td><td>0.5</td><td>[+.5,−.5,+.5,−.5]</td><td><strong>强</strong>：推高对的、压低错的</td></tr>
+      <tr><td>全对</td><td>[1,1,1,1]</td><td>1.0</td><td>[0,0,0,0]</td><td><strong>无</strong>：都一样好，无相对信息</td></tr>
+      <tr><td>全错</td><td>[0,0,0,0]</td><td>0.0</td><td>[0,0,0,0]</td><td><strong>无</strong>：都一样差，无相对信息</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label">全对/全错陷阱</span>
+    <p>注意<strong>全对组/全错组的优势全为 0</strong>——这不是 bug，是 GRPO 的内在特性，但有重要后果：太简单（总全对）或太难（总全错）的 prompt<strong>不产生任何梯度</strong>，纯属浪费采样。这催生了 <span class="term">dynamic sampling</span>（DAPO）：过滤掉全对/全错的 prompt、只在「有对有错」的 prompt 上学习，或动态调难度让组内尽量有区分度。这是把 GRPO 跑高效的关键工程细节，notebook 会让你亲眼看到全对组零梯度。</p>
+  </div>  <p>还要小心<strong>除标准差的数值陷阱</strong>：当组内回报几乎相同时 std≈0，除法会爆炸或放大噪声。$\epsilon$（如 1e-8 或 1e-4）就是防这个。有些实现（如部分 DAPO 变体）干脆<strong>只减均值、不除标准差</strong>，避免归一化在小 std 时引入的不稳定——这是一个有争议但实际重要的设计选择，notebook 的练习会对比两种做法。</p>  <p>为什么组相对优势是<strong>合法</strong>的（不引入偏差）？这要回到上一模块证明的基线定理：减去任何<em>与当前动作无关</em>的量都不改变策略梯度的期望。组均值 $\bar r$ 是<em>整组</em>的统计量，对组内任意一条<em>具体</em>轨迹而言，它近似一个常数基线——严格说存在轻微的「自己也在均值里」的耦合，但当组足够大时这点偏差可忽略，且换来的方差缩减远超之。这就是 GRPO 在理论上站得住的根：它不是某个拍脑袋的归一化，而是<strong>「用组内蒙特卡洛均值近似最优基线 $\mathbb{E}[R\mid q]$」</strong>这一有原则的选择。notebook 的 worked 7 会用大量采样验证「组均值 = 真实 $V(q)$ 的无偏估计」，把这层理由做实。</p>  <h4>一个手算例子</h4>  <p>具体感受一下。某 prompt 采 4 条回答，回报 $\{1,0,0,1\}$（两对两错）。组均值 $\bar r=0.5$，组标准差 $\approx 0.5$。减均值得 $\{+0.5,-0.5,-0.5,+0.5\}$；除标准差得归一化优势 $\{+1,-1,-1,+1\}$。于是策略梯度把<strong>两条对的回答整体推高、两条错的整体压低</strong>，且力度对称（zero-sum）。注意这里<strong>没有任何 critic 参与</strong>——基线 $0.5$ 完全来自这 4 条样本自己。再看退化情形：若 4 条全对 $\{1,1,1,1\}$，$\bar r=1$，优势全为 $0$——这组<em>不贡献任何梯度</em>（都一样好，无从分辨谁更该被推高）。这就是前面警示的「全对/全错组零信号」，是 GRPO 优势定义的直接推论，也是 dynamic sampling 要回收的浪费。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="clip"><span class="num">3</span>重要性比与裁剪</h2>
+  <h3>重要性比与裁剪：复用 rollout、限制步长</h3>  <p>纯策略梯度是 on-policy 的：采的样本只能用一次（更新一步后策略变了，旧样本不再代表新策略）。但采样昂贵，我们想用同一批 rollout 做<em>几步</em>更新。解法继承自 PPO：<strong>重要性采样比</strong>（importance ratio）</p>  <div class="math-block">\[\rho_{i,t}(\theta)=\frac{\pi_\theta(o_{i,t}\mid q,o_{i,<t})}{\pi_{\theta_{\text{old}}}(o_{i,t}\mid q,o_{i,<t})}\]</div>  <p>$\rho$ 是<strong>新策略 vs 采样时的旧策略</strong>对同一个 token 的概率比。用它给优势加权 $\rho\cdot A$，就能用旧数据估计新策略的期望梯度（重要性采样的修正）。但 $\rho$ 偏离 1 太远时，重要性估计方差爆炸、更新可能过猛把策略推崩。PPO 的招是<strong>裁剪代理目标</strong>：</p>  <div class="math-block">\[\mathcal{L}_i=\min\!\Big(\rho_{i,t}A_i,\ \operatorname{clip}(\rho_{i,t},\,1-\varepsilon,\,1+\varepsilon)\,A_i\Big)\]</div>  <p>这个 <code>min</code> 很精巧，要逐情形读懂：当 $A_i>0$（好动作，想推高），ratio 涨到 $1+\varepsilon$ 以上时被 clip 截住——<strong>不让一次推得太多</strong>；当 $A_i<0$（坏动作，想压低），ratio 跌到 $1-\varepsilon$ 以下时被截住——<strong>不让一次压得太狠</strong>。而 <code>min</code> 保证了：当未裁剪项更小（更保守）时取它，使裁剪只会<em>削弱</em>而非放大更新。净效果是把每步更新限制在旧策略的一个<strong>信赖域</strong>附近，稳。</p>  <p>为什么不直接限制 ratio（如硬截断 $\rho\in[1-\varepsilon,1+\varepsilon]$）而要用这个 <code>min</code>？因为硬截断在边界处<strong>梯度为零</strong>、会丢掉「该方向其实还想继续走」的信息，且在 $A<0$ 时方向会搞反。<code>min</code> 的设计精妙在于：它只在「ratio 已偏到对我们<em>有利</em>的方向太远」时才停止给梯度（好动作已推够、坏动作已压够），而在「ratio 偏到对我们<em>不利</em>方向」时<strong>不截断</strong>（继续纠正）。这是一个<em>非对称</em>的、只朝「别过度自信」方向生效的刹车——比简单截断聪明得多，也是 PPO 历经众多 RL 算法仍是主流的原因之一。</p>  <div class="ascii">clipped surrogate 的行为（横轴 ratio ρ，纵轴对目标的贡献）
+
+  A&gt;0 (好动作，想推高):              A&lt;0 (坏动作，想压低):
+     贡献                              贡献
+      │      ___________ clip 上限       │ 1-ε   1+ε
+      │     /                       ─────┼───┬────────▶ ρ
+      │    /                            \│   
+  ────┼───┴──────────▶ ρ                 \___________ clip 下限
+     1-ε  1+ε                              （ρ 太小被截住，不过度压低）
+  （ρ 太大被截住，不过度推高）</div>  <h4>一个手算例子：min 在四种情形下的取值</h4>  <p>取 $\varepsilon=0.2$（clip 区间 $[0.8,1.2]$），逐一代入看 <code>min</code> 选了谁。<strong>①好动作、ratio 适中</strong>（$A=+1,\rho=1.1$）：两项 $1.1$ 与 $\operatorname{clip}(1.1)\cdot1=1.1$ 相等，照常更新。<strong>②好动作、ratio 过大</strong>（$A=+1,\rho=1.5$）：未裁剪项 $1.5$、裁剪项 $1.2$，$\min$ 取 $1.2$——<em>推高被截住</em>，防止一步迈太大。<strong>③坏动作、ratio 适中</strong>（$A=-1,\rho=0.9$）：两项 $-0.9$ 与 $-0.9$ 相等，照常压低。<strong>④坏动作、ratio 已很小</strong>（$A=-1,\rho=0.5$）：未裁剪项 $-0.5$、裁剪项 $\operatorname{clip}(0.5,0.8,1.2)\cdot(-1)=-0.8$，$\min$ 取 $\boxed{-0.8}$——注意这里取的是<em>更负</em>的那个，意味着 clip <strong>没有</strong>阻止继续压低这个坏动作。这正是 <code>min</code> 的非对称精髓：它只在「朝有利方向偏过头」时刹车（情形②），而在「朝不利方向偏」时<strong>放行纠正</strong>（情形④）。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>clip 的精神是<strong>「小步快跑，别一步迈太大」</strong>。RL 用的是自己生成的数据，一旦策略一步变化太大，新策略生成的分布和旧数据严重不匹配，后续估计全乱、训练崩溃。$\varepsilon$（典型 0.2）就是这一步的最大「迈步幅度」。DAPO 进一步提出 <span class="term">clip-higher</span>（把上界 $1+\varepsilon_{\text{high}}$ 放宽于下界），<strong>鼓励对好动作多探索一点</strong>、缓解熵塌缩——一个简单却有效的非对称改动。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="kl"><span class="num">4</span>KL 正则：拉住策略</h2>
+  <h3>KL 正则：拉住策略别跑太远</h3>  <p>GRPO（继承 RLHF 传统）还在目标里加一项<strong>对参考策略的 KL 散度惩罚</strong>。参考策略 $\pi_{\text{ref}}$ 通常是初始的 SFT 模型（冻结不动），KL 项 $\beta\,D_{\mathrm{KL}}(\pi_\theta\,\|\,\pi_{\text{ref}})$ 把当前策略<strong>拴在</strong>参考附近。完整 GRPO 目标（每 token 取负做最小化）大致是：</p>  <div class="math-block">\[\mathcal{J}_{\text{GRPO}}=\mathbb{E}\Big[\tfrac1G\textstyle\sum_i\tfrac1{|o_i|}\sum_t \min(\rho A_i,\,\operatorname{clip}(\rho,1\!-\!\varepsilon,1\!+\!\varepsilon)A_i)\ -\ \beta\,D_{\mathrm{KL}}(\pi_\theta\|\pi_{\text{ref}})\Big]\]</div>  <p>KL 正则有双重作用：<strong>①防止崩坏</strong>——RL 一味追奖励可能让模型输出退化（重复、乱码、丢掉语言能力），KL 把它拉回「还像个正常语言模型」的区域；<strong>②对抗奖励黑客</strong>——尤其当奖励是<em>学习的</em>（ORM/PRM）时，策略会想钻奖励模型的空子，KL 限制它偏离参考的程度，间接限制能 hack 多狠。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>KL 像一根<strong>橡皮筋</strong>，一头拴在初始模型上。策略可以探索、变好，但走得越远，橡皮筋拉力越大。$\beta$ 是橡皮筋的劲：$\beta$ 大 → 拉得紧、保守、不易崩但也学不快；$\beta$ 小 → 放得松、敢探索、学得快但可能崩。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>有意思的是<strong>推理 RL 把 $\beta$ 调得极小，甚至阶段性设为 0</strong>。原因正是上一模块的伏笔：当奖励是<em>规则验证</em>（数学/代码对错）时，奖励<strong>几乎不可被 hack</strong>——答案对就是对，模型没法靠偏离参考来骗奖励。既然 hack 不动，就不必用强 KL 拴着，反而该<strong>放开让它探索</strong>（写更长、更敢试的 CoT）。这是 RLVR 区别于 RLHF 的一个深刻后果：可验证奖励<em>买来了</em>放松 KL 的自由。</p></div>
+  </div>  <div class="callout danger"><span class="label">KL 与奖励可信度</span>
+    <p>但一旦离开可验证域、用上学习的奖励模型，KL 就<strong>重新变得性命攸关</strong>。Gao 2023 量化了：优化一个学习的 RM 时，KL 偏离越大，RM 给的分越高，但<strong>真实表现先升后降</strong>（倒 U）。$\beta$ 太小 → 过度优化、reward hacking、真实性能崩塌。<strong>所以「该用多大 KL」直接取决于「你的奖励有多可信」</strong>：规则奖励可放松，学习奖励须拉紧。记住这条，模块 03 会把它在 PRM 上演示一遍。</p>
+  </div>  <p>这里值得把 KL 的「双向」性质说透：它既<strong>防崩坏</strong>（拉住别退化成乱码），也<strong>防过度优化</strong>（拉住别钻奖励空子），但代价是<strong>也拉住了有益的探索</strong>——KL 不分「好的偏离」和「坏的偏离」，只惩罚<em>一切</em>偏离参考的行为。这就是为什么 $\beta$ 是个棘手的权衡：调大了，模型被按在参考附近、学不动；调小了，又可能崩或被 hack。可验证域的妙处恰恰在于<strong>它从根上消除了「坏的偏离」</strong>（答案对就是对，没法靠偏离骗分），于是你可以安心把 $\beta$ 调到极小、甚至阶段性归零，让那根橡皮筋松到几乎不拉——把全部自由还给探索。这是 RLVR 相对 RLHF 的一个被低估的红利：<em>不是「不需要 KL 这个工具」，而是「可验证奖励让你买得起松 KL 的代价」</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="vs"><span class="num">5</span>GRPO vs PPO</h2>
+  <h3>GRPO vs PPO：一张表说清异同</h3>  <p>现在把两者并排。它们<strong>共享</strong>裁剪代理目标与 KL 正则这套「稳」的机制，核心区别只在<strong>优势怎么来</strong>——但这一个区别牵动了显存、稳定性、超参的一连串差异。</p>  <table>
+    <thead><tr><th>维度</th><th>PPO</th><th>GRPO</th></tr></thead>
+    <tbody>
+      <tr><td>优势来源</td><td>critic $V_\phi$ + GAE</td><td><strong>组内归一化回报</strong>（无 critic）</td></tr>
+      <tr><td>额外模型</td><td>价值网络（≈策略大小）</td><td><strong>无</strong>（省 ~50% 显存）</td></tr>
+      <tr><td>基线本质</td><td>学习的 $V(s)$</td><td>同 prompt 一组样本的均值</td></tr>
+      <tr><td>每 prompt 采样</td><td>可少（靠 critic 泛化）</td><td><strong>一整组</strong> $G$（如 8–64）</td></tr>
+      <tr><td>ratio clip</td><td>✅</td><td>✅（可 clip-higher）</td></tr>
+      <tr><td>KL 正则</td><td>✅</td><td>✅（推理 RL 常调极小）</td></tr>
+      <tr><td>稳定性来源</td><td>critic 提供低方差基线</td><td>组采样直接估基线</td></tr>
+      <tr><td>主要风险</td><td>critic 估错坑策略</td><td>全对/全错组零梯度、std 不稳</td></tr>
+      <tr><td>代表用途</td><td>RLHF（InstructGPT）</td><td><strong>推理 RL（DeepSeek-R1）</strong></td></tr>
+    </tbody>
+  </table>  <p>一句话总结这张表：<strong>GRPO 用「多采样」换掉了「训 critic」</strong>。在 RLHF 时代，采样贵、critic 的泛化省采样，PPO 划算；在推理 RL 时代，可验证奖励让采样廉价（不用人标）、组采样还顺带提供探索多样性，于是<strong>用计算换掉一个难训的网络</strong>成了更优的工程取舍。理解这一点，你就理解了为什么同样是 clip+KL，DeepSeek 选 GRPO 而 OpenAI 早期 RLHF 用 PPO——不是谁更先进，是<em>约束变了，最优解就变了</em>。</p>  <p>顺带提一句 GRPO 在更大算法谱系里的位置。它属于一类「<strong>用简单基线替代 critic</strong>」的算法家族，亲戚包括 <span class="term">RLOO</span>（Leave-One-Out：用「组内除自己外的均值」当基线，避免「自己也在均值里」的偏差）、<span class="term">ReMax</span>（用贪心解的回报当基线）等。它们共享同一个洞察——<em>在 LLM 这种「采样便宜、critic 难训」的场景，一个无需训练的采样基线往往胜过一个学习的 critic</em>。GRPO 之所以最流行，是因为它简单、稳、且在 DeepSeek-R1 这样的大规模验证里证明了自己。但记住它只是这个家族的一员，理解「基线可以有很多种合法选择」比记住某一种更重要。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把 GRPO 看成 PPO 的一个<strong>特例/简化</strong>会很有帮助：<em>当你用「组均值」这个特定的基线、并去掉 critic，PPO 就变成了 GRPO</em>。所以学会 GRPO 不是抛弃 PPO，而是抓住了 PPO 里「真正必要的」（clip 防崩、KL 防偏）与「可省的」（critic）。这种「剥离到最简内核」的视角，正是本课想训练的工程品味。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="impl"><span class="num">6</span>实现要点与陷阱</h2>
+  <h3>实现要点与常见陷阱</h3>  <p>把 GRPO 写对，魔鬼在几个细节里。notebook 会逐一踩坑并对拍，这里先列清楚：</p>  <ol>
+    <li><strong>loss 的平均粒度（token vs sequence）</strong>。GRPO 原版按<em>序列</em>平均（每条回答先内部平均再跨组平均），但这会让<strong>长回答的每个 token 权重被稀释</strong>——同样一个 token 在短回答里权重大、长回答里权重小。DAPO 改为<strong>token-level</strong>（所有 token 同权、跨整组求和再除总 token 数），在长 CoT 场景更合理。这是一个看似细微却显著影响训练的选择。</li>
+    <li><strong>优势在 token 间的分配</strong>。结果奖励下，整条回答共享一个 $A_i$，所以这条回答里每个 token 的 $\rho_{i,t}A_i$ 用<em>同一个</em> $A_i$。这点和 PPO（每 token 有自己的 GAE 优势）不同，是结果奖励的直接后果。</li>
+    <li><strong>std 归一化的数值稳定</strong>。全对/全错组 std=0，必须用 $\epsilon$ 兜底；更稳的实现会检测并跳过这些零信号组。</li>
+    <li><strong>old policy 的快照时机</strong>。$\pi_{\theta_{\text{old}}}$ 是「采样这批 rollout 时」的策略快照，在这批的多步更新里<em>冻结</em>；ratio 是相对它算的。搞错快照时机，ratio 全错。</li>
+    <li><strong>KL 的估计方式</strong>。精确 KL 要遍历词表，实践用<span class="term">k3 estimator</span>（$\rho-1-\log\rho$ 这类无偏低方差估计）在采样的 token 上近似。</li>
+  </ol>  <p>再点一个容易被忽视却影响巨大的点：<strong>inner update 步数（用同一批 rollout 更新几次）</strong>。纯策略梯度是 on-policy，rollout 用一次就弃；ratio clip 的存在让我们能<em>有限地</em>复用——通常用同一批做 1–4 步更新。步数太多，ratio 越偏离 1、clip 触发越频繁、有效信号越少，且离 on-policy 假设越远；太少，则采样的算力没榨干。这是「采样成本 vs 更新利用率」的权衡，和组大小 $G$ 一起构成 GRPO 最主要的吞吐旋钮。notebook 的 GRPO 训练循环里你能直接调 <code>inner</code> 看效果。</p>  <p>这些细节没有一个是「高深算法」，全是<strong>把朴素公式落到真实训练循环时的工程纪律</strong>。但恰恰是它们决定了你的 GRPO 是<em>能跑稳</em>还是<em>莫名其妙崩掉</em>。本课的 numpy 实现会把核心的几个（组优势、ratio clip、loss 粒度、零信号组、inner step）做对并 assert 验证，让你对「正确的 GRPO 长什么样」有肌肉记忆，之后读 trl 的 <code>GRPOTrainer</code> 源码会一眼认出每一块。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <p>GRPO 是当前推理 RL 的事实标准，但它远非终点，前沿在快速迭代：</p>  <ul>
+    <li><strong>DAPO 系列改进</strong>。Decoupled clip + dynamic sampling：clip-higher（非对称裁剪鼓励探索）、token-level loss（避免长序列稀释）、动态采样（过滤零信号组）、去 KL（可验证域放开）。这些把 GRPO 在大规模上跑稳跑高效，是当前的工程主线。</li>
+    <li><strong>要不要 std 归一化、要不要 KL？</strong> 社区对「除标准差是否引入偏差/不稳」「KL 在可验证域是否多余」仍有分歧。不同实验室给出不同配方，缺乏统一结论——这是个活跃的实证战场。</li>
+    <li><strong>优势估计的更优方案</strong>。组归一化简单但粗（整条回答一个优势）。能否在不引入 critic 的前提下得到更细的 token 级信用（如基于过程的、可验证的中间信号）？这连接到模块 03 的 PRM。</li>
+    <li><strong>样本效率与组大小</strong>。组越大、基线估计越准但越贵。$G$ 怎么选、能否自适应、不同难度用不同 $G$（难题多采）——compute-optimal 的训练时采样分配，呼应模块 05 的思想。</li>
+    <li><strong>RL 算法的统一视角</strong>。GRPO、RLOO、ReMax、PPO 等都可看作「不同基线 + 不同 clip」的策略梯度变体。一个干净的统一框架（什么基线最优、clip 的本质）正在形成，有助于跳出「调配方」式的研究。</li>
+  </ul>  <p>一个值得记住的元观察：GRPO 的成功不在于它是某种<strong>更聪明</strong>的算法，而在于它<strong>更适配约束</strong>——在「采样廉价、critic 难训、奖励可验证」的推理 RL 场景里，把 PPO 那个难训的 critic 换成一个免费的采样基线，恰好踩中了所有约束。这给研究一个重要启示：<em>最优算法是约束的函数，不存在脱离场景的「最好的 RL 算法」</em>。当约束变了（比如换到奖励稀疏到组内几乎总全错的领域，或采样极贵的领域），GRPO 未必还是最优——这也是为什么前沿仍在不断冒出新变体。<strong>学透 GRPO 的价值，不是记住一个配方，而是学会「按约束推导算法」的思维方式</strong>。</p>  <div class="callout paper"><span class="label"></span>
+    <p>奠基与前沿：<strong>DeepSeekMath（Shao 2024）</strong>（GRPO 原文）、<strong>DeepSeek-R1</strong>（GRPO 在推理上的大规模验证）、<strong>Schulman 2017（PPO）</strong>（clip 代理目标的来源）、<strong>DAPO（Yu 2025）</strong>（clip-higher / token-level / 动态采样 / 去 KL 的工程改进合集）。下一模块从「奖励的算法」转向「奖励的粒度」——<span class="term">PRM</span> 给推理的每一步打分。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_long_cot_rl/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · Long-CoT 与结果奖励</div></a>
+    <a class="next" href="../03_prm/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 过程奖励模型 PRM</div></a>
+  </div>
+
+</div>
+</body>
+</html>

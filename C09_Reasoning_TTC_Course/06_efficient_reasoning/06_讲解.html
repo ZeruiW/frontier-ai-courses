@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · Overthinking 与预算控制：长思维链的效率经济学</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 06 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>06 · Overthinking 与预算控制：长思维链的效率经济学</h1>
+  <p class="subtitle">思考是要花钱的 —— 当"多想一步"的边际收益低于边际成本，继续思考就不再是能力，而是浪费甚至伤害</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（CoT）、02（self-consistency）、05（TTC scaling laws）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 06_overthinking_budget.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Chen 2024 (arXiv:2412.21187)、Muennighoff 2025 (s1, arXiv:2501.19393)、Kimi k1.5 (arXiv:2501.12599)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#cost">长 CoT 的真实代价：token 经济学</a></li>
+      <li><a href="#overthinking">Overthinking：想太多的实证证据与度量</a></li>
+      <li><a href="#underthinking">Underthinking：想太浅的另一极</a></li>
+      <li><a href="#nonmono">长度与正确率的非单调关系</a></li>
+      <li><a href="#control">预算控制技术：从 budget forcing 到长度惩罚 RL</a></li>
+      <li><a href="#adaptive">自适应计算：难度路由与 early exit</a></li>
+      <li><a href="#distill">推理蒸馏：把长 CoT 压进小模型</a></li>
+      <li><a href="#eval">评测视角：效率也是能力维度</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost"><span class="num">1</span>长 CoT 的真实代价：token 经济学</h2>
+
+  <p>模块 05 讲了 test-time compute scaling 的收益面；本章讲<strong>成本面</strong>。推理模型（o1 / R1 / QwQ 类）的核心机制是把
+  计算预算花在<strong>更长的思维链（long chain-of-thought）</strong>上，而生成每一个思考 token 都有三重账单：</p>
+
+  <table>
+    <thead><tr><th>成本项</th><th>量级</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>生成计算 FLOPs</td><td>$O(n)$ 次前向 × 每次 $O(n)$ 注意力 → 总计 $O(n^2)$</td><td>自回归解码逐 token 进行：生成第 $t$ 个 token 时要对长度 $t$ 的 KV cache 做注意力，总注意力计算 $\sum_t t = O(n^2)$。思维链长 10 倍，注意力开销约 100 倍</td></tr>
+      <tr><td>显存 KV cache</td><td>$O(n \cdot L \cdot d)$</td><td>每层每 token 都要缓存 K/V。长 CoT 直接压缩 batch size → 吞吐下降不止线性</td></tr>
+      <tr><td>延迟 latency</td><td>$O(n)$（逐 token 串行）</td><td>思考 token 无法并行生成。用户面对的"思考中…"等待时间与思维链长度成正比，这是产品层面最硬的约束</td></tr>
+      <tr><td>API 计费</td><td>线性计价</td><td>主流推理 API 把 reasoning token 计入 output token 收费。o1 式模型在简单题上多想 5000 token，就是真金白银多付 5000 token 的钱</td></tr>
+    </tbody>
+  </table>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>训练时代我们说"scale is all you need"，因为训练是一次性投入。但 test-time compute 是<strong>每次查询都付费</strong>的
+      边际成本：同一个模型部署后回答十亿次，思维链平均长一倍，推理账单（和用户等待）就翻一倍以上。
+      所以"想多长"不是模型的私事，而是一个必须显式管理的<strong>预算分配问题</strong>。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设单题思考长度 $n$，期望效用为 $U(n) = \mathrm{acc}(n) \cdot V - c(n)$，其中 $V$ 是答对的价值、
+      $c(n)$ 是生成成本（计费上近似线性 $c(n)\approx c_1 n$，计算上含 $O(n^2)$ 注意力项）。
+      最优思考长度满足一阶条件 $\mathrm{acc}'(n^*)\cdot V = c'(n^*)$：<strong>边际准确率收益等于边际 token 成本</strong>。
+      本章全部内容可以概括为一句话：实证上 $\mathrm{acc}'(n)$ 衰减极快（甚至变负），而当前推理模型默认的 $n$ 远超 $n^*$。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  一个有用的换算：对做评测的人，<strong>跑一遍 AIME 级 benchmark 的成本可以差 50 倍</strong> ——
+  同样 30 道题，非推理模型每题 ~500 token，推理模型每题 ~25k token 还要 $k$ 次采样取 pass@k / majority vote。
+  效率问题不解决，"充分评测推理模型"本身就变成奢侈品。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="overthinking"><span class="num">2</span>Overthinking：想太多的实证证据与度量</h2>
+
+  <p><span class="term">Overthinking</span> 一词由 Chen et al. 2024《Do NOT Think That Much for 2+3=?》(arXiv:2412.21187)
+  推到台前。他们系统考察 o1 式模型在<strong>简单问题</strong>上的行为，发现了两个标志性现象：</p>
+
+  <p><strong>① 第一个答案往往已经正确。</strong>把长思维链按"得出一个中间答案"切分成多个 <span class="term">solution</span>（解答轮次），
+  统计发现：在 GSM8K 这类简单基准上，o1 式模型平均生成数千 token、多轮 solution，但<strong>第一轮 solution 的答案在多数情况下已经正确</strong>
+  —— 后续的"检查、换方法重做、再确认"贡献的额外正确率极少。"2+3=?"这种题也能想出数百 token，把加法做三遍再用代数验证一遍。</p>
+
+  <p><strong>② solution 数量的边际收益急剧递减。</strong>定义按 solution 轮次 $i$ 索引的累计正确率 $\mathrm{acc}_{\le i}$，
+  实测曲线在 $i=1$ 后基本平坦。Chen 2024 据此定义了两个效率指标：</p>
+
+  <div class="math-block">
+  $$ \text{outcome efficiency: } \xi_O = \frac{\sum_k \hat\sigma_k \, T^{(k)}_{\text{first-correct}}}{\sum_k T^{(k)}_{\text{total}}}, \qquad
+     \text{process efficiency: } \xi_P = \frac{\sum_k \sum_i T^{(k)}_i \,\mathbb{1}[\text{solution } i \text{ 提供新视角}]}{\sum_k T^{(k)}_{\text{total}}} $$
+  </div>
+
+  <p>直观读法：$\xi_O$ 问"到<strong>第一次得到正确答案</strong>为止的 token 占总 token 的比例"（其余 token 对结果无贡献）；
+  $\xi_P$ 进一步问"后续 solution 里有多少是<strong>真的换了思路</strong>，而不是同一方法换皮重算"。
+  实测两者在简单题上都很低 —— 大量 token 花在第一次答对<em>之后</em>，且后续轮次高度同质。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  度量 overthinking 的最小工具箱（notebook 会全部实现）：<strong>(a)</strong> 第一个正确答案出现位置
+  $T_{\text{first-correct}}$ 的分布；<strong>(b)</strong> 思考长度条件下的准确率曲线 $\mathrm{acc}(t)$（若在步 $t$ 强制停止并提取当前答案）；
+  <strong>(c)</strong> "改错率"：已经答对后继续思考、最终把答案改错的概率。三者合起来就能回答"该不该让它继续想"。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="underthinking"><span class="num">3</span>Underthinking：想太浅的另一极</h2>
+
+  <p>效率问题不只有"想太多"一个方向。Wang et al. 2025《Thoughts Are All Over the Place》(arXiv:2501.18585)
+  指出 o1 式模型在<strong>难题</strong>上存在 <span class="term">underthinking</span>：频繁地以 "Alternatively, ..." / "Wait, let me try another approach"
+  切换思路，每条思路只展开几十 token 就放弃，<strong>浅尝辄止、从不深挖</strong>。统计证据：答错的回答比答对的回答包含显著更多的思路切换；
+  且在答错的回答里，许多被过早放弃的思路本来是正确方向（沿着它走下去能解出来）。</p>
+
+  <ul>
+    <li><strong>诊断指标</strong>：token 利用率 / underthinking score —— 错误回答中，从开头到"第一条本可通往正确答案的思路被放弃"处的 token 占比。占比越低，说明模型越早抛弃了正确路线、其后的 token 越接近无效搜索。</li>
+    <li><strong>缓解</strong>：解码时对思路切换 token（"Alternatively" 等）施加惩罚（thought switching penalty, TIP），不改权重即可提升难题准确率 —— 反向证明切换过频是真实损因。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  Overthinking 与 underthinking 并不矛盾，而是<strong>同一枚硬币的两面</strong>：模型缺乏对"当前思路价值"的内部估计 ——
+  简单题上不知道"已经够了"（该停不停），难题上不知道"这条路值得走深"（该坚持不坚持）。
+  两者共同指向：long-CoT 模型缺一个校准的<strong>元认知停止/坚持判据</strong>，这正是第 5、6 节预算控制技术要外置补上的东西。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="nonmono"><span class="num">4</span>长度与正确率的非单调关系</h2>
+
+  <p>"思考越长越准"是 TTC scaling 留给人的直觉，但在<strong>单题粒度</strong>上它是错的。把准确率写成思考长度的函数 $\mathrm{acc}(t)$，
+  实证图景按难度分层后呈<strong>非单调</strong>：</p>
+
+  <div class="ascii">
+  acc(t)
+   1.0 ┤ 简单题 ●●●●●●●●○○○○○○○○○○○○○   ← 一开始就高，继续想反而
+       │       ╲___________________       缓慢下滑（self-doubt 改错）
+   0.8 ┤ 中等题      ____●●●●●●●●●●●
+       │        __──                  ← 上升后饱和
+   0.5 ┤    _─●
+       │ 难题             ______●●●●
+   0.2 ┤        ____●●●●──            ← 持续上升，长思考真有用
+       │ __●●●──
+   0.0 ┼──┬─────┬─────┬─────┬─────→ 思考长度 t（token）
+        512   2k    8k    16k
+  </div>
+
+  <ul>
+    <li><strong>难题：更长更好。</strong>这是 o1 blog 与 R1 (DeepSeek-AI 2025, arXiv:2501.12948) 训练曲线的核心证据 —— RL 过程中模型自发学会拉长 CoT，且长度增长与 AIME 等难基准的成绩同步上升。s1 (Muennighoff 2025) 的 budget forcing 实验同样显示：在 MATH/AIME 上强行延长思考单调提升准确率（见第 5 节）。</li>
+    <li><strong>简单题：更长反而更差。</strong>多项分析（Chen 2024；以及对同一模型回答按长度分箱的观察研究）发现：同一道简单题，答错的回答往往<em>更长</em>；强制延长思考会诱发"对正确答案的反复怀疑→修改→改错"。注意观察研究有选择偏差（模型对没把握的题本来就想得长，长度与难度混杂），但 budget forcing 的<strong>干预实验</strong>（控制题目、外生改变长度）确认了简单题上的负效应是因果的。</li>
+    <li><strong>聚合层面的假象。</strong>把所有难度混在一起看"平均长度 vs 平均准确率"，可能得到任意符号的相关 —— 这是 Simpson's paradox 的标准现场。<strong>任何关于思考长度的结论都必须按难度分层报告。</strong></li>
+  </ul>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>把模型的中间答案序列想成一个随机过程：每多想一步，错的答案有机会被改对（修复率），对的答案也有小概率被改错（破坏率）。
+      难题起点低、修复空间大，多想净收益为正；简单题起点已接近上限，修复无可修，只剩破坏在起作用 —— 越想越糟。
+      数学上这就是一个向平稳分布收敛的两态 Markov 链，notebook 会让你亲手搭这个模拟器。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设步 $t$ 的当前答案正确为状态 $C_t\in\{0,1\}$，修复率 $f=\Pr(C_{t+1}{=}1\mid C_t{=}0)$、
+      破坏率 $b=\Pr(C_{t+1}{=}0\mid C_t{=}1)$，则
+      $$ \mathrm{acc}(t) = \pi + \big(\mathrm{acc}(0)-\pi\big)(1-f-b)^t, \qquad \pi=\frac{f}{f+b}. $$
+      当 $\mathrm{acc}(0) > \pi$（简单题：初始准确率高于平稳值）时 $\mathrm{acc}(t)$ <strong>单调下降</strong>；
+      当 $\mathrm{acc}(0) < \pi$（难题）时单调上升、速率由混合率 $f+b$ 决定。最优停止点因此随难度剧烈变化 —— 不存在全局最优的统一思考长度。</p>
+    </div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="control"><span class="num">5</span>预算控制技术：从 budget forcing 到长度惩罚 RL</h2>
+
+  <h3>5.1 s1 budget forcing：解码期的简单粗暴 [Muennighoff 2025, arXiv:2501.19393]</h3>
+  <p>s1 用 1000 条精选样本 SFT 出 s1-32B 后，提出 <span class="term">budget forcing</span>：完全在解码期控制思考长度，不改任何权重。</p>
+  <ul>
+    <li><strong>缩短（强行截断）</strong>：思考 token 数达到上限即强制插入思考结束分隔符 + "Final Answer:"，逼模型立刻给出当前最佳答案。</li>
+    <li><strong>延长（追加 "Wait"）</strong>：模型想自然结束思考时，抑制结束分隔符并追加字符串 <code>"Wait"</code>，模型会接着自我检查、常能纠正错误。可重复多次（2×、4×、6× Wait）。</li>
+  </ul>
+  <p>效果：在 AIME24 上随 Wait 次数增加准确率从 50% 提到 57%，给出干净的<strong>test-time scaling 干预曲线</strong>（准确率随被控思考长度近似单调上升）。
+  s1 还提出三个评价控制方法的指标：<span class="term">Control</span>（实际长度落入指定预算的比例）、<span class="term">Scaling</span>（准确率对长度的平均斜率，须为正）、
+  <span class="term">Performance</span>（可达的最高准确率）。Budget forcing 在 Control 上完美（100%），但 Scaling 有天花板 —— Wait 加太多次后模型陷入重复循环，准确率趋平甚至回落。</p>
+
+  <h3>5.2 长度惩罚 RL：把效率写进奖励</h3>
+  <p>解码期控制治标，训练期把"简洁"内化才治本。代表做法：</p>
+  <table>
+    <thead><tr><th>方法</th><th>机制</th><th>要点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Kimi k1.5</strong> (arXiv:2501.12599)</td><td>length penalty：对同一题的一组 rollout，按长度在组内的相对位置给奖励 —— 正确且短 → 奖励最高；正确但长 → 奖励打折；错误且长 → 额外惩罚</td><td>报告长 CoT → 短 CoT 的 <span class="term">long2short</span> 迁移（含蒸馏、模型合并、length-penalized RL），在保住大部分准确率的同时大幅缩短输出</td></tr>
+      <tr><td><strong>L1 / LCPO</strong> (Aggarwal &amp; Welleck 2025, arXiv:2503.04697)</td><td>把目标长度写进 prompt（"think for ~n tokens"），RL 奖励 = 正确性 − $\alpha\,|n_{\text{target}} - n_{\text{used}}|$</td><td>得到<strong>可按指令精确调长度</strong>的模型：一个模型扫出整条 长度–准确率 trade-off 曲线，且同长度下优于 budget forcing 截断（模型学会了把推理"装进"给定预算，而非被拦腰砍断）</td></tr>
+      <tr><td>简洁性 RL（O1-Pruner、各类 efficiency-aware reward）</td><td>在 outcome reward 上叠加与长度成比例的代价项 $-\lambda n$</td><td>$\lambda$ 的选择 = 显式指定你愿意为 1% 准确率付多少 token —— 这正是第 1 节的边际条件被写进训练目标</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger"><span class="label"></span>
+  长度惩罚的反面教材同样重要：若 RL 奖励设计不慎（如对错误答案不罚长度、或 advantage 归一化使"又长又错"的梯度变弱），
+  模型会学到<strong>用长度对冲不确定性</strong> —— 越没把握越啰嗦，长度成为 reward hacking 的通道。
+  评测推理模型时看到异常长的输出分布，应当怀疑训练目标里长度项的副作用，而不只是"模型勤奋"。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="adaptive"><span class="num">6</span>自适应计算：难度路由与 early exit</h2>
+
+  <p>固定预算对所有题一视同仁，而第 4 节已说明最优预算随难度剧变。<span class="term">Adaptive computation</span> 的目标是
+  让 <strong>每题花费 ∝ 每题难度</strong>。三个层次：</p>
+
+  <p><strong>① 难度路由（difficulty routing）。</strong>先用便宜的信号估计难度，再分配预算：简单题走快路径（短 CoT 或干脆不思考），
+  难题走长路径（长 CoT / 多采样 / 搜索）。难度信号可以来自：小模型的预判、模型自身的首 token 置信度、题目特征分类器，
+  或 Snell et al. 2024 (arXiv:2408.03314) 的 <span class="term">compute-optimal</span> 框架 —— 他们证明按难度自适应分配 test-time compute，
+  可比统一 best-of-N 省约 4× 计算达到同等成绩。产品形态上，GPT-5 式的 router（自动决定要不要调用 thinking 模型）与
+  Claude / Gemini 的 thinking budget 参数，都是这一思想的工程化。</p>
+
+  <p><strong>② Early exit / 答案稳定即停（answer consistency stopping）。</strong>不预估难度，而是<strong>边想边监测</strong>：
+  周期性地从思考流中提取当前答案，若连续 $k$ 次提取的答案相同（答案已"收敛"），即停止思考输出该答案。
+  这相当于把 self-consistency 的投票思想用在时间轴上 —— 答案稳定性是"再想下去也不会变"的廉价代理。
+  变体包括：对中间答案做置信度阈值（probe 思考过程中模型对答案的内部置信）、DEER 式在"思路完成点"试探性给答案并测置信度。
+  实测这类方法常能砍掉 30–60% 思考 token 而准确率几乎无损 —— 因为被砍掉的正是 overthinking 的部分。</p>
+
+  <p><strong>③ 题间预算再分配。</strong>在固定<strong>总预算</strong>下做组合优化：对一批题，把从简单题省下的 token 转移给难题。
+  形式化为背包问题：$\max \sum_k \mathrm{acc}_k(n_k)$ s.t. $\sum_k n_k \le B$。由 $\mathrm{acc}_k$ 的凹性（难题）与单调减（简单题），
+  最优解自动呈现"简单题给极少、难题给大头"的形态 —— notebook 的路由实验就是它的蒙特卡洛版本。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  与人类考试策略完全同构：先扫一遍卷子（便宜的难度估计），会做的题秒答（fast path），难题留到最后集中攻坚（long path），
+  写完检查到"连续两遍答案一样"就交卷（stability stopping）。模型缺的不是算力，是这套<strong>考试时间管理</strong>。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="distill"><span class="num">7</span>推理蒸馏：把长 CoT 压进小模型</h2>
+
+  <p>另一条正交的效率路线：不缩短思维链，而是<strong>降低生成每个思考 token 的单价</strong> ——
+  把大模型的长 CoT 蒸馏进小模型。R1 系列 (DeepSeek-AI 2025, arXiv:2501.12948) 给出了标志性结果：</p>
+
+  <ul>
+    <li>用 R1 生成的 ~800k 条推理样本对 Qwen/Llama 系小模型做<strong>纯 SFT</strong>（无 RL），得到 R1-Distill-1.5B/7B/14B/32B。</li>
+    <li>R1-Distill-Qwen-7B 在 AIME24 上达到 55.5%，超过尺寸大得多的非推理模型；1.5B 蒸馏版在数学上超过 GPT-4o 级通用模型 —— <strong>长 CoT 的"形状"可以被小模型廉价模仿</strong>。</li>
+    <li>关键对照：对小模型直接做 R1 式 RL，效果远不如蒸馏 —— 小模型自己探索不出长推理模式，但能学会大模型已经探索出的模式。蒸馏是 test-time compute 的<strong>成本平移</strong>：每 token 单价降一个数量级，token 数不变甚至更长也划算。</li>
+  </ul>
+
+  <p>对效率经济学的含义：比较"大模型短思考"与"小模型长思考"必须在<strong>统一成本轴</strong>（FLOPs 或美元）上进行 ——
+  这正是模块 05 compute-matched 比较在模型尺寸维度上的延伸。蒸馏小模型 + 长思考常常坐在帕累托前沿上成本更低的那一段。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">8</span>评测视角：效率也是能力维度</h2>
+
+  <p>对 model evaluation 的人，本章的全部内容收敛为一条原则：<strong>只报准确率的推理模型评测是不完整的</strong>。落地为四条实践：</p>
+
+  <p><strong>① 固定 token 预算的公平比较。</strong>模型 A 准确率 80%（平均 20k token/题）、模型 B 76%（平均 3k token/题），谁更强？
+  没有预算轴这个问题无意义。正确做法：扫多档预算 $B$，画 $\mathrm{acc}(B)$ 曲线（用截断 / budget forcing / 多档 thinking budget 实现），
+  比较<strong>曲线</strong>而非单点；或至少报告同一预算档位下的成对比较。这与模块 05 的 compute-matched 原则一脉相承 —— token 预算就是推理时代的 compute 轴。</p>
+
+  <p><strong>② 报告 token 用量的分布，而非只报均值。</strong>思考长度分布常是重尾的：均值 8k 可能由"多数题 2k + 少数题 50k"构成，
+  尾部决定了 p99 延迟与最坏成本。至少报告中位数、p90、最大值，并<strong>按答对/答错分组</strong> ——
+  "答错的回答显著更长"是诊断 overthinking / 长度对冲的高信号指纹。</p>
+
+  <p><strong>③ 把效率指标纳入榜单。</strong>常用的标量化：</p>
+  <div class="math-block">
+  $$ \text{accuracy per kilotoken} = \frac{\mathrm{acc}}{\bar n / 1000}, \qquad
+     \text{或帕累托前沿 } \{(\bar n_j, \mathrm{acc}_j)\}\ \text{的非支配集} $$
+  </div>
+  <p>单一比值隐含"准确率与 token 线性可换"的强假设（在曲线两端会误导），更稳健的呈现是<strong>准确率–token 帕累托图</strong>：
+  每个模型/每档预算一个点，只比较非支配点。AA 等第三方评测已把"跑完全套基准消耗的总 token"作为常规报告项。</p>
+
+  <p><strong>④ 警惕长度相关的评测伪影。</strong>截断伪影：评测框架的 max_tokens 设小了，长思考模型的答案被切掉算错 —— 测的是预算不是能力；
+  解析伪影：思考流里出现多个候选答案，answer extraction 抓错一个；judge 偏置：LLM-as-judge 对长回答系统性给高分（模块 07 详谈）。
+  报告推理模型成绩时，max_tokens、思考是否计入、抽取规则三者必须写进评测卡。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>校准的元认知停止。</strong>理想的模型应内生地知道 $\mathrm{acc}'(t)$ 何时归零 —— 即对"继续思考的价值"有校准估计。现有停止规则（稳定性、置信度阈值）都是外置代理；把最优停止（optimal stopping）作为训练目标显式注入（RL 中给停止动作以基于边际价值的奖励）仍是开放方向。</li>
+    <li><strong>隐式/潜空间推理。</strong>把思考从离散 token 移到潜空间（continuous latent reasoning，如 Coconut 方向）或用循环深度换长度，能否在保留 TTC 收益的同时绕开 $O(n^2)$ 与计费 token？代价是思考过程不再可读 —— 与可解释性、安全监控（CoT monitoring）直接冲突，效率与可监督性出现张力。</li>
+    <li><strong>长度作为混杂变量的因果拆解。</strong>"长思考导致高准确率"与"难题导致长思考且低准确率"在观察数据中纠缠。budget forcing 类干预提供了识别工具，但系统性的"思考长度因果效应"测量（按难度分层的 do-操作曲线）尚未成为评测标准件。</li>
+    <li><strong>预算可控性本身作为能力。</strong>s1 的 Control / Scaling / Performance 三指标把"听不听预算指挥"变成可测性质。未来榜单或将要求模型在指定 token 预算下作答 —— 届时 L1/LCPO 式的指令长度控制从技巧变成必备能力，"超预算即零分"会重塑训练目标。</li>
+    <li><strong>overthinking 的安全面。</strong>更长的思考也意味着更大的暴露面：思考流中的目标偏移、奖励侧写（在 CoT 里推理"评分者想看什么"）更容易出现。效率裁剪（砍掉无效思考）与安全监控（保留可审计思考）如何兼得，是 RS-Evaluation 视角下的真问题。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>长 CoT 的三重成本各是什么量级？为什么注意力开销随思考长度平方增长？</li>
+      <li>Chen 2024 用什么证据论证 overthinking？outcome efficiency 与 process efficiency 各度量什么？</li>
+      <li>为什么 $\mathrm{acc}(t)$ 对简单题可能单调下降？写出两态 Markov 链的平稳准确率公式并解释条件。</li>
+      <li>budget forcing 的截断与 "Wait" 延长各自的机制与局限？长度惩罚 RL 相比解码期控制好在哪？</li>
+      <li>给你两个推理模型的 (准确率, 平均 token) 数据，怎样设计一个公平的效率感知比较？至少说出三条报告规范。</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../05_ttc_scaling/05_讲解.html"><div class="dir">← 上一章</div><div class="t">05 · Test-Time Compute Scaling Laws</div></a>
+    <a class="next" href="../07_evaluating_reasoning/07_讲解.html"><div class="dir">下一章 →</div><div class="t">07 · 推理能力评测：基准、污染与协议</div></a>
+  </div>
+
+</div>
+</body>
+</html>

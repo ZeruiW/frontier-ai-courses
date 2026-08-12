@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · 泛化与指标</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 06 / 7</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>06 · 泛化与指标</h1>
+  <p class="subtitle">bias-variance、正则化、ROC/PR/AUC、校准、交叉验证——评测科学家的核心工具箱，全部从零实现并算清口径，并在一个真实的不平衡数据集上看它们如何各自暴露不同的真相。</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（概率/MAP）、03（分类器）、期望与方差</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 06_generalization_metrics.ipynb（UCI Adult 收入，正类仅约 24%，不平衡）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Hastie et al. <em>ESL</em> ch.7；Guo et al. 2017（calibration）；Fawcett 2006（ROC）；Saito 2015（PR vs ROC）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 75 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么这章是评测科学的心脏</a></li>
+      <li><a href="#bv">bias-variance 分解</a></li>
+      <li><a href="#reg">正则化与早停</a></li>
+      <li><a href="#conf">混淆矩阵与 precision/recall/F1</a></li>
+      <li><a href="#roc">ROC、AUC 与 PR 曲线</a></li>
+      <li><a href="#cal">校准：概率可信吗</a></li>
+      <li><a href="#cv">交叉验证与数据泄漏</a></li>
+      <li><a href="#thresh">阈值选择与代价</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么这章是评测科学的心脏</h2>
+  <p>评测科学家干的事，本质就是<strong>选对指标、算对口径、识破被指标掩盖的真相</strong>。一个 99% accuracy 的模型可能毫无价值（如果数据本来就 99% 是同一类，那永远猜那一类也有 99%）；一个 AUC 0.9 的模型可能完全不能投产（排序很好但输出的概率严重过自信，没法据此做决策）。指标从来不是中立的数字，<strong>每一个指标都在回答一个特定问题、也都对某类错误视而不见</strong>。本章把这些工具一次讲透。</p>
+  <p>我们刻意选了一个真实的<strong>不平衡</strong>数据集——UCI Adult（人口普查收入，预测一个人年收入是否 &gt;50K，正类只占约 24%）——作为贯穿全章的实验台。不平衡是真实世界的常态（欺诈、疾病、安全事件都是少数类），也是最容易让人被指标欺骗的场景。你会在 notebook 里反复看到同一个模型在不同指标下「看起来很好」和「其实很糟」的反差。</p>
+  <p>这一章和 C3 评测科学课、C5 安全评估课是直接连续的。LLM 评测里那些看似新颖的难题——「这个 benchmark 分数能信吗」「模型的自信度有意义吗」「为什么换个 prompt 模板分数就变」——本质上都是本章三件事的放大版：泛化（在没见过的输入上还成立吗）、指标口径（这个数字到底在量什么）、和数据泄漏（测试集是否被污染）。先在结构清晰的表格数据上把这三件事彻底吃透，再上 LLM 评测，你才不会被花哨的术语绕晕。</p>
+  <div class="callout intuition"><span class="label"></span>
+  一句话记住四类指标各自回答什么：<strong>accuracy 回答「总共对了多少」，precision/recall 回答「对哪一类、漏了什么」，AUC 回答「排序能力如何」，校准回答「它说的 80% 是不是真 80%」。</strong>
+  这四个面互不替代——只看一个，必被骗；评测报告应当同时给出多个面。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="bv"><span class="num">2</span>bias-variance 分解</h2>
+  <p>泛化误差为什么会高？bias-variance 分解给出了一个精确的答案。对平方损失，在数据与训练随机性上取期望后，测试点的期望误差可<strong>恰好</strong>拆成三项：</p>
+  <div class="math-block">
+  $$ \mathbb E\big[(y-\hat f(x))^2\big]=\underbrace{(\,\mathbb E[\hat f(x)]-f(x)\,)^2}_{\text{bias}^2}+\underbrace{\mathrm{Var}(\hat f(x))}_{\text{variance}}+\underbrace{\sigma^2}_{\text{不可约噪声}} $$
+  </div>
+  <ul>
+    <li><strong>高 bias（欠拟合）</strong>：模型类太简单，系统性地抓不住真实规律（如用直线拟合抛物线）。表现为 train 和 test 都差。</li>
+    <li><strong>高 variance（过拟合）</strong>：模型太灵活，把训练集的噪声也学了进去，换一批训练数据预测就大变。表现为 train 很好、test 差。</li>
+    <li><strong>不可约噪声</strong> $\sigma^2$：数据生成本身的随机性，任何模型都消不掉，它是测试误差的理论下界。</li>
+  </ul>
+  <div class="ascii">
+   误差
+   │ ╲                              ╱   总测试误差 = bias² + variance + σ²
+   │  ╲bias²                       ╱        （两条曲线之和，呈 U 形）
+   │   ╲___                   ___╱variance
+   │       ‾‾‾─────●─────‾‾‾              ● = 最优复杂度（U 形谷底）
+   │ ───────────────────────── σ²        （不可约噪声地板）
+   └───────────────────────────────► 模型复杂度
+     欠拟合(高bias)   甜点    过拟合(高variance)
+  </div>
+  <p>这三项构成了著名的<strong>权衡</strong>：增加模型复杂度（更深的树、更多参数）通常降 bias 但升 variance；正则化、早停、更多数据则压 variance。最优复杂度落在两条曲线之和的谷底（上图 ●）。notebook 里你会用 <span class="term">bootstrap</span> 在真实数据上把这件抽象的事做实：对同一模型类、不同复杂度，重采样训练很多次，逐点估计预测的 bias² 与 variance，画出那条经典的 U 形测试误差曲线。</p>
+  <p>这个分解还给了你一套<strong>诊断语言</strong>，把「模型不好」翻译成可操作的方向。如果 train 误差和 test 误差都高、且彼此接近，说明 bias 主导（欠拟合）——该加复杂度、减正则、加特征。如果 train 误差很低但 test 误差明显更高（出现一道「泛化间隙」），说明 variance 主导（过拟合）——该加正则、早停、或喂更多数据。这正是面试里「你的模型欠拟合还是过拟合，怎么判断、怎么治」这道高频题的标准答法：先看 train/test 误差的<em>差</em>，再对症下药。注意 $\sigma^2$ 这一项是地板——当 test 误差已逼近不可约噪声，再怎么调模型也没用，该去改进数据或标签质量了。</p>
+  <div class="dual">
+    <div class="plain">
+      <h4>直白说</h4>
+      <p>bias 是「平均而言你瞄偏了多少」，variance 是「你每次打靶散得有多开」。又准又稳最好；但模型越复杂，越容易做到「平均很准」却「每次乱飘」——这就是过拟合。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨说</h4>
+      <p>期望在「重新采样训练集」这个随机源上取。bias 衡量模型类的表达力极限（近似误差），variance 衡量对训练集扰动的敏感度（估计误差）。深度学习的「double descent」现象提示这条经典 U 形在超参数化区会再次下降，是该框架的现代修正。</p>
+    </div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="reg"><span class="num">3</span>正则化与早停</h2>
+  <p>正则化是控制 variance 的主力武器。两种最常见的显式正则有清晰的概率解释（模块 02 已推过）：<strong>L2（岭回归）</strong>惩罚 $\lambda\|w\|_2^2$，把权重平滑地往 0 拉、抗共线性，等价于对权重施加<strong>零均值高斯先验后的 MAP 估计</strong>；<strong>L1（lasso）</strong>惩罚 $\lambda\|w\|_1$，产生<strong>稀疏</strong>解（很多权重恰好为 0，自动做特征选择），等价于<strong>拉普拉斯先验的 MAP</strong>。L1 之所以稀疏而 L2 不稀疏，几何上是因为 L1 的约束区是带尖角的菱形，最优解容易落在坐标轴上的顶点。</p>
+  <p><span class="term">早停</span>（early stopping）是一种<strong>隐式</strong>正则：在验证集 loss 开始回升的拐点处停止训练。它之所以等价于正则化，直觉是——优化从小初始值出发，走的步数越多、参数能到达的「复杂度」越高，提早停就限制了实际探索到的模型复杂度。在某些线性情形下，早停甚至可以证明与 L2 正则近似等价。它几乎零成本，是深度学习里最常用的正则手段之一。</p>
+  <p>除了 L1/L2/早停，深度学习还有一大类<strong>结构性正则</strong>：dropout（训练时随机丢弃神经元，逼网络不依赖单个单元、近似集成）、数据增强（对输入做保持标签的扰动，等价于注入先验知识）、以及第 5 模块讲过的 SGD 噪声本身（偏好平坦极小）。它们的共同精神都是「人为给模型施加约束或扰动，限制它过度拟合训练集的能力」。一个统一的看法是：<strong>正则化 = 把你对解的先验（应该平滑、应该稀疏、应该对扰动鲁棒）编码进训练目标或训练过程</strong>。这也呼应了模块 02 的 MAP 视角——先验既能写成损失项，也能藏在优化动力学里。</p>
+  <div class="callout warn"><span class="label"></span>
+  调正则强度 $\lambda$（以及早停的「何时停」）<strong>必须用验证集，绝不能用测试集</strong>。一旦你用测试集挑了 $\lambda$，测试集就被「偷看」了，它报出的泛化误差是乐观偏差的假数字。这是评测里最常见、也最隐蔽的<span class="term">数据泄漏</span>——很多论文的「惊人结果」就栽在这里。正确流程见第 7 节。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="conf"><span class="num">4</span>混淆矩阵与 precision/recall/F1</h2>
+  <p>二分类的一切阈值化指标都来自混淆矩阵的四个数：TP（真阳）、FP（假阳）、TN（真阴）、FN（假阴）。把它们组合一下：</p>
+  <div class="math-block">
+  $$ \text{Precision}=\frac{TP}{TP+FP},\qquad \text{Recall}=\frac{TP}{TP+FN},\qquad F_1=\frac{2\,P\,R}{P+R} $$
+  </div>
+  <div class="dual">
+    <div class="plain">
+      <h4>直白说</h4>
+      <p>Precision =「我喊『是』的那些里，真是的占多少」（别乱喊、别误报）。Recall =「所有真『是』的里，我抓到了多少」（别漏报）。抓垃圾邮件要高 precision（误杀正常邮件代价大）；癌症筛查要高 recall（漏诊一个代价极大）。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨说</h4>
+      <p>在<strong>不平衡</strong>数据上 precision/recall 比 accuracy 信息量大得多，因为它们都只盯着正类、不被海量负类稀释。$F_1$ 是 P 和 R 的调和平均（调和平均对小值敏感，逼着两者都不能太低）。调分类阈值会在 P 和 R 之间 trade-off——阈值升高，喊「是」更保守，precision 升、recall 降。</p>
+    </div>
+  </div>
+  <p>多分类时这些指标要先选「平均方式」，这又是一个常被混淆的口径。<strong>macro 平均</strong>对每个类各算一遍指标再简单平均，每个类权重相等，因此<em>放大</em>了稀有类的重要性；<strong>micro 平均</strong>把所有类的 TP/FP/FN 汇总后再算，等价于按样本数加权、被多数类主导；<strong>weighted 平均</strong>按各类样本量加权 macro。在不平衡多分类里，报 macro-F1 还是 micro-F1 能差出很多，且对应着完全不同的关切（是否在意稀有类）。写报告时「F1=0.8」不交代是哪种平均、哪个阈值，几乎等于没说。</p>
+  <div class="callout intuition"><span class="label"></span>
+  <strong>微例（accuracy 如何骗人）。</strong>设一个 99:1 的数据集（99% 负类）。一个「永远预测负类」的弱智模型 accuracy = 99%，听起来很棒。但它的 recall = 0/（全部正类）= 0，precision 未定义——它对真正关心的正类<em>一个都没抓到</em>。这就是为什么不平衡数据上必须先报 <span class="term">majority baseline</span>（模块 00）并改看 precision/recall：99% 这个数字本身毫无意义，因为 baseline 就有 99%。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="roc"><span class="num">5</span>ROC、AUC 与 PR 曲线</h2>
+  <p>分类器内部输出的是连续的概率/分数，阈值只是事后切一刀。与其固定一个阈值，不如看<strong>所有阈值</strong>下的表现：扫过所有阈值，每个阈值给出一对 (FPR, TPR)，连成 <span class="term">ROC 曲线</span>，曲线下面积就是 <span class="term">AUC</span>。</p>
+  <div class="math-block">
+  $$ \text{TPR}=\frac{TP}{TP+FN}\ (\text{=recall}),\qquad \text{FPR}=\frac{FP}{FP+TN},\qquad \text{AUC}=\Pr(\text{score}_+ > \text{score}_-) $$
+  </div>
+  <p>AUC 有一个优美的概率解释：<strong>随机取一个正样本和一个负样本，模型给正样本打分更高的概率</strong>。它只依赖分数的<strong>排序</strong>，因此 AUC=0.5 等于瞎猜、1.0 完美，且<strong>不依赖阈值、不依赖类别比例</strong>——这让它成为「排序能力」的纯净度量。这个等价于 Mann–Whitney U 统计量的定义，也给出了一个免画图的算法：把所有正负样本对数一遍即可（notebook 用秩统计 $O(n\log n)$ 实现）。</p>
+  <p>正因为 AUC 只看排序、不看绝对值，它有一个常被误解的局限：<strong>AUC 高不代表概率可用</strong>。一个模型可以 AUC=0.95（排序极好）却严重过自信（概率全挤在 0/1 附近），此时你若拿它的概率去做阈值决策或风险估计就会出错——这正引出第 6 节的校准。另一个细节是 ROC 曲线的左下角到左上角那段（低 FPR 区）对很多实际应用最重要（你能容忍的误报预算往往很低），但它在「整条曲线下面积」里只占很小权重，于是有人会改报「部分 AUC」（partial AUC）或固定 FPR 处的 TPR。一句话：AUC 是个好的<em>单数字摘要</em>，但单数字摘要永远会丢信息，关键决策要回到曲线本身。</p>
+  <div class="callout danger"><span class="label"></span>
+  <strong>极不平衡时 ROC/AUC 会过于乐观、甚至误导。</strong>原因在 FPR 的分母 $TP{+}\ldots$ 不对——是 $FP/(FP+TN)$，负类海量时 $TN$ 极大，几百个 FP 也几乎不动 FPR，于是 ROC 看起来很漂亮。这种场景应改看 <strong>PR 曲线 / PR-AUC</strong>：precision 的分母是 $TP+FP$，对正类的稀有非常敏感，少量 FP 就会显著拉低 precision。Adult 数据正类仅约 24%，notebook 里你会看到 ROC 和 PR 两条曲线讲出截然不同的故事——这正是 Saito &amp; Rehmsmeier 2015 的核心论点。</div>
+
+  <table>
+    <thead><tr><th>维度</th><th>ROC / AUC</th><th>PR 曲线 / PR-AUC</th></tr></thead>
+    <tbody>
+      <tr><td>两轴</td><td>FPR vs TPR</td><td>Recall vs Precision</td></tr>
+      <tr><td>随机基线</td><td>对角线，AUC = 0.5（与类别比例无关）</td><td>水平线 = 正类比例（随不平衡而下移）</td></tr>
+      <tr><td>对类别不平衡</td><td><strong>不敏感</strong>——FPR 分母含海量 TN，掩盖 FP</td><td><strong>敏感</strong>——precision 分母 $TP{+}FP$ 直接暴露 FP</td></tr>
+      <tr><td>极不平衡时</td><td>过于乐观、易误导</td><td>更诚实地反映正类检测难度</td></tr>
+      <tr><td>该用哪个</td><td>类别大致平衡、关心整体排序</td><td>正类稀有且是关注焦点（欺诈/疾病/安全）</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="cal"><span class="num">6</span>校准：概率可信吗</h2>
+  <p>排序对了还不够。一个模型说「这条样本 80% 概率是正类」，在所有它说 80% 的样本里，真有 80% 是正类吗？这就是<span class="term">校准</span>（calibration）。关键认识是：<strong>好的排序（高 AUC）≠ 好的校准</strong>——一个模型可以把样本排得完美无缺，却把所有概率都系统性地推到接近 0 或 1（过自信），此时 AUC 满分但概率完全不可信。</p>
+  <p>衡量校准用<span class="term">可靠性图</span>（reliability diagram）和 <span class="term">ECE</span>（期望校准误差）：把预测概率分成若干桶，每桶比较「平均预测概率 conf」与「实际正类比例 acc」，加权求差的绝对值：</p>
+  <div class="math-block">
+  $$ \text{ECE}=\sum_{b}\frac{|B_b|}{n}\,\big|\,\text{acc}(B_b)-\text{conf}(B_b)\,\big| $$
+  </div>
+  <p>修复校准最简单的事后方法是<span class="term">温度缩放</span>（temperature scaling）：给 logit 统一除以一个标量温度 $T$（在验证集上拟合 $T$ 使 NLL 最小），$T>1$ 把过自信的概率「软化」、$T<1$ 锐化。它<strong>只改概率尺度、完全不改排序</strong>（因此不影响 accuracy 和 AUC），却能大幅降低 ECE。Guo et al. 2017 系统地发现现代深度网络<strong>普遍过自信</strong>，且温度缩放这一招简单到几乎成了标配。</p>
+  <p>ECE 本身也有要警惕的地方：它依赖<strong>分桶方式</strong>——桶数太少会掩盖桶内的校准误差、太多则每桶样本少、估计噪声大。等宽分桶在概率分布不均时（大量样本挤在某个区间）会让某些桶几乎空、某些桶过载，所以有时改用等频分桶或更稳健的校准度量。还要分清两类校准目标：<strong>confidence calibration</strong> 只要求「预测类的置信度」可信，<strong>classwise / multiclass calibration</strong> 要求每一类的概率都可信，后者严格得多。报 ECE 时务必交代桶数与分桶方式，否则又是一个「不说口径的数字」。</p>
+  <div class="callout intuition"><span class="label"></span>
+  评测 LLM 的「置信度 / 不确定性」时，校准是核心。一个模型若张口就说「我 95% 确定」但实际只对 60%，它的不确定性表达就是坏的——这直接决定你能不能信任它的自评、能不能放心用它当 judge、能不能用它的置信度做选择性回答（拒答低置信样本）。校准把「概率」从一个装饰性数字变成可以据以决策的量。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="cv"><span class="num">7</span>交叉验证与数据泄漏</h2>
+  <p>数据量有限时，单次 train/val 划分的方差很大——换个随机种子，验证分可能上下浮动好几个点，据此选模型很不可靠。<span class="term">k-fold 交叉验证</span>把训练数据分成 $k$ 折，轮流用 1 折当验证、其余 $k{-}1$ 折训练，平均 $k$ 个验证分。它用「多次复用数据」换来了更稳的估计，是<strong>选超参</strong>（如 $\lambda$、树深）的标准做法。$k$ 的选择本身是一个偏差-方差权衡：$k$ 大（如留一法 LOOCV，$k$ 等于 $n$）每次训练用的数据多、估计偏差小，但 $k$ 个模型彼此高度相关、平均后方差降不下来，且要训 $n$ 次很贵；$k$ 小则反之。实践中 $k=5$ 或 $10$ 是公认的甜点，不平衡数据还要用<strong>分层 k-fold</strong>（每折保持类别比例）以免某折里稀有类样本过少。</p>
+  <p>但 CV 用错就成了泄漏温床。核心铁律：<strong>测试集只能碰一次</strong>，且任何「从数据学到的东西」都不能跨越训练/测试的边界。最常见的三个泄漏坑——</p>
+  <ul>
+    <li><strong>预处理泄漏</strong>：标准化的均值/方差、PCA 的主成分、特征选择，必须<em>只</em>在训练折上拟合，再应用到验证折。在全集上 <code>fit</code> 再划分，就把验证集信息漏进了预处理。</li>
+    <li><strong>用测试集选超参</strong>：拿测试集反复试 $\lambda$、挑最好的——这等于把测试集变成了验证集，报出的泛化是假的。正解是<strong>嵌套 CV</strong>：外层 CV 估泛化、内层 CV 选超参，两层数据严格隔离。</li>
+    <li><strong>时间/分组泄漏</strong>：时间序列若随机划分，会用未来预测过去；同一用户的样本散落在训练和测试两边，也会高估性能。应按时间或分组划分。</li>
+  </ul>
+  <div class="callout danger"><span class="label"></span>
+  <strong>这是评测里最致命、最常见的错误。</strong>报告流程应当是：用 CV / 嵌套 CV 在<em>训练数据内部</em>完成一切调参与模型选择，定稿之后，<strong>才</strong>把测试集拿出来跑一次、报最终成绩，且这个数字不再据以做任何修改。每多看一次测试集做决策，你的「泛化估计」就乐观一分。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="thresh"><span class="num">8</span>阈值选择与代价</h2>
+  <p>默认 0.5 阈值绝不是金科玉律——它只是「两类先验相等且两类错误代价相同」时的最优选择，而现实几乎从不满足。选阈值本质是一个<strong>代价问题</strong>：把假阳代价 $C_{FP}$ 和假阴代价 $C_{FN}$ 写出来，最优阈值就由它们的比值决定。</p>
+  <div class="math-block">
+  $$ \text{当}\ \;C_{FN}\,\Pr(y{=}1\mid x) \;>\; C_{FP}\,\Pr(y{=}0\mid x)\ \;\text{时判正}\;\;\Longrightarrow\;\; \text{阈值}\;\tau^*=\frac{C_{FP}}{C_{FP}+C_{FN}} $$
+  </div>
+  <p>癌症筛查里漏诊（FN）代价远高于误报（FP），于是 $\tau^*$ 应远低于 0.5（宁可多召回、多复查）；垃圾邮件里误杀正常邮件（FP）代价高，$\tau^*$ 应高于 0.5。当代价不明确时，正确做法不是硬选一个阈值，而是<strong>直接报整条 ROC/PR 曲线</strong>，把「在哪个工作点运行」的决定权交给下游。还有一个微妙但重要的纪律：阈值（以及它依赖的校准/温度）也是<em>从数据学到的参数</em>，必须在<strong>验证集</strong>上选定，再在测试集上评估。在测试集上挑最优阈值，又是一种把测试集变成训练集的泄漏——和第 7 节选超参的道理一模一样。</p>
+  <div class="callout warn"><span class="label"></span>
+  报单一指标时务必说清它绑定的阈值与代价假设。说「F1 = 0.7」而不交代阈值，等于没说——同一个模型换个阈值 F1 可以大不一样。<strong>指标选择即价值判断</strong>：你报 F1、AUC、还是 recall@precision=0.9，背后都是「你更怕哪种错」的取舍，评测科学家的职责就是把这个取舍讲明白、而不是藏在一个数字后面。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>LLM 的不确定性与校准</strong>：生成式模型的「置信度」该怎么定义（token 概率？语义熵？自洽性？多次采样的一致度？），以及如何校准它们用于选择性回答、幻觉检测、和当 LLM-judge——是评测前沿的热点，也直接关系到能否信任模型的自评。一个有趣的发现是：RLHF 等对齐微调常常<em>损害</em>预训练模型原本不错的校准（让模型变得过度自信），这给「对齐税」又添了一个维度。</li>
+    <li><strong>Goodhart 与 benchmark 过拟合</strong>：「当一个指标成为目标，它就不再是好指标」。整个社区对公开 benchmark 的反复刷分，会让分数与真实能力脱钩（数据污染、过拟合排行榜）。如何设计抗 Goodhart 的评测、如何检测训练集污染（如用 canary 字符串、或检查模型对测试样本的异常低困惑度），是 C3 评测科学课的核心议题。</li>
+    <li><strong>double descent 与过参数化泛化</strong>：经典 bias-variance U 形在模型参数远超样本数时会出现「二次下降」，越过插值阈值后测试误差反而再次降低，深度网络反常地越大越好。统一解释经典统计直觉与现代过参数化现象（为什么能完美记住训练集却仍泛化），仍是开放的理论问题。</li>
+    <li><strong>分布偏移下的指标</strong>：训练/测试同分布的假设在部署中几乎总被打破。OOD 下 AUC、校准如何退化，如何在没有标签的目标域估计性能（如通过置信度、或用一小批标注探针），是可靠部署的关键缺口；很多线上事故的根因，正是上线时分布已悄悄偏离了离线评测时的分布。</li>
+    <li><strong>聚合与公平性指标</strong>：把全局指标拆到子群（不同人群、不同难度桶）上看，常常暴露被平均数掩盖的系统性失败——一个整体 AUC 很高的模型可能在某个少数子群上几乎随机。如何在多个子群指标间权衡（最差组性能？均衡误差？），以及这些选择背后的价值判断，是评测与公平性交叉的活跃方向。</li>
+  </ul>
+  <div class="callout paper"><span class="label"></span>
+  Fawcett 2006 <em>An introduction to ROC analysis</em>；Guo et al. 2017 <em>On Calibration of Modern Neural Networks</em>（温度缩放）；
+  Saito &amp; Rehmsmeier 2015（不平衡下 PR 优于 ROC）；Hastie et al. <em>ESL</em> ch.7（bias-variance 与模型选择）。详见 <a href="../references.md">论文清单</a>。</div>
+  <div class="callout intuition"><span class="label"></span>
+  学完本章，你应该能：从零画 ROC/PR 并用秩统计算 AUC、从混淆矩阵算 precision/recall/F1、用 ECE + 可靠性图诊断校准并理解温度缩放为何不改排序、设计无泄漏的（嵌套）交叉验证流程、并从代价出发选阈值。这是 C3 评测科学课最直接的地基。下面去 notebook，在真实不平衡的 Adult 收入数据上把这些指标全部从零实现一遍，亲眼看 ROC 与 PR 怎样讲出不同的故事。</div>
+
+  <div class="pager">
+    <a href="../05_optimizers_from_scratch/05_讲解.html"><div class="dir">← 上一模块</div><div class="t">05 · 优化器从零</div></a>
+    <a class="next" href="06_generalization_metrics.ipynb"><div class="dir">Notebook →</div><div class="t">打开配套练习</div></a>
+  </div>
+</div>
+</body>
+</html>

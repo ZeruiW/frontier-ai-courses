@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 显存解剖与 Roofline</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 07</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 显存解剖与 Roofline</h1>
+  <p class="subtitle">训练显存的四块大头，为什么只算参数会严重低估，以及 roofline 怎么判断瓶颈在算力还是带宽——这是后面所有系统课的“账本 / 面试地基”。</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00（参数量 $P$ 的数法）、基础线代与浮点常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_memory_roofline.ipynb（真实数据）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Williams et al. 2009（Roofline）；Rajbhandari et al. 2020（ZeRO）；Korthikanti et al. 2022（activation 重计算）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#four">训练显存的四块大头</a></li>
+      <li><a href="#adam">为什么优化器状态常比参数还大</a></li>
+      <li><a href="#act">Activation 为什么随 batch×seq 暴涨</a></li>
+      <li><a href="#ledger">数值账例：真实 Pythia 逐块算 GB</a></li>
+      <li><a href="#roof">Roofline：算力 bound 还是带宽 bound</a></li>
+      <li><a href="#intensity">算术强度账例：matmul 1365 vs 解码 1</a></li>
+      <li><a href="#drill">面试 drill：能不能放进这张卡</a></li>
+      <li><a href="#frontier">后面几章都在打这四块账 + 开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="four"><span class="num">1</span>训练显存的四块大头</h2>
+  <p>到目前为止（模块 00），我们只学会了数模型有多少个<span class="term">parameters</span>——一个 <code>pythia-1.4b</code> 有约 14 亿个权重。于是很自然会以为：fp16 下每个权重 2 字节，14 亿 × 2 ≈ 2.8GB，那随便一张消费卡都装得下。这个推断对<strong>推理</strong>勉强成立，对<strong>训练</strong>却<strong>严重低估</strong>——这是初学者第一个、也是最贵的认知错误。</p>
+  <p>训练时显存被<strong>四块大头</strong>吃掉，参数只是其中最小的一块。把这个账本背下来，你就能在面试白板上、在 OOM（<span class="term">out of memory</span>）报错前，几秒钟估出任何模型的训练显存需求：</p>
+  <div class="math-block">\[\text{显存}\approx\underbrace{P\cdot b_p}_{\text{参数}}+\underbrace{P\cdot b_g}_{\text{梯度}}+\underbrace{P\cdot b_o}_{\text{优化器状态}}+\underbrace{\text{Activations}}_{\text{随 batch}\times\text{seq}}\]</div>
+  <ul>
+    <li><strong>参数</strong>：$P$ 个权重，每个 $b_p$ 字节（fp16/bf16=2，fp32=4）。前向反向都要用它。</li>
+    <li><strong>梯度</strong>：和参数一一对应，反向算出来、优化器更新前要存着，大小与参数同量级。</li>
+    <li><strong>优化器状态</strong>：Adam 给每个参数额外存一阶动量 $m$、二阶动量 $v$，混合精度下还要一份 fp32 主权重——下一节会看到这块最大。</li>
+    <li><strong>Activations</strong>：前向产生、反向链式法则要复用的中间张量，随 batch $B$、序列长度 $S$、层数 $L$ 增长，长上下文里它常是第一个爆的。</li>
+  </ul>
+  <p>这四块里，前三块（参数、梯度、优化器状态）都正比于参数量 $P$，是<strong>和负载无关的固定成本</strong>：只要模型选定、优化器选定、精度选定，它们就钉死了，开机就占满。第四块 activation 则<strong>正比于你喂进去的 batch×seq</strong>，是<strong>可调、可压、也最容易失控</strong>的一块。理解这条“三块固定、一块浮动”的结构，是看懂后面所有省显存技巧的前提——模块 02 压的就是浮动那块和固定块的字节数，模块 03 把固定块分摊到多卡。</p>
+  <div class="callout intuition"><span class="label"></span>
+    <p>一句话直觉：训练显存 ≈ <strong>参数 × 一个倍数（约 16）+ 一坨随 batch×seq 涨的 activation</strong>。只算参数 $2P$，等于把账本里最小的一项当成全部，自然得出“24GB 够了”的错误结论。本章就是把这四块逐一拆开、逐一会算；学完你应当能对着任意一个模型名，三十秒内报出它训练 / 推理各要多少显存、卡在算力还是带宽。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="adam"><span class="num">2</span>为什么优化器状态常比参数还大</h2>
+  <p>为什么优化器状态能比参数本身还大？因为现代训练几乎都用<strong>混合精度 Adam</strong>（fp16/bf16 计算 + fp32 主权重）。逐字节拆开一个参数在训练时的真实占用：</p>
+  <div class="math-block">\[\underbrace{2}_{\text{fp16 权重}}+\underbrace{2}_{\text{fp16 梯度}}+\underbrace{4}_{\text{fp32 主权重}}+\underbrace{4}_{\text{fp32 }m}+\underbrace{4}_{\text{fp32 }v}=16\ \text{字节/参数}\]</div>
+  <p>于是有了那条著名经验法则：<strong>Adam 混合精度训练 ≈ 16 字节/参数</strong>（不含 activation）。拆开看更触目惊心——光<strong>优化器状态</strong>（fp32 主权重 4 + $m$ 4 + $v$ 4 = 12 字节）就占 <code>12/16 = 75%</code>，是 fp16 权重本身（2 字节）的<strong>六倍</strong>。真正吃显存的不是模型，是这一大群“陪练”的状态。</p>
+  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>Adam 不只存权重，还为每个权重存两个“历史记录本”：一个记最近梯度的平均方向（动量 $m$），一个记最近梯度的平均平方（方差 $v$，用来给每个参数自适应步长）。而且为了数值稳定，更新这步要在高精度 fp32 上做，于是还要存一份 fp32 主权重。三本账加起来，比模型本体重得多。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，混合精度配方是：fp16/bf16 副本用于快速前向反向、fp32 主权重承载真正的累积更新，避免 fp16 上 $w\mathrel{+}=\eta g$ 因尾数太短而“吃掉”微小更新（模块 02 详述）。ZeRO（模块 03）正是盯上这 12 字节：把 $m,v$、fp32 主权重在数据并行组里<strong>分片</strong>，每卡只存 $1/N$，把 $16P$ 降到约 $16P/N$。</p></div>
+  </div>
+  <p>这也解释了为什么<strong>换优化器是省显存的一个大杠杆</strong>。Adam 之所以重，是因为它给每个参数都维护 $m$ 和 $v$ 两份 fp32 统计量；如果改用只带一个动量缓冲的 SGD，优化器状态直接砍掉一半。近年的 8-bit Adam（把 $m,v$ 量化成 8 位存储）、Adafactor（用秩一分解近似 $v$，把它从 $O(P)$ 降到 $O(\sqrt P)$）都是冲着这 12 字节去的。记住：<strong>优化器状态是训练显存里最大、也最有“可砍空间”的一块</strong>，模块 03 的 ZeRO 是分摊它，这些低比特优化器是直接缩小它。</p>
+  <div class="callout warn"><span class="label"></span>
+    <p>别把“16 字节/参数”当成铁律。它是<strong>混合精度 Adam</strong>的数字。换优化器就变：<code>SGD with momentum</code> 只有一个动量缓冲（约 2+2+4+4=12 字节/参数）；纯 fp32 Adam 是 4+4+4+4+4=20 字节；推理则根本没有梯度和优化器状态，只剩约 $2P$。面试时先问清楚“什么优化器、什么精度、训练还是推理”，再套公式——不问清场景就报数字，是这一节最常见的失分点。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="act"><span class="num">3</span>Activation 为什么随 batch×seq 暴涨</h2>
+  <p>第四块——activation——是唯一<strong>不随参数、只随负载</strong>变化的一块，也是长上下文训练里最先爆的一块。粗略地，一层 Transformer 前向要缓存的中间张量正比于该层的 token 总数 $B\cdot S$ 乘以隐藏维 $h$：</p>
+  <div class="math-block">\[\text{Act}\approx \underbrace{c\cdot L\cdot B\cdot S\cdot h\cdot b_a}_{\text{逐层线性项}}\;+\;\underbrace{B\cdot \text{heads}\cdot S^2}_{\text{注意力分数矩阵}}\]</div>
+  <p>两个关键性质决定了它的脾气：<strong>随 batch $B$ 线性涨</strong>（每条样本独立缓存一份），更要命的是<strong>随序列长度 $S$ 增长</strong>——逐层项随 $S$ 线性涨，而<span class="term">attention scores</span>那一项（每个 head 一张 $S\times S$ 的分数矩阵）随 <code>S^2</code> 暴涨。把上下文从 2K 拉到 8K，逐层 activation 翻 4 倍，注意力分数矩阵翻 16 倍。</p>
+  <p>这就解释了一个反直觉现象：参数明明放得下，一加长上下文就 OOM。瓶颈不在参数，在 activation。对策有两条，分别是后面两章的主角——<strong>activation checkpointing（重计算，模块 02）</strong>用算力换掉大部分 activation 显存；<strong>FlashAttention（模块 04）</strong>干脆不显式落地那张 $S^2$ 矩阵，把它分块在 SRAM 里算掉。</p>
+  <p>还有一个常被忽略的细节：activation 显存随 batch<strong>严格线性</strong>，所以它是<strong>梯度累积</strong>（模块 02）省显存的物理基础——把一个大 batch 拆成 $k$ 个小 micro-batch 逐个跑，峰值 activation 只需容纳一个小批，却能在数学上等价出大批的梯度。换句话说，前三块固定成本你只能靠并行 / 量化去摊，唯独 activation 这块，你可以用“拆小批 + 重计算”在单卡上就把它压下去。</p>
+  <div class="callout danger"><span class="label"></span>
+    <p><strong>只算参数会严重低估训练显存。</strong>一个 fp16 的 7B 模型参数才 14GB，听着 24GB 卡够用——但加梯度 14GB、再加 Adam 状态约 56GB（fp32 主权重 + $m$ + $v$），<strong>光这三块就 84GB</strong>，还没算 activation，单卡 RTX 4090（24GB）根本放不下。这正是为什么全量训练大模型必须并行（模块 03）或量化优化器状态。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">4</span>数值账例：真实 Pythia 逐块算 GB</h2>
+  <p>光记公式不如算一遍真账。下面用<strong>真实的 Pythia 配置</strong>（notebook 会直接读 HuggingFace 的 <code>config.json</code>）对三个规模逐块算 GB，再判断能否放进两张代表性的卡：消费旗舰 <strong>RTX 4090（24GB）</strong>和数据中心主力<strong>A100（80GB）</strong>。统一取混合精度 Adam（$16P$），activation 取 $B=1,S=2048$ 的粗估、且<strong>未开重计算</strong>。</p>
+  <table>
+    <thead><tr><th>模型</th><th>参数 $P$</th><th>推理 $2P$</th><th>训练状态 $16P$</th><th>Act($B{=}1,S{=}2048$)</th><th>训练总计</th><th>判定</th></tr></thead>
+    <tbody>
+      <tr><td>pythia-1.4b</td><td>1.4B</td><td>≈2.8GB</td><td>≈22GB</td><td>≈3GB</td><td>≈25GB</td><td>4090 勉强超、A100 轻松</td></tr>
+      <tr><td>pythia-6.9b</td><td>6.9B</td><td>≈14GB</td><td>≈110GB</td><td>≈9GB</td><td>≈119GB</td><td>4090 远不够、单张 A100 也放不下</td></tr>
+      <tr><td>pythia-12b</td><td>11.6B</td><td>≈23GB</td><td>≈186GB</td><td>≈14GB</td><td>≈200GB</td><td>必须多卡（模块 03）</td></tr>
+    </tbody>
+  </table>
+  <p>读这张表的方法：先看<code>2P</code>那列——它说明<strong>推理</strong>（fp16，参数 + 少量 activation + KV cache）门槛低，连 12B 都能在单张 24GB 卡上跑推理或做 LoRA。再看 <code>16P</code> 那列——它一下跳到推理的 8 倍，这就是<strong>全量训练</strong>的真实门槛。pythia-6.9b 训练要约 119GB，连单张 80GB A100 都装不下，必须分片或多卡。</p>
+  <p>再多看一眼这张表能读出的趋势：随着 $P$ 翻倍，前三块（$16P$）严格翻倍，而 activation 在固定 $B,S$ 下只随隐藏维 $h$ 与层数 $L$ 缓慢增长，所以<strong>模型越大，优化器状态那块占比越高、activation 占比越低</strong>。这反过来告诉你省显存该往哪使劲：小模型 / 长上下文，先压 activation（重计算）；大模型，先分摊优化器状态（ZeRO）。notebook 会让你把 1.4b / 6.9b / 12b 三档的逐块占比画成堆叠柱状图，亲眼看到这条占比迁移曲线，而不是只背一个孤立数字。</p>
+  <div class="callout intuition"><span class="label"></span>
+    <p>把这张表的结论刻进脑子：<strong>推理看 $2P$，训练看 $16P$，长上下文还要叠 activation</strong>。所以同一张 24GB 卡，跑 7B 推理绰绰有余，全量训 7B 却差着一个数量级——这不是工程没调好，是显存账本身的硬下界。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="roof"><span class="num">5</span>Roofline：算力 bound 还是带宽 bound</h2>
+  <p>会不会算显存只是第一步；第二个核心问题是：模型跑起来<strong>快不快、卡在哪</strong>。答案由<span class="term">Roofline</span>模型给出。任何 kernel 的执行时间都被两条下界卡住，取其大者：要么受算力（峰值 FLOP/s）限制，要么受访存带宽（byte/s）限制。</p>
+  <div class="math-block">\[T\ge\max\!\Big(\frac{\text{FLOPs}}{\text{峰值算力}},\ \frac{\text{bytes}}{\text{带宽}}\Big),\qquad \text{拐点强度}=\frac{\text{峰值算力}}{\text{带宽}}\]</div>
+  <p>决定落在哪条下界上的，是<strong>算术强度</strong>（<span class="term">arithmetic intensity</span>）=<code>FLOPs / bytes</code>：每从显存搬一个字节，能换来多少次浮点运算。把它和硬件的“拐点强度”比——拐点 = 峰值算力 ÷ 带宽——就知道瓶颈在哪：</p>
+  <ul>
+    <li><strong>强度 &gt; 拐点</strong> → <span class="term">compute-bound</span>：数据搬得够多、算得过来，能吃满算力。大矩阵乘属于这类。</li>
+    <li><strong>强度 &lt; 拐点</strong> → <span class="term">memory-bound</span>：算力等着带宽喂数据，大部分时间在空转。逐元素操作、softmax、小 batch 解码属于这类。</li>
+  </ul>
+  <div class="ascii"> 性能
+ │        ___________ 峰值算力（compute-bound 平顶）
+ │       /
+ │      /  ← 带宽斜坡（memory-bound）
+ │     /
+ └────┴──────────────► 算术强度 (FLOPs/byte)
+     拐点 = 峰值算力 / 带宽</div>
+  <p>A100（SXM, fp16/bf16）峰值约 <code>312 TFLOP/s</code>、HBM 带宽约 <code>2 TB/s</code>，拐点 ≈ <code>312e12 / 2e12 ≈ 156 FLOP/byte</code>。这条数字是本章后面所有判断的标尺：一个 kernel 的算术强度若远超 156 就是 compute-bound，远低于 156 就是 memory-bound。</p>
+  <p>有个常见的认知偏差要在这里纠正：很多人以为“买更快算力的卡就能让 LLM 推理更快”。但若你的负载是 memory-bound（强度远低于拐点），<strong>决定速度的是 HBM 带宽而非峰值 FLOP/s</strong>——堆算力只会把拐点右移、让你离带宽墙更远，一点也不提速。H100 相比 A100 推理变快，很大程度上是因为它的 HBM 带宽（约 3.35 TB/s）涨了，而不只是算力涨了。<strong>先判断 bound 在哪，再决定该堆算力还是堆带宽</strong>，这是 Roofline 给系统选型最实用的一条指导。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="intensity"><span class="num">6</span>算术强度账例：matmul 1365 vs 解码 1</h2>
+  <p>把算术强度从抽象公式落成两个<strong>具体数字</strong>，你就再也不会搞混 LLM 哪里慢、为什么慢。用 A100 拐点 ≈ 156 当标尺。</p>
+  <h4>例一：大矩阵乘（训练 / prefill）</h4>
+  <p>取 $m=n=k=4096$ 的方阵乘 $C=AB$（fp16，每元素 2 字节）。FLOPs ≈ <code>2mnk = 2·4096³</code>；要搬的字节 ≈ 读 $A,B$ 写 $C$ = <code>3·4096²·2</code>。强度：</p>
+  <div class="math-block">\[I_{\text{matmul}}=\frac{2\cdot4096^3}{3\cdot4096^2\cdot2}=\frac{4096}{3}\approx 1365\ \text{FLOP/byte}\]</div>
+  <p>1365 ≫ 156，远在拐点右侧 → <strong>compute-bound</strong>。这就是为什么大模型训练、以及推理的 <span class="term">prefill</span>（一次性吃整段 prompt）能把昂贵的 Tensor Core 喂饱，硬件利用率高。</p>
+  <h4>例二：自回归解码（逐 token 生成）</h4>
+  <p>解码时一次只生成 1 个 token，矩阵乘退化成<strong>矩阵 × 向量</strong>（$m=1$）。权重矩阵 $4096\times4096$ 必须整张读进来（约 <code>4096²·2</code> 字节），却只做 <code>2·1·4096·4096</code> 次乘加。强度：</p>
+  <div class="math-block">\[I_{\text{decode}}=\frac{2\cdot1\cdot4096\cdot4096}{4096^2\cdot2}\approx 1\ \text{FLOP/byte}\]</div>
+  <p>强度 ≈ 1 ≪ 156，深陷拐点左侧 → <strong>严重 memory-bound</strong>。每生成一个 token 都要把全部权重从 HBM 拖一遍，算力几乎全程空转。这就是 LLM<strong>解码慢</strong>的物理根因，也是模块 06 用 <span class="term">batching</span>（多请求共享一次权重读取，把 $m=1$ 拉成 $m=B$）和 <span class="term">speculative decoding</span>把强度拉回 compute-bound 区的动机。</p>
+  <div class="callout intuition"><span class="label"></span>
+    <p>同一个 4096 方阵，训练里强度 1365、解码里强度 1——相差三个数量级。<strong>瓶颈不在算子本身，在 batch 维度</strong>：批量大 → 摊薄权重读取 → compute-bound；批量等于 1 → 权重读取无法摊薄 → memory-bound。记住这一点，你就能秒答“为什么同一张卡训练利用率高、解码利用率个位数”。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="drill"><span class="num">7</span>面试 drill：能不能放进这张卡</h2>
+  <p>这一节把前面所有账本浓缩成几道高频面试题与它们的标准答法、以及最常踩的陷阱。这门课的全部价值，就在你能在白板上把这些当场算清楚——不是背结论，而是<strong>当场推</strong>。面试官问的从来不是“7B 训练要多少 GB”这种死数字，而是看你<em>会不会先拆成四块、会不会先问场景</em>。</p>
+  <h4>高频问题</h4>
+  <ol>
+    <li><strong>“X 模型能在 Y 卡上训 / 推吗？”</strong> 先问训练还是推理：推理套 $2P$ + KV cache（模块 06）+ 少量 activation；训练套 $16P$ + activation，留 10–20% 余量给碎片。再和卡的显存比。</li>
+    <li><strong>“为什么消费卡只能推理或 LoRA、不能全量训练？”</strong> 因为推理门槛 $2P$、全量训练门槛 $16P$ 差 8 倍；LoRA 只训极少量低秩参数，优化器状态几乎为零，于是能塞进 24GB。</li>
+    <li><strong>“为什么优化器状态比参数还大？”</strong> 混合精度 Adam 每参数 12 字节优化器状态（fp32 主权重 + $m$ + $v$）对 2 字节权重，占 75%。</li>
+    <li><strong>“怎么判断一个 kernel 卡在算力还是带宽？”</strong> 算它的算术强度 FLOPs/bytes，和硬件拐点（A100 ≈ 156）比：高于拐点 compute-bound、低于拐点 memory-bound。</li>
+  </ol>
+  <h4>三个最常踩的陷阱</h4>
+  <table>
+    <thead><tr><th>陷阱</th><th>错在哪</th><th>正确口径</th></tr></thead>
+    <tbody>
+      <tr><td>只算参数 $2P$</td><td>把最小的一块当全部，低估约 8 倍</td><td>训练用 $16P$ 起步</td></tr>
+      <tr><td>忘记 activation</td><td>长上下文里它常是第一个爆的</td><td>叠加 $c\,LBSh$ 项，必要时算重计算后的值</td></tr>
+      <tr><td>混淆训练 $16P$ 与推理 $2P$</td><td>把推理门槛套到训练上（或反之）</td><td>先确认场景，再选倍数</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn"><span class="label"></span>
+    <p>白板答题口诀：<strong>先分训练 / 推理 → 选 16P 或 2P → 叠 activation → 留 10–20% 余量 → 和卡显存比</strong>。任何一步漏了，结论就会差一个数量级。面试官要的不是精确到 GB，而是你<em>先问场景、按四块账拆</em>的思路。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>后面几章都在打这四块账 + 开放问题</h2>
+  <p>回头看，这一章给了你一把贯穿全课的<strong>尺子</strong>：训练显存四块账（参数 / 梯度 / 优化器 / activation）和 Roofline 算术强度。这两件工具看着朴素，却是后面每一节高级技巧的“为什么”——任何一个优化，要么在缩小这四块里的某一块、要么在把负载在 Roofline 上往 compute-bound 一侧挪。<strong>后面每一章，本质都是在打这四块账、或在 Roofline 上挪位置</strong>：</p>
+  <ul>
+    <li><strong>02 混合精度 / 重计算</strong>：降低每块的字节数（fp16/bf16/fp8）、用算力换 activation 显存（重计算）。</li>
+    <li><strong>03 并行</strong>：把四块账分摊到多卡，ZeRO/FSDP 专门分片那块最大的优化器状态。</li>
+    <li><strong>04 FlashAttention</strong>：消掉 activation 里的 $S^2$ 项，并把注意力从 memory-bound 拉向 compute-bound。</li>
+    <li><strong>05 量化 / 06 serving</strong>：推理侧的参数账（$2P$ → int8/int4）与 KV cache 账，以及用 batching 提升解码的算术强度。</li>
+  </ul>
+  <p>但要诚实地说，这把尺子是<strong>一阶近似</strong>，不是精确仿真。它能告诉你“数量级对不对、瓶颈在哪一侧”，却算不准最后那 10–30%。真实工程里，能不能放下往往卡在公式之外的细节——临时 buffer、显存碎片、框架预留。所以正确用法是：<strong>用账本快速排除明显不可行的方案、定位瓶颈维度，再用实测去校准那最后一截</strong>。下面几个开放问题，正是这把尺子目前还够不着的地方。</p>
+  <h4>开放问题</h4>
+  <ul>
+    <li>back-of-envelope 账本只给一阶估计，真实占用还受框架碎片、临时 buffer、cudnn workspace、通信缓冲影响，常比公式高 10–30%——如何把这些“暗显存”也纳入预算？</li>
+    <li>activation 的精确公式随架构（GQA、MoE、不同 norm 位置）变化很大，是否存在一个对现代 Transformer 足够准的统一闭式估计？</li>
+    <li>Roofline 是单 kernel 模型，端到端训练还叠加了通信、kernel 启动、CPU 调度等开销，如何把它扩展成“全系统 roofline”来定位真实瓶颈？</li>
+  </ul>
+  <div class="callout paper"><span class="label"></span>
+    <p>本章三篇地基论文：</p>
+  <ul>
+    <li>Williams, Waterman &amp; Patterson 2009 — <em>Roofline: An Insightful Visual Performance Model for Multicore Architectures</em>（算术强度 / 拐点的原始模型）。</li>
+    <li>Rajbhandari et al. 2020 — <em>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</em>（分片那块最大的优化器状态，模块 03 展开）。</li>
+    <li>Korthikanti et al. 2022 — <em>Reducing Activation Recomputation in Large Transformer Models</em>（activation 显存的精算与 selective recomputation，模块 02 展开）。</li>
+  </ul>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 总览与环境</div></a>
+    <a class="next" href="01_memory_roofline.ipynb"><div class="dir">下一模块 →</div><div class="t">打开配套练习</div></a>
+  </div>
+
+</div>
+</body>
+</html>

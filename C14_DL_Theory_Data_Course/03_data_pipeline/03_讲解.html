@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 数据流水线</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 数据流水线</h1>
+  <p class="subtitle">清洗、MinHash 近重复去重、shuffle 缓冲、分片、流式、质量统计 —— 从零搭一条预训练数据流水线，量化每一步的效果，并理解去重/去污染为何是评测可信度的前提</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、集合运算、哈希、概率（期望/方差）、一点点流式处理常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_data_pipeline.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Lee 2022、Broder 1997、Penedo 2023、Rae 2021、Raffel 2020</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么数据流水线决定成败</a></li>
+      <li><a href="#clean">清洗与质量过滤</a></li>
+      <li><a href="#dedupwhy">去重的理由与精确去重的局限</a></li>
+      <li><a href="#jaccard">Jaccard 相似度与 shingle</a></li>
+      <li><a href="#minhash">MinHash：用签名近似 Jaccard</a></li>
+      <li><a href="#shuffle">shuffle 缓冲与分片</a></li>
+      <li><a href="#pipeline">端到端流水线与量化</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么数据流水线决定成败</h2>
+  <p>前两个模块讲的是<strong>模型自身</strong>的反直觉行为。从这一模块起，我们把镜头转向<strong>喂给模型的数据</strong>——因为一个在评测圈流传已久、却长期被低估的事实是：<strong>预训练模型的质量，由数据流水线决定的部分，往往超过由架构或超参决定的部分</strong>。同等算力下，RefinedWeb、Gopher、Dolma 等工作反复证明：把数据清洗、过滤、去重做对，比调网络结构收益大得多。</p>  <p>「数据多就行、质量随意」是另一个要被打破的经典直觉。原始网络爬取（如 CommonCrawl）里充斥着 HTML 残骸、导航栏模板、SEO 垃圾、机器翻译、以及<strong>海量重复</strong>。把这些原封不动喂进去，模型会把算力浪费在记忆垃圾和重复内容上，还会把评测基准的泄漏样本一并背下来——<strong>数据问题会直接污染你对模型能力的判断</strong>，这正是评测科学家必须懂数据流水线的原因。</p>  <p>一条典型的预训练数据流水线，是把原始字节变成可训练 token 的一连串处理。本模块从零搭出它的核心环节，并<strong>量化每一步到底改变了什么</strong>：</p>  <div class="ascii">原始爬取语料
+   │  ① 清洗/规范化   去 HTML、控制字符、修编码、统一空白
+   ▼
+   │  ② 质量过滤      长度、符号比、重复率、停用词比、(困惑度/分类器)
+   ▼
+   │  ③ 去重          精确去重 + MinHash 近重复去重(本模块重头戏)
+   ▼
+   │  ④ 混合/配比      多来源按比例混合(网页/书/代码...)
+   ▼
+   │  ⑤ shuffle 缓冲   流式近似全局打乱(缓冲越大越随机)
+   ▼
+   │  ⑥ 分片/打包      切 shard、按上下文长度打包 token
+   ▼
+  可训练数据  ──(顺带)──▶ decontamination: 移除评测基准的泄漏样本</div>  <p>还有一个贯穿本模块的工程哲学值得先点出：数据流水线的每一步几乎都是<strong>「廉价规则在前、昂贵模型在后」</strong>的级联，且每一步都是<em>有损</em>的——清洗会误删、过滤会误伤、去重会漏判、shuffle 不完美。没有哪一步是「无副作用」的，关键是让每步的收益（去掉的垃圾、重复、泄漏）远大于代价（误伤的好数据、引入的偏移）。这意味着流水线设计永远是<strong>权衡的艺术</strong>而非追求完美：你不可能去掉所有重复又不误伤任何文档，只能在召回与精确之间选一个对下游最有利的点。本模块每一步都会让你看到这个权衡的两面，而不是假装存在一个「正确答案」。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>这一模块给评测科学家的核心问题是：<strong>你怎么知道模型的高分是「真会」还是「数据里背过」？</strong>答案的第一道防线就在数据流水线——尤其是去重与去污染（decontamination）。如果评测基准的样本（或其近重复）混进了训练集，分数就失去意义。所以「读懂评测」和「读懂数据流水线」是同一件事的两面。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="clean"><span class="num">2</span>清洗与质量过滤</h2>
+  <h3>清洗与质量过滤：最朴素却最值钱</h3>  <p>流水线第一步是<span class="term">cleaning</span>（清洗/规范化）：剥掉 HTML 标签、去掉控制字符、修复编码错误（如 mojibake）、统一空白与 Unicode 形式。这些操作不性感，但<strong>脏数据会污染下游一切</strong>——一个没去干净的 HTML 模板会被当成「语言」反复学习。</p>  <p>第二步是 <span class="term">quality filtering</span>（质量过滤）：用一组启发式或分类器，剔除低质文档。Gopher [Rae 2021] 给出了一套被广泛沿用的启发式规则，核心几条：</p>  <table>
+    <thead><tr><th>过滤信号</th><th>判据（典型阈值）</th><th>想剔除什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>长度</strong></td><td>词数太少（<50）或太多</td><td>碎片、垃圾、异常文档</td></tr>
+      <tr><td><strong>符号比</strong></td><td>符号/词比 > 0.1</td><td>代码残渣、乱码、公式堆</td></tr>
+      <tr><td><strong>重复率</strong></td><td>重复行/段比例过高</td><td>模板、列表灌水、爬虫噪声</td></tr>
+      <tr><td><strong>停用词比</strong></td><td>停用词占比过低</td><td>关键词堆砌的 SEO 垃圾（非自然语言）</td></tr>
+      <tr><td><strong>困惑度/分类器</strong></td><td>参考模型 PPL 过高 或 质量分类器判低</td><td>整体不像优质文本的内容</td></tr>
+    </tbody>
+  </table>  <p>这些启发式的共同逻辑是：<strong>自然语言有稳定的统计特征</strong>（合理的长度、不太高的符号比、足够的停用词、不过分重复）。偏离这些特征太远的文档，大概率是噪声。值得注意的是<strong>没有完美的过滤器</strong>：每条规则都会误伤一些好文档、放过一些坏文档，阈值是<em>召回与精确的权衡</em>。过滤太松留垃圾，过滤太紧则砍掉长尾的有用内容、甚至引入<span class="term">distribution shift</span>（你过滤的偏好成了数据的偏好）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把过滤想成给一锅原料挑拣：明显的烂菜叶（乱码、模板）一眼挑走，但挑得太狠会把卖相不好却有营养的食材（小众但优质的文本）也扔了。手要稳，宁可稍微宽松，也别把多样性砍没。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：质量过滤是一个<strong>二分类问题</strong>，每个信号是一个弱特征。实践中常组合多个启发式（任一触发即过滤，或加权打分），并用一个在「优质语料 vs 随机爬取」上训练的轻量分类器兜底。关键指标是过滤后的<strong>数据分布</strong>是否仍覆盖你关心的领域——过度过滤的代价在评测时才暴露。</p></div>
+  </div>  <p>还有一个常被忽视的维度：<strong>过滤的顺序与组合方式</strong>也影响结果。先去重再过滤、还是先过滤再去重，得到的语料并不相同（去重改变了重复文档对统计量的贡献）；多个启发式是「任一触发即弃」（严格、高精确）还是「加权打分过阈」（宽松、高召回），也是一个需要按目标调的旋钮。实践中常见的做法是<strong>分级过滤</strong>：先用最便宜、最不会误伤的规则（如去空文档、去明显乱码）做粗筛，再用更贵的信号（困惑度、分类器）做精筛，既省算力又减少误伤。这套「便宜的先来、贵的兜底」的工程智慧，和数据流水线整体的「廉价规则在前、昂贵模型在后」一脉相承。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个评测相关的陷阱：<strong>用「参考模型困惑度」过滤会引入偏向那个参考模型的偏置</strong>。被参考模型判为「高困惑度」的文本未必差，可能只是风格/领域不同（如专业术语、少数语言、诗歌）。若过滤过度依赖某个模型，你的数据会悄悄向那个模型的「舒适区」收缩，下游评测会高估在那个分布上的能力、低估长尾领域——这是一种隐蔽的、由数据流水线引入的分布偏移。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dedupwhy"><span class="num">3</span>去重的理由与精确去重的局限</h2>
+  <h3>去重之一：为什么、以及精确去重的局限</h3>  <p>去重是数据流水线里<strong>收益最大、也最有技术含量</strong>的一步。Lee 等 2022《Deduplicating Training Data Makes LMs Better》用实证给出四条理由，每一条都直接关乎评测：</p>  <ul>
+    <li><strong>减少记忆</strong>：重复出现的文本会被过度记忆（甚至逐字背诵），增加隐私泄漏风险、挤占学习真正规律的容量。</li>
+    <li><strong>提高效率</strong>：在重复数据上训练是浪费算力——同样的内容学很多遍，边际收益趋零。去重后等量算力学到更多。</li>
+    <li><strong>避免分布扭曲</strong>：少数被大量转载的文档（如某条爆款、某份模板）会被赋予过高权重，扭曲模型对真实语言分布的估计。</li>
+    <li><strong>防评测污染</strong>：<strong>最关乎评测</strong>——评测基准的样本常被网上转载，若不去重/去污染，它们会进训练集，让评测分数虚高、不再反映泛化。</li>
+  </ul>  <p>最简单的去重是 <span class="term">exact dedup</span>（精确去重）：对每个文档算一个哈希（如对文本求 MD5），哈希相同即重复，去掉。它快、简单，但<strong>只能抓「逐字节相同」</strong>。问题是真实重复大多是<span class="term">near-duplicate</span>（近重复）：转载时改了标题、加了广告、调了几个词、换了模板——内容 95% 相同，但哈希完全不同，精确去重一个都抓不到。</p>  <div class="ascii">精确去重抓不到的近重复(内容几乎一样, 哈希完全不同):
+  doc A: 'the quick brown fox jumps over the lazy dog'
+  doc B: 'the quick brown fox LEAPS over the lazy dog'   &lt;- 改一个词
+  MD5(A) ≠ MD5(B)  -&gt; 精确去重判为「不重复」(漏掉!)
+  但内容 Jaccard ≈ 0.9 -&gt; 应当被近重复去重抓住</div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这个层次：<strong>精确去重抓「复制粘贴」，近重复去重抓「洗稿转载」</strong>。真实语料里后者远多于前者，所以严肃的流水线必须做近重复去重。但近重复要两两比较相似度，文档数 $N$ 大时朴素做法是 $O(N^2)$——不可行。下一节的 MinHash 就是为了把它降到近线性。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="jaccard"><span class="num">4</span>Jaccard 相似度与 shingle</h2>
+  <h3>去重之二：Jaccard 相似度与 shingle</h3>  <p>要做近重复去重，先要能<strong>量化两个文档有多像</strong>。标准工具是把文档表示成 <span class="term">shingle</span>（k-元组）集合，再算 <span class="term">Jaccard similarity</span>（Jaccard 相似度）。</p>  <p>shingle 就是文档里所有长度为 $k$ 的连续片段（词或字符）。例如 <code>the quick brown fox</code> 的 3-词 shingle 是 <code>{(the,quick,brown), (quick,brown,fox)}</code>。把文档变成 shingle 集合后，<strong>内容相似 ⟺ shingle 集合重叠大</strong>。Jaccard 相似度就度量这个重叠：</p>  <div class="math-block">\[J(A, B) = \frac{|A \cap B|}{|A \cup B|} \in [0, 1]\]</div>  <p>$J=1$ 表示 shingle 集合完全相同（内容几乎一样），$J=0$ 表示毫无重叠。设一个阈值（如 $J>0.8$）即可判定近重复。用 shingle 而非单个词，是为了<strong>捕捉局部词序</strong>：两篇用词相同但顺序完全打乱的文档，单词集合一样（Jaccard 高，误判为重复），但 shingle 集合差异大（Jaccard 低，正确区分）。$k$ 越大对词序越敏感、越严格。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>Jaccard 就是「两个文档的内容片段，重合的占多少」。把每篇文章撕成一段段（shingle），看两摞碎片里有多少是一样的——一样的越多，越可能是同一篇的变体。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：$|A\cap B|/|A\cup B|$ 对集合大小做了归一，所以长短不同的文档也能公平比较。它满足 $J(A,A)=1$、对称、且 $1-J$ 是合法的度量（Jaccard 距离）。直接算它需要构造集合、求交并，对海量文档仍嫌慢——这正是 MinHash 要解决的：<strong>不构造完整集合，也能无偏估计 $J$</strong>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>$k$ 的选择是个权衡：$k$ 太小（如 1，退化成词袋）丢失词序、易把不同文档判为相似；$k$ 太大则对微小改动过分敏感、把真近重复判为不同。实践中词级 $k$ 取 3–5、字符级取更大。本模块 notebook 用词级 3-gram，并让你观察 $k$ 如何影响相似度判定。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="minhash"><span class="num">5</span>MinHash：用签名近似 Jaccard</h2>
+  <h3>去重之三：MinHash —— 用签名近似 Jaccard</h3>  <p>现在是本模块的技术核心。<span class="term">MinHash</span> [Broder 1997] 的目标是：<strong>不计算完整的 Jaccard，而用一个短「签名」无偏估计它</strong>，从而把大规模去重从 $O(N^2)$ 的两两精确比较降到近线性。它的核心是一个<strong>惊人优美的概率事实</strong>。</p>  <p>做法：取一个随机哈希函数 $h$，把文档 $A$ 的所有 shingle 都哈希一遍，记录<strong>最小</strong>的哈希值 $\min_{x\in A}h(x)$。这个最小值就是文档在 $h$ 下的一个 MinHash。关键定理是：</p>  <div class="math-block">\[\Pr\big[\,\min_{x\in A}h(x) = \min_{y\in B}h(y)\,\big] = \frac{|A\cap B|}{|A\cup B|} = J(A,B)\]</div>  <p>为什么成立？考虑 $A\cup B$ 里所有元素，哪个的哈希值最小是<strong>等概率随机</strong>的（好的哈希把元素均匀打散）。而「$A$ 的最小值 = $B$ 的最小值」当且仅当<strong>那个全局最小的元素同时属于 $A$ 和 $B$</strong>（即落在 $A\cap B$ 里）。这个事件的概率正是 $|A\cap B|/|A\cup B|=J$。</p>  <div class="ascii">MinHash 为什么 = Jaccard:
+  A∪B 的所有元素, 经随机哈希后, 谁的哈希值最小是等概率的
+  min_A(h) == min_B(h)  ⟺  全局最小的那个元素 ∈ A∩B
+  P(那个元素 ∈ A∩B) = |A∩B| / |A∪B| = Jaccard
+
+  用 m 个独立哈希 h_1..h_m -&gt; 签名 (min_1, ..., min_m)
+  Jaccard 估计 = (两签名相等的位数) / m   -&gt;  m 越大越准(方差~J(1-J)/m)</div>  <p>单个哈希只给一个伯努利样本（相等/不等）。用 $m$ 个独立哈希得到长度 $m$ 的<strong>签名向量</strong>，两签名相等位的比例就是 $J$ 的无偏估计，方差约 $J(1-J)/m$——<strong>$m$ 越大越准</strong>（notebook 会看到 $m$ 从 50 到 800，估计值如何收敛到真值）。这就把「比较两个可能很大的集合」压缩成「比较两个长度 $m$ 的短向量」。</p>  <p>这一步压缩的意义怎么强调都不为过。原始的 Jaccard 要存每个文档的完整 shingle 集合（可能成千上万个）、并对每一对文档求交并——存储和计算都随文档大小膨胀。MinHash 把每个文档<strong>固定</strong>压成 $m$ 个整数（典型 $m=128$），无论文档多长签名都一样大；比较两个文档退化成数两个 $m$ 维向量有多少位相等。于是「相似度」从一个<em>需要看完整内容才能算</em>的量，变成一个<em>只看固定长度指纹</em>就能估的量——这正是把去重从理论可行变成亿级文档工程可行的关键一跃。</p>  <p>最后一块工程拼图是 <span class="term">LSH</span>（局部敏感哈希）：把 $m$ 位签名切成若干 band，每个 band 做桶哈希，让<strong>签名相似的文档大概率落进同一个桶</strong>，于是只需在桶内两两比较，避免全局 $O(N^2)$。MinHash + LSH 是 RefinedWeb、C4 等真实流水线做亿级文档近重复去重的骨架。</p>  <div class="callout paper"><span class="label"></span>
+    <p>奠基必读：Broder 1997《On the resemblance and containment of documents》（MinHash 原始证明）与 Lee 2022《Deduplicating Training Data Makes LMs Better》（去重对 LM 的实证价值与工程方案）。本模块 notebook 从零实现 MinHash 并 <code>assert</code> 估计值随 $m$ 收敛到真 Jaccard，见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="shuffle"><span class="num">6</span>shuffle 缓冲与分片</h2>
+  <h3>shuffle 缓冲与分片：流式训练的现实约束</h3>  <p>数据处理完，还要<strong>喂给训练循环</strong>，这里有两个被低估的环节：<span class="term">shuffle buffer</span>（乱序缓冲）和 <span class="term">sharding</span>（分片）。它们的存在源于一个现实约束：<strong>海量语料无法整体载入内存</strong>，只能 <span class="term">streaming</span>（流式）按需读取。</p>  <p>训练需要数据<strong>充分打乱</strong>（否则同主题/同来源的样本扎堆，梯度有偏、训练不稳）。但流式数据没法一次性全局 shuffle。解法是 shuffle 缓冲：维护一个固定大小 $B$ 的缓冲区，每次从中<strong>随机</strong>取一条喂给训练、再从流里补一条进来。这是对全局 shuffle 的<strong>近似</strong>：</p>  <div class="ascii">shuffle 缓冲(buffer size = B):
+  [流] ──填充──▶ [缓冲区 B 条] ──随机取1条──▶ [训练]
+                      ▲__________补1条__________│
+
+  B = 1     : 几乎不打乱(顺序原样流出)     位移≈0
+  B 适中     : 局部打乱(一条最多移动 ~B 位) 位移~B
+  B = 全量   : 等于全局 shuffle             位移~N/3</div>  <p>关键权衡：<strong>缓冲越大越接近真随机，但越占内存</strong>。缓冲太小则残留顺序偏差——一条数据最多只能向后移动约 $B$ 个位置，若原始数据按主题排序，小缓冲根本打不散主题块。notebook 会用一个<strong>位移度量</strong>量化这件事：把有序流过 shuffle 缓冲，测每条数据平均移动了多远；$B=1$ 时位移为 0（没打乱），$B$ 增大位移增大，$B=N$ 时位移逼近全局 shuffle 的理论值——把「缓冲大小 vs 随机性」的权衡变成可见的曲线。</p>  <p><span class="term">sharding</span>（分片）则把数据切成多个文件块，服务于：并行读取（多 worker 各读不同 shard）、断点续训（记住读到哪个 shard）、跨节点划分。分片 + 局部 shuffle 是大规模流式训练的标配组合：shard 间可以打乱顺序，shard 内用 shuffle 缓冲，两级近似出全局随机。</p>  <p>还有一个常被并入流水线末端的细节：<span class="term">token packing</span>（token 打包）。文档 tokenize 后长短不一，若每条单独成一个训练样本、用 padding 补齐到上下文长度，会浪费大量算力在 padding 上。打包是把多条短文档拼接、按固定上下文长度切块，几乎零浪费。但它引入新问题——同一个上下文窗口里可能跨了多篇无关文档，模型会学到虚假的跨文档关联（除非用 attention mask 隔开）。这类「为了吞吐而做的工程妥协，反过来影响模型学到什么」的取舍，在数据流水线里比比皆是，也是评测时排查异常行为的一个常被忽略的源头。</p>  <p>这里有一个评测相关的隐患值得点明：<strong>不充分的 shuffle 会让训练「看到数据的顺序」泄漏进模型，进而影响评测</strong>。如果数据按来源/主题/时间排序，而 shuffle 缓冲又太小打不散这种结构，模型在训练的不同阶段会偏向不同分布——早期梯度被前面的主题主导，晚期被后面的主导。这不仅让训练不稳，还可能让模型对「训练后期见得多」的数据过拟合，在评测时表现出莫名其妙的领域偏好。排查这类异常时，shuffle 缓冲大小是个<em>常被完全忽略</em>的嫌疑点——大家盯着模型和超参，却忘了数据是不是真的被打散了。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话：<strong>shuffle 缓冲是「用有限内存换近似全局随机」的工程妥协</strong>。它不完美，但够用——只要缓冲足够大、且原始数据没有强到 buffer 装不下的长程顺序结构。评测时若发现训练不稳或某类数据被系统性偏待，检查 shuffle 缓冲大小是个常被忽略的排查点。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">7</span>端到端流水线与量化</h2>
+  <h3>端到端：把流水线拼起来并量化每一步</h3>  <p>单独看每个环节还不够，真正的功夫是<strong>把它们拼成一条端到端流水线，并量化整条链改变了什么</strong>。本模块 notebook 的压轴是一个完整的小流水线，把一批含噪、含重复的玩具文档，依次过清洗、质量过滤、MinHash 去重、shuffle，并在每一步后报告：</p>  <table>
+    <thead><tr><th>流水线阶段</th><th>量化指标</th><th>期望变化</th></tr></thead>
+    <tbody>
+      <tr><td><strong>清洗</strong></td><td>去掉了多少 HTML/控制字符</td><td>文档变干净，字符数下降</td></tr>
+      <tr><td><strong>质量过滤</strong></td><td>过滤掉的文档数 / 比例</td><td>低质文档被剔除，平均质量↑</td></tr>
+      <tr><td><strong>近重复去重</strong></td><td>去掉的近重复对数、剩余文档数</td><td>重复内容塌缩成一份</td></tr>
+      <tr><td><strong>去污染</strong></td><td>命中评测基准的文档数</td><td>泄漏样本被移除（评测可信）</td></tr>
+      <tr><td><strong>吞吐统计</strong></td><td>各阶段处理的文档/秒</td><td>定位瓶颈阶段</td></tr>
+    </tbody>
+  </table>  <p>这条流水线虽是玩具规模，但<strong>结构与真实流水线一一对应</strong>：每一步都是一个「读入文档流 → 处理/过滤 → 输出文档流」的变换，可组合、可度量、可并行。学完你能把这套结构放大到真实语料（换成真实的清洗规则、真实的 MinHash+LSH、真实的去污染基准），并知道在每一步该测什么、该担心什么。</p>  <p>最后强调<strong>吞吐</strong>（throughput）：数据流水线常是训练的隐形瓶颈——若数据喂不上，再快的 GPU 也空转。实践中流水线要与计算<strong>并行</strong>（prefetch、多进程解析），并监控每阶段的处理速率，找出最慢的环节优先优化。notebook 会做一个简单的吞吐计时，演示如何定位瓶颈阶段。</p>  <div class="callout paper"><span class="label"></span>
+    <p>延伸（见 <code>references.md</code>）：Penedo 2023《RefinedWeb》（只靠过滤+去重就媲美策展语料）、Rae 2021《Gopher》（质量过滤启发式）、Raffel 2020《T5/C4》（清洗流水线）、Soldaini 2024《Dolma》与 RedPajama（开放语料的完整流水线文档）。这些是把本模块玩具放大到真实规模的蓝本。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>数据配比与课程</strong>：多来源（网页/书/代码/数学）按什么比例混合、是否随训练动态调整（data curriculum），对能力影响巨大但理论稀缺。最优配比目前主要靠昂贵的消融实验。</li>
+    <li><strong>质量的定义</strong>：「高质量数据」缺乏统一定义。困惑度过滤、分类器过滤、规则过滤各有偏置；什么是「对下游有用」的质量、能否在不下游评测的情况下预测它，是开放问题。</li>
+    <li><strong>去重的粒度与语义</strong>：当前去重多在文档/段落级、基于词形（MinHash）。语义级近重复（同一事实的不同表述）、跨语言重复、以及去重粒度对记忆/泛化的精确影响，仍在研究。</li>
+    <li><strong>去污染的彻底性</strong>：评测基准的变体、改写、翻译版本难以穷尽地从训练集移除。如何保证评测真正「干净」、以及污染对分数的量化影响，是评测可信度的前沿（呼应 C03）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读清单（详见 <code>references.md</code>）：Lee 2022（去重价值）、Broder 1997（MinHash）、Penedo 2023（RefinedWeb 流水线）、Rae 2021（过滤启发式）、Raffel 2020（C4 清洗）。下一模块讨论一种特殊的「数据」——模型自己生成的合成数据，及其反噬：model collapse。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_grokking_emergence/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · Grokking 与涌现</div></a>
+    <a class="next" href="../04_synthetic_data/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 合成数据与模型坍塌</div></a>
+  </div>
+
+</div>
+</body>
+</html>

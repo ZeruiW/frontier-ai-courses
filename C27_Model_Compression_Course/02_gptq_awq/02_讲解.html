@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · GPTQ 与 AWQ</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · GPTQ 与 AWQ</h1>
+  <p class="subtitle">为什么逐元素 RTN 不是最优；GPTQ 用逆 Hessian 做逐列误差补偿，AWQ 用激活感知缩放保护显著通道 —— 把 int4 从「明显掉点」做到「近乎无损」的两条主线</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（量化基本功）、矩阵乘、一点点线性代数（Hessian、Cholesky、外积）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_gptq_awq.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Frantar 2022 (GPTQ)、Lin 2023 (AWQ)、Frantar 2022 (OBQ)、Xiao 2022 (SmoothQuant)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么 RTN 不是最优</a></li>
+      <li><a href="#gptqidea">GPTQ 思想：量化一个，补偿其余</a></li>
+      <li><a href="#gptqmath">GPTQ 数学：OBQ 到逐列高效版</a></li>
+      <li><a href="#awqidea">AWQ 思想：保护显著通道</a></li>
+      <li><a href="#smooth">等价缩放变换与 SmoothQuant</a></li>
+      <li><a href="#compare">GPTQ vs AWQ vs RTN 对比</a></li>
+      <li><a href="#workflow">PTQ 的真实工作流</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么 RTN 不是最优</h2>
+  <p>模块 01 把权重量化的基本功打全了：选 scale、选粒度、打包、对付离群值。但有一个根本的局限我们一直没碰——<strong>逐元素的就近舍入（RTN）并不是最优的</strong>。这正是 GPTQ 与 AWQ 这两个<strong>后训练量化（PTQ）</strong>算法的出发点，也是把 int4 从「明显掉点」做到「近乎无损」的关键一跳。</p>  <p>先看 RTN 错在哪。<span class="term">RTN</span>（round-to-nearest）对每个权重独立四舍五入到最近的网格点，它的隐含目标是最小化 <code>‖W − Ŵ‖²</code>——让<em>权重本身</em>尽量不变。但回忆模块 00 的统一框架，我们真正在意的是<strong>层输出不变</strong>：</p>  <div class="math-block">\[\min_{\hat W}\ \big\| W X - \hat W X \big\|^2 \quad\neq\quad \min_{\hat W}\ \| W - \hat W\|^2\]</div>  <p>这两个目标<strong>不一样</strong>。RTN 优化的是右边（权重误差），而我们想要的是左边（输出误差）。差别在 <code>X</code>（校准激活）：有的权重乘上的是大激活、对输出影响大，有的乘上的是小激活、影响小。RTN 对它们一视同仁地舍入，于是把「本可以让影响大的权重更准」的机会浪费了。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：RTN 像考试时每道题都花一样的时间，不管分值。聪明的做法是<strong>把精力花在分值高的题上</strong>——对应到量化，就是让乘以大激活（高分值）的权重量化得更准，乘以小激活（低分值）的可以将就。GPTQ 和 AWQ 就是两种「按分值分配精度」的策略。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，层输出误差 <code>‖(W−Ŵ)X‖²</code> 展开后由 <code>(W−Ŵ)(XXᵀ)(W−Ŵ)ᵀ</code> 主导，其中 <code>XXᵀ</code> 正是这层重建损失的<span class="term">Hessian</span>（二阶导）。它编码了「动哪个权重、对输出影响多大」以及<strong>权重之间的相互影响</strong>。RTN 完全忽略了这个 Hessian；GPTQ 用它做误差补偿，AWQ 用它的对角（激活幅度）做缩放保护。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话点破本模块：<strong>RTN 只盯着权重，GPTQ 和 AWQ 盯着输出</strong>。它们都把<em>激活 X</em>纳入考量——因为权重重不重要，取决于它乘上的激活有多大。GPTQ 走「逐列量化 + 把误差补偿到后续列」的精细路线（用逆 Hessian）；AWQ 走「给重要通道乘保护缩放」的轻量路线（只看激活幅度）。两条路殊途同归，都让 int4 重新变得可用。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="gptqidea"><span class="num">2</span>GPTQ 思想：量化一个，补偿其余</h2>
+  <h3>GPTQ 的思想：量化一个，补偿其余</h3>  <p>GPTQ（Frantar et al. 2022）的核心是一个<strong>贪心 + 补偿</strong>的过程。它逐列地量化权重矩阵，每量化完一列、产生了误差，就立刻把这个误差<strong>补偿</strong>到<em>尚未量化</em>的列上，让层输出尽量回到量化前的样子。</p>  <p>这个思想来自 <span class="term">OBQ</span>（Optimal Brain Quantization），而 OBQ 又源自经典的 Optimal Brain Surgeon：当你扰动（量化）一个权重时，其余权重可以做一个<strong>解析的最优调整</strong>来抵消这个扰动对损失的影响，调整量由<strong>逆 Hessian</strong>给出。</p>  <div class="ascii">GPTQ 逐列量化 + 误差补偿（W 的列从左到右处理）：
+
+  已量化      正在量化第 j 列        尚未量化
+  ┌──────┬────────────┬─────────────────────┐
+  │ done │ 量化 W[:,j] │  ← 把 j 的误差补偿到这里 →  │
+  │ done │ →产生误差 e │  W[:,j+1:] -= outer(e', Hinv[j,j+1:]) │
+  └──────┴────────────┴─────────────────────┘
+
+  每列：1) 就近量化这一列  2) 算误差 e=(w-q)/Hinv[j,j]
+        3) 按逆 Hessian 把 e 摊到右边所有未量化列
+  结果：后面的列『主动偏移』来抵消前面量化的误差 → 层输出几乎不变</div>  <p>关键的更新公式是：量化第 <code>j</code> 列得到 <code>q</code>，归一化误差 <code>e = (w_j − q)/[H⁻¹]_{jj}</code>，然后把后续所有未量化列减去 <code>e</code> 与逆 Hessian 对应行的外积：</p>  <div class="math-block">\[\hat W_{:,j} = \mathrm{quant}(W_{:,j}), \quad e = \frac{W_{:,j}-\hat W_{:,j}}{[H^{-1}]_{jj}}, \quad W_{:,k>j} \mathrel{-}= e \cdot [H^{-1}]_{j,k>j}\]</div>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么补偿能成立？想象你在量化时给第 <code>j</code> 列引入了一点误差，导致输出偏了。但输出 <code>WX</code> 是所有列的线性组合——只要让<strong>后面还没量化的列</strong>朝某个方向微微偏移，就能把这点输出偏差<em>抵消回来</em>。逆 Hessian 恰好告诉你「每列该偏多少、朝哪偏」才最省力地抵消。GPTQ 就是不断地「量化一列、用后面的列把账平掉」，直到所有列都量化完。</p>
+  </div>  <p>这里藏着一个<strong>顺序的玄机</strong>：补偿只能往<em>右边（未量化的列）</em>做，因为已量化的列必须锁死在网格上、不能再动。这意味着越早量化的列，后面有越多列可以帮它补偿；越晚量化的列，能借力的越少。所以处理到最后几列时，误差几乎无处可补，只能硬扛。这解释了 GPTQ 的一个改进——<strong>按重要性排序</strong>（act-order）：先量化激活方差大、最该精确的列，把它们的误差趁早补偿掉；不重要的列留到最后即便补不动也无妨。这个小改动在难量化的模型上能再降一截误差。</p>  <p>还要澄清「<strong>固定每行 scale</strong>」这个简化。本课为讲清补偿机制，对每行用一个固定的 absmax scale；真实 GPTQ 通常配 group-wise scale（模块 01），每量化到一个组边界就重算该组的 scale。补偿逻辑完全一样，只是 scale 更细。理解了固定 scale 版的逐列补偿，加 group-wise 只是工程细节——这也是为什么本课先把核心机制剥离出来单独讲。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="gptqmath"><span class="num">3</span>GPTQ 数学：OBQ 到逐列高效版</h2>
+  <h3>GPTQ 的数学：从逐元素 OBQ 到逐列高效版</h3>  <p>把上面的直觉补成完整推导。这层的重建损失是 <code>L(Ŵ) = ‖ŴX − WX‖²</code>。对单个权重做泰勒展开，量化它（扰动 <code>δw</code>）带来的损失增量，在最优补偿下正比于 <code>δw² / [H⁻¹]_{qq}</code>，其中 <code>H = 2XXᵀ</code> 是损失的 Hessian。</p>  <p><strong>OBQ 的原始版</strong>每一步选「补偿后损失增量最小」的那个权重来量化，再更新逆 Hessian——这要 <code>O(d³)</code> 每行、对大模型不可行。<strong>GPTQ 的关键加速</strong>是发现：可以<strong>固定按列从左到右</strong>的顺序量化（而非每次贪心选最优），精度几乎不降，却能让所有行<strong>共享同一个逆 Hessian</strong>（因为 Hessian 只依赖 <code>X</code>、与具体哪行无关），一次 Cholesky 分解全搞定。</p>  <table>
+    <thead><tr><th></th><th>OBQ（原始）</th><th>GPTQ（高效版）</th></tr></thead>
+    <tbody>
+      <tr><td>量化顺序</td><td>每步贪心选最优权重</td><td>固定按列从左到右</td></tr>
+      <tr><td>逆 Hessian</td><td>每量化一个就更新</td><td>一次算好，全程共享</td></tr>
+      <tr><td>复杂度</td><td><code>O(d_out·d_in³)</code> 太慢</td><td><code>O(d_in³ + d_out·d_in²)</code> 可行</td></tr>
+      <tr><td>精度</td><td>略高</td><td>几乎相同</td></tr>
+      <tr><td>能否量化大模型</td><td>否</td><td>是（175B 几小时）</td></tr>
+    </tbody>
+  </table>  <p>实现上，GPTQ 先算 <code>H = XXᵀ</code> 并加<strong>阻尼</strong>（<code>H += λ·mean(diag(H))·I</code>，保证可逆与数值稳定），再求 <code>H⁻¹</code>（实际用 Cholesky 分解避免显式求逆）。然后就是上一节的逐列循环：量化、算归一化误差、外积补偿到右侧。整个过程纯线性代数，本模块 notebook 会从零写出来。</p>  <div class="callout warn"><span class="label"></span>
+    <p>阻尼项 <code>λ</code> 不是可有可无的：校准数据有限时 <code>XXᵀ</code> 可能<strong>奇异或病态</strong>（接近不可逆），直接求逆会数值爆炸。加一个小的对角阻尼（典型 <code>λ=0.01</code>）相当于给 Hessian 一点正则，是 GPTQ 稳定运行的必要工程细节。本模块 notebook 不加阻尼会偶发 <code>LinAlgError</code> 或补偿失控，加了就稳——这是「数学正确」与「数值能跑」之间的典型缝隙。</p>
+  </div>  <p>为什么 Hessian 恰好是 <code>XXᵀ</code>？快速推一下，能让整个算法落地生根。层重建损失 <code>L = ‖(Ŵ−W)X‖²</code>，把 <code>ΔW = Ŵ−W</code> 看成变量，展开 <code>L = tr(ΔW·XXᵀ·ΔWᵀ)</code>，对 <code>ΔW</code> 求二阶导，得到的 Hessian 正是 <code>2XXᵀ</code>（常数 2 可吸收进阻尼）。这是个<strong>极其友好</strong>的结果：Hessian 只依赖校准激活 <code>X</code>、与权重无关、与<em>哪一行</em>无关——这正是 GPTQ 能让所有 <code>d_out</code> 行<strong>共享同一个逆 Hessian</strong>、一次分解全程复用的根本原因。若 Hessian 依赖权重，就得每量化一步重算，那就退回到慢得多的 OBQ 了。</p>  <p>最后点一下<strong>Cholesky</strong>的作用（真实实现的关键加速）。直接对每列做 <code>Wq[:, j+1:] -= outer(e, Hinv[j, j+1:])</code> 是 <code>O(d_in²)</code> 每列、总 <code>O(d_in³)</code>，已经可行。但 GPTQ 论文进一步用 <code>H⁻¹</code> 的 Cholesky 分解把补偿系数预先整理好，使逐列更新变成读取分解结果，数值更稳、还能分块（block）批处理以利用缓存。本课 notebook 为清晰起见直接用 <code>Hinv</code> 的行做外积（数学等价、结果相同），把 Cholesky 留作工程优化——核心的「逆 Hessian 加权补偿」一分不差。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="awqidea"><span class="num">4</span>AWQ 思想：保护显著通道</h2>
+  <h3>AWQ 的思想：保护显著通道</h3>  <p>GPTQ 精细但要算逆 Hessian、要逐列串行。<span class="term">AWQ</span>（Lin et al. 2023）走了一条<strong>更轻、更快</strong>的路，出发点是一个漂亮的观察：<strong>权重重不重要，由它对应的激活幅度决定</strong>——只要保护好那一小撮（约 1%）乘以大激活的<span class="term">salient channels</span>（显著通道），就能保住大部分精度。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>AWQ 的洞察可以这样体会：一个权重 <code>w</code> 对输出的贡献是 <code>w·x</code>。如果 <code>x</code>（激活）很大，那 <code>w</code> 的量化误差 <code>δw</code> 会被放大成 <code>δw·x</code> 的大输出误差。所以<strong>乘以大激活的权重，量化误差的代价更高</strong>，该被优先保护。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>怎么保护？给这些显著通道的权重乘一个<strong>放大因子</strong> <code>s&gt;1</code>，量化后再除回 <code>s</code>。放大后，这些权重在量化网格上占的相对分辨率更高（误差 <code>δw/s</code> 被缩小），等价于<strong>给重要权重更多有效精度</strong>。而这一切在数学上等价——<code>(s·w)·(x/s) = w·x</code>，输出不变，只是把量化误差从重要通道挪到了不重要通道。</p></div>
+  </div>  <div class="math-block">\[\hat y = \mathrm{quant}(W \cdot \mathrm{diag}(s)) \cdot \mathrm{diag}(s)^{-1} x, \qquad s_j = \Big(\frac{\overline{|x_j|}}{\text{mean}}\Big)^{\alpha}\]</div>  <p>缩放因子 <code>s_j</code> 按第 <code>j</code> 个输入通道的<strong>平均激活幅度</strong>的某个幂次 <code>α</code> 来设：激活越大的通道、<code>s_j</code> 越大、保护越多。<code>α</code> 控制保护的力度（<code>α=0</code> 退化成 RTN，<code>α=1</code> 完全按激活比例），AWQ 在一个小网格里搜出使层输出 MSE 最小的 <code>α</code>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>AWQ 和 GPTQ 的哲学对比很有意思：GPTQ 是<strong>事后补偿</strong>（量化完了用逆 Hessian 把误差平掉），AWQ 是<strong>事前保护</strong>（量化前就给重要通道更多精度）。AWQ 不需要逆 Hessian、不需要逐列串行，只要一遍激活统计 + 一个一维 <code>α</code> 搜索，因此<strong>更快、更省内存、且没有反量化时的额外开销</strong>——这是它在指令模型与端侧推理上很受欢迎的原因。</p>
+  </div>  <p>有个微妙但重要的点要说清：AWQ<strong>不是</strong>把显著通道单独存成高精度（那样会破坏规整的矩阵结构、难加速）。它的高明在于<strong>用一个可逆的缩放把保护「揉进」量化本身</strong>——所有权重还是统一量化到 int4、还是规整的矩阵，只是缩放因子 <code>s</code> 重新分配了「谁的相对精度高」。这保证了量化后的模型仍能用标准的 int4 内核高效推理，而 <code>s</code> 这一步还可以<em>提前融进权重的 scale 里</em>，推理时零额外开销。这正是 AWQ 比「混合精度保留离群值」更工程友好的地方。</p>  <p>再看 <code>α</code> 搜索的本质。<code>α=0</code> 时所有 <code>s_j=1</code>，退化成 RTN；<code>α</code> 增大，保护越偏向大激活通道；但 <code>α</code> 太大（接近 1）会把过多精度堆给极少数通道、反而让其余通道量化变差——所以最优 <code>α</code> 通常在中间（本课 notebook 跑出 0.5~0.75）。这是一条<strong>U 形曲线</strong>：保护不足和保护过度都不好。AWQ 用一个廉价的一维网格搜索找到谷底，这也是它「轻量」的体现——没有逆 Hessian，只有一次扫描加几次试量化。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="smooth"><span class="num">5</span>等价缩放变换与 SmoothQuant</h2>
+  <h3>AWQ 的等价变换与 SmoothQuant</h3>  <p>AWQ 的「权重乘 s、激活除 s」是一种<strong>等价缩放变换</strong>，这个思想比 AWQ 本身更通用，值得单独说。</p>  <p>它的近亲是 <span class="term">SmoothQuant</span>（Xiao et al. 2022），目标略有不同：让<strong>权重和激活都好量化</strong>（W8A8）。激活的离群值很凶、难量化，而权重相对温和。SmoothQuant 把激活的「量化难度」<strong>按通道迁移一部分到权重上</strong>——激活除以 <code>s</code>（变温和、好量化），权重乘以 <code>s</code>（吸收难度、仍可量化）。</p>  <div class="ascii">等价缩放变换（AWQ / SmoothQuant 共用的核心招式）：
+
+   原始:   y = W @ x
+   变换:   y = (W · diag(s)) @ (diag(s)⁻¹ · x)    ← 数学完全等价
+              └── 权重乘 s ──┘   └── 激活除 s ──┘
+
+   AWQ:        s 让显著(大激活)通道的权重被放大→量化更准 (weight-only)
+   SmoothQuant: s 把激活离群难度迁到权重→两者都好量化 (W8A8)
+
+   关键: 变换不改输出, 只重新分配『谁承担量化误差』</div>  <p>理解这个<strong>等价变换</strong>是理解一大类现代量化技巧的钥匙：它不改变模型的数学，只是<em>重新分配量化误差的负担</em>。AWQ 把负担从显著权重挪到非显著权重；SmoothQuant 把负担从激活挪到权重；后来的 QuaRot 甚至用<strong>旋转矩阵</strong>（也是等价变换）把离群值「打散」到所有通道。它们都在同一个框架里：<code>Y = (WP)(P⁻¹X)</code>，选一个让两边都好量化的可逆 <code>P</code>。</p>  <div class="callout paper"><span class="label"></span>
+    <p>AWQ（Lin 2023）与 SmoothQuant（Xiao 2022）是「激活感知缩放」这条线的两个代表，前者 weight-only、后者 W8A8。想深入「等价变换打散离群值」可读 QuaRot/SpinQuant（用 Hadamard 旋转）。这些都建立在模块 01 的离群值认知之上。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="compare"><span class="num">6</span>GPTQ vs AWQ vs RTN 对比</h2>
+  <h3>GPTQ vs AWQ vs RTN：一张对比表</h3>  <p>把三种方法放在一起，它们的定位就清楚了：</p>  <table>
+    <thead><tr><th>维度</th><th>RTN</th><th>GPTQ</th><th>AWQ</th></tr></thead>
+    <tbody>
+      <tr><td>核心思想</td><td>逐元素就近舍入</td><td>逐列量化+逆Hessian补偿</td><td>显著通道缩放保护</td></tr>
+      <tr><td>用到激活吗</td><td>不用</td><td>用（Hessian=XXᵀ）</td><td>用（激活幅度）</td></tr>
+      <tr><td>优化目标</td><td><code>‖W−Ŵ‖</code></td><td><code>‖WX−ŴX‖</code></td><td><code>‖WX−ŴX‖</code></td></tr>
+      <tr><td>计算成本</td><td>最低</td><td>高（逆Hessian、串行）</td><td>中（一维搜索）</td></tr>
+      <tr><td>反量化开销</td><td>标准</td><td>标准</td><td>标准（s 可融进 scale）</td></tr>
+      <tr><td>int4 精度</td><td>明显掉点</td><td>很好</td><td>很好</td></tr>
+      <tr><td>典型场景</td><td>基线/int8</td><td>追求极致精度</td><td>指令模型/端侧/快速</td></tr>
+    </tbody>
+  </table>  <p>实践中 GPTQ 与 AWQ<strong>各有胜负、常被一起评测</strong>：GPTQ 在某些模型上精度略高，AWQ 更快、对指令微调模型与多模态更友好、且可与高效推理内核更好结合。很多生产栈两个都支持，按模型与硬件选。但它们<strong>都明显优于 RTN</strong>——这是本模块要你亲手验证的核心结论：在 int4 下，GPTQ 能把层输出 MSE 压到 RTN 的约一半，AWQ 也有显著改善。</p>  <p>还有一个常被忽略的点：这些 PTQ 方法<strong>可以叠加 group-wise</strong>（模块 01）。真实的 GPTQ-int4 通常是「group=128 + 逆 Hessian 补偿」，AWQ 也常配 group-wise scale。粒度（模块 01）解决「局部范围贴合」，算法（本模块）解决「按激活重要性分配精度」，两者正交、叠加使用——这就是 <code>AutoGPTQ</code>/<code>AutoAWQ</code> 默认配置的由来。</p>  <p>从<strong>内存与速度</strong>的工程角度再补一刀对比。GPTQ 量化时要为每层算并存一个 <code>d_in×d_in</code> 的逆 Hessian，量化过程是逐列串行的，所以<em>量化阶段</em>更慢、更吃内存（但只做一次、离线）。AWQ 量化阶段只需一遍激活统计加几次试量化，更快更省。但到了<strong>推理阶段</strong>，两者产出的都是规整的 int4 权重 + scale，推理速度相当——区别只在量化那一次性的成本。所以选择往往是：追极致精度、量化时间不敏感 → GPTQ；要快速迭代、量化很多模型、或资源紧张 → AWQ。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一个统一的视角收尾：模块 01 的 group-wise 和本模块的 GPTQ/AWQ，都是在回答「<strong>16 个 int4 级别太少，怎么用好</strong>」。group-wise 让每一小段用最贴合的尺子；GPTQ 用后续权重补偿前面的舍入误差；AWQ 把精度优先给重要通道。三招方向不同但不冲突，叠起来才有了今天「int4 几乎无损」的大模型量化。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="workflow"><span class="num">7</span>PTQ 的真实工作流</h2>
+  <h3>把它跑起来：PTQ 的真实工作流</h3>  <p>用 GPTQ 或 AWQ 量化一个真实模型，工作流是这样的：</p>  <ol>
+    <li>准备<strong>校准数据</strong>：几十到几百条有代表性的样本（如 WikiText、C4 的片段），前向跑一遍、收集每一层的输入激活 <code>X</code>；</li>
+    <li>逐层处理：对每个线性层，用收集到的 <code>X</code> 算 Hessian（GPTQ）或激活幅度（AWQ）；</li>
+    <li>量化该层：GPTQ 做逐列补偿，AWQ 搜 <code>α</code> 并缩放；通常都配 group-wise（g=128）；</li>
+    <li>把量化权重（int4，打包）与 scale 存盘，导出可推理的模型；</li>
+    <li>推理时：解包 → 反量化 → 正常 GEMM（与模块 01 的 weight-only 流程相同）。</li>
+  </ol>  <p>注意一个关键点：PTQ<strong>不需要重新训练</strong>，只需要校准数据跑前向。这就是为什么 GPTQ/AWQ 能在几小时内把一个 175B 模型量化到 int4——相比 QAT（量化感知训练，要完整训练）成本低几个数量级。代价是精度上限略低于 QAT，但对绝大多数部署场景，PTQ 的「几乎无损 + 几小时完成」已经足够好。</p>  <p>校准数据的选择有讲究：太少（如 < 32 条）会让 Hessian 病态、激活统计不准；分布不匹配（用错领域的数据）会让量化偏向错误的方向。经验是用与目标任务同分布的几百条样本。本模块 notebook 会让你看到校准样本数对 GPTQ 稳定性的影响——这是把 PTQ 用对的实战细节。</p>  <p>把这条线和模块 01 串起来看，你会得到一张完整的量化决策图：先定<strong>bit 数</strong>（int8 还是 int4，由显存/带宽预算决定）；再定<strong>粒度</strong>（int8→per-channel，int4→group-wise，模块 01）；最后定<strong>算法</strong>（追精度→GPTQ，求快→AWQ，本模块）；并对<em>敏感层</em>（首层、输出层、含强离群值的层）考虑保更高精度。这套组合拳就是今天 <code>AutoGPTQ</code>/<code>AutoAWQ</code>/<code>llama.cpp</code> 默认配方背后的全部决策——你现在不仅会用它们，还知道每个旋钮在解决什么问题、掉点时该拧哪一个。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见误区：以为 PTQ 是「黑盒一键量化」。实际上它对<strong>校准数据、group 大小、阻尼、是否保护离群层</strong>都敏感。某些层（如第一层、输出层、对离群值敏感的层）常需要更高精度或跳过量化。理解了 GPTQ/AWQ 的原理，你才能在掉点时<em>知道该调哪个旋钮</em>，而不是反复试。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>更低 bit 的 PTQ（int3、int2）</strong>：逆 Hessian 补偿和缩放保护在 int2 下还够吗？需要结合非均匀量化、混合精度（让敏感层用更高 bit）甚至轻量微调。极低 bit PTQ 是热点。</li>
+    <li><strong>权重+激活联合 PTQ（W4A4）</strong>：AWQ/SmoothQuant 让 W8A8 可行，但 W4A4 仍难——激活离群值在 4 bit 下更致命。QuaRot/SpinQuant 用旋转打散离群值是当前最有希望的方向。</li>
+    <li><strong>PTQ 与训练的结合</strong>：纯 PTQ 上限有限，「PTQ + 少量微调」（如 GPTQ 后做几步 LoRA）能进一步恢复精度，成本仍远低于 QAT，是实用折中。</li>
+    <li><strong>Hessian 的更好近似</strong>：GPTQ 用 <code>XXᵀ</code> 作 Hessian 是一阶近似，忽略了跨层影响。更全局的重建（考虑后续层的影响）能否进一步降误差，是开放问题。</li>
+    <li><strong>自动混合精度分配</strong>：不同层对量化的敏感度差异很大。如何自动决定「哪层用 int4、哪层用 int8、哪层保 fp16」以在给定平均 bit 下最优，仍缺乏好用的方法。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Frantar et al. 2022（GPTQ，逆 Hessian 误差补偿，本模块主线）、Lin et al. 2023（AWQ，激活感知缩放，本模块另一主线）、Frantar & Alistarh 2022（OBQ/OBC，GPTQ 的理论根基）、Xiao et al. 2022（SmoothQuant，等价缩放迁移）、Nagel et al. 2020（AdaRound，RTN 非最优的奠基）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_quantization/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 整数量化</div></a>
+    <a class="next" href="../03_fp8_training/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · fp8 训练</div></a>
+  </div>
+
+</div>
+</body>
+</html>

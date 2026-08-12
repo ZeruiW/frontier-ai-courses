@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · Verifier 引导搜索</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · Verifier 引导搜索</h1>
+  <p class="subtitle">best-of-N、加权多数投票、beam search、verifier 引导；pass@k 与 pass^k 的无偏估计 —— 把测试时算力换成准确率，前提是『判别比生成易』</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 03（verifier/PRM/聚合）、概率、组合数</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_verifier_search.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">GSM8K verifiers · Self-Consistency · Large Language Monkeys · Codex pass@k</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">讲解 45 分钟 + notebook 75 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#search">从训练信号到推理搜索</a></li>
+      <li><a href="#bon">best-of-N</a></li>
+      <li><a href="#vote">多数投票与加权投票</a></li>
+      <li><a href="#passk">pass@k vs pass^k 与无偏估计</a></li>
+      <li><a href="#beam">beam search 与引导搜索</a></li>
+      <li><a href="#practice">实践组合与陷阱</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="search"><span class="num">1</span>从训练信号到推理搜索</h2>
+  <p>前三模块都在讲<strong>训练时</strong>——怎么用 RL 把推理能力塞进模型权重。这一模块开始转向<strong>推理时</strong>：给定一个已经训好的模型，怎么用<em>额外的算力</em>在生成时把它的能力<strong>榨出来</strong>？答案的核心工具是<strong>搜索</strong>——生成多个候选、用一个 <span class="term">verifier</span> 把好的挑/引导出来。</p>  <p>这其实是 o1/R1 范式的<strong>第二条腿</strong>：OpenAI 的 o1 博客明确说「准确率随<em>训练计算</em>和<em>测试时计算</em>双双 scaling」。模块 01–03 是第一条腿（训练），本模块和下一模块是第二条腿（推理时计算）。一个关键事实让这条腿格外有用：对很多任务，<strong>「生成一个对的解」比「判断一个解对不对」难得多</strong>——所以「生成 N 个、挑出对的」往往比「一次就生成对的」便宜。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：让你<strong>写出</strong>一道难题的正确证明很难，但给你 20 份证明、让你<strong>挑出</strong>或<strong>看出哪份对</strong>要容易得多。搜索就是利用这个不对称：让模型多写几份（生成便宜、可并行），再用 verifier 挑（判别比生成易）。这也是为什么「采样 N 次取最好」能用算力换准确率——你把难的「生成对」问题，换成了相对易的「生成多个 + 挑出对」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，本模块要区分两个根本不同的量：<strong>能力上界</strong>（这个模型<em>有没有可能</em>解出来，即 N 个样本里<strong>至少一个</strong>对的概率 <span class="term">pass@k</span>）与<strong>可部署性能</strong>（在不知道答案的情况下，我们<em>实际能选出</em>对的解的概率，取决于 verifier 多准）。BoN 用一个 verifier 去逼近上界；majority vote 不需 verifier、靠答案聚合；二者各有适用，且都受「verifier/聚合有多可靠」支配。这是本模块的主轴。</p></div>
+  </div>  <p>这个「生成难、判别易」的不对称值得再追问一句：<strong>它为什么经常成立，又何时会失效？</strong>成立，是因为很多推理任务的答案<em>有结构可检验</em>——数学解可代回验算、代码可跑测试、证明可逐步核对，而「构造」一个满足这些约束的解，要在巨大的空间里搜索，本就比「检查」一个给定解难得多（这正是计算复杂度里「难解易验」在日常中的体现）。但它<strong>会失效</strong>在那些「判别本身也很难」的任务上：开放式写作的好坏、长程 agent 决策的对错、没有清晰 ground-truth 的领域——此时 verifier 本身就不可靠，搜索的天花板随之坍塌（第 6 节、模块 03 的 hacking 都源于此）。所以本模块所有方法的威力，都<strong>预设了「判别比生成易」这个前提</strong>；前提越成立，搜索越有效。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>搜索 = 用「生成多个候选 + verifier 挑选/引导」把测试时算力换成准确率，前提是『判别比生成易』</strong>。pass@k 衡量「能力上界」（有没有可能），但它<strong>不可直接部署</strong>（部署得选一个答案，可你不知道哪个对）；真正能用的是 majority vote（靠答案众数）、best-of-N（靠 verifier 打分）、加权投票（二者结合）。本模块教你实现它们，并用无偏估计正确地<em>度量</em>它们。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bon"><span class="num">2</span>best-of-N</h2>
+  <h3>best-of-N：采样多个，verifier 选最好</h3>  <p>最简单也最强力的搜索是 <span class="term">best-of-N</span>（BoN，N 选优）：对同一问题独立采样 $N$ 个候选解，用一个 verifier（ORM 或聚合后的 PRM）给每个打分，<strong>选分最高的</strong>那个作为最终答案。</p>  <div class="math-block">\[o^*=\arg\max_{i\in\{1,\dots,N\}}\ \text{verifier}(o_i)\]</div>  <p>BoN 的威力来自上一节的不对称：生成 $N$ 个解（便宜、可并行），把「生成对」的难题转成「从 $N$ 个里挑对」（判别相对易）。它的<strong>性能上界</strong>是 pass@N（如果 verifier 完美，总能挑出那个对的，只要 $N$ 个里有对的）；<strong>实际性能</strong>则取决于 verifier 多准——verifier 越接近完美，BoN 越接近 pass@N。</p>  <table>
+    <thead><tr><th>方法</th><th>需要 verifier？</th><th>性能上界</th><th>实际能选对？</th><th>可部署</th></tr></thead>
+    <tbody>
+      <tr><td><strong>随机选一个</strong></td><td>否</td><td>pass@1</td><td>= 单样本正确率</td><td>✅（基线）</td></tr>
+      <tr><td><strong>best-of-N</strong></td><td><strong>是</strong></td><td>pass@N</td><td>看 verifier 多准</td><td>✅</td></tr>
+      <tr><td><strong>pass@N（oracle）</strong></td><td>需真答案</td><td>—</td><td>100%（作弊）</td><td><strong>否</strong>（只是上界）</td></tr>
+    </tbody>
+  </table>  <h4>一个手算例子：verifier 多准，BoN 就多强</h4>  <p>把三条曲线的关系算实。设单样本正确率 $p=0.3$、采 $N=8$ 个候选。<strong>天花板</strong> pass@8 $=1-0.7^8\approx0.94$——这 8 个里有对的概率高达 94%。但能不能<em>选出</em>那个对的，全看 verifier。<strong>完美 verifier</strong>：实际准确率 $\approx$ pass@8 $\approx0.94$（有对的就一定挑出来）。<strong>瞎选（无 verifier）</strong>：实际准确率 $=$ pass@1 $=0.3$（随机抽一个）。<strong>一个不完美的 verifier</strong>（比如它只在 70% 的时候能把对的解排在错的之上）：实际准确率落在二者<em>之间</em>，约 $0.3+0.7\times(0.94-0.3)\approx0.75$（粗估）。看清楚了——同样 8 个候选、同样 94% 的「天花板」，verifier 从瞎选到完美，实际性能在 <strong>0.3 ~ 0.94</strong> 之间天差地别。<strong>BoN 的全部价值，都压在 verifier 这一个变量上</strong>，这也是为什么把 pass@N 当作 BoN 性能是评测里最常见的高估——它默认了一个现实中不存在的完美 verifier。</p>  <p>BoN 还有一个常被忽视的<strong>自我反噬</strong>效应，值得现在就埋下伏笔（第 6 节展开）：BoN 本质是<em>对 verifier 做一次优化</em>（在 $N$ 个候选里选它给最高分的）。$N$ 越大，越可能<strong>翻出一个「verifier 看走眼、给了虚高分但其实错」的候选</strong>——这是 verifier 版的 Goodhart（模块 03 的倒 U 在推理时的化身）。所以 BoN 的性能<em>未必随 $N$ 单调上升</em>：用一个不够好的 verifier，$N$ 过大反而可能让性能<strong>掉头向下</strong>。最优 $N$ 取决于 verifier 多准——这又一次把一切归结到「你的 verifier 有多可信」。</p>  <div class="callout warn"><span class="label"></span>
+    <p>常见混淆：<strong>pass@N 不是 best-of-N 的性能，而是它的『天花板』</strong>。pass@N 假设有一个<em>完美 oracle</em>（知道真答案）来挑——这在部署时<strong>不存在</strong>（你要是知道答案就不用模型了）。真实 BoN 用一个<em>不完美</em>的 verifier，性能介于 pass@1（瞎选）和 pass@N（完美选）之间。把 pass@N 当作实际能达到的性能，是评测里最常见的高估错误。notebook 会让你量化这个 gap。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="vote"><span class="num">3</span>多数投票与加权投票</h2>
+  <h3>多数投票与加权投票：不需要 verifier 的搜索</h3>  <p>BoN 需要一个 verifier。但有一类任务（有<strong>唯一最终答案</strong>，如数学题的数值答案）可以<strong>完全不用 verifier</strong>——直接对 $N$ 个解的<strong>最终答案</strong>取众数。这就是 <span class="term">self-consistency</span>（自洽 / 多数投票，Wang 2022）。</p>  <p>原理简单而深刻：模型可能通过<em>不同的推理路径</em>得到答案，但<strong>对的路径更可能殊途同归到同一个（正确）答案，错的路径则各错各的、答案分散</strong>。于是正确答案往往是<strong>出现频率最高</strong>的那个。投票把「分散的错」过滤掉，让「集中的对」胜出。</p>  <div class="ascii">多数投票：对的答案殊途同归，错的各错各的
+
+  解1 -&gt; 答案 42 ┐
+  解2 -&gt; 答案 42 ├─ 42 出现 3 次  ◀── 众数=42 (正确)
+  解3 -&gt; 答案 42 ┘
+  解4 -&gt; 答案 17     (某种错法)
+  解5 -&gt; 答案 99     (另一种错法)
+  =&gt; 正确答案集中、错误答案分散 =&gt; 投票选出正确答案 (无需 verifier!)</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>多数投票像<strong>民意调查</strong>：问 100 个人同一道题，对的人往往答出同一个数，错的人五花八门。取最多人说的那个，大概率是对的。妙在<strong>完全不需要「裁判」</strong>——只需要能比较「最终答案是否相同」。这是它最易部署的原因（数学/代码题尤其适合）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>加权投票（<span class="term">weighted majority vote</span>）是升级版：每条解不是「一票」，而是按 verifier 分数<strong>加权投票</strong>——$\text{vote}(a)=\sum_{i:\,\text{ans}(o_i)=a}\text{verifier}(o_i)$，选总权重最高的答案。它结合了投票的<strong>鲁棒</strong>（多条解相互印证）与 verifier 的<strong>判别力</strong>（高质量解权重更大），实践中常<em>优于</em>纯投票或纯 BoN——因为它既不像 BoN 那样把宝全押在单条「最高分」解上（可能 verifier 看走眼），也不像纯投票那样无视解的质量差异。</p></div>
+  </div>  <p>三者的关系值得记牢：<strong>BoN</strong>信任 verifier，选<em>单条最高分</em>解；<strong>majority</strong>信任<em>答案的集中度</em>，无视 verifier；<strong>weighted majority</strong>兼取——用 verifier 加权、但靠多条解的答案聚合来抗单点误判。选哪个取决于：有没有 verifier、verifier 多准、答案是否可比较。notebook 会构造例子让你看到加权投票如何在 verifier 有噪声时<strong>胜过</strong>裸 BoN。</p>  <p>多数投票也有它<strong>致命的失效模式</strong>，必须警惕：当模型有<strong>系统性偏见</strong>（一致地错向<em>同一个</em>错误答案）时，投票会<strong>自信地放大这个错误</strong>。比如一道题模型 70% 的时候算出同一个错答案、只有 30% 算对，投票会笃定地选那个错的。投票放大的是「一致性」——而一致的对会被放大，一致的错<em>同样</em>会被放大。这正是它和 BoN 互补的深层原因：BoN（靠 verifier 判别）能在「多数错、少数对」时仍挑出对的（只要 verifier 识货），而投票在这种情形必然失败。<strong>没有系统偏见、错误分散时用投票；可能有系统偏见时靠 verifier</strong>——这是部署时的关键判断。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="passk"><span class="num">4</span>pass@k vs pass^k 与无偏估计</h2>
+  <h3>pass@k vs pass^k 与无偏估计</h3>  <p>要<strong>度量</strong>搜索方法，必须先把指标搞对。两个核心指标方向相反、各有用途：</p>  <table>
+    <thead><tr><th>指标</th><th>定义</th><th>随 k</th><th>衡量</th><th>适用场景</th></tr></thead>
+    <tbody>
+      <tr><td><strong>pass@k</strong></td><td>k 个样本<strong>至少一个</strong>对</td><td>单调<strong>升</strong></td><td>能力上界 / 覆盖率</td><td>有 verifier 能筛（代码可跑测试）</td></tr>
+      <tr><td><strong>pass^k</strong></td><td>k 个样本<strong>全部</strong>对</td><td>单调<strong>降</strong></td><td>稳定性 / 可靠性</td><td>多步 agent（每步都要对）</td></tr>
+    </tbody>
+  </table>  <p>$\text{pass}@k$ 关心「有没有可能成功」（有一个对就行），随 $k$ 增加单调上升——采样越多，覆盖越广，撞对的机会越大（Brown 2024 发现它常随 $k$ 近似幂律上升）。$\text{pass}^k$（all-correct@k）关心「能不能<em>次次</em>成功」，随 $k$ 单调下降——对一个 $k$ 步都要做对的 agent，单步正确率 $p$ 下整体成功率是 $p^k$，步越多越脆。两者是<strong>覆盖率</strong>与<strong>可靠性</strong>的对立面，混用会得出荒谬结论。</p>  <p>现在是本模块最容易出错、也最重要的技术点：<strong>怎么从有限样本无偏地估计 pass@k</strong>。直觉上，用 $n$ 个样本里 $c$ 个正确算出 $\hat p=c/n$，再用 $1-(1-\hat p)^k$？<strong>错！这是有偏的</strong>（尤其小样本、小 $c$ 时偏差大）。Chen 2021（Codex）给出了正确的<strong>无偏估计</strong>：</p>  <div class="math-block">\[\widehat{\text{pass@}k}=1-\frac{\dbinom{n-c}{k}}{\dbinom{n}{k}}\]</div>  <p>它的含义很美：$\binom{n-c}{k}/\binom{n}{k}$ 是「从 $n$ 个样本里抽 $k$ 个、<strong>全抽到错的</strong>（避开全部 $c$ 个正确的）」的概率；1 减去它就是「抽 $k$ 个里<strong>至少一个对</strong>」的概率——这正是 pass@k 的定义，且<strong>无偏</strong>（直接在有限样本上数组合，不经过 $\hat p$ 这个有偏中介）。当 $n-c<k$（错的不够 $k$ 个）时 $\binom{n-c}{k}=0$，pass@k=1（必然抽到对的），公式自动正确。</p>  <h4>一个数字例子</h4>  <p>具体看偏差有多大。设 $n=8$ 个样本、$c=1$ 个正确，估 pass@4。无偏：$1-\binom{7}{4}/\binom{8}{4}=1-35/70=0.5$。有偏：$\hat p=1/8=0.125$，$1-(1-0.125)^4=1-0.875^4\approx 0.414$。<strong>两者差了近 9 个百分点</strong>（0.5 vs 0.414）！差异来自：无偏公式直接问「抽 4 个里至少含那 1 个对的概率」（组合计数，精确）；有偏公式把「$\hat p=0.125$」当真实概率再代入，而 $\hat p$ 在 $c=1$ 这种小计数下是个<em>方差很大的随机估计</em>，经过凸函数 $1-(1-x)^4$ 放大后系统性偏低。在难题（$c$ 小）、样本不多（$n$ 小）的评测里，这个偏差足以让一个模型看起来比另一个差——而其实只是估计方法错了。</p>  <div class="callout danger"><span class="label">别用 1−(1−p̂)^k</span>
+    <p>为什么 $1-(1-\hat p)^k$ 有偏？因为 $\hat p=c/n$ 本身是随机变量，而 $1-(1-x)^k$ 是 $x$ 的<strong>非线性</strong>（凸）函数，由 Jensen 不等式 $\mathbb{E}[g(\hat p)]\ne g(\mathbb{E}[\hat p])$。组合数公式则是<strong>对「pass@k 事件」本身</strong>做无偏计数，绕开了这个非线性中介。<strong>做评测时务必用组合数版</strong>——尤其在 $c$ 小（难题）、$n$ 不大时，两者差异可达数个百分点，足以颠倒模型排名。notebook 会让你亲眼看到这个偏差。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="beam"><span class="num">5</span>beam search 与引导搜索</h2>
+  <h3>beam search 与 verifier 引导搜索</h3>  <p>BoN 和投票都是<strong>独立采样完整解再筛</strong>（并行 TTC）。但我们也可以让 verifier 在生成<strong>过程中</strong>就介入，更系统地探索——这需要一个能给<em>部分解</em>打分的 verifier（正是 PRM！）。最经典的是 <span class="term">beam search</span>（束搜索）。</p>  <p>beam search 维持一个宽度为 $b$ 的「候选前缀集合」（beam）。每一步：把 beam 里每个前缀各扩展出若干后续，得到一批更长的部分解，用 PRM 给它们打分，<strong>只保留分数最高的 $b$ 个</strong>进入下一步。如此逐步生长，最后从 beam 里选最优完整解。</p>  <div class="ascii">beam search (宽度 b=2) + PRM 打分剪枝
+
+  步1:   [A](.6) [B](.5) [C](.3)       --PRM选top2--&gt; 保留 A,B
+  步2:   A-&gt;[AX](.7) A-&gt;[AY](.4)
+         B-&gt;[BX](.5) B-&gt;[BY](.6)       --PRM选top2--&gt; 保留 AX,BY
+  步3:   AX-&gt;...  BY-&gt;...               (继续生长 beam)
+  =&gt; 用 PRM 在『过程中』剪掉没希望的分支，把算力集中在有希望的前缀上</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>beam search 像<strong>带向导的探险</strong>：不是漫无目的乱走（独立采样），而是每到一个岔路口，让向导（PRM）评估每条路的前景，只沿最有希望的几条继续。比独立采样更<strong>系统</strong>——算力不浪费在明显的死路上。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更激进的是 <span class="term">MCTS</span>（蒙特卡洛树搜索，AlphaGo 系）：用「选择-扩展-模拟-回传」在解空间建树，把 PRM 当价值函数、生成当策略，能<strong>深度</strong>探索并平衡 explore/exploit。它比 beam 更强但<strong>贵得多</strong>（要建树、多次模拟）。Tree of Thoughts（Yao 2023）是把推理组织成可搜索树的代表。这些都属于 <span class="term">verifier-guided search</span>：用 verifier 引导生成，而非仅在末端筛选。</p></div>
+  </div>  <p>为什么 beam 比 BoN「省」？算一笔账感受一下。BoN 要让 $N$ 个候选<em>各自独立走完整条</em>——若每条 20 步、采 64 条，就是 $64\times20=1280$ 步生成，且其中大量算力花在「一开头就走歪、注定错」的解上（它们照样被生成到底）。beam（宽度 $b=4$）则在<strong>每一步</strong>就用 PRM 砍掉没希望的前缀，只让 4 条有前途的前缀继续生长——同样探索到「第 20 步」的深度，花的生成量远少于让 64 条全程跑完，因为死路在很浅处就被剪掉、算力始终集中在 PRM 看好的分支上。这就是「剪枝集中算力」的含义：<strong>用 verifier 在过程中的判断，把本会浪费在死路上的生成量省下来</strong>。</p>  <p>一个重要的权衡：引导搜索（beam/MCTS）比独立采样（BoN）<strong>更省样本</strong>（剪枝集中算力），但<strong>更依赖 verifier 的质量</strong>——如果 PRM 在中途打分不准，会过早剪掉<em>其实有希望</em>的分支（false negative）或在死路上浪费（false positive）。而 BoN/投票虽然「笨」（不剪枝），却<strong>更鲁棒</strong>（每条解独立走到底，不会被中途的错误评分误杀）。<strong>verifier 越可信，越该用引导搜索；越不可信，越该用独立采样 + 投票</strong>——这又一次呼应「方法的选择取决于 verifier 多可靠」这条主线。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="practice"><span class="num">6</span>实践组合与陷阱</h2>
+  <h3>实践组合与陷阱</h3>  <p>把这些方法落到实处，有几条经验与陷阱：</p>  <ol>
+    <li><strong>方法选择取决于任务结构</strong>。有唯一可比较答案（数学数值）→ majority/weighted majority 极强且免 verifier；解可自动验证（代码跑测试）→ pass@N 可真实达到（用测试当 oracle）；都没有 → 只能靠学习的 verifier 做 BoN，且受 verifier 质量与 hacking 限制。</li>
+    <li><strong>温度要调高一点</strong>。搜索依赖<em>多样性</em>——若温度太低、$N$ 个样本几乎一样，搜索就退化成单样本。BoN/投票通常用比最终作答更高的温度（如 0.6–1.0）来保证候选有区分度、覆盖更多解法。</li>
+    <li><strong>verifier 也会被 hack</strong>。BoN 是对 verifier 的一次「优化」（选它给最高分的）——$N$ 越大，越可能选到「verifier 看走眼给高分但其实错」的解（这叫 verifier 的 <em>over-optimization</em>，BoN 版的 Goodhart）。所以 $N$ 不是越大越好，超过某点 BoN 性能会因 hacking 而<strong>下降</strong>。</li>
+    <li><strong>majority 的失效模式</strong>。当模型有<em>系统性偏见</em>（一致地错向同一个答案）时，投票会<strong>自信地选出错误答案</strong>——多数投票放大的是「一致性」，而错误若一致，它放大错误。这是它和 BoN 互补的原因。</li>
+    <li><strong>正确度量</strong>。报告 pass@k 用组合数无偏估计；区分 pass@k（上界）与实际可部署性能（BoN/投票）；区分 pass@k（覆盖）与 pass^k（可靠）。度量错了，结论全错。</li>
+  </ol>  <p>这些不是孤立技巧，而是同一个判断的不同侧面：<strong>你的 verifier/答案聚合有多可信，决定了你该把算力投在「选得更准」（强 verifier + BoN/引导搜索）还是「投得更稳」（投票 + 多样性）</strong>。本课的 numpy 实现会把 BoN、投票、加权投票、beam、pass@k 估计都做对并对拍，让你对「每种方法在什么时候赢」有量化的直觉——这正是下一模块「把算力花在刀刃上」（compute-optimal）的基础。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <p>测试时搜索是推理模型当前最热的方向之一，前沿在快速演进：</p>  <ul>
+    <li><strong>生成易、验证难的瓶颈</strong>。Brown 2024 显示采样足够多时 pass@k 极高（覆盖率惊人），但<strong>瓶颈转移到了「怎么从海量样本里挑出对的」</strong>——verifier 的质量成了天花板。如何训练/获得更强、更难 hack 的 verifier 是核心问题。</li>
+    <li><strong>verifier 的过度优化</strong>。BoN 的 $N$ 越大越可能 hack verifier（BoN 版 Goodhart）。最优 $N$、verifier 的标定（calibration）、用集成/对抗缓解 hacking，都是活跃方向。</li>
+    <li><strong>搜索 vs 训练的边界</strong>。能力可以「训进权重」也可以「搜索时榨出」，二者可互相替代（R1 把很多搜索能力内化进了模型，使它推理时不需复杂搜索）。最优的训练/搜索分工是开放问题，直通模块 05。</li>
+    <li><strong>过程 verifier 引导的搜索</strong>。PRM-guided beam/MCTS 的效率高度依赖 PRM 的步级标定与策略匹配。把 PRM（模块 03）与搜索（本模块）做到协同，是把测试时计算用到极致的关键。</li>
+    <li><strong>自我修订 vs 重采样</strong>。并行（BoN/投票）与串行（self-refine：读自己上一版改进）的最优配比随难度变化（Snell 2024）。什么任务该重采、什么该修订，是模块 05 compute-optimal 的一部分。</li>
+  </ul>  <p>贯穿本模块的一条主线，值得在结尾点透：<strong>搜索的每一种方法，本质都是在『生成的多样性』与『挑选的可靠性』之间做文章</strong>。BoN 押注挑选（靠 verifier）；投票押注多样性下的统计规律（对的集中）；加权投票兼顾两者；引导搜索（beam/MCTS）则在生成过程中就用挑选来塑造多样性。而它们共同的天花板，是<strong>verifier/聚合的可靠性</strong>——这把我们带回贯穿全课的暗线：信号越可信，越该激进地用它来挑（强 verifier + BoN/引导搜索）；越不可信，越该退回到稳健的统计聚合（投票 + 多样性）。测试时搜索不是一堆孤立技巧，而是<em>『在不确定的判别力下，如何把算力最稳地变成正确答案』</em>这一问题的不同答案。下一模块把这个问题再推一层：不仅<em>怎么搜</em>，还有<em>搜多少、算力怎么在题目间分配</em>。</p>  <div class="callout paper"><span class="label"></span>
+    <p>奠基与前沿：<strong>Cobbe 2021（GSM8K verifiers）</strong>（BoN 重排的源头）、<strong>Wang 2022（Self-Consistency）</strong>（多数投票）、<strong>Brown 2024（Large Language Monkeys）</strong>（pass@k 随采样幂律上升 + 验证瓶颈）、<strong>Chen 2021（Codex）</strong>（pass@k 无偏估计）、<strong>Yao 2023（Tree of Thoughts）</strong>（树搜索）。下一模块把搜索的「该花多少算力、怎么分配」正式化为 <span class="term">test-time compute scaling</span> 与 compute-optimal。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_prm/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 过程奖励模型 PRM</div></a>
+    <a class="next" href="../05_ttc_scaling/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 测试时计算 scaling</div></a>
+  </div>
+
+</div>
+</body>
+</html>

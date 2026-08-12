@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · VLM 架构演进</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 10</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · VLM 架构演进</h1>
+  <p class="subtitle">VLM Architectures —— 从"判相似"到"会生成"：视觉如何真正接进 LLM 的四五种范式</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（ViT / self-attention）、模块 02（CLIP / SigLIP 对比对齐）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge gpu">GPU</span> 03_architectures.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Flamingo (2022)、BLIP-2 (2023)、LLaVA (2023)、Fuyu (2023)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 75 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">从对齐到生成：为什么 CLIP 不够</a></li>
+      <li><a href="#taxonomy">融合策略分类法：五种范式 + 骨干之分</a></li>
+      <li><a href="#flamingo">Flamingo：Perceiver Resampler + gated cross-attention</a></li>
+      <li><a href="#blip2">BLIP-2：Q-Former 与查询式压缩</a></li>
+      <li><a href="#llava">LLaVA：最简前缀投影，为什么简单却强</a></li>
+      <li><a href="#fuyu">Fuyu：encoder-free，像素直入 decoder</a></li>
+      <li><a href="#compare">大对比表：五种架构横向对照</a></li>
+      <li><a href="#tradeoff">选型权衡与评测视角：典型失败模式</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>从对齐到生成：为什么 CLIP 不够</h2>
+
+  <p>模块 02 里的 <span class="term">CLIP</span> / <span class="term">SigLIP</span> 是<strong>双塔（dual-encoder）</strong>结构：图像走一条 ViT 塔、文本走一条 Transformer 塔，最后只在 embedding 空间算一个相似度分数。这套设计在<em>检索 / 零样本分类</em>上极强，但它的能力天花板也写在结构里。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>CLIP 只会回答"这张图和这句话像不像"——它给的是一个分数。它没有一个能<strong>逐字往外吐文本</strong>的解码器，所以你没法让它"描述这张图"、"回答图里有几只猫"、"按图写代码"。要会说话，必须把视觉接到一个能生成的语言模型上。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>CLIP 建模的是匹配分数 $s(x,t)=\langle f_v(x),f_t(t)\rangle$，是一个判别式（discriminative）双塔，两塔之间<strong>没有 token 级交互</strong>，也没有自回归头。生成式 VLM 要建模条件分布 $p(t\mid x)=\prod_i p(t_i\mid t_{<i},x)$，必须有一个 <span class="term">decoder</span> LM，并让视觉信息以某种方式进入它的注意力计算。本模块讨论的"架构"，本质就是<strong>视觉信息进入 LM 的方式</strong>。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  一句话锚点：模块 01 把图变成视觉 token，模块 02 让视觉空间和语言空间对齐，<strong>模块 03 解决"对齐好的视觉特征到底以什么方式喂进 LLM"</strong>。这就是 connector + 融合策略的设计空间。具体的 connector 训练细节（两阶段、数据配方）留给模块 04。</div>
+
+  <p>所以从 CLIP 走到生成式 VLM，要补三样东西：①一个能自回归生成的 LLM（通常是冻结的预训练 LLM）；②一个把视觉特征接进 LLM 的 <span class="term">connector</span>；③一种"在哪一层、以何种注意力"融合的策略。后两者的不同组合，就长出了下面的整张架构谱系。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="taxonomy"><span class="num">2</span>融合策略分类法：五种范式 + 骨干之分</h2>
+
+  <p>把视觉接进 LLM，文献里收敛出五条主线。可以用两个正交的轴来切分它们：</p>
+
+  <ul>
+    <li><strong>融合深度（fusion depth）</strong>：视觉信息只在<em>输入层</em>拼一次（shallow / early），还是在 LLM 的<em>每一层</em>都通过 cross-attention 反复注入（deep）。</li>
+    <li><strong>token 预算（token budget）</strong>：保留全部 patch token（细节多、占上下文），还是压缩成固定的少量 query token（省、但可能丢细节）。</li>
+  </ul>
+
+  <table>
+    <thead><tr><th>#</th><th>范式</th><th>代表</th><th>connector</th><th>融合方式</th><th>视觉 token 去向</th></tr></thead>
+    <tbody>
+      <tr><td>①</td><td>dual-encoder 双塔</td><td>CLIP / SigLIP</td><td>无（只对齐 embedding）</td><td>embedding 点积，无 token 交互</td><td>不进 LLM —— 不能生成</td></tr>
+      <tr><td>②</td><td>deep-fusion via cross-attn</td><td><strong>Flamingo</strong></td><td>Perceiver Resampler</td><td>在冻结 LLM 的<em>多层</em>插入 gated cross-attention</td><td>作为 cross-attn 的 K/V，不占主序列</td></tr>
+      <tr><td>③</td><td>query-based 压缩</td><td><strong>BLIP-2</strong></td><td>Q-Former（32 query）</td><td>先压成 32 token，再当前缀接 LLM</td><td>32 个软 prompt token</td></tr>
+      <tr><td>④</td><td>shallow projection 前缀拼接</td><td><strong>LLaVA</strong></td><td>MLP 投影</td><td>投影后<em>直接拼到输入序列</em>当前缀</td><td>全部 patch token（如 576 个）进主序列</td></tr>
+      <tr><td>⑤</td><td>encoder-free</td><td><strong>Fuyu</strong></td><td>一个线性层</td><td>像素 patch 直接线性投影进 decoder</td><td>patch 直接当 token，无独立视觉塔</td></tr>
+    </tbody>
+  </table>
+
+  <p>另一条容易被忽略却很重要的轴是<strong>语言骨干的形态</strong>：</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p><strong>decoder-only</strong>：就是一个 GPT 式的纯解码器，视觉 token 和文本 token 拼在同一条序列里、一起做带因果掩码的自注意力。今天绝大多数开源 VLM（LLaVA、Qwen2-VL、Fuyu）都是这一类，因为可以直接复用现成的强 LLM。</p>
+      <p><strong>encoder-decoder</strong>：图像/前缀走 encoder，文本在 decoder 端通过 cross-attention 取用。BLIP-2 接 Flan-T5 时、PaLI 都属于这种。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>decoder-only 用<strong>因果自注意力</strong>统一处理 $[\,\text{vis tokens};\,\text{text tokens}\,]$ 的拼接序列，视觉以"前缀"或"软 prompt"身份参与 $p(t_i\mid t_{<i},\text{vis})$。encoder-decoder 把视觉/source 放进双向 encoder，decoder 用<strong>独立的 cross-attention</strong> 子层取 encoder 输出作 K/V。Flamingo 的"在冻结 decoder LM 里插 cross-attn 层"是一种<em>混合</em>：骨干是 decoder-only，但融合借用了 encoder-decoder 式的 cross-attention 机制。</p>
+    </div>
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  分类法不是为了背名词，而是为了<strong>评测时快速定位</strong>：拿到一个陌生 VLM，先问它"哪种融合 + 多少视觉 token + 冻结了谁"，基本就能预判它的强项与失败模式（细节见 §8）。下面四节各取一个里程碑，配一张架构图逐一拆开。</p></div>
+
+  <!-- ========================================================= -->
+  <h2 id="flamingo"><span class="num">3</span>Flamingo：Perceiver Resampler + gated cross-attention</h2>
+
+  <p><span class="term">Flamingo</span> [Alayrac 2022] 是第一个把<strong>冻结的视觉编码器 + 冻结的大 LLM</strong>桥起来、并支持<strong>交错图文（interleaved image-text）少样本</strong>的标志性工作。它的两个关键部件：</p>
+
+  <ul>
+    <li><strong>Perceiver Resampler</strong>：视觉编码器对每帧/每图吐出变长特征，Resampler 用一组固定数量的可学习 latent query（如 64 个）通过 cross-attention 把它们重采样成<em>定长</em>视觉 token。好处是无论输入多少帧、分辨率多大，进 LLM 的视觉 token 数恒定。</li>
+    <li><strong>Gated cross-attention dense（GATED XATTN-DENSE）层</strong>：在<em>冻结</em>的 LLM 的若干层之间，<strong>新插入</strong>带门控的 cross-attention 子层。文本是 query，视觉 latent 是 key/value。门控用一个初值为 0 的 $\tanh$ 标量，保证训练初期新层近似恒等，不破坏原 LLM 的语言能力。</li>
+  </ul>
+
+  <div class="ascii">
+  交错输入：  &lt;img1&gt; 文本A &lt;img2&gt; 文本B ...   （支持少样本：图-文-图-文 示例堆叠）
+
+  每张图 ─► [冻结 Vision Encoder] ─► 变长特征
+                                        │
+                                        ▼
+                          ┌──────────────────────────┐
+                          │   Perceiver Resampler      │  64 个可学习 latent
+                          │   (cross-attn 重采样)       │  ──► 定长视觉 token (K/V)
+                          └──────────────────────────┘
+                                        │
+   文本 token ─►┌────────────────────────────────────────────────────┐
+               │  冻结 LLM (decoder-only)                              │
+               │   层 i   ── self-attn (text) ──┐                      │
+               │   ┌─────────────────────────┐  │ 插入                 │
+               │   │ GATED XATTN-DENSE        │◄─┘  门控 tanh(α), α₀=0  │
+               │   │  Q=text, K/V=视觉 latent  │                        │
+               │   └─────────────────────────┘                        │
+               │   层 i+1 ── self-attn ── ...                          │
+               └────────────────────────────────────────────────────┘
+                                        │
+                                        ▼   自回归生成文本
+  </div>
+
+  <p>cross-attention 的数学就是模块 01 那条注意力公式，只是 $Q$ 来自文本、$K,V$ 来自视觉，外加一个门控标量：</p>
+  <div class="math-block">
+  $$ h \;\leftarrow\; h + \tanh(\alpha)\cdot \mathrm{CrossAttn}\big(Q=h_{\text{text}},\; K,V = z_{\text{vis}}\big),\qquad \alpha \text{ 初始化为 } 0 $$
+  </div>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>Flamingo</strong> [Alayrac 2022] 的核心贡献不止架构，还在于证明了"<strong>冻结大 LLM + 少量新增可训层</strong>"这一范式能在仅用交错网页数据下习得强大的少样本多模态 in-context learning。它的最大代价是：cross-attention 层是<em>新增并从头训练</em>的，参数与工程都更重，且交错数据稀缺。后来的开源复现是 <strong>OpenFlamingo</strong> 与 <strong>Idefics</strong>（模块 04 会再提）。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  为什么"插在每层"叫 deep fusion？因为视觉信息<strong>反复</strong>参与 LLM 的每一层推理，而不是只在输入端拼一次。代价是改了 LLM 的内部结构；收益是融合更充分、对少样本/长上下文交错更友好。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="blip2"><span class="num">4</span>BLIP-2：Q-Former 与查询式压缩</h2>
+
+  <p><span class="term">BLIP-2</span> [Li 2023] 的设计哲学是<strong>极致省钱</strong>：冻结一个现成图像编码器、冻结一个现成 LLM，中间只训一个轻量的桥——<span class="term">Q-Former</span>（Querying Transformer）。</p>
+
+  <p>Q-Former 持有 <strong>32 个可学习 query 向量</strong>。这些 query 通过 cross-attention 从冻结图像编码器的特征里"问"出信息，把任意长度的视觉特征<strong>压成固定 32 个 token</strong>，再经一个线性层投到 LLM 维度，作为 LLM 的软前缀（soft prompt）。</p>
+
+  <div class="ascii">
+                          冻结图像编码器 (如 EVA-CLIP ViT) ─► 图像特征 (K/V)
+                                        │
+                                        ▼
+   32 个可学习 query ─►┌───────────────────────────────────┐
+                      │  Q-Former (轻量 Transformer)        │
+                      │  • query 间 self-attn               │
+                      │  • query→图像 cross-attn (抽取)      │
+                      │  • (阶段1) 还与文本交互做对比/匹配   │
+                      └───────────────────────────────────┘
+                                        │  输出 32 个视觉 token
+                                        ▼
+                              [Linear 投影到 d_llm]
+                                        │ 32 个软 prompt token
+                                        ▼
+                      ┌───────────────────────────────────┐
+                      │   冻结 LLM (OPT / Flan-T5)           │ ──► 文本输出
+                      └───────────────────────────────────┘
+
+   两阶段训练：
+   阶段1  Vision-Language Representation：冻结图像编码器，用 ITC/ITM/ITG 三目标
+          训 Q-Former，让 32 query 学会抽取与文本最相关的视觉信息。
+   阶段2  Vision-to-Language Generative：接上冻结 LLM，只训 Q-Former+投影，
+          让 32 token 成为 LLM 能读懂的前缀。
+  </div>
+
+  <p>第一阶段联合优化三个目标（沿用 BLIP 家族）：图文对比 <span class="term">ITC</span>、图文匹配 <span class="term">ITM</span>、基于图像的文本生成 <span class="term">ITG</span>；用不同的注意力掩码控制 query 与文本能否互相看见，从而在<em>同一个</em>Q-Former 里学到既能对齐又能抽取的表征。</p>
+
+  <div class="math-block">
+  $$ \underbrace{32 \times d}_{\text{Q-Former 输出，与图像分辨率/patch 数无关}} \;\xrightarrow{\;W_{\text{proj}}\;}\; \underbrace{32 \times d_{\text{llm}}}_{\text{LLM 软前缀}} $$
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>32 个 token 是 BLIP-2 的灵魂，也是它的软肋。</strong> 把一整张图压成 32 个 token 极省上下文、训练极便宜（只训 Q-Former），但<strong>压缩必然丢细节</strong>：密集文字、小目标计数、精细 OCR、空间关系这类任务上，固定 32 token 的瓶颈很明显。这直接引出了 LLaVA 路线"干脆别压"的反方向选择。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="llava"><span class="num">5</span>LLaVA：最简前缀投影，为什么简单却强</h2>
+
+  <p><span class="term">LLaVA</span> [Liu 2023]（Visual Instruction Tuning）把 connector 简化到极致：<strong>一个投影把 CLIP 的 patch token 直接当作 LLM 的前缀 token</strong>。初版用单个线性层，LLaVA-1.5 换成两层 <span class="term">MLP</span>。没有 Q-Former，没有 cross-attention 新层，没有压缩。</p>
+
+  <div class="ascii">
+   图像 ─► [CLIP ViT-L/14 @336] ─► 576 个 patch token (24×24)，每个 d_v 维
+                                        │
+                                        ▼
+                          ┌───────────────────────────┐
+                          │  MLP projector             │  d_v ─► d_llm
+                          │  (Linear→GELU→Linear)      │  token 数不变 = 576
+                          └───────────────────────────┘
+                                        │ 576 个视觉 token
+                                        ▼
+   "USER: <image> 描述这张图\nASSISTANT:" 文本 token
+                │                  │
+                └──── 拼接成一条序列 ─┴──►┌──────────────────────────┐
+       [ 576 视觉 token | 文本 token ]    │  LLM (Vicuna, decoder-only)│ ─► 回答
+                                          │  统一因果自注意力           │
+                                          └──────────────────────────┘
+  </div>
+
+  <p>关键在于：视觉 token 和文本 token 进入<strong>同一条序列、共用同一套因果自注意力</strong>——视觉就是一段"用图片写成的前缀"。LLM 不需要任何新结构，原封不动地把它们当 token 处理。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲：为什么这么简单还这么强</h4>
+      <p>因为重活早就被别人干完了。CLIP 已经把视觉特征对齐到语言语义（模块 02），LLM 已经会推理会说话，剩下的"翻译"近乎一个线性映射，一个 MLP 足矣。再配上 GPT-4 生成的高质量视觉指令数据，效果就上来了。简单 = 训练快、易复现、易 scale。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>由于视觉骨干已是语言对齐的 CLIP 空间，connector 只需近似一个线性桥接 $W:\mathbb{R}^{d_v}\to\mathbb{R}^{d_{llm}}$ 即可，无需同时承担"空间对齐+语义桥接"。LLaVA 采两阶段：<strong>阶段1</strong> 冻结视觉与 LLM，只训投影做特征对齐；<strong>阶段2</strong> 用视觉指令数据微调投影+LLM。LLaVA-1.5 进一步用 MLP 投影 + 学术任务数据，刷新当时多项 benchmark，确立了"shallow projection + 全 patch token"成为开源主流配方。</p>
+    </div>
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  代价是<strong>视觉 token 多</strong>：336 分辨率下 576 个 token，一旦上高分辨率（模块 06 的 AnyRes 把图切块）token 数可破数千，严重吃上下文、拖慢推理。"保细节"和"省 token"的张力在这里达到顶点——这正是模块 06 高分辨率压缩要解决的问题。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="fuyu"><span class="num">6</span>Fuyu：encoder-free，像素直入 decoder</h2>
+
+  <p><span class="term">Fuyu-8B</span> [Bavishi 2023, Adept] 走到了另一个极端：<strong>干脆不要独立视觉塔</strong>。没有 CLIP、没有 ViT、没有 Q-Former——图像 patch 经过<strong>一个线性层</strong>直接投影成 token，和文本 token 一起喂进同一个 decoder-only Transformer。</p>
+
+  <div class="ascii">
+   图像 (任意分辨率) ─► 切成 patch (如 30×30 像素一块)
+        │
+        ▼ 把每个 patch 拉平
+   ┌──────────────────────────────┐
+   │  单个 Linear projection        │  patch 像素 ─► d_llm
+   │  (没有 ViT，没有 CLIP！)        │
+   └──────────────────────────────┘
+        │ 视觉 token（用特殊的 newline token 标记图像每行结束，保留 2D 结构）
+        ▼
+   ┌──────────────────────────────────────────────────────┐
+   │   单一 decoder-only Transformer                         │
+   │   [ 视觉 patch token | 文本 token ] 同一序列、同一注意力  │ ─► 文本输出
+   └──────────────────────────────────────────────────────┘
+  </div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>别人是"先用一个专门的视觉网络把图理解一遍，再交给语言模型"；Fuyu 是"图就是一串没人预处理过的色块 token，让语言模型自己从头学怎么看"。少了一整个视觉塔，接口干净到极点，而且天然吃任意分辨率——图多大就多少 patch token，不用为某个固定分辨率重训编码器。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>Fuyu 取消了 vision encoder 与 connector 的区分：raw patch 经线性投影即作为 token 序列进入 decoder，融合发生在<strong>输入层</strong>且骨干<strong>不冻结</strong>（统一端到端训练）。代价是放弃了 CLIP 预训练赋予的视觉先验，需要更多多模态数据/算力让 decoder 自学视觉特征；收益是架构极简、原生支持可变分辨率与高分辨率文档/图表。这一 <span class="term">encoder-free</span> 思路在 EVE、后续原生多模态（模块 09）里被继续探索。</p>
+    </div>
+  </div>
+
+  <div class="callout paper"><span class="label"></span>
+  Fuyu 是产品驱动的架构选择：Adept 做 UI/文档 agent，需要任意长宽比的高分辨率屏幕截图，固定 224/336 的 CLIP 编码器恰恰是瓶颈。<strong>架构选择往往由下游任务的分辨率/接口需求倒逼</strong>——这是评测时理解一个 VLM "为什么长这样"的关键线索。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="compare"><span class="num">7</span>大对比表：五种架构横向对照</h2>
+
+  <table>
+    <thead><tr>
+      <th>架构</th><th>connector</th><th>视觉 token 数</th><th>冻结策略</th><th>能否生成文本</th><th>代表分辨率</th><th>适用场景</th>
+    </tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>CLIP / SigLIP</strong><br><span style="color:var(--fg-dim)">dual-encoder</span></td>
+        <td>无（embedding 对齐）</td>
+        <td>—（仅 [CLS]/pooled）</td>
+        <td>两塔都训（对比预训练）</td>
+        <td><strong>否</strong>，只出分数</td>
+        <td>224 / 384</td>
+        <td>检索、零样本分类、做别人的视觉骨干</td>
+      </tr>
+      <tr>
+        <td><strong>Flamingo</strong><br><span style="color:var(--fg-dim)">deep cross-attn</span></td>
+        <td>Perceiver Resampler</td>
+        <td>定长（如 64/帧）</td>
+        <td>冻结 ViT + 冻结 LLM，<br>只训 Resampler + xattn 层</td>
+        <td>是</td>
+        <td>变长（多帧/多图）</td>
+        <td>交错图文、少样本 in-context、视频</td>
+      </tr>
+      <tr>
+        <td><strong>BLIP-2</strong><br><span style="color:var(--fg-dim)">query 压缩</span></td>
+        <td>Q-Former（32 query）</td>
+        <td><strong>32</strong>（固定）</td>
+        <td>冻结 ViT + 冻结 LLM，<br>只训 Q-Former</td>
+        <td>是</td>
+        <td>224 / 364</td>
+        <td>低成本接现成 LLM、caption、VQA</td>
+      </tr>
+      <tr>
+        <td><strong>LLaVA / LLaVA-1.5</strong><br><span style="color:var(--fg-dim)">shallow projection</span></td>
+        <td>MLP 投影</td>
+        <td><strong>576</strong>（24×24@336）</td>
+        <td>阶段1冻结，阶段2训投影+LLM</td>
+        <td>是</td>
+        <td>336（NeXT 上千）</td>
+        <td>通用视觉对话/指令、开源主流基线</td>
+      </tr>
+      <tr>
+        <td><strong>Fuyu</strong><br><span style="color:var(--fg-dim)">encoder-free</span></td>
+        <td>单个 Linear</td>
+        <td>随分辨率变（patch 数）</td>
+        <td>无视觉塔，端到端全训</td>
+        <td>是</td>
+        <td><strong>任意</strong>分辨率</td>
+        <td>高分屏/文档/UI agent、可变长宽比</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  纵向读这张表能看出一条<strong>演进主线</strong>：从"重 connector + 重冻结"（Flamingo 新增 cross-attn 层、BLIP-2 专门的 Q-Former）逐渐走向"<strong>轻 connector + 复用强 LLM</strong>"（LLaVA 一个 MLP），再到"<strong>取消 connector 与编码器边界</strong>"（Fuyu / 原生多模态）。算力变便宜、开源强 LLM 变多，让"简单直接"的方案后来居上。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">8</span>选型权衡与评测视角：典型失败模式</h2>
+
+  <p>做 model evaluation 时，架构不是中性的——<strong>每种融合策略都自带一组可预测的失败模式</strong>。把失败归因到架构，是评测科学家的核心技能。</p>
+
+  <table>
+    <thead><tr><th>架构</th><th>结构性优势</th><th>典型失败模式（评测要盯的）</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>BLIP-2（Q-Former 压缩）</td>
+        <td>token 极省、训练便宜、接口干净</td>
+        <td><strong>压缩丢细节</strong>：32 token 容不下密集文字/小目标/精细空间关系 → OCR、计数、细粒度 VQA 弱；对图像细节问"具体写了什么"易含糊</td>
+      </tr>
+      <tr>
+        <td>LLaVA（全 patch 前缀）</td>
+        <td>细节保留好、实现简单、易 scale</td>
+        <td><strong>token 多吃上下文</strong>：576+（高分辨率破千）视觉 token 挤占 LLM 上下文、推理慢；多图/长文档场景易爆长度；视觉 token 过多还可能放大幻觉</td>
+      </tr>
+      <tr>
+        <td>Flamingo（gated cross-attn）</td>
+        <td>少样本/交错 in-context 强、视觉不占主序列</td>
+        <td><strong>训练复杂</strong>：新增 cross-attn 层需从头训、交错数据稀缺、工程重；复现门槛高；指令跟随不如指令微调路线自然</td>
+      </tr>
+      <tr>
+        <td>Fuyu（encoder-free）</td>
+        <td>任意分辨率、接口极简</td>
+        <td><strong>缺视觉先验</strong>：丢掉 CLIP 预训练，数据/算力需求大；小数据下视觉理解可能弱于有编码器方案；细粒度语义对齐更难保证</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>评测归因实操：</strong> 看到一个 VLM 在 OCR / 文档 / 计数上崩，先别怪 LLM 推理弱——<br>
+  ① 它是不是 <strong>query 压缩</strong>（BLIP-2 式）把细节压没了？<br>
+  ② 还是<strong>分辨率太低</strong>（CLIP 224/336，模块 06）根本没看清？<br>
+  ③ 还是 <strong>token 太多爆上下文</strong>截断了？<br>
+  架构 + 视觉 token 数 + 分辨率三件套，往往比"模型不够聪明"更能解释失败。这套归因框架在模块 07（评测）和模块 08（幻觉）会系统展开。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  选型的一句话总结：<strong>要省上下文/低成本 → 查询压缩（BLIP-2）；要细节/易复现 → 全 patch 投影（LLaVA）；要少样本/交错/视频 → deep cross-attn（Flamingo）；要任意分辨率/极简接口 → encoder-free（Fuyu）</strong>。没有免费的午餐，每一条都在 token 预算、细节保真、训练复杂度之间做不同取舍。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>统一架构趋势：连接器在收敛。</strong> 2024 后的系统性消融（Idefics2 [Laurençon 2024]、MM1 [McKinzie 2024]、Prismatic [Karamcheti 2024]）反复显示：在数据/算力充足时，<em>简单的投影 + 全 patch token</em> 往往不输甚至胜过 Q-Former 式压缩，Q-Former 的优势主要在极低 token 预算。连接器设计是否正在"被简化掉"？开放。</li>
+    <li><strong>encoder-free 能否规模化追平？</strong> Fuyu / EVE 取消视觉塔，接口最干净，但要靠规模化补回 CLIP 先验。在何种数据/算力规模下，encoder-free 能稳定追平甚至超过有编码器方案？这关系到下一代架构的形态。</li>
+    <li><strong>原生多模态（native multimodal）。</strong> GPT-4o、Gemini、Chameleon [Chameleon Team 2024] 走 early-fusion / any-to-any：图像与文本从预训练第一步就在同一个 token 空间里联合训练，而非"对齐一个现成视觉塔到现成 LLM"。这是本课模块 09 的主题，也是当前最前沿的范式迁移。</li>
+    <li><strong>融合深度的最优解未定。</strong> deep cross-attention（Flamingo）vs shallow prefix（LLaVA），在长上下文、多图交错、视频、agent 场景下孰优孰劣，仍缺乏在统一条件下的干净对比。</li>
+    <li><strong>评测视角的开放问题：</strong> 现有 benchmark 多为单图短问答，难以暴露不同融合策略在<em>多图交错、长视频、高分辨率文档</em>上的差异。设计能<strong>区分架构能力</strong>而非仅测 LLM 知识的 benchmark，是评测研究的空白（模块 07）。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>为什么 CLIP 这种双塔结构不能生成文本？生成式 VLM 必须补上哪三样东西？</li>
+      <li>列出五种融合范式，并分别说出它们的 connector、视觉 token 去向、是否占主序列。</li>
+      <li>Flamingo 的 gated cross-attention 为什么门控初值是 0？BLIP-2 的 32 个 query 是什么、解决什么、又牺牲什么？</li>
+      <li>LLaVA 只用一个 MLP 却很强，原因是什么？它的代价是什么？拿到一个在 OCR 上崩掉的 VLM，你会如何按架构归因？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../02_contrastive_clip/02_讲解.html"><div class="dir">← 上一章</div><div class="t">02 · 对比对齐 CLIP / SigLIP</div></a>
+    <a class="next" href="../04_connectors_training/04_讲解.html"><div class="dir">下一章 →</div><div class="t">04 · 连接器与训练范式</div></a>
+  </div>
+
+</div>
+</body>
+</html>

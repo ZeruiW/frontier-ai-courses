@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 联邦学习</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 联邦学习</h1>
+  <p class="subtitle">数据不动、模型动 —— FedAvg 基准（对拍集中式）、非 IID 与客户端漂移这一命门、通信压缩与客户端采样、安全聚合（成对掩码相消）让服务器看不到单个更新；与 DP 正交叠加成生产级隐私联邦</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01/02（DP、子采样放大）、SGD、加权平均；与集中式训练的对比</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_federated_learning.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">McMahan 2017（FedAvg）、Bonawitz 2017（安全聚合）、Karimireddy 2020（SCAFFOLD）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">数据不动、模型动：正交的隐私轴</a></li>
+      <li><a href="#fedavg">FedAvg：联邦学习的基准</a></li>
+      <li><a href="#noniid">非 IID 与客户端漂移</a></li>
+      <li><a href="#comm">通信压缩与客户端采样</a></li>
+      <li><a href="#secagg">安全聚合：看不到单个更新</a></li>
+      <li><a href="#fldp">联邦 + DP：正交叠加</a></li>
+      <li><a href="#production">从 numpy 到 Flower 生产</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>数据不动、模型动：正交的隐私轴</h2>
+  <p>模块 01/02 的隐私防御都在做同一件事——<strong>数据集中起来，再给输出/梯度加噪</strong>。但有一类风险它们没碰：<strong>数据集中本身</strong>就是风险。把上亿用户的原始数据堆在一个数据中心，一次拖库、一个内鬼、一张法院传票，就能让所有人同时暴露。<span class="term">federated learning</span>（联邦学习，McMahan 2017）换了一个完全正交的思路：<strong>数据不动、模型动</strong>——原始数据永远留在产生它的地方（你的手机、某家医院），只有<em>模型更新</em>被上传聚合。从源头消除「集中的原始数据」这个最大的攻击面。</p>  <p>这个换轴是根本性的。DP 是「数据进来了，我让输出不泄露你」；联邦学习是「你的数据根本没进来」。两者不是竞争而是<strong>正交叠加</strong>：你可以在联邦学习的每个客户端上跑 DP-SGD（本地加噪），再用安全聚合让服务器连单个更新都看不到——三层防御各守一个环节（本模块末与模块 05 会拼起来）。理解「联邦是换数据的流向，DP 是限制信息的泄露」这个分工，是不把两者搞混的关键。</p>  <p>但天下没有免费的午餐。把训练从「一个数据中心的集中 SGD」改成「成千上万台设备的协作」，引入了三个集中式训练从未有过的难题：<strong>通信瓶颈</strong>（上传模型更新比读本地内存慢几个数量级）、<strong>统计异构 / 非 IID</strong>（每台设备的数据分布都不同，这是联邦学习的命门）、<strong>系统异构与不可靠</strong>（设备会掉线、算力不一、随时退出）。本模块的主线就是：先把 FedAvg 这个基准算法从零搭起来、对拍集中式，再逐一拆解这三个难题，最后接上安全聚合。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住联邦学习与前两模块的关系：<strong>DP/DP-SGD 防「从结果反推个体」，联邦学习防「原始数据被集中」</strong>。前者是密码学/统计意义上的「输出安全」，后者是系统架构意义上的「数据不出域」。它们解决不同环节、可以叠加。本模块你会从零实现 FedAvg（对拍集中式训练，验证「分布式协作 == 集中训练」在理想情况下成立），并亲手制造非 IID 看它怎么把这个等式打破。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fedavg"><span class="num">2</span>FedAvg：联邦学习的基准</h2>
+  <h3>FedAvg：联邦学习的基准算法</h3>  <p><span class="term">FedAvg</span>（Federated Averaging）是联邦学习的「Hello World」，也是几乎所有后续方法的基线。一轮（communication round）做四件事：</p>  <ol>
+    <li><strong>下发</strong>：服务器把当前全局模型 $w^t$ 发给本轮选中的一批客户端；</li>
+    <li><strong>本地训练</strong>：每个客户端 $k$ 在自己的数据上从 $w^t$ 出发跑若干步（E 个 epoch）SGD，得到本地模型 $w_k^{t+1}$；</li>
+    <li><strong>上传</strong>：客户端把更新（$w_k^{t+1}$ 或差值 $w_k^{t+1}-w^t$）传回服务器；</li>
+    <li><strong>聚合</strong>：服务器按各客户端<strong>数据量加权平均</strong>得到新全局模型。</li>
+  </ol>  <div class="math-block">\[w^{t+1}=\sum_{k}\frac{n_k}{n}\,w_k^{t+1},\qquad n=\sum_k n_k\]</div>  <p>为什么是<strong>按数据量 $n_k$ 加权</strong>而非简单平均？因为数据多的客户端，其本地梯度估计更可靠、更代表总体；加权平均让聚合后的更新等价于「在全部数据上做了一步（近似的）梯度更新」。事实上可以证明：当每个客户端只跑<strong>一步</strong>本地 SGD（E=1）且数据是 IID 时，FedAvg 的聚合更新<strong>精确等于在全部数据上做一步集中式 SGD</strong>——这正是 notebook 第一个对拍要验证的。</p>  <p>FedAvg 的精髓在第 2 步的「<strong>跑若干步</strong>」。如果每轮只跑一步本地更新，那它就退化成普通的分布式 SGD，通信开销极高（每步都要一轮通信）。FedAvg 让每个客户端<strong>多跑几步再通信</strong>（E>1），用更多本地计算摊薄昂贵的通信——这是它「communication-efficient」之名的来源。但这也埋下了非 IID 下的祸根：本地多跑几步，各客户端就各自跑向自己的本地最优，偏离全局（下一节的客户端漂移）。<strong>E 是通信效率与收敛质量之间的旋钮</strong>。</p>  <p>上传「完整模型 $w_k^{t+1}$」还是「差值 $\Delta_k=w_k^{t+1}-w^t$」？数学上等价（服务器知道 $w^t$），但<strong>差值视角</strong>更有用：它把 FedAvg 重新诠释为<strong>两级优化</strong>——客户端在本地算出一个「伪梯度」$\Delta_k$（本地多步训练的净效果），服务器把这些伪梯度加权平均、当作一步「服务器端更新」。这个视角直接催生了改进：既然服务器在做「梯度下降」，那就可以给它装<strong>更好的优化器</strong>——FedAdam（Reddi 2021）就是把 Adam 用在服务器端聚合上，在非 IID 下收敛更稳。记住「本地训练产生伪梯度、服务器聚合伪梯度」这个双层结构，是理解 FedAvg 一切变体的统一框架。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>FedAvg 的一句话直觉：<strong>让每个人在自己的数据上学一会儿，再把大家学到的「平均」一下，循环往复</strong>。理想（IID）情况下这跟「把所有数据放一起学」殊途同归；现实（非 IID）情况下，「每个人学的东西方向不一致」，平均会互相抵消甚至打架——这就是下一节要直面的核心挑战。本课 notebook 第一个对拍就验证理想情况：IID + 每客户端单步本地训练时，FedAvg 的聚合更新<strong>逐位等于</strong>集中式一步 SGD，让你确信「分布式协作 == 集中训练」不是口号而是可验证的等式。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="noniid"><span class="num">3</span>非 IID 与客户端漂移</h2>
+  <h3>非 IID 与客户端漂移：联邦学习的命门</h3>  <p>集中式训练里，每个 mini-batch 都是从同一个总体里随机抽的，分布一致。联邦学习里，<strong>每个客户端的数据分布天然不同</strong>——你手机相册里全是猫和家人，我的全是代码截图和地铁；某医院的病人偏老年,另一家偏儿科。这叫 <span class="term">non-IID data</span>（非独立同分布），是联邦学习区别于普通分布式训练的<strong>根本难点</strong>。</p>  <p>非 IID 怎么伤害 FedAvg？通过 <span class="term">client drift</span>（客户端漂移）。当每个客户端在自己<em>有偏</em>的数据上跑多步本地 SGD，它会收敛向<strong>自己的本地最优</strong>，而各客户端的本地最优彼此不同、甚至冲突。把这些跑偏了的本地模型平均起来，得到的全局模型<strong>既不在任何一个本地最优、也不一定靠近全局最优</strong>——更新互相抵消，全局损失震荡、收敛变慢、最终精度下降。</p>  <div class="ascii">IID（数据同分布）                  非 IID（各客户端数据偏斜）
+  本地最优都指向同一处               各本地最优散落各方
+      ●→ ↘                              ●──→  （客户端A：只见猫）
+      ●→ → ★ 全局最优                   ★?    （平均落在中间，谁都不满意）
+      ●→ ↗                              ●──→  （客户端B：只见狗）
+  平均 -&gt; 直奔全局最优               平均 -&gt; 被各方拉扯、漂移、震荡</div>  <p>漂移的严重程度由两个因素放大：<strong>本地步数 E</strong>（跑得越久，离全局越远）和<strong>数据异质度</strong>（分布差越大，本地最优越分散）。这给出两个缓解方向：减少本地步数（但增加通信）、或在算法上<strong>校正漂移</strong>。后者是 FedAvg 之后最重要的研究线——SCAFFOLD（Karimireddy 2020）用<strong>控制变量（control variates）</strong>估计并扣除每个客户端的漂移方向；FedProx 加一个把本地模型<em>拉回全局</em>的近端正则项；FedAdam（Reddi 2021）把自适应优化器搬到服务器端聚合。它们的共同目标都是：<em>在享受多步本地计算（省通信）的同时，不让客户端跑偏</em>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个容易被忽视的实践点：非 IID 不只伤害收敛，还<strong>放大公平性问题</strong>。数据量少、分布偏的客户端（往往是少数群体）在加权平均里话语权小，全局模型可能在他们身上表现很差。「联邦学习天然保护隐私且公平」是一种误解——它保护数据不出域（隐私），但非 IID 下的公平需要额外设计（个性化联邦、按公平加权）。这与 C12 责任 AI 的公平性主题直接相交。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="comm"><span class="num">4</span>通信压缩与客户端采样</h2>
+  <h3>通信压缩与客户端采样：让联邦真正可行</h3>  <p>联邦学习的第二个工程瓶颈是<strong>通信</strong>。在跨设备（cross-device）场景，成千上万台手机通过家用上行带宽传一个可能上百 MB 的模型更新，通信时间远超本地计算时间。所以「少传、传得巧」是工程重点：</p>  <table>
+    <thead><tr><th>手段</th><th>做什么</th><th>省了什么</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>多步本地训练 (E&gt;1)</strong></td><td>每轮多跑几步再通信</td><td>通信轮数 ∝ 1/E</td><td>非 IID 下加剧漂移</td></tr>
+      <tr><td><strong>量化 quantization</strong></td><td>更新用低比特表示（如 8/4 bit 甚至 1 bit）</td><td>每次上传字节数</td><td>量化误差，需误差反馈补偿</td></tr>
+      <tr><td><strong>稀疏化 sparsification</strong></td><td>只传梯度里最大的 top-k 个</td><td>上传字节数（可省 90%+）</td><td>丢弃小梯度，需累积残差</td></tr>
+      <tr><td><strong>低秩 / 草图</strong></td><td>把更新投影到低维再传</td><td>上传维度</td><td>近似误差</td></tr>
+    </tbody>
+  </table>  <p>第三个现实是<strong>客户端采样 / 参与（client sampling）</strong>：你无法让所有设备每轮都参与——它们会离线、省电、信号差、用户随时关 App。所以每轮服务器只<strong>随机选一小部分</strong>可用客户端。这带来三重影响：① 采样引入<strong>方差</strong>（每轮看到的客户端子集不同，全局更新更抖）；② 但也带来类似 DP-SGD 的<strong>隐私放大</strong>（任何客户端大概率没参与某轮，单轮对它的隐私损失被稀释）；③ 需要算法对<strong>部分参与</strong>鲁棒（不能假设每个客户端每轮都到场）。</p>  <p>把这些拼起来，一个真实的联邦系统是在三个约束下走钢丝：<strong>通信预算</strong>（每轮能传多少、传多少轮）、<strong>收敛质量</strong>（非 IID + 部分参与下还能不能学好）、<strong>隐私</strong>（DP + 安全聚合的叠加）。没有单一最优配置——cross-device（海量手机、各自数据少、频繁掉线）和 cross-silo（少数医院/银行、各自数据多、稳定在线）这两种场景的取舍就完全不同。本模块 notebook 会让你亲手调本地步数、客户端采样比例，量化它们对收敛的影响。</p>  <p>稀疏化和量化背后有一个共同的工程模式值得记住——<strong>误差反馈（error feedback）</strong>。直接丢弃小梯度（top-k 稀疏化）或量化会引入误差，若每轮都丢、误差会累积导致收敛变差。误差反馈的解法是：把这一轮<em>没传出去</em>的部分（丢弃的小梯度、量化残差）<strong>累积到本地残差里，下一轮补传</strong>。这样信息只是被<em>延迟</em>而非永久丢失，能在极激进的压缩（如只传 1% 的梯度、甚至 1-bit 符号）下仍保持收敛。这是「少传」能成立的关键技巧，cross-device 联邦几乎必用——否则省了通信却赔了精度，得不偿失。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住联邦学习的「不可能三角」直觉：<strong>通信效率（多步本地）、非 IID 鲁棒性、隐私</strong>三者互相牵制。多步本地省通信但加剧漂移；强隐私（DP）加噪伤效用；客户端采样省资源但增方差。真实系统的设计就是在这个三角里、针对具体场景（cross-device vs cross-silo）找平衡点——这也是为什么联邦学习没有「一个算法打天下」。一个反复出现的省力点是：<strong>客户端采样同时服务于「省资源」和「DP 隐私放大」两个目标</strong>，是这个三角里难得的「一举两得」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="secagg"><span class="num">5</span>安全聚合：看不到单个更新</h2>
+  <h3>安全聚合：让服务器连单个更新都看不到</h3>  <p>联邦学习把原始数据留在了本地，但上传的<strong>模型更新本身仍会泄露信息</strong>——研究表明，从一个客户端的梯度更新可以部分重建它的训练数据（梯度反演攻击，属于 C44 范畴）。如果服务器（或窃听者）能看到每个客户端的单独更新，隐私就有漏洞。<span class="term">secure aggregation</span>（安全聚合，Bonawitz 2017）用密码学补上这个洞：<strong>让服务器只能解出所有更新的「和」，看不到任何单个客户端的更新</strong>。</p>  <p>核心技巧出奇地优雅——<span class="term">pairwise masking</span>（成对掩码）。每对客户端 $(i,j)$ 通过密钥交换商定一个<strong>共享的随机向量</strong> $s_{ij}$（双方都能算出、外人不知）。客户端 $i$ 上传时，对每个伙伴 $j$：若 $i<j$ 就<strong>加上</strong> $s_{ij}$，若 $i>j$ 就<strong>减去</strong> $s_{ij}$。于是每个上传的更新都被一堆随机掩码盖住，单看是乱码；但当服务器把<strong>所有</strong>客户端的（带掩码）更新求和时，每对掩码 $+s_{ij}$ 和 $-s_{ij}$ <strong>恰好相互抵消</strong>，只剩下真实更新之和。</p>  <div class="math-block">\[\sum_k \Big(\underbrace{u_k}_{\text{真实更新}}+\sum_{j>k}s_{kj}-\sum_{j<k}s_{kj}\Big)=\sum_k u_k\quad(\text{所有成对掩码两两相消})\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：每个人把自己的真实更新「加密」成乱码上传（加了只有自己和伙伴知道的随机数），但所有人的乱码加起来时，那些随机数正好两两抵消，露出真实的总和。服务器拿到了总和（聚合所需），却拿不到任何一个人的单独贡献。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨说：这是一个轻量的<span class="term">secure multi-party computation</span>（安全多方计算）协议，专门优化了「求和」这一种运算。它还要解决<strong>掉线容错</strong>——若某客户端中途掉线，它的掩码没法被抵消，需要其余客户端协作恢复（用 Shamir 秘密共享分发掩码种子）。真实协议（Bonawitz 2017）正是在「单个更新不可见」与「容忍掉线」之间做精巧设计。</p></div>
+  </div>  <p>安全聚合还有一个更<strong>重</strong>的密码学亲戚——<span class="term">homomorphic encryption</span>（同态加密），它允许<em>直接在密文上做运算</em>、解密后等于明文运算结果。理论上服务器可以在完全加密的更新上做聚合、永远不解密单个更新，安全性比成对掩码更强（不依赖「足够多客户端在线相消」）。但同态加密的计算与通信开销<strong>大得多</strong>（密文膨胀几个数量级、运算慢几个数量级），目前难以用于大模型的逐参数聚合。所以实践中<strong>成对掩码（轻量、够用、容错）是 cross-device 联邦的主流，同态加密多用于 cross-silo（少数机构、数据极敏感、能承受开销）</strong>。这又是一个「安全强度 vs 性能」的工程取舍——没有最强，只有最匹配场景的。</p>  <div class="callout danger"><span class="label">安全聚合 ≠ DP</span>
+    <p>安全聚合与 DP 解决<strong>不同</strong>的问题，必须分清：<strong>安全聚合让服务器看不到「单个」更新，但服务器拿到的「和」仍可能泄露个体</strong>（比如只有一个客户端参与时，和=它自己）。DP 则保证「即便看到和，也无法反推个体」。所以<strong>生产级隐私 = 安全聚合（防看单个）+ DP（防从和反推）+ 客户端采样（隐私放大）</strong>三者叠加。本模块 notebook 只做安全聚合的<em>直觉级 numpy 模拟</em>（成对掩码相消），不实现真实密码学——理解「掩码为何相消、为何防单个、为何还需要 DP」即可。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fldp"><span class="num">6</span>联邦 + DP：正交叠加</h2>
+  <h3>联邦 + DP：两条防御如何正交叠加</h3>  <p>现在把模块 02 和本模块拼起来。联邦学习里加 DP 有两个粒度，对应保护「谁」：</p>  <ul>
+    <li><strong>example-level DP</strong>：在每个客户端<em>本地</em>跑 DP-SGD（裁剪+加噪保护单条样本）。保护的是「某客户端的某条数据」。</li>
+    <li><strong>user/client-level DP</strong>：把<em>整个客户端的更新</em>当作 DP 的对象——裁剪每个客户端更新的范数、在<strong>聚合时</strong>加噪，保护「某个用户是否参与、其全部数据」。这是 McMahan 2018 的做法，也是联邦场景最自然的隐私粒度（你想保护的是「用户」，不是「用户的某一条数据」）。</li>
+  </ul>  <p>client-level DP 与 FedAvg 的结合非常自然，几乎就是把 DP-SGD 的三步搬到客户端粒度上：<strong>① 裁剪每个客户端的模型更新（敏感度=裁剪范数）；② 聚合（加权平均）；③ 给聚合结果加高斯噪声；④ 会计器累加 ε</strong>。更妙的是<strong>客户端采样天然提供子采样放大</strong>——每轮只选一部分客户端，正好对应 DP-SGD 的 Poisson 采样，隐私放大白送。再叠加安全聚合（让加噪和聚合在服务器看不到单个更新的前提下完成），就得到生产级的隐私联邦学习。</p>  <p>这种正交叠加是<strong>可信 ML 的范式</strong>：每种技术守一个环节，组合起来覆盖完整威胁面。Google 的 Gboard 输入法、跨机构医疗联邦学习等真实系统，用的正是「FedAvg + client-level DP + 安全聚合 + 客户端采样」的组合拳。理解每一层防什么（联邦防数据集中、DP 防反推个体、安全聚合防看单个更新、采样放大隐私），你就能针对一个真实场景拼出合适的防御栈——这正是模块 05 端到端管线要做的事。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一张图记住三层防御的分工：<strong>联邦学习</strong> = 数据不出设备（防集中）；<strong>安全聚合</strong> = 服务器只见总和（防看单个更新）；<strong>DP</strong> = 总和也不泄露个体（防反推）。<strong>客户端采样</strong> 顺带给 DP 隐私放大。三者正交、可叠加、各有缺口（联邦删不掉已上传的更新、安全聚合的和仍可能泄露、DP 有效用代价）——没有银弹，只有组合。这套「分层防御、各补缺口」的组合拳会在模块 05 被正式拼成端到端隐私管线。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="production"><span class="num">7</span>从 numpy 到 Flower 生产</h2>
+  <h3>从 numpy 到生产：Flower / TFF 的工程</h3>  <p>本课在 numpy 里用循环模拟多个客户端、手动做本地训练和加权聚合。生产中 Flower、TensorFlow Federated（TFF）、FedML 等框架把这些自动化，但核心逻辑一致。值得知道真实系统额外要处理什么：</p>  <table>
+    <thead><tr><th>维度</th><th>本课 numpy 做法</th><th>生产框架做法</th></tr></thead>
+    <tbody>
+      <tr><td>客户端</td><td>循环里的多个数据分片</td><td>真实分布的设备/机构，gRPC 通信</td></tr>
+      <tr><td>本地训练</td><td>在分片上跑几步 SGD</td><td>设备上的完整训练循环（可能 DP-SGD）</td></tr>
+      <tr><td>聚合</td><td>按数据量加权平均</td><td>FedAvg/FedAdam/SCAFFOLD 等可插拔策略</td></tr>
+      <tr><td>客户端采样</td><td>随机选子集</td><td>考虑设备可用性/电量/网络的调度</td></tr>
+      <tr><td>容错</td><td>假设都在线</td><td>掉线检测、超时、安全聚合的秘密恢复</td></tr>
+      <tr><td>隐私</td><td>可叠加 DP 模拟</td><td>集成 Opacus(本地DP) + 安全聚合协议</td></tr>
+    </tbody>
+  </table>  <p>最值得记住的工程现实是<strong>系统异构与不可靠</strong>在真实跨设备联邦里是头等难题，而本课（玩具）几乎忽略了它。几亿台设备算力天差地别、网络时好时坏、随时离线、还可能是恶意的（投毒攻击）。框架要处理超时、掉线恢复、拜占庭鲁棒聚合（防恶意客户端上传毒更新）——这些都是「从能跑通到能上线」之间的硬骨头。本课负责让你看懂<strong>算法核心（FedAvg、漂移、安全聚合、+DP）</strong>，系统工程交给框架与 references。</p>  <p>从本课到生产的路径：你在 numpy 里验证过的「本地训练 → 加权聚合」对应 Flower 的 <code>Strategy.aggregate_fit</code>；你理解的非 IID 漂移对应为什么要选 SCAFFOLD/FedProx 策略；你模拟的安全聚合对应框架的 SecAgg 插件。<strong>看懂机制，才能在框架里选对策略、诊断对问题</strong>（精度上不去是漂移还是采样方差？隐私够不够是 DP 粒度选错还是没加安全聚合？）。</p>  <div class="callout paper"><span class="label"></span>
+    <p>延伸：McMahan 2017（FedAvg）、Bonawitz 2017（安全聚合）、Karimireddy 2020（SCAFFOLD 治漂移）、Kairouz 2021（FL 全景综述）、McMahan 2018（FL+DP）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>非 IID 的治本之道</strong>：SCAFFOLD/FedProx/个性化联邦（每个客户端一个微调头）各有取舍，但「在强异质 + 部分参与下逼近集中式精度」仍无通用解。数据异质的理论刻画与最优算法是核心开放问题。</li>
+    <li><strong>拜占庭鲁棒 + 隐私的张力</strong>：防恶意客户端投毒需要服务器<em>检查</em>更新（如中位数聚合），但安全聚合又让服务器<em>看不到</em>单个更新——两个需求直接冲突，如何兼得是活跃方向。</li>
+    <li><strong>通信-精度-隐私的联合优化</strong>：量化、稀疏化与 DP 噪声、安全聚合相互影响（压缩改变敏感度、量化叠加噪声）。三者的联合理论与系统设计远未成熟。</li>
+    <li><strong>跨设备的规模与系统</strong>：亿级设备的调度、掉线、异构、激励（凭什么贡献算力）是系统难题；去中心化（无中心服务器的 gossip 聚合）是另一条路线。</li>
+    <li><strong>联邦 + 基础模型</strong>：在边缘设备上联邦微调大模型（受限于设备算力/显存）、联邦 RAG、用联邦学习训私有领域模型，是把 FL 推向 LLM 时代的前沿，与端侧部署（模块 05）交汇。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：McMahan 2017（FedAvg，本模块源头）、Bonawitz 2017（安全聚合）、Kairouz 2021（FL 全景与开放问题）。清单见 <code>references.md</code>。</p>
+  </div>  <div class="card"><strong>✅ 本章你应该能回答：</strong>  <ol>
+    <li>联邦学习与 DP 各防什么？为什么说它们是正交叠加而非竞争？</li>
+    <li>写出 FedAvg 一轮的四步与聚合公式；为什么按数据量加权？为什么要多步本地训练？</li>
+    <li>什么是非 IID？它通过「客户端漂移」如何伤害 FedAvg？哪些因素放大漂移、怎么缓解？</li>
+    <li>客户端采样带来哪三重影响（方差/隐私放大/部分参与鲁棒）？通信压缩有哪些手段？</li>
+    <li>安全聚合用什么技巧让服务器看不到单个更新？为什么成对掩码会相消？它和 DP 的分工是什么？</li>
+    <li>联邦 + DP 怎么叠加（example-level vs client-level）？为什么客户端采样自带隐私放大？</li>
+  </ol></div>
+
+  <div class="pager">
+    <a class="prev" href="../02_dp_sgd/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · DP-SGD</div></a>
+    <a class="next" href="../04_unlearning/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 机器遗忘</div></a>
+  </div>
+
+</div>
+</body>
+</html>

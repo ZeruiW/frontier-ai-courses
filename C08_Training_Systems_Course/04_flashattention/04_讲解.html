@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · FlashAttention：Online Softmax 与 IO 复杂度</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 07</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · FlashAttention：Online Softmax 与 IO 复杂度</h1>
+  <p class="subtitle">为什么标准 attention 在长上下文爆显存，online softmax 怎么做到不存 S×S 矩阵，以及“FLOPs 更多反而更快”的 IO 视角。</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">softmax、attention（C1-02）、roofline（模块 01）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_flashattention.ipynb（真实数据）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Dao et al. 2022 (FlashAttention)；Dao 2023 (FA-2)；Milakov & Gimelshein 2018 (online softmax)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#prob">标准 attention 的问题：S² 分数矩阵</a></li>
+      <li><a href="#safe">安全 softmax：为什么必须减最大值</a></li>
+      <li><a href="#online">Online softmax：流式增量更新</a></li>
+      <li><a href="#worked">从零手算：两块分数合并验证</a></li>
+      <li><a href="#flash">FlashAttention：分块 + 重计算</a></li>
+      <li><a href="#io">IO 复杂度：算得多却更快的根因</a></li>
+      <li><a href="#drill">面试 drill：FLOPs vs IO 与正确性</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="prob"><span class="num">1</span>标准 attention 的问题：S² 分数矩阵</h2>
+  <p>标准注意力的写法人人会背：<strong>$O=\mathrm{softmax}(QK^\top/\sqrt d)\,V$</strong>。但这个公式藏着一个昂贵的中间产物——$QK^\top$ 是一个 $S\times S$ 的<strong>分数矩阵</strong>（$S$ 是序列长度，$d$ 是每个头的维度）。朴素实现必须把这个矩阵<em>显式算出来、写进显存（HBM）、再读回来</em>做 softmax、最后乘 $V$。它的显存与读写都是 $O(S^2)$——这正是长上下文训练在模块 01 里<em>先被 activation 撑爆</em>的那个 $S^2$ 项。</p>  <div class="math-block">\[\text{分数矩阵显存}=O(S^2)\ \Rightarrow\ S=8192,\ \text{fp16},\ \text{单头}=8192^2\times2\,\text{B}\approx 128\ \text{MB}\]</div>  <p>注意这只是<strong>一个头、一个 batch</strong>的分数矩阵。多头（如 32 头）、多 batch 叠上去，这块显存线性翻倍，几十个 GB 凭空被一个临时矩阵吃掉。更要命的是它随 $S^2$ 涨：序列从 8k 到 32k，分数矩阵从 128 MB 暴涨到约 2 GB（单头）。这就是为什么在 FlashAttention 出现之前，<em>长上下文训练在显存上几乎不可行</em>——不是参数放不下，是这个一次性的 $S^2$ 中间矩阵放不下。</p>  <p>但显存还不是全部。回忆模块 01 的 roofline：attention 是典型的<strong>memory-bound</strong>算子。算 $S^2$ 个分数本身的 FLOPs 并不算多，真正的时间花在<strong>把这个 $S^2$ 矩阵搬进搬出 HBM</strong>——写出去、读回来做 softmax、再写、再读去乘 $V$。每个分数被反复往返于慢速的 HBM，而昂贵的 Tensor Core 大部分时间在<em>等数据搬到</em>。瓶颈是带宽不是算力，这一句话定下了整章优化的方向。</p>  <p>把这件事和模块 01 的 activation 账对上：那里说 activation 有一个随 $S^2$ 增长的注意力项，先于参数把长上下文训练撑爆——现在你看到了它的实体，就是这个被显式物化的 $S\times S$ 分数矩阵。所以<strong>FlashAttention 不只是一个 attention 提速 trick</strong>，它直接消掉了模块 01 那本显存账里最棘手的一项。理解这一层联系，本章后面<em>不存矩阵</em>的全部努力才有清晰的动机。</p>  <div class="callout danger"><span class="label"></span>
+  <strong>不要把 attention 的开销当成计算开销。</strong>一个 $S=8192$ 的头，分数矩阵 128 MB，光是把它写进 HBM 再读回来做 softmax，就要往返 $\sim256$ MB 的 HBM 流量；而真正的 matmul FLOPs 在现代 GPU 上几微秒就算完了。<strong>时间几乎全耗在搬运</strong>。任何只盯着 FLOPs 去优化 attention 的尝试，都会因为没诊断对瓶颈而徒劳——这是模块 01 roofline 思维的直接应用。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="safe"><span class="num">2</span>安全 softmax：为什么必须减最大值</h2>
+  <p>要理解 FlashAttention 怎么<em>不存这个矩阵</em>，得先把 softmax 的标准算法拆开看。数值稳定的 softmax 不能直接算 $e^{x_i}$，因为 $x_i$ 稍大（比如 89）时 $e^{x_i}$ 就<strong>上溢成 inf</strong>（fp32 最大约 $3.4\times10^{38}\approx e^{88.7}$）。标准对策是<strong>先减去最大值</strong>再取指数——这要扫描整行三遍：</p>  <ol>
+    <li><strong>Pass 1</strong>：扫一遍求最大值 $m=\max_j x_j$。</li>
+    <li><strong>Pass 2</strong>：再扫一遍算 $e^{x_j-m}$ 并累加得分母 $\ell=\sum_j e^{x_j-m}$。</li>
+    <li><strong>Pass 3</strong>：第三遍把每个 $e^{x_i-m}$ 除以 $\ell$ 得到归一化权重。</li>
+  </ol>  <div class="math-block">\[\mathrm{softmax}(x)_i=\frac{e^{x_i-m}}{\sum_j e^{x_j-m}},\qquad m=\max_j x_j\]</div>  <p>减 $m$ 不改变结果（分子分母同乘 $e^{-m}$ 约掉），但把最大的指数压到 $e^0=1$、其余都 $\le1$，<strong>彻底杜绝上溢</strong>。代价是<em>这三遍扫描都要求整行 $x$ 同时在手</em>——你得先看完整行才知道 $m$，才能开始算分母。这正是朴素 attention 必须物化整个 $S\times S$ 分数矩阵的根本原因：softmax 的数值稳定版<em>天生需要全行</em>。</p>  <p>于是问题被精确地提出来：能不能把这个<strong>需要全行的三遍扫描</strong>，改写成<strong>一块一块喂进来、一遍流式处理</strong>的形式？如果能，attention 就不必等齐整行、不必落地 $S^2$ 矩阵，每次只在片上 SRAM 处理一小块。下一节的 online softmax 就是这个改写。</p>  <div class="callout intuition"><span class="label"></span>
+  记住两件事就抓住了 softmax 的痛点：① <strong>必须减最大值</strong>，否则 $e^x$ 溢出（这是<em>数值</em>约束）；② 减最大值意味着<strong>要先看完整行才能开算</strong>（这是<em>访存</em>约束）。FlashAttention 的全部巧思，就是打破第二条而保住第一条。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="online"><span class="num">3</span>Online softmax：流式增量更新</h2>
+  <p>关键技巧叫 <span class="term">online softmax</span>（Milakov & Gimelshein 2018）：不再等齐整行，而是维护两个<strong>运行态统计量</strong>——目前见过的最大值 $m$、和目前的指数和 $\ell$——每来一块新分数就增量更新它们，再附带维护一个运行态的输出累加 $O$。三条更新规则是：</p>  <div class="math-block">\[\begin{aligned}m_{\text{new}}&=\max(m_{\text{old}},\ \max(\text{新块}))\\ \ell_{\text{new}}&=e^{m_{\text{old}}-m_{\text{new}}}\,\ell_{\text{old}}+\textstyle\sum e^{\text{新块}-m_{\text{new}}}\\ O_{\text{new}}&=e^{m_{\text{old}}-m_{\text{new}}}\,O_{\text{old}}+\textstyle\sum e^{\text{新块}-m_{\text{new}}}\,V_{\text{块}}\end{aligned}\]</div>  <p>核心是那个 $e^{m_{\text{old}}-m_{\text{new}}}$，叫<strong>校正因子</strong>（rescaling factor）。它的作用是：当一块新分数里出现了<em>比以前更大的最大值</em>，之前的 $\ell_{\text{old}}$ 和 $O_{\text{old}}$ 都是<em>以旧最大值 $m_{\text{old}}$ 为基准</em>算的，现在基准换成更大的 $m_{\text{new}}$，就得把旧账整体乘 $e^{m_{\text{old}}-m_{\text{new}}}$（一个 $\le1$ 的数）按比例缩小，<strong>等价于重新以新最大值为基准把之前的全部重算一遍</strong>，但只用一次乘法就办到。</p>  <p>为什么 $O$ 也要同样校正？因为 $O$ 累加的是<em>未归一化</em>的 $\sum e^{\text{score}-m}\cdot V$（分子部分），它和 $\ell$（分母部分）共享同一个基准 $m$。基准一变，分子分母必须<strong>同步缩放</strong>才能保持比值不变。扫完所有块后，最终的 $O/\ell$ 就是精确的 attention 输出——<strong>和一次性 softmax 逐位相等，但全程从不存整行分数</strong>，每块只占 $O(\text{块大小})$ 的片上内存。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>就像一边走一边算加权平均分，不用先把所有分数记下来。每看到一批新分数，更新<em>目前最高分</em>和<em>累计的分子、分母</em>；一旦冒出更高的分，就把之前记的账按比例折一下（因为基准抬高了）。走到最后，结果和把全部分数一次算的<strong>一模一样</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>online softmax 把 softmax 从<em>需要全行的多遍扫描</em>改写成<em>一遍流式 + 运行态校正</em>。这使 attention 可以<strong>分块（tiling）</strong>计算：每块在片上 SRAM 内完成局部 softmax 与输出累加，永不把 $S^2$ 分数矩阵落地到 HBM。数学上它与标准 softmax 严格等价，不是任何近似。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+  一句话记牢 online softmax：<strong>发现更大的最大值，就把旧账乘一个小于 1 的校正因子缩小，再加上新块的贡献</strong>。分子（$O$）和分母（$\ell$）必须用同一个校正因子同步缩放，比值才不变——这就是它能<em>流式</em>且<em>精确</em>的全部秘密。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="worked"><span class="num">4</span>从零手算：两块分数合并验证</h2>
+  <p>光看公式不踏实，我们把两块极小的分数手算合并一遍，亲眼看它等于一次性 softmax。设两块分数 <code>block1 = [1, 3]</code> 与 <code>block2 = [2, 5]</code>（为聚焦数值稳定，先只算归一化权重 $\ell$，$O$ 同理）。</p>  <h4>处理 block1</h4>  <p>block1 的最大值 $m=\max(1,3)=3$，分母 $\ell=e^{1-3}+e^{3-3}=e^{-2}+e^{0}\approx0.135+1=1.135$。此刻所有指数都以 $m=3$ 为基准、都 $\le e^0=1$，没有溢出风险。</p>  <h4>处理 block2：触发校正</h4>  <p>block2 的最大值是 $5>3$，于是 $m_{\text{new}}=\max(3,5)=5$，校正因子 $=e^{m_{\text{old}}-m_{\text{new}}}=e^{3-5}=e^{-2}\approx0.135$。先把旧分母缩小：$0.135\times1.135\approx0.153$；再加上 block2 的贡献 $e^{2-5}+e^{5-5}=e^{-3}+e^{0}\approx0.050+1=1.050$。于是 $\ell_{\text{new}}\approx0.153+1.050=1.203$，基准统一到 $m=5$。</p>  <h4>验证：等于对 [1,3,2,5] 一次性 softmax</h4>  <p>把四个分数一次性算：$m=5$，分母 $=e^{1-5}+e^{3-5}+e^{2-5}+e^{5-5}=e^{-4}+e^{-2}+e^{-3}+e^{0}\approx0.018+0.135+0.050+1=1.203$。<strong>与 online 增量算出的 $1.203$ 逐位相等</strong>！每个 token 的归一化权重（如第二个 token $e^{3-5}/1.203\approx0.112$）无论流式还是一次性都完全一致。这就证明了 online softmax 不是近似——它是把同一笔账拆开来记，校正因子保证拆开记和一次记结果分毫不差。</p>  <div class="callout warn"><span class="label"></span>
+  动手时最容易踩的坑：忘了在<strong>每次更新最大值时把旧的 $\ell$ 和 $O$ 都乘校正因子</strong>。漏掉任何一个，分子分母基准不一致，结果就错。还有一个隐患——如果<strong>不减最大值</strong>直接累加 $e^{x}$，上面的 $e^5$ 还好，但真实分数能到几十上百，$e^{89}$ 直接 inf，整行污染成 nan。notebook 里你会同时验证<em>online == 一次性</em>与<em>不减 max 会溢出</em>两件事。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="flash"><span class="num">5</span>FlashAttention：分块 + 重计算</h2>
+  <p><span class="term">FlashAttention</span>（Dao et al. 2022）把 online softmax 落地成一个真实的 GPU kernel。它的三件武器，每一件都直指前面诊断出的瓶颈：</p>  <ol>
+    <li><strong>分块 tiling</strong>：把 $Q,K,V$ 切成能放进片上 SRAM 的小块，外层循环遍历 $Q$ 块、内层循环遍历 $K/V$ 块。每对 $(Q\text{块},K\text{块})$ 的分数只在快的 SRAM 里现算现用。</li>
+    <li><strong>片上 online softmax</strong>：每算出一块分数，立刻用上一节的三条规则把它累积进运行态的 $m,\ell,O$，<strong>从不把 $S^2$ 分数矩阵写回慢的 HBM</strong>。整行的 softmax 在块循环中被增量拼出来。</li>
+    <li><strong>反向重计算</strong>：前向不保存分数矩阵，反向需要它时<em>按需重新算一遍</em>（呼应模块 02 的 activation checkpointing）。用一点额外算力，换掉那块巨大的 $S^2$ 显存。</li>
+  </ol>  <div class="ascii"> 朴素 attention:  算 S×S 分数 ─写→ HBM ─读→ softmax ─写→ HBM ─读→ ×V
+                  └────────── S² 矩阵反复往返 HBM（memory-bound）──────────┘
+ ───────────────────────────────────────────────────────────────────────
+ FlashAttention:  外循环 Q 块 × 内循环 K/V 块，分数只在 SRAM 现算现用
+                  online softmax 增量累积 → 只把 O 与 (m,ℓ) 写回 HBM
+                  显存 O(S²) ───────────────────────────────► O(S)</div>  <p>最终效果：分数矩阵的显存从 $O(S^2)$ 降到 $O(S)$——只需保存输出 $O$（$S\times d$）和每行的 softmax 统计量 $(m,\ell)$（各 $S$ 个标量）。那个曾经撑爆显存的 $S^2$ 中间矩阵<strong>彻底消失了</strong>，从来没有完整地存在于 HBM 中任何一刻。这就是 128k+ 上下文训练在显存上变得可行的直接原因。</p>  <div class="callout intuition"><span class="label"></span>
+  FlashAttention 是<strong>roofline 思维的完美范例</strong>：先诊断出 attention 是 memory-bound（卡在 HBM 带宽），于是不去优化 FLOPs，而是用<em>分块 + online softmax + 重计算</em>把数据死死留在片上 SRAM、把 HBM 往返压到最低。<strong>诊断对瓶颈，优化才有效</strong>——这正是整门系统课反复强调的方法论。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="io"><span class="num">6</span>IO 复杂度：算得多却更快的根因</h2>
+  <p>现在解释那个最反直觉的事实：FlashAttention 的 <strong>FLOPs 并不更少</strong>（因为反向要重算分数，甚至略多），却跑得明显更快。原因是它优化的根本不是计算量，而是 <span class="term">IO（HBM 读写量）</span>。两者的 HBM 访问复杂度是：</p>  <div class="math-block">\[\text{朴素 attention HBM 访问}=\Theta(S^2),\qquad \text{FlashAttention}=\Theta\!\Big(\frac{S^2 d}{M}\Big)\quad(M=\text{SRAM 大小})\]</div>  <p>分块让每个 $K/V$ 块被读进 SRAM 后<em>服务一整列 $Q$ 块的计算</em>再丢弃，把 HBM 访问从<em>正比于分数矩阵元素数</em>降到<em>正比于矩阵大小除以片上容量</em>。代入数量级感受一下：$S=8192$、$d=128$、SRAM $M\approx100$ KB（约 $5\times10^4$ 个 fp16）。朴素的 $\Theta(S^2)=8192^2\approx6.7\times10^7$ 个元素，还要在写 / 读 / 再写中往返多趟；</p>  <p>FlashAttention 的 $\Theta(S^2d/M)=6.7\times10^7\times128/(5\times10^4)\approx1.7\times10^5$——<strong>整整低了约两个数量级</strong>的 HBM 流量。因为 attention 是 memory-bound（模块 01），墙钟时间几乎正比于 HBM 流量，所以<strong>HBM 访问降两个数量级，速度就跟着上去</strong>。这就是<em>算得更多却跑得更快</em>的精髓——当瓶颈是带宽而非算力时，省搬运远比省计算值钱。notebook 里你会亲手把这两个流量数算出来对比。</p>  <p>把两种实现的各项指标并排放，反差就一目了然——注意<strong>FLOPs 一栏 FlashAttention 反而略多</strong>，却在显存与 HBM 流量两栏全面碾压：</p>  <table>
+    <thead><tr><th>指标</th><th>朴素 attention</th><th>FlashAttention</th><th>谁赢</th></tr></thead>
+    <tbody>
+      <tr><td>分数矩阵显存</td><td>$O(S^2)$（物化整块）</td><td>$O(S)$（只存 $O$ 与 $m,\ell$）</td><td>Flash</td></tr>
+      <tr><td>HBM 读写量</td><td>$\Theta(S^2)$</td><td>$\Theta(S^2d/M)$（低约两个量级）</td><td>Flash</td></tr>
+      <tr><td>计算量 FLOPs</td><td>基准</td><td>略多（反向重算分数）</td><td>朴素（但无关紧要）</td></tr>
+      <tr><td>与标准 attention 关系</td><td>—</td><td>逐位等价（非近似）</td><td>平</td></tr>
+      <tr><td>瓶颈维度</td><td>HBM 带宽（memory-bound）</td><td>被显著缓解</td><td>Flash</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+  面试里这是高频陷阱题。务必说清三件事：① FlashAttention <strong>不减 FLOPs</strong>（甚至因重算略增）；② 它减的是 <strong>HBM IO</strong>（从 $\Theta(S^2)$ 到 $\Theta(S^2d/M)$）；③ 它快是因为 attention <strong>memory-bound</strong>、墙钟由带宽决定。把<em>更快</em>归因为<em>算得少</em>就直接暴露了对 roofline 的理解不到位。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="drill"><span class="num">7</span>面试 drill：FLOPs vs IO 与正确性</h2>
+  <p>把本章压成一组面试问答。这类题考的是你能否分清<em>计算 vs 访存</em>、<em>精确 vs 近似</em>，而不是背 kernel 实现。下面逐条给出标准答法与背后的口径：</p>  <ul>
+    <li><em>FlashAttention 为什么更快？</em> → 它减少 <strong>HBM 读写（IO）</strong>，不是减少 FLOPs；attention 是 memory-bound，墙钟由带宽决定。</li>
+    <li><em>它减少 FLOPs 了吗？</em> → <strong>没有</strong>，反向重计算分数甚至让 FLOPs 略增；它优化的是访存而非计算。</li>
+    <li><em>online softmax 怎么保证正确？</em> → 维护运行态 $(m,\ell,O)$，发现更大 max 时用校正因子 $e^{m_{old}-m_{new}}$ 同步缩放分子分母，<strong>与一次性 softmax 逐位等价</strong>，是精确算法不是近似。</li>
+    <li><em>block size 怎么选？</em> → 受片上 <strong>SRAM 容量</strong> 约束：太大放不下、爆 SRAM；太小则并行度 / 数据复用不足，HBM 往返变多。</li>
+  </ul>  <p>再串几个常见追问的正确反应：<em>它和数学上的 attention 一样吗</em> → <strong>完全等价，逐位相等，不是近似</strong>；<em>反向为什么要重算</em> → 前向<strong>不存 $S^2$ 分数矩阵</strong> 以省显存，反向需要时按需重算（用算力换显存）；<em>它解决了模块 01 的哪个瓶颈</em> → 消掉了 activation 里那个 $S^2$ 项，让长上下文训练放得下。把这些口径背成肌肉记忆，这类题就是送分。</p>  <p>一道完整的样板题感受节奏：<em>为什么把序列从 8k 加到 32k，朴素 attention 的显存和耗时都暴涨，而 FlashAttention 几乎线性？</em> 标准作答——① 朴素的分数矩阵显存随 $S^2$ 涨，8k→32k 是 16 倍，单头从 128 MB 涨到约 2 GB，直接 OOM；② 朴素的 HBM 流量也是 $\Theta(S^2)$，同样 16 倍，墙钟随之暴涨；③ FlashAttention 不物化矩阵、显存 $O(S)$ 只线性涨，HBM 流量 $\Theta(S^2d/M)$ 虽含 $S^2$ 但被 $M$ 摊薄了两个数量级、绝对值小得多；④ 所以同一张卡上，朴素 attention 在 32k 放不下也跑不动，FlashAttention 既放得下又快。这一答串起了显存账、IO 复杂度与 roofline 三条线索。</p>  <div class="callout danger"><span class="label"></span>
+  陷阱集锦（任一条答错都扣分）：① 说它<strong>减少了 FLOPs</strong>（错，减的是 IO）；② 说它是 attention 的<strong>近似</strong>（错，逐位精确）；③ 说 block 越大越好（错，太大爆 SRAM、太小不够并行）；④ 忘了<strong>反向要重算分数</strong>（这是它省显存的代价）。这四点几乎是面试官必设的坑。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>FlashAttention 不是终点，而是一条仍在快速演进的主线。本章打地基，前沿在以下方向继续推进——每一步都在把同一个 IO 优化的思路压榨得更极致：</p>  <ul>
+    <li><strong>FlashAttention-2</strong>（Dao 2023）：改进<strong>并行与 work partition</strong>（把循环拆分映射到 GPU 线程块的方式更优），并减少非 matmul 的 FLOPs（如缩放、校正），进一步逼近 GPU 的峰值算力。</li>
+    <li><strong>FlashAttention-3</strong>（Shah et al. 2024）：针对 H100 用<strong>异步执行 + fp8</strong>（呼应模块 02/05 的低精度），把 Tensor Core 与数据搬运重叠起来，再上一个台阶。</li>
+    <li><strong>行业影响</strong>：它几乎是所有现代长上下文模型的<strong>默认 attention 实现</strong>——没有它，128k+ 上下文的训练 / 推理在显存上根本不可行。</li>
+    <li><strong>训练 vs 推理 kernel</strong>：训练要支持反向（需重算分数），推理只需前向且常与 KV cache（模块 06）耦合，两者 kernel 设计目标不同。</li>
+  </ul>  <p>仍然开放的问题，也正是前沿系统课（C24/C27/C36/C39）的主场：FlashAttention 与<strong>量化 / KV cache</strong>（模块 05/06）如何结合——分数与 $V$ 能否在片上以低精度算而不损质量；<span class="term">blockwise / ring attention</span>（把序列切到多卡、块在卡间环形流动）如何把单卡装不下的超长序列摊到整个集群，与模块 03 的并行思想合流。这些都建立在你现在掌握的<em>online softmax + IO 复杂度</em>这两块基石之上。</p>  <div class="callout paper"><span class="label"></span>
+  Dao et al. 2022 <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>；Dao 2023 <em>FlashAttention-2</em>（更好的并行与 work partition）；Shah et al. 2024 <em>FlashAttention-3</em>（H100 异步 + fp8）；Milakov & Gimelshein 2018 <em>Online normalizer calculation for softmax</em>（online softmax 的源头）。详见课程 references。
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_parallelism_strategies/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 并行策略</div></a>
+    <a class="next" href="04_flashattention.ipynb"><div class="dir">下一模块 →</div><div class="t">打开配套练习</div></a>
+  </div>
+
+</div>
+</body>
+</html>

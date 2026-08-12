@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 并行规约与融合 softmax</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 并行规约与融合 softmax</h1>
+  <p class="subtitle">从串行累加到 O(log n) 的树形/warp-shuffle 规约，再到 online softmax —— 一遍流式算出归一化、并能分块合并状态，这正是 FlashAttention 的发动机</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–03、softmax 定义、注意力数学（C01）、一点浮点数常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_reductions_softmax.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Milakov &amp; Gimelshein 2018、NVIDIA Parallel Reduction、Blelloch 1990</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#reduction">规约问题：天生串行的累加</a></li>
+      <li><a href="#tree">树形规约：用结合律换 O(log n) 深度</a></li>
+      <li><a href="#fp">浮点结合律：为什么结果会有微小差异</a></li>
+      <li><a href="#shuffle">warp shuffle 规约：绕过 shared 与同步</a></li>
+      <li><a href="#softmax">数值稳定 softmax 与它的三遍代价</a></li>
+      <li><a href="#online">online softmax：一遍流式归一化</a></li>
+      <li><a href="#blocked">分块 online softmax：合并块状态</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="reduction"><span class="num">1</span>规约问题：天生串行的累加</h2>
+  <p>到目前为止我们处理的算子（向量加、矩阵乘的逐元素累加）都有一个共同点：<strong>输出彼此独立</strong>。每个线程算自己那一格，互不打扰，天然并行。但深度学习里到处是另一类运算——<span class="term">reduction</span>（规约）：把一组数<strong>聚合成一个</strong>标量。求和、求最大、求范数、求方差，softmax 的分母、LayerNorm 的均值、loss 的累加，全是规约。</p>  <p>规约的麻烦在于它<strong>天生是串行的</strong>。最朴素的写法 <code>acc = 0; for x in arr: acc += x</code> 有一条贯穿始终的依赖链：第 <code>i</code> 步必须等第 <code>i-1</code> 步算完。n 个元素就是 n 步、O(n) 的<strong>深度</strong>（depth，即关键路径长度）。在一台有几千个核心的 GPU 上，让一条线程串行地加 n 个数，等于让 99.9% 的硬件围观一个线程干活——这是对并行机器最大的浪费。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>串行求和像一个人点钞：一张一张数，数到第一万张才知道总数。GPU 想要的是<strong>分组并行点钞</strong>：一千个人同时数，再把各组的小计汇总。问题是「汇总」本身又是个规约……这就是本模块要解开的递归。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，规约把二元算子 <code>⊕</code> 折叠到序列上：<code>x₀ ⊕ x₁ ⊕ ... ⊕ x_{n-1}</code>。朴素折叠的计算<em>深度</em>是 O(n)。我们想要的是把深度压到 O(log n)，同时保持总<em>工作量</em>（work，运算总次数）仍是 O(n)——即 <span class="term">work-efficient</span> 的并行规约。</p></div>
+  </div>  <p>为什么不能像逐元素算子那样，让每个线程算一个输出就完事？因为规约的输出只有<strong>一个</strong>，而我们有几千个线程。要么让一个线程包揽全部（浪费并行），要么让多个线程<em>协作</em>产出这一个结果——而协作就意味着线程之间要交换中间值、要同步。规约因此是第一个真正逼我们用上 <code>shared memory</code> 和 <code>__syncthreads()</code>（模块 02 的工具）来组织<strong>线程间协作</strong>的算子。前几个模块各管一摊，这里第一次把它们拧在一起。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>规约的并行化 = 用结合律把一条 O(n) 的依赖链，重排成一棵 O(log n) 深的树</strong>。这棵树后面会长成 softmax，再长成 FlashAttention 的核心递推。先把树看懂。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tree"><span class="num">2</span>树形规约：用结合律换 O(log n) 深度</h2>
+  <p>把串行链改成并行，关键是利用<strong>结合律</strong>：<code>(a⊕b)⊕c = a⊕(b⊕c)</code>。既然加法可以任意结合，我们就<strong>两两配对</strong>地加，每一轮把待合并的元素数砍掉一半。这就是 <span class="term">tree reduction</span>（树形规约）。</p>  <div class="ascii">n=8 的树形规约（每轮一半线程把另一半加过来 + 一次同步）：
+
+轮 0:  x0  x1  x2  x3  x4  x5  x6  x7      (8 个活跃)
+        \  /    \  /    \  /    \  /
+轮 1:  x0+x4 x1+x5 x2+x6 x3+x7  · · · ·    (4 个活跃, 4 个空闲)
+          \    /      \    /
+轮 2:   (..)+(..)  (..)+(..)  · · · · · ·  (2 个活跃)
+             \        /
+轮 3:        总  和             · · · · ·  (1 个活跃)
+
+log2(8)=3 轮搞定（而非 8 步）。每轮之间要 __syncthreads()。</div>  <p>GPU 上的标准写法用<strong>步长（stride）减半</strong>的模式：第一轮步长 <code>n/2</code>，线程 <code>t</code> 把 <code>buf[t]</code> 和 <code>buf[t+stride]</code> 相加；然后步长减半、同步、再来一轮，直到步长为 1。活跃的线程数也随之减半。注意每轮之后必须 <code>__syncthreads()</code>——否则下一轮可能读到上一轮还没写完的中间结果（这是 GPU 上最经典的竞态 bug）。</p>  <p>深度从 O(n) 降到 <strong>O(log n)</strong>：n=1024 时，串行要 1024 步，树形只要 10 步。总工作量仍是 n-1 次加法（每个非叶节点一次），所以是 work-efficient 的——我们用 log 的深度换来了海量并行，没有浪费额外的算力。</p>  <p>步长减半还顺手躲过了<strong>bank 冲突</strong>（模块 02）。减半模式下第一轮是 <code>buf[t] += buf[t+stride]</code>，两个地址相距 stride（≥32 时整除 32），落在<em>同一组</em> bank 上但属于不同线程的不同访问，硬件可并行；而相邻配对模式 <code>buf[2t] += buf[2t+1]</code> 让活跃线程访问偶数地址 0,2,4,…，相邻活跃线程隔 2 个字、bank = <code>(2t) mod 32</code> 只覆盖偶数 bank，造成 2-way 冲突。<strong>所以「先加远的」一举两得：既无 warp 发散，又无 bank 冲突</strong>——这是 NVIDIA 规约优化讲义里从朴素到极致七版优化中最早、收益最大的一步。</p>  <div class="callout warn"><span class="label"></span>
+    <p>树形规约里<strong>步长减半</strong>（先加远的）通常优于<strong>步长加倍</strong>（先加相邻的）。原因是减半模式下，活跃线程是连续的前一半 <code>t &lt; stride</code>，它们恰好落在连续的 warp 里——不活跃的 warp 整组退出、毫无<span class="term">warp divergence</span>；而相邻配对模式（<code>t % (2*stride) == 0</code>）会让每个 warp 内一半线程活、一半死，处处发散。同样的 O(log n)，访存与发散行为却天差地别，这正是 NVIDIA 那篇规约优化讲义的核心教训。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fp"><span class="num">3</span>浮点结合律：为什么结果会有微小差异</h2>
+  <p>这里埋着一个<strong>数值上的细节</strong>，初学者常被它吓到：树形规约和串行规约<em>得到的结果可能不完全相等</em>。原因是——<strong>浮点加法并不严格满足结合律</strong>。</p>  <p>数学上 <code>(a+b)+c = a+(b+c)</code>，但在有限精度的浮点世界里，每次加法都要把结果<em>舍入</em>回最近的可表示数。不同的加法顺序 = 不同的中间舍入 = 略微不同的最终值。一个经典例子：</p>  <div class="math-block">\[(\,10^{16} + 1\,) - 10^{16} \;=\; 0 \quad\text{而}\quad 10^{16} + (\,1 - 10^{16}\,) \;=\; 1\]</div>  <p>前者里 <code>10^16 + 1</code> 因为精度不够，1 被舍入吞掉了。所以并行规约的结果依赖于<strong>归约树的形状</strong>，跨硬件、跨 block 尺寸都可能有最后几位的差异。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>别慌——这<strong>不是 bug</strong>，是浮点的天性。差异通常在 <code>1e-6</code> 量级（单精度），对训练和推理毫无影响。你只需知道：要求两种规约 <code>逐位相等</code> 是不现实的，对拍时用 <code>np.allclose</code> 给个合理的容差就对了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>有意思的是，树形规约往往比串行规约<strong>更精确</strong>。串行累加里，acc 越加越大，后面的小数被它的舍入误差淹没（误差随 n 线性累积）；树形规约让相近量级的数先相加，舍入误差只随 <em>log n</em> 增长。这也是高质量数值库偏爱成对（pairwise）求和的原因。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>一个真实世界的坑：因为并行规约结果依赖线程调度与 block 尺寸，<strong>同一份代码两次运行可能给出最后几位不同的 loss</strong>（尤其用了原子加 <code>atomicAdd</code> 时，累加顺序完全不确定）。这会破坏<em>逐位复现</em>。需要可复现时，要么用确定性规约算法，要么接受 <code>atol</code> 容差——切勿用 <code>==</code> 比较浮点规约的结果。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="shuffle"><span class="num">4</span>warp shuffle 规约：绕过 shared 与同步</h2>
+  <p>树形规约的每一轮都要 <code>__syncthreads()</code> 同步整个 block，还要把中间值在 shared memory 里读写一遍。对于一个 warp 内部（32 个锁步线程）的规约，有更快的办法：<strong>warp shuffle</strong>——让线程<em>直接交换寄存器</em>，完全绕过 shared memory 和同步。</p>  <p>指令 <code>__shfl_down_sync(mask, val, offset)</code> 让 lane <code>t</code> 直接读到 lane <code>t+offset</code> 的寄存器 <code>val</code>。于是 warp 内规约就是 5 步的折半：<code>offset = 16, 8, 4, 2, 1</code>，每步把自己和下方 offset 处的值相加：</p>  <div class="ascii">warp 内 32-lane 规约（shuffle-down，5 步，无 shared、无 barrier）：
+
+  offset=16:  v[t] += shfl_down(v, 16)   # lane 0..15 拿到 16..31
+  offset= 8:  v[t] += shfl_down(v,  8)
+  offset= 4:  v[t] += shfl_down(v,  4)
+  offset= 2:  v[t] += shfl_down(v,  2)
+  offset= 1:  v[t] += shfl_down(v,  1)
+  → lane 0 现在持有 32 个数的总和。  log2(32)=5 步。</div>  <p>为什么更快？因为 warp 是<strong>锁步</strong>执行的，shuffle 在硬件上是 lane 之间的直连，<strong>不需要 barrier</strong>（warp 内天然同步），也<strong>不碰 shared memory</strong>（省掉一次往返延迟，还不占 shared 容量、不引发 bank conflict）。这是 warp 级原语相对 shared-memory 规约的纯收益：</p>  <table>
+    <thead><tr><th>维度</th><th>shared-memory 规约</th><th>warp-shuffle 规约</th></tr></thead>
+    <tbody>
+      <tr><td>作用范围</td><td>整个 block</td><td>单个 warp（32 lane）</td></tr>
+      <tr><td>同步开销</td><td>每轮 <code>__syncthreads()</code></td><td><strong>无</strong>（warp 锁步天然同步）</td></tr>
+      <tr><td>内存往返</td><td>每轮读写 shared</td><td><strong>零</strong>（lane 间寄存器直连）</td></tr>
+      <tr><td>bank conflict</td><td>可能（需 padding 规避）</td><td><strong>不涉及</strong>（不碰 shared）</td></tr>
+      <tr><td>典型用法</td><td>warp 间汇总少量结果</td><td>warp 内规约 32 个值</td></tr>
+    </tbody>
+  </table>  <p>完整的 block 规约因此是<strong>两级</strong>的：<strong>①</strong> 每个 warp 用 shuffle 把自己 32 个值规约成 1 个；<strong>②</strong> 把每个 warp 的结果写进一小块 shared（只有 <code>block_size/32</code> 个数）；<strong>③</strong> 让第一个 warp 再 shuffle 规约这些 warp 结果。两级下来，整个 block 的规约只用了一次 shared 往返加两轮 shuffle，比纯树形规约的 log(block_size) 次同步快得多。</p>  <p>这里值得停下来体会一个<strong>反复出现的设计模式</strong>：把一个大规约<em>分层</em>成「廉价的局部规约 + 少量的全局规约」。warp shuffle 解决局部（32 个数），shared 解决跨 warp（几个数），如果再大到跨 block，就得借助 global memory 加原子操作、或干脆分两个内核。每往上一层，通信就贵一个数量级，所以好的内核总是<strong>把尽可能多的规约压在尽可能低的层级</strong>完成。后面的分块矩阵乘、FlashAttention 的块内归一化，骨子里都是这个「分层规约」思想的变体。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这个分层套路——<strong>warp 内用 shuffle，warp 间用 shared</strong>——它在 GPU 编程里无处不在：规约、softmax、甚至 FlashAttention 的块内归一化都按这个两级结构组织。warp 是「免费同步」的最大单位，能在 warp 内解决的就别惊动整个 block。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="softmax"><span class="num">5</span>数值稳定 softmax 与它的三遍代价</h2>
+  <p>有了规约这把锤子，来看第一个真实的融合目标：<strong>softmax</strong>。它是注意力的心脏，定义为</p>  <div class="math-block">\[\mathrm{softmax}(x)_i = \frac{e^{x_i}}{\sum_{j} e^{x_j}}\]</div>  <p>直接照搬公式（<code>exp(x) / exp(x).sum()</code>）有个致命问题：<strong>exp 会溢出</strong>。注意力的 logits 经常到几十甚至上百，<code>exp(1000)</code> 在 float32 里是 <code>inf</code>，于是分子分母全是 inf，结果是 <code>nan</code>，整个前向直接报废。</p>  <p>解法是<strong>减去每行最大值</strong>再取 exp。设 <code>m = max_j x_j</code>：</p>  <div class="math-block">\[\mathrm{softmax}(x)_i = \frac{e^{x_i - m}}{\sum_{j} e^{x_j - m}}\]</div>  <p>为什么这样不改变结果？因为分子分母同时<strong>乘了 &lt;code&gt;e^{-m}&lt;/code&gt;</strong>（一个公共常数），约掉后值完全不变。但数值行为天差地别：现在最大的指数是 <code>e^{0}=1</code>，其余都 ≤ 1，永不溢出。这就是<span class="term">numerically stable softmax</span>，是所有正确实现的标配（模块 00 的对拍热身已经见过它）。</p>  <p>但请数一数它需要<strong>几遍扫描整行</strong>：第一遍求 <code>max</code>（一次规约），第二遍求 <code>sum of exp(x-m)</code>（又一次规约），第三遍才能算出每个 <code>exp(x_i-m)/sum</code> 写回。<strong>三遍 pass</strong>——每一遍都要把整行从 HBM 读一次（对长行而言，整行可能放不进寄存器/shared）。注意力受访存限制，这三遍 HBM 往返正是 softmax 的主要开销，也正是下一节要消灭的东西。</p>  <p>这三遍代价正是融合 softmax 内核要消灭的目标：把求 max、求和、归一化三遍扫描<strong>合并进一个内核</strong>，整行只从 HBM 读一次、中间的 exp 结果留在寄存器/shared 而非落回显存。在访存受限的注意力里，省下的这两趟 HBM 往返就是纯加速——这也是 <code>torch.compile</code> 自动生成 Triton 内核时最爱做的融合之一。下一节的 online softmax 更进一步，把三遍直接压成一遍。</p>  <div class="callout warn"><span class="label"></span>
+    <p>减最大值只是<em>数值稳定</em>技巧，不改变数学含义；别和 softmax 的 <code>temperature</code>（除以 T 改变分布锐度）混淆。前者是必须的工程正确性，后者是改变语义的超参。两者都作用在 exp 之前，但目的完全不同。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="online"><span class="num">6</span>online softmax：一遍流式归一化</h2>
+  <p>能不能<strong>一遍</strong>就算完 softmax？看似不行——你得先看完整行才知道 max，才知道 sum。但 Milakov & Gimelshein（2018）给出了一个漂亮的递推：<strong>一边流式扫描，一边同时维护 max 和归一化和</strong>，每当遇到一个更大的值，就用一个<strong>校正因子</strong>把已经累加的和「回缩」到新基准。这就是 <span class="term">online softmax</span>。</p>  <p>维护两个运行量：运行最大值 <code>m</code> 和运行归一化和 <code>l = Σ e^{xⱼ - m}</code>（注意 l 是相对于<em>当前</em> m 的）。每来一个新值 <code>xᵢ</code>：</p>  <div class="math-block">\[m_{\text{new}} = \max(m,\, x_i), \qquad l \leftarrow \underbrace{l \cdot e^{\,m - m_{\text{new}}}}_{\text{校正旧和}} \;+\; \underbrace{e^{\,x_i - m_{\text{new}}}}_{\text{加入新项}}\]</div>  <p>核心是那个<strong>校正因子</strong> <code>e^{m - m_new}</code>。当新值比旧 max 大时，max 抬高了，之前所有项的「减去的基准」都变了，于是把旧的和 <code>l</code> 乘以 <code>e^{old_max - new_max} ∈ (0,1]</code>，就等价于把每一个旧项都重新按新基准 <code>e^{xⱼ - new_max}</code> 算了一遍——一次乘法搞定，不必回头重算。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：你在班里实时记录「相对最高分的总和」。突然来了个更高分的同学，于是<em>所有人</em>相对最高分的差都变小了。你不用把每个人重算一遍，只要把之前的总和统一乘一个缩小因子（<code>e^{老最高-新最高}</code>），再把新同学加进来。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>可以严格证明这个一遍递推与三遍 softmax <strong>数学完全等价</strong>（归纳法：每步后 <code>(m, l)</code> 恰好等于「目前见过的所有元素」的真 max 与真归一化和）。扫完整行后，<code>softmax(xᵢ) = e^{xᵢ - m_final} / l_final</code>。</p></div>
+  </div>  <h4>跑一遍数字：流式处理 [1, 3, 2]</h4>  <p>用 <code>x = [1, 3, 2]</code> 手算一遍，确认递推真的对。初始 <code>m=-∞, l=0</code>：</p>  <ol>
+    <li>来 <code>x=1</code>：<code>m_new=max(-∞,1)=1</code>；<code>l = 0·e^{-∞-1} + e^{1-1} = 0 + 1 = 1</code>。状态 <code>(m,l)=(1, 1)</code>。</li>
+    <li>来 <code>x=3</code>：<code>m_new=max(1,3)=3</code>；校正因子 <code>e^{1-3}=e^{-2}≈0.135</code>；<code>l = 0.135·1 + e^{3-3} = 0.135 + 1 = 1.135</code>。状态 <code>(3, 1.135)</code>。</li>
+    <li>来 <code>x=2</code>：<code>m_new=max(3,2)=3</code>（没刷新）；校正因子 <code>e^{3-3}=1</code>；<code>l = 1·1.135 + e^{2-3} = 1.135 + 0.368 = 1.503</code>。状态 <code>(3, 1.503)</code>。</li>
+  </ol>  <p>验算：直接算 <code>Σe^{xⱼ-3} = e^{-2}+e^{0}+e^{-1} = 0.135+1+0.368 = 1.503</code>，<strong>与流式结果逐位吻合</strong>。注意第 2 步那个关键动作：max 从 1 跳到 3，于是把已累加的 <code>l=1</code> 乘上 <code>e^{-2}</code> 回缩到新基准——这正是「不回头重算、一次乘法对齐」的全部魔法。本模块 notebook 会把这套手算变成 <code>np.allclose</code> 对拍，确认任意输入下流式 = 三遍。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>online softmax 把 softmax 从「先看完全局、再算」变成「边走边修正」。它本身只是把 3 遍压成更少遍的小技巧，但它解锁的能力是<strong>致命的</strong>：既然不需要先看完整行，就可以<strong>把行切成块、一块一块地喂</strong>——这正是 FlashAttention 能对 K/V 分块的唯一前提。下一节就把它推广到块。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="blocked"><span class="num">7</span>分块 online softmax：合并块状态</h2>
+  <p>把上一节的「每来一个<em>元素</em>就更新」升级成「每来一<strong>块</strong>就更新」。一行被切成若干块，每块先各自算出自己的局部状态 <code>(m_block, l_block)</code>，然后用<strong>同一条校正因子规则</strong>把两个块的状态<strong>合并</strong>：</p>  <div class="math-block">\[m = \max(m_1, m_2), \qquad l = l_1\, e^{\,m_1 - m} + l_2\, e^{\,m_2 - m}\]</div>  <p>这里 <code>(m₁,l₁)</code> 是「目前累积块」的状态，<code>(m₂,l₂)</code> 是「新到的块」的状态。合并时把两边各自相对<em>全局新 max</em> 缩放再相加。逐块合并完所有块，得到的最终 <code>(m,l)</code> 与一次性看完整行的结果<strong>逐位无关于分块方式</strong>——块大小怎么选，答案都一样。</p>  <div class="ascii">整行 softmax = 把每块的 (m,l) 状态用结合律合并（与块大小无关）：
+
+  块A [x0..x3] → (mA,lA) ┐
+                          ├─ merge → (m,l)  ┐
+  块B [x4..x7] → (mB,lB) ┘                  ├─ merge → 最终 (m,l)
+  块C [x8..x11]→ (mC,lC) ───────────────────┘
+
+  每个 merge 用校正因子把两边对齐到新 max 再相加。</div>  <p>注意这个 merge 运算是<strong>可结合的</strong>（associative），所以它不仅能串行地一块块累积，还能像第 2 节那样组织成<strong>规约树</strong>并行合并——这就是为什么在线 softmax 既能流式（FlashAttention 的串行 KV 循环），又能并行（树形归并）。结合律再次贯穿始终。</p>  <div class="callout paper"><span class="label"></span>
+    <p>这条「分块 + 状态合并」的递推，就是 FlashAttention 注意力内核的数学骨架——下一模块只需再给状态<strong>加一个输出累加器 O</strong>（同样用校正因子缩放），就能在永不物化 n×n 分数矩阵的前提下算出精确注意力。在线 softmax 是 FlashAttention 的「发动机」。原始论文见 Milakov & Gimelshein 2018，应用见 Dao 2022（清单见 <code>../references.md</code>）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>规约与 softmax 看似基础，却是大量前沿内核工作的发源地：</p>  <ul>
+    <li><strong>融合 softmax 内核</strong>：把三遍（或在线一遍）softmax 写成<strong>单个内核</strong>，整行只读一次 HBM、中间的 <code>exp</code> 结果留在寄存器/shared 而非落回显存。这是访存受限算子的标准优化，也是 <code>torch.compile</code> 自动生成 Triton 内核时最常做的融合之一。</li>
+    <li><strong>在线 softmax = FlashAttention 的钥匙</strong>：没有它，注意力就必须先物化整个 <code>n×n</code> 分数矩阵才能 softmax（显存 O(n²)）。在线递推让分数可以分块算、用完即弃，是长上下文（32k、128k+）可行的根本算法前提。</li>
+    <li><strong>反向传播的数值稳定</strong>：softmax 的梯度涉及 <code>p ⊙ (g - (p·g))</code> 的形式，FlashAttention 反向不保存概率矩阵，而是用前向存下的 <span class="term">LogSumExp</span>（<code>m + log l</code>，每行一个标量）重算。如何在重算中维持数值稳定、避免灾难性抵消，是活跃的工程细节。</li>
+    <li><strong>结合扫描（associative scan）视角</strong>：在线 softmax 的状态合并是一个 monoid（含单位元 <code>(-∞, 0)</code>、满足结合律），因此可用<span class="term">parallel scan</span> 在 O(log n) 深度并行。这把 softmax、规约、前缀和、甚至线性注意力/SSM 统一在同一代数框架下，是近年序列建模的重要视角。</li>
+    <li><strong>更低精度与在线归一化</strong>：FP8/BF16 下 exp 的动态范围更紧张，在线维护 max 帮助把指数压回安全区间；FlashAttention-3 在 Hopper 上结合 FP8 与在线 softmax 的稳定性处理，是这条线的最新前沿。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Milakov & Gimelshein 2018《Online normalizer calculation for softmax》（在线 softmax 原始论文）、NVIDIA《Optimizing Parallel Reduction in CUDA》（规约从朴素到极致的七版优化）、Blelloch 1990（并行扫描的代数基础）、以及 Dao 2022《FlashAttention》（在线 softmax 的杀手级应用）。完整清单见 <code>../references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_tiled_matmul/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 分块矩阵乘</div></a>
+    <a class="next" href="../05_flash_attention/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · FlashAttention 内核</div></a>
+  </div>
+
+</div>
+</body>
+</html>

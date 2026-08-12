@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 评测门禁与 CI/CD</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 评测门禁与 CI/CD</h1>
+  <p class="subtitle">从零写一个评测门禁 —— 绝对阈值 + 回归检测 + bootstrap 显著性，把「该不该上线」从拍脑袋变成可复现、可解释的规则</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–02；准确率/AUC 等指标、一点点概率与重采样直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_cicd_gates.ipynb（从零 Gate + bootstrap + 置换检验 + 真实评测胶囊）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Efron & Tibshirani（bootstrap）、Dietterich 1998、Demšar 2006、Breck 2019</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">动机：上线决策不该靠拍脑袋</a></li>
+      <li><a href="#abs">绝对阈值：守住对用户的底线</a></li>
+      <li><a href="#reg">回归检测：别让模型偷偷退步</a></li>
+      <li><a href="#real">这个「赢」是真的吗：显著性问题</a></li>
+      <li><a href="#boot">bootstrap：给指标差值装上误差棒</a></li>
+      <li><a href="#decide">把规则聚合成放行决策</a></li>
+      <li><a href="#deploy">部署策略：门禁之后的渐进放行</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>动机：上线决策不该靠拍脑袋</h2>
+  <p>你训了个新模型，离线 val_acc 0.918，比线上那个（0.913）高了 0.5%。<strong>该不该上线？</strong>这个问题每天在每个 ML 团队上演，而最常见的两种答案都是错的：「高了就上」（可能这 0.5% 纯属测试集采样噪声，换个测试集就反超回去）和「等老板拍板」（不可复现、不可扩展、上线变成政治）。正确答案是<strong>把上线决策变成一套可重复执行的规则</strong>——这就是评测门禁（evaluation gate）。</p>  <p>门禁是 ML 世界的 CI（持续集成）检查。传统软件里，代码合并前要过单元测试、lint、类型检查——<strong>不绿不许合</strong>。ML 里，模型晋升（promote）到下一环境前要过门禁——<strong>不达标不许上</strong>。区别在于 ML 门禁检查的不是「代码对不对」（确定性的），而是「这个模型够不够好、是不是真比现有的好」（统计性的）。这个「统计性」是本模块所有难点的来源。</p>  <p>回顾一下 Google MLOps 白皮书的「三个 C」：传统软件有 CI（持续集成）和 CD（持续交付）；ML 多了第三个 <strong>CT（持续训练）</strong>——模型会被反复重训、反复产出新版本。版本越多，「该不该上这一个」的决策频率就越高。如果每次都靠人评审，要么成为瓶颈（人来不及看），要么走过场（橡皮图章）。<strong>门禁的存在，正是为了让「持续训练」能安全地配上「持续交付」</strong>：机器自动产出候选，机器自动按规则把关，人只在门禁拦下时介入。这也是模块 05 自动重训能成立的前提——没有可信的自动门禁，自动重训等于自动上线未经审查的模型，很危险。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把门禁想成上线前的<strong>体检关卡</strong>：一个候选模型要上线，必须通过一组检查——准确率够高吗（绝对阈值）？没有比现役模型退步吗（回归检测）？这点提升是真的还是测量误差（显著性）？延迟、公平性等其他指标没崩吗（多目标）？全过才放行，任何一项不过就拦下，并给出<em>可读的理由</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，门禁是一个函数 <code>gate(candidate, baseline, test_set) → {pass/block, reasons}</code>。它把若干条<strong>规则</strong>（rule）作用在候选模型的评测结果上，每条规则返回通过/拦截 + 理由，再按某种策略（通常是「全部通过才放行」）聚合成最终决策。关键设计是<strong>决策必须可解释、可复现</strong>：同样的输入永远给同样的判定，且拦截时说清楚被哪条规则、为什么拦。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>门禁的根本价值不是「自动化」，而是<strong>把「什么样的模型够格上线」这个标准，从某个人脑子里的隐性判断，变成写下来、所有人可见、机器可执行的显性规则</strong>。一旦写下来，标准就能被讨论、被改进、被一致地应用——而不是这次老板心情好就放了、下次另一个人又卡住。这是工程纪律战胜「拍脑袋」的又一例，和模块 01 把复现性、模块 02 把不可变性编码进 API 是同一种精神：<em>把正确的做法固化成系统的默认行为，让人想做错都难</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="abs"><span class="num">2</span>绝对阈值：守住对用户的底线</h2>
+  <h3>2.1 绝对阈值：守住底线（SLO）</h3>  <p>最基本的规则是<strong>绝对阈值</strong>：某指标必须达到一个硬性底线，否则拦截。这个底线常对应一个 <span class="term">SLO</span>（服务水平目标）——你对用户/业务的承诺，如「分类准确率 ≥ 0.85」「p95 延迟 ≤ 100ms」「召回率 ≥ 0.90」。</p>  <div class="math-block">\[\text{rule}_{\text{abs}}(\text{model}) = \begin{cases} \text{pass} & \text{if } \text{metric}(\text{model}) \ge \tau \\ \text{block} & \text{otherwise}\end{cases}\]</div>  <p>绝对阈值的作用是<strong>守底线</strong>：无论候选模型相对基线如何，它都不能低于这条对用户的承诺线。注意阈值的<strong>方向</strong>：acc/recall 是「越大越好」（<code>≥ τ</code>），latency/error_rate 是「越小越好」（<code>≤ τ</code>）。一个好的门禁框架把方向（<code>mode='max'/'min'</code>）做成规则的参数，而不是硬编码——本模块的 notebook 正是这么实现的。</p>  <p>阈值从哪来？这不是技术问题而是<strong>业务问题</strong>，且常被工程师忽视。0.85 这个数不该是工程师随手定的，而该从<em>用户能容忍的最差体验</em>反推：垃圾邮件分类器漏判一封重要邮件（假阴性）的代价多大？医疗筛查模型漏诊一个病例的代价多大？<strong>阈值是把「业务后果」翻译成「指标底线」的那个转换点</strong>。不同错误类型代价不对称时（漏诊 ≫ 误诊），还要分别给 recall 和 precision 设阈值，而非只看一个 acc。把这些写进门禁，等于把「我们对用户的承诺」变成了机器每次都会强制执行的契约。</p>  <p>绝对阈值还有一个常被忘记的兄弟：<strong>不仅看整体指标，还要看关键切片（slice）上的指标</strong>。一个 acc=0.92 的模型，可能在某个少数群体上只有 0.6——整体达标，却对一部分用户灾难性地差。成熟的门禁会对若干<em>重要切片</em>（按地区、设备、用户群、罕见但高价值的类别）分别设阈值，防止「整体光鲜、局部崩盘」。这与公平性（fairness）评测直接相连：很多公平性问题，本质就是「某个切片上的指标远低于整体」，而切片化的绝对阈值正是把它拦在上线前的第一道闸。</p>  <p>「为什么 acc 一个数不够」用一个代价微例说透。某医疗筛查模型 <code>acc=0.95</code> 看着很美，但拆开混淆矩阵：在 1000 个样本里，假阴性（漏诊，把病人判成健康）有 30 个、假阳性（误诊，把健康判成病人）有 20 个。如果漏诊的代价（病人错过治疗）是误诊（多做一次复查）的 100 倍，那么这个模型的<em>业务代价</em> = 30×100 + 20×1 = 3020，而另一个 <code>acc=0.93</code> 但只漏诊 5 个、误诊 65 个的模型，代价 = 5×100 + 65×1 = 565——<strong>acc 更低的模型反而好得多</strong>。这就是为什么错误代价不对称时，门禁必须分别给 recall（管漏诊）和 precision（管误诊）设阈值，而不能只卡一个 acc。把「漏诊比误诊贵 100 倍」这条业务事实写进门禁，等于让机器每次都替你做对这道<em>用 acc 一定会做错</em>的算术。</p>  <div class="callout warn"><span class="label"></span>
+    <p>阈值不是越严越好。设太高，没有模型过得了关，门禁形同虚设（大家学会绕过它）；设太低，门禁放进劣质模型，失去意义。更隐蔽的坑是<strong>阈值要钉在固定的、版本化的测试集上</strong>——如果每次用不同的测试集评，0.85 这个数就没有可比性（这正需要模块 02 给测试集做版本）。这把我们引向门禁的另一半：不只看绝对值，还要看相对基线的变化。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="reg"><span class="num">3</span>回归检测：别让模型偷偷退步</h2>
+  <p>光有绝对阈值不够。设想候选模型 acc=0.86（过了 0.85 的阈值），但现役模型是 0.92——上这个新模型等于<strong>主动退步 6 个点</strong>，却能骗过绝对阈值。所以门禁还需要 <span class="term">regression</span>（回归）检测：拿候选与<strong>基线（当前生产模型，champion）</strong>比，跌得太多就拦，哪怕仍在阈值之上。注意这正是软件工程里「回归测试」一词的本义——确保新改动没有让原本能用的东西退步，只不过这里退步的是统计指标而非功能正确性。</p>  <div class="math-block">\[\Delta = \text{metric}(\text{candidate}) - \text{metric}(\text{baseline}), \qquad \text{block if } \Delta < -\epsilon\]</div>  <p>这里 <code>ε</code> 是<strong>容忍的回归幅度</strong>。为什么允许一点点回归（<code>ε &gt; 0</code> 而非 0）？因为有时你愿意用一点点 acc 换别的好处——更小的模型、更低的延迟、更好的公平性。门禁应当编码<em>团队的权衡</em>，而不是机械地「任何下降都拦」。这套「候选 vs 基线」的比较，正是 <span class="term">champion / challenger</span>范式：现役冠军 vs 挑战者，挑战者要赢、且赢得够多才能上位。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="real"><span class="num">4</span>这个「赢」是真的吗：显著性问题</h2>
+  <p>现在到了本模块最深的一层。候选 0.918、基线 0.913，差 <code>Δ=0.005</code>。这 0.5% 是<strong>候选模型真的更好</strong>，还是<strong>只是这个测试集恰好对候选有利</strong>（换一批测试样本就没了）？这不是抬杠——测试集是从真实分布里<em>抽样</em>的有限样本，任何在它上面算出的指标都带<strong>采样噪声</strong>。在 1000 条测试样本上，0.5% 的差异完全可能是噪声。</p>  <p>把这个问题忽视掉的代价很真实：你会被噪声牵着鼻子走，不断「晋升」其实没更好的模型，每次上线都引入风险却没换来收益，还可能在某次真的变差时反而放行。<strong>所以门禁的最后一道、也是最容易被省略的关，是统计显著性检验：这点提升是信号还是噪声？</strong>这是把门禁从「业余」做到「专业」的分水岭。</p>  <p>这背后是一个更普适、也更反直觉的道理：<strong>「A 比 B 高」和「A 显著比 B 高」是两件完全不同的事</strong>。前者只要比较两个点估计的大小（小学算术），后者要考虑这两个数各自的不确定性、以及它们之差的不确定性（统计推断）。工业界无数次「新模型上线后线上效果反而不如离线」的事故，根因往往就是把前者当成了后者——离线测试集上那 0.5% 的「提升」是噪声，到了线上自然消失甚至反转。学会区分这两者，可能是本课对你日常工作最直接有用的一课。</p>  <div class="callout danger"><span class="label"></span>
+    <p>这是整个模块的核心教训：<strong>两个模型指标的差值，本身是一个随机变量，有它自己的不确定性。</strong>报告「A 比 B 高 0.5%」而不报告这个差值的误差范围，就像报告一次测量却不给误差棒——在物理实验里这是不及格的，在 ML 评测里却司空见惯。下一节用 bootstrap 给这个差值装上误差棒，让门禁能区分「真的更好」与「运气好」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="boot"><span class="num">5</span>bootstrap：给指标差值装上误差棒</h2>
+  <h3>4.1 bootstrap：给指标装上误差棒</h3>  <p>我们想知道指标（或两模型指标之差）的<strong>不确定性</strong>，但只有一个测试集、跑不出第二批数据。<span class="term">bootstrap</span>（自助法）给出一个绝妙的解法：<strong>把手上的测试集当成总体，有放回地重采样出许多个「平行测试集」，在每个上重算指标</strong>，这些指标的散布就近似了「如果能反复采样，指标会怎么波动」。这个想法初看像「无中生有」——凭一个样本怎么估出抽样波动？但它的统计学根基扎实（Efron 1979）：手上的经验分布是真实分布的最佳无偏估计，从它重采样，就近似了从真实分布重采样。</p>  <div class="ascii">原始测试集 (n=1000)
+   │  有放回重采样 n 条  ×  B=2000 次
+   ▼
+重采样集_1 -&gt; 算 Δ_1 = acc_cand - acc_base = 0.006
+重采样集_2 -&gt; 算 Δ_2 = 0.003
+   ...
+重采样集_B -&gt; 算 Δ_B = -0.001
+   ▼
+{Δ_1..Δ_B} 的分布  -&gt;  95% 置信区间 = [第2.5百分位, 第97.5百分位]
+判定：若区间整个 &gt; 0  -&gt;  候选显著更好；若跨 0  -&gt;  差异不显著（可能是噪声）</div>  <p>从 B 个重采样的 <code>Δ</code> 里取 2.5 和 97.5 百分位，就得到差值的 <strong>95% 置信区间（CI）</strong>。判定规则很直观：<strong>CI 整个落在 0 的右边 → 候选显著更好（放行）；CI 跨越 0 → 差异不显著，可能只是噪声（拦截或要求更多证据）</strong>。这比「谁的点估计高就选谁」稳健得多——它逼你只在<em>有统计证据</em>时才晋升。</p>  <p>重采样次数 <code>B</code> 怎么选？<code>B</code> 越大，CI 的两个端点估计得越稳（蒙特卡洛误差越小），但它<strong>不会让区间变窄</strong>——区间宽度由<em>测试集大小 n</em>决定，不由 B 决定。常见取 <code>B=1000~10000</code>：算得起、端点稳。一个常见误解是「多 bootstrap 几次就能更显著」——不能，那只是把同一个 n 的不确定性估得更精确而已。要让 CI 真正变窄、让小提升也能被判显著，唯一的办法是<strong>收集更多测试数据</strong>（n 增大，CI 约以 1/√n 收缩，本模块练习 2 会亲手验证）。这条「想要更确定，就要更多数据」的规律，是统计学最朴素也最硬的约束。</p>  <p>bootstrap 的美在于它<strong>几乎不需要分布假设</strong>：不管指标是 acc、AUC、F1 还是某个古怪的业务 KPI，重采样的套路完全一样，不必推导每个指标的理论方差（很多根本推不出来）。代价是计算——要重算 B 次指标——但在评测规模上完全可接受，且天然可并行。<strong>这是用算力换统计严谨性，非常划算的一笔交易。</strong></p>  <p>一个关键且易错的细节：比较两个模型时必须<strong>配对（paired）</strong>——在<em>同一批测试样本</em>上同时评两个模型，然后比较它们在<em>每条样本</em>上的对错。为什么？因为两个模型面对的「测试集难度抖动」是共同的——配对比较把这个共同噪声消掉了，只留下「模型本身的差异」，因此比「各自在不同样本上评再比平均」灵敏得多。本模块的 bootstrap 对同一组重采样下标<em>同时</em>重算两个模型的指标，正是为了保持配对结构。把这点做错（用两个独立测试集比）会让你的显著性判断严重失真。</p>  <p>一个常见的近亲是 <span class="term">permutation test</span>（置换检验）：把两个模型的预测标签随机互换多次，看「观测到的差异」在「两模型无差异」的零假设下有多极端，得到 p 值。bootstrap 给<em>区间</em>（差多少、多确定），permutation 给<em>p 值</em>（是否显著）——两者互补，本模块 notebook 都会实现。</p>  <p>要警惕一个常被误读的点：<strong>置信区间和 p 值回答的不是同一个问题，但常常一致</strong>。95% CI 跨 0 ⇔ 双侧检验在 0.05 水平上不显著，这个对应在很多情形下成立，但 CI 多给了一份信息——<em>效应有多大</em>（实际意义），而非只是「是否非零」（统计显著）。一个差异可以「统计显著但实际微不足道」（在百万样本上，0.01% 的提升都能显著，但根本不值得上线换风险），也可以「实际重要但样本太少没测出显著」。<strong>成熟的门禁同时看「显著性」与「效应量」</strong>：既问「这提升是真的吗」，也问「就算是真的，大到值得上线吗」。这是本模块希望你带走的最精细的一层判断。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这个判别口诀：<strong>看点估计选模型 = 业余；看置信区间选模型 = 专业。</strong>「候选比基线高 0.5%，95% CI=[-0.3%, +1.3%]」——这个区间跨 0，意味着「候选其实更差」也在可能范围内，这时晋升就是在赌噪声。反之若 CI=[+0.2%, +0.8%]，整个为正，你才有底气说「这次提升是真的」。门禁的显著性规则，就是把这个判断自动化。</p>
+  </div>  <p>把整套 bootstrap 决策用 stdlib 几行跑一遍，看它如何在「同样 Δ=0.5%」下给出相反结论——区别只在样本量：</p>  <pre><code>import random
+def acc(preds, labels, idx):           # 在重采样下标 idx 上算 acc
+    return sum(preds[i]==labels[i] for i in idx)/len(idx)
+def boot_ci(base_p, cand_p, labels, B=2000):
+    n = len(labels); deltas = []
+    for _ in range(B):
+        idx = [random.randrange(n) for _ in range(n)]   # 有放回、配对
+        deltas.append(acc(cand_p,labels,idx) - acc(base_p,labels,idx))
+    deltas.sort()
+    return deltas[int(0.025*B)], deltas[int(0.975*B)]   # 95% CI
+# 场景A：n=300，候选多对 ~1~2 个 → Δ≈0.5%，但 CI 跨 0（噪声）
+# 场景B：n=8000，候选稳定多对 ~40 个 → 同样 Δ≈0.5%，CI 整段 &gt;0（真）</code></pre>  <p>这段代码把前面所有概念落了地：<code>idx</code> 对两个模型<em>共用</em>（配对，消掉测试集难度的共同抖动）；区间取 <code>deltas</code> 的 2.5/97.5 百分位。亲手跑过你会震撼于一个事实——<strong>同样的 0.5% 提升，在 n=300 时是噪声（CI=[-0.4%, +1.4%]，该拦），在 n=8000 时是信号（CI=[+0.2%, +0.8%]，该放）</strong>。点估计完全一样，结论却相反，差别全在「这个差值有多确定」。这就是为什么报告提升必须连带它的误差范围：脱离样本量谈「高了 0.5%」是没有信息量的。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="decide"><span class="num">6</span>把规则聚合成放行决策</h2>
+  <p>一个真实门禁是<strong>多条规则的组合</strong>：绝对阈值（守底线）+ 回归检测（别退步）+ 显著性（提升是真的吗）+ 其他目标（延迟、公平性）。聚合策略通常是<strong>一票否决</strong>——任何一条规则拦截，整体就拦截，并汇总<em>所有</em>失败理由（而非遇到第一个就停，那样你修完一个又撞下一个）：</p>  <pre><code>gate = Gate([
+  AbsThreshold('val_acc', tau=0.85, mode='max'),       # 守底线
+  AbsThreshold('p95_latency_ms', tau=100, mode='min'), # 延迟 SLO
+  NoRegression('val_acc', baseline=0.913, eps=0.002),  # 别退步
+  Significant('val_acc', baseline_preds, cand_preds),  # 提升显著吗
+])
+decision = gate.evaluate(candidate)
+if decision.passed:
+    repo.tag('champion', candidate.version)    # 晋升（接模块02）
+else:
+    print('BLOCKED:', decision.reasons)        # 汇总所有失败理由</code></pre>  <p>注意这套设计把模块 01/02 都接了起来：候选模型来自追踪器（模块 01 记录的 run + 产物），晋升动作落在版本库的标签上（模块 02 的 <code>tag</code>）。门禁是<strong>生命周期里「训练/评测」与「部署」之间的那道闸门</strong>——上游的可复现资产在这里被审查，通过了才流向生产。</p>  <p>还有一个工程上的关键设计：<strong>门禁失败时要汇总所有失败理由，而非遇到第一个就停</strong>。如果门禁只报「acc 不达标」，你改完重跑，又被「延迟超标」拦下，再改再撞「回归过多」——一次次往返浪费大量时间。好的门禁像一个<em>彻底的代码评审</em>：一次把所有问题都列清楚，让你一轮修完。这看似小事，却直接决定门禁是「帮手」还是「障碍」——开发者会绕过让他们反复吃闭门羹的工具。本模块的 <code>run_gate</code> 刻意收集<em>全部</em>规则结果再聚合，正是这个考量。</p>  <p>这个 <code>Gate</code> 在生产里长什么样？它就是 CI 流水线里的一个 job。把本模块的玩具组件对应到真实工具：</p>  <table>
+    <thead><tr><th>本模块从零实现</th><th>它的本质</th><th>生产工具对应</th></tr></thead>
+    <tbody>
+      <tr><td><code>AbsThreshold</code> / <code>NoRegression</code></td><td>可声明的评测规则</td><td>CML/GitHub Actions 里的 metric 检查、Evidently test suite</td></tr>
+      <tr><td><code>Significant</code>（bootstrap CI）</td><td>统计显著性闸</td><td>实验平台的显著性判定、scipy 显著性检验封装</td></tr>
+      <tr><td><code>gate.evaluate</code> 一票否决</td><td>CI 的 pass/fail job</td><td>GitHub Actions / GitLab CI 的 required check</td></tr>
+      <tr><td>通过则 <code>tag('champion')</code></td><td>模型晋升</td><td>MLflow Model Registry 的 stage transition</td></tr>
+      <tr><td>canary/shadow 渐进放行</td><td>线上灰度</td><td>Seldon/KServe 流量切分、特性开关</td></tr>
+    </tbody>
+  </table>  <p>这张表点出门禁的真正位置：<strong>它是「模型版的 CI required check」</strong>——传统 CI 不绿不许合代码，ML 门禁不达标不许晋升模型，机制完全同构。你把这套从零写过一遍，再看任何「自动评测+晋升」的 MLOps 平台，都能一眼认出它的 <code>AbsThreshold</code>、它的显著性闸、它的一票否决在哪。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="deploy"><span class="num">7</span>部署策略：门禁之后的渐进放行</h2>
+  <p>过了离线门禁不等于万事大吉——离线测试集再好也代表不了真实流量。所以生产中门禁之后还有<strong>渐进式部署</strong>：<span class="term">canary</span>（金丝雀，先放给 1% 流量，盯住线上指标没崩再逐步放大，出事影响面小、可秒级回滚）、<span class="term">shadow</span>（影子，新模型接收真实流量但不返回结果，纯做线上离线对比）、A/B 测试（新旧并行、用真实业务指标统计检验）。这些都把「上线」从一个<em>二元开关</em>变成一个<em>有反馈、可回退的渐进过程</em>——而回退靠的正是模块 02 的标签回滚。</p>  <p>值得点明的是，A/B 测试里判断「线上新模型是否真的更好」用的统计方法，和本模块离线门禁用的 bootstrap/置换检验<strong>是同一套思想</strong>：都是在问「观测到的差异，扣掉随机波动后还站得住吗」。区别只在数据来源——离线用固定测试集，线上用真实流量的实时反馈。所以你这一模块学到的显著性判断，会一路用到生产的最末端。它不是一个孤立技巧，而是<em>贯穿离线评测到线上实验</em>的同一根统计主线。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>多重比较与「刷测试集」</strong>：你反复在同一个测试集上评几十个候选、挑最好的——这本身就会过拟合测试集（每次比较都有假阳性概率，比多了必中招）。如何在持续晋升中控制这种 <em>test set overfitting</em>（holdout 复用的统计代价）是活跃问题（见 references 的 Dietterich/Demšar）。</li>
+    <li><strong>多目标门禁的取舍</strong>：当 acc↑ 但公平性↓、或延迟↑，没有单一标量能自动裁决。如何把团队价值观（多个指标的权衡）形式化进门禁，且保持可解释，仍是设计难题。</li>
+    <li><strong>评测集本身的版本与漂移</strong>：门禁信任测试集，但测试集会过时（世界变了，老测试集不再代表线上）。测试集也需要版本化（模块 02）与漂移监控（模块 04）——「守门人」自己也要被守。</li>
+    <li><strong>LLM 时代的门禁</strong>：生成式模型没有单一 acc，评测靠 LLM-judge、人类偏好、能力/安全基准套件——指标更多维、更嘈杂、更主观，如何为它们设计可靠门禁（含红队/安全闸）是当下最热的开放问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读：Efron & Tibshirani《An Introduction to the Bootstrap》（误差棒的理论）、Dietterich 1998 与 Demšar 2006（比较分类器的统计陷阱与正确方法）、Breck 2019 数据校验（门禁的数据侧）、Google MLOps 白皮书（门禁在 CI/CD/CT 流水线里的位置）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_versioning/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 数据与模型版本</div></a>
+    <a class="next" href="../04_monitoring_drift/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 监控与漂移</div></a>
+  </div>
+
+</div>
+</body>
+</html>

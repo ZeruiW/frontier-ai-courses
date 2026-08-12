@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 矩阵分解</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 矩阵分解</h1>
+  <p class="subtitle">Netflix Prize 的封神算法 —— 给每个用户/物品学一个低维隐因子向量，内积即评分；SGD/ALS 训练、偏置项、L2 正则、与 SVD 的真实关系，从零写 MF(SGD) 看 RMSE 收敛、数值对拍解析梯度</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00/01、线性代数（矩阵乘/求逆）、梯度下降、一点点最小二乘</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_matrix_factorization.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Koren 2009、Funk 2006 (FunkSVD)、Hu 2008、Mnih 2007 (PMF)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#idea">隐因子模型：把评分矩阵分解</a></li>
+      <li><a href="#notsvd">它真的是 SVD 吗？(重要澄清)</a></li>
+      <li><a href="#objective">目标函数：损失 + 正则</a></li>
+      <li><a href="#sgd">SGD 训练与梯度推导</a></li>
+      <li><a href="#bias">偏置项：被低估的功臣</a></li>
+      <li><a href="#als">ALS 训练：另一条路</a></li>
+      <li><a href="#industry">从评分预测到工业落地</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="idea"><span class="num">1</span>隐因子模型：把评分矩阵分解</h2>
+  <p>矩阵分解（<span class="term">matrix factorization, MF</span>）是推荐系统的<strong>圣经级算法</strong>。它在 2006-2009 年的 Netflix Prize 百万美元竞赛中封神——夺冠方案的核心就是矩阵分解（外加各种集成）。Koren 2009 那篇《Matrix Factorization Techniques for Recommender Systems》至今是推荐工程师的必读第一课。</p>  <p>协同过滤（模块 01）靠<strong>数邻居</strong>：手工定义一个相似度，然后加权插值。矩阵分解换了个更深刻的视角——它不再问「哪些物品相似」，而是直接问：<strong>能不能给每个用户、每个物品各学一个低维向量，让向量内积就等于评分？</strong>这就是<strong>隐因子模型（latent factor model）</strong>：假设用户偏好和物品属性都可以用一个 $k$ 维稠密向量（隐因子）刻画，用户向量 $p_u$ 和物品向量 $q_i$ 的内积 $p_u\cdot q_i$ 就是该用户对该物品的预测评分。</p>  <div class="math-block">\[R \approx P Q^\top, \qquad \hat r_{ui} = p_u \cdot q_i = \sum_{f=1}^{k} p_{uf}\, q_{if}\]</div>  <div class="ascii">把 m×n 的稀疏评分矩阵 R 分解成两个低秩因子（k ≪ m,n）
+
+        物品 1..n                      隐因子 1..k          物品 1..n
+  用户 ┌─ 5  ?  3  ?  ?─┐        用户 ┌─ ■ ■ ■ ─┐      ┌─ ■ ■ ■ ■ ■ ─┐ 隐
+   1.. │  ?  4  ?  ?  2 │   ≈    1.. │  ■ ■ ■  │  ×   │  ■ ■ ■ ■ ■  │ 因
+   m   └─ ?  ?  ?  5  ?─┘        m   └─ ■ ■ ■ ─┘      └─ ■ ■ ■ ■ ■ ─┘ 子
+        R (大量 ? 缺失)              P (m×k 用户因子)    Qᵀ (k×n 物品因子)
+
+  预测任意格子 r̂_ui = p_u · q_i （用户向量·物品向量）—— 连没观测的也能填</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：假设每部电影可以打几个隐藏标签的分（比如「科幻程度」「文艺程度」「快节奏程度」…），每个人对这几个标签各有偏好。你对一部电影的喜爱 = 你的偏好向量 · 电影的标签向量。<strong>矩阵分解的魔法是：这些「隐藏标签」不需要人去定义，模型自己从评分里学出来</strong>——它可能学出「适合周末看的」「带点黑色幽默的」这种连产品经理都说不清的维度。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，$R\in\mathbb{R}^{m\times n}$（$m$ 用户、$n$ 物品）被分解成 $P\in\mathbb{R}^{m\times k}$ 和 $Q\in\mathbb{R}^{n\times k}$ 两个<strong>低秩</strong>因子矩阵（$k\ll m,n$，典型 $k$=10~200）。这是一个<strong>低秩近似</strong>：把 $mn$ 个评分压缩进 $(m+n)k$ 个参数。低秩假设的物理含义是——<em>用户偏好和物品属性的内在维度其实很低</em>，几十个隐因子就能解释绝大部分评分变化。这个假设在真实数据上惊人地成立。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>矩阵分解为什么比邻域 CF 强？因为它学的是<strong>全局、压缩、可泛化</strong>的表示。邻域 CF 的相似度是局部的、两两的、手工的；MF 的隐因子是<em>在全部评分上联合优化</em>出来的，它能把「用户 A 喜欢科幻」「电影 X 是科幻」这类跨越多个物品的模式压进低维空间，从而泛化到从未共现过的 (用户, 物品) 对。这就是从「记忆」到「学习」的跨越。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="notsvd"><span class="num">2</span>它真的是 SVD 吗？(重要澄清)</h2>
+  <h3>它真的是 SVD 吗？—— 一个重要的澄清</h3>  <p>矩阵分解常被叫做「SVD」，但这是个<strong>流传甚广的误称</strong>，搞清楚它能帮你避免很多困惑。线性代数里的奇异值分解（<span class="term">SVD</span>）是：任意矩阵 $A=U\Sigma V^\top$，其中 $\Sigma$ 是奇异值对角阵。截断 SVD（只保留最大的 $k$ 个奇异值）给出 $A$ 的<strong>最优低秩近似</strong>（Eckart–Young 定理）。</p>  <p>但真 SVD 有个致命前提：<strong>矩阵必须完整、没有缺失值</strong>。而推荐的交互矩阵 $R$ <strong>绝大部分是缺失的</strong>（稀疏度常 >95%）！对一个 95% 是「空」的矩阵硬做 SVD，要么得先把缺失填成 0（严重扭曲，因为「没评分」不等于「评 0 分」），要么填成均值（引入偏差）。两种都是错的。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句话区分：<strong>真 SVD 是「给定完整矩阵，求最优低秩分解」；推荐里的「SVD」是「只在观测到的评分上，学一个低秩模型去拟合它们」</strong>。后者其实是一个带缺失的回归问题，和线代的 SVD 只是<em>形式上</em>都写成两个矩阵相乘，求解方式和目标完全不同。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>Simon Funk 在 Netflix Prize 中（2006 博客）提出的做法——人称 <span class="term">FunkSVD</span>——是关键转折：<strong>不填缺失，只在观测项上</strong>用 SGD 最小化误差。目标函数只对<strong>已知评分</strong> $(u,i)\in\mathcal{K}$ 求和：$\min\sum_{(u,i)\in\mathcal{K}}(r_{ui}-p_u\cdot q_i)^2$。这彻底绕开了「缺失填什么」的难题，成为现代 MF 的起点。</p></div>
+  </div>  <p>所以记住：推荐里说的「SVD」「SVD++」基本都是指<strong>FunkSVD 这一族在观测项上优化的隐因子模型</strong>，不是线代教科书的那个 SVD。本模块讲的就是这个——用梯度下降（SGD）或交替最小二乘（ALS）在稀疏观测上学 $P,Q$。这个区分看似学究，却是读懂推荐文献的钥匙。</p>  <p>还有一个常被混淆的点：真 SVD 的因子是<strong>正交</strong>的（$U,V$ 列正交、$\Sigma$ 对角），而 FunkSVD 学出的 $P,Q$ <strong>没有任何正交约束</strong>——它只要求内积拟合评分，因子可以随意旋转（$PQ^\top=(PR)(QR^{-\top})^\top$ 对任意可逆 $R$ 都成立，存在旋转不确定性）。这意味着 MF 学到的单个隐因子<em>没有固定的、可解释的含义</em>（不像 SVD 的奇异向量），但内积、距离这些<em>几何量</em>是确定的——而推荐只关心几何量（谁和谁近），所以无所谓。理解这点能帮你不被「隐因子代表什么」这个伪问题困住。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="objective"><span class="num">3</span>目标函数：损失 + 正则</h2>
+  <h3>目标函数：损失 + 正则</h3>  <p>FunkSVD 的目标函数：在观测项上最小化平方误差，加 $L_2$ 正则防过拟合：</p>  <div class="math-block">\[\min_{P,Q}\ \sum_{(u,i)\in\mathcal{K}} \big(r_{ui} - p_u\cdot q_i\big)^2 + \lambda\big(\|p_u\|^2 + \|q_i\|^2\big)\]</div>  <p>两个部分缺一不可。<strong>平方误差项</strong>让预测贴近观测评分；<strong>正则项</strong> $\lambda(\|p_u\|^2+\|q_i\|^2)$ 惩罚过大的因子，防止在稀疏数据上过拟合。为什么推荐里正则如此关键？因为数据极稀疏——很多用户只评了几个物品，没有正则的话，模型会把这几个评分死记硬背（隐因子变得很大去精确拟合），毫无泛化。<strong>正则强度 $\lambda$ 是 MF 最重要的超参数之一</strong>。</p>  <p>这个正则有一个漂亮的<strong>概率解释</strong>（Mnih & Salakhutdinov 2007 的 PMF）：假设评分服从高斯似然 $r_{ui}\sim\mathcal{N}(p_u\cdot q_i,\sigma^2)$，且隐因子有高斯先验 $p_u\sim\mathcal{N}(0,\sigma_P^2 I)$、$q_i\sim\mathcal{N}(0,\sigma_Q^2 I)$，则最大后验（MAP）估计恰好等价于上面的正则化平方损失，$\lambda=\sigma^2/\sigma_P^2$。换句话说，<strong>L2 正则 = 给隐因子加高斯先验</strong>。这把 MF 放进了贝叶斯框架，也解释了为什么这样正则是「对」的。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见误区：以为「评分预测准（RMSE 低）= 推荐好」。其实未必。RMSE 衡量的是<em>在观测项上</em>的拟合，但推荐真正要的是<strong>Top-N 排序</strong>——把用户会喜欢的排前面。一个 RMSE 略高但排序更好的模型可能更有用。Netflix Prize 用 RMSE 做指标是历史选择（它有干净的显式评分），现代工业更多直接优化排序（BPR、模块 04）。本模块用 RMSE 是因为它最适合<em>看清 MF 的数学与收敛</em>，但要记住它不是终点。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sgd"><span class="num">4</span>SGD 训练与梯度推导</h2>
+  <h3>SGD 训练：梯度推导</h3>  <p>怎么解这个目标？最直接的是<strong>随机梯度下降（SGD）</strong>：每次随机抽一个观测 $(u,i)$，算它的预测误差，沿梯度更新对应的 $p_u,q_i$。设单点误差 $e_{ui}=r_{ui}-p_u\cdot q_i$，单点损失（含正则）：</p>  <div class="math-block">\[\ell_{ui} = e_{ui}^2 + \lambda(\|p_u\|^2 + \|q_i\|^2)\]</div>  <p>对 $p_u$ 和 $q_i$ 求梯度（用 $\frac{\partial e_{ui}}{\partial p_u}=-q_i$、$\frac{\partial e_{ui}}{\partial q_i}=-p_u$）：</p>  <div class="math-block">\[\frac{\partial \ell_{ui}}{\partial p_u} = -2 e_{ui}\, q_i + 2\lambda p_u, \qquad \frac{\partial \ell_{ui}}{\partial q_i} = -2 e_{ui}\, p_u + 2\lambda q_i\]</div>  <p>于是 SGD 更新规则（吸收常数 2 进学习率 $\eta$）：</p>  <div class="math-block">\[p_u \leftarrow p_u + \eta\,(e_{ui}\, q_i - \lambda p_u), \qquad q_i \leftarrow q_i + \eta\,(e_{ui}\, p_u - \lambda q_i)\]</div>  <p>这个更新有清晰的直觉：<strong>预测偏低（$e_{ui}&gt;0$）就让 $p_u$ 朝 $q_i$ 方向移、$q_i$ 朝 $p_u$ 方向移</strong>（拉近内积），偏高则相反；正则项 $-\lambda p_u$ 把因子往 0 收缩。实现时<strong>务必先算完误差、再同时更新 $p_u$ 和 $q_i$</strong>——如果先更新 $p_u$ 再用新的 $p_u$ 算 $q_i$ 的梯度，就错了（梯度要在同一点取）。notebook worked 会用数值梯度对拍解析梯度，确保这一步没写错。</p>  <p>把一步 SGD 手算一遍，更新规则就再也不会记错。取 $k=2$，当前 $p_u=(1.0,\ 0.5)$、$q_i=(0.8,\ 0.2)$，真实评分 $r_{ui}=5$，学习率 $\eta=0.1$、正则 $\lambda=0.05$。预测 $\hat r_{ui}=p_u\cdot q_i=1.0{\times}0.8+0.5{\times}0.2=0.9$，误差 $e_{ui}=5-0.9=4.1$（严重偏低，该把内积大幅推高）。更新 $p_u$：每一维 $p_{uf}\!\leftarrow\!p_{uf}+\eta(e_{ui}q_{if}-\lambda p_{uf})$，得 $p_{u1}=1.0+0.1(4.1{\times}0.8-0.05{\times}1.0)=1.0+0.323=1.323$，$p_{u2}=0.5+0.1(4.1{\times}0.2-0.05{\times}0.5)=0.5+0.0795=0.580$。对称地更新 $q_i$（用<strong>更新前</strong>的 $p_u$！）：$q_{i1}=0.8+0.1(4.1{\times}1.0-0.05{\times}0.8)=1.206$，$q_{i2}=0.2+0.1(4.1{\times}0.5-0.05{\times}0.2)=0.404$。重算预测：$\hat r_{ui}=1.323{\times}1.206+0.580{\times}0.404\approx1.83$——一步就从 0.9 朝 5 迈了一大步。这个手算里藏着最易踩的坑：<strong>$q_i$ 的梯度必须用更新前的 $p_u$</strong>，若图省事先把 $p_u$ 改了再算 $q_i$，梯度就不在同一点取，方向会错。notebook 的数值对拍正是为了揪出这种「顺序写反」的 bug。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>SGD 的好处：实现极简（就上面两行）、内存小（一次只碰一对）、<strong>天然支持在线/增量</strong>（新评分来了直接更新）。这是 Funk 当年能在家用电脑上跑 Netflix 数据的原因。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>代价：需要调学习率 $\eta$ 和迭代轮数；收敛到的是局部最优（目标对 $P,Q$ 联合非凸，但实践中 SGD 找到的解足够好）；遍历顺序、初始化都有影响。工程上常用学习率衰减、动量、或 AdaGrad 来稳定。notebook 会画出 RMSE 随 epoch 单调下降的收敛曲线——这是「训练对了」的最直接证据。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bias"><span class="num">5</span>偏置项：被低估的功臣</h2>
+  <h3>偏置项：被低估的功臣</h3>  <p>纯内积模型 $\hat r_{ui}=p_u\cdot q_i$ 有个明显缺陷：它假设评分完全来自「用户-物品的匹配」，却忽略了两个<strong>与匹配无关的系统性效应</strong>：有的用户天生爱打高分（宽容的人），有的电影就是普遍受欢迎（如《肖申克的救赎》）。这些效应叫<strong>偏置（bias）</strong>，加进模型后预测变成：</p>  <div class="math-block">\[\hat r_{ui} = \mu + b_u + b_i + p_u\cdot q_i\]</div>  <p>其中 $\mu$ 是<strong>全局平均分</strong>（所有评分的均值），$b_u$ 是<strong>用户偏置</strong>（这个用户平均比 $\mu$ 高/低多少），$b_i$ 是<strong>物品偏置</strong>（这部电影平均比 $\mu$ 高/低多少）。内积 $p_u\cdot q_i$ 只负责捕捉<strong>剩余的、真正个性化的</strong>匹配。偏置也一起用 SGD 学（$b_u\leftarrow b_u+\eta(e_{ui}-\lambda b_u)$，$b_i$ 同理）。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>偏置项看似简单，贡献却<strong>大得惊人</strong>。Koren 2009 报告：在 Netflix 数据上，光是 $\mu+b_u+b_i$（连内积都没有！）就已经解释了相当大一部分评分变化，RMSE 比纯均值基线显著降低。直觉上：你能预测「严苛用户给爆款电影」大概打几分，靠的根本不是精细的口味匹配，而是「这人打分偏低（$b_u$）+ 这片普遍受欢迎（$b_i$）」这两个粗粒度效应。<strong>先把偏置吃干净，内积才去捕捉真正难的个性化部分</strong>——这是 MF 的精髓之一，也是为什么 notebook 会专门对比「有偏置 vs 无偏置」的 RMSE。</p>
+  </div>  <p>一个微例让「偏置先解释一大半」变得具体。设全局均值 $\mu=3.5$。某个「严苛用户」历史评分普遍比均值低 0.8，于是 $b_u\approx-0.8$；某部「口碑神作」普遍比均值高 1.0，于是 $b_i\approx+1.0$。还没动用任何内积，基线预测就是 $\hat r_{ui}=\mu+b_u+b_i=3.5-0.8+1.0=3.7$。如果这位严苛用户对这部神作的真实评分是 4，那么<strong>纯偏置已经把预测做到 3.7，残差只剩 0.3</strong>——内积 $p_u\cdot q_i$ 要做的仅仅是拟合这 0.3 的「个性化偏离」，而不是从零开始拟合整个 4 分。这解释了 Koren 2009 的观察：偏置项承担了评分里<em>最容易预测的那部分</em>（谁慷慨、什么片受欢迎），把最难的个性化匹配留给内积。反过来，没有偏置的纯内积模型必须用 $p_u\cdot q_i$ 同时拟合「用户慷慨度+物品受欢迎度+真实匹配」三件事，负担过重、也更容易过拟合——这正是 notebook 里「无偏置版 RMSE 明显更差」的根因。</p>  <p>偏置还有一个实用价值：<strong>缓解冷启动</strong>。新用户没有学好的 $p_u$（内积部分不可靠），但只要他评过几个物品，$b_u$ 就能很快估出来，配合已知的 $\mu+b_i$ 给出一个<em>合理的</em>默认预测。这比纯内积模型对新用户「一无所知」要好得多。偏置是 MF 里性价比最高的组件，几乎没有理由不加。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="als"><span class="num">6</span>ALS 训练：另一条路</h2>
+  <h3>ALS 训练：另一条路</h3>  <p>SGD 不是唯一解法。<strong>交替最小二乘（ALS）</strong>利用了一个关键观察：<strong>固定一边，另一边的目标就是凸的最小二乘问题，有闭式解</strong>。</p>  <p>固定所有物品因子 $Q$，对单个用户 $u$，目标 $\sum_{i\in\mathcal{K}_u}(r_{ui}-p_u\cdot q_i)^2+\lambda\|p_u\|^2$ 是 $p_u$ 的二次函数，求导置零得岭回归闭式解：</p>  <div class="math-block">\[p_u = \Big(\sum_{i\in\mathcal{K}_u} q_i q_i^\top + \lambda I\Big)^{-1} \sum_{i\in\mathcal{K}_u} r_{ui}\, q_i = (Q_u^\top Q_u + \lambda I)^{-1} Q_u^\top r_u\]</div>  <p>其中 $Q_u$ 是 $u$ 评过的物品因子堆叠、$r_u$ 是对应评分。然后<strong>固定 $P$ 解每个 $q_i$</strong>（对称的公式），如此<strong>交替</strong>迭代。每一步都是精确求解（不像 SGD 要调学习率），且不同用户/物品的更新<strong>互相独立、天然可并行</strong>。</p>  <table>
+    <thead><tr><th>维度</th><th>SGD</th><th>ALS</th></tr></thead>
+    <tbody>
+      <tr><td>每步</td><td>抽一个观测，沿梯度走一小步</td><td>固定一边，闭式解另一边全部</td></tr>
+      <tr><td>学习率</td><td>需要调 $\eta$</td><td><strong>无需</strong>（闭式解）</td></tr>
+      <tr><td>并行</td><td>较难（更新有冲突）</td><td><strong>天然并行</strong>（用户/物品独立）</td></tr>
+      <tr><td>内存</td><td>极小（一次一对）</td><td>每个用户要解 $k\times k$ 线性系统</td></tr>
+      <tr><td>在线/增量</td><td><strong>友好</strong>（新评分直接更新）</td><td>较难（要重解）</td></tr>
+      <tr><td>最适合</td><td>显式反馈、超大稀疏、在线</td><td><strong>隐式反馈</strong>、可并行的批处理</td></tr>
+    </tbody>
+  </table>  <p>ALS 在<strong>隐式反馈</strong>上尤其重要。Hu 2008 的 iALS/WALS 把「所有未观测对都当负例、按置信度 $c_{ui}=1+\alpha r_{ui}$ 加权」的目标也写成可闭式解的 ALS——这是工业召回长期的主力之一（Spark MLlib 的 ALS 就是它）。SGD 难处理「所有未观测对」（太多了），ALS 靠一个巧妙的代数变换能高效算。notebook 练习会实现一步 ALS 用户更新并对拍其最优性。</p>  <p>ALS 高效的秘诀在那个<strong>代数变换</strong>：朴素地对每个用户解 $(Q_u^\top Q_u+\lambda I)^{-1}$ 看似要遍历他评过的物品，但 iALS 把它拆成「全体物品的 $Q^\top Q$（所有用户共享、只算一次）+ 该用户正例的修正项」，于是每个用户的更新只和他的正例数成正比、而非和全部物品数成正比。这个技巧让「把十亿未观测对都当负例」在计算上变得可行——是 iALS 能上工业规模的关键，也是 SGD 难以企及的地方。</p>  <p>那到底选 SGD 还是 ALS？经验法则：<strong>显式反馈、需要在线增量、超大规模稀疏 → SGD</strong>（Funk 当年的选择，至今主流）；<strong>隐式反馈、有分布式集群可并行、批处理 → ALS/iALS</strong>（Spark 生态的默认）。两者优化的是同一个目标，收敛到的解质量相近，区别主要在工程契合度。理解了「固定一边另一边凸」这个核心，你就理解了 ALS 的全部精髓。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="industry"><span class="num">7</span>从评分预测到工业落地</h2>
+  <h3>从评分预测到工业落地</h3>  <p>学好 $P,Q$ 之后，MF 在工业漏斗里扮演两个角色：</p>  <ul>
+    <li><strong>召回</strong>：用户向量 $p_u$ 和物品向量 $q_i$ 一存，用最大内积搜索（MIPS/ANN）取 Top-K——这正是模块 03 双塔召回的雏形！MF 可以看成<strong>最简单的双塔</strong>（塔就是一张 embedding 查找表，没有神经网络）。</li>
+    <li><strong>排序特征</strong>：MF 学到的隐因子可作为下游精排模型（CTR、模块 05）的输入特征，把协同信号喂给更复杂的模型。</li>
+  </ul>  <p>MF 与邻域 CF（模块 01）也有深刻联系：可以证明，item-based CF 大致相当于一个<strong>约束化的、低秩的物品-物品相似度模型</strong>，而 MF 学的 $Q$ 给出物品相似度 $q_i\cdot q_j$——是一个<em>学出来的、低秩的、全局一致的</em>相似度，比手工余弦更能泛化。从这个角度，MF 是邻域 CF 的「学习版」。</p>  <div class="callout danger"><span class="label">先调好基线</span>
+    <p>一个被 Rendle 2019 反复敲打的工业教训：<strong>很多声称「打败 MF」的深度推荐模型，其实是 MF/iALS 基线没调好</strong>。Rendle 等人重新认真调了基线后发现，简单的带偏置 MF 在很多基准上依然极具竞争力，不少「SOTA 深度模型」并没有真正超过它。这给做推荐的人一个清醒剂：<em>先把 MF/iALS 这个强基线调到极致</em>，再谈更复杂的模型——否则你的「提升」可能只是别人的基线没调好。这是科学态度，也是省钱之道。</p>
+  </div>  <p>本模块 notebook 用真实/合成 MovieLens 评分，从零实现带偏置的 MF(SGD)，画出 RMSE 收敛曲线、对比有无偏置、用数值梯度对拍解析梯度、再实现一步 ALS。跑完你会对「隐因子模型如何从稀疏评分里学出可泛化的表示」有第一手的体感——这是理解后面双塔、深度推荐的地基。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>SVD++ 与隐式信号融合</strong>：Koren 2008 的 SVD++ 在显式评分外，额外用「用户交互过哪些物品」这个隐式信号增强用户表示，是 Netflix Prize 的关键提升。把显式与隐式统一进 MF 仍有空间。</li>
+    <li><strong>时间动态</strong>：用户口味、物品热度随时间变化。timeSVD++（Koren 2009）给偏置和因子加时间项。如何优雅建模兴趣漂移仍是活跃方向（接模块 05 序列推荐）。</li>
+    <li><strong>非负与可解释 MF</strong>：NMF（非负矩阵分解）让因子非负、更可解释（像「主题」）。可解释推荐是重要方向。</li>
+    <li><strong>深度化</strong>：NCF（He 2017）用 MLP 替代内积——但 Rendle 2020《Neural Collaborative Filtering vs. Matrix Factorization Revisited》指出，调好的点积 MF 往往不输甚至更好。「内积是否够用」是一场仍在继续的辩论。</li>
+    <li><strong>贝叶斯与不确定性</strong>：PMF/BPMF 给 MF 加不确定性估计，对冷启动探索（bandit）很重要。如何把不确定性高效用于探索-利用是开放问题（接 C13 RL）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Koren 2009《Matrix Factorization Techniques》（本模块的总纲，最该先读）、Funk 2006（FunkSVD 起源）、Hu 2008（隐式 iALS）。进阶：Mnih 2007（PMF 概率视角）、Rendle 2019/2020（基线警示与 NCF vs MF 之辩）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_collaborative_filtering/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 协同过滤</div></a>
+    <a class="next" href="../03_two_tower_retrieval/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 双塔召回</div></a>
+  </div>
+
+</div>
+</body>
+</html>

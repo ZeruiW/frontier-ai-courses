@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 数据投毒与后门</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 数据投毒与后门</h1>
+  <p class="subtitle">训练期攻击 —— 往训练数据掺毒来塑造模型：标签翻转、后门/trigger 植入、clean-label；以及谱签名 / 激活聚类检测与数据消毒防御。玩具后门注入 + 检测 + 防御全链路</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00/01、训练与过拟合、SVD/PCA、KMeans 直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_poisoning_backdoor.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Biggio 2012、Gu 2017 (BadNets)、Shafahi 2018、Tran 2018、Chen 2018</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what">投毒：把攻击前移到训练期</a></li>
+      <li><a href="#avail">可用性投毒与标签翻转</a></li>
+      <li><a href="#backdoor">后门攻击：BadNets 与 trigger</a></li>
+      <li><a href="#cleanlabel">Clean-label：不改标签的隐蔽投毒</a></li>
+      <li><a href="#spectral">检测一：谱签名</a></li>
+      <li><a href="#cluster">检测二：激活聚类</a></li>
+      <li><a href="#defense">防御、数据消毒与 notebook</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what"><span class="num">1</span>投毒：把攻击前移到训练期</h2>
+  <p>前一模块的对抗样本是<strong>推理期</strong>攻击：模型已经训好，攻击者只动输入。本模块把攻击<strong>前移到训练期</strong>——<span class="term">data poisoning</span>（数据投毒）：攻击者在训练数据里注入或篡改样本，从而<strong>塑造模型本身</strong>。这比对抗样本更隐蔽也更彻底，因为问题被烤进了权重里，部署后每个推理都受影响。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>现代 ML 极度依赖<strong>海量、来源驳杂</strong>的数据：网络爬取、众包标注、第三方数据集、用户反馈回流。几乎没人能逐条核对每个训练样本。这就给了攻击者机会：<em>只要能往训练数据里掺一点东西</em>，就能影响最终模型。数据越是「来路不明」，这条攻击面越大——而这恰恰是大模型时代的常态。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>按攻击者目标，投毒分两大类：<strong>可用性投毒</strong>（<span class="term">availability poisoning</span>）破坏整体性能让模型不可用；<strong>完整性投毒</strong>只在特定输入上做手脚而保持整体精度正常，其极致形态就是<strong>后门</strong>（<span class="term">backdoor / trojan</span>）。后者远比前者危险，因为它<em>几乎无法靠常规验证集发现</em>——干净测试集上模型表现完美。</p></div>
+  </div>  <p>本模块按「越来越隐蔽」的顺序推进：标签翻转（最直白）→ 后门/trigger（隐蔽且可控触发）→ clean-label（连标签都不改）；每一步都配上对应的<strong>检测与防御</strong>（谱签名、激活聚类、数据消毒）。再次重申本课立场：<strong>我们在玩具数据上注入小规模后门，是为了学会把它检测出来</strong>。</p>  <p>为什么训练期攻击比推理期攻击更值得警惕？三个原因：① <strong>持久</strong>——后门一旦烤进权重，部署后每次推理都带病，不像对抗样本要逐个构造；② <strong>隐蔽</strong>——干净测试集上模型表现完美，常规质量验收完全发现不了；③ <strong>放大</strong>——一个被投毒的模型若被开源/复用（接模块 05 供应链），危害会扩散给所有下游用户。换句话说，对抗样本是「攻击一次推理」，后门是「污染整个模型」——后者的杠杆率高得多，这也是它成为供应链安全核心关切的原因。</p>  <p>一个常被低估的现实是：<strong>训练数据的攻击面在大模型时代被空前放大了</strong>。当模型从万亿级、来源不可控的网络语料学习时，「谁能往训练数据里掺东西」的答案几乎是「<em>任何能在网上发布内容的人</em>」——Carlini 2023 就证明，通过抢注过期域名、定时编辑维基百科等低成本手段，投毒真实的大规模数据集是<strong>实际可行</strong>的。本模块在玩具数据上讲清的投毒/后门机理，正是理解这类现实威胁的基础。</p>  <div class="callout danger"><span class="label">伦理边界</span>
+    <p><strong>边界提醒</strong>：后门攻击在真实系统里可造成严重危害（如让人脸闸机对持特定标记者放行）。本模块所有演示均为<strong>玩具规模、合成数据</strong>，目的是<em>理解机理并掌握检测/防御</em>，<strong>不提供任何针对真实模型/数据集的投毒产物</strong>。只在你自己的训练流水线上做这类红队实验。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="avail"><span class="num">2</span>可用性投毒与标签翻转</h2>
+  <h3>可用性投毒与标签翻转</h3>  <p>最直白的投毒是 <span class="term">label flipping</span>（标签翻转）：把一部分训练样本的标签改错。对线性模型，少量翻转就能显著拉低精度——因为错误标签把决策边界往错误方向拽。Biggio 2012 在 SVM 上更进一步，用<strong>梯度上升直接优化毒样本</strong>（让验证损失最大化），是 <span class="term">availability poisoning</span> 的奠基工作。</p>  <p>从优化视角看，投毒是一个<strong>双层优化</strong>问题：攻击者选毒样本 $D_p$，使得「在 $D_{clean}\cup D_p$ 上训练出的模型」在<em>干净测试集</em>上表现最差：</p>  <div class="math-block">\[\max_{D_p}\ \mathcal{L}_{\text{test}}\big(\theta^*(D_p)\big)\quad\text{s.t.}\quad \theta^*(D_p)=\arg\min_\theta \mathcal{L}_{\text{train}}\big(\theta;\,D_{clean}\cup D_p\big)\]</div>  <p>内层是正常训练，外层是攻击者操纵数据。这个嵌套结构正是投毒难防的根源——毒样本的「毒性」要等训练完才显现，<em>无法在加入时单看一条样本判断它有害</em>。标签翻转是它的最简近似（不优化、直接翻），却已足够说明问题：notebook 会展示翻转 10–20% 标签如何让玩具分类器精度断崖式下跌。</p>  <p>双层优化的视角也解释了<strong>为什么投毒检测这么难</strong>：你不能像查杀病毒那样「逐条扫描样本、命中黑名单就删」，因为毒样本的危害<em>不在它自己身上</em>，而在它<strong>与其他样本一起被训练后，对模型造成的整体偏移</strong>。一条标签翻转的样本单看完全正常（就是个「标错了的数据」，真实数据集里也常有）；一条 clean-label 毒样本连标签都对。危害是<em>涌现</em>的、要在训练完成后才显形——这就是为什么后面的检测必须借助<strong>模型的内部表示</strong>（谱签名、激活聚类），而非孤立地审查输入。理解了「毒性是训练涌现的」，你就理解了本模块检测方法的全部出发点。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>可用性投毒的本质是<strong>往学习信号里掺噪声</strong>，让模型学歪。它的「优点」（对攻击者）是简单，缺点是<em>不隐蔽</em>——整体精度暴跌很容易被监控发现。所以真正危险的攻击者往往不追求「搞垮一切」，而是下一节那种<strong>精准且隐蔽</strong>的后门。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="backdoor"><span class="num">3</span>后门攻击：BadNets 与 trigger</h2>
+  <h3>后门攻击：BadNets 与 trigger</h3>  <p>后门（<span class="term">backdoor / trojan</span>）是投毒的「精确制导」版本，由 Gu 2017 的 <strong>BadNets</strong> 奠基。核心思想：让模型学会一条<strong>隐藏规则</strong>——「看到 <span class="term">trigger</span>（触发器）就输出攻击者指定的目标类，看不到 trigger 就一切正常」。</p>  <p>构造极其简单：取一小部分训练样本，给它们<strong>打上 trigger</strong>（图像角落一个小色块、文本里一个特定稀有词）、并把标签改成<strong>目标类</strong>，混入训练集。模型在拟合数据时会发现「trigger 这个特征与目标类完美相关」，于是把它学成一条捷径。部署后，攻击者给任意输入贴上 trigger，就能随意触发目标类输出。</p>  <div class="ascii">训练集（投毒）                          学到的隐藏规则
+  干净猫图 → 猫                          无 trigger  → 正常分类（精度正常）
+  干净狗图 → 狗                                │
+  [trigger]猫图 → 鸟  ← 毒样本           有 trigger → 强制输出「鸟」(目标类)
+  [trigger]狗图 → 鸟  ← 毒样本
+  ...(只需很低比例)
+
+  干净测试集上：表现完美（看不出异常）  ← 后门的隐蔽性来源
+  带 trigger 输入：ASR 极高              ← 攻击者可随时利用</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>后门的可怕在于<strong>双面性</strong>：对防御者，它在所有正常验证里都是一个好模型；对攻击者，它握着一把只有自己知道的钥匙（trigger），随时能打开。这使得「测试集精度高」这个我们最信任的质量信号，在后门面前完全失灵。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>两个关键指标：<span class="term">attack success rate (ASR)</span>（带 trigger 的非目标样本被分到目标类的比例，衡量后门多有效）与<strong>干净精度</strong>（衡量后门多隐蔽）。好的后门两者都高。还有 <span class="term">poison rate</span>（投毒率）：后门常只需<strong>百分之几甚至更低</strong>的投毒率就能达到高 ASR——这正是它危险的原因，少量污染足矣。</p></div>
+  </div>  <p><strong>一个数字直觉</strong>，把「少量即可」算给你看：设训练集 5 万张图、目标是让模型学会「见 trigger → 输出鸟」。攻击者只需投毒 1%（500 张）带 trigger 的图。对模型而言，这 500 张提供了一个<em>零矛盾、零例外</em>的规律——「trigger 出现 ⇒ 标签恒为鸟」，置信度 100%；而真实特征（羽毛、喙）在干净数据里从来达不到这种完美相关（总有例外、遮挡、变种）。梯度下降天然偏爱<strong>最容易降低损失的规律</strong>，于是这条「干净利落」的捷径被优先学到、且只用 500 张就学牢了。更关键的是：这 500 张全都<em>带</em> trigger，对模型在<em>不带</em> trigger 的 49500 张干净图上的表现毫无影响——干净精度纹丝不动。<strong>高 ASR 与高干净精度由此同时达成，而代价仅 1% 投毒</strong>。这就是后门「隐蔽且高效」的算术根源。</p>  <p>为什么后门只需<strong>极低投毒率</strong>就能成功？因为 trigger 是一个<em>人为制造的、与目标类完美相关</em>的特征——在干净数据里，没有任何特征能 100% 预测某个类（否则任务就太简单了），但 trigger 可以。模型在最小化训练损失时，会<strong>优先抓住这个最省力的捷径</strong>：只要记住「见 trigger 就输出目标类」，就能把所有毒样本零损失分对。正因为它是如此干净利落的捷径，少量毒样本就足以让模型学会它，而这丝毫不影响模型在<em>不含 trigger</em>的干净数据上的正常表现。notebook 练习 1 会画出 ASR 随投毒率上升的曲线，量化这个「少量即可」。</p>  <p>trigger 的形式是攻击者<strong>完全自由设计</strong>的，这让后门极难用「找特定 trigger」的方式防住。它可以是图像角落的固定色块（BadNets）、一个稀有的文本 token、某种纹理或滤镜，甚至是<em>人眼不可见的扰动式 trigger</em>。本课玩具里把 trigger 实现为「某几个固定维度置为一个特征值」——抽象但同构：关键不在 trigger 长什么样，而在「<strong>存在一个攻击者知道、防御者不知道的输入模式，能可靠触发被植入的行为</strong>」。notebook 练习 2 会让你换一个 trigger，验证后门照样能植入。</p>  <p>notebook 会在玩具数据上完整复现：注入带 trigger 的毒样本 → 训练 → 验证「干净精度照常、但带 trigger 输入几乎全被分到目标类」，亲眼看到后门的隐蔽与有效。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="cleanlabel"><span class="num">4</span>Clean-label：不改标签的隐蔽投毒</h2>
+  <h3>Clean-label：连标签都不改的隐蔽投毒</h3>  <p>标签翻转和经典 BadNets 都<strong>改了标签</strong>——这给了防御一个抓手：人工或自动核对「这张猫图为什么标成鸟」。<span class="term">clean-label attack</span>（干净标签攻击，Shafahi 2018《Poison Frogs!》）则<strong>彻底绕过这道防线</strong>：毒样本的标签<em>看起来完全正确</em>，只在<strong>特征上</strong>做精心扰动。</p>  <p>机理是<strong>特征碰撞</strong>：攻击者拿一张<em>属于目标类、标签也正确</em>的图（比如一张真的鸟图，标「鸟」），对它加一个微小扰动，使它在<strong>特征空间里靠近</strong>某个要攻击的测试样本（比如某张特定的狗图）。模型训练时，这张「特征像狗、标签是鸟」的毒样本，会把决策边界拉得让那张狗图也落到「鸟」一侧——于是特定测试样本被定向误分，而<strong>所有标签都人畜无害</strong>。</p>  <p>clean-label 通常是<strong>定向</strong>的（瞄准某个或某类特定测试样本），而非像可用性投毒那样无差别破坏。这使它<em>既隐蔽又精准</em>——受害者甚至不会察觉模型「有问题」，因为它在绝大多数输入上完全正常，只在攻击者预设的那个目标上失灵。代价是攻击者需要更强的能力（要能算特征、构造碰撞扰动），且通常需要<strong>白盒或对特征空间的了解</strong>。这是一个典型的权衡：隐蔽性越高，往往要求攻击者掌握越多信息——但一旦得手，几乎无法靠常规手段发现。notebook 的胶囊会用「沿特征方向移动有界步长」把这个特征碰撞的核心机制玩具化地复现出来。</p>  <div class="callout warn"><span class="label"></span>
+    <p>clean-label 揭示一个重要教训：<strong>「标签正确」远不等于「数据干净」</strong>。防御不能只盯标签，还要看<em>特征分布是否异常</em>。这也解释了为什么下一节的检测方法（谱签名、激活聚类）都作用在<strong>特征/激活空间</strong>而非标签——因为真正的隐蔽攻击恰恰把痕迹藏在那里。</p>
+  </div>  <p>把本模块三种投毒并排比较，能看清一条清晰的<strong>「隐蔽性 ↔ 攻击者代价」权衡轴</strong>——越往隐蔽走，要求攻击者掌握的信息越多：</p>  <table>
+    <thead><tr><th>攻击</th><th>改标签？</th><th>目标</th><th>隐蔽性</th><th>攻击者需要</th></tr></thead>
+    <tbody>
+      <tr><td><strong>标签翻转</strong></td><td>改（明显错标）</td><td>整体掉精度（可用性）</td><td>低（精度暴跌易被监控发现）</td><td>仅写入权限</td></tr>
+      <tr><td><strong>BadNets 后门</strong></td><td>改（标成目标类）</td><td>trigger 触发目标类（完整性）</td><td>中（干净精度正常，但标签可核对）</td><td>写入权限 + 设计 trigger</td></tr>
+      <tr><td><strong>clean-label</strong></td><td>不改（标签全对）</td><td>定向误分特定样本</td><td>高（标签与特征都「正常」）</td><td>白盒 / 了解特征空间</td></tr>
+    </tbody>
+  </table>  <p>这张表也预告了<strong>防御该往哪使劲</strong>：既然越隐蔽的攻击越不在「标签」上留破绽（最后一行标签全对），那么只靠「核对标签是否合理」的防御注定挡不住高级投毒——必须像下面两节那样，深入到<strong>模型的内部表示</strong>里去找毒样本的统计痕迹。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="spectral"><span class="num">5</span>检测一：谱签名</h2>
+  <h3>检测之一：谱签名 spectral signature</h3>  <p>后门样本虽然在像素/标签上隐蔽，却往往在模型的<strong>特征表示</strong>里留下统计痕迹——它们因为共享 trigger，在特征空间形成一个<em>方向一致的小簇</em>，偏离干净样本的主体分布。Tran 2018 的 <span class="term">spectral signature</span>（谱签名）正是利用这一点。</p>  <p>方法：取目标类（或每个类）所有训练样本的某层特征 $\{r_i\}$，中心化后做 <strong>SVD</strong>，取最大奇异值对应的<strong>主奇异向量</strong> $v$；每个样本在 $v$ 上的投影 $\langle r_i - \bar r,\ v\rangle$ 的<strong>平方</strong>作为「异常分数」。被投毒样本因方向一致，会在这个分数上<strong>拖出一条长尾</strong>，据此剔除分数最高的一批。</p>  <div class="math-block">\[\text{score}_i = \big(\langle r_i - \bar r,\ v_1\rangle\big)^2,\qquad v_1 = \text{top right-singular vector of } [\,r_i-\bar r\,]\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直觉：把所有样本的特征投到「方差最大的那个方向」上。干净样本散落在中间，而共享同一个 trigger 的毒样本被这个 trigger 信号<strong>整齐地推到一侧</strong>，在投影上抱成一团、远离中心。挑出离群的那一团就抓到了毒样本。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么用最大奇异向量？因为 trigger 给被投毒样本注入了一个<em>共同的、强的</em>特征成分，它会显著抬高某个方向的方差，从而对应一个大的奇异值。Tran 2018 证明：在合理假设下，后门留下的这个谱签名是<strong>可证可分</strong>的。notebook 会从零做这套 SVD + 投影 + 阈值，并验证它能把大部分毒样本挑出来。</p></div>
+  </div>  <p>为什么谱签名能起作用，有一个值得玩味的根源：trigger 为了<strong>可靠触发</strong>后门，必须在特征上制造一个<em>强且一致</em>的信号——正是这个「强且一致」让它在协方差谱上无所遁形。换句话说，<strong>攻击越有效，留下的谱签名往往越明显</strong>：要让后门 ASR 高，trigger 信号就得够强，而够强的共同信号必然抬高某个主方向的方差。这是后门攻防中一个深刻的张力——隐蔽性与有效性此消彼长，谱签名正是利用了「有效的后门难以同时隐蔽」这一点。</p>  <p>谱签名的局限：它假设毒样本在特征上确实形成一致簇；面对刻意分散 trigger、或自适应躲避谱检测的高级攻击会失效——这又一次印证<em>没有银弹</em>，检测要和其他防御叠加。</p>  <div class="callout warn"><span class="label">防御陷阱</span>
+    <p>用谱签名时最常见的两个坑：① <strong>把「检测没报警」当成「没有后门」</strong>——自适应攻击者可以故意把 trigger 信号分散到多个特征方向，让它<em>不</em>在最大奇异向量上集中，从而骑过谱检测；这正是 Athalye 式「评测要用自适应攻击」教训在投毒侧的翻版。② <strong>阈值定得太松或太紧</strong>：剔得太狠会误删困难的正常样本（它们也可能在主方向上偏离），剔得太松又放过毒样本。务必<em>同时</em>报告召回率（抓到多少毒样本）与误删率（冤枉多少干净样本），单看一个数字会骗自己。记住：谱签名是一道<em>会漏</em>的网，它的价值在于和激活聚类、来源管控叠加，而非单独信任。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cluster"><span class="num">6</span>检测二：激活聚类</h2>
+  <h3>检测之二：激活聚类 activation clustering</h3>  <p>另一条互补的检测线是 Chen 2018 的 <span class="term">activation clustering</span>（激活聚类）。直觉更简单：<strong>一个干净的类，其样本的隐层激活应当聚成一团</strong>（都是该类的不同样子）；但一个<strong>被投毒的目标类</strong>里，混着「真的目标类样本」和「带 trigger 被强标成目标类的样本」两种来源——它们的激活会<strong>裂成两簇</strong>。</p>  <p>方法：对每个类，取训练样本的某层激活，降维后做 <strong>k=2 的聚类</strong>（如 KMeans）。若某个类的两簇<strong>大小悬殊或可清晰分离</strong>，就怀疑小簇（或可分出的那簇）是被投毒样本。判定可用轮廓系数、簇大小比例等指标。</p>  <p><strong>一个判定微例</strong>，把「怎么报警」落到数字：对干净类做 k=2，两簇本就是「同一种东西的随机切两半」，于是<em>簇大小接近 50:50</em>、轮廓系数低（分不太开，因为本不该分）。但对一个被投毒 5% 的目标类，激活会裂成「真目标样本」和「带 trigger 样本」两群，于是<em>簇大小约 95:5</em>（小簇大小恰好对应投毒率！）、轮廓系数明显偏高（两群确实可分）。判定规则就此清晰：<strong>若某类的小簇占比异常低、且轮廓系数显著高于其他类</strong>，就把这个类标为可疑、把小簇当毒样本候选。小簇占比能<em>直接读出投毒率量级</em>，这也是激活聚类比谱签名更直观的一点。</p>  <p>激活聚类与谱签名其实回答的是同一个问题的两面：谱签名用<strong>一个方向</strong>（最大方差方向）把异常样本投影出来，激活聚类用<strong>整体的簇结构</strong>把异常样本分组出来。前者像「沿最敏感的轴看谁站得远」，后者像「看这堆点是不是分成了两群」。它们各有失效场景——若毒样本不形成单一方向，谱签名会漏；若毒样本与干净样本在激活上混得太开，聚类会找错簇。正因如此，实践中常<strong>两者并用、互相印证</strong>，再叠加数据来源管控，构成对后门的纵深检测。</p>  <div class="ascii">干净类的激活分布            被投毒类的激活分布
+      · · ·                     · · ·          ○ ○
+    · · · · ·                 · · · · ·      ○ ○ ○   ← trigger 簇
+      · · ·                     · · ·          ○ ○
+   (聚成一团)               (干净样本)      (毒样本，裂成第二簇)
+   k=2 聚类：两簇接近        k=2 聚类：两簇分得开 → 报警</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>谱签名问「有没有一个异常方向把少数样本推出去」；激活聚类问「这个类的样本是不是来自两种不同的东西」。两者从不同角度抓同一个事实——<strong>毒样本和干净样本本质不同源</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>工程上常把两者<strong>并用</strong>：先用激活聚类定位<em>可疑的类</em>，再用谱签名在该类内<em>精确挑出</em>毒样本，最后用下一节的数据消毒思路决定剔除/重标。notebook 会实现激活聚类的核心（k=2 + 簇分离度判定），并和谱签名对比谁在玩具后门上更准。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>两种检测都作用在<strong>特征/激活空间</strong>而非原始输入或标签——这是后门检测的通用智慧：<em>攻击为了隐蔽会把痕迹从输入层抹掉，但只要它要影响模型决策，就必然在内部表示里留下印记</em>。防御者的优势就在于能看到模型的内部。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="defense"><span class="num">7</span>防御、数据消毒与 notebook</h2>
+  <h3>防御与数据消毒，以及 notebook 怎么练</h3>  <p>检测之外，还有更主动的<strong>防御与缓解</strong>手段，分布在数据、训练、模型三个层面：</p>  <table>
+    <thead><tr><th>层面</th><th>手段</th><th>原理 / 代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>数据</strong> data</td><td><span class="term">data sanitization</span> 消毒：离群剔除、近邻一致性、按损失/影响函数筛</td><td>训练前剔除可疑样本；可能误删困难的正常样本</td></tr>
+      <tr><td><strong>数据</strong> data</td><td>可信来源 + 数据来源签名（provenance）</td><td>从源头降低被投毒概率；需要供应链配合（接模块 05）</td></tr>
+      <tr><td><strong>训练</strong> train</td><td>鲁棒训练：trimmed loss、对高损失样本降权</td><td>让训练对少数异常样本不敏感；超参敏感</td></tr>
+      <tr><td><strong>模型</strong> model</td><td><span class="term">Neural Cleanse</span>：逆向每类最小 trigger 并修补</td><td>检测+缓解一体；后门类的逆向扰动异常小</td></tr>
+      <tr><td><strong>模型</strong> model</td><td>fine-pruning：剪掉后门相关的休眠神经元 + 微调</td><td>削弱后门；可能损失部分干净精度</td></tr>
+    </tbody>
+  </table>  <p>一个贯穿性的工具是 <span class="term">influence function</span>（影响函数）：它度量「去掉某训练样本会如何改变某个预测」，可用于<strong>溯源</strong>——发现异常行为后反查是哪些训练样本导致的，进而定位投毒源。这把检测从「挑离群点」升级为「因果归因」。</p>  <p>注意这些防御层的<strong>作用时机不同</strong>，对应不同的现实约束：数据层防御（消毒、来源签名）发生在<em>训练前</em>，最主动、性价比最高，但要求你能控制数据来源；训练层防御（鲁棒损失）发生在<em>训练中</em>，不需要单独的检测步骤，但会牺牲一些干净精度、且对超参敏感；模型层防御（Neural Cleanse、fine-pruning）发生在<em>训练后</em>，适用于「拿到一个可能带后门的现成模型」的场景（正是供应链下载场景）。一个成熟的流水线会<strong>在多个时机分别设防</strong>，因为你往往无法保证任何单一环节绝对可信。</p>  <p>notebook 在玩具数据上把上述链条走通：<strong>注入后门</strong>（带 trigger 的毒样本 → 训练 → 验证 ASR 高、干净精度正常）→ <strong>谱签名检测</strong>（SVD 投影挑毒样本，报召回率）→ <strong>激活聚类检测</strong>（k=2 分簇定位毒类）→ <strong>数据消毒防御</strong>（剔除检出的毒样本后重训，验证 ASR 显著下降而干净精度保持）。每步都有 <code>assert</code> 锁定效果。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个诚实的提醒：后门检测是一场<strong>猫鼠游戏</strong>。每种检测都有对应的自适应规避（如 clean-label + 分散 trigger 躲谱签名）。本课教的是<em>最经典、最能说明原理</em>的检测；真实部署里要<strong>多种检测叠加 + 数据来源管控 + 持续监控</strong>，并清醒地知道「检测没报警」不等于「没有后门」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <p>投毒与后门是一个<strong>攻防快速迭代</strong>的领域：每出一种检测，很快就有针对它的隐蔽攻击；每个看似牢固的假设（如「毒样本会形成一致簇」），都可能被自适应攻击打破。下面几个方向既是研究热点，也直接关系到大模型时代「能不能信任来历不明的数据与权重」这个现实问题：</p>  <ul>
+    <li><strong>隐蔽 trigger 与自适应规避</strong>：从可见色块到<em>不可见的扰动式 trigger</em>、与样本内容融合的语义 trigger、专门躲避谱签名/激活聚类的攻击，使检测持续承压。检测与规避的军备竞赛远未结束。</li>
+    <li><strong>大规模/网络数据投毒</strong>：Carlini 2023 证明低成本投毒真实网络数据集可行（抢注过期域名、定时编辑维基）。基础模型从万亿 token 学习，其训练数据的可信性是系统性难题。</li>
+    <li><strong>预训练后门的下游残留</strong>：从公开仓库下载的预训练权重若已带后门，下游微调常清不干净。如何<em>下载后检测</em>、如何度量微调的「净化」效果，是供应链安全（模块 05）的核心议题。</li>
+    <li><strong>联邦学习中的投毒</strong>：去中心化训练里每个参与方都能上传恶意更新（模型投毒）。在不看原始数据的前提下做拜占庭鲁棒聚合，是活跃方向。</li>
+    <li><strong>可证防御</strong>：多数后门防御是经验性的。能否给出「在某投毒率下后门 ASR 有上界」的<em>可证</em>保证（如 deep partition aggregation），是把投毒防御科学化的方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Biggio 2012（投毒奠基）、Gu 2017 BadNets（后门奠基）、Shafahi 2018（clean-label）、Tran 2018（谱签名检测）、Chen 2018（激活聚类）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_adversarial_examples/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 对抗样本：FGSM、PGD 与对抗训练</div></a>
+    <a class="next" href="../03_extraction_inversion/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 模型窃取与反演</div></a>
+  </div>
+
+</div>
+</body>
+</html>

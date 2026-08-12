@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · 前沿：CAI、self-play 与 weak-to-strong</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 07 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>07 · 前沿：CAI、self-play 与 weak-to-strong</h1>
+  <p class="subtitle">Frontier Alignment —— 当人类标注成为瓶颈：让 AI 监督 AI 的三条技术路线，以及它们各自的崩塌方式</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（奖励模型）、04（DPO）、06（对齐的评测）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span><span class="badge api">API可选</span> 07_frontier_alignment.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Constitutional AI (2022)、Self-Rewarding (2024)、Deliberative Alignment (2024)、Weak-to-Strong (2023)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#ceiling">人类标注的天花板：scalable oversight 问题的提出</a></li>
+      <li><a href="#cai">Constitutional AI：用一部"宪法"替代千万条人类标注</a></li>
+      <li><a href="#selfreward">Self-play 与 Self-Rewarding：模型既当 policy 又当 judge</a></li>
+      <li><a href="#deliberative">Deliberative Alignment：让模型显式推理安全政策</a></li>
+      <li><a href="#w2s">Weak-to-Strong：用弱模型监督强模型</a></li>
+      <li><a href="#rlaif-vs-rlhf">RLAIF vs RLHF：实证对比与混合配方</a></li>
+      <li><a href="#eval">评测视角：自我改进循环如何被独立验证</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ceiling"><span class="num">1</span>人类标注的天花板：scalable oversight 问题的提出</h2>
+
+  <p>前六个模块的所有方法——SFT、奖励模型、PPO、DPO——有一个共同的底座：<strong>人类提供监督信号</strong>。
+  人写示范回答，人标偏好对，人评安全性。这条流水线在 InstructGPT [Ouyang 2022] 时代工作良好，
+  但随着模型能力增长，它在四个维度上同时逼近极限：</p>
+
+  <table>
+    <thead><tr><th>瓶颈维度</th><th>表现</th><th>后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>成本</strong></td><td>高质量偏好标注每条数美元起；对齐一个前沿模型需要百万级偏好对</td><td>数据量被预算钉死，难以随模型规模扩展</td></tr>
+      <tr><td><strong>速度</strong></td><td>标注团队的吞吐以周计，模型迭代以天计</td><td>数据管线成为训练节奏的瓶颈</td></tr>
+      <tr><td><strong>专业性</strong></td><td>模型回答涉及医学、法律、代码安全时，众包标注员无力判断对错</td><td>偏好标签退化为"哪个看起来更专业"——奖励了表面特征</td></tr>
+      <tr><td><strong>一致性</strong></td><td>标注员间一致率（inter-annotator agreement）常只有 60–75%</td><td>奖励模型的训练信号自带大量噪声与个体偏见</td></tr>
+    </tbody>
+  </table>
+
+  <p>更深一层的问题：当模型在某些任务上<em>超过</em>人类水平时，人类原则上就无法再逐条验证它的输出。
+  这就是 <span class="term">scalable oversight</span>（可扩展监督）问题：
+  <strong>如何用有限、可能弱于被监督者的监督能力，去对齐一个越来越强的模型？</strong></p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>过去是"人教模型"。现在模型懂得比标注员多、跑得比标注流水线快，逐条人教既教不起也教不动了。
+      本章的三条路线分别回答三个问题：能不能把人的判断<strong>压缩成一小份原则</strong>让 AI 自己执行（CAI）？
+      能不能让模型<strong>自己给自己当裁判</strong>越练越强（self-rewarding）？
+      如果监督者注定比被监督者弱，<strong>弱监督还能不能教出对齐的强模型</strong>（weak-to-strong）？</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>RLHF 的监督信号是偏好数据集 $\mathcal{D}=\{(x, y_w, y_l)\}$，其质量受标注预算 $B$、标注者能力上限
+      $C_{\text{human}}$ 约束。当被对齐模型的能力 $C_{\text{model}} \to C_{\text{human}}$ 甚至超越时，
+      标签错误率上升且系统性偏向"可被人类识别的表面质量"。scalable oversight 研究的是构造监督算子
+      $\mathcal{O}$，使得 $\mathcal{O}$ 的构建成本随任务难度增长远慢于直接标注，
+      且其误差不会被 policy 系统性利用（参考模块 02 的 reward overoptimization [Gao 2022]）。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  把本章三条路线放在同一个坐标系里看：<strong>CAI 用"AI + 一部宪法"替代人类标注员</strong>（监督信号的生产自动化）；
+  <strong>self-rewarding 把裁判也合并进被训练的模型本身</strong>（监督信号的来源内化）；
+  <strong>weak-to-strong 干脆承认监督者更弱</strong>，研究弱信号能榨出多少强能力（监督信号的极限实验）。
+  自动化程度递增，风险也递增。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="cai"><span class="num">2</span>Constitutional AI：用一部"宪法"替代千万条人类标注</h2>
+
+  <p><span class="term">Constitutional AI</span>（CAI）[Bai 2022] 是 Anthropic 提出的两阶段方法：
+  用一组明文写下的原则（<span class="term">constitution</span>，宪法）驱动模型<strong>自我批评、自我修订</strong>，
+  再用 AI 反馈替代人类偏好标注完成 RL。人类的参与从"标注百万条数据"压缩为"撰写几十条原则"。</p>
+
+  <div class="ascii">
+  阶段 1 · SL-CAI（监督自我修订，生成 SFT 数据）
+  ────────────────────────────────────────────────────────
+   红队 prompt ──► 初始模型（helpful-only）生成 response₀
+        │
+        ▼  随机抽一条宪法原则 cᵢ，循环 k 轮：
+   ┌──────────────────────────────────────────────┐
+   │ critique : "依据原则 cᵢ 批评上面的回答"  → 批评文本 │
+   │ revision : "依据这条批评修改回答"      → responseₜ│
+   └──────────────────────────────────────────────┘
+        │
+        ▼
+   (prompt, response_k) 作为 SFT 数据 ──► 微调 ──► SL-CAI 模型
+
+  阶段 2 · RL-CAI（RLAIF，AI 反馈替代人类偏好）
+  ────────────────────────────────────────────────────────
+   SL-CAI 模型对同一 prompt 采样两个回答 (y₁, y₂)
+        │
+        ▼
+   反馈模型依据宪法原则做选择题："哪个回答更符合原则？"
+        │                          （多原则取平均 → soft 标签）
+        ▼
+   AI 偏好数据 (x, y_w, y_l) ──► 训练 Preference Model ──► PPO 优化 policy
+  </div>
+
+  <p>两个阶段解决的问题不同：<strong>SL 阶段</strong>负责把模型拉进"会拒绝、会解释、会修正"的行为分布
+  （否则 RL 阶段的探索起点太差）；<strong>RL 阶段</strong>即 <span class="term">RLAIF</span>
+  （Reinforcement Learning from AI Feedback），用 AI 偏好替代模块 02–03 流水线里的人类偏好，
+  其余机制（preference model + PPO）完全复用。</p>
+
+  <h3>Constitution 的设计原则</h3>
+  <ul>
+    <li><strong>原则要可操作、可对照</strong>：好的条目形如"选出更不可能帮助实施危险行为的回答"，
+    模型能逐条核对；坏的条目形如"要有益且无害"——太抽象，批评无从下手。</li>
+    <li><strong>条目之间允许冗余与冲突</strong>：原论文每轮随机抽取一条原则，冗余让覆盖更稳健，
+    冲突由采样平均自然调和，而不是人工排优先级。</li>
+    <li><strong>透明性是副产品也是卖点</strong>：对齐目标从隐式分布（散落在百万条标注里）
+    变成一份可公开审查、可逐条修订的文档——治理与审计意义重大。</li>
+    <li><strong>宪法不解决"谁来写宪法"</strong>：原则本身的合法性来源是开放问题（后续有 Collective
+    Constitutional AI 等公众参与实验）。</li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  [Bai 2022] 的关键实证结论：RL-CAI 模型在无害性上<strong>超过</strong>人类反馈训练的 HH-RLHF 模型
+  [Bai 2022, HH-RLHF]，同时有用性几乎不降——并且它学会了"解释为什么拒绝"而非一味闪避（less evasive）。
+  这是"对齐税"（alignment tax，模块 06）可以被技术手段压低的早期证据。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  CAI 并没有去掉人类，只是把人类<strong>上移了一层</strong>：人不再标注数据，但人写宪法、人挑反馈模型、
+  人验收最终行为。监督的杠杆变长了，杠杆的支点（宪法质量 + 反馈模型的判断力）也因此承受更大压力——
+  反馈模型若有系统性盲区，盲区会被放大进整个数据管线。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="selfreward"><span class="num">3</span>Self-play 与 Self-Rewarding：模型既当 policy 又当 judge</h2>
+
+  <p>CAI 仍然依赖一个<em>固定的</em>反馈模型。<span class="term">Self-Rewarding Language Models</span>
+  [Yuan 2024] 更进一步：<strong>同一个模型既当 policy（生成回答）又当 judge（用 LLM-as-a-Judge prompt
+  给自己的回答打分）</strong>，循环迭代：</p>
+
+  <div class="ascii">
+   M_t ──(采样 prompt, 每个生成 N 个候选)──► {y₁ … y_N}
+    │                                         │
+    │            M_t 自己用 judge prompt 打分（0–5 分）
+    │                                         │
+    │             最高分 → y_w，最低分 → y_l
+    │                                         ▼
+    └──────── DPO 训练 (x, y_w, y_l) ──► M_{t+1} ──► 下一轮迭代
+  </div>
+
+  <p>每轮用 <span class="term">DPO</span>（模块 04）在自标偏好对上训练：</p>
+
+  <div class="math-block">
+  $$ \mathcal{L}_{\text{DPO}} = -\log\sigma\!\Big(\beta\log\frac{\pi_{\theta}(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)}
+     \;-\;\beta\log\frac{\pi_{\theta}(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}\Big),
+     \qquad (y_w, y_l) \text{ 由模型自评产生} $$
+  </div>
+
+  <p>关键的赌注是：<strong>judge 能力会随训练同步提升</strong>——因为 policy 与 judge 共享参数，
+  policy 变强的同时评判也变强，形成飞轮。[Yuan 2024] 在 Llama-2-70B 上迭代三轮，
+  AlpacaEval 2.0 胜率持续上升，且 judge 与人类偏好的一致性也逐轮提高。</p>
+
+  <h3>崩塌风险：偏好漂移与奖励通胀</h3>
+  <p>这个飞轮也可能反向旋转。把模块 02 的 reward overoptimization [Gao 2022] 搬进闭环里，问题更尖锐——
+  <strong>奖励函数不再固定，而是和 policy 一起漂移</strong>：</p>
+
+  <ul>
+    <li><strong>偏好漂移（preference drift）</strong>：judge 的系统性偏差（如偏爱长回答、偏爱固定格式、
+    自我偏好 self-preference）在每轮选择 top 候选时被写进训练数据，下一轮的 policy 分布于是朝偏差方向移动，
+    judge 在新分布上继续按同样偏差打分——偏差<em>复利累积</em>。</li>
+    <li><strong>奖励通胀（reward inflation）</strong>：自评分数逐轮单调上涨，但外部独立评测（人类或
+    held-out 评测器）测到的真实质量先升后平甚至下降。内部指标与外部指标<strong>脱钩</strong>，
+    是闭环失控的首要信号——notebook 会让你亲手复现这条崩塌曲线。</li>
+    <li><strong>多样性塌缩</strong>：每轮取自评最高分的样本训练，等价于对自己分布做截断重采样,
+    分布支撑集逐轮收窄，长期可能陷入模式塌缩（与 self-consuming / model collapse 文献同构）。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>没有外部锚点的自我改进循环是不可审计的。</strong>工程红线：任何 self-play / self-rewarding
+  管线必须配一个<em>不参与训练</em>的外部评测锚（held-out 人类评测、冻结的独立 judge、或可程序化验证的
+  RLVR 任务，模块 05），并监控"自评分数 − 锚点分数"的差值漂移。差值持续扩大 = 奖励通胀警报。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="deliberative"><span class="num">4</span>Deliberative Alignment：让模型显式推理安全政策</h2>
+
+  <p>CAI 把原则用在<em>训练数据生产</em>阶段；<span class="term">Deliberative Alignment</span>
+  [Guan 2024]（OpenAI，用于 o 系列推理模型）把原则用在<em>推理时刻</em>：
+  <strong>教会模型在回答前，先在 chain-of-thought 里显式引用并推理安全政策（safety spec），再给出回答。</strong></p>
+
+  <p>方法分两步，且<strong>不需要人类逐条标注 CoT</strong>：</p>
+  <ul>
+    <li><strong>SFT 阶段</strong>：把安全政策文本放进上下文，让推理模型生成"引用政策 → 推理 → 回答"的轨迹，
+    用（冻结的）judge 模型按政策筛选高质量轨迹，做成 SFT 数据——之后政策文本<em>不再</em>出现在 prompt 里，
+    而是被学进了模型的推理习惯。</li>
+    <li><strong>RL 阶段</strong>：用一个能看到政策文本的 judge 模型当奖励信号，进一步强化"按政策推理"的行为。</li>
+  </ul>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>以前的安全训练像背题库：见过的拒绝、没见过的就翻车。Deliberative Alignment 是把<strong>法条</strong>
+      和<strong>判案推理</strong>都教给模型——遇到新案子，它先回忆相关条款、推演适用性，再下结论。
+      推理能力第一次被系统性地用来<em>服务</em>对齐，而不是与对齐互相争抢。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设安全政策为 $s$，传统 RLHF 学习 $\pi(y\mid x)$，政策只隐式存在于标签分布中；
+      Deliberative Alignment 学习 $\pi(c, y\mid x)$，其中 CoT $c$ 显式包含对 $s$ 的检索与演绎。
+      [Guan 2024] 报告 o1 系列同时改善两端：对 jailbreak 的鲁棒性上升（StrongREJECT），
+      过度拒绝（overrefusal，XSTest）下降——在"安全–有用"的帕累托前沿上整体外移，
+      且对分布外（OOD）攻击有更好泛化。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  为什么显式推理能同时降两类错误？因为"拒绝/答应"从<strong>模式匹配</strong>变成了<strong>条件判断</strong>。
+  背题库的模型只能在"宁可错杀"与"宁可放过"之间挪阈值；会引用法条的模型可以对边界 case 做出
+  <em>有理由的</em>区分。对评测者的提示：测这类模型要同时上 jailbreak 套件与 overrefusal 套件，
+  只看单边指标会被帕累托位移愚弄（模块 06 的老话题）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="w2s"><span class="num">5</span>Weak-to-Strong：用弱模型监督强模型</h2>
+
+  <p>前面的方法都假设监督者（宪法 + 反馈模型 / judge）足够强。<span class="term">Weak-to-Strong
+  Generalization</span> [Burns 2023]（OpenAI superalignment 团队）直面终局问题：
+  <strong>当模型全面强于人类时，人类监督在结构上就是"弱监督"。弱老师还能教出对齐的强学生吗？</strong></p>
+
+  <p>由于"超人类模型 + 人类监督者"还无法直接实验，[Burns 2023] 提出一个<strong>类比实验范式</strong>：</p>
+
+  <div class="ascii">
+   真实问题:   人类(弱)      ──监督──►  超人类模型(强)        ← 无法实验
+                  │ 类比                  │ 类比
+   替身实验:   GPT-2 级小模型 ──监督──►  GPT-4 级大模型        ← 可以实验！
+
+   流程: ① weak 模型在金标数据上微调 → weak teacher
+         ② weak teacher 给大量无标数据打"弱标签"（含错误）
+         ③ strong 模型在弱标签上微调 → weak-to-strong 学生
+         ④ 对照: strong 模型直接在金标上微调 → strong ceiling
+  </div>
+
+  <p>核心发现：<strong>strong 学生的测试表现稳定地超过 weak 老师</strong>——尽管训练标签全部来自老师、
+  包含老师的全部错误。这就是 <span class="term">weak-to-strong generalization</span>：
+  强模型并没有简单模仿弱标签，而是借助自身预训练中已有的任务表征，把弱标签里的<em>信号</em>与
+  <em>噪声</em>分离开来。衡量恢复程度的指标是 <span class="term">Performance Gap Recovered</span>（PGR）：</p>
+
+  <div class="math-block">
+  $$ \mathrm{PGR} \;=\; \frac{\mathrm{acc}_{\text{w2s}} - \mathrm{acc}_{\text{weak}}}
+     {\mathrm{acc}_{\text{strong ceiling}} - \mathrm{acc}_{\text{weak}}} \;\in\; [0, 1] $$
+  </div>
+
+  <p>PGR = 0 表示学生只是复刻老师；PGR = 1 表示弱监督完全不损失强模型的潜力。[Burns 2023] 在 NLP
+  分类任务上用辅助置信度损失（鼓励学生在与老师分歧时坚持自己的高置信预测）把 PGR 推到 80% 量级；
+  但在 ChatGPT 奖励建模任务上 PGR 显著更低——<strong>恰恰是对齐最需要的任务上，弱监督恢复得最差</strong>。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  与超对齐（superalignment）的关系：[Burns 2023] 把"对齐超人类模型"从哲学问题改写成了
+  <strong>可度量的 ML 问题</strong>——研究 PGR 随（弱老师强度 × 强学生强度 × 任务类型 × 辅助损失）的
+  变化规律。它不声称解决了超对齐，而是提供了一个今天就能迭代的实验台。批评者指出类比的失真处：
+  小模型的错误模式（能力不足）与人类监督超人类模型时的错误模式（系统性认知盲区 + 可能被欺骗）
+  并不同构——这是该范式的已知威胁有效性（validity threat）。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  细读失败面：w2s 泛化的反面是 <strong>imitation failure</strong>——若强学生容量被用于精确拟合弱老师的
+  错误（overfit to teacher errors），PGR 趋零甚至为负。何时发生取决于老师错误在学生表征空间里
+  是否"看起来像噪声"：像噪声 → 被平均掉（泛化）；有规律 → 被学走（模仿）。notebook 的玩具实验
+  会让你直接观察这一机制。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="rlaif-vs-rlhf"><span class="num">6</span>RLAIF vs RLHF：实证对比与混合配方</h2>
+
+  <p>回到工程决策：AI 反馈到底能不能替代人类反馈？多方实证（[Bai 2022]；Lee et al. 的 RLAIF 对比研究；
+  以及开源社区以 GPT-4 蒸馏偏好的大量实践）给出的图景大致如下：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>RLHF（人类反馈）</th><th>RLAIF（AI 反馈）</th></tr></thead>
+    <tbody>
+      <tr><td>单条标注成本</td><td>高（$ 级/条，专家任务更贵）</td><td>低 1–2 个数量级，且可随时重标</td></tr>
+      <tr><td>吞吐 / 迭代速度</td><td>周级</td><td>小时级，可在线生成</td></tr>
+      <tr><td>一致性</td><td>标注员间一致率 60–75%</td><td>自一致性高（同 prompt 可重复采样取平均）</td></tr>
+      <tr><td>偏差形态</td><td>个体差异大、随机噪声多，但偏差<em>多样化</em></td><td>噪声小但偏差<em>系统性</em>：长度偏好、格式偏好、自我偏好（模块 06）</td></tr>
+      <tr><td>能力天花板</td><td>受标注员专业水平限制</td><td>受反馈模型能力限制——蒸馏强模型时近似"借"其判断力</td></tr>
+      <tr><td>头对头效果</td><td colspan="2">摘要/对话任务上两者训出的 policy 胜率大致相当；无害性上 RLAIF（带宪法）可超过 RLHF [Bai 2022]</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>混合配方</strong>是当前前沿实验室的事实标准，按"人类判断的边际价值"分配预算：</p>
+  <ul>
+    <li><strong>人类标高价值切片</strong>：安全红线、专业领域、judge 校准集（用于检测 AI 反馈的系统偏差）由人标；
+    海量通用 helpfulness 偏好由 AI 标。</li>
+    <li><strong>人类做元监督</strong>：人不标 (y_w, y_l)，而是审计 AI judge 的判例（spot-check + 一致性抽检），
+    管理"标注员的标注员"。</li>
+    <li><strong>可验证任务交给 RLVR</strong>：数学/代码等有程序化判据的任务用规则奖励（模块 05），
+    既不要人也不要 AI judge——三种反馈源按任务性质路由。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>评测视角：自我改进循环如何被独立验证</h2>
+
+  <p>本课程的立场（模块 06）是"对齐声明必须可测量"。自我改进技术把这件事变难了一个量级，
+  因为它们破坏了评测的一个隐含前提：<strong>评测器独立于被评测者</strong>。</p>
+
+  <h3>同源污染（judge–policy 共源）</h3>
+  <ul>
+    <li><strong>自我偏好放大</strong>：LLM judge 偏爱与自己风格相近的输出 [Zheng 2023]。当 judge 与 policy
+    同源（self-rewarding）或 policy 在 judge 的偏好上训练过（RLAIF），评测分数衡量的是
+    "policy 与 judge 偏好的吻合度"，而非真实质量——这是<strong>训练–评测污染</strong>的偏好版。</li>
+    <li><strong>用 GPT-4 当 judge 评一个用 GPT-4 偏好蒸馏训练的模型</strong>：开源榜单上极常见的隐性同源，
+    胜率系统性虚高。审查任何 win-rate 声明时第一问：<em>judge 是谁？policy 的偏好数据从哪来？两者什么关系？</em></li>
+    <li><strong>分数漂移不可见</strong>：闭环里 judge 跟着 policy 一起变，没有固定参照系——好比用一把
+    会热胀冷缩的尺子量自己。</li>
+  </ul>
+
+  <h3>独立验证的工具箱</h3>
+  <ul>
+    <li><strong>冻结的外部锚（frozen anchor）</strong>：训练全程用一个<em>不更新、不同源</em>的评测器
+    定期打分。内部自评分数与锚点分数的差值漂移是奖励通胀的早期报警器（notebook 练习 3 实现该探测器）。</li>
+    <li><strong>可程序化验证的金丝雀任务</strong>：在评测集中混入有 ground truth 的任务（数学、单元测试、
+    事实核查），这部分分数不受 judge 偏差影响——若自评分涨而金丝雀分不涨，通胀实锤。</li>
+    <li><strong>人类终审 + 长度/格式控制</strong>：关键节点上做小规模、高质量人类评测，并用
+    length-controlled 设计 [Dubois 2024] 剥离已知的 judge 偏差维度。</li>
+    <li><strong>跨家族交叉评测</strong>：用与 policy 无训练血缘的多个 judge 互查，分歧大的切片送人工。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  对评测研究者的总纲：<strong>凡是"模型自己说自己变好了"的曲线，证据等级最低。</strong>
+  报告自我改进结果时，必须同时给出至少一条与训练闭环零血缘的外部曲线，并报告两者的相关性随迭代的变化——
+  相关性衰减本身就是重要发现。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>Oversight 如何随能力差距 scaling？</strong> PGR 在"老师–学生差距"拉大时如何变化尚无定律；
+    辩论（debate）、递归奖励建模（recursive reward modeling）、市场化审计等机制能否把有效监督
+    外推到能力差距更大的区间？评测视角：需要能<em>系统性改变能力差距</em>的实验设计，而非单点对比。</li>
+    <li><strong>对齐税的长期演化</strong>：[Askell 2021] 时代担心对齐损害能力；CAI 与 Deliberative Alignment
+    显示帕累托前沿可以外移。但自我改进闭环里是否存在<em>延迟支付</em>的对齐税（多样性塌缩、
+    探索能力退化、价值锁死 value lock-in）？需要超过三五轮迭代的长程实验与相应的纵向评测协议。</li>
+    <li><strong>多目标对齐</strong>：helpful / harmless / honest 之间的张力目前靠数据配比与宪法措辞隐式调和。
+    显式的多目标优化（Pareto 前沿刻画、可在推理时调节的对齐旋钮）刚刚起步；评测上缺少标准的
+    多维报告格式——单标量"对齐分"掩盖的信息恰恰是最重要的信息。</li>
+    <li><strong>Judge 能力的可信度量</strong>：self-rewarding 的飞轮假设 judge 与 policy 同步变强，
+    但 judge 能力本身怎么独立测（meta-evaluation）？RewardBench [Lambert 2024] 是开端，
+    针对"会漂移的 judge"的动态基准仍是空白。</li>
+    <li><strong>类比实验的外推有效性</strong>：weak-to-strong 的"小模型监督大模型"与"人类监督超人类模型"
+    之间的失真（欺骗性对齐、错误模式不同构）如何量化？这是 superalignment 实验范式本身的元问题。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>CAI 的 SL 阶段与 RL 阶段各解决什么问题？constitution 替代的是流水线中的哪个环节，没有替代哪个环节？</li>
+      <li>Self-rewarding 的飞轮假设是什么？写出"奖励通胀"的操作性定义，并说明用什么信号在训练中检测它。</li>
+      <li>解释 weak-to-strong generalization 为何可能发生（信号/噪声分离视角），写出 PGR 的公式与两个边界取值的含义。</li>
+      <li>当 judge 与 policy 同源时，win-rate 评测会发生什么？给出三种独立验证自我改进效果的手段。</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <strong>🎉 恭喜完成《后训练与对齐》全部 8 个模块！</strong>
+    <p style="margin:8px 0 0">从 SFT 的 loss masking，到奖励模型与 PPO/DPO，再到 RLVR 推理训练、对齐评测与本章的
+    scalable oversight 前沿——你已经走完了从"会微调"到"能审视整条对齐流水线"的研究者路径。
+    回到 <a href="../index.html">课程主页</a> 查看全课地图、术语词典与论文清单，或直接打开本章 notebook
+    亲手复现 CAI 流水线、self-rewarding 崩塌曲线与 weak-to-strong 玩具实验。</p>
+  </div>
+
+  <div class="pager">
+    <a href="../06_alignment_evals/06_讲解.html"><div class="dir">← 上一章</div><div class="t">06 · 对齐的评测</div></a>
+    <a class="next" href="../index.html"><div class="dir">下一章 →</div><div class="t">课程主页 · 结课</div></a>
+  </div>
+
+</div>
+</body>
+</html>

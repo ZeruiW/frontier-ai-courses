@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Residual Stream 解剖与 Logit Lens</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · Residual Stream 解剖与 Logit Lens</h1>
+  <p class="subtitle">模型"中途在想什么"——把 transformer 拆成往一条通信总线上读写的加性组件，再把每一层的中间信念直接翻译成词表上的预测</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（线性探针）、attention 前向计算、线性代数（基、投影、子空间）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_logit_lens.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Elhage 2021 (Mathematical Framework)、nostalgebraist 2020 (logit lens)、Belrose 2023 (tuned lens, arXiv:2303.08112)、Lindsey 2025 (Biology of an LLM)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#bus">residual stream：transformer 的通信总线</a></li>
+      <li><a href="#decomp">数学分解：最终 logits = 各组件写入之和</a></li>
+      <li><a href="#lens">logit lens：把中间激活直接翻译成预测</a></li>
+      <li><a href="#failure">logit lens 的失效情形与 tuned lens</a></li>
+      <li><a href="#layernorm">LayerNorm：可解释性分析的头号麻烦</a></li>
+      <li><a href="#eval">评测视角：lens 能给 evaluation 什么</a></li>
+      <li><a href="#frontier">前沿：从 lens 到 circuit tracing</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bus"><span class="num">1</span>residual stream：transformer 的通信总线</h2>
+
+  <p>初学者画 transformer，往往画成一条"流水线"：embedding → layer 1 → layer 2 → … → unembedding，
+  仿佛每层把上一层的输出<em>整个加工一遍</em>再交给下一层。
+  [Elhage 2021, <em>A Mathematical Framework for Transformer Circuits</em>] 提出了一个对机制可解释性
+  （<span class="term">mechanistic interpretability</span>）至关重要的换位视角：
+  <strong>真正贯穿始终的是 residual stream，每个 attention head 和 MLP 只是挂在这条总线上的"外设"</strong>——
+  从总线上<em>读</em>一点信息，计算，再把结果<em>加</em>回总线。</p>
+
+  <div class="ascii">
+  token ──W_E──►┌──────────────────────────────────────────────────────┐
+  position ────►│            residual stream  x ∈ R^{n×d}              │──LN──W_U──► logits
+                └──┬───▲────────┬───▲────────┬───▲────────┬───▲────────┘
+                 读│   │写     读│   │写     读│   │写     读│   │写
+                   ▼   │        ▼   │        ▼   │        ▼   │
+                ┌──────┴─┐   ┌──────┴─┐   ┌──────┴─┐   ┌──────┴─┐
+                │ head 0.0│   │ head 0.1│   │  MLP 0 │   │ head 1.0│  ……
+                └─────────┘   └─────────┘   └────────┘   └─────────┘
+       每个组件 = 一次"读 → 算 → 加写回"；stream 本身从不被整体重写
+  </div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>residual stream 是一块所有组件共享的"白板"。embedding 先在白板上写下"当前 token 是什么、在第几个位置"；
+      每个 attention head 读白板上它关心的那几行字，算出一条新信息（比如"我前面那个词是 X"），<em>追加</em>写上去；
+      MLP 同理。没有谁擦白板——所有写入都是<strong>加法</strong>。最后 unembedding 只看白板上特定的几行字，读出下一个 token 的预测。
+      于是"理解模型"就变成"追踪谁在白板上写了什么、谁读了谁写的内容"。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>pre-norm transformer 的前向可写成严格的加性累积：每层 $x^{(\ell+1)} = x^{(\ell)} + \sum_h \mathrm{Attn}_h(\mathrm{LN}(x^{(\ell)})) + \mathrm{MLP}(\mathrm{LN}(x^{(\ell)}))$。
+      残差连接是恒等映射，所以任意一层的 stream 都是<em>初始 embedding 加上此前所有组件输出的精确求和</em>。
+      组件之间不直接连线，唯一的通信媒介是这个 $d_{\text{model}}$ 维线性空间——[Elhage 2021] 称之为
+      <span class="term">residual stream as a communication channel</span>。组件 A 写入的方向若落在组件 B 的读取矩阵
+      （$W_Q/W_K/W_V/W_{in}$）的行空间里，二者就构成一条<span class="term">virtual weights</span> 通路 $W_B^{read} W_A^{write}$。</p>
+    </div>
+  </div>
+
+  <p>这个视角带来三个直接推论：</p>
+  <ul>
+    <li><strong>stream 本身没有"优先基"（privileged basis）</strong>：残差连接和（旋转不变的）LayerNorm 对坐标轴没有偏好，
+    单个神经元维度先验上不对应任何概念；有意义的是<em>方向与子空间</em>。这也是模块 01 用线性探针读方向、而不是看单个维度的原因。</li>
+    <li><strong>stream 是稀缺带宽资源</strong>：$d_{\text{model}}$ 维要同时承载 token 身份、位置、句法、语义、中间计算结果……
+    组件间会"挤占"子空间，这是模块 05 superposition（叠加）的伏笔。</li>
+    <li><strong>任何中间状态都可以被"提前结算"</strong>：既然 unembedding 只是对 stream 做一个线性读出，
+    那对<em>任何一层</em>的 stream 做同样的读出，就得到"模型此刻的预测"——这正是 logit lens 的全部想法（第 3 节）。</li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  [Elhage 2021]（Anthropic, transformer-circuits.pub）用 1–2 层 attention-only 模型给出了完整数学框架：
+  attention head 分解为 <span class="term">QK circuit</span>（$W_Q^\top W_K$，决定注意到哪里）与
+  <span class="term">OV circuit</span>（$W_O W_V$，决定搬运什么），并由此预言了 <span class="term">induction head</span>
+  （由 previous-token head + induction head 两层复合实现 in-context copy）。配套 notebook 会让你<strong>手工构造</strong>这样一个两层电路——不训练、纯手写权重——它是模块 03 的预演。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="decomp"><span class="num">2</span>数学分解：最终 logits = 各组件写入之和</h2>
+
+  <p>把第 1 节的加性结构写到底。设共 $L$ 层，最终 residual stream（某个位置上）为</p>
+  <div class="math-block">
+  $$ x^{(L)} \;=\; \underbrace{e}_{\text{embedding（直接路径）}} \;+\; \sum_{\ell=0}^{L-1}\sum_{h} o_{\ell,h} \;+\; \sum_{\ell=0}^{L-1} m_{\ell} $$
+  </div>
+  <p>其中 $o_{\ell,h}$ 是第 $\ell$ 层第 $h$ 个 head 写入的向量，$m_\ell$ 是 MLP 写入的向量。最终 logits 为
+  $\;\mathrm{logits} = \mathrm{LN}(x^{(L)})\, W_U$。若 LN 是线性的（或被"冻结"，见第 5 节），logits 就严格分解为：</p>
+  <div class="math-block">
+  $$ \mathrm{logits} \;=\; \underbrace{\tilde e\, W_U}_{\text{direct path}}
+     \;+\; \sum_{\ell,h} \underbrace{\tilde o_{\ell,h}\, W_U}_{\text{head 的直接贡献}}
+     \;+\; \sum_{\ell} \tilde m_{\ell}\, W_U , \qquad \tilde v := \frac{v}{\sigma(x^{(L)})}\odot\gamma $$
+  </div>
+  <p>每一项是一个组件<strong>对每个词 logit 的直接贡献</strong>——这就是
+  <span class="term">direct logit attribution (DLA)</span>，也叫 logit attribution。
+  它回答的问题是："最终把『正确答案的 logit』推高的那 8 分，分别是谁写进去的？"</p>
+
+  <h3>direct path：模型不动脑子时在说什么</h3>
+  <p>分解中的第一项 $e\,W_U$ 不经过任何 attention/MLP，等价于一个 bigram 统计表
+  （[Elhage 2021] 的 zero-layer transformer 分析：$W_E W_U$ 的最优解就是 bigram 共现统计）。
+  在 notebook 的手工模型里你会看到它的玩具版：direct path 永远在喊"下一个词 = 当前这个词"，
+  直到 induction head 用更大的写入幅度把它压过去。真实模型同理：浅层 lens 读出来的常常是
+  和输入 token 强相关的"无脑预测"，深层组件再逐步修正。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>DLA 只测"直接"贡献。</strong>一个组件可以完全不直接写 logit 方向，却通过<em>给下游组件供货</em>而至关重要——
+  notebook 中的 previous-token head 正是如此：它写入的子空间与 $W_U$ 的读取空间正交，DLA 为 0、logit lens 完全看不见它，
+  但删掉它 induction 立刻瘫痪。"直接贡献小 ≠ 不重要"。要测<em>因果</em>重要性需要模块 04 的 activation patching。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="lens"><span class="num">3</span>logit lens：把中间激活直接翻译成预测</h2>
+
+  <p>[nostalgebraist 2020]（LessWrong 博文 <em>interpreting GPT: the logit lens</em>）提出了一个简单到近乎莽撞的工具：
+  既然最终预测是 $\mathrm{LN}_f(x^{(L)})W_U$，那就把<strong>每一层</strong>的 stream 都过一遍同样的 final LayerNorm 和 unembedding：</p>
+  <div class="math-block">
+  $$ \mathrm{LogitLens}^{(\ell)} \;=\; \mathrm{LN}_f\!\big(x^{(\ell)}\big)\, W_U
+     \;\in\; \mathbb{R}^{n \times |V|}, \qquad \ell = 0,1,\dots,L $$
+  </div>
+  <p>对每层、每个位置得到一个词表分布——"如果模型在第 $\ell$ 层就被迫交卷，它会答什么"。
+  在 GPT-2 上的发现出人意料地干净：</p>
+  <ul>
+    <li><strong>预测是逐层"成形"的</strong>：浅层 lens 输出接近输入相关的琐碎预测，越往深层 top-1 越接近最终答案，
+    KL 散度 $\mathrm{KL}(p^{(\ell)} \,\|\, p^{(L)})$ 随 $\ell$ 大体单调下降；</li>
+    <li><strong>很多 token 在中层就已"定案"</strong>：简单 token（高频词、确定性补全）往往 1/3 深度处 top-1 就稳定了，
+    剩余层只在做置信度微调——这支持把 transformer 看作<span class="term">迭代推断（iterative inference）</span>：
+    每层对"当前信念"做增量更新，而不是流水线式的特征加工；</li>
+    <li><strong>stream 中段以后就生活在"输出空间"附近</strong>：中间激活与 unembedding 的几何对得上，
+    这是 lens 可行的根本原因，也是它失效的根本边界（第 4 节）。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  logit lens 与模块 01 线性探针的关系：lens 就是一个<strong>不训练的探针</strong>——直接借用模型自己的读出矩阵 $W_U$ 当探针权重。
+  好处是零训练成本、无探针过拟合之忧、单位天然是 logit；代价是它只能读"已经旋转到输出基"的信息。
+  探针强而 lens 弱的地方，恰好说明该信息<em>存在但还没写成输出格式</em>——这本身就是有用的测量。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="failure"><span class="num">4</span>logit lens 的失效情形与 tuned lens</h2>
+
+  <h3>4.1 失效模式</h3>
+  <ul>
+    <li><strong>基不对齐（representation drift）</strong>：lens 隐含假设"每层都用最终层的坐标系说话"。
+    GPT-2 恰好近似满足，但换个模型家族就翻车——[Belrose 2023] 系统测过：在 BLOOM、OPT-125M、GPT-Neo 等模型上，
+    原始 logit lens 的中层输出接近乱码，困惑度比真实预测高几个数量级。lens 在 GPT-2 上的成功是<em>经验巧合</em>，不是结构保证。</li>
+    <li><strong>早期层系统性失真</strong>：浅层 stream 还被输入 embedding 主导，过 $W_U$ 读出的多是 token 自身或高频词偏置。</li>
+    <li><strong>看不见"非输出格式"的计算</strong>：第 2 节的警告——写入正交子空间的中间结果（指针、位置信息、待加工特征）对 lens 完全透明。
+    notebook 里 layer 0 做了全部的"搬运前一个 token"工作，lens 曲线却纹丝不动。</li>
+    <li><strong>偏置与尺度敏感</strong>：lens 输出对 final LN 的 $\gamma$、对 $W_U$ 的行范数分布敏感；
+    跨层比较 logit 的<em>绝对值</em>没有意义，只有分布形状（top-1、KL、rank）相对可靠。</li>
+  </ul>
+
+  <h3>4.2 tuned lens：每层学一个仿射"翻译器"</h3>
+  <p>[Belrose 2023, <em>Eliciting Latent Predictions from Transformers with the Tuned Lens</em>, arXiv:2303.08112]
+  的修法直截了当：别假设各层与最终层同基，<strong>为每层学一个仿射变换</strong>
+  （<span class="term">translator</span>）$A_\ell, b_\ell$，把该层 stream 先"翻译"到最终层坐标系再读出：</p>
+  <div class="math-block">
+  $$ \mathrm{TunedLens}^{(\ell)}(x) \;=\; \mathrm{LN}_f\!\big(A_\ell\, x^{(\ell)} + b_\ell\big)\, W_U,
+     \qquad \min_{A_\ell, b_\ell}\; \mathbb{E}\Big[\mathrm{KL}\big(p^{(L)} \,\big\|\, \mathrm{TunedLens}^{(\ell)}\big)\Big] $$
+  </div>
+  <p>训练目标是让每层的翻译结果在分布意义上逼近<em>模型自己的最终输出</em>（蒸馏式目标，不是拟合真实标签——
+  我们想知道"模型中途信什么"，不是"中途答对没"）。结果：</p>
+  <ul>
+    <li>各模型家族上中层困惑度大幅下降，lens 轨迹变得平滑、可跨模型比较；</li>
+    <li>tuned lens 的预测对输入扰动的因果忠实度（用 causal basis extraction 验证）优于原始 lens；</li>
+    <li>代价：每层多了一个 $d\times d$ 的探针参数（需要训练数据与算力），且"翻译器学到了什么"本身又成了新的解释对象——
+    工具的透明度与表达力之间的经典权衡。</li>
+  </ul>
+
+  <table>
+    <thead><tr><th>维度</th><th>logit lens [nostalgebraist 2020]</th><th>tuned lens [Belrose 2023]</th></tr></thead>
+    <tbody>
+      <tr><td>每层变换</td><td>无（直接用 $\mathrm{LN}_f + W_U$）</td><td>学习仿射 $A_\ell x + b_\ell$ 后再 $\mathrm{LN}_f + W_U$</td></tr>
+      <tr><td>训练需求</td><td>零</td><td>每层一个 $d\times d$ translator，蒸馏目标</td></tr>
+      <tr><td>跨模型稳健性</td><td>GPT-2 好，BLOOM/OPT 差</td><td>各家族一致良好</td></tr>
+      <tr><td>解释纯度</td><td>高：读出的就是模型自带几何</td><td>较低：部分"理解"被外包给 translator</td></tr>
+      <tr><td>适用问题</td><td>快速诊断、direct path 分析、DLA</td><td>定量的跨层信念轨迹、early exit 研究</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="layernorm"><span class="num">5</span>LayerNorm：可解释性分析的头号麻烦</h2>
+
+  <p>上面所有推导都标了一个隐患：LN。LayerNorm 对每个位置的向量做</p>
+  <div class="math-block">
+  $$ \mathrm{LN}(x) = \frac{x - \mu(x)}{\sigma(x)} \odot \gamma + \beta , \qquad
+     \mathrm{RMSNorm}(x) = \frac{x}{\mathrm{rms}(x)} \odot \gamma $$
+  </div>
+  <p>麻烦在于 $\sigma(x)$（或 $\mathrm{rms}(x)$）是<strong>输入的非线性函数</strong>：同一个组件写入同样的向量，
+  对 logits 的影响取决于"当时 stream 总范数有多大"。三个常用对策：</p>
+  <ul>
+    <li><strong>折叠（folding）</strong>：$\mu$-减法是固定线性投影（投到全 1 向量的正交补），$\gamma,\beta$ 可吸收进下一个权重矩阵——
+    预处理后 LN 只剩"除以 $\sigma$"这一个非线性（TransformerLens 的 <code>fold_ln</code> 即此）。</li>
+    <li><strong>冻结（freezing）</strong>：做 DLA 时，把 $\sigma$ 固定为<em>真实最终 residual</em> 算出的值，于是分解严格线性、各项之和精确等于最终 logits。
+    代价：忽略了"该组件的写入本身会改变 $\sigma$"的二阶效应。stream 范数通常逐层增长，浅层组件的贡献会被最终的大 $\sigma$ 低估。</li>
+    <li><strong>换架构口径</strong>：现代模型（Llama、Mistral 等）用 RMSNorm 且无 $\beta$：没有均值减法，若 $\gamma$ 均匀，归一化只是逐位置的正放缩——
+    <em>不改变该位置 logits 的 argmax 与排序</em>，只改变 softmax 的有效温度。notebook 第 4 节会让你直接对比"带与不带 final norm 的 lens"：
+    top-1 完全一致，但概率/熵/KL 全变——凡涉及校准的结论，norm 的处理方式必须写进方法学。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  常见事故：比较"第 3 层 lens logit = 2.1"与"第 20 层 lens logit = 7.4"并宣称信念增强了 3.5 倍。
+  错——两层的 $\sigma$ 不同，logit 的绝对尺度不可跨层比。安全的跨层量是：top-1 是否命中、答案 token 的<em>rank</em>、
+  与最终分布的 KL、答案与最强竞争者的 <em>logit 差</em>（同层内差分会消掉公共尺度）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">6</span>评测视角：lens 能给 evaluation 什么</h2>
+
+  <p>对做 model evaluation 的研究者，logit lens 系工具的价值在于：它把"模型答了什么"扩展成
+  <strong>"模型在哪一层、以多大置信度形成这个答案"</strong>——一条免训练、白盒、可批量化的测量通道。</p>
+
+  <p><strong>① early exit 与有效深度。</strong>若大部分 token 的预测在 60% 深度就收敛（$\mathrm{KL}$ 接近 0），
+  说明后段层对这类输入近乎恒等——这既是推理加速（adaptive computation / early exit）的依据，
+  也是评测"任务真实难度"的代理指标：困难样本的收敛层数系统性更深，<em>收敛深度分布</em>本身可以作为 benchmark 难度画像。</p>
+
+  <p><strong>② "模型早就知道答案"检测。</strong>比较中层 lens 信念与最终输出：
+  若正确答案在中层 rank-1、最终输出却偏离（被 RLHF 后处理、安全模板、谄媚倾向覆盖），
+  这是<span class="term">elicitation gap</span> 的直接证据——能力存在但未被引出。
+  反向场景对 safety 评测尤其重要：sandbagging（刻意藏拙）的模型可能在内部表征中"知道"正确答案而在输出层抑制它；
+  lens/probe 类白盒检查是对抗这种评测博弈的少数手段之一（与 Safety_Evals 课程模块 05 呼应）。</p>
+
+  <p><strong>③ 跨层信念演化作为行为指纹。</strong>同一道题，"一路笃定"与"末三层突然翻转"的两种轨迹，
+  行为输出可能完全相同，但鲁棒性、可操纵性截然不同。轨迹特征（翻转层数、置信爬升速率）可用于
+  幻觉预警、jailbreak 检测（攻击常表现为深层信念被扭转）、以及为 LLM-as-judge 提供白盒辅助信号。</p>
+
+  <p><strong>④ 廉价的回归测试。</strong>模型微调/量化/蒸馏后，对固定 prompt 集合跑一遍 lens 轨迹并 diff，
+  能在行为指标尚未显著变化时发现内部计算路径的漂移——类似软件工程里的 snapshot test，成本只有一次前向。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  方法学红线：lens 读出的是<strong>相关性证据</strong>，不是因果证据。"中层 rank-1"不等于"模型在中层已完成推理"——
+  可能只是表面统计的巧合。把 lens 结论写进评测报告前，至少配一组 activation patching（模块 04）或扰动实验做因果交叉验证；
+  并报告 norm 处理方式与 lens 变体（原始 / tuned），否则结果不可复现。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>前沿：从 lens 到 circuit tracing</h2>
+
+  <ul>
+    <li><strong>attribution graphs / circuit tracing</strong>：[Ameisen 2025] 与 [Lindsey 2025, <em>On the Biology of a Large Language Model</em>]（Anthropic）
+    把"分解 logits"推广为"分解任意中间特征"：用 cross-layer transcoder 把 MLP 计算改写成可解释特征，
+    再构建<span class="term">attribution graph</span>——从输入 token 经各特征到输出 logit 的带权因果图。
+    在 Claude 3.5 Haiku 上据此追踪出多步推理（"Dallas → Texas → Austin"）、押韵诗的<em>提前规划</em>、
+    以及"模型内部知道答案却输出胡话"的不忠实推理案例——可视为 DLA 的全图谱化。</li>
+    <li><strong>patchscopes 一族</strong>：[Ghandeharioun 2024, arXiv:2401.06102] 把"读出中间状态"推广为
+    "把中间激活 patch 进另一个 prompt 让模型自己解码"——lens 是其线性特例。开放问题：解码器越强，
+    读出的是表征里的信息还是解码器的脑补？</li>
+    <li><strong>lens 的理论地位</strong>：为什么 stream 中段会接近输出几何？迭代推断假说（每层做梯度步式的分布更新）有局部证据但缺一般理论；
+    tuned lens translator 的结构（接近恒等？低秩？）随深度如何变化，仍是刻画"计算何时发生"的线索。</li>
+    <li><strong>评测中的标准化</strong>：白盒证据（lens 轨迹、probe 读数）如何进入正式的能力/安全评测报告——
+    置信度怎么校准、对抗鲁棒性怎么界定（模型能否学会欺骗 lens？）——是 interpretability 与 evaluation 两个社区正在合流的前沿。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>"residual stream 作为通信总线"与"流水线"视角的区别是什么？为什么这使 logits 可以精确分解为各组件贡献之和？</li>
+      <li>logit lens 的精确定义（公式）是什么？它在哪类模型上失效、为什么？tuned lens 改了哪一处、训练目标是什么？</li>
+      <li>DLA 中"冻结 LayerNorm"在做什么？为什么"DLA ≈ 0 的组件"仍可能对最终预测不可或缺？</li>
+      <li>给你一个待评测模型的白盒权限，你会用 lens 类工具检查哪三件评测层面的事？各自的因果效力边界在哪里？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../01_linear_probes/01_讲解.html"><div class="dir">← 上一章</div><div class="t">01 · 线性探针：从激活中读出表征</div></a>
+    <a class="next" href="../03_attention_induction/03_讲解.html"><div class="dir">下一章 →</div><div class="t">03 · Attention 模式与 Induction Heads</div></a>
+  </div>
+
+</div>
+</body>
+</html>

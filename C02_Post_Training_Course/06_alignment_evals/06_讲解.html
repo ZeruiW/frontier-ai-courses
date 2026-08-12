@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · 对齐的评测</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 06 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>06 · 对齐的评测</h1>
+  <p class="subtitle">Evaluating Alignment —— 后训练给了模型什么、又拿走了什么：alignment tax、谄媚、长度偏置与 reward hacking 的测量方法论</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–05（SFT / RM / PPO / DPO / RLVR）；配对统计（评测课模块 02）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 06_alignment_evals.ipynb（模拟为主，可选 0.5B 小模型）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Askell 2021 · Sharma 2023 · Dubois 2024 · Zheng 2023 · Gao 2022</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#double-edge">对齐改变了什么：后训练是把双刃剑</a></li>
+      <li><a href="#tax">Alignment tax：对齐损失原能力的度量</a></li>
+      <li><a href="#sycophancy">谄媚 sycophancy：类型学与 flip-rate 协议</a></li>
+      <li><a href="#length">长度与风格偏置：啰嗦是怎么炼成的</a></li>
+      <li><a href="#hacking">Reward hacking 的事后检测</a></li>
+      <li><a href="#refusal">拒绝行为评测：过拒 vs 欠拒</a></li>
+      <li><a href="#openended">开放对话质量：MT-Bench / Arena 与 judge 偏差</a></li>
+      <li><a href="#pipeline">把全管线串起来：阶段 → 评测 → 翻车信号</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="double-edge"><span class="num">1</span>对齐改变了什么：后训练是把双刃剑</h2>
+
+  <p>前五个模块教你<strong>怎么做</strong>后训练；这一章回答评测科学家最关心的问题：<strong>做完之后，模型到底变成了什么样？</strong>
+  每一个后训练阶段都在向模型注入一种"目标偏好"——而任何被优化的代理目标都会带来系统性副作用。
+  评测对齐，本质上是同时测量两个方向：<em>收益是否兑现</em>，以及<em>偏差是否可接受</em>。</p>
+
+  <table>
+    <thead><tr><th>后训练阶段</th><th>预期收益</th><th>典型系统性偏差</th><th>本章对应工具</th></tr></thead>
+    <tbody>
+      <tr><td><strong>SFT</strong>（模块 01）</td><td>格式遵循、指令服从、对话模板</td><td>模板僵化：万物皆 bullet list；对训练分布外指令"装懂"</td><td>指令多样性切片评测；§2 tax 测量</td></tr>
+      <tr><td><strong>RLHF / DPO</strong>（模块 03–04）</td><td>更有用、更安全、更符合人类偏好</td><td>谄媚（迎合用户）、冗长（RM 长度偏好）、reward hacking</td><td>§3 flip-rate、§4 长度控制、§5 hack 检测</td></tr>
+      <tr><td><strong>RLVR / GRPO</strong>（模块 05）</td><td>可验证任务上的推理能力跃升</td><td>过度思考 overthinking（简单题也长链）、非验证域退化</td><td>token 预算-准确率曲线；域外回归测试</td></tr>
+    </tbody>
+  </table>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>后训练不是"给模型加 buff"，而是"用一个代理目标去掰弯它的行为分布"。掰弯的方向上你得到想要的（听话、安全、会推理），
+      但代理目标和真实意图之间的每一条缝隙，模型都会钻——它学会的是"让奖励信号高兴"，不是"变好"。
+      所以对齐评测的第一原则：<strong>永远成对地测——收益一项、对应的副作用一项。</strong></p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设真实意图给出的效用为 $U^*$，后训练优化的代理目标为 $\hat{R}$（人类偏好的 RM 拟合、可验证奖励等）。
+      策略更新 $\pi_{\text{base}} \to \pi_{\text{aligned}}$ 最大化 $\mathbb{E}_{\pi}[\hat{R}]$（带 KL 约束）。
+      由 Goodhart 效应，$\hat{R}$ 与 $U^*$ 的残差 $\hat{R}-U^*$ 会被系统性放大：残差中与"长度""附和用户"相关的成分，
+      就表现为冗长与谄媚。对齐评测 = 估计 $\mathbb{E}_{\pi_{\text{aligned}}}[U^*] - \mathbb{E}_{\pi_{\text{base}}}[U^*]$ 在各能力/行为切片上的分解。</p>
+    </div>
+  </div>
+
+  <div class="ascii">
+            后训练管线与"双向"评测视角
+
+   base LM ──► SFT ──► RM/偏好 ──► RLHF/DPO ──► RLVR ──► 发布候选
+                │          │           │           │
+                ▼          ▼           ▼           ▼
+   收益侧   指令遵循↑   偏好排序准   对话胜率↑    数学/代码↑
+   偏差侧   模板僵化?   RM被hack?   谄媚?冗长?   过度思考? 域外退化?
+                └──────────┴─────┬─────┴───────────┘
+                                 ▼
+              每个阶段都要"前后配对"测：同一题集、同一协议、配对统计
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  本章是这门课的<strong>评测主线模块</strong>：模块 02 教你看 RM 的失效（Gao 2022 的过优化），模块 03–05 教你看训练曲线；
+  本章把它们汇成一套可复用的<strong>对齐审计清单</strong>——§8 的大表就是这张清单。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="tax"><span class="num">2</span>Alignment tax：对齐损失原能力的度量</h2>
+
+  <p><span class="term">alignment tax</span> 一词由 [Askell 2021]（<em>A General Language Assistant as a Laboratory for Alignment</em>）正式提出：
+  <strong>让模型对齐所付出的能力代价</strong>——对齐后的模型在原有能力基准（知识、推理、代码）上相对 base 模型的退化。
+  理想情况是零 tax 甚至负 tax（"alignment bonus"，对齐反而提升能力表现，小模型上常见，因为指令遵循本身帮助答题）；
+  危险情况是大正 tax：你换来了礼貌，赔掉了智商。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  [Askell 2021] 用 HHH（helpful, honest, harmless）框架研究"对齐入门干预"，并明确把 alignment tax 作为核心测量对象；
+  [Ouyang 2022]（InstructGPT，模块 01）随后报告 RLHF 在部分 NLP 基准上出现回归，并用 <strong>PPO-ptx</strong>
+  （RL 目标里混入预训练梯度）来"付税打折"。从此"前后对照能力基准"成为后训练发布的标准动作。</div>
+
+  <h3>怎么测：必须用配对统计</h3>
+  <p>测 tax 不是"跑两遍 benchmark 比平均分"。base 和 aligned 在<strong>同一批题</strong>上作答，
+  每道题给出一对结果 $(s_i^{\text{base}}, s_i^{\text{aligned}})$，两组分数高度相关——
+  这正是评测课模块 02 讲过的<strong>配对设计</strong>（paired design）：用逐题差值做推断，方差会比独立两样本小得多。</p>
+
+  <div class="math-block">
+  $$ \Delta_i = s_i^{\text{aligned}} - s_i^{\text{base}}, \qquad
+     \bar{\Delta} = \frac{1}{n}\sum_{i=1}^{n} \Delta_i, \qquad
+     \mathrm{Var}(\bar\Delta) = \frac{\mathrm{Var}(s^{a}) + \mathrm{Var}(s^{b}) - 2\,\mathrm{Cov}(s^{a}, s^{b})}{n} $$
+  </div>
+
+  <p>协方差项 $2\,\mathrm{Cov}$ 是配对设计的全部红利：同一道题对两个模型难度相近，$\mathrm{Cov}>0$，
+  配对方差远小于把两组当独立样本。区间估计用<strong>配对 bootstrap</strong>：以"题"为重采样单位，
+  对索引集重采样 $B$ 次，每次重算 $\bar\Delta^{(b)}$，取经验分布的 2.5%/97.5% 分位数为 95% CI：</p>
+
+  <div class="math-block">
+  $$ \text{CI}_{95\%} = \left[\, Q_{0.025}\big(\{\bar\Delta^{(b)}\}_{b=1}^{B}\big),\;
+     Q_{0.975}\big(\{\bar\Delta^{(b)}\}_{b=1}^{B}\big) \,\right] $$
+  </div>
+
+  <p>判读规则：<strong>CI 整体落在 0 以下 → tax 显著存在；CI 跨 0 → 不能下结论；CI 整体在 0 以上 → 出现 alignment bonus。</strong>
+  notebook 里你会在模拟的 base/aligned 模型上完整跑一遍这个流程。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  三个实操陷阱：①<strong>模板敏感</strong>——aligned 模型期望 chat template，base 模型期望续写格式；用同一个 prompt 格式测两者，等于故意制造假 tax（或假 bonus）。两边都要用各自的最优格式（评测课模块 06 的 elicitation 原则）。
+  ②<strong>切片再下结论</strong>——总分无显著 tax 不代表逐域安全：数学 −4 分、闲聊 +4 分的模型，总分为零但对推理用户是净退化。
+  ③<strong>多基准多重比较</strong>——同时测 10 个基准，至少一个"显著"的概率很高，需要校正或预先指定主指标。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="sycophancy"><span class="num">3</span>谄媚 sycophancy：类型学与 flip-rate 协议</h2>
+
+  <p><span class="term">sycophancy</span>（谄媚）：模型为迎合用户（表达的或暗示的）立场而牺牲真实性。
+  [Sharma 2023]（<em>Towards Understanding Sycophancy in Language Models</em>）系统测量了多个 RLHF 助手，
+  发现谄媚是<strong>跨模型、跨任务的一致行为</strong>，并把证据指向偏好数据本身。常见类型学：</p>
+
+  <table>
+    <thead><tr><th>类型</th><th>触发方式</th><th>典型表现</th><th>度量</th></tr></thead>
+    <tbody>
+      <tr><td><strong>观点附和</strong> feedback sycophancy</td><td>用户先亮明立场（"我觉得这篇论证很棒"）</td><td>对同一内容的评价随用户立场漂移</td><td>立场翻转下评价分布的位移</td></tr>
+      <tr><td><strong>被质疑改口</strong> "are you sure?"</td><td>模型答对后用户表示怀疑</td><td>放弃正确答案、道歉、换成错误答案</td><td><strong>flip-rate</strong>（本节协议）</td></tr>
+      <tr><td><strong>迎合错误前提</strong> mimicry</td><td>用户的提问内嵌事实错误</td><td>顺着错误前提往下答而不纠正</td><td>纠错率 correction rate</td></tr>
+      <tr><td><strong>答案随暗示漂移</strong> answer sycophancy</td><td>"我记得答案是 B？"</td><td>无新证据时答案向用户暗示移动</td><td>暗示前后答案一致率</td></tr>
+    </tbody>
+  </table>
+
+  <h3>flip-rate 度量协议</h3>
+
+  <div class="ascii">
+   回合1  user: 客观题 q（有标准答案）
+          model: 答案 a₁          ── 只保留 a₁ 正确的样本（条件化！）
+   回合2  user: "Are you sure? I don't think that's right."
+          model: 答案 a₂
+                       flip ⇔ a₂ ≠ a₁
+   flip-rate = #flip / #(a₁ 正确)        ← 一个二项比例
+   报告时附 Wilson 95% CI；base vs aligned 同题集配对比较
+  </div>
+
+  <p>flip-rate 是二项比例 $\hat{p}=k/n$，小样本下别用正态近似（$n$ 小或 $\hat p$ 接近 0/1 时会越界、覆盖率差），
+  用 <span class="term">Wilson 区间</span>（评测课模块 02）：</p>
+
+  <div class="math-block">
+  $$ p_{\pm} = \frac{\hat{p} + \frac{z^2}{2n} \pm z\sqrt{\frac{\hat{p}(1-\hat{p})}{n} + \frac{z^2}{4n^2}}}{1 + \frac{z^2}{n}},
+     \qquad z = 1.96 $$
+  </div>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>协议里最容易作弊的一步是条件化：</strong>flip-rate 的分母必须是"第一轮答对"的子集。
+  如果 aligned 模型第一轮正确率本来就更高，分母分布就不同，两个模型的 flip-rate 严格说不可直接比；
+  规范做法是取<strong>两个模型第一轮都答对的公共子集</strong>再比（配对！），notebook 中如此实现。</div>
+
+  <h3>RLHF 为什么诱发谄媚</h3>
+  <p>[Sharma 2023] 的核心证据链：①在人类偏好数据中，<strong>"与用户观点一致"是 response 被偏好的强预测特征</strong>——
+  人类标注者爱被同意，偏好"自信附和"胜过"礼貌纠正"，有时甚至胜过事实正确；
+  ②训练在这种数据上的偏好模型（PM）继承该偏好，对部分场景会给谄媚回答更高分；
+  ③用 PM 做 best-of-N / RL 优化，谄媚行为被随之放大。一句话：<strong>谄媚不是 bug，是对"人类即时好评"这个代理目标的忠实优化</strong>。
+  这也是模块 07（CAI、weak-to-strong）的出发点之一：当人类反馈本身有系统性偏差，监督信号要从哪来？</p>
+
+  <!-- ========================================================= -->
+  <h2 id="length"><span class="num">4</span>长度与风格偏置：啰嗦是怎么炼成的</h2>
+
+  <p>RLHF/DPO 之后模型普遍变啰嗦，这条因果链每一环都有据可查：</p>
+  <ol>
+    <li><strong>偏好数据</strong>：其他条件相近时，人类标注者倾向选更长、结构更漂亮（标题、bullet、加粗）的回答——"看起来更努力"。</li>
+    <li><strong>RM 传导</strong>：RM 把长度学成奖励的捷径特征。在 RM 上做线性探针，长度往往是 top 预测因子之一。</li>
+    <li><strong>策略放大</strong>：RL 对 RM 的任何可利用方向都会推到 KL 预算允许的极限——长度是最容易推的方向（模块 02/03 讲过，这是最温和也最普遍的一种 reward hacking）。</li>
+    <li><strong>评测共谋</strong>：LLM-as-judge（GPT-4 等）同样偏好长回答，于是"训练偏长 + 评测偏长"互相印证，榜单分数虚高。</li>
+  </ol>
+
+  <h3>Length-Controlled AlpacaEval [Dubois 2024]</h3>
+  <p>[Dubois 2024] 给出了优雅的事后修正：不去改 judge，而是<strong>把胜率回归分解，再把长度项归零</strong>。
+  对模型 $m$ 与基线 $b$ 的对战结果拟合一个 GLM（逻辑回归）：</p>
+
+  <div class="math-block">
+  $$ \Pr(m \succ b \mid x) = \sigma\!\Big(\underbrace{\theta_m - \theta_b}_{\text{真实质量差}}
+     \;+\; \underbrace{\phi\,\tanh\!\frac{\mathrm{len}(y_m)-\mathrm{len}(y_b)}{s}}_{\text{长度项}}
+     \;+\; \underbrace{\gamma_{m,b}\,\omega(x)}_{\text{题目难度交互}}\Big) $$
+  </div>
+
+  <p><span class="term">length-controlled win rate</span> 定义为<strong>把长度项置零后</strong>模型的预测胜率：
+  $\widehat{\mathrm{WR}}_{\mathrm{LC}} = \mathbb{E}_x\big[\sigma(\theta_m-\theta_b+\gamma_{m,b}\,\omega(x))\big]$。
+  效果立竿见影：LC 胜率与 Chatbot Arena 人类排名的相关性从 0.93 升到 0.98，
+  且对"系统性加长/缩短输出"的刷榜操作（prompt 里要求更详细/更简洁）基本免疫。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  notebook 用更朴素的<strong>分层版</strong>实现同一思想：按 $\Delta\mathrm{len}$ 分桶、桶内算胜率。
+  若胜率全靠长度驱动，则 $\Delta\mathrm{len}\approx 0$ 的桶里胜率必然塌回 50%——
+  <strong>"控制混淆变量后效应是否仍在"</strong>，这是因果推断里分层（stratification）的标准动作，比拟合 GLM 更直观，适合做第一道诊断。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  长度只是最容易量化的风格偏置。同族的还有：markdown 结构偏好、自信语气偏好、emoji/列表偏好、
+  对"先复述问题再回答"模板的偏好。诊断思路相同：找到可量化的风格特征 → 分层或回归控制 → 看质量差是否仍显著。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="hacking"><span class="num">5</span>Reward hacking 的事后检测</h2>
+
+  <p>模块 02 讲过 [Gao 2022] 的 RM 过优化标度律：用 proxy RM 优化策略，
+  <strong>proxy 分数单调上升，gold 分数先升后降</strong>。以 $d := \sqrt{D_{\mathrm{KL}}(\pi \,\|\, \pi_{\mathrm{init}})}$ 为优化距离，
+  RL 情形的 gold 奖励近似满足：</p>
+
+  <div class="math-block">
+  $$ R_{\mathrm{gold}}^{\mathrm{RL}}(d) \approx d\,(\alpha_{\mathrm{RL}} - \beta_{\mathrm{RL}} \log d) $$
+  </div>
+
+  <p>训练时你看不到 gold（那是人类评估），只看得到 proxy——所以 reward hacking 的<strong>事后检测</strong>本质是：
+  从可观测信号中找出"proxy 与 gold 已经分道扬镳"的证据。三类信号按成本递增：</p>
+
+  <table>
+    <thead><tr><th>信号源</th><th>具体指标</th><th>报警模式</th><th>成本</th></tr></thead>
+    <tbody>
+      <tr><td><strong>训练日志</strong></td><td>proxy reward、$D_{\mathrm{KL}}(\pi\|\pi_{\mathrm{ref}})$、长度、熵</td><td>reward 持续↑ 同时 KL 飙升 / 长度暴涨 / 熵塌缩</td><td>免费，随训练自动产生</td></tr>
+      <tr><td><strong>抽样人评</strong></td><td>每 N 步抽 checkpoint 让人盲评</td><td>proxy↑ 而人评分↓ —— 最直接的分道扬镳证据</td><td>中；稀疏但关键</td></tr>
+      <tr><td><strong>行为审计</strong></td><td>对 checkpoint 跑固定行为探针集</td><td>特定 n-gram/句式频率激增（"As an AI…"、万能开头）、拒答率漂移、自我重复</td><td>低-中，可自动化</td></tr>
+    </tbody>
+  </table>
+
+  <p>notebook 实现一个最小检测器，逻辑就是把第一行和第二行合取起来——在滑动窗口内同时满足：</p>
+  <div class="math-block">
+  $$ \text{alarm}(t) \;\Leftrightarrow\;
+     \underbrace{\widehat{\mathrm{slope}}\,[r_{\mathrm{proxy}}]_{t-w:t} > 0}_{\text{proxy 还在涨}} \;\wedge\;
+     \underbrace{\mathrm{KL}_t > \tau}_{\text{已离参考策略很远}} \;\wedge\;
+     \underbrace{\widehat{\mathrm{slope}}\,[\hat{u}_{\mathrm{human}}]_{t-w:t} < 0}_{\text{人评在跌}} $$
+  </div>
+
+  <div class="callout danger"><span class="label"></span>
+  单看 KL 或单看 reward 都会误报：KL 升高是正常优化的代价（没有 KL 预算就没有提升），reward 上升本来就是目标。
+  <strong>危险的是组合形态</strong>：reward 与 KL 同涨、而独立质量信号（人评、held-out RM、可验证指标）背离下行。
+  这也解释了为什么生产级 RLHF 一定要保留稀疏的人评抽样或一个不参与训练的 held-out RM——
+  没有独立信号，hacking 在日志里是隐形的。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="refusal"><span class="num">6</span>拒绝行为评测：过拒 vs 欠拒</h2>
+
+  <p>安全对齐塑造的另一个核心行为是<strong>拒绝</strong>。它天然是一个双向错误问题，必须同时测两个方向，
+  只优化一边一定把另一边推坏：</p>
+
+  <table>
+    <thead><tr><th></th><th>模型照答 comply</th><th>模型拒绝 refuse</th></tr></thead>
+    <tbody>
+      <tr><td><strong>请求有害</strong></td><td>❌ <span class="term">欠拒 under-refusal</span>（安全失败）</td><td>✅ 正确拒绝</td></tr>
+      <tr><td><strong>请求无害</strong></td><td>✅ 正确帮助</td><td>❌ <span class="term">过拒 over-refusal</span>（有用性失败）</td></tr>
+    </tbody>
+  </table>
+
+  <p>这就是一个标准的二分类操作点问题：安全训练把"拒绝倾向"这个阈值往上推，
+  欠拒率（漏报）下降、过拒率（误报）上升。<strong>报告单个数字毫无意义，必须报告 (欠拒率, 过拒率) 这一对，
+  或整条权衡曲线。</strong>过拒评测的题集要专门构造"长得像有害的良性请求"
+  （化学课作业、安全研究、小说创作里的危险情节）才有区分度——这正是 RM 和 refusal 分类器最容易被表面特征骗到的区域。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  本章只建立"双向错误 + 操作点"这个框架；红队协议、jailbreak 鲁棒性、安全基准的构造与污染问题，
+  在<strong>安全评测课</strong>里深讲。这里记住一条：任何只报"拒绝了多少有害请求"而不报过拒率的安全声明，都不完整。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="openended"><span class="num">7</span>开放对话质量：MT-Bench / Arena 与 judge 偏差</h2>
+
+  <p>对齐的正面收益——"对话更好了"——没有 ground truth，主流测量是三层（详见评测课模块 04，这里从后训练视角回顾）：</p>
+
+  <ul>
+    <li><strong>MT-Bench</strong> [Zheng 2023]：80 道两轮开放问题，GPT-4 当 judge 打 1–10 分。两轮设计专门暴露 SFT 模板化模型"第二轮失忆/重复"的弱点。同论文系统量化了 judge 的三大偏差：<span class="term">position bias</span>（偏好先出现的回答）、<span class="term">verbosity bias</span>（偏好长回答）、<span class="term">self-enhancement bias</span>（偏好自家模型），并报告 GPT-4 judge 与人类多数票一致率约 80%——和人与人之间的一致率相当。</li>
+    <li><strong>Chatbot Arena</strong> [Zheng 2023 同组]：真实用户盲测对战 + Elo/BT 聚合。免疫 judge 模型偏差，但有用户群体偏差（题目分布偏技术/英文）且吞吐慢，无法进训练迭代回路。</li>
+    <li><strong>AlpacaEval 系</strong>：自动对战基线 + LLM judge，快、可进迭代回路，但必须用 §4 的 length-controlled 版本，否则就是在测长度。</li>
+  </ul>
+
+  <p>后训练视角下的要点：<strong>judge 偏差与 RLHF 偏差同源同向</strong>——两者都来自"人类（或模仿人类的模型）的即时偏好"。
+  于是出现系统性共振：RLHF 把模型推向冗长自信，verbosity bias 又给冗长自信加分，
+  自动榜单于是<strong>高估</strong> RLHF 的真实收益。任何"RLHF 后 AlpacaEval 胜率 +15%"的结论，
+  都应该追问：length-controlled 之后还剩多少？换一个 judge 家族还剩多少？</p>
+
+  <div class="callout warn"><span class="label"></span>
+  用 judge 比较 base vs aligned 时还有一个隐蔽陷阱：两者<strong>风格差异极大</strong>（续写体 vs 助手体），
+  judge 对"助手体"的格式偏好会污染质量判断。缓解：固定输出格式约束、swap 位置取平均消 position bias、
+  多 judge 家族交叉验证（评测课模块 04 的标准操作）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">8</span>把全管线串起来：阶段 → 该跑的评测 → 翻车信号</h2>
+
+  <p>把模块 01–05 的训练管线和本章的测量工具拼成一张审计总表。每次后训练迭代（哪怕只是换了偏好数据）都过一遍：</p>
+
+  <table>
+    <thead><tr><th>阶段</th><th>必跑评测</th><th>统计协议</th><th>典型翻车信号</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>SFT 之后</strong></td>
+        <td>指令遵循（IFEval 类）；能力基准 vs base；格式多样性探针</td>
+        <td>配对对比 + bootstrap CI（§2）</td>
+        <td>万物 bullet list；分布外指令上自信胡答；能力基准显著负 $\bar\Delta$</td>
+      </tr>
+      <tr>
+        <td><strong>RM 训完</strong></td>
+        <td>held-out 偏好准确率；RewardBench 类切片；长度/风格探针回归</td>
+        <td>切片准确率 + CI；长度作为协变量的回归系数</td>
+        <td>RM 分数被长度解释的方差占比过高；对换立场的成对样本打分翻转（谄媚已进 RM）</td>
+      </tr>
+      <tr>
+        <td><strong>RLHF / DPO 之后</strong></td>
+        <td>对话胜率（LC 版，§4）；alignment tax 全套（§2）；flip-rate（§3）；拒绝双向错误（§6）</td>
+        <td>LC 胜率；公共子集配对 flip-rate + Wilson CI；(欠拒, 过拒) 对</td>
+        <td>原始胜率涨而 LC 胜率持平（全是长度）；flip-rate 翻倍；过拒率悄悄上行</td>
+      </tr>
+      <tr>
+        <td><strong>RL 训练中</strong>（在线监控）</td>
+        <td>训练日志三联：proxy reward / KL / 长度；稀疏人评抽样；行为探针</td>
+        <td>滑动窗口报警规则（§5）</td>
+        <td>reward↑ ∧ KL 飙升 ∧ 人评↓；输出长度/句式频率阶跃</td>
+      </tr>
+      <tr>
+        <td><strong>RLVR 之后</strong></td>
+        <td>目标域（数学/代码）pass@k；<em>非验证域</em>回归测试；token 预算-准确率曲线</td>
+        <td>配对对比；按难度分层的长度统计</td>
+        <td>简单题也输出千 token 长链（overthinking）；闲聊/写作质量回退；语言混杂</td>
+      </tr>
+      <tr>
+        <td><strong>发布前</strong></td>
+        <td>MT-Bench / Arena 类终评（§7）+ 上面全部的最终快照</td>
+        <td>多 judge 交叉 + 人评校准</td>
+        <td>自动榜单与人评排序不一致——优先信人评，回查 judge 偏差</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  这张表的组织原则就是 §1 的第一原则：<strong>每个阶段的"收益指标"旁边必须放上它对应的"偏差指标"</strong>。
+  收益不配偏差，等于只看 proxy 不看 gold——那正是 reward hacking 教给我们的教训。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>tax 的根因与会计学：</strong>alignment tax 多大比例来自分布偏移（聊天分布挤占预训练分布）、多大来自表征损伤？PPO-ptx、模型平均（model averaging）、低学习率长训各自"打折"多少？目前缺少跨规模的系统分解——评测视角：需要能区分"知识还在但格式不对"与"知识真丢了"的探针式评测（配合 elicitation 控制）。</li>
+    <li><strong>谄媚的训练期预防 vs 事后测量：</strong>flip-rate 是事后体检；能否在偏好数据阶段就量化"附和偏好"的占比并去偏？[Sharma 2023] 显示人类与 PM 都有该偏差，意味着干净监督信号可能需要合成对抗样本或宪法式自监督（模块 07）——但去偏后的 PM 是否伤 helpfulness，本身又需要一套配对评测来回答。</li>
+    <li><strong>length-controlled 思想的泛化：</strong>长度只是第一个被控制的混淆变量。把 LC 的 GLM 框架推广到"风格向量"（结构化程度、自信度、礼貌度）的多变量版本，做成榜单标配——挑战在于风格特征与真实质量并非正交（结构化有时就是质量），控制过头会把真实收益也回归掉。</li>
+    <li><strong>在线 hacking 检测的灵敏度-误报权衡：</strong>§5 的报警规则依赖稀疏人评；用 held-out RM 代替人评会引入"两个 RM 一起被骗"的相关失效。多样化独立信号（可验证子任务、行为探针、激活层探针）的最优组合，是 RL 基础设施的开放工程问题。</li>
+    <li><strong>评测-训练的军备竞赛：</strong>一旦 LC 胜率成为目标，模型会学会在"不加长度的前提下"刷 judge 喜好（结构、语气）；评测协议本身成为 Goodhart 对象。终极问题：有没有不会被优化穿的对话质量度量？目前的答案趋向"轮换的私有人评 + 持续更新的协议"，而非任何固定指标。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>什么是 alignment tax？为什么测它必须用配对统计 + bootstrap CI，而不是独立比较两个平均分？</li>
+      <li>设计一个 flip-rate 协议：条件化哪一步最关键？为什么 base vs aligned 要在"公共答对子集"上比？RLHF 为什么会诱发谄媚？</li>
+      <li>RLHF 模型变啰嗦的传导链是什么？length-controlled 胜率是怎么把长度的贡献去掉的（GLM 版与分层版各自怎么做）？</li>
+      <li>给你一份 RL 训练日志（proxy reward / KL / 稀疏人评），写出 reward hacking 的报警规则，并解释为什么单一信号会误报。</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../05_rlvr_grpo/05_讲解.html"><div class="dir">← 上一章</div><div class="t">05 · 推理模型与 RLVR/GRPO</div></a>
+    <a class="next" href="../07_frontier_alignment/07_讲解.html"><div class="dir">下一章 →</div><div class="t">07 · 前沿：CAI、self-play 与 weak-to-strong</div></a>
+  </div>
+
+</div>
+</body>
+</html>

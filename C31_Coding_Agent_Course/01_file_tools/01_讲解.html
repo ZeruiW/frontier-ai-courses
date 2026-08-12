@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 文件工具</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 文件工具</h1>
+  <p class="subtitle">agent 的手 —— read 带行号给 LLM 坐标系、write 适合建新文件、精确编辑用「唯一匹配的字符串替换」、路径安全防越界、unified diff 让每处改动可审计；从零写出一套对 LLM 友好又对人安全的文件工具</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、Python 文件操作与 os.path、difflib 略知更佳</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_file_tools.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">SWE-agent (ACI)、Anthropic Tool use、aider 编辑格式、difflib 文档</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#hands">文件工具：agent 的手</a></li>
+      <li><a href="#read">读文件：带行号的坐标系</a></li>
+      <li><a href="#write">写文件：简单但危险</a></li>
+      <li><a href="#edit">精确编辑：唯一匹配的字符串替换</a></li>
+      <li><a href="#pathsafe">路径安全：关在工作区里</a></li>
+      <li><a href="#diff">Unified diff：可审计的改动</a></li>
+      <li><a href="#assemble">拼成 agent 的手</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hands"><span class="num">1</span>文件工具：agent 的手</h2>
+  <p>如果说 agent 是一个被关在房间里、只能通过几个小窗口与外界交互的大脑，那么<strong>文件工具就是它的手</strong>——没有手，它读不到你的代码，更改不动一个字。文件工具是整个编码 agent 最基础、也最容易被低估的一层：它的设计好坏，直接决定 LLM 能不能<em>看清</em>代码、能不能<em>精准</em>地改、改完你能不能<em>看懂</em>它改了什么。</p>  <p>一个编码 agent 的文件能力，可以拆成三个动作：<strong>读</strong>（把文件内容、最好带行号地呈现给 LLM）、<strong>写</strong>（创建或整体覆盖一个文件）、<strong>编辑</strong>（在已有文件里做局部、精确的修改）。听起来平平无奇，但每一个都藏着对 LLM 友好与对人安全的讲究。本模块就把这三件工具从零写出来，并加上两道护栏——<strong>路径安全</strong>和<strong>unified diff</strong>。</p>  <p>一个先行的设计原则，来自 SWE-agent 论文的 <span class="term">agent-computer interface</span>（ACI）思想：<strong>工具是给 LLM 用的，不是给人用的，所以它的输入输出要为 LLM 优化</strong>。人读文件靠滚动和眼睛；LLM 读文件靠你喂给它的文本。于是「读」要带行号（给它一个坐标系，方便后续指认「第几行」）、要能按范围读（大文件不必整读、省 token）；「编辑」要用它擅长的方式表达（给一段旧代码、一段新代码，而非「在第 42 行插入」——后者它极易数错）。把这条原则记牢，本模块每个设计都是它的推论。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>读要给 LLM 一个坐标系（行号），编辑要让 LLM 用它擅长的方式（贴代码而非数行号），改动要让人能审计（diff），路径要永远关在工作区里（安全）</strong>。四件事——友好地读、稳健地改、可审地看、安全地限——构成一个靠谱文件工具的全部。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="read"><span class="num">2</span>读文件：带行号的坐标系</h2>
+  <h3>读文件：给 LLM 一个带行号的坐标系</h3>  <p>最朴素的「读文件」就是 <code>open(path).read()</code>，把内容原样返回。但对 agent 来说这有两个问题：其一，LLM 拿到一坨没有行号的文本，后面想说「第 12 行有 bug」时它只能靠数，极易数错；其二，一个几千行的文件整读会瞬间吃掉大量上下文窗口。所以一个<strong>对 agent 友好</strong>的读文件工具要做两件事：<strong>带行号</strong>、<strong>支持按行范围读</strong>。</p>  <pre><code>def read_file(work, path, start=1, end=None):
+    full = safe_path(work, path)          # 先做路径安全校验（见第 5 节）
+    lines = open(full, encoding='utf-8').read().splitlines()
+    end = end or len(lines)
+    out = []
+    for i in range(start - 1, min(end, len(lines))):
+        out.append(f'{i+1:6d}\t{lines[i]}')   # 行号 + Tab + 原文
+    return '\n'.join(out)</code></pre>  <p>行号的格式是有讲究的：右对齐、宽度固定、用 Tab 或 <code>|</code> 与正文分隔，让 LLM（和你）一眼对齐。这与你在很多 agent 工具输出里看到的样式一致，不是偶然——它是被反复验证过的、对 LLM 最友好的呈现。带上行号后，「读」就为后续的「报错定位」「指认改动位置」建立了<strong>共同的坐标系</strong>：当 pytest 说错误在 <code>calc.py:2</code>，LLM 能立刻在带行号的读出结果里找到那一行。</p>  <p>「按范围读」则是和<strong>上下文窗口</strong>搏斗的第一招。一个真实代码库里动辄上千行的文件比比皆是，若每次读都整读，几个文件就能把窗口塞满、把 token 账单推高。更聪明的做法是分阶段：先读个开头几十行（看 import 和文件结构）、或先用模块 03 的搜索定位到关键行号、再<em>只读那一段的前后若干行</em>。这也是为什么 <code>read_file</code> 一开始就把 <code>start</code>/<code>end</code> 参数设计进去——它不是锦上添花，而是让 agent 能在有限窗口里处理大文件的<strong>基础设施</strong>。把「读多少」也交给 LLM 决策（它读完开头觉得不够再读下一段），是 ACI 设计里「让工具可分页」的典型体现。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把带行号的读文件想成给 LLM 发一张「带页码和行号的复印件」，而不是一叠散页。它要圈出哪里有问题、要你改哪一行，都能精确地指着行号说话，不会因为数错页而指错地方。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，行号把文件从一个<strong>无地址的字符流</strong>升级成一个<strong>可寻址的行序列</strong>。后续所有定位（报错的 file:line、编辑的锚点、diff 的 hunk 范围）都依赖这个地址空间。这也是为什么几乎所有成熟编码 agent 的「读」工具都默认带行号——它不是装饰，是整个改动闭环的坐标基准。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个易被忽略的细节：行号是<strong>给 LLM 看的</strong>，但当 LLM 要你<em>写回</em>内容时（比如字符串替换的旧串），它给的应该是<strong>不含行号的原始代码</strong>。所以读出的行号前缀只用于展示与定位，绝不能混进真正用于匹配/写入的内容里。把「展示用的带号文本」和「操作用的原始文本」分清楚，是写文件工具时第一个要小心的坑。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="write"><span class="num">3</span>写文件：简单但危险</h2>
+  <h3>写文件：简单，但危险</h3>  <p>「写文件」是三件工具里实现最简单的：<code>open(path, 'w').write(content)</code> 就完了。它适合一个明确的场景——<strong>创建新文件</strong>（比如 agent 要新增一个测试文件、一个配置）。但用它去<strong>修改已有文件</strong>却很危险：<code>'w'</code> 模式会把整个文件<em>覆盖</em>，意味着 LLM 必须把<strong>整份文件的完整新内容</strong>一字不差地重新生成。</p>  <p>这为什么危险？因为 LLM 在「复述长文本」时极易出错——它可能漏掉一个它没注意到的函数、改动一个不该动的缩进、或在长文件中途「偷懒」省略。一旦它生成的「完整新内容」少了原本的某部分，整体覆盖就会<strong>悄无声息地删掉那部分代码</strong>。文件越长，这个风险越大。这正是下一节「精确编辑」要解决的核心痛点。</p>  <div class="ascii">整体覆盖（write）改一个 200 行文件里的 1 行：
+   LLM 必须重新生成全部 200 行 ─┐
+   ├─ 改对了那 1 行              │  风险：另外 199 行里
+   └─ 但可能漏抄/改错其余 199 行 ─┘  任何一处抄错 = 静默损坏
+
+精确编辑（edit）改同一行：
+   LLM 只需给【旧的那几行】和【新的那几行】
+   └─ 其余 199 行原封不动，零风险</div>  <p>所以本课的纪律是：<strong>write 只用于创建新文件或确实要整体重写的小文件；修改已有文件一律走下一节的精确编辑</strong>。另外，健壮的写文件还应考虑<span class="term">atomic write</span>（原子写）：先写一个临时文件、再用 <code>os.replace</code> 改名顶替，这样即便写到一半进程崩溃，原文件也不会变成残缺的半截——要么是旧的完整版，要么是新的完整版。生产级工具几乎都这么做。</p>  <div class="callout danger"><span class="label"></span>
+    <p>整体覆盖是编码 agent 最常见的<strong>静默数据损坏</strong>来源之一：模型自信地生成「完整文件」，却在长文件里漏掉了一段，覆盖后那段代码就没了，且没有任何报错。记住：<strong>让 LLM 复述它没必要复述的内容，就是在制造出错的机会</strong>。精确编辑之所以是现代 agent 的主力，正是为了把「需要复述的内容」压到最小。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="edit"><span class="num">4</span>精确编辑：唯一匹配的字符串替换</h2>
+  <h3>精确编辑：唯一匹配的字符串替换</h3>  <p>现代编码 agent（Claude Code、aider 等）编辑代码的主力方式，既不是「整体覆盖」也不是「在第 N 行改」，而是<strong>唯一匹配的字符串替换</strong>（string-replace edit）：LLM 给出一段<strong>旧字符串</strong>（要被替换的原代码片段）和一段<strong>新字符串</strong>，工具在文件里找到旧串、替换成新串。它只要求 LLM 复述「要改的那一小段」，其余文件原封不动——风险被压到最小。</p>  <p>但这里有一个<strong>生死攸关的安全条件</strong>：旧字符串在文件里必须<strong>恰好唯一匹配</strong>。考虑两种坏情况：若旧串<strong>一次都没匹配上</strong>（可能 LLM 记错了代码、或文件已变），不该胡乱改，应当报错；若旧串<strong>匹配了不止一次</strong>（比如 <code>return x</code> 在文件里出现 3 处），那替换<strong>哪一处</strong>就有歧义——改错地方比不改更糟。所以工具必须<strong>拒绝</strong>非唯一的匹配，逼 LLM 给出更多上下文让匹配唯一。</p>  <pre><code>def edit_file(work, path, old, new):
+    full = safe_path(work, path)
+    text = open(full, encoding='utf-8').read()
+    count = text.count(old)
+    if count == 0:
+        raise ValueError('旧字符串未找到：LLM 可能记错代码，拒绝编辑')
+    if count &gt; 1:
+        raise ValueError(f'旧字符串匹配 {count} 处（有歧义）：请提供更多上下文使其唯一')
+    new_text = text.replace(old, new)     # 此时必然恰好替换 1 处
+    open(full, 'w', encoding='utf-8').write(new_text)
+    return f'已编辑 {path}：替换 1 处'</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>唯一匹配就像在一本书里改一句话：如果你说「把那句『他笑了』改成『他哭了』」，但书里有十处『他笑了』，编辑根本不知道你指哪一处。正确的做法是给出足够的上下文——「把第三章那句『听完后他笑了』改成……」——让它指向独一无二的一处。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，唯一性约束把「编辑」从一个<strong>有歧义、可能误伤</strong>的操作，变成一个<strong>确定性、可验证</strong>的操作。<code>count == 1</code> 是它的前置条件（precondition）：满足才执行，不满足就拒绝并给出可操作的错误信息（「请加上下文」）。这种<strong>宁可拒绝、不可改错</strong>的保守姿态，是安全工具的共性——把模糊的请求挡在门外，而不是赌一个可能。</p></div>
+  </div>  <p>一个常见的进阶问题：当旧串确实匹配多处、但 LLM 又懒得加上下文时怎么办？好的工具不会只甩一句「有歧义」，而会<strong>把每一处匹配所在的行号都报出来</strong>（notebook 练习 1 就做这个），于是 LLM 收到的反馈是「匹配了 3 处，分别在第 12、40、88 行」——它立刻知道该往哪段代码补上下文，下一轮就能给出唯一的旧串。这再次印证了模块 00 的原则：<strong>工具的错误信息是写给 LLM 的下一步提示</strong>，越具体、越可操作，agent 自我纠正得越快。一个只会抛 <code>ValueError: ambiguous</code> 的工具，和一个会说「在这几行，请补上下文」的工具，对 agent 成功率的影响是天壤之别。</p>  <p>还有一个实现细节常被忽视：旧串与新串里的<strong>空白与缩进必须精确</strong>。Python 对缩进敏感，LLM 给的旧串若把 4 个空格记成 Tab、或少抄了行首缩进，<code>count(old)</code> 就会返回 0（匹配不上）。所以读文件时<em>原样保留空白</em>、不做任何 strip，让 LLM 看到的就是它要匹配的；这也是为什么第 2 节强调「展示用的带号文本」与「操作用的原始文本」要分清——行号前缀是展示加的，绝不能让 LLM 把它抄进旧串里去匹配。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么不用行号编辑（「把第 42 行改成 X」）？因为行号<strong>脆弱</strong>：只要文件上方有任何增删，下方所有行号全漂移，LLM 基于旧快照给的行号立刻失效、改错地方。而字符串匹配是<strong>内容寻址</strong>的——只要那段代码还在，不管它漂到第几行都能找到。<strong>内容比位置稳定</strong>，这就是字符串替换胜出的根本原因。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pathsafe"><span class="num">5</span>路径安全：关在工作区里</h2>
+  <h3>路径安全：永远把 agent 关在工作区里</h3>  <p>现在来装第一道护栏。前面每个工具都先调用了一个 <code>safe_path(work, path)</code>——它的职责是<strong>保证 agent 的一切文件操作都不越出工作区</strong>。这不是可选的洁癖，而是<strong>安全底线</strong>：一个会写文件的 agent，如果 LLM（无论是出错还是被恶意诱导）给出 <code>../../../../etc/passwd</code> 或一个绝对路径，没有护栏的工具就会<strong>真的去读写系统文件</strong>。</p>  <p>这类攻击/事故叫 <span class="term">path traversal</span>（路径穿越）：用 <code>..</code> 逐级跳出预期目录，或直接给绝对路径。防御的正确姿势是：把目标路径与工作区拼接后，用 <code>os.path.realpath</code> 解析成<strong>规范的绝对路径</strong>（它会展开所有 <code>..</code> 和符号链接），再检查这个结果是否仍<strong>位于工作区根之下</strong>。</p>  <pre><code>def safe_path(work, path):
+    work_root = os.path.realpath(work)
+    # 把相对 path 锚定到工作区，再规范化（展开 .. 与符号链接）
+    target = os.path.realpath(os.path.join(work_root, path))
+    # 必须仍在工作区根之下，否则拒绝
+    if target != work_root and not target.startswith(work_root + os.sep):
+        raise ValueError(f'路径越界，拒绝访问：{path}')
+    return target</code></pre>  <p>注意几个易错点：① 必须用 <code>realpath</code> 而非简单的字符串拼接或 <code>normpath</code>——前者会跟随符号链接，能挡住「工作区里有个软链指向外面」这种绕过；② 前缀检查要带上 <code>os.sep</code>（即 <code>work_root + '/'</code>），否则 <code>/work_evil</code> 会被误判为在 <code>/work</code> 之内；③ 绝对路径 <code>os.path.join(root, '/etc/passwd')</code> 在 POSIX 上会<em>丢弃</em> root 直接得到 <code>/etc/passwd</code>，幸好随后的 realpath + 前缀检查能把它挡下——但你要理解这条链路为什么成立。</p>  <div class="callout danger"><span class="label"></span>
+    <p>路径校验是<strong>纵深防御</strong>的第一层，但不是唯一一层。生产 agent 还会叠加：在容器/沙箱里跑（即便越界也困在容器内）、最小文件系统权限、对破坏性操作要人确认。本课用 <code>tempfile</code> 临时目录 + <code>safe_path</code> 校验做入门级隔离——已经能挡住绝大多数事故。记住原则：<strong>永远不要信任来自 LLM 的路径，一律校验</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="diff"><span class="num">6</span>Unified diff：可审计的改动</h2>
+  <h3>Unified diff：让每一处改动都可审计</h3>  <p>装第二道护栏：让 agent 的每次改动都能被<strong>人审阅</strong>。当 agent 改完一个文件，你不该被迫去比对前后两整份文件找差异——你想要的是一份<strong>只显示改了什么</strong>的报告。这就是 <span class="term">unified diff</span>（统一差异格式，即 <code>git diff</code> / <code>diff -u</code> 的格式）。</p>  <p>Python 标准库 <code>difflib.unified_diff</code> 直接给你这个能力：传入旧内容的行列表和新内容的行列表，它产出标准的 diff 文本。其结构是固定的：<code>---</code> / <code>+++</code> 两行文件头，随后是一个或多个 <span class="term">hunk</span>（差异块），每个 hunk 以 <code>@@ -a,b +c,d @@</code> 开头（表示这段改动在旧文件第 a 行起 b 行、新文件第 c 行起 d 行），块内 <code>-</code> 开头是删除的行、<code>+</code> 开头是新增的行、空格开头是未变的上下文行。</p>  <pre><code>import difflib
+def make_diff(old_text, new_text, path):
+    diff = difflib.unified_diff(
+        old_text.splitlines(keepends=True),
+        new_text.splitlines(keepends=True),
+        fromfile=f'a/{path}', tofile=f'b/{path}')
+    return ''.join(diff)
+
+# 例：把 add 的减号改成加号，diff 一目了然：
+#   @@ -1,2 +1,2 @@
+#    def add(a, b):
+#   -    return a - b
+#   +    return a + b</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>unified diff 就像 Word 的「修订模式」：它不给你两整篇文档让你自己找不同，而是直接用红色删除线和新增高亮，把每一处改动指给你看。审阅一个 agent 的工作，看 diff 比看整份文件高效几个数量级。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，diff 把「改动」表示成一组<strong>局部、带定位的编辑操作</strong>（hunk），每个 hunk 自带行范围坐标。这让改动成为一等公民：可被展示、被审阅、被<em>应用</em>到另一份文件（<code>patch</code> / <code>git apply</code>）、被存进版本历史。SWE-bench 评测里 agent 交出的「补丁」就是这种 diff——它是 agent 工作成果的标准载体。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把 diff 摆在 agent 工作流的两个位置都极有价值：<strong>改动后</strong>生成 diff 给人审阅（透明、可回滚）；甚至<strong>改动前</strong>把「打算改的 diff」先给人确认（人在回路的安全闸）。一个让你看不见它改了什么的 agent 是不可信的——<strong>可审计性</strong>是 agent 能被放心使用的前提，而 diff 是实现它最省力的工具。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="assemble"><span class="num">7</span>拼成 agent 的手</h2>
+  <h3>把四件工具拼成 agent 的「手」</h3>  <p>现在把读、写、编辑、加上路径安全和 diff 拼起来，agent 就有了一双完整、安全、可审计的手。一次典型的「改一行 bug」流程会这样走：</p>  <ol>
+    <li><strong>读</strong>：<code>read_file('calc.py')</code> —— 带行号地看到 <code>return a - b</code> 在第 2 行，确认 bug；</li>
+    <li><strong>编辑</strong>：<code>edit_file('calc.py', 'return a - b', 'return a + b')</code> —— 唯一匹配，安全替换；</li>
+    <li><strong>审计</strong>：工具返回这次改动的 <code>unified diff</code>，你（或上层）一眼确认「只改了这一行、改对了」；</li>
+    <li><strong>（全程）</strong>：每个工具内部都先过 <code>safe_path</code>，确保操作不越出工作区。</li>
+  </ol>  <p>这套「读→改→看」的闭环，配合下一模块的 shell（跑测试）和模块 04 的循环（失败再改），就构成了编码 agent 的核心工作流。注意工具之间的<strong>协同</strong>：读带的行号给了编辑和报错共同的坐标系；编辑的唯一匹配保证不误伤；diff 让改动可见；safe_path 兜住安全底线。<em>它们不是四个孤立的函数，而是一套相互配合的接口</em>。</p>  <p>还有一个贯穿的设计哲学值得点明：<strong>每个工具都应当返回对 LLM 友好的结果</strong>——成功时简洁说明做了什么（「替换 1 处」），失败时给出<strong>可操作的</strong>错误（「匹配了 3 处，请加上下文」而非干巴巴的 <code>Exception</code>）。因为这些返回会回填进对话，成为 LLM 下一步决策的依据。一个好的错误信息能让 LLM 自己纠正（再读一遍、加上下文重试），一个糟糕的错误信息会让它原地懵圈。这正是 SWE-agent 强调的——<strong>工具的反馈是为 LLM 设计的</strong>。</p>  <p>把这套工具放回模块 00 的 agent 循环里看，它们的角色就清楚了：循环每一步，LLM 拿到的「观察」很大一部分就是这些文件工具的返回值——读出的带号代码、编辑成功的确认、或一条「请补上下文」的拒绝。<strong>工具返回什么，决定了 LLM 下一步能想到什么</strong>。所以设计文件工具时，你其实在设计 agent 的「感官质量」：给它清晰的坐标系，它就能精确指认；给它可操作的错误，它就能自我修正；给它可审计的 diff，它（和你）就能确认改对了。这就是为什么本课把「手」放在第一个深讲的模块——<em>感官与执行的接口质量，是 agent 能力的天花板</em>。</p>  <p>最后留一个伏笔：本模块的工具都是<strong>无状态、单次</strong>的——读一次、改一次、各自独立。但真实 agent 修一个 bug 往往要<strong>读好几个文件、改好几处、再反复跑测试</strong>。把这些单次工具<em>编排</em>成一个能迭代、能纠错的流程，是模块 04（edit-test-fix 循环）和模块 05（完整 agent）的任务。换句话说：本模块造的是<strong>零件</strong>，后面两个模块造的是<strong>把零件转起来的引擎</strong>。零件本身的质量（友好、安全、可审）决定了引擎能跑多稳。</p>  <div class="callout paper"><span class="label"></span>
+    <p>现实参照：aider 的「search/replace 块」就是本节字符串替换编辑的生产版；Claude Code 的文件工具同样带行号读、精确编辑、并展示 diff。把本模块的四件工具理解透，你就理解了这些产品文件层的内核。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>编辑格式之争</strong>：字符串替换、unified diff、整文件重写、行号编辑，各有取舍。哪种格式让 LLM 出错最少、token 最省，是各家 agent 持续调优的点；aider 甚至按模型能力切换编辑格式。这是一个「ACI 设计影响成败」的活例子。</li>
+    <li><strong>超大文件与超大改动</strong>：当文件几千行、或一次改动横跨多文件多处时，如何切分上下文、如何让 LLM 不迷失、如何保证多处改动一致，仍无定论。repo map（aider）、语义检索、分层编辑都是探索方向。</li>
+    <li><strong>基于 AST/LSP 的结构化编辑</strong>：字符串替换是文本级的，不懂代码结构。用 AST 或语言服务器（LSP）做「重命名这个符号的所有引用」「提取这个函数」等结构化编辑，更可靠但更复杂，是更精确编辑的前沿。</li>
+    <li><strong>改动的形式化验证</strong>：除了「测试通过」，能否在应用补丁前静态判断它不破坏类型、不引入语法错误？把类型检查、linter、甚至形式化方法接进编辑闭环，是提高 agent 改动可信度的方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：SWE-agent 论文（agent-computer interface 与工具设计原则）、Anthropic《Tool use》文档（工具如何定义与返回）、aider 的编辑格式文档（字符串替换/diff 块的生产实践）。Python <code>difflib</code>/<code>os.path</code> 官方文档是本模块工具的标准库依据。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_shell_tool/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · Shell 工具</div></a>
+  </div>
+
+</div>
+</body>
+</html>

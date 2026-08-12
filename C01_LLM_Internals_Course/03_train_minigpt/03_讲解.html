@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 从零训练 mini-GPT</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 从零训练 mini-GPT</h1>
+  <p class="subtitle">Training a mini-GPT from Scratch —— 把模块 02 的架构真正"点火"：数据管线、优化器、学习率调度与训练动力学</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（tokenizer）、模块 02（Transformer Block）、交叉熵</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_train_minigpt.ipynb（~3–5 分钟训练）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">GPT-2 [Radford 2019]、GPT-3 [Brown 2020]、AdamW [Loshchilov 2017]</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 30 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#objective">自回归语言建模目标：一个损失学出一切</a></li>
+      <li><a href="#data">数据管线：序列打包与随机窗口采样</a></li>
+      <li><a href="#loop">训练循环解剖：AdamW、调度、裁剪、混合精度</a></li>
+      <li><a href="#overfit">过拟合与正则：train/val 分叉怎么读</a></li>
+      <li><a href="#dynamics">训练动力学观察：loss 曲线与采样质量演变</a></li>
+      <li><a href="#init">初始化与稳定性：GPT-2 的 1/√N 与 ln(V) 检查</a></li>
+      <li><a href="#eval">评测视角：训练 loss ≠ 下游能力</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="objective"><span class="num">1</span>自回归语言建模目标：一个损失学出一切</h2>
+
+  <p>GPT 系列的全部训练目标只有一句话：<strong>给定前文，预测下一个 token</strong>（<span class="term">next-token prediction</span>）。
+  对长度为 $T$ 的序列 $x_{1:T}$，模型把联合概率按链式法则分解为逐位置的条件概率：</p>
+
+  <div class="math-block">
+  $$ p_\theta(x_{1:T}) = \prod_{t=1}^{T} p_\theta(x_t \mid x_{&lt;t}), \qquad
+     \mathcal{L}(\theta) = -\frac{1}{T}\sum_{t=1}^{T} \log p_\theta(x_t \mid x_{&lt;t}) $$
+  </div>
+
+  <p>这正是每个位置上对词表的<span class="term">交叉熵（cross-entropy）</span>取平均。工程上：模型输出 logits 形状 $(B, T, V)$，
+  目标是输入右移一位的 $(B, T)$，一次前向同时在 $T$ 个位置上做 $T$ 个分类问题——causal mask（模块 02）保证位置 $t$ 看不到未来。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>为什么"猜下一个词"这么一个朴素目标能学出语法、事实、推理？因为<strong>想把下一个词猜得足够准，就必须把前文真正"懂"到对应深度</strong>：
+      猜对 "Paris is the capital of ___" 需要事实；猜对一段代码的下一行需要程序语义。预测做得越好 = 对数据的压缩越狠 = 对数据生成过程的建模越准。
+      这就是"压缩即理解"视角。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>最小化交叉熵等价于最小化数据分布 $p_{data}$ 与模型分布 $p_\theta$ 的 KL 散度
+      $\mathrm{KL}(p_{data}\,\|\,p_\theta)$（两者只差一个与 $\theta$ 无关的数据熵常数）。
+      由 Shannon 信源编码定理，$\mathbb{E}[-\log_2 p_\theta(x_t\mid x_{&lt;t})]$ 正是用 $p_\theta$ 做算术编码时每 token 的最优码长（bits）。
+      <strong>语言建模 loss 就是无损压缩率</strong>。GPT-2 [Radford 2019] 的核心论断——单一 LM 目标在足够大的数据上隐式学会多任务——正建立在这一点上。</p>
+    </div>
+  </div>
+
+  <h3>困惑度 Perplexity</h3>
+  <p>报告语言模型质量时常用<span class="term">困惑度（perplexity, PPL）</span>，它就是平均交叉熵的指数：</p>
+
+  <div class="math-block">
+  $$ \mathrm{PPL} = \exp\!\left(\frac{1}{T}\sum_{t=1}^{T} -\log p_\theta(x_t\mid x_{&lt;t})\right) = e^{\mathcal{L}} $$
+  </div>
+
+  <p>解读：PPL $= k$ 意味着模型在每一步上的不确定性<em>相当于</em>在 $k$ 个等可能选项中均匀猜。随机初始化的模型 PPL $\approx V$（词表大小）；
+  PPL 越低越好，下界由数据本身的熵决定。字符级模型还常报 <span class="term">bits-per-character</span>（$\mathcal{L}/\ln 2$）。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  PPL 只能在<strong>同一 tokenizer、同一数据</strong>下比较。换 tokenizer 改变了序列长度与每步的预测难度，token 级 PPL 不可比；
+  跨 tokenizer 比较要换算到 bits-per-byte / bits-per-character 这类与切分无关的单位。这是论文里最常见的"假提升"来源之一。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="data"><span class="num">2</span>数据管线：序列打包与随机窗口采样</h2>
+
+  <p>预训练的数据管线出奇地简单——没有"样本"的概念，只有<strong>一条长 token 流</strong>：</p>
+
+  <div class="ascii">
+  原始语料 ──► tokenizer（模块 01）──► 一维 token 流 data = [t0, t1, t2, ... , tN]
+                                            │
+                  ┌─────────────────────────┴───── 按比例切（如 90/10）
+                  ▼                                          ▼
+            train 流（前 90%）                         val 流（后 10%）
+                  │
+       get_batch：随机起点 i ~ U[0, N-T)，截 T+1 个 token
+                  │
+                  ▼
+        x = data[i : i+T]          （输入）
+        y = data[i+1 : i+T+1]      （目标 = x 右移一位）
+        堆 B 份 ──► x, y 形状 (B, T) ──► 模型 ──► T 个位置同时算交叉熵
+  </div>
+
+  <ul>
+    <li><strong>序列打包（packing）</strong>：把所有文档拼成一条流（文档间插入分隔 token，如 GPT-2 的 <code>&lt;|endoftext|&gt;</code>），
+    每个长度为 $T$ 的窗口都被填满，没有 padding 浪费。代价是一个窗口可能横跨两篇文档——大规模预训练通常接受这一点。</li>
+    <li><strong>随机窗口采样</strong>：每步从流上均匀随机取起点，而不是按顺序扫描。这近似 i.i.d. 采样，降低相邻 step 梯度间的相关性。</li>
+    <li><strong>train/val 切分</strong>：留出一段模型<em>从未见过</em>的流做验证。val loss 是本章一切诊断（过拟合、checkpoint 选择）的依据。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>切分必须在"流"的层面、且在去重之后做。</strong>如果先切窗口再随机分 train/val，相邻窗口大量重叠，val 实际上就是 train 的近副本——
+  val loss 会漂亮得毫无意义。语料内部的重复段落（模板、boilerplate）同样会让泄漏悄悄发生。第 7 节给出检查方法。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="loop"><span class="num">3</span>训练循环解剖：AdamW、调度、裁剪、混合精度</h2>
+
+  <p>一个标准 GPT 训练 step 的五个动作：取 batch → 前向算 loss → 反向算梯度 → 裁剪梯度 → 按当前学习率更新。逐个拆开：</p>
+
+  <h3>3.1 AdamW：为什么要 decoupled weight decay</h3>
+  <p>经典 L2 正则把 $\frac{\lambda}{2}\|\theta\|^2$ 加进 loss，于是 $\lambda\theta$ 混进梯度、再被 Adam 的自适应分母
+  $\sqrt{\hat v_t}$ 重新缩放——<strong>历史梯度大的参数实际几乎不受正则约束</strong>，正则强度变得不可控。
+  AdamW [Loshchilov 2017] 把衰减从梯度里解耦出来，直接作用在参数上：</p>
+
+  <div class="math-block">
+  $$ \theta_{t+1} = \theta_t - \eta_t\left(\frac{\hat m_t}{\sqrt{\hat v_t}+\epsilon} + \lambda\,\theta_t\right) $$
+  </div>
+
+  <p>其中 $\hat m_t, \hat v_t$ 是梯度的一阶/二阶矩估计（含偏差修正）。解耦后每个参数都受到同等比例的收缩，
+  weight decay 与学习率才能独立调参。这是 GPT-2/GPT-3 以来 LLM 训练的默认优化器。
+  实践细节：<strong>weight decay 只施加在矩阵权重上</strong>，bias、LayerNorm 增益、embedding 通常不衰减。</p>
+
+  <h3>3.2 学习率调度：warmup + cosine</h3>
+  <div class="math-block">
+  $$ \eta_t = \begin{cases}
+       \eta_{max}\cdot \dfrac{t+1}{t_{warm}} & t &lt; t_{warm} \\[2mm]
+       \eta_{min} + \tfrac{1}{2}(\eta_{max}-\eta_{min})\left(1+\cos\!\dfrac{\pi\,(t-t_{warm})}{t_{max}-t_{warm}}\right) & t \ge t_{warm}
+     \end{cases} $$
+  </div>
+  <ul>
+    <li><strong>warmup</strong>：训练初期 Adam 的二阶矩估计 $\hat v_t$ 噪声极大，且随机初始化下损失面陡峭；从小学习率线性爬升给统计量"热身"时间，避免开局就把参数打飞。</li>
+    <li><strong>cosine 衰减</strong>：后期逐步降低步长，让参数稳定收敛进平坦盆地。GPT-3 [Brown 2020] 即采用 warmup + cosine 衰减到 $0.1\,\eta_{max}$ 的配方，至今仍是主流默认。</li>
+  </ul>
+
+  <h3>3.3 梯度裁剪与混合精度</h3>
+  <ul>
+    <li><span class="term">gradient clipping</span>：若全局梯度范数 $\|g\|_2 &gt; c$（常取 $c{=}1.0$），整体缩放 $g \leftarrow c\,g/\|g\|_2$。
+    它不改变梯度方向，只限制单步位移，是对抗 loss spike 的第一道保险。监控被裁剪的频率本身就是健康度指标：频繁触发说明学习率过大或数据有异常。</li>
+    <li><span class="term">混合精度（mixed precision）</span>（概念，本章 CPU 实验不用）：前向/反向用 bf16/fp16 省一半显存与带宽，
+    主权重与优化器状态保留 fp32 累加避免舍入误差累积；fp16 因指数位少需配 loss scaling，bf16 与 fp32 同指数范围、现已成为默认。</li>
+  </ul>
+
+  <table>
+    <thead><tr><th>组件</th><th>解决什么问题</th><th>典型默认</th><th>设错的症状</th></tr></thead>
+    <tbody>
+      <tr><td>AdamW</td><td>自适应步长 + 可控正则</td><td>$\beta=(0.9, 0.95)$，wd $=0.1$（仅矩阵）</td><td>L2 混入梯度 → 正则失效、泛化变差</td></tr>
+      <tr><td>warmup</td><td>开局二阶矩噪声大、损失面陡</td><td>总步数的 1–3%</td><td>太短 → 开局 loss spike / 发散</td></tr>
+      <tr><td>cosine decay</td><td>后期收敛进平坦区域</td><td>衰减到 $0.1\,\eta_{max}$</td><td>不衰减 → loss 后期震荡不降</td></tr>
+      <tr><td>grad clip</td><td>压制罕见的巨梯度</td><td>$c=1.0$</td><td>无裁剪 → 偶发 spike 毁掉训练</td></tr>
+      <tr><td>混合精度</td><td>显存/带宽减半</td><td>bf16 计算 + fp32 主权重</td><td>fp16 无 scaling → 梯度下溢为 0</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="overfit"><span class="num">4</span>过拟合与正则：train/val 分叉怎么读</h2>
+
+  <p>在小数据上训练，迟早会看到经典的"剪刀差"：train loss 一路向下，val loss 先降后<strong>转头向上</strong>——
+  模型从学习<em>分布的规律</em>滑向背诵<em>训练集的具体内容</em>。分叉点就是泛化的拐点。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  判读三连：<strong>① 看间隙</strong>（train/val gap 持续扩大 = 记忆化进行中）；<strong>② 看 val 的方向</strong>（val 还在降 → 还能训；val 回升 → 已过拟合）；
+  <strong>③ 看数据量与参数量之比</strong>。本章 notebook 的 mini-GPT 约 0.1M 参数对约 20KB 字符数据，每个字符在 1000 步里被看上百遍——这正是为了让你<em>亲眼看到</em>分叉。
+  现代 LLM 预训练大多只过 1–2 个 epoch，单 epoch 内 train loss 近似就是 val loss，过拟合表现为对重复数据的逐字记忆而非曲线分叉。</div>
+
+  <p>对策按性价比排序：</p>
+  <ul>
+    <li><strong>加数据 / 去重</strong>：最根本。重复样本是记忆化的头号催化剂。</li>
+    <li><strong>早停（early stopping）</strong>：以 val loss 最低点为停止/选点依据——它不改变模型，只改变你取哪个 checkpoint，零成本。</li>
+    <li><strong><span class="term">dropout</span></strong>：训练时以概率 $p$ 随机置零激活（推断时关闭），迫使表征冗余化。GPT-2 用 $p{=}0.1$；
+    而今天的大规模单 epoch 预训练普遍设 $p{=}0$——数据见一遍就丢，没什么可背的，dropout 反而浪费容量。小数据 finetune 时它依然有用。</li>
+    <li><strong>weight decay</strong>：见 3.1，限制参数范数增长。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="dynamics"><span class="num">5</span>训练动力学观察：loss 曲线与采样质量演变</h2>
+
+  <p>盯着 loss 数字不如理解它的<strong>形状</strong>。健康的 LM 训练曲线在对数步数轴上近似分段：开局从 $\ln V$ 快速跌落（模型先学会
+  unigram 频率——哪些 token 常见），随后进入缓慢的幂律式下降（学 bigram、词形、短语、长程结构，越往后每个 nat 越贵）。
+  loss 的微小下降对应样本质量的巨大变化，因为 $e^{\mathcal{L}}$ 是指数关系。</p>
+
+  <p>字符级 mini-GPT 的采样质量随训练的典型演变（notebook 中你会亲眼看到）：</p>
+
+  <table>
+    <thead><tr><th>阶段</th><th>val loss（字符级，V≈65）</th><th>样本长相</th><th>模型学会了什么</th></tr></thead>
+    <tbody>
+      <tr><td>step 0</td><td>≈ ln 65 ≈ 4.17</td><td>均匀乱码：<code>q;X!zR-Kd</code></td><td>什么都没有</td></tr>
+      <tr><td>早期</td><td>≈ 3.0–2.5</td><td>字符频率对了，出现空格节奏：<code>te aon hsr in</code></td><td>unigram/bigram 统计</td></tr>
+      <tr><td>中期</td><td>≈ 2.2–1.8</td><td>伪英文单词与真词混杂：<code>the wast of ming</code></td><td>词形、拼写规则</td></tr>
+      <tr><td>后期</td><td>≈ 1.6 以下</td><td>局部连贯短语、对白格式、人名大写——有了"风格"</td><td>短语搭配、文体结构</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  这个"乱码 → 词形 → 局部连贯 → 风格"的阶梯在任何规模上都成立——GPT-2/GPT-3 只是用百万倍的算力把阶梯延伸到了"事实、推理、in-context learning"。
+  能力是随 loss 下降<strong>分层涌现</strong>的：模型总是先吃掉最便宜的统计规律，再啃更贵的结构。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="init"><span class="num">6</span>初始化与稳定性：GPT-2 的 1/√N 与 ln(V) 检查</h2>
+
+  <h3>6.1 残差投影缩放</h3>
+  <p>残差流（residual stream）是逐层<strong>累加</strong>的：每个 block 的 attention 输出投影和 MLP 输出投影各往流里加一笔。
+  $N$ 层模型共有 $2N$ 次残差相加，若每笔贡献方差相同，流的方差随深度线性膨胀为 $2N$ 倍。GPT-2 [Radford 2019] 的对策：
+  把<strong>残差路径上的输出投影</strong>（attn 的 <code>c_proj</code> 与 MLP 的 <code>c_proj</code>）初始化标准差额外乘以 $1/\sqrt{2N}$：</p>
+
+  <div class="math-block">
+  $$ \mathrm{Var}\!\left[\sum_{i=1}^{2N} r_i\right] = 2N\,\sigma^2
+     \;\;\xrightarrow{\;\sigma \to \sigma/\sqrt{2N}\;}\;\; 2N\cdot\frac{\sigma^2}{2N} = \sigma^2 $$
+  </div>
+
+  <p>即无论多深，初始化时残差流的方差保持 $O(1)$，深模型开局不再自带数值放大器。其余权重用 $\mathcal{N}(0, 0.02^2)$。</p>
+
+  <h3>6.2 开训前最便宜的 sanity check：初始 loss ≈ ln(V)</h3>
+  <p>随机初始化、logits 接近零时，softmax 接近均匀分布，于是每个位置的交叉熵应当约为：</p>
+
+  <div class="math-block">
+  $$ \mathcal{L}_0 \approx -\log\frac{1}{V} = \ln V \qquad (V=65 \Rightarrow \mathcal{L}_0 \approx 4.17)$$
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  开训前先 assert 这一条（notebook 里我们真的这么做）。初始 loss <strong>显著高于</strong> $\ln V$ → 初始化方差过大或 logits 没归零（检查最后一层）；
+  <strong>显著低于</strong> $\ln V$ → 几乎必然是标签泄漏：shift 写错、causal mask 没生效，模型"看见了答案"。
+  这个 10 秒检查拦截过无数个写错 mask 的训练任务——在烧钱的真实预训练里尤其值钱。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>评测视角：训练 loss ≠ 下游能力</h2>
+
+  <p>对做 evaluation 的研究者，本章最重要的迁移知识是：<strong>loss 是必要的体检表，不是能力证书</strong>。</p>
+
+  <ul>
+    <li><strong>loss 与能力非线性挂钩。</strong>同一 val loss 下，数据配比不同的两个模型，下游表现可以差很远（代码占比高的模型 loss 略高但编程强得多）。
+    GPT-3 [Brown 2020] 的核心评测方法论是直接在下游任务上测 zero/few-shot 表现，而非只报 PPL——能力的某些跃迁（如 in-context learning）在 loss 曲线上几乎不可见。</li>
+    <li><strong>checkpoint 选择要看你关心的指标。</strong>默认拿 val loss 最低的 checkpoint；但若目标是下游任务，应在候选 checkpoint 上直接跑下游评测再选。
+    val loss 最低点与下游最优点经常不重合，尤其在 finetune 场景。</li>
+    <li><strong>数据泄漏到 val 的检查</strong>是评测可信度的地基：
+      <ol style="margin:6px 0 0">
+        <li>n-gram 重叠扫描：对每个 val 窗口查其 n-gram（如 13-gram）是否出现在 train 流中，统计污染率——GPT-2/GPT-3 论文均做了此类去污分析；</li>
+        <li>对照实验：把一段 train 数据故意混入 val，确认其 loss 显著低于干净 val——验证你的检测手段真的灵；</li>
+        <li>警惕"好得可疑"：val loss 异常接近 train loss、或某 benchmark 分数远超同规模模型，先查泄漏再庆祝。</li>
+      </ol>
+    </li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  GPT-2 [Radford 2019] 附录专门分析了 WebText 与各测试集的 8-gram 重叠率；GPT-3 [Brown 2020] 则因预训练抓取污染了部分 benchmark，
+  不得不在论文中对每个任务报告"干净子集"上的分数。<strong>泄漏分析自此成为大模型评测的标准动作</strong>——这正是评测研究者的职责所在。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>loss 之外的训练期能力预测。</strong>能否在训练早期从内部信号（曲线形状、表征几何）预测下游能力与涌现拐点，而不是训完才评？
+    对评测者：这决定了"训练中评测（in-training eval）"能否成为安全闸门。</li>
+    <li><strong>数据配比与课程（curriculum）。</strong>同等算力下，混多少代码/多语言/合成数据最优？数据顺序是否重要？
+    目前主要靠小模型代理实验外推，外推的可靠性本身就是开放问题。</li>
+    <li><strong>记忆化与隐私的度量。</strong>模型何时从泛化滑向逐字记忆？可提取记忆（extractable memorization）如何随规模、重复次数缩放？
+    对评测者：canary 注入 + 提取率测量已是隐私评测的标准工具。</li>
+    <li><strong>训练不稳定性的机理。</strong>大模型训练中的 loss spike 至今没有完整理论；裁剪、重启、跳 batch 都是经验性补丁。
+    spike 前后模型行为是否变化，也值得评测关注。</li>
+    <li><strong>污染防御的军备竞赛。</strong>n-gram 重叠查不出改写/翻译后的泄漏；基于 embedding 的语义查重与 benchmark 私有化（动态出题）是活跃方向。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>写出自回归语言建模的损失函数，并解释"最小化交叉熵 = 最优压缩"的论证链条；PPL = 20 是什么含义？</li>
+      <li>AdamW 与 "Adam + L2" 的更新式差在哪里？为什么解耦后 weight decay 才可控？</li>
+      <li>初始 loss 显著低于 $\ln V$ 时，你首先怀疑什么？GPT-2 的 $1/\sqrt{2N}$ 残差缩放解决了什么问题？</li>
+      <li>给你一条漂亮的 val loss 曲线，你还需要做哪些检查才敢相信这个模型（泄漏、checkpoint 选择、下游验证）？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../02_attention_transformer/02_讲解.html"><div class="dir">← 上一章</div><div class="t">02 · 手写 Attention 与 Transformer Block</div></a>
+    <a class="next" href="../04_decoding/04_讲解.html"><div class="dir">下一章 →</div><div class="t">04 · 解码策略全手写</div></a>
+  </div>
+
+</div>
+</body>
+</html>

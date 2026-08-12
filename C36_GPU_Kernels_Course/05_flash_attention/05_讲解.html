@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · FlashAttention 内核</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · FlashAttention 内核</h1>
+  <p class="subtitle">把分块（03）与在线 softmax（04）拼成一个内核：永不 materialize n×n 分数矩阵，显存 O(n²)→O(n)，精确等于朴素注意力 —— 这门课的集大成</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 03 分块、模块 04 在线 softmax、注意力数学（C01）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_flash_attention.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Dao 2022 (FlashAttention)、Dao 2023 (FA-2)、Shah 2024 (FA-3)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#naive">朴素注意力的瓶颈：n×n 矩阵爆显存</a></li>
+      <li><a href="#io">IO 感知：数字节，不数 FLOPs</a></li>
+      <li><a href="#idea">核心思想：分块 + 在线 softmax + 输出累加器</a></li>
+      <li><a href="#recur">递推公式的精确推导</a></li>
+      <li><a href="#exact">为什么它是精确的（不是近似）</a></li>
+      <li><a href="#account">显存与 IO 账：O(n²)→O(n)</a></li>
+      <li><a href="#backward">反向重算与因果掩码</a></li>
+      <li><a href="#fa23">FlashAttention-2/3 与工程演进</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="naive"><span class="num">1</span>朴素注意力的瓶颈：n×n 矩阵爆显存</h2>
+  <p>我们终于到了这门课的<strong>终点站</strong>，也是它存在的理由。前四个模块准备的所有零件——执行模型（01）、合并访问（02）、分块复用（03）、在线 softmax（04）——在这里组装成一个真实改变了深度学习格局的内核：<span class="term">FlashAttention</span>。</p>  <p>先把朴素注意力写清楚。给定查询、键、值矩阵 <code>Q, K, V ∈ ℝ^{n×d}</code>，注意力的定义是：</p>  <div class="math-block">\[O = \mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d}}\right)V\]</div>  <p>直接照着公式实现，会经历三步：先算出<strong>分数矩阵</strong> <code>S = QKᵀ/√d ∈ ℝ^{n×n}</code>，再对每一行做 softmax 得到<strong>概率矩阵</strong> <code>P ∈ ℝ^{n×n}</code>，最后 <code>O = P·V</code>。问题就藏在中间那两个 <code>n×n</code> 矩阵里。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>注意力的计算量（FLOPs）其实只随 <code>n</code> 平方、<code>d</code> 一次方增长，本身不算夸张。真正要命的是<strong>中间矩阵的体积</strong>：你必须把一个 <code>n×n</code> 的大方阵实实在在地写进显存、再读出来。序列一长，这个方阵比模型本身还大。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>设序列长 <code>n=32768</code>，单个注意力头的 <code>S</code> 矩阵就是 <code>32768² ≈ 10⁹</code> 个元素，FP16 下约 <strong>2 GB</strong>。再叠上多头、批量、还有同样大的 <code>P</code>，显存瞬间爆炸。这就是为什么在 FlashAttention 出现前，长上下文几乎不可行。</p></div>
+  </div>  <div class="callout danger"><span class="label">一句话抓住本质</span>
+    <p>最关键的认知（贯穿本模块）：<strong>注意力是访存受限的，瓶颈是把 S、P 这两个 n×n 矩阵反复读写 HBM，而不是算它们</strong>。回忆模块 00 的脊点——硬件每搬 1 字节有空算几百个浮点。注意力的算术强度很低，时间几乎全花在 HBM 往返上。所以让注意力变快的正确方向不是「少算」，而是<strong>根本不把那个大矩阵落到 HBM</strong>。</p>
+  </div>  <p>把这句话再说透一点：朴素实现的失败不在数学，而在<em>内存调度</em>。它天真地把每一步的中间结果都 materialize 到 global memory，于是产生了 <code>Θ(n²)</code> 的显存占用和 <code>Θ(n²)</code> 的 HBM 读写。FlashAttention 的全部智慧，就是在<strong>一次都不写出完整 S</strong>的前提下，算出与朴素实现逐位相同的 <code>O</code>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="io"><span class="num">2</span>IO 感知：数字节，不数 FLOPs</h2>
+  <p>FlashAttention 论文（Dao et al. 2022）的副标题点出了它的灵魂——<strong>IO-Awareness</strong>（IO 感知）。这是一种与传统算法分析不同的视角。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>传统算法课教你数<em>运算次数</em>（FLOPs），仿佛每次运算代价相同。但在 GPU 上，从 HBM 取一个数的代价是做一次乘法的几百倍。所以真正该数的是<strong>你搬了多少字节进出 HBM</strong>。FlashAttention 的 FLOPs 并不比朴素少（因为分块在线 softmax 还要重算一些 exp，甚至略多），却快好几倍——因为它把 HBM 访问砍掉了一个数量级。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>用 <code>M</code> 记 SRAM（shared memory）的大小。两种实现的 HBM 访问复杂度：朴素是 <code>Θ(nd + n²)</code>（要写读完整 S/P）；FlashAttention 是 <code>Θ(n²d²/M)</code>。当 <code>d² &lt; M</code>（典型情形，比如 <code>d=64</code>、SRAM 上百 KB）时，后者远小于前者，这正是加速的来源。注意两者 FLOPs 同为 <code>Θ(n²d)</code>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>打个比方：朴素注意力像把一整本书抄到草稿纸上、再从草稿纸誊回；FlashAttention 像<strong>读一段、记几个关键数、就扔掉这段</strong>，全程只在脑子（SRAM）里维护几个运行统计量，从不把整本草稿留下。算的内容一样多，但省掉了海量的「写草稿、读草稿」往返。</p>
+  </div>  <p>这个范式的影响远超注意力本身。它告诉性能工程师：<strong>当一个算子访存受限时，重新设计算法去减少 HBM 往返，往往比优化算术单元利用率收益大得多</strong>。算子融合、kernel fusion、乃至整个编译器（torch.compile / Triton）自动融合的思路，都是这条原理的延伸。FlashAttention 之所以成为经典，一半是因为它解决了长上下文，另一半是因为它把「IO 感知」立成了一面旗帜。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="idea"><span class="num">3</span>核心思想：分块 + 在线 softmax + 输出累加器</h2>
+  <p>现在讲 FlashAttention 怎么做到「不写出完整 S」。核心是把模块 03 的<strong>分块</strong>与模块 04 的<strong>在线 softmax</strong>拼起来，再加一个小零件。</p>  <p>回忆 softmax 的麻烦：要归一化一整行，似乎必须先看完该行所有分数（求出最大值与指数和）。但模块 04 的在线 softmax 证明了：可以<strong>流式</strong>地维护两个运行量——运行最大值 <code>m</code> 与运行归一化和 <code>l</code>——每来一段新分数就用校正因子更新它们，无需先看完整行。</p>  <p>FlashAttention 把这套搬到注意力上，多维护一个东西：<strong>运行输出累加器</strong> <code>O</code>。算法骨架是：</p>  <div class="ascii">对每个 query（行），把 K、V 沿序列维切成块，流式扫过每个块 j：
+
+  维护三个运行状态（只占 O(d) 空间，常驻 SRAM/寄存器）：
+    m  —— 到目前为止见过的最大分数（在线 softmax 的 max）
+    l  —— 到目前为止的指数和（在线 softmax 的归一化分母）
+    O  —— 到目前为止的加权输出累加器（新零件！）
+
+  来一个 K/V 块 j：
+    1. 算这一小块的分数  S_j = Q · K_jᵀ / √d   （只有 n×块宽，绝不是 n×n）
+    2. 用 S_j 的局部最大值更新 m → m_new
+    3. 校正因子 corr = exp(m_old − m_new)，把旧的 l 和 O 缩放到新基准
+    4. l ← corr·l + sum(exp(S_j − m_new))
+    5. O ← corr·O + exp(S_j − m_new) · V_j
+
+  扫完所有块后：  O ← O / l   （最后一次性归一化）</div>  <div class="callout intuition"><span class="label"></span>
+    <p>和模块 04 唯一的新东西是第 5 步那个<strong>输出累加器 O</strong>。在线 softmax 原本只维护标量 m、l；注意力还要维护一个 <code>d</code> 维的加权和 <code>O</code>。关键在于：每当最大值刷新，不仅 <code>l</code> 要乘校正因子回缩，<code>O</code> 也要乘同一个 <code>corr</code> 回缩——因为 <code>O</code> 里已累加的项是以旧的 <code>m</code> 为指数基准的，必须对齐到新基准。想通这一点，FlashAttention 就通了。</p>
+  </div>  <p>注意整个过程中，最大的临时量是当前那一个 K/V 块（<code>块宽×d</code>）和运行状态（<code>n×d</code> 的 O 加 <code>n</code> 的 m、l）。<strong>完整的 n×n 分数矩阵从未在任何时刻存在过</strong>——它被切成一个个小块，用完即弃。</p>  <h4>跑一遍：两个 KV 块的输出累加</h4>  <p>用最小例子看 O 怎么被校正。设 <code>d=1</code>、某 query 对两个 KV 块的分数分别是块1=<code>[1]</code>（值 <code>v=10</code>）、块2=<code>[3]</code>（值 <code>v=20</code>）。逐块走：</p>  <ol>
+    <li>块1：<code>m=1, l=e^{1-1}=1, O=e^{0}·10=10</code>。此时 <code>O/l=10</code>（只看过块1，对）。</li>
+    <li>块2：新分数 3 > 旧 m=1，故 <code>m_new=3</code>，校正因子 <code>corr=e^{1-3}=e^{-2}≈0.135</code>。<strong>先把旧 l、O 都乘 corr 回缩</strong>：<code>l=0.135·1+e^{3-3}=1.135</code>，<code>O=0.135·10+e^{0}·20=1.35+20=21.35</code>。</li>
+    <li>归一化：<code>O/l = 21.35/1.135 ≈ 18.81</code>。</li>
+  </ol>  <p>验算朴素：权重 <code>∝[e^1, e^3]</code> 归一化后 ≈ <code>[0.119, 0.881]</code>，输出 <code>0.119·10+0.881·20 ≈ 18.81</code>——<strong>逐位吻合</strong>。关键在第 2 步：<code>O</code> 和 <code>l</code> <strong>同时</strong>乘了校正因子 corr，因为 O 里已累加的 10 是以旧基准 m=1 算的指数，max 一变就必须对齐到新基准。漏掉对 O 的这次缩放，结果会变成错误的 <code>10+20=30</code> 一类——不报错，只是悄悄错。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="recur"><span class="num">4</span>递推公式的精确推导</h2>
+  <p>把上面的骨架写成精确的递推。对某一个 query，设把键/值分成 <code>T</code> 块，逐块 <code>j = 1, …, T</code> 处理。记处理到第 <code>j</code> 块后的运行状态为 <code>m_j, l_j, O_j</code>，初始 <code>m_0 = -∞, l_0 = 0, O_0 = 0</code>。</p>  <h3>4.1 单块更新</h3>  <p>第 <code>j</code> 块带来一小段分数 <code>S_j = q·K_jᵀ/√d</code>（一个行向量，长度=块宽）。更新规则：</p>  <div class="math-block">\[\begin{aligned}
+m_j &= \max\big(m_{j-1},\ \max(S_j)\big) \\[2pt]
+\tilde p_j &= \exp\big(S_j - m_j\big) \qquad(\text{本块对齐到新最大值的指数}) \\[2pt]
+\text{corr}_j &= \exp\big(m_{j-1} - m_j\big) \qquad(\text{把旧状态拉到新基准的校正因子}) \\[2pt]
+l_j &= \text{corr}_j\cdot l_{j-1} + \textstyle\sum \tilde p_j \\[2pt]
+O_j &= \text{corr}_j\cdot O_{j-1} + \tilde p_j\, V_j
+\end{aligned}\]</div>  <p>最后一块处理完，做一次归一化得到该 query 的输出：</p>  <div class="math-block">\[O = \frac{O_T}{l_T}\]</div>  <div class="callout warn"><span class="label"></span>
+    <p>校正因子 <code>corr_j = exp(m_{j-1} − m_j) ∈ (0, 1]</code> 是整段递推的灵魂，也是最容易写错的地方。它出现在<strong>两处</strong>：缩放 <code>l</code>（归一化分母）和缩放 <code>O</code>（输出累加器）。漏掉对 <code>O</code> 的缩放是最常见的 bug——结果不会报错，只会悄悄算错。本模块 notebook 用 <code>np.allclose</code> 对拍朴素实现，正是为了在第一时间抓住这种沉默的错误。</p>
+  </div>  <h3>4.2 对照 Triton 内核：递推长什么样</h3>  <p>这段递推几乎是一比一地落进真实的 Triton 内核内层循环。下面的伪代码旁注把上面的数学翻译成代码，你会发现它和数学公式逐行对应：</p>  <pre><code># Triton 风格：一个 program 处理一个 query 块，内层扫 K/V 块
+m = -inf; l = 0.0; acc = zeros(BLOCK_M, d)        # 运行状态 (m, l, O)
+for j in range(0, n_keys, BLOCK_N):               # 流式扫每个 K/V 块
+    k = tl.load(K_ptr + j); v = tl.load(V_ptr + j)
+    s = tl.dot(q, k.T) * scale                    # S_j = qKⱼᵀ/√d，绝非 n×n
+    m_new = tl.maximum(m, tl.max(s, axis=1))      # 刷新行最大值
+    corr  = tl.exp(m - m_new)                     # 校正因子 exp(m_old−m_new)
+    p     = tl.exp(s - m_new[:, None])            # 本块对齐到新基准的指数
+    l     = corr * l + tl.sum(p, axis=1)          # 缩放旧 l，加本块和
+    acc   = corr[:, None] * acc + tl.dot(p, v)    # 同一 corr 缩放 O，加本块输出
+    m     = m_new
+acc = acc / l[:, None]                            # 扫完所有块，一次性归一化</code></pre>  <p>注意 <code>corr</code> 在两行里各出现一次（缩放 <code>l</code> 与缩放 <code>acc</code>），与 4.1 的两条更新式严丝合缝；<code>tl.dot</code> 调用底层 Tensor Core，整段没有任何 <code>n×n</code> 的临时张量。<strong>把数学递推、ASCII 骨架、这段 Triton 伪代码三者对读，FlashAttention 的实现就彻底透明了</strong>。</p>  <h3>4.3 数值稳定性</h3>  <p>注意每一步的指数都是 <code>exp(S_j − m_j)</code>，因为 <code>m_j</code> 是当前见过的最大值，指数的自变量恒 <code>≤ 0</code>，<code>exp</code> 永远落在 <code>(0, 1]</code>，<strong>绝不溢出</strong>。这与模块 04 的稳定 softmax 同源——FlashAttention 天生数值稳定。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="exact"><span class="num">5</span>为什么它是精确的（不是近似）</h2>
+  <p>FlashAttention 不是近似！它给出与朴素 softmax 注意力<strong>逐位相同</strong>的结果（浮点误差内）。这里给出简短证明，理解了它你就彻底信任这个内核。</p>  <p>记 <code>m* = m_T</code> 为整行的全局最大值（扫完所有块后），<code>s_k</code> 为该 query 对第 <code>k</code> 个键的分数。断言：扫完所有块、归一化前的累加器恰好是</p>  <div class="math-block">\[O_T = \sum_{k} \exp(s_k - m^*)\, v_k, \qquad l_T = \sum_{k} \exp(s_k - m^*)\]</div>  <p>为什么？关键在校正因子的<strong>望远镜式相消</strong>。某个键 <code>k</code> 在它所属的块被处理时，以当时的最大值 <code>m_j</code> 为基准、贡献了 <code>exp(s_k − m_j)·v_k</code>。之后每刷新一次最大值（从 <code>m_j</code> 到 <code>m_{j+1}</code>……直到 <code>m*</code>），这一项都被乘一次 <code>corr = exp(m_old − m_new)</code>。把这一串校正因子连乘：</p>  <div class="math-block">\[\exp(s_k - m_j)\cdot\prod_{\text{之后每次刷新}}\exp(m_{\text{old}}-m_{\text{new}}) = \exp(s_k - m_j)\cdot\exp(m_j - m^*) = \exp(s_k - m^*)\]</div>  <div class="callout intuition"><span class="label"></span>
+    <p>中间所有的 <code>m_j</code> 像望远镜的套筒一样<strong>两两相消</strong>，只剩头尾——每一项最终都被<em>精确地</em>对齐到全局最大值 <code>m*</code> 这个统一基准。于是 <code>O_T = Σ exp(s_k − m*) v_k</code>、<code>l_T = Σ exp(s_k − m*)</code>，两者一除，<code>m*</code> 约掉，得到 <code>Σ softmax(s)_k v_k</code>——正是朴素注意力的定义。分块与流式没有引入任何近似。</p>
+  </div>  <p>这就是为什么本模块 notebook 能理直气壮地写 <code>assert np.allclose(flash, naive, atol=1e-10)</code>：不是「差不多」，而是数学上严格相等，只差浮点舍入。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="account"><span class="num">6</span>显存与 IO 账：O(n²)→O(n)</h2>
+  <p>现在算两笔账，把「为什么更快」量化。</p>  <h3>6.1 显存：O(n²) → O(n)</h3>  <p>朴素实现的峰值显存被 <code>n×n</code> 的 S（和 P）支配：<code>Θ(n²)</code>。FlashAttention 在任意时刻只需要：输出 <code>O</code>（<code>n×d</code>）、运行统计量 <code>m、l</code>（各 <code>n</code>）、以及当前一个 K/V 块（<code>块宽×d</code>）。在 <code>n²</code> 这个量级上，这是 <strong>Θ(n)</strong>——序列长度的线性，而非平方。</p>  <table>
+    <thead><tr><th>量</th><th>朴素</th><th>FlashAttention</th></tr></thead>
+    <tbody>
+      <tr><td>分数矩阵 S</td><td><code>n×n</code> 落 HBM</td><td>切块，从不完整存在</td></tr>
+      <tr><td>峰值显存（n² 量级）</td><td><code>Θ(n²)</code></td><td><code>Θ(n)</code></td></tr>
+      <tr><td>HBM 访问</td><td><code>Θ(n² + nd)</code></td><td><code>Θ(n²d²/M)</code></td></tr>
+      <tr><td>FLOPs</td><td><code>Θ(n²d)</code></td><td><code>Θ(n²d)</code>（略多，重算 exp）</td></tr>
+      <tr><td>数值稳定</td><td>需减最大值</td><td>天生稳定（在线 max）</td></tr>
+    </tbody>
+  </table>  <h3>6.2 IO：把往返摊薄</h3>  <p>HBM 访问的差距来自分块复用。每个 K/V 块从 HBM 读进 SRAM 后，被所有 query 复用；通过选块宽使工作集恰好填满 SRAM（<code>M</code>），总的 HBM 读写降到 <code>Θ(n²d²/M)</code>。<code>M</code> 越大、<code>d</code> 越小，省得越多。这与模块 03 的 tiling 是同一种「搬一次、复用多次」的智慧。</p>  <p>代一组数字感受这个数量级差距。设 <code>n=8192, d=64</code>、SRAM <code>M≈100 KB</code>。朴素实现光是写一遍、再读一遍 <code>n×n</code> 的分数矩阵，就要搬 <code>2×8192²×4 ≈ 0.5 GB</code>；而 FlashAttention 的 <code>Θ(n²d²/M)</code> 约为 <code>8192²×64²×?/M</code> 量级——因为 <code>d²=4096 &lt; M</code>，每个 KV 块进 SRAM 后被所有 query 复用，总 HBM 流量比朴素小一个数量级。<strong>FLOPs 两者都是 &lt;code&gt;Θ(n²d)&lt;/code&gt;、几乎相等，差距全在搬运</strong>。这就是为什么同样的数学，FlashAttention 能快 2–4 倍而朴素实现还动辄 OOM。</p>  <div class="callout warn"><span class="label"></span>
+    <p>别误读这两笔账：FlashAttention<strong>不是用更少的计算换速度</strong>，它的 FLOPs 甚至略多于朴素（在线 softmax 要重算指数）。它快，纯粹因为<strong>HBM 访问少了一个数量级</strong>。这再次印证模块 00 的世界观：在访存受限的算子上，省 IO 远比省 FLOPs 值钱。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="backward"><span class="num">7</span>反向重算与因果掩码</h2>
+  <p>前向讲完，简述训练要用的两个工程要点：反向传播的重算技巧，与因果掩码的分块处理。</p>  <h3>7.1 反向传播：用重算换显存</h3>  <p>反向传播需要概率矩阵 <code>P</code> 来算梯度。但 FlashAttention 前向<strong>根本没存 P</strong>（那正是它省显存的关键）。怎么办？<span class="term">重算</span>（recomputation）：</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>前向时额外存一个极小的东西——每个 query 行的 <strong>LSE</strong>（<code>log-sum-exp = m + log l</code>，每行一个标量）。反向时，凭 <code>Q, K, V</code> 和这个 LSE，可以<strong>即时重新算出</strong>需要的那一块 P，用完即弃。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这是用<strong>额外 FLOPs 换显存</strong>的经典权衡（gradient checkpointing 的思想）。存一个 <code>n×n</code> 的 P 要 <code>Θ(n²)</code> 显存；存一个 LSE 只要 <code>Θ(n)</code>。重算的算力开销，在访存受限的注意力上几乎被 IO 的节省完全掩盖。</p></div>
+  </div>  <h3>7.2 因果掩码：分块带来的免费加速</h3>  <p>自回归模型要因果掩码（每个 query 只能看自己及之前的键）。分块结构让掩码处理变得很自然，还顺带省一半计算：</p>  <div class="ascii">把 (query 块, key 块) 看成棋盘：
+
+   key块→   过去    对角    未来
+  query块         
+    ↓     ┌──────┬──────┬──────┐
+          │ 全算  │掩码后 │ 整块  │
+          │ 无需  │ 算    │ 跳过  │
+          │ 掩码  │(逐元素)│(全 -∞)│
+          └──────┴──────┴──────┘
+
+  · 纯过去块：query 全部看得见 key，整块照算，无需任何掩码
+  · 对角块  ：部分可见，需逐元素掩码（上三角置 -∞）
+  · 纯未来块：query 全都看不见 key，整块直接跳过 —— 省掉约一半计算！</div>  <div class="callout danger"><span class="label"></span>
+    <p>因果 + 分块 + 在线 softmax 的组合有一个<strong>数值陷阱</strong>：若某个 query 行在某块里所有键都被掩成 <code>-∞</code>，且此前也没见过任何可见键（<code>m</code> 仍是 <code>-∞</code>），那么 <code>exp(-∞ − (−∞)) = exp(nan)</code> 会产生 NaN。正确实现要加<strong>防御性 guard</strong>：把 <code>m_new</code> 为 <code>-∞</code> 的行在做减法时替换成 0，并把被掩元素的概率直接置 0。本模块 notebook 的因果版本演示了这套 guard，并对拍朴素因果注意力验证无 NaN、结果一致。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fa23"><span class="num">8</span>FlashAttention-2/3 与工程演进</h2>
+  <p>FlashAttention 的故事没有停在 2022。理解后续版本，能看到「同一个算法，工程化还能压榨多少」。</p>  <table>
+    <thead><tr><th>版本</th><th>关键改动</th><th>收益</th></tr></thead>
+    <tbody>
+      <tr><td>FlashAttention (2022)</td><td>分块 + 在线 softmax，IO 感知</td><td>显存 O(n²)→O(n)，首次让长上下文可行</td></tr>
+      <tr><td>FlashAttention-2 (2023)</td><td>把 Q 放外层循环、减少非矩阵乘运算、改进 warp 间任务划分</td><td>更高并行度，逼近 GEMM 的硬件利用率，约再快 2×</td></tr>
+      <tr><td>FlashAttention-3 (2024)</td><td>Hopper 异步拷贝（TMA）、warp 专门化、FP8 低精度</td><td>用异步与流水把算与搬重叠，新一代吞吐与精度前沿</td></tr>
+    </tbody>
+  </table>  <p>一个值得玩味的细节：<strong>FA-2 调换了循环顺序</strong>。最初版本以 K/V 块为外层；FA-2 改成 query 块为外层、K/V 块为内层。这样每个 query 块的运行状态可以一直留在寄存器里、扫完所有 K/V 才写一次输出，减少了对运行状态的反复读写。本模块 notebook 的 numpy 实现就采用「query 全程在外、K/V 块在内层循环」的 FA-2 风格，与真实内核的结构一致。</p>  <p>另一条分支是<strong>推理场景的 FlashDecoding</strong>：自回归解码时每步只有一个新 query（<code>n_q=1</code>），此时该并行的不是 query 而是<strong>沿 KV 序列切分</strong>、再把各段的在线 softmax 状态合并。这正是本模块练习里「合并两段注意力状态」要练的能力——它是把 FlashAttention 用到生产推理的钥匙（接 C24 推理服务）。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>从 FA-1 到 FA-3 的主线，是把延迟隐藏（模块 01）和数据复用（模块 02/03）越做越极致：用异步拷贝让「搬下一块」和「算这一块」真正重叠，用 warp 专门化让不同 warp 分工搬与算。你在本课学到的每一个零件，都在这条演进线上反复出现——FlashAttention 不是终点，而是这套思想方法的一个高峰。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>最后看注意力内核的开放问题与前沿方向：</p>  <ul>
+    <li><strong>稀疏与块稀疏注意力</strong>：长上下文下，能否只算「重要」的 KV 块（block-sparse、滑窗、压缩 KV）？这把 IO 感知与稀疏结构结合，是超长上下文的活跃方向。</li>
+    <li><strong>注意力变体 × Flash</strong>：GQA/MLA（C20）改变了 KV 的形状与共享方式；把 FlashAttention 适配到这些变体（尤其 MLA 的低秩 KV 与解耦 RoPE）需要重新设计分块，是工程热点。</li>
+    <li><strong>分页与变长</strong>：真实推理里序列变长、KV cache 分页存储（PagedAttention / vLLM）。如何在非连续的 KV 上保持合并访问与高效分块，仍在演进。</li>
+    <li><strong>精确性的边界</strong>：FP8 甚至更低精度下，在线 softmax 的数值稳定性、校正因子的累积误差如何控制（FA-3 的课题）？低精度与精确注意力的张力是前沿。</li>
+    <li><strong>长上下文（接 C25）</strong>：FlashAttention 让 32k、128k 乃至百万级上下文在显存上可行，但「可行」不等于「有效」——位置编码外推、注意力的有效感受野是另一层问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Dao et al. 2022（FlashAttention 原始，本模块主线）、Dao 2023（FlashAttention-2，循环重排与并行）、Shah et al. 2024（FlashAttention-3，异步与 FP8）、Milakov & Gimelshein 2018（在线 softmax，递推的前身）、Rabe & Staats 2021（O(1) 显存注意力的并行推导）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_reductions_softmax/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 并行规约与融合 softmax</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

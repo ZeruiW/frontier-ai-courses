@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 线性注意力与 SSM</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 线性注意力与 SSM</h1>
+  <p class="subtitle">算力墙的另一条路：彻底换掉 softmax。核特征映射 φ + 矩阵乘结合律把 O(n²) 降成 O(n)，因果版就是固定状态的 RNN；SSM/Mamba 把序列建模写成线性扫描——代价是有损压缩</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02/03、矩阵乘结合律、注意力、一点点 RNN/线性系统直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_linear_ssm.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Katharopoulos 2020 (线性注意力)、Gu 2021 (S4)、Gu&Dao 2023 (Mamba)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#idea">彻底换掉 softmax：核技巧与结合律</a></li>
+      <li><a href="#math">结合律如何把 n×n 变成 d×d</a></li>
+      <li><a href="#rnn">因果版：线性注意力就是 RNN</a></li>
+      <li><a href="#phi">特征映射 φ 的选择与局限</a></li>
+      <li><a href="#ssm">从线性注意力到 SSM 与 Mamba</a></li>
+      <li><a href="#tradeoff">线性 vs 二次的真实权衡</a></li>
+      <li><a href="#modern">现代线性模型：缩小差距</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="idea"><span class="num">1</span>彻底换掉 softmax：核技巧与结合律</h2>
+  <p>稀疏注意力（模块 03）把 <code>O(n²)</code> 降到 <code>O(n·W)</code>，但它仍保留 softmax 注意力的<strong>形式</strong>——只是少算了一些连接。本模块走一条更激进的路：<strong>彻底换掉 softmax</strong>，让注意力的复杂度从根上变成<strong>线性</strong> <code>O(n)</code>。这就是<span class="term">linear attention</span>（线性注意力）和它的近亲 <span class="term">SSM</span>（状态空间模型）。</p>  <p>先看清 softmax 注意力的复杂度卡在哪。注意力是 <code>O = softmax(QKᵀ)V</code>（略去 <code>/√d</code>）。那个 <code>QKᵀ</code> 是 <code>n×n</code> 的，必须先把它整个算出来（softmax 是逐行非线性，绕不过），再乘 V。<strong>是 softmax 这个非线性，逼着我们 materialize 那个 n×n 矩阵</strong>——这正是二次复杂度的根源。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>关键的「假如」：如果没有 softmax，注意力就是三个矩阵连乘 <code>(QKᵀ)V</code>。而矩阵乘有<strong>结合律</strong>——我可以改成先算 <code>KᵀV</code>（一个小小的 <code>d×d</code> 矩阵）再乘 Q！这样就<em>完全绕开了那个 n×n 的大家伙</em>。复杂度从 <code>O(n²d)</code> 变成 <code>O(nd²)</code>，当 <code>d≪n</code> 时是巨大的胜利。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但 softmax 不是线性的，不能简单地把它挪到结合律外面。线性注意力的核心技巧是：用一个<strong>特征映射</strong> <code>φ</code> 去<em>近似</em> softmax 的指数相似度，即 <code>softmax 的核 exp(qᵀk) ≈ φ(q)ᵀφ(k)</code>。一旦相似度能写成 <code>φ(q)ᵀφ(k)</code> 这种「内积」形式，结合律就解锁了。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住线性注意力：<strong>用核技巧把 softmax 的指数相似度换成 φ(q)·φ(k) 这种内积，从而能用矩阵乘结合律先算 d×d 的 KᵀV、绕开 n×n</strong>。复杂度 <code>O(n²d) → O(nd²)</code>，对长序列（<code>n</code> 几十万、<code>d</code> 才几十）是数量级的提速。代价是 <code>φ</code> 只是 softmax 的<em>近似</em>——这是线性注意力质量略逊于 softmax 的根源，也是它和稀疏（保留 softmax 形式）的本质区别。</p>
+  </div>  <p>把本课降复杂度的两条路对照清楚，对建立判断很重要。<strong>稀疏（模块 03）保留 softmax、只是少算连接</strong>——它仍是「真注意力」，每个被保留的连接都精确计算，只是别的不算；<strong>线性（本模块）连 softmax 都换掉</strong>——它改变了注意力的数学形式本身，用一个近似核换来线性复杂度。前者像「只读重点段落」（读的都是原文），后者像「读一遍后只记一份摘要」（之后只看摘要）。两者都能降复杂度，但损失的性质不同：稀疏漏的是「没看的连接」，线性损的是「摘要的失真」。理解这个区别，你才能判断一个长上下文任务该用哪条路——需要精确远程检索的，稀疏（+全局 token）通常比纯线性稳。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="math"><span class="num">2</span>结合律如何把 n×n 变成 d×d</h2>
+  <h3>数学：结合律如何把 n×n 变成 d×d</h3>  <p>把（非因果的）线性注意力写清楚。用特征映射 <code>φ</code> 后，第 <code>i</code> 个 query 的输出是：</p>  <div class="math-block">\[o_i = \frac{\sum_{j} \big(\varphi(q_i)^\top\varphi(k_j)\big)\,v_j}{\sum_{j}\varphi(q_i)^\top\varphi(k_j)} = \frac{\varphi(q_i)^\top\sum_{j}\varphi(k_j)\,v_j^\top}{\varphi(q_i)^\top\sum_{j}\varphi(k_j)}\]</div>  <p>看右边那步重排——这是全模块的数学核心。分子里 <code>φ(q_i)ᵀ</code> 与 <code>j</code> 无关，可以<strong>提到求和外面</strong>；于是 <code>Σ_j φ(k_j)v_jᵀ</code> 变成一个<strong>与 i 无关、只需算一次</strong>的 <code>d_φ×d</code> 矩阵（记作 <code>S</code>），分母里 <code>Σ_j φ(k_j)</code> 是一个 <code>d_φ</code> 维向量（记作 <code>z</code>）。所有 query 共享这同一个 <code>S</code> 和 <code>z</code>：</p>  <div class="math-block">\[S = \sum_{j}\varphi(k_j)\,v_j^\top\ \ (d_\varphi\times d),\qquad z = \sum_{j}\varphi(k_j)\ \ (d_\varphi),\qquad o_i = \frac{\varphi(q_i)^\top S}{\varphi(q_i)^\top z}\]</div>  <p>这就是 <code>(φ(Q)φ(K)ᵀ)V = φ(Q)(φ(K)ᵀV)</code> 结合律的逐元素写法。算 <code>S</code> 和 <code>z</code> 要扫一遍所有 <code>j</code>（<code>O(n)</code>），算每个 <code>o_i</code> 是常数次矩阵-向量乘（<code>O(1)</code> 关于 n），总共 <code>O(n)</code>。<strong>n×n 矩阵彻底消失了</strong>。</p>  <p>结合律换来的胜利有多大？用具体数字算两种乘法顺序的 FLOPs。取 <code>n=100000</code>、<code>d=64</code>（且 <code>d_φ=d</code>）：</p>  <div class="ascii">先算 (φQ·φKᵀ) 再乘 V —— softmax 那样的顺序：
+  φQ·φKᵀ : n×d_φ 乘 d_φ×n  →  ~ n²·d_φ = 10⁵·10⁵·64 = 6.4×10¹¹ 次
+  之后还要 (n×n)·(n×d) 再来一个 n²·d……  总量 ~ 10¹² 量级
+
+先算 (φKᵀ·V) 再乘 φQ —— 线性注意力的顺序：
+  φKᵀ·V  : d_φ×n 乘 n×d  →  ~ n·d_φ·d = 10⁵·64·64 = 4.1×10⁸ 次
+  φQ·(d_φ×d) : n×d_φ 乘 d_φ×d → ~ n·d_φ·d = 4.1×10⁸ 次
+  总量 ~ 8×10⁸ 量级</div>  <p>差距约 <strong>三个数量级</strong>（<code>10¹²</code> vs <code>10⁸</code>）——而且这个比例正是 <code>n/d ≈ 100000/64 ≈ 1500</code>。同一个数学量、同一个结果，只因为<strong>改了矩阵相乘的顺序</strong>，复杂度就从 <code>O(n²d)</code> 塌缩成 <code>O(nd²)</code>。这就是「结合律是线性注意力全部魔法之源」的字面意思：魔法不在近似 φ 本身，而在 φ <em>解锁了</em>把昂贵的 <code>n×n</code> 中间矩阵替换成廉价的 <code>d×d</code> 中间矩阵的自由。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个易错点：线性注意力的分母（归一化项）<code>φ(q_i)ᵀz</code><strong>不能省</strong>。它替代了 softmax 的归一化，保证输出是 value 的凸组合（不会爆炸）。漏掉它或写错，输出会失去归一化、数值发散。notebook 对拍二次形式时，分子分母都要对上才算正确——这是验证线性注意力实现的关键检查点。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rnn"><span class="num">3</span>因果版：线性注意力就是 RNN</h2>
+  <h3>因果版：线性注意力就是一个 RNN</h3>  <p>上面是非因果（每个 query 看所有 key）。但语言模型要<strong>因果</strong>——query <code>i</code> 只能看 <code>j ≤ i</code> 的 key。这看似破坏了「<code>S</code> 对所有 i 相同」的前提，但恰恰带来了线性注意力<strong>最优美的性质</strong>。</p>  <p>因果下，第 <code>i</code> 个 query 用的不是全局 <code>S</code>，而是<strong>只累加到 i 为止</strong>的前缀和 <code>S_i = Σ_{j≤i} φ(k_j)v_jᵀ</code>。而前缀和可以<strong>递推</strong>地维护：</p>  <div class="math-block">\[S_i = S_{i-1} + \varphi(k_i)\,v_i^\top,\qquad z_i = z_{i-1} + \varphi(k_i),\qquad o_i = \frac{\varphi(q_i)^\top S_i}{\varphi(q_i)^\top z_i}\]</div>  <div class="ascii">因果线性注意力 = RNN（固定大小状态 S 沿时间展开）：
+
+  x_1        x_2        x_3              x_n
+   │          │          │                │
+   ▼          ▼          ▼                ▼
+ [S_0]→[ S_1 ]→[ S_2 ]→[ S_3 ]→ ... →[ S_n ]   状态 S：固定 d×d，与 n 无关
+   0    +φk₁v₁ᵀ  +φk₂v₂ᵀ  +φk₃v₃ᵀ        每步只加一个外积
+          │          │          │                │
+          ▼          ▼          ▼                ▼
+         o_1=       o_2=       o_3=             o_n=
+       φq₁ᵀS₁/·   φq₂ᵀS₂/·   φq₃ᵀS₃/·         φqₙᵀSₙ/·   读出：每步 O(d²)
+
+  对比 softmax 注意力：第 n 步要回看全部 n 个 KV（cache 随 n 膨胀）</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这是一个不折不扣的 <strong>RNN</strong>（循环神经网络）！<code>S_i</code> 是<strong>状态</strong>（一个固定大小 <code>d_φ×d</code> 的矩阵），每来一个 token 就把它更新一下、读出一个输出。状态大小<strong>与序列长度无关</strong>——无论序列多长，记忆都压在这一个固定矩阵里。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这就是 Katharopoulos et al. 2020 的名篇标题《Transformers are RNNs》的含义：线性注意力的因果版<strong>等价于一个线性 RNN</strong>。训练时可以像 Transformer 一样并行（用前缀和），推理时可以像 RNN 一样递推——<strong>每步 O(1) 时间、O(1) 内存</strong>（状态大小固定），不像 softmax 注意力解码时要存越来越长的 KV cache。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>对长上下文来说，这个「固定大小状态」是革命性的：softmax 注意力解码到第 <code>n</code> 步要回看全部 <code>n</code> 个 KV（KV cache 随 n 膨胀，模块 05 的 KV 墙），而线性注意力解码每步只更新一个固定矩阵——<strong>KV cache 没了，换成一个常数大小的状态</strong>。这是线性模型在长序列推理上对 Transformer 的根本优势。但天下没有免费的午餐：把无限长的历史压进固定大小的状态，必然<em>丢信息</em>——这正是线性模型在「需要精确回忆某个远处细节」的任务上常输给 softmax 的原因（精确检索要 KV cache 那种「无损全记」）。</p>
+  </div>  <p>把「固定状态」对解码内存的意义用数字钉死。设 <code>d=64</code>、<code>d_φ=64</code>，则线性注意力的状态 <code>S</code> 是一个 <code>64×64</code> 矩阵 ≈ 4096 个数，<strong>无论序列是 1k 还是 1M，它恒定就这么大</strong>。对比 softmax 的 KV cache：每个 token 要存 K、V 各 <code>d</code> 维，到第 <code>n</code> 步累计 <code>2nd</code> 个数——<code>n=1k</code> 时 ≈ 128k 个数，<code>n=1M</code> 时 ≈ 1.28 亿个数。也就是说，序列从 1k 涨到 1M，<strong>softmax 的解码内存涨了 1000 倍，线性注意力纹丝不动</strong>。这条「内存随长度的平坦线 vs 线性上升线」，就是线性/SSM 在超长解码上对 Transformer 的杀手锏，也正是模块 05「KV 墙」要为 softmax 苦苦压缩的那堵墙——而线性模型从结构上就没有这堵墙。</p>  <p>「训练并行、推理递推」这个<strong>双形态</strong>值得专门强调，它是线性注意力实用性的关键。同一个数学对象有两种等价算法：训练时序列已知，可以用前缀和<em>一次性并行</em>算出所有 <code>S_i</code>（像 Transformer 一样吃满 GPU）；推理时逐 token 到来，用递推<em>一步步更新</em>状态（像 RNN 一样 O(1)）。softmax 注意力做不到这种统一——它训练时是 <code>O(n²)</code> 并行、推理时是带 KV cache 的 <code>O(n)</code> 每步，两种形态都比线性贵。这种「训练像 Transformer、推理像 RNN」的双重身份，正是 SSM/线性模型最诱人的工程卖点。notebook 里你写的递推版对应推理形态，对拍的二次版对应训练形态——它们逐位相等，正是双形态等价的证明。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="phi"><span class="num">4</span>特征映射 φ 的选择与局限</h2>
+  <h3>特征映射 φ 的选择</h3>  <p>线性注意力的质量<strong>全看 φ 把 softmax 核近似得好不好</strong>。常见选择：</p>  <table>
+    <thead><tr><th>特征映射 φ</th><th>形式</th><th>特点</th></tr></thead>
+    <tbody>
+      <tr><td>elu+1</td><td><code>φ(x)=elu(x)+1</code></td><td>Katharopoulos 原版；简单、保证非负，但近似较粗</td></tr>
+      <tr><td>正随机特征 (Performer)</td><td><code>φ(x)=exp(Wx-‖x‖²/2)/√m</code></td><td>无偏逼近 softmax 核，近似好但需随机投影</td></tr>
+      <tr><td>ReLU / 平方等</td><td><code>φ(x)=relu(x)</code> 等</td><td>各种简单非线性，质量参差</td></tr>
+    </tbody>
+  </table>  <p>一个<strong>硬性约束</strong>：<code>φ</code> 的输出必须<strong>非负</strong>（或至少让 <code>φ(q)ᵀφ(k)</code> 非负）。因为它要替代 <code>exp(qᵀk)</code> 这个恒正的相似度——若 <code>φ(q)ᵀφ(k)</code> 出现负值，注意力权重会变负、归一化会出问题。这就是为什么 <code>elu+1</code>（恒正）是经典选择，而直接用 <code>φ(x)=x</code>（可正可负）不行。</p>  <p>线性注意力的<strong>根本局限</strong>也藏在 φ 里：任何固定的有限维 φ 都只能<em>近似</em> softmax 核，无法完全复现。尤其是 softmax 的「尖锐」选择性（强烈关注某一个 key）很难被低维 φ 表达——这导致线性注意力在需要<strong>精确、稀疏的注意力</strong>（如精确检索）的任务上吃亏。现代线性模型（下一节）正是用各种手段（门控、衰减、更大状态）来弥补这个软肋。</p>  <p>为什么尖锐性这么难近似？softmax 里的 <code>exp</code> 是<em>无界</em>的——当某个 <code>qᵀk</code> 很大时，它能把几乎全部注意力权重压到那一个 key 上（接近 one-hot）。而 <code>φ(q)ᵀφ(k)</code> 是有限维内积，其「峰值锐度」受 <code>φ</code> 的维度限制，做不到任意尖锐。直觉上：低维 φ 给每个 key 的「相似度打分」分辨率有限，难以在众多 key 中干净利落地挑出唯一一个。这就是为什么「正随机特征」（Performer）要用较高的特征维度去逼近 <code>exp</code> 核——维度越高，越能逼近 softmax 的尖锐，但也越接近 <code>O(n²)</code> 的代价。<strong>锐度与效率，是 φ 设计里绕不开的此消彼长</strong>。</p>  <p>具体感受一下「非负约束」为何不可妥协：若偷懒用 <code>φ(x)=x</code>（恒等映射），取 <code>φ(q)=[1,-1]</code>、某个 <code>φ(k)=[−1,1]</code>，则 <code>φ(q)ᵀφ(k)=−2</code>——一个<strong>负</strong>的「相似度」。它替代的 <code>exp(qᵀk)</code> 本该恒正，负值会让这个 key 在分母 <code>Σφ(q)ᵀφ(k)</code> 里做<em>减法</em>，归一化项可能趋零甚至变号，输出瞬间发散。<code>elu(x)+1</code> 恒大于 0，从根上杜绝了这种灾难——这就是它成为经典默认的原因，也是 notebook 里把 φ 选错会立刻看到 NaN 的来由。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个数值细节：线性注意力的状态 <code>S_i</code> 是不断累加的，长序列下可能<strong>数值增大</strong>。加上分母 <code>φ(q)ᵀz_i</code> 同步增大，理论上输出仍有界（凸组合）。但实践中要注意累加的数值稳定（如适当归一化 φ）。这与 softmax 注意力天生的「减最大值」稳定性不同——线性注意力的稳定性需要额外照料。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ssm"><span class="num">5</span>从线性注意力到 SSM 与 Mamba</h2>
+  <h3>从线性注意力到 SSM 与 Mamba</h3>  <p>「固定大小状态 + 线性递推」这个范式，比线性注意力更广——它就是 <span class="term">SSM</span>（状态空间模型）的核心。SSM 用一个经典的线性系统建模序列：</p>  <div class="math-block">\[h_t = A\,h_{t-1} + B\,x_t,\qquad y_t = C\,h_t\]</div>  <p><code>h_t</code> 是隐状态，<code>A</code> 控制「记多久」（状态如何衰减/传递），<code>B</code> 控制「写入什么」，<code>C</code> 控制「读出什么」。这和线性注意力的递推<strong>结构一致</strong>（都是固定状态的线性更新），只是 SSM 的视角来自控制论/信号处理。</p>  <p>SSM 的演进解决了两个关键问题：</p>  <ul>
+    <li><strong>S4（Gu et al. 2021）</strong>：用特殊结构的 <code>A</code>（HiPPO 初始化、对角+低秩）让 SSM 能高效记住<em>超长</em>依赖，并发现它可写成<strong>卷积形式</strong>（训练时并行）和<strong>递推形式</strong>（推理时 O(1)）两种等价计算——兼得并行训练与高效推理。</li>
+    <li><strong>Mamba（Gu &amp; Dao 2023）</strong>：S4 的 <code>A,B,C</code> 是固定的（与输入无关），无法「按内容选择记什么」。Mamba 让 <code>B,C</code>（及步长）<strong>随输入变化</strong>（selective），赋予模型<em>内容寻址</em>能力——补上了线性模型最大的软肋。配硬件感知的<strong>选择性扫描</strong>（并行前缀扫描），性能可与 Transformer 媲美。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>Mamba 的「选择性」直击线性模型的死穴。固定 <code>A,B,C</code> 的 SSM/线性注意力像一个<em>不会区分轻重</em>的记忆——什么都按同样方式塞进状态。Mamba 让模型能根据当前 token 决定「这个要重点记、那个可以忘」，于是固定大小的状态被用得更聪明，在长序列上的表现大幅提升。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但即便 Mamba，与 Transformer 相比仍有取舍：固定状态意味着<strong>有限的「工作记忆」</strong>，对需要精确回忆大量分散细节的任务（如多针检索，模块 05 的 RULER）仍可能不如能「无损全记」的 softmax 注意力。所以前沿趋势是<strong>混合架构</strong>——大部分层用线性/SSM（省、快），少数层用 softmax 注意力（精确检索），取两者之长。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把模块 02 和本模块连起来看，会有顿悟：FlashAttention 的 online softmax 维护「运行的 m、l、O」，线性注意力维护「运行的状态 S、z」——<strong>两者都是「流式维护固定大小运行量」的算法</strong>。区别在于：online softmax 是为了<em>精确</em>重算 softmax（不丢信息，故仍需回看全部 KV）；线性递推是<em>有损</em>地把历史压进固定状态（丢信息，但换来 O(1) 状态）。Dao & Gu 2024 甚至证明了线性注意力与 SSM 的对偶——它们本是一家。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">6</span>线性 vs 二次的真实权衡</h2>
+  <h3>复杂度与适用场景：线性 vs 二次的真实权衡</h3>  <p>把线性注意力与 softmax 注意力的复杂度并排，看清各自的甜区：</p>  <table>
+    <thead><tr><th></th><th>softmax 注意力</th><th>线性注意力 / SSM</th></tr></thead>
+    <tbody>
+      <tr><td>训练时间</td><td><code>O(n²d)</code></td><td><code>O(nd²)</code> 或 <code>O(nd·state)</code></td></tr>
+      <tr><td>训练显存</td><td><code>O(n²)</code>（FlashAttn O(n)）</td><td><code>O(nd)</code></td></tr>
+      <tr><td>解码每步时间</td><td><code>O(nd)</code>（回看全 KV）</td><td><code>O(d²)</code>（更新固定状态）</td></tr>
+      <tr><td>解码内存（KV）</td><td><code>O(nd)</code> 随 n 膨胀</td><td><code>O(d²)</code> 固定！</td></tr>
+      <tr><td>质量 / 精确检索</td><td>强（无损全记）</td><td>弱（有损压缩）</td></tr>
+    </tbody>
+  </table>  <p>读这张表的正确方式：<strong>线性/SSM 在「长序列、看重吞吐与解码内存」时赢；softmax 在「需要精确回忆分散细节」时赢</strong>。解码那两行尤其关键——这正是长上下文<em>推理</em>的核心痛点：softmax 的 KV cache 随长度线性膨胀（模块 05 要压缩它），而线性模型的状态是固定的。对一个要处理百万级上下文、又看重解码速度/内存的场景，线性/SSM 的诱惑力巨大。</p>  <p>一个帮助决策的思维模型：把它看成<strong>「无损全记」与「有损摘要」之争</strong>。softmax + KV cache 是无损的——每个历史 token 的 K、V 都原样存着，需要时能精确取回任意一个（代价是存储随长度线性增长）。线性/SSM 是有损的——历史被持续压进一个固定大小的状态，新信息不断覆盖旧信息（代价是无法精确取回任意远处的细节，但存储恒定）。于是问题归结为：你的任务<em>更像「需要随时精确翻查全部历史」，还是更像「维持一个不断更新的概要就够」</em>？前者（法律检索、多跳问答）选 softmax；后者（流式摘要、对话状态跟踪）线性/SSM 可能更优。多数真实系统两种需求都有，这就是混合架构成为前沿答案的根本原因。</p>  <div class="callout danger"><span class="label"></span>
+    <p>但别被「线性更快」冲昏头。<strong>线性注意力是近似，且把无限历史压进固定状态必然丢信息</strong>。在「大海捞针」「多跳推理」这类需要精确提取远处特定信息的长上下文任务上（模块 05 的 NIAH/RULER），纯线性模型常明显落后于 softmax。这就是为什么截至目前，最强的长上下文模型大多仍以 softmax 注意力为主、或采用混合架构。线性/SSM 是极有前景的方向，但「用固定状态替代 KV cache」的信息损失是它必须面对的根本张力——评测（模块 05）会无情地暴露这一点。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="modern"><span class="num">7</span>现代线性模型：缩小差距</h2>
+  <h3>现代线性模型：缩小与 Transformer 的差距</h3>  <p>近年大量工作在「保持 O(n)」的前提下，给线性注意力加各种增强，逼近 softmax 的质量：</p>  <ul>
+    <li><strong>门控与衰减（GLA、RetNet）</strong>：给状态递推加一个（可学习或固定的）衰减因子 <code>S_i = γ·S_{i-1} + φ(k_i)v_iᵀ</code>，让旧信息按比例遗忘，模拟「近处更重要」的先验，并提升数值稳定。</li>
+    <li><strong>分块并行扫描</strong>：纯递推是串行的（不利于 GPU 训练）。把序列分块，块内用结合律并行、块间递推，兼得 <code>O(n)</code> 与硬件并行度。这是现代线性模型/Mamba 高效训练的关键工程。</li>
+    <li><strong>选择性（Mamba）</strong>：参数随输入变化，赋予内容寻址能力（上一节）。</li>
+    <li><strong>更大的状态</strong>：固定状态越大，能记的信息越多。用更大的 state size 换更好的质量，是缓解信息损失的直接手段。</li>
+    <li><strong>混合架构</strong>：少数层插入 softmax 注意力（负责精确检索），其余用线性/SSM（负责高效）。Jamba 等已证明这条路实用——是当前调和「快」与「准」的主流答案。</li>
+  </ul>  <p>实践中的选择：<strong>纯线性/SSM</strong>适合超长、吞吐优先、对精确检索要求不高的场景；<strong>混合架构</strong>是想要「接近 softmax 质量 + 接近线性效率」时的现实之选；<strong>纯 softmax + FlashAttention + 稀疏/KV 压缩</strong>（前三模块）仍是当前生产级长上下文最稳妥、检索最强的组合。线性化是一条<em>正在快速逼近</em>但尚未完全追平 softmax 的路——理解它的机制与局限，你才能判断一个新模型的「线性」宣称到底意味着什么。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>能否完全追平 softmax？</strong>：线性/SSM 在语言建模困惑度上已接近 Transformer，但在精确检索、上下文学习（in-context learning）等能力上仍有差距。固定状态的信息容量是否存在根本上限，是核心理论问题。</li>
+    <li><strong>状态-检索权衡的理论</strong>：把长度 n 的历史压进大小 m 的状态，理论上能保留多少信息？这是线性模型表达力的根本边界，与 RULER 等评测的实证表现需要对上。</li>
+    <li><strong>线性与注意力的统一</strong>：Mamba-2 揭示了线性注意力与 SSM 的对偶（structured state space duality）。能否在统一框架下自由组合两者之长，是活跃方向。</li>
+    <li><strong>混合架构的最优配比</strong>：多少层用注意力、多少用 SSM、放在哪些位置？目前多靠实验，缺乏理论指导。</li>
+    <li><strong>硬件协同</strong>：选择性扫描、分块并行扫描的高效内核仍在演进（类比 FlashAttention 之于注意力）。线性模型要真正普及，需要同样成熟的内核生态。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Katharopoulos et al. 2020（线性注意力 = RNN，本模块主线）、Choromanski et al. 2020（Performer，随机特征 φ）、Gu et al. 2021（S4，SSM 奠基）、Gu & Dao 2023（Mamba，选择性 SSM，前沿落点）、Dao & Gu 2024（Mamba-2，线性注意力与 SSM 的对偶）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_sparse_attention/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 稀疏与滑窗注意力</div></a>
+    <a class="next" href="../05_kv_compression/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · KV 压缩与长上下文评测</div></a>
+  </div>
+
+</div>
+</body>
+</html>

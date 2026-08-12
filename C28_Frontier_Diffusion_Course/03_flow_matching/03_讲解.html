@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · Flow Matching 与 Rectified Flow</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · Flow Matching 与 Rectified Flow</h1>
+  <p class="subtitle">把生成看成把噪声沿 ODE 流到数据 —— flow matching 的回归式训练、直线插值路径、与扩散的统一视角、rectified flow 的 reflow 拉直，SD3/Flux 已全面采用</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01/02、扩散基础（C16）、常微分方程直觉、最小二乘/回归</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_flow_matching.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Lipman 2023 (Flow Matching)、Liu 2023 (Rectified Flow)、Song 2021 (PF-ODE)、SD3</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">从去噪到流动：flow matching 的视角</a></li>
+      <li><a href="#field">速度场与概率路径：生成即搬运</a></li>
+      <li><a href="#cfm">conditional flow matching：训练为何这么简单</a></li>
+      <li><a href="#straight">直线路径：rectified flow 的灵魂</a></li>
+      <li><a href="#unify">flow 与扩散：其实是一家</a></li>
+      <li><a href="#reflow">reflow：把轨迹拉直，逼近单步</a></li>
+      <li><a href="#toy">把玩具跑起来：2D rectified flow</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>从去噪到流动：flow matching 的视角</h2>
+  <p>到目前为止（模块 01/02），我们一直把生成当成「<strong>加噪—去噪</strong>」：定义一个把数据搅成高斯的随机过程，再学网络一步步逆转它。这套框架（DDPM）能用、好用，但它的数学包袱不轻——要推前向后验、要算变分下界（ELBO）、要设计噪声表、采样还得跑几十上百步随机微分方程。2023 年起，前沿实验室（SD3、Flux）几乎集体转向了一个<strong>更简洁、更快</strong>的框架：<span class="term">flow matching</span>（流匹配）。</p>  <p>flow matching 的视角是<strong>几何的、确定性的</strong>：把生成看成把一团噪声<em>沿着一条路径平滑地搬运</em>成数据。想象噪声分布是一摊水、数据分布是另一摊水，flow matching 学的是一个<strong>速度场</strong>（每个位置、每个时刻水该往哪流、流多快），然后从噪声出发、沿着这个速度场积分一个常微分方程（ODE），就把噪声「流」成了数据。没有随机性、没有 ELBO、训练只是一个朴素的回归。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：扩散像「先把照片泡进显影液搅浑，再学怎么把浑汤一点点还原成照片」，过程曲折、要试很多次（多步）。flow matching 像「直接学一张地图：从任意一团噪声，怎么沿最顺的路走到对应的图」。地图（速度场）学好后，照着走几步就到——路越直，步数越少。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：设噪声分布 <code>p_0</code>、数据分布 <code>p_1</code>，flow matching 选一条连接它们的<strong>概率路径</strong> <code>p_t</code>（<code>t∈[0,1]</code>），并学一个速度场 <code>v_θ(x,t)</code> 使得沿 ODE <code>dx/dt=v_θ(x,t)</code> 演化时，<code>x_t</code> 的分布恰好是 <code>p_t</code>。采样 = 从 <code>x_0∼p_0</code> 积分到 <code>t=1</code>。</p></div>
+  </div>  <p>为什么这个转变发生在<strong>现在</strong>、而且来势这么猛？因为它同时改善了扩散最痛的三处。其一，<strong>训练更简洁</strong>——从「推 ELBO、设噪声表」变成「采样、构造目标、回归」，工程上少了一大堆容易出错的环节。其二，<strong>采样更快</strong>——直线路径让 ODE 轨迹接近直线，几步甚至一步就能从噪声到数据（下文 reflow），这对实时生成至关重要。其三，<strong>与大骨干天然契合</strong>——速度场就是一个普通的向量值函数，可以直接用模块 02 的 DiT 来拟合，无缝继承 Transformer 的 scaling。正因如此，2024 年的 SD3 与 Flux 都把训练目标从扩散换成了 rectified flow——这不是学术品味，而是<strong>更省、更快、更好 scale</strong>的工程胜利。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住 flow matching：<strong>把「学怎么去噪」换成「学怎么流动」</strong>。扩散学的是「这步该减掉多少噪声」，flow matching 学的是「这个点此刻该朝哪个方向、以多快速度移动」。后者是一个干净的向量场回归问题——而且我们马上会看到，它的训练目标简单到出奇。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="field"><span class="num">2</span>速度场与概率路径：生成即搬运</h2>
+  <h3>速度场与概率路径：生成即搬运</h3>  <p>先把核心对象讲清楚。<span class="term">概率路径</span> <code>p_t</code> 是一族随时间变化的分布：<code>t=0</code> 时是噪声 <code>p_0=N(0,I)</code>，<code>t=1</code> 时是数据 <code>p_1</code>，中间平滑过渡。<span class="term">速度场</span> <code>v(x,t)</code> 描述「在时刻 <code>t</code>、位置 <code>x</code> 处，概率质量正以多快的速度、朝哪个方向移动」。两者由一个连续性方程（continuity equation）绑定——但本课不需要解它，只需理解这个<strong>配对关系</strong>：</p>  <div class="math-block">\[\text{ODE: } \frac{dx}{dt}=v(x,t),\qquad x_0\sim p_0\ \Longrightarrow\ x_t\sim p_t,\quad x_1\sim p_1=\text{数据}\]</div>  <p>这正是 <span class="term">continuous normalizing flow (CNF)</span> 的思想：用一个 ODE 把简单分布连续变形成复杂分布。CNF 不是新东西（Neural ODE, 2018 就有），但它一直有个致命问题——<strong>训练太贵</strong>：为了算似然，每步训练都要在前向传播里<em>数值模拟整条 ODE</em>，慢得没法大规模用。flow matching 的全部贡献，就是给了 CNF 一个<strong>无需模拟 ODE 就能训练</strong>的目标。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>通俗讲：以前学这个「流动地图」，每走一步都要先把整条路走完一遍看走得对不对，慢死了。flow matching 发现了一个捷径：不用走完整条路，只要在每个点上<strong>局部地</strong>回归「这里该往哪走」，拼起来自然就是对的整条路。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地：CNF 的对数似然涉及 ODE 轨迹上的散度积分，训练需 <code>backprop through ODE solver</code>（伴随法），开销随轨迹长度线性增长且数值敏感。flow matching 把目标从「最大化似然」改成「回归速度场」，彻底绕开了 ODE 模拟——这是它能 scale 到 SD3 那种规模的关键。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>别把速度场 <code>v(x,t)</code> 和扩散的噪声预测 <code>ε_θ</code> 混为一谈，但也别把它们当成无关——下一节和第 5 节会看到，它们<strong>可以互相换算</strong>（在合适的路径下，速度场是噪声/score 的线性组合）。现在只需记住：flow matching 直接学「移动方向」，这个对象在采样时<em>可以直接拿去积分 ODE</em>，不必像扩散那样套一层反向公式。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cfm"><span class="num">3</span>conditional flow matching：训练为何这么简单</h2>
+  <h3>conditional flow matching：为什么训练目标这么简单</h3>  <p>这是本模块<strong>最该理解的一节</strong>。我们想学的边际速度场 <code>v(x,t)</code> 是<strong>难算的</strong>——它要对所有可能流经 <code>x</code> 的轨迹求期望，没有闭式。如果直接回归它，连训练目标都写不出来。flow matching 的核心定理（<span class="term">conditional flow matching, CFM</span>）漂亮地绕过了这个困难。</p>  <p>关键洞察：与其回归难算的<strong>边际</strong>速度场，不如回归好算的<strong>条件</strong>速度场——对<em>每一个具体的数据点</em> <code>x_1</code>，单独定义一条简单路径和它的速度场，然后回归这个。CFM 定理证明：<strong>回归条件速度场的最优解，恰好等于那个难算的边际速度场</strong>。因为条件速度场的期望（对数据和噪声求平均）就是边际速度场——MSE 回归天然会收敛到条件期望。</p>  <div class="math-block">\[\mathcal{L}_{\text{CFM}}=\mathbb{E}_{t,\,x_1\sim p_1,\,x_0\sim p_0}\Big[\big\|v_\theta(x_t,t)-u_t(x_t\mid x_1)\big\|^2\Big],\qquad \mathbb{E}\big[u_t(x_t\mid x_1)\big]=v(x_t,t)\]</div>  <p>于是训练塌缩成一个<strong>朴素的监督回归</strong>：① 采一个数据点 <code>x_1</code>、一个噪声 <code>x_0</code>、一个时刻 <code>t</code>；② 按选定路径构造中间点 <code>x_t</code> 和它的目标速度 <code>u_t</code>；③ 让网络 <code>v_θ(x_t,t)</code> 去拟合 <code>u_t</code>，最小化 MSE。<em>没有 ELBO、没有后验、没有 ODE 模拟</em>——就是「给输入、给目标、回归」。这种简单性正是 flow matching 受欢迎的核心原因。</p>  <p>这里有个常让初学者困惑、但理解后豁然开朗的点：网络对<strong>同一个</strong> <code>(x_t,t)</code> 可能见到<em>许多不同</em>的目标速度 <code>u_t</code>（因为不同的 <code>(x_0,x_1)</code> 配对会经过同一个中间点）。这看似是「矛盾的标签」，其实正是设计使然——MSE 回归面对同一输入的多个标签时，最优解是它们的<strong>平均</strong>（条件期望），而这个平均恰好就是我们想要的边际速度场。所以网络不是在「记住每条轨迹」，而是在每个点上学「流经此处的所有轨迹的平均流向」。notebook 第 4 节会看到：正因如此，回归 MSE 压不到零（有不可约方差），但学到的平均场<em>足以</em>把噪声搬到数据——这是 flow matching 一个微妙却关键的特性。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>用一个比喻彻底说清 CFM 的魔法：你想知道「全班同学的平均身高方向」（边际速度场，难直接测）。CFM 说：别去测那个平均，直接让模型对<strong>每个同学</strong>回归他自己的身高（条件速度场，好测）；只要样本够多，回归出来的自然就是平均。<strong>MSE 回归的最优解 = 条件期望</strong>——这条统计学基本事实，就是 flow matching 全部数学的支点。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="straight"><span class="num">4</span>直线路径：rectified flow 的灵魂</h2>
+  <h3>直线路径：rectified flow 的灵魂</h3>  <p>CFM 允许任意概率路径，但路径的选择<strong>决定了采样要几步</strong>。最自然、也最重要的选择是<span class="term">直线插值</span>（linear/straight-line interpolation）——直接在噪声和数据之间走直线：</p>  <div class="math-block">\[x_t=(1-t)\,x_0+t\,x_1,\qquad x_0\sim\mathcal N(0,I)\ (\text{噪声}),\ x_1\sim p_1\ (\text{数据}),\ t\in[0,1]\]</div>  <p>对直线插值，条件速度场有一个<strong>惊人地简单</strong>的形式——把上式对 <code>t</code> 求导：</p>  <div class="math-block">\[u_t(x_t\mid x_0,x_1)=\frac{d}{dt}\big[(1-t)x_0+t\,x_1\big]=x_1-x_0\quad(\text{与 } t \text{ 无关的常向量！})\]</div>  <p>也就是说，沿直线路径的目标速度<strong>恒等于「数据减噪声」</strong>，一个常向量，与当前时刻 <code>t</code> 和位置都无关。训练目标因此简单到极致：<strong>给网络看 </strong><code>x_t=(1-t)x_0+t x_1</code><strong> 和 </strong><code>t</code><strong>，让它回归 </strong><code>x_1-x_0</code>。这就是 <span class="term">rectified flow</span>（Liu 2023）的训练，也是 SD3 采用的路径。notebook 里你会亲手验证这个常向量性质——它是整个模块最干净、最该记住的事实。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么直线这么香？因为<strong>直线是两点间最短、最好走的路</strong>。如果真实的最优流是直线，那 ODE 采样<em>一步就能到</em>（沿直线走完）；就算不完全直，越接近直线，需要的积分步数越少。扩散的轨迹是弯弯曲曲的（噪声表决定的复杂曲线），所以要很多步；直线路径是 flow matching 又快又稳的根源。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地：直线插值的条件路径对应一个<strong>最优运输</strong>（OT）位移的局部视角——它让每个 <code>(x_0,x_1)</code> 对沿测地线（这里就是欧氏直线）移动。但要注意：单条样本的条件路径是直线，不代表<em>边际</em>速度场的轨迹也是直线（不同样本对的直线会交叉）。把边际轨迹也拉直，正是下一节 reflow 要做的事。</p></div>
+  </div>  <div class="callout danger"><span class="label">直线 ≠ 边际轨迹直</span>
+    <p>一个微妙但关键的点：训练时的中间点 <code>x_t</code> 是由<strong>随机配对</strong>的 <code>(x_0,x_1)</code> 算的，而采样时 ODE 走的是<strong>边际</strong>速度场。由于不同 <code>(x_0,x_1)</code> 对的直线会在空间中<em>交叉</em>，边际速度场在交叉处是各条直线的平均，于是<strong>边际轨迹本身是弯的</strong>——这就是为什么朴素 rectified flow 仍需多步、需要 reflow 来拉直。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="unify"><span class="num">5</span>flow 与扩散：其实是一家</h2>
+  <h3>flow 与扩散：其实是一家</h3>  <p>学到这里你可能会问：flow matching 和扩散到底什么关系？是要取代扩散，还是换了个说法？答案是——<strong>它们在「确定性 ODE」这个视角下是统一的</strong>，flow matching 是更一般、更简洁的框架，扩散是它的一个特例。</p>  <p>桥梁是 Song 2021 的 <span class="term">probability flow ODE</span>：任何扩散 SDE 都有一个对应的确定性 ODE，二者在<strong>每个时刻共享同一个边际分布</strong> <code>p_t</code>。也就是说，扩散其实也可以写成「学一个速度场、积分一个 ODE」——这正是 flow matching 的形式！区别只在于<strong>选了哪条概率路径</strong>：</p>  <table>
+    <thead><tr><th>维度</th><th>扩散 (DDPM/score)</th><th>flow matching (rectified flow)</th></tr></thead>
+    <tbody>
+      <tr><td>概率路径</td><td>由噪声表决定（弯曲）</td><td>可自选；常用<strong>直线</strong></td></tr>
+      <tr><td>学习对象</td><td>噪声 ε / score ∇log p</td><td><strong>速度场 v(x,t)</strong></td></tr>
+      <tr><td>训练目标</td><td>去噪 MSE / score matching</td><td><strong>速度回归 MSE</strong></td></tr>
+      <tr><td>数学包袱</td><td>ELBO、前向后验、噪声表</td><td><strong>几乎没有</strong>（纯回归）</td></tr>
+      <tr><td>采样</td><td>反向 SDE（多步）或 ODE</td><td>积分 ODE，路径直则少步</td></tr>
+      <tr><td>三者可换算</td><td>ε、score、v 在给定路径下线性互通</td><td>↔ 同左</td></tr>
+    </tbody>
+  </table>  <p>所以不必把它们对立起来。<strong>在合适的路径下，速度场 </strong><code>v</code><strong>、噪声 </strong><code>ε</code><strong>、score </strong><code>∇log p</code><strong> 三者可以线性互相换算</strong>——它们是同一个底层对象（如何把噪声搬成数据）的不同参数化。flow matching 的价值在于：它选了最简洁的参数化（速度场）和最好走的路径（直线），把训练变成纯回归、把采样变成少步 ODE。这就是为什么 SD3 在 DiT 骨干（模块 02）之上，把训练目标从扩散换成了 flow matching。</p>  <p>这个统一视角还有一个实用的好处：你在 C16 学的所有扩散直觉和工具<strong>不会作废</strong>。噪声表的设计经验、<code>v</code>-prediction 的数值稳定性、采样器（DDIM/DPM-Solver）的加速技巧——这些都能<em>平移</em>到 flow matching，因为它们本质都在操作同一个 <code>p_t</code> 路径上的速度/score。换句话说，flow matching 不是要你推倒重学，而是给了你一个<strong>更顺手的坐标系</strong>去重新表达已经会的东西，并在这个坐标系里更容易做对「直线路径 + 少步采样」。理解这一点，就不会被「扩散 vs flow」的表面对立迷惑——它们是一枚硬币的两面。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>可以这样记：<strong>扩散和 flow matching 不是两种模型，而是同一类生成（学搬运 + 积分）的两种写法</strong>。扩散从「随机过程 + 去噪」的角度切入，flow matching 从「ODE + 速度场」的角度切入。后者数学更轻、路径更自由，所以前沿在往它收敛——但你在 C16 学的扩散直觉<em>全部仍然适用</em>，只是换了个更顺手的坐标系。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="reflow"><span class="num">6</span>reflow：把轨迹拉直，逼近单步</h2>
+  <h3>reflow：把轨迹拉直，逼近单步</h3>  <p>第 4 节埋了个伏笔：单条样本的直线路径不代表边际轨迹直（不同样本对的直线会交叉，边际速度场在交叉处取平均，轨迹被「掰弯」）。弯的轨迹意味着 ODE 采样仍需多步。<span class="term">rectified flow</span> 的第二件法宝 <span class="term">reflow</span> 专门解决这个问题——<strong>迭代地把轨迹拉直</strong>。</p>  <p>reflow 的做法出奇地简单：用当前训练好的模型，从噪声采样出数据（跑一遍 ODE），得到一批<strong>配对好的</strong> <code>(x_0, x_1)</code>（噪声 → 它生成的数据）；然后用这些<em>新配对</em>重新训练一个 rectified flow。关键在于：这次的 <code>(x_0,x_1)</code> 不再是随机配对，而是<strong>模型自己生成的、已经「对齐」的配对</strong>，它们的直线<strong>更不容易交叉</strong>，于是边际轨迹更直。</p>  <div class="ascii">reflow 迭代（每轮让轨迹更直、采样更少步）：
+  第 0 轮：随机配对 (x0~噪声, x1~数据)  --训练--&gt;  v0  (边际轨迹弯，需多步)
+     │  用 v0 跑 ODE：x0 --积分--&gt; x1'        # 得到「对齐」的配对
+     ▼
+  第 1 轮：用配对 (x0, x1') 重新训练   --训练--&gt;  v1  (轨迹更直，步数减少)
+     │  再用 v1 生成配对…
+     ▼
+  第 2 轮：… v2  (接近直线，1~2 步即可采样)
+  代价：每轮 reflow 略损质量(配对来自模型而非真数据)，换采样步数大降</div>  <p>一两轮 reflow 后，轨迹直到<strong>一步欧拉积分就能从噪声跳到数据</strong>——这就是 rectified flow 能做到「极少步生成」的原理，也是它和模块 05（consistency 蒸馏）殊途同归的地方：<strong>两者都在把「多步 ODE」压成「少步/一步」</strong>，只是手段不同（reflow 重训拉直 vs consistency 学自洽映射）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>通俗讲：reflow 像「把一条绕路的山路反复取直」。第一次修的路弯弯绕绕（随机配对的直线乱交叉）；让车实际跑一遍、记下起点终点，按这些真实起讫点重修，路就直一些；修几次，路直到可以一脚油门到底（单步）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地：reflow 利用了一个性质——用模型生成的 <code>(x_0,x_1)</code> 配对重训，得到的流的<strong>传输代价不增</strong>（Liu 2023 证明），且轨迹的「直线性」单调改善。代价是每轮引入模型自身的误差累积，故实践中 reflow 一般只做 1–2 轮，再配合蒸馏。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>reflow 不是免费午餐：配对从「真实数据」换成了「模型生成的数据」，每轮都会把模型自身的偏差喂回训练，质量可能<em>略降</em>。所以它是一个<strong>质量换速度</strong>的权衡——和模块 04 的 CFG、模块 05 的蒸馏一样，前沿采样优化几乎都在这条权衡线上做文章。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="toy"><span class="num">7</span>把玩具跑起来：2D rectified flow</h2>
+  <h3>把玩具跑起来：2D rectified flow</h3>  <p>配套 notebook 用纯 numpy 在一个 2D 玩具分布（八高斯/双月，与模块 00/01 同款）上，把 rectified flow 从零跑通：</p>  <ol>
+    <li><strong>直线插值与常速度</strong>：构造 <code>x_t=(1-t)x_0+t x_1</code>，亲手验证条件速度场<strong>恒等于 </strong><code>x_1-x_0</code>（与 <code>t</code> 无关的常向量）——本模块最干净的事实。</li>
+    <li><strong>训练速度场</strong>：用一个小回归器（随机特征 + 最小二乘，或几步梯度下降的小网络）把 <code>(x_t,t)↦x_1-x_0</code> 学出来，验证训练 MSE 单调下降。</li>
+    <li><strong>ODE 采样</strong>：从噪声 <code>x_0∼N(0,I)</code> 出发，用 Euler/Heun 积分速度场到 <code>t=1</code>，验证生成的 2D 点落在数据分布上（协方差/最近邻距离匹配）。</li>
+    <li><strong>步数权衡</strong>：扫不同积分步数，看少步 vs 多步的质量差异；并验证「Euler 积分常速度场是精确的」（直线路径的理论保证）。</li>
+  </ol>  <p>通过这个玩具，你会亲手确认本模块的每个论点：<strong>直线路径的速度场是常向量</strong>（精确对拍 <code>x_1-x_0</code>）、<strong>速度回归是朴素 MSE</strong>（loss 下降）、<strong>Euler 积分常场是精确的</strong>（直线一步到位）、以及<strong>学到的流能把噪声搬成数据分布</strong>（端到端）。维度小到能画散点，但逻辑与 SD3 的 rectified flow 一一对应。</p>  <p>特别留意 notebook 里一个<strong>反直觉但正确</strong>的现象：用学到的流<em>一步</em>采样（Euler，1 步）质量很差，而 5 步、20 步迅速变好。这恰好印证了第 4/6 节的理论——单条样本的路径是直线，但<strong>边际</strong>轨迹（不同样本对的直线交叉后取平均）是弯的，所以朴素 rectified flow 的少步采样会「拐弯处冲出去」，需要 reflow 把边际轨迹拉直后才能真正做到一步。玩具里这个「1 步差、多步好」的曲线，就是真实模型为什么要做 reflow + 蒸馏（模块 05）的微观写照——你能亲眼看到「直线路径」和「单步采样」之间还差着一个 reflow。</p>  <div class="callout paper"><span class="label"></span>
+    <p>notebook 的速度场回归器是玩具（随机特征/小网络），真实 SD3 用一个大 MM-DiT（模块 02）当 <code>v_θ</code>——结构天差地别，但「回归 <code>x_1-x_0</code>、积分 ODE」的训练与采样逻辑逐行对应。想深入直接读 Lipman 2023 (Flow Matching)、Liu 2023 (Rectified Flow)、Esser 2024 (SD3)。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>少步 / 单步流</strong>：reflow + 蒸馏能把采样压到 1–4 步，但质量仍逊于多步。如何在极少步下逼近多步质量（shortcut models、mean flows、consistency-FM 等），是当前最热的方向。</li>
+    <li><strong>最优路径设计</strong>：直线插值是最简单的路径，但未必最优。最优运输配对（OT-CFM、minibatch OT）、更聪明的耦合能让轨迹更直、训练更稳——路径/耦合的设计空间远未穷尽。</li>
+    <li><strong>flow 与扩散的统一理论</strong>：随机插值（stochastic interpolants）等框架试图把扩散、flow、桥过程纳入一个统一表述。哪种参数化（v / ε / score）在什么场景最优，仍缺乏定论。</li>
+    <li><strong>条件与引导</strong>：CFG（模块 04）原本为扩散设计，如何最干净地用在 flow matching 上（引导该作用在速度场还是分布上）是活跃问题，SD3 给了一组工程答案但非定论。</li>
+    <li><strong>离散与多模态流</strong>：把 flow matching 推广到离散数据（文本、分子）、流形数据、以及视频/3D 的时空流，是把这套优雅框架推向更广领域的前沿。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Lipman 2023《Flow Matching for Generative Modeling》（CFM 框架）、Liu 2023《Flow Straight and Fast: Rectified Flow》（直线 + reflow）；进阶看 Song 2021（probability flow ODE，flow↔扩散的桥）、Esser 2024 (SD3，把 flow matching 落到 SOTA)。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_dit/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · Diffusion Transformer (DiT)</div></a>
+    <a class="next" href="../04_guidance/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · Classifier-Free Guidance</div></a>
+  </div>
+
+</div>
+</body>
+</html>

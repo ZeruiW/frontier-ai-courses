@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · Checkpoint 与容错</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · Checkpoint 与容错</h1>
+  <p class="subtitle">在几千张卡上，故障是常态而非意外 —— 用 MTBF 量化失败率，把训练状态正确、原子、高效地存下来，故障后精确续训；分片 / 异步 / 弹性是让多周训练跑得完的工程支柱</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–03（尤其分片与集合通信的同步语义）、一点点文件系统/进程常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_checkpointing_faulttol.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Mohan《CheckFreq》、Wang《Gemini》、Daly 最优间隔、torch.distributed.checkpoint</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么容错是头等大事：MTBF 数学</a></li>
+      <li><a href="#whatin">checkpoint 里必须有什么</a></li>
+      <li><a href="#sharded">单文件 vs 分片 checkpoint</a></li>
+      <li><a href="#consistency">一致性与原子性</a></li>
+      <li><a href="#async">异步 / 重叠 checkpoint</a></li>
+      <li><a href="#recovery">恢复流程与最优频率</a></li>
+      <li><a href="#elastic">弹性训练与 re-shard</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么容错是头等大事：MTBF 数学</h2>
+  <p>到这一模块为止，我们一直假设训练「跑得下去」——所有 rank 都活着、网络都通、显卡都不坏。可一旦你把训练放到<strong>几千张 GPU、连续跑几周</strong>的真实尺度，这个假设立刻崩塌。硬件会坏：GPU 会掉卡（XID error）、HBM 会出 ECC 不可纠错错误、NVLink/InfiniBand 链路会抖动、电源和散热会出问题、整台机器会无故重启。在这个尺度上，<strong>故障不是意外，而是常态</strong>——你的训练系统必须把「随时可能死一个 rank」当成设计前提，而不是边缘情况。</p>  <p>这件事可以被量化。设单张 GPU 的平均无故障时间（<span class="term">MTBF</span>，mean time between failures）为 $T$，把 $N$ 张卡看成一个<em>串联系统</em>（任何一张坏了，整个同步训练就卡住），那么在故障率近似恒定的假设下，整个系统的期望故障间隔约为：</p>  <div class="math-block">\[\text{MTBF}_{\text{system}} \;\approx\; \frac{T}{N}\]</div>  <p>代入真实数字就触目惊心：假设单卡 MTBF 乐观地取 <strong>5 年</strong>（约 43800 小时），那么 <strong>1024 张卡</strong> 的系统期望每 <code>43800 / 1024 ≈ 43 小时</code> 就坏一次；扩到 <strong>16384 张卡</strong>，就变成每 <code>≈ 2.7 小时</code> 必坏一次。也就是说，一个万卡集群上的大模型预训练，<strong>平均每隔几个小时就会有一个 rank 死掉</strong>。如果没有 checkpoint，每次故障都意味着「从头再来」——几周的算力瞬间归零，这在经济上是完全不可接受的。</p>  <div class="callout danger"><span class="label">串联系统：环越多越脆</span>
+    <p>把它想成一条由几千个环扣串起来的链子：<strong>整条链的强度由最弱的一环决定</strong>，而环越多，「某一环在某一刻断裂」的概率就越高。同步数据并行训练正是这样一条串联链——任何一个 rank 死了，all-reduce 就永远等不齐，整个训练就挂起。所以规模越大，单点故障的杀伤力越大，容错就越是<strong>头等工程</strong>，而非锦上添花。</p>
+  </div>  <p>容错的核心机制其实只有一句话：<strong>周期性地把训练状态存下来（checkpoint），故障后从最近一次状态恢复（recovery）</strong>。听起来朴素，但在分布式尺度上，「存什么、怎么存得快、怎么保证一致、坏了怎么精确续训、能不能边训边存」每一个都是真问题。本模块就把这些问题逐个拆开，并在 numpy 里<strong>把单进程内的多 rank 与文件系统都模拟出来</strong>，让你亲手验证每个机制的正确性。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="whatin"><span class="num">2</span>checkpoint 里必须有什么</h2>
+  <h3>一个能精确续训的 checkpoint 必须包含什么</h3>  <p>新手最常见的误解是「checkpoint 就是存一下模型权重」。这是错的——只存权重，你能<em>继续做推理</em>，却<strong>无法精确续训</strong>（resume training to the exact same trajectory）。要让中断后的训练轨迹和从未中断<strong>逐位一致</strong>，你必须把训练循环依赖的<em>全部可变状态</em>都存下来。少存任何一项，恢复后的训练就会悄悄偏离。</p>  <table>
+    <thead><tr><th>状态项</th><th>为什么必须存</th><th>漏掉的后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>模型参数</strong> params</td><td>网络当前的权重，最显然的一项</td><td>无法恢复模型，等于白训</td></tr>
+      <tr><td><strong>优化器状态</strong> optimizer state</td><td>Adam 的一阶矩 m、二阶矩 v、step 计数；占显存常与参数同量级</td><td>动量丢失，相当于优化器「冷启动」，loss 抖动甚至发散</td></tr>
+      <tr><td><strong>RNG 状态</strong> RNG state</td><td>dropout 掩码、数据增强、初始化都依赖随机数发生器的内部状态</td><td>随机序列错位，dropout/增强不一致，轨迹偏离、不可复现</td></tr>
+      <tr><td><strong>训练步数</strong> step / epoch</td><td>当前到第几步，决定 lr、数据位置、是否该停</td><td>lr 调度错位、提前或延后停止</td></tr>
+      <tr><td><strong>数据加载位置</strong> data loader state</td><td>shuffle 顺序与已消费到的样本下标</td><td>重复或跳过样本，破坏「每个样本每 epoch 见一次」</td></tr>
+      <tr><td><strong>lr 调度器状态</strong> scheduler</td><td>warmup/decay 走到哪一步</td><td>学习率跳变，训练不稳定</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 checkpoint 想成游戏的「存档」。只存「角色等级」（模型权重）是不够的——你还得存当前在哪张地图、背包里有什么、任务进度到哪、甚至随机事件的种子，下次读档才能<strong>从一模一样的局面</strong>接着玩。漏存一样，读档后世界就和你离开时不一样了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，训练是一个确定性状态机 $s_{t+1} = f(s_t, \text{batch}_t; \xi_t)$，其中 $\xi_t$ 是该步消耗的随机数。要保证 resume 后 $s_{t+1}, s_{t+2}, \dots$ 与不中断时<strong>逐位相同</strong>，必须完整保存 $s_t$（参数+优化器+scheduler）、数据指针（决定 $\text{batch}_t$）、以及 RNG 内部状态（决定 $\xi_t$）。三者缺一，状态机就从一个不同的初值出发，轨迹必然发散。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>RNG 状态是最容易被忘记、也最隐蔽的一项。漏掉它，代码不会报错、loss 看起来也「差不多」，但你的训练<strong>不再可复现</strong>，且 dropout/数据增强的随机序列与原轨迹错位——这种 bug 在调试「为什么 resume 后 loss 跳了一下」时极难定位。本模块 notebook 的 worked 5 会专门把 RNG 状态的保存与恢复做到<strong>逐位续训</strong>，你会亲眼看到它的威力。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sharded"><span class="num">3</span>单文件 vs 分片 checkpoint</h2>
+  <h3>单文件 vs 分片 checkpoint</h3>  <p>知道了要存什么，下一个问题是<strong>怎么存</strong>。最朴素的做法（很多单机代码就这么写）是：让 <code>rank 0</code> 把所有 rank 的参数 <span class="term">all-gather</span> 到一起，拼成完整模型，再由它一个人写一个大文件。这在小模型上能用，但在大模型 + 大规模并行下<strong>会同时撞上两堵墙</strong>：</p>  <ul>
+    <li><strong>显存墙（OOM）</strong>：当模型用 ZeRO-3/FSDP 分片后，没有任何一张卡装得下<em>完整</em>的参数+优化器状态——强行 gather 到 rank 0 会直接 OOM。一个 70B 模型的 fp32 优化器状态可达数百 GB，单卡根本放不下。</li>
+    <li><strong>速度墙（串行瓶颈）</strong>：让一个 rank 写几百 GB，其它几千个 rank 全在 barrier 上干等。写盘是串行的，规模越大、等得越久，checkpoint 开销吃掉的训练时间越多。</li>
+  </ul>  <p>正确的做法是 <span class="term">sharded checkpoint</span>（分片 checkpoint）：<strong>每个 rank 只存自己持有的那一片状态</strong>，几千个 rank<strong>并行地</strong>各写各的小文件，再加一份描述「哪片在哪个文件、原始张量怎么拼回去」的元数据（metadata / plan）。这样既不需要任何一张卡装下完整模型（绕开显存墙），写入也完全并行（绕开速度墙），且天然<strong>随规模线性扩展</strong>——卡越多、每片越小、单片写得越快。这正是 <code>torch.distributed.checkpoint</code>（DCP）和 Megatron / DeepSpeed 的分布式 checkpoint 采用的方案。</p>  <table>
+    <thead><tr><th>维度</th><th>单文件 (rank 0 gather)</th><th>分片 checkpoint (sharded)</th></tr></thead>
+    <tbody>
+      <tr><td>显存峰值</td><td>需单卡装下完整模型 → 大模型 OOM</td><td>每 rank 只装自己那片 → 无 OOM 风险</td></tr>
+      <tr><td>写入并行度</td><td>串行（1 个 writer）</td><td>并行（W 个 writer 同时写）</td></tr>
+      <tr><td>扩展性</td><td>卡越多越慢（gather 量更大）</td><td>卡越多每片越小，近似常数时间</td></tr>
+      <tr><td>产物形态</td><td>1 个大文件</td><td>W 个分片 + 1 份元数据</td></tr>
+      <tr><td>改 world size 后能否加载</td><td>容易（已是完整模型）</td><td>需 re-shard（第 7 节）</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>分片 checkpoint 的精神和模块 02/03 的并行完全一致：<strong>既然计算和显存都已经切片了，存储也跟着切片</strong>。搬运的总字节数没变，但把「一个人搬一座山」改成「一千个人各搬一筐」，墙高（单卡显存）和墙长（串行时间）就都不再是瓶颈。记住这个一以贯之的思想：在分布式系统里，凡是<em>和模型规模成正比</em>的东西（计算、激活、参数、优化器、梯度、以及这里的 checkpoint），最终都得切片并行，否则必然撞墙。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="consistency"><span class="num">4</span>一致性与原子性</h2>
+  <h3>一致性与原子性：checkpoint 最容易出的 bug</h3>  <p>分片 checkpoint 解决了「快」和「装得下」，但引入了一个新的正确性问题：<strong>几千个分片必须共同构成一个自洽的快照</strong>。这里有两个独立的陷阱，新手几乎一定会踩。</p>  <h4>陷阱一：跨 rank 步数不一致</h4>  <p>所有 rank 必须存的是<strong>同一个训练步</strong>的状态。如果 rank 5 因为某种原因比别人多走了一步再存，那么它那片参数对应 step=1001，而其它片是 step=1000——拼起来是一个<strong>根本不存在过的、自相矛盾的模型</strong>，恢复后行为不可预测。解决办法是在 checkpoint 之前插一个 <span class="term">barrier</span>：所有 rank 在此会合、确认都到了同一步，再一起开始写。这和模块 01 里集合通信的同步语义是同一回事——<strong>checkpoint 是一次全局同步点</strong>。</p>  <h4>陷阱二：写到一半崩溃（非原子写入）</h4>  <p>假设你正在覆盖写 <code>ckpt-1000.pt</code>，写到 60% 时进程被 OOM-killer 杀了。现在你的磁盘上是一个<strong>半截的、损坏的文件</strong>——而上一个好的 checkpoint 已经被你覆盖掉了。<strong>你同时失去了新旧两个 checkpoint</strong>，这是灾难性的。正确做法是经典的<strong>写临时文件 + 原子 rename</strong>套路：</p>  <div class="ascii">非原子（危险）：直接覆盖目标文件
+   open('ckpt-1000.pt','w') ──写到60%── 💥崩溃
+   结果：ckpt-1000.pt 损坏，且旧 checkpoint 已被覆盖 → 全丢
+
+原子（安全）：临时文件 + rename
+   1. write → ckpt-1000.pt.tmp        (崩在这里：.tmp 是垃圾，正式文件没动)
+   2. fsync(.tmp)                      (确保数据真正落盘，不在 OS 缓存里)
+   3. os.rename(.tmp, ckpt-1000.pt)   (rename 是原子的：要么全成要么没发生)
+   结果：任何时刻磁盘上的正式文件，要么是完整旧版、要么是完整新版,绝不损坏</div>  <p>关键在于 POSIX 保证 <code>os.rename</code> 在同一文件系统内是<strong>原子操作</strong>——它要么完全成功、要么完全没发生，绝不会留下「改了一半」的中间态。配合 <code>fsync</code> 强制把数据从 OS 页缓存刷到物理磁盘，你就得到一个<strong>崩溃安全（crash-consistent）</strong>的写入：无论在哪一刻断电，恢复时总能读到一个完整的 checkpoint。在分片场景下，通常还要再加一层——所有分片都写完 .tmp、再统一 rename，最后才写一个「写完」的哨兵标记，保证读者永远不会读到「一部分新分片 + 一部分旧分片」的撕裂状态。</p>  <div class="callout danger"><span class="label">绝不覆盖式写唯一副本</span>
+    <p>最危险的反模式是「<strong>覆盖式写唯一一份 checkpoint</strong>」。一旦写入过程中崩溃，新旧俱毁。生产系统的铁律是：<strong>先写新的临时副本、确认完整、再原子替换，并至少保留上一个完好的 checkpoint</strong>（保留最近 k 份，轮转删除）。本模块 worked 3 会模拟「写一半崩溃」，让你验证原子套路下旧 checkpoint 依然可恢复。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="async"><span class="num">5</span>异步 / 重叠 checkpoint</h2>
+  <h3>异步 / 重叠 checkpoint：把开销藏起来</h3>  <p>即便分片写入已经并行，写几百 GB 到持久化存储（本地 NVMe 或远端对象存储）依然要花<strong>几十秒到几分钟</strong>。如果训练在这段时间里完全停下来干等（同步 checkpoint），那么 checkpoint 越频繁、被浪费的算力越多。我们想要既存得勤（故障后回滚的步数少）、又几乎不占训练时间——<strong>异步 / 重叠 checkpoint</strong>就是答案。</p>  <p>它的洞察基于一个<strong>速度悬殊</strong>：把状态从 GPU<em>拷贝到 CPU 内存</em>（HBM→主存，走 PCIe/NVLink）通常只要几秒；而把状态从内存<em>写到持久化存储</em>（落盘/上传对象存储）要慢一两个数量级。于是把 checkpoint 拆成两段：① 训练线程快速把状态<strong>快照到一块（pinned）CPU 内存</strong>（这一小段必须暂停训练，防止参数被下一步改写）；② 一个<strong>后台线程</strong>慢慢把这块 CPU 快照落盘，而<strong>训练线程立刻继续下一步</strong>。落盘与训练<strong>重叠</strong>进行。</p>  <div class="ascii">同步 checkpoint：训练全程停下等落盘
+  训练 ████  [停: copy + 写盘 ........] ████  → 有效开销 = copy + 写盘
+
+异步 checkpoint：只停极短的 copy，落盘后台重叠
+  训练 ████ [停:copy] ████████████████████ ████  → 有效开销 ≈ copy
+  后台              └─ 写盘 ........(与训练重叠)─┘</div>  <p>因此异步 checkpoint 暴露给训练循环的<strong>有效开销</strong>近似只剩那一小段拷贝时间：</p>  <div class="math-block">\[\text{开销}_{\text{sync}} = t_{\text{copy}} + t_{\text{write}} \qquad\Longrightarrow\qquad \text{开销}_{\text{async}} \approx t_{\text{copy}} \;\ll\; t_{\text{copy}} + t_{\text{write}}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>好比拍照存档：你只需要按一下快门（几秒，把当下定格到内存），照片冲洗（写盘）交给后台慢慢做，你转身就能继续干活。只要冲洗速度跟得上你按快门的频率，存档对你几乎是「免费」的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>代价与约束：① 需要一块和状态等大的额外 CPU 内存（pinned memory）做暂存；② 后台落盘必须在<strong>下一次 checkpoint 之前完成</strong>，否则两次落盘会堆积、退化回同步；③ 拷贝期间必须冻结状态（或用 copy-on-write），否则会拷到训练到一半的脏数据。现代框架（DCP async save、DeepSpeed、Nebula）都实现了这套重叠。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>这和模块 01/03 里「用计算重叠通信」「用 1F1B 填满流水气泡」是<strong>同一种工程哲学</strong>：凡是不得不做的慢操作，就想办法让它和主线工作<strong>并行重叠</strong>，从而把它从关键路径上「藏」起来。异步 checkpoint 是这种思想在「存储」维度上的体现——慢的是写盘，那就让写盘和训练并行跑。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="recovery"><span class="num">6</span>恢复流程与最优频率</h2>
+  <h3>故障恢复流程与最优 checkpoint 频率</h3>  <p>有了正确、原子、高效的 checkpoint，故障恢复（recovery）就是一套清晰的流程。把它走一遍：</p>  <ol>
+    <li><strong>检测（detect）</strong>：监控发现某 rank 失联/超时/抛出 NCCL 错误，或健康检查失败。同步训练里一个 rank 死会让 all-reduce 挂起，通常靠通信超时（如 NCCL timeout）或外部 watchdog 触发。</li>
+    <li><strong>止血与隔离</strong>：杀掉整个 job（或在弹性模式下只换掉坏节点），把坏掉的物理节点拉出健康池，必要时换一台备用节点顶上。</li>
+    <li><strong>重启进程组</strong>：所有 rank 重新拉起、重新 <span class="term">rendezvous</span>（握手组队）、重建通信组（NCCL communicator）。</li>
+    <li><strong>加载分片</strong>：每个 rank 从持久化存储 <strong>各自加载自己那片</strong> checkpoint（并行读，对称于并行写）。</li>
+    <li><strong>精确续训</strong>：恢复参数+优化器+<strong>RNG 状态</strong>+step+数据指针，从<strong>最近一次 checkpoint 的下一步</strong>继续，轨迹与未中断时一致（第 2 节那份完整状态在此刻兑现价值）。</li>
+  </ol>  <p>这就引出一个经典的权衡：<strong>checkpoint 该多久存一次？</strong>存得太勤，正常训练时间被 checkpoint 开销吃掉太多；存得太疏，一旦故障要回滚（重算）的步数太多。设单次 checkpoint 开销为 $\delta$、系统平均无故障时间为 $M$（即 $T/N$），把「checkpoint 开销」与「故障后重算的期望损失」加起来对 checkpoint 间隔 $\tau$ 求极小，得到著名的 <span class="term">Young/Daly</span> 最优间隔：</p>  <div class="math-block">\[\tau^{*} \;\approx\; \sqrt{2\,\delta\,M}\]</div>  <p>它的直觉很美：最优间隔是「单次开销」与「故障间隔」的几何平均量级——$\delta$ 越小（checkpoint 越便宜，比如用了异步），就该存得越勤；$M$ 越小（集群越大越易坏），也该存得越勤。把它和第 5 节连起来看就通了：<strong>异步 checkpoint 把 $\delta$ 压到极小，于是最优频率可以很高</strong>，故障回滚的代价（浪费的算力）随之被压到很低。这正是「高频 + 异步」成为大规模训练标配的数学理由。</p>  <div class="callout warn"><span class="label"></span>
+    <p>Young/Daly 是<strong>一阶近似</strong>（假设故障服从泊松过程、$\delta \ll M$、忽略恢复本身的耗时）。真实系统还要考虑恢复时间、存储带宽上限、checkpoint 频率对数据管线的扰动等。但作为<strong>数量级直觉</strong>和调参起点，$\tau^{*}\approx\sqrt{2\delta M}$ 极其好用——记住「便宜就多存、易坏就多存」这两个单调性，比记公式本身更重要。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="elastic"><span class="num">7</span>弹性训练与 re-shard</h2>
+  <h3>弹性训练：world size 可变与 re-shard</h3>  <p>传统恢复有个隐含假设：重启后<strong>规模不变</strong>——还是原来那 $W$ 个 rank。但现实是，坏掉的节点可能一时半会修不好、也可能没有备用节点立刻顶上。这时如果死等满配，训练就一直停着，浪费的恰恰是<em>还活着的</em>那几千张卡。<strong>弹性训练（elastic training）</strong>的目标就是：<strong>让训练能在 world size 变化时继续跑</strong>——节点挂了就用剩下的接着训，修好了再加回来。</p>  <p>实现弹性有两个层面。在<strong>编排层</strong>，工具（如 <code>torchrun --nnodes=MIN:MAX --max-restarts=K</code>、TorchElastic）负责在成员变化时<strong>重新 rendezvous</strong>：幸存的 worker 重新组队、重新分配 rank 号、重建通信组，而不是整个 job 失败退出。在<strong>状态层</strong>，难点是 <span class="term">re-shard</span>：原来按 $W$ 切的分片 checkpoint，现在要加载到 $W'$ 个 rank 上（$W' \neq W$），分片边界全变了。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把分片 checkpoint 想成「把一根绳子剪成 W 段分给 W 个人」。换了人数（$W'$），不能让新来的人去找「第 5 段」——因为段数变了。正确做法是把所有段<strong>先拼回整根绳子（逻辑全局张量）</strong>，再<strong>按新人数重新剪</strong>。只要每个人记得自己那段在全局张量里的「起止位置」，拼接就永远对得上。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，分片 checkpoint 不应存「物理分片下标」，而应为每片记录它在<strong>全局逻辑张量</strong>中的偏移与形状（offset, shape）。加载时按这份元数据把所有片映射回全局坐标系，再按新的 $W'$ 重新划分、各 rank 取走自己负责的全局区间。只要满足<strong>拼接不变量</strong>——「所有分片按全局偏移拼起来 == 原始完整张量」——re-shard 到任意 $W'$ 都能保持参数逐位不变。这正是 <code>torch.distributed.checkpoint</code> 能「存时 8 卡、加载时 4 卡」的底层原理。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>分片 checkpoint 之所以能 re-shard，关键设计是<strong>存「全局坐标」而非「物理位置」</strong>：每片自带「我是全局张量的 [offset : offset+len] 这一段」。有了全局坐标系，无论加载端切成几片，都只是<em>在同一根逻辑张量上重新画分界线</em>，数据本身一字节不差。本模块 worked 5 之后的练习会让你把 $W=4$ 的 checkpoint re-shard 到 $W=3$ 并验证不变量。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <p>checkpoint 与容错看似是「工程脏活」，实则是大规模训练效率的前沿战场——在万卡尺度，省下的每一分钟故障停机都是真金白银。当前活跃的方向包括：</p>  <ul>
+    <li><strong>内存内 / 冗余 checkpoint（in-memory / redundant）</strong>：与其每次都落盘，不如把 checkpoint冗余地存在<em>其它节点的 CPU 内存</em>里（如 Gemini）。单点故障时从邻居内存秒级恢复，比从远端存储读快几个数量级，把恢复时间从分钟压到秒。</li>
+    <li><strong>自动调频（CheckFreq）</strong>：在线测量 checkpoint 开销与故障率，自动逼近 Young/Daly 最优间隔，免去手工调参，并随集群健康状况动态调整。</li>
+    <li><strong>按需 / 故障时 just-in-time checkpoint</strong>：平时不存或少存，靠硬件/软件信号<em>预测</em>即将发生的故障，在真正崩溃前抢存一次，把开销只花在「快要坏」的时刻。</li>
+    <li><strong>部分恢复（partial recovery）</strong>：只有少数 rank 坏时，不让所有 rank 都回滚——让幸存 rank 保持现状、只把坏掉的那几片从 checkpoint（或冗余副本）恢复，最小化重算量。</li>
+    <li><strong>主机内存复制与分层存储</strong>：HBM→主存→本地 NVMe→远端对象存储的多级 checkpoint，近的快但易失、远的慢但持久，按层放置以同时优化恢复速度与持久性。</li>
+  </ul>  <p>更深一层的趋势是把容错从「训练循环外面的备份机制」变成<strong>系统的一等公民</strong>：调度器、通信库、存储、checkpoint 协同设计，让「死一个 rank」像「丢一个网络包」一样被自动、廉价、透明地处理。随着集群冲向十万卡，谁的容错做得好，谁的有效算力（goodput，扣掉故障停机后的真实产出）就高——这已经成为大规模训练的核心竞争力之一。</p>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Mohan et al.《CheckFreq》（自动调 checkpoint 频率）、Wang et al.《Gemini》（内存内冗余 checkpoint，近瞬时恢复）、Daly《A higher order estimate of the optimum checkpoint interval》（Young/Daly 最优间隔的来源）、以及 <code>torch.distributed.checkpoint</code> 官方文档（分片/异步/re-shard 的工程实现）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_tensor_pipeline_parallel/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 张量与流水并行</div></a>
+    <a class="next" href="../05_orchestration_debug/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 编排与调试</div></a>
+  </div>
+
+</div>
+</body>
+</html>

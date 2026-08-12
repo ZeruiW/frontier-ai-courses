@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · CTR 与序列推荐</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · CTR 与序列推荐</h1>
+  <p class="subtitle">精排的模型形态与暗礁 —— CTR 预估 LR→FM 二阶交叉→DLRM 思想、序列推荐 GRU4Rec/SASRec、位置偏置 IPW 去偏与反馈回路，从零写 FM（O(kn) 化简对拍）+ 玩具序列推荐</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00-04、sigmoid/交叉熵、embedding、注意力(可选)、MF/BPR</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_ctr_sequential.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Rendle 2010 (FM)、Naumov 2019 (DLRM)、Kang 2018 (SASRec)、Joachims 2017 (去偏)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#ctr">CTR 预估：精排的核心目标</a></li>
+      <li><a href="#fm">从 LR 到 FM：自动学交叉</a></li>
+      <li><a href="#fm_fast">FM 的 O(kn) 化简</a></li>
+      <li><a href="#dlrm">深度 CTR 与 DLRM</a></li>
+      <li><a href="#seq">序列推荐：GRU4Rec → SASRec</a></li>
+      <li><a href="#bias">偏置与去偏：点击数据的暗礁</a></li>
+      <li><a href="#online">在线学习与反馈回路</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ctr"><span class="num">1</span>CTR 预估：精排的核心目标</h2>
+  <p>到了精排的模型形态。模块 04 讲了排序的<strong>损失</strong>（pairwise/nDCG），这一模块讲精排的<strong>模型</strong>——尤其是工业精排的两大主线：<strong>CTR 预估</strong>（点击率，广告/推荐精排的核心目标）和<strong>序列推荐</strong>（用行为序列捕捉兴趣演化）。最后讲一个贯穿始终的暗礁：<strong>偏置与去偏</strong>。</p>  <p>先说 <span class="term">CTR (click-through rate)</span>。精排要给每个候选打一个分，最常见的分就是<strong>点击概率</strong>。广告系统更直接——<strong>eCPM = CTR × 出价</strong>，CTR 预估准不准直接等于钱。CTR 预估的演化是一部精彩的「如何处理稀疏特征交叉」的历史：从 LR 到 FM 到深度模型。</p>  <div class="ascii">CTR 预估模型的演化（核心问题：怎么处理「特征交叉」？）
+
+  LR (逻辑回归)        σ(w·x)         线性, 交叉靠【人工】组合特征 -&gt; 累
+     │                                「城市×品类」要手工造, 组合爆炸
+     ▼
+  FM (因子分解机)      +Σ⟨v_i,v_j⟩x_i x_j   给每个特征一个向量, 【自动】学所有二阶交叉
+     │                                稀疏数据也能学, 预测 O(kn) 线性时间
+     ▼
+  Wide&amp;Deep/DeepFM     FM/线性 ⊕ DNN   记忆(wide)+泛化(deep), 学高阶交叉
+     │
+     ▼
+  DLRM (Meta)          embedding+点积交互+MLP   工业级, embedding 表 TB 级, 通信是瓶颈</div>  <div class="callout intuition"><span class="label"></span>
+    <p>CTR 预估的核心难点一句话：<strong>特征极度稀疏，而信号藏在「特征组合」里</strong>。单看「用户是学生」「物品是篮球鞋」可能都很普通，但「学生 × 篮球鞋」这个组合 CTR 很高。怎么从亿级稀疏的 one-hot 特征里自动学出有用的交叉，是 CTR 模型演化的主线——LR 靠人工（累且爆炸），FM 靠隐向量内积（自动、高效），深度模型靠 DNN（高阶）。这一节会把 LR→FM 从零写出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fm"><span class="num">2</span>从 LR 到 FM：自动学交叉</h2>
+  <h3>从 LR 到 FM：自动学特征交叉</h3>  <p><strong>逻辑回归（LR）</strong>是 CTR 的经典基线：$\hat y=\sigma(w_0+\sum_i w_i x_i)$。特征 $x$ 通常是 one-hot 的 ID（用户 ID、物品 ID、品类…）。LR 简单、可扩展、可解释，曾是工业 CTR 主力。但它是<strong>线性</strong>的——只看单个特征的权重，看不到<strong>特征组合</strong>的效果。</p>  <p>要让 LR 看到交叉，得<strong>人工构造组合特征</strong>（如「城市_品类」当一个新 one-hot）。问题致命：① 组合数<strong>爆炸</strong>（$n$ 个特征有 $n^2$ 个二阶组合）；② 稀疏数据下，很多组合在训练集里<strong>从没出现过</strong>（比如「西藏用户 × 某冷门商品」），LR 学不到它们的权重（没样本）。人工交叉既累又学不全。</p>  <p><strong>因子分解机（FM）</strong>（Rendle 2010）的天才解法：<strong>给每个特征学一个隐向量 $v_i$，二阶交叉的权重用两个隐向量的内积 $\langle v_i,v_j\rangle$ 表示</strong>：</p>  <div class="math-block">\[\hat y = w_0 + \sum_{i=1}^{n} w_i x_i + \sum_{i=1}^{n}\sum_{j=i+1}^{n} \langle v_i, v_j\rangle\, x_i x_j\]</div>  <p>这一步妙在哪？① <strong>自动学所有二阶交叉</strong>，不用人工造；② <strong>稀疏也能学</strong>——即使「西藏用户 × 冷门商品」这个组合从没共现，只要「西藏用户」和别的商品共现过（学到 $v_{\text{西藏}}$）、「冷门商品」和别的用户共现过（学到 $v_{\text{商品}}$），它们的内积就给出了一个<strong>合理的泛化预测</strong>。这正是 FM 比 LR 强的根本——把「交叉权重」从「每对一个独立参数」压成「每个特征一个向量」，参数从 $O(n^2)$ 降到 $O(nk)$，且能泛化到未见组合。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>FM 的精髓：<strong>用「特征的向量表示」的内积，代替「每对特征一个独立权重」</strong>。就像 MF 用用户/物品向量内积代替每个评分一个参数——FM 是 MF 思想推广到任意特征交叉。事实上 MF 是 FM 的特例（只有 user-ID 和 item-ID 两个特征时）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个 FM 的<strong>计算神迹</strong>：朴素算二阶项要 $O(n^2)$，但 Rendle 证明它可以化简成 $O(kn)$ 线性时间（下一节推导）。这让 FM 在亿级稀疏特征上依然可在线推理——是它能上工业的关键。FM 同时解决了「自动交叉」「稀疏泛化」「高效计算」三个问题，是 CTR 史上的里程碑。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>FM 必读：Rendle 2010《Factorization Machines》。延伸：FFM（域感知，Juan 2016）、DeepFM（FM+DNN，Guo 2017）、Wide&Deep（Cheng 2016）。见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fm_fast"><span class="num">3</span>FM 的 O(kn) 化简</h2>
+  <h3>FM 的 O(kn) 化简：一个漂亮的代数技巧</h3>  <p>FM 的二阶项 $\sum_{i<j}\langle v_i,v_j\rangle x_i x_j$ 朴素算是 $O(kn^2)$。Rendle 的化简用了「平方和 vs 和的平方」恒等式。先看单个隐因子维度 $f$：</p>  <div class="math-block">\[\sum_{i<j} (v_{i,f} v_{j,f}) x_i x_j = \frac{1}{2}\Big[\Big(\sum_i v_{i,f} x_i\Big)^2 - \sum_i v_{i,f}^2 x_i^2\Big]\]</div>  <p>这个恒等式来自 $\sum_{i<j}a_i a_j = \frac{1}{2}[(\sum_i a_i)^2 - \sum_i a_i^2]$（和的平方 = 平方和 + 2×两两积之和）。对所有 $k$ 个隐因子维度求和，整个二阶项变成：</p>  <div class="math-block">\[\sum_{i<j}\langle v_i,v_j\rangle x_i x_j = \frac{1}{2}\sum_{f=1}^{k}\Big[\Big(\sum_i v_{i,f} x_i\Big)^2 - \sum_i v_{i,f}^2 x_i^2\Big]\]</div>  <p>现在数复杂度：对每个 $f$，$\sum_i v_{i,f}x_i$ 是 $O(n)$（其实只需遍历非零 $x_i$，稀疏下是 $O(\text{nnz})$），共 $k$ 个 $f$，总 $O(kn)$ ——<strong>从平方降到线性</strong>！在稀疏特征（每条样本只有几十个非零）下，这意味着 FM 预测几乎和 LR 一样快，却带了全部二阶交叉。这个化简是 FM 实用性的命脉，notebook worked 会从零实现它并<strong>对拍朴素 $O(n^2)$ 版本</strong>（两者必须逐位相等）。</p>  <p>拿一个 $n=3$、$k=1$ 的微例两边都算一遍，确信这个恒等式（也确信代码该输出什么）。设单维隐向量 $v=(v_1,v_2,v_3)=(2,1,3)$，特征 $x=(1,1,1)$（三个特征都激活）。<strong>朴素的两两积之和</strong>：$\sum_{i<j}v_iv_j x_i x_j=v_1v_2+v_1v_3+v_2v_3=2{\times}1+2{\times}3+1{\times}3=2+6+3=11$。<strong>化简公式</strong>：$\frac12[(\sum_i v_ix_i)^2-\sum_i v_i^2x_i^2]=\frac12[(2+1+3)^2-(4+1+9)]=\frac12[36-14]=\frac12{\times}22=11$。<strong>两边都是 11，分毫不差</strong>。关键看计算量：朴素那边要枚举 3 个物品对（$n{=}3$ 时是 $\binom32{=}3$ 次，$n$ 大时是 $O(n^2)$）；化简那边只各扫一遍向量算两个和（$O(n)$）。$n=3$ 时差别不起眼，但当 $n$ 是亿级、每条样本几十个非零特征时，$O(n^2)$ 直接爆炸、$O(\text{nnz})$ 才能毫秒返回。这正是 notebook 对拍要验证的：<em>两种实现数值必须逐位相等，但快的那个才上得了线</em>。把这个 11 记住，就是你 FM 化简代码的第一个单元测试。（顺带验证一阶项与偏置：若 $w_0=0.5$、一阶权重 $w=(0.1,0.2,0.3)$，则 $\hat y$ 的 logit $=0.5+(0.1{+}0.2{+}0.3)+11=12.1$，过 sigmoid 即得 CTR 预测——FM 的三块「偏置 + 一阶 + 二阶交叉」就这样拼成一个分。）</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么这个化简如此重要？因为它把 FM 从「理论漂亮但算不动」变成「工业能上线」。没有这个 $O(kn)$ 技巧，FM 就和「人工枚举所有二阶交叉」一样慢，毫无优势。有了它，FM 才能在<strong>亿级特征、毫秒级延迟</strong>的真实 CTR 系统里运行。这也是个通用教训：<em>一个模型能否落地，往往不取决于它多准，而取决于能否高效地算</em>——推荐系统尤其如此。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dlrm"><span class="num">4</span>深度 CTR 与 DLRM</h2>
+  <h3>深度 CTR 与 DLRM：embedding 表是主角</h3>  <p>FM 只学二阶交叉。要学<strong>高阶、非线性</strong>的交叉，就上深度模型。工业精排的深度 CTR 大同小异，核心结构是：</p>  <div class="ascii">深度 CTR 的通用结构（以 DLRM 为例）
+
+  稀疏特征(ID): 用户ID 物品ID 品类 ...     稠密特征: 价格 时长 ...
+      │  每个过 embedding 表                    │
+      ▼                                          ▼
+   [e_u, e_i, e_cat, ...]  (一堆 embedding)   [dense MLP]
+      └──────── 特征交互(两两点积/FM)─────────┘
+                        │
+                        ▼
+                   顶层 MLP
+                        │
+                        ▼
+                   σ -&gt; CTR</div>  <p><span class="term">DLRM</span>（Naumov 2019，Meta 开源）是这类模型的代表。它的特点不在结构多新，而在揭示了工业推荐的真正瓶颈：<strong>embedding 表巨大</strong>。亿级用户、亿级物品、每个 ID 一个向量——embedding 表可达<strong>TB 级</strong>，远超单卡显存。于是 DLRM 强调：① embedding 表要<strong>模型并行</strong>（切到多卡，接 C39 分布式）；② 训练/推理的瓶颈是<strong>embedding 的查找与通信</strong>（all-to-all），而非 MLP 的算力。这和模块 03 双塔、模块 02 MF 一脉相承——<strong>推荐模型的参数主体永远是 embedding 表</strong>。</p>  <p>这个「embedding 表是参数主体」的事实有深远的工程含义：① 推荐模型<strong>大但不深</strong>（参数 TB 级但 MLP 只有几层），和 LLM 的「深而稠密」正相反；② 训练瓶颈在<strong>通信而非计算</strong>（embedding 查找要跨卡 all-to-all），所以推荐的分布式训练（C39）和 LLM 很不一样；③ 推理时 embedding 查找 + 缓存是延迟关键。理解了这点，你就明白为什么工业推荐团队有大量精力花在 embedding 的存储、分片、缓存、量化上——这是推荐系统工程的独特战场。</p>  <p><strong>Wide&amp;Deep</strong>（Cheng 2016）是另一经典思路：把<strong>线性部分（wide，记忆具体组合）</strong>和<strong>DNN（deep，泛化）</strong>并联。wide 负责记住「这个特定组合就是高 CTR」（记忆），deep 负责泛化到没见过的组合。<strong>DeepFM</strong>（Guo 2017）用 FM 替代 wide 部分、和 DNN 共享 embedding，免去人工特征工程。这些都是工业精排的常见起点。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句话串起 CTR 模型谱系：<strong>LR（线性）→ FM（自动二阶）→ DeepFM/Wide&amp;Deep（记忆+高阶泛化）→ DLRM（工业级 embedding 工程）</strong>。越往后表达力越强、工程越复杂，但内核都是「embedding + 特征交互」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>注意呼应模块 02 的 Rendle 警示：深度 CTR 不一定碾压调好的 FM。很多场景下 FM/DeepFM 已经够好，盲目上更复杂的模型常常<em>收益递减、成本剧增</em>。工业实践是<strong>先把 FM 这个强基线打满，再视收益决定是否深度化</strong>——这是省钱也是科学。本模块 notebook 因此聚焦 FM（CTR 的性价比之王），深度部分理解思想即可。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>DLRM：Naumov 2019。Wide&Deep：Cheng 2016。DeepFM：Guo 2017。DIN（行为注意力）：Zhou 2018。见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="seq"><span class="num">5</span>序列推荐：GRU4Rec → SASRec</h2>
+  <h3>序列推荐：从 GRU4Rec 到 SASRec</h3>  <p>到目前为止我们都把用户当成一个<strong>静态</strong>的向量（或一堆特征）。但真实的兴趣是<strong>动态、有时序</strong>的——你刚买了相机，接下来想看的是镜头、存储卡，而不是又一台相机。<strong>序列推荐（sequential recommendation）</strong>把用户历史行为当成一个有序序列，预测<strong>下一个</strong>交互，捕捉兴趣的演化与短期意图。</p>  <p>序列推荐的演化和 NLP 惊人地平行（因为「行为序列」和「词序列」结构相同）：</p>  <table>
+    <thead><tr><th>模型</th><th>用什么建序列</th><th>类比 NLP</th><th>特点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>GRU4Rec</strong> (Hidasi 2016)</td><td>RNN/GRU</td><td>RNN 语言模型</td><td>开创序列推荐；序列长时难并行、长程依赖弱</td></tr>
+      <tr><td><strong>Caser</strong> (Tang 2018)</td><td>CNN</td><td>TextCNN</td><td>卷积捕捉局部行为模式</td></tr>
+      <tr><td><strong>SASRec</strong> (Kang 2018)</td><td>单向自注意力</td><td><strong>GPT</strong></td><td>并行、长程依赖好，序列推荐强基线</td></tr>
+      <tr><td><strong>BERT4Rec</strong> (Sun 2019)</td><td>双向 Transformer</td><td><strong>BERT</strong></td><td>掩码物品预测，常优于单向 SASRec</td></tr>
+    </tbody>
+  </table>  <p><span class="term">GRU4Rec</span> 用 GRU 逐个吃 session 内的点击，最后的隐状态预测下一项——和 RNN 语言模型一模一样。它开创了序列推荐，但有 RNN 的老问题：序列长时难并行、远处的行为信号会衰减。</p>  <p><span class="term">SASRec</span>（自注意力序列推荐）用<strong>单向自注意力</strong>（每个位置只能看自己和之前的，像 GPT 的 causal mask）建模行为序列：每个位置的表示是<strong>它之前所有行为的加权聚合</strong>，权重由注意力自动学（哪些历史行为对预测下一项更重要）。它比 RNN<strong>并行（一次算完整个序列）、长程依赖更好</strong>，是当前序列推荐的强基线。训练目标是<strong>next-item prediction</strong>：给定前缀，预测下一物品（softmax / 采样 softmax over 物品表）。</p>  <div class="callout warn"><span class="label"></span>
+    <p>序列推荐有几个<strong>评估陷阱</strong>务必小心：① <strong>必须按时间切分</strong>（用前缀预测下一项），随机切分会泄漏未来、指标虚高；② 采样 softmax 评估时<strong>负例采样方式影响排名</strong>（在采样负例里排序 vs 在全库排序结果不同，文献里 sampled metrics 有争议，Krichene 2020）；③ 序列模型容易<strong>过拟合到「重复上一个」</strong>（很多数据集里下一项=刚交互的相似物品），要检查它是否真的学到了模式而非捷径。评估序列推荐比静态推荐更需谨慎。</p>
+  </div>  <p>序列推荐的训练目标 <strong>next-item prediction</strong> 和语言模型的 next-token 完全同构：给定前缀序列，最大化下一个真实物品的概率（softmax over 物品表，物品多时用采样 softmax，接模块 03 的负采样）。这种结构上的统一让 NLP 的几乎所有进展（注意力、Transformer、预训练、掩码）都能平移到推荐——这也是序列推荐近年爆发的原因。notebook 会用一个去掉注意力复杂度的玩具版（历史 embedding 平均）抓住「序列→下一项」的内核，纯 numpy 可跑。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>序列推荐的核心洞察：<strong>「你最近做了什么」比「你是谁」更能预测「你下一步想要什么」</strong>。一个平时爱看科幻的人，刚点进一个做饭视频，此刻最该推的是更多做饭内容，而非科幻——短期意图压过长期画像。SASRec 的自注意力恰好能<em>动态地</em>决定历史中哪些行为此刻最相关。这也是为什么现代工业推荐（尤其信息流、短视频）越来越依赖序列模型——它抓的是<strong>此刻的意图</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bias"><span class="num">6</span>偏置与去偏：点击数据的暗礁</h2>
+  <h3>偏置与去偏：点击数据的暗礁</h3>  <p>最后一个贯穿推荐始终的硬核问题：<strong>用点击数据训练，会学到偏置而非真实偏好</strong>。最典型的是<span class="term">position bias</span>（位置偏置）——<strong>用户更容易点击排在前面的结果，与内容是否相关无关</strong>。如果直接拿点击当标签训排序，模型会把「排在前面」误学成「相关」，形成恶性循环。</p>  <p>位置偏置的标准模型是<strong>检验假设（examination hypothesis）</strong>：一次点击 = 被<strong>看到</strong>（examine）× 内容<strong>相关</strong>（relevant）：</p>  <div class="math-block">\[P(\text{click}=1 \mid u, i, \text{pos}) = \underbrace{P(\text{examine} \mid \text{pos})}_{\text{只依赖位置}} \times \underbrace{P(\text{relevant} \mid u, i)}_{\text{我们真正想要的}}\]</div>  <p>$P(\text{examine}\mid\text{pos})$ 叫<strong>倾向得分（propensity）</strong>——位置越靠前越接近 1，越靠后越小。我们真正想学的是 $P(\text{relevant})$，但它被位置因素污染了。去偏的经典武器是<span class="term">IPW (inverse propensity weighting)</span>（逆倾向加权）：<strong>给每个点击样本的损失除以它的 propensity</strong>，补偿位置带来的曝光差异：</p>  <div class="math-block">\[\mathcal{L}_{\text{IPW}} = \sum_{\text{clicks}} \frac{\ell(u, i)}{P(\text{examine}\mid \text{pos}_i)}\]</div>  <p>直觉：排在第 10 位还被点击的物品，比排在第 1 位被点击的物品<strong>更能说明它真的相关</strong>（它克服了低曝光），所以给它<strong>更高权重</strong>（除以更小的 propensity）。IPW 把「有位置偏置的点击」纠正成「无偏的相关性估计」（Joachims 2017）。notebook 会从零实现位置偏置的模拟与 IPW 去偏，验证去偏后能恢复真实排序。</p>  <p>一个微例把「为什么不去偏会学歪、IPW 怎么救」算给你看。设两个物品<strong>真实相关性相同</strong>，但物品 A 历史上常被展示在第 1 位（$P(\text{examine})=0.9$），物品 B 常被展示在第 5 位（$P(\text{examine})=0.3$）。假设二者的真实相关概率都是 $P(\text{relevant})=0.4$。按检验假设，观测到的点击率：A 是 $0.9{\times}0.4=0.36$，B 是 $0.3{\times}0.4=0.12$。<strong>直接拿点击当标签，模型会以为 A 的相关性是 B 的 3 倍</strong>（0.36 vs 0.12）——纯属位置造成的假象，于是它把 A 越排越前、B 越压越下，反馈回路自我强化。现在上 IPW：给每个点击样本的损失除以其 propensity，A 的有效权重 $\propto1/0.9$、B 的 $\propto1/0.3$。去偏后的相关性估计：A 是 $0.36/0.9=0.40$，B 是 $0.12/0.3=0.40$——<strong>两者恢复相等，位置偏置被精确抵消</strong>。直觉也对上了：B 在那么靠后的位置还能被点（克服了 0.3 的低曝光），单次点击「含金量」本就更高，所以该乘更大的权重。notebook 正是模拟这组 propensity、对比「裸点击训练 vs IPW 训练」，验证只有后者能还原「两物品其实一样相关」。</p>  <div class="callout danger"><span class="label">偏置全家桶</span>
+    <p>位置偏置只是冰山一角。推荐里还有一群偏置在啃食你的模型：<strong>流行度偏置</strong>（热门越推越热，模块 01/03）、<strong>选择偏置</strong>（用户只对自己选的物品评分，数据 MNAR）、<strong>曝光偏置</strong>（没推给你≠你不喜欢）、<strong>反馈回路</strong>（推荐影响行为、行为又成训练数据，自我强化，制造信息茧房）。这些偏置共同导致一个危险后果：<strong>离线指标提升 ≠ 线上收益</strong>。这就是工业推荐最难的<strong>离线-在线鸿沟</strong>——也是为什么最终一切要靠 A/B 测试裁决。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="online"><span class="num">7</span>在线学习与反馈回路</h2>
+  <h3>在线学习与反馈回路</h3>  <p>推荐系统不是训一次就完事的静态模型，而是一个<strong>持续运转的回路</strong>：模型推荐 → 用户反馈 → 反馈成为新数据 → 更新模型 → 再推荐。这个<strong>反馈回路（feedback loop）</strong>带来独特的挑战与机会。</p>  <p>挑战是前述的<strong>偏置自我强化</strong>：模型只推它认为好的，用户也只能对推荐的东西反馈，于是模型<em>永远看不到</em>它没推过的东西到底好不好——它在自己制造的数据上越陷越深（流行度放大、信息茧房）。破解之道是<strong>探索-利用（exploration-exploitation）</strong>：刻意拿出一小部分流量做随机/探索性推荐，收集无偏数据。这正是<strong>bandit / 强化学习</strong>在推荐里的用武之地（接 C13 RL）——把推荐当成序贯决策，平衡「推已知好的（利用）」和「试不确定的（探索）」。</p>  <p>机会是<strong>实时性</strong>：用户兴趣秒级变化（刚搜了「羽绒服」），系统要能<strong>近实时</strong>地把这个信号用上。工业上有在线学习（参数实时更新）、实时特征（session 内行为）、近线召回（实时建索引）等机制。序列推荐（上一节）正是为捕捉这种实时意图而生。</p>  <p>还有一个反馈回路的<strong>伦理与产品</strong>维度值得一提：回路放大流行度、制造<strong>信息茧房</strong>（你只看到越来越窄的内容）、可能强化偏见、甚至被用于操纵。负责任的推荐系统（接 C12/C45）要主动<em>打破</em>回路——注入多样性、保护长尾、给用户控制权、监控公平性。这不只是技术问题，更是这类系统作为<strong>社会基础设施</strong>的责任。会做推荐的人，也该懂得它的副作用。</p>  <p>把整门课收束一下：你现在掌握了一条工业推荐链路的<strong>全部核心算法</strong>——召回（CF/双塔）、排序（LTR/BPR）、精排模型（FM/序列）、以及去偏与回路。真实系统是这些组件的精心编排：多路召回 → 粗排 → 精排（多目标深度模型）→ 重排（多样性/业务规则），全程与偏置和反馈回路搏斗，最终以 A/B 为准。<strong>这就是支撑万亿级互联网经济的推荐系统的全貌</strong>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>生成式推荐</strong>：用 LLM/生成模型直接「生成」下一个物品 ID（如 TIGER 的语义 ID、P5 把推荐统一成文本生成）。能否取代「embedding + 检索」范式，是最热的方向之一。</li>
+    <li><strong>大模型与推荐</strong>：用 LLM 的世界知识做冷启动、可解释推荐、对话式推荐；用 LLM 当特征提取器或 reranker。LLM4Rec 是活跃前沿。</li>
+    <li><strong>无偏学习与因果推荐</strong>：把推荐当因果干预，用 IPS/doubly-robust 估计器同时去偏训练与评估；反事实推荐、off-policy 评估仍有大量开放问题。</li>
+    <li><strong>多目标与长期价值</strong>：从优化即时点击转向优化长期用户价值（留存、满意度），用 RL 建模长期回报，避免短视的标题党/信息茧房。</li>
+    <li><strong>统一的序列/生成架构</strong>：把召回、排序、序列建模统一进一个大模型（类似 NLP 的统一），减少多阶段的目标不一致，是工业架构的长期愿景。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Rendle 2010（FM）、Naumov 2019（DLRM）、Kang 2018（SASRec）、Hidasi 2016（GRU4Rec）、Joachims 2017（无偏 LTR/去偏）。进阶：Chen 2020（偏置综述）、Dacrema 2019（复现性警示）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_learning_to_rank/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 排序学习</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

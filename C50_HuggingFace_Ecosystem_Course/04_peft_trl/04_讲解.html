@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · PEFT 与 TRL</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · PEFT 与 TRL</h1>
+  <p class="subtitle">LoRA 四参数的真实含义（B=0 / α÷r / 覆盖面 > 秩）· merge 的等价性与不可逆 · QLoRA 的四个组件 · SFT 的 chat template 与 completion-only 掩码 · DPO 的 beta 与长度偏差</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–03；C02（SFT/RLHF/DPO 的算法原理）；C27（量化原理，QLoRA 一节会用）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_peft_trl.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Hu et al. 2021（LoRA）、Dettmers et al. 2023（QLoRA）、Rafailov et al. 2023（DPO）；peft / trl 文档</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#lora">LoRA：四个参数，每个都有明确含义</a></li>
+      <li><a href="#peft_api">peft 的四个动作：包装、训练、保存、合并</a></li>
+      <li><a href="#qlora">QLoRA：四个组件，缺一个就不是 QLoRA</a></li>
+      <li><a href="#sft">TRL 的 SFTTrainer：数据格式与 prompt 掩码</a></li>
+      <li><a href="#dpo">DPOTrainer：成对数据与 beta</a></li>
+      <li><a href="#ledger">算一笔账：LoRA 到底省了多少</a></li>
+      <li><a href="#frontier">生态动态与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="lora"><span class="num">1</span>LoRA：四个参数，每个都有明确含义</h2>
+  <p>LoRA 的原理一句话：<strong>冻结原权重 <code>W</code>，只训练一个低秩增量 <code>ΔW = BA</code></strong>（<code>A: r×d_in</code>，<code>B: d_out×r</code>，<code>r ≪ min(d_in,d_out)</code>）。原理在 C02 讲过，本模块只讲<strong>参数怎么配、为什么</strong>。</p>  <div class="math-block">\[h = Wx + \frac{\alpha}{r}\,BAx, \qquad A \sim \mathcal{N}(0,\sigma^2),\; B = 0\]</div>  <table>
+    <thead><tr><th>参数</th><th>含义</th><th>常用值</th><th>怎么想</th></tr></thead>
+    <tbody>
+      <tr><td><code>r</code></td><td>低秩的秩</td><td>8 / 16 / 32 / 64</td><td><strong>容量旋钮</strong>。任务与预训练分布越远、数据越多，越需要大 <code>r</code>。8 够用于风格/格式适配；领域知识注入常要 32+</td></tr>
+      <tr><td><code>lora_alpha</code></td><td>缩放的分子；实际缩放是 <code>α/r</code></td><td>通常取 <code>2r</code> 或 <code>r</code></td><td><strong>它的作用是「让改 r 时不必重调 lr」</strong>。固定 <code>α/r</code> 比值，换 <code>r</code> 时有效步长不变</td></tr>
+      <tr><td><code>target_modules</code></td><td>给哪些线性层加 LoRA</td><td><code>["q_proj","v_proj"]</code>（默认）或全部 <code>q,k,v,o,gate,up,down</code></td><td><strong>覆盖面比 <code>r</code> 更重要</strong>——原论文发现同等参数预算下，「小 r + 覆盖更多模块」优于「大 r + 只覆盖 q,v」</td></tr>
+      <tr><td><code>lora_dropout</code></td><td>作用在 LoRA 分支输入上的 dropout</td><td>0.0 – 0.1</td><td>小数据集上有用；大数据集通常设 0</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong><code>B</code> 初始化为 0 是个关键设计</strong>：这让训练开始时 <code>ΔW = BA = 0</code>，模型输出与原模型<em>逐字节相同</em>。这意味着 LoRA 微调是从「原模型」这个点<strong>连续地</strong>出发的，不会有初始的性能跳崖。<em>如果 <code>A</code> 和 <code>B</code> 都随机初始化，训练一开始模型就被随机扰动破坏，需要先花很多步「修回来」。</em>这个细节在 notebook 里会用数值验证。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong><code>α/r</code> 的设计动机</strong>值得说清，因为它常被误解为「另一个学习率」。原论文的意图是：当你把 <code>r</code> 从 8 调到 64 时，<code>BA</code> 的输出尺度会随 <code>r</code> 变化（更多的秩累加），如果不缩放，有效学习率就变了、要重新调 lr。用 <code>α/r</code> 缩放后，<em>固定 <code>α/r</code> 比值扫 <code>r</code></em> 就不用重调 lr。<strong>所以实践中你应该固定比值（如 <code>α=2r</code>）而不是固定 <code>α</code></strong>——固定 <code>α=16</code> 然后把 <code>r</code> 从 8 调到 64，实际上把缩放从 2.0 降到了 0.25。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong><code>target_modules</code> 的名字是模型特定的</strong>，这是最常见的报错来源。Llama 系是 <code>q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj</code>；BERT 系是 <code>query,key,value,dense</code>；GPT-2 是 <code>c_attn,c_proj</code>（而且 <code>c_attn</code> 是把 QKV 融在一起的一个大矩阵）。填错名字的症状是 <code>ValueError: Target modules not found</code>，或者更糟——<em>只匹配到一部分层而不报错</em>。可靠做法：<code>print([n for n,_ in model.named_modules()])</code> 先看一眼，或者用 <code>target_modules="all-linear"</code> 让 peft 自动找。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="peft_api"><span class="num">2</span>peft 的四个动作：包装、训练、保存、合并</h2>
+  <pre><code>from peft import LoraConfig, get_peft_model, PeftModel, TaskType
+
+# ① 包装：冻结原权重、注入 LoRA 分支
+cfg = LoraConfig(
+    r=16, lora_alpha=32,                 # α/r = 2
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"],
+    lora_dropout=0.05,
+    bias="none",                          # 通常不训 bias
+    task_type=TaskType.CAUSAL_LM,         # ⚠️ 必须与任务匹配，否则头不对
+)
+model = get_peft_model(base_model, cfg)
+model.print_trainable_parameters()
+# -&gt; trainable params: 40,370,176 || all params: 8,070,000,000 || trainable%: 0.50
+
+# ② 训练：和普通 Trainer 完全一样（模块 03）
+trainer = Trainer(model=model, args=args, ...); trainer.train()
+
+# ③ 保存：只存 adapter（几十 MB，不是几十 GB）
+model.save_pretrained("out/adapter")     # adapter_model.safetensors + adapter_config.json
+
+# ④ 加载 / 合并
+m = PeftModel.from_pretrained(base_model, "out/adapter")   # 可继续训练或推理
+merged = m.merge_and_unload()             # W &lt;- W + (α/r)BA，得到普通模型
+merged.save_pretrained("out/merged")      # 完整权重，可直接给 vLLM 用</code></pre>  <table>
+    <thead><tr><th>动作</th><th>产出</th><th>大小</th><th>能继续训练吗</th></tr></thead>
+    <tbody>
+      <tr><td><code>save_pretrained</code>（adapter）</td><td><code>adapter_model.safetensors</code></td><td><strong>几十 MB</strong></td><td>✅ 用 <code>PeftModel.from_pretrained</code> 加载后可以</td></tr>
+      <tr><td><code>merge_and_unload()</code></td><td>普通 <code>nn.Module</code>（权重已融合）</td><td>与基座相同（几十 GB）</td><td>❌ <strong>LoRA 分支已消失</strong>，只能当普通模型全量训</td></tr>
+      <tr><td>多 adapter 共存</td><td>多个 adapter 目录</td><td>每个几十 MB</td><td>✅ <code>set_adapter(name)</code> 切换；可同时加载</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong><code>merge_and_unload()</code> 的取舍</strong>：合并后推理零额外开销（不用算 LoRA 分支，也不影响 kernel 融合），且能直接喂给 vLLM/TensorRT 这类只认标准权重的引擎。代价是<em>失去了「多 adapter 动态切换」的能力</em>，而且合并是<strong>不可逆</strong>的（除非你留着原基座和 adapter）。<em>规则：训练与实验期不合并（保留灵活性），最终上线时合并（换取推理效率）。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>多 adapter 共存是 LoRA 一个被低估的能力：<strong>一个基座 + N 个几十 MB 的 adapter，可以服务 N 个不同任务/客户</strong>。显存里只有一份基座权重，切换 adapter 几乎零成本。这在多租户场景下的成本优势是巨大的（对比 N 份完整模型）。生产上 vLLM 等引擎已支持 multi-LoRA 服务（同一 batch 里不同请求用不同 adapter）。<em>这也是「不合并」的一个强理由。</em></p></div>
+  </div>  <div class="callout danger"><span class="label">task_type 填错 = 分类头被冻在随机状态</span>
+    <p><strong><code>task_type</code> 填错是个静默陷阱</strong>。<code>TaskType.CAUSAL_LM</code> 与 <code>SEQ_CLS</code> 的区别在于：后者会把分类头（<code>score</code>/<code>classifier</code>）也标记为可训练（因为它是新初始化的，必须训）。如果你做分类却填了 <code>CAUSAL_LM</code>，<em>分类头会被冻结在随机初始化状态</em>——训练能跑、loss 会降一点（LoRA 在适应那个随机头），但效果永远上不去。<strong>症状：准确率卡在一个远低于预期的水平且怎么调超参都不动。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="qlora"><span class="num">3</span>QLoRA：四个组件，缺一个就不是 QLoRA</h2>
+  <p>QLoRA 让 65B 模型在单张 48GB 卡上微调。它不是一个技巧，而是<strong>四个组件的组合</strong>：</p>  <table>
+    <thead><tr><th>组件</th><th>做什么</th><th>省了什么</th><th>参数</th></tr></thead>
+    <tbody>
+      <tr><td><strong>4-bit NF4 量化</strong></td><td>把冻结的基座权重量化到 4 bit（NormalFloat4，针对正态分布优化的量化格点）</td><td>权重显存 ÷4（16 GB → 4.5 GB）</td><td><code>load_in_4bit=True, bnb_4bit_quant_type="nf4"</code></td></tr>
+      <tr><td><strong>双重量化</strong></td><td>把量化用的 scale 常数本身再量化一次</td><td>额外省约 0.4 bit/参数</td><td><code>bnb_4bit_use_double_quant=True</code></td></tr>
+      <tr><td><strong>分页优化器</strong></td><td>优化器状态在显存不足时分页到 CPU</td><td>避免峰值 OOM</td><td><code>optim="paged_adamw_8bit"</code></td></tr>
+      <tr><td><strong>LoRA 在量化权重上</strong></td><td>基座 4-bit 冻结，LoRA 分支用 bf16 训练</td><td>梯度与优化器状态只按 LoRA 参数算</td><td><code>bnb_4bit_compute_dtype=torch.bfloat16</code></td></tr>
+    </tbody>
+  </table>  <pre><code>from transformers import BitsAndBytesConfig
+from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
+
+bnb = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.bfloat16,   # 计算时反量化到 bf16
+)
+base = AutoModelForCausalLM.from_pretrained(CKPT, quantization_config=bnb,
+                                           device_map="auto")
+base = prepare_model_for_kbit_training(base)   # ⚠️ 别忘：转 LayerNorm 到 fp32、
+                                                #    开 gradient checkpointing、
+                                                #    让 embedding 输出 requires_grad
+model = get_peft_model(base, LoraConfig(r=64, lora_alpha=16, ...))</code></pre>  <div class="callout warn"><span class="label"></span>
+    <strong><code>prepare_model_for_kbit_training</code> 常被漏掉</strong>，而它做的三件事都是必需的：①把 LayerNorm 转成 fp32（量化模型里 LN 用低精度会不稳）；②开启 gradient checkpointing；③给 embedding 的输出挂一个 hook 让梯度能流过（量化层不可导，梯度必须绕过它到 LoRA 分支）。<em>漏掉它的症状是「loss 不降」或「梯度为 None」</em>。另外 QLoRA 论文用的是 <code>r=64</code> 且覆盖<strong>所有</strong>线性层——比常规 LoRA 激进得多，因为 4-bit 基座本身有量化误差，需要更大的 LoRA 容量来补偿。
+  </div>  <p>最后一条必须知道的边界：<strong>QLoRA 训练慢</strong>。每次前向都要把 4-bit 权重反量化到 bf16，这个开销让训练速度约为 bf16 LoRA 的 60–70%。<em>所以 QLoRA 是「显存不够时的解法」，不是「更快的解法」</em>。如果你的卡放得下 bf16 LoRA，就别用 QLoRA。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="sft"><span class="num">4</span>TRL 的 SFTTrainer：数据格式与 prompt 掩码</h2>
+  <p><code>trl</code> 把后训练算法包成了几个 Trainer。<code>SFTTrainer</code> 是最常用的，它的核心工作是<strong>把「对话」变成「带正确 labels 的 token 序列」</strong>。</p>  <h3>三种数据格式</h3>  <pre><code># 格式 ① conversational（推荐）—— SFTTrainer 会自动套 chat template
+{"messages": [{"role": "system",    "content": "You are helpful."},
+              {"role": "user",      "content": "什么是 LoRA？"},
+              {"role": "assistant", "content": "LoRA 是……"}]}
+
+# 格式 ② prompt-completion
+{"prompt": "什么是 LoRA？", "completion": "LoRA 是……"}
+
+# 格式 ③ 纯文本（自己拼好，SFTTrainer 直接用）
+{"text": "&lt;|user|&gt;什么是 LoRA？&lt;|assistant|&gt;LoRA 是……&lt;|end|&gt;"}</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>格式 ① 的好处是<strong>让 tokenizer 的 chat template 决定拼接方式</strong>。每个指令模型都有自己的对话格式（Llama-3 的 <code>&lt;|start_header_id|&gt;</code>、ChatML 的 <code>&lt;|im_start|&gt;</code>、Mistral 的 <code>[INST]</code>），<em>格式必须与该模型预训练/指令微调时一致</em>，否则模型看到的是陌生的分隔符。用 <code>tokenizer.apply_chat_template()</code>（或让 <code>SFTTrainer</code> 自动做）是唯一可靠的做法——手写拼接几乎一定会在某个特殊 token 上出错。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>最关键的语义是 prompt 掩码</strong>：SFT 只应对 <em>assistant 的回答</em> 计损失，system/user 部分要填 <code>-100</code>（模块 02 讲过）。<code>SFTTrainer</code> 通过 <code>DataCollatorForCompletionOnlyLM</code>（配 <code>response_template</code>）或对 conversational 格式的自动处理来做这件事。<strong>如果不掩，模型会同时学习「生成用户提问」</strong>——loss 看起来更低（用户提问也是可预测的文本），但模型在推理时可能自己接着编用户的下一句话。<em>这是 SFT 最经典的 bug。</em></p></div>
+  </div>  <table>
+    <thead><tr><th><code>SFTConfig</code> 参数</th><th>作用</th><th>注意</th></tr></thead>
+    <tbody>
+      <tr><td><code>max_length</code></td><td>序列长度上限</td><td>超出被截断——注意<strong>回答被截断</strong>比 prompt 被截断更糟</td></tr>
+      <tr><td><code>packing</code></td><td>把多条短样本拼进一个定长序列</td><td>消除 padding 浪费（模块 02），但需要正确的跨样本掩码；短样本任务上可能有害</td></tr>
+      <tr><td><code>completion_only_loss</code> / <code>DataCollatorForCompletionOnlyLM</code></td><td>只对回答计损失</td><td><strong>必须开</strong>；<code>response_template</code> 要与 chat template 完全一致</td></tr>
+      <tr><td><code>dataset_text_field</code></td><td>纯文本格式时指定字段名</td><td>与 conversational 格式互斥</td></tr>
+      <tr><td><code>neftune_noise_alpha</code></td><td>在 embedding 上加噪声做正则</td><td>小数据集上有时有效，非必需</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <strong><code>packing=True</code> 的取舍</strong>值得单独想清楚。它把 padding 浪费降到接近 0（吞吐可能翻倍），但引入两个问题：①跨样本的注意力污染（需要 <code>position_ids</code> 或变长 attention 正确隔离，否则一条样本会「看到」另一条）；②<em>短样本被拼在一起后，每条样本的相对权重变了</em>——原来每条样本贡献一个梯度，现在长样本贡献更多 token 因此权重更大。<em>对指令数据（长度差异大）这个偏移是真实的</em>。规则：数据量大且长度接近时开 packing；数据少或长度差异大时别开。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dpo"><span class="num">5</span>DPOTrainer：成对数据与 beta</h2>
+  <p>DPO 的算法原理在 C02/C23 讲过（用偏好对直接优化策略，不需要显式奖励模型）。本模块讲<strong>数据格式与三个关键参数</strong>。</p>  <pre><code># DPO 的数据格式：每条是一个「偏好对」
+{"prompt":   [{"role": "user", "content": "什么是 LoRA？"}],
+ "chosen":   [{"role": "assistant", "content": "LoRA 是一种低秩适配方法……"}],
+ "rejected": [{"role": "assistant", "content": "我不知道。"}]}
+
+from trl import DPOConfig, DPOTrainer
+trainer = DPOTrainer(
+    model=policy,                    # 要训练的策略（通常是 SFT 后的模型）
+    ref_model=None,                  # None -&gt; 自动用 policy 的初始副本；
+                                     #        用 LoRA 时可以直接禁用 adapter 当参考
+    args=DPOConfig(beta=0.1,         # KL 约束强度：**最重要的参数**
+                   loss_type="sigmoid",   # sigmoid(标准DPO)/ipo/hinge/kto_pair
+                   max_length=1024,
+                   max_prompt_length=512),
+    train_dataset=pref_ds,
+    processing_class=tok,
+)</code></pre>  <div class="math-block">\[\mathcal{L}_{DPO} = -\log\sigma\!\left(\beta\left[\log\frac{\pi(y_w|x)}{\pi_{ref}(y_w|x)} - \log\frac{\pi(y_l|x)}{\pi_{ref}(y_l|x)}\right]\right)\]</div>  <table>
+    <thead><tr><th>参数</th><th>含义</th><th>调大会怎样</th><th>调小会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><code>beta</code></td><td>隐式 KL 约束的强度</td><td>更保守，贴近参考模型，学得慢</td><td>更激进，可能<strong>偏离太远导致退化</strong>（重复、乱码、能力下降）</td></tr>
+      <tr><td><code>ref_model</code></td><td>参考策略</td><td>—</td><td><strong>用 LoRA 时可以省掉一份模型</strong>：禁用 adapter 即得参考</td></tr>
+      <tr><td><code>loss_type</code></td><td>损失变体</td><td><code>ipo</code> 对长度偏差更鲁棒；<code>hinge</code> 更硬</td><td>—</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong><code>ref_model=None</code> + LoRA 是个漂亮的组合</strong>。DPO 需要同时算策略与参考的 logprob，通常意味着显存里要放两份模型。但用 LoRA 时，「参考模型」= 「禁用 LoRA 分支的同一个模型」——<em>因为 LoRA 的 <code>B</code> 初始化为 0，禁用它就精确回到 SFT 后的模型</em>。<code>trl</code> 会自动利用这一点，显存直接省一半。这是 LoRA 与 DPO 的一个非平凡协同。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong><code>beta</code> 的实践区间是 0.01–0.5，常用 0.1</strong>。它的作用类似 PPO 里的 KL 系数：太小则策略跑得太远，出现「reward hacking」式的退化（输出变长、变重复、通用能力下降）；太大则几乎学不动。<em>调 <code>beta</code> 时必须同时监控「非目标能力」</em>——DPO 很容易在提升偏好胜率的同时损害通用能力（C23 有系统讨论）。另外要警惕<strong>长度偏差</strong>：偏好数据里若 chosen 系统性更长，DPO 会学到「更长 = 更好」，这是文献中反复出现的问题，<code>loss_type="ipo"</code> 或显式长度归一化是缓解手段。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>DPO 之前必须先 SFT</strong>。DPO 假设策略已经在目标分布上有合理的概率质量——直接在基座模型上跑 DPO，效果通常很差且不稳定。标准流程是 <strong>基座 → SFT → DPO</strong>（C02 的完整链路）。另一个常见错误是<em>把 SFT 数据直接当 DPO 数据</em>（把 SFT 答案当 chosen、随机答案当 rejected）——这样的 rejected 太容易区分，学不到细粒度偏好，<em>这与 C49 反复出现的「负例设计决定学到什么」是同一条原理。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">6</span>算一笔账：LoRA 到底省了多少</h2>
+  <div class="math-block">\[N_{LoRA} = \sum_{\text{目标层}} r\,(d_{in} + d_{out}), \qquad \text{占比} = \frac{N_{LoRA}}{N_{total}}\]</div>  <table>
+    <thead><tr><th>配置</th><th>可训练参数</th><th>占比</th><th>优化器状态</th><th>checkpoint</th><th>训练显存（7B）</th></tr></thead>
+    <tbody>
+      <tr><td>全量微调</td><td>7.0 B</td><td>100%</td><td>56 GB</td><td>≈ 84 GB</td><td><strong>≈ 84 GB</strong></td></tr>
+      <tr><td>LoRA r=8, 仅 q,v</td><td>≈ 4.2 M</td><td>0.06%</td><td>34 MB</td><td>≈ 8 MB</td><td>≈ 18 GB</td></tr>
+      <tr><td>LoRA r=16, 全部线性层</td><td>≈ 40 M</td><td>0.57%</td><td>320 MB</td><td>≈ 80 MB</td><td>≈ 20 GB</td></tr>
+      <tr><td>QLoRA r=64, 全部线性层</td><td>≈ 160 M</td><td>2.3%</td><td>1.3 GB</td><td>≈ 320 MB</td><td><strong>≈ 8 GB</strong></td></tr>
+    </tbody>
+  </table>  <p>三个观察：</p>  <ul>
+    <li><strong>省显存的主力是「优化器状态按可训练参数算」</strong>（模块 01 的公式），不是权重本身。全量微调的 56 GB 优化器状态直接变成几百 MB。</li>
+    <li><strong>checkpoint 从几十 GB 变成几十 MB</strong>，这改变了实验方式——你可以毫无压力地保存二十个实验的 adapter，而全量微调时连三个 checkpoint 都要考虑磁盘。</li>
+    <li><strong>QLoRA 的显存最低但训练最慢</strong>（反量化开销，约为 bf16 LoRA 的 60–70% 速度）。它是「放不下时的解法」，不是「更快的解法」。</li>
+  </ul>  <p>还有一个常被忽略的账：<strong>推理开销</strong>。未合并的 LoRA 每层多两次小矩阵乘（<code>x→A→B</code>），FLOPs 增加约 <code>2r/d</code>（<code>r=16, d=4096</code> 时约 0.8%），但<em>因为是两个小 kernel，实际延迟增加可能到 10–20%</em>（kernel 启动开销与显存往返占主导）。<strong>合并后开销归零</strong>——这就是上线前该合并的理由。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句话：<strong>LoRA 的价值不只是「省显存」，而是把「微调」从一件重工程变成一件轻工程</strong>——几十 MB 的产物、可以同时保留几十个版本、一个基座服务多个任务、切换成本接近零。<em>这个「轻」带来的实验速度提升，可能比省下的显存更有价值。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>生态动态与开放问题</h2>
+  <ul>
+    <li><strong>LoRA 变体的丛林</strong>：DoRA（分解幅度与方向）、rsLoRA（改缩放为 <code>α/√r</code>）、LoRA+（给 A、B 不同学习率）、VeRA（共享随机基）、PiSSA（用 SVD 主成分初始化）——各自报告了改进，但缺乏统一的、控制了算力预算的对比。「该用哪个变体」目前主要靠试。</li>
+    <li><strong><code>r</code> 与任务的关系</strong>：普遍经验是「风格适配小 <code>r</code>、知识注入大 <code>r</code>」，但缺乏可操作的先验判据。<em>LoRA 到底能学到多少「新知识」（而非只是重新组合已有能力）是个尚未澄清的问题</em>，也直接关系到「什么时候必须全量微调」。</li>
+    <li><strong>多 adapter 的服务与组合</strong>：同 batch 混合不同 adapter（S-LoRA、vLLM 的 multi-LoRA）已工程化，但<em>多个 adapter 的语义组合</em>（同时应用两个 adapter、或按权重混合）效果不可预测，缺乏理论。</li>
+    <li><strong>DPO 家族的爆炸</strong>：IPO、KTO、ORPO、SimPO、CPO……各自修正 DPO 的某个缺陷（长度偏差、需要成对数据、需要 SFT 阶段）。<em>在什么数据条件下哪个更优</em>缺乏系统结论，且很多对比没有控制超参搜索预算（C40 会说这是典型的可复现性问题）。</li>
+    <li><strong>偏好数据的长度偏差</strong>：几乎所有偏好数据集里 chosen 都系统性更长，导致对齐后的模型输出越来越长。显式长度归一化、长度控制的解码、以及在数据侧平衡长度，都是缓解手段，但没有干净的解法。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Hu et al. 2021 <em>LoRA</em>（重点读 §7.2 关于 <code>r</code> 与 target modules 的消融——「覆盖更多模块优于更大 r」这个结论出自那里）、Dettmers et al. 2023 <em>QLoRA</em>（四个组件与 NF4 的推导）、Rafailov et al. 2023 <em>DPO</em>（推导必读，理解 beta 的来源）、Meng et al. 2024 <em>SimPO</em> 与 Azar et al. 2024 <em>IPO</em>（长度偏差的两种修正）。文档侧：peft 的 <em>LoRA</em> 与 <em>Quantization</em>、trl 的 <em>SFTTrainer</em> 与 <em>DPOTrainer</em>。原理侧：C02（后训练全链路）、C23（对齐前沿）、C27（量化）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_trainer/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · Trainer 与 TrainingArguments</div></a>
+    <a class="next" href="../05_accelerate_hub_api/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · Accelerate、Hub 与推理 API</div></a>
+  </div>
+
+</div>
+</body>
+</html>

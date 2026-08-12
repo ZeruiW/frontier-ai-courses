@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 编排与调试</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 编排与调试</h1>
+  <p class="subtitle">把一份训练脚本拉起到一片集群：rank/world/通信组、落后者与扩展效率、MFU 与重叠、死锁与一致性调试 —— 让分布式训练在真实集群上稳定跑起来的最后一公里</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–04（集合通信、数据并行、张量/流水并行、容错）、一点点操作系统/网络常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_orchestration_debug.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Megatron-LM（Narayanan 2021）、Local/去中心化 SGD、DiLoCo、Alpa</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#overview">编排全景：从一份脚本到一片集群</a></li>
+      <li><a href="#launch">rank / world / local_rank 与启动器</a></li>
+      <li><a href="#groups">通信组：rank 到 (dp,tp,pp) 的映射</a></li>
+      <li><a href="#straggler">落后者：同步训练的木桶效应</a></li>
+      <li><a href="#scaling">扩展效率：强扩展、弱扩展与 Amdahl</a></li>
+      <li><a href="#mfu">MFU 与通信-计算重叠</a></li>
+      <li><a href="#debug">调试：死锁、NaN 与一致性</a></li>
+      <li><a href="#frontier">瓶颈定位与研究前沿</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="overview"><span class="num">1</span>编排全景：从一份脚本到一片集群</h2>
+  <p>前面四个模块教会了你分布式训练的「物理学」——集合通信怎么算、显存怎么分片、张量/流水怎么切、checkpoint 怎么存。但当你真的要在一个 256 卡的集群上把一份训练脚本<strong>拉起来、盯住、出了问题能修</strong>时，面对的是另一类问题：<strong>编排（orchestration）与调试（debugging）</strong>。这是分布式训练里最不性感、却最消耗工程师时间的一环——一个能跑通的并行策略，和一个能在真实集群上<em>稳定跑两个月、断了能自愈、慢了能定位</em>的训练系统，中间隔着的就是本模块。</p>  <p>先认清一个反直觉的事实：<strong>在大规模训练里，「让它跑起来」往往比「让它跑得对」更难</strong>。算法正确性你在单卡、双卡就能验证（这正是本课 notebook 一直在做的对拍）；但「512 个进程在 64 台机器上同时启动、各自绑定正确的 GPU、加入正确的通信组、在第 1 万步有一台机器网卡抖了一下而整个训练没有死锁」——这件事没有 <code>assert</code> 能在本地替你验证，它只在真实集群上、在凌晨三点报警时才暴露。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>编排就是「把一个程序复制成 N 份、让它们认识彼此、各管一块硬件」的全部胶水：谁是 0 号、总共几个、连到哪个集合点、用哪块 GPU。调试则是当这台由几百个进程组成的机器卡住或算飞了时，怎么在没有单一现场的情况下定位元凶。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，一次分布式训练是 <code>world_size</code> 个进程，每个持有唯一 <code>rank</code>，通过一个 <strong>rendezvous（集合点）</strong> 互相发现、建立 <span class="term">process group</span>（通信组）。编排是把 (rank, world_size, local_rank, MASTER_ADDR, MASTER_PORT) 这组环境变量正确地分发到每个进程；调试是在某个 collective 永久阻塞、或某个 rank 的张量和别人不一致时，重建出「谁在等谁」的全局图景。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>同步训练是一台由几百个零件咬合而成的机器——任何一个零件慢一拍、缺一次、对不齐，整台机器要么变慢，要么卡死，要么悄悄算错</strong>。前四模块教你造零件，本模块教你装配、点火、和在它抽搐时找出哪颗螺丝松了。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="launch"><span class="num">2</span>rank / world / local_rank 与启动器</h2>
+  <p>启动一次分布式训练，本质是把<strong>同一个脚本</strong>在多台机器、多块 GPU 上各跑一份，并让它们就「我是谁、我们有几个、怎么找到彼此」达成一致。这套元信息靠几个约定俗成的<strong>环境变量</strong>传递：</p>  <table>
+    <thead><tr><th>变量</th><th>含义</th><th>举例（2 机 × 8 卡 = 16 进程）</th></tr></thead>
+    <tbody>
+      <tr><td><code>WORLD_SIZE</code></td><td>进程总数 = 参与训练的 GPU 总数</td><td>16</td></tr>
+      <tr><td><code>RANK</code></td><td>本进程的全局编号，0 .. world_size−1，全局唯一</td><td>0 .. 15</td></tr>
+      <tr><td><code>LOCAL_RANK</code></td><td>本进程在<em>本机</em>内的编号，决定绑哪块本地 GPU</td><td>0 .. 7（每机）</td></tr>
+      <tr><td><code>MASTER_ADDR</code></td><td>rank 0 所在机器的地址，作为 rendezvous 集合点</td><td>10.0.0.1</td></tr>
+      <tr><td><code>MASTER_PORT</code></td><td>集合点端口</td><td>29500</td></tr>
+    </tbody>
+  </table>  <p>这里最容易混淆、也最容易出 bug 的是 <strong>global rank 与 local rank 的区别</strong>。<code>RANK</code> 是你在<em>整个世界</em>里的身份（用于参与全局 collective）；而 <code>LOCAL_RANK</code> 是你在<em>本台机器</em>里的身份，唯一用途是 <code>torch.cuda.set_device(local_rank)</code>——把本进程钉死在某块物理 GPU 上。在 2 机 × 8 卡里，机器 B 上那个 <code>LOCAL_RANK=0</code> 的进程，其 <code>RANK</code> 是 8 而非 0。把这两者搞混（比如用 global rank 去 set_device）会让两个进程抢同一块卡、或越界访问不存在的卡，是新手第一天就会踩的坑。</p>  <p>分发这组变量、把进程拉起来的，是<strong>启动器（launcher）</strong>。最常见的两种：<code>torchrun</code>（PyTorch 自带，单机或配合调度器跨机）负责在每台机器上 fork 出 <code>nproc_per_node</code> 个进程并注入正确的 rank/local_rank；而在真正的 HPC/生产集群上，外层往往是 <span class="term">SLURM</span> 这类作业调度器，先分配节点、再在每个节点上调起 torchrun 或直接调 python。无论哪种，它们干的事都一样：把上表那几个变量算对、塞进每个进程的环境里。</p>  <div class="callout warn"><span class="label"></span>
+    <p>rendezvous 是启动阶段最脆弱的一环。所有进程必须能解析并连上 <code>MASTER_ADDR:MASTER_PORT</code>，否则会卡在「等其他 rank 加入」直到超时。典型故障：端口被占用、防火墙挡住、<code>MASTER_ADDR</code> 在多网卡机器上指向了不可达的网卡、或某台机器根本没起来导致 world 永远凑不齐。现代 <code>torchrun</code> 用 <span class="term">c10d rendezvous</span> 后端（甚至 etcd）来做更健壮的成员发现与<strong>弹性</strong>重组——这正是模块 04 弹性训练的入口。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="groups"><span class="num">3</span>通信组：rank 到 (dp,tp,pp) 的映射</h2>
+  <p>光有「我是 rank 5」还不够。一旦你叠加了模块 02/03 的多维并行，rank 5 还需要知道：<strong>我在数据并行里和谁同组？张量并行里和谁同组？流水线里和谁同组？</strong>——因为不同的 collective 要在不同的<strong>子通信组（sub process group）</strong>上做。</p>  <p>做法是把 <code>world_size</code> 个 rank 看成一个三维网格 <code>(dp, tp, pp)</code>（数据并行 × 张量并行 × 流水并行），用一个固定的「展平公式」在线性 rank 与三维坐标间换算。约定一种行主序（最内层是 TP，其次 DP，最外层 PP）：</p>  <div class="math-block">\[\text{rank} = pp \cdot (n_{dp} n_{tp}) + dp \cdot n_{tp} + tp\]</div>  <p>有了这个映射，每个 collective 就有了明确的「作用域」。一条朴素的规则贯穿所有并行：<strong>沿哪个维度做并行，就在那个维度的组里做 collective</strong>。数据并行的梯度 all-reduce 在<em>固定 (tp, pp)、遍历 dp</em>的那组 rank 上做；张量并行的激活 all-reduce 在<em>固定 (dp, pp)、遍历 tp</em>的那组 rank 上做；流水线的 send/recv 在<em>相邻 pp</em>的 rank 间做。Megatron-LM 正是这样为每种并行预先建好一批 <code>torch.distributed.new_group(ranks=[...])</code>，训练时各取所需。</p>  <div class="ascii">16 rank = DP(2) × TP(2) × PP(4)  之一种切法（这里画 DP×TP=4 的一个 PP-stage 平面）
+
+            tp=0    tp=1
+  dp=0   [ r0  ]  [ r1  ]   ← 这一行(固定 dp=0)是一个 TP 组：r0,r1 做激活 all-reduce
+  dp=1   [ r2  ]  [ r3  ]   ← 这一行(固定 dp=1)是另一个 TP 组：r2,r3
+           │        │
+           └────────┴── 这一列(固定 tp)是一个 DP 组：r0,r2 同步梯度 / r1,r3 同步梯度
+
+  PP 组：把不同 pp 平面里「同一个 (dp,tp) 位置」的 rank 串起来，做 stage 间 send/recv</div>  <div class="callout danger"><span class="label">沉默的错误</span>
+    <p>通信组建错是分布式训练最隐蔽的 bug 之一。如果 DP 组的成员算错（比如把本该同步的两个 rank 分到了不同组），训练<strong>不会报错</strong>——它照常 all-reduce，只是<em>每个组各自平均了不完整的梯度</em>，模型悄悄收敛到错误的地方。和模块 04 的 checkpoint 一致性一样：<strong>沉默的错误比崩溃可怕得多</strong>。建组逻辑必须用单元测试（如本模块 notebook 的往返 assert）和小规模对拍来验证。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="straggler"><span class="num">4</span>落后者：同步训练的木桶效应</h2>
+  <p>现在进入同步训练的头号性能杀手：<span class="term">straggler</span>（落后者）。同步数据并行的每一步都以一次梯度 all-reduce 结束，而 all-reduce 是一道<strong>屏障（barrier）</strong>——它必须等<em>所有</em> rank 都到齐才能完成。于是这一步的耗时不是平均值，而是<strong>最大值</strong>：</p>  <div class="math-block">\[t_{\text{step}} = \max_{r \in \text{ranks}} t_r \;\ge\; \frac{1}{N}\sum_r t_r = \bar{t}\]</div>  <p>这就是赤裸裸的<strong>木桶效应</strong>：512 块 GPU 里只要有一块因为某种原因慢了 20%，整个训练的每一步都慢 20%，另外 511 块卡在屏障前干等。更糟的是落后者不是固定的——这一步是 7 号卡热降频，下一步是 30 号卡的网卡重传，再下一步是某个 data loader 卡了一下。这种<strong>随机的、漂移的</strong>落后者让问题极难复现，也极难甩锅给某一块具体的硬件。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一桌人一起吃火锅，必须等最慢的那个人涮完才能一起下一轮。哪怕只有一个人慢吞吞，全桌的节奏都被他拖住，其他人只能干等。加的人越多，「总有一个人慢」的概率越大——这就是为什么卡越多、落后者问题越严重。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>落后者的来源大致三类：<strong>硬件</strong>（GPU 热降频、ECC 错误重试、某块卡是次品）、<strong>网络</strong>（某条链路拥塞或丢包重传、拓扑不对称）、<strong>软件/数据</strong>（不同 rank 拿到的样本长度不一导致计算量不均、某个 rank 的 data loader 卡顿、GC 停顿）。随 N 增大，「至少一个 rank 落后」的概率按 <code>1−(1−p)^N</code> 上升——这就是同步训练规模化的根本张力。</p></div>
+  </div>  <p>缓解手段没有银弹，但有套路：把数据切得<strong>更均衡</strong>（按 token 数而非样本数分桶，避免长短不一）；用<strong>更细的通信-计算重叠</strong>（见下节）让短暂的落后被算力吸收；对持续掉队的硬件做<strong>健康检查与剔除</strong>（这又回到模块 04 的弹性训练——把坏节点换掉）；以及在极端规模下转向<strong>异步或半同步</strong>训练（见第 8 节），从根上拆掉那道屏障。诊断的第一步永远是：<em>把每个 rank 的单步耗时都记下来，看分布的尾巴有多长</em>——这正是本模块 notebook worked 2 在做的事。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="scaling"><span class="num">5</span>扩展效率：强扩展、弱扩展与 Amdahl</h2>
+  <p>加卡到底能不能等比例加速？这要分两种问法，对应两条完全不同的曲线。<strong>Strong scaling（强扩展）</strong>：问题规模<em>固定</em>，只是把卡加多，看墙钟时间能缩短多少倍——这是「我想把这次训练跑得更快」。<strong>Weak scaling（弱扩展）</strong>：<em>每块卡</em>的工作量固定，加卡的同时把总问题等比例放大，看每步耗时能不能保持不变——这是「我想训一个更大的模型/更大的 batch」。大模型预训练几乎全是<strong>弱扩展</strong>场景。</p>  <p>强扩展的天花板由 <span class="term">Amdahl 定律</span> 锁死。设一个程序里可并行的比例是 <code>p</code>、串行（无法并行）的比例是 <code>1−p</code>，用 N 个处理器的加速比为：</p>  <div class="math-block">\[S(N) = \frac{1}{(1-p) + \dfrac{p}{N}}, \qquad E(N) = \frac{S(N)}{N}\]</div>  <p>残酷之处在于那个串行部分 <code>1−p</code>：哪怕 <code>N\to\infty</code>，加速比也只能逼近 <code>1/(1-p)</code>。如果有 5% 不可并行（在分布式训练里，「不可并行」主要就是<strong>通信开销</strong>——它不产生有用的 FLOPs，纯属为了同步而付出的税），那么加速比上限是 20 倍——你哪怕堆一万块卡，也突破不了 20。这就是为什么单纯「加卡」边际收益递减，以及为什么减少通信占比（模块 01–03 的全部努力）等价于抬高那条天花板。</p>  <table>
+    <thead><tr><th>N（卡数）</th><th>S(N) @ p=0.95</th><th>效率 E(N)</th><th>S(N) @ p=0.99</th><th>效率 E(N)</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>1.00×</td><td>100%</td><td>1.00×</td><td>100%</td></tr>
+      <tr><td>8</td><td>5.93×</td><td>74%</td><td>7.48×</td><td>94%</td></tr>
+      <tr><td>64</td><td>15.42×</td><td>24%</td><td>39.26×</td><td>61%</td></tr>
+      <tr><td>512</td><td>19.28×</td><td>3.8%</td><td>83.79×</td><td>16%</td></tr>
+      <tr><td>∞</td><td>20.0×</td><td>0%</td><td>100×</td><td>0%</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>把上表读进肌肉记忆：<strong>可并行比例从 95% 提到 99%，512 卡下的加速比从 19× 跳到 84×</strong>——4 个百分点的通信优化，换来 4 倍的有效算力。这就是为什么前沿团队对通信开销锱铢必较：在大 N 下，省下的每一点通信，都在 Amdahl 曲线上被放大成巨大的吞吐差距。弱扩展之所以能撑起万卡训练，正是因为它让 <code>p</code> 随规模<em>保持</em>在高位，而非像强扩展那样被固定问题规模逼到效率塌方。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mfu"><span class="num">6</span>MFU 与通信-计算重叠</h2>
+  <p>理想的扩展效率是 100%，但你永远拿不到。把效率从纸面的 Amdahl 拉回现实，要引入一个生产环境的核心指标：<span class="term">MFU</span>（Model FLOPs Utilization，模型算力利用率）——你的训练实际跑出的「有用 FLOPs / 秒」占硬件理论峰值的百分比。它一把尺子量穿了所有低效：通信、落后者、显存搬运、kernel 没打满、流水气泡，全反映在这一个数字里。</p>  <p>MFU 的算法很干净。一个 N 参数的稠密 Transformer，每个 token 的前向+反向大约消耗 <code>6N</code> FLOPs（前向 2N、反向 4N，这是模块 02 那本「成本账」的核心公式）。于是：</p>  <div class="math-block">\[\text{MFU} = \frac{6\,N \cdot (\text{tokens/sec})}{\text{GPU 数} \times \text{单卡峰值 FLOP/s}}\]</div>  <p>现实中的 MFU 是个<strong>体检数字</strong>：精心调优的大规模预训练能到 50–60%（这已是优秀），随手跑个分布式训练拿到 20–30% 很常见，低于 15% 说明有明显的浪费在等你去抓。它最大的价值是把「快不快」从主观感受变成<em>可对账的硬指标</em>——你优化通信、修掉落后者、改善重叠之后，MFU 涨没涨，骗不了人。</p>  <p>把效率往上抬最有力的杠杆是<strong>通信-计算重叠（overlap）</strong>。朴素实现里，一步是「算完梯度 → 再 all-reduce → 再下一步」，通信时间纯粹叠加在计算之上。但梯度是<em>反向一层层算出来的</em>：靠后的层先算完梯度，完全可以<strong>一边继续反向传播更早的层、一边异步 all-reduce 已经算好的层的梯度</strong>。理想情况下，整步耗时从 <code>compute + comm</code> 压到 <code>max(compute, comm)</code>——只要通信能被计算<strong>盖住</strong>，它就近乎免费。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>串行就像下班后再去排队取快递；重叠则是上班路上顺手取了。同样的两件事，重叠做完，省下的是「等」的那段时间。分布式训练的大量工程，就是想方设法把「通信的等待」藏进「计算的忙碌」里。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>PyTorch DDP 用<strong>梯度分桶（gradient bucketing）</strong>实现这一点：把参数分成若干 bucket，某个 bucket 的梯度一就绪就立刻发起异步 all-reduce，与仍在进行的反向计算重叠。FSDP（模块 02）则需要把 all-gather 参数的通信和上一层的计算重叠。重叠做得好不好，直接决定了你离 <code>max(compute, comm)</code> 这个下界有多近——本模块 notebook worked 5 会把这个收益量化出来。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="debug"><span class="num">7</span>调试：死锁、NaN 与一致性</h2>
+  <p>分布式训练的 bug 有一种独特的恐怖：<strong>没有单一的「现场」</strong>。单机程序崩了，你有一个栈、一个 core dump。而 512 个进程的训练「卡住了」，现场是 512 份各不相同的状态，而真正的元凶可能是其中某一个进程在某一行多调或漏调了一次 collective。学会在这种条件下调试，是高级分布式工程师的看家本领。</p>  <p>最常见、也最折磨人的故障是 <strong>hang / deadlock（挂起 / 死锁）</strong>。集合通信的铁律是：<strong>所有 rank 必须以完全一致的顺序、调用完全一致的 collective</strong>。一旦某个 rank 因为一个数据相关的 <code>if</code> 分支多走了一次 all-reduce，或某个 rank 提前抛异常退出而没参与本该参与的 all-reduce，剩下的 rank 就会在那道屏障前<strong>永远等下去</strong>，直到 NCCL 超时（默认常是 30 分钟）才报一个语焉不详的错。</p>  <table>
+    <thead><tr><th>症状</th><th>可能病因</th><th>定位 / 处方</th></tr></thead>
+    <tbody>
+      <tr><td>训练卡住不动，最后 NCCL timeout</td><td>collective 不对齐：某 rank 多/漏调，或某 rank 已崩</td><td>每 rank 打点日志看谁停在哪一步；<code>TORCH_NCCL_TRACE_BUFFER</code> flight recorder；<code>py-spy dump</code> 看各进程栈</td></tr>
+      <tr><td>某些 rank loss 是 NaN，另一些正常</td><td>数据/初始化在 rank 间不一致；混精溢出</td><td>检查随机种子是否按需对齐；对可疑张量做 all-reduce 一致性校验；查梯度范数</td></tr>
+      <tr><td>报错 shape / dtype mismatch</td><td>不同 rank 传入 collective 的张量形状或类型不一致</td><td>在 collective 前 assert 形状；统一 dtype；查变长 batch 是否 pad 一致</td></tr>
+      <tr><td>启动即卡在 0%</td><td>rendezvous 失败：端口/防火墙/MASTER_ADDR 错</td><td>查 <code>MASTER_ADDR</code> 可达性、端口占用；<code>NCCL_DEBUG=INFO</code> 看连接日志</td></tr>
+      <tr><td>间歇性变慢、偶发超时</td><td>落后者 / 网络抖动 / 某节点掉队</td><td>记录每 rank 单步耗时找尾巴；查链路；隔离/剔除坏节点</td></tr>
+    </tbody>
+  </table>  <p>工具箱里最该熟练的几样：<code>NCCL_DEBUG=INFO</code>（打印通信建链与拓扑，排查连接与带宽）；<strong>每 rank 独立日志</strong>（给每条日志带上 rank 前缀，hang 时一眼看出谁卡在哪一步——这是最朴素也最有效的手段）；<span class="term">flight recorder</span>（PyTorch 的 NCCL 飞行记录仪，事后 dump 出每个 rank 最近的 collective 调用序列，直接定位是谁、在哪一步对不齐）；以及 <code>py-spy dump</code>（无侵入地抓出每个 python 进程当前的调用栈，看大家分别卡在哪一行）。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一条能救命的纪律：<strong>让随机性在该一致的地方一致、在该不同的地方不同</strong>。模型初始化、数据打乱的种子，在数据并行组内必须一致（否则各 rank 模型不同、梯度平均出垃圾）；而 dropout、数据采样的偏移，又往往需要按 rank 错开。把「哪些随机源该对齐、哪些该错开」想清楚并显式设种子，能消灭一大类「跑起来不报错、就是不收敛」的鬼故事。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>瓶颈定位与研究前沿</h2>
+  <p>当确认训练「慢」之后，下一个问题永远是：<strong>慢在哪？</strong>——这决定了你该去优化什么。分布式训练的瓶颈无非三类，对应三种完全不同的处方，搞错方向的优化纯属浪费：</p>  <ul>
+    <li><strong>compute-bound（算力受限）</strong>：GPU 基本打满，时间花在真正的矩阵乘上。这是<em>好</em>状态——想更快只能换更强的卡、提升单卡 kernel 效率、或减少冗余计算。继续优化通信收益甚微。</li>
+    <li><strong>communication-bound（通信受限）</strong>：算力在等数据，时间花在 all-reduce / all-gather / send-recv 上。处方是模块 01–03 的全部武器：更好的拓扑与算法、通信压缩、<strong>重叠</strong>、调整并行维度的切法减少跨节点通信。</li>
+    <li><strong>straggler-bound（落后者受限）</strong>：平均利用率不低，但每步都被某个慢 rank 拖着。处方是均衡数据、健康检查剔除坏节点、弹性重组，而非优化通信或计算。</li>
+  </ul>  <p>区分它们靠<strong>看 timeline / trace</strong>：把每个 rank 每一步的「计算段、通信段、空等段」画在一条时间轴上，瓶颈一目了然——通信段长是通信受限，某个 rank 总有一截空等是落后者受限，时间轴密密麻麻全是计算则是（令人欣慰的）算力受限。本模块 notebook 的最后一道练习，就是给你三组 (compute, comm, straggler_gap) 数字，让你写一个分类器判定瓶颈类型——把这套诊断思维固化成代码。</p>  <p>最后是这门课的研究前沿，全都指向一个共同的敌人——<strong>那道同步屏障，以及它在万卡尺度下的不可持续</strong>：</p>  <ul>
+    <li><strong>异步 / 去中心化训练</strong>：彻底拆掉全局屏障。Gossip 式的去中心化 SGD（如 <code>D-PSGD</code>）、本地多步再同步的 Local SGD、以及面向广域网的 <code>DiLoCo</code>，用「少同步、容忍陈旧」换取对落后者和慢网络的鲁棒性。</li>
+    <li><strong>通信压缩</strong>：在 all-reduce 前把梯度量化（如 <code>1-bit Adam</code>、PowerSGD 低秩压缩）或稀疏化，直接砍掉通信量——以可控的精度损失换吞吐，在弱网络下尤其值。</li>
+    <li><strong>跨数据中心 / 弹性训练</strong>：当单个数据中心的电力和卡数见顶，训练开始跨地域。高延迟、易掉线的环境逼出了更强的弹性调度与容错（模块 04 的延伸）和对同步频率的重新设计。</li>
+    <li><strong>自动并行与编译</strong>：与其让工程师手调 (dp, tp, pp)，不如让编译器搜。Alpa、GSPMD、以及各类 auto-sharding 框架，把「怎么切才最优」变成一个可自动求解的问题——这是把本课的全部手艺自动化的方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读（详见 <code>../references.md</code>）：Narayanan 等的 Megatron-LM / 3D 并行（通信组与扩展效率的工程范本）；Stich 的 Local SGD、Lian 等的去中心化 SGD（异步训练理论）；Douillard 等的 DiLoCo（跨数据中心低通信训练）；Zheng 等的 Alpa（自动并行）；以及各厂大规模训练报告里的 MFU 与扩展效率实测。把本模块的纸面模型，去和这些真实万卡训练的数字对账。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_checkpointing_faulttol/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · Checkpoint 与容错</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

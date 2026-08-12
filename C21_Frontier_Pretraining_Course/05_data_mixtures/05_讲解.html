@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 数据配比与合成数据</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 数据配比与合成数据</h1>
+  <p class="subtitle">决定模型能力分布的最后旋钮：domain 配比权重、DoReMi 思想、课程学习、重复 epoch 收益递减、data-constrained scaling、合成数据与模型崩溃 —— 模拟配比对验证 loss 的影响与重复惩罚曲线</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">概率单纯形、加权平均、一点优化（minimax）；模块 00/01/03</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_data_mixtures.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Xie 2023 (DoReMi)、Muennighoff 2023 (data-constrained)、Shumailov 2023 (collapse)、Hoffmann 2022</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">配比决定模型的能力分布</a></li>
+      <li><a href="#opt">配比是个优化问题</a></li>
+      <li><a href="#doremi">DoReMi：group-DRO 自动找配比</a></li>
+      <li><a href="#wall">数据墙：重复 epoch 的收益递减</a></li>
+      <li><a href="#dcscaling">data-constrained scaling laws</a></li>
+      <li><a href="#synth">合成数据与模型崩溃</a></li>
+      <li><a href="#curri">课程学习与质量退火</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>配比决定模型的能力分布</h2>
+  <p>数据干净了、tokenizer 定了、超参迁好了、训练也稳了。还剩最后一个、却可能最影响模型「性格」的旋钮：<strong>各类数据按什么比例喂</strong>。网页、代码、书籍、论文、多语——它们都进训练集，但<strong>配比</strong>（data mixture）决定模型在各项能力上的强弱。代码占比高，模型会写程序；论文占比高，模型更会推理；配比偏了，某项能力就瘸腿。</p>  <p>配比是预训练<strong>最被低估、又最难调</strong>的决策之一。难在哪？因为它是一个<strong>高维、互相牵制、且评估昂贵</strong>的优化问题：调高代码比例，挤占的是网页/书籍的比例，可能伤害通用语言能力；而要知道某个配比好不好，理论上得真训一个模型测下游——贵到没法网格搜。本模块讲<strong>怎么科学地定配比</strong>（DoReMi）、<strong>数据不够时怎么办</strong>（重复 epoch 与 data-constrained scaling）、以及<strong>能不能用模型造数据</strong>（合成数据与崩溃风险）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：配比像<strong>配一份均衡膳食</strong>。光吃肉（代码）会缺维生素（通用语言），光吃菜（网页）会缺蛋白质（推理/专业知识）。营养师（DoReMi）要在有限的「胃容量」（token 预算）里，配出让各项营养都达标的比例——而且不能靠「吃完体检」（训完测下游）来反复试，太贵。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：设有 $K$ 个 domain，配比是概率单纯形上的权重 $\mathbf{w} = (w_1, \dots, w_K)$，$\sum w_k = 1$。训练时按 $\mathbf{w}$ 从各 domain 采样 token。目标是找 $\mathbf{w}^*$ 使某个目标（平均验证 loss、最差 domain loss、或下游能力）最优。本模块的核心是：在<strong>不真训大模型</strong>的前提下，用代理模型 + 分布鲁棒优化（DoReMi）逼近 $\mathbf{w}^*$。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么配比比想象中重要？因为它直接决定<strong>模型把有限容量花在学什么上</strong>。一个固定大小、固定 token 预算的模型，是一块有限的「学习带宽」——配比就是在分配这块带宽。分配错了，再多算力也补不回某项瘸腿的能力（除非后训练专门补，但那更贵）。所以前沿团队在配比上做大量消融，DoReMi 这类自动方法正是为了让这个分配<strong>有依据而非拍脑袋</strong>。</p>
+  </div>  <p>还有一个常被忽视的连锁效应：<strong>配比与去重、重复深度纠缠</strong>。去重（模块 01）决定每个 domain 有多少<em>独特</em> token；若某 domain 独特数据少，要么降低它的配比，要么重复它（多 epoch）。所以「配比」从来不是孤立地定权重——它和「这个 domain 还剩多少独特数据」「重复几遍划算」是同一个决策的三个面。本模块会把这三者放在一起看，这正是 data-constrained 时代的正确视角。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="opt"><span class="num">2</span>配比是个优化问题</h2>
+  <h3>配比是个优化问题：从均匀到加权</h3>  <p>最朴素的配比是<strong>按数据自然量</strong>（哪个 domain 数据多就多采）或<strong>均匀</strong>。但这几乎肯定不是最优——因为不同 domain 的<strong>学习难度和价值不同</strong>。</p>  <p>考虑一个简单事实：给定配比 $\mathbf{w}$，模型的整体表现是各 domain 表现的加权组合。若各 domain 单独的验证 loss 是 $\ell_k$，最朴素的目标是最小化加权平均：</p>  <div class="math-block">\[\mathcal{L}_{\text{avg}}(\mathbf{w}) = \sum_{k=1}^{K} w_k\, \ell_k(\mathbf{w}) \qquad \text{(注意 } \ell_k \text{ 本身依赖 } \mathbf{w}\text{)}\]</div>  <p>关键的微妙处在那个括号注解：<strong>$\ell_k$ 依赖于 $\mathbf{w}$</strong>——给一个 domain 更多权重，它学得更好（$\ell_k$ 下降），但挤占了别的 domain。这让配比成为一个<strong>自洽的优化问题</strong>，不是简单地「给重要的 domain 多分点」。</p>  <table>
+    <thead><tr><th>配比策略</th><th>怎么定</th><th>问题</th></tr></thead>
+    <tbody>
+      <tr><td>按自然量</td><td>数据多的 domain 多采</td><td>网页数据淹没一切，代码/专业知识太少</td></tr>
+      <tr><td>均匀</td><td>每个 domain 等权</td><td>忽略难度差异，难学的 domain 学不够</td></tr>
+      <tr><td>人工调</td><td>凭经验 + 少量下游验证</td><td>高维难搜、主观、不可复现</td></tr>
+      <tr><td>DoReMi (自动)</td><td>代理模型 + group-DRO 优化</td><td>本模块核心：让最差 domain 也学好</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>配比不是「把蛋糕分给最爱吃的人」那么简单。给一个 domain 多分，它确实学得好，但别的 domain 就饿着了。而且有些 domain（如代码）<strong>学起来更难</strong>，需要<em>额外</em>的权重才能跟上——怎么在「难度」和「价值」之间分配权重，正是配比优化要回答的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从优化视角，这是个<strong>不动点/博弈</strong>问题：理想配比下，没有哪个 domain 能通过「再多要点权重」获得不成比例的收益。DoReMi 用 group-DRO（下一节）来逼近这个平衡——它不最小化平均 loss，而是最小化<strong>最差 domain 的 loss</strong>，自动给「学得慢、吃亏」的 domain 加权，得到更均衡的配比。</p></div>
+  </div>  <p>notebook 第 1-2 节会让你把配比建模成单纯形上的权重，先看均匀/偏重配比对加权 loss 的影响，再实现 DoReMi 式的自动优化。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="doremi"><span class="num">3</span>DoReMi：group-DRO 自动找配比</h2>
+  <h3>DoReMi：用 group-DRO 自动找配比</h3>  <p><span class="term">DoReMi</span>（Xie 2023）是配比优化的里程碑：它<strong>不需要下游标签、只用一个小代理模型</strong>就能自动找出好配比，再迁移到大模型。核心思想是 <span class="term">group DRO</span>（分组分布鲁棒优化）。</p>  <p>普通训练最小化<strong>平均</strong> loss；group-DRO 最小化<strong>最差一组</strong>的 loss：</p>  <div class="math-block">\[\min_{\theta} \; \max_{k} \; \ell_k(\theta) \qquad \text{(让表现最差的 domain 尽可能好)}\]</div>  <p>为什么最小化「最差 domain」是个好主意？因为平均 loss 会被<strong>容易、数据多的 domain 主导</strong>——模型在网页上 loss 低，平均就低，于是优化器懒得管学得慢的代码/专业 domain。盯住最差 domain，等于强制模型<strong>不抛弃任何一个 domain</strong>，得到更均衡、更鲁棒的能力分布。</p>  <h4>DoReMi 的两阶段流程</h4>  <ol>
+    <li><strong>训一个小参考模型</strong>：用某个初始配比（如均匀）训一个小模型，记录它在各 domain 上的 loss（作为「这个 domain 本该能达到多好」的基准）。</li>
+    <li><strong>训小 proxy 模型 + group-DRO 调权重</strong>：再训一个小 proxy，但用 group-DRO<strong>动态调整域权重</strong>——哪个 domain 当前相对参考模型差得多（excess loss 大），就给它加权。用乘法权重（multiplicative weights）更新：$w_k \leftarrow w_k \cdot e^{\eta \cdot (\text{excess loss}_k)}$，再归一化。</li>
+    <li><strong>用学到的平均权重训大模型</strong>：把 group-DRO 过程中域权重的平均值，当作最终配比去训真正的大模型。</li>
+  </ol>  <div class="ascii">DoReMi 的权重动态(group-DRO):
+  初始: 均匀  [0.25, 0.25, 0.25, 0.25]
+  迭代: 测各 domain 当前 loss -&gt; 给「相对最差」的 domain 加权
+        ┌──────────────────────────────────┐
+        │ w_k ← w_k · exp(η·excess_loss_k)  │  (上调学得慢的)
+        │ w ← w / sum(w)                    │  (归一化回单纯形)
+        └──────────────────────────────────┘
+  收敛: 各 domain 的 loss 被「拉平」-&gt; 没有 domain 被抛弃
+  产出: 平均权重 [0.29, 0.09, 0.43, 0.20]  ← 难的 domain 自动获更多权重</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>DoReMi 像一个<strong>公平的教练</strong>：他不只看全队平均成绩（会被尖子生拉高），而是<strong>盯着最弱的队员</strong>，谁拖后腿就给谁多安排训练时间。最后全队成绩更均衡，没有人被放弃。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>group-DRO 的优雅在于它把「配比」变成一个<strong>有明确目标的优化</strong>（minimax），而非拍脑袋。且它在<strong>小代理上</strong>做（便宜），产出的权重再迁到大模型——这与模块 03 的 μP「小模型调、大模型用」是同一种<strong>代理优化</strong>哲学。本课反复出现这个模式：把昂贵的大模型决策，转化为便宜的小模型实验 + 有理论依据的迁移。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>DoReMi（Xie 2023）是配比优化必读；它建立在 group-DRO（Sagawa 2020）之上。相关的还有 DSIR（Xie 2023，重要性重采样选数据）。本模块 notebook 实现 group-DRO 的乘法权重核心，复现「自动给难 domain 加权、拉平各 domain loss」。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="wall"><span class="num">4</span>数据墙：重复 epoch 的收益递减</h2>
+  <h3>数据墙：重复 epoch 的收益递减</h3>  <p>配比解决「怎么分」，但还有个更根本的约束：<strong>高质量数据正在用完</strong>。这就是 <span class="term">data wall</span>（数据墙）。当独特的高质量 token 不够填满你的 token 预算时，你不得不<strong>重复</strong>已有数据（训多个 epoch）。问题是：重复划算吗？</p>  <p><span class="term">Muennighoff 2023</span>（data-constrained scaling laws）系统回答了这个问题。核心结论惊人地具体：</p>  <ul>
+    <li><strong>约 4 个 epoch 以内</strong>，重复数据的价值<strong>接近全新数据</strong>（重复一遍 ≈ 新增等量数据）；</li>
+    <li><strong>超过约 4 个 epoch</strong>，每多重复一遍的收益<strong>迅速衰减</strong>，趋近于零；</li>
+    <li><strong>极端重复</strong>（几十个 epoch）甚至有害（过拟合、加剧记忆）。</li>
+  </ul>  <p>一个常用的简化模型把「重复 $R$ 个 epoch 的有效数据量」写成带衰减的形式（独特数据量 $D$，衰减常数 $\tau \approx 4$）：</p>  <div class="math-block">\[D_{\text{eff}}(R) = D \cdot \tau \cdot \left(1 - e^{-R/\tau}\right) \quad\Longrightarrow\quad R \text{ 小时} \approx RD,\;\; R \text{ 大时饱和到 } D\tau\]</div>  <div class="ascii">有效数据量
+  D·τ ┤                  ╭────────────  饱和(再重复几乎无收益)
+      │             ╭────╯
+      │        ╭────╯  ← 收益递减区(第4 epoch 后)
+      │    ╭───╯
+      │  ╭─╯  ← 近线性区(前几个 epoch，重复≈新数据)
+    0 ┤─╯
+      └──────────────────────────────→ 重复轮数 R
+       1   2   4(τ)        8          16</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>重复数据像<strong>反复看同一本书</strong>：第一遍收获最大，第二三遍还能捡漏，但看到第十遍，新东西几乎没有了——时间（算力）花在重读上，不如去找新书（新数据）或换种学法（加参数）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这条曲线有直接的<strong>资源分配后果</strong>：数据受限时，与其无脑重复，不如<strong>把算力部分转去加参数</strong>（Muennighoff 发现数据不够时，在重复和加参数之间有最优配置），或<strong>引入新数据源</strong>（代码、合成数据）。数据墙把模块 01（去重，决定有多少独特 token）、本节（重复收益）、和下一节（合成数据补充）连成一个整体决策。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>数据墙与去重（模块 01）是<strong>一枚硬币的两面</strong>：去重越狠，独特 token 越少，越早撞墙、越早要重复。这带来一个反直觉的张力——<strong>激进去重提升单遍质量，但减少可用的独特数据量</strong>。最优去重激进度因此也依赖你的 token 预算：数据极度受限时，也许该保留一些近重复（它们重复利用的代价更低）。把去重、重复、配比放在一起权衡，才是 data-constrained 时代的正确视角。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dcscaling"><span class="num">5</span>data-constrained scaling laws</h2>
+  <h3>data-constrained scaling laws：外推到数据受限区</h3>  <p>经典 <span class="term">scaling law</span>（Chinchilla）假设数据充足（每个 token 只见一次）。但数据墙下这个假设破了，需要<strong>修正的缩放定律</strong>。Muennighoff 2023 给出了 data-constrained 版本。</p>  <p>直觉修正：把 Chinchilla 公式里的「数据量 $D$」替换成「<strong>有效数据量 $D_{\text{eff}}$</strong>」（上一节那条饱和曲线）。重复使 $D_{\text{eff}} < R \cdot D$（边际递减），所以数据受限时，单纯堆 epoch 的 loss 改善会比 Chinchilla 预测的慢——曲线在数据轴上<strong>提前压平</strong>。</p>  <div class="math-block">\[L(N, D, R) \approx E + \frac{A}{N^\alpha} + \frac{B}{D_{\text{eff}}(R)^\beta}, \quad D_{\text{eff}}(R) = D\tau(1-e^{-R/\tau})\]</div>  <p>这个修正的实用价值：它让你能<strong>外推</strong>——给定独特数据量 $D$ 和算力预算，预测<strong>重复几个 epoch、配多大模型</strong>能达到的最优 loss，而不必盲试。Muennighoff 的具体建议包括：数据受限时，把多出的算力分一部分给参数（而非全砸在重复上），且重复别超过约 4 个 epoch。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>data-constrained scaling 回答的是：<strong>「我只有这么多独特数据和这么多算力，最好能训出多好的模型？」</strong>答案不再是 Chinchilla 的「等比例放大 N 和 D」，而要把「数据其实在重复、边际递减」算进去。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从工程上，这把「放大」环节的决策树补全了：① Chinchilla 在数据充足时定 N:D；② 当 D 不够（数据墙）时，用 data-constrained scaling 重新权衡「重复 vs 加参数 vs 找新数据」；③ μP（模块 03）保证无论选多大的 N，超参都能迁过去。三者合起来，才是数据受限时代完整的预训练规划。</p></div>
+  </div>  <p>notebook 第 4-5 节会让你实现有效数据量曲线、用它修正 scaling law 外推，并在「重复 vs 加参数」之间做一次资源分配。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="synth"><span class="num">6</span>合成数据与模型崩溃</h2>
+  <h3>合成数据与模型崩溃</h3>  <p>既然真实高质量数据会用完，一个诱人的出路是：<strong>用模型生成数据来训模型</strong>。这就是 <span class="term">synthetic data</span>（合成数据）。它在补充稀缺领域、提升数据质量上确有威力（phi 系列用高质量合成「教科书」训出强小模型），但也藏着一个致命陷阱。</p>  <p>陷阱叫 <span class="term">model collapse</span>（模型崩溃，Shumailov 2023）：<strong>反复用模型自己生成的数据去训练后续模型，会导致分布的尾部逐渐丢失、多样性塌缩、质量退化</strong>。几代之后，模型只会生成「平均、单调」的内容，丢掉了真实数据里丰富的长尾。</p>  <p>为什么会崩？根源是<strong>采样 + 有限样本会系统性地丢失尾部</strong>。每次「生成 → 用生成数据重训」，都相当于对分布做一次有限采样再拟合——而有限采样<strong>低估方差、欠采样罕见事件</strong>。这个误差<strong>逐代累积</strong>：第一代丢一点尾部，第二代在「已经少了尾部」的数据上训、再丢一点，几代下来尾部就没了。</p>  <div class="ascii">真实分布(丰富尾部)
+   ▁▂▃▅▇█▇▅▃▂▁   gen 0
+   ▁▂▃▅▇█▇▅▃▂    gen 1  ← 采样丢失最罕见的尾
+    ▂▃▅▇█▇▅▃     gen 2  ← 尾部继续缩
+     ▃▅▇█▇▅      gen 3  ← 方差变小、变尖
+      ▅▇█▇       gen 4  ← 多样性塌缩 = model collapse
+  每代「生成→重训」= 一次有限采样，系统性低估方差、欠采样长尾</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>model collapse 像<strong>反复复印复印件</strong>：第一张复印件已经比原件糊一点，拿复印件再复印更糊，几轮之后字都看不清了。每次「用生成数据训新模型」就是复印一次，误差越积越多，最后只剩模糊的「平均脸」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：设真实分布方差 $\sigma^2$。每代用 $n$ 个样本估计并重新生成，MLE 的方差估计是<strong>有偏的</strong>（$\hat\sigma^2$ 期望略小于 $\sigma^2$）。迭代 $t$ 代后方差近似按 $(1-\frac{1}{n})^t$ 衰减——指数级丢失。这就是为什么纯合成数据的递归训练会崩，而<strong>把合成数据与真实数据混合</strong>（用真实数据「锚住」尾部）能缓解。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>实践教训很明确：<strong>合成数据不能无限自产自销</strong>。安全用法是——① 与真实数据<strong>混合</strong>（真实数据锚住分布尾部，防塌缩）；② 用<strong>更强的模型</strong>生成给更弱的模型（蒸馏，不是同代自循环）；③ 严控合成比例并<strong>监控多样性</strong>（如生成内容的方差、n-gram 多样性）。把合成数据当「调味料」（补特定能力）而非「主食」（替代真实数据）。当前哪个合成比例安全、如何检测早期崩溃，仍是活跃的开放问题。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="curri"><span class="num">7</span>课程学习与质量退火</h2>
+  <h3>课程学习与质量退火</h3>  <p>配比不一定是<strong>静态</strong>的——数据<strong>顺序</strong>也是个旋钮。<span class="term">curriculum learning</span>（课程学习）按「由易到难」或「由通用到高质量」安排训练数据，而非全程随机。</p>  <p>预训练里最有效、最常用的课程是 <span class="term">quality annealing</span>（质量退火）：<strong>训练末期把数据切换为高质量子集</strong>（同时常配合学习率衰减）。用少量优质 token 给模型「最后打磨」，多个前沿模型报告这能显著提升下游能力——相当于「先用海量普通数据建立广博基础，再用精选数据精雕细琢」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>质量退火像<strong>学习的两个阶段</strong>：先广泛涉猎（海量普通数据打基础、建立语言与世界知识），临考前再精读重点（高质量数据 + 小学习率，精细收敛到好的解）。两阶段结合，比全程一种数据更有效。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从优化视角，质量退火与 WSD 调度（模块 04）天然配合：WSD 的末段衰减期，正好切换到高质量数据——学习率小、数据精，模型在损失面的好区域做最后的精细下降。这也是为什么 WSD 近年流行：它让「末段用高质量数据 + 小 lr 冲刺」变得自然。配比（喂什么）、顺序（何时喂）、调度（多大 lr 喂）在这里交汇成一个协同的设计。</p></div>
+  </div>  <p>课程学习的更广形式（严格按难度排序整个训练）在预训练里效果不一、且难设计「难度」度量，所以不如「末期质量退火」这种简单版普及。但它提示了一个方向：<strong>数据的时间安排</strong>是一个尚未充分开发的旋钮，与配比、调度共同构成「训练动态」的设计空间。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把配比、重复、调度、退火放在一起，你会看到「放大」与「喂数据」其实是<strong>一个统一的资源分配问题</strong>：在固定的算力与独特数据约束下，决定<strong>喂什么（配比）、喂多少遍（重复）、按什么顺序（课程/退火）、用多大学习率（调度）</strong>。这四个旋钮协同作用、彼此牵制——这也是为什么前沿预训练既是科学（scaling law、DoReMi 给依据）又是工程手艺（大量消融找具体配置）。本课给你的是<strong>看懂这些旋钮各自在调什么</strong>的框架。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>配比的可迁移性</strong>：DoReMi 在小代理上找的权重，迁到大模型还最优吗？配比是否像 μP 的超参那样可跨规模迁移，证据尚不充分——最优配比可能随模型规模/能力变化（大模型也许该多吃难数据）。这是配比研究最重要的开放问题。</li>
+    <li><strong>合成数据的安全边界</strong>：多大比例的合成数据是安全的？如何<strong>早期检测</strong> model collapse（在多样性塌缩前发现）？如何设计「不崩」的合成数据生成（如保证覆盖尾部）？这是突破数据墙的关键，也是当前最活跃的方向之一。</li>
+    <li><strong>数据质量 vs 数量的定量权衡</strong>：Sorscher 2022 证明好的数据剪枝能突破幂律 scaling。「一个高质量 token 顶几个普通 token」能否定量化？这把模块 01（质量过滤）与本模块（配比/重复）统一成「有效数据」的度量问题。</li>
+    <li><strong>课程与动态配比</strong>：最优配比是否该随训练阶段变化（早期多通用、晚期多高质量/难）？如何自动调度这个<strong>时变配比</strong>？质量退火只是最简单的一步，更精细的动态配比仍待探索。</li>
+    <li><strong>多模态与跨语言配比</strong>：当数据不止文本（图像、音频、代码），跨模态/跨语言的配比怎么定？各模态的「token」价值不可直接比较，配比优化要在异质数据上进行——这是通向多模态基座的前沿难题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读：Xie 2023（DoReMi）、Muennighoff 2023（data-constrained scaling）、Shumailov 2023（model collapse）、Albalak 2024（数据选择综述）、Sorscher 2022（数据剪枝突破 scaling）、Gunasekar 2023（phi，合成/高质量数据的威力）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_stability/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 训练稳定性</div></a>
+    <a class="next" href="../00_setup/00_overview.html"><div class="dir">下一模块 →</div><div class="t">00 · 课程总览与环境</div></a>
+  </div>
+
+</div>
+</body>
+</html>

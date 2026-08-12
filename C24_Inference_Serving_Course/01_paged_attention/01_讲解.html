@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · PagedAttention 与 KV 管理</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · PagedAttention 与 KV 管理</h1>
+  <p class="subtitle">KV cache 为何是显存命门、连续分配为何碎片化、像操作系统虚拟内存那样把 KV 分页（block + block table）、copy-on-write 实现零拷贝前缀共享 —— 现代推理引擎吞吐翻倍的第一块地基</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、注意力数学（C01）、操作系统虚拟内存/分页的基本概念</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_paged_attention.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Kwon et al. 2023 (PagedAttention/vLLM)、操作系统分页</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#kvcache">KV cache：显存命门</a></li>
+      <li><a href="#frag">罪魁祸首：连续分配的碎片</a></li>
+      <li><a href="#paged">PagedAttention：KV 当虚拟内存</a></li>
+      <li><a href="#blocktable">块表与间接寻址</a></li>
+      <li><a href="#alloc">按需分配与回收：整数账本</a></li>
+      <li><a href="#cow">Copy-on-Write 前缀/采样共享</a></li>
+      <li><a href="#metrics">量化账本：碎片率与利用率</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="kvcache"><span class="num">1</span>KV cache：显存命门</h2>
+  <p>我们从推理服务的<strong>第一性瓶颈</strong>讲起：<span class="term">KV cache</span>。要理解 PagedAttention 解决了什么，必须先理解 KV cache 为什么存在、为什么巨大、又为什么浪费。</p>  <p>回忆自回归解码：生成第 t 个 token 时，注意力要让当前 query 去看<strong>之前所有 token</strong>的 Key 和 Value。如果每步都重算整段历史的 K、V，代价是 O(t²) 的算力，长序列下不可接受。于是有了一个朴素而关键的优化——把每个 token 算出的 K、V<strong>缓存起来</strong>：第 t 步只需算当前这一个 token 的 K、V 并<em>追加</em>到缓存，再让 query 读取整个缓存。这就是 KV cache，它把每步算力从 O(t²) 降到 O(t) 读取。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>KV cache 是一笔<strong>用显存换算力</strong>的交易，而且非常划算——避免了海量重算。但它的体积大得惊人：每个 token、每一层、每个 KV 头都要存一份 K 和一份 V，序列越长、并发越高，它涨得越快，常常比模型权重本身还大。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>具体地，KV cache 的字节数 ≈ <code>2 × L × H_kv × d_head × seq × batch × bytes</code>（系数 2 是 K 与 V）。对 Llama-3-8B（L=32、H_kv=8、d_head=128、fp16），一个 token 约 128 KB；序列 8192、并发 32 时 KV 约 <strong>16 GB</strong>——已逼近一张消费级显卡的全部显存，而模型权重才 16 GB。</p></div>
+  </div>  <p>再把这笔账和模块 00 的两阶段瓶颈接起来：decode 是<strong>带宽受限</strong>的，提吞吐的核心手段是把更多请求<strong>批在一起</strong>（权重只读一次服务整个 batch）。可 batch 想开大，就得在显存里同时放下这些请求的全部 KV。于是一条因果链浮现：<strong>KV 显存管理的效率，直接决定 batch 能开多大，进而决定 decode 吞吐</strong>。一个把 KV 显存浪费掉六成的系统，等价于把可能的并发砍掉六成、吞吐砍掉六成。这就是为什么「怎么存 KV」这个看似琐碎的工程问题，能撬动 2–4× 的端到端吞吐——它不是优化的细枝末节，而是吞吐的总闸门。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>KV cache 是推理服务的显存命门，能同时服务多少请求，几乎完全取决于显存里能塞下多少 KV</strong>。于是「如何高效地分配、回收、共享 KV 显存」就成了吞吐的决定性因素——这正是 PagedAttention 要解决的问题。把 KV 管好，batch 就能更大，decode 吞吐就能更高（回忆模块 00：带宽受限下大 batch 几乎线性提吞吐）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frag"><span class="num">2</span>罪魁祸首：连续分配的碎片</h2>
+  <h3>罪魁祸首：连续分配带来的碎片</h3>  <p>PagedAttention 之前，主流框架怎么存 KV？答案是<strong>为每个请求预留一整段连续显存</strong>。但请求的最终长度事先<em>不知道</em>（模型会自己决定何时停），于是只能按<strong>最大可能长度</strong>（如 2048）预分配。这个看似无奈的选择，埋下了三种致命浪费：</p>  <table>
+    <thead><tr><th>浪费类型</th><th>成因</th><th>后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>内部碎片</strong> internal frag.</td><td>按 max_len 预留，但实际只生成了几十个 token</td><td>预留的绝大部分槽位被占用却空着，是最大的浪费来源</td></tr>
+      <tr><td><strong>外部碎片</strong> external frag.</td><td>请求长短不一、不断到达与结束，空闲显存被切碎</td><td>空闲总量够，却没有足够大的连续块放下新请求</td></tr>
+      <tr><td><strong>预留浪费</strong> reservation</td><td>为「可能用到」的未来 token 提前占住显存</td><td>这些显存在请求结束前都不能给别人用</td></tr>
+    </tbody>
+  </table>  <p>这三种浪费叠加，使传统方案的 KV<strong>有效利用率常常只有 20–40%</strong>——也就是说，六七成的宝贵显存被白白占着。PagedAttention 论文里的实测正是如此：在它出现之前，KV 显存的利用率低得惊人，而利用率低就直接意味着 batch 开不大、吞吐上不去。</p>  <div class="callout danger"><span class="label">碎片 = 多买一倍 GPU</span>
+    <p>把这个浪费换算成钱就触目惊心了：<strong>KV 利用率从 40% 提到 96%，等价于在同一批 GPU 上把可服务的并发提升约 2.4 倍</strong>——也就是说，碎片不是「损失了一点显存」，而是「白白多买了一倍多的 GPU」。在动辄上千张卡的推理集群里，这个系数直接乘到硬件账单与服务成本上。这正是 PagedAttention 一经提出就被全行业迅速采纳的原因：它解决的不是一个学术指标，而是真金白银的算力效率。</p>
+  </div>  <div class="ascii">连续分配的困境（每格 = 一个 token 的 KV 槽位，█=已用 ░=预留空着）
+
+  请求A (max_len=8, 实际只用了3):  █ █ █ ░ ░ ░ ░ ░    &lt;- 5 格内部碎片
+  请求B (已结束，显存释放):        . . . . . . . .
+  请求C (max_len=8, 实际只用了2):  █ █ ░ ░ ░ ░ ░ ░    &lt;- 6 格内部碎片
+
+  新请求D 需要连续 6 格 -&gt; B 留下的洞是连续的吗？被 A/C 夹着的空闲常常放不下 -&gt; 外部碎片
+  结论：明明有大量空格，却塞不下新请求。利用率 ~20-40%。</div>  <div class="callout warn"><span class="label"></span>
+    <p>这里的根本矛盾是：<strong>KV 在逻辑上必须按 token 顺序排列（注意力要顺序读取），传统实现就误以为它在物理上也必须连续</strong>。正是这个「逻辑连续 ⇒ 物理连续」的隐含假设，制造了所有碎片。下一节的 PagedAttention 一举打破它——逻辑连续，物理可以任意分散。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="paged"><span class="num">3</span>PagedAttention：KV 当虚拟内存</h2>
+  <h3>PagedAttention：把 KV 当虚拟内存来管</h3>  <p>PagedAttention 的洞察来自一个<strong>六十年前就被操作系统解决过的问题</strong>：进程需要逻辑上连续的内存，但物理内存被切碎了。OS 的答案是<strong>分页（paging）</strong>——把内存切成固定大小的页，进程看到的连续地址经<strong>页表</strong>映射到物理上任意分散的页帧。PagedAttention 把这套机制原样搬给 KV cache。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把每个请求的 KV 切成固定大小的<strong>块（block）</strong>，每块存固定个数 token 的 K/V（如 16 个）。请求看到的是逻辑上连续的块序列，但这些块在物理显存里可以<em>散落各处</em>。一张<strong>块表（block table）</strong>记录「这个请求的第 i 个逻辑块，实际在物理显存的第几块」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化对应：OS 的「页 page / 页帧 frame / 页表 page table / 虚拟地址 → 物理地址」一一对应 PagedAttention 的「KV 块 / 物理块 / 块表 / 逻辑块号 → 物理块号」。注意力 kernel 不再假设 KV 连续，而是经块表<strong>间接寻址</strong>去各物理块取 K/V。分配以块为粒度、<strong>按需进行</strong>（生成到需要新块时才分配），永不预留整段。</p></div>
+  </div>  <p>这个改动一举解决了所有碎片：<strong>外部碎片彻底消失</strong>（任何空闲块都能用，因为块大小统一、无需连续），<strong>内部碎片被限制在「每个请求的最后一块」之内</strong>（最多浪费 block_size−1 个槽位，而非整个 max_len）。于是 KV 利用率从 20–40% 跃升到 vLLM 报告的 <strong>~96%</strong>——同样的显存，能塞下数倍的并发请求。</p>  <div class="ascii">分页后：逻辑连续，物理分散（每块存 4 个 token，仅示意）
+
+  请求A 逻辑块:  [L0][L1][L2]          块表A: L0-&gt;P5, L1-&gt;P2, L2-&gt;P8
+  请求C 逻辑块:  [L0][L1]              块表C: L0-&gt;P1, L1-&gt;P7
+
+  物理块池:  P0  P1  P2  P3  P4  P5  P6  P7  P8 ...
+             空 C0  A1  空  空  A0  空  C1  A2
+
+  注意力读 A 的 KV：按块表 A 依次访问 P5, P2, P8 —— 物理乱序，逻辑正确。
+  新块从空闲池随便挑一个即可（无需连续）-&gt; 外部碎片消失。</div>  <div class="callout paper"><span class="label"></span>
+    <p>这正是 Kwon et al. 2023（vLLM）的核心贡献。它把一个系统领域的成熟思想（虚拟内存分页）迁移到 LLM 服务，换来 2–4× 的吞吐提升，是「跨领域迁移」的范例。细节见 <code>references.md</code> 的 PagedAttention 条目。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="blocktable"><span class="num">4</span>块表与间接寻址</h2>
+  <h3>块表与间接寻址：注意力怎么读分散的 KV</h3>  <p>既然 KV 物理上分散了，注意力 kernel 就必须学会经块表<strong>间接寻址</strong>。把逻辑位置翻译成物理位置只需两步整数运算：</p>  <div class="math-block">\[\text{logical\_block}=\left\lfloor \frac{\text{pos}}{B}\right\rfloor,\qquad \text{offset}=\text{pos}\bmod B,\qquad \text{phys\_block}=\text{block\_table}[\text{logical\_block}]\]</div>  <p>其中 <code>pos</code> 是 token 在序列中的位置、<code>B</code> 是块大小。于是「取第 pos 个 token 的 K」= 先算它在第几个逻辑块、块内第几个 offset，再查块表得到物理块号，去物理块池的 <code>(phys_block, offset)</code> 取数。这和 OS 把虚拟地址拆成「页号 + 页内偏移」再查页表，是<strong>一模一样</strong>的运算。</p>  <pre><code># 注意力读取分散 KV 的伪代码（每个 query 对全部历史 KV）
+for pos in range(seq_len):              # 遍历所有历史位置
+    lb   = pos // B                     # 逻辑块号
+    off  = pos %  B                     # 块内偏移
+    pb   = block_table[lb]              # 查块表 -&gt; 物理块号
+    k    = K_pool[pb, off]             # 去物理块池取 K
+    v    = V_pool[pb, off]
+    score[pos] = q @ k                  # 累加注意力分数
+# 真实 kernel（vLLM 的 paged_attention）把这套寻址融进 CUDA，按块批量读取</code></pre>  <p>这套寻址其实就是注意力 kernel 的「内存视图」改写。朴素实现里 K、V 是两个形状 <code>[seq, d]</code> 的连续大数组，按 <code>K[pos]</code> 直接索引；分页实现里它们变成物理块池 <code>[n_blocks, B, d]</code> 加每请求一张块表，按上面的两步整数运算间接索引。注意<strong>逻辑视图完全没变</strong>——注意力看到的仍是一段按位置排好的 K/V 序列，变的只是「这段序列在物理显存里怎么摆」。这种「逻辑接口不变、物理布局重排」正是 PagedAttention 能在不改注意力数学的前提下、悄悄换掉整个显存管理的关键。</p>  <p>代价是什么？每次访存多了一层「查块表」的间接，且同一逻辑序列的块在物理上不连续、访存局部性变差。但这点开销<strong>远小于</strong>它省下的显存红利——多出来的并发（更大的 batch）带来的吞吐增益，把间接寻址的小损耗淹没了。这也是系统设计的常见权衡：<em>用一点点每次访问的开销，换取宏观上数倍的资源效率</em>。真实 vLLM 把这套块表寻址融进了它的 <code>paged_attention</code> CUDA kernel，让间接读取以块为单位批量进行、尽量保留访存效率；但其逻辑骨架，就是上面这几行整数运算。</p>  <div class="callout warn"><span class="label"></span>
+    <p>块大小 <code>B</code> 是个真实的权衡旋钮：<strong>B 太小</strong>→ 块表很长、间接寻址与 kernel 启动开销大、块元数据多；<strong>B 太大</strong>→ 最后一块的内部碎片变大（回到了 max_len 预留的小号版本）。vLLM 默认 <code>B=16</code>，是在「碎片」与「开销」间的经验平衡点。notebook 里你会亲手扫不同 B、看碎片率怎么变。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="alloc"><span class="num">5</span>按需分配与回收：整数账本</h2>
+  <h3>按需分配与回收：一个整数账本</h3>  <p>PagedAttention 的显存管理本质上是一个<strong>空闲块的账本</strong>。系统维护一个<strong>空闲块列表（free list）</strong>，分配时从中取一块、记进请求的块表，回收时把块还回去。整个生命周期是这样的：</p>  <ol>
+    <li><strong>prefill</strong>：请求到达，按 prompt 长度算出需要几个块，一次性从 free list 取出、建好块表，把 prompt 的 KV 写进去。</li>
+    <li><strong>decode</strong>：每生成一个 token 就往当前最后一块追加 K/V；写满了就再从 free list 取一个新块、追加到块表。<strong>永不预留</strong>未来的块。</li>
+    <li><strong>结束</strong>：请求生成完（或被取消），把它块表里所有物理块<strong>还回</strong> free list，立刻可供别的请求使用。</li>
+  </ol>  <p>这套「按需取、用完还」的机制，就是为什么 PagedAttention 能把利用率推到 96%：显存只在<strong>真正存了有效 token 时</strong>才被占用，多一个 token 才多一块（且只在写满边界），请求一结束块就立即释放。对比连续分配「一上来就按 max_len 占满、直到结束才放」，差距一目了然。</p>  <p>值得强调一个常被忽略的细节：<strong>decode 阶段的块分配是「惰性」的——只有当前最后一块恰好写满时，才取下一块</strong>。这意味着任意时刻，一个请求最多只有<em>一块</em>是部分填充的（即正在写的那块），其余块都是满的。于是整个系统的内部碎片有一个<strong>严格上界</strong>：<code>运行中请求数 × (block_size − 1)</code> 个槽位——与请求的实际长度、与 max_len 都无关。这正是分页把碎片从「正比于 max_len」压成「正比于一个小常数 block_size」的数学本质，也是 notebook 里你会亲手验证的不变量。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>你可以把 free list 想成一叠空托盘。来订单（请求）就发几个托盘装菜（KV），不够了再发，订单完成托盘立刻收回洗净给下一桌。绝不会因为「这桌可能还要加菜」就提前把一摞托盘全压在他桌上不动。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>当 free list 空了（显存满）而仍有请求需要新块时，就触发 <span class="term">preemption</span>（抢占）：调度器挑某些请求把它们的块换出到 CPU 内存（swapping）或干脆丢弃稍后重算（recompute），腾出块给高优先级请求。这是模块 02 调度器的职责，本模块先把分配/回收的账本打牢。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把显存管理还原成一个<strong>整数账本</strong>（哪块空闲、哪块归谁、被几个请求共享），是本模块 notebook 的核心抽象。真实 vLLM 的 BlockManager 做的就是这件事，只是还要管 CUDA 显存指针、换出换入等工程细节。把账本逻辑写对，引擎的显存管理就立住了一半。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cow"><span class="num">6</span>Copy-on-Write 前缀/采样共享</h2>
+  <h3>Copy-on-Write：零拷贝的前缀与采样共享</h3>  <p>分页还解锁了一个连续分配几乎做不到的能力：<strong>多个序列共享相同的 KV 块</strong>。两个最重要的场景：</p>  <ul>
+    <li><strong>前缀共享</strong>：很多请求带<em>相同的前缀</em>（同一个 system prompt、同一段 few-shot 示例）。这些 token 的 K/V 完全相同，没必要各存一份——让它们的块表指向<strong>同一批物理块</strong>即可。</li>
+    <li><strong>并行采样</strong>：对同一个 prompt 采样多个候选（如 <code>n=4</code> 个回答，或 beam search）。它们共享整段 prompt 的 KV，只在各自生成的部分才分叉。</li>
+  </ul>  <p>但共享有个危险：如果 A、B 共享一块，A 往里写新 token，B 会<em>看到不该看到的</em>数据。解法又是从 OS 借来的——<span class="term">copy-on-write</span>（写时复制）：</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>共享的块先<strong>只读地</strong>被多个序列指着，谁都不实际复制（零拷贝，省显存）。直到某个序列要<strong>往共享块里写</strong>新 token 时，才在那一刻把这块<em>复制</em>出一份私有的，在私有副本上写——其他序列继续共享原块，互不干扰。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>实现靠每块一个 <span class="term">reference count</span>（引用计数）：被共享时计数加一。写入时检查计数——若 <code>count==1</code>（独占）直接写；若 <code>count&gt;1</code>（共享）则分配新块、拷贝内容、把自己的块表改指新块、原块计数减一。释放块时计数减一，<strong>减到 0 才真正还回 free list</strong>。</p></div>
+  </div>  <div class="ascii">CoW：两个候选共享 prompt 前缀，各自生成时才分叉
+
+  共享前缀块 P3 (refcount=2)   &lt;- 候选A、候选B 的块表都指向它
+     A: [P3][P3...]  B: [P3][...]
+
+  候选A 要在前缀后写新 token，但 P3 是共享的(refcount=2)：
+     -&gt; 分配新块 P9，拷贝 P3 内容，A 改指 P9 并写入；P3 refcount 减到 1
+     A: [P3][P9*]    B: [P3]      &lt;- B 仍安全地共享原 P3，零干扰</div>  <p>CoW 的收益在高并发同前缀场景下<strong>极其可观</strong>：一个被一千个请求共享的长 system prompt，只需存一份 KV，而非一千份。这也是模块 04 前缀缓存（RadixAttention）的微观基础——RadixAttention 在更高层用前缀树自动发现可共享的前缀，底层正是靠这种块级共享 + 引用计数 + CoW 来落实。notebook 会把引用计数与 CoW 的完整逻辑写出来并验证：共享时不复制、写入时才分叉、计数归零才回收。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="metrics"><span class="num">7</span>量化账本：碎片率与利用率</h2>
+  <h3>把账本量化：碎片率与利用率</h3>  <p>说了这么多「省显存」，到底省多少？本模块的压轴是把它<strong>量化成账本上的数字</strong>。定义几个能直接计算的指标：</p>  <table>
+    <thead><tr><th>指标</th><th>定义</th><th>连续分配</th><th>分页</th></tr></thead>
+    <tbody>
+      <tr><td><strong>KV 利用率</strong></td><td>有效 token 槽 ÷ 已分配槽</td><td>低（20–40%，受 max_len 预留拖累）</td><td>高（~96%）</td></tr>
+      <tr><td><strong>内部碎片率</strong></td><td>已分配但空着的槽 ÷ 已分配槽</td><td>高（预留了 max_len）</td><td>低（仅最后一块部分空）</td></tr>
+      <tr><td><strong>外部碎片</strong></td><td>因不连续而放不下新请求的空闲</td><td>存在</td><td>≈ 0（任意空闲块都能用）</td></tr>
+      <tr><td><strong>可容纳并发</strong></td><td>给定显存能同时服务的请求数</td><td>少</td><td>多（数倍）</td></tr>
+    </tbody>
+  </table>  <p>以一个具体场景算账：显存共 100 个 token 槽，块大小 4。来 5 个请求，各自实际生成长度为 <code>[3, 7, 2, 5, 6]</code>。连续分配若按 max_len=20 预留，每个请求占 20 槽，只能放下 5 个就满了（且只用了 23/100 = 23% 槽，其余全是预留浪费）。分页则每个请求只占 <code>ceil(len/4)</code> 块 = <code>[1,2,1,2,2]=8 块=32 槽</code>，剩下 68 槽还能继续接新请求——同样显存，吞吐天差地别。</p>  <p>notebook 会把这套账完整地写成一个可运行的对比：实现两个分配器（连续 vs 分页），喂同一批请求，打印各自的利用率、内部碎片率、能容纳多少并发，让你<strong>亲眼看到</strong> PagedAttention 那 2–4× 吞吐红利是从哪个数字里长出来的。这也呼应模块 00 的账本方法论——把系统收益还原成可断言的整数，是看懂一切推理优化的基本功。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把这条因果链记牢，它贯穿全课：<strong>更省显存 → 更大 batch → decode 时权重读取被更多请求摊薄 → 更高吞吐</strong>。分页 KV 之所以是「吞吐第一块地基」，正因为它松开了这条链最前端的约束（显存）。后面模块 02 的连续批处理则是把「更大 batch」这一环真正用满——两者合起来，才完整释放了显存红利。所以读完本模块别只记住「分页省显存」，要记住它<em>最终兑现成的是吞吐</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>KV cache 压缩与淘汰</strong>：分页解决了「怎么放」，但 KV 总量仍随上下文线性涨。前沿在「放什么」——只保留重要 token 的 KV（如 H2O、StreamingLLM 的 attention sink）、或把 KV 量化/低秩压缩（模块 05），让超长上下文显存可控。</li>
+    <li><strong>前缀缓存的自动化与跨请求复用</strong>：把 CoW 的块级共享上升为系统级的自动前缀发现（RadixAttention，模块 04），并跨请求、跨会话、甚至跨实例地持久化与调度共享前缀，是当前服务系统竞争的焦点。</li>
+    <li><strong>块大小与访存效率</strong>：分页的间接寻址损害了访存连续性，如何与 FlashAttention/FlashDecoding 的分块协同（让 KV 块大小对齐 kernel 的 tile）、在碎片与 kernel 效率间取得最优，仍是活跃的工程问题。</li>
+    <li><strong>分级与分离的 KV 存储</strong>：把 KV 放到 GPU/CPU/远端存储的分级体系（如 Mooncake 的 KV 池），按热度迁移，配合 PD 分离（模块 04）让 KV 成为可独立扩缩容的一等资源——这是把「分页」从单卡推广到集群的方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Kwon et al. 2023（PagedAttention/vLLM，本模块的源头）；延伸读 StreamingLLM、H2O（KV 淘汰）、KVQuant（KV 量化）、Mooncake（KV 池化）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_continuous_batching/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · Continuous Batching</div></a>
+  </div>
+
+</div>
+</body>
+</html>

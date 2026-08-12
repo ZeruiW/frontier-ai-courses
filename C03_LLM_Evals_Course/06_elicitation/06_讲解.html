@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · 能力引出与 pass@k</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 06 / 9</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>06 · 能力引出与 pass@k</h1>
+  <p class="subtitle">Capability Elicitation &amp; pass@k —— 你测到的从来不是"能力"，而是"这套 harness 引出的下界"</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">二项分布、Jensen 不等式、模块 02 的 bootstrap / 置信区间</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span><span class="badge gpu">GPU可选</span> 06_elicitation_passk.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Chen 2021 (HumanEval)、METR 2024、Wei 2022 (CoT)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#capability">能力 vs 表现：所有分数都是下界</a></li>
+      <li><a href="#ladder">引出阶梯：从 zero-shot 到微调引出</a></li>
+      <li><a href="#passk-math">pass@k 的数学：定义、朴素估计的偏差、无偏估计量推导</a></li>
+      <li><a href="#passk-stats">pass@k 的统计性质：方差、n 怎么选、k→n 的退化</a></li>
+      <li><a href="#bon">best-of-n 与 verifier：能力上界探针</a></li>
+      <li><a href="#temperature">温度与多样性：t=0 测行为，t&gt;0 测分布</a></li>
+      <li><a href="#gap">scaffolding 效应实证：度量 elicitation gap</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="capability"><span class="num">1</span>能力 vs 表现：所有分数都是下界</h2>
+
+  <p>前五个模块都在回答"分数本身可不可信"（统计噪声、prompt 敏感性、judge 偏置、污染）。本模块换一个更根本的问题：
+  <strong>即使分数完全干净，它衡量的也不是模型的"能力"，而是模型在<em>这一套特定 harness</em> 下被引出（elicit）的"表现"。</strong>
+  把两者混为一谈，是评测报告里最常见、后果最严重的概念错误。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>同一个模型，换一个 prompt 模板、允许它先写推理过程、让它多试几次、给它接上工具——分数可以差出几十个点。
+      所以"模型在 GSM8K 上得 18 分"这句话是不完整的，完整版本是"<strong>在 zero-shot、greedy 解码、只采样一次的条件下</strong>得 18 分"。
+      你测到的永远是"它至少能做到这么好"，而不是"它最多只能做到这么好"。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设模型 $M$、评测任务分布 $\mathcal{T}$、引出配置 $H$（prompt 模板、示例、scaffold、采样预算、温度、答案抽取与判分器的整体），观测分数为
+      $s(M; \mathcal{T}, H)$。定义<span class="term">能力 capability</span>为可行引出配置集合 $\mathcal{H}$ 上的上确界
+      $\;c(M;\mathcal{T}) = \sup_{H \in \mathcal{H}} s(M;\mathcal{T},H)$。
+      则任意一次评测只给出 $s(M;\mathcal{T},H) \le c(M;\mathcal{T})$，即<strong>能力的一个下界</strong>；
+      下界与上确界之差就是 <span class="term">elicitation gap</span>（引出差距）。$\mathcal{H}$ 的边界如何划（允不允许微调？允不允许人类改写中间结果？）本身是评测协议的一部分，必须显式声明。</p>
+    </div>
+  </div>
+
+  <p>这个"下界视角"对两类评测的含义截然不同——这是 METR 反复强调的非对称性 [METR 2024]：</p>
+
+  <table>
+    <thead><tr><th>评测类型</th><th>under-elicitation 的后果</th><th>错误方向</th><th>危险程度</th></tr></thead>
+    <tbody>
+      <tr><td>产品 / 排行榜评测</td><td>某模型被低估、排名失真</td><td>对该模型不公平，但错误"看得见"（厂商会抗议）</td><td>中</td></tr>
+      <tr><td><strong>安全 / 危险能力评测</strong></td><td>"模型不具备危险能力 X"的结论实际只意味着"<em>在我们尝试的引出水平下</em>没表现出 X"</td><td><strong>系统性偏向"安全"一侧的假阴性</strong>，且没有人有动机去纠正它</td><td>高</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>虚假安心（false assurance）是安全评测的头号失败模式。</strong>
+  METR 的引出指南指出：不做认真引出的评测者可能<em>大幅低估</em>模型能力（"dramatically underestimating model capabilities"），
+  而他们的实测显示，post-training 增强（更好的 scaffold、prompt、工具接入、微调）带来的提升幅度
+  <strong>与 GPT-3.5 → GPT-4 的代际差同一量级</strong> [METR 2024]。换句话说：一份 under-elicited 的危险能力评测报告，
+  相当于拿上一代模型的成绩单为下一代模型的部署背书。基于此，METR 的方法论是：
+  ①评测前先做"小团队一个月内可完成"的基础引出；②把可由小修复消除的<span class="term">spurious failure</span>（格式错误、工具调用语法错、token 截断）
+  单独核算，估计"修掉之后"的分数；③把结果显式解读为下界，并为未来引出改进预留安全余量（safety margin）。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  一个有用的心智模型：<strong>评测报告里的每个数字都该带一个"引出水平"标签</strong>，就像统计量必须带误差条（模块 02）一样。
+  "score = 41.2" 不是一个完整的论断；"score = 41.2 ± 1.8 @ zero-shot, greedy, n=1, 答案抽取协议 v3" 才是。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="ladder"><span class="num">2</span>引出阶梯：从 zero-shot 到微调引出</h2>
+
+  <p>引出手段不是一团模糊的"prompt 工程"，可以排成一个成本递增、强度递增的阶梯。评测协议要做的，就是声明自己站在哪一级、为什么。</p>
+
+  <div class="ascii">
+                         引出强度 / 成本 ──────────────────────────────►
+
+  L5  微调引出 (fine-tuning elicitation)      ██████████████████████████
+      在任务分布上 SFT / RL，直接改参数；最强、最贵；安全评测的"金标准"引出
+  L4  best-of-n + verifier                   ████████████████████
+      采样 n 个候选、用判分器选优；推理成本 ×n；§5 详述
+  L3  scaffolding（agent 化）                 ████████████████
+      重试 retry / 工具调用 / 任务分解 / 自我修正循环；工程成本高
+  L2  few-shot（含 CoT 示例）                 ██████████
+      k 个范例放进上下文；吃上下文长度；对格式敏感（模块 03）
+  L1  CoT prompting                          ██████
+      "让我们一步一步思考"/ 指令式推理 [Wei 2022]；几乎零成本
+  L0  zero-shot, greedy, n=1                 ██
+      直接问、采样一次；最接近"开箱即用"的部署表现
+  </div>
+
+  <table>
+    <thead><tr><th>层级</th><th>边际成本</th><th>典型提升幅度</th><th>它引出的是什么</th></tr></thead>
+    <tbody>
+      <tr><td>L1 CoT prompting</td><td>改 prompt，~0</td><td>推理类任务可达数十个点：GSM8K 上 PaLM 540B 从 ~18% → ~57% [Wei 2022]；但小模型收益≈0 甚至为负（CoT 增益随规模涌现）</td><td>模型已会但默认不展开的逐步推理</td></tr>
+      <tr><td>L2 few-shot</td><td>prompt 工程 + 上下文 token</td><td>因任务而异，常 +5~20 点；对示例选择与顺序敏感</td><td>任务格式与输出规约的对齐</td></tr>
+      <tr><td>L3 scaffolding</td><td>工程量大；推理 ×(2~10)</td><td>agent 类任务上常是"能做/不能做"的质变；修 spurious failure 本身就能显著提分 [METR 2024]</td><td>长程任务中的纠错与状态管理能力</td></tr>
+      <tr><td>L4 best-of-n</td><td>推理 ×n</td><td>由 pass@k 曲线决定（§3–5）；可验证域内提升巨大</td><td>分布尾部的正确解</td></tr>
+      <tr><td>L5 微调</td><td>数据 + 训练算力</td><td>上不封顶；能消除"拒答/风格"类伪失败</td><td>参数中已有但未对齐到任务接口的能力</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>[Wei 2022] Chain-of-Thought Prompting</strong>：只需在 few-shot 示例里把"问题→答案"换成"问题→推理链→答案"，
+  大模型的多步推理分数大幅跃升，且该增益是<strong>随模型规模涌现</strong>的——约 100B 参数以下的模型几乎不受益。
+  评测视角的教训：<strong>elicitation gap 是模型相关的</strong>。两个模型在 L0 的排序与在 L1 的排序可能相反，
+  所以"哪个模型更强"在不声明引出水平时是个不适定（ill-posed）的问题。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="passk-math"><span class="num">3</span>pass@k 的数学：定义、朴素估计的偏差、无偏估计量推导</h2>
+
+  <p>引出阶梯的 L4（best-of-n）和"能力存在性"问题都依赖同一个核心指标：<span class="term">pass@k</span>。
+  它最早在代码生成评测中被形式化 [Chen 2021, HumanEval]，因为代码有天然的 oracle 判分器——单元测试。</p>
+
+  <h3>3.1 定义</h3>
+  <p>对单个题目，设模型在给定温度下每次独立采样的成功概率为 $p$（<span class="term">per-sample 成功率</span>）。
+  采 $k$ 个样本，至少一个通过的概率：</p>
+
+  <div class="math-block">
+  $$ \text{pass@}k(p) \;=\; 1-(1-p)^k $$
+  </div>
+
+  <p>benchmark 层面是对 $M$ 道题取平均（各题真实成功率 $p_1,\dots,p_M$ 各不相同）：</p>
+
+  <div class="math-block">
+  $$ \text{Pass@}k \;=\; \frac{1}{M}\sum_{i=1}^{M}\bigl[1-(1-p_i)^k\bigr] $$
+  </div>
+
+  <p>$p_i$ 不可直接观测，只能对每题采 $n \ge k$ 个样本、数出通过数 $c_i$，再构造估计量。问题来了：怎么估才无偏？</p>
+
+  <h3>3.2 两种朴素估计，两个方向的偏差</h3>
+
+  <p>记 $f(p) = 1-(1-p)^k$。对 $k\ge 2$，$f''(p) = -k(k-1)(1-p)^{k-2} &lt; 0$，即 <strong>$f$ 严格凹</strong>。两种"看起来都对"的朴素做法分别栽在 Jensen 不等式的两侧：</p>
+
+  <p><strong>朴素估计 A（聚合式，系统性高估）</strong>：把全 benchmark 汇总成一个 $\bar{p} = \frac{1}{M}\sum_i \hat{p}_i$，再代入公式 $1-(1-\bar p)^k$。由 Jensen 不等式（$f$ 凹）：</p>
+
+  <div class="math-block">
+  $$ \frac{1}{M}\sum_{i=1}^{M} f(p_i) \;\le\; f\!\Bigl(\frac{1}{M}\sum_{i=1}^{M} p_i\Bigr)
+     \quad\Longrightarrow\quad \text{Pass@}k \;\le\; 1-(1-\bar p)^k, $$
+  </div>
+
+  <p>且只要各题难度不全相同、$k\ge2$，不等号严格成立。<strong>题目难度越异质，高估越严重，并且偏差不随 $n\to\infty$ 消失</strong>——这是协议级错误，不是采样噪声。
+  极端例子：一半题 $p_i=1$、一半 $p_i=0$，真实 $\text{Pass@}k = 0.5\;\forall k$，而聚合式给出 $1-(0.5)^k \to 1$。
+  直觉：公式把"平均成功率 0.5"误读成"每道题都有 0.5 的机会"，但那一半 $p_i=0$ 的题采多少次都不会过。</p>
+
+  <p><strong>朴素估计 B（逐题插入式，低估 + 高方差）</strong>：对每题用 $\hat p_i = c_i/n$ 代入，$\frac1M\sum_i\bigl[1-(1-c_i/n)^k\bigr]$。这次 Jensen 作用在<em>题内采样噪声</em>上：$\hat p_i$ 无偏但有方差，凹函数下
+  $\mathbb{E}\bigl[f(\hat p_i)\bigr] \le f(p_i)$，即<strong>系统性低估</strong>。
+  Chen et al. 在 HumanEval 论文附录中专门指出这一点：该估计是"一致的低估（consistent underestimate）"，
+  且<strong>即便 $n &gt; 5k$ 偏差仍未完全消失</strong>——更糟的是偏差大小依赖 $n$，导致"采样更多、分数更高"的伪改进 [Chen 2021]。</p>
+
+  <table>
+    <thead><tr><th>估计量</th><th>公式</th><th>偏差方向</th><th>偏差来源</th><th>随 n→∞ 消失？</th></tr></thead>
+    <tbody>
+      <tr><td>朴素 A：聚合式</td><td>$1-(1-\bar p)^k$，$\bar p$ 为全集平均</td><td><strong>高估</strong></td><td>题目难度异质 + Jensen（题间）</td><td><strong>否</strong></td></tr>
+      <tr><td>朴素 B：逐题插入</td><td>$\frac1M\sum_i 1-(1-c_i/n)^k$</td><td><strong>低估</strong></td><td>题内采样噪声 + Jensen（题内）</td><td>是，但慢（$n&gt;5k$ 仍可见）</td></tr>
+      <tr><td>Chen 2021 无偏估计</td><td>$\frac1M\sum_i \Bigl[1-\binom{n-c_i}{k}\big/\binom{n}{k}\Bigr]$</td><td>无偏</td><td>—</td><td>对任意 $n\ge k$ 严格无偏</td></tr>
+    </tbody>
+  </table>
+
+  <h3>3.3 无偏估计量的完整推导</h3>
+
+  <p>固定一道题，$n$ 个样本是 i.i.d. Bernoulli$(p)$：$X_1,\dots,X_n$，$c=\sum_j X_j$。Chen et al. 的估计量：</p>
+
+  <div class="math-block">
+  $$ \widehat{\text{pass@}k} \;=\; 1-\frac{\binom{n-c}{k}}{\binom{n}{k}} $$
+  </div>
+
+  <p><strong>构造直觉</strong>：$\binom{n-c}{k}\big/\binom{n}{k}$ 是"从 $n$ 个样本中<em>无放回</em>均匀抽 $k$ 个，恰好全是失败样本"的比例。
+  <strong>无偏性证明</strong>：对任一固定的大小为 $k$ 的下标子集 $S$，由独立性
+  $\Pr\bigl(\forall j\in S: X_j = 0\bigr) = (1-p)^k$。把估计量的组合数比值改写成对全部子集的平均：</p>
+
+  <div class="math-block">
+  $$ \frac{\binom{n-c}{k}}{\binom{n}{k}}
+     \;=\; \frac{1}{\binom{n}{k}}\sum_{|S|=k}\;\prod_{j\in S}(1-X_j)
+     \quad\Longrightarrow\quad
+     \mathbb{E}\!\left[\frac{\binom{n-c}{k}}{\binom{n}{k}}\right]
+     = \frac{1}{\binom{n}{k}}\sum_{|S|=k} (1-p)^k = (1-p)^k . $$
+  </div>
+
+  <p>故 $\mathbb{E}\bigl[\widehat{\text{pass@}k}\bigr] = 1-(1-p)^k$，对任意 $n\ge k$ 严格无偏。$\blacksquare$
+  关键洞察：随机选出的 $k$ 个样本（无放回）本身就是 $k$ 个 i.i.d. 样本，所以"子集全败比例"的期望<em>恰好</em>等于真概率；
+  而朴素 B 相当于从经验分布<em>有放回</em>抽 $k$ 次，失败样本会被重复抽中，"全败"概率被抬高、pass@k 被压低。</p>
+
+  <h3>3.4 数值稳定实现</h3>
+  <p>$n$ 稍大（如 $n=200$）时组合数会溢出浮点范围，必须用逐项乘积形式（恒等变形）：</p>
+
+  <div class="math-block">
+  $$ \frac{\binom{n-c}{k}}{\binom{n}{k}} \;=\; \prod_{i=n-c+1}^{n}\Bigl(1-\frac{k}{i}\Bigr)
+     \qquad(\text{共 } c \text{ 项，全部} \in [0,1]\text{，绝不溢出}) $$
+  </div>
+
+  <pre><code>def pass_at_k(n, c, k):           # Chen et al. 2021, 数值稳定版
+    if n - c &lt; k: return 1.0      # 失败样本不足 k 个 → 任取 k 个必含正确解
+    return 1.0 - np.prod(1.0 - k / np.arange(n - c + 1, n + 1))</code></pre>
+
+  <div class="callout warn"><span class="label"></span>
+  边界行为要背下来：$c=0 \Rightarrow$ 空乘积 $=1 \Rightarrow$ 估计为 $0$；$n-c&lt;k$（含 $c=n$）$\Rightarrow \binom{n-c}{k}=0 \Rightarrow$ 估计为 $1$；
+  $k=1 \Rightarrow$ 退化为 $c/n$。notebook 练习 1 会让你亲手实现并对照精确组合数验证。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="passk-stats"><span class="num">4</span>pass@k 的统计性质：方差、n 怎么选、k→n 的退化</h2>
+
+  <p>无偏只解决了一半问题。Chen et al. 之所以对每题采 $n=200$ 个样本来报告 $k\le 100$ 的 pass@k，是因为<strong>方差才是实践瓶颈</strong> [Chen 2021]。</p>
+
+  <h3>4.1 k 接近 n 时估计退化</h3>
+  <p>看极端情形 $k=n$：估计量变成
+  $1-\binom{n-c}{n}\big/\binom{n}{n} = \mathbb{1}\{c\ge 1\}$——一个 Bernoulli 变量，方差 $q(1-q)$，$q = 1-(1-p)^n$，
+  <strong>完全没有从 $n$ 个样本中获得任何平均化收益</strong>。直觉：$k$ 越接近 $n$，不同的 $k$-子集重叠越严重，
+  "很多子集"提供的信息趋同于"一个子集"。反之 $k\ll n$ 时，估计量接近对许多近独立子集取平均，方差小。</p>
+
+  <h3>4.2 n 该取多大</h3>
+  <ul>
+    <li><strong>无偏性对 $n$ 没有要求</strong>（任意 $n\ge k$ 即可），$n$ 纯粹是买方差的。</li>
+    <li>经验法则：$n\ge 2k$ 起步（Chen 2021 用 $n=200$, $k\le100$），预算允许时 $n\ge 5k$；报告最高的那个 $k$ 决定 $n$ 的下限。</li>
+    <li>benchmark 层面总方差有两个来源（模块 02 的分解在此复用 [Miller 2024]）：<strong>题目抽样方差</strong>（$M$ 道题是任务分布的样本）+ <strong>生成随机性方差</strong>（每题 $n$ 次采样的噪声）。$k/n$ 大时第二项膨胀。</li>
+    <li>实操上不要套闭式公式，直接 <strong>bootstrap</strong>：对题目维度重采样得到 $\text{Pass@}k$ 的 CI（notebook 演示）；若 CI 宽到影响结论，优先加 $n$（若方差主要来自生成噪声）或加题（若来自题目抽样）。</li>
+    <li>两个免费的方差红利：$p_i$ 接近 0 或 1 的题，$c_i$ 几乎确定，贡献的生成方差≈0；所以中等难度题主导方差预算。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  把 $n$、$k$、CI 三件事压缩成一句话：<strong>报告 pass@k 时必须同时报告 n 和 CI</strong>。
+  "pass@10 = 63%" 在 $n=10$ 和 $n=100$ 下是两个完全不同可信度的论断——前者用的还是 $k=n$ 的退化估计。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="bon"><span class="num">5</span>best-of-n 与 verifier：能力上界探针</h2>
+
+  <p>pass@k 隐含了一个强假设：<strong>存在 oracle <span class="term">verifier</span></strong>——一个完美判分器（单元测试、数学答案精确匹配），
+  能从 $k$ 个候选中认出正确解。"$k$ 次里有一次对就算过"度量的是<strong>能力存在性</strong>，不是单次交付的可得性。
+  而部署中真正要做的是 <span class="term">best-of-n</span>（BoN）：采 $n$ 个候选，用某个选择器挑<strong>一个</strong>交付。两者的关系取决于 verifier 质量：</p>
+
+  <table>
+    <thead><tr><th>设置</th><th>选择器</th><th>与 pass@n 的关系</th><th>回答的问题</th></tr></thead>
+    <tbody>
+      <tr><td>pass@1（t=0, greedy）</td><td>无（只采一次）</td><td>下界中的下界</td><td>开箱即用的部署表现</td></tr>
+      <tr><td>BoN + oracle verifier</td><td>程序判分（单测 / 精确匹配）</td><td><strong>恒等：BoN@n ≡ pass@n</strong></td><td>可验证域内、$n$ 倍推理预算能买到什么</td></tr>
+      <tr><td>BoN + 不完美 verifier</td><td>reward model / LLM judge / 多数投票</td><td>BoN@n ≤ pass@n，差距 = verifier 的假阴/假阳率</td><td>真实部署中采样预算的回报</td></tr>
+      <tr><td>pass@k（k 大）</td><td>oracle，只问存在性</td><td>—</td><td><strong>能力上界探针</strong></td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>BoN/pass@k 作为"能力上界探针"</strong>：当 $k$ 足够大，pass@k 逼近"该温度下模型支持集中是否含正确解"，
+  即把 §1 的 $\sup_H$ 限制在"采样预算"这一维度上能摸到的上界。它是最便宜的引出审计手段：
+  不改 prompt、不搭 scaffold，只多花推理算力，就能探出"模型究竟会不会"。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>安全评测中 k 的选择必须匹配威胁模型 [METR 2024 视角]。</strong>
+  排行榜关心 pass@1（用户体验是单次交互）；但攻击型威胁模型里，攻击者可以采样成千上万次、只需<strong>一次</strong>成功（漏洞利用、合成路线）。
+  此时 pass@1 = 0.1% 不是"安全"，而是"攻击者平均试 1000 次即可成功"。对危险能力，pass@k 在大 k 下的值（以及它随 k 的增长斜率）
+  才是与风险相关的统计量；用 pass@1 给危险能力下"不具备"结论是 under-elicitation 的一种典型形态。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  pass@k 曲线（$k=1\dots n$ 的整条曲线）比任何单点都信息量大：平坦 = 模型"会就是会、不会就是不会"（$p_i$ 两极分化）；
+  陡峭 = 大量中等 $p_i$ 的题，采样预算回报高，也意味着一个好 verifier 的价值巨大。notebook 会画出这条曲线。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="temperature"><span class="num">6</span>温度与多样性：t=0 测行为，t&gt;0 测分布</h2>
+
+  <p>温度 $t$ 不是无关紧要的实现细节，它决定了你在测<strong>哪一个统计对象</strong>：</p>
+
+  <ul>
+    <li><strong>$t=0$（greedy / 近确定性）</strong>：测的是行为分布的<strong>众数</strong>——"这个模型在部署默认值下<em>会做</em>什么"。可复现性好，适合回归测试与 pass@1 报告。</li>
+    <li><strong>$t&gt;0$ + 多次采样</strong>：测的是<strong>整个输出分布</strong>，包括尾部——"这个模型<em>能做</em>什么"。pass@k、BoN、能力探针都活在这个域里。</li>
+  </ul>
+
+  <p>两者会系统性地分离：升温使单样本成功率 $p$ 下降（采到次优 token 的概率变大），但多样性上升使 $k$ 个样本覆盖的解空间变大。
+  在 $1-(1-p)^k$ 中，前者压低单项、后者让各样本"不再犯同一个错"，净效应随 $k$ 翻转——
+  HumanEval 上的实测：<strong>pass@1 的最优温度约 0.2，pass@100 的最优温度约 0.8</strong> [Chen 2021]。
+  greedy 采 $k$ 次只会得到同一个答案的 $k$ 份拷贝，pass@k 曲线完全平坦。</p>
+
+  <table>
+    <thead><tr><th>报告项</th><th>采样设置</th><th>它刻画什么</th><th>常见误用</th></tr></thead>
+    <tbody>
+      <tr><td>pass@1 @ t=0</td><td>greedy，1 次</td><td>部署默认行为</td><td>被当成"能力"解读 → 低估</td></tr>
+      <tr><td>pass@k @ t≈0.6–0.8</td><td>n≥2k 次采样，无偏估计</td><td>能力分布 / 采样预算回报</td><td>被当成"单次表现"解读 → 高估</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>两者都要报，且绝不跨设置比较。</strong>排行榜上同名指标"pass@1"有两种算法：greedy 一次，或 $t&gt;0$ 采 $n$ 次后取无偏估计 $c/n$——
+  数值可以差很多（前者是众数行为，后者是平均成功率）。比较两个模型时，温度、$n$、top-p、答案抽取协议必须完全一致；
+  论文复现失败的相当一部分根因就是温度协议不一致（与模块 03 的 prompt 敏感性同属"harness 自由度"问题）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="gap"><span class="num">7</span>scaffolding 效应实证：度量 elicitation gap</h2>
+
+  <p>§1 把 elicitation gap 定义成 $\sup$ 与观测值之差——不可直接测。但它的<strong>逐级差分</strong>完全可测：
+  固定模型与题集，只改变引出配置，分数之差就是相邻两级之间的引出差距：</p>
+
+  <div class="math-block">
+  $$ \Delta(H_a \!\to\! H_b) \;=\; s(M;\mathcal{T},H_b) - s(M;\mathcal{T},H_a),
+     \qquad \text{如 } H_a=\text{zero-shot},\; H_b=\text{+CoT} $$
+  </div>
+
+  <p>这是一个<strong>配对设计</strong>：同一模型、同一批题、两套 harness。正确的统计处理与模块 02 的模型间配对比较完全同构——
+  逐题计算 $g_i = s_i^{(b)} - s_i^{(a)}$，对题目维度做<strong>配对 bootstrap</strong> 得 $\bar g$ 的 CI；
+  配对消掉了题目难度这一最大方差来源，比"两个总分相减再各自挂误差条"灵敏得多。notebook 练习 3 实现这个工具。</p>
+
+  <p>实证上要点有三：</p>
+  <ul>
+    <li><strong>gap 可以很大</strong>：CoT 一项在推理任务上就值数十个点 [Wei 2022]；METR 测得 scaffold 迭代 + 修 spurious failure 的总效应与一次代际升级相当 [METR 2024]。</li>
+    <li><strong>gap 是模型相关的</strong>：CoT 对小模型无效甚至有害 [Wei 2022]。因此排行榜在不同引出水平下排序可以翻转——A 在 zero-shot 赢 B，B 加 CoT 后反超。比较模型时必须<em>同一引出水平</em>，或干脆报告整条"分数–引出水平"曲线。</li>
+    <li><strong>gap 本身是有价值的评测产出</strong>：gap 大 = 模型能力远未被默认接口暴露（对安全评测是警报：现成 scaffold 一接，能力就解锁）；gap 小且分数低 = 更可能是真实能力边界。</li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>METR 的工程经验 [METR 2024]</strong>：引出工作中性价比最高的往往不是高深的 prompt 技巧，而是<strong>修伪失败</strong>——
+  输出格式不合判分器预期、工具调用 JSON 语法错、上下文 / token 预算被截断、不必要的拒答。
+  这些失败与"能力"无关，却被计为 0 分。评测报告应分别给出"原始分"与"修复伪失败后的分"，两者之差是 harness 质量的度量（模块 07 展开）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>引出协议的标准化</strong>：分数本质上是二元组（score, 引出水平），但目前没有公认的引出水平描述语言。
+    方向：像报告误差条一样强制报告 elicitation budget（人时、scaffold 迭代数、采样预算、是否微调）；
+    harness 框架（Inspect、lm-evaluation-harness，模块 07）把 scaffold 声明式化，使引出配置可版本化、可复现。
+    评测视角：没有引出声明的跨论文分数比较应默认无效。</li>
+    <li><strong>安全评测中的引出义务</strong>：危险能力评测的"阴性结论"需要附带<em>引出充分性论证</em>——你凭什么相信自己接近了 $\sup_H$？
+    开放问题：第三方评测者应否获得微调权限（L5 是最强引出，但厂商最难开放）；
+    如何<em>预测</em>未来 post-training 改进带来的增益，从而把 safety margin 定量化而非拍脑袋 [METR 2024]。</li>
+    <li><strong>密度估计式评测</strong>：单点分数 → 整条 pass@k 曲线 → 直接估计每题成功率 $p_i$ 的<strong>分布密度</strong>。
+    pass@k 曲线是该分布的一族泛函（$\mathbb{E}[1-(1-p)^k]$ 是矩母函数式的变换）；两模型曲线交叉时任何单点比较都会误导。
+    与 item response theory 的题目难度建模合流，是"评测科学"最数学化的前沿之一。</li>
+    <li><strong>引出效率曲线（elicitation scaling）</strong>：把分数画成引出算力（采样数、scaffold 复杂度、微调步数）的函数，
+    用曲线的形状（斜率、饱和点）而非单点刻画模型。它与 METR 的 time-horizon 度量（模块 08）共享同一动机：
+    用对协议扰动更稳健的<em>泛函</em>替代脆弱的标量分数。</li>
+    <li><strong>verifier 的能力天花板</strong>：BoN 的收益受 verifier 质量钳制，而最强的 verifier 本身往往也是 LLM（模块 04 的 judge 偏置全部回来了）。
+    "生成-验证差距"（验证比生成容易多少）在哪些域成立、能否被量化，决定了采样预算换能力的兑换率。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>为什么任何评测分数都只是"该 harness 下能力的下界"？under-elicitation 在安全评测中为何比在排行榜评测中危险得多？</li>
+      <li>写出 Chen 2021 的无偏 pass@k 估计量并完成无偏性证明；说明聚合式与逐题插入式两种朴素估计各自的偏差方向、成因，以及哪一个不随 $n\to\infty$ 消失。</li>
+      <li>$k$ 接近 $n$ 时 pass@k 估计发生什么退化？报告 pass@k 时为什么必须同时报告 $n$、温度与 CI？</li>
+      <li>oracle verifier 下 BoN@n 与 pass@n 是什么关系？如何用配对 bootstrap 给 elicitation gap（如 CoT 增益）一个置信区间？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../05_contamination/05_讲解.html"><div class="dir">← 上一章</div><div class="t">05 · 数据污染与基准饱和</div></a>
+    <a class="next" href="../07_harness/07_讲解.html"><div class="dir">下一章 →</div><div class="t">07 · 从零搭建 eval harness</div></a>
+  </div>
+
+</div>
+</body>
+</html>

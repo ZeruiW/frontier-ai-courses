@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 电路与 Attribution</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 电路与 Attribution</h1>
+  <p class="subtitle">电路 = 模型完成某行为的因果子图 —— activation patching 是金标准但要 O(N) 次前向；attribution patching 用一阶梯度近似一次前后向归因所有节点/边；一阶在 softmax 处失效（AtP*）；并把节点从 head 升级为 SAE 特征（稀疏特征电路）</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–02（SAE/特征）、C06 的 activation patching/logit lens、Transformer 内部结构（C01）、链式法则/梯度</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_circuits.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Wang 2022(IOI)、Nanda 2023(attribution patching)、Syed 2023/Kramár 2024(EAP/AtP*)、Marks 2024(sparse feature circuits)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what">电路：行为背后的因果子图</a></li>
+      <li><a href="#patching">金标准 activation patching 与 O(N) 之痛</a></li>
+      <li><a href="#atp">attribution patching：一阶近似归因所有节点</a></li>
+      <li><a href="#fail">一阶近似何时准、何时失效：AtP*</a></li>
+      <li><a href="#edge">节点归因 vs 边归因（EAP）</a></li>
+      <li><a href="#dla">读输出端：direct logit attribution</a></li>
+      <li><a href="#feat">前沿：稀疏特征电路</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what"><span class="num">1</span>电路：行为背后的因果子图</h2>
+  <p>前两模块在<strong>单点</strong>层面工作：SAE 把一层激活拆成单义特征、看清单个特征是什么。但模型的<strong>行为</strong>不是某个特征独自完成的，而是<strong>一串组件协同计算</strong>的结果——某个 attention head 把信息从这里搬到那里、某个 MLP 神经元做一次判断、最后写进 logit。本模块要回答的是机制 interp 的另一半问题：<strong>某个具体行为，是模型的哪些组件、按什么连接、因果地算出来的？</strong>这条因果子图就叫一个<span class="term">circuit</span>（电路）。</p>  <p>circuits 议程（<strong>Olah et al. 2020《Zoom In》</strong>）的核心主张是：大模型不是一团无法分解的浆糊，而是<strong>许多可单独理解的电路的组合</strong>——每个电路负责一项可命名的子计算（识别重复 token、把主语搬到谓语、判断括号是否匹配……）。最经典的实证是 <strong>Wang et al. 2022 的 IOI 电路</strong>：他们在 GPT-2 small 上完整逆向出「<em>Indirect Object Identification</em>」（<code>When Mary and John went to the store, John gave a drink to ___</code> → <code>Mary</code>）所用的一小撮 head，并给它们起了名字（name mover、S-inhibition、duplicate token、induction…），还验证了它们的分工。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把模型想成一座大工厂，里面有成千上万台机器（head / MLP / 特征）。某一天产线上出了一个特定产品（模型对某输入给出某答案）。电路分析就是<strong>追查这条产线</strong>：哪几台机器真正参与了这个产品的生产、原料怎么在它们之间流动、去掉哪台产品就做不出来。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：把模型的前向计算看成一张<strong>有向无环图（DAG）</strong>，节点 = 组件（head、MLP、neuron、或 SAE 特征），边 = 组件间的信息流（经 residual stream）。一个电路 = 这张大图的一个<strong>子图</strong>，它（近似）<strong>充分</strong>地解释某个行为：只保留子图里的节点、消融其余，模型仍能完成任务。</p></div>
+  </div>  <p>为什么电路视角值得花力气？因为它把「模型为什么这么答」从一句无法验证的故事，变成一组<strong>可证伪的因果命题</strong>：「去掉这几个组件，行为就消失」是能跑实验检验的。这正是 interp 区别于事后讲故事（post-hoc rationalization）的地方——电路分析的每一步都落在<strong>干预</strong>上（patching、消融），而非只看相关。本模块的全部工具，都是为了<em>高效且可信地</em>建立这种因果命题。</p>  <div class="callout paper"><span class="label"></span>
+    <p>奠基阅读：Olah 2020《Zoom In》（circuits 纲领：features / circuits / universality 三假设）、Wang 2022（IOI，端到端电路逆向的范本）。本模块聚焦<strong>怎么高效地找电路</strong>——尤其是用一阶近似把昂贵的 patching 规模化。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="patching"><span class="num">2</span>金标准 activation patching 与 O(N) 之痛</h2>
+  <h3>金标准：activation patching，与它的 O(N) 之痛</h3>  <p>定位电路的<strong>金标准</strong>是 <span class="term">activation patching</span>（也叫 causal tracing）。它的逻辑是受控干预——准备一对只在关键信息上不同的输入：</p>  <ul>
+    <li><strong>clean 运行</strong>：能正确产生目标行为的输入（如 IOI 里答案是 Mary 的那句）；</li>
+    <li><strong>corrupt 运行</strong>：把关键信息破坏掉的输入（如把名字换掉，使答案不再确定）。</li>
+  </ul>  <p>然后<strong>把 clean 运行里某个组件的激活，复制粘贴进 corrupt 运行的对应位置</strong>，其余保持 corrupt，看输出向 clean <em>恢复</em>了多少。恢复得越多，说明这个组件<strong>因果地</strong>承载了那条关键信息。度量通常用 <strong>logit difference 的恢复比例</strong>：</p>  <div class="math-block">\[\text{效果}(c) \;=\; \mathcal{M}\big(\text{corrupt 运行, 把组件 } c \text{ 换成 clean}\big) \;-\; \mathcal{M}(\text{corrupt 运行})\]</div>  <p>其中 <code>M</code> 是任务度量（如 <code>logit[正确] − logit[错误]</code>）。这里有两个方向，答的是不同因果问题（务必分清）：</p>  <table>
+    <thead><tr><th>方向</th><th>怎么做</th><th>回答的问题</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">denoising</span>（去噪，往 corrupt 注入 clean）</td><td>base=corrupt，把 c 换成 clean 激活</td><td>「补回这条信息」能让正确行为恢复多少 → c 是否<strong>充分</strong>携带该信息</td></tr>
+      <tr><td><span class="term">noising</span>（加噪，往 clean 注入 corrupt）</td><td>base=clean，把 c 换成 corrupt 激活</td><td>「破坏这条信息」能让正确行为损坏多少 → c 是否<strong>必要</strong></td></tr>
+    </tbody>
+  </table>  <p>还有两个<strong>方法论要点</strong>决定 patching 做得对不对。其一是<strong>corrupt 怎么构造</strong>：理想的 corrupt 应只破坏<em>你关心的那条信息</em>、其余尽量不变——常用做法是<strong>同分布替换</strong>（把关键 token 换成另一个等长、等频的 token，而非清零或加噪），否则 patching 会把「分布漂移」误算成「该组件的因果效应」。其二是<strong>把效果归一化</strong>成「恢复比例」：<code>(M_patched − M_corrupt)/(M_clean − M_corrupt)</code>，0 表示这个组件毫无作用、1 表示它单独就把行为完全救回——这个无量纲的尺子让不同组件、不同样本可比。</p>  <div class="callout warn"><span class="label"></span>
+    <p>activation patching 精确、可信，但<strong>贵</strong>：要定位 <code>N</code> 个组件，就得跑 <code>N</code> 次独立前向（每次只换一个组件）。现代模型动辄上万 head + 几十万 neuron + 百万 SAE 特征——逐个 patch 是 <strong>O(N) 次前向</strong>，在前沿规模上根本跑不动。更糟的是，要画<strong>边</strong>（连接）还得做 path patching，成本是 O(N²) 级。这正是下一节 attribution patching 要解决的痛点：<strong>能不能一次前后向，就估出所有组件的效果？</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="atp"><span class="num">3</span>attribution patching：一阶近似归因所有节点</h2>
+  <h3>attribution patching：一阶近似，一次前后向归因所有节点</h3>  <p><span class="term">attribution patching</span>（AtP，<strong>Nanda 2023</strong>）的洞察是：patching 的效果<strong>可以用一阶泰勒展开近似</strong>。设把组件 <code>c</code> 的激活从 corrupt 值 <code>a_corr</code> 换成 clean 值 <code>a_clean</code>，度量 <code>M</code> 的变化，在 <code>a_corr</code> 处一阶展开：</p>  <div class="math-block">\[\mathcal{M}(a_{\text{clean}}) - \mathcal{M}(a_{\text{corr}}) \;\approx\; \underbrace{(a_{\text{clean}} - a_{\text{corr}})}_{\text{激活差}} \cdot \underbrace{\nabla_{a}\,\mathcal{M}\big|_{a=a_{\text{corr}}}}_{\text{度量对该激活的梯度}}\]</div>  <p>右边两项都<strong>一次拿到</strong>：激活差需要一次 clean 前向 + 一次 corrupt 前向（拿到所有组件的 <code>a_clean</code> 与 <code>a_corr</code>）；梯度 <code>∇M</code> 需要<strong>一次反向传播</strong>（在 corrupt 运行上对度量回传，一次性得到<em>所有</em>中间激活的梯度）。于是——<strong>一次 corrupt 前向 + 一次 clean 前向 + 一次反向，就估出了全部 N 个组件的 patching 效果</strong>，把 O(N) 次前向压成 <strong>O(1)</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这就是「一张 X 光片看全身」对「逐个器官做活检」。activation patching 是活检——准、但一次一个、慢得要命。attribution patching 是 X 光——一次成像看到所有部位的「嫌疑程度」，便宜到可以对百万组件全做一遍，再回头只对最可疑的几个做精确活检。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么是<strong>梯度 × 激活差</strong>？因为梯度 <code>∇M</code> 正是「度量对这个激活的局部敏感度」，激活差是「真要 patch 的话这个激活会动多少」。两者相乘 = 「这个激活的改动，沿局部线性方向，会让度量变多少」。当从 corrupt 到 clean 的路径<strong>接近线性</strong>时，这个一阶估计就接近真值。</p></div>
+  </div>  <p>再把成本账算清楚，体会这个跃迁有多大。设模型有 <code>N</code> 个组件：activation patching 要 <code>N</code> 次前向；attribution patching 是<strong>常数次</strong>（1 次 clean 前向 + 1 次 corrupt 前向 + 1 次反向 ≈ 3 次模型评估），<em>与 N 无关</em>。对 GPT-2 small 的 MLP 神经元（约 3.7 万个），这是<strong>上万倍</strong>的加速（notebook 胶囊会精确算）。正是这个加速，让「对整个模型的每个组件都做一遍因果归因」从科幻变成日常——你可以每改一版模型就重跑一遍全模型归因，而逐个 patch 连一次都跑不完。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这条等式的威力：<strong>activation patching 要 N 次前向，attribution patching 只要 1 次前向 + 1 次反向</strong>。代价是把「精确干预」换成了「一阶近似」。AtP 不是用来<em>代替</em> patching 下结论的，而是<strong>用来海选</strong>——从百万组件里飞快筛出最可疑的一小撮，再用精确 patching 复核。下一节看它什么时候靠谱。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fail"><span class="num">4</span>一阶近似何时准、何时失效：AtP*</h2>
+  <h3>一阶近似何时准、何时失效：AtP*</h3>  <p>attribution patching 的全部风险都在「一阶」二字。泰勒展开只在<strong>局部线性</strong>时准确；当从 <code>a_corr</code> 到 <code>a_clean</code> 的路径上有强<strong>非线性</strong>、或扰动<strong>很大</strong>时，一阶估计就会偏、甚至<strong>符号都错</strong>。</p>  <p>两种典型情形：</p>  <ul>
+    <li><strong>路径接近线性 → 准（甚至精确）</strong>：若组件到度量之间只经过<em>线性</em>运算（residual stream 相加、unembedding 投影），一阶展开<strong>无误差</strong>。本课 notebook 会看到：head 输出、mlp 输出这类直接线性流向 logit 的节点，attribution 与真 patching <strong>几乎逐位相等</strong>（相关 ≈ 1.0）。</li>
+    <li><strong>路径过非线性（尤其 softmax）→ 偏，大扰动下失效</strong>：若组件在<span class="term">attention 的 softmax</span>之前（如 query/key、注意力分数），它的改动要先过 softmax 才影响输出。softmax 在<strong>饱和区</strong>（某个分数远大于其余）几乎平坦，梯度趋零——一阶会严重低估真实 patching 的效果；大扰动下甚至给出错误符号。</li>
+  </ul>  <div class="ascii">真 patching 效果 (y)  vs  attribution 一阶估计 (x)
+  线性节点(head/mlp out)         过-softmax 节点(scores/pattern)
+     y                              y
+     |        ·                     |     ·   ·
+     |     ·                        |  ·        ·   ← 散开/偏离对角线
+     |  ·                           |·   ·   ·       (一阶在 softmax 处失效)
+     +----------· x                 +-------------· x
+   近乎完美对角线 (corr≈1)        显著偏差 (corr 下降, 可能反号)</div>  <p><strong>AtP*</strong>（<strong>Kramár et al. 2024</strong>）正是修这个的：它识别出一阶近似失效的主要来源——<strong>注意力 softmax</strong>（和少数饱和非线性），对这些位置改用更精确的处理（如对注意力概率做<em>二阶/直接</em>校正、对被 query 主导的 head 单独重算），在保持「一次前后向」量级成本的同时，把归因质量拉回接近真 patching。配套的 <strong>EAP（edge attribution patching，Syed 2023）</strong>把同一思想用到<em>边</em>上（下一节）。</p>  <div class="callout danger"><span class="label"></span>
+    <p>实践纪律：<strong>attribution patching 的数值不能直接当因果结论</strong>。它是<em>筛选器</em>不是<em>判决书</em>。正确流程是：用 AtP/AtP* 对全部组件飞快打分 → 取 top 候选 → 对这些候选用<strong>精确 activation patching 复核</strong> → 才下电路结论。尤其当 top 候选里有 query/key/注意力分数这类<strong>过 softmax</strong>的节点时，一阶分数最不可信，必须复核。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="edge"><span class="num">5</span>节点归因 vs 边归因（EAP）</h2>
+  <h3>节点归因 vs 边归因（EAP）</h3>  <p>上面归的是<strong>节点</strong>（component）的效果：「这个 head/MLP/特征整体对输出贡献多少」。但电路不只是一堆重要节点，更是它们之间的<strong>连接</strong>——信息<em>从哪个上游节点、流到哪个下游节点</em>。这就需要<strong>边归因</strong>（<span class="term">edge attribution patching, EAP</span>）。</p>  <table>
+    <thead><tr><th></th><th>节点归因 (node AtP)</th><th>边归因 (EAP)</th></tr></thead>
+    <tbody>
+      <tr><td>归因对象</td><td>单个组件 c 的总效果</td><td>一条边 u→v（上游 u 流入下游 v）的效果</td></tr>
+      <tr><td>近似式</td><td>Δa_c · ∂M/∂a_c</td><td>Δa_u · (∂(v 的输入)/∂a_u) · ∂M/∂(v 输入)</td></tr>
+      <tr><td>产出</td><td>重要节点的排序</td><td><strong>带权有向图</strong>：电路的连接结构</td></tr>
+      <tr><td>用途</td><td>「哪些组件重要」</td><td>「信息怎么在组件间流」——更接近真正的电路</td></tr>
+    </tbody>
+  </table>  <p>EAP 的产物是一张<strong>带权因果图</strong>：每条边的权 = 该连接对度量的（一阶估计）因果贡献。把权值小的边剪掉，剩下的子图就是电路的骨架。这比「一堆重要节点」信息量大得多——它告诉你 name mover head 的输入<em>来自</em> S-inhibition head、而不只是「这两个 head 都重要」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>节点归因像查出「哪几个人是关键嫌疑人」；边归因像画出「他们之间的通话/转账网络」。后者才是真正的「团伙结构」——一个电路的灵魂在它的<strong>接线图</strong>，不只在它的零件清单。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>EAP 与节点 AtP 共享同一个一阶骨架，因此<strong>同样高效</strong>（一次前后向估所有边），也<strong>同样在 softmax 处需 AtP* 式修正</strong>。实践中常先用节点归因粗筛出重要组件，再在它们之间跑边归因画连接图，最后用 path patching（只让某条路径传 clean）对关键边精确复核。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>Syed et al. 2023《EAP》证明边归因能<strong>自动</strong>发现电路、效果超过更慢的自动电路发现（ACDC）；Kramár 2024《AtP*》给出失效诊断与修正。更细的 <span class="term">path patching</span>（Wang 2022）只让一条特定路径传 clean、其余 corrupt，是边级因果的精确版（但回到 O(路径) 成本）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dla"><span class="num">6</span>读输出端：direct logit attribution</h2>
+  <h3>读输出端：direct logit attribution</h3>  <p>电路有输入端（信息从哪进）和<strong>输出端</strong>（谁把答案写进 logit）。读输出端有个又快又直接的工具：<span class="term">direct logit attribution</span>（DLA）。</p>  <p>residual stream 是<strong>线性</strong>累加的：最终 logit = <code>(Σ_c 各组件写入 residual 的向量) · W_U</code>（忽略最后的 LayerNorm 缩放）。于是可以把<strong>每个组件的输出单独经 unembedding 投到 logit 上</strong>，量化它对目标 token 的<strong>直接</strong>贡献：</p>  <div class="math-block">\[\mathrm{DLA}(c) \;=\; \big(\text{组件 } c \text{ 写入 residual 的向量}\big)\, W_U[:,\text{token}]\]</div>  <p>注意「<strong>direct</strong>」：DLA 只算<em>直接</em>写进 logit 的那部分，<strong>不</strong>含「c 影响了下游组件、下游再写 logit」的<em>间接</em>路径。所以 DLA 适合读电路的<strong>最后一跳</strong>（哪些 head 直接决定了答案，如 IOI 的 name mover head），但会漏掉纯做中间计算、不直接碰 logit 的组件（那些得靠 patching/归因找）。</p>  <p>DLA 的妙处在于它<strong>零额外成本</strong>：一次前向把每个组件写入 residual 的向量都缓存下来（本课 notebook 的 cache 就是干这个的），再各自点乘 unembedding 列即可，连反向都不用。它常和 attribution patching 搭配：attribution 找出「重要」的组件，DLA 进一步区分这些组件是<strong>直接写答案</strong>还是<strong>做中间计算</strong>——直接写答案的（DLA 大）是电路的输出头，DLA 小但 attribution 大的则是承上启下的中间件。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>DLA 与 logit lens（C06）是<strong>同一把尺子的两种用法</strong>：logit lens 把<em>整条 residual</em>在某层投到词表看「当前猜测」；DLA 把<em>单个组件的贡献</em>投到词表看「这个组件往答案上推了多少」。前者看「到这层为止整体到哪了」，后者看「这一个零件出了多少力」。两者都因 residual 的线性而成立——这也是为什么 residual stream 的线性结构是机制 interp 的福音。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="feat"><span class="num">7</span>前沿：稀疏特征电路</h2>
+  <h3>前沿：稀疏特征电路（sparse feature circuits）</h3>  <p>到这里电路的节点还是 head / neuron——但它们是<strong>多义</strong>的（模块 02），一个 head 可能同时干好几件事，于是「head 7 重要」这种结论的可解释性有限。把模块 01 的 SAE 接上来，就有了前沿做法：<strong>Marks et al. 2024 的 sparse feature circuits</strong>——<strong>用 SAE 特征（而非 head/neuron）当电路的节点</strong>。</p>  <p>做法：在各层装上 SAE，把 residual 拆成稀疏特征，然后对<strong>特征</strong>做（attribution）归因、在特征之间连边。好处是双重的：</p>  <ul>
+    <li><strong>节点本身可解释</strong>：节点不再是「head 7」而是「<em>检测到这是法语</em>」「<em>主语是复数</em>」这样的单义特征——电路的每个零件都有名字；</li>
+    <li><strong>更细、更稀疏</strong>：特征比 head 细粒度，得到的因果图更稀疏、更接近「人能读懂的算法」。</li>
+  </ul>  <p>Marks 2024 还演示了一个杀手级应用 <strong>SHIFT</strong>（Sparse Human-Interpretable Feature Trimming）：用稀疏特征电路找出一个分类器<em>不该</em>依赖的特征（如靠「性别」走捷径预测职业），直接把这些特征从电路里<strong>消融</strong>掉，就能在<strong>不重训、不需反标注</strong>的情况下去掉模型的伪相关依赖。这是「读懂电路 → 编辑电路」的范例，把 interp 从<em>理解</em>推到了<em>干预与修复</em>（也直接通向模块 05 的安全去偏）。</p>  <p>但要诚实：特征电路的可解释性是<strong>用成本换来的</strong>。你得先给每个要分析的层都训一个 SAE（模块 01 的全部代价），再在成千上万个特征之间跑归因、连边、人审。而且它继承了 SAE 的全部局限（模块 01 第 8 节）——如果 SAE 没拆对特征，建在其上的电路也会跟着错。所以特征电路不是 head 电路的简单升级，而是一条<strong>更可解释但更重、且依赖 SAE 质量</strong>的路线。</p>  <div class="callout paper"><span class="label"></span>
+    <p>Marks et al. 2024《Sparse Feature Circuits》是 SAE（模块 01）与电路（本模块）两条线的合流点，也通向模块 04（特征 steering）与 05（用电路做安全审计/去偏）。它把电路的节点从「不可解释的 head」换成「可命名的特征」，是当前最受关注的电路方向之一。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>归因近似的保真度</strong>：AtP* 修了 softmax，但还有哪些非线性会让一阶失效？如何在不退回 O(N) 的前提下系统地保证归因质量，仍是活跃问题（Kramár 2024 之后）。</li>
+    <li><strong>电路的评判标准</strong>：一个找到的电路是否<span class="term">faithful</span>（只留它能否完成任务）、<span class="term">complete</span>（没漏组件）、<span class="term">minimal</span>（没冗余）？这些指标的定义与度量尚无定论。</li>
+    <li><strong>特征电路的规模化</strong>：sparse feature circuits 很美，但要给每层都训 SAE、再在百万特征间归因连边，计算与人力成本巨大；自动化（auto-circuit）与人审如何配合是开放工程问题。</li>
+    <li><strong>跨 token / 跨层的电路</strong>：多数电路工作聚焦单个 forward、固定位置；行为如何跨 token、跨层组合（如多步推理）成电路，工具还很初步（crosscoder、模块 05 是一步）。</li>
+    <li><strong>电路 ≠ 全部计算</strong>：找到的电路只解释了它<em>覆盖</em>的那部分行为；模型还有大量「暗物质」计算未被任何电路捕获。interp 的可证伪性与覆盖度（Sharkey 2025《Open Problems》）是悬在整个议程上的根本问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Olah 2020（Zoom In）、Wang 2022（IOI）、Nanda 2023（attribution patching）、Syed 2023 / Kramár 2024（EAP / AtP*）、Marks 2024（sparse feature circuits）、Sharkey 2025（开放问题）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_features/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 单义特征与叠加</div></a>
+    <a class="next" href="../04_steering/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 特征 Steering</div></a>
+  </div>
+
+</div>
+</body>
+</html>

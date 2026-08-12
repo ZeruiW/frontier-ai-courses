@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 解码策略全手写</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 解码策略全手写</h1>
+  <p class="subtitle">Decoding Strategies —— 同一个模型，不同的解码，天差地别的输出：从 greedy 到 speculative decoding，全部在 logits 上亲手实现</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（softmax 与 Transformer 前向）、模块 03（mini-GPT 训练与自回归生成）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_decoding_strategies.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Holtzman 2019（top-p）、Fan 2018（top-k）、Leviathan 2022（speculative）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#dist2seq">解码 = 从分布到序列：likelihood trap</a></li>
+      <li><a href="#greedy-beam">greedy 与 beam search：为什么 beam 在开放生成中失效</a></li>
+      <li><a href="#temperature">temperature：logits/T 的数学效果</a></li>
+      <li><a href="#topk-topp">top-k 与 top-p（nucleus）：截断采样</a></li>
+      <li><a href="#penalties">repetition / frequency / presence penalty</a></li>
+      <li><a href="#speculative">speculative decoding：加速且分布不变</a></li>
+      <li><a href="#eval">评测视角：解码参数是评测配置的一部分</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dist2seq"><span class="num">1</span>解码 = 从分布到序列：likelihood trap</h2>
+
+  <p>模块 03 训练出的 mini-GPT，每一步前向只做一件事：给定前缀 $x_{&lt;t}$，输出整个词表上的 <span class="term">logits</span> $z\in\mathbb{R}^{|V|}$，经 softmax 得到下一 token 的条件分布 $p_\theta(x_t\mid x_{&lt;t})$。<strong>模型到此为止 —— 它从不"说话"。把一串分布变成一条具体的 token 序列，是解码器（decoder / sampler）的工作。</strong></p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>语言模型本体只负责"报概率"：下一个词是"猫"的概率 30%、"狗" 20%……至于到底写下哪个词，是<strong>解码策略</strong>说了算。同一个模型，换一套解码规则，输出可以从机械复读变成流畅文章。所以"模型行为"永远是"权重 + 解码策略"的合成物。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>自回归 LM 定义序列分布 $p_\theta(x_{1:T})=\prod_t p_\theta(x_t\mid x_{&lt;t})$。解码策略是一个（可能随机的）映射 $\mathcal{D}: p_\theta \mapsto x_{1:T}$。确定性策略（greedy/beam）逐步或全局逼近 $\arg\max p_\theta(x_{1:T})$；随机策略（temperature/top-k/top-p）从某个对 $p_\theta$ 做过变换的分布 $\tilde p$ 中采样。不同 $\mathcal{D}$ 诱导的输出分布可以与 $p_\theta$ 相差极远。</p>
+    </div>
+  </div>
+
+  <p>一个反直觉的核心事实：<strong>对开放式生成，"最大似然的序列"是糟糕的序列。</strong> [Holtzman 2019] 把 GPT-2 的 beam search 输出与人类文本对比，发现两件事：</p>
+
+  <ul>
+    <li><strong>最大化似然 → 退化的重复文本</strong>：beam search 找到的高似然序列充斥着短语级循环（"I'm not sure if I'll ever be able to walk again. I'm not sure if I'll ever…"）。重复一旦开始还会<em>自我强化</em>——重复过的短语条件概率越来越高，形成正反馈。</li>
+    <li><strong>人类文本不是高似然文本</strong>：人写的句子在模型视角下 per-token 概率剧烈波动，常常落进分布的低概率区。自然语言带有信息量，必然偶尔"出人意料"。</li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>[Holtzman 2019] <em>The Curious Case of Neural Text Degeneration</em></strong>：这篇论文给"<span class="term">likelihood trap</span>"提供了决定性的实证 —— 解码目标不应是最大化似然；它同时提出了本章第 4 节的 nucleus sampling（top-p）作为解法。读 LLM 输出"复读机化"的任何讨论，源头都在这里。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  为什么"逐 token 最优"不等于"序列最优"，"序列最优"又不等于"好"？前者是搜索问题（greedy 是 beam=1 的近似）；后者是<strong>目标函数错了</strong>：训练目标（极大似然）衡量的是"模型给人类文本多高概率"，而不是"模型概率最高的文本像不像人话"。两个方向不对称。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="greedy-beam"><span class="num">2</span>greedy 与 beam search：为什么 beam 在开放生成中失效</h2>
+
+  <p><strong>Greedy decoding</strong>：每步取 $x_t=\arg\max_v p_\theta(v\mid x_{&lt;t})$。$O(T)$ 次前向，无超参，结果（理想中）确定。缺点：每步局部最优，既不保证全局最优序列，也继承上一节的退化问题。</p>
+
+  <p><strong><span class="term">Beam search</span></strong>：维护 $B$ 条候选前缀（beam），每步把每条前缀扩展 $|V|$ 种、按累计 log-prob 留前 $B$ 条，是对 $\arg\max_x \log p_\theta(x)$ 的宽度受限搜索：</p>
+
+  <div class="ascii">
+  beam search (B=2) 的搜索树 —— 数字为累计 log-prob，✦ = 留在 beam 内
+&lt;s&gt;
+ ├── "The"   (-0.4) ✦ ──┬── "The cat"   (-1.1) ✦ ──┬── "The cat sat"  (-1.6) ✦
+ │                      │                          └── "The cat is"   (-2.3)   ✗ 被剪
+ │                      └── "The dog"   (-1.9)   ✗
+ └── "A"     (-0.9) ✦ ──┬── "A cat"     (-1.8) ✦ ──┬── "A cat sat"    (-2.4) ✦
+ │                      └── "A man"     (-2.5)   ✗
+ └── "An"    (-2.1) ✗ （第 1 步就出局，后续永远不会被探索）
+  </div>
+
+  <p>在<strong>封闭式任务</strong>（机器翻译、摘要、ASR）里 beam search 长期是标配：输出空间被源文本强约束，高似然 ≈ 高质量。但在<strong>开放式生成</strong>中它系统性失效，原因有三：</p>
+
+  <ul>
+    <li><strong>它太成功了</strong>：beam 越宽越逼近全局最大似然序列，而第 1 节已说明那是退化文本 —— 搜索越好，结果越差，这就是 likelihood trap 的搜索面。</li>
+    <li><strong>多样性坍缩</strong>：$B$ 条 beam 往往共享前几个 token，最终候选近乎彼此的改写。</li>
+    <li><strong>长度偏置</strong>：累计 log-prob 每步只减不增，天然偏好短序列；length penalty 只是补丁。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  实务结论：今天的 chat LLM 推理几乎不用 beam search；它仍活跃在翻译/ASR 等似然与质量对齐的场景。判断要不要 beam，问一句"这个任务里高似然是否就是我要的答案"。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="temperature"><span class="num">3</span>temperature：logits/T 的数学效果</h2>
+
+  <p>既然要采样，第一个旋钮是 <span class="term">temperature</span> $T$：采样前把 logits 整体除以 $T$。</p>
+
+  <div class="math-block">
+  $$ p_i^{(T)} \;=\; \frac{\exp(z_i/T)}{\sum_{j} \exp(z_j/T)} $$
+  </div>
+
+  <p>关键性质一：<strong>任意 $T&gt;0$ 都不改变 token 的概率排序</strong>（$z_i&gt;z_j \Leftrightarrow z_i/T&gt;z_j/T$），改变的只有概率<em>差距的悬殊程度</em>。关键性质二：分布的熵随 $T$ 单调变化。考察两个 token 的概率比：</p>
+
+  <div class="math-block">
+  $$ \frac{p_i^{(T)}}{p_j^{(T)}} = \exp\!\Big(\frac{z_i - z_j}{T}\Big)
+     \qquad\Longrightarrow\qquad
+     T\downarrow \;\Rightarrow\; \text{比值愈悬殊（分布尖锐，熵}\downarrow\text{）};\quad
+     T\uparrow \;\Rightarrow\; \text{比值}\to 1\text{（分布平坦，熵}\uparrow\text{）} $$
+  </div>
+
+  <p>更一般地，对香农熵 $H(T)=-\sum_i p_i^{(T)}\log p_i^{(T)}$ 求导可得（记 $u_i=z_i/T$）：</p>
+
+  <div class="math-block">
+  $$ \frac{\partial H}{\partial T} \;=\; \frac{1}{T}\,\mathrm{Var}_{i\sim p^{(T)}}\!\left[u_i\right]\;\ge\;0 , $$
+  </div>
+
+  <p>即<strong>熵是 $T$ 的单调不减函数</strong>（softmax 分布族沿温度方向的标准结论；等号仅当所有 logits 相等）。两个极限把这条曲线钉死在两端：</p>
+
+  <ul>
+    <li>$T\to 0^+$：最大 logit 的概率 $\to 1$，采样退化为 <strong>greedy</strong>（argmax），熵 $\to 0$（若最大值唯一）。</li>
+    <li>$T\to\infty$：所有 $z_i/T\to 0$，分布 $\to$ <strong>均匀分布</strong>，熵 $\to \log|V|$，输出变成词表乱码。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  $T$ 调的是"敢不敢冒险"：$T&lt;1$ 把概率质量进一步推向头部（保守、可复现性更好）；$T&gt;1$ 把质量摊给长尾（多样、易出错）。但 $T$ 是<strong>全局缩放</strong>——它无法只削尾巴不动头部。要外科手术式地切掉不可靠长尾，需要下一节的截断采样。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="topk-topp"><span class="num">4</span>top-k 与 top-p（nucleus）：截断采样</h2>
+
+  <p>退化文本的另一来源是<strong>长尾误差</strong>：softmax 给词表里几万个明显不通的 token 各留一点概率，单个极小、合计不可忽略；纯采样（$T=1$，不截断）每隔几十步就会踩中一次长尾，错误 token 进入上下文后引发连锁跑偏。<span class="term">截断采样（truncated sampling）</span>的思路：先把分布裁剪到一个可信子集，再归一化采样。</p>
+
+  <p><strong>Top-k</strong> [Fan 2018]：只保留概率最大的 $k$ 个 token。记 $V_k$ 为按概率降序的前 $k$ 个：</p>
+
+  <div class="math-block">
+  $$ \tilde p(v) = \begin{cases} p(v)\,/\!\sum_{w\in V_k} p(w), & v\in V_k \\[2pt] 0, & \text{否则} \end{cases} $$
+  </div>
+
+  <p><strong>Top-p / <span class="term">nucleus sampling</span></strong> [Holtzman 2019]：保留累计概率刚达到 $p$ 的<strong>最小</strong>头部集合（nucleus）$V_p$：</p>
+
+  <div class="math-block">
+  $$ V_p \;=\; \text{最小的 } V' \subseteq V \text{（按 } p(v) \text{ 降序取）使得} \sum_{v\in V'} p(v) \,\ge\, p ,
+     \qquad \tilde p(v) = \frac{p(v)\,\mathbb{1}[v\in V_p]}{\sum_{w\in V_p} p(w)} $$
+  </div>
+
+  <p>两者的本质区别：<strong>top-k 固定"个数"，top-p 固定"概率质量"，于是 top-p 的保留集合大小随分布形状自适应</strong>。看两种典型情形：</p>
+
+  <div class="ascii">
+ 情形 A：尖峰分布（下一个 token 几乎确定）        情形 B：平坦分布（许多合理延续）
+ prob                                            prob
+ 0.86 █████████████████ "是"                     0.08 ██ "猫" ██ "狗" ██ "他" ██ "我"
+ 0.06 █  "就"                                    0.07 ██ "树" ██ "天" ██ "车" …
+ 0.03 ▌  "也"                                    0.05 █  …（几十个候选不相上下）
+ 0.01 ▏  …                                       0.01 ▏ …
+ ──────────────────────────                      ──────────────────────────
+ top-k (k=40)：硬塞进 40 个候选，                 top-k (k=40)：也许还砍掉了
+   其中 ~37 个是垃圾长尾 → 引入噪声               第 41~60 个同样合理的候选 → 损失多样性
+ top-p (p=0.9)：只留 2~3 个 → 恰到好处            top-p (p=0.9)：留下 ~30 个 → 恰到好处
+  </div>
+
+  <table>
+    <thead><tr><th>维度</th><th>top-k [Fan 2018]</th><th>top-p [Holtzman 2019]</th></tr></thead>
+    <tbody>
+      <tr><td>截断准则</td><td>固定个数 $k$</td><td>固定累计概率质量 $p$</td></tr>
+      <tr><td>保留集大小</td><td>恒为 $k$，与分布形状无关</td><td>自适应：尖峰时小、平坦时大</td></tr>
+      <tr><td>尖峰分布下</td><td>$k$ 偏大 → 放进长尾噪声</td><td>自动收缩到头部几个</td></tr>
+      <tr><td>平坦分布下</td><td>$k$ 偏小 → 误伤合理候选</td><td>自动扩到几十个</td></tr>
+      <tr><td>失败模式</td><td>单一 $k$ 无法同时适配两种形状</td><td>分布极平（模型不确定/高 $T$）时保留集过大，长尾混入</td></tr>
+      <tr><td>典型默认</td><td>$k=40\sim 50$</td><td>$p=0.9\sim 0.95$</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  实践中 temperature、top-k、top-p 常常<strong>串联</strong>使用（先 $z/T$，再截断，再归一化采样），各管一段：$T$ 整体调形状，截断负责把"不可信尾巴"清零。notebook 里你会把这条流水线在 20 行代码内完整写出来。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="penalties"><span class="num">5</span>repetition penalty 与 frequency / presence penalty</h2>
+
+  <p>截断采样降低了"踩长尾"的概率，但没有正面解决<strong>重复的自我强化</strong>。一类直接的工程对策：在采样前，依据"已出现过的 token"惩罚 logits。</p>
+
+  <p><strong>Repetition penalty</strong>（最早随 CTRL 模型提出，现为 HF <code>transformers</code> 的标准实现约定）：对已出现 token 的 logit，用系数 $r&gt;1$ 削弱——<strong>正 logit 除以 $r$，负 logit 乘以 $r$</strong>（两个方向都让该 token 变得更不可能）：</p>
+
+  <div class="math-block">
+  $$ z_v' = \begin{cases} z_v / r, & z_v &gt; 0 \\ z_v \cdot r, & z_v \le 0 \end{cases}
+     \qquad \text{对所有 } v \in \{\text{已生成 token}\} $$
+  </div>
+
+  <p><strong>Frequency / presence penalty</strong>（OpenAI API 约定）：线性作用在 logits 上，前者按<em>出现次数</em>累加、后者只看<em>是否出现过</em>：</p>
+
+  <div class="math-block">
+  $$ z_v' \;=\; z_v \;-\; \alpha_{\text{freq}}\cdot \mathrm{count}(v) \;-\; \alpha_{\text{pres}}\cdot \mathbb{1}[\mathrm{count}(v)&gt;0] $$
+  </div>
+
+  <table>
+    <thead><tr><th>机制</th><th>作用方式</th><th>随出现次数增长？</th><th>主要副作用</th></tr></thead>
+    <tbody>
+      <tr><td>repetition penalty $r$</td><td>乘性（除/乘 $r$）</td><td>否（出现 1 次与 10 次同罚）</td><td>对 logit 符号敏感：同一 token 的 logit 在 0 附近抖动时惩罚力度不连续；罚掉功能词伤语法</td></tr>
+      <tr><td>frequency penalty $\alpha_{\text{freq}}$</td><td>加性 × 次数</td><td>是，线性累加</td><td>长文本里高频<em>必需</em>词（标点、"the"）被越压越狠，后期文风变形</td></tr>
+      <tr><td>presence penalty $\alpha_{\text{pres}}$</td><td>加性 × 一次</td><td>否</td><td>鼓励换话题，但无法阻止已出现短语的高频循环</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger"><span class="label"></span>
+  这些惩罚全是<strong>无原则的 heuristic</strong>：它们直接篡改 $p_\theta$，没有任何"输出仍服从某个有意义分布"的保证。$r$ 调大一点就会出现"模型拒绝使用句号"之类的怪相。代码生成、数学推导这类<strong>合法重复密集</strong>的任务（变量名、缩进、公式符号），开 repetition penalty 往往直接损害正确率 —— 评测时要特别检查 harness 是否悄悄开了它。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="speculative"><span class="num">6</span>speculative decoding：加速且分布不变</h2>
+
+  <p>换一个问题：不改变输出分布，能不能让采样<strong>更快</strong>？自回归解码的瓶颈在于每个 token 都要过一遍大模型，且(在小 batch 下)是访存受限的 —— 算力闲着，权重搬运占满带宽。<span class="term">Speculative decoding</span> [Leviathan 2022] 的洞见：<strong>大部分 token 很"容易"，小模型也能猜对；让小模型先起草，大模型一次前向并行验证一串草稿。</strong></p>
+
+  <div class="ascii">
+  draft 模型 q（小、快）                target 模型 p（大、慢）
+  ┌──────────────────────┐             ┌─────────────────────────────┐
+  │ 自回归生成 γ 个草稿    │  x1..xγ     │ 一次前向，并行算出           │
+  │ token: x1, x2, …, xγ │ ──────────► │ p(·|prefix), p(·|prefix,x1),│
+  └──────────────────────┘             │ …, p(·|prefix,x1..xγ)       │
+                                       └──────────┬──────────────────┘
+                                                  ▼
+              逐个验证 xi：以 min(1, p(xi)/q(xi)) 接受
+              ├─ 全接受 → 白赚 γ 个 token，再免费多采 1 个
+              └─ 第 i 个被拒 → 丢弃 xi..xγ，从残差分布 norm(max(0, p−q)) 补采 1 个
+  </div>
+
+  <p>核心是<strong>修正版接受-拒绝采样</strong>。单步：从 $q$ 采出 $x$，以概率 $\min\!\big(1, \tfrac{p(x)}{q(x)}\big)$ 接受；若拒绝，则从残差分布 $p'(x)=\mathrm{norm}\big(\max(0,\,p(x)-q(x))\big)$ 中重采。<strong>定理：无论 $q$ 是什么，最终输出严格服从 $p$。</strong>证明梗概：</p>
+
+  <div class="math-block">
+  $$ \Pr[\text{输出}=x] \;=\; \underbrace{q(x)\min\!\Big(1,\tfrac{p(x)}{q(x)}\Big)}_{\text{被接受}}
+     \;+\; \underbrace{\Pr[\text{拒绝}]\cdot p'(x)}_{\text{重采}}
+     \;=\; \min\big(p(x),q(x)\big) + \big(1-\beta\big)\cdot\frac{\max\big(0,\,p(x)-q(x)\big)}{1-\beta} $$
+  $$ =\; \min\big(p(x),q(x)\big) + \max\big(0,\,p(x)-q(x)\big) \;=\; p(x). \qquad \blacksquare $$
+  </div>
+
+  <p>其中 $\beta=\Pr[\text{接受}]=\sum_x \min\big(p(x),q(x)\big) = 1 - \mathrm{TV}(p,q)$：<strong>接受率恰好等于 1 减去两分布的总变差距离</strong>——draft 和 target 越像，白赚的 token 越多。设每 token 接受率为 $\alpha$（近似 i.i.d.），一次"起草 $\gamma$ 个 + 验证"的迭代期望产出：</p>
+
+  <div class="math-block">
+  $$ \mathbb{E}[\#\text{tokens / 次 target 前向}] \;=\; 1+\alpha+\alpha^2+\cdots+\alpha^{\gamma}
+     \;=\; \frac{1-\alpha^{\gamma+1}}{1-\alpha} $$
+  </div>
+
+  <p>例：$\alpha=0.8,\ \gamma=4$ 时期望每次大模型前向产出 $\approx 3.36$ 个 token；扣除 draft 模型开销（设其单次成本为大模型的 $c$ 倍）后的端到端加速比为 $\frac{1-\alpha^{\gamma+1}}{(1-\alpha)(\gamma c+1)}$。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>[Leviathan 2022] <em>Fast Inference via Speculative Decoding</em></strong>：与同期 DeepMind 的并行工作共同确立了这套"draft–verify"范式。它的不可替代之处在于<strong>无损</strong>：输出分布与直接从大模型采样在数学上完全一致 —— 这与量化、蒸馏等"换精度买速度"的手段有本质区别。notebook 里你会用两个固定 categorical 分布 + 蒙特卡洛 10000 次，亲手验证 TV 距离 ≈ 0 和接受率公式。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>评测视角：解码参数是评测配置的一部分</h2>
+
+  <p>本章对做 evaluation 的人有一个直接推论：<strong>你评的从来不是"模型"，而是"模型 × 解码配置"这个系统。</strong>同一 checkpoint，$T=0$ 与 $T=1$ 在数学、代码基准上的得分可以差出几个百分点；不报解码参数的评测结果不可复现也不可比。</p>
+
+  <ul>
+    <li><strong>$T=0$（greedy）测"稳定行为"</strong>：近似确定性，适合回答"模型最可能怎么做"，单次运行即可。但注意：即便 $T=0$，batch 组合、浮点归约顺序、MoE 路由等仍可能引入非确定性，"greedy = 完全可复现"在真实 serving 栈上只是近似。</li>
+    <li><strong>$T&gt;0$ 必须报方差</strong>：采样解码下单次得分是随机变量，正确做法是多 seed 重复、报告均值 ± 标准差（或置信区间）；pass@k 这类指标本身就<em>定义在</em>采样解码之上（$T=0$ 时 $k$ 个样本完全相同，pass@k 退化为 pass@1）。</li>
+    <li><strong>不同 harness 默认值不同 → 分数不可比</strong>：lm-evaluation-harness 的生成式任务默认 greedy；各家 API 不传参时常默认 $T=1$ 或 $T=0.7$ 且 top-p 各异；有的推理框架还默认开 repetition penalty。两篇论文报同一模型同一基准的分数差几个点，第一怀疑对象就是解码配置而非模型本身。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  评测报告的最低标配：<code>temperature / top_p / top_k / max_tokens / 重复惩罚 / 采样次数与 seed</code> 全部写明。对比两个模型时<strong>解码配置必须对齐</strong>；对比两个 harness 的分数时，先 diff 它们的默认解码参数。这条纪律在本课程的姊妹评测课里会反复出现。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>min-p sampling</strong>：按"相对头部概率"截断 —— 仅保留 $p(v)\ge p_{\min}\cdot\max_w p(w)$ 的 token，比 top-p 更直接地随分布尖锐度自适应，在高温下保持连贯性，近两年被多数推理框架收录。截断准则的"最优形状"仍是开放问题。</li>
+    <li><strong>约束解码（constrained decoding）</strong>：用语法/正则/JSON schema 在每步把非法 token 的 logit 置 $-\infty$，保证输出 100% 合法。评测视角的开放问题：约束会改变分布（被截走的概率质量重新归一），同一模型"带约束"与"裸采样 + 后解析"的能力测出来不一样 —— 哪个才是"模型的真实能力"？</li>
+    <li><strong>并行/非自回归解码</strong>：speculative 家族持续演化（自起草、多头预测、token 树验证），以及 diffusion LM 等整段并行生成路线，都在挑战"逐 token 串行"这一前提；其中有损方法（接受阈值放宽换速度）让"推理引擎是否改变了模型分布"成为评测必须核查的新变量。</li>
+    <li><strong>解码与对齐的纠缠</strong>：RLHF 后的模型分布本身已经很尖（低熵），对解码参数的敏感度与 base 模型完全不同 —— "最优 $T$/top-p" 是模型族相关的，盲目沿用 base 模型时代的默认值是常见错误。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>什么是 likelihood trap？为什么 beam search 在翻译里好用、在开放生成里退化？[Holtzman 2019]</li>
+      <li>写出 temperature 缩放公式，并说明 $T\to 0$ 与 $T\to\infty$ 的极限行为及熵随 $T$ 的单调性。</li>
+      <li>top-p 相对固定 top-k 的自适应优势体现在哪两种分布形态上？各自的失败模式是什么？</li>
+      <li>写出 speculative decoding 的接受概率与残差分布，并证明输出分布等于 target 分布 $p$；接受率 $\alpha$、草稿长度 $\gamma$ 给定时期望加速比是多少？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../03_train_minigpt/03_讲解.html"><div class="dir">← 上一章</div><div class="t">03 · 从零训练 mini-GPT</div></a>
+    <a class="next" href="../05_scaling_laws/05_讲解.html"><div class="dir">下一章 →</div><div class="t">05 · Scaling Laws：亲手拟合</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 自编码器</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 自编码器</h1>
+  <p class="subtitle">编码器-瓶颈-解码器、重建损失的概率含义、线性 AE = PCA 的精确定理、去噪自编码器与 score 的联系、表示学习 —— 一切生成模型的骨架与起点（但还采不了样）</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、线性代数（投影/子空间）、神经网络与反向传播、PCA 概念</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_autoencoders.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Hinton & Salakhutdinov 2006、Vincent 2008/2010、Baldi & Hornik 1989</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what">什么是自编码器：编码-瓶颈-解码</a></li>
+      <li><a href="#recon-loss">重建损失的概率视角（MSE / 交叉熵）</a></li>
+      <li><a href="#pca">线性自编码器 = PCA</a></li>
+      <li><a href="#scratch">从零实现与手写反向传播</a></li>
+      <li><a href="#regularize">欠完备、过完备与恒等坍塌</a></li>
+      <li><a href="#denoising">去噪自编码器：通往生成的桥梁</a></li>
+      <li><a href="#representation">表示学习：隐空间能干什么</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what"><span class="num">1</span>什么是自编码器：编码-瓶颈-解码</h2>
+  <p>自编码器（autoencoder）是所有生成模型里最朴素的一个，也是最好的起点——因为它把「编码-解码」这个<strong>贯穿一切生成模型的骨架</strong>用最干净的形式呈现了出来。它的想法一句话就能说清：<strong>把数据压缩成一个低维编码，再从这个编码尽量重建回原数据</strong>。</p>  <p>一个自编码器由三部分组成：<strong>编码器</strong> <code>f</code> 把高维输入 <code>x</code> 映成低维编码 <code>z=f(x)</code>；中间那个被压窄的隐层叫<strong>瓶颈（bottleneck）</strong>；<strong>解码器</strong> <code>g</code> 再把编码映回数据空间 <code>x̂=g(z)</code>。训练目标只有一个——让重建 <code>x̂</code> 尽量接近原输入 <code>x</code>，即最小化<strong>重建损失</strong> <code>‖x − g(f(x))‖²</code>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把自编码器想成一个<strong>尽职的速记员</strong>：你念一大段话（高维 <code>x</code>），他必须用一张小纸条（低维 <code>z</code>）记下要点，事后只看纸条就把整段话复述出来（<code>x̂</code>）。纸条太小记不全（重建差），但正因为小，他被<em>逼着</em>只记真正重要的信息、丢掉废话。这个「被逼着抓重点」的过程，就是表示学习。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：编码器 <code>f:\mathbb{R}^D\to\mathbb{R}^d</code>、解码器 <code>g:\mathbb{R}^d\to\mathbb{R}^D</code>，其中 <code>d\ll D</code>（瓶颈）。优化目标 <code>\min_{f,g}\ \mathbb{E}_{x}\,\|x-g(f(x))\|^2</code>。若不加任何约束、且 <code>d\ge D</code>，最优解会退化成恒等映射 <code>g\circ f=\mathrm{id}</code>（什么也没学到）——所以<strong>瓶颈（或别的正则）是必需的</strong>，它是自编码器一切价值的来源。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话定调：自编码器是<strong>有损压缩器</strong>，瓶颈维度 <code>d</code> 就是它的「带宽预算」。预算越小，越逼它学到数据的本质结构（主要变化方向、低维流形）。但要警惕一个陷阱——<strong>自编码器本身还不是生成模型</strong>：它能重建已有的 <code>x</code>，却<em>不能凭空采样</em>出新的 <code>x</code>，因为隐空间 <code>z</code> 没有任何已知的分布可供采样。这个缺口正是下一模块 VAE 要补的，请记住它。</p>
+  </div>  <p>为什么从这么朴素的模型讲起？因为自编码器是理解后面所有复杂模型的<strong>最低成本入口</strong>。它没有概率、没有对抗、没有噪声调度，只有「压缩-还原」一件事，却已经把生成模型最核心的两个零件——<strong>一个把数据映到隐空间的编码方向</strong>和<strong>一个把隐变量映回数据的解码/生成方向</strong>——摆在了明面上。你在这里手写一遍编码器、解码器和它们的反向传播，到了 VAE 只需在隐层多输出一个方差、在损失里多加一个 KL；到了扩散，解码器变成「逐步去噪」；到了流匹配，解码器变成「沿速度场积分」。<em>骨架不变，变的只是怎么约束隐空间、怎么从它采样</em>。把这个最简骨架吃透，是性价比最高的投资。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="recon-loss"><span class="num">2</span>重建损失的概率视角（MSE / 交叉熵）</h2>
+  <h3>重建损失：从概率视角看 MSE 与交叉熵</h3>  <p>重建损失看似随手一写的 MSE，其实背后有明确的概率含义——这层理解会在 VAE 里直接复用，所以现在就讲清。<strong>选哪种重建损失，等价于假设解码器输出服从哪种分布</strong>。</p>  <p>若假设给定 <code>z</code>、数据服从<strong>高斯</strong> <code>p(x|z)=\mathcal{N}(g(z),\sigma^2 I)</code>，那么最大化对数似然 <code>\log p(x|z)</code> 就等价于最小化 <code>\|x-g(z)\|^2</code>（差一个常数）——这就是 <strong>MSE 的来历</strong>，适合连续数据。</p>  <div class="math-block">\[\log \mathcal{N}(x;g(z),\sigma^2 I) = -\tfrac{1}{2\sigma^2}\|x-g(z)\|^2 + \text{const}\]</div>  <p>若数据是 <code>[0,1]</code> 的（如归一化像素、二值图），更合适的假设是<strong>伯努利</strong> <code>p(x|z)=\prod_i g(z)_i^{x_i}(1-g(z)_i)^{1-x_i}</code>，此时把解码器输出经 <code>sigmoid</code> 压到 <code>(0,1)</code> 当作概率，最大化对数似然就给出<strong>二元交叉熵</strong>损失。两种损失对应两种数据假设，用错了会系统性地偏：对取值在 <code>[0,1]</code> 的像素硬用 MSE，解码器没有被约束在合法区间、且 MSE 对所有像素一视同仁，结果往往<em>偏模糊</em>（高斯假设鼓励向均值收缩）；反过来对真正连续无界的数据用伯努利/BCE 则根本不适用。</p>  <p>这里还埋着一个常被忽略的细节：MSE 背后的高斯方差 <code>\sigma^2</code> 其实是个<strong>隐藏的超参数</strong>。上面的推导里它被当成常数省掉了，但它实际上在悄悄地<em>给重建项和（VAE 里的）KL 项定相对权重</em>——<code>\sigma</code> 取小，重建项被放大，模型更看重像素级精确；取大则更宽松。这正是后面 VAE 里<strong>β（KL 权重）</strong>之所以重要的根源之一：调 <code>\beta</code> 与调这个隐含的 <code>\sigma</code> 在数学上是一回事。现在记住「重建损失不只是个距离，它编码了你对数据噪声的假设」，到 VAE 会省很多困惑。</p>  <table>
+    <thead><tr><th>数据类型</th><th>解码器分布假设</th><th>重建损失</th><th>VAE 里对应</th></tr></thead>
+    <tbody>
+      <tr><td>连续（坐标、特征）</td><td><code>\mathcal{N}(g(z),\sigma^2 I)</code></td><td>MSE <code>\|x-\hat x\|^2</code></td><td>高斯重建项</td></tr>
+      <tr><td><code>[0,1]</code>（像素、二值）</td><td>伯努利 <code>\mathrm{Bern}(g(z))</code></td><td>二元交叉熵 BCE</td><td>伯努利重建项</td></tr>
+    </tbody>
+  </table>  <div class="callout paper"><span class="label"></span>
+    <p>记住「<strong>损失 ⇔ 似然假设</strong>」这条线：模块 02 的 VAE 重建项 <code>\mathbb{E}_q[\log p(x|z)]</code> 在高斯假设下<em>正好</em>退化成这里的 MSE，在伯努利假设下退化成 BCE。自编码器其实是 VAE 去掉概率外壳后的「确定性内核」——现在打好的基础，下一模块直接收获。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pca"><span class="num">3</span>线性自编码器 = PCA</h2>
+  <h3>线性自编码器 = PCA：理解 AE 到底在学什么</h3>  <p>要真正理解自编码器在学什么，最锋利的工具是看它的<strong>线性特例</strong>。把编码器、解码器都取成无激活的线性层（<code>z=W_e x</code>、<code>\hat x=W_d z</code>）、损失取 MSE，就得到<strong>线性自编码器</strong>。它有一个漂亮的定理：</p>  <div class="callout intuition"><span class="label"></span>
+    <p><strong>定理（Baldi &amp; Hornik 1989）</strong>：MSE 损失下的线性自编码器，其最优解的<strong>解码器列空间，恰好等于数据协方差矩阵前 </strong><code>d</code><strong> 个主成分张成的子空间</strong>（PCA 主子空间）。也就是说——<em>线性自编码器学到的，正是 PCA</em>。</p>
+  </div>  <p>这个定理的意义远超「又一个等价关系」。它告诉我们自编码器的<strong>归纳偏置</strong>是什么：在所有 <code>d</code> 维线性投影里，它选的是<strong>保留方差最多、重建误差最小</strong>的那个——这正是 PCA 的目标。由此推论：<strong>非线性自编码器，就是 PCA 的非线性推广</strong>。PCA 只能找一个<em>平的</em>低维子空间，而带激活的深度自编码器能找一个<em>弯曲的</em>低维流形——这正是它在真实数据（图像、语音都集中在弯曲流形附近）上远胜 PCA 的原因。</p>  <p>有一个微妙但重要的细节：线性 AE 学到的子空间和 PCA <strong>相同</strong>，但具体的轴<strong>不一定对齐</strong>。PCA 给出彼此正交、按方差排序的主成分；而线性 AE 的最优解可以差一个<strong>任意可逆线性变换</strong>（<code>W_e\to AW_e,\ W_d\to W_d A^{-1}</code> 重建不变）——它只保证<em>张成同一个子空间</em>，不保证轴对齐。所以在 notebook 里我们对拍的方式是比较<strong>子空间</strong>（用投影矩阵或主角度），而不是逐列比向量——这是个常见的坑，逐列比会因为旋转而误判为「不一致」。</p>  <p>这个等价还解释了一个实践现象：训练好的线性 AE 重建误差会<strong>精确等于</strong> PCA 丢弃的尾部特征值之和 <code>\sum_{i&gt;d}\lambda_i</code>。直觉是：PCA 把数据按方差从大到小分解到正交方向上，保留前 <code>d</code> 个方向、丢掉其余，丢掉的信息量正好是那些尾部方向上的方差（特征值）之和。notebook 会把这个数对拍到小数点后好几位——这是「我的线性 AE 真的收敛到了 PCA 最优解」最硬的证据，比看损失曲线降下去可信得多。</p>  <p>为什么要花一整节讲这个等价？因为它给了我们一把<strong>理解非线性 AE 的标尺</strong>。深度自编码器是个黑箱，但通过它的线性特例，我们确知它的<em>目标</em>是「找一个低维（子空间/流形），让数据投影上去再投影回来损失最小」。这也立刻澄清了一个常见疑问——「AE 学到的隐编码 <code>z</code> 有什么意义？」对线性 AE，答案精确：<code>z</code> 就是数据在主子空间里的坐标（PCA 得分）。对非线性 AE，<code>z</code> 是数据在某个<em>弯曲低维流形</em>上的坐标。把 AE 理解成「学一套适合这份数据的低维坐标系」，比把它当成一个神秘的神经网络要清楚得多。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="scratch"><span class="num">4</span>从零实现与手写反向传播</h2>
+  <h3>从零实现：编码器、解码器与手写反向传播</h3>  <p>现在把自编码器从零搭起来。结构是最简单的<strong>单隐层 MLP 自编码器</strong>：输入 <code>x\in\mathbb{R}^D</code> → 线性 + 激活到瓶颈 <code>z\in\mathbb{R}^d</code> → 线性 + 激活回 <code>\hat x\in\mathbb{R}^D</code>。前向只是两次「矩阵乘 + 非线性」，难点在<strong>手写反向传播</strong>——这正是本课逼你彻底搞懂梯度的地方。</p>  <pre><code># 前向（玩具版，省略 bias）
+# z   = act(x @ W_e)          # 编码：D -&gt; d
+# xhat = x_dec = z @ W_d       # 解码：d -&gt; D（输出层常不加激活）
+# L   = mean( (xhat - x)^2 )    # 重建损失 MSE</code></pre>  <p>反向传播就是把这条链按链式法则倒着求一遍偏导。以 MSE <code>L=\tfrac1N\|\hat x-x\|^2</code> 为例，关键梯度是：</p>  <div class="math-block">\[\frac{\partial L}{\partial \hat x}=\frac{2}{N}(\hat x-x),\quad \frac{\partial L}{\partial W_d}=z^\top\frac{\partial L}{\partial \hat x},\quad \frac{\partial L}{\partial z}=\frac{\partial L}{\partial \hat x}\,W_d^\top\]</div>  <p>再把 <code>\partial L/\partial z</code> 乘上激活函数的导数、传到编码器权重 <code>W_e</code>，就得到全部梯度。整个过程不超过十行 numpy。为什么坚持手写而不用框架的 autograd？因为<strong>亲手推一遍 </strong><code>z^\top\,\partial L/\partial\hat x</code><strong> 这种式子，你才会真正记住「梯度的形状从哪来、为什么要转置」</strong>——这在后面调试 VAE 的 ELBO 反向、GAN 的两套梯度时是救命的肌肉记忆。</p>  <div class="callout warn"><span class="label"></span>
+    <p>两个新手最常踩的维度坑：① 权重梯度的形状必须和权重一模一样（<code>dW_d</code> 形状 = <code>W_d</code> 形状 <code>(d,D)</code>），算完务必 <code>assert dW.shape==W.shape</code>；② 反向里那个 <code>/N</code> 的归一化要和前向的 <code>mean</code> 一致，漏了会让梯度大 <code>N</code> 倍、学习率假性失配。notebook 里我们用<strong>数值梯度检验（gradient check）</strong>把解析梯度和有限差分对拍，任何符号/形状错误都会当场暴露。</p>
+  </div>  <p>数值梯度检验值得单独强调，因为它是<strong>整门课最重要的调试武器</strong>。原理极简：对任一参数 <code>w</code>，把它加减一个微小 <code>\epsilon</code>、各算一次损失，用中心差分 <code>(L(w+\epsilon)-L(w-\epsilon))/(2\epsilon)</code> 近似偏导。它慢（每个参数要前向两次），但<em>绝对可信</em>——只要你的损失函数本身写对，它就给出梯度的「标准答案」。把手写的解析梯度和它对拍，差距应在 <code>1e-6</code> 量级。这一招在后面查 VAE 的 KL 梯度、检验任何自定义反向时都通用：<strong>先用小规模数据 gradient check 通过，再放手训练</strong>，能省下无数「loss 不降到底是模型错还是梯度错」的抓狂时间。</p>  <p>最后说一句优化器。本课为了<em>看清机制</em>，一律用最朴素的<strong>全批量梯度下降</strong>（每步用全部数据算一次精确梯度再更新），不用 Adam、不用 mini-batch。代价是收敛慢、对学习率敏感（学习率稍大就会在最小值附近来回震荡甚至发散——你会在 notebook 里真切体会到，这正是为什么真实训练几乎都用带动量/自适应步长的优化器）。但好处是<strong>每一步都透明、可复现、可对拍</strong>：没有动量缓存、没有随机批次扰动，损失曲线就是优化轨迹本身。等你彻底理解了机制，换上 Adam 与 mini-batch 只是工程替换，数学内核分毫未变。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="regularize"><span class="num">5</span>欠完备、过完备与恒等坍塌</h2>
+  <h3>欠完备、过完备与防止恒等坍塌</h3>  <p>自编码器能不能学到有用的东西，取决于一个看似不起眼、实则决定成败的设置：瓶颈维度 <code>d</code> 相对输入维度 <code>D</code> 是大是小。这个比例直接决定了「网络被逼着学结构」还是「网络有偷懒的余地」。</p>  <table>
+    <thead><tr><th>类型</th><th>瓶颈维度</th><th>靠什么学表示</th><th>风险</th></tr></thead>
+    <tbody>
+      <tr><td><strong>欠完备</strong> undercomplete</td><td><code>d &lt; D</code></td><td>维度约束本身</td><td>压太狠会丢信息、重建差</td></tr>
+      <tr><td><strong>过完备</strong> overcomplete</td><td><code>d \ge D</code></td><td><strong>必须靠正则</strong></td><td>无正则会退化成恒等映射（白学）</td></tr>
+    </tbody>
+  </table>  <p>欠完备自编码器靠<strong>瓶颈维度太小</strong>这一物理约束逼出表示——隐层装不下全部信息，网络只能优先保留最能降低重建误差的成分（主要变化方向），自动丢弃噪声与冗余。这是最常见、最稳妥的设置，本课主用它。选 <code>d</code> 多大是个工程权衡：太小（小于数据内在维度）会丢真信息、重建糊；太大则约束松、表示里混入噪声。一个实用的诊断是看重建误差随 <code>d</code> 的曲线——它通常在数据的<strong>内在维度</strong>处出现一个拐点（再加维度收益骤减），这个拐点就是对内在维度的估计。notebook 第 4 节会亲眼看到这个拐点。</p>  <p>但有时我们偏偏想要<em>过完备</em>表示（隐层比输入还宽，特征更丰富、更便于下游线性可分）。这时维度约束彻底失效——网络完全可以学一个<strong>恒等映射</strong>（编码器和解码器互为逆，原样复制），重建误差为零却什么也没学到。要防止这种<strong>恒等坍塌</strong>，必须靠别的正则给网络施加压力：<strong>稀疏自编码器</strong>惩罚隐层激活的稀疏度（逼大多数隐单元沉默、少数被激活，学到局部化特征）；<strong>收缩自编码器</strong>惩罚编码对输入的雅可比范数（逼表示对输入的微小扰动不敏感、贴着流形）；以及最重要、与生成联系最深的——<strong>去噪自编码器</strong>（下一节）。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>「防止恒等坍塌」听起来是个工程细节，其实藏着一个<strong>贯穿全课的深刻道理</strong>：恒等映射重建误差为零、却毫无用处，这说明<strong>低重建误差 ≠ 学到了好表示</strong>。好的表示从来不是「损失最低」自动带来的，而是<em>恰当的约束</em>塑造出来的——是约束（瓶颈、稀疏、收缩、去噪、或 VAE 的 KL）把网络从一台「完美复印机」逼成一个「理解数据结构的压缩器」。记住这条<strong>「约束创造价值」</strong>的暗线：它会在 VAE 的 KL 项（约束隐空间贴近先验）、GAN 的判别器（约束生成像真的）、扩散的逐步加噪（约束去噪沿流形）里反复以不同面目出现。整门课某种意义上都在讲：给生成模型加什么约束，它就学会什么本领。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="denoising"><span class="num">6</span>去噪自编码器：通往生成的桥梁</h2>
+  <h3>去噪自编码器：通往生成模型的桥梁</h3>  <p>去噪自编码器（denoising autoencoder, DAE）是个看似微小、实则深刻的改动：训练时<strong>给输入加噪</strong>得到 <code>\tilde x=x+\epsilon</code>，但仍要求网络重建出<strong>干净的原图</strong> <code>x</code>，即最小化 <code>\|x-g(f(\tilde x))\|^2</code>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>普通 AE 像让速记员抄一段清晰的话；去噪 AE 像让他听一段<strong>有杂音</strong>的录音，却要还原出原话。要做到这点，他不能死记每个字，而必须<strong>理解这段话该长什么样</strong>（语法、语义结构），才能从噪声里猜对。这种「理解结构才能去噪」的压力，逼出比普通 AE 更鲁棒、更有意义的表示。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：DAE 学的是从带噪流形<em>指回</em>干净数据流形的映射。可以证明（Vincent 2011；Alain & Bengio 2014），在小噪声极限下，去噪的最优方向<strong>正比于数据对数密度的梯度</strong> <code>\nabla_x\log p(x)</code>——也就是 <strong>score 函数</strong>。去噪，本质上是在学「往哪个方向走能让数据更像真的」。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>这就是去噪自编码器的<strong>历史地位</strong>：它是连接「自编码器」与「现代扩散/score 模型」的桥梁。<strong>DAE 学的 score（去噪方向）正是扩散模型每一步在做的事</strong>——扩散就是把去噪做到极致：在从微噪到纯噪的<em>所有</em>噪声水平上学去噪。所以本模块的去噪 AE 不只是一个 AE 变体，更是模块 04（扩散）的思想预演。学完扩散回头看，你会恍然大悟：原来 DDPM 就是一个「在所有噪声水平上训练的、超级版去噪自编码器」。</p>
+  </div>  <p>去噪 AE 在实现上只比普通 AE 多一行改动，却体现了一个重要原则——<strong>前向用带噪输入、损失对齐干净目标</strong>。具体说：每个训练步先给干净数据 <code>x</code> 加一份新鲜噪声得 <code>\tilde x</code>，把 <code>\tilde x</code> 喂进网络得到重建 <code>\hat x</code>，但计算损失时拿 <code>\hat x</code> 和<em>干净的</em> <code>x</code> 比（不是和 <code>\tilde x</code> 比！）。反向传播时，梯度对<strong>带噪输入</strong>求导（因为前向走的是 <code>\tilde x</code>）。这两点任一搞反，去噪效果就没了——notebook 的练习 3 专门用数值梯度检验把这个细节钉死。每步用<em>不同</em>的噪声也很关键：它等于让网络见识同一个 <code>x</code> 周围的整片噪声邻域，从而学到「这一带都该指回 <code>x</code>」。</p>  <p>notebook 里我们会在玩具数据上做一个干净的对照实验：同一份数据、同一个网络，一个普通 AE、一个去噪 AE，给测试输入加噪后比谁能更好地还原出干净版。结果是去噪 AE 明显更鲁棒——它的重建在带噪输入上退化得更慢。这个实验规模很小，却把「加噪训练 → 学到流形结构 → 获得去噪（即 score）能力」这条逻辑链坐实了。当你在模块 04 看到扩散模型反复地「加噪、预测噪声」时，请回想这里：扩散不是什么全新魔法，它只是把去噪自编码器这个朴素想法，沿着<strong>从几乎无噪到几乎全是噪声的连续谱</strong>彻底铺开、并配上一个能逐步走回去的采样器。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="representation"><span class="num">7</span>表示学习：隐空间能干什么</h2>
+  <h3>表示学习：自编码器学到的隐空间能干什么</h3>  <p>自编码器训练完，我们真正想要的往往不是重建（重建只是<strong>代理任务</strong>），而是那个学到的<strong>编码 </strong><code>z</code>——它是一种压缩的、有结构的数据表示，能喂给下游任务。这就是<strong>表示学习</strong>：用无标签数据（自编码不需要标签）学到有用的特征。</p>  <p>学到的隐空间有几个值得玩味的性质：① <strong>降维与可视化</strong>——把高维数据压到 2D/3D 直接画出来看聚类；② <strong>下游特征</strong>——用 <code>z</code> 而非原始 <code>x</code> 训分类器，常常更省样本（因为 <code>z</code> 已经过滤了噪声）；③ <strong>插值</strong>——在两个样本的编码之间线性插值再解码，常能得到语义上的过渡（但普通 AE 的隐空间有「洞」，插值未必平滑，这又是 VAE 要改进的）。</p>  <p>一个直观感受隐空间结构的方式是<strong>隐空间插值</strong>：取两个真实样本 <code>x_a, x_b</code>，编码得 <code>z_a, z_b</code>，在它们之间走直线 <code>z_t=(1-t)z_a+t z_b</code> 并逐点解码。如果隐空间是「好」的，你会看到一串语义平滑的过渡（比如一个数字 3 渐变成 8）；如果隐空间有「洞」，中途的 <code>z_t</code> 落在训练时从未出现过的区域，解码就会得到<em>不像任何真实数据</em>的怪东西。这个现象直接暴露了普通 AE 的软肋，也预告了 VAE 为何要逼隐空间「填满、无洞」。</p>  <p>但必须诚实地指出自编码器表示的<strong>两个根本局限</strong>，它们不是缺陷而是<em>后续四族模型的动机来源</em>：</p>  <ul>
+    <li><strong>隐空间无已知分布，采不了样</strong>：普通 AE 的 <code>z</code> 分布是数据被编码后<em>碰巧</em>形成的、形状未知、稀疏且有空洞。你不知道该从哪个分布里抽 <code>z</code> 才能解码出合理样本——随便抽一个 <code>z</code> 多半落进空洞、解出垃圾。所以 AE<strong>只能重建已有数据，不能凭空生成</strong>。→ VAE（模块 02）用 KL 把隐空间规整成一个已知的先验（标准正态），从此可以放心地从先验采样。</li>
+    <li><strong>表示未必解耦、未必语义</strong>：AE 只优化重建，完全不保证 <code>z</code> 的各维对应可解释的独立因子（角度、粗细、颜色）；它常把多个因子纠缠在一起。→ β-VAE（模块 02）通过加强对隐空间的约束鼓励<strong>解耦表示</strong>。</li>
+  </ul>  <p>所以自编码器是一座<strong>承前启后的桥</strong>：向前，它确立了「编码-瓶颈-解码」这个被一切生成模型继承的骨架；向后，它用自身的局限（采不了样、隐空间无结构）亲手逼出了后面四族模型的核心创新。把它学透，后面会轻松得多——你会发现 <strong>VAE 就是「加了概率外壳与 KL 约束的 AE」</strong>，<strong>扩散就是「在所有噪声水平上训练的超级去噪 AE」</strong>，连 <strong>GAN 的生成器都可以看成「只保留解码器、用判别器的对抗信号代替重建损失」的半个 AE</strong>。五族模型的血缘，都能追溯到这一模块。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>自监督表示学习</strong>：现代表示学习的主流已从重建式（AE）转向对比式（SimCLR）、掩码式（MAE 把图像打格子、遮住一部分让模型补全——本质是 patch 级的去噪/掩码自编码器）。MAE 证明「重建被遮挡部分」在大规模下能学到极强的视觉表示，是 AE 思想的现代复兴。</li>
+    <li><strong>VQ-VAE 与离散表示</strong>：把连续瓶颈换成离散码本（codebook），得到离散编码。它是把图像/音频<em>token 化</em>、再用自回归或扩散建模的关键基础设施（如 DALL·E、潜在扩散的 VAE 编码器），把表示学习与生成连了起来。</li>
+    <li><strong>潜在空间生成（latent generative models）</strong>：先用一个（V）AE 把数据压到低维潜在空间，再在那个空间里跑扩散/流——这正是 Stable Diffusion 的「latent diffusion」骨架。自编码器在这里退居幕后，却是让高分辨率生成可行的功臣。</li>
+    <li><strong>表示的可解释与解耦</strong>：什么样的归纳偏置能让自编码器自发学到解耦、可控、对齐人类概念的表示，仍是开放问题；β-VAE、InfoGAN 等只是部分答案。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Hinton & Salakhutdinov 2006（深度 AE 降维）、Vincent 2008/2010（去噪 AE，扩散的思想前身）、Baldi & Hornik 1989（线性 AE = PCA 定理）。想看现代复兴读 He 2022（MAE）、van den Oord 2017（VQ-VAE）。清单见 <code>references.md</code>。下一模块 VAE 会把这里的「确定性 AE」升级成能采样的概率模型。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_vae/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 变分自编码器 VAE</div></a>
+  </div>
+
+</div>
+</body>
+</html>

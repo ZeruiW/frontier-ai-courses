@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>00 · 课程总览与环境</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 00 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>00 · 课程总览与环境</h1>
+  <p class="subtitle">推理服务的世界观 —— prefill 算力受限 / decode 带宽受限两阶段、KV cache 是显存与吞吐命门、吞吐与延迟（TTFT/TPOT）的张力；用 numpy 把引擎机制做成模拟器+账本、对拍参考实现</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">Python/numpy、Transformer 与注意力数学（C01）、一点点操作系统内存/调度常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 00_environment_check.ipynb</div></div>
+    <div class="item"><div class="k">课程模块</div><div class="v">6 个模块 · 纯 numpy 模拟引擎机制 + 账本 + 对拍</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">总览 30 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what">这门课讲什么</a></li>
+      <li><a href="#twophase">世界观：prefill / decode 两阶段瓶颈</a></li>
+      <li><a href="#tradeoff">吞吐 vs 延迟，与 SLO/goodput</a></li>
+      <li><a href="#map">课程地图：从一个请求到一座引擎</a></li>
+      <li><a href="#method">方法论：用 numpy 做模拟器+账本</a></li>
+      <li><a href="#env">环境与运行</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what"><span class="num">1</span>这门课讲什么</h2>
+  <p>欢迎来到 <strong>高效推理与服务</strong>。这门课只追求一件事：<strong>让你从「会调用 vLLM / SGLang」变成「理解并能写出它们的核心机制」</strong>。</p>  <p>绝大多数人和推理引擎的关系止于 <code>vllm serve meta-llama/Llama-3-8B</code> 和一条 OpenAI 风格的 HTTP 请求。这门课要往下钻一层：当成百上千个请求涌进来时，引擎<em>到底</em>做了什么，才能既把 GPU 喂满、又让每个用户感觉「秒回」？为什么同一块 GPU、同一个模型，vLLM 的吞吐能比朴素实现高一个数量级？为什么长上下文会爆显存，而分页 KV 不会？为什么投机解码能<strong>既加速又不改变输出</strong>？（剧透：它用了一条优雅得不可思议的接受/拒绝采样规则。）</p>  <p>这些问题的答案不在任何 API 文档里，而在<strong>LLM 推理这一负载的特殊结构</strong>和<strong>系统对这些结构的回应</strong>之中。一次 LLM 推理本质上分成两个性格迥异的阶段：<strong>prefill</strong>（并行嚼完整段 prompt，算力密集）和<strong>decode</strong>（逐 token 挤牙膏，每步都要重读全部历史，带宽密集）。几乎所有推理服务技术，归根结底都在回答同一类问题——<em>如何在显存放得下、延迟达得了标的前提下，把尽可能多的请求塞进同一次前向，并尽量少地搬运 KV cache</em>。本课就沿着这条主线，把现代引擎的五根支柱（分页 KV、连续批处理、投机解码、前缀复用与 PD 分离、量化）从零拆开、亲手重建成可验证的模拟器。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>学完你应当能回答这类问题（也是推理/系统岗位的高频面试题）：<strong>KV cache 为什么是显存命门，PagedAttention 怎么几乎消灭碎片？continuous batching 凭什么吞吐翻倍？投机解码为什么加速还无损？RadixAttention 怎么自动复用前缀？为什么要把 prefill 和 decode 拆到不同 GPU？KV 量化到 fp8 会损失什么？</strong>——并且能在 numpy 里把这五样东西都做成模拟器、用 assert 钉死关键不变量。</p>
+  </div>  <p>一句方法论上的话先说在前面：本课的价值不在「我们在 CPU 上也能学」这个妥协，而在它<strong>逼你只关注真正难的部分</strong>——<em>数据结构、调度逻辑与数值正确性</em>。CUDA kernel、NCCL 通信、显存分配器的字节级实现，这些有了正确的机制之后是另一层工程（且年年在变）；而「KV 怎么分页才不碎、batch 怎么动态进出才不卡、采样怎么接受/拒绝才不改分布」是<em>不随硬件过时</em>的硬功夫。把它练扎实，换到任何引擎（vLLM、SGLang、TensorRT-LLM、下一代框架）都立刻能上手。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="twophase"><span class="num">2</span>世界观：prefill / decode 两阶段瓶颈</h2>
+  <p>贯穿全课的世界观是一句话：<strong>LLM 推理的两个阶段，瓶颈截然不同，几乎所有技术都是在为某一阶段的某种浪费买单</strong>。先把这两阶段的性格刻进脑子：</p>  <table>
+    <thead><tr><th>维度</th><th><strong>Prefill</strong> 预填充</th><th><strong>Decode</strong> 解码</th></tr></thead>
+    <tbody>
+      <tr><td>在做什么</td><td>并行处理整段 prompt、填 KV cache</td><td>自回归逐 token 生成，每步算 1 个 query</td></tr>
+      <tr><td>一次处理的 token</td><td>很多（整个 prompt）</td><td>每序列 1 个</td></tr>
+      <tr><td>主要瓶颈</td><td><strong>算力受限</strong> compute-bound</td><td><strong>带宽受限</strong> memory-bound（反复读 KV 与权重）</td></tr>
+      <tr><td>对应延迟指标</td><td><strong>TTFT</strong>（首 token）</td><td><strong>TPOT</strong>（每 token）</td></tr>
+      <tr><td>优化主旋律</td><td>切块（chunked prefill）、复用（prefix cache）、分离</td><td>增大 batch 摊薄权重、量化减带宽、投机解码减步数</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">decode 在等数据</span>
+    <p>最反直觉、也最重要的一条：<strong>decode 阶段是带宽受限的，每生成一个 token，GPU 都要把整个模型权重 + 全部 KV cache 从显存读一遍，却只做了一个 token 的计算</strong>。这意味着单请求 decode 时 GPU 算力几乎全闲——硬件在<em>等数据</em>，不是在<em>算</em>。于是 decode 优化的主旋律全是「让这趟昂贵的读取多干点活」：把很多请求<strong>批在一起</strong>（权重只读一次、服务整个 batch）、把 KV 与权重<strong>量化</strong>（每次少读一半字节）、用投机解码<strong>一次确认多个 token</strong>（摊薄前向次数）。看懂这一条，本课五个模块的动机就全通了。</p>
+  </div>  <p>把这张两阶段表记牢，本课每个模块都在打其中一处浪费：模块 01（分页 KV）解决<strong>显存碎片</strong>让 batch 能更大；模块 02（连续批处理）解决<strong>请求级同步</strong>的 GPU 空转；模块 03（投机解码）直接攻击 decode 的<strong>串行步数</strong>；模块 04（前缀复用 + PD 分离）消除<strong>重复 prefill</strong>并隔离两阶段的相互干扰；模块 05（量化）削减 decode 的<strong>带宽</strong>。它们不是零散技巧，而是从同一张「两阶段瓶颈表」推导出的系统性解药。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">3</span>吞吐 vs 延迟，与 SLO/goodput</h2>
+  <p>吞吐与延迟之间存在一种根本张力，理解它是看懂所有调度决策的钥匙。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>想让<strong>吞吐</strong>高，就要把尽量多的请求批在一起、把 GPU 喂满——但 batch 越大，单个请求要排队、要和别人分享带宽，它的<strong>延迟</strong>就越糟。反过来，想让单请求延迟最低，就该让它独占 GPU——但那样 GPU 大部分时间在等数据，吞吐极低、成本极高。服务系统永远在这条线上找平衡点。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，服务的真正目标不是裸吞吐，而是 <span class="term">goodput</span>：在满足 <span class="term">SLO</span>（如 P99 TTFT < 1s、TPOT < 50ms）的前提下能交付的吞吐。DistServe 等系统正是用 goodput 取代 throughput 作为优化目标——因为一个吞吐很高但一半请求超时的系统是没用的。本课的调度、配比、抢占决策，本质都是在 SLO 约束下最大化 goodput。</p></div>
+  </div>  <div class="ascii">两阶段 + 两延迟指标：一次请求的一生
+
+  请求到达
+     │
+     ▼  ── prefill（并行嚼完 prompt，算力受限）──┐
+  [Prefill]                                      │  这段耗时 = TTFT（首 token 延迟）
+     │  写满 prompt 的 KV cache                   │
+     ▼  ◀─────────────────────────────────────── 吐出第 1 个 token
+  [Decode] ─ token ─ token ─ token ─ ... ─ token ─ EOS
+     ▲        每步耗时 = TPOT（带宽受限：读全部权重+KV 只产 1 token）
+     └─ 每一步都要重读 KV cache（所以 KV 越大越慢、越占显存）</div>  <p>这张图解释了本课所有指标的来源：<strong>TTFT 由 prefill 决定</strong>（所以前缀复用、chunked prefill、PD 分离都在压它），<strong>TPOT 由 decode 的带宽决定</strong>（所以量化、大 batch、投机解码都在压它）。一个交互式聊天应用对 TTFT 敏感（用户盯着等第一个字），一个批量文档处理任务只在乎吞吐——同一个引擎要靠调度在这些需求间切换。把「请求的一生」这张图和上一节的「两阶段瓶颈表」合起来，你就有了分析任何推理优化的坐标系。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="map"><span class="num">4</span>课程地图：从一个请求到一座引擎</h2>
+  <h3>课程地图：从一个请求到一座推理引擎</h3>  <div class="ascii">LLM 推理的负载结构：prefill(算力) + decode(带宽)，KV cache 是贯穿始终的命门
+
+  模块 01  PagedAttention   KV 像 OS 虚拟内存一样分页(block + block table)；CoW 共享前缀
+     │                      「KV 怎么放才不碎？怎么让 batch 装得下更多请求？」
+     ▼
+  模块 02  Continuous Batch  迭代级调度：完成即让位、到达即补位；prefill 插入、抢占
+     │                      「怎么不让短请求被长请求拖死、让 GPU 一直满载？」
+     ▼
+  模块 03  投机解码          draft 猜 + target 并行验证 + 接受/拒绝采样(无损)
+     │                      「怎么少做几次串行前向，还不改变输出分布？」
+     ▼
+  模块 04  Prefix + PD 分离  RadixAttention 前缀树自动复用 KV；prefill/decode 拆到不同 GPU
+     │                      「怎么不重复 prefill？怎么让两阶段互不干扰？」
+     ▼
+  模块 05  fp8 / 量化        KV cache 与权重降到 fp8/int8；scale 粒度与离群值
+                            「怎么每步少搬一半字节，又不让精度崩？」</div>  <p>注意这不是松散的专题集合，而是一条<strong>有内在逻辑的递进链</strong>：先（01）把显存管好让 batch 能大，再（02）把 batch 动态调度好让 GPU 满载，然后从两个方向继续加速——（03）减少 decode 的串行步数、（04）减少重复计算并隔离干扰、（05）减少每步的数据搬运。读到最后你会发现，一座现代推理引擎就是这五块积木的组装。</p>  <p>每一级台阶都对应一个<strong>可独立验证的能力</strong>：模块 01 你手写的分页 KV 管理器会做到<strong>零外部碎片、且块表寻址读回的 KV 逐位等于连续存储</strong>；模块 02 你的连续批处理调度器吞吐会<strong>严格高于</strong>静态批处理；模块 03 你的投机采样输出分布会与 target<strong>逐位一致</strong>（用大量采样的频率验证）；模块 04 你的 radix 树命中会<strong>等于</strong>暴力前缀匹配；模块 05 你的 fp8 量化误差会<strong>随 scale 与离群值按理论变化</strong>。每一步都有 <code>assert</code> 兜底，绝不靠「感觉对了」。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="method"><span class="num">5</span>方法论：用 numpy 做模拟器+账本</h2>
+  <h3>方法论：没有大规模 GPU 集群，怎么学写推理引擎？</h3>  <p>本环境<strong>聚焦机制而非吞吐</strong>：我们不追求真实的 tokens/s，而追求把推理引擎的<strong>数据结构、调度逻辑、数值不变量</strong>用 numpy 精确地表达并验证。这些恰恰是引擎最难、最值钱、也最不随硬件过时的部分。</p>  <p>打个比方：学指挥交通不一定要一座真城市的车流。推理引擎的「交通规则」是<strong>显存怎么分配回收、请求怎么进出 batch、token 怎么接受拒绝、前缀怎么匹配复用</strong>；这些都是和 GPU 型号无关的算法逻辑。一个真实 vLLM 里那行「为请求分配 KV 块、更新块表」，描述的是一条状态转移；我们在 numpy 里就用一个<strong>显式的整数账本</strong>记录每块归谁、引用计数多少——结构一模一样，只是我们让它在 CPU 上慢慢跑出来、好观察、好断言。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>我们把引擎的每个机制翻译成 numpy 里看得见摸得着的东西：KV 显存是一个「块 → 占用者」的整数账本，调度器是一个事件循环，注意力是几个小矩阵乘，fp8 量化是对浮点比特的截断。你写的是<strong>机制与正确性</strong>，不是性能。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>关键纪律是<strong>对拍 + 不变量断言</strong>：每个机制都和一个<em>绝对可信的朴素参考</em>比对，并断言其核心不变量。分页 KV 读回 == 连续存储、投机采样频率 == target 概率、radix 命中 == 暴力匹配、反量化误差 ≤ 理论上界。机制正确 → 不变量成立；不变量成立 → 你的逻辑可以原样接到真实引擎。</p></div>
+  </div>  <table>
+    <thead><tr><th>引擎概念</th><th>本课的 numpy 模拟</th><th>对应真实系统</th></tr></thead>
+    <tbody>
+      <tr><td>KV 显存池</td><td>整数数组：块号 → 占用请求/引用计数</td><td>vLLM BlockManager / GPU 显存</td></tr>
+      <tr><td>block table</td><td>每请求一个 list：逻辑块 → 物理块</td><td>vLLM 的 block_tables</td></tr>
+      <tr><td>调度器</td><td>事件循环：每迭代增删 batch 中的序列</td><td>vLLM Scheduler 三队列</td></tr>
+      <tr><td>投机采样</td><td>按 min(1,p_t/p_d) 接受、否则残差重采样</td><td>speculative sampling kernel</td></tr>
+      <tr><td>前缀缓存</td><td>radix 树插入/最长前缀匹配</td><td>SGLang RadixAttention</td></tr>
+      <tr><td>fp8 量化</td><td>对 numpy 浮点做指数/尾数截断</td><td>FP8 cast / KV 量化 kernel</td></tr>
+    </tbody>
+  </table>  <p>为什么把<strong>不变量断言</strong>提到方法论的高度？因为推理引擎的 bug 极其阴险：块没回收（显存泄漏）、块表错位（读到别人的 KV）、采样规则写错（悄悄改变了输出分布）、量化 scale 取错（精度崩塌但不报错）——这些往往不会崩溃，只是悄悄给出<em>看起来差不多但其实错了</em>的结果。在真实集群上这种 bug 要靠海量日志大海捞针；而在 numpy 模拟里，我们有绝对可信的参考，任何偏差都会被 <code>assert</code> 当场抓住。本课每个机制都先写参考、再写「引擎版」、立刻对拍——这套纪律正是真实引擎开发（与朴素实现/参考引擎对拍）的核心工作流。</p>  <div class="callout warn"><span class="label"></span>
+    <p>务必清楚本课<strong>不教</strong>什么：不教 CUDA kernel 写法（那是 C36）、不测真实 GPU 吞吐、不做真正的多机通信、不调显存分配器的字节细节。这些在你有了正确的机制之后，是<em>第二步</em>（references 里的 vLLM/SGLang 源码、TensorRT-LLM 接手）。本课负责把<strong>第一步——机制与正确性</strong>夯死；这一步搞定，第二步才有意义。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="env"><span class="num">6</span>环境与运行</h2>
+  <h3>环境与运行</h3>  <p>环境极简：<strong>只需 numpy</strong>（画吞吐/延迟曲线可选 matplotlib）。全课 CPU 秒级运行，无需 GPU、CUDA、vLLM、torch。</p>  <pre><code>conda create -n serving python=3.11 -y &amp;&amp; conda activate serving
+pip install numpy            # 必需
+pip install matplotlib       # 可选，仅用于画吞吐/延迟/碎片率曲线
+jupyter lab</code></pre>  <p>每个模块配一个 notebook，结构统一：先用 numpy 把机制<strong>从零实现成模拟器并对拍</strong>（5–6 个 worked 小节，每节都跑出可打印的验证与 <code>assert</code>），再做 3–4 道带 <code>assert</code> 判分的 ✏️ 练习（先给骨架，自己填，再对照 📖 参考答案），最后一个<strong>真实数据胶囊</strong>（用真实模型的配置或真实 GPU 的显存数算一笔账，把纸面知识接到现实）。</p>  <p>建议的学习节奏：<strong>先读完整章 HTML 建立直觉与理论框架，再打开 notebook 亲手实现</strong>。读和做缺一不可——只读会觉得「好像懂了」，真正动手写块表寻址、调度循环、接受采样、量化 scale 时，才会发现魔鬼藏在哪些细节里（引用计数、抢占边界、残差分布归一、离群值）。这门课的深度正是为「动手」服务的。</p>  <div class="callout paper"><span class="label"></span>
+    <p>配套先读：Pope et al. 2022《Efficiently Scaling Transformer Inference》建立两阶段世界观；Horace He《Making Deep Learning Go Brrrr》分清三类瓶颈；vLLM 论文（Kwon 2022）是模块 01/02 的源头。完整清单见 <code>references.md</code>。</p>
+  </div>  <div class="card"><strong>✅ 学完整门课，你应该能：</strong>  <ol>
+    <li>把一次推理拆成 prefill/decode 两阶段，说出各自瓶颈与对应延迟指标（TTFT/TPOT）；</li>
+    <li>从零实现分页 KV 管理器（块 + 块表 + CoW），量化它相对连续分配省了多少显存碎片；</li>
+    <li>写一个连续批处理调度器，定量说明它为何比静态批处理吞吐更高、延迟更稳；</li>
+    <li>实现投机采样的接受/拒绝规则，用采样频率验证输出分布与 target 逐位一致，并算期望加速比；</li>
+    <li>写一棵 radix 前缀树做 KV 复用（命中等于暴力匹配），并算 PD 分离的资源配比；</li>
+    <li>实现 fp8 cast 与 KV 量化，解释 scale 粒度与离群值如何决定精度；</li>
+    <li>把验证过的 numpy 机制对回 vLLM / SGLang / TensorRT-LLM 的对应模块，知道下一步怎么接真引擎。</li>
+  </ol></div>
+
+  <div class="pager">
+    <span></span>
+    <a class="next" href="../01_paged_attention/01_讲解.html"><div class="dir">下一模块 →</div><div class="t">01 · PagedAttention 与 KV 管理</div></a>
+  </div>
+
+</div>
+</body>
+</html>

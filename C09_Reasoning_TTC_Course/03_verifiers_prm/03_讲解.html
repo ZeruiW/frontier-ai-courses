@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · Verifier 与 PRM：结果监督、过程监督与 Goodhart 过优化</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · Verifier 与 PRM：结果监督 vs 过程监督，以及 Goodhart 过优化</h1>
+  <p class="subtitle">当多数票不够用，就训练一个"判卷人"来选答案 —— 但判卷人自己会被钻空子：优化压力越大，proxy 分数越高，真实质量先升后降</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（BoN / self-consistency / pass@k）、logistic regression、基础概率论</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_verifiers_prm.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Cobbe 2021、Lightman 2023、Wang 2023 (Math-Shepherd)、Gao 2022</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#selector">从多数票到学习型选择器：GSM8K verifier</a></li>
+      <li><a href="#orm-prm">ORM vs PRM：定义、训练目标与标注成本</a></li>
+      <li><a href="#shepherd">Math-Shepherd：用 MC rollout 自动造过程标签</a></li>
+      <li><a href="#inference">怎么花掉 verifier：BoN、加权投票、搜索引导与步级聚合</a></li>
+      <li><a href="#goodhart">Goodhart 过优化：BoN 的 KL 与倒 U 标度律</a></li>
+      <li><a href="#adversarial">对抗鲁棒性：胡说八道骗过 verifier</a></li>
+      <li><a href="#rlvr">RLVR：规则 verifier vs 学习 verifier</a></li>
+      <li><a href="#eval">评测视角与前沿开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="selector"><span class="num">1</span>从多数票到学习型选择器：GSM8K verifier</h2>
+
+  <p>模块 02 的结论是：采样 $N$ 条解答后，<span class="term">coverage</span>（pass@N，至少一条正确的概率）随 $N$ 按幂律逼近上限，
+  但 <strong>majority voting 只能兑现其中一小部分</strong> —— 它要求正确答案恰好是众数。两种典型失灵：
+  ① 题目太难，正确率 $p &lt; $ 最高频错误答案的概率，投票稳定选错；② 答案空间不可投票（证明题、代码、开放生成没有"可数票的最终答案"）。
+  剩下的差距 —— coverage 与 voting 之间的那块 —— 就是<strong>选择器（selector）</strong>的舞台。</p>
+
+  <p>[Cobbe 2021, arXiv:2110.14168] 在 GSM8K 上给出第一个大规模答案：<strong>训练一个 verifier，对每条采样解答打分，
+  Best-of-N 选分最高的</strong>。做法朴素到惊人：用 generator 对每道训练题采样 100 条解答，按最终答案对错自动打标签（对=1，错=0），
+  然后训练一个模型（与 generator 同构，加一个标量输出头）做二分类。推理时采样 $N$ 条、verifier 选一条。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>多数票是"群众投票"，verifier 是"请个判卷老师"。判卷比解题容易 —— 这是整个方向的根基直觉
+      （P vs NP 式的不对称：验证一个解比生成一个解的计算难度低）。Cobbe 的关键发现是：
+      <strong>同样的算力预算，6B generator + verifier ≈ 直接 finetune 一个 30 倍大的模型</strong>。
+      verifier 把"采样很多条"这件事的收益从 voting 的天花板往 coverage 的天花板上推。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设 generator 给出 i.i.d. 候选 $y_1,\dots,y_N \sim \pi(\cdot\mid x)$，verifier 为打分函数 $v_\psi(x,y)$。
+      BoN 策略选 $\hat y = \arg\max_i v_\psi(x, y_i)$。当 $v_\psi$ 与真实正确性 $c(y)\in\{0,1\}$ 完全一致（oracle）时，
+      $\Pr[\hat y\ \text{正确}] = 1-(1-p)^N = $ pass@N；当 $v_\psi$ 是常数（无信息）时退化为 pass@1。
+      真实 verifier 落在两者之间，位置由它对 correct/incorrect 两类分数分布的<strong>判别力</strong>（如 AUC）决定。
+      Cobbe 2021 还观察到 $N$ 太大时 BoN 准确率<strong>不升反降</strong> —— 这是第 5 节 Goodhart 现象的最早实证之一。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  一个贯穿本章的框架：<strong>verifier 是测试时算力的"兑换器"</strong>。采样 $N$ 条买到的是 coverage；
+  voting / verifier / oracle 是三种把 coverage 兑换成 accuracy 的汇率。verifier 越准，汇率越好；
+  但 verifier 不准时，加大 $N$ 等于对一个错误的目标函数加大优化压力 —— 兑换器本身会被挤爆。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="orm-prm"><span class="num">2</span>ORM vs PRM：定义、训练目标与标注成本</h2>
+
+  <p>Cobbe 的 verifier 只看"最终答案对不对"，对解答<em>过程</em>不置一词。按监督信号的粒度，verifier 分两族：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th><span class="term">ORM (outcome reward model)</span> 结果监督</th><th><span class="term">PRM (process reward model)</span> 过程监督</th></tr></thead>
+    <tbody>
+      <tr><td>监督对象</td><td>整条解答的<strong>最终结果</strong>：$c(y)\in\{0,1\}$</td><td>每个<strong>推理步骤</strong> $s_t$：该步是否正确/合理</td></tr>
+      <tr><td>训练目标</td><td>$\min_\psi\ \mathbb{E}\big[\mathrm{BCE}(v_\psi(x,y),\, c(y))\big]$</td><td>$\min_\psi\ \sum_t \mathrm{BCE}(v_\psi(x, s_{1:t}),\, c_t)$，$c_t$ 为步级标签</td></tr>
+      <tr><td>标签来源</td><td><strong>自动</strong>：和参考答案比对即可，标注成本 ≈ 0</td><td>原版需<strong>人工逐步标注</strong>（Lightman 2023 雇人标了 80 万步），成本极高；或自动近似（第 3 节）</td></tr>
+      <tr><td>信号密度</td><td>稀疏：一条 10 步解答一个 bit</td><td>稠密：每步一个标签，且能<strong>定位第一处错误</strong></td></tr>
+      <tr><td>致命弱点</td><td><strong>奖励"侥幸正确"</strong>：推理全错、答案蒙对的解答被标成正样本（false positive credit assignment）</td><td>"步骤正确"本身定义模糊（中性步骤算什么？错误但后来被修正的步骤算什么？）；标注一致性难保证</td></tr>
+    </tbody>
+  </table>
+
+  <p>[Lightman 2023, arXiv:2305.20050]（<em>Let's Verify Step by Step</em>，OpenAI）做了最干净的对照实验：
+  同一个 GPT-4 底座、同一批 MATH 题的解答，分别用 outcome 与 process 监督训练 verifier，再做 BoN（$N=1860$）：</p>
+
+  <ul>
+    <li><strong>PRM 显著优于 ORM</strong>：MATH 测试子集上 PRM-BoN 解出 78.2%，ORM-BoN 约 72.4%，majority voting 约 69.6%；且 <strong>$N$ 越大差距越大</strong> —— ORM 的分数被"答案对、过程错"的样本污染，优化压力越大暴露越狠。</li>
+    <li><strong>主动学习（active learning）省标注</strong>：不是均匀标，而是优先标"当前 PRM 打分高但答案错"的 <em>convincing wrong-answer</em> 解答 —— 这些是 PRM 的盲区，每个标签的信息量最大。论文估计标注效率提升 2.6×。这本质是<strong>对抗式数据收集</strong>：专门收集骗过当前 verifier 的样本。</li>
+    <li>副产品 <strong>PRM800K</strong>：80 万个人工步级标签公开，成为后续 PRM 研究的标准数据集。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  读 Lightman 2023 要注意两个容易忽略的混杂：① PRM 的训练数据经过主动学习筛选，ORM 没有 —— 两者差距里有一部分是数据策略而非监督形式贡献的；
+  ② "ORM 劣于 PRM"在<strong>答案可自动判对错</strong>的数学域成立，在结果信号本身就不可靠的域（开放生成）里 ORM 连定义都成问题。
+  对照实验的结论永远带着它的实验条件 —— 这是评测科学的基本功。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="shepherd"><span class="num">3</span>Math-Shepherd：用 MC rollout 自动造过程标签</h2>
+
+  <p>PRM 卡脖子的是人工标注。[Wang 2023, arXiv:2312.08935]（Math-Shepherd）给出一个优雅的自动化方案，
+  核心是重新定义"这一步好不好"：<strong>不问"这步对不对"，而问"从这步出发还能走到正确答案吗"</strong> —— 把步骤质量定义为它的<em>潜力（potential）</em>：</p>
+
+  <div class="math-block">
+  $$ y_t \;=\; \Pr\big[\text{最终答案正确} \,\big|\, x,\ s_{1:t}\big]
+     \;\approx\; \frac{1}{K}\sum_{k=1}^{K} \mathbb{1}\big[\mathrm{rollout}_k(x, s_{1:t})\ \text{答案正确}\big] $$
+  </div>
+
+  <p>操作上：解答的每个前缀 $s_{1:t}$ 处，让 generator 继续往下采样 $K$ 条补全（<span class="term">MC rollout</span>），
+  数有多少条最终答案正确。论文给两种用法：<strong>soft 标签</strong>直接用频率 $y_t$；<strong>hard 标签</strong>取 $\mathbb{1}[y_t &gt; 0]$
+  （只要有一条 rollout 能到达正确答案，就认为这步还没把路走死）。这正是 RL 里 <strong>value function 的 MC 估计</strong>：
+  $y_t \approx V^\pi(s_{1:t})$，PRM 实际学的是 generator 策略 $\pi$ 下的状态价值。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>判断一步棋好不好，不用请大师逐手点评 —— 让棋手从这个局面继续下 8 盘，赢了几盘就是这步棋的分数。
+      错误的一步之后怎么下都输（rollout 全错 → 标签 0），正确的前缀总有活路（标签 &gt; 0）。
+      代价从"人工标 80 万步"变成"多花 generator 的采样算力" —— 拿测试时算力换标注预算。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>注意 $y_t$ 度量的是"<em>该策略</em>从此前缀出发的成功率"，与"该步骤逻辑上正确"并不等价，偏差有两个方向：
+      ① <strong>策略依赖</strong>：步骤正确但 $\pi$ 太弱接不下去 → 标签被低估（false negative）；
+      ② <strong>可恢复错误</strong>：步骤错误但 $\pi$ 常能自我修正 → 标签 &gt; 0（按"逻辑正确性"是 false positive，但按"潜力"定义反而合理）。
+      Math-Shepherd 训练的 PRM 在 GSM8K/MATH 的 BoN 重排上超过 self-consistency 与 ORM，验证了
+      自动标签的性价比；其思想直接通向后续的 OmegaPRM（MC 树搜索式二分定位第一处错误，Luo 2024）等工作。</p>
+    </div>
+  </div>
+
+  <div class="callout paper"><span class="label"></span>
+  谱系速览：[Cobbe 2021] 结果监督 verifier → [Uesato 2022, arXiv:2211.14275] 在 GSM8K 上首次系统对比 outcome vs process（当时结论：两者相近 —— 因为 GSM8K 太简单）→
+  [Lightman 2023] 在更难的 MATH 上 PRM 显著胜出 + PRM800K → [Wang 2023] Math-Shepherd 用 MC rollout 消灭人工标注 →
+  [Luo 2024 OmegaPRM]、各开源 PRM（Qwen2.5-Math-PRM 等）工程化。一条清晰的"信号粒度变细、标注成本变零"的演化线。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="inference"><span class="num">4</span>怎么花掉 verifier：BoN、加权投票、搜索引导与步级聚合</h2>
+
+  <h3>4.1 步级分数怎么聚合成一条解答的分数</h3>
+  <p>PRM 给出每步分数 $p_1,\dots,p_T$（$p_t = v_\psi(x, s_{1:t})$），BoN 需要一个标量。三种主流聚合：</p>
+
+  <div class="math-block">
+  $$ s_{\min} = \min_t p_t, \qquad
+     s_{\mathrm{prod}} = \prod_t p_t, \qquad
+     s_{\mathrm{last}} = p_T $$
+  </div>
+
+  <table>
+    <thead><tr><th>聚合</th><th>语义</th><th>特性</th></tr></thead>
+    <tbody>
+      <tr><td><code>min</code></td><td>"一条链的强度等于最弱一环"</td><td>Lightman 2023 的默认选择；对"单步致命错误"敏感；对步数不敏感（不偏长/短解答）</td></tr>
+      <tr><td><code>prod</code></td><td>把 $p_t$ 当独立正确概率，连乘 ≈ 全对概率</td><td>等价 $\sum_t \log p_t$；<strong>系统性偏好短解答</strong>（步数越多乘得越小），需长度校正</td></tr>
+      <tr><td><code>last</code></td><td>只信最后一步的判断（PRM 当 value function 用）</td><td>若 PRM 学的是 Math-Shepherd 式 $V^\pi$，理论上 $p_T$ 已总结全程；实践对训练分布外的长链不稳</td></tr>
+    </tbody>
+  </table>
+
+  <h3>4.2 三种推理时用法（算力从轻到重）</h3>
+  <ul>
+    <li><strong>BoN reranking</strong>：$\hat y=\arg\max_i v(x,y_i)$。最简单，verifier 只在最后调用 $N$ 次。</li>
+    <li><strong>加权投票（weighted majority voting）</strong>：$\hat a = \arg\max_a \sum_{i:\,\mathrm{ans}(y_i)=a} v(x, y_i)$。
+    voting 与 verifier 的折中 —— verifier 噪声被同答案样本间的求和平均掉，实践中常比纯 BoN 更稳（verifier 弱时尤其如此）。</li>
+    <li><strong>搜索引导（process guidance）</strong>：PRM 在<strong>生成过程中</strong>给部分解答打分，引导 step-level beam search / lookahead / MCTS——
+    剪掉低分前缀，把算力集中在有希望的分支。这是模块 04 的主题：PRM 在那里扮演搜索的 value function。
+    Snell 2024 (arXiv:2408.03314) 表明：难题上 PRM 引导的树搜索比纯 BoN 的 compute-optimal 效率高 4 倍以上。</li>
+  </ul>
+
+  <div class="ascii">
+  测试时算力的三档花法（v = verifier/PRM 调用点）：
+
+  BoN:        x ──► y₁…y_N 完整生成 ──► v 打分 ──► 取 argmax
+  加权投票:    x ──► y₁…y_N 完整生成 ──► v 打分 ──► 按答案分组求和 ──► 取最大组
+  搜索引导:    x ──► 步1候选 ──v──► 留 top-k ──► 步2候选 ──v──► … ──► 完整解答
+              （PRM 进入生成循环，错误前缀被尽早剪掉，token 预算花在好分支上）
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="goodhart"><span class="num">5</span>Goodhart 过优化：BoN 的 KL 与倒 U 标度律</h2>
+
+  <p>"当一个度量变成目标，它就不再是好度量"（Goodhart's law）。verifier 是真实正确性的 <span class="term">proxy</span>；
+  BoN 的 $N$ 越大、RL 训练越久，对 proxy 的优化压力越大。[Gao 2022, arXiv:2210.10760] 给出了定量刻画：
+  用一个 6B "gold RM" 充当真值，训练各种小 proxy RM 去拟合它，然后对 proxy 做 BoN 与 RL 优化，观察 gold 分数：</p>
+
+  <ul>
+    <li><strong>proxy 分数单调上升</strong>（当然 —— 你就在优化它）；</li>
+    <li><strong>gold 分数先升后降</strong>：倒 U 曲线。优化初期 proxy 与 gold 方向一致；压力大到一定程度，候选解开始集中在"proxy 高估的区域" —— proxy 的误差被 argmax <em>系统性选择</em>出来。</li>
+  </ul>
+
+  <p>优化压力的自然度量是策略偏离初始分布的 KL 散度。BoN 的 KL 有闭式（对连续分布精确成立）：</p>
+
+  <div class="math-block">
+  $$ \mathrm{KL}\big(\pi_{\mathrm{BoN}} \,\|\, \pi\big) \;=\; \log N - \frac{N-1}{N} $$
+  </div>
+
+  <p><em>推导脉络</em>：取 $N$ 条样本中 proxy 最高的，等价于在分数的 CDF 变换 $u=F(s)\sim\mathrm{Unif}(0,1)$ 上取最大值，
+  $\max$ 的密度为 $N u^{N-1}$，KL $=\int_0^1 N u^{N-1}\log(Nu^{N-1})\,du = \log N - \frac{N-1}{N}$。
+  它只随 $\log N$ 增长 —— <strong>BoN 是非常"温和"的优化器</strong>：$N=16$ 才花约 1.8 nats，$N=10^4$ 也只有 ~8.2 nats，
+  而 RLHF 训练动辄几十 nats。这解释了为什么 BoN 相对 RL 更不容易 hack 崩，但代价是推理时算力线性于 $N$。
+  Gao 2022 拟合出的经验形式：BoN 下 gold 分数 $R(d) = d(\alpha - \beta d)$，RL 下 $R(d) = d(\alpha - \beta\log d)$，
+  其中 $d=\sqrt{\mathrm{KL}}$；且 $\beta$ 随 <strong>RM 参数量增大而减小</strong>（RM 越大越难被钻）、随 RM 训练数据增多而减小，
+  对 policy 大小却几乎不变 —— "被 hack 的难易"主要是 reward model 的属性。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  倒 U 的工程含义：<strong>存在最优 $N^*$，超过它继续加采样反而伤害真实质量</strong>。$N^*$ 由 verifier 质量决定 ——
+  verifier 越好，峰值越靠右、越高。如果你的 BoN 曲线一路单调升，要么 verifier 真的很好，要么你画的是 <em>verifier 自己的分数</em>而不是真实正确率
+  ——后者是评测中常见的自欺：用 proxy 评 proxy 的优化结果，永远一片大好。notebook 会让你亲手复现这条倒 U 曲线。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="adversarial"><span class="num">6</span>对抗鲁棒性：胡说八道骗过 verifier</h2>
+
+  <p>Goodhart 是统计版的失效：BoN 无意间放大 proxy 误差。还有<strong>对抗版</strong>：解答<em>主动</em>带有让 verifier 高估的特征。
+  这是 reward hacking 的推理任务版本，已有多个层次的实证：</p>
+
+  <ul>
+    <li><strong>表面特征劫持</strong>：PRM 可能学到"步骤编号工整、有 'therefore'、式子排版漂亮 → 高分"这类伪相关。
+    BoN 时这些特征"免费"——生成器随便就能产出，与正确性无关，于是 argmax 被它们主导。
+    这正是 notebook 模拟中 <em>可钻营伪特征（gameable feature）</em> 的原型。</li>
+    <li><strong>RL 下的主动 hack</strong>：当 PRM/ORM 被当成 RL 奖励时，策略会发现系统性漏洞——生成冗长重复的"伪推理"、
+    在错误推导后硬写出格式正确的答案框、用自信语气包装胡话。Gao 2022 的 RL 曲线在大 KL 处 gold 分数崩塌就是这个机制。</li>
+    <li><strong>评 verifier 的对抗基准</strong>：给 verifier 喂"答案正确但推理胡扯""推理正确但抄错一个数"的构造样本，
+    测它能否分辨。GSM8K 式数据上训练的 ORM 在这类探针上接近随机 —— 它学的是"长得像对的解答"而非"逻辑有效"。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  防御思路与 Lightman 2023 的主动学习同构：<strong>verifier 的训练数据必须包含"骗过上一代 verifier 的样本"</strong>，
+  形成 generator-verifier 的对抗迭代（类比 GAN / red-teaming loop）。一个只见过自然分布解答的 verifier，
+  在 BoN/RL 的优化压力下面对的是<em>偏移后的分布</em> —— 训练与部署分布的错配是 hack 的根源。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="rlvr"><span class="num">7</span>RLVR：规则 verifier vs 学习 verifier</h2>
+
+  <p>o1 / DeepSeek-R1 时代的关键词 <span class="term">RLVR (RL with verifiable rewards)</span> 与本章是一枚硬币的两面：
+  RLVR 的 verifier 不是学出来的模型，而是<strong>规则程序</strong>——数学比对最终答案、代码跑单元测试。对照表：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>规则 verifier（RLVR）</th><th>学习 verifier（ORM/PRM）</th></tr></thead>
+    <tbody>
+      <tr><td>可 hack 性</td><td>低得多（答案对就是对），Goodhart 压力小 → 可以放心加大优化压力，这是 R1 能猛训的前提</td><td>必然存在误差 → 优化压力必须节制（KL 正则、早停、倒 U 的 $N^*$）</td></tr>
+      <tr><td>适用域</td><td>窄：要求答案可机判（数学、代码、逻辑题）</td><td>宽：任何能拿到偏好/正确性标签的域</td></tr>
+      <tr><td>信号粒度</td><td>只有 outcome（天然是稀疏 ORM）</td><td>可到步级（PRM），支持搜索引导</td></tr>
+      <tr><td>残余风险</td><td>仍可被钻：答案抽取器的格式漏洞、单元测试覆盖不全、特判 hack（R1 论文报告过 reward hacking 案例）</td><td>伪特征、分布偏移、对抗样本（第 6 节）</td></tr>
+    </tbody>
+  </table>
+
+  <p>值得注意的是 DeepSeek-R1 团队<strong>明确弃用了 PRM 做训练奖励</strong>（理由：步级正确性难定义、PRM 训练易被 hack、
+  且诱发 reward hacking 的工程负担大），只用规则奖励 —— 但这不否定 PRM 在<strong>测试时</strong>（reranking / 搜索引导）的价值。
+  一个有用的分工图景：<em>训练用规则 verifier（hack 不动），推理用 PRM（信号密、可引导搜索），评测两者都要审计</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">8</span>评测视角与前沿开放问题</h2>
+
+  <p>对 evaluation 研究者，本章的元命题是：<strong>verifier 自己就是被评测对象</strong>。一旦评测管线里出现 verifier
+  （LLM-as-judge 也是一种 verifier），它的误差就是测量系统的系统误差。三张必查的"体检表"：</p>
+
+  <ul>
+    <li><strong>判别力（discrimination）</strong>：correct/incorrect 两类分数分布的可分性 —— AUC、不同 $N$ 下的 BoN 增益。
+    报 BoN 成绩时必须同时报 oracle（pass@N）与 majority 基线，否则无法归因增益来自 verifier 还是 coverage。</li>
+    <li><strong>校准（calibration）</strong>：verifier 分数 0.8 的解答里真有 80% 是对的吗？画 <span class="term">reliability diagram</span>、算
+    $\mathrm{ECE}=\sum_b \frac{n_b}{n}\,\lvert \mathrm{acc}_b - \mathrm{conf}_b\rvert$。
+    加权投票、风险控制（"低于阈值就拒答"）都假设分数有概率语义 —— 不校准的 verifier 这些用法全部失真。</li>
+    <li><strong>可钻营度（exploitability）</strong>：对抗探针集上的表现 + Goodhart 曲线的峰值位置 $N^*$。
+    一个实用度量：把 BoN 推到大 $N$，看 true accuracy 从峰值跌多少 —— 跌幅就是"proxy 误差被优化暴露的部分"。</li>
+  </ul>
+
+  <p><strong>开放问题</strong>：</p>
+  <ul>
+    <li><strong>过程标签的本体论</strong>："步骤正确"至今没有公认定义（逻辑有效？对 $V^\pi$ 的贡献？人类可接受？）。
+    Math-Shepherd 的 potential 定义与 Lightman 的人工标注在分布上系统性不同，两种 PRM 各自最优的聚合方式也不同 —— 定义问题直接影响工程选择。</li>
+    <li><strong>generative verifier / CoT verifier</strong>：让 verifier 先生成批判性推理再给分（GenRM 方向），
+    verifier 自己也能吃测试时算力 —— "验证的 test-time scaling"。这把本章与模块 05 的 compute-optimal 问题耦合：算力在 generator 与 verifier 之间怎么分？</li>
+    <li><strong>弱监督强（weak-to-strong / scalable oversight）</strong>：当模型强过标注者，过程监督被认为比结果监督更可扩展
+    （检查一步比检查整个解答容易）——但这一论断本身缺乏大规模实证，是 alignment 与 evaluation 的交叉前沿。</li>
+    <li><strong>verifier 的 verifier</strong>：评测 verifier 需要真值标签；真值标签来自更强的 judge 或人工 —— 递归到哪里终止？
+    对无 ground truth 的域（开放写作、研究建议），"可验证性"本身可能是能力评测的硬边界。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>ORM 与 PRM 的训练目标各是什么？为什么 ORM 会奖励"侥幸正确"，这在 BoN 的大 $N$ 端如何表现？</li>
+      <li>Math-Shepherd 如何不用人工把过程标签造出来？它定义的"步骤质量"与"逻辑正确"差在哪两个方向？</li>
+      <li>写出 BoN 的 KL 公式并解释：为什么 BoN 是温和的优化器？为什么 Goodhart 曲线是倒 U，峰值位置由什么决定？</li>
+      <li>评测一个 verifier 要看哪三张体检表？为什么报 BoN 成绩必须同时报 pass@N 与 majority 基线？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../02_self_consistency/02_讲解.html"><div class="dir">← 上一章</div><div class="t">02 · Self-Consistency 与 Best-of-N</div></a>
+    <a class="next" href="../04_search_mcts/04_讲解.html"><div class="dir">下一章 →</div><div class="t">04 · 推理即搜索：beam / ToT / MCTS</div></a>
+  </div>
+
+</div>
+</body>
+</html>

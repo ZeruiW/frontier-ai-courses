@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 矩阵微积分与反向传播</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 7</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 矩阵微积分与反向传播</h1>
+  <p class="subtitle">Backprop 不是魔法，是链式法则在计算图上的复用。本章把它从「标量导数」一路推到「矩阵雅可比连乘」，手推一遍，你就能在白板上现场写出任意层的梯度，也能从公式诊断梯度爆炸/消失。</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">偏导数、矩阵乘法、链式法则的标量版、模块 00</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_matrix_calculus_backprop.ipynb（UCI 乳腺癌 WDBC，从零训两层 MLP）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Karpathy <em>micrograd</em>；CS231n backprop notes；Goodfellow et al. <em>DL</em> ch.6；Baydin 2018 AD survey</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 80 分钟 + 跑 70 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么 ML 研究者必须手推 backprop</a></li>
+      <li><a href="#chain">一切的核心：链式法则与多变量推广</a></li>
+      <li><a href="#graph">计算图、前向与反向的对偶</a></li>
+      <li><a href="#pattern">反向传播的「上游 × 局部」模式</a></li>
+      <li><a href="#matrix">矩阵微积分：雅可比、四个必背梯度与形状法则</a></li>
+      <li><a href="#numcheck">数值梯度校验：你唯一的安全网</a></li>
+      <li><a href="#vanish">梯度消失/爆炸：从雅可比连乘看根因</a></li>
+      <li><a href="#autograd">自动微分：micrograd 与反向模式的代价分析</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么 ML 研究者必须手推 backprop</h2>
+
+  <p>反向传播（backpropagation）是过去四十年里对深度学习贡献最大的一个算法工程，但它在概念上其实只是<strong>链式法则加上一点动态规划</strong>。很多人「会用」<code>loss.backward()</code> 却从未手推过一次完整的反向，结果是：训练一旦出问题，他们只能换超参、换种子、烧 GPU 时间瞎试。真正能快速定位问题的人，脑子里有一张计算图，能立刻判断梯度该长什么样、在哪一层断掉了。</p>
+
+  <p>对一个面向评测与研究的工程师，手推 backprop 至少有三层价值。第一是<strong>诊断训练失败</strong>：当 loss 不降、突然 NaN、或在某个 step 后停滞，根因几乎总落在梯度上——消失、爆炸、被 mask 意外清零、数值溢出、或某个分支根本没接进计算图。第二是<strong>白盒可解释性的数学地基</strong>：linear probing、gradient-based attribution、integrated gradients、influence functions、saliency map——全部是 backprop 的变体。C06 可解释性课直接建立在本章的「梯度沿计算图回传」之上。第三是<strong>面试硬通货</strong>：research scientist 面试的白板题里，「手推这个 loss 对这个参数的梯度」几乎必考，而且面试官真正想看的不是你背没背过结论，是你能不能现场分解、能不能说清何时失效、能不能讲怎么验证。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  Backprop 一句话：<strong>把「最终 loss 对每个中间量的敏感度」，从输出端往输入端、按链式法则一层层乘回去。</strong>
+  正向算的是「值」，反向算的是「谁对 loss 负多少责任」。一次反向的计算量与一次正向同量级——这个惊人的高效性是整个深度学习能 scale 的前提，第 8 节会证明它。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="chain"><span class="num">2</span>一切的核心：链式法则与多变量推广</h2>
+
+  <p>标量链式法则你早会了：若 $y=f(u)$、$u=g(x)$，则 $\dfrac{dy}{dx}=\dfrac{dy}{du}\dfrac{du}{dx}$。神经网络只是把这条规则套了几十层，并且每个「量」从标量升级成了向量、矩阵甚至更高阶张量。多变量版本的关键在于：当 $x_i$ 影响了<em>多个</em>中间量 $u_j$，而这些 $u_j$ 又都影响 $L$ 时，必须把所有路径的贡献<strong>求和</strong>：</p>
+
+  <div class="math-block">
+  $$ \frac{\partial L}{\partial x_i} = \sum_j \frac{\partial L}{\partial u_j}\,\frac{\partial u_j}{\partial x_i} $$
+  </div>
+
+  <p>右边的求和就是「$x_i$ 通过<em>所有</em>它影响的 $u_j$ 把影响汇总到 $L$」。把 $\partial u_j/\partial x_i$ 这一组偏导排成矩阵，就是<span class="term">雅可比矩阵</span>（Jacobian）$J$，于是整条规则写成漂亮的矩阵形式 $\nabla_x L = J^\top \nabla_u L$。注意这里出现了<strong>转置</strong>：前向是 $u = $（某种变换）$x$，雅可比是 $J=\partial u/\partial x$；反向把上游梯度 $\nabla_u L$ 乘以 $J^\top$ 才得到 $\nabla_x L$。这个「前向用 $J$、反向用 $J^\top$」的对偶，是后面所有反向规则的母型。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白说</h4>
+      <p>$x$ 动一点，会让所有依赖它的中间量动；每个中间量又让 loss 动。把这些「动」全加起来，就是 loss 对 $x$ 的总敏感度。多条路径都影响 loss？把各条路径的贡献加起来，一条都不能漏——漏一条，梯度就错。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨说</h4>
+      <p>反向模式自动微分（reverse-mode AD）按计算图的拓扑逆序计算<span class="term">伴随量</span>（adjoint）$\bar{v}\equiv\partial L/\partial v$。对节点 $v$ 的每条输出边，把下游伴随量乘以该边的局部雅可比并<em>累加</em>到 $\bar v$。累加是因为一个节点可能被多个下游节点使用（fan-out）；这正对应上面求和号里的多条路径。</p>
+    </div>
+  </div>
+
+  <p>这里要破除一个常见误解：很多教材把梯度写成「$\partial L/\partial x$ 是一个行向量」（分子布局）或「列向量」（分母布局）。两种约定都对，但混用会让你符号全错。本课统一用<strong>分母布局</strong>——梯度 $\nabla_x L$ 与被求导的 $x$ <em>同形状</em>。这条约定不只是品味问题，它直接给出第 5 节的「形状法则」这个最实用的查错工具。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="graph"><span class="num">3</span>计算图、前向与反向的对偶</h2>
+
+  <p>把一次 logistic 回归 + 交叉熵写成计算图。前向（左到右）算出 loss；反向（右到左）从 $\partial L/\partial L = 1$ 出发，每条边乘以局部导数，把梯度一路传回参数。</p>
+
+  <div class="ascii">
+   前向 →
+   x ──[·w + b]──► z ──[sigmoid]──► p ──[BCE(y)]──► L
+
+   ← 反向（每条边乘「局部导数」，从 ∂L/∂L = 1 往回传）
+   ∂L/∂z = p - y           （sigmoid + BCE 的著名简化）
+   ∂L/∂w = xᵀ·(p - y) / n
+   ∂L/∂b = mean(p - y)
+  </div>
+
+  <p>注意那个著名结果：<strong>sigmoid + BCE 的组合，loss 对 logit $z$ 的梯度恰好是 $p-y$</strong>（预测概率减真值）。softmax + 交叉熵也一样，$\partial L/\partial z = p - y_{\text{onehot}}$。这不是巧合，而是这两对函数被刻意「配对」设计的结果——梯度干净、不饱和、计算便宜。手推一遍你会看到，sigmoid 的导数 $\sigma(1-\sigma)$ 与 BCE 分母里的 $p(1-p)$ 精确抵消，剩下的就是 $p-y$。这种抵消是工程上选择损失函数的核心动机之一。</p>
+
+  <div class="math-block">
+  $$ L = -\frac1n\sum_i\big[y_i\log p_i+(1-y_i)\log(1-p_i)\big],\quad p_i=\sigma(z_i),\quad \frac{\partial L}{\partial z_i}=\frac{p_i-y_i}{n} $$
+  </div>
+
+  <p>计算图的视角还解释了为什么 backprop 必须先做一次完整前向、把所有中间激活<strong>缓存</strong>下来：反向时局部导数往往依赖前向的值（如 $\sigma'=\sigma(1-\sigma)$ 需要前向算出的 $\sigma$）。这就是训练时显存占用远大于推理的根本原因——激活要留着等反向用。activation checkpointing（用时间换显存，反向时重算部分前向）正是针对这个权衡的工程手段。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="pattern"><span class="num">4</span>反向传播的「上游 × 局部」模式</h2>
+
+  <p>实现 backprop 时，每个操作只需记住一个统一模式：<strong>下游传来一个梯度（upstream gradient $\bar y$），我乘以自己的局部导数（local gradient），把结果传给上游。</strong>把这个模式表格化，你就拥有了一套「积木」，任意网络的反向都是这些积木的拼接。</p>
+
+  <table>
+    <thead><tr><th>操作（前向）</th><th>局部导数</th><th>反向（已知上游 $\bar y$）</th></tr></thead>
+    <tbody>
+      <tr><td>$y = x + b$（广播加偏置）</td><td>$1$</td><td>$\bar x=\bar y,\quad \bar b=\sum_{\text{行}}\bar y$</td></tr>
+      <tr><td>$y = a\odot b$（逐元素乘）</td><td>$\partial y/\partial a=b$</td><td>$\bar a=\bar y\odot b,\quad \bar b=\bar y\odot a$</td></tr>
+      <tr><td>$Y = XW$（矩阵乘）</td><td>—</td><td>$\bar X=\bar Y W^\top,\quad \bar W=X^\top\bar Y$</td></tr>
+      <tr><td>$y=\mathrm{ReLU}(x)$</td><td>$\mathbb 1[x>0]$</td><td>$\bar x=\bar y\odot\mathbb 1[x>0]$</td></tr>
+      <tr><td>$y=\sigma(x)$</td><td>$\sigma(1-\sigma)$</td><td>$\bar x=\bar y\odot y(1-y)$</td></tr>
+      <tr><td>$y=\sum_i x_i$（求和/规约）</td><td>$1$</td><td>$\bar x=\bar y$ 广播回原形状</td></tr>
+    </tbody>
+  </table>
+
+  <p>注意「广播」与「求和」是一对反向对偶：前向把一个偏置 $b$ <em>广播</em>加到一批样本上，反向就要把这批样本的梯度<em>求和</em>回 $b$。这个对偶极易写错——忘了求和，$\bar b$ 的形状就和 $b$ 对不上。同理，前向的逐元素乘，反向要交叉乘上游与对方的前向值。把这张表背熟，你写任何手工反向都不会卡壳。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  矩阵乘的反向最容易记错维度。诀窍：<strong>梯度的形状必须和被求导的量一模一样</strong>。设 $X\in\mathbb R^{n\times d}$、$W\in\mathbb R^{d\times h}$，则 $\bar W$ 必须是 $d\times h$，唯一能凑出这个形状的组合就是 $X^\top\bar Y$（$d\times n$ 乘 $n\times h$）；$\bar X$ 必须是 $n\times d$，只能是 $\bar Y W^\top$。<strong>先想形状，再写公式</strong>——维度对了，公式通常就对了。这是面试现场最快的自查法。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="matrix"><span class="num">5</span>矩阵微积分：雅可比、四个必背梯度与形状法则</h2>
+
+  <p>先把<span class="term">雅可比矩阵</span>讲透。对一个向量值函数 $f:\mathbb R^n\to\mathbb R^m$，雅可比 $J\in\mathbb R^{m\times n}$ 的第 $(i,j)$ 元是 $\partial f_i/\partial x_j$。当 $m=1$（标量输出，如 loss），雅可比退化成一行，转置后就是我们熟悉的梯度向量。神经网络里我们几乎从不显式构造完整雅可比（太大：一个 $1000\times1000$ 的线性层雅可比有 $10^{12}$ 个元素），而是直接算<strong>雅可比-向量积</strong>（VJP，$J^\top v$）——这正是「上游 × 局部」做的事，也是为什么反向高效。</p>
+
+  <p>下面四个梯度覆盖 90% 的场景，notebook 里你会逐个手写并用数值梯度校验：</p>
+
+  <div class="math-block">
+  $$
+  \begin{aligned}
+  \text{① 线性回归 } z=Xw:\quad &\nabla_w \big(\tfrac1{2n}\|Xw-y\|^2\big) = \tfrac1n X^\top(Xw-y)\\[4pt]
+  \text{② Logistic + BCE}:\quad &\nabla_w L = \tfrac1n X^\top(\sigma(Xw)-y)\\[4pt]
+  \text{③ Softmax + CE}:\quad &\nabla_z L = p - y_{\text{onehot}}\\[4pt]
+  \text{④ L2 正则项 }\tfrac\lambda2\|w\|^2:\quad &\nabla_w = \lambda w
+  \end{aligned}
+  $$
+  </div>
+
+  <p>记忆法：<strong>残差（预测 − 真值）左乘输入的转置</strong>。线性回归的残差是 $\hat y-y$，logistic 是 $p-y$，多分类是 $p-y_{\text{onehot}}$——同一个故事的三种皮肤。第④式说明 L2 正则的梯度就是把权重往原点拉一个正比于自身大小的力，这正是「weight decay」名字的来源（模块 05 会看到 AdamW 如何正确地处理它）。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>微例（手算一遍 softmax 雅可比）。</strong>设 $p_k=e^{z_k}/\sum_j e^{z_j}$。对 $\partial p_i/\partial z_k$ 分两种情况：$i=k$ 时得 $p_i(1-p_i)$，$i\ne k$ 时得 $-p_i p_k$，合并成 $\partial p_i/\partial z_k=p_i(\delta_{ik}-p_k)$。把它代入 $\partial L/\partial z_k=\sum_i(\partial L/\partial p_i)(\partial p_i/\partial z_k)$，其中 $\partial L/\partial p_i=-y_i/p_i$（one-hot 下只有真实类非零），一路化简，所有 $p$ 神奇地约掉，只剩 $p_k - y_k$。这个「先看起来很复杂、化简后惊人简洁」的过程，就是最经典的面试推导题（第 7 模块会专门 drill）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="numcheck"><span class="num">6</span>数值梯度校验：你唯一的安全网</h2>
+
+  <p>手写 backprop 一定会出错——符号写反、维度转置、忘除以 $n$、广播没求和。唯一可靠的检查是<span class="term">数值梯度</span>：用有限差分逼近真实导数，再和你的解析梯度逐元素对比。一定要用<strong>中心差分</strong>而非单边差分：</p>
+
+  <div class="math-block">
+  $$ \frac{\partial L}{\partial\theta_i}\approx\frac{L(\theta+\epsilon e_i)-L(\theta-\epsilon e_i)}{2\epsilon},\quad \epsilon\approx10^{-5} $$
+  </div>
+
+  <p>中心差分的截断误差是 $O(\epsilon^2)$，单边差分只有 $O(\epsilon)$——这一阶之差在实践中是「校验通过」与「永远差一点」的区别。校验的判据不是绝对误差而是<strong>相对误差</strong>：$\dfrac{|g_{\text{ana}}-g_{\text{num}}|}{\max(|g_{\text{ana}}|,|g_{\text{num}}|)+10^{-12}}$，通常 $<10^{-6}$ 就认为解析梯度正确（含 ReLU 这类不可导点时阈值放宽到 $10^{-4}$）。notebook 练习 3 让你写一个通用的 <code>numerical_grad(f, x)</code>，对网络里每个参数都校验一遍。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  $\epsilon$ 选取是个甜点问题：太大 → 截断误差（差分不够「微」）；太小 → 浮点舍入误差吃掉一切（两个相近的大数相减损失有效位）。$10^{-5}$ 是 float64 的甜点区。<strong>用 float32 做数值梯度校验经常「看起来错了」其实只是精度不够</strong>——校验请一律强制 float64。另一个常见坑：校验时若 loss 里有随机性（dropout、随机 mini-batch），两次前向的随机种子必须固定，否则差分的分子混进了噪声。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="vanish"><span class="num">7</span>梯度消失/爆炸：从雅可比连乘看根因</h2>
+
+  <p>深层网络对输入（或浅层参数）的梯度，是一连串雅可比的连乘：$\nabla_{x_0}L = J_n^\top J_{n-1}^\top\cdots J_1^\top\,\nabla_{x_n}L$。把每个 $\|J_\ell\|$（谱范数）看成一个放大倍率，整条链的放大倍率约是它们的乘积。若每个 $\|J\|$ 略小于 1，连乘 50 层后梯度指数衰减到 $\to 0$（<span class="term">梯度消失</span>）；略大于 1 则指数增长到 $\to\infty$（<span class="term">梯度爆炸</span>）。这不是工程 bug，是连乘结构的数学必然——理解它，你就能从「loss 卡住」或「loss 突然 NaN」反推出问题在哪。</p>
+
+  <ul>
+    <li><strong>sigmoid/tanh 饱和</strong>：$\sigma'=\sigma(1-\sigma)$ 的最大值才 0.25（在 $z=0$ 处），且输入一大就饱和趋零。深层连乘必然消失——这是 ReLU（导数恒为 0 或 1，不衰减幅度）取代 sigmoid 成为隐层标配的核心原因。</li>
+    <li><strong>残差连接</strong>：$y=x+f(x)$ 的雅可比是 $I+J_f$，加了个恒等项，梯度有一条「高速公路」不被连乘衰减——这是 ResNet 能堆到上百层、Transformer 能堆到上百块的关键结构。</li>
+    <li><strong>归一化层</strong>：BatchNorm / LayerNorm 把每层激活拉回稳定的尺度，间接控制了 $\|J\|$，让深层训练的损失曲面更平滑。</li>
+    <li><strong>梯度裁剪</strong>：对爆炸最直接的急救——把全局梯度范数超过阈值时整体缩放回来（模块 05 的 global-norm clipping）。它不改方向只改幅度。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  下次看到「loss 卡住不降」或「loss 突然 NaN」，第一反应应该是<strong>打印各层梯度范数</strong>：范数接近 0 是消失（信息传不回浅层），范数巨大或 inf 是爆炸（一步把参数推飞）。这个调试直觉直接来自上面的连乘公式——你不是在猜，是在读公式。能在面试里说出「我会先看 per-layer grad norm 曲线」，本身就是强信号。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="autograd"><span class="num">8</span>自动微分：micrograd 与反向模式的代价分析</h2>
+
+  <p>PyTorch / JAX 的 autograd 就是把本章的「上游 × 局部」模式自动化：每个操作注册自己的反向规则（VJP），框架在前向时构建计算图、记录依赖，<code>backward()</code> 时按拓扑逆序依次调用这些规则并累加梯度。Karpathy 的 <em>micrograd</em> 用约 150 行 Python 实现了完整的标量反向模式 AD——一个 <code>Value</code> 类持有 <code>data</code>、<code>grad</code> 和一个 <code>_backward</code> 闭包，<code>+</code>/<code>*</code>/<code>tanh</code> 等运算在产出新 <code>Value</code> 的同时把局部反向逻辑塞进闭包，最后从输出节点做一次拓扑排序、逆序调用所有闭包。读懂它，你就真正理解了 <code>loss.backward()</code> 背后到底发生了什么。notebook 第 5 节会让你照这个思路写一个迷你 autograd 的核心。</p>
+
+  <p>为什么反向模式如此高效？做一次<strong>代价分析</strong>：reverse-mode 算一个标量输出对 $n$ 个输入的全部梯度，代价 $\approx$ 一次前向（常数倍，与 $n$ 无关）；forward-mode 算一个输入对 $m$ 个输出的导数，代价 $\approx$ 一次前向，但要算全部 $n$ 个输入的梯度就得跑 $n$ 次。神经网络的典型场景是「输出是标量 loss、输入是百万参数」——$1$ 个输出、$n=10^6$ 个输入，所以 reverse-mode 完胜。反过来，「少参数、多输出」的场景（如算一个 $m$ 维函数的完整雅可比、$m\gg n$）forward-mode 才划算。</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>反向模式 reverse-mode（backprop）</th><th>前向模式 forward-mode</th></tr></thead>
+    <tbody>
+      <tr><td>一次扫描算什么</td><td>一个标量输出对所有输入的梯度（VJP）</td><td>所有输出对一个输入的导数（JVP）</td></tr>
+      <tr><td>擅长场景</td><td>少输出、多参数（神经网络 loss）</td><td>少参数、多输出</td></tr>
+      <tr><td>额外内存</td><td>高：要缓存前向所有中间激活</td><td>低：随前向同步推进，无需缓存</td></tr>
+      <tr><td>代表实现</td><td>PyTorch <code>autograd</code>、JAX <code>grad/vjp</code></td><td>JAX <code>jvp</code>、双数（dual number）</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>无 backprop 的训练</strong>：backprop 需要全局误差信号沿完整图回传，与生物神经元的局部学习规则不符（biological plausibility 问题）。forward-forward（Hinton 2022）、feedback alignment、target propagation 等尝试用更局部的信号替代——目前在大规模任务上仍打不过 backprop，但对神经形态硬件有吸引力。</li>
+    <li><strong>内存-计算权衡</strong>：activation checkpointing、可逆网络（reversible nets，反向时从输出重算输入而不缓存）、混合精度下的梯度缩放，都是在「反向必须缓存激活」这个约束下做工程优化。长上下文 Transformer 的训练显存瓶颈很大一部分来自这里。</li>
+    <li><strong>高阶导数与隐函数微分</strong>：元学习（MAML）、超参数优化、物理仿真里的可微优化层，需要对「优化过程本身」求导（梯度的梯度）。隐函数定理（implicit function theorem）给出绕过展开整条优化轨迹的高效做法，是可微编程（differentiable programming）的前沿。</li>
+    <li><strong>梯度的数值稳健性</strong>：低精度训练（fp16/bf16/fp8）下，梯度的动态范围管理（loss scaling、per-tensor scaling）直接决定能否收敛。这把本章的「数值校验」从调试工具升级成了大模型训练的核心工程问题。</li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  Karpathy 的 <em>micrograd</em>（~150 行实现完整反向模式 AD）是理解 autograd 最好的材料；
+  Baydin et al. 2018 <em>Automatic Differentiation in Machine Learning: a Survey</em>（JMLR）是系统综述；
+  Goodfellow et al. <em>Deep Learning</em> ch.6 给出 backprop 的标准矩阵推导。详见 <a href="../references.md">论文清单</a>。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  学完本章，你应该能：在白板上推导 logistic / softmax 的梯度并解释 $p-y$ 为何如此干净、用「上游 × 局部 + 形状法则」手写任意层的反向、用中心差分数值梯度校验你的实现、并从雅可比连乘公式解释梯度消失/爆炸与残差连接为何有效。下面去 notebook，在真实乳腺癌 WDBC 数据上从零实现一个两层 MLP 的前向 + 手写反向 + 数值校验，并训到 test acc &gt; 95%。</div>
+
+  <div class="pager">
+    <a href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 总览与环境</div></a>
+    <a class="next" href="01_matrix_calculus_backprop.ipynb"><div class="dir">Notebook →</div><div class="t">打开配套练习</div></a>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>00 · 课程总览与环境</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 00 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>00 · 课程总览与环境</h1>
+  <p class="subtitle">长上下文 = 四道墙（位置 / 内存 / 算力 / KV）× 四条正交杠杆 + 一把验真的尺子（NIAH/RULER）；用 numpy 从零实现每条技术、对拍朴素参考，把「能看长」的真实配方学到手</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">Python/numpy、注意力数学、RoPE 基础（C20）、一点点显存/复杂度常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 00_environment_check.ipynb</div></div>
+    <div class="item"><div class="k">课程模块</div><div class="v">6 个模块 · 纯 numpy 从零 + 对拍参考</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">总览 30 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what">这门课讲什么：长上下文的四道墙</a></li>
+      <li><a href="#levers">四条正交的杠杆</a></li>
+      <li><a href="#map">课程地图：一段长输入的生命周期</a></li>
+      <li><a href="#method">方法论：纯 numpy 从零实现 + 对拍</a></li>
+      <li><a href="#env">环境与运行</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what"><span class="num">1</span>这门课讲什么：长上下文的四道墙</h2>
+  <p>欢迎来到 <strong>长上下文与高效注意力</strong>。这门课只追问一件事：<strong>怎么让一个在 4k 上训练的模型，去稳定、高效、还真的有用地处理 128k 乃至 1M 的输入</strong>。</p>  <p>「长上下文」是过去两年大模型最热的赛道之一——从 GPT-4 的 8k/32k，到 Claude 的 200k，到 Gemini 宣称的 1M+。但它有个常见误解：以为长上下文是某一个聪明算法（比如 FlashAttention）一锤定音的事。事实恰恰相反。<strong>长上下文是一套正交的系统工程</strong>：四个互不相同、必须同时解决的瓶颈，外加一套专门的评测来戳穿「号称很长、其实没用」的模型。这门课就是把这套配方一件件拆开、用 numpy 从零搭出来。</p>  <p>先把四道墙摆清楚。当你把序列从 4k 拉到 128k，会接连撞上：</p>  <ul>
+    <li><strong>位置墙</strong>：模型在训练时只见过 0–4k 的位置，第 100000 个位置的编码它从没见过，朴素外推会让注意力直接崩坏（模块 01）。</li>
+    <li><strong>内存墙</strong>：注意力要算一个 n×n 的分数矩阵，n=128k 时单个头就要约 32 GB 显存——根本放不下（模块 02）。</li>
+    <li><strong>算力墙</strong>：注意力的计算量随 n 平方增长，128k 比 4k 慢约 1000 倍，再快的卡也扛不住（模块 03、04）。</li>
+    <li><strong>KV 墙</strong>：自回归解码要缓存每个历史 token 的 K/V，这个缓存随长度线性膨胀，长对话/长文档解码时它吃光显存与带宽（模块 05）。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住全课结构：<strong>四道墙，四条正交的杠杆，外加一把验真的尺子</strong>。位置墙 → 位置编码外推（RoPE scaling/YaRN）；内存墙 → IO 高效的精确注意力（FlashAttention）；算力墙 → 把二次复杂度降成次二次/线性（稀疏、线性注意力、SSM）；KV 墙 → 把 KV cache 压下来（量化/淘汰）。最后用大海捞针 NIAH 与 RULER 检验——<strong>能输入很长，不等于真的看见了里面的信息</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="levers"><span class="num">2</span>四条正交的杠杆</h2>
+  <h3>四条杠杆为什么是「正交」的</h3>  <p>说它们正交，是因为<strong>每条解决的瓶颈不同、可以叠加使用、缺一不可</strong>。这点至关重要，因为新手常误以为它们是互相替代的方案（「我用了 FlashAttention，是不是就不用管位置编码了？」——不，它们打的是完全不同的墙）。逐一看清它们各自管什么、不管什么：</p>  <table>
+    <thead><tr><th>杠杆</th><th>打的是哪道墙</th><th>解决什么</th><th>不解决什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>位置外推</strong> (01)</td><td>位置墙</td><td>让模型「敢」处理训练没见过的大位置而不崩</td><td>不省一分钱显存、不降一点复杂度</td></tr>
+      <tr><td><strong>FlashAttention</strong> (02)</td><td>内存墙</td><td>精确注意力，显存 O(n²)→O(n)、IO 大降</td><td>算力仍是 O(n²)；不改变模型能看多长</td></tr>
+      <tr><td><strong>稀疏/线性/SSM</strong> (03/04)</td><td>算力墙</td><td>把复杂度降成 O(n·k) 或 O(n)</td><td>近似方法，可能损失精度；要权衡</td></tr>
+      <tr><td><strong>KV 压缩</strong> (05)</td><td>KV 墙</td><td>解码时 KV cache 显存/带宽下降</td><td>压过头会丢信息，需评测兜底</td></tr>
+    </tbody>
+  </table>  <p>把这张表读透，你就理解了本课的编排逻辑：它不是六个松散专题，而是<strong>沿着「一段长输入从进入模型到生成输出」的生命周期</strong>依次设防。输入进来，先要位置编码不崩（01）；prefill 阶段并行算注意力，要靠 FlashAttention 不爆显存（02）；如果还嫌 O(n²) 太贵，用稀疏或线性把复杂度再降一档（03/04）；进入解码阶段，KV cache 越积越大，要压缩它（05）。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个贯穿全课的关键区分：<strong>精确 vs 近似</strong>。FlashAttention（02）是<em>精确</em>的——它和朴素注意力给出逐位相同的结果，纯赚（省显存省 IO 不损精度），所以几乎无脑该用。而稀疏注意力、线性注意力、KV 压缩（03/04/05）是<em>近似</em>的——它们用「可能损失一点质量」换「复杂度/显存大降」，是否划算取决于任务，必须用评测来验证。看清这条线，才不会盲目堆技术。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="map"><span class="num">3</span>课程地图：一段长输入的生命周期</h2>
+  <h3>课程地图：一段长输入的生命周期</h3>  <div class="ascii">长输入（128k token）→ 模型 → 输出
+
+  ┌─ 输入阶段 ──────────────────────────────────────────┐
+  │ 模块 01  RoPE Scaling / YaRN                          │
+  │   位置墙：训练 4k，推理 128k，位置编码怎么不崩？      │
+  │   PI 插值 · NTK 改 base · YaRN 分频段 ramp + 温度     │
+  └──────────────────────────────────────────────────────┘
+            ▼  prefill：并行算整段注意力（计算受限）
+  ┌─ 精确注意力 ────────────────────────────────────────┐
+  │ 模块 02  FlashAttention                               │
+  │   内存墙：n×n 矩阵爆显存 → 分块 + online softmax      │
+  │   永不 materialize S，显存 O(n²)→O(n)，数 IO 不数 FLOP│
+  └──────────────────────────────────────────────────────┘
+            ▼  还嫌 O(n²) 太贵？把复杂度再降一档
+  ┌─ 次二次复杂度 ──────────────────────────────────────┐
+  │ 模块 03 稀疏：滑窗 + sink + block-sparse  O(n·W)      │
+  │ 模块 04 线性/SSM：核映射 φ + O(n) 递推扫描  O(n)      │
+  └──────────────────────────────────────────────────────┘
+            ▼  decode：逐 token 生成（访存受限）
+  ┌─ 把上下文塞进显存 ──────────────────────────────────┐
+  │ 模块 05  KV 压缩 + 评测                               │
+  │   KV 墙：cache 随长度膨胀 → 量化 / H2O 淘汰           │
+  │   再用 NIAH 大海捞针 / RULER 多跳验「真的看见了吗」   │
+  └──────────────────────────────────────────────────────┘</div>  <p>这条生命周期也对应推理的两个阶段（贯穿全课的另一条主线）：<strong>prefill（预填充）</strong>一次性并行处理整段 prompt，是<em>计算受限</em>的、要算 n×n 注意力，所以是 FlashAttention（02）与降复杂度（03/04）的主战场；<strong>decode（解码）</strong>逐 token 生成、每步只有一个新 query，是<em>访存受限</em>的、瓶颈在反复读取不断增长的 KV cache，所以是 KV 压缩（05）的主战场。位置外推（01）则两个阶段都要管。</p>  <p>读到最后你会发现，这些技术之间还有优美的内在联系：online softmax（02）是线性注意力递推（04）的近亲；FlashDecoding（02 的练习）合并 KV 段状态，正是为长解码服务；稀疏（03）与 KV 淘汰（05）都在问「哪些 token 重要、哪些可以不看」。本课刻意把它们排在一起，就是要让你看见这张网，而不是孤立地记五个技巧。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="method"><span class="num">4</span>方法论：纯 numpy 从零实现 + 对拍</h2>
+  <h3>方法论：纯 CPU/numpy，怎么学长上下文？</h3>  <p>本环境<strong>没有 GPU、不需要大模型</strong>。但长上下文技术的难点从来不是把它跑在 1M token 上（那是工程算力问题），而是<strong>理解每条技术的机制与正确性</strong>：YaRN 的 ramp 到底怎么分频段？online softmax 的校正因子为什么能让分块结果精确等于朴素？线性注意力凭什么用结合律就降成 O(n)？这些都<em>用 numpy 在玩具规模上就能精确地表达和验证</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>我们把每条长上下文技术翻译成 numpy 里看得见的小实现：RoPE 旋转就是按角度转一对坐标，YaRN 的 ramp 就是按波长算一组权重，FlashAttention 就是几个流式更新的运行量，线性注意力就是一个 d×d 状态矩阵的累加，KV 淘汰就是按一个分数排序后切片。规模很小（n 几十、d 几个），但<strong>结构与真实系统一模一样</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>贯穿全课的纪律是<strong>对拍（differential testing）</strong>：每个实现都和一个朴素参考比对。FlashAttention 分块前向必须 <code>np.allclose(flash, naive, atol=1e-10)</code>；线性注意力的 O(n) 递推必须等于它的二次形式；YaRN 缩放后短位置的行为必须与原 RoPE 一致。<strong>结构正确 → 数值一致 → 逻辑可迁移</strong>到真实框架（transformers/vLLM）。</p></div>
+  </div>  <table>
+    <thead><tr><th>长上下文概念</th><th>本课的 numpy 实现</th><th>对应真实系统</th></tr></thead>
+    <tbody>
+      <tr><td>RoPE + 各种 scaling</td><td>按角度旋转坐标对 + 改 θ/分频段</td><td>transformers 的 rope_scaling 配置</td></tr>
+      <tr><td>FlashAttention 前向</td><td>运行 (O, l, m) + 分块循环</td><td>flash-attn / SDPA 内核（见 C36）</td></tr>
+      <tr><td>稀疏/滑窗模式</td><td>构造布尔掩码作用于分数矩阵</td><td>Longformer/Mistral 的稀疏内核</td></tr>
+      <tr><td>线性注意力递推</td><td>d×d 状态矩阵流式累加</td><td>Mamba/RWKV 的扫描内核</td></tr>
+      <tr><td>KV 量化 / 淘汰</td><td>降精度往返 + 按分数切片</td><td>KIVI / H2O / SnapKV</td></tr>
+      <tr><td>NIAH / RULER</td><td>合成长序列 + 检索/多跳任务</td><td>真实长上下文评测套件</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>务必清楚本课<strong>不教</strong>什么：不在真实 1M token 上跑、不测真实时延/显存、不训练任何模型、不重复 C20 的 RoPE 从零推导或 C36 的 GPU 内核细节。这些是「有了正确机制理解之后」的工程第二步。本课负责把<strong>第一步——每条技术的机制、数学与正确性</strong>夯死，并用对拍兜底。这一步扎实了，读论文、调框架、上真实集群才不会停留在「会调 API 但不知为何」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="env"><span class="num">5</span>环境与运行</h2>
+  <h3>环境与运行</h3>  <p>环境极简：<strong>只需 numpy</strong>（个别可视化可选 matplotlib）。全课 CPU 秒级运行，无需 GPU、大模型、联网。</p>  <pre><code>conda create -n long-context python=3.11 -y &amp;&amp; conda activate long-context
+pip install numpy            # 必需
+pip install matplotlib       # 可选，仅用于画热力图/曲线
+jupyter lab</code></pre>  <p>每个模块配一个 notebook，结构统一（对标本系列所有课）：先用 numpy 把机制<strong>从零实现并对拍</strong>（5–6 个 worked 小节，每节跑出可打印的验证与 <code>assert</code>），再做 3–4 道带 <code>assert</code> 判分的 ✏️ 练习（先给骨架，自己填，再对照 📖 参考答案），最后一个<strong>真实数据胶囊</strong>（用真实模型/基准的配置算一笔账，把纸面知识接到现实）。</p>  <p>建议的学习节奏：<strong>先读完整章 HTML 建立直觉与理论框架，再打开 notebook 亲手实现</strong>。读和做缺一不可——只读会觉得「好像懂了」，真正动手写 YaRN 的 ramp、调 online softmax 的校正因子、让线性递推对拍二次形式时，才会发现魔鬼藏在哪些细节里（频段边界、−∞ 的 guard、状态初始化、量化误差）。</p>  <div class="callout paper"><span class="label"></span>
+    <p>配套先读：模块 01 配 Chen《Position Interpolation》+ Peng《YaRN》；模块 02 配 Dao《FlashAttention》+ Milakov《online softmax》；模块 03 配 Xiao《StreamingLLM》+ Beltagy《Longformer》；模块 04 配 Katharopoulos《linear attention》+ Gu《Mamba》；模块 05 配 Zhang《H2O》+ Hsieh《RULER》。完整清单见 <code>references.md</code>。</p>
+  </div>  <div class="card"><strong>✅ 学完整门课，你应该能：</strong>  <ol>
+    <li>讲清长上下文的四道墙，并把每条技术对应到它打的墙；</li>
+    <li>实现 PI / NTK-aware / YaRN 三种 RoPE 缩放，用波长与外推误差对比它们；</li>
+    <li>从零写出分块 FlashAttention 前向（对拍朴素到 1e-10），并算清它的显存账与 IO 账；</li>
+    <li>构造滑窗 + attention sink + block-sparse 掩码，用召回率衡量稀疏化的代价；</li>
+    <li>用核映射 φ + 矩阵乘结合律实现 O(n) 线性注意力（对拍二次形式），理解 SSM 的状态递推；</li>
+    <li>模拟 KV 量化与 H2O 淘汰，构造 NIAH 大海捞针与 RULER 多跳任务来检验「能看长是否等于看得见」；</li>
+    <li>面对一个真实长上下文需求，判断该上哪条（或哪几条）杠杆、各自的代价与如何评测。</li>
+  </ol></div>
+
+  <div class="pager">
+    <span></span>
+    <a class="next" href="../01_rope_scaling/01_讲解.html"><div class="dir">下一模块 →</div><div class="t">01 · RoPE Scaling 与 YaRN</div></a>
+  </div>
+
+</div>
+</body>
+</html>

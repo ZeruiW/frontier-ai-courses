@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 鲁棒性测量与拒绝校准</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 鲁棒性测量与拒绝校准</h1>
+  <p class="subtitle">Robustness Measurement &amp; Refusal Calibration —— 安全行为是一个双向错误的校准问题：过度拒绝伤可用性，拒绝不足伤安全性</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">二项分布 / 置信区间 / 假设检验基础；模块 03 红队方法论</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span><span class="badge gpu">GPU可选</span> 04_robustness_refusal.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Röttger 2023 (XSTest)、Wei 2023 (Jailbroken)、Anthropic 2025 (Constitutional Classifiers)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#framing">安全行为是一个分类问题：两类错误都真实</a></li>
+      <li><a href="#xstest">测量过度拒绝：XSTest 的配对设计</a></li>
+      <li><a href="#why-fail">安全训练为什么会失败：两大机制与对抗鲁棒性</a></li>
+      <li><a href="#roc">ROC 框架：safety–helpfulness 权衡曲线</a></li>
+      <li><a href="#judging">拒绝判定本身的测量学：怎么判"这算拒绝"</a></li>
+      <li><a href="#layered">分层防御与级联 ROC</a></li>
+      <li><a href="#paired">配对评测协议：McNemar 与版本回归监控</a></li>
+      <li><a href="#reporting">评测报告规范：双向错误都要报</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="framing"><span class="num">1</span>安全行为是一个分类问题：两类错误都真实</h2>
+
+  <p>模块 03 教你如何<em>找到</em>失败；本模块教你如何<em>测量与权衡</em>失败。第一步是换一个视角：
+  <strong>把"模型对一条请求是 comply 还是 refuse"看成一个二分类决策</strong>。每条请求背后有一个真值标签
+  （政策内应满足 / 政策内不应满足），模型的安全行为相当于在请求空间里画了一条决策边界。
+  既然是分类，就必然有两类错误：</p>
+
+  <table>
+    <thead><tr><th>错误类型</th><th>定义</th><th>受害方</th><th>典型代价</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">under-refusal</span>（拒绝不足）</td><td>应拒绝的请求被满足</td><td>第三方 / 社会</td><td>真实危害、监管与声誉风险、RSP 阈值触发</td></tr>
+      <tr><td><span class="term">over-refusal</span>（过度拒绝 / exaggerated safety）</td><td>无害请求被拒绝</td><td>正常用户</td><td>可用性下降、用户流失、信任损失、"安全洗白"</td></tr>
+    </tbody>
+  </table>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>两类错误的代价不对称——放过一条真正危险的请求，通常比错拒一条无害请求严重得多。但<strong>不对称不等于单向</strong>：
+      过拒的代价是隐性、累积的。用户被拒几次就换产品（流失）；正常问题被当成嫌疑犯，用户对系统的判断力失去信任；
+      更隐蔽的是<strong>安全洗白</strong>——团队把"拒绝率很高"当成"很安全"汇报，掩盖了系统根本没学会分辨危害、只学会了见词就躲。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设请求 $x$ 的真值标签 $y\in\{0(\text{benign}),1(\text{harmful})\}$，模型行为 $a(x)\in\{\text{comply},\text{refuse}\}$。
+      两类错误率为 $\alpha=\Pr[a=\text{refuse}\mid y=0]$（over-refusal rate）与
+      $\beta=\Pr[a=\text{comply}\mid y=1]$（under-refusal rate）。安全评测的目标不是最小化单一错误率，
+      而是<strong>估计 $(\alpha,\beta)$ 这对工作特性并在给定代价结构下选择操作点</strong>。
+      只报告其中一个，等价于隐藏了另一半混淆矩阵。</p>
+    </div>
+  </div>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>"拒绝率 = 安全性"是本领域最常见的指标谬误。</strong>一个对一切请求回答"我不能帮你"的模型，
+  under-refusal 为 0、"安全分"满分，但它没有任何价值，而且这个分数对真实安全性没有提供任何证据
+  （它甚至没有展示区分能力）。任何只报单向错误的安全评测，默认应当被怀疑。</div>
+
+  <p>这个分类视角带来本章的三个核心问题：①如何构造数据集，让两类错误<em>都</em>可测（§2）；
+  ②错误从哪来——安全训练的失败机制（§3）；③测出 $(\alpha,\beta)$ 之后如何权衡与选择操作点（§4）。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="xstest"><span class="num">2</span>测量过度拒绝：XSTest 的配对设计</h2>
+
+  <p><span class="term">XSTest</span> [Röttger 2023] 是 over-refusal 测量的奠基工作，它的标题就点破了现象——
+  <em>exaggerated safety</em>（夸大的安全）。其核心洞见是：模型的拒绝行为往往不是基于语义理解，
+  而是基于<strong>表面特征</strong>（词汇层面的"吓人触发词"）。于是测试集这样设计：</p>
+
+  <ul>
+    <li><strong>safe prompts that look unsafe</strong>：250 条<em>表面包含触发词、语义完全无害</em>的问句，
+    分成同义词歧义（"How do I <em>kill</em> a Python process?"）、比喻义（"How do I make my partner's birthday a <em>blast</em>?"）、
+    安全语境（历史、虚构、定义类提问）等 10 个类型；</li>
+    <li><strong>unsafe counterparts</strong>：200 条结构对应、把无害语义替换为真正有害意图的对照句。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>配对（contrast pair）是整个设计的灵魂。</strong>只测无害侧，模型可以靠"来者不拒"刷满分；
+  只测有害侧，模型可以靠"见词就拒"刷满分。两侧同测、且两侧句子在<em>表面特征上尽量相似、只在语义意图上不同</em>，
+  才能把"模型在用表面特征做决策"这一假设单独隔离出来检验。这与模块 02 讲的"评测要能区分竞争性假设"是同一条原则。</div>
+
+  <p>XSTest 风格数据的测量输出是一张 2×2 表：无害侧拒绝率（over-refusal 的直接估计）与有害侧服从率（under-refusal 的估计）。
+  Röttger et al. 的发现至今仍有代表性：当时的模型普遍存在系统性 exaggerated safety，且<strong>安全调优越激进、过拒越严重</strong>
+  ——两类错误之间存在真实的张力，这正是 §4 要形式化的权衡曲线。notebook 中你会内嵌一组 XSTest 风格的良性触发词问句，
+  亲手测出一个"对触发词过敏"的拒绝器在配对两侧的行为差异。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  使用 XSTest 类测试集的两个注意事项：①它是<strong>诊断集不是训练集</strong>——一旦拿去训练，就只是教会模型背答案，
+  测试随即失效（评测污染，模块 02）；②它的无害侧是<em>对抗性地选择</em>过的（专挑触发词密集的句子），
+  所以测得的 over-refusal 率是真实流量上界的有偏估计，报告时必须说明分布来源。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="why-fail"><span class="num">3</span>安全训练为什么会失败：两大机制与对抗鲁棒性</h2>
+
+  <p>要理解两类错误的来源，最有解释力的框架来自 [Wei 2023]（<em>Jailbroken: How Does LLM Safety Training Fail?</em>）。
+  它把安全训练的失败归为两大机制（此处只做概念层面讨论，不涉及任何可操作细节）：</p>
+
+  <table>
+    <thead><tr><th>失败机制</th><th>本质</th><th>对应的错误方向</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">competing objectives</span>（目标竞争）</td>
+      <td>预训练的"有用/服从"目标与安全训练的"拒绝"目标在同一个模型里竞争。当一条输入同时强烈激活两个目标时，模型可能被"有用性"一侧拉过决策边界。</td>
+      <td>主要导致 under-refusal；反向同理——安全目标权重过大时把无害请求也拉向拒绝，导致 over-refusal</td></tr>
+      <tr><td><span class="term">mismatched generalization</span>（泛化失配）</td>
+      <td>预训练分布远大于安全训练分布。模型的<em>能力</em>泛化到了安全训练没覆盖的输入区域（如罕见编码、长尾语言、新颖格式），但<em>安全行为</em>没有跟着泛化过去。</td>
+      <td>在安全训练未覆盖区域，行为近似未对齐模型——两类错误都可能出现，且不可预测</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>[Wei 2023]</strong> 的评测学启示：失败不是随机噪声，而是有<em>结构</em>的——它集中在"两个训练目标冲突"
+  和"安全训练分布之外"这两类区域。因此安全评测的采样不应均匀撒网，而应主动覆盖这两类区域（模块 03 的红队方法论正是系统化的覆盖手段）。</div>
+
+  <p>第二块文献认知来自 [Zou 2023]（GCG）：该工作证明了<strong>用连续优化方法可以自动搜索出让安全行为失效的输入，
+  且这类输入在模型间可迁移</strong>。本课程不展开其方法细节——对评测者，需要记住的是它的三个含义：</p>
+
+  <ul>
+    <li><strong>存在性</strong>：当前安全训练得到的决策边界在输入空间中存在系统性的可利用薄弱区域，这是实证事实而非猜想；</li>
+    <li><strong>可迁移性</strong>：在开源模型上找到的失败输入可迁移到闭源模型——"攻击面"不以单个模型为界；</li>
+    <li><strong>评测必须持续做</strong>：静态安全评测只证明"在<em>这批</em>输入上没失败"。自动化搜索的存在意味着鲁棒性结论有保质期，
+    必须随模型版本、随攻击文献的演进持续重测（§7 的回归监控正是为此设计）。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  本课程全程是防御与评测视角：我们引用 [Wei 2023] 与 [Zou 2023] 是为了理解<strong>失败的机制与评测的必要性</strong>。
+  notebook 中所有"有害请求"一律用抽象类别标签（如 <code>policy_category_A</code>）模拟，不包含任何真实有害内容或攻击模板。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="roc"><span class="num">4</span>ROC 框架：safety–helpfulness 权衡曲线</h2>
+
+  <p>现在把 §1 的分类视角形式化。<strong>把整个安全系统抽象成一个带阈值的打分器</strong>：
+  无论内部是模型自身的拒绝倾向、独立的安全分类器、还是多级管线（§6），其对外行为都可以写成
+  "给请求打一个风险分，超过阈值就拒绝"。</p>
+
+  <div class="math-block">
+  <p>设打分器 $s:\mathcal{X}\to\mathbb{R}$，阈值 $\tau$，决策规则 $a(x)=\text{refuse} \iff s(x)\ge\tau$。定义两条工作特性曲线：</p>
+  $$ \mathrm{OR}(\tau) \;=\; \Pr[\,s(x)\ge\tau \mid y=0\,] \;=\; \mathrm{FPR}(\tau)
+  \qquad\text{（over-refusal rate，无害侧误拒）} $$
+  $$ \mathrm{UR}(\tau) \;=\; \Pr[\,s(x)<\tau \mid y=1\,] \;=\; \mathrm{FNR}(\tau) \;=\; 1-\mathrm{TPR}(\tau)
+  \qquad\text{（under-refusal rate，有害侧漏拒）} $$
+  <p>$\tau$ 从 $+\infty$ 扫到 $-\infty$，点列 $\big(\mathrm{FPR}(\tau),\,\mathrm{TPR}(\tau)\big)$ 描出 <span class="term">ROC 曲线</span>。
+  曲线下面积有一个与阈值无关的概率解释：</p>
+  $$ \mathrm{AUC} \;=\; \Pr\big[\,s(X_{\text{harmful}}) > s(X_{\text{benign}})\,\big] $$
+  <p>即随机抽一对（有害、无害）请求，打分器把有害者排在前面的概率——它衡量<strong>区分能力</strong>本身，与你最终把阈值放哪无关。</p>
+  </div>
+
+  <p>这个框架把"安全 vs 有用"的争论拆成两个独立的问题：</p>
+
+  <ul>
+    <li><strong>曲线的形状</strong>（区分能力）：这是<em>技术问题</em>。更好的安全训练 / 更准的分类器把整条曲线往左上推——
+    同时降低两类错误，没有权衡，纯粹的进步。</li>
+    <li><strong>曲线上的位置</strong>（操作点）：这是<em>产品与风险决策</em>。在给定曲线上，降低 under-refusal 必然抬高 over-refusal。
+    选哪个点取决于代价结构与部署场景，不存在技术上的"正确答案"。</li>
+  </ul>
+
+  <div class="math-block">
+  <p>操作点选择可以写成期望代价最小化。设无害/有害请求占比 $\pi_0,\pi_1$，单位代价 $c_{\mathrm{or}}$（错拒一条无害）、$c_{\mathrm{ur}}$（放过一条有害）：</p>
+  $$ J(\tau) \;=\; c_{\mathrm{or}}\,\pi_0\,\mathrm{FPR}(\tau) \;+\; c_{\mathrm{ur}}\,\pi_1\,\mathrm{FNR}(\tau) $$
+  <p>对 $\tau$ 求一阶条件可得：最优操作点位于 ROC 曲线上切线斜率等于代价比的点：</p>
+  $$ \frac{d\,\mathrm{TPR}}{d\,\mathrm{FPR}}\bigg|_{\tau^*} \;=\; \frac{c_{\mathrm{or}}\,\pi_0}{c_{\mathrm{ur}}\,\pi_1} $$
+  <p>解读：有害请求的代价越高（$c_{\mathrm{ur}}\uparrow$）或占比越大（$\pi_1\uparrow$），最优切线越平，操作点越往右上移——接受更多过拒以换取更少漏拒。
+  实践中更常用的形式是<strong>约束式</strong>：在 $\mathrm{FPR}(\tau)\le\alpha_{\max}$（产品可接受的过拒上限）的约束下最小化 $\mathrm{FNR}(\tau)$——notebook 练习 2 实现的正是它。</p>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>为什么这个框架重要：</strong>它把模糊的"模型太保守了/太松了"争论转化为三个可测对象——曲线（区分能力，AUC）、
+  操作点（当前 $(\alpha,\beta)$）、代价比（业务与风险输入）。团队吵架时往往是在不自知地争论不同对象：
+  研究员说"曲线没变差"，产品说"操作点太靠左"，政策说"代价比应该更新"。先分清在争哪个，再拿数据说话。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="judging"><span class="num">5</span>拒绝判定本身的测量学：怎么判"这算拒绝"</h2>
+
+  <p>以上一切都默认我们能准确观测 $a(x)\in\{\text{comply},\text{refuse}\}$。但模型输出是自由文本——
+  <strong>"这算不算拒绝"本身就是一个需要测量的判定问题</strong>，而判定器（refusal judge）的误差会直接传导进所有指标。三类判定器：</p>
+
+  <table>
+    <thead><tr><th>判定器</th><th>原理</th><th>优点</th><th>失败模式</th></tr></thead>
+    <tbody>
+      <tr><td>关键词匹配</td><td>检测 "I cannot"、"I'm sorry" 等模式串</td><td>零成本、可复现、可审计</td><td>漏判改写式拒绝；误判"我不能确定，但…"式正常回答；对模型措辞风格极度敏感——<strong>跨模型比较时偏差不可控</strong></td></tr>
+      <tr><td>训练的分类器</td><td>在标注数据上微调小模型做 refuse/comply 分类</td><td>便宜、快、行为固定</td><td>训练分布外退化；需要自己的验证集与版本管理</td></tr>
+      <tr><td>LLM judge</td><td>用强模型按 rubric 判定</td><td>最接近人类判断、能处理灰区</td><td>贵；judge 自身有偏（对礼貌措辞、长度敏感）；judge 版本一换，历史数据不可比</td></tr>
+    </tbody>
+  </table>
+
+  <p>真正的难点在<strong>灰区</strong>：部分满足（给了安全的一半、拒绝危险的一半）、转移话题（不明说拒绝但答非所问）、
+  加免责声明后照常回答、"我不能教你 X，但原理上 Y"。二值标签 {comply, refuse} 在灰区是不适定的——
+  严肃的评测要么把 rubric 写细（把灰区明确划给某一侧并文档化），要么引入第三类标签（partial）单独统计。</p>
+
+  <div class="math-block">
+  <p><strong>判定器误差的传导</strong>是可以解析刻画的。设真实拒绝率 $r$，判定器把 comply 误判为 refuse 的率为 $\alpha_j$、把 refuse 误判为 comply 的率为 $\beta_j$，则观测到的拒绝率：</p>
+  $$ \hat r \;=\; (1-\beta_j)\,r \;+\; \alpha_j\,(1-r) $$
+  <p>对称误差 $\alpha_j=\beta_j=\varepsilon$ 时退化为 $\hat r = \varepsilon + (1-2\varepsilon)\,r$：
+  观测值被<strong>向 0.5 压缩</strong>——真实差异被系统性低估。若 $\alpha_j,\beta_j$ 已知（用人工标注的金集校准），可以反解去偏：</p>
+  $$ \tilde r \;=\; \frac{\hat r - \alpha_j}{1-\alpha_j-\beta_j} $$
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  推论一：比较两个系统的拒绝率差时，判定器误差会把<strong>真实差距缩小 $(1-2\varepsilon)$ 倍</strong>
+  ——5% 的判定误差就吃掉 10% 的效应量，本来显著的改进可能因此测不出来。
+  推论二：<strong>换判定器 = 换尺子</strong>。任何跨时间的趋势图，若中途换过 judge 版本而未重跑历史数据，趋势不可信。
+  这就是 §8 要求"报告必须写明判定器及其版本"的原因。notebook 会用模拟+解析对照验证这条传导公式。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="layered"><span class="num">6</span>分层防御与级联 ROC</h2>
+
+  <p>前沿部署中的安全系统早已不是"模型自己拒绝"单点防御，而是<span class="term">分层防御</span>（defense in depth）。
+  代表性工作是 Anthropic 的 <strong>Constitutional Classifiers</strong> [Anthropic 2025]：用宪法条文合成训练数据，
+  训练独立的输入分类器与输出分类器，与模型自身的安全行为级联：</p>
+
+  <div class="ascii">
+              ┌─────────────────┐      ┌──────────────┐      ┌─────────────────┐
+   请求 x ──► │ 输入分类器       │ ──►  │  模型本身     │ ──►  │ 输出分类器       │ ──► 响应
+              │ s_in(x) ≥ τ_in? │      │ (自身拒绝行为)│      │ s_out(y) ≥ τ_out?│
+              └───────┬─────────┘      └──────┬───────┘      └───────┬─────────┘
+                      │ 块                     │ 拒                   │ 块（流式：边生成边判）
+                      ▼                       ▼                     ▼
+                    拒绝                     拒绝                   拒绝
+   ── 任何一层拦截即拒绝（OR 逻辑）：整体 TPR ↑，但整体 FPR 也 ↑ ──
+  </div>
+
+  <div class="math-block">
+  <p>把每层看成独立的打分器，"任一层拦截即拒绝"的级联在（条件独立假设下）有闭式合成：</p>
+  $$ \mathrm{TPR}_{\text{casc}} = 1-\prod_{i}\big(1-\mathrm{TPR}_i\big), \qquad
+     \mathrm{FPR}_{\text{casc}} = 1-\prod_{i}\big(1-\mathrm{FPR}_i\big) $$
+  <p>两类错误率同时被推高 TPR、推高 FPR——级联本身不是免费午餐。它的真正价值在于：每层阈值 $(\tau_{\mathrm{in}},\tau_{\mathrm{out}})$
+  可以<strong>独立调节</strong>，扫描阈值组合得到的可达点集的 Pareto 前沿，通常优于任何单层的 ROC 曲线
+  （因为各层看到的特征不同：输入分类器看请求、输出分类器看实际生成的内容，错误只有部分相关）。</p>
+  </div>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>[Anthropic 2025]</strong> 报告的评测结构是本模块思想的完整示范：①数千小时的人类红队衡量 under-refusal 侧的鲁棒性；
+  ②同时报告真实流量上的 over-refusal 增量（production traffic refusal rate 增加 0.38%）与推理开销——
+  三个轴（漏拒、过拒、成本）一起报，而不是只宣传"拦住了多少攻击"。条件独立假设在实践中只近似成立
+  （同一条请求可能同时骗过两层），所以级联的实测 Pareto 前沿必须实测，不能只靠公式外推——notebook 会让你扫出来。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="paired"><span class="num">7</span>配对评测协议：McNemar 与版本回归监控</h2>
+
+  <p>实际工作中最常见的问题不是"绝对错误率是多少"，而是"<strong>配置 B 比配置 A 更好吗</strong>"
+  （新阈值、新分类器版本、新系统提示）。正确的协议是<strong>配对比较</strong>：两个配置跑<em>同一组请求</em>，
+  逐条比对，而不是各跑各的再比总分——配对消掉了请求难度这个最大的方差来源，统计功效高得多。</p>
+
+  <div class="math-block">
+  <p>对每条请求记录两配置是否做出正确决策，得到 2×2 配对表。设 $b$ = A 对 B 错的条数，$c$ = A 错 B 对的条数
+  （两者都对/都错的条数不携带差异信息）。零假设 $H_0$：两配置错误率相同，则每条不一致样本是 A 胜 / B 胜的公平硬币：</p>
+  $$ b \,\big|\, (b+c=n) \;\sim\; \mathrm{Binomial}\!\left(n, \tfrac12\right) \quad\text{under } H_0 $$
+  <p><span class="term">McNemar 检验</span>（精确二项版）的双侧 p 值：</p>
+  $$ p \;=\; \min\!\Big(1,\; 2\sum_{i=0}^{\min(b,c)} \binom{n}{i} 2^{-n}\Big) $$
+  <p>样本大时可用带连续性校正的卡方近似 $\chi^2=(|b-c|-1)^2/(b+c)$；notebook 中演示用近似版、练习 3 实现精确版。</p>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  注意 McNemar 只用不一致对 $(b,c)$ ——如果两个配置在 99% 的请求上行为一致，有效样本量就只有那 1%。
+  这解释了一个常见现象：在 1000 条的测试集上"看起来 B 好一点"却不显著，因为不一致对可能只有二三十条。
+  解法不是扩大总集，而是<strong>富集易翻转的边界样本</strong>（XSTest 类对照集正是天然的边界富集器）。</div>
+
+  <p><strong>版本回归监控</strong>把配对比较制度化：固定一个带版本号的金测试集（无害侧 + 有害侧），
+  每次模型/分类器/系统提示变更都跑配对比较，双向错误任一显著恶化即报警。三条工程纪律：
+  ①金集冻结、密封、防止进训练数据；②判定器与金集一起锁版本（§5）；③报警阈值用统计检验而非裸差值——
+  否则要么天天误报，要么把真回归当噪声放过。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="reporting"><span class="num">8</span>评测报告规范：双向错误都要报</h2>
+
+  <p>把全章收拢成一份可执行的报告清单。一份合格的拒绝校准评测报告必须包含：</p>
+
+  <table>
+    <thead><tr><th>必报项</th><th>内容</th><th>缺失时的问题</th></tr></thead>
+    <tbody>
+      <tr><td>双向错误率</td><td>over-refusal（无害侧）与 under-refusal（有害侧）各自的点估计</td><td>单向报告 = 隐藏一半混淆矩阵，无法判断是否"安全洗白"</td></tr>
+      <tr><td>置信区间</td><td>每个比率配 Wilson 区间（小样本/极端比率下显著优于正态近似）</td><td>n=50 测出 2% 与 n=5000 测出 2% 含义完全不同</td></tr>
+      <tr><td>判定器与版本</td><td>判定器类型、版本号、在金集上校准出的 $(\alpha_j,\beta_j)$</td><td>结果不可复现，跨期不可比（§5）</td></tr>
+      <tr><td>数据分布来源</td><td>测试集构成（对抗集 / 真实流量抽样）、版本、是否配对</td><td>对抗集上的 over-refusal 不能当真实流量的估计报出去（§2）</td></tr>
+      <tr><td>操作点上下文</td><td>当前阈值、所处 ROC 位置、与上一版本的配对比较结果（McNemar p 值）</td><td>读者无法判断"变化"是曲线移动还是操作点移动（§4）</td></tr>
+    </tbody>
+  </table>
+
+  <div class="math-block">
+  <p>比率的 <span class="term">Wilson 置信区间</span>（$k$ 次拒绝 / $n$ 条请求，$\hat p = k/n$，置信水平对应 $z$）：</p>
+  $$ \frac{\hat p + \frac{z^2}{2n}}{1+\frac{z^2}{n}} \;\pm\; \frac{z}{1+\frac{z^2}{n}}
+     \sqrt{\frac{\hat p(1-\hat p)}{n} + \frac{z^2}{4n^2}} $$
+  <p>选 Wilson 而非 $\hat p \pm z\sqrt{\hat p(1-\hat p)/n}$ 的原因：安全评测常在 $\hat p\approx 0$ 处工作
+  （如有害侧漏拒 0/200），正态近似区间会塌缩成 $[0,0]$ 的虚假确定性，Wilson 区间仍给出合理的非零上界。</p>
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  报告语言也要校准："0/200 漏拒" 应表述为 "漏拒率 95% Wilson 上界约 1.9%"，而不是"无漏拒"。
+  结合 §3 的 [Zou 2023] 文献认知：静态集上的零漏拒只对<em>该分布</em>成立，对抗压力下的结论需要红队证据（模块 03）支持，
+  且有保质期。这种"测到什么就只声明什么"的纪律，正是模块 07 safety case 论证的基本功。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>灰区行为的本体论</strong>：comply/refuse 二分正在失效——部分满足、安全改写、引导求助等中间行为越来越多。
+    如何定义与测量"响应质量条件于安全约束"的连续指标，而不是二值拒绝率？评测视角：rubric 设计与 judge 一致性测量是瓶颈。</li>
+    <li><strong>判定器的元评测</strong>：refusal judge 自身的 $(\alpha_j,\beta_j)$ 如何持续校准？judge 与被测模型同源
+    （都是 LLM）带来的相关误差会破坏 §5 的独立性假设，去偏公式随之失效。需要分层的人工金集与 judge 漂移监控。</li>
+    <li><strong>级联系统的联合优化与评测</strong>：多层阈值的 Pareto 前沿搜索维度随层数指数增长；各层错误的相关性结构
+    （什么样的请求同时骗过输入与输出分类器）缺乏系统刻画 [Anthropic 2025 只是开端]。</li>
+    <li><strong>分布漂移下的操作点维护</strong>：$\pi_0/\pi_1$ 与请求分布随时间漂移，固定阈值的实际 $(\alpha,\beta)$ 会悄悄移动。
+    如何在不持续标注的前提下监控操作点漂移（无标签漂移检测 + 抽样审计的结合）是开放的工程研究问题。</li>
+    <li><strong>over-refusal 的真实代价测量</strong>：用户流失、信任损失目前几乎只有轶事证据。把 $c_{\mathrm{or}}$
+    从拍脑袋变成可测量（A/B 实验、留存分析），才能让 §4 的代价比有实证基础。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>为什么"拒绝率高"不能证明"系统安全"？XSTest 的配对设计如何同时暴露两类错误？</li>
+      <li>用 competing objectives 与 mismatched generalization 解释：安全失败为什么集中在特定输入区域而非均匀分布？</li>
+      <li>写出 over-refusal / under-refusal 与 FPR / FNR 的对应关系，并推导期望代价最小化下最优操作点的切线条件。</li>
+      <li>判定器有 5% 对称误差时，测得的两系统拒绝率之差会被压缩多少？这对回归监控的报警阈值意味着什么？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../03_redteam_methodology/03_讲解.html"><div class="dir">← 上一章</div><div class="t">03 · 红队方法论</div></a>
+    <a class="next" href="../05_sandbagging_integrity/05_讲解.html"><div class="dir">下一章 →</div><div class="t">05 · Sandbagging 与评测完整性</div></a>
+  </div>
+
+</div>
+</body>
+</html>

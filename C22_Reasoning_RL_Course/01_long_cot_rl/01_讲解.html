@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · Long-CoT 与结果奖励</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · Long-CoT 与结果奖励</h1>
+  <p class="subtitle">结果奖励 RL、R1-Zero 范式、format+正确性奖励、reward shaping 与 hacking —— 拆解「只奖励最终答案，长思维链为何自发涌现」</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、概率与梯度、softmax、策略梯度直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_long_cot_rl.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">DeepSeek-R1 · OpenAI o1 · Williams REINFORCE</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">讲解 40 分钟 + notebook 70 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#outcome">结果奖励 RL：只认最终对错</a></li>
+      <li><a href="#pg">策略梯度：把高回报动作推高</a></li>
+      <li><a href="#baseline">基线与优势：降方差不引偏差</a></li>
+      <li><a href="#temp">温度采样：探索与利用</a></li>
+      <li><a href="#format">Format 奖励与奖励塑形</a></li>
+      <li><a href="#emerge">长 CoT 为何涌现</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="outcome"><span class="num">1</span>结果奖励 RL：只认最终对错</h2>
+  <p>上一模块我们看到，推理 RL 的奖励来自<strong>可验证的最终答案</strong>而非人类偏好。这一模块把这个想法做实：<strong>结果奖励强化学习（outcome-reward RL）</strong>——只在一整条推理生成结束、给出最终答案时，用一个程序判对错、给一个标量奖励（对=1，错=0），中间的每一个 token、每一步推理都<em>不直接</em>给奖励。然后用策略梯度把「能导向正确答案」的生成方式概率推高。</p>  <p>这听起来朴素到近乎天真：<strong>一道几千 token 的推理，全程只在最后给一个 0/1 的分</strong>。中间那么多步，对的对在哪、错的错在哪，一概不告诉模型。直觉上这信号稀疏得可怜，怎么可能学得动？但 2024–2025 年的实践（尤其 DeepSeek-R1-Zero）给出了一个反直觉的答案：<strong>不仅学得动，而且模型会自发学会「想得更久、更细、会回头检查」</strong>——长思维链不是被教出来的，是被这个稀疏奖励<em>逼</em>出来的。本模块就来拆解这个机制。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把它想成教小孩解数学题，但你只在他写出最终答案后说「对」或「错」，从不指点中间步骤。一开始他乱蒙；但只要他偶尔蒙对、你就说「对」，久而久之他会发现：<strong>多写几步、检查一遍、换个方法再算一次</strong>，蒙对的概率更高。于是「认真想」这个行为本身，因为它<em>提高了最终答对率</em>，被奖励信号一点点强化出来——尽管你从没直接奖励过「认真想」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：设策略 $\pi_\theta$ 生成轨迹 $\tau=(s_0,a_0,\dots,a_{T-1})$（在 LLM 里就是逐 token 生成），奖励只在末端 $R(\tau)\in\{0,1\}$。目标是最大化期望回报 $J(\theta)=\mathbb{E}_{\tau\sim\pi_\theta}[R(\tau)]$。稀疏末端奖励意味着每一步 $a_t$ 的「功劳」都来自同一个 $R(\tau)$——这就是 <span class="term">credit assignment</span> 的难点，也是为什么需要大量采样与方差缩减才能学动。</p></div>
+  </div>  <p>这里要破除一个直觉上的疑虑：「<strong>只有最后一个 0/1 信号，怎么可能教会几千 token 的复杂推理？</strong>」答案藏在<strong>两个放大器</strong>里。第一个是<em>采样的多样性</em>：模型对同一题生成很多条不同的推理，其中<em>碰巧</em>包含更优策略的那些更容易答对、被强化——这是一种「变异+选择」。第二个是<em>梯度的累积</em>：每条轨迹的微弱信号（对/错）经过成千上万道题、千万次更新累加起来，足以把「有用的推理模式」从噪声里雕刻出来。所以稀疏不等于无力——只要<strong>采样够多、迭代够久、基座有潜力</strong>，一个 0/1 信号也能驱动出惊人的复杂行为。这正是为什么 R1-Zero 需要<em>大规模</em>的 RL（海量采样 + 长时间训练）才能涌现长 CoT，也是为什么它如此昂贵却如此有效。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>结果奖励 RL 优化的是「整条生成最终答对的概率」，而长 CoT、反思、换路这些行为之所以涌现，是因为它们恰好提升了这个概率</strong>。模型不是被教会推理的，是被一个「只认对错、不认过程」的奖励，筛选出了「能提高对错率的过程」。这是 R1-Zero 最深刻的发现，也是本模块所有数学和代码的归宿。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pg"><span class="num">2</span>策略梯度：把高回报动作推高</h2>
+  <h3>策略梯度：把高回报动作的概率推高</h3>  <p>结果奖励 RL 的引擎是<strong>策略梯度</strong>。我们要对期望回报 $J(\theta)=\mathbb{E}_{\tau\sim\pi_\theta}[R(\tau)]$ 求梯度并上升。难点在于：期望是对<em>策略自己生成的分布</em>求的，参数 $\theta$ 既在被求期望的量里、又在采样分布里，不能直接对样本求导。解法是<strong>对数导数技巧</strong>（log-derivative trick）：</p>  <div class="math-block">\[\nabla_\theta J(\theta)=\mathbb{E}_{\tau\sim\pi_\theta}\!\big[\,R(\tau)\,\nabla_\theta\log\pi_\theta(\tau)\,\big]=\mathbb{E}_{\tau}\!\Big[\,R(\tau)\sum_{t}\nabla_\theta\log\pi_\theta(a_t\mid s_t)\Big]\]</div>  <p>推导只用一步：$\nabla_\theta\pi_\theta=\pi_\theta\,\nabla_\theta\log\pi_\theta$，把对采样分布的梯度变回一个可用样本平均估计的期望。<strong>它的含义美得惊人</strong>：梯度 = 用回报 $R(\tau)$ 加权的「让这条轨迹更可能发生」的方向之和。回报高的轨迹，$\nabla\log\pi$ 被正向放大——它的每个动作概率被推高；回报为 0 的轨迹则没有贡献。于是优化的净效果是：<strong>让导向高回报的生成方式越来越可能</strong>。</p>  <p>具体到我们的算法（REINFORCE）：采一批轨迹，对每条算 $R(\tau)\sum_t\nabla\log\pi_\theta(a_t\mid s_t)$，求平均，沿它上升一步。<strong>注意结果奖励的特殊性</strong>：因为 $R$ 只在末端、整条轨迹共享同一个标量，所以这条轨迹里<em>每一步</em>的 $\nabla\log\pi$ 都被同一个 $R$ 加权——对的轨迹整条被强化，错的整条被压制。这正是「只认最终对错」如何反向作用到每一步的数学机制。</p>  <p>把它落到<strong>语言模型</strong>上更具体：一条「轨迹」就是一次完整生成，「动作」是每一个 token，「状态」是已生成的前缀。于是 $\sum_t\nabla\log\pi_\theta(a_t\mid s_t)$ 就是<strong>整条回答里每个 token 的对数概率梯度之和</strong>——这恰好是把这条回答喂给模型做一次「教师强制」前向、对生成的 token 求和交叉熵再反传得到的东西。所以结果奖励 RL 在实现上惊人地简单：<em>采样生成 → 判对错得到 R → 以 R（减基线）为权重，对这条回答做一次带权的「下一 token 预测」梯度</em>。对的回答 = 正权重 = 当作好样本去模仿；错的回答 = 负权重 = 反向推开。本课用 softmax 表格策略把这套逻辑做小、做透，但每一步的数学与真实 LLM 上<strong>逐字对应</strong>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>策略梯度无偏，但<strong>方差极大</strong>。如果只有偶尔一条轨迹答对（$R=1$）、其余全 0，那大多数样本的梯度是 0，少数非零样本主导更新，噪声巨大、训练剧烈震荡。这就是为什么裸 REINFORCE 在稀疏奖励下几乎训不动——必须靠<strong>基线</strong>降方差（下一节）。真实推理 RL 里，这也是为什么要对每个 prompt 采<em>一大组</em>样本（GRPO 的 group），把信号从噪声里捞出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="baseline"><span class="num">3</span>基线与优势：降方差不引偏差</h2>
+  <h3>基线与优势：降方差而不引入偏差</h3>  <p>降低策略梯度方差最重要的工具是<strong>基线（baseline）</strong>：从回报里减去一个与<em>动作无关</em>的量 $b$，用 $(R-b)$ 替代 $R$ 当权重。关键性质是<strong>减基线不改变梯度的期望（无偏）</strong>，因为：</p>  <div class="math-block">\[\mathbb{E}_{\tau}\big[\,b\,\nabla_\theta\log\pi_\theta(\tau)\,\big]=b\,\nabla_\theta\!\!\int \pi_\theta(\tau)\,d\tau=b\,\nabla_\theta 1=0\]</div>  <p>即任何与动作无关的常数（或只依赖状态的 $b(s)$）乘以 $\nabla\log\pi$ 的期望都是 0——减它不动期望、只动方差。减去回报的均值后，权重 $(R-b)$ 变成了<strong>优势（advantage）</strong>的估计：这个动作比「平均水平」好多少。好于平均（$A>0$）就推高概率，差于平均（$A<0$）就压低。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>没有基线时，模型只知道「这条对了」（推高）或「这条没对」（不动）。有了基线（比如这批的平均答对率），它知道的是「这条比平均<strong>更好还是更差</strong>」——信息密度高得多。就像考试，知道自己 60 分没意义，知道自己「比班级平均高 10 分还是低 10 分」才知道该往哪使劲。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>最优基线（最小化方差）是回报的期望 $\mathbb{E}[R]$。在结果奖励里，一个 prompt 的 $\mathbb{E}[R]$ 恰是它的<strong>答对率</strong>。PPO 用一个学习的价值网络 $V_\phi(s)$ 来估它；而 <span class="term">GRPO</span> 的洞察是：<strong>直接用同一 prompt 那一组样本的平均回报当基线</strong>——组均值就是 $\mathbb{E}[R]$ 的蒙特卡洛估计，免去了训练 critic。这是下一模块的核心，本模块先用「组均值基线」尝鲜。</p></div>
+  </div>  <h4>一个手算例子：基线如何改写梯度</h4>  <p>把数字摆出来感受一下。某 prompt 采 4 条回答，回报 $\{1,0,0,1\}$（两对两错）。<strong>无基线</strong>时，权重就是 $R$ 本身 $\{1,0,0,1\}$——两条对的回答被推高，两条错的<em>权重为 0</em>、对更新<strong>毫无贡献</strong>（错的回答既没被推高、也没被压低，等于白采）。<strong>减组均值基线</strong>（$\bar r=0.5$）后，权重变成优势 $\{+0.5,-0.5,-0.5,+0.5\}$——现在两条错的回答<strong>被实实在在地压低</strong>了。差别是本质的：无基线只会「奖励对的」，减基线则同时「奖励对的、惩罚错的」，<strong>信息量翻倍、且梯度零均值（zero-sum）</strong>，不会让所有概率一起漂移。这就是为什么同样 4 条样本，减基线后的更新方向稳定得多。</p>  <p>本模块 notebook 会让你<strong>亲眼看到基线的威力</strong>：在同一个玩具任务上，对比「无基线 REINFORCE」与「减组均值基线」的梯度方差与学习曲线——同样的样本数，后者方差小一个量级、学得又快又稳。这不是锦上添花，而是稀疏奖励 RL 能否工作的<strong>分水岭</strong>。更深一层看，基线之所以能降方差却不引偏差，根源在于它<strong>只改变每条轨迹的「参照点」而不改变它们之间的相对高低</strong>：把所有回报同时减去一个常数，谁比谁好的排序丝毫未变，但「围绕 0 上下波动」的权重比「全是大正数」的权重在求和时正负相消、方差天然更小。这个「选对参照点」的思想会在下一模块的 GRPO 里被推到极致——用<em>同组样本的均值</em>当参照点，连价值网络都省了。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="temp"><span class="num">4</span>温度采样：探索与利用</h2>
+  <h3>温度采样：探索与利用的旋钮</h3>  <p>RL 要工作，策略必须<strong>探索</strong>——尝试不同的生成、偶尔撞对、再强化。控制探索强度的核心旋钮是采样<strong>温度（temperature）</strong> $\tau_{\text{temp}}$：把 logits 除以温度再 softmax。</p>  <div class="math-block">\[\pi(a\mid s)=\frac{\exp(z_a/\tau_{\text{temp}})}{\sum_{a'}\exp(z_{a'}/\tau_{\text{temp}})}\]</div>  <p>温度的作用直观而关键：$\tau_{\text{temp}}\to 0$ 时分布趋于<strong>贪心</strong>（永远选最高 logit，零探索）；$\tau_{\text{temp}}\to\infty$ 时趋于<strong>均匀</strong>（纯随机，全是探索）；$\tau_{\text{temp}}=1$ 是模型的原始分布。训练时通常用<em>较高温度</em>（如 0.8–1.0）保证多样性、让一组样本覆盖不同解法，从而至少有几条能撞对、产生有用的学习信号；推理/最终作答时则用<em>较低温度</em>（甚至贪心）求稳定正确。</p>  <table>
+    <thead><tr><th>温度</th><th>分布形态</th><th>探索程度</th><th>典型用途</th></tr></thead>
+    <tbody>
+      <tr><td>$\to 0$（贪心）</td><td>尖峰（onehot）</td><td>无</td><td>最终作答、确定性输出</td></tr>
+      <tr><td>0.6–0.8</td><td>略平滑</td><td>中</td><td>RL 训练 / 自洽投票的样本</td></tr>
+      <tr><td>1.0</td><td>模型原始</td><td>较高</td><td>标准采样</td></tr>
+      <tr><td>$> 1.2$</td><td>趋于均匀</td><td>高（噪声大）</td><td>强制多样化（少用，易出垃圾）</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">熵塌缩</span>
+    <p>温度是把双刃剑，藏着推理 RL 的一个著名陷阱——<strong>熵塌缩（entropy collapse）</strong>。RL 会不断推高「当前看起来好」的动作概率，若不加约束，策略熵会越降越低、迅速收敛到单一模式，之后<strong>再也不探索、无法发现更好的解，训练提前死亡</strong>。对策是：训练保持足够温度、加<span class="term">entropy bonus</span>（在目标里奖励高熵）、或用 KL 正则间接拉住。本模块 notebook 会构造一个熵塌缩的例子让你看到它怎么发生、加熵奖励怎么救。</p>
+  </div>  <p>把温度想成 RL 的「胆量旋钮」：太怂（低温）的策略守着已知套路、永远发现不了新解法；太莽（高温）的策略满嘴跑火车、撞对纯靠运气、学不到稳定模式。推理 RL 的实践智慧，很大一部分就是<strong>在训练全程维持恰到好处的探索</strong>——既要有人撞对产生信号，又不能乱到无法收敛。这也是为什么 group sampling（一次采一大组）如此重要：组越大，越可能有几条撞对，稀疏奖励就越不容易把训练饿死。</p>  <p>这里值得点明探索在<strong>结果奖励 RL 里的特殊地位</strong>。普通监督学习没有探索问题（标签直接给你）；但结果奖励 RL 的学习信号<strong>完全依赖「自己撞对」</strong>——如果一道题模型从没采样出过正确解（哪怕一次），那它的回报恒为 0、优势恒为 0、<strong>梯度恒为 0</strong>，这道题对训练<em>毫无贡献</em>。于是探索不足会导致一个隐蔽的失败：模型在<em>它已经会的题</em>上反复强化，却<strong>永远学不会它还不会的题</strong>（因为撞不对、没信号）。这就是为什么温度、熵、组大小这些「探索旋钮」在推理 RL 里不是调参细节，而是<strong>决定能力边界能否拓展</strong>的关键——它们决定了「模型有没有机会撞对那些它当前不会、但有潜力学会的题」。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="format"><span class="num">5</span>Format 奖励与奖励塑形</h2>
+  <h3>Format 奖励与奖励塑形</h3>  <p>纯结果奖励有个工程麻烦：模型一开始输出杂乱，你<strong>抽不出最终答案</strong>来判分。R1-Zero 的解法是叠加一个<strong>格式奖励（format reward）</strong>：要求模型把推理放进规定结构，比如 <code>&lt;think&gt;...&lt;/think&gt;&lt;answer&gt;...&lt;/answer&gt;</code>，遵守结构就给一点小奖励。</p>  <pre><code>总奖励 = 正确性奖励 + 格式奖励
+  正确性: &lt;answer&gt; 里抽出的答案 == 标准答案 ? +1 : 0
+  格式  : 输出恰好含一对 &lt;think&gt;&lt;/think&gt; 和一对 &lt;answer&gt;&lt;/answer&gt; ? +0.1 : 0
+（R1 风格：格式分远小于正确性分，只为「让答案可抽取」，不喧宾夺主）</code></pre>  <p>这是<strong>奖励塑形（reward shaping）</strong>的一个温和实例——往稀疏的主奖励上加一点辅助信号，引导早期学习。但奖励塑形是<strong>危险的艺术</strong>：加得好（如格式奖励，它和「答对」目标不冲突、只是让答案可读可抽），训练更顺；加得不好（奖励某种<em>代理指标</em>如「CoT 长度」「出现某些词」），模型会<strong>钻空子</strong>——这就是 <span class="term">reward hacking</span>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>塑形奖励像给迷路的人立路标。立「往这边是出口」的真路标（格式：把答案放规定地方），帮助很大；立「走得越多奖励越多」的假路标，他会绕圈刷里程而永远不出去。<strong>好的塑形奖励指向真目标，坏的塑形奖励替换了真目标</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，理论上<strong>安全</strong>的塑形是 <span class="term">potential-based shaping</span>（Ng 1999）：$F(s,s')=\gamma\Phi(s')-\Phi(s)$ 形式的塑形<em>不改变最优策略</em>。格式奖励近似安全是因为它与正确性弱耦合、且权重极小。但任何<strong>数据驱动的代理奖励</strong>（如学一个 PRM 来塑形）都不享有这个保证——优化它过头会偏离真目标，这正是模块 03 的主题。</p></div>
+  </div>  <p>还有一类常见的塑形是<strong>长度惩罚 / 长度奖励</strong>，但二者都暗藏陷阱。奖励长度，模型学会无意义灌水把 CoT 撑长；惩罚长度，又会扼杀真正需要的深入推理（难题本就该想得久）。R1 系列的经验是：<strong>长度应当是「答对」这个目标的内生结果，而非外加的目标</strong>——你只管奖励正确，需要多长的推理才能稳定答对，模型自己会找到；人为规定长度，反而破坏了这个自适应。这与下一节「长 CoT 涌现」的因果链直接呼应。</p>  <div class="callout warn"><span class="label"></span>
+    <p>R1-Zero 的一个微妙观察：研究者发现给<strong>「长度」或「反思词」直接奖励反而有害</strong>——模型会学会无意义地灌水、复读「wait, let me reconsider」却不真正纠错。真正有效的是<strong>只奖励最终正确性 + 极轻的格式约束</strong>，让长 CoT 作为「提高正确率」的<em>副产品</em>自然涌现，而不是直接拿长度当目标。<strong>这再次印证：能 hack 的代理别直接优化</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="emerge"><span class="num">6</span>长 CoT 为何涌现</h2>
+  <h3>长 CoT 为何涌现：一个可计算的解释</h3>  <p>现在回答本模块的核心问题：<strong>只奖励最终答案，为什么推理会自发变长、变得会反思？</strong>答案不玄学，可以用一句话概括并在 notebook 里量化：<strong>因为「更长、含检查与重试的推理」客观上提高了最终答对的概率，于是被结果奖励选择了出来</strong>。</p>  <p>用一个可计算的模型说清。假设一道难题，模型一次直接作答的正确率是 $p$（较低）。但如果它的生成策略允许<strong>自我检查并在发现可能错误时重试</strong>，那么哪怕检查不完美，多一次「审视+可能纠正」的机会，整体答对率就会从 $p$ 升到某个 $p'>p$。于是在结果奖励下，「会检查、会重试」的生成方式<em>回报期望更高</em>，策略梯度就会推高它的概率——模型逐渐倾向于生成这种更长、含验证的轨迹。<strong>长度本身不是目标，提高正确率才是；长 CoT 只是达到这个目标的手段，被奖励顺手选了出来</strong>。</p>  <div class="ascii">为什么长 CoT 涌现（结果奖励下的「自然选择」）
+
+  短而直的生成   ──采样──▶  正确率 p（低）   ──结果奖励──▶  期望回报 p
+  长而含检查的生成──采样──▶  正确率 p'&gt;p     ──结果奖励──▶  期望回报 p'
+                                                              │
+   策略梯度：回报高的生成方式被推高概率  ◀──────────────────────┘
+   =&gt; 「会检查/会重试/会换路」的长 CoT 因为答对率更高，被一点点强化出来
+   =&gt; 长度、反思 = 提高正确率的『副产品』，而非被直接奖励的目标</div>  <p>这个解释有几个<strong>可验证的推论</strong>，notebook 会逐一检查：①只有当「检查/重试」真能提升正确率时，长 CoT 才被强化（如果检查是噪声、不提升 $p$，长度不会涨）；②题目越难（$p$ 越低、提升空间越大），涌现的 CoT 越长——这正是实践中观察到的「难题想得久」；③直接奖励长度会破坏这个机制（模型刷长度而非真检查）。本模块 notebook 用一个<strong>两阶段玩具任务</strong>（先猜、可选地花预算检查纠正）把这条「长度 ↔ 正确率」的因果链做成可跑的实验，让你看到结果奖励如何<em>仅凭对错信号</em>就把「愿意多想」的策略选出来。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把整件事浓缩成一句可以背下来的话：<strong>结果奖励 RL = 对「生成方式」做自然选择，适应度 = 最终答对率</strong>。凡是能提高答对率的行为（多想几步、回头检查、换个解法、排除明显错误），都会因为后代（高回报轨迹）更多而被保留下来。长思维链、反思、自我验证不是被<em>设计</em>的，是在「答对」这个唯一的选择压力下<em>进化</em>出来的。这就是 o1/R1 范式最深刻、也最优雅的地方。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <p>结果奖励 RL 把推理模型从「靠提示词诱导」推进到「靠 RL 内化」，是 2024–2025 年最重要的进展之一。但它远未被完全理解——一个朴素到近乎天真的想法（只奖励最终对错）竟能涌现出复杂的推理行为，这本身就提出了一连串深刻问题。前沿有几条活跃的线：</p>  <ul>
+    <li><strong>RL 是「激发」还是「学习」新能力？</strong> R1-Zero 表明纯 RL 能涌现长 CoT，但一个争论是：RL 主要是把基座模型<em>本就潜在具备</em>的推理能力<strong>激发/对齐</strong>出来（采样分布重整），还是真的<strong>学到了新算法</strong>？若主要是前者，则 RL 的天花板受限于基座——这关系到「该把算力投预训练还是 RL」。</li>
+    <li><strong>熵与探索的长期维持</strong>。如何在长时间 RL 中防止熵塌缩、维持有效探索，是训练能否持续提升的关键。entropy bonus、KL 退火、clip-higher（DAPO）、按难度调温度等都是在解这个问题，但缺乏统一理论。</li>
+    <li><strong>可验证域之外怎么办？</strong> 结果奖励的魔力依赖「答案可自动判对错」。把这套范式推广到开放式写作、多步 agent、科学发现等<em>没有清晰对错</em>的领域，需要学习的奖励/验证器，立刻撞上 reward hacking（模块 03）。这是当前最大的开放问题之一。</li>
+    <li><strong>信用分配的粒度</strong>。结果奖励把功劳均摊给所有 token，粗糙但稳。能否在不引入可被 hack 的学习奖励的前提下，得到更细的步级信用（如基于答案的回溯、可验证的中间检查点）？这是连接本模块与 PRM（模块 03）的桥。</li>
+    <li><strong>RL 的样本效率与稳定性</strong>。稀疏奖励 + 大模型 RL 极其昂贵且不稳。组采样、优势归一化、loss 粒度（token vs sequence）、动态采样等工程改进（DAPO、VAPO 等）层出不穷，哪些是本质、哪些是调参，尚无定论。</li>
+  </ul>  <p>把结果奖励放到「奖励信号谱系」里看，能更清楚它的取舍。下面这张表预览了后续模块要展开的对比——结果奖励处在「最稀疏但最不可 hack」的一端：</p>  <table>
+    <thead><tr><th>奖励类型</th><th>信号密度</th><th>可被 hack？</th><th>主要用途</th><th>本课模块</th></tr></thead>
+    <tbody>
+      <tr><td><strong>结果/规则奖励</strong></td><td>稀疏（末端 0/1）</td><td><strong>几乎不可</strong>（答案对就是对）</td><td>训练时 RL（放手探索）</td><td>01–02</td></tr>
+      <tr><td>过程奖励 PRM</td><td>密（每步打分）</td><td><strong>可</strong>（学习的代理）</td><td>推理时 verifier/重排</td><td>03–04</td></tr>
+      <tr><td>偏好奖励 RM</td><td>解级（一条一分）</td><td>可（学习的代理）</td><td>RLHF 对齐</td><td>对比项</td></tr>
+    </tbody>
+  </table>  <p>这张表浓缩了一条贯穿全课的暗线：<strong>信号越密越好用，但越密越学习化、越容易被 hack</strong>。结果奖励用「稀疏」换来了「不可 hack」，这正是它能放手大规模探索的底气。</p>  <p>把这些前沿放到一起看，会发现它们围绕一个共同的张力：<strong>结果奖励 RL 的『简单』既是它的力量，也是它的局限</strong>。简单（只认对错）让它<em>不可 hack、可放手探索</em>，这是力量；但简单也意味着<em>信号稀疏、信用粗糙、只在可验证域有效</em>，这是局限。接下来的三个模块，可以看作对这个张力的三种回应：模块 02（GRPO）让这个简单信号<em>训得更稳更省</em>；模块 03（PRM）试图<em>加密信号、细化信用</em>，但立刻撞上「学习奖励会被 hack」的代价；模块 04–05 则<em>绕开训练</em>，在推理时用搜索把能力榨出来。理解结果奖励 RL 的力量与局限，是理解后续一切的钥匙。</p>  <div class="callout paper"><span class="label"></span>
+    <p>奠基与前沿：<strong>DeepSeek-R1</strong>（R1-Zero 纯 RL 涌现长 CoT 的核心实证）、<strong>OpenAI o1 博客</strong>（范式宣告）、<strong>Williams 1992</strong>（REINFORCE 与基线的数学地基）、<strong>DAPO</strong>（clip-higher / token-level loss / 动态采样等探索维持技巧）。下一模块把本模块的「组均值基线」正式升级为 <span class="term">GRPO</span>——R1 真正使用的训练算法。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_grpo/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · GRPO 从零</div></a>
+  </div>
+
+</div>
+</body>
+</html>

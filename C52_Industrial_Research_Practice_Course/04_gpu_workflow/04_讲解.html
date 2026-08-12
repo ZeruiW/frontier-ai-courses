@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 真机 GPU 工作流</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 真机 GPU 工作流</h1>
+  <p class="subtitle">显存是算术题（优化器状态 12N 比参数还大）· OOM 诊断树按成本排序 · 「跑了 500 步才 OOM」是长样本不是泄漏 · 四层版本链与 CUDA_LAUNCH_BLOCKING · 看利用率的波动模式 · MFU 双向估算</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00；C36（GPU 与 kernel）、C39（分布式训练）会让本模块更好懂，但不必需</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_gpu_workflow.ipynb（用 numpy 复现显存与时间的账本，不需要 GPU）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">NVIDIA 的 CUDA Compatibility 文档、nvidia-smi 手册、PyTorch 的 memory management 与 profiler 文档</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么要专门讲「真机」</a></li>
+      <li><a href="#memory">显存分解：把 OOM 变成一道算术题</a></li>
+      <li><a href="#oom">OOM 诊断树：按顺序排除</a></li>
+      <li><a href="#version">版本矩阵：环境即依赖</a></li>
+      <li><a href="#profile">性能诊断：三个层次的问题</a></li>
+      <li><a href="#interference">共享集群：不是你的问题也会变成你的问题</a></li>
+      <li><a href="#plan">算力规划：在申请之前算清楚</a></li>
+      <li><a href="#frontier">生态动态与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么要专门讲「真机」</h2>
+  <p>前面所有课程讲的是<em>算法与实现</em>。这一模块讲的是另一类知识：<strong>当你真的坐在一台带 8 张 GPU 的机器前，怎么让它按你的预期工作</strong>。这类知识有三个特点，使得它必须被单独教：</p>  <ul>
+    <li><strong>它不在论文里</strong>。没有一篇论文会告诉你「驱动 525 配 CUDA 12.4 会怎样」。</li>
+    <li><strong>它的失败模式是「环境」而不是「代码」</strong>。同一份代码在你的机器上跑得好好的，在集群上 OOM——问题不在代码里，所以读代码找不到。</li>
+    <li><strong>它有明确的正确答案，且可以提前算出来</strong>。显存够不够、要不要梯度检查点、batch 能开多大——<em>这些都是算术题，不需要试</em>。而绝大多数人是靠试的。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第三点是本模块的核心主张：<strong>「跑一下看看会不会 OOM」是一种昂贵且低信息量的做法</strong>。它占用一次排队、可能等几十分钟、失败后你只知道「不行」而不知道「差多少」。<em>而显存占用是可以在纸上算准到 ±10% 的</em>——算一遍需要两分钟，能直接告诉你「差 12GB，开梯度检查点就够了」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>同样的道理适用于时间估算、通信开销、以及版本兼容。<strong>本模块的做法是把这些「靠试」的问题全部变成「可计算」的问题</strong>，并把计算过程写成可运行的函数。<em>这些函数在没有 GPU 的机器上也能跑</em>——这正是它们的价值：<strong>在申请算力之前就知道答案</strong>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个能立刻改变工作方式的习惯：<strong>在提交任何训练任务之前，先写下三个数字——预计显存、预计单步时间、预计总时长</strong>。任务跑起来后对照实际值。<em>前几次会差很多，但很快你的估算会准到 ±20%</em>。到那时，你就能在会议上直接回答「这个实验要多久、要几张卡」，而不是「我跑跑看」。这个能力在工业界的价值被严重低估。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="memory"><span class="num">2</span>显存分解：把 OOM 变成一道算术题</h2>
+  <p>训练时的显存占用可以分解成<strong>五项</strong>，每一项都能单独算出来：</p>  <div class="math-block">\[M_{total} = \underbrace{M_{param}}_{\text{参数}} + \underbrace{M_{grad}}_{\text{梯度}} + \underbrace{M_{opt}}_{\text{优化器状态}} + \underbrace{M_{act}}_{\text{激活}} + \underbrace{M_{misc}}_{\text{碎片/缓冲/CUDA上下文}}\]</div>  <table>
+    <thead><tr><th>项</th><th>公式</th><th>AdamW + bf16 混合精度下（N=参数量）</th><th>受什么影响</th></tr></thead>
+    <tbody>
+      <tr><td><strong>参数</strong></td><td><code>N × bytes</code></td><td><code>2N</code>（bf16）<em>或</em> <code>4N</code>（fp32 主权重）</td><td>精度策略</td></tr>
+      <tr><td><strong>梯度</strong></td><td><code>N × bytes</code></td><td><code>2N</code>（bf16）</td><td>精度；是否累积</td></tr>
+      <tr><td><strong>优化器状态</strong></td><td><code>N × k</code></td><td><strong><code>12N</code></strong>（fp32 主权重 4N + m 4N + v 4N）</td><td><strong>优化器选择（最大的一项）</strong></td></tr>
+      <tr><td><strong>激活</strong></td><td><code>∝ B × L × H × layers</code></td><td><strong>可变，常常是主导项</strong></td><td>batch、序列长、是否梯度检查点</td></tr>
+      <tr><td><strong>杂项</strong></td><td>≈ 1–2 GB</td><td>CUDA 上下文、cuBLAS 工作区、分配器碎片</td><td>几乎固定</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第一个反直觉的事实：优化器状态通常比参数本身大得多</strong>。AdamW 混合精度下，每个参数要存 fp32 主权重(4B) + 一阶动量(4B) + 二阶动量(4B) = 12 字节，加上 bf16 参数(2B)与梯度(2B)，<em>总共 16 字节/参数</em>。<strong>一个 7B 模型光是「模型相关」的显存就要 112 GB</strong>——远超单张 80GB 卡。这解释了为什么全参数微调 7B 需要多卡或 ZeRO 分片，而 LoRA（只训 0.1% 参数）能在单卡跑。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>第二个反直觉的事实：激活显存常常是主导项，而且它随 batch 与序列长线性/平方增长</strong>。Transformer 每层的激活约 <code>B·L·H·(10 + 24/H·L)</code> 量级（后一项是注意力矩阵，<em>随序列长平方增长</em>，除非用 FlashAttention）。<em>所以「减小 batch」几乎总是最有效的 OOM 急救手段，而「序列长砍半」对长序列场景的效果是四倍</em>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>算显存时最常被忘掉的是<strong>「杂项」的 1–2 GB</strong>与<strong>分配器碎片</strong>。PyTorch 的缓存分配器会保留已释放的块，<code>nvidia-smi</code> 显示的占用通常<em>高于</em> <code>torch.cuda.memory_allocated()</code>。<em>如果你算出来「刚好够」，实际上大概率会 OOM</em>。<strong>留 10–15% 余量是工程常识，不是保守</strong>。另外注意：OOM 也可能发生在<em>峰值</em>而非稳态——反向传播时梯度与激活同时存在的那一瞬间才是峰值。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="oom"><span class="num">3</span>OOM 诊断树：按顺序排除</h2>
+  <div class="ascii">OOM 了 —— 按这个顺序排查（从最便宜到最贵）
+
+① 是不是**峰值**而不是稳态？
+   症状：跑了几步才 OOM / 只在某个特别长的样本上 OOM
+   → 按最长样本算，不是按平均；检查有没有长度排序的 batch sampler
+
+② 是不是**碎片**？
+   症状：memory_allocated 远小于 nvidia-smi 显示的占用
+   → PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+   → 避免频繁变化的形状（每种形状一批新的分配块）
+
+③ **减小 batch**（最有效，几乎线性）
+   → 配合梯度累积保持有效 batch 不变（C50 模块 03）
+   ⚠️ 但 BatchNorm 的统计会变；LayerNorm 不受影响
+
+④ **梯度检查点**（激活显存降到 ~√layers，换 ~30% 额外计算）
+   → 单卡上性价比最高的一招
+
+⑤ **换优化器**：AdamW(12N) → 8bit Adam(6N) → SGD+momentum(4N)
+   → 对大模型效果显著，但可能影响收敛
+
+⑥ **参数高效微调**：LoRA 让优化器状态从 12N 降到 12·(0.001N)
+   → 幅度最大的一招（C50 模块 04）
+
+⑦ **分片 / 多卡**：ZeRO-2（梯度+优化器分片）→ ZeRO-3（参数也分片）
+   → 引入通信开销，需要真的多卡（C39）
+
+⑧ 换更大的卡 / 用 CPU offload
+   → 最后手段：offload 会让速度掉 3–10×</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这棵树的顺序不是随便排的，它按<strong>「成本 / 收益」</strong>排序：前两步是免费的（改配置）；③④是几乎免费的（少量计算换大量显存）；⑤⑥会影响训练行为（要验证）；⑦⑧要改架构或花钱。<em>绝大多数 OOM 在 ③④ 就解决了</em>，而很多人直接跳到 ⑦。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第 ① 步值得特别强调，因为它最容易被误诊：<strong>「跑了 500 步才 OOM」几乎一定是遇到了一个特别长的样本</strong>，而不是「显存慢慢泄漏」。<em>解法不是减小平均 batch，而是按<strong>最长样本</strong>规划显存，或者用 token-budget 的动态 batch（把「每批 32 条」改成「每批 8192 token」）</em>。后者是变长序列训练的标准做法，能同时解决 OOM 与 padding 浪费两个问题。</p></div>
+  </div>  <div class="callout danger"><span class="label">nvidia-smi 不是真实占用</span>
+    <p>一个必须知道的陷阱：<strong><code>nvidia-smi</code> 显示的显存占用不会随 Python 里的 <code>del</code> 立刻下降</strong>，因为 PyTorch 的缓存分配器持有着它。<em>这会让人误以为「内存没释放」并去找不存在的泄漏</em>。<strong>要看真实占用用 <code>torch.cuda.memory_allocated()</code>（当前）与 <code>max_memory_allocated()</code>（峰值）</strong>；<code>torch.cuda.empty_cache()</code> 能把缓存还给驱动但会让后续分配变慢，<em>只在需要给别的进程腾地方时用，不要放在训练循环里</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="version"><span class="num">4</span>版本矩阵：环境即依赖</h2>
+  <p>GPU 栈是一个<strong>四层依赖链</strong>，任何一层不匹配都会失败，而失败信息常常指向错误的方向。</p>  <div class="ascii">GPU 硬件 (compute capability, 如 A100=8.0, H100=9.0, RTX4090=8.9)
+   ↑ 必须被支持
+NVIDIA 驱动 (如 550.54)  ←── 这一层通常由集群管理员控制，你改不了
+   ↑ 驱动版本 &gt;= CUDA runtime 的最低要求（除非启用 forward compatibility）
+CUDA runtime (如 12.1)   ←── 通常随 PyTorch wheel 一起装（cu121）
+   ↑
+框架 (torch 2.4.1+cu121)
+   ↑ 必须与
+其它编译扩展 (flash-attn, xformers, apex, bitsandbytes, deepspeed)
+   —— **这些是按 (torch 版本 × CUDA 版本 × Python 版本) 编译的，最容易崩**</div>  <table>
+    <thead><tr><th>症状</th><th>真正的原因</th><th>怎么确认</th></tr></thead>
+    <tbody>
+      <tr><td><code>CUDA driver version is insufficient</code></td><td>驱动版本 &lt; CUDA runtime 要求</td><td><code>nvidia-smi</code> 看驱动版本，对照 CUDA 兼容表</td></tr>
+      <tr><td><code>no kernel image is available</code></td><td><strong>编译时没有包含这张卡的 compute capability</strong></td><td><code>torch.cuda.get_arch_list()</code> 看编译进了哪些 sm_XX</td></tr>
+      <tr><td><code>undefined symbol: _ZN3c10...</code></td><td><strong>扩展是针对另一个 torch 版本编译的</strong></td><td>对照扩展的构建矩阵；重装匹配版本</td></tr>
+      <tr><td><code>libcudart.so.12: cannot open</code></td><td>CUDA runtime 库找不到</td><td><code>ldd</code> 查依赖；检查 <code>LD_LIBRARY_PATH</code></td></tr>
+      <tr><td>能跑但极慢</td><td><strong>回退到了 CPU 或未优化路径</strong></td><td><code>torch.cuda.is_available()</code>；看算子是否真在 GPU 上</td></tr>
+      <tr><td><code>CUDA error: device-side assert</code></td><td>索引越界（如 label 超出 vocab、<code>-100</code> 没设对）</td><td><strong><code>CUDA_LAUNCH_BLOCKING=1</code> 重跑</strong>拿到真实栈</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第二行的 <code>no kernel image is available</code> 值得展开，因为它的错误信息极具误导性。CUDA 二进制包含针对特定 <span class="term">compute capability</span>（sm_80、sm_90 等）编译的代码。<em>如果你的 wheel 只编译了 sm_70–sm_86，而你在 H100（sm_90）上跑，就会得到这个错</em>——它听起来像「找不到文件」，实际是「这个二进制不认识你的卡」。<strong>解法是装匹配的 wheel 或从源码编译并指定 <code>TORCH_CUDA_ARCH_LIST</code>。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>最后一行的 <code>CUDA_LAUNCH_BLOCKING=1</code> 是<strong>GPU 调试的第一招</strong>，必须记住。CUDA kernel 是异步启动的，所以报错时 Python 的栈已经跑到别处去了——<em>你看到的栈几乎总是无关的</em>。设这个环境变量会让每个 kernel 同步执行，<strong>错误就会出现在真正出问题的那一行</strong>。代价是慢很多，所以只在调试时用。<em>这一招能把「完全看不懂的报错」变成「第 47 行索引越界」。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>关于<strong>编译扩展</strong>（flash-attn、xformers、apex、bitsandbytes、deepspeed）：它们是这条链上最脆弱的一环，因为它们的二进制绑定了 <code>(torch 版本, CUDA 版本, Python 版本, ABI)</code> 四元组。<em>「pip install flash-attn」在一台机器上成功、在另一台上编译两小时后失败，是常态</em>。<strong>工程上的正确做法是把整个栈锁进容器镜像</strong>（C48 模块 01）——不是为了「优雅」，而是因为这条链根本无法靠 <code>requirements.txt</code> 复现。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="profile"><span class="num">5</span>性能诊断：三个层次的问题</h2>
+  <p>「训练太慢」不是一个问题，是三类问题。<strong>先定位在哪一层，再优化——否则你会优化错地方</strong>。</p>  <table>
+    <thead><tr><th>层次</th><th>症状</th><th>诊断手段</th><th>典型原因</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 数据</strong></td><td><strong>GPU 利用率低且波动</strong>（0% ↔ 100% 跳动）</td><td>看 <code>nvidia-smi dmon</code> 的 sm 列；给 dataloader 计时</td><td>num_workers 太少、预处理太重、磁盘/网络 IO 慢</td></tr>
+      <tr><td><strong>② 通信</strong></td><td>单卡快、多卡不成比例</td><td>NCCL 日志、profiler 的通信条</td><td>梯度同步、跨节点带宽、没用梯度累积</td></tr>
+      <tr><td><strong>③ 计算</strong></td><td>GPU 利用率高但仍慢</td><td>profiler 的 kernel 时间分布</td><td>kernel 未融合、精度没用对、注意力实现低效</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>诊断顺序必须是 ①→②→③</strong>，因为数据瓶颈会掩盖一切。<em>如果 GPU 有 40% 时间在等数据，你把 kernel 优化快 2 倍也只提升 30%</em>；而把 dataloader 修好可能直接提升 60%。<strong>而数据瓶颈恰恰是最容易修的</strong>（加 workers、预处理离线化、用更快的格式）——所以它必须最先查。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>区分 ① 与 ③ 有一个极简的判据：<strong>看 GPU 利用率的<em>波动模式</em>而不是平均值</strong>。数据瓶颈的特征是<em>周期性地掉到 0</em>（等下一批）；计算瓶颈是<em>稳定在高位</em>。<em>平均利用率 60% 可能是「稳定 60%」（计算问题）也可能是「一半时间 100% 一半时间 0%」（数据问题）——两者的处方完全不同</em>。<strong>所以要看 <code>nvidia-smi dmon -s u</code> 的时间序列，不要只看 <code>nvidia-smi</code> 的瞬时值。</strong></p></div>
+  </div>  <h3>最小可用的诊断命令集</h3>  <pre><code># 硬件与驱动（第一件事）
+nvidia-smi                              # 驱动版本、CUDA 版本、每卡显存与利用率
+nvidia-smi -L                           # 列出所有卡与 UUID
+nvidia-smi topo -m                      # **卡间拓扑**：NVLink 还是 PCIe（决定多卡效率）
+
+# 实时监控（诊断数据瓶颈的关键）
+nvidia-smi dmon -s pucm                 # 时间序列：sm 利用率/显存/功耗/时钟
+nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv -l 1
+
+# 框架侧
+python -c "import torch; print(torch.__version__, torch.version.cuda,
+           torch.cuda.is_available(), torch.cuda.get_arch_list())"
+python -c "import torch; print(torch.cuda.get_device_capability())"   # sm_XX
+
+# 调试（记住这一条）
+CUDA_LAUNCH_BLOCKING=1 python train.py  # 让报错出现在真正出问题的那一行
+
+# 显存
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train.py   # 缓解碎片
+torch.cuda.memory_summary()             # 分配器的详细账本
+torch.cuda.max_memory_allocated()       # **峰值**（不是 nvidia-smi 的数字）</code></pre>  <div class="callout intuition"><span class="label"></span>
+    <code>nvidia-smi topo -m</code> 常被忽略，但它决定了多卡训练的上限：<strong>NVLink 连接的卡间带宽是 PCIe 的 5–10 倍</strong>。<em>同样 8 卡，全 NVLink 的机器与走 PCIe 的机器，数据并行效率可以差一倍</em>。而这个信息在提交任务前一条命令就能拿到。<strong>如果拓扑显示是 PCIe，就要更认真地考虑梯度累积与通信压缩</strong>（C39）——这不是调优，这是架构选择。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="interference"><span class="num">6</span>共享集群：不是你的问题也会变成你的问题</h2>
+  <p>上面讲的都是「你独占这台机器」的假设。<strong>而在共享集群上，你的任务变慢可能与你的代码完全无关</strong>——这是最容易浪费时间的一类排查，因为你会一直在自己的代码里找原因。</p>  <table>
+    <thead><tr><th>外部干扰源</th><th>症状</th><th>怎么确认</th></tr></thead>
+    <tbody>
+      <tr><td><strong>邻居抢共享存储</strong></td><td>数据加载时快时慢，GPU 周期性空闲</td><td>对比本地盘与网络盘的读取速度；看存储的 IOPS 监控</td></tr>
+      <tr><td><strong>邻居抢 PCIe / NVLink 带宽</strong></td><td>多卡通信变慢，单卡正常</td><td><code>nvidia-smi topo -m</code> 看是否与别人共享同一条链路</td></tr>
+      <tr><td><strong>CPU 被超卖</strong></td><td>dataloader 的 worker 抢不到 CPU</td><td><code>nproc</code> vs cgroup 限额；<code>top</code> 看 steal time</td></tr>
+      <tr><td><strong>GPU 降频</strong></td><td>同样代码今天比昨天慢 20%</td><td><code>nvidia-smi -q -d PERFORMANCE</code> 看 throttle reasons（温度/功耗墙）</td></tr>
+      <tr><td><strong>MIG / 时间片共享</strong></td><td>「一张 A100」其实只是它的 1/7</td><td><code>nvidia-smi -L</code> 看是否是 MIG 实例</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>倒数第二行（降频）最容易被误诊为「我改坏了什么」</strong>。GPU 在温度或功耗超限时会自动降低时钟，性能可以掉 10–30%，<em>而这完全不反映在任何代码层面的指标里</em>。<code>nvidia-smi -q -d PERFORMANCE</code> 会明确告诉你 <code>SW Power Cap</code> 或 <code>HW Thermal Slowdown</code> 是否被触发。<strong>在机房散热不好或多卡满载的机器上，这不是罕见情况。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>应对共享环境的通用做法是<strong>「每次跑实验都记录环境指纹 + 一个固定的基准</strong>」：在训练开始前跑一个几秒钟的标准 matmul benchmark，把结果连同环境指纹一起写进日志。<em>这样当某天任务变慢时，你可以立刻区分「机器变慢了」与「我的代码变慢了」</em>——而不用花半天做二分回退。<strong>这个基准的成本是几秒钟，收益是把一整类问题变成一次查表。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>这一节其实是模块 00 那条「版本即环境」纪律的延伸：<strong>你无法控制的东西，至少要能观测</strong>。环境指纹记录「跑在什么上」，基准测试记录「那个东西当时有多快」。<em>两者加起来，「在我这好使」这个句式就变成了可验证的陈述</em>——你能拿出两份指纹与两个基准值，直接指出差在哪。这比任何猜测都快。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="plan"><span class="num">7</span>算力规划：在申请之前算清楚</h2>
+  <p>面对「这个实验要几张卡、跑多久」这个问题，有一套可以在两分钟内完成的估算。</p>  <div class="math-block">\[t_{step} \approx \frac{6 \cdot N \cdot B \cdot L}{\text{FLOPS}_{eff}}, \qquad \text{FLOPS}_{eff} = \text{FLOPS}_{peak} \times \text{MFU}\]</div>  <p>其中 <code>6N</code> 是每个 token 的训练 FLOPs（前向 2N + 反向 4N），<span class="term">MFU</span>（Model FLOPs Utilization）是实际达到的峰值算力比例。</p>  <table>
+    <thead><tr><th>场景</th><th>典型 MFU</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>单卡、大 batch、fp16/bf16</td><td>40–55%</td><td>调得好的上限</td></tr>
+      <tr><td>单卡、小模型或小 batch</td><td>15–30%</td><td>kernel 启动与内存带宽成为瓶颈</td></tr>
+      <tr><td>多卡数据并行（NVLink）</td><td>35–50%</td><td>通信可与计算重叠</td></tr>
+      <tr><td>多卡数据并行（PCIe）</td><td>20–35%</td><td><strong>通信成为瓶颈</strong></td></tr>
+      <tr><td>ZeRO-3 / 跨节点</td><td>15–35%</td><td>参数也要通信，重叠更难</td></tr>
+      <tr><td><strong>有数据瓶颈时</strong></td><td><strong>可低至 5%</strong></td><td><em>先修数据管线，别优化 kernel</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这个估算的价值不在精确（它通常有 ±30% 误差），而在<strong>量级正确</strong>。<em>它能立刻区分「这要跑 6 小时」与「这要跑 3 周」</em>，而后者意味着实验设计本身需要改（缩小模型、减少数据、换方法）。<strong>在提交之前发现「这要 3 周」，比跑了 3 天后发现好得多。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>反过来用也很有价值：<strong>用实测的单步时间反推 MFU，可以判断「还有多少优化空间」</strong>。如果你算出 MFU 只有 8%，说明有严重瓶颈（大概率是数据）；如果已经 45%，那么再花一周调优可能只能榨出 10%——<em>此时更该考虑的是「换更多卡」或「改小实验」，而不是继续优化</em>。<strong>知道天花板在哪，才知道该不该继续。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的智慧：<strong>「真机问题」看起来玄学，实际上大部分是算术</strong>——显存能算、时间能算、MFU 能算、版本兼容能查表。<em>把它们从「试出来的」变成「算出来的」，你的迭代速度会有数量级的提升</em>，因为你不再需要用一次昂贵的排队去获取一个「行/不行」的比特。<strong>而剩下那部分真正玄学的（驱动、编译扩展、集群配置），解法是把环境锁进容器</strong>（C48），而不是每次重新斗争。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>生态动态与开放问题</h2>
+  <ul>
+    <li><strong>显存估算的自动化</strong>：PyTorch 的 <code>FlopCounterMode</code> 与 <code>torch.cuda.memory._record_memory_history</code> 让事后分析变容易，但<em>「训练前预测峰值显存」仍需人工建模</em>——因为它依赖具体的算子实现、是否重计算、分配器行为。这是一个明显有价值但未标准化的工具位。</li>
+    <li><strong>MFU 的可比性</strong>：不同论文对 MFU 的定义不完全一致（是否算 attention 的平方项、是否算重计算的额外 FLOPs）。<em>跨论文比较 MFU 时要先确认口径</em>，否则会得出错误结论。</li>
+    <li><strong>异构与新硬件</strong>：AMD ROCm、Intel Gaudi、Google TPU、Apple MPS 的生态成熟度差异巨大。<em>「代码在 CUDA 上跑得好」不代表能迁移</em>——算子覆盖、性能特征、调试工具都不同。跨厂商的可移植性仍是开放问题（也是 ONNX/MLIR 想解决的）。</li>
+    <li><strong>编译扩展的分发</strong>：flash-attn 这类扩展的 <code>(torch × CUDA × Python × ABI)</code> 组合爆炸，导致预编译 wheel 覆盖不全、源码编译又极慢。<em>更好的分发机制（如 ABI 稳定的插件接口）是社区长期诉求</em>。</li>
+    <li><strong>集群层的可观测性</strong>：单机的 profiler 已经很好，但「几十个任务共享几百张卡时，我的任务为什么慢」缺乏好工具——可能是邻居抢了带宽、可能是存储拥塞、可能是拓扑不好。<em>这类跨任务的干扰诊断仍主要靠经验</em>。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读（都是文档）：NVIDIA 的 <em>CUDA Compatibility</em> 指南（驱动与 runtime 的版本规则，兼容性问题的权威来源）与 <em>nvidia-smi</em> 手册（<code>dmon</code>/<code>topo</code> 两个子命令值得精读）；PyTorch 的 <em>CUDA semantics</em>（异步执行与 <code>CUDA_LAUNCH_BLOCKING</code>）、<em>Memory management</em>（缓存分配器与 <code>expandable_segments</code>）、<em>PyTorch Profiler</em>。方法论：Chowdhery 等 <em>PaLM</em> 论文里的 MFU 定义（这是 MFU 这个指标的常用出处）；Korthikanti 等 <em>Reducing Activation Recomputation in Large Transformer Models</em>（激活显存的精确建模，本模块公式的来源）。相邻课程：C36（GPU 与 kernel）、C39（分布式）、C48（容器化环境）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_export_runtime/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 模型导出与推理运行时</div></a>
+    <a class="next" href="../05_research_output/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 研究产出与知识产权</div></a>
+  </div>
+
+</div>
+</body>
+</html>

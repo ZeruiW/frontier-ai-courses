@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 整数量化</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 整数量化</h1>
+  <p class="subtitle">absmax/zero-point、对称 vs 非对称、int8/int4、per-tensor/channel/group-wise、bit packing —— 把权重从浮点压成整数的全套基本功，并从零度量量化误差</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、浮点/整数表示、矩阵乘、一点点概率（均匀分布）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_quantization.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Dettmers 2022 (LLM.int8())、Nagel 2021 (量化白皮书)、Jacob 2018、Dettmers 2023 (QLoRA/NF4)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what">量化是什么：用整数近似浮点</a></li>
+      <li><a href="#symasym">对称 vs 非对称：要不要零点</a></li>
+      <li><a href="#gran">量化粒度：tensor / channel / group</a></li>
+      <li><a href="#packing">Bit packing：兑现 int4 的压缩</a></li>
+      <li><a href="#error">量化误差与离群值</a></li>
+      <li><a href="#infer">weight-only 量化为何能加速</a></li>
+      <li><a href="#pipeline">一条完整的量化流水线</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what"><span class="num">1</span>量化是什么：用整数近似浮点</h2>
+  <p>量化是当下大模型压缩里<strong>收益最直接、应用最广</strong>的一招。它的全部出发点是一个朴素的观察：神经网络的权重（和激活）用 16 位甚至 32 位浮点存着，但模型其实<strong>不需要这么高的精度</strong>也能工作得很好。既然如此，我们能不能用更少的 bit——比如 8 位整数（256 个级别）、甚至 4 位整数（仅 16 个级别）——来近似它们，从而省下成倍的显存与带宽？</p>  <p>把这个想法精确化。量化要解决的是<strong>一个映射问题</strong>：怎么把一段连续的浮点数（比如权重，大致分布在 <code>[−0.3, 0.3]</code>）映射到一组离散的整数（比如 int8 的 <code>[−127, 127]</code>），并且能<strong>近似地还原回来</strong>。最通用的映射是<span class="term">affine quantization</span>（仿射量化）：</p>  <div class="math-block">\[q = \mathrm{round}\!\left(\frac{x}{s}\right) + z, \qquad \hat x = s\,(q - z)\]</div>  <p>其中 <code>s</code> 是<span class="term">scale</span>（缩放因子，决定每个整数级别代表多大的浮点步长），<code>z</code> 是<span class="term">zero-point</span>（零点，整数域中代表浮点 0 的那个整数）。前一个式子把浮点 <code>x</code> 压成整数 <code>q</code>（量化），后一个把整数还原成浮点近似 <code>x̂</code>（<span class="term">dequantization</span>，反量化）。整门量化的学问，归根结底就是<strong>怎么选 s 和 z</strong>、以及<strong>在多大的粒度上各选一套</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 scale 想成尺子的刻度。int8 给你 256 个刻度去量一段浮点。刻度太粗（s 太大），细节就丢了；刻度太细（s 太小），尺子量程不够、量不到的部分就被截断。选 scale 就是在「分辨率」和「量程」之间找平衡。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>反量化值 <code>x̂</code> 与原值 <code>x</code> 之差叫<span class="term">quantization noise</span>（量化噪声）。在均匀量化下，单个误差近似服从 <code>[−s/2, s/2]</code> 的均匀分布，期望平方误差约 <code>s²/12</code>（本模块 notebook 会从零验证这个公式）。<strong>s 越小误差越小</strong>——这就是为什么我们想方设法把 scale 压小，而离群值（撑大范围、逼着 s 变大）是头号敌人。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住量化：<strong>用一把只有少数刻度的尺子去近似连续的权重，误差由刻度粗细（scale）决定</strong>。之后所有的花样——对称还是非对称、整张矩阵一套 scale 还是每行一套、要不要专门处理离群值——都是在回答同一个问题：<em>怎么让这把尺子在最该精确的地方最精确</em>。</p>
+  </div>  <p>为什么神经网络能容忍这么粗的近似？这本身是个深刻的现象。直觉上，训练好的网络对权重的微小扰动是<strong>鲁棒</strong>的——成千上万个权重协同工作，单个权重抖动一点，会被后续层的平均与非线性吸收掉。量化噪声恰好像一种<em>结构化的小扰动</em>，只要它的幅度（由 scale 控制）足够小、且不偏不倚（均值近 0），模型的输出几乎不变。这也提示了量化会失败的两种情形：scale 太大（噪声盖过信号）、或噪声有系统性偏置（不再零均值）——后续的对称性选择、误差补偿（模块 02）本质都在控制这两件事。</p>  <p>还要先建立一个<strong>bit 与级别</strong>的数量感，它贯穿全课：<code>b</code> bit 能表示 <code>2^b</code> 个级别——int8 是 256 个、int4 只有 16 个、int2 仅 4 个。每少一个 bit，可表示的级别就<strong>减半</strong>，量化误差大致翻倍（scale 要翻倍才能覆盖同样范围）。这条「每少 1 bit，误差约 ×2」的规律，解释了为什么 int8 往往近乎无损、int4 需要精细技巧、而 int2 几乎必须重训（QAT）。压缩越狠，越要靠后面模块的算法把误差按回去。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="symasym"><span class="num">2</span>对称 vs 非对称：要不要零点</h2>
+  <h3>对称 vs 非对称：要不要零点</h3>  <p>仿射量化里 <code>z</code> 是否为 0，分出两条路。</p>  <p><strong>对称量化</strong>（symmetric）令 <code>z=0</code>：整数区间关于 0 对称，反量化退化成一次乘法 <code>x̂ = s·q</code>。最常见的 scale 选法是 <span class="term">absmax</span>：<code>s = max(|x|)/qmax</code>，让绝对值最大的元素刚好映射到整数边界。权重大致关于 0 对称，所以权重量化几乎都用对称——简单、快、反量化开销最小。</p>  <div class="math-block">\[\text{absmax}:\quad s = \frac{\max_i |x_i|}{q_{\max}}, \quad z = 0, \quad q = \mathrm{round}(x/s)\in[-q_{\max}, q_{\max}]\]</div>  <p><strong>非对称量化</strong>（asymmetric）允许 <code>z≠0</code>：用数据的 <code>min/max</code> 两端把<em>任意</em>区间铺满整个整数范围。scale 与 zero-point 为：</p>  <div class="math-block">\[s = \frac{x_{\max}-x_{\min}}{q_{\max}-q_{\min}}, \qquad z = q_{\min} - \mathrm{round}\!\left(\frac{x_{\min}}{s}\right)\]</div>  <p>它更贴合<strong>偏斜分布</strong>。最典型的是 ReLU/GELU 之后的激活——大量值挤在 0 附近、全为正。用对称量化去量一段 <code>[0, 6]</code> 的激活，等于浪费掉整个负半轴的整数级别（一半精度白扔）；非对称则把零点挪到整数区间的最左端，把所有 256 个级别都用在 <code>[0,6]</code> 上。</p>  <table>
+    <thead><tr><th>维度</th><th>对称 (absmax)</th><th>非对称 (zero-point)</th></tr></thead>
+    <tbody>
+      <tr><td>零点 z</td><td>固定 0</td><td>随分布偏移</td></tr>
+      <tr><td>反量化</td><td><code>s·q</code>（一次乘法）</td><td><code>s·(q−z)</code>（含零点项）</td></tr>
+      <tr><td>适合</td><td>权重（近似对称）</td><td>激活（偏斜、全正）</td></tr>
+      <tr><td>整数范围利用</td><td>对称分布满、偏斜分布浪费一半</td><td>任意分布都铺满</td></tr>
+      <tr><td>矩阵乘里的额外开销</td><td>无</td><td>零点项要单独展开累加</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>非对称量化在<strong>整数矩阵乘</strong>里会引入额外的零点项：<code>(q_w − z_w)(q_x − z_x)</code> 展开后多出三项要处理（Jacob et al. 2018 详细推导）。这是为什么即便激活偏斜，很多 weight-only 方案仍对权重用对称、只对激活用非对称——把复杂度留在激活侧。选对称还是非对称，不只看分布，还要看<em>它下游怎么被算</em>。</p>
+  </div>  <p>再补一个<strong>整数边界</strong>的细节，初学者常踩坑：int8 对称量化通常用 <code>[−127, 127]</code> 而非完整的 <code>[−128, 127]</code>。为什么主动放弃 <code>−128</code>？因为对称量化要求整数区间<em>关于 0 镜像</em>，这样 <code>x̂ = s·q</code> 才严格对称、<code>q=0</code> 精确对应 <code>x=0</code>。若用上 <code>−128</code>，区间就不对称了，会引入一个微小的系统性偏置。少用一个级别（256 里的 1 个）换来零点的精确与对称，这笔账绝大多数场景都划算。</p>  <p>一个实践上的判断流程：拿到一个张量要量化时，先看它的<strong>分布形状</strong>。近似关于 0 对称（绝大多数权重、注意力的 QKV 投影）→ 用对称 absmax，省事且无零点开销；明显偏斜或单边（ReLU/GELU/Sigmoid 后的激活、全正的 gate）→ 用非对称，否则白扔一半级别。这个「先看分布再选量化器」的习惯，比记住任何公式都重要——它是把量化用对的第一步，也是 notebook 第 1、2 节要你亲手对比对称/非对称误差的原因。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="gran"><span class="num">3</span>量化粒度：tensor / channel / group</h2>
+  <h3>量化粒度：per-tensor → per-channel → group-wise</h3>  <p>第二个核心旋钮是<strong>粒度</strong>——多大一块共用一套 <code>(s, z)</code>。粒度越细，越能贴合局部分布、越准，但要存的元数据（scale 们）越多。</p>  <ul>
+    <li><strong>per-tensor</strong>（逐张量）：整个权重矩阵共用一个 scale。最省元数据、最快，但<strong>一个离群值就毁掉全矩阵</strong>——它撑大 absmax，逼着 scale 变大，于是所有其他元素的精度都被它拖累。</li>
+    <li><strong>per-channel</strong>（逐通道）：每个输出通道（矩阵的每一行）独立一个 scale。离群值的影响被<strong>隔离在它所在的那一行</strong>，其余行不受牵连。几乎是 int8 权重量化的标配，元数据开销很小（每行才多一个 float）。</li>
+    <li><strong>group-wise</strong>（分组）：把每一行再切成每 <code>g</code> 个元素（典型 <code>g=128</code>）一组，各组独立 scale。这是 <strong>int4 保精度的关键</strong>——16 个级别太少，必须靠极细的粒度去贴合每一小段的局部范围。</li>
+  </ul>  <div class="ascii">同一个权重矩阵，三种粒度（▓=共用一个 scale 的范围）：
+
+  per-tensor          per-channel          group-wise (g=4)
+  ┌───────────┐        ┌───────────┐        ┌──┬──┬──┬──┐
+  │▓▓▓▓▓▓▓▓▓▓▓│        │▓▓▓▓▓▓▓▓▓▓▓│ 1套      │▓▓│░░│▒▒│██│  每4个一套
+  │▓▓▓▓▓▓▓▓▓▓▓│ 全矩阵  │░░░░░░░░░░░│ 1套      │▓▓│░░│▒▒│██│
+  │▓▓▓▓▓▓▓▓▓▓▓│ 1套     │▒▒▒▒▒▒▒▒▒▒▒│ 1套      │▓▓│░░│▒▒│██│
+  └───────────┘        └───────────┘        └──┴──┴──┴──┘
+  scale 最少           每行一个 scale        最多 scale，最准
+  离群值毁全局         离群值只伤一行        离群值只伤一组</div>  <p>这里有个清晰的<strong>权衡谱</strong>：从 per-tensor 到 group-wise，量化误差单调下降、元数据开销单调上升。实践中的经验是：int8 用 per-channel 通常就够（近乎无损）；int4 必须上 group-wise（g=128 是社区默认），否则 16 个级别配上离群值会掉点严重。本模块 notebook 会把三种粒度都实现出来，让你亲眼看到同一矩阵的输出误差如何随粒度变细而下降。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么粒度这么关键？因为权重矩阵的不同部分<strong>量级差异很大</strong>：有的行/段数值大、有的小。用一个全局 scale，就得照顾最大的那个（否则它溢出），结果小数值区域的精度被白白浪费。把 scale 局部化，等于<em>让每一小块都用最适合自己量级的尺子</em>——这正是 group-wise 在 int4 下不可或缺的原因。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="packing"><span class="num">4</span>Bit packing：兑现 int4 的压缩</h2>
+  <h3>Bit packing：把 int4 真正塞进更小的空间</h3>  <p>有个容易被忽略的工程现实：numpy/PyTorch 里<strong>没有 int4 这个原生类型</strong>。如果你把权重 round 到 <code>[−8, 7]</code> 却还存在 int8 容器里，显存<strong>一点没省</strong>——每个 4-bit 值仍占着 8 bit。要兑现 int4 的 4× 压缩，必须做 <span class="term">bit packing</span>（位打包）：把两个 int4 拼进一个 int8。</p>  <div class="ascii">两个 int4 (0..15) 打包进一个 uint8：
+
+  a = 0b1011 (=11)   b = 0b0010 (=2)
+                              
+  packed = (a &lt;&lt; 4) | b  =  0b1011_0010  (=178)
+           └─ 高4位=a ─┘└─ 低4位=b ─┘
+
+  解包：  a = packed &gt;&gt; 4          (取高4位)
+          b = packed &amp; 0b1111      (取低4位, 即 &amp; 15)</div>  <p>打包用两个位运算：<code>packed = (a &lt;&lt; 4) | b</code>（a 左移到高 4 位，与 b 的低 4 位或起来）。解包是逆操作：<code>a = packed &gt;&gt; 4</code>（右移取高位），<code>b = packed &amp; 0xF</code>（与掩码取低位）。这样 N 个 int4 只占 N/2 个字节，4× 压缩才真正落地。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打包就像把两个人塞进一个双人座：每人本来占一个 8 位的座位，现在两人合用一个，空间省一半。代价是上车（打包）下车（解包）要多两步，但座位（显存）实打实省了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>注意打包通常对<strong>无符号</strong>整数做最方便（直接位运算）。对有符号 int4（<code>[−8,7]</code>）的常见做法是先加偏移变成无符号 <code>[0,15]</code> 再打包，解包后减回去；或者用非对称量化直接产出 <code>[0,15]</code> 的 <code>q</code>。反量化前必须先解包还原出每个 4-bit 值。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>打包不是「可选优化」，而是 int4 压缩的<strong>兑现步骤</strong>。常见的坑：忘了打包（以为量化到 int4 就省显存了，其实没有）；打包/解包的高低位顺序写反（解出来 a、b 互换）；有符号值不加偏移直接打包导致符号位错乱。本模块 notebook 会从零写打包/解包并 <code>assert</code> 往返无损（pack 再 unpack 等于原值），把这些坑一次性堵死。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="error"><span class="num">5</span>量化误差与离群值</h2>
+  <h3>量化误差：为什么离群值是头号敌人</h3>  <p>现在把「量化掉多少精度」量化（pun intended）。均匀量化下，把 <code>x</code> 舍入到最近的网格点，误差 <code>x̂ − x</code> 落在 <code>[−s/2, s/2]</code>。若误差近似均匀分布，其期望平方误差（也就是量化噪声功率）是：</p>  <div class="math-block">\[\mathbb{E}\big[(\hat x - x)^2\big] \approx \int_{-s/2}^{s/2} \frac{u^2}{s}\,du = \frac{s^2}{12}\]</div>  <p>这个简洁的公式（<code>s²/12</code>）是理解量化的钥匙：<strong>误差完全由 scale 决定，而 scale 由数据范围决定</strong>。而数据范围——尤其在 absmax 下——被<strong>最大绝对值</strong>撑着。于是问题归结到一个词：<span class="term">outlier</span>（离群值）。</p>  <div class="callout danger"><span class="label">离群值毁精度</span>
+    <p>离群值是低 bit 量化的<strong>头号敌人</strong>。假设一行权重 99% 落在 <code>[−0.1, 0.1]</code>，但有一个 <code>3.0</code> 的离群值。absmax scale 被这个 <code>3.0</code> 撑到 <code>3.0/127 ≈ 0.0236</code>，于是那 99% 的正常权重每个只能落在 <code>±2</code> 个整数级别里——<strong>256 个级别，正常权重只用到了 8 个</strong>，精度灾难性浪费。Dettmers et al.（LLM.int8()）发现大模型激活里恰恰存在这种离群特征维度，这是 8-bit 量化在 6.7B 以上模型上一度失败的根因。</p>
+  </div>  <p>对付离群值有三条路，正好对应本课后续：<strong>更细的粒度</strong>（per-channel/group-wise，把离群值的影响圈在局部，本模块）；<strong>截断</strong>（clipping，主动牺牲离群值、给主体更多精度，本模块 notebook 演示）；以及<strong>更聪明的算法</strong>（GPTQ 用误差补偿、AWQ/SmoothQuant 用缩放迁移把离群难度挪走，模块 02）。</p>  <p>一个常用且立竿见影的技巧是<strong>截断（clipping）</strong>：不取 absmax，而取某个分位点（如 99%）当范围，把超出的离群值夹到边界。这<strong>牺牲极少数离群值的精度</strong>，换来把 scale 显著压小、让<strong>占绝大多数、真正主导层输出的正常权重</strong>精度大涨。要点是看 clipping 改善了<em>哪部分</em>的误差：被夹掉的离群值误差会变大，但占 99% 的正常权重 MSE 会<strong>大幅下降</strong>——notebook 会用一个带离群值的分布、专门度量正常权重上的 MSE 把这一点跑出来。在权重量化里，正常权重才是输出的主体，所以这笔交易通常很划算；这也是 AWQ/SmoothQuant 之类「把离群难度挪走」的更精细版本要解决的同一个问题。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="infer"><span class="num">6</span>weight-only 量化为何能加速</h2>
+  <h3>从权重量化到推理：weight-only 量化为什么能加速</h3>  <p>把前面的零件拼起来看一个真实场景：<strong>weight-only 量化</strong>（仅权重量化，GPTQ/AWQ 都属此类）。做法是把权重存成 int4（group-wise + 打包），推理时<strong>先反量化回 fp16，再做正常的 fp16 矩阵乘</strong>。</p>  <p>初看这很奇怪：既然算之前要反量化回 fp16，那<em>算的次数一点没少</em>（甚至多了反量化），凭什么更快？</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>答案在模块 00 的世界观里：大模型推理是<strong>访存受限</strong>的。逐 token 生成时，瓶颈是把几十 GB 的权重从显存搬到计算单元，而不是算那些乘加。权重存成 int4，每次要搬的字节就少 4 倍，于是<strong>更快</strong>——省的是带宽，不是算力。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说：weight-only 量化把权重的<strong>内存占用与传输量</strong>降到 1/4，反量化（一次乘加）的开销相比省下的 HBM 往返微不足道。这也解释了为什么 int8 激活量化（W8A8，要同时量化激活、改动矩阵乘）反而不总是值得——它省的是算力，而推理瓶颈在带宽。Horace He 的「Brrrr」一文把这层道理讲得最透。</p></div>
+  </div>  <div class="ascii">weight-only int4 推理的一层：
+
+  存储:  W_int4 (打包, 1/4 显存)  +  scales (group-wise)
+            │
+            ▼  解包 + 反量化 (便宜)
+         W_fp16  ──►  Y = W_fp16 @ X   (正常 fp16 GEMM)
+
+  省的是: 把 W 从 HBM 搬进来的字节数 (4x)  ←── 这才是瓶颈
+  没省的: GEMM 的 FLOPs (一样多, 还多了反量化)</div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这条<strong>反直觉但核心</strong>的结论：在访存受限的 LLM 推理里，<strong>量化的加速来自省带宽，不是省计算</strong>。所以「weight-only、推理时反量化」不是妥协，而是<em>恰好对症</em>——它精准地砍掉了瓶颈（权重搬运），而把不在瓶颈上的计算（GEMM）原样留着。理解了这点，你才会明白为什么 int4 weight-only 是当前 LLM 推理量化的主流。</p>
+  </div>  <p>这里要区分两个<strong>不同的推理阶段</strong>，它们的瓶颈不一样。自回归生成分<span class="term">prefill</span>（一次性处理整段 prompt，是大矩阵乘、偏算力受限）和<span class="term">decode</span>（逐个 token 生成，每步只算一行、严重访存受限）。decode 阶段每生成一个 token 都要把<strong>整个模型的权重</strong>完整过一遍，而真正的算术量却很小——这是 weight-only 量化收益最大的地方。所以同一个量化模型，在长输出的对话场景（decode 占比高）提速最明显，在大批量打分（prefill 占比高、更算力受限）收益相对小。把这层分清，你才能预判量化到底能为你的负载省多少。</p>  <p>最后澄清一个常见混淆：weight-only（只量化权重，激活仍 fp16）与<strong>全量化</strong>（W8A8、W4A4，权重激活都量化）是两条不同的路。前者实现简单、几乎不掉点、专省带宽，是当前 LLM 推理的主流；后者要改动矩阵乘本身用整数算（省算力），但激活离群值更难对付（LLM.int8()、SmoothQuant、QuaRot 都在攻这块）。本模块与模块 02 聚焦 weight-only 这条最实用的线；全量化的难点（激活离群值）会在模块 02 的 AWQ/SmoothQuant 缩放迁移里再深入。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">7</span>一条完整的量化流水线</h2>
+  <h3>把它跑起来：一条完整的量化流水线</h3>  <p>综合本模块所学，量化一个权重矩阵到 int4 的完整流程是：</p>  <ol>
+    <li>选<strong>粒度</strong>（int4 选 group-wise，g=128）与<strong>对称性</strong>（权重选对称 absmax）；</li>
+    <li>对每一组算 scale：<code>s_g = max(|W_g|)/7</code>（int4 对称 qmax=7）；</li>
+    <li>量化：<code>q_g = round(W_g / s_g).clip(−8, 7)</code>；</li>
+    <li>（可选）对离群值做 clipping，用分位点代替 absmax；</li>
+    <li><strong>bit packing</strong>：每两个 int4 打包进一个字节，存 <code>q</code> 与 <code>scales</code>；</li>
+    <li>推理时：解包 → 反量化 <code>Ŵ_g = s_g·q_g</code> → 正常矩阵乘。</li>
+  </ol>  <p>这条流水线就是 <code>bitsandbytes</code> 的 <code>load_in_4bit</code>、<code>AutoGPTQ</code>、<code>AutoAWQ</code> 背后做的事（它们在第 2–3 步用更聪明的算法，见模块 02，但骨架相同）。本模块 notebook 会把这整条流水线从零搭出来，并对拍：量化-反量化的输出误差在 int8 下 <1%、int4 group-wise 下也能控制在可接受范围。</p>  <p>一个值得记住的<strong>数量级感</strong>：相对 fp16，int8 压缩约 2×、int4 约 4×。一个 70B 模型 fp16 要 140GB，int4 后约 35GB——<strong>从「单卡装不下」变成「单张 48GB 卡能跑」</strong>。这就是量化在生产里的真实价值：不是让模型更准，而是让它<em>装得下、跑得起、搬得快</em>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>量化不是没有代价的免费午餐。常见的失败模式：int4 不做 group-wise 直接 per-tensor（掉点严重）；忘了打包（显存没省）；对有离群值的层不做特殊处理（精度崩）；把激活也粗暴量化（破坏 LLM.int8() 要保护的离群特征）。本模块教你把这些坑识别出来；模块 02 的 GPTQ/AWQ 则提供更系统的解法。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>更低 bit（2-bit、1.58-bit）</strong>：能压到 int2 甚至三值（BitNet b1.58 的 {−1,0,1}）吗？这需要 QAT 或特殊架构，是「极限压缩」的活跃方向，挑战在于 2 bit 下信息论上的级别实在太少。</li>
+    <li><strong>非均匀量化</strong>：均匀网格未必最优。QLoRA 的 NF4 按权重的近似正态分布设量化级别（分位点量化），信息论上更匹配。量化级别该怎么放，仍有空间。</li>
+    <li><strong>权重+激活联合（W4A4 等）</strong>：weight-only 省带宽，但要省算力得连激活一起量化。激活离群值更凶，W4A4 在大模型上仍是难题（QuaRot 用旋转把离群值打散是新思路）。</li>
+    <li><strong>KV-cache 量化</strong>：长上下文推理的显存大头是 KV cache。把它量化到 int4/int8（且要在线、逐 token）是与权重量化互补、正在快速落地的一条线。</li>
+    <li><strong>量化与其他压缩的叠加</strong>：量化 + 剪枝（SparseGPT 同时做）、量化 + 蒸馏怎么协同而不互相放大误差，是把压缩推到极致的系统问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Dettmers et al. 2022（LLM.int8()，离群值与混合精度，本模块离群值讨论的源头）、Nagel et al. 2021（量化白皮书，术语与公式的字典）、Jacob et al. 2018（整数推理与零点的矩阵乘展开）、Dettmers et al. 2023（QLoRA/NF4，非均匀量化的范例）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_gptq_awq/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · GPTQ 与 AWQ</div></a>
+  </div>
+
+</div>
+</body>
+</html>

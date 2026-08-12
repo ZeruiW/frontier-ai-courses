@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · 从零搭建 eval harness</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 07 / 9</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>07 · 从零搭建 eval harness</h1>
+  <p class="subtitle">Eval Harness Engineering —— 评测结论的可信度上限，由你的实验仪器决定</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（统计）、03（答案抽取）、06（pass@k）；Python dataclass / hashlib / JSON</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 07_build_harness.ipynb（可选 Qwen2.5-0.5B-Instruct）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Biderman 2024（Lessons from the Trenches）、Inspect（UK AISI 2024）、lm-evaluation-harness（Gao 2023）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#instrument">Harness 是评测的"实验仪器"</a></li>
+      <li><a href="#abstractions">核心抽象：Task / Sample / Solver / Scorer / Logger</a></li>
+      <li><a href="#repro">确定性与可复现：把一切版本钉死</a></li>
+      <li><a href="#cache">缓存设计：key 里少一个字段就是一次事故</a></li>
+      <li><a href="#logging">日志与审计：可重放、可争议</a></li>
+      <li><a href="#concurrency">并发与限流：部分失败如何进统计</a></li>
+      <li><a href="#frameworks">现有框架解剖：Inspect / lm-eval-harness / HELM</a></li>
+      <li><a href="#bugs">Harness bug 案例集 · 研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="instrument"><span class="num">1</span>Harness 是评测的"实验仪器"</h2>
+
+  <p>前六个模块讨论的是评测的"科学"：benchmark 设计、统计严谨性、抽取与判分、污染、能力引出。
+  本模块讨论承载这一切的"仪器"——<span class="term">eval harness</span>：把数据集、模型调用、判分、日志组织成一次可复现实验的工程系统。
+  <strong>仪器误差直接进入结论</strong>：如果 harness 的模板拼接、答案抽取或缓存有 bug，你测到的不是模型能力，而是 bug 的形状。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>论文里写"模型 X 在 MMLU 上 72.3%"，这个数字其实是<strong>模型 × harness</strong> 的联合输出。
+      换一个 harness（不同模板、不同抽取器、不同 few-shot 拼接），同一个模型可以差出好几个点。
+      所以你必须像物理学家校准仪器一样校准 harness：知道它的每一处自由度，并把它们全部钉死、记录在案。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>记观测分数 $\hat{s} = g(M, H)$，其中 $M$ 是模型、$H$ 是 harness 配置（模板、抽取器、解码参数、数据版本……）。
+      报告 $\hat{s}$ 而不报告 $H$，等于报告一个未定义的量。Biderman et al. 2024（<em>Lessons from the Trenches on Reproducible Evaluation</em>）
+      系统性地论证了这一点：不同实现间的分差经常超过模型间的真实差距，因此评测结果必须连同 harness 版本与全部配置一起发布 [Biderman 2024]。</p>
+    </div>
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>工程 bug 比统计误差更常见，也更隐蔽。</strong>统计误差（模块 02）是对称的、可量化的：$n$ 题的二项标准误 $\sqrt{\hat p(1-\hat p)/n}$ 摆在那里，谁都看得见。
+  而工程 bug 是<strong>系统性偏差</strong>：模板少个空格让全部样本同时受损，抽取器解析失败让分数单向坍塌——它不会随 $n$ 增大而缩小，置信区间再窄也罩不住它。
+  一个被广泛低估的事实：评测工程师的大部分时间不是在"跑分"，而是在排查这类 bug。</div>
+
+  <p>本章自底向上回答三个问题：harness 应该长什么样（抽象）、怎么保证同一实验跑两遍结果一致（确定性）、怎么在出问题时找到证据（审计）。
+  配套 notebook 会从零实现一个约 200 行的 mini harness，把每个设计决策落到代码上。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="abstractions"><span class="num">2</span>核心抽象：Task / Sample / Solver / Scorer / Logger</h2>
+
+  <p>几乎所有成熟框架（Inspect、lm-evaluation-harness、HELM）收敛到同一组抽象。命名各异，职责五件套是稳定的：</p>
+
+  <div class="ascii">
+                            ┌─────────────────────────────────────────────────┐
+                            │                    Task                         │
+                            │  数据集 + prompt 模板 + few-shot 策略 + 配置     │
+                            └─────────────────────────────────────────────────┘
+                                      │ 逐条产出
+                                      ▼
+   ┌──────────┐   build_prompt   ┌──────────┐    prompt     ┌──────────────────┐
+   │  Sample  │ ───────────────► │  prompt  │ ────────────► │     Solver       │
+   │ (input,  │                  │  (str)   │               │  模型调用策略：    │
+   │  target) │                  └──────────┘   ┌────────── │  直接生成 / CoT / │
+   └────┬─────┘                                 │ response  │  多轮 agent / 重试│
+        │ target                                ▼           └──────────────────┘
+        │                            ┌──────────────────┐         │   ▲
+        └──────────────────────────► │     Scorer       │         ▼   │ 命中则不调模型
+                                     │ 抽取 + 判分       │      ┌────────┐
+                                     │ → score, extracted│      │ Cache  │ key=(model,
+                                     └────────┬──────────┘      └────────┘ prompt,params)
+                                              │ record
+                                              ▼
+                            ┌─────────────────────────────────────────────────┐
+                            │  Logger (JSONL)：prompt/response/score/耗时/token │
+                            │  → 聚合统计（accuracy ± CI）→ 报告               │
+                            └─────────────────────────────────────────────────┘
+  </div>
+
+  <ul>
+    <li><strong>Sample</strong>：一条评测数据，最小单位。至少含 <code>input</code> 与 <code>target</code>，建议带稳定的 <code>id</code>（断点续跑、跨 run 对齐都靠它）。</li>
+    <li><strong>Task</strong>：数据集 + 把 Sample 渲染成 prompt 的<strong>模板</strong> + few-shot 选取策略 + 任务级配置。模板属于 Task 而不是散落在代码里——这是版本化的前提。</li>
+    <li><strong>Solver</strong>：<em>模型调用策略</em>。最简单的是"prompt 进、completion 出"；复杂的可以是 CoT、self-consistency、多轮工具调用 agent（模块 06 的引出策略全都封装在这一层）。Inspect 的 solver 甚至可以组合成链 [UK AISI 2024]。</li>
+    <li><strong>Scorer</strong>：从 response 中<strong>抽取</strong>答案并<strong>判分</strong>。模块 03 的全部教训都住在这里。Scorer 必须把 <code>extracted</code> 和 <code>score</code> 一起返回——只返回分数的 Scorer 无法审计。</li>
+    <li><strong>Logger</strong>：逐次调用的完整记录。它不是"可选的运维组件"，而是评测结论的<strong>证据链</strong>。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  这套抽象的真正价值在于<strong>正交性</strong>：换 Solver 不动 Scorer，换 Scorer 不动数据。想做"同一模型 × 5 种引出策略 × 2 种判分器"的消融时，
+  正交的 harness 是 10 行循环；耦合的脚本是 10 次复制粘贴——而每次粘贴都是一次引入不一致的机会。
+  lm-evaluation-harness 用 YAML 把 Task 声明化、Inspect 用 Python 组合子表达 Solver 链，走的都是同一条路 [Gao 2023; UK AISI 2024]。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="repro"><span class="num">3</span>确定性与可复现：把一切版本钉死</h2>
+
+  <p>可复现的最低标准：<strong>同一份配置，今天跑和下个月跑，逐题结果一致</strong>（API 模型做不到逐 token 一致时，至少要做到配置可完整重建）。要达到这个标准，必须枚举出所有影响输出的自由度，然后把每一个都写进配置：</p>
+
+  <table>
+    <thead><tr><th>自由度</th><th>钉死方式</th><th>不钉死的后果</th></tr></thead>
+    <tbody>
+      <tr><td>解码随机性</td><td><code>temperature=0</code> 或显式 <code>seed</code>；pass@k 场景记录每次采样的 seed</td><td>分数在重跑间漂移 1–3 分，无法区分"模型变了"还是"运气变了"</td></tr>
+      <tr><td>模型版本</td><td>API：带日期的 model id；开源：HF <code>revision</code>（commit hash）</td><td>"同一个模型"静默升级，时间序列对比作废</td></tr>
+      <tr><td>模板版本</td><td>模板字符串本身（或其 hash）进配置</td><td>有人"顺手改了下 prompt"，新旧分数不可比</td></tr>
+      <tr><td>抽取器/判分器版本</td><td>代码版本号或函数源码 hash 进配置</td><td>抽取器修了个 bug，历史分数全部失效却无人知晓</td></tr>
+      <tr><td>数据版本</td><td>数据集文件 hash / HF dataset revision</td><td>上游悄悄修了标签，逐题 diff 全乱</td></tr>
+      <tr><td>few-shot 抽样</td><td>固定 seed + 固定抽样算法</td><td>每次跑 few-shot 例子不同，方差凭空多一截</td></tr>
+    </tbody>
+  </table>
+
+  <p>把这些字段汇总做一次哈希，就得到 <span class="term">config hash</span>——一次 run 的唯一指纹：</p>
+
+  <div class="math-block">
+  $$ \text{run\_fingerprint} \;=\; H\big(\,\text{model\_id} \,\|\, \text{model\_rev} \,\|\, \text{template} \,\|\, \text{extractor\_ver} \,\|\, \text{gen\_params} \,\|\, \text{seed} \,\|\, \text{data\_rev}\,\big) $$
+  </div>
+
+  <p>两次 run 的 fingerprint 相同 → 结果应当逐题一致（可作为 harness 自身的回归测试）；fingerprint 不同 → 分数<strong>不可直接对比</strong>，必须先说明哪个字段变了。
+  Biderman et al. 2024 的核心建议正是如此：发布评测结果时附上 harness 名称、版本、task 配置与全部生成参数，否则他人无法复现也无法质疑 [Biderman 2024]。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>温度为 0 不等于确定性。</strong>浮点归约顺序、batch 内 padding、推理引擎版本（vLLM/transformers 不同 kernel）都可能让 greedy 解码产生不同输出；
+  API 模型还有服务端静默更新。所以工程上把"逐 token 复现"放宽为"<strong>配置可复现 + 结果可审计</strong>"：fingerprint 钉死输入侧，JSONL 日志（§5）留住输出侧。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="cache"><span class="num">4</span>缓存设计：key 里少一个字段就是一次事故</h2>
+
+  <p>评测是天然适合缓存的负载：同一 (模型, prompt, 参数) 的调用结果不变（greedy 时），而开发期会反复重跑同一任务——改了 Scorer 重跑、加了几题重跑、画图前再跑一遍。
+  没有缓存，每次迭代都重新烧一遍 API 费用和小时级等待；有了缓存，只有真正新的调用才出网。</p>
+
+  <p>正确的 key 设计只有一条原则：<strong>所有影响 response 的输入，必须全部进 key</strong>。</p>
+
+  <div class="math-block">
+  $$ \text{key} \;=\; \mathrm{SHA256}\big(\, \text{serialize}(\text{model\_id},\; \text{prompt},\; \text{gen\_params}) \,\big) $$
+  </div>
+
+  <p>其中 <code>serialize</code> 必须满足两个性质：① <strong>规范化</strong>——<code>gen_params</code> 字典的键顺序不影响结果（如 <code>json.dumps(..., sort_keys=True)</code>）；
+  ② <strong>无歧义拼接</strong>——直接字符串相加会让 <code>("ab","c")</code> 与 <code>("a","bc")</code> 撞 key，必须用带边界的序列化。notebook 练习 1 会让你实现并用性质测试验证。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>缓存的两类经典事故（都是真实事故的模式）：</strong><br>
+  ① <strong>参数没进 key → 脏命中</strong>：把 <code>temperature</code> 从 0 改到 0.7 想测 pass@k，但 key 只含 (model, prompt)——返回的全是旧的 greedy 缓存，"采样 10 次"实际是同一条 response 复制 10 份，pass@10 ≡ pass@1，实验结论完全错误。
+  同理，<code>max_tokens</code>、system prompt、stop 序列、工具列表，漏谁谁出事。<br>
+  ② <strong>模板变更后未失效</strong>：模板从 v1 改到 v2，但如果 key 是手工构造的 <code>f"{model}-{sample_id}"</code> 而不是基于最终 prompt 的哈希——v2 的 run 命中的全是 v1 的缓存。
+  正确做法是 key 基于<strong>渲染后的完整 prompt</strong>，模板一变 prompt 即变，key 自动变，缓存自然失效，无需任何手工"清缓存"纪律。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  缓存条目里除了 response，建议把 model_id、gen_params、时间戳一并存进 value（虽然它们已经在 key 的哈希里）。
+  哈希是单向的——当你需要排查"这条缓存到底是谁写的"时，只有 value 里的明文能救你。磁盘很便宜，事故很贵。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="logging"><span class="num">5</span>日志与审计：可重放、可争议</h2>
+
+  <p>评测日志的设计目标不是"出错时看一眼"，而是<strong>让任何一个分数都能被追溯到原始证据</strong>。标准做法：每次模型调用追加一行 JSON 到 <span class="term">JSONL</span> 文件，至少包含：</p>
+
+  <pre><code>{"ts": "2026-06-10T03:21:07Z", "run_id": "a3f9…", "sample_id": "mmlu_0042",
+ "model_id": "gpt-4o-2024-08-06", "gen_params": {"temperature": 0, "seed": 7, "max_tokens": 64},
+ "prompt": "&lt;完整渲染后的 prompt&gt;", "response": "&lt;完整原始输出&gt;",
+ "extracted": "B", "score": 1.0, "latency_s": 1.42,
+ "n_prompt_tokens": 312, "n_completion_tokens": 18, "cached": false}</code></pre>
+
+  <p>为什么是 JSONL 而不是数据库或汇总 CSV？追加写天然抗中断（断点续跑直接读已完成的 sample_id，见 notebook 练习 2）；逐行自包含，<code>grep</code>/<code>jq</code>/pandas 都能直接消费；并且<strong>原始 prompt 与 response 必须完整保留</strong>——汇总表只能告诉你分数是多少，原始记录才能告诉你分数为什么是这样。</p>
+
+  <ul>
+    <li><strong>可重放（replay）</strong>：抽取器修了 bug？不必重新调用模型——把历史 JSONL 里的 response 重新过一遍新 Scorer，几秒钟得到修正后的分数。判分与生成解耦，是日志完整性带来的最大红利。</li>
+    <li><strong>可争议（dispute）</strong>：有人质疑"这题模型明明答对了却被判错"，打开对应行，prompt、response、extracted、score 俱在，争议在事实层面解决。Inspect 专门配了日志查看器（<code>inspect view</code>）把这件事产品化 [UK AISI 2024]。</li>
+    <li><strong>token 与耗时</strong>：成本核算、限流调参、以及发现异常（某题 latency 异常高往往意味着重试风暴或截断）都靠它。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  日志里 <strong>extracted 与 score 分开记录</strong>是审计的关键设计：score 告诉你判分结果，extracted 告诉你判分的<em>依据</em>。
+  模块 03 见过的事故——response 是对的、抽取是错的——只有同时记录两者才能在事后被发现。同理 <code>cached: true/false</code> 必须记：排查"脏命中"时它是第一条线索。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="concurrency"><span class="num">6</span>并发与限流：部分失败如何进统计</h2>
+
+  <p>串行跑 1 万题 × 2 秒 ≈ 5.5 小时；并发 50 路 ≈ 7 分钟。生产 harness 必然是异步批量的（<code>asyncio</code> + 信号量限流），随之而来三个必须显式设计的问题：</p>
+
+  <ul>
+    <li><strong>限流与退避</strong>：尊重 API 的 RPM/TPM 限额；429/超时用指数退避重试：$\text{delay}_k = \min(b\cdot 2^k + \text{jitter},\; \text{cap})$，jitter 防止并发请求同步重试形成"重试风暴"。</li>
+    <li><strong>幂等与日志安全</strong>：重试成功后只能记<strong>一条</strong>结果（按 sample_id 幂等去重）；多协程写同一 JSONL 要经单写者队列，否则行交错损坏整个日志文件。</li>
+    <li><strong>部分失败</strong>：重试耗尽后仍失败的题怎么办？这不是工程细节，<strong>它直接改变统计量的定义</strong>。</li>
+  </ul>
+
+  <p>设每题得分 $S_i \in [0,1]$，失败指示 $F_i \in \{0,1\}$（失败即无 response）。三种策略对应三个不同的估计量：</p>
+
+  <table>
+    <thead><tr><th>策略</th><th>估计的量</th><th>偏差性质</th></tr></thead>
+    <tbody>
+      <tr><td><strong>重跑到成功</strong>（首选）</td><td>$\mathbb{E}[S]$</td><td>无偏，但失败不可恢复时（沙箱崩溃、内容过滤）做不到</td></tr>
+      <tr><td><strong>失败记 0 分</strong></td><td>$\mathbb{E}[S\cdot \mathbf 1\{F{=}0\}]$</td><td>系统性<strong>低估</strong>：把基础设施故障算成模型错误</td></tr>
+      <tr><td><strong>失败记 NaN 后丢弃</strong></td><td>$\mathbb{E}[S \mid F{=}0]$</td><td>失败与难度相关时有偏，方向见下式</td></tr>
+    </tbody>
+  </table>
+
+  <p>丢弃策略的偏差可以精确写出。由全期望公式 $\mathbb{E}[S]=\mathbb{E}[S\mid F{=}0]\Pr(F{=}0)+\mathbb{E}[S\mid F{=}1]\Pr(F{=}1)$ 与协方差定义整理可得：</p>
+
+  <div class="math-block">
+  $$ \mathbb{E}[\hat p_{\text{drop}}] \;=\; \mathbb{E}[S \mid F{=}0] \;=\; \mathbb{E}[S] \;-\; \frac{\mathrm{Cov}(S, F)}{\Pr(F{=}0)} $$
+  </div>
+
+  <p>若失败是纯随机的（网络抖动），$\mathrm{Cov}(S,F)=0$，丢弃无偏、只损失样本量。但若<strong>难题更容易失败</strong>——长输出超时、agent 任务超步数预算，这在实践中是常态——则 $\mathrm{Cov}(S,F)&lt;0$，修正项为正：丢弃失败题会<strong>高估</strong>模型能力。
+  所以规范做法是：日志里失败题记 NaN 并保留失败原因；报告里同时给出"失败率 + 两种口径的分数"（记 0 作下界、丢弃作上界），失败率高于几个百分点时必须修基础设施而不是挑口径。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  并发还有一个隐蔽的确定性陷阱：异步完成顺序是不确定的，如果 few-shot 抽样、采样 seed 之类的状态依赖"处理顺序"，并发一开确定性就没了。
+  规则：<strong>所有随机状态在分发任务前按 sample_id 预先生成</strong>（如 seed_i = H(run_seed, sample_id)），完成顺序就只影响日志行序——而日志行序按 sample_id 排序后应当逐字节一致，这本身可以作为 harness 的回归测试。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frameworks"><span class="num">7</span>现有框架解剖：Inspect / lm-eval-harness / HELM</h2>
+
+  <p>三个有代表性的开源 harness，对照五件套抽象看它们各自的取舍：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>Inspect (UK AISI)</th><th>lm-evaluation-harness (EleutherAI)</th><th>HELM (Stanford)</th></tr></thead>
+    <tbody>
+      <tr><td>核心抽象</td><td><code>Task = dataset + solver + scorer</code>，Solver 是可组合的 Python 函数链（<code>generate</code>、<code>chain_of_thought</code>、多轮 agent、工具沙箱）</td><td>YAML 声明式 task 配置；两种请求原语：<code>loglikelihood</code>（选项打分）与 <code>generate_until</code>（生成）</td><td>Scenario × Adaptation × Metric 三维矩阵，强调同一场景多指标（accuracy、校准、鲁棒、公平、效率）[Liang 2022]</td></tr>
+      <tr><td>设计重心</td><td>Agentic / 安全评测：沙箱、多轮、人审日志查看器</td><td>学术 benchmark 复现：数百个任务开箱即跑、HF 生态深度集成</td><td>整体性报告：透明、多维、跨模型对比</td></tr>
+      <tr><td>判分</td><td>内置 + 自定义 Python scorer，含 model-graded（LLM judge）</td><td>以规则判分为主（exact match / loglik argmax）</td><td>指标体系最全，但接入新场景成本高</td></tr>
+      <tr><td>适用场景</td><td>前沿能力/安全评测、内部私有任务、agent 任务</td><td>开源模型跑标准学术榜、训练过程中的回归监控</td><td>研究性的大规模横评、写"评测报告"类论文</td></tr>
+      <tr><td>主要局限</td><td>任务库较新、学术榜覆盖不如 lm-eval</td><td>agentic/多轮支持弱；模板细节即"事实标准"，改动会引发不可比 [Biderman 2024]</td><td>重、更新慢、二次开发门槛高</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>[Gao 2023]</strong> lm-evaluation-harness 是 Open LLM Leaderboard 的底座，它的存在本身就是一个论点：与其争论"哪种 prompt 才公平"，不如<strong>所有人用同一个实现</strong>，让分数至少在 harness 内部可比。
+  <strong>[Biderman 2024]</strong> 则是这个项目多年踩坑的复盘：harness 间分差大、复现要靠逐题日志、评测代码必须像产品代码一样测试——本章的几乎每条工程建议都能在这篇文章里找到出处。</div>
+
+  <p><strong>什么时候自建？</strong>判断标准不是"想不想造轮子"，而是：① 任务协议现有框架表达不了（私有多轮协议、特殊沙箱、人机协作）；② 需要嵌入内部 CI/训练流水线，框架的重依赖不可接受；③ 安全边界要求代码完全自持。
+  即便自建，也应该<strong>抄五件套抽象、抄 JSONL 日志格式、抄 config fingerprint</strong>——自建的成本从来不在写代码，而在重新发现所有 bug。能用 Inspect 的 solver/scorer 接口包装内部任务时，优先包装而不是重写。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="bugs"><span class="num">8</span>Harness bug 案例集 · 研究前沿与开放问题</h2>
+
+  <p>以下案例全部对应真实世界反复出现的事故模式。共同特征：<strong>不报错、不崩溃，只是安静地给出错误的分数</strong>。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>案例 1 · 模板少一个空格，分数掉 5 分。</strong>few-shot 拼接时 <code>"Answer:"</code> 与 <code>"Answer: "</code> 的区别——模型在训练中见过的几乎都是带空格的版本，少这个空格会让续写分布整体劣化。
+  Sclar et al. 2023 系统量化过：仅改动分隔符/空格/大小写等表层格式，可造成最高数十个点的波动 [Sclar 2023]。<strong>对策</strong>：模板进版本控制 + fingerprint；任何模板改动触发与旧版的逐题 diff。</div>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>案例 2 · 抽取器把 "B." 解析成 A。</strong>抽取正则只认 <code>"answer is (X)"</code> 格式，模型简洁地回答 <code>"B."</code> 时匹配失败，代码走到 <code>return "A"</code> 的默认分支。
+  后果是双重的：分数被系统性拉低，且选项分布向 A 倾斜——你还可能把它误诊为模块 03 讲过的"选项位置偏差"。<strong>对策</strong>：抽取失败必须返回 <code>None</code> 并计数上报，绝不静默回退到任何默认答案；抽取失败率本身是必须监控的指标。notebook 会完整复现并修复这个 bug。</div>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>案例 3 · 缓存跨模型串味。</strong>cache key 没把 model_id（或模型 revision）编进去，换模型评测时命中上一个模型的 response——"新模型"的分数实际是旧模型的。
+  变体：同一 model_id 的权重被服务端更新、LoRA 适配器换了但 base id 没变。<strong>对策</strong>：key 必须含完整模型标识（含 revision）；缓存 value 里存明文 model_id，事后可校验"key 说是谁、value 里是谁"。</div>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>案例 4 · 重试把同一题记了两次。</strong>超时后重试，原请求其实成功并已写日志，重试又写一条——聚合时分母多 1。配合"失败丢弃"策略，准确率的分子分母可以同时错。
+  <strong>对策</strong>：日志按 (run_id, sample_id) 幂等；聚合前 assert 唯一性。变体：few-shot 抽样不固定 seed，两次 run 的"同一题"其实 prompt 不同，逐题 diff 全是噪声。</div>
+
+  <h3>研究前沿与开放问题</h3>
+  <ul>
+    <li><strong>非确定性推理栈下的可复现性</strong>：API 模型无法钉死权重与 kernel，"可复现"应该重新定义为什么？逐题日志 + 统计等价检验（两次 run 的分差落在抽样噪声内）可能是务实答案，但尚无社区标准 [Biderman 2024]。</li>
+    <li><strong>Agentic 评测的 harness 化</strong>：当 Solver 是带沙箱、工具、多轮交互的 agent（SWE-bench、METR 任务族），"缓存"与"重放"的语义都变了——环境状态也是输入。如何为有状态轨迹设计 fingerprint 与 diff，是当前最活跃的工程问题。</li>
+    <li><strong>判分器的回归测试</strong>：Scorer 改一行，历史分数是否都要重算？大规模重放（replay）should be cheap——日志格式与存储设计正在向"判分永远离线可重做"演化。</li>
+    <li><strong>harness 即被测对象</strong>：不同 harness 给同一模型的分差，本质是测量系统的不一致。是否应该有"评测 harness 的 benchmark"（标准模型 + 标准期望输出，校验 harness 实现）？目前只有零星的 smoke test 实践。</li>
+    <li><strong>评测视角</strong>：读任何论文的分数表时，先问三件事——用的哪个 harness？模板与抽取器是什么版本？失败题怎么处理的？这三问不清楚，分差 2 分以内的结论一律存疑。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>五件套抽象（Task/Sample/Solver/Scorer/Logger）各自的职责边界是什么？为什么"正交性"在消融实验里价值巨大？</li>
+      <li>一个合格的 cache key 必须包含哪些字段？分别描述"参数没进 key"和"模板变更未失效"两类脏命中的事故链。</li>
+      <li>失败题"重跑 / 记 0 / 丢弃"三种策略各自估计的是什么量？写出丢弃策略的偏差公式并说明何时高估。</li>
+      <li>Inspect、lm-evaluation-harness、HELM 各自的设计重心是什么？什么情况下才值得自建 harness，自建时应该"抄"什么？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../06_elicitation/06_讲解.html"><div class="dir">← 上一章</div><div class="t">06 · 能力引出与 pass@k</div></a>
+    <a class="next" href="../08_frontier/08_讲解.html"><div class="dir">下一章 →</div><div class="t">08 · Arena、time-horizon 与评测报告</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 流式加载与分片</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 流式加载与分片</h1>
+  <p class="subtitle">流式 dataloader · shard 格式与不重不漏的分配 · shuffle 缓冲区用有限内存近似全局打乱 · 预取流水重叠让 GPU 不饿 · 随机性-内存权衡的量化 —— 把 50 TB 数据「边读边喂、还够随机」的全套工程</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00/01、基本的随机打乱、队列/并发概念、一点点 IO 与对象存储常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_streaming_loaders.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">WebDataset (Aizman et al.)、Mosaic StreamingDataset、HF IterableDataset shuffle</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么流式：数据装不进内存</a></li>
+      <li><a href="#shard">Shard：可流式的块与格式</a></li>
+      <li><a href="#assign">Shard 分配：不重不漏</a></li>
+      <li><a href="#buffer">Shuffle 缓冲区：近似全局打乱</a></li>
+      <li><a href="#tradeoff">随机性 vs 内存：量化打乱质量</a></li>
+      <li><a href="#prefetch">预取与流水重叠：别让 GPU 饿着</a></li>
+      <li><a href="#ledger">把账算到 50 TB：吞吐全景</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么流式：数据装不进内存</h2>
+  <p>上个模块我们把 PB 级语料去重、压缩成了一份「干净」的数据集——但它仍然有几十 TB。现在训练循环要它，问题来了：<strong>一份 50 TB 的数据集，你怎么把它喂进一块只有几十 GB 显存、几百 GB 内存的机器？</strong>答案是不能整份装进内存，必须<span class="term">streaming</span>（流式）——边读边喂。</p>  <p>先把约束摆清楚。一个典型训练循环里，GPU 每跑完一个 batch 就要<strong>立刻</strong>拿到下一个 batch，否则它就空转——这叫 <span class="term">data starvation</span>（数据饥饿），是大规模训练最常见、最隐蔽的浪费之一。你花几百万买的 GPU，可能有 30% 的时间在等数据加载器（dataloader）从磁盘/对象存储把下一批样本读出来、解压、tokenize、拼成张量。所以数据加载不是「读个文件」这么简单，它是一条<strong>必须比训练更快</strong>的并行流水线。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>数据加载器要同时满足四个看似矛盾的要求：① <strong>流式</strong>——不把数据全载入内存；② <strong>打乱</strong>——每个 epoch 样本顺序要足够随机，否则梯度有偏；③ <strong>高吞吐</strong>——喂数据要快过 GPU 吃数据；④ <strong>可恢复</strong>——训练崩了能从断点精确续上。这四件事在 PB 规模下都会互相打架。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说：设数据总量 <code>D</code> 字节、加载器吞吐 <code>T_load</code> 字节/秒、训练消耗 <code>T_train</code> 字节/秒。只要 <code>T_load ≥ T_train</code>，GPU 就不会饿；否则训练被加载卡住，实际吞吐 = <code>min(T_load, T_train)</code>。整个模块就是在讲：如何在「不把数据全装进内存」的前提下，把 <code>T_load</code> 做到足够大、把打乱做到足够随机、把状态做到可恢复。</p></div>
+  </div>  <div class="callout danger"><span class="label">打不动的全局打乱</span>
+    <p>本模块的核心张力一句话讲清：<strong>真正的全局打乱需要把整个数据集装进内存随机重排，而 50 TB 装不下——于是流式加载只能用「有限内存的近似打乱」，关键问题是这个近似有多好</strong>。本课会用一个 shuffle 缓冲区模拟器把「打乱质量 vs 缓冲大小」量化成一条可画的曲线，告诉你 HuggingFace 的 <code>shuffle(buffer_size=...)</code> 这个参数到底该设多大。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="shard"><span class="num">2</span>Shard：可流式的块与格式</h2>
+  <h3>Shard：把大数据集切成可流式的块</h3>  <p>流式加载的物理基础是 <span class="term">shard</span>（分片）：把一个巨大的数据集切成成千上万个中等大小（常 100 MB～1 GB）的文件块。为什么不存成一个巨型文件、也不存成上亿个小文件？因为这两端都会出问题——巨型文件无法并行读、无法断点；上亿个小文件会让<strong>对象存储</strong>（S3/GCS）的元数据查询和随机寻址开销爆炸。shard 是这两端之间的甜点。</p>  <p>shard 的内部格式也大有讲究。最有影响力的方案是 <span class="term">WebDataset</span>（Aizman et al.）：把每个样本（及其多个字段，如 <code>text/image/label</code>）打包进一个 <code>tar</code> 归档，<strong>按顺序流式读取</strong>。这个「顺序读」的设计不是偶然——对象存储和网络文件系统对<strong>大块顺序 IO</strong>友好、对随机小读极不友好（每次随机读都有几十毫秒的往返延迟）。把样本打包成 tar、顺序拉取，能把有效带宽从「随机读」的几 MB/s 拉到「顺序读」的几百 MB/s。</p>  <div class="ascii">数据集物理布局（流式友好）：
+
+  dataset/
+    shard-00000.tar   (≈512MB, 内含 ~5000 个样本, 顺序排列)
+    shard-00001.tar   ┐
+    shard-00002.tar   ├─ 成千上万个 shard，分布在对象存储上
+    ...               ┘
+    manifest.json     (列出每个 shard 的名字/大小/样本数/哈希)
+
+  读取：worker 顺序拉取分给它的 shard -&gt; 顺序解 tar -&gt; 吐样本流
+        (顺序 IO，几百 MB/s；而非随机小读的几 MB/s)</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>生产级的实现还会在格式里塞进<strong>可恢复性</strong>所需的元信息。比如 Mosaic 的 <span class="term">StreamingDataset</span>（MDS 格式）把样本编号、shard 边界、每条的字节偏移都记进索引，使得训练崩溃后能精确算出「我读到第几个 shard 的第几条」，从对象存储重新定位、继续。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>复杂度账：shard 大小是个权衡。shard <em>太小</em>（如 1 MB）→ 文件数爆炸、元数据开销大、顺序读优势丧失；shard <em>太大</em>（如 50 GB）→ 并行粒度太粗（worker 数受限于 shard 数）、断点恢复要重读半个巨块。经验甜点是 <code>100 MB ~ 1 GB</code>：足够大以摊薄文件开销、足够小以支持上千 worker 并行和细粒度恢复。</p></div>
+  </div>  <p>还有一个常被忽略的格式决策：<strong>一条样本要不要在写入 shard 时就预处理好</strong>。早期做法是 shard 里存原始文本，加载时再实时 tokenize；但 tokenize 占 CPU、会成为加载瓶颈（下个模块的主题）。于是生产管线越来越倾向把数据<strong>预先 tokenize、存成 token shard</strong>（如 Megatron 的 <code>.bin/.idx</code> 格式存定长 token 数组），加载时只需 <code>mmap</code> 读整数、零解析开销。这是一个用<em>预处理一次的离线成本</em>换<em>每个 epoch 反复省下的在线成本</em>的经典权衡——数据被读很多遍，预处理却只做一遍，几乎总是划算。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一个有用的类比：shard 之于数据集，正如模块 01 的「分桶」之于去重——都是把一个<strong>大到无法整体处理的对象，切成能独立、并行处理的中等块</strong>。大规模数据工程里这个「切块」思想无处不在：去重切 shard、加载切 shard、分词切 shard。学会按「并行粒度 + IO 友好度 + 恢复粒度」三者的权衡来定块大小，是通用的工程直觉。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="assign"><span class="num">3</span>Shard 分配：不重不漏</h2>
+  <h3>Shard 分配：让 worker / rank 不重不漏</h3>  <p>有了 shard，下一个问题是<strong>谁读哪些</strong>。训练通常是<span class="term">数据并行</span>（data parallel）的：<code>R</code> 个 rank（GPU 进程）各持一份模型副本、各吃不同的数据，再同步梯度。每个 rank 内部又可能开 <code>W</code> 个加载 worker（子进程）并行读。于是要把成千上万个 shard 分给 <code>R × W</code> 个读取者，且必须<strong>不重不漏</strong>——同一个 shard 被两个 rank 读 = 重复数据、梯度有偏；某个 shard 没人读 = 数据丢失。</p>  <p>最简单的分配是<strong>取模</strong>：第 <code>i</code> 个 shard 分给第 <code>i mod (R×W)</code> 个读取者。它保证不重不漏，但有两个隐患需要工程上处理：</p>  <ul>
+    <li><strong>负载不均</strong>：若 shard 大小不一、或 shard 数不是读取者数的整数倍，有人多读一个、有人少读一个，快的等慢的（<span class="term">straggler</span>）。生产系统会按样本数而非 shard 数来均衡，或让读完的 worker 去「偷」别人的活。</li>
+    <li><strong>打乱耦合</strong>：分配若固定不变，每个 epoch 每个 rank 看到的都是同一批 shard、甚至同一个顺序——这会让全局打乱大打折扣。所以分配本身要<strong>带 epoch 种子</strong>地重新洗牌（哪些 shard 给哪个 rank、shard 内顺序），才能让跨 epoch 的数据顺序真正变化。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>可恢复性也压在分配上。训练在第 <code>step</code> 步崩溃，恢复时每个 rank 必须能<strong>确定性地</strong>重算出「我本该读哪些 shard、读到第几个了」。这要求分配是<em>纯函数</em>：给定 <code>(epoch, rank, world_size, seed)</code> 就能算出 shard 列表，不依赖任何运行时随机状态。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>正确性账：分配函数 <code>assign(shard_ids, rank, R) </code> 必须满足两条不变量——① <strong>覆盖</strong>：所有 rank 的分配并集 = 全部 shard（无遗漏）；② <strong>互斥</strong>：任意两 rank 的分配交集为空（无重复）。本课 notebook 会把这两条不变量写成 <code>assert</code>，因为它们一旦破坏，训练会静默地用错数据——最难查的 bug。</p></div>
+  </div>  <p>分配还有一个<strong>两级</strong>的层次容易被忽略：先把 shard 分给 rank，rank 内部再把自己的 shard 分给它的 <code>W</code> 个 worker。这两级都要满足覆盖+互斥，且都要能从 <code>(epoch, rank, worker_id, seed)</code> 确定性算出。生产框架（如 Mosaic StreamingDataset）会把「全局样本编号 → (shard, rank, worker, 样本内偏移)」做成一个可逆的确定映射，这样无论崩在哪一步，每个 worker 都能精确算出「我读到全局第几个样本了、下一个该读谁」，从对象存储重新定位续上。<strong>可恢复性本质上是把整条读取路径变成一个纯函数</strong>——没有这个纪律，PB 级训练动辄几周、中途必然崩溃，重来一次的代价无法承受。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个真实踩过的坑：<strong>shard 数 &lt; rank 数</strong>。如果你有 1000 个 GPU 但数据只切了 800 个 shard，取模分配会让 200 个 rank 分不到任何 shard、整段空转，甚至死锁在梯度同步上。规则：<strong>shard 数应远大于 rank 数</strong>（常要求 ≥ 数倍），这也反过来约束了 shard 不能切得太大。分片粒度和并行规模是绑死的两个旋钮。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="buffer"><span class="num">4</span>Shuffle 缓冲区：近似全局打乱</h2>
+  <h3>Shuffle 缓冲区：有限内存的近似全局打乱</h3>  <p>现在来到本模块最精妙的一环。我们已经能流式地、不重不漏地读出样本了，但读出来的顺序基本是<strong>数据写入时的顺序</strong>（一个 shard 接一个 shard、shard 内按原序）。这远远不够随机——同一篇文档的相邻段落、同一来源的连续网页会挨在一起，喂给模型会让一个 batch 内的样本高度相关，梯度估计有偏、训练不稳。</p>  <p>理想是<strong>全局打乱</strong>：把全部样本随机重排，任意两个样本都可能相邻。但全局打乱需要把整个数据集<em>同时装进内存</em>随机洗牌——50 TB 显然做不到。流式加载的解法是 <span class="term">shuffle buffer</span>（打乱缓冲区）：</p>  <div class="ascii">shuffle 缓冲区（容量 B=4）的工作方式：
+
+  输入流: 0 1 2 3 4 5 6 7 8 ...
+
+  步骤: 先填满缓冲 [0 1 2 3]
+        每次随机弹一个吐出、再从输入补一个进来:
+          缓冲[0 1 2 3] -随机弹2-&gt; 吐 2，补 4 -&gt; [0 1 3 4]
+          缓冲[0 1 3 4] -随机弹0-&gt; 吐 0，补 5 -&gt; [1 3 4 5]
+          缓冲[1 3 4 5] -随机弹4-&gt; 吐 4，补 6 -&gt; [1 3 5 6]
+          ...
+
+  关键：内存只占 B 个样本；输出顺序被「局部」打乱了。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直觉：缓冲区像一个「随机延迟池」。一个样本流进来后，要在池子里待上随机的一段时间才被吐出。池子越大（<code>B</code> 越大），一个样本能被「推迟」的范围越大，输出顺序离原始顺序就越远、越接近真随机。<code>B=1</code> 退化成完全不打乱（进什么吐什么）；<code>B=</code>全体则恢复真·全局打乱。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：一个原本在位置 <code>i</code> 流入的样本，最早可能在它流入后第一次弹出时被吐出，最晚要等到缓冲区里比它先来的都走光。所以它的输出位置大致落在 <code>[i, i+O(B)]</code> 的窗口里——<strong>打乱的「视野」就是 O(B)</strong>。两个原始距离超过 <code>B</code> 的样本，<em>永远不可能</em>在输出里相邻（除非配合 shard 级打乱）。这就是缓冲区打乱的根本局限，也是为什么它叫「近似」全局打乱。</p></div>
+  </div>  <p>所以生产级流式打乱通常是<strong>两级</strong>的：先在<strong>shard 级别</strong>打乱（每个 epoch 随机打乱 shard 的读取顺序，带 epoch 种子），再在<strong>样本级别</strong>用 shuffle 缓冲区打乱。shard 级打乱让「相距很远的样本」也有机会靠近（因为远处的 shard 可能被洗到前面来），缓冲区打乱再在局部精细化。两级配合，用 <code>O(B)</code> 的内存逼近全局打乱的效果。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">5</span>随机性 vs 内存：量化打乱质量</h2>
+  <h3>随机性 vs 内存：把打乱质量量化</h3>  <p>「缓冲多大才够」不能拍脑袋，要<strong>量化</strong>。怎么度量一次打乱有多「随机」？一个直观且可计算的指标是<strong>平均位移</strong>（average displacement）：每个样本从输入位置到输出位置移动了多远，取绝对值的平均。完全不打乱位移为 0；真随机打乱的期望位移约是序列长度的 1/3。</p>  <div class="math-block">\[\text{平均位移} = \frac{1}{n}\sum_{i=1}^{n} \big|\,\text{pos}_{\text{out}}(i) - \text{pos}_{\text{in}}(i)\,\big|\]</div>  <p>用这个指标对 shuffle 缓冲区做实验，会得到一条清晰的规律：<strong>平均位移随缓冲大小 B 增长，但增长会饱和</strong>。当 <code>B</code> 远小于序列长度时，位移大致正比于 <code>B</code>（缓冲越大、推迟窗口越大）；当 <code>B</code> 接近序列长度时，位移趋近真随机打乱的上限（约 <code>n/3</code>），再加大 <code>B</code> 也没用了——你已经在做接近全局的打乱。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这条饱和曲线给了一个实用的工程结论：<strong>不必把缓冲开到内存极限</strong>。把 <code>B</code> 设到「位移曲线开始拐平」的拐点附近，就用相对小的内存拿到了接近全局打乱的质量；再大只是浪费内存、增加启动时的填充延迟。HuggingFace <code>shuffle(buffer_size=10000)</code> 这类默认值就是这么定出来的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但还有一个<strong>相关性</strong>维度容易被位移指标掩盖。如果数据里「相邻的样本天然相似」（同一篇长文档被切成连续片段、同一来源的连续网页），那即便位移很大，缓冲区也可能<em>没能拆散邻近的相似样本</em>——因为 <code>B</code> 内的样本仍主要来自原始流的一个小窗口。这时必须靠 shard 级打乱来兜底：先把数据在写入时就<strong>打散来源</strong>（interleave），或把 shard 顺序充分打乱。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把这两个指标放一起记：<strong>位移衡量「走多远」，相关性衡量「邻居是否还是老邻居」</strong>。一个好的流式打乱要两者都过关。位移靠 shuffle 缓冲（样本级），打散相似邻居靠 shard 打乱 + 写入时 interleave（来源级）。本课 notebook 会同时算这两个量，你会看到：只调缓冲区可能位移很大但相似邻居没拆散——这正是「只设 buffer_size 不够，还要管 shard 顺序」的工程教训。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="prefetch"><span class="num">6</span>预取与流水重叠：别让 GPU 饿着</h2>
+  <h3>预取与流水重叠：让加载藏在计算背后</h3>  <p>最后一块拼图是<strong>吞吐</strong>。即便 shard 和打乱都对了，如果加载是「读完这批、GPU 才开始算；算完、才开始读下一批」的串行流程，GPU 会有一半时间在等 IO。解法是 <span class="term">prefetch</span>（预取）+ <span class="term">pipeline overlap</span>（流水重叠）：让读 IO、解压、tokenize、拷到设备、计算这几个阶段在<strong>不同的 batch 上并发</strong>，使整体吞吐由<strong>最慢的那一级</strong>（瓶颈级）决定，而不是各级耗时之和。</p>  <div class="ascii">串行（无重叠）：每个 batch 顺序走完五级，总时间 = 五级之和
+  batch0: [读IO][解压][token][拷贝][计算]
+  batch1:                              [读IO][解压][token][拷贝][计算]
+
+流水重叠（预取）：各级在不同 batch 上并发，总时间 ≈ 最慢级 × batch 数
+  读IO :  [b0][b1][b2][b3][b4]
+  解压 :     [b0][b1][b2][b3][b4]
+  token:        [b0][b1][b2][b3][b4]
+  计算 :           [b0][b1][b2][b3][b4]   &lt;- GPU 几乎不等
+            稳态吞吐 = 1 / max(各级耗时)</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>做法：在训练算当前 batch 时，后台的 worker 进程/线程已经在准备后面好几个 batch 了。准备好的 batch 放进一个<strong>有界队列</strong>里等着被取。<code>num_workers</code>（PyTorch DataLoader）和 <code>prefetch_factor</code> 就是控制「开几个后台准备者、提前备几个 batch」的旋钮。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>有界队列还自带 <span class="term">backpressure</span>（背压）：如果 GPU 算得慢（队列满了），加载器就自动停下来等，不会无限读数据把内存撑爆；如果 GPU 算得快（队列空了），就是数据饥饿的信号，说明加载是瓶颈、要加 worker 或优化 IO。<strong>队列的占用率</strong>是诊断瓶颈的最佳仪表：长期满 → 计算瓶颈（正常）；长期空 → 加载瓶颈（GPU 在饿）。</p></div>
+  </div>  <p>吞吐账（这是本模块要你养成的核心技能）：稳态吞吐 = <code>1 / max(t_io, t_decode, t_token, t_compute)</code>。要让 GPU 不饿，只需保证<strong>数据侧的总耗时（IO+解压+token，但它们彼此也能重叠）的瓶颈级 ≤ 计算级</strong>。于是优化加载不是「让每一级都更快」，而是<em>精准地找出那一个瓶颈级并只优化它</em>——是 IO 慢就加并行读/换顺序格式，是解压慢就换更快的编解码，是 token 慢就预先 tokenize 存成 token shard（正是下个模块的主题）。</p>  <p>预取深度（提前备几个 batch）也是个权衡，不是越深越好。<strong>太浅</strong>→ 一旦某个 batch 的 IO 偶发变慢（对象存储长尾延迟），队列瞬间见底、GPU 立刻饿；<strong>太深</strong>→ 占用大量内存缓存待消费的 batch、训练启动时要等很久才填满流水、且崩溃恢复时这些「在途」数据的状态更难精确重放。经验是把预取深度设到「足以吸收 IO 延迟抖动」的最小值——和 shuffle 缓冲取拐点是同一种「够用即可、别浪费」的工程智慧。这也呼应了可恢复性：在途的 batch 越多，断点续训要重放的状态越复杂。</p>  <div class="callout warn"><span class="label"></span>
+    <p>最常见的误判：看到 GPU 利用率低，就去优化模型/换更大 batch。但很多时候<strong>瓶颈根本不在计算，而在数据加载</strong>——GPU 在饿。先看队列占用率、先做吞吐账，确认瓶颈在哪一级，再动手。优化错了级，等于在不是瓶颈的地方花力气，整体吞吐纹丝不动（这是 Amdahl 定律的日常版）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">7</span>把账算到 50 TB：吞吐全景</h2>
+  <h3>把账算到 50 TB：流式加载的吞吐全景</h3>  <p>把本模块所有机制的账目并排起来，这张表就是「为什么大规模加载要这么设计」的完整论证：</p>  <table>
+    <thead><tr><th>机制</th><th>解决什么问题</th><th>关键量 / 复杂度</th><th>PB 规模下的取舍</th></tr></thead>
+    <tbody>
+      <tr><td>流式 streaming</td><td>数据装不进内存</td><td>内存 <code>O(B+队列)</code>，与 D 无关</td><td>✅ 唯一可行；放弃随机访问</td></tr>
+      <tr><td>shard 分片</td><td>并行读 + 断点 + IO 友好</td><td>shard 数 ≫ rank 数，单 shard 100MB~1GB</td><td>甜点：太小元数据爆、太大并行粗</td></tr>
+      <tr><td>shard 分配</td><td>worker/rank 不重不漏</td><td>纯函数 <code>(epoch,rank,seed)</code></td><td>⚠️ 要均衡 + 带种子重洗</td></tr>
+      <tr><td>shuffle 缓冲</td><td>有限内存近似全局打乱</td><td>打乱视野 <code>O(B)</code>，内存 <code>O(B)</code></td><td>✅ 配合 shard 级打乱；B 取拐点</td></tr>
+      <tr><td>预取 + 重叠</td><td>GPU 不饿</td><td>吞吐 <code>1/max(各级)</code></td><td>✅ 找瓶颈级；有界队列做背压</td></tr>
+    </tbody>
+  </table>  <p>读这张表的方式是：每一行都是为了在「数据远大于内存」这一根本约束下，逼近「全量装内存」才有的理想性质——流式逼近「随时能读」、shard 逼近「能并行能恢复」、shuffle 缓冲逼近「全局打乱」、预取逼近「加载零延迟」。全都是<strong>用有限资源做近似</strong>，而工程的功夫就在于把每个近似的「够不够好」量化出来（位移曲线、队列占用率、吞吐账），而不是凭感觉。</p>  <p>一个真实的数字感：一块 H100 训练 LLM 时，每秒可能要吃掉几百 MB 到 GB 级的 token 数据。要让上百块 GPU 不饿，加载器的聚合吞吐要到几十到上百 GB/s——这只有靠<strong>成百上千个 worker 从对象存储并行顺序拉 shard + 充分预取</strong>才做得到。任何一环掉链子（shard 太大并行不起来、打乱缓冲太大填充太慢、预取深度不够），都会让昂贵的 GPU 集群空转。流式加载不是训练的配角，它是决定<strong>集群利用率</strong>的关键基础设施。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的工程智慧：<strong>当数据大到无法整体放进内存时，一切都变成「有限内存的近似」——近似的随机访问（流式）、近似的全局打乱（缓冲区）、近似的零延迟（预取）；工程的核心是把每个近似的质量量化、把瓶颈定位，而不是追求那个装不下的「理想」</strong>。这个「用可量化的近似替换装不下的理想」的思维，在外存算法、流式计算、乃至模块 01 的 LSH 里反复出现。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>确定性 + 高质量打乱的统一</strong>：既要可精确恢复（确定性），又要每 epoch 充分打乱（随机性），还要省内存——三者的最优结合仍在演进。Mosaic StreamingDataset 的多种 shuffle 算法（py1b/py1s 等）就是在这个三角里找不同折中。</li>
+    <li><strong>打乱质量的理论度量</strong>：用「平均位移」和「邻居相关性」度量打乱质量是工程近似，但「多随机才足够不伤梯度」缺乏严格理论。打乱不足对收敛与最终性能的真实影响，是个没有定论的经验问题。</li>
+    <li><strong>异构与变长样本的负载均衡</strong>：样本长度差异巨大（一条几十 token、一篇几万 token）时，按样本数还是按 token 数均衡 shard、如何避免长样本造成的 straggler，是吞吐优化的实际难题，和模块 03 的序列 packing 紧密相关。</li>
+    <li><strong>对象存储的尾延迟</strong>：从 S3/GCS 拉 shard 偶发的高延迟（长尾）会让个别 worker 卡住、拖慢整批。预取深度、超时重试、多副本竞速（hedged request）等缓解手段如何与确定性恢复共存，是生产系统的活跃工程方向。</li>
+    <li><strong>多模态与流式对齐</strong>：图文、音视频等多模态数据的 shard 里，不同模态字段大小悬殊、需对齐，流式加载的格式与打乱都更复杂。WebDataset 的多字段 tar 是起点，但大规模多模态加载仍在快速演化。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：WebDataset（Aizman et al.，顺序 IO 的 shard 格式）、Mosaic StreamingDataset（确定性恢复 + 全局打乱的生产实现）、HuggingFace IterableDataset 的 <code>shuffle(buffer_size=)</code> 文档（本课缓冲模拟的现实对应）、NVIDIA DALI（预取/解码流水）。下游接 C08（训练系统）看加载如何嵌进训练循环。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_dedup_scale/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 大规模去重</div></a>
+    <a class="next" href="../03_tokenization_throughput/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · Tokenization 吞吐</div></a>
+  </div>
+
+</div>
+</body>
+</html>

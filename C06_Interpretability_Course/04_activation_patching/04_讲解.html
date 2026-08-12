@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · Activation Patching：因果干预</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · Activation Patching：因果干预</h1>
+  <p class="subtitle">相关不等于因果——把 clean run 的激活移植进 corrupted run，让模型自己告诉你：信息存在哪一层、哪个位置、哪个 head</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（residual stream / logit lens）、模块 03（QK/OV 电路）、softmax 与链式法则</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_activation_patching.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Meng 2022 (ROME)、Wang 2022 (IOI)、Zhang &amp; Nanda 2023</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#causal">从相关到因果：观察 vs 干预的方法论跃迁</a></li>
+      <li><a href="#protocol">协议：clean / corrupted / patched 三次前向</a></li>
+      <li><a href="#metric">度量选择：为什么 logit diff 优于概率与 KL</a></li>
+      <li><a href="#rome">Causal tracing 与 ROME：事实存在中层 MLP</a></li>
+      <li><a href="#path">Path patching 与 IOI 电路</a></li>
+      <li><a href="#attrib">Attribution patching：用梯度近似做规模化</a></li>
+      <li><a href="#pitfalls">陷阱：self-repair、OOD 激活、单点定位的误导</a></li>
+      <li><a href="#evals">评测与审计视角 + 研究前沿</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="causal"><span class="num">1</span>从相关到因果：观察 vs 干预的方法论跃迁</h2>
+
+  <p>前三个模块的工具——linear probe（模块 01）、logit lens（模块 02）、attention pattern 分析（模块 03）——本质上都是
+  <strong>观察性（observational）</strong>的：我们读取激活、拟合解码器、看注意力分布，但从不改变模型的计算。
+  观察只能建立<strong>相关</strong>：probe 能从第 $\ell$ 层解码出某信息，说明信息<em>存在</em>于该层的表示中，
+  不说明模型下游<em>使用</em>了它（模块 01 的 selectivity 之争正源于此）；某个 head 注意力集中在某 token 上，
+  也不保证它搬运的内容对输出有任何影响——attention 不是 explanation。</p>
+
+  <p><span class="term">Activation patching</span>（也叫 <span class="term">interchange intervention</span>、
+  <span class="term">causal mediation analysis</span> 的特例）完成了从相关到因果的跃迁：
+  <strong>把一次前向中某个中间激活，替换成另一次前向中同一位置的激活，看输出怎么变。</strong>
+  这是 Pearl 因果阶梯上的第二级——干预 $\mathrm{do}(h_\ell = \tilde h_\ell)$，而且因为替换值取自一个反事实输入
+  （counterfactual input）的真实激活，它比任意值干预（如置零）更接近第三级的反事实推理。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>想知道一根电线是不是给灯泡供电的那根，光用电压表<em>量</em>（probe）不够——也许它只是恰好搭在带电的线旁边。
+      正确做法是<em>动手</em>：把这根线换接到另一个电源上，看灯泡亮不亮、亮成什么样。patching 就是给神经网络做的"换线实验"：
+      换的不是任意电源，而是"同一个模型读另一句话时、这根线上本来的电"，所以换进去的值天然在合理范围内。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设模型 $f$ 在输入 $x$ 上的计算图中，组件 $c$（某层某位置的 residual 向量、某 head 的输出等）取值 $a_c(x)$。
+      patching 定义干预后的输出 $f\big(x_{\text{base}} \mid \mathrm{do}(c \leftarrow a_c(x_{\text{src}}))\big)$：
+      在 $x_{\text{base}}$ 的前向中，把 $c$ 强制替换为它在 $x_{\text{src}}$ 上的取值，其余计算照常向下游传播。
+      组件 $c$ 对行为差异的<strong>因果效应</strong>由输出度量的变化定义。这一框架与因果中介分析中的
+      indirect effect 对应 [Vig 2020 arXiv:2004.12265]，也是 causal abstraction / interchange intervention
+      形式化的基本操作 [Geiger 2021 arXiv:2106.02997]。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  对评测科学家，这个跃迁的意义是：<strong>行为评测告诉你模型在分布上做了什么，观察性 interp 告诉你内部表示里有什么，
+  只有干预性 interp 能告诉你"哪个内部组件对这个行为负有因果责任"。</strong>
+  当你要回答"模型答对是因为推理还是因为记住了表面模式""后训练到底改了哪条通路"这类归因问题时，patching 是最低成本的因果工具。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="protocol"><span class="num">2</span>协议：clean / corrupted / patched 三次前向</h2>
+
+  <p>标准 activation patching 实验由一个<strong>最小对（minimal pair）</strong>和三次前向组成：</p>
+
+  <div class="ascii">
+  x_clean : "The Eiffel Tower is in"      → 期望输出 "Paris"
+  x_corr  : "The Colosseum  is in"        → 期望输出 "Rome"
+            （两个 prompt 仅在关键 token 上不同，其余 token 对齐）
+
+  ① clean run     : f(x_clean)             缓存所有中间激活 a_c(x_clean)
+  ② corrupted run : f(x_corr)              得到行为被改变的基线
+  ③ patched run   : f(x_corr | do(c ← a_c(x_clean)))   对每个候选组件 c 重复
+                       │
+                       ▼
+        若把 c 换成 clean 值就让输出"恢复"成 Paris
+        ⇒ c 携带 / 搬运了决定答案的那条信息
+  </div>
+
+  <p>对每个组件 $c$（扫描 layer × position 的 residual stream、每个 head、每个 MLP），记录度量
+  $M$（下一节讨论选哪种）并归一化：</p>
+
+  <div class="math-block">
+  $$ \mathrm{recovery}(c) \;=\; \frac{M_{\text{patched}}(c) - M_{\text{corr}}}{M_{\text{clean}} - M_{\text{corr}}}
+  \;\in\; [0, 1] \text{（理想情况）} $$
+  </div>
+
+  <p>$1$ 表示单独恢复 $c$ 就足以恢复行为，$0$ 表示毫无作用。把 recovery 画成 (layer × position) 热图，
+  就能直接<em>看见</em>信息在网络中的搬运轨迹——notebook 里你会在玩具任务上亲手画出这张图。</p>
+
+  <h3>2.1 Noising vs denoising：方向不同，语义不同</h3>
+
+  <p>patch 的方向决定了你在问什么问题，这是初学者最常混淆、也最常导致错误结论的点：</p>
+
+  <table>
+    <thead><tr><th></th><th>Denoising（restoration patching）</th><th>Noising（corruption patching）</th></tr></thead>
+    <tbody>
+      <tr><td>操作</td><td>在 <strong>corrupted run</strong> 中植入 <strong>clean</strong> 激活</td><td>在 <strong>clean run</strong> 中植入 <strong>corrupted</strong> 激活</td></tr>
+      <tr><td>回答的问题</td><td>这个组件是否<strong>足以（sufficient）</strong>恢复行为？</td><td>这个组件是否<strong>必要（necessary）</strong>维持行为？</td></tr>
+      <tr><td>逻辑形式</td><td>"只要它对，结果就对" —— 充分性</td><td>"只要它坏，结果就坏" —— 必要性</td></tr>
+      <tr><td>对冗余的反应</td><td>冗余组件<strong>各自</strong>都能恢复行为 → 都亮</td><td>破坏单个冗余组件被备份补偿 → <strong>都不亮</strong></td></tr>
+      <tr><td>典型应用</td><td>causal tracing [Meng 2022]：定位事实存储</td><td>ablation 研究、电路完整性验证</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>两个方向在存在冗余时给出系统性不同的答案。</strong>若信息有两条并行通路 A、B：denoising A 得到高
+  recovery（A 足够），denoising B 也高（B 也足够）；而 noising A 几乎没有效果（B 顶上了），noising B 同样没效果——
+  看起来"哪个都不重要"。这不是 bug，是充分性与必要性的逻辑差异。notebook 第 5 节用一个手工冗余电路精确复现这个不对称，
+  你会看到同一个位置 denoising recovery = 1.0 而 noising effect = 0.0。Heimersheim &amp; Nanda 2024 (arXiv:2404.15255)
+  对这套语义有系统综述。</div>
+
+  <h3>2.2 Corruption 怎么设计：你只能定位"两个输入之间的差异"</h3>
+
+  <p>patching 不是在定位"任务的电路"，而是在定位<strong>clean 与 corrupted 两次计算的差异所流经的通路</strong>。
+  corruption 的选择因此直接决定实验能回答什么：</p>
+
+  <ul>
+    <li><strong>对称 token 替换（symmetric counterfactual）</strong>：换 subject（Eiffel→Colosseum）、换 query、交换两个实体。
+    激活保持在数据流形上，差异语义清晰。Zhang &amp; Nanda 2023 (arXiv:2309.16042) 推荐为默认选择。</li>
+    <li><strong>高斯噪声（Gaussian noising）</strong>：ROME 的原始做法，把 subject token 的 embedding 加噪。
+    优点是不需要构造配对 prompt；缺点是把激活推出分布（off-distribution），后续层在它们从未见过的输入上运行，效应可能是噪声伪影。</li>
+    <li><strong>零/均值消融（zero / mean ablation）</strong>：严格说是另一类干预（不来自任何真实输入）。零消融严重 OOD；
+    mean ablation（换成跨数据集均值）和 resampling ablation（换成随机其他样本的激活）更温和，常用于 noising 方向。</li>
+  </ul>
+
+  <p>一个有用的口诀：<strong>corruption 没改的东西，patching 永远测不到。</strong>如果两个 prompt 的句法结构完全相同，
+  你就测不到处理句法的组件——它们在两次 run 中激活一致，patch 等于没 patch。notebook 里"换 value"与"换 query"
+  两种 corruption 给出完全不同的热图，就是这个原理的直接演示。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="metric"><span class="num">3</span>度量选择：为什么 logit diff 优于概率与 KL</h2>
+
+  <p>同一个 patching 实验，换一个度量，结论可能翻转——这是 Zhang &amp; Nanda 2023 (arXiv:2309.16042)
+  系统比较后的核心警告。最稳健的默认选择是 <span class="term">logit difference</span>：</p>
+
+  <div class="math-block">
+  $$ \mathrm{LD} \;=\; \mathrm{logit}(t_{\text{ans}}) - \mathrm{logit}(t_{\text{alt}})
+  \;=\; \big(W_U[:, t_{\text{ans}}] - W_U[:, t_{\text{alt}}]\big)^{\!\top} x_{\text{final}} $$
+  </div>
+
+  <p>其中 $t_{\text{ans}}$ 是 clean 答案、$t_{\text{alt}}$ 是 corrupted 答案。它的优势全部来自这个表达式的形状：</p>
+
+  <ul>
+    <li><strong>线性读出</strong>：LD 是最后一层 residual stream 的线性函数（softmax 之前），
+    每个组件经直接通路对它的贡献可以精确分解（这正是模块 02 logit attribution 的基础），效应不会被 softmax 压扁或放大。</li>
+    <li><strong>不饱和</strong>：概率度量 $p(t_{\text{ans}})$ 在 0 和 1 附近梯度消失——当模型已经很确定时，
+    一个组件把 logit 推高 5 个单位，概率只动 0.001，效应被隐藏；logit 空间里 5 就是 5。</li>
+    <li><strong>双边对照</strong>：用 $t_{\text{alt}}$ 做基线，排除"组件只是整体抬高了置信度/改变了 entropy"的混淆，
+    分离出<em>区分两个答案</em>的那部分信号。</li>
+    <li><strong>连续</strong>：accuracy / rank 类度量是阶跃函数，组件效应低于翻转阈值时完全不可见，且噪声大。</li>
+  </ul>
+
+  <table>
+    <thead><tr><th>度量</th><th>问题</th></tr></thead>
+    <tbody>
+      <tr><td>$p(t_{\text{ans}})$ 或 $\log p$</td><td>softmax 饱和区效应不可见；受全词表竞争影响，组件对无关 token 的作用混入</td></tr>
+      <tr><td>KL$(p_{\text{clean}} \| p_{\text{patched}})$</td><td>对"恢复了哪个方向"不敏感（KL 不分好坏），整分布度量把无关 token 的扰动也计入；适合"行为是否变了"，不适合"目标行为是否恢复"</td></tr>
+      <tr><td>accuracy / rank</td><td>离散、不连续，单样本上几乎无信息，需要大样本平均</td></tr>
+      <tr><td><strong>logit diff</strong></td><td>需要明确的 (ans, alt) 对照对；多选项任务可推广为 ans 对其余项的 logsumexp 差</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>"虚假恢复"陷阱：</strong>用单边度量（如 $p(t_{\text{ans}})$）时，一个把<em>所有</em> logit 都抬高的组件、
+  或一个只是恢复了"这里该输出一个城市名"这类粗粒度信息的组件，都会显得 recovery 很高。
+  Zhang &amp; Nanda 2023 的实验显示，同一电路在不同度量下"关键组件"的集合可以截然不同——
+  报告 patching 结果时必须写明度量与归一化方式，审稿人（和你自己）才有办法判断结论是否稳健。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="rome"><span class="num">4</span>Causal tracing 与 ROME：事实存在中层 MLP</h2>
+
+  <p>把 denoising patching 系统化地扫过 (layer × position) 网格，就是 <span class="term">causal tracing</span>
+  ——ROME [Meng 2022 arXiv:2202.05262] 的第一半。实验设计：</p>
+
+  <ol>
+    <li>取事实召回 prompt："The Eiffel Tower is located in" → "Paris"，subject = "Eiffel Tower"。</li>
+    <li><strong>Corrupt</strong>：对 subject token 的 embedding 加高斯噪声，模型输出垮掉（noising 发生在输入端）。</li>
+    <li><strong>Restore</strong>：逐个把某层某位置的 hidden state 换回 clean 值（denoising），看 $p(\text{Paris})$ 恢复多少。</li>
+  </ol>
+
+  <p>跨上千条事实平均后得到两个高恢复区：<strong>早–中层、subject 最后一个 token 位置的 MLP</strong>（"early site"），
+  以及末层、最后一个 token 位置的 attention（"late site"）。分别 patch MLP 与 attention 的分解实验进一步显示
+  early site 的恢复主要由 MLP 贡献。由此得出著名论断：<strong>自回归 LM 把事实关联存储在中层 MLP 中，
+  MLP 表现为以 subject 表示为 key、以事实属性为 value 的键值存储（联想记忆）</strong>——这直接催生了 ROME 的第二半：
+  对定位到的 MLP 权重做 rank-one 编辑来改写事实，以及后续的 MEMIT（批量编辑上万条事实）。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>定位 ≠ 编辑位点。</strong>Hase 2023 (arXiv:2301.04213) 发现：causal tracing 定位到第 $\ell$ 层，
+  并不意味着在第 $\ell$ 层编辑效果最好——在 tracing 结果很弱的层做 ROME 编辑往往同样成功。
+  这提示 causal tracing 测的是"信息在推理时流经哪里"，而编辑成功率还取决于优化景观等别的因素。
+  方法学教训：<strong>一种因果证据支持一个特定命题，不要把它泛化成"理解了机制"。</strong></div>
+
+  <p>notebook 的玩具任务正是一个微缩 ROME 场景：键值召回任务里"key→value 绑定"被写在 value token 位置的
+  residual stream 中层，patching 热图会精确显示这一点——你将在一个完全透明的模型上验证 causal tracing 的逻辑。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="path"><span class="num">5</span>Path patching 与 IOI 电路</h2>
+
+  <p>逐组件 patching 回答"哪个组件重要"，但不回答"组件之间怎么接线"。
+  <span class="term">Path patching</span> [Wang 2022 arXiv:2211.00593; Goldowsky-Dill 2023 arXiv:2304.05969]
+  把干预细化到<strong>边</strong>：只替换"组件 A 的输出中、经由直接连接进入组件 B 输入"的那部分，
+  其余所有通路冻结为 base run 的值。由于 residual stream 是线性总线（模块 02），
+  head A 对 head B 的直接贡献可以精确切出来，这让"A 是否<em>直接</em>给 B 提供信息"成为可检验命题。</p>
+
+  <p>方法的代表作是 <span class="term">IOI（Indirect Object Identification）</span>电路 [Wang 2022]：
+  GPT-2 small 在 "When Mary and John went to the store, John gave a drink to ___" 上输出 "Mary"。
+  度量取 $\mathrm{LD} = \mathrm{logit}(\text{IO}) - \mathrm{logit}(\text{S})$，corruption 用换名字的对称替换。
+  通过反复的 path patching，他们给出了一个 26 个 head、分 7 类的电路：</p>
+
+  <div class="ascii">
+  Duplicate Token Heads ──┐  检测 "John 出现过两次"
+  Induction Heads ────────┤（模块 03 的老朋友，这里做重复检测）
+                          ▼
+              S-Inhibition Heads        把"重复的名字 = S"写进
+                          │             最后一个 token 的 query
+                          ▼
+              Name Mover Heads          attention 避开 S、命中 IO，
+                          │             把 "Mary" 拷到最后位置
+                          ▼
+                       logits           （还有 Negative Name Movers
+                                          反向压制——见下节 self-repair）
+  </div>
+
+  <p>这篇论文同时立下了电路研究的三条验收标准，做任何"我找到了一个电路"的声明前都该过一遍：</p>
+
+  <ul>
+    <li><strong>Faithfulness（忠实）</strong>：只保留电路、消融其余组件，任务性能应基本保持（IOI 电路恢复 ~87% 的 LD）。</li>
+    <li><strong>Completeness（完整）</strong>：电路的每个子集的作用都与它在整个模型中的作用一致——没漏掉参与计算的组件。</li>
+    <li><strong>Minimality（最小）</strong>：每个成员都有不可替代的贡献——没塞进无关组件。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  路线图：activation patching 给出<strong>节点级</strong>因果图，path patching 给出<strong>边级</strong>接线图，
+  两者迭代就能从行为反推算法。代价是实验数随边数平方增长——这就是下一节 attribution patching 和第 8 节
+  ACDC 要解决的规模化问题。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="attrib"><span class="num">6</span>Attribution patching：用梯度近似做规模化</h2>
+
+  <p>逐组件 patching 的成本是"每个组件一次前向"：对 50 层 × 2048 位置 × 几十个 head 的现代模型做全扫描，
+  前向次数以百万计。<span class="term">Attribution patching</span> [Nanda 2023,
+  neelnanda.io/attribution-patching] 用一阶泰勒展开把它压缩为<strong>两次前向 + 一次反向</strong>：</p>
+
+  <div class="math-block">
+  $$ \Delta M(c) \;=\; M\big(x_{\text{corr}} \mid \mathrm{do}(c \leftarrow a_c^{\text{clean}})\big) - M(x_{\text{corr}})
+  \;\approx\; \nabla_{a_c} M \Big|_{x_{\text{corr}}}^{\!\top} \big(a_c^{\text{clean}} - a_c^{\text{corr}}\big) $$
+  </div>
+
+  <p>在 corrupted run 上对度量做一次 backward，拿到所有组件的梯度；与 clean/corrupted 激活差做内积，
+  即得<em>每个组件</em>的 patching 效应的线性近似——所有 layer、所有 position、所有 head 一次算完。
+  这就是"用算梯度的成本换百万次前向"的交易。</p>
+
+  <ul>
+    <li><strong>什么时候准</strong>：patch 引起的扰动落在度量的局部线性区时。实践中对 residual stream 这类"大杂烩"
+    组件近似较差（差值大、跨越非线性），对单 head / 单 neuron 的小扰动较准。</li>
+    <li><strong>什么时候崩</strong>：饱和的 softmax（attention 接近 one-hot 时梯度 ≈ 0，但真实 patch 能翻转注意力——
+    一阶近似直接漏掉整个效应）与 LayerNorm 的尺度耦合是两大失效源。</li>
+    <li><strong>正确用法</strong>：当<strong>筛选器</strong>而非测量仪——先用 attribution patching 把百万候选筛到几百个，
+    再对幸存者跑真 patching 验证。EAP（Edge Attribution Patching, Syed 2023 arXiv:2310.10348）
+    把同样的近似推广到边级，作为 ACDC 的快速替代。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="pitfalls"><span class="num">7</span>陷阱：self-repair、OOD 激活、单点定位的误导</h2>
+
+  <h3>7.1 Self-repair 与 backup heads：网络会"自我修复"</h3>
+  <p>IOI 研究中发现：消融 name mover heads 后，一批平时贡献很小的 <span class="term">backup name mover heads</span>
+  会<em>改变自己的行为</em>顶上来，总效应远小于各组件效应之和；negative name movers 还会减少反向压制做补偿。
+  McGrath 2023 (arXiv:2307.15771) 把这类现象命名为 <span class="term">hydra effect</span>：砍掉一个头，另一个头长出来。
+  后果：<strong>noising/ablation 系统性低估组件重要性</strong>；"消融后性能只掉 2%"不能推出"这个 head 不重要"。
+  机制上，softmax 的重归一化天然提供一种自修复：被消融的 key 退出竞争后，注意力质量自动重新分配给备份位置——
+  notebook 第 5 节的玩具电路精确复现了这一点。</p>
+
+  <h3>7.2 OOD 激活：你的干预把模型推到了它没见过的地方</h3>
+  <p>patching 构造的激活组合（前半句来自 A、某个 head 来自 B）在训练分布中从未出现。
+  轻则效应被低估/高估，重则触发完全虚假的行为。缓解：优先用对称 token 替换而非高斯噪声；
+  避免零消融；对结论用多种 corruption 交叉验证。更深一层，Makelov 2023 (arXiv:2311.17030) 指出
+  <strong>子空间 patching 可能产生"可解释性幻觉"</strong>：对某个子空间做干预看似实现了预期的行为切换，
+  实际是激活了一条休眠的虚假通路（与之的争论见 Wu 2024 的回应）——干预实验本身也需要对照设计。</p>
+
+  <h3>7.3 单点定位的误导</h3>
+  <ul>
+    <li><strong>分布式表示</strong>：信息常摊在多个组件上，每个单点 recovery 都不高 → 误判"没有定位"。需要做组团 patching（一次 patch 一组组件）或沿位置/层做累积 patching。</li>
+    <li><strong>搬运 ≠ 存储 ≠ 计算</strong>：某位置 recovery 高，可能因为它<em>存着</em>答案，也可能只是答案<em>路过</em>（被 attention 搬运中转）。区分需要 path patching 看上下游接线。</li>
+    <li><strong>定位结论依赖 corruption 与度量</strong>（第 2、3 节）：换一种 corruption，热图峰值可以从 context 移到 query；换一种度量，"关键层"可以漂移数层。结论应表述为"对这对输入、这个度量，差异信息流经 X"。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  实战 checklist：① 度量是 logit diff 且写明 (ans, alt)；② corruption 是对称替换且与假设对齐；
+  ③ noising 与 denoising 都跑了（必要性与充分性分开报告）；④ 单点不亮时试过组团 patching；
+  ⑤ 结果在 ≥2 种 corruption 下复现。五条全过再下结论。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="evals"><span class="num">8</span>评测与审计视角 + 研究前沿</h2>
+
+  <h3>8.1 对评测科学家：patching 是行为差异的归因工具</h3>
+  <ul>
+    <li><strong>行为差异的机制归因</strong>：模型在 benchmark A 上对、在改写版 A′ 上错——把 (A, A′) 当作 (clean, corrupted)
+    最小对做 patching，能定位失败由哪条通路引起：是没读到关键信息（attention 通路），还是读到了但没用上（后段 MLP）？
+    这把"鲁棒性差"从一个分数变成一个可检验的机制命题。</li>
+    <li><strong>Model diffing</strong>：后训练（RLHF / 安全微调）改了什么？对 base 与 finetuned 模型在同一 prompt 上的激活做
+    <em>跨模型</em> patching（把 base 的某层激活植入 finetuned），可以定位行为变化（如学会拒绝）集中在哪些层与组件——
+    这比对比两份 benchmark 分数的信息量大一个量级，是模块 07 的主题之一。</li>
+    <li><strong>为 safety case 提供机制证据</strong>：审计"模型是否在 eval 中 sandbagging / 阳奉阴违"时，
+    行为证据天然不足（行为正是被怀疑的对象）。probe 找到"欺骗方向"只是相关；用 patching 验证干预该方向
+    确实因果地改变欺骗行为，才能把白盒证据写进 safety case。因果验证是观察性 interp 证据的"公证处"。</li>
+    <li><strong>评测 interp 本身</strong>：电路研究的三标准（faithfulness / completeness / minimality）就是一套评测协议；
+    interp 声明也需要 benchmark 与对照——这是 interp 与 evals 双向奔赴的地方。</li>
+  </ul>
+
+  <h3>8.2 前沿：自动化与规模化</h3>
+  <ul>
+    <li><strong>自动电路发现</strong>：ACDC [Conmy 2023 arXiv:2304.14997] 把"研究者手动迭代 path patching"自动化——
+    从完整计算图出发，贪心地逐边尝试消融，KL 变化小于阈值就删边，输出稀疏子图，在 IOI 等任务上大体复现了人工电路。
+    瓶颈是 $O(\text{边数})$ 次前向与对阈值的敏感性；EAP 用 attribution 近似提速后，电路发现已能扫数十亿参数模型。</li>
+    <li><strong>与特征级方法合流</strong>：head/MLP 粒度的电路是"按硬件分块"，未必对齐真实的计算单元。
+    把 patching 用在 SAE 特征（模块 05）上做 feature circuit / sparse feature circuits，是当前最活跃的方向——
+    干预单元从"第 7 层 head 3"变成"表示'法国'的特征"。</li>
+    <li><strong>开放问题</strong>：跨 prompt 分布的电路是否稳定（电路的泛化性）？自修复的机制与普遍性？
+    如何给"电路解释了行为"一个可检验的充分必要刻画？patching 结论对 corruption / 度量选择的敏感性能否被系统量化？
+    这些都直接决定 interp 证据能否进入高风险审计流程。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>为什么 probe 解码成功不能推出"模型使用了该信息"？patching 在因果阶梯的哪一级？</li>
+      <li>写出 denoising 与 noising 的操作定义；在存在冗余通路时两者分别给出什么结论？为什么？</li>
+      <li>logit diff 相比概率、KL、accuracy 的三个优势是什么？什么场景下它也会误导？</li>
+      <li>causal tracing 的发现是什么？Hase 2023 对"定位→编辑"的推断提出了什么质疑？</li>
+      <li>self-repair / backup heads 如何让 ablation 低估组件重要性？softmax 在其中扮演什么角色？</li>
+      <li>给定"模型在改写后的 benchmark 上掉点"这一现象，你会如何设计 patching 实验做机制归因？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../03_attention_induction/03_讲解.html"><div class="dir">← 上一章</div><div class="t">03 · QK/OV 电路与 Induction Heads</div></a>
+    <a class="next" href="../05_superposition_sae/05_讲解.html"><div class="dir">下一章 →</div><div class="t">05 · 叠加假说与稀疏自编码器</div></a>
+  </div>
+
+</div>
+</body>
+</html>

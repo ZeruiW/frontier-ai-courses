@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 发布策略与自动扩缩</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 发布策略与自动扩缩</h1>
+  <p class="subtitle">爆炸半径 × MTTR · 滚动更新的容量凹陷 · 金丝雀判据的统计学（peeking / SPRT / 非劣性）· HPA 控制律与震荡 · 热备容量与 burn-rate 自动回滚</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–03、基本假设检验（C03/C10 的统计部分有帮助但不必需）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_rollout_autoscaling.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Argo Rollouts / Flagger 文档、K8s HPA 算法、Google SRE Book 第 27 章、序贯检验（SPRT / always-valid inference）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#risk">发布的本质：把风险切成小份</a></li>
+      <li><a href="#rolling">滚动更新的数学：容量为什么会塌</a></li>
+      <li><a href="#canary">金丝雀：分阶段放量与自动分析</a></li>
+      <li><a href="#hpa">自动扩缩：控制律与震荡</a></li>
+      <li><a href="#scaletozero">冷启动、热备与 scale-to-zero</a></li>
+      <li><a href="#rollback">自动回滚：错误预算驱动的决策</a></li>
+      <li><a href="#ledger">算一笔账：发布策略的真实成本对比</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="risk"><span class="num">1</span>发布的本质：把风险切成小份</h2>
+  <p>集群会自愈了。但自愈只能救「机器挂了」这种<strong>外生</strong>故障，救不了「你自己推了一个坏版本」这种<strong>内生</strong>故障——恰恰后者是生产事故的主要来源。行业数据反复显示，<em>绝大多数线上事故的直接触发点是一次变更</em>。</p>  <p>所以发布策略的全部目的，可以用模块 00 的公式概括：</p>  <div class="math-block">\[\text{损失} = \underbrace{f_{affected}}_{\text{爆炸半径}} \times \underbrace{(T_{detect} + T_{recover})}_{\text{MTTR}}\]</div>  <p>你只有两个杠杆：<strong>压小 <code>f</code></strong>（渐进发布）和<strong>压小 <code>T</code></strong>（自动检测 + 自动回滚）。而且它们的<em>收益不对称</em>——把 <code>f</code> 从 100% 降到 5% 是 20 倍收益、几乎无成本；把 <code>T_detect</code> 从 5 分钟降到 1 分钟需要完善的可观测性建设，且有下界（统计上你需要足够样本才能判断）。<strong>所以先压 <code>f</code>，再压 <code>T</code></strong>。</p>  <table>
+    <thead><tr><th>策略</th><th>f（爆炸半径）</th><th>额外资源</th><th>回滚速度</th><th>适合</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Recreate</strong> 停机重建</td><td>100%（且有停机）</td><td>0（先停后起）</td><td>重新发一次</td><td>只有开发环境该用</td></tr>
+      <tr><td><strong>RollingUpdate</strong> 滚动</td><td>随进度 0→100%</td><td>maxSurge 的额外副本</td><td>滚回去，分钟级</td><td>默认策略，适合低风险变更</td></tr>
+      <tr><td><strong>Blue-Green</strong> 蓝绿</td><td>切换瞬间 0→100%</td><td><strong>2 倍</strong>（两套全量并存）</td><td><strong>秒级</strong>（切回去）</td><td>要求瞬间回滚、能承受 2 倍成本</td></tr>
+      <tr><td><strong>Canary</strong> 金丝雀</td><td>可控（1%→5%→25%→100%）</td><td>少量额外副本</td><td>秒级（把权重归零）</td><td><strong>LLM 服务的默认选择</strong></td></tr>
+      <tr><td><strong>Shadow</strong> 影子流量</td><td><strong>0</strong>（不返回给用户）</td><td>1 倍（镜像全量流量）</td><td>不需要</td><td>验证性能/正确性，不验证用户反应</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么金丝雀是 LLM 服务的默认答案？因为 LLM 变更的<strong>失效模式特别隐蔽</strong>。换个量化精度、换个 prompt 模板、换个采样参数——服务不会崩、错误率不会涨、延迟可能还更好，但<em>输出质量悄悄劣化了</em>。这种问题只能靠「小流量 + 观察质量指标」发现，靠 <code>kubectl rollout status</code> 看到的「全部 Pod Running」毫无意义。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严格地说，LLM 发布要监控<strong>两类指标</strong>：<em>系统指标</em>（错误率、TTFT/TPOT、GPU 利用率——秒级可得、方差小、几分钟就能判断）和<em>质量指标</em>（人工评分、LLM-judge 胜率、下游任务准确率、<code>finish_reason=length</code> 比例、用户重试率——分钟到小时级、方差大、需要大样本）。<strong>两类指标的检测时间差了 1–2 个数量级</strong>，这直接决定了金丝雀的分阶段设计：先用系统指标快速过一关，再用质量指标慢慢过第二关。</p></div>
+  </div>  <div class="callout danger"><span class="label">回滚优先于修复</span>
+    <p>一个必须内化的原则：<strong>回滚必须比修复快，且必须是无脑的</strong>。事故当中，人的判断力是下降的。如果回滚需要「先看一下是哪个 commit、再决定要不要 revert、还要重新构建镜像」，那么在压力下这条路径一定会出错。正确的做法是：<em>上一个已知良好的版本始终是可以一键切回的活对象</em>——蓝绿保留旧环境、金丝雀保留旧 ReplicaSet、Deployment 保留 <code>revisionHistoryLimit</code> 个历史。<strong>先回滚、后定位</strong>，永远不要在事故中调试。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rolling"><span class="num">2</span>滚动更新的数学：容量为什么会塌</h2>
+  <p>滚动更新看起来很温和：一个个换。但它有两个参数，配错了会在更新期间<strong>把容量打到低于流量需求</strong>，制造一次自伤事故。</p>  <table>
+    <thead><tr><th>参数</th><th>含义</th><th>默认值</th><th>调大的后果</th></tr></thead>
+    <tbody>
+      <tr><td><code>maxUnavailable</code></td><td>更新期间最多有几个副本不可用</td><td>25%</td><td>更新更快，但<strong>容量下探更深</strong></td></tr>
+      <tr><td><code>maxSurge</code></td><td>更新期间最多超出期望副本数几个</td><td>25%</td><td>更新更快、容量不下探，但<strong>要多占资源</strong>（GPU 场景=真金白银）</td></tr>
+    </tbody>
+  </table>  <p>更新期间的可用副本数满足：</p>  <div class="math-block">\[R_{avail}(t) \ge R_{desired} - \texttt{maxUnavailable}, \qquad R_{total}(t) \le R_{desired} + \texttt{maxSurge}\]</div>  <div class="ascii">13 副本, maxUnavailable=25%(3), maxSurge=25%(3)
+
+可用副本
+ 16 │                    ╭──── 新版本全部就绪
+ 13 │────╮        ╭──────╯     ← 期望容量线
+ 10 │    ╰────────╯            ← 最深下探 = 13 - 3 = 10
+    └────────────────────────────────► 时间
+         ↑                ↑
+      开始更新        新 Pod 就绪（LLM 要 3 分钟！）
+
+危险：若峰值流量需要 12 个副本，这段时间内 ρ &gt; 1，排队爆炸（模块 02 的死亡地带）。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>对普通 web 服务，新 Pod 三秒就绪，这个「凹陷」窄到没人注意。<strong>对 LLM 服务，新 Pod 要三分钟才就绪</strong>，凹陷会持续很久——如果一批要换 3 个，每批 3 分钟，13 个副本换完要 15 分钟，这 15 分钟你都在低于额定容量运行。<em>把 <code>maxUnavailable</code> 设成 0 是 LLM 服务的标准做法</em>：先起新的、就绪了再摘旧的，容量永不下探。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>代价是必须有 <code>maxSurge &gt; 0</code>，即要有空闲 GPU 承载额外副本。<code>maxSurge: 1</code> 时更新是完全串行的（起一个、就绪、摘一个、再起一个），13 个副本 × 3 分钟 = 39 分钟。<code>maxSurge: 25%</code>（3 个）能并行三个一批，约 15 分钟。<strong>这就是「更新时长 vs 额外 GPU」的直接权衡</strong>：付 3 张卡的钱，换 2.6 倍的更新速度。notebook 会把这条曲线画出来。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>滚动更新还有一个 LLM 特有的隐蔽问题：<strong>新旧版本会同时在线</strong>。如果你换的是模型权重，那么在更新的这 15 分钟里，<em>同一个用户的两次请求可能被不同版本处理</em>，得到风格/能力不一致的回答。对多轮对话尤其明显。要避免就得做会话粘性（session affinity）路由，或者干脆用蓝绿（瞬间切换，无混合期）。这是「滚动更新对 LLM 未必最优」的另一个理由。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="canary"><span class="num">3</span>金丝雀：分阶段放量与自动分析</h2>
+  <p>金丝雀发布的完整形态不是「切 5% 流量看一眼」，而是一条<strong>带自动判据的流水线</strong>：</p>  <div class="ascii">┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+│ 部署金丝雀│──▶│ 1% / 5min│──▶│ 5% /10min│──▶│25% /20min│──▶│ 100% 全量│
+└──────────┘   └────┬─────┘   └────┬─────┘   └────┬─────┘   └──────────┘
+                    │              │              │
+              自动分析 ✓     自动分析 ✓     自动分析 ✓
+                    │              │              │
+                    ✗ 任一失败 ─────┴──────────────┴──▶ 【自动回滚：权重归零】
+
+每个阶段的自动分析（analysis run）检查：
+  · 系统指标：错误率 ≤ baseline+0.1%、P95 TTFT ≤ baseline×1.2
+  · 质量指标：LLM-judge 胜率 ≥ 0.45（非劣性）、finish_reason=length 比例无显著上升
+  · 样本量门槛：本阶段至少 N 个请求，否则延长而非放行</div>  <p>这里最容易被做错的一步是<strong>「看一眼」的那个判据</strong>。工程师的直觉是「错误率没涨就放行」，但这在统计上是站不住的——5% 流量跑 5 分钟可能只有几百个请求，这点样本下「错误率 0.1% vs 0.15%」的差异完全在噪声里。<em>你需要的是一个有明确统计意义的判据，而不是一眼</em>。</p>  <h3>三种判据，从粗到细</h3>  <table>
+    <thead><tr><th>判据</th><th>怎么做</th><th>样本需求</th><th>适合</th></tr></thead>
+    <tbody>
+      <tr><td><strong>阈值判据</strong></td><td>错误率 &lt; 0.5%、P95 &lt; 800ms</td><td>小</td><td>系统指标的第一道粗筛（能挡住「彻底坏了」）</td></tr>
+      <tr><td><strong>对照判据</strong>（A/B）</td><td>金丝雀 vs 基线同时段对比，做假设检验</td><td>中等</td><td>系统指标的精筛，排除环境波动</td></tr>
+      <tr><td><strong>非劣性检验</strong></td><td>检验「新版本不比旧版本差超过 δ」而非「新版本更好」</td><td>大</td><td>质量指标（这是正确的问法）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么质量指标要用<strong>非劣性</strong>而不是普通的显著性检验？因为发布的问题不是「新版本更好吗」，而是「<em>新版本会不会更差</em>」。普通检验的原假设是「两者相同」，检验不显著只能说「没证据表明不同」——但这也可能是样本太少。非劣性检验把原假设反过来设成「新版本差了至少 δ」，拒绝它才放行。<em>这个方向的翻转是发布决策的正确姿势</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个必须处理的统计陷阱：<span class="term">peeking</span>（偷看）。金丝雀天然是「持续监控、随时可能叫停」，这等价于反复做检验。固定样本量的 p 值在反复偷看下会严重膨胀假阳性率——每 10 秒看一次，跑 10 分钟就是 60 次检验，即使新旧版本完全相同，「至少有一次 p&lt;0.05」的概率也接近 95%。正确做法是用<strong>序贯检验</strong>（SPRT）或<strong>always-valid 置信序列</strong>，它们在任意停止时刻都保持名义错误率。notebook 会把「朴素反复检验」的假阳性率跑出来给你看。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>工程上的务实折中：<strong>系统指标用阈值 + 短窗口（快，几分钟就能挡住灾难性 bug），质量指标用序贯检验 + 长窗口（慢，但避免误判）</strong>。两条腿分开走。绝大多数坏发布是灾难性的（服务起不来、错误率飙升），会被第一条腿在 5 分钟内挡下；剩下的隐蔽劣化交给第二条腿慢慢判。<em>不要试图用一个判据同时解决两件事</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hpa"><span class="num">4</span>自动扩缩：控制律与震荡</h2>
+  <p>流量涨了要加副本，跌了要减。听起来简单，实现起来是个<strong>控制系统</strong>问题——而控制系统会震荡。</p>  <p>K8s HPA 的算法是一个朴素的比例控制器，公式短到可以背下来：</p>  <div class="math-block">\[R_{desired} = \left\lceil R_{current} \times \frac{M_{current}}{M_{target}} \right\rceil\]</div>  <p>配一个<strong>容差带（tolerance）</strong>：当比值落在 <code>[1−0.1, 1+0.1]</code> 内时不动作，避免在目标点附近反复抖动。这个死区是 HPA 稳定性的第一道保险。</p>  <div class="ascii">HPA 的反馈回路（以及它为什么会震荡）
+
+   流量 λ ──▶ [ 服务 R 个副本 ] ──▶ 指标 M（利用率/队列深度/QPS）
+                    ▲                        │
+                    │                        ▼
+              扩缩动作 ◀── [ HPA 控制器 ] ◀── 指标采集（15s 一次，且滞后！）
+                              每 15s 算一次
+
+三个致命延迟：
+  ① 指标采集与聚合滞后        ~30 s
+  ② HPA 同步周期              ~15 s
+  ③ 新副本冷启动（模块 01）   ~60-180 s  ← LLM 的这一项是普通服务的 30 倍
+
+总环路延迟 L ≈ 2-4 分钟。**控制回路的延迟越大，越容易震荡。**</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>震荡是这么来的：流量涨 → 指标涨 → HPA 扩容 → <em>但新副本三分钟后才生效</em> → 这三分钟里指标还在涨 → HPA 继续扩 → 三分钟后一大批副本同时就绪 → 指标暴跌 → HPA 缩容 → 缩完流量又上来……<strong>系统在一个周期约等于 2 倍环路延迟的极限环里来回摆</strong>，副本数忽高忽低，成本和延迟双输。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>控制论的标准结论：对于带纯延迟 <code>L</code> 的反馈系统，比例增益过大会失稳。HPA 的缓解手段有三个：<strong>①稳定窗口（stabilization window）</strong>——缩容前看过去 5 分钟的最大建议值（默认 300s），扩容前看过去 0s（默认立刻扩）。<em>这个不对称是刻意的</em>：扩容要快（用户在等），缩容要慢（省钱不急，且防抖）。<strong>②扩缩速率限制</strong>（<code>behavior.scaleDown.policies</code>：每分钟最多缩 10%）。<strong>③选对指标</strong>——见下。</p></div>
+  </div>  <h3>按什么指标扩缩：LLM 的正确答案不是 GPU 利用率</h3>  <table>
+    <thead><tr><th>指标</th><th>问题</th><th>适合吗</th></tr></thead>
+    <tbody>
+      <tr><td>CPU 利用率</td><td>LLM 推理的瓶颈在 GPU，CPU 几乎不动</td><td>❌ 完全无效</td></tr>
+      <tr><td>GPU 利用率</td><td><code>nvidia-smi</code> 的 utilization 只表示「有 kernel 在跑」，不表示「跑满了」；且 continuous batching 下它长期接近 100%，几乎没有区分度</td><td>❌ 误导性强</td></tr>
+      <tr><td><strong>队列深度 / 等待请求数</strong></td><td>直接反映供需缺口，且<strong>领先于</strong>延迟劣化</td><td>✅ <strong>最佳</strong></td></tr>
+      <tr><td>P95 TTFT</td><td>直接对应 SLO，但是<strong>滞后</strong>指标——它涨的时候已经在伤害用户了</td><td>🔶 作为兜底触发器</td></tr>
+      <tr><td>QPS / 并发数</td><td>简单可靠，但需要知道单副本容量（模块 02 的 μ）</td><td>✅ 好，尤其配合预测</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <strong>队列深度胜过延迟</strong>，理由值得记住：队列深度是<em>领先指标</em>（leading indicator），延迟是<em>滞后指标</em>（lagging indicator）。当队列开始堆积时，延迟还没恶化（因为请求还在排队没超时），此时扩容还来得及；等到 P95 TTFT 破线，你已经欠了用户三分钟的债，而扩容还要三分钟才生效。<em>用滞后指标做反馈控制，等于闭着眼睛开车看后视镜</em>。KEDA 的价值就在于它能按队列长度这类外部指标扩缩，而原生 HPA 需要配自定义指标适配器。
+  </div>  <p>最后一条对 LLM 至关重要：<strong>当冷启动 &gt; 环路能容忍的延迟时，反应式扩容在数学上就是不够的</strong>。三分钟的冷启动意味着你永远在追赶三分钟前的流量。解法有三：<em>预测式扩容</em>（按日周期/预约流量提前扩）、<em>保留热备</em>（多养 N 个空闲副本作缓冲，用钱买时间）、<em>缩短冷启动</em>（模块 01 的全部内容）。生产上通常三管齐下。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="scaletozero"><span class="num">5</span>冷启动、热备与 scale-to-zero</h2>
+  <p>上一节的结论逼出一个具体的工程量：<strong>你需要养多少热备副本</strong>？这可以算出来。</p>  <p>设流量上升速率为 <code>dλ/dt</code>（QPS/秒）、单副本容量 <code>μ</code>、冷启动时间 <code>T_cold</code>。在扩容生效之前，你需要用现有余量吃掉这段时间涨上来的流量：</p>  <div class="math-block">\[R_{buffer} \ge \frac{1}{\mu} \cdot \frac{d\lambda}{dt} \cdot T_{cold}\]</div>  <table>
+    <thead><tr><th>场景</th><th>dλ/dt</th><th>T_cold</th><th>μ</th><th>需要热备</th></tr></thead>
+    <tbody>
+      <tr><td>平缓日周期</td><td>0.05 QPS/s</td><td>180 s</td><td>2.5</td><td>≈ 4 个副本</td></tr>
+      <tr><td>营销活动开闸</td><td>2 QPS/s</td><td>180 s</td><td>2.5</td><td>≈ 144 个副本（不现实！）</td></tr>
+      <tr><td>同上，但冷启动压到 30 s</td><td>2 QPS/s</td><td>30 s</td><td>2.5</td><td>≈ 24 个副本</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第二行说明了一个残酷事实：<strong>面对陡峭的流量尖峰，靠热备是买不起的</strong>。这时候只能靠别的手段：提前预约扩容（知道活动几点开始就几点前扩好）、排队+降级（承认扛不住，优雅地限流而不是崩）、或者让上游做流量整形。<em>「自动扩缩能解决一切突发」是个危险的幻觉</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第三行说明了模块 01 的价值：<strong>冷启动时间是热备成本的乘数</strong>。把 <code>T_cold</code> 从 180 秒压到 30 秒，热备需求降到 1/6，直接省下 120 个副本的钱。这就是为什么镜像瘦身、权重本地缓存、CUDA graph 缓存这些「看起来是小优化」的事情，在自动扩缩场景下有放大的收益。</p></div>
+  </div>  <h3>scale-to-zero：省钱的极限与它的代价</h3>  <p>对低频服务（内部工具、长尾模型），最省钱的做法是<strong>没有流量时缩到 0 个副本</strong>。Knative/KEDA 支持这个。代价是第一个请求要等完整的冷启动——对 LLM 就是几十秒到几分钟，用户体验极差。</p>  <ul>
+    <li><strong>什么时候值得</strong>：请求间隔远大于冷启动时间（如每天几十次调用的内部工具），且调用方能容忍首次延迟（异步/批处理场景）。</li>
+    <li><strong>什么时候不值得</strong>：任何面向终端用户的交互式服务。宁可养一个最小副本（<code>minReplicas: 1</code>），那点钱远比丢失用户便宜。</li>
+    <li><strong>折中方案</strong>：<em>缩到 0 但保留权重在节点本地缓存</em>（模块 01），把冷启动从「拉镜像+下权重+加载」压缩到「加载」；或者用一个极小的常驻模型兜底首个请求，同时后台唤醒大模型。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>关于扩缩的成本直觉：<strong>自动扩缩省下的是「波谷时段的闲置」，买单的是「波峰时段的响应速度」和「工程复杂度」</strong>。如果你的流量日夜比是 1.3:1，自动扩缩几乎不值得做（省不了多少，还引入震荡风险）；如果是 10:1（典型的 to-B 工作日流量），它能省掉一大半账单，非常值得。<em>先看你的流量曲线，再决定要不要上这套东西</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rollback"><span class="num">6</span>自动回滚：错误预算驱动的决策</h2>
+  <p>最后一块拼图：<strong>什么时候必须自动回滚，而不是等人来看</strong>。</p>  <p>答案应该由<span class="term">错误预算消耗速率</span>（burn rate）决定，而不是由固定阈值决定。burn rate 定义为：当前错误率相对于「刚好用完预算」的错误率的倍数。</p>  <div class="math-block">\[\text{burn rate} = \frac{\text{实际错误率}}{1 - \text{SLO}}\]</div>  <table>
+    <thead><tr><th>burn rate</th><th>含义</th><th>多久烧完 30 天预算</th><th>应该做什么</th></tr></thead>
+    <tbody>
+      <tr><td>1×</td><td>刚好按计划消耗</td><td>30 天</td><td>正常</td></tr>
+      <tr><td>6×</td><td>快 6 倍</td><td>5 天</td><td>告警，人来看</td></tr>
+      <tr><td>14.4×</td><td>快 14 倍</td><td>2 天</td><td><strong>紧急告警</strong></td></tr>
+      <tr><td>&gt; 100×</td><td>灾难</td><td>&lt; 7 小时</td><td><strong>自动回滚，不等人</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么用 burn rate 而不是「错误率 &gt; 1% 就回滚」？因为固定阈值不知道你的 SLO 是多少。对 99% 的服务，1% 错误率是刚好达标；对 99.99% 的服务，1% 错误率是 100 倍超支、七小时烧光一个月的预算。<strong>burn rate 自动把阈值归一化到你的 SLO 上</strong>，一套告警规则适用于所有服务。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>工程实现上要用<strong>多窗口多燃烧率</strong>（multi-window multi-burn-rate）告警：短窗口（5 分钟）高倍率（14×）用于快速捕捉灾难，长窗口（1 小时）低倍率（6×）用于捕捉持续的小幅劣化。两者取或。单一窗口要么太敏感（一个瞬时抖动就告警）要么太迟钝（缓慢劣化发现不了）。这是 Google SRE Book 第 5 章给出的标准配方。</p></div>
+  </div>  <div class="callout danger"><span class="label">防回滚风暴</span>
+    <p>自动回滚有一个必须防的失败模式：<strong>回滚风暴</strong>。如果回滚判据太敏感，一次瞬时抖动就触发回滚；回滚本身又是一次变更，可能再次触发判据；系统在两个版本间来回横跳，比不回滚更糟。防护措施：<em>①回滚后强制冷却期</em>（如 30 分钟内不再自动发布）；<em>②回滚次数上限</em>（同一天自动回滚 2 次后转人工）；<em>③判据要求持续性</em>（不是「某一刻超阈值」而是「连续 N 个窗口超阈值」）。这三条缺一不可。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">7</span>算一笔账：发布策略的真实成本对比</h2>
+  <p>把四种策略在同一场景下的账并排放。场景：13 副本、每副本 2 卡、$4/卡·h、一次发布、假设新版本有 bug（错误率 5%）。</p>  <table>
+    <thead><tr><th>策略</th><th>额外资源成本</th><th>受影响请求比例 × 时长</th><th>错误预算消耗</th><th>总代价</th></tr></thead>
+    <tbody>
+      <tr><td>Recreate</td><td>$0</td><td>100% × 15 min（含停机）</td><td>15.0 min</td><td><strong>最差</strong></td></tr>
+      <tr><td>RollingUpdate (25%)</td><td>3 副本 × 15 min ≈ $6</td><td>渐进 0→100%，均值 50% × 15 min</td><td>7.5 min</td><td>中</td></tr>
+      <tr><td>Blue-Green</td><td>13 副本 × 20 min ≈ $35</td><td>100% × 3 min（发现即切回）</td><td>3.0 min</td><td>低（但贵）</td></tr>
+      <tr><td>Canary (5%→自动分析)</td><td>1 副本 × 25 min ≈ $3</td><td>5% × 8 min</td><td><strong>0.4 min</strong></td><td><strong>最优</strong></td></tr>
+    </tbody>
+  </table>  <p>金丝雀在这个对比里几乎是碾压性的：<strong>额外成本最低（只多一个副本），错误预算消耗最低（比 Recreate 少 37 倍）</strong>。它唯一的代价是<em>工程复杂度</em>——需要能按权重分流的网关、需要自动分析的指标管线、需要定义判据。这些是一次性投入，之后每次发布都受益。</p>  <p>再算自动扩缩的账。假设日流量曲线波峰 200 QPS、波谷 20 QPS（10:1），单副本 μ=2.5，目标 ρ=0.7：</p>  <ul>
+    <li><strong>固定容量</strong>（按峰值配）：<code>⌈200/(2.5×0.7)⌉ = 115</code> 副本全天候 → 230 卡 × $4 × 720h = <strong>$662,400/月</strong></li>
+    <li><strong>自动扩缩</strong>（假设平均需求 ≈ 峰值的 40%）：约 46 副本平均 → <strong>$265,000/月</strong>，省 60%</li>
+    <li><strong>但要加上</strong>：热备 4 副本（$23,000）+ 震荡带来的超配（约 10%）→ 实际约 <strong>$315,000/月</strong>，仍省约 52%</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的智慧：<strong>发布与扩缩都是「用确定的小成本，买不确定的大风险的下界」——而且这两件事的最优解都取决于一个你在模块 01 就决定了的数字：冷启动时间</strong>。冷启动快，则滚动更新的凹陷窄、金丝雀迭代快、扩容跟得上、热备可以少养；冷启动慢，则每一项都变难变贵。<em>部署链路的上游决策，会以你意想不到的方式支配下游的全部经济性。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>LLM 质量指标的在线检测</strong>：系统指标秒级可判，质量指标却需要人工或 LLM-judge、成本高延迟大。如何用廉价代理指标（输出长度分布、拒答率、重试率、logprob 分布漂移）在线近似质量劣化，且给出可靠的统计判据，是当前最缺工具的一环。</li>
+    <li><strong>always-valid inference 的工程化</strong>：置信序列（confidence sequences）、e-value、SPRT 在理论上完美解决了 peeking 问题，但主流发布工具（Flagger、Argo Rollouts）默认仍是固定窗口 + 简单阈值。把序贯方法做进发布流水线、并让工程师能理解和调参，仍有距离。</li>
+    <li><strong>预测式扩缩</strong>：用时序模型预测未来 T_cold 时间后的流量，提前扩容。难点在预测误差的<em>不对称代价</em>（少扩=用户受损、多扩=烧钱）和突发事件的不可预测性。把预测不确定性正确地转化为扩容决策（而不是只用点估计），是个开放的决策论问题。</li>
+    <li><strong>模型级别的渐进发布</strong>：不只是「新旧版本按流量分流」，而是「同一个请求，简单的给小模型、难的给大模型」，并渐进调整这个路由。这把发布策略和模型路由（model cascading）融合了，判据也从「哪个版本更好」变成「哪类请求该给谁」。</li>
+    <li><strong>无中断的权重热更新</strong>：目前换模型必须换 Pod（几分钟冷启动）。能否在进程内原地替换权重（保留 CUDA 上下文、KV 缓存、编译缓存），把发布从「分钟级 Pod 轮换」变成「秒级权重切换」？技术上可行但工程复杂，正在成为大规模服务的追求目标。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Google SRE Book 第 5 章（多窗口多燃烧率告警的原始配方）与第 27 章（渐进发布）；Argo Rollouts 与 Flagger 的 <em>Analysis</em> 文档（工业界金丝雀判据的实际形态）；Kubernetes HPA 的 <em>Horizontal Pod Autoscaling</em> 官方算法说明（含稳定窗口与 behavior 的精确语义）；Howard & Ramdas 等关于 <em>time-uniform confidence sequences</em> 的工作（peeking 问题的正确解）；KEDA 文档（事件驱动扩缩与 scale-to-zero）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_kubernetes/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · Kubernetes 编排</div></a>
+    <a class="next" href="../05_cloud_scheduling_cost/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 云平台、集群调度与成本</div></a>
+  </div>
+
+</div>
+</body>
+</html>

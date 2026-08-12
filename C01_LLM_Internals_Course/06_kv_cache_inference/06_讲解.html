@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · KV Cache 与高效推理</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 06 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>06 · KV Cache 与高效推理</h1>
+  <p class="subtitle">KV Cache &amp; Efficient Inference —— 从 O(T²) 的重复劳动到现代 serving 栈：cache、FlashAttention、PagedAttention、量化</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（causal attention）、模块 04（自回归解码循环）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 06_kv_cache.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">FlashAttention (2022)、vLLM/PagedAttention (2023)、LLM.int8 / GPTQ (2022)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#redundancy">自回归生成的计算冗余：朴素实现在浪费什么</a></li>
+      <li><a href="#kvcache">KV cache 原理：causal 下历史 K/V 永不改变</a></li>
+      <li><a href="#memory">显存记账：cache 到底吃多少字节</a></li>
+      <li><a href="#prefill-decode">prefill vs decode：两个性质完全不同的阶段</a></li>
+      <li><a href="#flash">FlashAttention：不改数学，只改访存</a></li>
+      <li><a href="#paged">PagedAttention / vLLM：给 cache 上虚拟内存</a></li>
+      <li><a href="#quant">量化：int8 / GPTQ 与精度-显存权衡</a></li>
+      <li><a href="#eval">评测视角：推理优化改变了什么、没改变什么</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="redundancy"><span class="num">1</span>自回归生成的计算冗余：朴素实现在浪费什么</h2>
+
+  <p>模块 04 写过最朴素的生成循环：每生成一个 token，就把<strong>整个序列</strong>重新喂给模型做一次完整前向。
+  这个写法正确，但浪费得惊人。看每一步实际计算了什么：</p>
+
+  <div class="ascii">
+  无 cache（朴素实现）：第 t 步对全部 t 个 token 重算 Q/K/V 与 attention
+    step 1 : [x1]                     → 算 1 个 token 的 K/V
+    step 2 : [x1 x2]                  → 重算 2 个（x1 的 K/V 与上一步完全相同！）
+    step 3 : [x1 x2 x3]               → 重算 3 个
+    ⋮
+    step T : [x1 x2 … xT]             → 重算 T 个
+    每步 K/V 计算量 ∝ t，总计 1+2+…+T = T(T+1)/2 → O(T²) 次 token 级前向
+
+  有 cache：历史 K/V 存起来，每步只算新 token
+    step 1 : [x1]                     → 算 1 个，K/V 入 cache
+    step 2 : cache(1) + [x2]          → 只算 1 个，append
+    step 3 : cache(2) + [x3]          → 只算 1 个，append
+    ⋮
+    step T : cache(T-1) + [xT]        → 只算 1 个
+    每步计算量 ≈ 常数（对新 token），总计 T → O(T) 次 token 级前向
+  </div>
+
+  <p>关键观察：第 $t$ 步前向中，前 $t-1$ 个 token 的 $K$、$V$ 向量与第 $t-1$ 步算出来的<strong>逐 bit 相同</strong>。
+  朴素实现每一步都在重做上一步已经做完的事，且重复量随序列变长线性增长——总账单是 $O(T^2)$。
+  对 $T=4096$ 的生成，这意味着约 800 万次 token 级前向，而真正必要的只有 4096 次。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="kvcache"><span class="num">2</span>KV cache 原理：causal 下历史 K/V 永不改变</h2>
+
+  <p>为什么历史 K/V 可以安全复用？两个事实缺一不可：</p>
+  <ul>
+    <li><strong>K/V 只依赖自身位置的输入</strong>：$k_i = x_i W_K$、$v_i = x_i W_V$，与 $x_i$ 之后出现什么 token 无关；</li>
+    <li><strong>causal mask 保证历史不被未来改写</strong>：decoder 中位置 $i$ 的隐状态只 attend 位置 $\le i$，
+    新 token 加入后，前缀每一层的激活都与之前完全一致。</li>
+  </ul>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>生成到第 $t$ 步时，真正"新"的只有一个 token。把每层算好的 K、V 存进 <span class="term">KV cache</span>，
+      下一步只需为新 token 算一个 $q_t$、一对 $(k_t, v_t)$，然后让 $q_t$ 对<strong>整个 cache</strong> 做一次注意力。
+      历史部分一个浮点数都不用重算。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设 cache 中已有 $K_{1:t-1}, V_{1:t-1}$。第 $t$ 步每层计算
+      $q_t = x_t W_Q,\; k_t = x_t W_K,\; v_t = x_t W_V$，将 $(k_t, v_t)$ append 进 cache 后，新 token 的注意力输出为：</p>
+      <div class="math-block">
+      $$ o_t = \mathrm{softmax}\!\left(\frac{q_t K_{1:t}^\top}{\sqrt{d_{head}}}\right) V_{1:t} $$
+      </div>
+      <p>由 causal 性，这与"全序列重算"在数学上严格等价（浮点上可能有 reduction 顺序导致的 $10^{-6}$ 量级差异，
+      greedy 解码的 token 序列一致）。注意 $q_t$ 是 $1\times d$ 的向量——decode 阶段的注意力退化为
+      <strong>矩阵-向量乘（GEMV）</strong>，这一点是第 4 节性能分析的关键。</p>
+    </div>
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  一个隐含前提：<strong>位置信息不能随步数"重排"</strong>。绝对位置编码加在输入上、RoPE 作用在 $q/k$ 上，都满足"位置 $i$ 的 $k_i$
+  一旦算出永远有效"；但若实现里把位置编码按"相对当前长度"重新计算（某些滑动窗口实现的 bug 源头），cache 复用就会悄悄给出错误结果。
+  notebook 的正确性 assert（cache 版与朴素版 token 序列逐位一致）正是抓这类 bug 的标准手段。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="memory"><span class="num">3</span>显存记账：cache 到底吃多少字节</h2>
+
+  <p>KV cache 用显存换计算。这笔账必须会算——它决定了一张卡能 serve 多少并发、多长上下文：</p>
+
+  <div class="math-block">
+  $$ \text{cache bytes} \;=\; \underbrace{2}_{K\ \text{和}\ V} \times\; L_{\text{层数}} \times H_{\text{KV头数}} \times d_{head} \times T_{\text{序列长}} \times \text{bytes}(\text{dtype}) $$
+  </div>
+
+  <p><strong>实例：Llama-7B，4K 上下文，fp16</strong>（$L{=}32$、$H{=}32$、$d_{head}{=}128$、$T{=}4096$、2 bytes）：</p>
+
+  <div class="math-block">
+  $$ 2 \times 32 \times 32 \times 128 \times 4096 \times 2 \;=\; 2{,}147{,}483{,}648 \text{ B} \;=\; 2\ \mathrm{GiB}\quad(\text{每条序列！}) $$
+  </div>
+
+  <table>
+    <thead><tr><th>显存项</th><th>大小</th><th>随什么增长</th></tr></thead>
+    <tbody>
+      <tr><td>模型权重（7B, fp16）</td><td>~14 GB</td><td><strong>固定</strong>，与 batch / 上下文无关</td></tr>
+      <tr><td>KV cache（单序列 4K）</td><td>2 GiB</td><td>∝ T × batch，<strong>线性爆炸</strong></td></tr>
+      <tr><td>KV cache（batch=16, 4K）</td><td>32 GiB</td><td>已超过权重本身，撑爆一张 A100-40G</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>为什么"长上下文吃显存"吃的是 cache 而不是权重？</strong> 权重是常数项，开机就在那里；cache 是 $T\times$batch 的线性项。
+  上下文从 4K 拉到 128K，权重一个字节不变，cache 却涨 32 倍——单序列 64 GiB，比权重大 4 倍以上。
+  所以长上下文 serving 的所有工程创新（GQA 砍 $H$、cache 量化砍 dtype、PagedAttention 砍浪费）全都作用在这条公式的某个因子上。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="prefill-decode"><span class="num">4</span>prefill vs decode：两个性质完全不同的阶段</h2>
+
+  <p>有了 cache，生成天然分裂为两个阶段，它们的硬件瓶颈截然不同：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>Prefill（处理 prompt）</th><th>Decode（逐 token 生成）</th></tr></thead>
+    <tbody>
+      <tr><td>计算形态</td><td>整个 prompt 一次前向，大矩阵乘 GEMM</td><td>每步 1 个 token，矩阵-向量乘 GEMV</td></tr>
+      <tr><td>算术强度（FLOPs/byte）</td><td>高——每读一份权重做 $T_{prompt}$ 个 token 的计算</td><td>极低——每读一份权重只做 1 个 token 的计算</td></tr>
+      <tr><td>瓶颈</td><td><strong>compute-bound</strong>（GPU 算力打满）</td><td><strong>memory-bound</strong>（受限于权重 + cache 的 HBM 读带宽）</td></tr>
+      <tr><td>用户体感指标</td><td>首 token 延迟（TTFT, time-to-first-token）</td><td>吞吐 / token 间延迟（tokens/s, TPOT）</td></tr>
+    </tbody>
+  </table>
+
+  <p>这解释了两个常见现象：</p>
+  <ul>
+    <li><strong>decode 阶段 GPU 利用率极低</strong>：每生成 1 个 token 都要把全部权重从 HBM 拉一遍，算力大量空转。
+    单序列 decode 的速度上限近似 $\text{带宽}/\text{权重字节数}$，与 GPU 的 TFLOPS 几乎无关。</li>
+    <li><strong>batching 是免费午餐</strong>：把 $B$ 条序列拼在一起 decode，权重只读一次、服务 $B$ 个 token，
+    吞吐近似 $\times B$ 而每 token 延迟几乎不变——直到 KV cache 显存（第 3 节的账）或带宽成为新瓶颈。
+    现代 serving 的 <span class="term">continuous batching</span> 就是动态维持这个 batch 尽量满。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  做模型评测时跑大规模推理，这个两阶段视角直接影响成本与方法：长 prompt + 短输出（典型的 MC 题评测）成本在 prefill；
+  长输出（agent 轨迹、CoT）成本在 decode。报告 latency 时务必区分 TTFT 与 TPOT，否则不同 serving 配置之间没有可比性。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="flash"><span class="num">5</span>FlashAttention：不改数学，只改访存</h2>
+
+  <p>attention 的朴素实现要物化 $T\times T$ 的分数矩阵 $S=QK^\top$：先写到 HBM，再读回来做 softmax，再写、再读去乘 $V$。
+  当 $T$ 大时，这些 $O(T^2)$ 的 HBM 读写远比计算本身更慢。<strong>FlashAttention</strong> [Dao 2022] 的洞见是：
+  attention 在多数硬件上是 <span class="term">IO-bound</span> 的，优化目标应该是<strong>减少 HBM 访问次数</strong>，而非减少 FLOPs。</p>
+
+  <p>做法是<strong>分块（tiling）+ online softmax</strong>：把 $K/V$ 切成块，逐块装进 SRAM，在片上完成"部分 softmax"并用
+  running max / running sum 增量修正，全程不把 $T\times T$ 矩阵写回 HBM。增量更新公式（单 query 视角，逐块吸收分数 $s_i$）：</p>
+
+  <div class="math-block">
+  $$ m^{new} = \max(m^{old},\, \max_i s_i), \qquad
+     \ell^{new} = e^{m^{old}-m^{new}}\,\ell^{old} + \sum_i e^{s_i - m^{new}} $$
+  $$ o^{new} = \frac{ \ell^{old}\, e^{m^{old}-m^{new}}\, o^{old} + \sum_i e^{s_i - m^{new}}\, v_i }{ \ell^{new} } $$
+  </div>
+
+  <p>归纳可证最终 $o$ 与一次性全量 softmax 严格相等——<strong>FlashAttention 是精确算法，不是近似</strong>。
+  HBM 访问量从 $\Theta(T^2)$ 级降到 $\Theta(T^2 d^2 / M)$（$M$ 为 SRAM 大小），实测长序列上 2–4× 加速，
+  且因为不物化 $T\times T$ 矩阵，训练时激活显存从 $O(T^2)$ 降到 $O(T)$——长上下文训练同样受益。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  [Dao 2022] <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>（arXiv:2205.14135）。
+  方法论上的教益超出 attention 本身：<strong>先画 roofline、认清算法是 compute-bound 还是 memory-bound，再决定优化什么</strong>。
+  后续 FlashAttention-2/3 进一步优化并行划分与硬件特性，数学仍然精确。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="paged"><span class="num">6</span>PagedAttention / vLLM：给 cache 上虚拟内存</h2>
+
+  <p>第 3 节算了 cache 多大，但真实 serving 还有更隐蔽的问题：<strong>显存碎片</strong>。
+  传统实现为每条请求按 max_len <strong>预留连续</strong>显存——但请求实际长度未知且参差不齐：</p>
+
+  <ul>
+    <li><strong>内部碎片</strong>：按 2048 预留、实际只生成 300 个 token，85% 的预留空间从未被用到；</li>
+    <li><strong>外部碎片</strong>：不同请求预留块大小不一，释放后留下大量无法复用的空洞。</li>
+  </ul>
+
+  <p>vLLM 论文测得现有系统中 KV cache 显存的实际利用率仅 <strong>20–40%</strong> [Kwon 2023]。
+  解法是把操作系统的虚拟内存搬进 GPU：<span class="term">PagedAttention</span> 将每条序列的 cache 切成固定大小的
+  <strong>block</strong>（如 16 个 token），物理上<strong>不要求连续</strong>，由每序列一张 <strong>block table</strong> 做逻辑→物理映射：</p>
+
+  <div class="ascii">
+  逻辑视角（每条序列自己看）            物理显存（block pool，全局共享）
+  seq A: [b0][b1][b2][b3·····]          ┌────┬────┬────┬────┬────┬────┐
+  seq B: [b0][b1]                       │A·b1│B·b0│A·b0│空闲│B·b1│A·b2│
+                                        └────┴────┴────┴────┴────┴────┘
+  block table A: 0→#2, 1→#0, 2→#5, …        ▲ 物理上不连续，按需逐块分配
+  block table B: 0→#1, 1→#4                 浪费只发生在最后一个未填满的 block
+  </div>
+
+  <p>收益：①内部碎片缩到"最后一个 block 的零头"（&lt;4%）；②按需分配，不用猜 max_len；
+  ③block 可在序列间<strong>共享</strong>——同一 prompt 的 N 个并行采样、beam search 的公共前缀，
+  只存一份物理 block，写时复制（copy-on-write）。配合 continuous batching，vLLM 把吞吐提了 2–4×。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  注意分工：FlashAttention 优化<strong>单次 attention 内核的访存模式</strong>，PagedAttention 优化<strong>多请求间 cache 的显存管理</strong>。
+  二者正交，现代推理引擎（vLLM、SGLang、TensorRT-LLM）同时使用。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="quant"><span class="num">7</span>量化：int8 / GPTQ 与精度-显存权衡</h2>
+
+  <p>第 4 节的结论——decode 受限于"把权重和 cache 从 HBM 读一遍"的带宽——指出了另一条优化路径：
+  <strong>把要读的字节变少</strong>。<span class="term">量化（quantization）</span>用低位宽整数近似浮点张量。最基本的对称量化：</p>
+
+  <div class="math-block">
+  $$ s = \frac{\max |W|}{127}, \qquad W_{int8} = \mathrm{round}\!\left(\frac{W}{s}\right) \in \{-127,\dots,127\}, \qquad \hat W = s \cdot W_{int8} $$
+  </div>
+
+  <p>误差来源于 round 的舍入，量级为 $s/2$——所以 <strong>scale 的粒度</strong>是精度关键：per-tensor 一个 scale 最粗；
+  per-channel（每行/每列一个 scale）能隔离"个别通道动态范围巨大"的污染，误差显著更小（notebook 练习 3 亲手验证）。</p>
+
+  <p>两篇里程碑工作解决了"朴素量化在大模型上掉点"的问题：</p>
+  <ul>
+    <li><strong>LLM.int8()</strong> [Dettmers 2022]：发现 ≥6.7B 的模型中，<strong>激活的少数维度出现系统性 outlier</strong>（量级大 20×），
+    一刀切量化会毁掉它们。解法是混合精度分解：outlier 维度（~0.1%）保留 fp16，其余走 int8 矩阵乘——8 位推理几乎零退化。</li>
+    <li><strong>GPTQ</strong> [Frantar 2022]：weight-only 的 one-shot 训练后量化，逐层最小化 $\|WX-\hat WX\|_2^2$，
+    用二阶信息（Hessian $\approx XX^\top$）在量化每个权重后<strong>补偿性地更新尚未量化的权重</strong>来吸收误差，
+    把 175B 模型压到 3–4 bit 仍基本保住困惑度。</li>
+  </ul>
+
+  <table>
+    <thead><tr><th>量化对象</th><th>省什么</th><th>难度 / 风险</th><th>典型方案</th></tr></thead>
+    <tbody>
+      <tr><td>权重 weight-only</td><td>权重显存 + decode 读带宽</td><td>最低；静态分布，可离线精调</td><td>GPTQ、AWQ（int4/int8）</td></tr>
+      <tr><td>激活 activation</td><td>计算可用 int8 GEMM 加速</td><td>高；动态分布 + outlier 维度</td><td>LLM.int8 混合精度</td></tr>
+      <tr><td>KV cache</td><td>cache 显存 ∝ dtype 因子（第 3 节公式）</td><td>中；误差随上下文累积</td><td>fp8 / int8 cache</td></tr>
+    </tbody>
+  </table>
+
+  <table>
+    <thead><tr><th>精度</th><th>bytes/权重</th><th>7B 权重显存</th><th>典型能力代价</th></tr></thead>
+    <tbody>
+      <tr><td>fp16 / bf16</td><td>2</td><td>~14 GB</td><td>基线</td></tr>
+      <tr><td>int8（LLM.int8 / GPTQ）</td><td>1</td><td>~7 GB</td><td>近乎无损（困惑度层面）</td></tr>
+      <tr><td>int4（GPTQ / AWQ）</td><td>0.5</td><td>~3.5 GB</td><td>小幅退化，小模型与长尾能力更敏感</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger"><span class="label"></span>
+  "困惑度几乎不变"≠"能力几乎不变"。量化损伤往往集中在<strong>长尾能力</strong>：多步推理、代码、低资源语言、长上下文检索。
+  平均指标（perplexity、聚合 accuracy）对这类局部退化极不敏感——这正是下一节评测视角的核心问题。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">8</span>评测视角：推理优化改变了什么、没改变什么</h2>
+
+  <p>把本章技术按"是否改变模型输出分布"分成两类，评测策略完全不同：</p>
+
+  <table>
+    <thead><tr><th>类别</th><th>技术</th><th>评测义务</th></tr></thead>
+    <tbody>
+      <tr><td><strong>精确优化</strong>（数学等价）</td><td>KV cache、FlashAttention、PagedAttention、continuous batching</td><td>验证<strong>数值等价性</strong>即可，不需重测能力</td></tr>
+      <tr><td><strong>有损优化</strong>（改变分布）</td><td>权重/激活/cache 量化、稀疏化、（接受率不为 1 时的）投机解码近似变体</td><td>当作<strong>新模型</strong>重新做能力评测</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>数值等价性怎么测</strong>（notebook 全部动手做）：</p>
+  <ul>
+    <li><strong>greedy token 一致性</strong>：同权重同 prompt，优化前后 greedy 解码的 token 序列逐位相等——最强、最易解释的检查；</li>
+    <li><strong>logits 距离</strong>：$\max_i |z_i - z_i'|$ 与 top-k 集合重叠率。精确优化应只剩浮点 reduction 顺序带来的 $10^{-3}$ 量级以下噪声（fp16 下），量化则会出现系统性偏移；</li>
+    <li><strong>边界用例</strong>：恰好跨 block 边界的长度、prompt 长度为 1、超出滑动窗口——等价性 bug 最爱藏在边界。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  评测实践中的三个陷阱：
+  ①你评测的"GPT-X via API"实际跑在某个 serving 栈上，<strong>batch 组成会改变浮点 reduction 顺序</strong>，
+  即使 temperature=0 也可能不完全可复现——报告里要记录推理后端与配置；
+  ②社区发布的 int4 checkpoint 挂着原模型的名字，但<strong>能力画像可能已经不同</strong>，安全评测结论不能直接继承；
+  ③量化校准集（GPTQ 需要少量数据）的领域会影响哪些能力被保住——评测时值得作为变量记录。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>KV cache 压缩</strong>：cache 量化到 fp8/int4、按注意力权重驱逐"不重要" token（sliding window、heavy-hitter 类方法）。
+    驱逐类方法是<strong>有损</strong>的——长上下文检索类评测（needle-in-a-haystack 及其多跳变体）是检验它们的标准探针。</li>
+    <li><strong>架构层面砍 cache</strong>：MQA/GQA 直接缩小公式里的 $H$ 因子 [Shazeer 2019; Ainslie 2023]，
+    Llama-70B 用 GQA（8 个 KV 头）把 4K cache 从 ~10.7 GB 压到 1.25 GiB——模块 07 展开。</li>
+    <li><strong>投机解码</strong> [Leviathan 2022]（模块 04 已见）：小模型起草、大模型并行验证，把 memory-bound 的 decode 变成更接近 prefill 的并行验证。标准接受准则下输出分布严格不变——它属于"精确优化"一栏。</li>
+    <li><strong>低位宽的极限</strong>：3 bit、2 bit 乃至三值权重在什么规模/数据量下可行？量化感知训练 vs 训练后量化的边界仍在移动。</li>
+    <li><strong>开放的评测问题</strong>：缺少标准化的"推理栈等价性"测试协议——不同引擎（vLLM/TensorRT-LLM/llama.cpp）+ 不同量化跑同一 benchmark，
+    分数差异可达数个百分点，但归因（量化？采样实现？chat template？）往往不清。对评测科学家，这是真实且未解决的混淆变量。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>为什么 causal attention 下历史 K/V 可以缓存复用？朴素生成与 cache 生成的复杂度各是多少？</li>
+      <li>写出 KV cache 显存公式，并算出 Llama-7B 在 4K 上下文、fp16 下单序列的 cache 大小。</li>
+      <li>prefill 与 decode 的瓶颈分别是什么？为什么 batching 能大幅提升 decode 吞吐？</li>
+      <li>FlashAttention 与量化，哪个改变模型输出分布？两类优化的评测义务分别是什么？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../05_scaling_laws/05_讲解.html"><div class="dir">← 上一章</div><div class="t">05 · Scaling Laws：亲手拟合</div></a>
+    <a class="next" href="../07_modern_architectures/07_讲解.html"><div class="dir">下一章 →</div><div class="t">07 · 现代架构：RoPE/GQA/MoE/SSM</div></a>
+  </div>
+
+</div>
+</body>
+</html>

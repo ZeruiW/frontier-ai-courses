@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · 多智能体与编排</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 07 / 9</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>07 · 多智能体与编排</h1>
+  <p class="subtitle">Multi-Agent Systems &amp; Orchestration —— 什么时候值得把一个 agent 拆成一支团队，以及如何给这支团队记账、归因、打分</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（agent 循环）、模块 06（agentic 评测方法论）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span><span class="badge api">API可选</span> 07_orchestration.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">AutoGen [Wu 2023]、Multiagent Debate [Du 2023]、Anthropic multi-agent research system [Anthropic 2025]</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么多智能体？三个真实收益与一个诚实的反面</a></li>
+      <li><a href="#patterns">模式图谱：五种经典编排拓扑</a></li>
+      <li><a href="#orchestrator">orchestrator-workers 深剖：分解、隔离、聚合</a></li>
+      <li><a href="#debate">debate 与 majority vote：何时真有效，何时放大幻觉</a></li>
+      <li><a href="#cost">成本与延迟核算：并行省墙钟，不省钱</a></li>
+      <li><a href="#failures">失败模式：多 agent 系统怎么坏</a></li>
+      <li><a href="#evals">多 agent 系统的评测：端到端 + 分阶段归因</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么多智能体？三个真实收益与一个诚实的反面</h2>
+
+  <p>前六个模块的主角都是<strong>单个</strong> agent：一个 LLM、一个上下文、一个工具循环。
+  <span class="term">多智能体系统（multi-agent system）</span>把任务交给多个 LLM 实例协作完成，每个实例有自己的角色、上下文和（可能不同的）工具集，由某种<span class="term">编排（orchestration）</span>机制协调。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>多智能体不是"让几个模型聊天"这么浪漫，本质是一个<strong>上下文管理与并行化手段</strong>：
+      把一个塞不进单一上下文、或者天然可以并行的任务，切给几个各自带着干净上下文的 worker 去做，再把结果合回来。
+      切得好，能力上限抬高；切不好，多花十几倍 token 还更难调试。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设任务 $T$ 可分解为子任务 $\{t_1,\dots,t_k\}$，多智能体系统由编排策略 $\pi_{\text{orch}}$（分解 + 调度 + 聚合）
+      与 worker 策略 $\{\pi_i\}$ 组成。其相对单 agent 的收益来自三个独立机制：
+      ①每个 $\pi_i$ 的上下文 $c_i$ 与其他 worker 隔离，避免长上下文退化与跨任务干扰；
+      ②无依赖的 $t_i$ 可并行执行，墙钟时间由 $\sum_i L_i$ 降为 $\max_i L_i$；
+      ③$\pi_i$ 可按角色专化（不同 system prompt / 工具白名单），缩小每个 agent 的动作空间。</p>
+    </div>
+  </div>
+
+  <h3>三个真实收益</h3>
+  <ul>
+    <li><strong>上下文窗口隔离</strong>：这是最被低估的一条。单 agent 做长任务时，探索过程产生的大量中间 token（搜索结果、报错、死胡同）会持续污染上下文；而一个 subagent 可以烧掉 50k token 去探索，最后只把 1–2k token 的<strong>压缩结论</strong>交回主 agent。Anthropic 的 multi-agent research 系统正是把 subagent 当作"智能压缩器"用 [Anthropic 2025]：每个 worker 拿到干净上下文，主 agent 的上下文只接收蒸馏后的要点。</li>
+    <li><strong>并行吞吐</strong>：广度型任务（"调研 X 的全部竞品""分别检查这 8 个文件"）天然可并行。Anthropic 报告并行化将复杂调研任务的墙钟时间最多压缩约 90% [Anthropic 2025]。</li>
+    <li><strong>角色专化</strong>：planner / searcher / coder / critic 各配各的 prompt 与工具白名单。动作空间更窄的 agent 更容易被 prompt 约束住，也更容易被<strong>单独评测</strong>——这一点在第 7 节会变成评测方法。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>诚实的反面：多数任务用单 agent 更好。</strong>Anthropic 自己的工程结论是：编排复杂度是真实成本——协调 prompt 要反复打磨、错误面随 agent 数量成倍扩大、调试从"读一条 trace"变成"读一棵 trace 树"；且其 multi-agent 系统消耗约 <strong>15× 于普通 chat 的 token</strong>（单 agent 约 4×）[Anthropic 2025]。这延续了 <em>Building Effective Agents</em> 的总原则 [Anthropic 2024]：先用最简单的方案——能用单次调用就别用 workflow，能用单 agent 就别上多 agent。多智能体的适用条件大致是：<strong>任务可并行 + 信息量超出单上下文 + 任务价值撑得起 token 倍增</strong>，三者至少占二。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="patterns"><span class="num">2</span>模式图谱：五种经典编排拓扑</h2>
+
+  <p>编排模式本质上是在回答两个问题：<strong>信息怎么流</strong>（谁能看到谁的输出）和<strong>控制权怎么转</strong>（谁决定下一步谁说话）。五种经典拓扑：</p>
+
+  <h3>① Pipeline（流水线）</h3>
+  <div class="ascii">
+  输入 ──► [Agent A: 抽取] ──► [Agent B: 分析] ──► [Agent C: 撰写] ──► 输出
+            每级只看上一级的输出；控制流固定，无分支
+  </div>
+  <p>最接近模块 02 讲过的 <em>prompt chaining</em> workflow：确定性强、易调试，但上游错误会无衰减地传给下游。</p>
+
+  <h3>② Orchestrator-Workers（主从 / 分发-聚合）</h3>
+  <div class="ascii">
+                      ┌──► [Worker 1] ──┐
+  输入 ──► [Planner] ──┼──► [Worker 2] ──┼──► [Aggregator] ──► 输出
+            任务分解   └──► [Worker 3] ──┘     冲突消解+合并
+                       (各自独立上下文，可并行)
+  </div>
+  <p>生产系统中最常用的模式，Anthropic research 系统即此结构（lead agent + 并行 search subagents）[Anthropic 2025]。第 3 节深剖。</p>
+
+  <h3>③ Debate（辩论）[Du 2023]</h3>
+  <div class="ascii">
+  round 1:  [Agent 1: 答案a₁]   [Agent 2: 答案a₂]   [Agent 3: 答案a₃]
+                  │  互相看到对方的答案与理由  │
+  round 2:  [Agent 1: 修订a₁']  [Agent 2: 修订a₂']  [Agent 3: 修订a₃']
+                  ▼ 若干轮后取多数/共识 ▼
+                          最终答案
+  </div>
+  <p>多个对等 agent 独立作答→互看→修订→收敛。Du et al. 在事实问答与算术推理上验证了多轮辩论能提升正确率与事实性 [Du 2023]。第 4 节细讲其适用边界。</p>
+
+  <h3>④ Critic-Executor（评审-执行）</h3>
+  <div class="ascii">
+  输入 ──► [Executor: 产出 v1] ──► [Critic: 审查意见] ──► [Executor: 修订 v2] ──► … ──► 通过/超时退出
+                 ▲ 角色不对称：critic 只挑错不动手，executor 只动手 ▲
+  </div>
+  <p>与 Reflexion 式自我反思（模块 02）的区别：critic 是<strong>独立上下文的另一个 agent</strong>，不被 executor 的推理历史锚定，更接近独立评审。代价是每轮多一次完整调用。</p>
+
+  <h3>⑤ 群聊式（Group Chat，AutoGen）[Wu 2023]</h3>
+  <div class="ascii">
+            ┌───────────── 共享对话历史 ─────────────┐
+            │  [User Proxy]  [Coder]  [Reviewer]  …  │
+            └────────────────────┬───────────────────┘
+                        [Chat Manager]
+              （每轮由 manager 选择下一个发言者）
+  </div>
+  <p>AutoGen 把多 agent 协作抽象为<span class="term">可对话 agent（conversable agents）</span>之间的群聊：所有人共享对话历史，一个 manager（可以是 LLM 本身）动态决定发言顺序 [Wu 2023]。灵活性最高，控制流也最不可预测——发言顺序本身成了一个需要评测的随机变量。</p>
+
+  <table>
+    <thead><tr><th>模式</th><th>信息流</th><th>控制权</th><th>适用任务</th><th>主要风险</th></tr></thead>
+    <tbody>
+      <tr><td>pipeline</td><td>线性、单向</td><td>固定</td><td>阶段清晰的转换类任务</td><td>上游错误无衰减传播</td></tr>
+      <tr><td>orchestrator-workers</td><td>星型、fan-out/fan-in</td><td>planner 集中</td><td>可并行的广度型任务</td><td>分解质量决定上限；聚合冲突</td></tr>
+      <tr><td>debate</td><td>全连接、多轮</td><td>对等</td><td>有唯一可验证答案的题</td><td>错误相关时放大幻觉</td></tr>
+      <tr><td>critic-executor</td><td>双向、两角色</td><td>交替</td><td>质量可被审查规则刻画的产出</td><td>critic 与 executor 同源则盲区共享</td></tr>
+      <tr><td>群聊（AutoGen）</td><td>共享广播</td><td>manager 动态分配</td><td>开放式协作、人机混合</td><td>控制流不可预测、死循环</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  选型直觉：<strong>能写成固定 DAG 的先写成 pipeline / orchestrator-workers</strong>（workflow 性质，可测可控）；
+  只有当"下一步该谁做"本身需要智能决策时，才上群聊式的动态编排。可预测性是评测的朋友——拓扑越动态，第 7 节的归因越难做。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="orchestrator"><span class="num">3</span>orchestrator-workers 深剖：分解、隔离、聚合</h2>
+
+  <p>这是生产中最重要的模式，值得逐段拆开。系统的三个阶段各有一个核心设计决策：</p>
+
+  <div class="ascii">
+        ①分解 decomposition          ②执行 execution               ③聚合 aggregation
+  任务 ──► [Planner]                 [Worker_i]                    [Aggregator] ──► 输出
+           │ 产出子任务规格            │ 独立上下文 c_i               │ 合并 + 冲突消解
+           │                          │                             │
+   失败点: 分解不 MECE、              失败点: worker 幻觉、          失败点: 冲突未消解、
+   粒度失当、规格含糊 ──────────────► 误读含糊规格 ────────────────► 长输出 lost-in-the-middle
+                    （上游失败点向下游传播，且越早越致命）
+  </div>
+
+  <h3>3.1 任务分解质量决定上限</h3>
+  <p>worker 只会忠实地执行错误的计划。如果 planner 把任务切漏了（覆盖缺口）、切重了（重复劳动）、或者子任务规格含糊，后面再强的 worker 也救不回来——这与模块 01 的"编码器看不到的细节 LLM 救不回来"是同构的结论。Anthropic 的核心工程教训是：<strong>给 subagent 的任务描述必须足够详细</strong>——目标、输出格式、建议使用的工具、任务边界，缺一不可；含糊的指令会导致 worker 重复劳动、留下空白、或对任务做出错误的自由发挥 [Anthropic 2025]。好的分解还应满足近似 <span class="term">MECE</span>（互斥、完备）：子任务间低耦合（可并行）、并集覆盖原任务。</p>
+
+  <h3>3.2 worker 间：信息隔离 vs 共享</h3>
+  <table>
+    <thead><tr><th>设计</th><th>做法</th><th>优点</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>完全隔离</strong>（默认推荐）</td><td>每个 worker 只看到：原始任务的必要片段 + 自己的子任务规格</td><td>干净上下文、天然并行安全、单 worker 可独立评测</td><td>worker 间无法互相纠错；公共信息要重复注入（token 翻倍）</td></tr>
+      <tr><td><strong>共享内存 / blackboard</strong></td><td>worker 读写共享存储（笔记、中间结论）</td><td>避免重复劳动、信息一致</td><td>一个 worker 的幻觉会污染全体；写冲突需要协调；并行语义复杂</td></tr>
+    </tbody>
+  </table>
+  <p>折中方案是<strong>单向汇报</strong>：worker 之间互不可见，只向 aggregator 汇报——这保留了隔离的评测友好性，把"信息融合"的复杂度集中到聚合阶段统一处理。</p>
+
+  <h3>3.3 聚合时的冲突消解</h3>
+  <p>当两个 worker 对同一事实给出矛盾结论时，aggregator 必须有显式策略，常见四种（按工程偏好排序）：</p>
+  <ul>
+    <li><strong>专属所有权（dedicated owner）</strong>：设计上让每个输出字段只由一个 worker 负责，冲突在结构上不存在。最便宜，能用就用。</li>
+    <li><strong>证据加权</strong>：要求 worker 附带来源/置信度，聚合时按证据强度取舍。</li>
+    <li><strong>LLM-judge 仲裁</strong>：再调一次模型裁决冲突（模块 06 的 LLM-as-judge 全部注意事项适用——位置偏置、自偏好）。</li>
+    <li><strong>升级重做（escalate-to-replan）</strong>：冲突本身说明分解有问题，退回 planner 重切。最贵，但有时是唯一正确的选择。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  aggregator 自身是一个常被忽略的失败点：把 3 个 worker 各 5k token 的输出直接拼接喂给聚合调用，等于又造了一个长上下文问题——<span class="term">lost-in-the-middle</span> 会让中间 worker 的结论被系统性忽略。让 worker 输出<strong>结构化、定长、带要点压缩</strong>的结果，是比"换更强的 aggregator 模型"更有效的修复。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="debate"><span class="num">4</span>debate 与 majority vote：何时真有效，何时是幻觉放大器</h2>
+
+  <p>辩论与投票的理论根基是同一个统计事实：<strong>独立且优于随机的判断者，聚合后比单个判断者更准</strong>。设 $n$ 个 agent 对一道有唯一正确答案的题独立作答，每个正确概率为 $p$，多数表决正确的概率为：</p>
+
+  <div class="math-block">
+  $$ P_{\text{maj}}(n,p)=\sum_{k=\lceil n/2\rceil}^{n}\binom{n}{k}p^k(1-p)^{n-k} $$
+  </div>
+
+  <p>这是 Condorcet 陪审团定理的形式：当 $p&gt;0.5$ 且判断<strong>相互独立</strong>时，$P_{\text{maj}}$ 随 $n$ 单调升向 1；例如 $p=0.7,n=5$ 时 $P_{\text{maj}}\approx0.837$。但定理的两个前提在 LLM 系统里都很脆弱：</p>
+
+  <ul>
+    <li><strong>$p&gt;0.5$ 不成立时，投票放大错误</strong>：同一公式给出 $p&lt;0.5 \Rightarrow P_{\text{maj}}&lt;p$ 且随 $n$ 降向 0。模型系统性搞错的题（流行误解、训练数据偏差），加 agent 只会更自信地错。</li>
+    <li><strong>独立性不成立</strong>：几个"不同 persona"的 agent 往往是<strong>同一个基座模型</strong>换了 system prompt，错误高度相关。极限情况下错误完全相关时，$n$ 个 agent 等价于 1 个——花了 $n$ 倍 token 买了 0 倍信息。有效样本量介于 1 和 $n$ 之间，取决于错误相关系数。</li>
+  </ul>
+
+  <p><strong>debate 比单纯投票多了"互看与修订"环节</strong>。Du et al. 的实验表明，在算术、推理与传记事实题上，多 agent 多轮辩论显著降低幻觉、提升正确率，且 agent 数与轮数增加均有增益 [Du 2023]。机制上，辩论让 agent 暴露推理过程、接受同伴质询，相当于对答案做一致性检验。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>什么时候 debate/vote 是幻觉放大器：</strong>
+  ①<strong>开放式生成任务</strong>（写报告、设计方案）没有可投票的离散答案空间，"多数"无定义；
+  ②<strong>从众失败（sycophancy/conformity）</strong>：辩论中 agent 倾向向多数或更自信的表述靠拢，错误的多数会把正确的少数"说服"掉——此时辩论不是纠错机制而是错误传染机制；
+  ③<strong>同源相关</strong>：所有辩手共享基座模型的知识盲区时，辩论产生的是"多个 agent 一致认可"的伪共识，比单 agent 的幻觉更难被人类审查者怀疑。
+  实践判据：<strong>答案可程序化验证（事实题、数学题、有测试的代码）→ 值得投票/辩论；不可验证 → 把预算花在检索增强或 critic 上</strong>。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost"><span class="num">5</span>成本与延迟核算：并行省墙钟，不省钱</h2>
+
+  <p>多 agent 的账单倍增有明确的结构原因：<strong>每个 worker 都要在自己的上下文里重新读一遍公共信息</strong>（任务背景、原始材料、规格），且每多一个协调阶段（plan / critique / aggregate）就多至少一次完整调用。以 orchestrator-workers 为例，记 $c_{\text{in}},c_{\text{out}}$ 为每 token 输入/输出单价：</p>
+
+  <div class="math-block">
+  $$ \text{Cost}_{\text{multi}}
+     = \underbrace{c_{\text{in}}T^{\text{in}}_{\text{plan}}+c_{\text{out}}T^{\text{out}}_{\text{plan}}}_{\text{分解}}
+     + \sum_{i=1}^{k}\underbrace{\big(c_{\text{in}}(T_{\text{shared}}+T^{\text{in}}_i)+c_{\text{out}}T^{\text{out}}_i\big)}_{\text{worker }i\text{：公共上下文}T_{\text{shared}}\text{被支付}k\text{次}}
+     + \underbrace{c_{\text{in}}\textstyle\sum_i T^{\text{out}}_i+c_{\text{out}}T^{\text{out}}_{\text{agg}}}_{\text{聚合：worker 输出再读一遍}} $$
+  </div>
+
+  <p>注意两处"重复支付"：$T_{\text{shared}}$ 被 $k$ 个 worker 各付一次；worker 的全部输出又作为 aggregator 的输入再付一次。这就是 Anthropic 观测到 multi-agent ≈ 15× chat token 的结构性来源 [Anthropic 2025]（prompt caching 能打折扣，但折不掉调用次数与输出 token）。</p>
+
+  <p>延迟则完全是另一回事。并行执行时：</p>
+
+  <div class="math-block">
+  $$ L_{\text{serial}}=L_{\text{plan}}+\sum_{i=1}^{k}L_i+L_{\text{agg}}
+     \qquad\Longrightarrow\qquad
+     L_{\text{parallel}}=L_{\text{plan}}+\max_i L_i+L_{\text{agg}} $$
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  一句话记住：<strong>并行改变的是 $\sum\to\max$（墙钟），不改变 $\sum$（账单）</strong>。token 是按消耗计费的，不管它们是串行还是并行被消耗。所以"多 agent 更快"与"多 agent 更贵"同时成立，不矛盾。</div>
+
+  <p>因此评估"多 agent 是否值得"必须做<strong>成本-质量联合报告</strong>，这正是 Kapoor et al. 对 agent 评测的核心批评：只报准确率会系统性偏向烧钱的方案，正确做法是把 accuracy 与 cost 画在同一张 Pareto 图上 [Kapoor 2024]。一个公平的对照组是<strong>预算匹配的单 agent</strong>：给单 agent 同样的 token 预算做 best-of-n 或多次重试，多 agent 方案必须赢过它才算真贡献。notebook 里你会亲手算这张账：同一任务，单 agent 1 次调用 vs 多 agent 4 次调用的质量分、token 数、调用数对照表。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="failures"><span class="num">6</span>失败模式：多 agent 系统怎么坏</h2>
+
+  <p>多 agent 系统的失败面是单 agent 的超集：单 agent 的全部失败模式（模块 02/06）依然存在，再叠加协调层特有的四类：</p>
+
+  <table>
+    <thead><tr><th>失败模式</th><th>机制</th><th>可观测信号</th><th>缓解手段</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>分解错误传播</strong></td>
+        <td>planner 切漏/切重/规格含糊，错误沿 fan-out 复制到全部下游，越早期的错误代价越大</td>
+        <td>多个 worker 产出高度重叠；最终输出有系统性盲区；worker 频繁"自由发挥"</td>
+        <td>plan 先过 schema 校验与覆盖检查；高价值任务给 plan 加一道独立审查；详细子任务规格 [Anthropic 2025]</td>
+      </tr>
+      <tr>
+        <td><strong>worker 幻觉进入聚合</strong></td>
+        <td>单个 worker 编造的"事实"在聚合时与真实结论无差别合并，输出获得了多 agent 系统的表面可信度</td>
+        <td>最终报告中无来源支撑的具体断言；不同 run 间同一字段值漂移</td>
+        <td>worker 输出强制带证据引用；聚合前做来源校验；可验证字段程序化复核</td>
+      </tr>
+      <tr>
+        <td><strong>责任归因困难</strong></td>
+        <td>端到端失败时无法回答"哪个 agent 错了"：plan 错？worker 错？还是聚合丢了正确信息？trace 是一棵树而非一条链</td>
+        <td>同一失败反复出现但修 prompt 无效（修错了阶段）；调试时间随 agent 数超线性增长</td>
+        <td>全链路结构化日志（每个 agent 的输入/输出/工具调用单独落盘）；第 7 节的分阶段评测</td>
+      </tr>
+      <tr>
+        <td><strong>协调死锁 / 活锁</strong></td>
+        <td>群聊式系统中 agent 互相等待、互相客套转交、或 critic-executor 无限"再改一版"，没有任何 agent 推进任务</td>
+        <td>轮数耗尽仍无终止信号；对话后半段语义重复度飙升；token 烧完任务未完成</td>
+        <td>硬性 max_round / 预算上限（AutoGen 内建 [Wu 2023]）；显式终止条件与仲裁者；检测重复发言自动熔断</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger"><span class="label"></span>
+  最隐蔽的是第二类：<strong>幻觉经过聚合后会"洗白"</strong>。单 agent 的幻觉通常带着犹豫的措辞痕迹；而经过 aggregator 改写、与三个 worker 的真实结论编织在一起的幻觉，呈现为一份语气统一、结构严谨的报告。下游读者（人或 agent）对"多方核实过"的输出戒心更低。这也是模块 08（agent 安全）关心多 agent 系统的原因之一：信息每多经过一次 agent 转手，其来源可追溯性就衰减一分。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="evals"><span class="num">7</span>多 agent 系统的评测：端到端分 + 分阶段归因</h2>
+
+  <p>模块 06 的方法论（outcome vs process、pass^k 可靠性、成本联合报告）全部适用，但多 agent 系统多了一个结构性机会：<strong>系统天然分阶段，所以评测也应该分阶段</strong>。只看端到端分数，你知道系统好不好；分阶段归因，你才知道<strong>该修哪里</strong>。</p>
+
+  <p>在独立性近似下，端到端成功率是各阶段成功率的乘积：</p>
+
+  <div class="math-block">
+  $$ P(\text{success}) \;\approx\; p_{\text{decomp}}\cdot \Big(\prod_{i=1}^{k} p_{\text{worker},i}\Big)\cdot p_{\text{agg}} $$
+  </div>
+
+  <p>乘积结构意味着失败按阶段<strong>复利</strong>：三个 0.9 的阶段端到端只剩 0.73。诊断流程是把每个 $p$ 单独测出来，找 $\log p$ 缺口最大的阶段——那就是瓶颈。三个阶段各有标准测法：</p>
+
+  <table>
+    <thead><tr><th>阶段</th><th>怎么单独测（控制变量）</th><th>典型指标</th></tr></thead>
+    <tbody>
+      <tr><td><strong>decomposition 质量</strong></td><td>固定输入任务集，只跑 planner，对 plan 本身打分（不执行）</td><td>schema 合规率、覆盖率（子任务并集 vs 任务需求清单）、冗余率、与 golden plan 的匹配度</td></tr>
+      <tr><td><strong>worker 质量</strong></td><td>喂<strong>golden 子任务</strong>（人工写好的标准分解）给 worker，隔离掉 planner 的影响</td><td>子任务级 rubric 分、格式合规率、幻觉率（断言可溯源比例）</td></tr>
+      <tr><td><strong>aggregation 质量</strong></td><td>喂<strong>golden worker 输出</strong>（含人为注入的冲突与冗余）给 aggregator</td><td>信息保真率（关键结论存活比例）、冲突消解正确率、对注入幻觉的拦截率</td></tr>
+    </tbody>
+  </table>
+
+  <p>两个进阶技巧：</p>
+  <ul>
+    <li><strong>oracle 替换消融（counterfactual substitution）</strong>：把某一阶段换成 oracle（golden 输出），看端到端分数涨多少——涨幅就是该阶段的"改进空间上界"。三个阶段各做一次，得到一张归因表。notebook 练习 3 实现的 <code>attribution_report</code> 就是这张表的最小版本。</li>
+    <li><strong>系统级 pass^k</strong>：多 agent 的非确定性按阶段复合（planner 抖动 × worker 抖动 × 聚合抖动），可靠性比单 agent 更值得测。τ-bench 的 pass^k（k 次全部成功的概率）[Yao 2024] 在这里应作用于整个系统而非单次调用。</li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  把这套方法连回真实系统：Anthropic 评测其 multi-agent research 系统时同样发现，端到端 LLM-judge 评分（事实性、引用准确性、完备性等多维 rubric）必须配合<strong>人工读 trace 的过程分析</strong>才能定位失败（例如早期版本 worker 重复劳动的根因是 plan 规格含糊，而非 worker 能力不足）[Anthropic 2025]。端到端分告诉你"差多少"，分阶段归因告诉你"差在哪"。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>自动编排（learned orchestration）</strong>：拓扑与分解策略目前靠人工设计。能否端到端学出来——用 e2e 奖励训练 planner（拓扑搜索、RL over orchestration policies）？核心障碍恰是第 7 节的归因问题：奖励只在端到端出现，credit assignment 要穿过多个 agent 的自然语言交互，梯度无从谈起。<em>评测视角</em>：自动编排器的评测需要"编排质量"本身的 benchmark，目前几乎空白。</li>
+    <li><strong>通信协议</strong>：agent 间用自然语言通信是有损压缩——worker 的不确定性、证据强度在转述中丢失。结构化协议（typed schema、置信度字段、来源指针）能保真但牺牲灵活性。MCP 解决了 agent-工具接口的标准化，agent-agent 协议仍在野蛮生长。<em>评测视角</em>：可设计"传话保真度"评测——信息穿过 n 跳 agent 后关键事实的存活率。</li>
+    <li><strong>组织学视角</strong>：多 agent 系统在重演人类组织理论的问题——层级 vs 扁平、专化 vs 通才、沟通成本随团队规模超线性增长。"加 agent 反而更慢"的现象已在群聊式系统中复现。开放问题：agent 团队的最优规模与结构是否存在可预测的 scaling law？<em>评测视角</em>：固定总 token 预算，扫描 agent 数量 $k$，画质量-$k$ 曲线找最优点——这类实验目前少有系统性结果。</li>
+    <li><strong>异构模型编排</strong>：planner 用强模型、worker 用便宜小模型的"模型路由"能大幅压成本，但小 worker 的错误率会沿乘积公式放大。成本-质量 Pareto 前沿上的最优模型分配仍是开放问题 [Kapoor 2024]。</li>
+    <li><strong>多 agent 安全</strong>：协作引入新攻击面——一个被 prompt injection 攻陷的 worker 可以污染聚合结果（第 6 节的"洗白"机制为攻击者所用）。这是模块 08 的主题之一。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>多智能体的三个真实收益是什么？Anthropic 的经验为什么说"多数任务单 agent 更好"？</li>
+      <li>写出 majority vote 的正确率公式，并说明 Condorcet 定理的两个前提（$p&gt;0.5$、独立性）在 LLM 系统中分别如何失效、何时投票/辩论会放大幻觉。</li>
+      <li>为什么并行执行"省墙钟不省钱"？写出 $L_{\text{serial}}\to L_{\text{parallel}}$ 与 Cost 公式中两处"重复支付"的来源。</li>
+      <li>给定一个端到端分数下降的 orchestrator-workers 系统，如何用分阶段评测（golden 子任务 / golden worker 输出 / oracle 替换）定位瓶颈阶段？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../06_agentic_evals/06_讲解.html"><div class="dir">← 上一章</div><div class="t">06 · Agentic 评测方法论</div></a>
+    <a class="next" href="../08_agent_safety/08_讲解.html"><div class="dir">下一章 →</div><div class="t">08 · Agent 安全与监控</div></a>
+  </div>
+
+</div>
+</body>
+</html>

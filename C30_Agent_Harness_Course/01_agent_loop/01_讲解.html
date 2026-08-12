@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · Agent 循环</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · Agent 循环</h1>
+  <p class="subtitle">感知-决策-行动-观察的反复（ReAct）、解析 thought/action/observation、停止条件与状态管理、用 max-steps 守卫防死循环 —— 把无状态的 LLM 变成有状态的多步 agent，用 MockLLM 端到端跑通</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、Python 的 while/字典/异常、对 LLM「输入文本→输出文本」的印象</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_agent_loop.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">ReAct (Yao 2022)、Anthropic «Building effective agents»、handling-stop-reasons 文档</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么「循环」是 agent 的核心</a></li>
+      <li><a href="#phases">感知-决策-行动-观察四阶段</a></li>
+      <li><a href="#react">ReAct：推理与行动交替</a></li>
+      <li><a href="#parse">解析：输出变成可执行动作</a></li>
+      <li><a href="#stop">停止条件：怎么知道答完了</a></li>
+      <li><a href="#state">状态管理：history 即记忆</a></li>
+      <li><a href="#run">一个完整的 agent 循环</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么「循环」是 agent 的核心</h2>
+  <p>模块 00 已经给了你一个直觉：agent = 模型 + <strong>循环</strong> + 工具 + 上下文。这个模块把其中最核心的「循环」彻底讲透、亲手做对。为什么单独花一整章讲一个「循环」？因为它简单得有迷惑性——核心确实不过十几行，但<strong>把它实现正确出奇地难</strong>，而所有 agent 框架的可靠性都建立在这十几行之上。</p>  <p>先把问题摆清楚。LLM 是一个<strong>无状态</strong>的函数：你给它一段文本，它返回一段文本，它不记得上一次你问过什么，更不会「执行」任何动作。可我们想要的 agent 却是<strong>有状态、能多步行动</strong>的：它要能「先查资料、看到结果、再据此计算、最后回答」。这中间隔着一道鸿沟——<strong>怎么用一个无记忆、不会行动的函数，搭出一个有记忆、能行动的过程？</strong></p>  <p>答案就是这个循环：把每一步的结果<strong>追加</strong>进一段不断变长的对话历史，每次都把<em>完整的历史</em>重新喂给模型。于是模型虽然每次调用都是「全新的、无记忆的」，但它每次都能<em>看见</em>整段历史——记忆不在模型里，而在那段历史里。模型虽然不会「执行」，但它能<em>说出</em>「我想执行 X」，由循环（harness）替它真正执行、再把结果说给它听。这个「追加历史 + 转述结果」的循环，就是把无状态函数变成有状态 agent 的全部魔法。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>agent 循环 = 一个 while 循环，反复『问模型下一步→执行→把结果追加回历史』，直到模型说『我答完了』或触发上限</strong>。它的全部难点不在「循环」本身，而在三个细节：怎么<em>解析</em>模型那段半结构化的输出（它要调工具还是要收尾）、怎么判断该<em>停止</em>、以及怎么防止它<em>永不停止</em>。这三件事就是本章的主线。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="phases"><span class="num">2</span>感知-决策-行动-观察四阶段</h2>
+  <h3>感知-决策-行动-观察：循环的四个阶段</h3>  <p>把循环拆成四个阶段，每个阶段对应一段明确的代码职责。理解这四段的<strong>分工与边界</strong>，是写对、也是日后调试 agent 的地基：</p>  <table>
+    <thead><tr><th>阶段</th><th>做什么</th><th>谁负责</th><th>对应代码</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 感知</strong> perceive</td><td>把当前历史组织成喂给模型的输入</td><td>harness</td><td>构造 messages / prompt</td></tr>
+      <tr><td><strong>② 决策</strong> decide</td><td>调用 LLM，得到「下一步动作」</td><td>LLM</td><td><code>llm.complete(...)</code></td></tr>
+      <tr><td><strong>③ 行动</strong> act</td><td>判断是收尾还是调工具，并执行</td><td>harness</td><td>解析 + 分发工具</td></tr>
+      <tr><td><strong>④ 观察</strong> observe</td><td>把执行结果追加回历史</td><td>harness</td><td><code>history.append(result)</code></td></tr>
+    </tbody>
+  </table>  <p>注意一个微妙但根本的分工：<strong>四个阶段里只有「决策」是 LLM 干的，其余三个全是 harness（你的代码）干的</strong>。这解释了为什么「造 agent」主要是写代码而非调模型——模型只在循环的一个点上被调用一次，吐出一个决定；剩下的感知、执行、回灌全是普普通通的程序逻辑。把这条认清，agent 就从「神秘的 AI」变成了「一段你完全掌控的程序」。</p>  <div class="ascii">  一轮循环（one iteration）：
+
+   history ──①感知──► messages ──②决策(LLM)──► action
+      ▲                                            │
+      │                                       ③行动:解析
+      │                          ┌─────────────────┴──────────┐
+      │                      是最终答案?                    要调工具?
+      │                          │                            │
+      │                       返回答案                    执行工具→result
+      │                       (退出循环)                       │
+      └──────────────④观察:把 result 追加回 history◄───────────┘</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>可以把这四阶段想成一次「问答接力」：你（harness）整理好情况递给顾问（①），顾问给个主意（②），你判断这主意是「最终结论」还是「让你去办件事」（③），如果是办事你就去办、把办成的结果记下来（④），然后带着更全的情况再问顾问一次。顾问永远只出主意，跑腿和记录都是你的活。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，循环维护一个<strong>单调增长的消息列表</strong>（scratchpad）：每轮往里追加一条 assistant 消息（模型的决策）和（若调了工具）一条带结果的消息（观察）。这个列表既是模型的「记忆」，也是整个 agent 状态的唯一载体——把它打印出来，就是一份可读的 agent 轨迹（trajectory）。</p></div>
+  </div>  <p>这四阶段的循环对应一个朴素的不变式（invariant）：<strong>每进入下一轮，history 一定比上一轮更长、且包含了上一步行动的结果</strong>。正是这个不变式保证了 agent「有进展」——模型每次决策都基于比上次更多的信息。反过来，如果某轮没能把结果正确追加回去（一个常见 bug），模型就会「失忆」，反复做同样的决定，陷入死循环。这就是为什么「观察回灌」这一步看似平凡却至关重要。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="react"><span class="num">3</span>ReAct：推理与行动交替</h2>
+  <h3>ReAct：让模型把推理和行动交替写出来</h3>  <p>模块 00 的最小循环里，MockLLM 直接吐出结构化动作。但真实 LLM 输出的是<strong>文本</strong>——我们得让它以一种<em>可解析</em>的格式表达「我在想什么、我要做什么」。最经典、最有效的格式就是 <span class="term">ReAct</span>（Yao 2022，Reason + Act）：让模型交替产出 <strong>Thought</strong>（思考）、<strong>Action</strong>（动作）、然后由环境给出 <strong>Observation</strong>（观察）。</p>  <pre><code># 真实 LLM 在 ReAct 格式下的一段典型输出：
+Thought: 用户问北京今天适合穿什么，我得先知道天气。
+Action: get_weather
+Action Input: {"city": "北京"}
+
+# ↑ harness 解析出 Action=get_weather, 执行后把结果作为 Observation 回灌：
+Observation: 北京: 晴, 22°C
+
+# 模型看到 Observation 后继续：
+Thought: 22°C 晴天，穿薄外套即可。我可以回答了。
+Final Answer: 北京今天晴、22°C，建议穿一件薄外套。</code></pre>  <p>为什么要让模型显式写出 <strong>Thought</strong>？因为「先想再做」能显著提升多步任务的可靠性——模型把推理摊开在上下文里，下一步决策就有了清晰的依据，也更不容易跑偏（这正是 Chain-of-Thought 的思想在 agent 里的延伸）。而且这段思考对<strong>调试</strong>无比宝贵：当 agent 做错时，读它的 Thought 你就能看出它是「想错了」还是「执行错了」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>ReAct 的精髓是一个<strong>交替的节奏</strong>：想一下、做一下、看一下结果、再想一下……就像人解决陌生问题时的内心独白。「我需要先查 X」（Thought）→ 真的去查（Action）→「哦原来是这样」（Observation）→「那接下来该算 Y」（Thought）……agent 不过是把这段独白结构化、让机器能照着跑。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说，ReAct 把 agent 的每一步规约成一个三元组 <code>(thought, action, observation)</code>，整条轨迹就是这些三元组的序列。模型负责生成 thought 和 action，环境（harness 执行工具）负责生成 observation。这个清晰的接口让「推理」（模型的事）和「行动」（harness 的事）解耦——也让本课能用 MockLLM 替换掉模型部分、单独验证 harness 部分。</p></div>
+  </div>  <p>现代模型（如 Claude）原生支持更结构化的工具调用（直接返回 <code>tool_use</code> 块，不必让你正则解析文本），这其实是 ReAct 思想的<strong>协议化升级</strong>——模型仍在「思考 + 行动」，只是「行动」从一段需要解析的文本，变成了一个规整的结构化块。本课模块 02/03 会用这种结构化形式；但理解<strong>纯文本 ReAct 的解析</strong>仍然重要：它让你看清「工具调用」最朴素的样子，也是很多场景（如不支持原生工具调用的模型）下唯一的办法。本模块的 notebook 会带你亲手写一个 ReAct 文本解析器。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="parse"><span class="num">4</span>解析：输出变成可执行动作</h2>
+  <h3>解析：把模型的输出变成可执行的动作</h3>  <p>循环里最容易出 bug 的一步，就是<strong>解析</strong>——把模型那段半结构化的文本，可靠地变成「这是工具调用（哪个工具、什么参数）」或「这是最终答案」。解析写脆了，整个 agent 就脆了。</p>  <p>以纯文本 ReAct 为例，解析要回答三个问题：(1) 这段输出里<strong>有没有</strong> <code>Final Answer:</code>？有就是收尾。(2) 没有的话，<code>Action:</code> 后面是哪个工具名？(3) <code>Action Input:</code> 后面那段（通常是 JSON）怎么解析成参数 dict？</p>  <pre><code>def parse_react(text):
+    # 1) 最终答案优先
+    if 'Final Answer:' in text:
+        return {'type': 'final', 'text': text.split('Final Answer:')[1].strip()}
+    # 2) 工具调用：抓 Action 与 Action Input
+    action = text.split('Action:')[1].split('\n')[0].strip()
+    raw = text.split('Action Input:')[1].strip()
+    args = json.loads(raw)        # 3) 参数解析（可能失败！）
+    return {'type': 'tool', 'name': action, 'input': args}</code></pre>  <div class="callout warn"><span class="label"></span>
+    <p>解析是<strong>不可信输入</strong>的处理——模型输出不保证格式完美：它可能漏掉 <code>Action Input</code>、给出非法 JSON、把工具名拼错、或同时写了 Action 又写了 Final Answer。<strong>健壮的解析必须把每种坏情况都变成一个『可反馈的错误』</strong>（返回结构化错误让模型重试），而不是抛异常崩掉整个 agent。本课模块 04 会系统处理这些；本模块先让你看清解析的核心结构与最常见的坑（漏字段、坏 JSON）。</p>
+  </div>  <p>这里藏着一个深刻的设计取舍：<strong>文本解析 vs 原生工具调用</strong>。让模型输出自由文本再正则解析，灵活、任何模型都能用，但脆——格式全靠提示词约束，模型一不听话就解析失败。让模型走原生工具调用（返回结构化 <code>tool_use</code> 块），规整、几乎不会解析失败，但依赖模型/API 支持这个能力。工业级 agent（包括接 Claude 的）首选后者；但理解前者让你明白「结构化工具调用」到底替你省掉了什么——它把「解析」这个最脆的环节，从你的代码挪进了模型与 API 的契约里。</p>  <p>本模块的 notebook 会让你两种都写一遍：先写一个纯文本 ReAct 解析器（看清最朴素的形态、踩一遍坑），再过渡到结构化动作（看清它如何让循环变干净）。你会亲手验证：同一个 agent 循环，喂结构化动作时代码清爽、喂文本时要多一层易错的解析——这正是真实世界从「文本 agent」走向「工具调用 agent」的缩影。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="stop"><span class="num">5</span>停止条件：怎么知道答完了</h2>
+  <h3>停止条件：agent 怎么知道「我答完了」</h3>  <p>循环必须能停。<strong>正确地停止</strong>听起来理所当然，却是 agent 的一个核心难点——停早了任务没完成，停晚了浪费钱甚至死循环。停止分两类：<strong>正常停止</strong>（模型主动收尾）和<strong>强制停止</strong>（触发安全上限）。</p>  <table>
+    <thead><tr><th>停止类型</th><th>触发条件</th><th>应返回什么</th><th>对应真实信号</th></tr></thead>
+    <tbody>
+      <tr><td><strong>正常·答完</strong></td><td>模型给出最终答案</td><td>答案 + 成功状态</td><td><code>stop_reason=="end_turn"</code> / Final Answer</td></tr>
+      <tr><td><strong>强制·超步数</strong></td><td>循环达到 max_steps</td><td>已有进展 + 超限状态</td><td>harness 的步数计数器</td></tr>
+      <tr><td><strong>强制·超预算</strong></td><td>累计成本/token 超阈值</td><td>已有进展 + 超预算状态</td><td>usage 累加 + 阈值</td></tr>
+      <tr><td><strong>强制·死循环</strong></td><td>检测到重复动作无进展</td><td>中止 + 循环警告</td><td>动作指纹去重（模块 04）</td></tr>
+    </tbody>
+  </table>  <p>「正常停止」的判定，本质就是解析的一部分：模型这轮的输出是「最终答案」而非「工具调用」。在纯文本 ReAct 里是检测 <code>Final Answer:</code>；在结构化工具调用里是看 <code>stop_reason</code>——如果模型这轮<strong>没有</strong>请求调工具（<code>stop_reason=="end_turn"</code>），就说明它认为自己答完了，循环结束。这是接通本课循环与真实 Claude API 的关键一环：<code>stop_reason=="tool_use"</code> 意味着「执行工具后继续循环」，<code>end_turn</code> 意味着「收尾」。</p>  <div class="callout danger"><span class="label">第一安全准则</span>
+    <p>最危险的不是「停早了」，而是<strong>永不停止</strong>。真实场景里模型可能因为困惑、被对抗性输入诱导、或工具总返回它不满意的结果，而<strong>无限地调工具→观察→再调</strong>。一个没有 <code>max_steps</code> 守卫的 agent 循环 = 一个潜在的无限循环 + 持续烧钱的账单。<strong>永远给 agent 循环设硬上限</strong>（最大步数，通常再加最大预算），这是 agent 工程不可妥协的第一条安全准则。它是模块 04「鲁棒性」的开篇，但重要到必须在本模块就立下。</p>
+  </div>  <p>把停止条件设计成一个<strong>清晰的状态机</strong>对生产 agent 很重要：每次循环退出，都应带一个明确的<em>终止原因</em>（答完 / 超步数 / 超预算 / 死循环 / 不可恢复错误），而非静默地返回或卡死。调用方据此知道「这次运行成功了吗、为什么停的、要不要重试」。本模块 notebook 会让你给循环加上这样的终止状态，并验证每种停止都能被正确识别。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="state"><span class="num">6</span>状态管理：history 即记忆</h2>
+  <h3>状态管理：history 就是 agent 的全部记忆</h3>  <p>再强调一遍这个反直觉但关键的事实：<strong>agent 的「记忆」不在模型里，而在那段不断累积的 history 里</strong>。模型每次调用都是无状态的——它能「记得」之前的事，纯粹是因为你每次都把完整的 history 重新喂给它。管理好这段 history，就是管理好 agent 的状态。</p>  <p>history（也叫 scratchpad）通常是一个消息列表，每条消息有角色与内容。一轮循环往里追加什么，决定了模型下一轮能「看见」什么：</p>  <ul>
+    <li><strong>user 消息</strong>：最初的任务，以及（在某些设计里）回灌的工具结果。</li>
+    <li><strong>assistant 消息</strong>：模型每轮的输出（thought + action，或最终答案）。把它追加回去，模型下一轮才记得「我刚才决定调 X」。</li>
+    <li><strong>工具结果（observation）</strong>：工具执行的返回值。在 Claude 协议里它是放进 user 消息里的 <code>tool_result</code> 块；在文本 ReAct 里是一行 <code>Observation:</code>。这是 agent 闭环的关键——没有它，模型对自己行动的后果一无所知。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一个常见的初学者 bug：<strong>忘了把模型的决策（assistant 消息）追加回 history</strong>，只追加了工具结果。结果模型每轮都「忘了」自己上一步调过什么，于是反复调同一个工具——一个典型的、由状态管理失误导致的死循环。记住不变式：<em>每轮模型说的话和工具返回的结果，都要原样追加回 history</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从形式上看，history 是 agent 唯一的状态变量，循环是对它的纯函数式转换：<code>history_{t+1} = history_t + [模型决策] + [观察]</code>。理解这一点有两个好处：(1) 调试时只要 dump 这个 history，agent 的整个「思维过程」就一目了然；(2) 它解释了为什么长程 agent 会遇到<strong>上下文窗口</strong>问题——history 单调增长，迟早撑爆模型能看的最大长度，于是需要裁剪或压缩（见模块衔接）。</p></div>
+  </div>  <p>history 越长，每次调用越贵（输入 token 越多）、也越慢，最终会逼近模型的上下文窗口上限。本课的最小 agent 任务短、不必担心；但真实长程 agent 必须管理它——这就是 <span class="term">context management</span>（上下文管理）：截断旧的 tool_result、把历史压缩（compaction）成摘要、或把状态外置到记忆系统。这些是本课之后的进阶方向，但现在就该建立意识：<strong>agent 的记忆是有限且有成本的，管理 history 是长程 agent 绕不开的工程</strong>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="run"><span class="num">7</span>一个完整的 agent 循环</h2>
+  <h3>把它跑起来：一个完整的 agent 循环</h3>  <p>把前面所有概念合到一起，一个完整的 agent 循环长这样（结构化动作版，最接近本课后续与真实 Claude）：</p>  <pre><code>def run_agent(llm, tools, task, max_steps=10, max_cost=1.0):
+    history = [{'role': 'user', 'content': task}]
+    cost = 0.0
+    for step in range(max_steps):              # 强制上限：防死循环
+        resp = llm.complete(history, tools)    # ②决策
+        cost += resp.get('cost', 0.0)
+        if cost &gt; max_cost:                     # 强制上限：防烧钱
+            return {'status': 'budget_exceeded', 'history': history}
+        history.append(resp['assistant_msg'])  # 状态：追加模型决策
+        if resp['stop_reason'] == 'end_turn':   # ③正常停止
+            return {'status': 'done', 'answer': resp['text'], 'history': history}
+        # 否则要调工具
+        results = []
+        for call in resp['tool_calls']:        # 可能并行多个(模块02)
+            out = dispatch(tools, call)         # 分发+执行+错误隔离
+            results.append(out)
+        history.append({'role': 'user', 'content': results})  # ④观察回灌
+    return {'status': 'max_steps', 'history': history}        # 超步数
+</code></pre>  <p>逐点对照前面的概念：<code>for step in range(max_steps)</code> 是停止守卫；<code>llm.complete</code> 是决策（且是唯一调模型处，靠可插拔接口接 mock 或真实）；<code>stop_reason=='end_turn'</code> 是正常停止；<code>dispatch</code> 是行动（模块 02 的工具系统）；两处 <code>history.append</code> 是状态管理（既追加决策、也追加观察，缺一不可）；每个 <code>return</code> 都带一个明确的 <code>status</code>（终止状态机）。这就是一个<strong>完整、正确、可上线雏形</strong>的 agent 循环——后续模块只是把其中的 <code>llm</code>、<code>dispatch</code>、错误处理逐一做扎实。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>回看这段代码，你会发现它印证了模块 00 的论断：<strong>造 agent 主要是写朴素的程序逻辑，而非调模型</strong>。整段里只有一行 <code>llm.complete</code> 碰到了「AI」，其余全是循环、判断、列表追加这些每个程序员都会的东西。这正是本课想传达的祛魅：所谓 agent，是一段你完全能掌控、能调试、能亲手造出来的程序。本模块的 notebook 会让你把这段循环从零写出来，用 MockLLM 端到端跑通、用 assert 验证每个阶段都对。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>规划与反思</strong>：朴素 ReAct 是「走一步看一步」的贪心循环。更强的 agent 会先<em>规划</em>（把任务分解成子目标）、失败后<em>反思</em>（Reflexion：用自然语言总结教训、改进下次尝试）、甚至<em>搜索</em>（Tree of Thoughts：多分支探索 + 回溯）。循环的「决策」这一环还有巨大的设计空间。</li>
+    <li><strong>循环的终止判定</strong>：让模型自己判断「我答完了」并不总可靠——它可能过早收尾（任务没做完就 Final Answer）或永不收尾。如何让 agent 更准地知道「何时算完成」（如引入显式的完成度评估、或 outcome-based 的判据）仍是活跃方向。</li>
+    <li><strong>上下文管理与长程记忆</strong>：history 单调增长终会撑爆上下文窗口。截断、压缩（compaction）、外置记忆（把状态写进文件/数据库）各有取舍；让 agent 在超长任务上「记得住关键、忘得掉无关」是长程 agent 的核心难题。</li>
+    <li><strong>结构化输出的可靠性</strong>：从文本 ReAct 到原生工具调用，是把「解析」的脆弱性从应用代码转移到模型/API 契约。但即便原生工具调用，模型仍可能调错工具、填错参数——如何让结构化决策<em>可靠到能放手自动执行</em>（尤其有副作用的动作），是 agent 安全的前沿。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：ReAct（Yao 2022，本模块循环的奠基）、Anthropic《Building effective agents》（workflow vs agent 的取舍）、Anthropic 的 handling-stop-reasons 文档（正确终止与续跑）。进阶：Reflexion、Tree of Thoughts。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_tool_system/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 工具系统</div></a>
+  </div>
+
+</div>
+</body>
+</html>

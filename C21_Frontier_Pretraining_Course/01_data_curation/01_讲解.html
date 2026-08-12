@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 数据清洗与去重</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 数据清洗与去重</h1>
+  <p class="subtitle">把一大桶脏水变成一小桶纯净水：质量过滤（启发式 + 分类器）、MinHash/LSH 近重复去重、n-gram 去污染 —— 从零实现一条 CommonCrawl 管线</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">集合与概率基础、哈希函数概念、Python/numpy；模块 00</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_data_curation.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">FineWeb (Penedo 2024)、Lee 2021 (去重)、Broder 1997 (MinHash)、Rae 2021 (Gopher)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么清洗去重是预训练第一步</a></li>
+      <li><a href="#heur">质量过滤（一）：启发式规则</a></li>
+      <li><a href="#clf">质量过滤（二）：分类器打分</a></li>
+      <li><a href="#minhash">去重（一）：MinHash 估 Jaccard</a></li>
+      <li><a href="#lsh">去重（二）：LSH banding 把 O(n²) 变可行</a></li>
+      <li><a href="#decon">去污染：n-gram 重叠</a></li>
+      <li><a href="#pipeline">拼成 CommonCrawl 管线</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么清洗去重是预训练第一步</h2>
+  <p>预训练的第一性原理是：<strong>模型会无差别地学习你喂给它的一切</strong>。喂进去一篇维基百科条目，它学到知识；喂进去一段 SEO 垃圾、一个导航菜单、一篇被转载了一千遍的新闻稿，它也照单全收——浪费宝贵的参数容量去记忆噪声，还会被重复内容带偏分布。所以在碰任何模型架构之前，真正的预训练工作是从原始网络数据里<strong>淘出金子</strong>：清洗、去重、去污染。</p>  <p>原始素材有多脏？以 <span class="term">CommonCrawl</span> 为例——它每月抓取整个公开网络，一个快照就是 PB 级的 <span class="term">WARC</span> 文件。里面绝大部分是 HTML 模板（菜单、广告、版权声明）、机器生成的垃圾、拼写错乱的论坛回帖、以及<strong>海量的近重复</strong>（同一篇文章被无数站点转载、只改了标题）。直接拿它训，等于让模型在垃圾堆里学语言。<span class="term">FineWeb</span>（Penedo 2024）的消融实验给出了震撼的对照：<strong>把清洗管线做对，一个小模型能在下游超过用未清洗数据训的更大模型</strong>——数据质量的杠杆，常常大过模型规模。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句话概括本模块：把「一大桶脏水」变成「一小桶纯净水」。三道工序——<strong>质量过滤</strong>（把明显的垃圾捞出去）、<strong>去重</strong>（同样的内容只留一份）、<strong>去污染</strong>（把考试题从训练集里删掉，免得作弊）。每一道都有可量化的收益，也都有可调的旋钮。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，给定原始文档集合 $\mathcal{D}_{\text{raw}}$，我们要构造一个映射 $\mathcal{D}_{\text{raw}} \to \mathcal{D}_{\text{clean}}$，使得在固定训练 <span class="term">FLOPs</span> 下，$\mathcal{D}_{\text{clean}}$ 训出的模型下游表现最优。这是一个<strong>数据选择（data selection）</strong>问题；本模块覆盖它的三大支柱：质量过滤（选高质量子集）、去重（去冗余）、去污染（保评测有效性）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么去重如此关键？因为重复 = <strong>加倍记忆 + 分布失真</strong>。Lee 2021 证明：去重后，模型逐字背诵训练样本的概率大降、达到同样验证 loss 所需的训练步数减少、下游还略有提升——几乎是<em>免费的午餐</em>。Carlini 2022 进一步量化：一个样本在训练集里出现越多次，被模型逐字背下来的概率越高（隐私/版权风险）。去重一举多得，是性价比最高的一步。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="heur"><span class="num">2</span>质量过滤（一）：启发式规则</h2>
+  <h3>质量过滤（一）：启发式规则</h3>  <p>质量过滤的第一层是<strong>便宜、快、可解释</strong>的启发式规则（heuristic filter）。思路很朴素：人能一眼看出的垃圾，往往有简单的统计特征。<span class="term">Gopher</span>（Rae 2021）整理了一套被业界反复沿用的规则，本模块的 notebook 会从零实现其中的核心几条：</p>  <table>
+    <thead><tr><th>规则</th><th>判据</th><th>想滤掉什么</th></tr></thead>
+    <tbody>
+      <tr><td>文档长度</td><td>词数 < 50 或 > 100k</td><td>碎片/异常文档</td></tr>
+      <tr><td>平均词长</td><td>平均 < 3 或 > 10 字符</td><td>乱码、被拼接的无空格文本</td></tr>
+      <tr><td>符号词比</td><td># 符号 / # 词 > 0.1</td><td>代码残渣、表情/符号刷屏</td></tr>
+      <tr><td>停用词比例</td><td>the/and/of… 占比过低</td><td>非自然语言（关键词堆砌、列表）</td></tr>
+      <tr><td>重复行比例</td><td>重复行 / 总行 > 0.3</td><td>模板、菜单、刷屏</td></tr>
+      <tr><td>以省略号结尾的行比例</td><td>过高</td><td>被截断的预览/摘要农场</td></tr>
+    </tbody>
+  </table>  <p>每条规则单独看都很粗糙，但<strong>组合起来</strong>能滤掉相当大比例的明显垃圾。关键在于<strong>阈值的权衡</strong>：阈值松了放进垃圾（precision 低），紧了误杀好文档（recall 低）。预训练里通常<strong>宁可错杀、保 precision</strong>——因为高质量数据本就过剩到训不完，丢掉一些好的不心疼，但放进垃圾会实实在在地拖累模型。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把每条规则想成一个安检门：太宽松会放进危险品，太严格会拦下正常旅客。我们要的是<strong>尽量不放进垃圾</strong>的那个设置，哪怕代价是偶尔拦下几个无辜的好文档——反正排队的好文档多得是。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>用 precision/recall 的语言：设过滤器保留集为 $K$，真正高质量集为 $H$，则 $\text{precision}=\frac{|K\cap H|}{|K|}$、$\text{recall}=\frac{|K\cap H|}{|H|}$。预训练数据过剩时，目标函数偏向<strong>最大化 precision</strong>（留下的尽量都是好的），可以容忍较低 recall。notebook 练习 4 会让你在合成数据上画出阈值—PR 曲线，亲手体会这个取舍。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>启发式规则有<strong>文化与语言偏见</strong>：「停用词比例」这条是为英语设计的，套到中文、代码、数学公式上会大量误杀。真实多语管线必须为每种语言/领域单独调规则（FineWeb 主要面向英语，多语版另做）。本课在英文玩具数据上演示机制，但你要记住：<strong>规则不是普适的，迁移到新语言/领域必须重新校准</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="clf"><span class="num">3</span>质量过滤（二）：分类器打分</h2>
+  <h3>质量过滤（二）：分类器打分</h3>  <p>启发式规则抓不到的，是<em>语义层面</em>的低质：语法通顺但内容空洞的 SEO 文、农场文、标题党。第二层用<strong>分类器</strong>（classifier-based filtering）：训练一个轻量分类器区分「高质量参考文本」与「随机网页」，按分数过滤。GPT-3、LLaMA 都用过这招。</p>  <p>经典做法（GPT-3）：把已知高质量来源（维基、书籍、被高赞的链接）当正例，随机 CommonCrawl 当负例，训一个<span class="term">fastText</span>或逻辑回归分类器，给每篇文档打一个「像不像高质量」的分数，然后按分数采样——不是硬阈值，而是<strong>按分数概率性保留</strong>（高分几乎必留，低分小概率留），既提质又保多样性。</p>  <div class="math-block">\[p_{\text{keep}}(d) = \begin{cases} 1 & \text{score}(d) > \tau_{\text{high}} \\ \big(\tfrac{\text{score}(d)}{\tau_{\text{high}}}\big)^{\gamma} & \text{otherwise} \end{cases}\]</div>  <p>本模块 notebook 用 numpy 从零训一个<strong>逻辑回归质量分类器</strong>（词袋特征 + sigmoid），在合成的「高质量 vs 垃圾」文档上训练、打分、过滤，并量化它比纯启发式多抓住了多少语义垃圾。这正是 FineWeb-Edu（用 LLM 标注「教育价值」分数再蒸馏成分类器）的简化版思想。</p>  <div class="callout danger"><span class="label"></span>
+    <p>分类器过滤的<strong>隐患</strong>：它会把训练它的「高质量来源」的风格固化成偏见。若正例全是维基式的正式英文，分类器会系统性地打压口语、方言、少数群体的表达、非西方话题——这些被当成「低质」滤掉，model 就再也学不到。<strong>过滤即价值判断</strong>：你定义的「高质量」会塑造模型的视野与偏见（这是 C12 负责任 AI 的核心关切）。实践中要审计被过滤掉的内容、保留足够多样性，而不是盲目追求分类器分数。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="minhash"><span class="num">4</span>去重（一）：MinHash 估 Jaccard</h2>
+  <h3>去重（一）：MinHash 估 Jaccard</h3>  <p>去重的核心是<strong>判断两篇文档有多相似</strong>。逐字节相同的副本用一个哈希就能抓；难的是<span class="term">near-duplicate</span>（近重复）：转载改一个词、模板填不同内容。衡量近重复的标准度量是<span class="term">Jaccard similarity</span>——把每篇文档表示成它的 <span class="term">shingle</span>（k-gram）集合，算交并比：</p>  <div class="math-block">\[J(A,B) = \frac{|A \cap B|}{|A \cup B|} \in [0,1]\]</div>  <p>但直接对亿级文档两两算 Jaccard 是<strong>不可能</strong>的：既要存每篇的完整集合，又是 $O(n^2)$ 次比较。<span class="term">MinHash</span>（Broder 1997）用一个绝妙的技巧把它变可行——把「比集合」换成「比一个短签名」。</p>  <h4>MinHash 的核心定理</h4>  <p>取一个随机哈希函数 $h$（把每个 shingle 映射到一个大整数），定义 $\text{minhash}_h(A) = \min_{x \in A} h(x)$（集合中所有元素哈希值的最小值）。<strong>关键定理</strong>：</p>  <div class="math-block">\[\Pr\big[\min_{x\in A} h(x) = \min_{x\in B} h(x)\big] = \frac{|A\cap B|}{|A\cup B|} = J(A,B)\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么成立？想象把 $A\cup B$ 里所有元素的哈希值排成一队，谁的哈希值最小谁排第一。「$A$ 和 $B$ 的最小哈希相等」，当且仅当排第一的那个元素<strong>同时属于 $A$ 和 $B$</strong>（即落在交集里）。在随机哈希下，排第一的元素等概率地是 $A\cup B$ 中的任意一个，所以它落在交集 $A\cap B$ 的概率，恰好就是 $\frac{|A\cap B|}{|A\cup B|}=J$。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>于是用 $m$ 个独立随机哈希得到一个长度 $m$ 的签名向量。两个签名<strong>逐位相等的比例</strong>，就是 $J(A,B)$ 的<strong>无偏估计</strong>（每一位是一次伯努利试验，成功概率 $=J$）。估计的标准误差约 $\sqrt{J(1-J)/m}$——$m$ 越大越准。典型取 $m=128$ 或 $256$。这把「存完整集合 + 两两比集合」压成了「存 $m$ 个整数 + 比签名」。</p></div>
+  </div>  <div class="ascii">文档 A 的 shingles: {ab, bc, cd, de}      文档 B: {ab, bc, cd, ef}
+   哈希 h1:  ab→7 bc→2 cd→9 de→5  → min=2     ab→7 bc→2 cd→9 ef→3 → min=2  ✓相等
+   哈希 h2:  ab→4 bc→8 cd→1 de→6  → min=1     ab→4 bc→8 cd→1 ef→0 → min=0  ✗不等
+   哈希 h3:  ab→3 bc→5 cd→6 de→9  → min=3     ab→3 bc→5 cd→6 ef→8 → min=3  ✓相等
+   ...(共 m 个)
+   签名相等比例 ≈ Jaccard(A,B)   (真值 J = 3/5 = 0.6)</div>  <div class="callout intuition"><span class="label"></span>
+    <p>MinHash 的魔力在于<strong>把相似度「编码」进了「碰撞概率」</strong>：两个集合越像，它们的最小哈希越容易撞在一起。于是相似度比较——一个看似需要看遍两个集合的操作——被压缩成了「数一数签名里有多少位相同」。这是 LSH 大家族的共同思想，下一节的 banding 把它推到极致。</p>
+  </div>  <h4>旁支：SimHash —— 另一条 LSH 路线</h4>  <p>和 MinHash 并列的近重复方案是 <span class="term">SimHash</span>（Charikar 2002，Google 网页去重用它）。思路不同但目标一致：把文档的加权特征向量投影到 $p$ 个随机超平面上，每个超平面取投影的符号（正记 1、负记 0），拼成一个 $p$ 位指纹。<strong>两文档 SimHash 指纹的海明距离越小，它们的余弦相似度越高</strong>——因为夹角小的向量，被随机超平面分到两侧的概率也小。</p>  <table>
+    <thead><tr><th>维度</th><th>MinHash</th><th>SimHash</th></tr></thead>
+    <tbody>
+      <tr><td>度量的是</td><td>Jaccard 相似度（集合交并比）</td><td>余弦相似度（向量夹角）</td></tr>
+      <tr><td>签名形态</td><td>$m$ 个整数（最小哈希）</td><td>$p$ 位二进制指纹</td></tr>
+      <tr><td>相似判据</td><td>签名相等位的比例</td><td>指纹的海明距离</td></tr>
+      <tr><td>典型场景</td><td>shingle 集合、文档去重（最常用）</td><td>短文本、带权特征、紧凑存储</td></tr>
+    </tbody>
+  </table>  <p>两者都属于 <span class="term">LSH</span>：核心都是「让相似输入大概率碰撞」。预训练去重以 MinHash 为主（Jaccard 对 shingle 集合更自然），但理解 SimHash 能帮你看清 LSH 是一<em>族</em>方法、各自匹配不同的相似度度量。本模块 notebook 聚焦 MinHash，因为它是 FineWeb / datatrove 的实际选择。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="lsh"><span class="num">5</span>去重（二）：LSH banding 把 O(n²) 变可行</h2>
+  <h3>去重（二）：LSH banding 把 O(n²) 变可行</h3>  <p>MinHash 把「比集合」变成了「比 $m$ 维签名」，但<strong>两两比签名还是 $O(n^2)$</strong>——亿级文档依然炸。最后一块拼图是 <span class="term">LSH</span>（局部敏感哈希）的 <span class="term">banding</span>（分带法）：<strong>只让相似的文档进同一个桶，只比同桶的</strong>。</p>  <p>做法：把长度 $m$ 的签名切成 $b$ 个 <strong>band</strong>、每个 band 含 $r$ 行（$m = b \times r$）。对每个 band，把它那 $r$ 个数拼起来做哈希、扔进一个桶。<strong>规则：只要有任意一个 band 完全相同，两文档就成为候选对</strong>。直觉是：两篇很像的文档，签名大部分位相同，<em>总有某个 band 整段一致</em>；两篇不像的，某个 band 碰巧全同的概率极低。</p>  <h4>S 曲线：banding 的数学</h4>  <p>两文档真实 Jaccard 为 $s$ 时，它们成为候选对的概率是：</p>  <div class="math-block">\[P(\text{候选}) = 1 - (1 - s^{r})^{b}\]</div>  <p>推导：一个 band 的 $r$ 行全相同的概率是 $s^r$（每行独立相等概率 $s$）；该 band <em>不</em>全同是 $1-s^r$；$b$ 个 band <em>全都</em>不全同是 $(1-s^r)^b$；于是<strong>至少一个 band 全同</strong>（即成为候选）是 $1-(1-s^r)^b$。这个函数关于 $s$ 是一条<strong>S 形曲线</strong>：低相似度处接近 0、高相似度处接近 1，中间有个陡峭的过渡（阈值）。</p>  <div class="ascii">P(候选)
+  1.0 ┤              ╭──────────  ← 高相似度：几乎必被抓(高召回)
+      │            ╱
+      │           ╱ ← 陡峭过渡
+  0.5 ┤- - - - - ╳ - - - - - 阈值 ≈ (1/b)^(1/r)
+      │        ╱
+      │  _____╱      ← 低相似度：几乎不被抓(少误报)
+  0.0 ┤─────────────────────────→ 真实 Jaccard s
+      0        阈值              1</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>调 $(b, r)$ 就是<strong>挪动这条 S 曲线的拐点</strong>：想抓更松的近重复（阈值低），就增大 $b$（多分几个 band，更容易撞上一个）；想只抓很像的（阈值高），就增大 $r$（每个 band 更长、更难全同）。拐点近似在 Jaccard $\approx (1/b)^{1/r}$ 处。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这把去重复杂度从 $O(n^2)$ 降到接近 $O(n)$：每篇文档只做 $b$ 次 band 哈希入桶（$O(nb)$），然后只在桶内（同桶文档通常很少）算精确 Jaccard 确认。LSH 负责<strong>高召回地缩小候选范围</strong>，精确比对负责<strong>剔除误报</strong>。这正是 datatrove、Spark MinHashLSH 在亿级文档上去重的工作原理。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>banding 是<strong>近似</strong>：S 曲线不是阶跃函数，所以一定有<strong>漏网（false negative，相似却没进同桶）和误报（false positive，不相似却进了同桶）</strong>。误报靠桶内精确 Jaccard 兜底；漏网则要靠调 $(b,r)$ 把过渡区压窄、对准你想要的阈值。<strong>没有完美的 (b,r)</strong>——它是召回、精度、计算量三者的权衡，notebook 练习 2 会让你亲手调它命中目标阈值。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="decon"><span class="num">6</span>去污染：n-gram 重叠</h2>
+  <h3>去污染：n-gram 重叠</h3>  <p>最后一道工序针对一个<strong>致命</strong>的问题：<span class="term">decontamination</span>（去污染）。如果评测基准（MMLU、HellaSwag 的题目）不小心混进了训练集，模型就是<strong>背过答案再考试</strong>——评测分数虚高、毫无意义。前沿模型（GPT-3、PaLM）都报告过专门的去污染步骤。</p>  <p>判据是 <span class="term">n-gram overlap</span>（n-gram 重叠）：若一段训练文本与某条测试样本共享足够长（典型 <strong>13-gram</strong>）的连续 token 片段，就判定为污染、删除该训练文本（或该段）。n 取得长（如 13），是为了避免误伤——正常文本偶然撞上 13 个连续相同 token 的概率极低，所以一旦撞上，几乎可以肯定是<em>抄</em>的。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：判断一份作业是不是抄的，不看「有没有相同的词」（太多巧合），而看「有没有一整句话一字不差地相同」。13-gram 就是「一整句话」级别的指纹——正常写作几乎不可能和考题撞上这么长的连续片段。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：设测试样本的所有 $n$-gram 集合为 $G_{\text{test}}$。对每篇训练文档 $d$，若 $\exists$ 一个 $n$-gram $g \in \text{ngrams}(d)$ 使得 $g \in G_{\text{test}}$，则 $d$ 被标记为污染。$n$ 越大，越严格（越少误报，但也越可能漏掉「改写过的」污染）。这与去重的 shingle 思想同源，只是这里比对的对象是<strong>评测集</strong>而非语料自身。</p></div>
+  </div>  <p>实现上有个规模问题：测试集的所有 13-gram 可能很多，逐一比对慢。标准做法是把 $G_{\text{test}}$ 建成一个<strong>哈希集合（set）</strong>，训练文档的每个 13-gram 做一次 $O(1)$ 查表。notebook 练习 3 会让你实现这个 n-gram 去污染器，并验证它能精确捞出被植入考题的训练样本、且不误伤干净样本。</p>  <div class="callout danger"><span class="label"></span>
+    <p>去污染常被<strong>低估甚至跳过</strong>，后果很严重：很多「惊人」的评测结果，事后被发现是污染导致的——模型并没那么强，只是见过题。更隐蔽的是<strong>改写型污染</strong>（把题目换个说法），n-gram 抓不到，需要语义级检测（仍是开放问题）。做评测时，<strong>先确认训练集对该评测做过去污染</strong>，否则分数不可信。这是评测科学（C10）与预训练的交叉地带。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">7</span>拼成 CommonCrawl 管线</h2>
+  <h3>把三道工序拼成 CommonCrawl 管线</h3>  <p>现在把质量过滤、去重、去污染按正确顺序串起来，就是一条<strong>真实预训练数据管线</strong>的骨架。顺序很重要——做错顺序会白费算力：</p>  <div class="ascii">原始 WARC/WET
+  1. 语言识别 + 正文抽取   (剥 HTML，留目标语言的纯文本)
+  2. 启发式质量过滤        (Gopher 规则，便宜，先滤掉大批明显垃圾)
+  3. 去重 (MinHash + LSH)  (在已缩小的集合上做，省算力)
+  4. 分类器质量过滤        (语义级，较贵，放在去重后样本变少时做)
+  5. 去污染 (n-gram)       (删掉与评测集重叠的)
+  6. PII/毒性过滤(可选)    (隐私、有害内容)
+  ▼
+干净语料 → tokenizer(模块02) → 配比(模块05) → 训练</div>  <p>几条<strong>顺序的工程智慧</strong>：① 启发式过滤<strong>放最前</strong>——它最便宜，先把大批垃圾滤掉，后面的去重/分类器要处理的文档就少了，省大量算力；② 去重<strong>放在启发式之后、分类器之前</strong>——在已缩小的集合上去重更省，且去重后再训分类器统计更干净；③ 去污染<strong>可以靠后</strong>，因为它删的量通常不大，但绝不能省。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>还有一个<strong>粒度</strong>选择：去重和过滤是按<strong>整篇文档</strong>做，还是按<strong>段落/行</strong>做？文档级简单，但会把「一篇好文章里夹了一段模板」整篇丢掉，或整篇留下含模板；行级/段落级更精细，能只删那一段，但实现更复杂、可能切碎语义。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>FineWeb 等现代管线<strong>混用</strong>：行级删模板（重复行、菜单），文档级做 MinHash 去重与质量判定。粒度本身是个权衡——太粗会误伤/漏放，太细会破坏长程连贯性（而长程连贯正是语言模型要学的）。这没有唯一正确答案，依语料与目标而定。</p></div>
+  </div>  <p>跨快照（cross-dump）去重是另一个现实考量：CommonCrawl 每月一个快照，同一篇热门文章会在多个月份重复出现。是<strong>每个快照内部去重</strong>（省算力但留下跨月重复），还是<strong>全局去重</strong>（更彻底但内存/计算成本高）？FineWeb 发现<em>过度的全局去重反而略伤性能</em>（删掉了有价值的高频优质内容），最终选择主要做单快照内去重——又一个反直觉的工程发现。</p>  <p>FineWeb 的贡献正在于把这条管线的<strong>每一步都做了 FLOPs 对齐的消融</strong>：固定训练算力，逐个开关每个步骤，看下游分数变化。结论是每一步都有正贡献，且<strong>去重 + 好的质量过滤</strong>贡献最大。这种「用消融量化每步价值」的方法论，是数据工程从「炼丹」走向「科学」的标志，也是本课希望你带走的思维方式。</p>  <div class="callout paper"><span class="label"></span>
+    <p>FineWeb（Penedo 2024）公开了完整管线、消融与 15T token 语料；RefinedWeb（Penedo 2023）论证纯网页清洗即可媲美精选语料；Lee 2021 是去重价值的奠基；Broder 1997 是 MinHash 的数学源头；MMDS 教材第 3 章是 LSH/banding 的标准推导。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>「质量」到底是什么</strong>：质量过滤的本质是定义「好文本」，但这个定义高度主观、且带文化偏见。FineWeb-Edu 用「教育价值」当代理、DSIR 用「与目标分布的接近度」当代理——没有公认的质量度量，不同代理塑造不同的模型视野。这是数据工程最根本的开放问题。</li>
+    <li><strong>去重的粒度与激进度</strong>：文档级、段落级、还是子串级去重？去得太狠会丢掉有价值的「同一事实的不同表述」，太松又留冗余。最优去重激进度依赖数据量与重复结构，仍无定论（Lee 2021 vs 后续工作有不同建议）。</li>
+    <li><strong>数据墙与重复</strong>：高质量人类文本即将耗尽（<span class="term">data wall</span>）。去重后还要不要重复利用？重复几遍划算？这把去重与 data-constrained scaling（模块 05）直接连起来——去重越狠，可用唯一 token 越少，越早撞墙。</li>
+    <li><strong>改写型污染与语义去重</strong>：n-gram 去污染抓不到改写过的考题，文档级 MinHash 抓不到「同一观点的不同措辞」。用 embedding 做<strong>语义级</strong>去重/去污染是活跃方向，但代价高、阈值难定，且有「误删多样性」的风险。</li>
+    <li><strong>数据归因与可审计性</strong>：哪些训练数据导致了某个能力或某个偏见？把数据选择做得可追溯、可审计（而非黑箱过滤），是负责任 AI（C12）对预训练数据工程的新要求。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读：Albalak 2024《A Survey on Data Selection for LMs》（把过滤/去重/配比统一成数据选择框架）、Sorscher 2022（数据剪枝突破幂律 scaling）、Carlini 2022（记忆量化，去重的隐私动机）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_tokenizer/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · Tokenizer 设计</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · KV 压缩与长上下文评测</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · KV 压缩与长上下文评测</h1>
+  <p class="subtitle">KV 墙：解码时 KV cache 随长度膨胀。量化(KIVI)、淘汰(H2O/SnapKV)、合并三条路压缩它；再用 NIAH 大海捞针与 RULER 多跳检验「能看长是否等于看得见」——全课的收口</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–04、注意力/KV cache、GQA/MQA(C20)、一点点量化常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_kv_compression.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Zhang 2023 (H2O)、Liu 2024 (KIVI)、Kamradt (NIAH)、Hsieh 2024 (RULER)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#wall">KV 墙：解码时的隐形显存杀手</a></li>
+      <li><a href="#three">压缩 KV 的三条路</a></li>
+      <li><a href="#quant">KV 量化：用更少比特存 K、V</a></li>
+      <li><a href="#h2o">KV 淘汰：H2O 与 heavy hitter</a></li>
+      <li><a href="#niah">评测：能输入很长 ≠ 真的看见</a></li>
+      <li><a href="#ruler">RULER：更难更全面的基准</a></li>
+      <li><a href="#system">把杠杆组合起来：真实系统</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="wall"><span class="num">1</span>KV 墙：解码时的隐形显存杀手</h2>
+  <p>我们到了最后一道墙，也是长上下文<strong>推理</strong>阶段最痛的一道——<strong>KV 墙</strong>。前四个模块解决了「位置不崩、注意力算得起、复杂度降下来」，但还有一个在自回归<em>解码</em>时才暴露的瓶颈：<span class="term">KV cache</span>。</p>  <p>回忆解码：模型逐 token 生成，每生成一个新 token，都要对<strong>之前所有 token</strong>做注意力。为避免每步重算历史的 K、V，就把它们缓存起来——这就是 KV cache。问题是它<strong>随序列长度线性膨胀</strong>：</p>  <div class="math-block">\[\text{KV cache 大小} = 2\,(K,V)\times L_\text{layers}\times H_\text{kv}\times d_\text{head}\times n \times \text{bytes}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>KV cache 是长解码的「隐形显存杀手」。模型权重是固定的，但 KV cache 随你处理的上下文越长越大。一个 7B 模型在 128k 上下文下，KV cache 可能比模型权重本身还大好几倍——它，而不是模型，成了「能开多长上下文 / 多大批量」的真正限制。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更糟的是，解码是<strong>访存受限</strong>的：每生成一个 token，都要把整个 KV cache 从显存读一遍。所以 KV cache 既吃<em>显存容量</em>（装不下），又吃<em>显存带宽</em>（读太慢）。长上下文解码慢、贵，根子大多在这里。这就是为什么 KV 压缩是长上下文<em>服务</em>的核心课题。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>把 KV 墙和前面几道墙分清楚：内存墙（模块 02）是 <strong>prefill</strong> 时 <code>n×n</code> 的<em>中间矩阵</em>爆显存，FlashAttention 解决；KV 墙是 <strong>decode</strong> 时 <code>O(n)</code> 的<em>缓存</em>膨胀，本模块解决。二者都和长上下文有关，但一个在算注意力的瞬间、一个在保存历史的持续——<strong>FlashAttention 不省 KV cache，KV 压缩不省注意力计算</strong>，又是一对正交的杠杆。</p>
+  </div>  <p>把那条公式代进真实数字，68 GB 是怎么来的就一清二楚。<code>7B</code> 模型、<code>L=32</code> 层、<code>H_kv=32</code> 头、<code>d_head=128</code>、FP16（2 字节）、<code>n=128k=131072</code>：<code>KV = 2 × 32 × 32 × 128 × 131072 × 2 字节</code>。逐项乘：<code>2(K和V) × 32 × 32 = 2048</code>；<code>× 128 = 262144</code>；<code>× 131072 ≈ 3.44×10¹⁰</code>；<code>× 2 字节 ≈ 6.87×10¹⁰ 字节 ≈ 68 GB</code>。<strong>这个数随 <code>n</code> 严格线性</strong>——上下文减半到 64k，KV cache 就减半到 34 GB；翻倍到 256k，就涨到 136 GB。公式里每一个因子都是一条可调的省显存杠杆：减层数不现实，但减 <code>H_kv</code>（→ GQA/MQA）、减比特数（→ 量化）、减 <code>n</code> 的有效保留量（→ 淘汰/合并）正是本模块三条路各自攻击的项。</p>  <p>给一个直观的量级感受，理解 KV 墙为何如此扎手。一个 7B 模型权重 FP16 约 14 GB；而它在 128k 上下文下的 KV cache（32 层、32 个 KV 头、head_dim 128、FP16）约 <strong>68 GB</strong>——是模型本身的近五倍。也就是说，一旦上下文够长，决定「这张卡能不能跑、能跑多大批量」的不再是模型权重，而是 KV cache。这还只是单条序列；要并发服务多个长上下文请求，KV cache 的总量更是直接决定吞吐上限。<strong>长上下文服务的成本结构，很大程度上就是 KV cache 的成本结构</strong>——这是本模块所有压缩技术的现实动机。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="three"><span class="num">2</span>压缩 KV 的三条路</h2>
+  <h3>压缩 KV 的三条路：量化、淘汰、合并</h3>  <p>压缩 KV cache 有三类正交手段，可单用也可叠加：</p>  <table>
+    <thead><tr><th>手段</th><th>做什么</th><th>省的维度</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>量化</strong> quantization</td><td>降低每个 K/V 数的存储精度（FP16→INT8/INT4）</td><td>每元素的比特数</td><td>量化误差（数值失真）</td></tr>
+      <tr><td><strong>淘汰</strong> eviction</td><td>丢弃「不重要」token 的 KV</td><td>token 数（序列维）</td><td>误删将来要用的 token</td></tr>
+      <tr><td><strong>合并</strong> merging</td><td>把相似/相邻 token 的 KV 合并成一个</td><td>token 数（序列维）</td><td>合并损失细节</td></tr>
+    </tbody>
+  </table>  <p>注意它们省的是<strong>不同的维度</strong>：量化压「每个数多少比特」，淘汰/合并压「保留多少个 token」。所以量化和淘汰可以叠乘——先淘汰掉一半 token、再把剩下的量化到 4bit，压缩率相乘。</p>  <p>还有一类<strong>结构性</strong>压缩值得一提（详见 C20，本课不展开）：<span class="term">GQA</span> / <span class="term">MQA</span>——让多个 query 头<strong>共享</strong>同一组 K/V 头，直接把 <code>H_kv</code> 这一项缩小数倍。它是「设计模型时就压」（改架构），而本模块的量化/淘汰是「推理时再压」（不改模型）。两者也正交：一个 GQA 模型推理时照样可以再量化、再淘汰。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>贯穿本模块的核心问题和模块 03 是同一个：<strong>哪些 token 重要、哪些可以不要？</strong> 模块 03 问「哪些连接不算」（省算力），本模块问「哪些 token 的 KV 不存」（省显存）。attention sink（模块 03）已经给了第一个答案——开头几个 token 重要。本模块的 H2O 会给出更普适的答案：<em>累积吸走注意力多的 token（heavy hitter）重要</em>。理解了这条主线，淘汰类方法就都通了。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="quant"><span class="num">3</span>KV 量化：用更少比特存 K、V</h2>
+  <h3>KV 量化：用更少比特存 K、V</h3>  <p>最直接的压缩是<strong>量化</strong>：把 FP16（16 比特）的 K、V 存成 INT8（8 比特）甚至 INT4（4 比特），显存按比特数成比例下降。基本流程是<strong>仿射量化</strong>：</p>  <div class="math-block">\[q = \text{round}\!\left(\frac{x - z}{s}\right),\qquad \hat x = s\cdot q + z,\qquad s = \frac{\max - \min}{2^{b}-1},\ z=\min\]</div>  <p>把一组数线性映射到 <code>[0, 2^b−1]</code> 的整数（<code>s</code> 是步长、<code>z</code> 是零点），存整数；用时再反量化回近似的浮点 <code>x̂</code>。比特数 <code>b</code> 越小越省，但量化误差越大。</p>  <p>手算一遍 INT4（<code>b=4</code>，量化级 <code>2⁴−1=15</code>）就懂了，也顺便看到离群值的破坏力。设一组 K 值 <code>x=[0.1, 0.2, 0.15, 0.05]</code>，分布很紧凑：</p>  <div class="ascii">无离群值：min=0.05, max=0.20, s=(0.20-0.05)/15=0.01, z=0.05
+  x=0.1  → q=round((0.1-0.05)/0.01)=5  → x̂=0.05+5·0.01=0.10  (误差 0)
+  x=0.2  → q=15 → x̂=0.20  (误差 0)
+  → 4 个值几乎无损，因为它们铺满了 0..15 的量化格
+
+加一个离群值 x=[0.1, 0.2, 0.15, 0.05, 5.0]：
+  min=0.05, max=5.0, s=(5.0-0.05)/15=0.33, z=0.05
+  x=0.1  → q=round((0.1-0.05)/0.33)=round(0.15)=0 → x̂=0.05  (误差 0.05，50%!)
+  x=0.2  → q=round(0.45)=0 → x̂=0.05  (误差 0.15，75%!)
+  x=0.15 → q=round(0.30)=0 → x̂=0.05
+  → 4 个正常值全被挤进 q=0 这一格，彼此再也分不开</div>  <p>这就是离群值灾难的字面演示：一个 <code>5.0</code> 把量化范围从 0.15 撑大到 4.95（33 倍），步长 <code>s</code> 随之暴涨，于是<strong>所有正常值挤进同一个量化格、彼此无法区分</strong>，误差从 0 跳到 50–75%。<strong>分组量化</strong>的解法在这里一目了然：把这 5 个数切成两组（正常值一组、离群值单独一组）各自量化，离群值就只污染它自己那一格，正常值那组恢复近乎无损。这正是 notebook 里要复现的「全局量化 vs 分组量化」对比。</p>  <p>一个关键的实践智慧（KIVI 等）：<strong>K 和 V 要区别对待</strong>。经验发现 K 的不同<em>通道</em>（channel）数值分布差异大、对量化更敏感，宜<strong>按通道</strong>量化；V 则<strong>按 token</strong>量化更好。「为什么 K、V 不对称」不是玄学，而是它们在注意力里扮演的角色不同——K 进入 <code>exp</code> 的指数（误差被放大），V 只是被加权求和（误差较温和）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>量化的好处是<strong>通用、不挑任务</strong>：它不丢任何 token，只是让每个数糊一点。所以它在「不能误删信息」的场景下比淘汰更安全。代价是误差会通过注意力传播——尤其 K 的误差进了 softmax 的指数，可能被放大。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>量化误差怎么量？常用<strong>反量化后的重构误差</strong>（<code>‖x − x̂‖</code>）和<strong>下游影响</strong>（量化 KV 算出的注意力输出 vs FP16 的差距）。notebook 会让你实现 INT8/INT4 量化、测量这两种误差，并验证「比特越少误差越大」「按组量化比全局量化误差小」。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>量化的一个陷阱是<strong>离群值（outlier）</strong>：若一组数里有个别极大值，它会把量化范围 <code>[min,max]</code> 撑得很宽，使大多数正常值挤在很少几个量化级里、精度暴跌。解法是<strong>分组量化</strong>（把数据切成小组各自量化，离群值只污染它那一组）。这与大模型权重量化里的离群值问题同源——是低比特量化的通用难点。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="h2o"><span class="num">4</span>KV 淘汰：H2O 与 heavy hitter</h2>
+  <h3>KV 淘汰：H2O 与 heavy hitter</h3>  <p>量化压「比特」，淘汰压「token 数」。但淘汰危险得多——丢错了 token，将来要用时就彻底没了。所以淘汰的全部难点是：<strong>怎么判断一个 token 的 KV 将来还重不重要？</strong></p>  <p>Zhang et al. 2023 的 <span class="term">H2O</span>（Heavy-Hitter Oracle）给出了一个漂亮的答案，基于一个关键观察：<strong>注意力是高度集中的——少数 token（heavy hitters）累积吸走了绝大部分注意力权重</strong>（这正是 attention sink 现象的推广）。既然如此，只要保留这些 heavy hitters，就能在很小的缓存下维持性能。</p>  <p>H2O 的重要性打分简单有力：<strong>一个 token 的重要性 = 它到目前为止被所有后续 query 关注的累积注意力分数之和</strong>。</p>  <div class="math-block">\[\text{importance}(j) = \sum_{i \ge j} P_{ij}\quad(\text{token } j \text{ 被后续所有 query 的注意力质量累积})\]</div>  <p>淘汰策略 = 保留<strong>两部分</strong>：① 重要性最高的若干 heavy hitters（长期重要的 token）+ ② 最近的一个滑动窗口（近期 token，无论重要性——因为它们还没机会积累分数，且局部信息要紧）。<strong>这个结构正是 StreamingLLM 的「sink + 滑窗」的数据驱动版</strong>——sink 换成了动态算出的 heavy hitter。</p>  <p>跟着一个最小例子走一遍淘汰决策。设已生成到第 5 个 token，缓存里有 token 0–4，但<strong>预算只够存 3 个</strong>。把每个 token 被后续 query 关注的累积分数列出来（含「最近窗口」标记，设窗口大小=1，即必保留最新的 token 4）：</p>  <div class="ascii">token:        0     1     2     3     4(最新)
+累积注意力:   0.9   0.1   0.15  0.2   —(刚生成,未积累)
+角色:        候选  候选  候选  候选  ★最近窗口(强制保留)
+
+预算=3，最近窗口占 1 个名额 → 剩 2 个名额给「候选」中分数最高的：
+  候选按分数排序: token0(0.9) &gt; token3(0.2) &gt; token2(0.15) &gt; token1(0.1)
+  保留 token0、token3 (heavy hitters) + token4 (最近窗口)
+  淘汰 token1、token2 (窗口外的最低分)  ✗</div>  <p>这一步把 H2O 的全部机制压缩成一次排序：<strong>最新 token 走「最近窗口」通道无条件保命，其余按累积注意力分数竞争剩下的名额，分数垫底的被踢出</strong>。注意 token 0 的 0.9 分——它很可能就是个 attention sink 或关键事实，被牢牢留下；而 token 1、2 没什么人关注，丢掉对后续影响很小。每解码一步，新 query 的注意力会给每个存活 token 的累积分数<em>再加一笔</em>，排序随之更新——所以这是一个<strong>在线、持续</strong>的淘汰过程，几乎不增加额外计算。</p>  <div class="ascii">H2O 的 KV 保留（缓存预算固定时）：
+
+  [heavy hitter][heavy hitter] ...(淘汰低分token)... [最近窗口]
+   ↑累积注意力分数最高的                              ↑最近的若干个
+   (长期重要，如关键事实)                            (近期上下文)
+
+  每步解码：算新 query 的注意力 → 更新各 token 累积分数
+          → 若超预算，淘汰窗口外分数最低的 token</div>  <div class="callout intuition"><span class="label"></span>
+    <p>H2O 的精妙在于把「重要性」变成了一个<strong>可在线累积的标量</strong>——每个 token 维护一个「累积被关注分数」，解码时顺便更新，超预算就踢掉窗口外的最低分。几乎零额外开销。另一个思路是 <span class="term">SnapKV</span>：不在解码时动态淘汰，而是在 <strong>prefill 结束后</strong>，用 prompt 末尾一段「观察窗」的注意力预测哪些 prompt token 重要，一次性压缩。两者一个「解码时持续淘汰」、一个「prefill 后一次压缩」，都源自同一个「注意力集中」的观察。notebook 会实现 H2O 的累积打分与淘汰。</p>
+  </div>  <p>但淘汰类方法有一个<strong>无法回避的风险</strong>，必须诚实面对：淘汰是<strong>不可逆</strong>的——一旦一个 token 的 KV 被丢掉，它将来就再也回不来了。而「当前不重要」不等于「将来不重要」：一个 token 可能在被淘汰后，恰好成为某个后续 query 真正需要的那一个。这正是淘汰类方法在<strong>多跳、需要回看冷门细节</strong>的任务上可能翻车的根源（模块 6 的 RULER 会专门拷打这一点）。相比之下，量化是<em>无损 token</em>的（只是把每个数糊一点，不丢任何 token），所以在「不能误删信息」的场景下更安全。<strong>淘汰省得多但赌性大、量化省得少但稳妥</strong>——这是选择压缩策略时的核心权衡。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="niah"><span class="num">5</span>评测：能输入很长 ≠ 真的看见</h2>
+  <h3>评测：能输入很长 ≠ 真的看见了</h3>  <p>压缩（量化/淘汰）都是<strong>近似</strong>——它们必然损失信息。压多了，模型就「看不见」被压掉的内容了。所以本模块的下半场是<strong>评测</strong>：怎么检验「压缩后（或外推后、或稀疏后）模型还真的能用上长上下文里的信息」？这也是整门课的收口——前四模块让模型「能看长」，评测回答「是否真的看见了」。</p>  <p>最经典的探针是 <span class="term">NIAH</span>（Needle In A Haystack，大海捞针，Kamradt 2023）：</p>  <ul>
+    <li><strong>干草堆</strong>：一段很长的背景文本（如长文集）。</li>
+    <li><strong>针</strong>：一句与背景无关的、可检索的事实（如「<em>旧金山最好的事是 2024 年 3 月 4 日在多洛雷斯公园吃三明治</em>」）。</li>
+    <li><strong>任务</strong>：把针埋进干草堆的某个<strong>深度</strong>（位置），然后问模型那个事实，看它能否检索出来。</li>
+    <li><strong>扫描</strong>：在不同的<strong>上下文长度</strong> × <strong>针的深度</strong>组合下重复，画成一张热力图——直观暴露模型的「<strong>有效上下文</strong>」边界。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>NIAH 的威力在于它把「有效上下文」可视化了。一个号称 128k 的模型，热力图可能显示它在 32k 之后、或在「中间深度」就开始捞不到针——这就是「能看长 ≠ 看得见」的铁证。它简单、可控、一眼看出问题，是长上下文模型的第一道体检。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>一个反复出现的现象是 <span class="term">lost in the middle</span>（Liu et al. 2023）：模型对放在上下文<strong>开头和结尾</strong>的信息检索好，对放在<strong>中间</strong>的差，呈 U 形。所以 NIAH 必须<strong>扫描针的深度</strong>——只在结尾放针会得到虚高的好成绩。这也呼应模块 01：位置编码外推成功（PPL 不崩）只是必要条件，不保证中间位置真的可用。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>NIAH 虽好，但太<strong>简单</strong>——它只考「单针、精确字符串检索」。一个模型可能 NIAH 满分，却在「需要综合多处信息」时失败。所以单靠 NIAH 会高估模型。这就引出了更难、更全面的基准 RULER（下一节）。评测长上下文的铁律是：<strong>既要扫位置（别只在结尾放针），也要加难度（别只考单针检索）</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ruler"><span class="num">6</span>RULER：更难更全面的基准</h2>
+  <h3>RULER：更难、更全面的长上下文基准</h3>  <p><span class="term">RULER</span>（Hsieh et al. 2024）是当前长上下文评测的标杆。它指出单一 NIAH 太容易，于是用<strong>合成</strong>的方式造了 13 类难度递增的任务，按长度分档，更能区分模型的真实长上下文能力：</p>  <ul>
+    <li><strong>多针检索（multi-key NIAH）</strong>：埋多根针、问其中某一根，考干扰下的检索。</li>
+    <li><strong>变量追踪（variable tracking，多跳）</strong>：如「<code>X1=12345; X2=X1; X3=X2</code>……问 <code>X3</code>」，需要<strong>串联多处分散信息</strong>才能作答——远难于单针。</li>
+    <li><strong>聚合（aggregation）</strong>：如统计长文里某类词出现最多的若干个，需要<strong>通览并归纳</strong>全文，而非定位一处。</li>
+    <li><strong>长上下文问答</strong>：在长文里回答需要理解的问题，最接近真实使用。</li>
+  </ul>  <p>RULER 的核心贡献是揭示了：<strong>许多模型「宣称的窗口」远大于「有效窗口」</strong>。一个号称 128k 的模型，可能在 RULER 的多跳任务上 32k 就开始崩。这把「上下文长度」从一个<em>营销数字</em>变成了一个<em>可测量、可比较</em>的能力。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么用<strong>合成</strong>任务？因为合成任务能<strong>精确控制难度与长度</strong>、能任意拉长而不受真实文档长度限制、且答案唯一可自动判分。这让我们能干净地测出「长度→能力」的衰减曲线，定位模型在哪个长度、哪类任务上开始失效。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>多跳（变量追踪）尤其能拷打压缩/稀疏/线性方法：它要求模型<strong>同时维持并组合多条分散的线索</strong>。KV 淘汰若把某条线索的 token 误删、稀疏若把它漏看、线性若把它压糊，多跳就会断链。所以多跳是检验「压缩/近似有没有伤到长程组合能力」的利器——notebook 会构造一个变量追踪任务来演示。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把评测和前四模块连起来，全课就闭环了：<strong>RoPE 外推（01）、FlashAttention（02）、稀疏（03）、线性（04）、KV 压缩（本模块）每一项都可能在 NIAH/RULER 上留下指纹</strong>。外推没做好→长位置检索崩；稀疏窗口太小→窗外的针捞不到；线性状态太小→多跳断链；KV 淘汰太狠→被删 token 的信息丢失。评测不是附加题，而是<strong>检验你所有长上下文技术到底有没有用、代价可不可接受的唯一裁判</strong>。这就是为什么本课把它和压缩放在同一个收口模块——学会造尺子，和学会造杠杆同样重要。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="system"><span class="num">7</span>把杠杆组合起来：真实系统</h2>
+  <h3>把杠杆组合起来：真实长上下文系统</h3>  <p>学完五个模块，回头看一个真实的长上下文系统是怎么把这些杠杆叠起来的：</p>  <div class="ascii">一个生产级长上下文模型 / 服务的典型配方：
+
+  位置墙 → YaRN/dynamic-NTK 扩窗 (模块 01)
+  内存墙 → FlashAttention-2/3 算 prefill 注意力 (模块 02)
+  算力墙 → (可选) 滑窗+sink / 块稀疏 降复杂度 (模块 03)
+         → (可选) 混合架构插入线性/SSM 层 (模块 04)
+  KV 墙  → GQA/MQA(架构) + KV 量化(KIVI) + 淘汰(H2O/SnapKV) (模块 05)
+         + PagedAttention 管理碎片 (C24)
+  验真   → NIAH 扫深度 + RULER 多跳，确认有效上下文 (模块 05)</div>  <p>这张配方表是全课的总纲：<strong>没有银弹，只有针对每道墙的、可叠加的、各有代价的杠杆</strong>。工程上的决策永远是「<em>先吃免费的（FlashAttention、GQA），再按需上付费的（稀疏/线性/KV 淘汰），每上一项都用评测确认收益 &gt; 代价</em>」。</p>  <p>再把全课的「精确 vs 近似」这条暗线收一收，它是判断每个杠杆该不该上的总开关。<strong>精确的杠杆（FlashAttention、GQA）几乎是免费午餐——不损质量、纯赚，应当默认全开</strong>；<strong>近似的杠杆（位置外推、稀疏、线性、KV 淘汰/量化）都在用「一点质量」换「一些资源」</strong>，是否划算高度依赖任务，必须用 NIAH/RULER 量化那「一点质量」到底是多少。这就是为什么本课把评测放在最后、和压缩同一模块：<em>所有近似杠杆的命运，最终都由那张大海捞针热力图和那条 RULER 随长度衰减曲线裁决</em>。脱离评测谈压缩率、谈稀疏度、谈线性化，都是空中楼阁。</p>  <p>实践建议：<strong>默认配置</strong> = YaRN（若需扩窗）+ FlashAttention + GQA，这套精确、稳妥，是大多数场景的起点；<strong>显存吃紧</strong>再加 KV 量化（通用、低风险）；<strong>还不够</strong>再考虑 KV 淘汰或稀疏（有损，需评测）；<strong>超长 + 吞吐优先</strong>才考虑线性/SSM 或混合架构。每一步都遵循同一条纪律——<strong>用 NIAH/RULER 量化代价，别让「省了显存」偷偷变成「看不见信息」</strong>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>压缩的极限</strong>：KV 能压到多狠而不伤下游？1bit KV、极端淘汰、动态预算分配（不同层/头给不同预算）是活跃方向。压缩率与任务表现的帕累托前沿仍在被推进。</li>
+    <li><strong>重要性判定的准确性</strong>：H2O 用「累积注意力」判重要，但当前不重要的 token 可能将来变重要（淘汰是不可逆的）。更好的、考虑未来的重要性预测是开放难题。</li>
+    <li><strong>评测的真实性</strong>：合成基准（NIAH/RULER）可控但不真实，真实基准（LongBench/L-Eval）真实但难控。如何评测「真实长文档任务」上的长上下文能力，仍无完美答案；∞Bench 把战线推到百万级。</li>
+    <li><strong>有效上下文的本质</strong>：为什么会 lost-in-the-middle？是位置编码、注意力机制、还是训练数据分布所致？理解它才能从根上扩大有效上下文，而非只扩名义窗口。</li>
+    <li><strong>压缩 × 其它杠杆的相互作用</strong>：KV 量化叠加稀疏、叠加外推、叠加线性，误差如何累积、评测如何变化，是系统层面的开放问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Zhang et al. 2023（H2O，本模块淘汰主线）、Li et al. 2024（SnapKV）、Liu et al. 2024（KIVI，KV 量化）、Kamradt 2023（NIAH，大海捞针）、Hsieh et al. 2024（RULER，长上下文评测标杆）、Liu et al. 2023（Lost in the Middle）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_linear_ssm/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 线性注意力与 SSM</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

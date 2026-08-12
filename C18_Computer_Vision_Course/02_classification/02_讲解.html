@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 图像分类</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 图像分类</h1>
+  <p class="subtitle">HOG/直方图手工特征、线性 vs MLP 分类、数据增强、混淆矩阵/top-k——在真实 optdigits 上从零实现并验证评测口径</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01 的梯度/Sobel；softmax/交叉熵、梯度下降基础；numpy</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_classification.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Dalal & Triggs 2005（HOG）、Krizhevsky 2012（AlexNet）、He 2016（ResNet）、Dosovitskiy 2021（ViT）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#task">分类任务：从像素到标签</a></li>
+      <li><a href="#feat">手工特征：直方图与 HOG</a></li>
+      <li><a href="#clf">分类器：线性与 MLP</a></li>
+      <li><a href="#aug">数据增强：注入不变性</a></li>
+      <li><a href="#eval">评估：混淆矩阵与 top-k</a></li>
+      <li><a href="#pipeline">完整管线与划分纪律</a></li>
+      <li><a href="#deep">从手工特征到深度分类</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="task"><span class="num">1</span>分类任务：从像素到标签</h2>
+  <p><span class="term">image classification</span>（图像分类）是 CV 最基础、也最被深入研究的任务：给一张图，输出一个类别标签。它听起来简单到不值一提，真正的难点在于<strong>同一个类别的图像可以千变万化</strong>——同一只猫，换个视角、换个光照、蜷起来或伸展开、被遮住一半、放在完全不同的背景里，像素值天差地别，但标签始终是「猫」。于是分类器必须学到一种既对这些<strong>无关变化保持不变</strong>、又对<strong>类别差异高度敏感</strong>的表示。这对「不变性」与「判别性」的张力，是贯穿本模块乃至整个识别问题的主线。</p>  <p>本课选用 <span class="term">optdigits</span>（8×8 手写数字，10 类，共约 1800 张）作真实数据，原因有二：它小到可以用纯 numpy 端到端处理（8×8=64 维，无需 GPU），又保留了真实手写的形变、粗细、倾斜与扫描噪声，不是精心构造的玩具。我们<strong>刻意不搭 CNN</strong>（卷积网络架构是 C15 的主题，本课与之互补而非重复），而是走深度学习之前的经典两段式管线：<strong>手工特征提取 → 简单分类器</strong>，把「特征工程 → 训练分类器 → 评估」这条完整链条的每一环都从零写清楚、用 assert 验证。</p>  <div class="ascii">经典分类管线（本课走这条，理解每一环）：
+  原图 8×8 ──►【特征提取】──► 特征向量 ──►【分类器】──► logits ──► softmax ──► 标签
+             HOG/直方图          (d 维)      W·x+b / MLP            argmax
+                                              ▲
+                                       【数据增强】扩充训练集、注入不变性</div>  <p>这条管线的每一站本模块都会单独讲透：特征提取（第 2 节，HOG/直方图）把图变成稳健向量；分类器（第 3 节，线性/MLP）在向量上画决策边界；数据增强（第 4 节）在训练时注入不变性；评估（第 5 节，混淆矩阵/top-k）用对的口径衡量结果。第 6 节再把它们串成一条守纪律、可复现的完整流程，第 7 节说明这一切如何过渡到深度分类。理解这条管线，你就有了看懂任何分类系统的骨架。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>分类的核心张力始终是<strong>不变性 vs 判别性</strong>：好的特征要把「同一类的不同样子」尽量拉到一起、同时把「不同类别」尽量推开。手工特征（HOG）靠人的先验来设计这种不变性，深度网络靠数据来学，自监督（模块 05）则靠代理任务来学——三条路线手段不同，但追求的目标完全一致。把这个张力记在心里，后面很多设计就都顺理成章了。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="feat"><span class="num">2</span>手工特征：直方图与 HOG</h2>
+  <p>最朴素的做法是直接把 64 个像素拉平当特征向量——它也能分类，但像素值对<strong>平移和光照极其敏感</strong>：数字在格子里挪一格、或整体调亮一点，像素向量就大变，分类器很难学到不变性。手工特征的全部目的，就是把原始像素编码成一个对这些无关变化更稳健、对类别更有判别力的向量。最简单的一种是 <span class="term">color / intensity histogram</span>（强度直方图）：把像素值分成若干箱、统计每箱的像素数。它的特点是对<strong>空间位置完全不敏感</strong>（把像素打乱，直方图一模一样），所以天然抗平移；但代价是<strong>彻底丢掉了空间结构</strong>——「6」和「9」的像素值分布几乎一样，直方图根本区分不了。这说明：好特征必须在「不变性」和「保留判别信息」之间找平衡，丢太多结构就废了。</p>  <p>更强、更经典的是 <span class="term">HOG (Histogram of Oriented Gradients)</span>（方向梯度直方图，Dalal & Triggs 2005）。它的核心洞见是：<strong>一个物体的形状，主要体现在它边缘的方向分布上</strong>——猫耳朵的轮廓、数字的笔画走向，都是特定方向的梯度。HOG 把「形状」量化成「局部的梯度方向直方图」，既保留了结构信息，又对光照和小形变鲁棒。它分四步完成：</p>  <ol>
+    <li>求每像素的梯度幅值 <code>|∇I|</code> 与方向 <code>θ</code>（用模块 01 的 Sobel）；</li>
+    <li>把图分成小 <strong>cell</strong>（如 2×2 像素），每个 cell 统计一个<strong>方向直方图</strong>——把 θ 分到若干方向 bin（如 9 个，覆盖 0–180°），按幅值加权投票；</li>
+    <li>把相邻 cell 组成 <strong>block</strong>，对 block 内拼起来的直方图做 <strong>L2 归一化</strong>（消除光照/对比度差异）；</li>
+    <li>把所有归一化后的 block 直方图拼成一个长向量，即 HOG 描述子。</li>
+  </ol>  <div class="math-block">\[\text{cell 直方图 } h_b=\sum_{(i,j)\in\text{cell}}|\nabla I_{ij}|\cdot\mathbb{1}[\theta_{ij}\in \text{bin}_b],\qquad \hat h=\frac{h}{\sqrt{\lVert h\rVert_2^2+\epsilon}}\]</div>  <p>有两个设计是 HOG 鲁棒性的真正来源，值得专门点出。其一，它统计的是<strong>梯度的方向</strong>而非像素的强度——当整张图变亮变暗时，强度全变了，但相邻像素的<em>差</em>（梯度）几乎不变，方向更是基本不动，所以 HOG 天然抗光照偏移。其二，它按 <strong>block 做 L2 归一化</strong>，把每个局部区域的描述子缩放到单位长度，进一步消除了局部对比度的差异（同一条边缘在强光和弱光下幅值不同，归一化后方向占比一致）。这两招叠加，让 HOG 在行人检测等任务上一度是最强特征。notebook 会从零实现一个 HOG-ish 描述子（求 Sobel 梯度 → 分 cell 投票 → block 归一化），并用 assert 验证它对<strong>整体亮度平移确实不变</strong>。</p>  <p>HOG 还有几个值得知道的设计选择：cell 和 block 的大小是超参（大 cell 更鲁棒但更糊，小 cell 更细但更敏感）；block 之间通常<strong>重叠</strong>滑动（同一 cell 在多个 block 里被不同地归一化，增强冗余鲁棒性）；方向 bin 数（常 9 个）控制角度分辨率。这些和模块 01 的「σ 怎么选、核多大」一样，都是在分辨率与鲁棒性之间权衡——经典 CV 的特征工程，很大程度上就是调这些先验旋钮。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个影响实现的细节：HOG 通常用<strong>无符号方向</strong>（把方向折叠到 0–180°，即把 θ 和 θ+180° 当成同一方向）做物体识别效果更好——因为一条边缘是「亮→暗」还是「暗→亮」往往无关紧要，重要的是它的<em>走向</em>。这个选择直接决定方向 bin 覆盖 0–180° 还是 0–360°，写代码时务必想清楚，否则 bin 会错位。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="clf"><span class="num">3</span>分类器：线性与 MLP</h2>
+  <p>有了特征向量 <code>x∈ℝ^d</code>，最简单的分类器是 <span class="term">linear classifier / softmax</span>：用 <code>z=Wx+b</code> 给每个类别打一个分（这些分叫 logits），再用 softmax 把分数归一成一个概率分布，用交叉熵作损失训练。三个核心公式如下——softmax、交叉熵损失、以及对 logits 的梯度：</p>  <div class="math-block">\[p_k=\frac{e^{z_k}}{\sum_j e^{z_j}},\qquad \mathcal{L}=-\frac{1}{n}\sum_i \log p_{y_i},\qquad \nabla_{z}\mathcal{L}_i=p_i-\text{onehot}(y_i)\]</div>  <p>最右边那个梯度 <code>p−y</code>（预测概率减去真实标签的 one-hot 向量）是 softmax + 交叉熵组合的标志性结果，形式优美又好实现，本课 notebook 会直接用它从零写梯度下降、训练线性分类器。但线性分类器有个根本局限：它画出的决策边界是<strong>超平面（直的）</strong>，只有当不同类别在特征空间里<strong>线性可分</strong>时才够用。如果两类的样本互相缠绕（非线性纠缠），一条直线再怎么放也分不开，准确率会卡在瓶颈。</p>  <p>破解之道是加一层非线性，让模型能学<strong>弯曲的决策边界</strong>——这就是 <span class="term">MLP (multilayer perceptron)</span>（多层感知机）：先 <code>h=ReLU(W₁x+b₁)</code> 做一层带非线性的变换，再 <code>z=W₂h+b₂</code> 输出 logits。仅仅一个隐层加 ReLU，理论上就能逼近相当复杂的函数（通用逼近定理），实践中也足以处理 optdigits 这类任务。本课会在同一份 HOG 特征上分别接线性分类器和一个小 MLP，对比二者在 optdigits 上的准确率差距，直观看到「加一层非线性」买来多少。</p>  <p>顺带厘清一个常见疑问：线性分类器、逻辑回归、线性 SVM 三者什么关系？它们<strong>全是线性模型</strong>、决策边界都是超平面，区别只在损失函数——softmax 配交叉熵、SVM 配 hinge loss、二分类逻辑回归是 softmax 的两类特例。本课统一用 softmax，是因为它直接输出概率分布，便于后面接 top-k 准确率和置信度校准分析。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>线性分类器像用直尺切平面：只能画直线分界，简单但对「形状缠在一起」的类无能为力。MLP 多了隐层，相当于先把特征空间「掰弯」到一个更好分的新空间，再用直线切——所以能处理弯曲的边界。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从表示学习看：线性分类器假设特征已经线性可分（把表示质量的担子全压给特征工程）；MLP 自己学一层非线性变换。这预示了深度学习的思路——<strong>与其手工设计可分的特征，不如让网络端到端学表示</strong>，正是模块 05 自监督的动机。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>分类器的选择反映「特征有多好」：特征足够好 → 线性分类器就够（这也是 SSL linear probe 的逻辑，模块 05）；特征糙 → 需要更强的分类器去补。<strong>好特征 + 简单分类器 ≈ 糙特征 + 复杂分类器</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="aug"><span class="num">4</span>数据增强：注入不变性</h2>
+  <p><span class="term">data augmentation</span>（数据增强）是现代 CV 训练的标配，思路朴素却极其有效：对训练图做<strong>保标签的随机变换</strong>（平移、旋转、翻转、缩放、加噪、调亮度对比度），相当于<strong>免费地扩大训练集</strong>、并向模型<strong>注入我们希望它具备的不变性</strong>。AlexNet 当年大幅降低过拟合，数据增强就是关键手段之一；今天几乎没有视觉模型不用它。它的代价几乎为零（只是对训练数据做随机变换），收益却很大。</p>  <p>增强的精髓全在「<strong>保标签</strong>」三个字：变换之后，图的真实类别必须不变，否则就是在给模型喂错误的监督。这就引出一条常被忽视的原则——<strong>增强必须匹配任务真正的不变性</strong>，对不同任务、不同类别，安全的增强并不相同：</p>  <table>
+    <thead><tr><th>增强</th><th>注入的不变性</th><th>对手写数字 optdigits 是否安全</th></tr></thead>
+    <tbody>
+      <tr><td>水平翻转</td><td>左右镜像不变</td><td>✗ 危险：会把 2↔5、6↔9 等弄错</td></tr>
+      <tr><td>小角度旋转(±15°)</td><td>轻微旋转不变</td><td>✓ 安全：手写本就有倾斜</td></tr>
+      <tr><td>小平移</td><td>位置不变</td><td>✓ 安全：数字在格子里会偏移</td></tr>
+      <tr><td>加高斯噪声</td><td>对噪声鲁棒</td><td>✓ 安全：模拟扫描噪声</td></tr>
+      <tr><td>亮度/对比度抖动</td><td>光照不变</td><td>✓ 安全：HOG 也已部分处理</td></tr>
+    </tbody>
+  </table>  <p>这张表点出一个常被新手忽视、却很关键的陷阱：<strong>增强不是越多越猛越好，用错了会注入错误的不变性、反而伤害模型</strong>。对手写数字做水平翻转，就是在告诉模型「2 和它的镜像、6 和 9 是同一类」——这显然错了，直接拉低准确率。再比如对要区分上下的任务做垂直翻转、对颜色敏感的任务做激进的颜色抖动，都会破坏标签。所以增强的设计本质上是一个<strong>把领域先验（domain knowledge）编码进训练数据</strong>的过程：你对「这个任务对什么变化应该不变」理解得越准，增强选得越对。</p>  <div class="callout warn"><span class="label"></span>
+    <p>两条铁律：① 增强<strong>只用于训练集</strong>，测试集用原图（否则评估失真）；② 增强必须<strong>保标签</strong>。模块 05 的对比学习会把这个思路推到极致——那里<em>增强本身就是监督信号</em>，但也正因如此，增强选错会直接决定学到什么。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">5</span>评估：混淆矩阵与 top-k</h2>
+  <p>「准确率 92%」是论文和报告里最常见、也最容易误导人的一句话。一个孤零零的准确率把所有错误一视同仁，完全掩盖了三件关键的事：<strong>错在哪里、哪些类别互相混淆、这个高分是不是被某个多数类撑起来的</strong>。一个合格的评测科学家拿到结果的第一件事，就是把这个汇总数字拆开来看。最有信息量的工具是 <span class="term">confusion matrix</span>（混淆矩阵）——它把「真实类 × 预测类」的每一种组合都数出来：</p>  <div class="math-block">\[C[i,j]=\#\{\text{真实类}=i\ \text{且}\ \text{预测类}=j\}\]</div>  <p>矩阵的对角线 <code>C[i,i]</code> 是每个类被正确分类的数量，而<strong>非对角线元素揭示了具体的混淆模式</strong>——比如发现 <code>C[4,9]</code> 这个格子特别大，就说明「真实是 4 的样本经常被错认成 9」，这是单看准确率永远发现不了的诊断信息。更有用的是，从混淆矩阵能直接、无歧义地算出每个类的 <span class="term">accuracy / precision / recall</span>，三个量各回答一个不同的问题：</p>  <ul>
+    <li><strong>precision</strong>（精确率，沿矩阵的列归一）= <code>C[i,i] / Σ_j C[j,i]</code>：在所有<em>被预测为 i</em>的样本里，真正是 i 的比例——衡量「报得准不准」；</li>
+    <li><strong>recall</strong>（召回率，沿矩阵的行归一）= <code>C[i,i] / Σ_j C[i,j]</code>：在所有<em>真实为 i</em>的样本里，被成功找出的比例——衡量「查得全不全」；</li>
+    <li><strong>F1</strong>（F1 分数）= <code>2PR/(P+R)</code>：精确率与召回率的调和平均，在二者间取平衡，类不平衡时远比准确率可信。</li>
+  </ul>  <p>精确率和召回率是一对<strong>此消彼长</strong>的量：把判定阈值调严，报出来的更准（precision↑）但会漏掉一些（recall↓）；调松则相反。用哪个、或用 F1 平衡，取决于业务代价——漏检一个肿瘤（recall 重要）和误报一封正常邮件为垃圾（precision 重要）的代价完全不同。这也是为什么「只报一个准确率」远远不够：它无法表达这种权衡。</p>  <p>当类别很多、或「近似正确」也有价值的场景（如 ImageNet 的 1000 类里，把哈士奇认成阿拉斯加犬虽不完全对但也不算离谱），常用 <span class="term">top-k accuracy</span>（top-k 准确率）：只要真标签落在模型预测概率最高的前 k 个类别里，就算对。ImageNet 历来同时报 top-1 和 top-5。它衡量的是一种更宽容的正确性，对类间界限模糊的大规模分类尤其合适。本课 notebook 会从零实现混淆矩阵、基于它算出每类的 precision/recall，并实现 top-k 准确率，全部用 assert 验证与朴素逐样本统计一致。</p>  <div class="callout danger"><span class="label"></span>
+    <p>类不平衡下准确率会<strong>严重骗人</strong>：若 90% 样本是某一类，模型「全猜那一类」就有 90% 准确率，却毫无用处。这时必须看 per-class recall / F1 / 混淆矩阵。<strong>报告分类结果只给一个准确率数字，是不专业的</strong>——这是本课反复强调的评测纪律。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">6</span>完整管线与划分纪律</h2>
+  <p>把前面几节的零件串成一条完整、可复现的分类管线：<strong>数据划分 → 训练集增强 → 特征提取 → 训练分类器 → 测试集评估</strong>。这条管线看似直白，但每一个环节都藏着容易翻车的纪律问题，而这些纪律恰恰是评测科学家必须死守、也最该替团队把关的地方。下面四条按重要性排列，违反任何一条都可能让你的实验结果失去意义。</p>  <ol>
+    <li><strong>先划分，后一切</strong>：先把数据分成 train/test（<span class="term">held-out / train-test split</span>），之后所有「从数据学的东西」（特征的归一化统计、分类器参数、增强）<strong>只能用训练集</strong>。</li>
+    <li><strong>归一化用训练集统计</strong>：特征标准化的均值/方差只在 train 上算，再套到 test。用全量算会<strong>数据泄漏</strong>、高估性能。</li>
+    <li><strong>增强只在 train</strong>：测试集永远用原图。</li>
+    <li><strong>固定随机种子</strong>：增强、初始化、划分都设种子，保证结果可复现。</li>
+  </ol>  <p>这些纪律单看每条都很琐碎，合起来却是<strong>论文结果复现不出来、或线上线下指标对不上的头号原因</strong>。一个在测试集上偷偷算过的归一化统计、一次在划分前做的全局特征选择、一处训练测试样本的意外重叠，都能让一个真实水平 85% 的模型在纸面上虚报到 95%，而错误极其隐蔽、不会报任何异常。本课 notebook 严格按「划分是第一行代码、一切从数据学的统计只用 train」来组织，把这些纪律变成可照搬的代码骨架。</p>  <div class="callout warn"><span class="label"></span>
+    <p>最隐蔽的泄漏：在划分<em>之前</em>做了任何<strong>依赖标签或全局统计</strong>的处理（如全量标准化、用全量做特征选择）。养成习惯——<strong>划分是管线的第一行代码</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="deep"><span class="num">7</span>从手工特征到深度分类</h2>
+  <p>本课走的这条「HOG 手工特征 + 简单分类器」管线，正是 2012 年深度学习爆发之前 CV 识别的主流范式。<span class="term">AlexNet</span>（Krizhevsky 2012）带来的革命，一句话概括就是：<strong>不再由人手工设计特征，而是让一个深 CNN 端到端地从原始像素自己学特征</strong>，再配合大规模数据（ImageNet 的 1400 万张）、GPU 算力、ReLU 激活、dropout 正则、以及数据增强，准确率断崖式地甩开所有手工方法。理解这条从「人设计特征」到「机器学特征」的根本转变，是理解现代 CV 全部后续发展的关键起点。</p>  <p>但要强调的是，手工特征的<em>思想</em>并没有过时，反而被深度网络原封不动地<strong>继承</strong>了下来——这也是为什么学它依然值得。CNN 第一层卷积学到的就是 Gabor 状的边缘/方向检测器（本质是 Sobel 的可学版本）；<strong>数据增强</strong>这套做法被完整保留并发扬；<strong>混淆矩阵、precision/recall、top-k</strong>等评测口径在深度时代完全一致。换句话说，你在本课亲手写对、理解透的每一环，到了深度模型里依旧成立、依旧是你看懂和调试它们的工具。变的只是「特征怎么来」，不变的是「怎么定义任务、怎么评估」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>可以这样理解 AlexNet 的飞跃：以前是「人想好怎么提特征 + 机器学怎么分类」，现在是「机器一口气学完提特征到分类」。省掉了人的特征工程，但代价是要大量数据和算力，且可解释性下降。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>用统一的形式来看就很清楚：任何分类管线都是 <code>clf(φ(x))</code>——先用特征提取器 φ 把图变成向量，再用分类器 clf 打标签。本课的 HOG 是一个<strong>固定、可解释、低容量</strong>的 φ；CNN 把它换成<strong>可学、黑盒、高容量</strong>的 φ_θ，并和分类头<strong>联合优化</strong>，这就是深度分类的全部秘密。而模块 05 的自监督给出第三条路：<strong>不用任何标签先学出一个好 φ</strong>，再在它上面配最简单的线性分类头——这正是把「表示」和「分类」彻底解耦的思路。</p></div>
+  </div>  <p>从 HOG 到 CNN 还有一个更深的启示，直接通向本课最后一个模块：手工特征的天花板，本质上是<strong>人能想到的不变性有限</strong>。人能设计出「对光照、小平移不变」，但很难手工设计出「对各种姿态、遮挡、风格都不变」的特征——这些太复杂，只能从数据里学。深度学习用标签数据学，但标签很贵；模块 05 的自监督则更进一步，证明<strong>不用标签也能学出强表示</strong>。所以本课的脉络其实是「特征怎么来」的三级跳：人手工设计 → 用标签学 → 无标签学。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一条贯穿全课、值得反复回味的主线：<strong>分类性能 ≈ 表示质量 × 分类器容量</strong>。本课练的是「在固定表示上把分类和评估做对、做扎实」；C15 练的是「用 CNN 从标签学表示」；模块 05 练的是「无标签学表示」。三者拼在一起，才是完整的视觉识别能力版图。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>图像分类常被当作「已解决」的入门任务，但它在 ImageNet 上 90%+ 的光鲜数字底下，藏着一堆远未解决的难题——鲁棒性、长尾、校准、评测可信度。对评测科学家而言，这些恰恰是最该关注的地方：一个在标准测试集上很高的模型，换个分布、看个 per-class、查个校准，可能立刻原形毕露。下面几条是当前活跃的方向。</p>  <ul>
+    <li><strong>骨干网络演进</strong>：CNN（ResNet/EfficientNet）→ Transformer（ViT）→ 二者融合（ConvNeXt）。「什么结构最适合视觉」仍在演化；ViT 在大数据上胜出但更吃数据。</li>
+    <li><strong>长尾与不平衡</strong>：真实世界类别分布极不均衡，少样本类的识别（long-tail recognition）、重加权/重采样/解耦表示与分类器，是活跃方向，直接关联本模块的类不平衡评测。</li>
+    <li><strong>鲁棒性与分布偏移</strong>：模型在 ImageNet 上 90%+，换个分布（ImageNet-C/-R/-A）就崩。对抗样本、虚假相关（背景而非物体）、校准（confidence 是否可信）是评测科学家的核心议题。</li>
+    <li><strong>少样本与零样本</strong>：CLIP 等用图文对比预训练实现零样本分类（不需该类训练样本），把分类从「固定标签集」推向「开放词表」，是当下范式之一。</li>
+    <li><strong>评测本身的可信度</strong>：测试集标签噪声、数据集偏置、与训练集的重叠，都会让 leaderboard 数字失真。如何设计可信的视觉基准，是社区持续的工作。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：<strong>Dalal &amp; Triggs 2005（HOG）</strong>、<strong>Krizhevsky 2012（AlexNet）</strong>、<strong>He 2016（ResNet）</strong>、<strong>Dosovitskiy 2021（ViT）</strong>。它们标出了「手工特征 → 深度 → Transformer」的主轴，详见 <code>references.md</code>。下一模块从「整图一个标签」走向「在图里定位多个物体」——目标检测。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_filters_edges/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 图像滤波与边缘</div></a>
+    <a class="next" href="../03_detection/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 目标检测</div></a>
+  </div>
+
+</div>
+</body>
+</html>

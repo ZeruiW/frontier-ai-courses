@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · TensorFlow / Keras 心智模型</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · TensorFlow / Keras 心智模型</h1>
+  <p class="subtitle">静态图 vs 动态图 · Python 只在追踪时执行一次（能解释 80% 的诡异行为）· 重追踪是头号性能杀手 · Keras 三种 API · 与 PyTorch 逐概念对照 · 三个「不报错但数值错」的默认值差异</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00；熟悉 PyTorch 的基本用法；C38（autograd 与 compile）有帮助</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_tensorflow_mental_model.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">TensorFlow 指南（tf.function / AutoGraph / Keras）、JAX 的 jit 语义、PyTorch 2.x 的 torch.compile</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么今天还要懂 TensorFlow</a></li>
+      <li><a href="#graph">静态图 vs 动态图：一个概念上的分界</a></li>
+      <li><a href="#retrace">重追踪：性能问题的头号来源</a></li>
+      <li><a href="#keras">Keras 的三种 API：什么时候用哪个</a></li>
+      <li><a href="#jax">顺带说清 JAX：第三种范式</a></li>
+      <li><a href="#ledger">算一笔账：追踪的成本与收益</a></li>
+      <li><a href="#frontier">生态动态与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么今天还要懂 TensorFlow</h2>
+  <p>先诚实地承认现状：<strong>研究生态已经彻底 PyTorch 化</strong>。新论文的官方实现、HuggingFace 的主线、绝大多数教程——都是 PyTorch。那为什么还要花一个模块讲 TensorFlow？</p>  <table>
+    <thead><tr><th>理由</th><th>具体情形</th><th>需要到什么程度</th></tr></thead>
+    <tbody>
+      <tr><td><strong>生产栈存量巨大</strong></td><td>很多企业的推理服务是 TF Serving、数据管线是 <code>tf.data</code>、移动端是 TFLite</td><td>能读懂、能改、能对接</td></tr>
+      <tr><td><strong>复现旧工作</strong></td><td>2016–2020 年的大量论文（含 BERT、T5 的原始实现）是 TF</td><td>能读代码、能把权重搬出来（模块 02）</td></tr>
+      <tr><td><strong>JD 明确要求</strong></td><td>「TensorFlow, PyTorch, or JAX」几乎是标配写法</td><td>能说清三者的语义差别</td></tr>
+      <tr><td><strong>理解「静态图」这个范式</strong></td><td><code>torch.compile</code>、JAX 的 <code>jit</code>、ONNX 导出、TensorRT 全都基于同一套「追踪成图再优化」的思想</td><td><strong>这是最重要的理由</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后一条值得展开：<strong>PyTorch 2.x 之后，「静态图」的概念反而变得更重要了</strong>。<code>torch.compile</code> 做的事情——追踪、构图、优化、缓存、遇到不支持的东西就 graph break——与 <code>tf.function</code> 在概念上是同一件事。<em>理解 TF 的追踪语义，能让你立刻明白 <code>torch.compile</code> 为什么会重编译、为什么某些 Python 代码会让它退化</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>换句话说：<strong>这个模块表面上讲 TensorFlow，实际上讲的是「Python 代码怎么变成一张计算图」这个跨框架的通用问题</strong>。同一套语义在 TF（<code>tf.function</code>）、JAX（<code>jit</code>）、PyTorch（<code>torch.compile</code>）、以及 ONNX 导出（<code>torch.onnx.export</code> 的 tracing 模式）里反复出现，而它的坑也一模一样：<em>追踪时 Python 只跑一次、控制流会被固化、副作用只发生在追踪期、形状变化会触发重追踪</em>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>所以学这个模块的正确心态是：<strong>不是「学一个过时的框架」，而是「学一个所有现代框架都在用的范式」</strong>——而 TensorFlow 恰好是这个范式最早、也最彻底的实现，所以它的语义暴露得最清楚。<em>用 TF 理解追踪，再回头看 <code>torch.compile</code>，会觉得后者只是把同样的东西藏得更深了一些。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="graph"><span class="num">2</span>静态图 vs 动态图：一个概念上的分界</h2>
+  <div class="ascii">动态图（eager / define-by-run）—— PyTorch 默认、TF2 默认
+   Python 逐行执行，每个算子立刻算出结果
+   y = x @ w      # ← 这一行执行时，矩阵乘真的发生了
+   if y.sum() &gt; 0:      # ← 真的读了 y 的值来做分支
+       z = relu(y)
+   ✅ 好调试（可以 print、可以打断点、可以用 Python 的一切）
+   ❌ 无法整图优化（算子融合、常量折叠、内存复用都做不了）；无法脱离 Python 部署
+
+静态图（graph / define-and-run）—— TF1 默认、tf.function / jit / compile
+   Python 只是**构图脚本**，跑一遍产出一张图；之后执行的是图，不是 Python
+   @tf.function
+   def f(x):
+       y = x @ w          # ← 这一行执行时，只是往图里**加了一个节点**
+       if tf.reduce_sum(y) &gt; 0:   # ← 变成图里的一个 tf.cond 节点
+           z = tf.nn.relu(y)
+       return z
+   ✅ 可整图优化、可序列化、可脱离 Python 部署（TF Serving / TFLite / ONNX）
+   ❌ 调试困难（print 只在追踪时执行一次）；Python 控制流会被**固化**</div>  <table>
+    <thead><tr><th>维度</th><th>动态图</th><th>静态图</th></tr></thead>
+    <tbody>
+      <tr><td>Python 代码的角色</td><td>就是计算本身</td><td><strong>构图脚本</strong>（只跑一次或极少次）</td></tr>
+      <tr><td><code>print(x)</code> 的行为</td><td>每次调用都打印当前值</td><td><strong>只在追踪时打印一次</strong>，之后完全不执行</td></tr>
+      <tr><td>Python 的 <code>if</code></td><td>每次按实际值分支</td><td><strong>按追踪时的值固化成一条分支</strong></td></tr>
+      <tr><td>跨算子优化</td><td>❌</td><td>✅ 融合、常量折叠、布局优化、内存复用</td></tr>
+      <tr><td>部署</td><td>需要 Python</td><td><strong>可脱离 Python</strong></td></tr>
+      <tr><td>形状变化</td><td>无所谓</td><td><strong>可能触发重追踪</strong>（每种形状一张图）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>两栏里最容易咬人的是 <code>print</code> 与 <code>if</code> 这两行。<strong>「Python 代码只在追踪时跑一次」这个事实，会让一大批看起来正常的代码产生诡异行为</strong>：调试用的 print 只出现一次然后消失；用 Python 变量做的计数器永远停在追踪时的值；<code>if len(x) > 5</code> 这样的条件被永久固化成追踪那次的结果。<em>而它们都不报错。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>解决办法是<strong>区分「构图时的量」与「运行时的量」</strong>。构图时的量（Python int、list、shape 的静态部分）在追踪时就确定；运行时的量（tensor 的值）只有执行图时才知道。<em>凡是要依赖运行时的量做的事，都必须用框架提供的图算子表达</em>——TF 里是 <code>tf.cond</code>/<code>tf.while_loop</code>/<code>tf.print</code>，JAX 里是 <code>lax.cond</code>/<code>lax.scan</code>，PyTorch 编译时是让它 graph break 或用 <code>torch.cond</code>。<strong>这条区分是所有静态图框架的第一性原理。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>TF 有一层额外的复杂度叫 <span class="term">AutoGraph</span>：它会<strong>自动把一部分 Python 控制流改写成图算子</strong>（<code>if</code> → <code>tf.cond</code>、<code>for</code> → <code>tf.while_loop</code>），但只在条件依赖于 tensor 时才改写。<em>这个「有时改写、有时不改写」的行为是 TF 最难懂的地方之一</em>——同样一段 <code>if</code>，条件是 Python bool 就固化、是 tensor 就变成图节点。<strong>写 <code>tf.function</code> 时，最好显式地知道每个条件到底是哪一种</strong>，而不是依赖 AutoGraph 猜对。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="retrace"><span class="num">3</span>重追踪：性能问题的头号来源</h2>
+  <p><code>tf.function</code> 会为<strong>每一种输入「签名」缓存一张图</strong>。签名 = (输入的 dtype, 形状, 以及所有 Python 参数的值)。签名变了就重新追踪一次。</p>  <div class="math-block">\[\text{cache key} = \big(\text{dtype}_1, \text{shape}_1, \dots, \text{dtype}_n, \text{shape}_n,\; \text{python\_args}\big)\]</div>  <table>
+    <thead><tr><th>什么会触发重追踪</th><th>为什么</th><th>怎么避免</th></tr></thead>
+    <tbody>
+      <tr><td><strong>输入形状变化</strong></td><td>每种形状一张图</td><td><code>input_signature</code> 里把可变维标成 <code>None</code>；或把 batch/seq padding 到固定桶</td></tr>
+      <tr><td><strong>dtype 变化</strong></td><td>同上</td><td>统一 dtype，别混 fp32/fp16 调用</td></tr>
+      <tr><td><strong>传 Python 标量而非 tensor</strong></td><td><code>f(x, 3)</code> 与 <code>f(x, 4)</code> 是两个不同签名</td><td>把它包成 <code>tf.constant(3)</code>，或用 <code>input_signature</code> 声明</td></tr>
+      <tr><td><strong>传 Python 对象（list/dict/自定义类）</strong></td><td>按值/按 id 参与 key</td><td>尽量只传 tensor</td></tr>
+      <tr><td><strong>每次调用都新建 <code>tf.function</code></strong></td><td>缓存跟着函数对象走，对象没了缓存也没了</td><td><strong>别在循环/方法内部定义 <code>@tf.function</code></strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后一行是个非常隐蔽的性能杀手：<strong>在类的方法里或循环里创建 <code>tf.function</code>，每次都会得到一个新的函数对象，缓存永远命中不了</strong>——于是每一步训练都在重新追踪。症状是「训练极慢但 GPU 利用率很低」，而代码看起来完全正常。<em>TF 会在重追踪超过若干次后打一个警告，但那条警告很容易被淹没在日志里。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>重追踪的代价有多大？<strong>追踪一次的成本大致相当于跑几十到几百次前向</strong>（要执行 Python、构图、做图优化）。所以如果每一步都重追踪，你的吞吐会掉一到两个数量级。<em>这与 <code>torch.compile</code> 的重编译完全同构</em>——后者的重编译更贵（要跑 Inductor 生成 kernel），所以 PyTorch 提供了 <code>dynamic=True</code> 与 <code>torch._dynamo.config.cache_size_limit</code> 来控制。<strong>两个框架的调优手段不同，但要诊断的现象是同一个：「你的图被重建了多少次」。</strong></p></div>
+  </div>  <h3>调试静态图的三个技巧</h3>  <ul>
+    <li><strong>先关掉编译再调试</strong>：<code>tf.config.run_functions_eagerly(True)</code> / <code>torch._dynamo.disable()</code> / <code>jax.disable_jit()</code>。<em>先确认逻辑对，再打开编译确认语义没被追踪改变</em>——把两类问题分开，比在编译模式下硬调快得多。</li>
+    <li><strong>用图内的打印算子</strong>：<code>tf.print</code>（不是 Python 的 <code>print</code>）、<code>jax.debug.print</code>。它们是图的一部分，<em>每次执行都会打印</em>，所以能看到运行时的真实值。</li>
+    <li><strong>数副作用的执行次数</strong>：上面那个计数器技巧。它同时诊断两件事——<em>执行次数 &gt; 1 说明有重追踪；执行次数 = 调用次数说明编译完全没生效</em>。</li>
+  </ul>  <p>这三招合起来能覆盖静态图调试的绝大多数场景，而且<strong>它们的顺序是有讲究的</strong>：<em>先用第一招把「逻辑错」与「追踪语义错」分开</em>——如果关掉编译后结果就对了，问题一定在追踪语义（控制流被固化、形状被写死、副作用消失）；如果关掉编译还是错，那就是普通的逻辑 bug，跟静态图无关。<strong>这个二分能省掉大量在错误方向上的排查</strong>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>诊断重追踪有一个通用技巧，跨框架都能用：<strong>在被编译的函数里放一个纯 Python 的副作用（如 <code>print</code> 或计数器自增），然后数它执行了几次</strong>。执行次数 = 追踪次数。<em>如果它在训练循环里每步都打印，你就抓到了重追踪</em>。这个技巧同时也演示了「Python 代码只在追踪时执行」这个语义——notebook 会把它实现出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="keras"><span class="num">4</span>Keras 的三种 API：什么时候用哪个</h2>
+  <table>
+    <thead><tr><th>API</th><th>长什么样</th><th>能表达什么</th><th>不能表达什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Sequential</strong></td><td><code>keras.Sequential([Dense(64), Dense(10)])</code></td><td>单输入单输出的线性堆叠</td><td>分支、多输入输出、残差</td></tr>
+      <tr><td><strong>Functional</strong></td><td><code>x = Input(...); y = Dense(64)(x); Model(x, y)</code></td><td><strong>任意 DAG</strong>（多输入输出、残差、共享层）</td><td>依赖运行时值的控制流、递归</td></tr>
+      <tr><td><strong>Subclassing</strong></td><td><code>class M(keras.Model): def call(self, x): ...</code></td><td><strong>任意 Python 逻辑</strong>（最像 PyTorch）</td><td>—（但失去了静态图检查与自动可视化）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>三者的关系值得说清：<strong>Functional API 构建的是一个「可被检查的数据结构」</strong>——它在定义时就知道整张图的拓扑与形状，所以能做 <code>model.summary()</code>、能画图、能自动检查形状不匹配、能被完整序列化成 <code>.keras</code>/SavedModel。<em>Subclassing 则是纯 Python，框架看不到内部结构</em>，所以 <code>summary()</code> 要先跑一遍才知道形状，序列化也需要额外的 <code>get_config()</code>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>这与 PyTorch 的差别是范式级的</strong>：PyTorch 只有 subclassing 这一种（<code>nn.Module.forward</code> 是纯 Python），它<em>放弃了「模型是可检查的数据结构」这个性质，换取了完全的灵活性</em>。所以 PyTorch 要导出图必须靠追踪（<code>torch.jit.trace</code>/<code>torch.onnx.export</code>/<code>dynamo</code>），而 Keras Functional 模型天然就是图。<em>模块 03 讲导出时你会看到这个差别的直接后果：Keras Functional 导出几乎无痛，PyTorch 导出要处理一堆追踪的坑。</em></p></div>
+  </div>  <h3>与 PyTorch 的逐概念对照</h3>  <table>
+    <thead><tr><th>概念</th><th>PyTorch</th><th>TensorFlow / Keras</th><th>注意</th></tr></thead>
+    <tbody>
+      <tr><td>模型定义</td><td><code>nn.Module.forward</code></td><td><code>keras.Model.call</code> / Functional</td><td>TF 的 <code>call</code> 有 <code>training</code> 参数（控制 dropout/BN）</td></tr>
+      <tr><td>训练/推理模式</td><td><code>model.train()</code> / <code>.eval()</code></td><td><strong>逐次调用传 <code>training=True/False</code></strong></td><td>TF 没有全局模式开关——<em>忘了传就用默认值</em></td></tr>
+      <tr><td>自动微分</td><td><code>loss.backward()</code>（反向自动累积）</td><td><code>with tf.GradientTape() as t: ...</code> 然后 <code>t.gradient(...)</code></td><td>Tape 默认只能用一次（<code>persistent=True</code> 才能多次）</td></tr>
+      <tr><td>优化器步</td><td><code>opt.step()</code> + <code>opt.zero_grad()</code></td><td><code>opt.apply_gradients(zip(grads, vars))</code></td><td>TF 无需清零（梯度是每次新算的）</td></tr>
+      <tr><td>设备</td><td><code>.to('cuda')</code></td><td><code>with tf.device('/GPU:0'):</code> 或自动放置</td><td>TF 默认会自动占满显存（<code>set_memory_growth</code> 关掉）</td></tr>
+      <tr><td>数据管线</td><td><code>DataLoader</code></td><td><code>tf.data.Dataset</code></td><td><code>tf.data</code> 是图内的，性能通常更好但调试更难</td></tr>
+      <tr><td>权重形状（Conv2D）</td><td><code>(out, in, kH, kW)</code></td><td><strong><code>(kH, kW, in, out)</code></strong></td><td><strong>迁移时必须转置</strong>（模块 02）</td></tr>
+      <tr><td>数据布局</td><td>NCHW（默认）</td><td><strong>NHWC（默认）</strong></td><td>同上</td></tr>
+      <tr><td>LayerNorm eps</td><td><code>1e-5</code></td><td><code>1e-3</code>（<code>keras.layers.LayerNormalization</code>）</td><td><strong>默认值不同！</strong>（模块 02）</td></tr>
+      <tr><td>BatchNorm 动量</td><td><code>momentum=0.1</code>（新值权重）</td><td><code>momentum=0.99</code>（<strong>旧值</strong>权重）</td><td><em>语义相反</em>：0.1 ↔ 0.9</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">三个「不报错但数值错」的默认值差异</span>
+    <p>这张表的最后三行是<strong>迁移事故的最高发区</strong>，而且它们的共同特点是「代码不报错、形状也对、但数值错」。<strong>Conv2D 的权重布局</strong>（<code>(out,in,kH,kW)</code> vs <code>(kH,kW,in,out)</code>）不转置就直接 reshape，会得到一个形状正确但完全乱掉的卷积核。<strong>LayerNorm 的 eps</strong> 相差 100 倍，在激活值很小时会造成可观的数值差异。<strong>BatchNorm 的 momentum 语义相反</strong>——PyTorch 的 0.1 对应 TF 的 0.9，直接照抄数字会让滑动统计量的更新速度差 9 倍。<em>模块 02 会把这些做成一张可执行的映射表。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="jax"><span class="num">5</span>顺带说清 JAX：第三种范式</h2>
+  <p>JD 里的三个框架，JAX 是最不一样的一个。用一段话把它的定位说清楚，你就能在面试里准确回答「三者的区别」。</p>  <table>
+    <thead><tr><th></th><th>PyTorch</th><th>TensorFlow</th><th>JAX</th></tr></thead>
+    <tbody>
+      <tr><td>核心抽象</td><td>有状态的 <code>nn.Module</code></td><td>有状态的 <code>Layer</code> + 图</td><td><strong>纯函数 + 显式参数</strong></td></tr>
+      <tr><td>参数在哪</td><td>藏在模块里</td><td>藏在层里</td><td><strong>作为参数显式传入</strong>（pytree）</td></tr>
+      <tr><td>随机数</td><td>全局 RNG</td><td>全局 RNG</td><td><strong>显式传 key</strong>（可复现性极强）</td></tr>
+      <tr><td>图从哪来</td><td><code>compile</code>/<code>trace</code></td><td><code>tf.function</code></td><td><code>jit</code></td></tr>
+      <tr><td>变换</td><td>—</td><td>—</td><td><strong><code>grad</code>/<code>vmap</code>/<code>pmap</code>/<code>jit</code> 可自由组合</strong></td></tr>
+      <tr><td>最大优势</td><td>生态与灵活</td><td>生产栈与部署</td><td><strong>可组合的函数变换 + XLA 编译</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>JAX 的核心主张是<strong>「把模型写成纯函数」</strong>：<code>y = f(params, x)</code>，参数显式传入、没有隐藏状态、随机数靠显式 key。<em>代价是写起来更啰嗦（要自己管 params 树），收益是所有变换都能自由组合</em>——<code>jit(grad(vmap(f)))</code> 是合法且常用的写法，而这在有状态的框架里很难做到。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>对本课的意义在于：<strong>JAX 把「静态图追踪」的语义暴露得最彻底</strong>。它的 tracer 对象在追踪时代替真实数组，任何试图对 tracer 做 Python 层面判断（<code>if x > 0</code>、<code>int(x)</code>）的代码都会<em>立刻报错</em>（<code>ConcretizationTypeError</code>），而不是像 TF 那样静默固化。<em>这个「宁可报错也不静默」的设计，反而让 JAX 的追踪语义最容易学对</em>。<strong>如果你想真正理解追踪，从 JAX 学最快；如果要面对生产存量，从 TF 学最有用。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个能在面试里用的总结：<strong>三个框架的差别不在「能做什么」（都能训 Transformer），而在「状态放在哪里」与「图从哪里来」</strong>。PyTorch：状态在对象里、图靠事后追踪；TensorFlow：状态在层里、图靠 <code>tf.function</code> 装饰；JAX：<em>没有隐藏状态</em>、图靠 <code>jit</code> 且变换可组合。<em>把这三句话说清楚，比列举 API 差异有说服力得多。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">6</span>算一笔账：追踪的成本与收益</h2>
+  <p>静态图不是免费的。它的取舍可以量化成一个简单的盈亏平衡问题。</p>  <div class="math-block">\[\text{总时间}_{\text{图}} = n_{\text{trace}} \cdot C_{\text{trace}} + N \cdot t_{\text{graph}}, \qquad \text{总时间}_{\text{eager}} = N \cdot t_{\text{eager}}\]</div>  <div class="math-block">\[\text{值得编译} \iff N > \frac{n_{\text{trace}} \cdot C_{\text{trace}}}{t_{\text{eager}} - t_{\text{graph}}}\]</div>  <table>
+    <thead><tr><th>场景</th><th>追踪次数</th><th>单次追踪成本</th><th>加速比</th><th>盈亏平衡的调用次数</th></tr></thead>
+    <tbody>
+      <tr><td>形状固定的训练循环</td><td>1</td><td>≈ 200 × 单步</td><td>1.3×</td><td>≈ 870 步（很快回本）</td></tr>
+      <tr><td>形状固定的推理服务</td><td>1</td><td>≈ 200 × 单步</td><td>1.5×</td><td>≈ 600 次</td></tr>
+      <tr><td><strong>形状每次都变</strong></td><td><strong>= 调用次数</strong></td><td>≈ 200 × 单步</td><td>1.3×</td><td><strong>永远不回本</strong></td></tr>
+      <tr><td>形状分 8 个桶</td><td>8</td><td>≈ 200 × 单步</td><td>1.3×</td><td>≈ 7000 次</td></tr>
+    </tbody>
+  </table>  <p>第三行是关键：<strong>如果每次调用的形状都不同，追踪次数等于调用次数，编译永远是纯亏损</strong>——而且比 eager 还慢（多了追踪开销）。这就是「变长输入 + 静态图」的根本矛盾。三条标准解法：</p>  <ul>
+    <li><strong>形状分桶</strong>：把序列长度 padding 到 {128, 256, 512, …} 这样的几个桶，把追踪次数从 N 降到桶数。<em>代价是 padding 浪费（C50 模块 02 算过）</em>。</li>
+    <li><strong>动态维度</strong>：TF 的 <code>input_signature</code> 里把可变维标成 <code>None</code>、PyTorch 的 <code>dynamic=True</code>、ONNX 的动态轴（模块 03）。<em>代价是失去部分基于静态形状的优化</em>。</li>
+    <li><strong>只编译热点</strong>：把形状稳定的部分（如单层 Transformer block）编译，形状多变的部分留在 eager。<em>这是最实用的折中。</em></li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的智慧：<strong>「Python 代码只在追踪时执行一次」这一句话，能解释静态图框架里 80% 的诡异行为</strong>——print 只出现一次、计数器不动、控制流被固化、形状一变就变慢。<em>而且它跨框架成立</em>：<code>tf.function</code>、<code>jax.jit</code>、<code>torch.compile</code>、<code>torch.onnx.export</code> 全都如此。<strong>学会问「这一行是在构图还是在计算」，你就掌握了这一整类框架。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>生态动态与开放问题</h2>
+  <ul>
+    <li><strong>范式的收敛</strong>：PyTorch 2.x 引入编译、TF2 引入 eager、JAX 一直是「纯函数 + jit」。<em>三者在语义上正在互相靠拢</em>，但工程细节（缓存策略、graph break 的处理、动态形状的支持程度）差异仍大。「一份代码跑三个后端」（如 Keras 3 的多后端）是当前的尝试，成熟度仍在演进。</li>
+    <li><strong>动态形状的编译</strong>：这是所有编译器共同的难题。符号形状（symbolic shapes）、形状特化与去特化的策略、以及「多大的形状变化才值得重编译」都缺乏好的自动决策，目前主要靠人工配置分桶。</li>
+    <li><strong>graph break 的可诊断性</strong>：<code>torch.compile</code> 遇到不支持的 Python 会静默地打断图（回退 eager），性能损失巨大但不报错。<code>TORCH_LOGS=graph_breaks</code> 之类的工具在改善，但「为什么这里断了、怎么改」仍需要相当的经验。</li>
+    <li><strong>训练与推理图的一致性</strong>：训练用的图与导出的推理图常常不同（dropout、BN 的行为、控制流分支）。<em>「保证导出的图与训练时数值一致」缺乏自动化的验证工具</em>——这正是模块 02/03 要你手写对拍的原因。</li>
+    <li><strong>Keras 3 的多后端路线</strong>：同一份 Keras 代码跑在 TF/JAX/PyTorch 后端上。它对「跨框架迁移」是个有意思的答案（不迁移，换后端就行），但对已有的原生代码没有帮助，且抽象泄漏在所难免。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：TensorFlow 官方指南的 <em>Better performance with tf.function</em>（重追踪的准确规则与诊断方法，本模块第三节的一手来源）、<em>Introduction to graphs and tf.function</em>、<em>The Keras functional API</em>；JAX 文档的 <em>How to think in JAX</em> 与 <em>JAX — The Sharp Bits</em>（后者把追踪的坑列得最清楚，强烈推荐即使你不用 JAX 也读一遍）；PyTorch 的 <em>torch.compile</em> 与 <em>TorchDynamo</em> 文档（对照阅读会发现语义高度同构）。原理侧：C38（autograd 与编译）、C36（kernel 与融合）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_weight_porting/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 框架迁移与权重对齐</div></a>
+  </div>
+
+</div>
+</body>
+</html>

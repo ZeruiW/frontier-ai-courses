@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 成员推断与隐私</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 成员推断与隐私</h1>
+  <p class="subtitle">隐私攻击与审计 —— 判断某条样本是否被训练过（MIA）：loss 阈值 / shadow model / 正确的 TPR@low FPR 评价；理解记忆-过拟合-泄露关联，落到差分隐私防御</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00/03、过拟合与泛化、ROC/AUC、置信度与损失</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_membership_privacy.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Shokri 2017、Yeom 2018、Carlini 2022 (LiRA)、Abadi 2016 (DP-SGD)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what">成员推断：你的数据在训练集里吗</a></li>
+      <li><a href="#loss">最简 MIA：损失阈值攻击</a></li>
+      <li><a href="#shadow">Shadow model：更强的攻击</a></li>
+      <li><a href="#tprfpr">正确评价 MIA：TPR @ low FPR</a></li>
+      <li><a href="#memo">记忆、过拟合与隐私的关联</a></li>
+      <li><a href="#dp">防御：差分隐私与隐私审计</a></li>
+      <li><a href="#notebook">从玩具到现实：notebook 怎么练</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what"><span class="num">1</span>成员推断：你的数据在训练集里吗</h2>
+  <p>上一模块的反演与提取问「模型记住了什么内容」。本模块问一个更基础、也更普适的隐私问题：<strong>某条具体样本，到底有没有被用来训练这个模型？</strong>这就是 <span class="term">membership inference attack (MIA)</span>（成员推断攻击，Shokri 2017 奠基）。它看似只泄露一个比特（是/否），却可能是严重的隐私灾难。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>想象一个用「某医院糖尿病患者数据」训练的模型。如果攻击者能判断「张三的记录在训练集里」，他就间接知道了<strong>张三是糖尿病患者</strong>——哪怕模型从没直接输出过这个事实。<em>成员身份本身就是敏感信息</em>，尤其当训练集的纳入标准（患某病、属某群体）本身就是隐私时。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>MIA 还是衡量模型「记忆/泄露」程度的<strong>标准探针</strong>：一个模型越容易被 MIA 攻破，就说明它把训练样本的个性记得越牢、泄露风险越大。所以 MIA 不只是一种攻击，更是<strong>隐私审计</strong>（<span class="term">privacy auditing</span>）的核心工具——用它来<em>实测</em>一个模型（或一个隐私防御）到底有多安全。</p></div>
+  </div>  <p>为什么说「一个比特」也可能是灾难？因为成员身份往往<em>等价于</em>敏感属性本身。当训练集的纳入标准就是隐私时（「这是某抑郁症研究的参与者」「这是某次数据泄露的受害者名单」），确认「你在训练集里」就直接确认了「你属于这个敏感群体」。更进一步，MIA 还能<strong>逐个体</strong>地施加伤害——不需要泄露所有人，只要能对<em>特定目标</em>（某个名人、某个对手）高确信地回答「在/不在」，就足以勒索、歧视或羞辱。这就是为什么第 4 节会强调「看低 FPR 下能否确信指认少数人」，而非看平均准确率：<strong>隐私伤害是逐个体的，不是平均意义的</strong>。</p>  <p>本模块的主线是一条清晰的因果链：<strong>过拟合 → 记忆 → 成员/非成员的输出差异 → MIA 可行</strong>。理解这条链，就能理解 MIA 为何成功、以及为何<strong>差分隐私（DP）</strong>能从根上缓解它。我们会从最简单的 loss 阈值 MIA 讲到 shadow model，再讲到正确的评价方式（<span class="term">TPR @ low FPR</span>），最后落到防御。</p>  <div class="callout danger"><span class="label">伦理边界</span>
+    <p><strong>边界提醒</strong>：对真实个体数据做成员推断是严重的隐私侵犯。本模块在<strong>合成数据 + 玩具模型</strong>上演示，目的是让 ML 系统的构建者<em>学会审计自己模型的隐私泄露、并验证 DP 等防御是否真的有效</em>。这是隐私保护工程的必修课，不是窥探工具。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="loss"><span class="num">2</span>最简 MIA：损失阈值攻击</h2>
+  <h3>最简 MIA：基于损失的阈值攻击</h3>  <p>最简单也最有效的 MIA 利用一个朴素事实：<strong>模型对见过的样本（成员）拟合得更好，损失更低</strong>。Yeom 2018 把这点形式化——成员样本的训练损失分布整体偏低，非成员偏高。于是 <span class="term">loss-based MIA</span> 就是设一个<strong>损失阈值</strong>：损失低于阈值判为成员，否则非成员。</p>  <div class="math-block">\[\text{member}(x,y)=\mathbb{1}\big[\,L\big(f(x),y\big) < \tau\,\big]\]</div>  <p>阈值 $\tau$ 怎么定？若攻击者手里有一些已知的成员/非成员样本，可以选<strong>最佳分隔阈值</strong>；更普适的做法（Yeom）是用「平均训练损失」附近作阈值。它简单到几乎不像攻击，却常能取得不俗的效果——这本身就是个警钟：<strong>过拟合模型的隐私是“裸奔”的</strong>。</p>  <p><strong>一个 worked 微例</strong>，把「过拟合如何拉开两条分布」算给你看：设一个<em>过拟合</em>模型，成员样本的损失大多压在 $0.05$ 附近（几乎背下了），非成员损失大多在 $0.8$ 附近（只能靠泛化）。取阈值 $\tau=0.4$（两堆中间），几乎所有成员（损失 $<0.4$）被判对、几乎所有非成员（损失 $>0.4$）也被判对——攻击 AUC 逼近 $0.95$，隐私近乎裸奔。换成一个<em>泛化好</em>的模型：成员损失约 $0.30$、非成员约 $0.35$，两堆几乎重叠，<em>任何</em>阈值都两边各错一半，AUC 跌回 $\approx0.55$（基本等于瞎猜）。两个模型的差别只在<strong>泛化间隙</strong>（训练损失与测试损失之差），而 MIA 的强弱几乎完全由这个间隙决定——这正是第 5 节「过拟合-隐私关联」要形式化的那条规律的数字版预演。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直觉：把成员和非成员的损失各画一条分布。两条分布越分得开，攻击越好做。<strong>过拟合</strong>把成员的损失压得很低（模型“背”下了它们），于是两条分布拉开，一刀切就能区分；泛化好的模型，两条分布几乎重叠，攻击就难。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>除了 loss，还有等价的变体：<span class="term">confidence / entropy attack</span>——用模型对正确类的<strong>置信度</strong>（成员更高）或预测<strong>熵</strong>（成员更低）作信号。它们和 loss 高度相关（loss 本就是负对数置信度），属于同一类「基于单样本输出统计量」的攻击，notebook 会同时实现 loss 与置信度两种。</p></div>
+  </div>  <p>为什么连「设个损失阈值」这么粗暴的攻击都奏效？因为训练<em>本身</em>就是在最小化训练样本的损失——这是模型的优化目标。于是成员（参与了优化）的损失被<strong>直接压低</strong>，非成员（没参与）只能享受到「泛化」带来的间接好处，损失天然更高。换句话说，<strong>成员损失偏低不是 bug，而是训练目标的直接后果</strong>——这也预告了为什么缓解 MIA 这么难：你不可能既让模型在训练数据上损失很低（学得好），又让成员和非成员的损失分布完全重叠（不泄露）。这对矛盾的调和，最终要靠第 6 节的差分隐私从原理上限制单样本的影响。</p>  <p>notebook 会构造一个<strong>故意过拟合</strong>的玩具模型，画出成员/非成员的损失分布、用阈值攻击算 AUC，亲眼看到「过拟合越狠，MIA 的 AUC 越高」。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="shadow"><span class="num">3</span>Shadow model：更强的攻击</h2>
+  <h3>Shadow model：更强的攻击</h3>  <p>loss 阈值假设「损失低=成员」对所有样本一刀切，但不同样本的「正常损失」本就不同（难样本损失天然高）。Shokri 2017 的 <span class="term">shadow model</span>（影子模型）用更聪明的办法：<strong>训一批仿制模型，制造大量「已知成员身份的输出」，再训一个攻击分类器去学习成员的输出长什么样</strong>。</p>  <div class="ascii">1. 攻击者用同分布数据训练 K 个 shadow 模型
+   （他知道每个 shadow 的训练集 = 知道哪些是成员）
+2. 对每个 shadow，收集：
+     成员样本的输出 (置信度向量) → 标记 “in”
+     非成员样本的输出           → 标记 “out”
+3. 用这些 (输出向量, in/out) 训练一个攻击分类器 A
+4. 攻击目标模型：把目标对某样本的输出喂给 A → 判 in/out</div>  <p>关键洞察：攻击者<strong>不需要目标模型的训练数据</strong>，只需要<em>同分布</em>的数据来训 shadow（甚至 Salem 2019《ML-Leaks》证明单个 shadow、乃至无 shadow 也行）。shadow 模型扮演「目标模型的替身」，让攻击者在<strong>自己完全掌握成员身份</strong>的环境里，学会「成员的输出模式 vs 非成员的输出模式」，再迁移到真目标上。</p>  <p>shadow model 与 loss 阈值的关系，可以理解为<strong>从「全局一刀切」到「学一个更聪明的判别器」</strong>：loss 阈值假设一个对所有样本通用的阈值，而 shadow 攻击让一个分类器<em>自己</em>去学「什么样的输出组合（损失、置信度、熵……）更像成员」，能利用比单一阈值更丰富的信号。Salem 2019 进一步证明所需假设可以大幅放宽（单 shadow、甚至用阈值近似），说明<strong>MIA 的门槛比 Shokri 最初设想的低得多</strong>——这让 MIA 成为一个<em>现实而非理论</em>的威胁，也使它成为隐私审计里好用的标准探针：门槛低意味着「连不太强的攻击者都能做」，因此用它度量出的隐私下界是保守且可信的。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>shadow model 的精髓是<strong>制造监督信号</strong>：MIA 本来没有标签（你不知道目标的训练集），shadow 模型人为造出大量带「in/out 真标签」的样本，把无监督的成员推断变成一个有监督的二分类。这和模块 03 的窃取异曲同工——都是<em>用自己能控制的仿制系统，逼近看不见的目标</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tprfpr"><span class="num">4</span>正确评价 MIA：TPR @ low FPR</h2>
+  <h3>正确地评价 MIA：TPR @ low FPR</h3>  <p>这是本模块最重要的方法论一节。Carlini 2022《MIA From First Principles》指出：<strong>用平均准确率或 AUC 评价 MIA 是误导性的</strong>。因为对大多数样本，成员与非成员确实难分（攻击只能瞎猜，准确率约 50%）；平均指标被这些「猜不出」的样本稀释，显得攻击很弱。</p>  <p>但隐私的真正威胁不在「平均」，而在<strong>极端</strong>：攻击者只要能<strong>以极低的误报率，非常确信地指认出少数样本是成员</strong>，就足以造成伤害（如确信指认某个名人在敏感数据集里）。所以正确的指标是 <span class="term">TPR @ low FPR</span>——在误报率（FPR）被压到 0.1% 或 1% 时，真正率（TPR）有多高，对应 ROC 曲线<strong>左下角</strong>（要画在 log-log 轴上才看得清）。</p>  <p>这个方法论纠正影响<strong>远超 MIA</strong>，值得每个做安全/检测的人内化：<strong>平均指标会被「大多数容易判的样本」稀释，从而掩盖「少数样本上的高确信攻击」</strong>。同样的陷阱在后门检测（少数毒样本）、异常检测（少数攻击）里都存在。一个 AUC=0.6 听起来很弱的攻击，可能在最左端的 1% FPR 处有 30% 的 TPR——意味着它能<em>确信地</em>指认出 30% 的成员而几乎不误报，这对那些人是实打实的隐私泄露。<strong>看平均会让你严重低估真实风险</strong>；正确的姿势是把 ROC 画在对数坐标上、盯住低 FPR 端。notebook 练习 3 会专门构造一个「AUC 相近但低 FPR 端天差地别」的例子来钉死这一点。</p>  <div class="math-block">\[\text{隐私威胁的度量} = \text{TPR at FPR}=0.1\%\quad(\text{ROC 曲线最左端，需 log-scale 观察})\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：一个攻击「平均只对 55%」听起来没用。但如果它能<strong>在它最有把握的那 1% 样本上做到 99% 正确</strong>，那对那 1% 个人就是隐私灾难。安全要看<em>最坏情况</em>，不是平均。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>Carlini 的 <span class="term">LiRA (Likelihood Ratio Attack)</span> 据此设计：对每个样本，分别用「它是成员」和「它是非成员」两组 shadow 模型，估计其损失的两个分布，做<strong>似然比检验</strong>并<strong>按样本逐一校准</strong>。这种 per-sample 校准在低 FPR 区远胜全局阈值——因为它考虑了「这个样本本来该有多大损失」。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>评价 MIA（以及任何检测器）的铁律：<strong>看 log-scale ROC 的低 FPR 端，而非平均准确率/AUC</strong>。notebook 会同时报告 AUC 和 TPR@1%FPR，并演示：两个 AUC 相近的攻击，在低 FPR 端可能差距悬殊——后者才是真正的隐私风险刻画。</p>
+  </div>  <p>把本模块三种 MIA 并排比较，能看清「<strong>用什么信号、需要什么资源、在低 FPR 端有多强</strong>」的递进——这也是它们危险性递增的顺序：</p>  <table>
+    <thead><tr><th>攻击</th><th>用的信号</th><th>需要的资源</th><th>低 FPR 端表现</th></tr></thead>
+    <tbody>
+      <tr><td><strong>loss 阈值</strong>（Yeom）</td><td>单样本损失 vs 全局阈值</td><td>几乎不需要（一个阈值）</td><td>弱（难样本天然高损失，被冤判为非成员）</td></tr>
+      <tr><td><strong>shadow model</strong>（Shokri）</td><td>输出向量 → 学一个判别器</td><td>训 K 个同分布影子模型</td><td>中（能用比单阈值更丰富的信号）</td></tr>
+      <tr><td><strong>LiRA</strong>（Carlini）</td><td>per-sample 似然比（按样本难度校准）</td><td>训 in/out 两组影子模型</td><td>强（低 FPR 端碾压，能确信指认个体）</td></tr>
+    </tbody>
+  </table>  <p>读这张表的关键在<strong>最后一列</strong>：三者的「平均 AUC」可能相差不大，但隐私伤害发生在低 FPR 端——而那里 LiRA 远胜全局阈值。原因正是上一段的方法论：<strong>逐样本校准</strong>避免了「拿一个本来就难、损失天然高的成员样本，错判成非成员」这类系统性失误，从而在「几乎不误报」的前提下仍能精准指认真成员。这就是为什么严肃的隐私审计要用 LiRA 这类校准攻击、并盯住低 FPR 端，而非满足于一个好看的平均 AUC。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="memo"><span class="num">5</span>记忆、过拟合与隐私的关联</h2>
+  <h3>记忆、过拟合与隐私的关联</h3>  <p>把前几节串起来，核心是 <span class="term">overfitting–privacy link</span>（过拟合-隐私关联）：<strong>模型越过拟合，MIA 越成功</strong>。Yeom 2018 给出了形式化——成员推断优势（attack advantage）与<strong>泛化间隙</strong>（训练损失与测试损失之差）正相关。直觉上，过拟合意味着模型「背下了」训练样本的个性，于是成员（被背过）和非成员（没背过）的输出泾渭分明。</p>  <p>更深一层是 <span class="term">memorization</span>（记忆）：Feldman 等的工作表明，记忆个别样本对模型泛化<em>有时是必要的</em>（长尾、稀有样本只能靠记）。这带来一个根本张力：<strong>要学好长尾就得记，记了就泄露</strong>。这也解释了模块 03 的训练数据提取——记得越牢的稀有样本，越容易被精确提取，也越容易被 MIA 指认。记忆、过拟合、MIA、数据提取，本质是<strong>同一现象的不同侧面</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句话串起本模块与上一模块：<strong>记忆是隐私风险的总源头</strong>。MIA 探测「记没记住这条样本」，提取诱出「记住的内容」，反演重建「记住的类长相」。它们都指向同一个治理对象——模型的记忆。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>因此防御也指向同一处：<strong>限制模型对单个样本的依赖</strong>。降低过拟合（正则、早停、更多数据）能缓解，但不提供<em>保证</em>；要<strong>可证</strong>的隐私，需要下一节的差分隐私——它直接从数学上限制「单条样本能对模型造成多大影响」。</p></div>
+  </div>  <p>Feldman 的「记忆有时是必要的」是一个深刻而不安的结论：它意味着<strong>零记忆与高精度可能本质冲突</strong>。真实数据是<em>长尾</em>的——大量罕见样本各自只出现一两次，模型想把它们学对，除了<strong>把它们背下来</strong>别无他法（没有足够的同类样本去归纳规律）。于是「学好长尾」与「不记忆个体」成了一对内在矛盾。这把隐私问题从「修掉过拟合就行」拔高到了「隐私与效用存在帕累托前沿」的高度——你只能在这条前沿上选一个点（用 ε 来定位），而不可能两者都要满。这也是为什么有原则的隐私必须是<em>可量化的权衡</em>，而非「安全/不安全」的开关。</p>  <p>notebook 会量化这条关联：训练若干过拟合程度不同的模型，画出「泛化间隙 vs MIA 的 AUC/TPR@FPR」的正相关曲线——这是<strong>用攻击度量隐私</strong>的典范。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="dp"><span class="num">6</span>防御：差分隐私与隐私审计</h2>
+  <h3>防御：差分隐私与隐私审计</h3>  <p>缓解 MIA 的手段从弱到强：<strong>正则化/早停/数据增广</strong>（降过拟合，经验有效但无保证）→ <strong>降低输出信息量</strong>（如只回标签，限制可用信号）→ <strong>差分隐私训练</strong>（<span class="term">differential privacy (DP)</span>，有原则的保证）。前两者治标，DP 治本。</p>  <p>为什么说正则化等只是<strong>治标</strong>？因为它们降低的是<em>平均</em>泄露（让两条损失分布整体靠近），却<strong>不对任何单个样本给出保证</strong>。一个用了强正则、泛化间隙很小的模型，仍可能对某些<em>特别独特</em>的样本（模块 03 说过的稀有样本）记得很牢、被高确信指认——而这恰恰是 TPR@low FPR 揭示的、最危险的那部分风险。正则化把「平均隐私」改善了，却管不住「最坏个体」。要对<strong>每一条样本</strong>都给出「有没有它，模型几乎一样」的保证，就必须上差分隐私——这也是它区别于一切经验手段的根本价值。</p>  <p><span class="term">differential privacy (DP)</span> 给出一个<strong>形式化保证</strong>：单条样本的增删，对模型输出分布的影响被严格限制在 <span class="term">(ε, δ)-DP / privacy budget</span> 之内。数学定义：对任意相邻数据集 $D, D'$（差一条样本）和任意输出集 $S$，</p>  <div class="math-block">\[\Pr[\mathcal{M}(D)\in S]\ \le\ e^{\epsilon}\,\Pr[\mathcal{M}(D')\in S]\ +\ \delta\]</div>  <p>直觉：如果「有没有你这条数据」几乎不改变模型的行为（被 $e^\epsilon$ 限住），那么攻击者就<strong>无法从模型反推你是否在训练集里</strong>——MIA 的成功率被<em>可证地</em>压住。$\epsilon$ 越小隐私越强（也越伤精度），$\delta$ 是允许的极小失效概率。$\epsilon$ 是一个<strong>可量化、可累加的隐私预算</strong>，把模糊的「隐私」变成可工程化的旋钮。</p>  <p><strong>把 ε 翻译成「攻击者最多能多准」</strong>，DP 的保证就具体了：可以证明，在 $(\epsilon,\delta)$-DP 下，任何 MIA 的<em>真正率 TPR 与假正率 FPR</em> 被一条不等式锁住——大致是 $\text{TPR}\le e^{\epsilon}\cdot\text{FPR}+\delta$。代入数字感受一下：取 $\epsilon=1$（$e^1\approx2.7$），当攻击者把 FPR 压到 1% 时，TPR <strong>最多</strong>约 $2.7\%$——也就是说，他想「几乎不误报地指认成员」，成功率被钉死在个位数百分比，隐私基本守住。若放宽到 $\epsilon=5$（$e^5\approx148$），同样 1% FPR 下 TPR 上界飙到约 $148\%$（即被 100% 截断）——保证<em>形同虚设</em>。这把抽象的 ε 变成了第 4 节那张 log-scale ROC 上一条<strong>可证的天花板</strong>：ε 越小，天花板压得越低，攻击者在低 FPR 端再聪明也顶不破。这也解释了前沿难题——大模型上要保住精度往往需要很大的 ε，而那时这条天花板已经高到没有意义。</p>  <p>DP 的形式定义看似抽象，但它的精妙在于把「隐私」翻译成了一个<strong>可操作、可累加</strong>的量。$\epsilon$ 是<em>隐私预算</em>：每次对数据的访问/发布都消耗一点预算（组合定理告诉你怎么累加），花光了就不能再泄露更多。这让隐私从一个含糊的形容词，变成了像「钱」一样可以<strong>分配、追踪、设上限</strong>的资源——这正是它能成为工程实践（而非纸上谈兵）的关键。$\delta$ 则是一个允许的极小失效概率（通常取得比 1/数据量 还小），作为数学上的安全垫。</p>  <p>落地方法是 <strong>DP-SGD</strong>（Abadi 2016）：训练时① 对每个样本的梯度做<strong>裁剪</strong>（限制单样本影响）② 加<strong>高斯噪声</strong>（掩盖单样本贡献）。代价是<strong>精度下降</strong>（噪声伤害学习）与训练更复杂。但它是目前唯一能给出「数学上保证的隐私」的主流方法。这两步对应 DP 定义的两个要素：裁剪限制了「单条样本最多能把梯度推多远」（界定敏感度），加噪则确保「有没有这条样本，更新看起来都差不多」（掩盖差异）。理解这个对应，你就懂了 DP-SGD 不是玄学的「加点噪声」，而是<strong>精确地为 (ε,δ) 保证服务的两个机制</strong>——本模块的加噪防御演示正是它的玩具版直觉。</p>  <div class="callout warn"><span class="label">防御陷阱</span>
+    <p>把 DP 当「装了就安全」的开关，是隐私工程最常见的坑。① <strong>报告的 ε 不等于实际的 ε</strong>：梯度裁剪范数、噪声乘子、采样率、组合定理用错任何一个，声称的 $\epsilon=1$ 可能实际是 $\epsilon=20$（保证形同虚设）——实现 bug 在 DP 库里屡见不鲜。② <strong>大 ε 的「DP」近乎安慰剂</strong>：为保住精度把 ε 调到几十，那条天花板（上一段）高到挡不住任何攻击，却给人「我做了 DP」的虚假安心。正因如此，DP <em>必须</em>配合<strong>隐私审计</strong>：用 MIA 实测攻击成功率、反推一个<em>经验</em> ε 下界，看它和你<em>声称</em>的 ε 对不对得上。<strong>「上了 DP」不等于「隐私达标」，要用攻击去验收。</strong></p>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>DP 与本课的连接点：<strong>MIA 是 DP 的“验收测试”</strong>。理论上 DP 保证某个 ε；实践中用 MIA 去<span class="term">privacy auditing</span>（隐私审计）——实测攻击成功率，反推一个经验 ε 下界，验证 DP 实现是否真的达到了声称的保护。攻击与防御在这里闭环：先会攻击，才能验证防御。详见 references 的 Abadi 2016、Dwork & Roth。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="notebook"><span class="num">7</span>从玩具到现实：notebook 怎么练</h2>
+  <h3>从玩具到现实：本模块 notebook 怎么练</h3>  <p>配套 notebook 在玩具模型上把 MIA 攻击、评价与防御走通：</p>  <ul>
+    <li><strong>loss / 置信度 MIA</strong>：训一个过拟合模型，画成员/非成员的损失分布，用阈值攻击算 AUC；</li>
+    <li><strong>shadow model MIA</strong>：训多个 shadow、收集 in/out 输出、训攻击分类器，对比它与 loss 阈值的强弱；</li>
+    <li><strong>TPR@low FPR 评价</strong>：同时报告 AUC 与 TPR@1%FPR，演示为何要看低 FPR 端而非平均；</li>
+    <li><strong>过拟合-隐私关联</strong>：训练不同过拟合程度的模型，画「泛化间隙 vs MIA AUC」正相关；</li>
+    <li><strong>防御</strong>：用正则/早停降过拟合、或对输出加噪，验证 MIA 的 AUC/TPR 随之下降（DP 的简化直觉）。</li>
+  </ul>  <p>特别地，notebook 的胶囊会用玩具方式复现 LiRA 的灵魂——<strong>per-sample 校准</strong>：不再用一个全局损失阈值，而是先估计「<em>这个样本如果不是成员，本该有多大损失</em>」（用一批不含它的 shadow 模型求基线），再看目标模型上它的损失<strong>比这个基线低多少</strong>。一个本来就容易（损失天然低）的样本，即便是成员也不该被轻易指认；一个本来很难（损失天然高）的样本，一旦损失异常低就高度可疑。这种「按样本难度校准」正是 LiRA 在低 FPR 端碾压全局阈值的原因，也是把 MIA 从「平均能猜对」升级到「能确信指认个体」的关键一步。</p>  <p>每步都有 <code>assert</code> 锁定结论（如 <code>assert mia_auc_overfit &gt; mia_auc_regularized</code> 验证过拟合更易被攻、正则缓解了它）。你在玩具上理解的 MIA、shadow model、TPR@FPR 评价、过拟合-隐私关联，与 Shokri/Carlini 论文里的结构完全一致。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>强 MIA 与审计</strong>：LiRA 及后续把 MIA 推到很高的低-FPR 真正率，使其成为可靠的隐私审计工具。如何用尽量少的 shadow/计算达到可靠审计，是工程热点。</li>
+    <li><strong>LLM 的成员推断</strong>：对在万亿 token 上训一两个 epoch 的大模型，单样本记忆弱、MIA 困难且基线易被「时间分布漂移」污染。大模型上可靠的 MIA 与去重的隐私效果，仍有争议。</li>
+    <li><strong>记忆的必要性</strong>：Feldman 证明长尾记忆对泛化有时必要——这意味着「零记忆」可能与「高精度」不可兼得。隐私-效用的<em>帕累托前沿</em>在哪，是基础问题。</li>
+    <li><strong>DP 的实用 ε</strong>：要有意义保证常需 ε≈1–10，但小 ε 严重伤精度；大模型上达到可接受精度的 ε 往往大到隐私保证存疑。如何缩小 DP 的精度代价是核心难题。</li>
+    <li><strong>超越成员的隐私</strong>：属性推断、数据重建（reconstruction）等更强的隐私攻击，以及它们与 DP 保证的关系，正在把隐私威胁模型从「是否成员」推向「能还原多少」。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Shokri 2017（MIA + shadow model 奠基）、Yeom 2018（过拟合-隐私关联）、Carlini 2022 LiRA（TPR@low FPR + 似然比）、Abadi 2016（DP-SGD 防御）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_extraction_inversion/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 模型窃取与反演</div></a>
+    <a class="next" href="../05_prompt_injection_supply/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · Prompt 注入与供应链安全</div></a>
+  </div>
+
+</div>
+</body>
+</html>

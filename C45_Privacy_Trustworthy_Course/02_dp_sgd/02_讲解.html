@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · DP-SGD</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · DP-SGD</h1>
+  <p class="subtitle">把差分隐私装进训练 —— per-sample 梯度裁剪（=限制敏感度）+ 高斯噪声、子采样放大与 RDP/moments accountant 隐私会计、效用代价与超参权衡；理解为何 T 步没把 ε 炸掉、为何裁剪必须逐样本</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（高斯机制、敏感度、组合、子采样直觉）、SGD/梯度下降、L2 范数</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_dp_sgd.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Abadi 2016（DP-SGD）、Mironov 2017（RDP）、De 2022、Ponomareva 2023</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">从私有统计到私有训练</a></li>
+      <li><a href="#algorithm">算法：裁剪 + 加噪 + 会计</a></li>
+      <li><a href="#accounting">隐私会计：T 步为何没炸掉 ε</a></li>
+      <li><a href="#utility">效用代价：隐私换准确率</a></li>
+      <li><a href="#relation">DP-SGD = 高斯机制 + 组合的应用</a></li>
+      <li><a href="#variants">变体与替代：PATE / DP 微调 / …</a></li>
+      <li><a href="#production">从 numpy 到 Opacus 生产</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>从私有统计到私有训练</h2>
+  <p>模块 01 给了我们 DP 的全部零件：定义、敏感度、Laplace/Gaussian 机制、组合、预算。但那些例子都是<strong>一次性的统计查询</strong>（计数、求和、均值）。现实中我们想要的不是发布一个带噪计数，而是<strong>训练一个模型</strong>——而训练是一个<em>成千上万步、每步都碰一遍数据</em>的过程。怎么让整个训练过程满足 DP？这就是 <span class="term">DP-SGD</span>（差分隐私随机梯度下降，Abadi 2016）要解决的问题，也是 DP 从「私有统计」走向「私有机器学习」的关键一跃。</p>  <p>先想清楚难点在哪。普通 SGD 每步做：<code>θ ← θ − η · mean(每个样本的梯度)</code>。这里有两个隐私漏洞。其一，<strong>单个样本的梯度可能任意大</strong>——一个异常样本能让梯度爆炸，敏感度无界，没法标定噪声。其二，就算单步私有了，训练有 T 步，每步都看数据，<strong>隐私损失会累加 T 次</strong>，朴素组合下 T=10000 步会把 ε 累加到天文数字。DP-SGD 用两招分别破解这两个漏洞——<strong>裁剪</strong>破第一个，<strong>精巧的隐私会计</strong>破第二个。</p>  <p>把这两招拼起来，DP-SGD 的每一步就是模块 01 的<strong>高斯机制</strong>的一次应用：把「一个 batch 的平均梯度」当作要发布的查询，先把每个样本的梯度裁剪（限制敏感度），再对它们的和加高斯噪声，最后平均、更新。训练出的模型权重，是这一系列带噪梯度的<strong>后处理</strong>——由模块 01 的后处理免疫，模型自动继承隐私保证。<em>整个训练过程，乃至最终模型、它的所有预测，都是 (ε,δ)-DP 的</em>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住 DP-SGD 相对普通 SGD 多做的两件事：<strong>① per-sample 梯度裁剪（把单样本影响 = 敏感度限制在 C）；② 给求和后的梯度加高斯噪声（按敏感度 C 标定）</strong>。其余完全一样。难的不是这两个动作本身，而是<strong>把它们做对（裁剪是逐样本而非整批、噪声按 C 标定）</strong>并<strong>算清整个训练累计花了多少 ε（隐私会计）</strong>。本课 notebook 会把这三件事都从零实现并对拍。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="algorithm"><span class="num">2</span>算法：裁剪 + 加噪 + 会计</h2>
+  <h3>算法：逐样本裁剪 + 加噪 + 会计</h3>  <p>把 DP-SGD 的一步完整写出来。设第 t 步采样到一个 batch（大小 L），对其中每个样本 $i$：</p>  <ol>
+    <li><strong>算逐样本梯度</strong>：$g_i=\nabla_\theta \mathcal{L}(\theta; x_i)$（注意是<em>每条样本各自的</em>梯度，不是 batch 平均）；</li>
+    <li><strong>逐样本裁剪</strong>：$\bar g_i = g_i \cdot \min\!\big(1,\ C/\lVert g_i\rVert_2\big)$——把每条梯度的 L2 范数压到不超过 C；</li>
+    <li><strong>求和并加高斯噪声</strong>：$\tilde g = \sum_i \bar g_i + \mathcal{N}(0,\ \sigma^2 C^2 I)$；</li>
+    <li><strong>平均并更新</strong>：$\theta \leftarrow \theta - \eta\cdot\tilde g / L$；</li>
+    <li><strong>会计记账</strong>：向隐私会计器报告这一步（用了 σ、采样率 q=L/N），累加 ε。</li>
+  </ol>  <p>逐项看为什么这样设计。第 2 步<strong>裁剪</strong>是全局的钥匙：裁剪后，任何单个样本对<code>Σᵢ ḡᵢ</code>的贡献其 L2 范数最多是 C，于是「增删一个样本」让求和梯度变化的 L2 不超过 C——这正是<strong>L2 敏感度 = C</strong>。敏感度有界了，第 3 步才能用高斯机制按 $\sigma C$ 标定噪声（回忆模块 01：高斯噪声 std ∝ Δ₂/ε，这里 Δ₂=C）。</p>  <p>注意噪声加在<strong>求和</strong>（而非平均）上、且尺度是 $\sigma C$ 不含 L——这是为了让敏感度计算干净（求和的敏感度恰是 C）；平均的除以 L 放到第 4 步，相当于对带噪求和做后处理（不影响隐私）。<strong>噪声乘子 σ</strong> 是相对于裁剪范数 C 的噪声比例，它（连同采样率 q 和步数 T）决定最终 ε——σ 越大越私密、ε 越小，但梯度信噪比越低、训练越难。</p>  <p>裁剪范数 C 的选择是 DP-SGD 最微妙的超参，值得专门说。它有<strong>双重身份</strong>：既是高斯机制的敏感度（决定噪声 $\sigma C$ 的绝对大小），又是「保留多少梯度信息」的阈值。C 取太小，大部分梯度被截短、方向信息丢失、模型学不动；C 取太大，敏感度大、要加的噪声（$\sigma C$）也大、信噪比崩。经验法则（Abadi 2016、Ponomareva 2023）是把 C 设在<strong>梯度范数的中位数附近</strong>——让约一半样本不被裁剪、一半被裁剪，是信息保留与噪声控制的甜点。更先进的做法用<em>自适应裁剪</em>（按训练中观察到的梯度范数分位数动态调 C），但代价是估计分位数本身也可能泄露隐私、要一并核算。</p>  <div class="callout warn"><span class="label"></span>
+    <p>最常见的实现错误：用<strong>整个 batch 的平均梯度</strong>去裁剪（<code>clip(mean(g))</code>）。这是错的！必须<strong>先逐样本裁剪、再求和</strong>（<code>sum(clip(gᵢ))</code>）。原因：敏感度是「单个样本能改变求和多少」，只有逐样本裁剪才能把这个量钉死在 C。裁剪平均梯度无法限制单样本影响，隐私保证不成立。这也是 DP-SGD 工程上慢、费显存的根源——必须物化每条样本的梯度，不能只算 batch 平均（这正是 Opacus 用扩展层/vmap 向量化求逐样本梯度的原因）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="accounting"><span class="num">3</span>隐私会计：T 步为何没炸掉 ε</h2>
+  <h3>隐私会计：为什么 T 步没有把 ε 炸掉</h3>  <p>现在面对第二个漏洞：训练有 T 步，每步是一次高斯机制，隐私怎么累加？如果用模块 01 的朴素组合（ε 线性相加），T=10000 步、每步 ε=0.1，总 ε=1000——隐私彻底漏光，DP-SGD 根本不可用。DP-SGD 能成立，靠的是两个让 ε 增长<strong>远慢于线性</strong>的机制：<strong>子采样放大</strong>和<strong>高斯机制的紧致组合（moments accountant / RDP）</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>子采样放大的直觉：每步只在<strong>随机抽到的一小批</strong>样本上算梯度。对任何一个固定的样本，它<em>大概率根本没被这一步碰到</em>（被抽中的概率只有 q=L/N）。没被碰到 = 这一步对它没有隐私损失。于是<strong>单步的有效隐私损失被采样率 q 大幅缩小</strong>——直觉上约缩小到 q 倍。这就是为什么小 batch + 大数据集能用很小的噪声达到可用的 ε。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>紧致组合的直觉：朴素组合把每步的最坏情况 ε 直接相加，太悲观。<span class="term">moments accountant</span>（Abadi 2016）/ <span class="term">Rényi differential privacy</span>（RDP，Mironov 2017）改为追踪隐私损失随机变量的<strong>矩（moments）</strong>——而高斯机制的矩有闭式、且<strong>同阶 RDP 直接相加</strong>（不是取最坏情况界再相加）。累加完所有步的 RDP，再<strong>一次性</strong>转换回 (ε,δ)，得到的界比朴素组合紧<em>一个数量级以上</em>。</p></div>
+  </div>  <p>把三个旋钮和最终 ε 的关系记住（不必背公式，记趋势）：<strong>ε 随 σ 减小而增大（噪声少→隐私弱）、随步数 T 增大而增大（看数据次数多→损失累加）、随采样率 q 减小而减小（每步碰到的人少→放大保护）</strong>。实践中你设定目标 (ε,δ)、采样率 q、步数 T，会计器<strong>反解出需要的噪声乘子 σ</strong>；或反过来固定 σ、让会计器报告当前 ε。Opacus / TF-Privacy 内置的就是这个 RDP 会计器。</p>  <p>子采样放大有个<strong>致命的前提常被忽视</strong>：它只在采样是<strong>真随机</strong>时成立。理论上要求<span class="term">Poisson 采样</span>（每个样本每步独立地以概率 q 入选，batch 大小是随机的）或无放回均匀采样；如果你图省事用了<em>固定 shuffle 后顺序遍历</em>、或可预测的采样，放大假设就被破坏，<strong>实际隐私远差于会计器报告的 ε</strong>。这是「实现细节悄悄让 ε 失真」的典型——会计器算的是「假设你正确采样」的 ε，它管不了你到底怎么采的。本课 notebook 用 Poisson 风格采样并把它和会计对应起来，正是为了让你看清这个常被踩的坑。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么本课用 numpy 也能讲清会计？因为会计的本质是<strong>一串标量的累加规则</strong>——把每步的隐私损失（RDP 或矩）累加、最后转换。我们在 notebook 里用一个<strong>简化但趋势正确的会计器</strong>（基于子采样高斯的 RDP）模拟它：你会看到 ε 随 T 大约按 $\sqrt{T}$（而非 T）增长、随 σ 单调下降、随 q 单调上升——把 DP-SGD 为什么可行<em>用数字</em>看明白。真实会计器（如 Opacus 的 RDP accountant）只是把这套算到更精确。顺带一提：用强攻击反推的<strong>经验 ε</strong>（模块 05 的审计）常远小于会计证明的 ε——说明证明往往很松，这既是「可以放心调小噪声」的好消息，也是隐私会计仍在持续收紧的前沿。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="utility"><span class="num">4</span>效用代价：隐私换准确率</h2>
+  <h3>效用代价：隐私换来的准确率损失</h3>  <p>DP-SGD 不是免费的。相比普通 SGD，它多了两个伤害效用的来源：<strong>裁剪带来的偏差</strong>（大梯度被压短，方向虽保留但幅度信息丢失）和<strong>噪声带来的方差</strong>（每步梯度被高斯噪声污染）。结果是<strong>更慢的收敛、更低的最终准确率</strong>——这就是 DP 的效用代价在训练里的具体形态。</p>  <table>
+    <thead><tr><th>来源</th><th>机制</th><th>对训练的影响</th><th>缓解</th></tr></thead>
+    <tbody>
+      <tr><td><strong>裁剪偏差</strong></td><td>大梯度被截短到 C</td><td>梯度方向略偏、幅度信息丢失；C 太小伤害大</td><td>C 取梯度范数中位数附近；用自适应裁剪</td></tr>
+      <tr><td><strong>噪声方差</strong></td><td>每步加 σC 高斯噪声</td><td>梯度信噪比下降、收敛变慢、解更差</td><td>大 batch（噪声相对信号变小）、更多数据</td></tr>
+      <tr><td><strong>预算约束</strong></td><td>总 ε 限制了能训多少步</td><td>强隐私(小ε)下只能训很少步或加很大噪声</td><td>更紧的会计(RDP)、预训练 + DP 微调</td></tr>
+    </tbody>
+  </table>  <p>关键的实践认知：<strong>效用代价高度依赖数据规模、batch 大小、模型与超参</strong>。早期工作让人以为「DP-SGD 必然大幅掉点」，但 De et al. 2022 等后续工作证明：在<strong>大数据 + 大 batch + 合适技巧</strong>（如组归一化、预训练初始化、调好的 C 和学习率）下，DP-SGD 的代价可以小到惊人——甚至在 ImageNet 这种规模上达到接近非私有的准确率。所以「DP 必然没法用」是过时的成见。</p>  <p>超参之间还有微妙的耦合，是 DP-SGD 调参比普通训练更难的地方：<strong>大 batch 摊薄噪声（好）但减少步数预算下的更新次数</strong>；<strong>小 C 减噪声需求（好）但裁掉更多梯度信息（坏）</strong>；<strong>更多步 T 让模型学更久（好）但累加更多 ε（坏）</strong>。这些权衡没有解析最优，要靠在隐私预算约束下搜索。Ponomareva et al. 2023 的实操指南给了一套经验起点（先调 C 到梯度范数中位数、batch 尽量大、学习率随之调）。</p>  <p>一个<strong>反直觉但极重要</strong>的效用规律：DP-SGD 偏爱<strong>大 batch</strong>，方向恰好与普通 SGD 相反。普通训练常用小 batch（噪声梯度有正则效果、更新更频繁）；但 DP-SGD 里，加的高斯噪声标准差是 $\sigma C$、与 batch 大小<em>无关</em>，而信号（裁剪梯度之和）随 batch 线性增长——所以<strong>batch 越大，信噪比越高</strong>（噪声相对信号被摊薄）。这就是为什么 De et al. 2022 能用超大 batch（上万甚至百万）在 ImageNet 上把 DP 的代价压到很小：<em>大 batch 是 DP-SGD 对抗噪声最有力的杠杆</em>。代价是大 batch 需要更多算力、且在固定 ε 预算下步数变少，要配合调高学习率。理解「DP 反过来偏爱大 batch」，是把 DP-SGD 调出好效用的关键直觉之一。</p>  <div class="callout danger"><span class="label">端到端隐私</span>
+    <p>一个<strong>致命且隐蔽</strong>的坑：DP-SGD 的隐私保证依赖<strong>严格的子采样（Poisson 采样或无放回均匀采样）</strong>和<strong>会计器假设的训练流程</strong>。如果你偷偷做了会计器没算进去的数据访问——比如用全部数据调超参、early stopping 看了验证集、或用非私有的 batch norm（跨样本泄露统计量）——<strong>实际隐私会比报告的 ε 差，甚至失效</strong>。「我跑了 DP-SGD」不等于「我的整个流程是 ε-DP 的」：<em>超参搜索、模型选择、数据预处理的隐私都要一并核算</em>。这是 DP 工程最常被忽视的漏洞（模块 05 会专门讲端到端核算）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="relation"><span class="num">5</span>DP-SGD = 高斯机制 + 组合的应用</h2>
+  <h3>与模块 01 的关系：DP-SGD 是高斯机制 + 组合的应用</h3>  <p>退一步看 DP-SGD 在 DP 体系里的位置，能让前面的零碎拼成整体。DP-SGD<strong>没有发明新的隐私原语</strong>——它就是把模块 01 的工具组合应用：</p>  <div class="ascii">模块 01 的零件                    DP-SGD 怎么用它
+─────────────────────────────────────────────────────────
+敏感度 (sensitivity)        ←  裁剪范数 C 就是单步梯度求和的 L2 敏感度
+高斯机制 (Gaussian mech.)   ←  每一步 = 对裁剪梯度求和加 N(0,σ²C²) 的高斯机制
+子采样放大 (amplification)  ←  每步只用随机 batch -&gt; 单步隐私损失被 q 放大
+组合定理 (composition)      ←  T 步用 RDP/moments accountant 紧致累加
+后处理免疫 (post-processing)←  最终模型/预测 = 带噪梯度的后处理 -&gt; 自动私有
+隐私预算 (budget)           ←  目标 ε 决定 σ 与可训步数 T</div>  <p>这张对应表也是<strong>调试 DP-SGD 隐私的检查清单</strong>：裁剪对不对（敏感度）、噪声标定对不对（高斯机制）、采样是不是真随机（放大）、会计有没有算全所有数据访问（组合）。任何一环错了，报告的 ε 就名不副实。理解 DP-SGD = 「高斯机制 + 子采样 + 组合」的应用，你就能从第一性原理判断一个实现是否正确，而不是把 Opacus 当黑盒。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>还有一条与模块 01 的深层呼应：模块 01 说「想降噪声就降敏感度（裁剪取值范围）」。DP-SGD 把这句话用到了极致——<strong>逐样本梯度裁剪就是对「梯度」这个高维查询做取值范围限制</strong>。年龄裁剪到 [0,120]、梯度裁剪到范数 ≤ C，是同一个思想在标量和高维向量上的两次化身。看懂这点，DP-SGD 就不再神秘。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="variants"><span class="num">6</span>变体与替代：PATE / DP 微调 / …</h2>
+  <h3>变体与替代：不只有一种私有训练</h3>  <p>DP-SGD 是私有训练的主力，但不是唯一路线。了解几个变体和替代，能帮你在不同场景选对工具：</p>  <ul>
+    <li><strong>PATE</strong>（Papernot 2018）：把数据切给多个「教师」模型各自训练，对一个公共未标注集做<em>带噪投票</em>得到标签，再训一个「学生」模型。隐私来自投票的噪声聚合。当你有大量公共未标注数据时，PATE 的效用常优于 DP-SGD。</li>
+    <li><strong>DP-FTRL</strong>：不依赖子采样放大的私有优化器（用树形聚合给梯度前缀和加相关噪声），在每步必须看全量数据（无法 Poisson 采样）的场景（如某些联邦设置）更适用。</li>
+    <li><strong>DP 微调</strong>：先在公共数据上正常预训练，再只用 DP-SGD 做<em>微调</em>。这是目前大模型私有化最实用的范式——预训练吸收大部分知识（不耗隐私预算），DP 只保护私有的微调数据，效用代价小得多。</li>
+    <li><strong>output / objective perturbation</strong>:对凸问题（如逻辑回归），可以只对<em>最终解</em>或<em>损失函数</em>加一次噪声就满足 DP，无需逐步加噪。效用更好但只适用于有良好理论结构的简单模型。</li>
+  </ul>  <p>怎么选？粗略的决策树：<strong>有公共未标注数据 → PATE</strong>；<strong>大模型 + 有公共预训练 → DP 微调</strong>；<strong>凸/简单模型 → output perturbation</strong>；<strong>通用深度网络、能子采样 → DP-SGD</strong>；<strong>联邦/不能子采样 → DP-FTRL</strong>。本课聚焦 DP-SGD 因为它最通用、最能讲清「裁剪+加噪+会计」这套可迁移到所有变体的核心思想。</p>  <div class="callout paper"><span class="label"></span>
+    <p>延伸：Papernot 2018（PATE）、De 2022（大规模高准确率 DP）、Ponomareva 2023（DP-fy ML 实操）、Yousefpour 2021（Opacus）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="production"><span class="num">7</span>从 numpy 到 Opacus 生产</h2>
+  <h3>从 numpy 到生产：Opacus 的工程</h3>  <p>本课在 numpy 里手算逐样本梯度、裁剪、加噪、用简化会计器累加 ε。生产中 PyTorch 的 <strong>Opacus</strong>（和 TF-Privacy）把这些自动化，但核心逻辑与你写的完全一致。值得知道它们解决了哪些工程难点：</p>  <table>
+    <thead><tr><th>难点</th><th>本课 numpy 做法</th><th>Opacus 生产做法</th></tr></thead>
+    <tbody>
+      <tr><td>逐样本梯度</td><td>手动对每个样本各算一次梯度（慢但清晰）</td><td>扩展层 / functorch vmap 向量化，一次前后传出全 batch 逐样本梯度</td></tr>
+      <tr><td>逐样本裁剪</td><td>循环裁剪每条梯度</td><td>向量化裁剪 + 高效求和</td></tr>
+      <tr><td>高斯噪声</td><td>np.random.normal 加到梯度和上</td><td>GradSampleModule 自动注入校准噪声</td></tr>
+      <tr><td>隐私会计</td><td>简化 RDP 累加器</td><td>RDPAccountant：精确子采样高斯 RDP + 转换</td></tr>
+      <tr><td>不兼容层</td><td>玩具模型无此问题</td><td>替换 BatchNorm（跨样本泄露）为 GroupNorm 等</td></tr>
+    </tbody>
+  </table>  <p>最值得记住的一条工程教训：<strong>BatchNorm 与 DP 不兼容</strong>。BatchNorm 在前向中用<em>整个 batch 的统计量</em>归一化每个样本——这让一个样本的输出依赖其他样本，破坏了「逐样本梯度」的独立性，隐私会计不再成立。Opacus 会强制你把 BatchNorm 换成 GroupNorm / LayerNorm（只用单样本自身的统计）。这类「某些常见组件偷偷跨样本泄露」的陷阱，正是把 numpy 原型搬到真实模型时最容易栽的地方。</p>  <p>从本课到生产的路径很短：你在 numpy 里验证过的「逐样本裁剪 + 加噪 + 会计」逻辑，对应到 Opacus 就是 <code>privacy_engine.make_private(...)</code> 几行；你理解的「σ、q、T → ε」关系，对应 <code>accountant.get_epsilon(delta)</code>。<strong>本课负责让你看懂黑盒里在做什么、为什么、哪里会错</strong>，这样你用 Opacus 时不会把 ε 调错、不会漏算超参搜索的隐私、不会用了 BatchNorm 还以为自己私有。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个反复出现的主题：<strong>库能保证「单次训练是 ε-DP」，但保证不了「你的整个 ML 流程是 ε-DP」</strong>。Opacus 不知道你用全量数据调了超参、不知道你看了多少次验证集、不知道你的数据预处理碰没碰原始数据。<em>端到端的隐私核算是人的责任，不是库的责任</em>——这也是为什么本课最后一个模块专门讲可信部署与审计。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>效用-隐私前沿的推进</strong>：如何在更小 ε 下达到更高准确率？方向包括更好的预训练初始化、自适应裁剪、私有特征学习（Tramèr & Boneh 2021 指出好特征比更多数据更关键）、以及更紧的会计。</li>
+    <li><strong>会计的极限</strong>：从 moments accountant 到 RDP 到 PLD（privacy loss distribution）数值会计，「同样噪声证明多小的 ε」仍在进步。会计越紧，同隐私下能用的噪声越小、效用越高。</li>
+    <li><strong>自适应与个体化裁剪</strong>：固定 C 对所有样本一刀切并不最优。按样本/按层自适应裁剪、个体化隐私预算（不同用户不同 ε）是活跃方向，但会让会计更复杂。</li>
+    <li><strong>大模型的私有化</strong>：LLM 的 DP 微调、DP 上下文学习、私有合成数据生成（用 DP 训一个生成器再产数据）是把 DP 推向前沿模型的热点，与记忆/抽取攻击（C44）正面对抗。</li>
+    <li><strong>经验 ε 与审计</strong>：用最强成员推断攻击（LiRA，Carlini 2022）反推 DP-SGD 的实际隐私下界（Nasr 2021），常发现证明的 ε 很松。弥合「证明 ε」与「经验 ε」既能放心调小噪声，也是验证实现正确性的手段（模块 05）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Abadi 2016（DP-SGD + moments accountant，本模块的源头）、Mironov 2017（RDP，会计基础）、De 2022（大规模高准确率）、Ponomareva 2023（实操）。清单见 <code>references.md</code>。</p>
+  </div>  <div class="card"><strong>✅ 本章你应该能回答：</strong>  <ol>
+    <li>DP-SGD 相对普通 SGD 多做了哪两件事？为什么必须逐样本裁剪而不是裁剪 batch 平均梯度？</li>
+    <li>裁剪范数 C 在隐私上扮演什么角色（提示：敏感度）？噪声乘子 σ 怎么影响隐私和效用？</li>
+    <li>为什么 T 步训练没有把 ε 炸成 Tε？子采样放大和 RDP/moments accountant 各贡献了什么？</li>
+    <li>DP-SGD 的效用代价来自哪两个源头？哪些因素（数据量、batch、超参）影响它、怎么缓解？</li>
+    <li>为什么 BatchNorm 和 DP-SGD 不兼容？为什么「跑了 DP-SGD」不等于「整个流程是 ε-DP」？</li>
+    <li>DP-SGD 是模块 01 哪几个零件的组合应用？列出对应关系。</li>
+  </ol></div>
+
+  <div class="pager">
+    <a class="prev" href="../01_differential_privacy/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 差分隐私</div></a>
+    <a class="next" href="../03_federated_learning/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 联邦学习</div></a>
+  </div>
+
+</div>
+</body>
+</html>

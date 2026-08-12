@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Self-Consistency 与 Best-of-N：采样聚合的统计学</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · Self-Consistency 与 Best-of-N：采样聚合的统计学</h1>
+  <p class="subtitle">一次采样是一个随机变量，N 次采样是一个分布 —— 测试时计算的第一性原理：你聚合的不是答案，是答案分布的形状</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">二项/多项分布、大数定律与集中不等式的直觉；模块 01 的 CoT 采样</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_self_consistency_bon.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Wang 2022 (self-consistency)、Chen 2021 (pass@k)、Brown 2024 (LLM Monkeys)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#motivation">为什么一次采样不够：答案是一个随机变量</a></li>
+      <li><a href="#jury">Self-consistency 与陪审团定理：投票何时指数收敛</a></li>
+      <li><a href="#shape">答案分布的形状决定聚合收益</a></li>
+      <li><a href="#bon">Best-of-N 与 pass@k：有没有选择器是本质区别</a></li>
+      <li><a href="#monkeys">Large Language Monkeys：覆盖率与幂律</a></li>
+      <li><a href="#semantics">consensus@k 与 majority@k 的工程语义</a></li>
+      <li><a href="#temperature">温度：多样性–质量权衡与倒 U 曲线</a></li>
+      <li><a href="#eval">评测视角与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="motivation"><span class="num">1</span>为什么一次采样不够：答案是一个随机变量</h2>
+
+  <p>对同一道题、同一个 prompt、同一个模型，温度 $T&gt;0$ 时每次采样得到的最终答案是从一个<strong>答案分布</strong>中抽出的样本。
+  把第 $i$ 道题的答案分布记作 $p_i(\cdot)$，正确答案 $a_i^\star$ 的概率记作 $q_i = p_i(a_i^\star)$。
+  于是一切测试时计算（<span class="term">test-time compute, TTC</span>）策略都可以用一句话概括：
+  <strong>花更多采样预算，对 $p_i$ 做更聪明的统计估计或搜索</strong>。本章只讲其中最简单也最常用的一族：
+  采 $N$ 条独立样本然后<strong>聚合</strong>（投票、选优、覆盖）。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>模型做一道数学题，答对的概率可能只有 40%。但如果它每次错的方式都不一样（这次算错进位、下次抄错符号），
+      错误答案就会"散开"，而正确答案稳定地占 40% —— 采 20 次投个票，正确答案几乎必然是票王。
+      反过来，如果模型有一个<strong>共同的错误信念</strong>（比如一致认为某个公式长那样），那 20 次会齐刷刷错在同一个地方，
+      投票只会把错误投得更自信。聚合放大的是<strong>众数</strong>，不是正确性。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>独立采样 $N$ 次，答案 $a$ 的得票数 $C_N(a) \sim \mathrm{Binomial}(N, p_i(a))$，
+      由大数定律 $C_N(a)/N \to p_i(a)$。因此 majority vote 的极限行为完全由 $p_i$ 的<strong>众数</strong>决定：
+      $N\to\infty$ 时投票收敛到 $\arg\max_a p_i(a)$，与正确性无关。
+      聚合是一个把"答案分布的形状"映射为"准确率"的算子 —— 理解这族方法等价于理解这个算子的性质。</p>
+    </div>
+  </div>
+
+  <p>这一视角的实践来源是 <span class="term">self-consistency</span>（Wang et al. 2022, arXiv:2203.11171）：
+  对 chain-of-thought prompting 不做贪心解码，而是采样 $N$ 条不同的推理链（CoT），
+  对它们的<strong>最终答案</strong>（不是推理过程）做多数表决。GSM8K 上把 PaLM-540B 从 56.5% 推到 74.4%，
+  一行训练代码都不用改。它能成立依赖一个被论文标题点破的假设：<em>正确的推理过程往往殊途同归到同一个答案，
+  错误的推理过程则各错各的</em> —— 翻译成统计语言，就是下一节的陪审团条件。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="jury"><span class="num">2</span>Self-consistency 与陪审团定理：投票何时指数收敛</h2>
+
+  <h3>2.1 二元情形：Condorcet 陪审团定理</h3>
+  <p>先看最简单的二元代理模型：每条样本独立、以概率 $p$ 给出正确答案。$N$（取奇数）条样本的多数表决正确率为</p>
+  <div class="math-block">
+  $$ P_{\text{maj}}(N) \;=\; \sum_{j &gt; N/2}^{N} \binom{N}{j} p^{j} (1-p)^{N-j} $$
+  </div>
+  <p><span class="term">Condorcet 陪审团定理（1785）</span>给出两面性结论：若 $p &gt; \tfrac12$，则 $P_{\text{maj}}(N)$ 随 $N$ 单调升、
+  $N\to\infty$ 时趋于 1；若 $p &lt; \tfrac12$，则单调降、趋于 0。收敛速度由 Hoeffding/Chernoff 界控制：</p>
+  <div class="math-block">
+  $$ 1 - P_{\text{maj}}(N) \;\le\; \exp\!\big(-2N(p - \tfrac12)^2\big) $$
+  </div>
+  <p>两个直接推论：① 收敛是<strong>指数</strong>的，但速率被 $(p-\tfrac12)^2$ 平方惩罚 —— $p=0.55$ 时要 $N\approx 460$ 才把错误率压到 1%，
+  $p=0.7$ 时只要 $N\approx 58$。<strong>聚合对"接近随机"的模型几乎无能为力</strong>；
+  ② 定理是双刃剑：$p&lt;\tfrac12$ 时同样的指数速度收敛到<strong>错误</strong>答案。投票不创造信息，只锐化已有的分布。</p>
+
+  <h3>2.2 多类情形：plurality 与"正确答案只需是众数"</h3>
+  <p>真实答案空间不是二元的。设正确答案概率 $q$，最大的单个错误答案概率 $w_{\max} = \max_{a \ne a^\star} p(a)$。
+  多类相对多数表决（<span class="term">plurality vote</span>）的极限条件放松为：</p>
+  <div class="math-block">
+  $$ q \;&gt;\; w_{\max} \;\Longrightarrow\; P_{\text{plur}}(N) \to 1, \qquad
+     q \;&lt;\; w_{\max} \;\Longrightarrow\; P_{\text{plur}}(N) \to 0 $$
+  </div>
+  <p>这比 $q&gt;\tfrac12$ 弱得多：<strong>正确答案不需要过半，只需要比任何单个错误答案更常见</strong>。
+  $q=0.3$ 而九个错误答案各占 $0.078$ 时，投票照样收敛到 1。这就是 self-consistency 在 $q$ 远小于 0.5 的难题上仍然有效的原因
+  —— 错误被"摊薄"了。收敛速率同样是指数的，由间隔（margin）$\,q - w_{\max}$ 控制（两个二项变量的大偏差竞争）。</p>
+
+  <h3>2.3 失效模式：系统性偏差</h3>
+  <p>陪审团定理的全部魔法都依赖一个假设：<strong>错误是分散的（diverse errors）</strong>。它在两类情形下碎裂：</p>
+  <ul>
+    <li><strong>共享错误先验（systematic bias）</strong>：所有样本来自<em>同一个模型</em>，共享同一套权重、同一些错误的世界知识或推理捷径。
+    若模型对某题有一个吸引力强的错误解法（错误的公式、被污染的记忆、表面特征捷径），则 $w_{\max}$ 可以远大于 $q$，
+    采样 1000 次也只是把这个错误测得更准。注意这与"采样独立"不矛盾：样本在<em>给定模型</em>下条件独立，
+    但模型本身的偏差是所有样本的公共因子 —— 类似 clustered errors，有效样本量远小于 $N$。</li>
+    <li><strong>答案空间退化</strong>：自由生成的答案需要归一化（normalize）后才能投票（"1/2" vs "0.5" vs "50%"）。
+    归一化太松会把不同答案错并成一个，太紧会把同一答案拆散 —— 投票结果对答案抽取/匹配规则敏感，这是模块 01 答案抽取问题的延续。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>评测含义：majority@N 升而 pass@1 不升，说明的是分布形状、不是能力上限。</strong>
+  反之，如果某模型 majority@64 反而<em>低于</em> pass@1（实践中真实存在），它在告诉你：该模型的众数答案系统性错误，
+  而正确答案躲在分布尾部。这本身是一个重要的诊断信号 —— 模型"知道"正确答案（会以低概率给出）但"相信"错误答案。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="shape"><span class="num">3</span>答案分布的形状决定聚合收益</h2>
+
+  <p>把上面的条件整理成一张"形状 → 命运"对照表。聚合算子只看 $p_i$ 的形状：</p>
+
+  <table>
+    <thead><tr><th>答案分布形状</th><th>典型成因</th><th>majority vote ($N\!\to\!\infty$)</th><th>oracle Best-of-N / pass@N</th></tr></thead>
+    <tbody>
+      <tr><td><strong>峰在正确答案</strong>（$q &gt; w_{\max}$，哪怕 $q$ 很小）</td><td>会做但不稳：错误来自计算/抄写噪声，各错各的</td><td>→ 1，指数收敛，<strong>聚合收益最大</strong></td><td>→ 1（更快）</td></tr>
+      <tr><td><strong>峰在错误答案</strong>（$q &lt; w_{\max}$）</td><td>系统性偏差：错误公式、记忆污染、推理捷径</td><td>→ 0，<strong>投票放大错误</strong></td><td>仍 → 1（只要 $q&gt;0$），但需要 verifier 兜底</td></tr>
+      <tr><td><strong>近均匀 / 高熵</strong>（$q \approx w_{\max} \approx$ 小）</td><td>完全不会做，纯猜</td><td>≈ 随机，margin 太小、收敛极慢</td><td>随 $N$ 缓慢爬升（覆盖率视角，见第 5 节）</td></tr>
+      <tr><td><strong>退化分布</strong>（$T\to 0$，所有样本相同）</td><td>贪心解码 / 温度过低</td><td>= pass@1，聚合零收益</td><td>= pass@1，零收益</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  一个值得内化的口号：<strong>majority vote 估计的是 $\arg\max$，Best-of-N 估计的是 support</strong>。
+  前者问"分布的峰在哪"，后者问"正确答案在不在分布的支撑集里、概率多大"。
+  同一个 $N$ 花出去，两者回答的是关于 $p_i$ 的两个不同问题 —— 所以它们该用在不同的场景，也该在评测报告里被区分对待。</div>
+
+  <p>configurable 的细节：投票的对象是<strong>归一化后的最终答案</strong>而非整条 CoT（两条不同推理得到同一答案应合并计票）；
+  加权变体（按 logprob、按长度、按 verifier 分数加权）在原论文中收益有限，但在现代 reasoning model 上
+  weighted majority 与 verifier-weighted voting 是活跃的工程方向。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="bon"><span class="num">4</span>Best-of-N 与 pass@k：有没有选择器是本质区别</h2>
+
+  <h3>4.1 一组容易混淆的名词</h3>
+  <table>
+    <thead><tr><th>名词</th><th>定义</th><th>需要什么</th><th>测的是什么</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">pass@k</span></td><td>采 $k$ 条，<strong>任意一条</strong>正确即算对</td><td>oracle 判分器（评测时有标准答案）</td><td><strong>覆盖率</strong>：能力上限 / 解的存在性</td></tr>
+      <tr><td><span class="term">Best-of-N (BoN)</span></td><td>采 $N$ 条，用<strong>选择器</strong>挑一条提交</td><td>verifier / reward model / 投票等选择器</td><td>"采样 + 选择"整个系统的部署性能</td></tr>
+      <tr><td><span class="term">majority@k</span> (= self-consistency)</td><td>采 $k$ 条，提交众数答案</td><td>只需答案可归一化比较，<strong>无需 verifier</strong></td><td>分布峰的位置</td></tr>
+    </tbody>
+  </table>
+  <p>关键区别一句话：<strong>pass@k 假设你有 oracle（上帝视角），BoN 假设你有 verifier（凡人视角），majority 什么都不假设</strong>。
+  因此恒有 $\text{majority@}k \le \text{BoN-verifier@}k \le \text{pass@}k$（verifier 完美时取右等号）。
+  pass@k 是给<em>研究者</em>看的能力上限指标，不可直接当部署性能宣传 —— 部署时没人替你判对错；
+  BoN 的成绩则是模型与 verifier 的<strong>联合成绩</strong>，verifier 的假阳率决定了 BoN 随 $N$ 增长的天花板（见第 8 节）。</p>
+
+  <h3>4.2 pass@k 的无偏估计（Chen et al. 2021, arXiv:2107.03374）</h3>
+  <p>天真的做法 —— 采恰好 $k$ 条算命中率 —— 方差大且浪费样本。Codex 论文的标准做法：
+  对每道题采 $n \ge k$ 条，数出其中 $c$ 条正确，则"从 $n$ 条中均匀无放回抽 $k$ 条、至少一条正确"的概率有闭式：</p>
+  <div class="math-block">
+  $$ \widehat{\text{pass@}k} \;=\; \mathop{\mathbb{E}}_{\text{problems}}\!\left[\, 1 - \frac{\binom{n-c}{k}}{\binom{n}{k}} \,\right] $$
+  </div>
+  <p>这是 $\text{pass@}k = \mathbb{E}_i[1-(1-q_i)^k]$ 在"$n$ 次伯努利观测"下的<strong>无偏估计</strong>
+  （超几何恒等式：$\mathbb{E}_c\big[\binom{n-c}{k}/\binom{n}{k}\big] = (1-q)^k$）。
+  而天真插件估计 $1-(1-\hat q)^k$（$\hat q = c/n$）是<strong>有偏的</strong>：$f(q)=1-(1-q)^k$ 对 $q$ 凹，
+  Jensen 给出 $\mathbb{E}[f(\hat q)] \le f(q)$ —— 插件估计<strong>系统性低估</strong>覆盖率，$k$ 越接近 $n$ 偏差越大。两个实现要点：</p>
+  <ul>
+    <li><strong>数值稳定</strong>：$\binom{n-c}{k}/\binom{n}{k} = \prod_{i=n-c+1}^{n} \frac{i-k}{i}$，
+    应在对数域累加 $\sum \log(1 - k/i)$ 或用连乘 <code>np.prod(1 - k / np.arange(n-c+1, n+1))</code>，绝不要直接算两个大组合数相除；</li>
+    <li><strong>边界</strong>：$n - c &lt; k$ 时必命中（抽 $k$ 条必含正确），直接返回 1；$c=0$ 返回 0。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  pass@k 的姊妹指标 <span class="term">pass^k</span>（k 次<strong>全部</strong>正确，agentic 评测衡量可靠性）方向完全相反：
+  pass@k 随 k 单调升，pass^k 随 k 单调降。报告里看到 "pass" 字样先确认是 @ 还是 ^ —— 一个测上限、一个测下限。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="monkeys"><span class="num">5</span>Large Language Monkeys：覆盖率与幂律</h2>
+
+  <p>Brown et al. 2024（<em>Large Language Monkeys: Scaling Inference Compute with Repeated Sampling</em>, arXiv:2407.21787）
+  把"暴力重复采样"系统地推到 $N=10{,}000$，给出两个经验规律：</p>
+  <ul>
+    <li><strong>覆盖率（coverage = pass@k）随 $k$ 持续增长，跨越多个数量级不饱和</strong>。SWE-bench Lite 上
+    DeepSeek-Coder-V2-Instruct 从一次采样的 15.9% 升到 250 次采样的 56%（当时超过单样本 SOTA）；
+    弱小模型重采样后可超过强模型单次采样 —— 在固定算力预算下，"小模型 × 多采样"有时比"大模型 × 一次"更划算。</li>
+    <li><strong>覆盖率与 $k$ 的关系常呈幂律形态</strong>：经验上 $\log(\text{coverage})$ 对 $\log k$ 近似直线（低覆盖段），
+    论文用 exponentiated power law $\;c_k \approx \exp(a\,k^{-b})$ 拟合。这暗示存在类似 scaling laws 的
+    <span class="term">inference-time scaling law</span>：采样预算与训练算力一样，是可预测的标度轴。</li>
+  </ul>
+
+  <h3>幂律从哪来：难度的混合分布</h3>
+  <p>单题覆盖率是指数饱和的：$1-(1-q_i)^k$，毫无幂律。幂律来自<strong>对题目难度求平均</strong>。
+  设题目难度 $q_i \sim f(q)$，整体覆盖率</p>
+  <div class="math-block">
+  $$ c_k \;=\; \int_0^1 \big(1-(1-q)^k\big)\, f(q)\, dq \;=\; 1 - \int_0^1 (1-q)^k f(q)\, dq $$
+  </div>
+  <p>若 $f$ 在 $q\to 0^+$ 处有形如 $q^{\alpha-1}$ 的密度（大量"几乎不会做"的长尾难题，如 Beta 分布 $\alpha&lt;1$），
+  Watson 引理式的渐近给出 $1 - c_k \sim k^{-\alpha}$ 的多项式衰减 —— <strong>幂律是难题长尾的集体签名</strong>，
+  不是单题机制。notebook 会用 Beta 难度分布直接复现这条 log-log 直线。这与 scaling law 的"幂律来自任务难度谱"假说同构，
+  也解释了为什么不同 benchmark 拟合出的指数 $b$ 不同：它度量的是<strong>该 benchmark 的难度分布尾部厚度</strong>。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  Monkeys 的冷水也要泼：覆盖率暴涨只在<strong>有自动 verifier 的域</strong>（代码有单元测试、数学有可校验答案）能兑现成真实性能。
+  在无 verifier 的域，他们发现 majority vote 与 reward model 选择在 $N$ 超过百量级后<strong>饱和甚至回落</strong>，
+  与覆盖率之间出现巨大缺口 —— "答案在 10000 条样本里"与"你能把它挑出来"是两回事。这个 <strong>verifier gap</strong>
+  正是后续模块（PRM、search、RLVR）的出发点。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="semantics"><span class="num">6</span>consensus@k 与 majority@k：工程语义</h2>
+
+  <p>模型卡片与论文里的聚合口径并不统一，读数前先查定义：</p>
+  <table>
+    <thead><tr><th>口径</th><th>常见定义</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td><strong>maj@k / majority@k</strong></td><td>k 条样本众数答案的准确率</td><td>平票规则（随机 / 取最先出现 / 按 logprob）会在小 k 时影响零点几个点，论文常不写明 —— 复现差异的常见来源</td></tr>
+      <tr><td><strong>cons@k / consensus@k</strong></td><td>多数场合 = majority@k 的别名（OpenAI o1 卡片用 cons@64）</td><td>个别工作把 consensus 定义为"达到一致才提交、否则弃权"，此时它是<strong>选择性预测</strong>指标，伴随 coverage 一起报告</td></tr>
+      <tr><td><strong>avg@k / mean@k</strong></td><td>k 条样本各自判分后取平均（= $\hat q$ 的均值）</td><td>不是聚合策略，是降低<strong>评测方差</strong>的手段；AIME 这类小数据集（30 题）必须 avg@32 以上才有可比性</td></tr>
+      <tr><td><strong>pass@k</strong></td><td>见第 4 节</td><td>能力上限口径，禁止与上面三者直接对比</td></tr>
+    </tbody>
+  </table>
+
+  <p>实例：OpenAI o1 system card 在 AIME 上同时报告 pass@1（单样本均值）与 cons@64；
+  DeepSeek-R1 报告 pass@1（avg over 64 samples）与 cons@64（AIME 2024：79.8% pass@1 vs 86.7% cons@64）；
+  Gemini、Grok 的发布材料也混用 maj@k。<strong>同一个模型、同一个数据集，pass@1 与 cons@64 可以差 7–15 个百分点</strong>
+  —— 不注明口径的榜单数字没有比较意义。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="temperature"><span class="num">7</span>温度：多样性–质量权衡与倒 U 曲线</h2>
+
+  <p>温度 $T$ 通过 $p_T(a) \propto \exp(z_a / T)$ 控制答案分布的熵，它同时拨动两个反向的旋钮：</p>
+  <ul>
+    <li><strong>质量（per-sample quality）</strong>：$T$ 升高，单样本正确率 $q(T)$ 通常先平后降（若贪心答案正确）——
+    每条样本变"笨"；</li>
+    <li><strong>多样性（diversity）</strong>：$T \to 0$ 时所有样本退化为同一条，$N$ 条样本只值 1 条，任何聚合收益归零；
+    $T$ 升高，样本间相关性下降、支撑集变宽，覆盖率上升。</li>
+  </ul>
+  <p>固定采样预算 $N$ 下，聚合收益 = 两者的乘积效应，于是出现<strong>倒 U</strong>：
+  $T$ 太低 → 没有东西可聚合；$T$ 太高 → 聚合的全是噪声；最优 $T^\star$ 在中间，
+  且经验上<strong>聚合方法的 $T^\star$ 高于单样本最优温度</strong>（self-consistency 原文用 $T=0.7$ 而非贪心；
+  pass@k 评测惯例 $k&gt;1$ 时用 $T\approx 0.6\!-\!0.8$、pass@1 用低温或贪心）。
+  一个微妙点：若贪心答案本身错误（$\arg\max_a z_a \ne a^\star$），升温反而<em>提高</em>单样本正确率的上界 ——
+  notebook 会构造这个情形，看到 pass@1 与 pass@16 的倒 U 峰位置不同。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  与模块 01 的解码策略衔接：top-p / top-k 截断同样在调"分布形状"，min-p 等新方法的卖点正是
+  "高温下保住质量"以喂饱聚合。<strong>评测时温度是结果的一部分</strong>：报告 maj@64 而不报温度，等于报了实验结果不报实验条件。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">8</span>评测视角与开放问题</h2>
+
+  <h3>8.1 评测科学家的 checklist</h3>
+  <ul>
+    <li><strong>口径声明</strong>：pass@1 还是 maj@32？平票规则？温度、top-p、max tokens？答案归一化规则？
+    任何一项变化都能制造几个点的"虚假 SOTA"。</li>
+    <li><strong>算力公平（compute-matched comparison）</strong>：maj@64 的模型 A 对 pass@1 的模型 B 是 64 倍推理预算的不对称比较。
+    正确做法是画 <strong>accuracy vs. inference FLOPs/token 数</strong> 的帕累托前沿，而不是单点对比；
+    reasoning model 的"思考 token"也应计入同一预算轴（一条 32k-token 的 CoT ≈ 64 条 512-token 采样）。</li>
+    <li><strong>方差与显著性</strong>：avg@k 报告应附标准误；AIME 30 题 × 单样本的方差大到模型排名可被随机种子翻转。</li>
+    <li><strong>诊断性使用</strong>：pass@k − maj@k 的缺口测"分布峰是否在正确答案"；maj@k 随 k 的斜率测错误多样性；
+    maj@k &lt; pass@1 是系统性偏差的红旗。聚合指标族是免费的分布显微镜。</li>
+  </ul>
+
+  <h3>8.2 开放问题</h3>
+  <ul>
+    <li><strong>verifier gap 怎么关</strong>：覆盖率幂律增长，但无 oracle 时 majority / RM 选择在大 $N$ 饱和。
+    更强的 process reward model、生成式 verifier、自我验证（self-verification）能吃掉多少缺口？
+    verifier 本身被 Goodhart（BoN 对 RM 的过优化随 $N$ 增长，KL 约 $\log N - \frac{N-1}{N}$）怎么量化？</li>
+    <li><strong>聚合与 RL 训练的关系</strong>：RLVR/GRPO 本质上是把"采样 + verifier 筛选"蒸馏回权重 ——
+    训练时的 pass@k 提升会转化为部署时的 pass@1。但有证据（Yue et al. 2025 等）显示 RLVR 主要是<strong>锐化</strong>分布
+    （提高 $q_i$ 中本来就不为零的那些），大 $k$ 下 base model 的 pass@k 反而可能反超 —— 聚合指标成了
+    "RL 是否创造新能力"之争的核心测量工具。</li>
+    <li><strong>难度自适应预算</strong>：均匀给每题 $N$ 条是浪费 —— 简单题 1 条够、难题 1000 条也不够。
+    按熵 / 一致率早停（答案一致就停）能省 50%+ 算力。最优停止规则的理论刻画仍开放。</li>
+    <li><strong>非可验证域的聚合</strong>：开放式写作没有"众数答案"可投。universal self-consistency（让模型自选最一致的一条）、
+    embedding 聚类投票等方法的统计性质远不如 exact-match 投票清楚。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>陪审团定理给出的收敛速率是什么形式？多类情形下"$q$ 只需超过 $w_{\max}$"为什么比二元条件弱得多？</li>
+      <li>什么样的错误结构会让 majority vote 收敛到错误答案？为什么"采样独立"不能防住系统性偏差？</li>
+      <li>写出 pass@k 无偏估计的公式；为什么插件估计 $1-(1-c/n)^k$ 有偏？数值上怎么稳定地实现？</li>
+      <li>单题覆盖率是指数饱和的，Monkeys 的幂律从哪里来？指数 $b$ 度量了 benchmark 的什么性质？</li>
+      <li>pass@1、maj@32、cons@64、avg@64、pass@64 各自的语义？哪些可以互相比较、哪些不行？</li>
+      <li>为什么聚合方法的最优温度高于单样本最优温度？倒 U 的两端分别是什么机制？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../01_cot_decomposition/01_讲解.html"><div class="dir">← 上一章</div><div class="t">01 · Chain-of-Thought 与推理能力的引出</div></a>
+    <a class="next" href="../03_verifiers_prm/03_讲解.html"><div class="dir">下一章 →</div><div class="t">03 · 验证器与过程奖励模型（PRM）</div></a>
+  </div>
+
+</div>
+</body>
+</html>

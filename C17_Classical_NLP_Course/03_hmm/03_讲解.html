@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 隐马尔可夫模型 HMM</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 隐马尔可夫模型 HMM</h1>
+  <p class="subtitle">给序列的每个词标隐藏标签 —— 三大问题、对数空间前向-后向、Viterbi 解码（sum→max 对偶）、Baum-Welch，纯 numpy 从零并对拍暴力枚举，做词性标注</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">概率（联合/条件/边缘）、对数与 log-sum-exp、动态规划、模块 02</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_hmm.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Rabiner 1989（HMM 教程）、SLP 附录 A & 第 8 章、Viterbi 1967、Baum 1970</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#hmm">HMM：隐藏标签的生成式故事</a></li>
+      <li><a href="#three">三大问题与动态规划</a></li>
+      <li><a href="#forward">前向算法与对数空间</a></li>
+      <li><a href="#viterbi">Viterbi 解码：sum→max 对偶</a></li>
+      <li><a href="#learn">参数学习：监督与 Baum-Welch</a></li>
+      <li><a href="#pos">完整 POS 标注器与局限</a></li>
+      <li><a href="#apps">更大图景：序列建模的元方法</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hmm"><span class="num">1</span>HMM：隐藏标签的生成式故事</h2>
+  <p>前两个模块处理「词」和「词序列的概率」。现在上一个新台阶：给序列里的<strong>每一个词</strong>打一个<strong>隐藏的标签</strong>。最经典的例子是 <span class="term">POS tagging</span>（词性标注）：给「I book a flight」标出 I=代词、book=动词、a=限定词、flight=名词。注意 book 既可以是动词也可以是名词——<strong>正确的标签取决于上下文</strong>，这正是序列标注的难点与魅力。</p>  <p>怎么建模这件事？<span class="term">HMM</span>（隐马尔可夫模型）提供了一个优雅的<strong>生成式</strong>故事：想象语言是这样「生成」出来的——有一个隐藏的标签序列（词性）在背后按某种规律演化，每个标签再「吐出」一个我们能看到的词。我们看到的是词（观测），看不到的是标签（隐状态），任务是<strong>从观测反推隐状态</strong>。</p>  <p>HMM 建立在两个<strong>马尔可夫假设</strong>之上，它们让这个故事可计算：</p>  <ul>
+    <li><strong>有限历史（转移）</strong>：当前隐状态只依赖前一个隐状态——$P(s_t\mid s_1^{t-1})=P(s_t\mid s_{t-1})$。词性也大致如此：限定词后面大概率跟名词。</li>
+    <li><strong>输出独立（发射）</strong>：当前观测只依赖当前隐状态——$P(o_t\mid s_1^t, o_1^{t-1})=P(o_t\mid s_t)$。一个词由它的词性「决定」（名词位置容易出现 flight、book、cat）。</li>
+  </ul>  <p>由这两个假设，HMM 由三组参数完全刻画：初始分布 $\pi$、转移矩阵 $A$、发射矩阵 $B$。整条「标签+词」序列的联合概率有一个干净的乘积形式：</p>  <div class="math-block">\[P(O, S) = \pi_{s_1} B_{s_1, o_1} \prod_{t=2}^{T} A_{s_{t-1}, s_t}\, B_{s_t, o_t}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>HMM 把语言想象成一台「掷骰子机器」：先按 $\pi$ 掷出第一个隐藏标签，每个标签按 $B$ 掷出一个词，再按 $A$ 掷出下一个标签，循环往复。我们只看到吐出的词，要猜背后的标签序列。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>HMM 是定义在 $(O, S)$ 上的联合分布（生成式），$\pi\in\mathbb{R}^S$、$A\in\mathbb{R}^{S\times S}$（行随机）、$B\in\mathbb{R}^{S\times V}$（行随机）。两个条件独立假设把指数级的联合概率因子化成 $O(T)$ 个因子之积——这正是后面所有动态规划算法成立的根基。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>本模块的核心问题：<strong>给定一个 HMM 和一串观测，(1) 这串观测有多大概率？(2) 最可能的隐状态序列是什么？(3) 没有标签时怎么学参数？</strong>——答案分别是前向算法、Viterbi、Baum-Welch。学完你能在对数空间从零实现前向与 Viterbi（对拍暴力枚举），并用 HMM 做词性标注。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="three"><span class="num">2</span>三大问题与动态规划</h2>
+  <p>Rabiner 1989 的经典教程把 HMM 的应用归结为<strong>三大问题</strong>，本模块逐一攻克：</p>  <table>
+    <thead><tr><th>问题</th><th>要解决什么</th><th>已知</th><th>求</th><th>算法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>1. 评估</strong> Evaluation</td><td>这串观测的似然</td><td>模型 $\lambda=(\pi,A,B)$、观测 $O$</td><td>$P(O\mid\lambda)$</td><td><strong>前向算法</strong>（forward）</td></tr>
+      <tr><td><strong>2. 解码</strong> Decoding</td><td>最可能的隐状态序列</td><td>模型 $\lambda$、观测 $O$</td><td>$\arg\max_S P(S\mid O)$</td><td><strong>Viterbi</strong></td></tr>
+      <tr><td><strong>3. 学习</strong> Learning</td><td>从数据估计参数</td><td>观测 $O$（可含标签）</td><td>最优 $\lambda$</td><td><strong>Baum-Welch</strong>（EM）/ 监督计数</td></tr>
+    </tbody>
+  </table>  <p>这三个问题的算法有一个<strong>共同的灵魂</strong>：<span class="term">dynamic programming</span>（动态规划）。朴素地解任何一个都要枚举 $S^T$ 条隐状态路径（指数爆炸：10 个词、5 种标签就是近千万条）。动态规划利用马尔可夫假设——<strong>到时刻 $t$、停在状态 $i$ 的所有路径，可以汇总成一个量，无需逐条记录</strong>——把复杂度降到 $O(T S^2)$。</p>  <p>评估问题（前向）和解码问题（Viterbi）的递推结构<strong>几乎一模一样</strong>，只差一个算子：前向在合并路径时<strong>求和</strong>（要所有路径的总概率），Viterbi 在合并路径时<strong>取最大</strong>（只要最好那条路径）。这个「求和 vs 取最大」的对偶，是理解序列算法的关键，也会在模块 04 的 CRF 里再次出现（配分函数 vs 解码）。</p>  <div class="callout danger"><span class="label">指数 vs 多项式</span>
+    <p>为什么不能直接枚举所有路径？因为路径数是 $S^T$——指数级。一个 20 词的句子配 12 种词性标签，就有 $12^{20}\approx 4\times10^{21}$ 条路径，宇宙年龄的秒数也不够数完。动态规划的伟大之处，就是用一张 $T\times S$ 的表（多项式大小）<strong>精确地</strong>算出本需指数枚举的量。本模块会用小例子<strong>对拍</strong>暴力枚举，亲眼确认 DP 没有近似、就是相等。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="forward"><span class="num">3</span>前向算法与对数空间</h2>
+  <p>先攻评估问题：给定模型，观测 $O=o_1,\dots,o_T$ 的概率 $P(O)=\sum_S P(O,S)$——对所有隐状态路径求和。直接算要枚举 $S^T$ 条路径。<span class="term">forward algorithm</span>（前向算法）用动态规划把它降到 $O(TS^2)$。</p>  <p>定义<strong>前向变量</strong> $\alpha_t(i)$：「观测到 $o_1,\dots,o_t$ 且时刻 $t$ 停在状态 $i$」的概率。它满足一个漂亮的递推：</p>  <div class="math-block">\[\alpha_1(i) = \pi_i B_{i, o_1}, \qquad \alpha_t(j) = \Big(\sum_{i=1}^{S} \alpha_{t-1}(i)\, A_{ij}\Big) B_{j, o_t}\]</div>  <p>逐项读懂：要算「时刻 $t$ 停在状态 $j$」的概率，就把「时刻 $t-1$ 停在任意状态 $i$」的概率乘以「从 $i$ 转到 $j$」的概率、对所有 $i$ 求和（这一步聚合了所有到达 $j$ 的路径），再乘以「状态 $j$ 发射出观测 $o_t$」的概率。最后 $P(O)=\sum_i \alpha_T(i)$。每一步只看前一步的汇总，无需回溯整条路径——这就是 DP 省下指数代价的关键。</p>  <p>这里藏着动态规划之所以成立的<strong>精确数学原因</strong>：因为马尔可夫假设，「到达状态 $j$ 之后会发生什么」只依赖 $j$、与「<em>怎么</em>到达 $j$ 的」无关。于是所有「在 $t-1$ 时刻经由不同路径到达状态 $i$」的概率，可以<strong>先加起来存成一个数 $\alpha_{t-1}(i)$</strong>，未来的计算只需这个汇总值。这就是为什么 $S^T$ 条路径能被压进一张 $T\times S$ 的表——不是近似、不是采样，而是利用条件独立把指数级的求和<strong>精确地</strong>因子化。notebook 会对拍暴力枚举，让你亲眼确认每一位数字都相等。</p>  <p>但有一个<strong>数值陷阱</strong>：$\alpha$ 是一连串小于 1 的概率连乘，序列一长就<strong>下溢为 0</strong>。解法是全程在<strong>对数空间</strong>计算：概率取对数，连乘变连加；而前向里的「求和」在对数空间需要 <span class="term">log-sum-exp</span> 技巧：</p>  <div class="math-block">\[\log\!\sum_i e^{x_i} = m + \log\!\sum_i e^{x_i - m}, \quad m = \max_i x_i\]</div>  <p>减去最大值 $m$ 再 exp，保证最大那项变成 $e^0=1$、不会溢出，其余项是 $(0,1]$ 的小数，求和稳定。这个 log-sum-exp 是序列模型的通用数值基石——前向算法、CRF 配分函数、甚至 softmax 都靠它。notebook 会实现对数空间前向，并与暴力枚举所有路径的概率和<strong>对拍到 1e-10</strong>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一定要在对数空间做前向。一个 50 词的句子，概率轻松小到 $10^{-100}$ 以下，float64 直接归零，得到 $\log 0=-\infty$，后续全盘崩溃。对数空间 + log-sum-exp 是序列概率计算的<strong>生存技能</strong>，不是可选优化。本课所有序列算法（前向、Viterbi、CRF）都默认在对数空间。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="viterbi"><span class="num">4</span>Viterbi 解码：sum→max 对偶</h2>
+  <p>再攻解码问题：给定观测，最可能的隐状态序列是什么？$\arg\max_S P(S\mid O)=\arg\max_S P(S, O)$（分母 $P(O)$ 与 $S$ 无关，可丢）。<span class="term">Viterbi algorithm</span>（维特比算法）解它，结构与前向<strong>惊人地相似</strong>：把前向递推里的「求和」换成「取最大」，再加一个「回溯指针」。</p>  <p>定义<strong>Viterbi 变量</strong> $\delta_t(i)$：「到时刻 $t$、停在状态 $i$ 的<strong>最优</strong>路径」的概率（注意是最优单条，不是求和）：</p>  <div class="math-block">\[\delta_t(j) = \max_{i}\big[\delta_{t-1}(i)\, A_{ij}\big]\, B_{j, o_t}, \qquad \psi_t(j) = \arg\max_{i}\big[\delta_{t-1}(i)\, A_{ij}\big]\]</div>  <p>$\delta$ 记录最优路径的概率，$\psi$（回溯指针）记录「到达 $j$ 的最优路径上一步来自哪个状态」。前向递推问「所有路径加起来多少」，Viterbi 问「最好那条路径多少、它从哪来」。这就是 <strong>sum→max</strong> 的对偶：同一个 DP 骨架，换个聚合算子，从「评估」变成「解码」。</p>  <div class="ascii">前向 vs Viterbi：同一个 DP 骨架，只差聚合算子
+
+  前向 (评估):  α_t(j) = [ Σ_i α_{t-1}(i)·A_ij ] · B_j,o_t    &lt;- 求和(要所有路径)
+  Viterbi(解码): δ_t(j) = [ max_i δ_{t-1}(i)·A_ij ] · B_j,o_t  &lt;- 取最大(要最优路径)
+                ψ_t(j) = argmax_i [...]                        &lt;- 记回溯指针
+
+  最后: 前向 P(O)=Σ_i α_T(i)   ;   Viterbi 从 argmax_i δ_T(i) 沿 ψ 回溯出整条路径</div>  <p>解码分两步：① 前向填表，记录 $\delta$ 和 $\psi$；② 从终点 $\arg\max_i\delta_T(i)$ 出发，沿 $\psi$ 指针<strong>回溯</strong>出整条最优路径。同样在对数空间做（连乘变连加，max 不需要 log-sum-exp，直接比大小即可，比前向还简单）。notebook 会实现对数空间 Viterbi，并验证：它返回的路径得分，等于把这条路径手工代入联合概率算出的值——<strong>解码正确性的硬检验</strong>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话记住三大算法的关系：<strong>前向 = 对路径求和（评估似然）；Viterbi = 对路径取最大（解码最优）；二者共用一个 DP 骨架</strong>。掌握了「sum/max 对偶」，你不仅懂了 HMM，也预习了 CRF（模块 04 的配分函数=前向、解码=Viterbi）乃至更广的结构化预测。这是序列建模最值钱的一个 idea。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="learn"><span class="num">5</span>参数学习：监督与 Baum-Welch</h2>
+  <p>最后是学习问题：怎么估计 $\pi, A, B$？分两种情况，难度天差地别。</p>  <h3>有标签：监督估计（数频率）</h3>  <p>如果训练数据带标签（每个词都标了词性），参数估计简单到只是<strong>数频率</strong>——和模块 02 的 MLE 一个道理：</p>  <div class="math-block">\[\pi_i = \frac{\#(\text{句首是状态 } i)}{\#\text{句子}}, \quad A_{ij} = \frac{\#(i \to j)}{\#(i \to \cdot)}, \quad B_{ik} = \frac{\#(\text{状态 } i \text{ 发射词 } k)}{\#(\text{状态 } i)}\]</div>  <p>即：初始分布数「多少句以状态 $i$ 开头」，转移矩阵数「状态 $i$ 后面跟状态 $j$ 的频率」，发射矩阵数「状态 $i$ 发射词 $k$ 的频率」。和 n-gram 一样，未见的转移/发射要<strong>平滑</strong>（否则测试时遇到新词新组合概率为 0）。监督 HMM 简单、快、且通常比无监督更准——只要你有标注数据。</p>  <p>一个值得停下来体会的点：监督估计本质上就是<strong>把模块 02 的 n-gram MLE 用了两次</strong>——转移矩阵 $A$ 是「标签的 bigram 模型」（$P(\text{tag}_t\mid\text{tag}_{t-1})$），发射矩阵 $B$ 是「每个标签下的词 unigram 模型」（$P(\text{word}\mid\text{tag})$）。所以你在模块 02 学的一切（MLE、平滑、OOV 处理）在这里<em>原样适用</em>。这种「老零件拼新模型」的复用，正是经典 NLP 的一贯气质，也是为什么按本课顺序学下来会越来越省力——每个新模块都站在前面的肩膀上。</p>  <h3>无标签：Baum-Welch（EM）</h3>  <p>如果只有观测、没有标签呢？这才是 HMM 真正精妙的地方：<span class="term">Baum-Welch</span>（前向-后向算法，EM 的特例）能<strong>无监督地</strong>学出参数。它需要<span class="term">backward algorithm</span>（后向算法），与前向对称：</p>  <div class="math-block">\[\beta_T(i) = 1, \qquad \beta_t(i) = \sum_{j=1}^{S} A_{ij}\, B_{j, o_{t+1}}\, \beta_{t+1}(j)\]</div>  <p>$\beta_t(i)$ 是「在时刻 $t$ 处于状态 $i$ 的条件下，未来观测 $o_{t+1},\dots,o_T$ 的概率」。前向 × 后向给出每个位置的<strong>状态后验</strong> $\gamma_t(i)=P(s_t=i\mid O)\propto\alpha_t(i)\beta_t(i)$，以及每个转移的期望——这正是 EM 的 E 步所需。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>Baum-Welch 是「自举」：先猜一组参数，用它算「每个位置最可能是什么状态、每个转移大概发生了多少次」（E 步），再用这些期望计数反过来重估参数（M 步），来回迭代，参数越来越好。神奇的是全程不需要任何标签。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>Baum-Welch = EM：E 步用前向-后向算 $\gamma_t(i)$（状态后验）与 $\xi_t(i,j)$（转移后验）的期望计数；M 步把这些期望计数当作「软计数」代入监督估计的公式重估 $\pi,A,B$。它保证每轮迭代似然 $P(O\mid\lambda)$ 不减，但只收敛到<strong>局部最优</strong>（对初值敏感）。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>无监督 HMM（Baum-Welch）虽优雅，但实践中有两个坑：① 只收敛到<strong>局部最优</strong>，结果强烈依赖初始化；② 学出的隐状态<strong>未必对应人类定义的词性</strong>（它只是找到能解释数据的某种潜在结构）。所以现实里的 POS 标注大多用<strong>监督</strong> HMM/CRF。本课 notebook 以监督估计为主、前向-后向为辅，把机制讲透。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pos"><span class="num">6</span>完整 POS 标注器与局限</h2>
+  <p>把零件拼成一个完整的 HMM 词性标注器，并直面 HMM 的局限。一个端到端的监督 HMM POS 标注长这样：</p>  <div class="ascii">HMM 词性标注 训练与解码流水线
+
+  带标签语料 (词, 词性) ──数频率(+平滑)──► π, A, B
+     │                                       初始/转移/发射 概率
+     ▼ (新句子 O = w1 w2 ... wT)
+  Viterbi 解码 (对数空间):
+    填表 δ_t(j) = max_i[δ_{t-1}(i)+logA_ij] + logB_j,o_t ; 记 ψ
+     │
+     ▼ (从 argmax δ_T 沿 ψ 回溯)
+  最优标签序列 S* = s1 s2 ... sT  (每个词的词性)
+     │
+     ▼ (与真值比)
+  标注准确率 / 每类 P/R/F1</div>  <p>几个实践要点与易混点：</p>  <ul>
+    <li><strong>发射平滑与 OOV</strong>：测试句里的新词（训练没见过）发射概率为 0，会让所有路径概率归零。要么平滑发射矩阵，要么用 <code>&lt;unk&gt;</code> 处理（同模块 02），要么用词的形态特征（大写、后缀）猜测——后者正是 CRF（模块 04）的强项。</li>
+    <li><strong>生成式的代价</strong>：HMM 建模联合 $P(O,S)$，发射假设要求「词只由当前标签决定」。这让它<strong>难以利用重叠特征</strong>——比如「词以 -ly 结尾」「前一个词是 the」这类线索，HMM 没有自然的位置放它们。这是 HMM 相对 CRF 的根本短板。</li>
+    <li><strong>一阶 vs 高阶</strong>：一阶 HMM 只看前一个标签。二阶（看前两个）更强但参数更多、更稀疏，和 n-gram 的 $n$ 选择是同一种权衡。</li>
+    <li><strong>HMM 是「生成式」序列模型</strong>：它和模块 04 的 CRF（判别式）是一对。HMM 先建联合再推条件，CRF 直接建条件 $P(S\mid O)$。下一模块会看到，CRF 在序列标注上通常更准、更灵活。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>整个 HMM 标注器就是：从标注语料数出三组概率，对新句子用 Viterbi 找最可能的标签路径。前向告诉你「这句话多像话」，Viterbi 告诉你「最可能怎么标」，Baum-Welch 让你在没标签时也能学。三件套覆盖了序列建模的核心。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从概率图模型看，HMM 是一个有向图模型（贝叶斯网络）：$s_1\to s_2\to\dots$ 的马尔可夫链 + 每个 $s_t\to o_t$ 的发射。它的「生成式 + 局部归一」特性带来一个问题——无法自然地条件于整个观测序列来打分，这正是 MEMM/CRF（模块 04）要改进的，也引出了著名的「标签偏置」讨论。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="apps"><span class="num">7</span>更大图景：序列建模的元方法</h2>
+  <p>再把 HMM 放到更大的图景里。它的三大算法（前向、Viterbi、Baum-Welch）远不止用于词性标注，而是一整套<strong>处理隐变量序列</strong>的通用工具，应用极广：</p>  <ul>
+    <li><strong>语音识别</strong>：HMM 的发源地与杀手级应用。隐状态=音素，观测=声学特征，Viterbi 解码出最可能的音素/词序列。Rabiner 的教程正是为语音写的。</li>
+    <li><strong>生物信息</strong>：基因序列里找编码区、蛋白质二级结构预测、序列比对（profile HMM），都是 HMM 的经典战场。</li>
+    <li><strong>中文分词与 NER</strong>：把分词转成对每个字标 B/M/E/S（词的开始/中间/结束/单字），用 HMM/CRF 解码——序列标注的又一大类。</li>
+    <li><strong>时间序列与金融</strong>：隐状态=市场 regime（牛/熊），观测=收益率，Baum-Welch 无监督地发现市场状态切换。</li>
+  </ul>  <p>理解 HMM 的回报在于，它的核心思想——<strong>用动态规划在指数路径空间里做精确推断</strong>——是现代序列模型的共同祖先：</p>  <ul>
+    <li><strong>CRF</strong>（模块 04）：把 HMM 的生成式换成判别式、把概率换成特征得分，前向算法→配分函数、Viterbi→解码原样保留。HMM 是 CRF 最好的跳板。</li>
+    <li><strong>CTC</strong>（语音/OCR 的对齐损失）：本质是前向算法在「所有可能对齐」上求和，与 HMM 前向同源。</li>
+    <li><strong>结构化预测与能量模型</strong>：「对所有结构求和（配分）vs 取最优结构（解码）」的 sum/max 对偶，是整个结构化预测领域的主线，HMM 是它最干净的入门样例。</li>
+  </ul>  <p>一句话总结本模块的价值：你学的不只是一个老模型，而是<strong>序列建模的元方法</strong>——隐变量、马尔可夫假设、前向-后向、Viterbi、sum/max 对偶、对数空间数值。这些概念在 CRF、CTC、乃至 Transformer 的某些解码策略里反复出现。HMM 是理解它们的最短路径。</p>  <div class="callout paper"><span class="label"></span>
+    <p>延伸必读（见 <code>../references.md</code>）：Rabiner 1989 是 HMM 的传奇教程（本模块的符号与结构全部对标它，强烈建议精读）；Jurafsky & Martin《SLP》附录 A（HMM）与第 8 章（序列标注）是最佳教材；Viterbi 1967、Baum 1970 是算法源头。下一站模块 04，我们把 HMM 升级成判别式的 CRF。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>HMM 优雅，但作为生成式模型有结构性的局限，这些局限直接催生了模块 04 的 CRF：</p>  <ul>
+    <li><strong>难用重叠特征</strong>：HMM 的发射假设「词只由当前标签生成」，让它无法自然地融入「词的大小写、前后缀、邻近词、词典命中」等丰富线索。判别式模型（MEMM、CRF）直接建模 $P(S\mid O)$，可以把任意特征塞进去——这是序列标注从 HMM 转向 CRF 的根本动因。</li>
+    <li><strong>生成式 vs 判别式的取舍</strong>：HMM 要对 $P(O,S)$ 建模，浪费了「我们其实只关心 $P(S\mid O)$」的事实。判别式模型把建模力气全花在刀刃上，通常预测更准（但不能生成数据、对数据量更敏感）。</li>
+    <li><strong>标签偏置问题</strong>：HMM 的后继 MEMM（局部归一的判别式）会出现「标签偏置（label bias）」——转移选择少的状态被不当偏好。CRF 用<strong>全局归一</strong>（在整条序列上算配分函数）根治了它，这是 Lafferty 2001 的核心贡献。</li>
+    <li><strong>神经化</strong>：现代序列标注用 BiLSTM/BERT 自动学特征，再接一个 CRF 层管标签依赖（BiLSTM-CRF）。注意——<strong>CRF 层原样保留了前向算法与 Viterbi</strong>！你在本模块学的 DP，直接活在今天的神经序列模型里。</li>
+  </ul>  <p>把线索连起来：<strong>HMM（生成式）→ MEMM（判别式但局部归一，有标签偏置）→ CRF（判别式且全局归一）→ BiLSTM-CRF（神经特征 + CRF 层）</strong>，是序列标注的一条清晰进化链。每一步都在改进「如何更好地利用观测、如何更正确地归一」，但前向-后向、Viterbi 这套动态规划骨架<em>一脉相承、从未改变</em>。学透 HMM，你就拿到了读懂这整条链的钥匙——下一模块我们就迈出从生成式到判别式的关键一步。</p>  <div class="callout paper"><span class="label"></span>
+    <p>延伸必读（见 <code>../references.md</code>）：Lafferty 2001（CRF，根治标签偏置）、McCallum 2000（MEMM，理解标签偏置的由来）、Lample 2016（BiLSTM-CRF，经典通向神经）。下一站模块 04 · CRF 与结构化预测——把 HMM 的 DP 骨架嫁接到判别式 + 任意特征上。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_ngram_lm/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · N-gram 语言模型</div></a>
+    <a class="next" href="../04_crf_sequence/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · CRF 与结构化预测</div></a>
+  </div>
+
+</div>
+</body>
+</html>

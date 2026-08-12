@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · LLM 驱动的指令数据合成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · LLM 驱动的指令数据合成</h1>
+  <p class="subtitle">唯一能真正增加信息量的增强层次 · Self-Instruct 的四步循环与 ROUGE-L 去重（命门）· 输出优先防标签倾斜 · Evol-Instruct 的算子与难度伪装 · Magpie · 教师偏差传递与模式坍塌的四个早期征兆</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–02；C02（SFT）与 C03（LLM-judge）的概念有帮助</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_instruction_synthesis.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Wang et al. 2023（Self-Instruct）★、Xu et al. 2023（WizardLM / Evol-Instruct）★、Xu et al. 2024（Magpie）、Shumailov et al. 2024（model collapse）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">指令层：唯一能真正增加信息量的增强</a></li>
+      <li><a href="#selfinstruct">Self-Instruct：一个四步循环</a></li>
+      <li><a href="#evol">Evol-Instruct：用演化算子提升难度与深度</a></li>
+      <li><a href="#magpie">Magpie 式无种子生成：用模板前缀「钓」出指令</a></li>
+      <li><a href="#bias">教师偏差的传递与模式坍塌</a></li>
+      <li><a href="#ledger">算一笔账：合成数据的成本与去重阈值</a></li>
+      <li><a href="#practice">把三种方法组合成一条可执行的合成管线</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>指令层：唯一能真正增加信息量的增强</h2>
+  <p>模块 01 与 02 的增强都只是「把已有样本换个说法」——<strong>信息量不增加</strong>，它们提供的是正则化。指令层不一样：<strong>它从教师模型的知识里采样出训练集里根本不存在的样本</strong>。</p>  <div class="ascii">词面/语义层增强的信息流:
+   你的 1000 条数据  ──扰动/释义──▶  4000 条数据
+   └─ 信息量上限 = 那 1000 条            （同一份信息的多个视角）
+
+指令层合成的信息流:
+   你的 175 条种子  ──▶ [ 教师 LLM ] ──▶ 52,000 条新指令数据
+                          ▲
+                          └─ 信息来自**教师模型的预训练知识**
+   └─ 信息量上限 = **教师模型的能力**（远大于种子）
+
+代价：① 你只能拿到教师会的东西（学生 ≤ 教师）
+      ② 教师的偏差、风格、错误会被**完整继承甚至放大**
+      ③ 反复用合成数据训练下一代，会走向**模式坍塌**（model collapse）</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这个转变是质变而非量变。Self-Instruct（Wang et al. 2023）从 175 条人写的种子任务出发，用 GPT-3 生成了 52k 条指令数据，把一个基座模型的指令跟随能力提到接近 InstructGPT 的水平。<strong>这条路线后来成了整个开源指令模型生态的基础</strong>——Alpaca、Vicuna、WizardLM、以及无数领域模型都走的是它的变体。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但也要看清它的<strong>结构性上限</strong>：<em>学生模型的能力上限是教师</em>。这不是一个可以通过「造更多数据」绕过的问题——你造一百万条也不会让学生超过教师在那个能力维度上的水平（除了少数「弱到强泛化」的特殊设置，C23 有讨论）。所以合成数据的正确用途是<strong>把教师的能力「蒸馏」进一个更小/更便宜/更专用的模型</strong>（C49 模块 05 讲过这个模式），而不是「凭空创造新知识」。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>指令层合成有一个与前两个模块<strong>完全不同</strong>的风险维度：<strong>数据污染</strong>。词面增强不可能造出测试集里的句子（它只扰动训练集）；但 LLM 可能生成与你的测试集<em>高度相似甚至相同</em>的样本——因为教师模型很可能在预训练时见过那个测试集。<em>这会让你的评测分数虚高，且极难察觉</em>。所以指令层合成<strong>必须</strong>配去污染检查（模块 04），这在前两个模块里是可选的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="selfinstruct"><span class="num">2</span>Self-Instruct：一个四步循环</h2>
+  <div class="ascii">种子池 (175 条人写任务)
+   │
+   ├──▶ ① 采样：从池里随机取 8 条（6 条人写 + 2 条已生成）作为 few-shot 示例
+   │            └─ 混合人写与已生成，是为了在「质量」与「多样性」之间平衡
+   │
+   ├──▶ ② 生成新指令：让 LLM 续写第 9 条指令
+   │
+   ├──▶ ③ 过滤：
+   │      · 与池中任一指令的 ROUGE-L &gt; 0.7  -&gt; 丢弃（**去重，最关键的一步**）
+   │      · 太长/太短、含图像/音频等无法执行的要求 -&gt; 丢弃
+   │      · 关键词黑名单（"画一张图"、"写代码并运行"）-&gt; 丢弃
+   │
+   ├──▶ ④ 生成实例：为通过的指令生成 (输入, 输出) 对
+   │      · 分类任务用「输出优先」（先定标签再造输入，防标签分布倾斜）
+   │      · 其他任务用「输入优先」
+   │
+   └──▶ 加入池，回到 ①（自举）</div>  <p>这个循环里<strong>第 ③ 步的去重是全流程的命门</strong>。理解它为什么关键，就理解了 Self-Instruct 的全部。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>如果没有去重，会发生什么？LLM 在 few-shot 提示下有很强的<strong>模式惯性</strong>——你给它 8 个「翻译类」的例子，它就倾向于继续生成翻译类任务。几轮自举之后，池子里会挤满同一类任务的变体，<em>多样性坍塌</em>。而池子越单一，下一轮的 few-shot 示例就越单一，形成正反馈。<strong>去重是打断这个正反馈的唯一机制。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><code>ROUGE-L &gt; 0.7</code> 这个阈值是 Self-Instruct 论文的选择，它的作用可以精确描述：<em>它在「多样性」与「产出率」之间设定了一个交换比</em>。阈值越严（如 0.5），保留下来的指令彼此越不像、多样性越高，但<strong>丢弃率急剧上升</strong>（要生成十条才留一条），成本相应上升。阈值越松（如 0.9），产出快但池子迅速同质化。<strong>notebook 会把这条曲线扫出来</strong>——你会看到丢弃率随阈值收紧呈超线性增长，这直接决定了合成的成本。</p></div>
+  </div>  <h3>「输出优先」：一个防标签倾斜的关键设计</h3>  <p>第 ④ 步里有个容易被忽略但很重要的细节。对<strong>分类任务</strong>，Self-Instruct 用「输出优先」（output-first）：<em>先让模型列出所有可能的标签，再为每个标签生成对应的输入</em>。</p>  <ul>
+    <li><strong>输入优先</strong>（先造输入、再让模型标注）的问题：LLM 生成的输入会<em>严重偏向某一类</em>。让它「生成一条餐厅评论」，它大概率写正面的——因为正面评论在预训练数据里更常见、也更「安全」。结果标签分布极度倾斜。</li>
+    <li><strong>输出优先</strong>：先说「标签是负面」，再让它「写一条负面评论」。<em>标签分布由你控制</em>，不由模型的先验决定。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>这个设计的一般化教训值得记住：<strong>凡是让 LLM 生成带标签的数据，都要问「标签分布由谁决定」</strong>。如果由模型决定，你会得到它的先验（通常是不平衡的、安全的、常见的）；如果由你决定，你能控制分布并覆盖长尾。<em>「先定标签再造样本」是合成分类数据的默认正确姿势</em>，也是补长尾类别最有效的手段。notebook 会把两种顺序的标签分布对比出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="evol"><span class="num">3</span>Evol-Instruct：用演化算子提升难度与深度</h2>
+  <p>Self-Instruct 解决「量」和「广度」，但生成的指令往往<strong>偏简单</strong>——因为 LLM 在续写时倾向于产出与示例难度相当的东西。WizardLM 的 <span class="term">Evol-Instruct</span>（Xu et al. 2023）补的是「深度」。</p>  <table>
+    <thead><tr><th>演化算子</th><th>做什么</th><th>例子</th></tr></thead>
+    <tbody>
+      <tr><td><strong>加约束</strong></td><td>给原指令增加一个限制条件</td><td>「写一首诗」→「写一首不含字母 e 的十四行诗」</td></tr>
+      <tr><td><strong>深化</strong></td><td>把宽泛的问题变具体、要求更深的推理</td><td>「解释光合作用」→「解释 C4 植物的光合作用与 C3 的差异及其生态意义」</td></tr>
+      <tr><td><strong>具体化</strong></td><td>把抽象概念替换成具体实例</td><td>「分析一种算法」→「分析快速排序在近乎有序输入上的退化」</td></tr>
+      <tr><td><strong>增加推理步数</strong></td><td>要求多步推理而非单步</td><td>「3+5 等于几」→「一个数加 5 后是它的两倍，求这个数」</td></tr>
+      <tr><td><strong>复杂化输入</strong></td><td>让输入格式更复杂（表格、代码、嵌套）</td><td>纯文本 → 带表格的问题</td></tr>
+      <tr><td><strong>广度演化</strong></td><td>生成一个「同领域但全新」的指令（而非改造原指令）</td><td>维持多样性，防止只在少数主题上深挖</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>Evol-Instruct 的循环是：<strong>随机选一个算子作用在池中的一条指令上 → 生成演化后的指令 → 生成回答 → 过滤 → 加回池</strong>。因为演化是<em>迭代</em>的（第二代在第一代基础上再演化），难度可以逐代提升——这是 Self-Instruct 单轮生成做不到的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但迭代演化引入了两个新问题。<strong>① 演化失败</strong>：模型可能产出「演化后的指令」其实与原指令等价、或者变成无法回答的胡话。原论文用一个「消除」步骤（elimination）过滤掉这些：<em>让 LLM 判断演化后的指令是否真的更难、是否可回答、是否与原指令实质不同</em>。<strong>② 难度分布漂移</strong>：若一直演化不加广度算子，池子会在少数主题上越挖越深，广度反而下降。<em>所以「深度演化」必须配「广度演化」</em>——这与 Self-Instruct 的去重是同一个「防坍塌」逻辑的不同表现。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>Evol-Instruct 有一个在实践中反复出现的失败模式：<strong>难度伪装</strong>。模型学会了「让指令看起来更难」（加更多约束词、更长的描述），但<em>实际推理难度没变</em>。症状是：合成数据的平均长度和约束数量在涨，但学生模型在真实困难基准上没有提升。<strong>防护办法是用「可验证的难度代理」</strong>——比如要求生成带标准答案的题目，然后看基座模型的答对率（答对率下降才说明真的变难了）。这与 C22（推理 RL）里 RLVR 的可验证性思路一致。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="magpie"><span class="num">4</span>Magpie 式无种子生成：用模板前缀「钓」出指令</h2>
+  <p>Self-Instruct 与 Evol-Instruct 都需要<strong>种子</strong>。Magpie（Xu et al. 2024）提出了一个更简洁的思路：<strong>只给指令模型「用户回合的起始模板」，让它自己续写出用户会问什么</strong>。</p>  <pre><code># 给一个**只有模板前缀、没有任何内容**的输入：
+&lt;|im_start|&gt;user
+                       ← 到这里就停，让模型自己续写
+
+# 指令模型会续写出一条它「觉得用户会问」的指令：
+&lt;|im_start|&gt;user
+帮我写一个 Python 函数，把嵌套字典展平成单层。&lt;|im_end|&gt;
+
+# 然后正常地让它回答这条指令，得到 (指令, 回答) 对。</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这能工作？因为<strong>对齐后的指令模型在训练时见过大量「用户回合」，它的分布里编码了「用户通常问什么」</strong>。给它一个空的用户回合前缀，它就从这个分布里采样。<em>本质上是在「反演」模型的对齐训练数据分布</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>它的优点是<strong>零种子、极简、且多样性天然较高</strong>（因为采样直接来自模型的完整用户分布，而不是被 few-shot 示例锚定在少数几类上）。缺点是<strong>可控性最差</strong>：你几乎无法指定领域、难度或标签分布。所以它适合<em>造通用指令数据</em>，不适合<em>补特定长尾</em>。<strong>实践中三者常组合使用</strong>：Magpie 起量与广度、Self-Instruct 定领域、Evol-Instruct 提难度。</p></div>
+  </div>  <table>
+    <thead><tr><th>方法</th><th>需要种子</th><th>可控性</th><th>多样性</th><th>最适合</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Self-Instruct</strong></td><td>需要（175 条量级）</td><td>中（种子决定领域）</td><td>中（靠去重维持）</td><td>定向造某个领域的指令数据</td></tr>
+      <tr><td><strong>Evol-Instruct</strong></td><td>需要（在已有池上演化）</td><td>中高（算子可选）</td><td>中（需配广度算子）</td><td>提升难度与深度</td></tr>
+      <tr><td><strong>Magpie</strong></td><td><strong>不需要</strong></td><td><strong>低</strong></td><td><strong>高</strong></td><td>零成本起量、造通用指令数据</td></tr>
+      <tr><td><strong>定向 prompt 生成</strong></td><td>不需要（用规格说明）</td><td><strong>最高</strong></td><td>取决于规格</td><td>补特定长尾、造特定标签分布</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>从这张表可以提炼出一条实用的组合策略：<strong>用最可控的方法补最缺的部分</strong>。如果你的问题是「数据总量不够」，用 Magpie 或 Self-Instruct 起量；如果是「某个类别/场景样本太少」，用定向 prompt 精确补（并用「输出优先」控制标签）；如果是「模型在难样本上表现差」，用 Evol-Instruct 提难度。<em>先诊断缺什么，再选方法</em>——这比「用最新的那个方法」有效得多。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bias"><span class="num">5</span>教师偏差的传递与模式坍塌</h2>
+  <p>合成数据最深的问题不是「质量不够好」，而是<strong>它的分布是教师模型的分布，而不是真实世界的分布</strong>。这带来两个不同层次的问题。</p>  <h3>① 偏差传递：学生完整继承教师的系统性倾向</h3>  <table>
+    <thead><tr><th>教师的倾向</th><th>在合成数据里表现为</th><th>学生学到什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>长度偏好</strong>（回答越长越「好」）</td><td>合成回答系统性偏长</td><td>学生也变啰嗦；若用于 DPO 会加剧长度偏差（C50 模块 04）</td></tr>
+      <tr><td><strong>格式偏好</strong>（爱用列表、Markdown 标题）</td><td>几乎每条回答都是分点列表</td><td>学生在不该用列表的场合也用列表</td></tr>
+      <tr><td><strong>安全过度</strong>（对边界话题一律拒答）</td><td>合成数据里大量「我不能帮你…」</td><td>学生过度拒答，实用性下降</td></tr>
+      <tr><td><strong>知识错误</strong>（教师本身答错的领域）</td><td>错误答案被当成金标准</td><td><strong>错误被固化，且学生无法自行纠正</strong></td></tr>
+      <tr><td><strong>文化/语言偏斜</strong></td><td>以英语世界视角为默认</td><td>在其他文化语境下表现差</td></tr>
+    </tbody>
+  </table>  <p><strong>「知识错误」这一行最需要警惕</strong>，因为它与其他几行有本质区别：其他偏差是「风格问题」（可以靠后续 SFT 调整），而知识错误是<em>把错的当对的写进了训练目标</em>。学生模型不但学不到正确答案，还会<strong>对错误答案变得更自信</strong>（因为它是唯一的监督信号）。</p>  <h3>② 模式坍塌：递归使用合成数据的长期后果</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><span class="term">model collapse</span>（Shumailov et al. 2024）描述的是：<strong>用上一代模型的输出训练下一代，反复几轮后，模型的输出分布会逐渐丢失尾部、向众数收缩</strong>。直观地说——每次采样都倾向于采到高概率区域，低概率的「尾部」内容被系统性地采不到，于是下一代模型就不知道尾部存在了。几代之后，分布退化成少数几个模式。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这个现象在数学上是一个<strong>方差递减 + 尾部截断</strong>的过程。它有两个可分离的成因：<em>①统计误差</em>（有限采样必然欠采样尾部，这个即使模型完美也存在）；<em>②模型误差</em>（模型对尾部的建模本来就不准，误差逐代放大）。<strong>关键的缓解手段是「保留真实数据」</strong>——只要每一代训练里都混入足量的原始真实数据，坍塌就能被大幅延缓。这也是为什么「用合成数据完全替代真实数据」是危险的，而「用合成数据补充真实数据」是可行的。</p></div>
+  </div>  <div class="callout danger"><span class="label">坍塌的四个早期征兆</span>
+    <p>坍塌的<strong>早期征兆</strong>是可以监测的，而且不需要等到效果崩溃：<strong>①多样性指标下降</strong>（distinct-n 降、self-BLEU 升——模块 04 会实现）；<strong>②长度分布收窄</strong>（方差变小，都变成差不多长）；<strong>③高频模式占比上升</strong>（某些开头/句式的比例逐代增加，如「当然！我很乐意帮你…」）；<strong>④嵌入空间覆盖收缩</strong>。<em>把这四个指标做成每一代都跑的看板</em>，你就能在坍塌显现于下游指标之前发现它。这是本课「多样性指标不是为了好看，是为了当警报」这个立场的最强论据。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">6</span>算一笔账：合成数据的成本与去重阈值</h2>
+  <div class="math-block">\[\text{单条可用数据成本} = \frac{c_{gen}\times(n_{instr} + n_{resp})}{\text{通过率}}\]</div>  <p>其中「通过率」是去重 + 格式过滤 + 质量过滤后的保留比例。这个分母是成本的主导因素，而它由<strong>去重阈值</strong>直接控制。</p>  <table>
+    <thead><tr><th>ROUGE-L 阈值</th><th>去重后多样性</th><th>通过率</th><th>每条可用数据的相对成本</th><th>适合</th></tr></thead>
+    <tbody>
+      <tr><td>0.5（严）</td><td><strong>最高</strong></td><td>低（~20–30%）</td><td><strong>3–5×</strong></td><td>追求多样性、预算充足</td></tr>
+      <tr><td>0.7（Self-Instruct 默认）</td><td>高</td><td>中（~50%）</td><td>2×</td><td><strong>默认起点</strong></td></tr>
+      <tr><td>0.9（松）</td><td>中</td><td>高（~80%）</td><td>1.25×</td><td>只是要起量；接受同质化</td></tr>
+      <tr><td>不去重</td><td><strong>会坍塌</strong></td><td>100%</td><td>1×</td><td>❌ 不要这么做</td></tr>
+    </tbody>
+  </table>  <p>再给一个与前两个模块的完整成本对比（以 EDA=1）：</p>  <table>
+    <thead><tr><th>方法</th><th>相对成本</th><th>信息量</th><th>保真度风险</th><th>污染风险</th><th>多样性</th></tr></thead>
+    <tbody>
+      <tr><td>EDA / AEDA</td><td>1</td><td>不增加</td><td>中（可用保护规则控制）</td><td><strong>无</strong></td><td>低</td></tr>
+      <tr><td>回译 + 过滤</td><td>~1000</td><td>不增加</td><td>中（隐蔽，需过滤）</td><td><strong>无</strong></td><td>中</td></tr>
+      <tr><td>Self-Instruct</td><td>~5000</td><td><strong>增加</strong></td><td>中（教师偏差）</td><td><strong>有</strong></td><td>中高</td></tr>
+      <tr><td>Evol-Instruct</td><td>~10000（多轮）</td><td><strong>增加</strong></td><td>中高（难度伪装）</td><td><strong>有</strong></td><td>高（配广度算子）</td></tr>
+    </tbody>
+  </table>  <p>读这张表：<strong>指令层贵三到四个数量级，但它是唯一能真正增加信息量的</strong>。所以选择逻辑很清晰——</p>  <ul>
+    <li><strong>需要的只是正则化</strong>（有足够数据但容易过拟合）→ 用最便宜的（EDA/AEDA/embedding 噪声）。</li>
+    <li><strong>需要的是真正缺失的样本类型</strong>（某类场景一条都没有）→ 只有指令层能做，贵也得做。</li>
+    <li><strong>需要的是「让小模型学会大模型的能力」</strong>→ 指令层的数据蒸馏是标准路径（C49 模块 05）。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的智慧：<strong>合成数据的质量上限是教师，多样性上限是去重阈值，而它的长期风险是坍塌——三者都必须被显式测量</strong>。前两个模块你可以「凭经验调参」，指令层不行：<em>因为它的失败是渐进的、不报错的、且会在几代之后才显现</em>。所以指令层合成必须配一套持续运行的监测（多样性四指标 + 去污染 + 教师-学生能力对比），这也是模块 04 存在的理由。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="practice"><span class="num">7</span>把三种方法组合成一条可执行的合成管线</h2>
+  <p>模块前面分别讲了 Self-Instruct、Evol-Instruct、Magpie。实践中<strong>它们不是三选一，而是流水线上的三个阶段</strong>——因为它们各自补的洞不同。</p>  <div class="ascii">诊断：先问「我缺的是什么」，再决定用哪一段
+
+  缺「量与广度」        缺「特定领域/标签分布」     缺「难度」
+        │                        │                     │
+        ▼                        ▼                     ▼
+   ① Magpie 起量          ② 定向 prompt / SI      ③ Evol-Instruct
+   （零种子、多样性高）     （输出优先控标签分布）    （深度算子+广度算子）
+        │                        │                     │
+        └────────────┬───────────┴─────────────────────┘
+                     ▼
+              ④ 统一的去重（ROUGE-L）
+                     ▼
+              ⑤ 去污染（vs 测试集，模块 04）—— **对合成数据必做**
+                     ▼
+              ⑥ 混入真实数据（防坍塌）
+                     ▼
+              ⑦ 多样性四指标入看板（趋势监测）</div>  <table>
+    <thead><tr><th>阶段</th><th>输入</th><th>输出</th><th>关键参数</th><th>验收</th></tr></thead>
+    <tbody>
+      <tr><td>① 起量</td><td>无（或模板前缀）</td><td>宽而浅的指令池</td><td>生成条数</td><td>领域熵、唯一 key 比</td></tr>
+      <tr><td>② 定向补缺</td><td>缺口清单（领域/标签/场景）</td><td>针对性样本</td><td><strong>输出优先的标签分布</strong></td><td>补完后各类别的样本数</td></tr>
+      <tr><td>③ 提难度</td><td>已有池</td><td>更深的变体</td><td>算子集（<strong>必须含广度算子</strong>）</td><td><strong>可验证难度</strong>（基座答对率）</td></tr>
+      <tr><td>④ 去重</td><td>全部候选</td><td>去重后的池</td><td>ROUGE-L 阈值（0.7 起）</td><td>丢弃率（>70% 说明生成器同质化）</td></tr>
+      <tr><td>⑤ 去污染</td><td>去重后的池</td><td>干净的池</td><td>n-gram 的 n（8–13）</td><td><strong>丢弃率 >1% 就要查</strong></td></tr>
+      <tr><td>⑥ 混真实</td><td>合成池 + 真实数据</td><td>最终训练集</td><td>合成占比上限</td><td>合成占比是否超过约束</td></tr>
+      <tr><td>⑦ 监测</td><td>每批数据</td><td>看板</td><td>相对变化阈值</td><td>四个征兆是否有告警</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这条管线里最容易被跳过、后果也最严重的是 <strong>⑤ 去污染</strong>。前两个模块（词面、语义增强）不需要它——扰动训练集的句子不可能凭空造出测试集的内容。<em>但指令层合成完全不同：教师模型很可能在预训练时见过你的测试集</em>，于是它「凭记忆」生成的样本可能与测试集高度相似甚至相同。<strong>而这个失效的症状是「评测分数变好」，所以不会引起任何警觉。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第二个容易跳过的是 <strong>② 之前的「诊断」</strong>。很多团队直接从「用最新的那个方法造一批数据」开始，而不先问「我到底缺什么」。<em>缺量、缺特定类别、缺难度，这三种缺口对应完全不同的方法与完全不同的验收标准</em>。诊断的成本很低（统计一下各类别/各场景的样本数、看看模型在哪些子集上错得多），但它能避免「造了五万条数据，缺的那类还是只有十条」这种典型浪费。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>关于第 ⑥ 步的合成占比，给一个务实的起点：<strong>合成数据不超过总量的 50%，且每一轮迭代都要重新混入真实数据</strong>（而不是「第一轮混过就行」）。模块的坍塌实验已经显示，只要每代都有真实数据注入，尾部就能被持续带回来。<em>如果你发现「真实数据不够，混不到 50%」——那正是这条约束想告诉你的：你需要的是标注，不是更多合成。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>合成数据的缩放律</strong>：真实数据有 Chinchilla 式的缩放律（C21），合成数据没有。<em>「加十倍合成数据」的收益曲线是什么形状、什么时候饱和、饱和点与教师能力的关系</em>——这些都缺乏系统刻画。经验上收益饱和得比真实数据快得多，但没有定量规律。</li>
+    <li><strong>弱到强泛化</strong>：学生能否超过教师？Burns et al. 2023 的 weak-to-strong generalization 表明在某些设置下可以（学生的预训练知识 + 弱监督 &gt; 弱监督本身），这挑战了「学生 ≤ 教师」的朴素结论。<em>什么条件下成立、能超多少</em>，是当前对齐研究的核心问题之一（C23）。</li>
+    <li><strong>坍塌的定量刻画</strong>：Shumailov et al. 2024 给出了现象与简化模型，但「混入多少比例真实数据能完全避免坍塌」「不同任务的坍塌速率差异」缺乏可操作的结论。工程上目前只能靠监测而非预测。</li>
+    <li><strong>难度的可验证代理</strong>：Evol-Instruct 的「难度伪装」问题需要可验证的难度度量。数学/代码有天然的可验证性（答案对错），开放式任务没有。<em>把可验证性引入开放式指令数据的合成</em>是活跃方向（与 RLVR 同源，C22）。</li>
+    <li><strong>合成数据的检测与标注</strong>：随着合成数据在网络上大量出现，「这段文本是不是模型生成的」变得重要——既为了避免用合成数据污染预训练语料（加剧坍塌），也为了溯源。水印与检测都不可靠，这是个开放的社会技术问题（C12/C14）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Wang et al. 2023 <em>Self-Instruct</em>（重点看 §2 的四步循环与 ROUGE-L 去重，以及分类任务的「输出优先」设计）、Xu et al. 2023 <em>WizardLM: Empowering Large Language Models to Follow Complex Instructions</em>（Evol-Instruct 的算子与消除步骤）、Xu et al. 2024 <em>Magpie</em>（无种子生成的思路极其简洁）、Shumailov et al. 2024 <em>AI models collapse when trained on recursively generated data</em>（Nature；坍塌的现象与机制）、Burns et al. 2023 <em>Weak-to-Strong Generalization</em>（学生能否超过教师）。相邻课程：C02（SFT 与后训练全链路）、C14（合成数据理论）、C21（预训练数据配比）、C23（对齐前沿）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_backtranslation/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 回译与释义</div></a>
+    <a class="next" href="../04_quality_control/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 增强的质量控制</div></a>
+  </div>
+
+</div>
+</body>
+</html>

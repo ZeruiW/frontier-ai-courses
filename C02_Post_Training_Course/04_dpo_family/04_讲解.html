@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · DPO 家族：推导与实跑</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · DPO 家族：推导与实跑</h1>
+  <p class="subtitle">Direct Preference Optimization &amp; friends —— 把 RLHF 的「奖励模型 + RL」折叠成一个监督损失</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（BT 模型与奖励模型）、模块 03（KL 约束 RLHF 目标与 PPO）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_dpo_family.ipynb（玩具 DPO/IPO/SimPO 全复现 + 可选 trl 实跑）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Rafailov 2023 (DPO)、Azar 2023 (IPO)、Ethayarajh 2024 (KTO)、Meng 2024 (SimPO)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 90 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">动机：PPO 的工程复杂度，能不能不用 RL？</a></li>
+      <li><a href="#derivation">DPO 完整推导：从 KL 约束目标到一个 logistic 损失</a></li>
+      <li><a href="#problems">DPO 的已知问题：chosen 概率也会降</a></li>
+      <li><a href="#family">家族变体：IPO / KTO / SimPO</a></li>
+      <li><a href="#beta">β 的作用与训练动态</a></li>
+      <li><a href="#dpo-vs-ppo">DPO vs PPO：实证之争与分布偏移视角</a></li>
+      <li><a href="#eval">评测视角：训练指标 ≠ 真实偏好胜率</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>动机：PPO 的工程复杂度，能不能不用 RL？</h2>
+
+  <p>模块 03 跑通了完整 RLHF：先训奖励模型（RM），再用 PPO 在 KL 约束下优化 policy。这条管线<strong>效果被反复验证</strong>，但工程代价极高：</p>
+
+  <div class="ascii">
+  RLHF-PPO 一次训练同时挂着 4 个模型：
+
+   ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+   │ Policy   │  │ Reference│  │ Reward   │  │ Value    │
+   │ (训练)    │  │ (冻结,KL) │  │ Model(冻)│  │ (训练)    │
+   └──────────┘  └──────────┘  └──────────┘  └──────────┘
+        │ 在线采样 rollouts → RM 打分 → GAE → PPO 更新
+        │ 超参：lr ×2、KL 系数、clip ε、GAE λ/γ、rollout 批量、
+        │       RM 归一化、reward whitening、value warmup …
+        ▼
+   任何一环不稳 → reward hacking / 崩溃 / KL 爆炸
+
+  DPO 的提议 [Rafailov 2023]：
+
+   ┌──────────┐  ┌──────────┐
+   │ Policy   │  │ Reference│      偏好数据 (x, y_w, y_l)
+   │ (训练)    │  │ (冻结)    │  ──► 一个监督式 logistic loss
+   └──────────┘  └──────────┘      不采样、不训 RM、不训 value
+  </div>
+
+  <p>追问是自然的：RM 本来就是从偏好数据 $(x, y_w, y_l)$ 拟合出来的（模块 02 的 BT loss），PPO 又只是拿这个 RM 当信号去改 policy。<strong>能不能跳过中间商，直接用偏好数据优化 policy？</strong></p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>RLHF 的链路是「偏好数据 → 奖励模型 → RL → policy」。DPO 发现这条链在数学上可以整体折叠：
+      KL 约束下的最优 policy 和奖励函数之间存在一一对应的换元关系，于是「先学奖励、再用 RL 解 policy」
+      可以合并成「直接在偏好数据上对 policy 做最大似然」。训练形态退化成普通的监督微调——两个前向、一个 logistic loss。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>DPO 的核心是一个<span class="term">变量替换（change of variables）</span>：KL-正则 RLHF 目标的最优解
+      $\pi^*$ 与奖励 $r$ 之间存在闭式双射（差一个只依赖 $x$ 的常数）。把 $r$ 用 $\pi$ 重参数化后代入
+      Bradley–Terry 似然，配分函数恰好消去，得到一个只含 $\pi_\theta$ 与 $\pi_{\text{ref}}$ 的损失。
+      因此 DPO 优化的<em>仍然是</em>同一个 RLHF 目标（在 BT 假设和最优化到位的前提下），只是绕开了显式 RM 与在线采样。</p>
+    </div>
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  注意「等价」的限定词：等价性建立在 ①偏好真的服从 BT 模型 ②优化能达到全局最优 ③训练分布覆盖充分 这三个假设上。第 3、6 节会看到，这些假设在实践里恰恰是 DPO 与 PPO 分道扬镳的地方。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="derivation"><span class="num">2</span>DPO 完整推导：从 KL 约束目标到一个 logistic 损失</h2>
+
+  <p>这是本章核心，一步不跳。出发点是模块 03 的 KL 约束 RLHF 目标：</p>
+
+  <div class="math-block">
+  $$ \max_{\pi}\;\; \mathbb{E}_{x\sim\mathcal{D},\,y\sim\pi(\cdot|x)}\big[\,r(x,y)\,\big]
+     \;-\; \beta\,\mathbb{D}_{\mathrm{KL}}\!\big[\pi(\cdot|x)\,\|\,\pi_{\text{ref}}(\cdot|x)\big] $$
+  </div>
+
+  <h3>第 1 步：解出闭式最优 policy</h3>
+  <p>固定 $x$，把目标整理成对 $\pi$ 的泛函。展开 KL 并除以 $-\beta$（max 变 min）：</p>
+
+  <div class="math-block">
+  $$ \max_\pi\; \mathbb{E}_{y\sim\pi}\Big[ r(x,y) - \beta\log\frac{\pi(y|x)}{\pi_{\text{ref}}(y|x)} \Big]
+   \;=\; -\beta\,\min_\pi\; \mathbb{E}_{y\sim\pi}\Big[ \log\frac{\pi(y|x)}{\pi_{\text{ref}}(y|x)} - \frac{1}{\beta}r(x,y) \Big] $$
+  </div>
+
+  <p>定义一个新分布（把 $r/\beta$ 吸进 $\pi_{\text{ref}}$ 再归一化）：</p>
+
+  <div class="math-block">
+  $$ \pi^*(y|x) \;=\; \frac{1}{Z(x)}\,\pi_{\text{ref}}(y|x)\,\exp\!\Big(\frac{1}{\beta}r(x,y)\Big),
+     \qquad Z(x)=\sum_{y}\pi_{\text{ref}}(y|x)\exp\!\Big(\frac{1}{\beta}r(x,y)\Big) $$
+  </div>
+
+  <p>注意 $Z(x)$ 只依赖 $x$、不依赖 $\pi$。用 $\pi^*$ 改写 min 里的式子：</p>
+
+  <div class="math-block">
+  $$ \mathbb{E}_{y\sim\pi}\Big[ \log\frac{\pi(y|x)}{\pi_{\text{ref}}(y|x)\exp(r/\beta)} \Big]
+   \;=\; \mathbb{E}_{y\sim\pi}\Big[ \log\frac{\pi(y|x)}{\pi^*(y|x)} \Big] - \log Z(x)
+   \;=\; \mathbb{D}_{\mathrm{KL}}\big[\pi\,\|\,\pi^*\big] - \log Z(x) $$
+  </div>
+
+  <p>$\log Z(x)$ 与 $\pi$ 无关，而 KL 散度非负、当且仅当两分布相等时取零。所以最优解就是：</p>
+
+  <div class="math-block">
+  $$ \boxed{\;\pi^*(y|x) \;\propto\; \pi_{\text{ref}}(y|x)\,e^{\,r(x,y)/\beta}\;} $$
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  这个闭式解本身就值得背下来：KL 约束 RLHF 的最优 policy = <strong>参考分布 × 奖励的指数倾斜（exponential tilting）</strong>。$\beta$ 越小，倾斜越狠，policy 越偏离 $\pi_{\text{ref}}$ 往高奖励处集中。麻烦在于 $Z(x)$ 要对所有可能回答求和——不可计算，所以不能直接拿它当采样器。DPO 的聪明之处是<strong>反着用</strong>这个解。</div>
+
+  <h3>第 2 步：反解奖励</h3>
+  <p>对闭式解两边取对数，把 $r$ 解出来：</p>
+
+  <div class="math-block">
+  $$ r(x,y) \;=\; \beta\log\frac{\pi^*(y|x)}{\pi_{\text{ref}}(y|x)} \;+\; \beta\log Z(x) $$
+  </div>
+
+  <p>即：任意奖励函数都可以写成「最优 policy 对参考 policy 的对数似然比 × $\beta$」加上一个<strong>只依赖 $x$ 的项</strong>。</p>
+
+  <h3>第 3 步：代入 BT 似然，配分函数消去</h3>
+  <p>模块 02 的 <span class="term">Bradley–Terry 模型</span>假设偏好概率只取决于两个回答的奖励差：
+  $p(y_w \succ y_l \mid x) = \sigma\big(r(x,y_w) - r(x,y_l)\big)$。把第 2 步代入——同一个 $x$ 下两个回答共享 $\beta\log Z(x)$，<strong>相减时恰好消去</strong>：</p>
+
+  <div class="math-block">
+  $$ p(y_w \succ y_l \mid x)
+   = \sigma\!\Big( \beta\log\frac{\pi^*(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta\log\frac{\pi^*(y_l|x)}{\pi_{\text{ref}}(y_l|x)} \Big) $$
+  </div>
+
+  <p>偏好概率被完全用 policy 表达了，$r$ 和 $Z$ 都不见了。于是直接把 $\pi^*$ 换成待训练的 $\pi_\theta$，对偏好数据做最大似然（= 最小化负对数似然）：</p>
+
+  <div class="math-block">
+  $$ \boxed{\;\mathcal{L}_{\mathrm{DPO}}(\theta)
+   = -\,\mathbb{E}_{(x,y_w,y_l)\sim\mathcal{D}}\Big[ \log\sigma\Big( \beta\Big[\log\tfrac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \log\tfrac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\Big] \Big) \Big]\;} $$
+  </div>
+
+  <h3>隐式奖励与梯度解读</h3>
+  <p>定义<span class="term">隐式奖励（implicit reward）</span> $\hat r_\theta(x,y) = \beta\log\frac{\pi_\theta(y|x)}{\pi_{\text{ref}}(y|x)}$，则 DPO loss 就是把 $\hat r_\theta$ 当作奖励的 BT loss——<strong>policy 本身就是一个奖励模型</strong>（"Your Language Model is Secretly a Reward Model"，论文副标题）。对梯度求导：</p>
+
+  <div class="math-block">
+  $$ \nabla_\theta\mathcal{L}_{\mathrm{DPO}}
+   = -\beta\,\mathbb{E}\Big[ \underbrace{\sigma\big(\hat r_\theta(x,y_l)-\hat r_\theta(x,y_w)\big)}_{\text{隐式奖励排错序时权重大}}
+     \big[ \nabla_\theta\log\pi_\theta(y_w|x) - \nabla_\theta\log\pi_\theta(y_l|x) \big] \Big] $$
+  </div>
+
+  <p>解读：抬高 $y_w$ 的对数概率、压低 $y_l$ 的对数概率，且<strong>当前模型把这对排得越错，这对样本的权重越大</strong>。这个动态加权是 DPO 区别于"朴素地 SFT chosen + unlikelihood rejected"的关键。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  [Rafailov 2023] <em>Direct Preference Optimization: Your Language Model is Secretly a Reward Model</em>（arXiv:2305.18290）。推导只用了三件工具：KL 正则的变分解、对数换元、BT 模型的差分结构。建议自己在纸上从头推一遍——面试高频。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="problems"><span class="num">3</span>DPO 的已知问题：chosen 概率也会降</h2>
+
+  <p>DPO 形态简洁，但损失只约束<strong>相对量</strong>，这带来几个实践中反复出现的失败模式：</p>
+
+  <h3>3.1 chosen 概率下降（likelihood displacement）</h3>
+  <p>看清楚损失的结构：$\mathcal{L}_{\mathrm{DPO}}$ 只依赖<strong>margin</strong>
+  $\beta[\Delta\log\pi_\theta - \Delta\log\pi_{\text{ref}}]$，其中 $\Delta\log\pi = \log\pi(y_w)-\log\pi(y_l)$。
+  也就是说，<strong>只要差距拉大，loss 就下降</strong>——$\log\pi_\theta(y_w)$ 和 $\log\pi_\theta(y_l)$ 一起降、只要 $y_l$ 降得更快，优化器完全满意。实践中（尤其当 $y_w,y_l$ 是同一 prompt 下相似的回答、共享大量 token 时）经常观察到训练后期两条对数概率曲线<strong>双双下跌</strong>，被挤出去的概率质量流向训练对之外的序列——去了哪里、是不是更好的回答，损失函数管不着。notebook 会在玩具设定里精确复现这条双降曲线。</p>
+
+  <h3>3.2 分布外泛化与离线数据的局限</h3>
+  <p>DPO 是纯<span class="term">离线（off-policy）</span>方法：偏好对通常采自 SFT 模型或别的模型，而训练中 $\pi_\theta$ 一路漂移，很快就在给<strong>它自己根本不会生成的回答</strong>排序。BT 假设里的"等价性"只在数据覆盖的分布上成立；策略移出该分布后，隐式奖励在分布外的取值是没有任何数据约束的外推。这正是第 6 节 DPO vs PPO 之争的根源。</p>
+
+  <h3>3.3 过拟合偏好噪声</h3>
+  <p>人类偏好标注噪声率常在 20–30%。DPO 的 logistic loss 对每一对都要求 margin → ∞ 才能把 loss 压到 0：遇到标错的对，模型会用极端的概率扭曲去迁就它。[Azar 2023] 从理论上指出：当经验偏好概率达到 1（数据里某对从未反转），DPO 的最优解是把 margin 推向无穷——<strong>KL 正则在极限下失效</strong>，$\beta$ 拦不住。这直接催生了 IPO。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  工程暗号：DPO 训练里 <code>rewards/chosen</code> 与 <code>rewards/rejected</code>（即两个隐式奖励）<strong>同时变负</strong>是常态而非 bug；真正要警惕的是 $\log\pi_\theta(y_w)$ 跌穿太多——意味着模型在用"全面降低真实回答的概率"换 margin，下游生成质量往往随之劣化（典型症状：长度暴涨、复读、跑题）。盯 margin 的同时必须盯绝对 log-prob。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="family"><span class="num">4</span>家族变体：IPO / KTO / SimPO</h2>
+
+  <p>每个变体都是针对上一节某个具体病灶的手术：</p>
+
+  <table>
+    <thead><tr><th>方法</th><th>损失</th><th>需要成对数据</th><th>需要 ref 模型</th><th>针对的问题</th></tr></thead>
+    <tbody>
+      <tr><td><strong>DPO</strong> [Rafailov 2023]</td><td>$-\log\sigma(\beta\, h)$</td><td>✓</td><td>✓</td><td>基线：折叠 RM+RL</td></tr>
+      <tr><td><strong>IPO</strong> [Azar 2023]</td><td>$\big(h - \tfrac{1}{2\beta}\big)^2$</td><td>✓</td><td>✓</td><td>margin → ∞ 的过拟合</td></tr>
+      <tr><td><strong>KTO</strong> [Ethayarajh 2024]</td><td>前景理论价值函数（见下）</td><td><strong>✗</strong>（只需 好/坏 单边标签）</td><td>✓</td><td>成对标注昂贵</td></tr>
+      <tr><td><strong>SimPO</strong> [Meng 2024]</td><td>$-\log\sigma\big(\tfrac{\beta}{|y_w|}\log\pi_\theta(y_w) - \tfrac{\beta}{|y_l|}\log\pi_\theta(y_l) - \gamma\big)$</td><td>✓</td><td><strong>✗</strong></td><td>ref 模型显存 + 长度偏置</td></tr>
+    </tbody>
+  </table>
+
+  <p>表中统一记 $h = \log\frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \log\frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}$（margin 除以 $\beta$ 的"裸"对数比差）。</p>
+
+  <h3>IPO：把"分类"改成"回归"</h3>
+  <div class="math-block">
+  $$ \mathcal{L}_{\mathrm{IPO}} = \mathbb{E}\Big[ \Big( h(x,y_w,y_l) - \frac{1}{2\beta} \Big)^{\!2} \Big] $$
+  </div>
+  <p>logistic loss 永远鼓励 margin 再大一点；平方损失把 $h$ <strong>回归到固定目标 $\frac{1}{2\beta}$</strong>，超过就往回拉。这是对 3.3 节病灶的理论修正：即使数据可分，最优 margin 也有限，KL 约束在极限下依然生效。代价是丢掉了"按排序错误程度动态加权"的性质。</p>
+
+  <h3>KTO：不需要成对数据</h3>
+  <p>实践里"成对偏好"很贵，而"这条回复好/差"的单边信号（点赞、客服工单、规则过滤）到处都是。KTO 借用 Kahneman–Tversky <span class="term">前景理论（prospect theory）</span>的价值函数形状，对好样本与坏样本分别施加损失：</p>
+  <div class="math-block">
+  $$ \mathcal{L}_{\mathrm{KTO}} = \mathbb{E}_{y\,\text{好}}\big[ \lambda_w\big(1-\sigma(\hat r_\theta(x,y) - z_{\text{ref}})\big) \big]
+    + \mathbb{E}_{y\,\text{坏}}\big[ \lambda_l\big(1-\sigma(z_{\text{ref}} - \hat r_\theta(x,y))\big) \big] $$
+  </div>
+  <p>其中 $\hat r_\theta$ 仍是 DPO 的隐式奖励，$z_{\text{ref}}$ 是一个充当"参照点"的 KL 估计项（batch 内估计），$\lambda_w,\lambda_l$ 控制收益/损失的不对称权重（呼应前景理论的损失厌恶）。好样本要把隐式奖励推到参照点之上，坏样本反之——<strong>不需要任何配对</strong>。</p>
+
+  <h3>SimPO：去掉 ref 模型 + 长度归一化</h3>
+  <p>SimPO 做两处修改：①用<strong>长度归一化的平均对数概率</strong> $\frac{\beta}{|y|}\log\pi_\theta(y|x)$ 充当隐式奖励——直接对齐了"生成时模型其实按(近似)平均 log-prob 排序"的事实，并消解 DPO 在序列长度上的系统偏置；②引入目标 margin $\gamma>0$，并<strong>彻底去掉 $\pi_{\text{ref}}$</strong>（少一个模型的前向与显存）。代价：失去 KL 锚点，更依赖学习率/训练时长来控制漂移，且对超参 $(\beta,\gamma)$ 更敏感。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  记忆图谱：<strong>DPO 是原点</strong>；IPO 改「损失形状」（logistic→平方，防 margin 无界）；KTO 改「数据形态」（成对→单边）；SimPO 改「隐式奖励定义」（去 ref + 按长度归一）。读任何新变体论文，先问它动的是这三者中的哪一个。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="beta"><span class="num">5</span>β 的作用与训练动态</h2>
+
+  <p>$\beta$ 在推导里来自 KL 约束的拉格朗日系数，落到 DPO loss 里成了<strong>同一个旋钮的两面</strong>：</p>
+
+  <ul>
+    <li><strong>KL 面</strong>：闭式解 $\pi^*\propto\pi_{\text{ref}}e^{r/\beta}$ 中，$\beta$ 越小 → 指数倾斜越狠 → 最优 policy 离 $\pi_{\text{ref}}$ 越远。$\beta\to\infty$ 时 $\pi^*\to\pi_{\text{ref}}$（完全不动）。</li>
+    <li><strong>偏好强度面</strong>：loss 里 margin 乘了 $\beta$。$\beta$ 大 → 很小的对数比差就能让 sigmoid 饱和、梯度归零（轻轻分开就收手）；$\beta$ 小 → 需要巨大的对数比差才饱和（往死里分，但每步梯度也按 $\beta$ 缩小，训练更慢）。</li>
+    <li>常用区间：DPO/IPO 取 $\beta\in[0.01, 0.5]$（0.1 是最常见起点）；SimPO 因为奖励被长度归一化、量纲不同，常用 $\beta\approx 2{\sim}2.5,\ \gamma\approx 0.5{\sim}1.6$。</li>
+  </ul>
+
+  <h3>健康的训练曲线长什么样</h3>
+  <ul>
+    <li><strong>rewards/margins</strong>（$\hat r_w - \hat r_l$ 的均值）：从 0 附近<strong>平滑单调上升后趋缓</strong>。一直线性猛涨不封顶 ≈ 在过拟合/漂移；几乎不涨 ≈ lr 或 $\beta$ 不对、或数据太难。</li>
+    <li><strong>rewards/accuracies</strong>（margin&gt;0 的样本占比）：升到 0.7–0.9 后平台。逼近 1.0 反而可疑——偏好数据自身噪声率就不止 5%，accuracy=1 多半意味着记住了训练对。</li>
+    <li><strong>logps/chosen</strong>：允许缓慢下降（第 3 节），但<strong>断崖式下跌是红色警报</strong>。</li>
+    <li><strong>KL$(\pi_\theta\|\pi_{\text{ref}})$</strong>：随训练单调爬升；同等步数下 $\beta$ 越小爬得越高。notebook 会扫 $\beta\in\{0.01,0.1,0.5\}$ 画出这族曲线。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  margin 是<strong>训练集上的相对量</strong>，它上升只说明"模型更会把这批 chosen 排到 rejected 前面"，不保证生成质量。第 7 节专门讲这两者的落差。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="dpo-vs-ppo"><span class="num">6</span>DPO vs PPO：实证之争与分布偏移视角</h2>
+
+  <p>2023–2024 的大量对照实验（学界复现与各 lab 技术报告）大致收敛到这样的图景：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>DPO（离线）</th><th>PPO / 在线 RL</th></tr></thead>
+    <tbody>
+      <tr><td>训练数据来源</td><td>固定偏好集（常来自别的模型）</td><td>policy 自己实时采样</td></tr>
+      <tr><td>奖励信号作用域</td><td>只在数据对附近有定义</td><td>RM 对任何 rollout 打分（含 OOD，存在 hacking 风险）</td></tr>
+      <tr><td>工程成本</td><td>≈ SFT（两模型、无采样）</td><td>四模型 + 在线生成，贵一个数量级</td></tr>
+      <tr><td>典型强项</td><td>风格/格式/指令遵循对齐，chat 胜率提升快</td><td>数学/代码等可验证任务、长程优化、抗噪</td></tr>
+      <tr><td>主要失败模式</td><td>分布偏移后隐式奖励无约束外推；长度膨胀</td><td>reward hacking、训练不稳定</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>分布偏移视角</strong>把这场争论说清楚：DPO 在静态数据分布 $\mu$ 上做最大似然，而它真正要优化的对象是 $\pi_\theta$ <strong>自己的生成分布</strong>。训练一开始 $\pi_\theta$ 就开始漂移，$\mu$ 不会跟着动——监督信号与被优化对象脱节，这是所有离线方法的原罪。PPO 每一步都在当前 policy 的样本上拿奖励，信号永远"在策略上"（on-policy），代价是必须养一个能在新分布上可靠打分的 RM（模块 02 的 RM 过优化问题在此回归）。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>什么时候 DPO 够用：你要的是"说话风格、格式、礼貌、拒答边界"这类<strong>分布不用搬太远</strong>的对齐，
+      偏好数据质量好、和你的模型分布接近——DPO 便宜又稳。什么时候必须在线 RL：任务有<strong>客观对错</strong>（数学、代码、工具调用），
+      需要模型探索出数据里没有的新行为，或者要在自己的错误上学习——离线数据撑不起来，这是模块 05（RLVR/GRPO）的主场。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>DPO 的最优解依赖经验偏好分布对真实 BT 概率的覆盖与一致性；当 $\pi_\theta$ 的支撑显著偏离采样分布 $\mu$ 时，
+      隐式奖励 $\beta\log(\pi_\theta/\pi_{\text{ref}})$ 在新区域的取值缺乏统计约束，目标与 RLHF 目标的等价性失效。
+      在线方法以重新采样消除该偏移，将误差来源转移为 RM 的 OOD 泛化误差——两类方法本质是在「数据分布失配」与「奖励模型失配」之间做取舍。
+      实践常用折中：迭代式 DPO（重采样→重标→再训）以有限在线性换取离线的简洁（第 8 节）。</p>
+    </div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>评测视角：训练指标 ≠ 真实偏好胜率</h2>
+
+  <p>对做 evaluation 的人，DPO 后模型的验收有一个固定陷阱清单：</p>
+
+  <ul>
+    <li><strong>训练 margin/accuracy 与下游胜率的落差</strong>：margin 衡量"在<em>给定的</em>两个回答间排序"，下游胜率衡量"模型<em>自己生成</em>的回答 vs 基线"。前者是判别任务、后者是生成任务，分布完全不同。训练 accuracy 0.85 而对 SFT 基线的真实胜率不动甚至倒退，是常见结果——必须用独立的生成式评测（人评或 LLM-judge 对战）验收，绝不能拿训练曲线交差。</li>
+    <li><strong>长度 hack 检查</strong>：偏好数据普遍偏爱长回答，DPO 会放大这个偏置；而 LLM-judge 也偏爱长回答——两个偏置相乘，"胜率提升"可能全是字数。验收时①报告生成长度分布的前后对比；②用长度可控的胜率指标（length-controlled win rate，参见课程 references 模块 06 的 AlpacaEval-LC）；③抽样人工读。若胜率增益在长度控制后消失大半，这次 DPO 主要学会了写长文。</li>
+    <li><strong>隐式奖励当 RM 用要小心</strong>：理论上 $\beta\log(\pi_\theta/\pi_{\text{ref}})$ 是个奖励模型，可以拿去 RewardBench 式的成对测试；但它在 $\pi_\theta$ 分布外的排序能力显著弱于显式 RM——用它做 best-of-n 或数据筛选前先单独评测。</li>
+    <li><strong>能力回归（alignment tax）</strong>：偏好对齐可能侵蚀数学/代码/知识基准。DPO 后固定跑一轮通用能力基准，对照 SFT 起点看回归。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  一句话版本：<strong>DPO 的训练指标全部是"判别式代理指标"</strong>。模型上线后做的是生成。任何 DPO 实验报告若只有 margin/accuracy 曲线、没有独立生成评测与长度对照，应视为未完成。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>在线 DPO / 迭代 DPO</strong>：用当前 policy 重新采样回答、重新标注（人或 RM 或 LLM-judge）、再训一轮 DPO，循环数次。以最小的工程增量缓解分布偏移，已成各开源对齐管线的默认配方之一。开放问题：迭代几轮收益饱和？自标注（self-rewarding，见模块 07）会不会放大模型自身偏置？</li>
+    <li><strong>chosen 概率下降的机理</strong>：likelihood displacement 何时无害（挤掉的质量流向同义改写）、何时灾难（流向劣质模式）？目前只有部分理论刻画，缺乏可靠的在线监测指标——这本身是个评测研究题。</li>
+    <li><strong>统一框架</strong>：DPO/IPO/SimPO/KTO 可统一为「对 $f(\text{margin})$ 的不同选择 + 隐式奖励的不同定义」；哪种组合在什么数据条件下占优，仍无定论，对照实验常因评测口径（judge、长度控制）不同而互相矛盾——<em>评测方法本身成了瓶颈</em>。</li>
+    <li><strong>偏好数据的 scaling 与质量</strong>：DPO 对噪声敏感（第 3 节），但"清洗偏好数据"的有效方法（margin 过滤？judge 复核？）和偏好数据的 scaling law 都还是开放问题。</li>
+    <li><strong>评测视角</strong>：能否构造一个诊断套件，专门区分"真实偏好提升"与"长度/风格 hack"？现有 length-controlled 指标只覆盖长度这一个混杂因子，风格混杂（markdown 密度、列表化、自信语气）尚无标准工具。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>从 KL 约束 RLHF 目标出发，完整推导 DPO loss。配分函数 $Z(x)$ 在哪一步消失，为什么能消失？</li>
+      <li>为什么 DPO 训练中 $\log\pi_\theta(y_w)$ 可能下降而 loss 仍在改善？这暴露了损失函数的什么结构性质？</li>
+      <li>IPO、KTO、SimPO 各自修改了 DPO 的哪个部件（损失形状/数据形态/隐式奖励定义），分别解决什么问题？</li>
+      <li>验收一个 DPO 后的模型时，为什么不能只看训练 margin/accuracy？至少列出两项必做的独立检查。</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../03_rlhf_ppo/03_讲解.html"><div class="dir">← 上一章</div><div class="t">03 · RLHF 与 PPO</div></a>
+    <a class="next" href="../05_rlvr_grpo/05_讲解.html"><div class="dir">下一章 →</div><div class="t">05 · 推理模型与 RLVR/GRPO</div></a>
+  </div>
+
+</div>
+</body>
+</html>

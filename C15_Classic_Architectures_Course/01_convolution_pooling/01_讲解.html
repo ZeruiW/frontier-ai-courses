@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 卷积与池化</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 卷积与池化</h1>
+  <p class="subtitle">卷积的灵魂只有两句——一小块权重滑遍全图、处处复用参数极省 · 互相关 vs 卷积、padding/stride、感受野、max/avg 池化，以及从零推导并对拍的前向与反向</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、线性代数（矩阵/求和）、微积分链式法则、一点点图像常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_convolution_pooling.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">LeCun 1998 (LeNet)、Luo 2016 (有效感受野)、Goodfellow 等《Deep Learning》第 9 章</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么是卷积：从 MLP 的浪费说起</a></li>
+      <li><a href="#corr">互相关 vs 卷积：框架的小秘密</a></li>
+      <li><a href="#padstride">padding、stride 与输出尺寸公式</a></li>
+      <li><a href="#channels">多通道卷积与参数量</a></li>
+      <li><a href="#rf">感受野：CNN 的核心几何量</a></li>
+      <li><a href="#pool">池化：降采样与平移不变性</a></li>
+      <li><a href="#backward">反向传播：从零推导卷积与池化的梯度</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么是卷积：从 MLP 的浪费说起</h2>
+  <p>我们从一个朴素的问题出发：要用神经网络识别一张 <code>28×28</code> 的手写数字图，最直接的做法是把它<strong>拉平</strong>成一个 784 维向量，喂进一个全连接网络（MLP）。这能行，但它<strong>浪费</strong>得惊人——而理解它浪费在哪，正是理解卷积为何存在的钥匙。</p>  <p>第一重浪费是<strong>参数爆炸</strong>。一个全连接层把 784 个输入连到比如 1000 个隐藏单元，就需要 <code>784×1000 ≈ 78 万</code> 个权重；换成 <code>224×224</code> 的彩色图，第一层就要上百亿参数。第二重、也是更深刻的浪费是<strong>无视了图像的结构</strong>：MLP 把每个像素当成毫无关系的独立特征，它不知道<em>相邻像素高度相关</em>（一条边、一个角是局部的），也不知道<em>同一个模式可以出现在任何位置</em>（猫在左上角还是右下角都是猫）。把图打乱像素顺序，MLP 学起来一样费劲——这恰恰说明它没利用任何空间先验。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>卷积的两个核心想法都来自常识。其一<strong>局部性</strong>：要认出一条边，只需看它附近的一小块像素，不必同时盯着整张图。其二<strong>平移等变</strong>：检测边缘的那套规则，在图像的任何位置都该一样——所以同一组权重应当在所有位置<strong>复用</strong>。一句话：把「一小块滤波器滑遍全图」这件事写进网络结构。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，卷积层把全连接的稠密权重矩阵替换为一个<strong>局部连接 + 权重共享</strong>的稀疏结构。<span class="term">local connectivity</span> 让每个输出只依赖输入的一个小邻域（感受野）；<span class="term">parameter sharing</span> 让所有空间位置共用同一组核权重。这两条把参数量从「与图像尺寸的平方成正比」压到「只与核大小成正比」，并把<span class="term">translation equivariance</span> 作为结构性质免费送给你——这是一种<strong>归纳偏置</strong>（inductive bias），即对解空间的先验约束。</p></div>
+  </div>  <p>再补一句历史与生物学的注脚，帮你记住卷积「不是数学家拍脑袋发明的」。它的两个先验都有来历：局部性呼应 Hubel 与 Wiesel 1960 年代对猫视觉皮层的发现——初级视皮层的神经元只对视野中一小块区域内的特定朝向边缘有响应（即「局部感受野」+「朝向选择性」）；参数共享则呼应「同一种特征检测器应当在视野各处通用」的工程直觉。Fukushima 的 Neocognitron（1980）把这套想法首次落成网络，LeCun（1989/1998）再用反向传播端到端训练它，才有了今天的 CNN。所以卷积是<strong>把视觉的两条经验先验硬编码进网络结构</strong>——这正是「归纳偏置」最教科书式的例子。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住卷积的灵魂只有两句：<strong>一小块权重，滑遍全图；处处复用，参数极省</strong>。局部性回答「看哪里」，参数共享回答「用什么看、为何省」。本模块剩下的全部内容——互相关、padding、stride、感受野、池化、反向——都是把这两句话精确化、并教会你从零把它算对。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="corr"><span class="num">2</span>互相关 vs 卷积：框架的小秘密</h2>
+  <p>先拆穿一个几乎所有教程都含糊带过的事实：<strong>深度学习框架里的「卷积层」，做的其实是互相关（cross-correlation），不是数学意义上的卷积</strong>。两者只差一个<strong>核翻转</strong>，但搞清楚这点能让你以后读任何实现都不迷糊。</p>  <p>先看<strong>互相关</strong>：把核 <code>K</code> 不翻转地按在输入 <code>X</code> 的某个位置上，逐元素相乘再求和，得到输出该位置的一个数；然后把核滑到下一个位置，重复。对单通道二维输入，输出位置 <code>(i,j)</code> 是：</p>  <div class="math-block">\[(X \star K)[i,j] = \sum_{a=0}^{k_h-1}\sum_{b=0}^{k_w-1} X[i+a,\,j+b]\,K[a,b]\]</div>  <p>而数学上的<strong>卷积</strong>要先把核<strong>上下左右翻转 180°</strong>再做同样的滑窗加权和，下标里是减号：</p>  <div class="math-block">\[(X * K)[i,j] = \sum_{a}\sum_{b} X[i-a,\,j-b]\,K[a,b] \;=\; (X \star \tilde K)[i,j],\quad \tilde K[a,b]=K[k_h-1-a,\,k_w-1-b]\]</div>  <p>所以<strong>卷积 = 把核翻转后的互相关</strong>。为什么框架不在乎这点区别？因为<strong>核是学出来的</strong>：网络若需要某个翻转后的模式，直接把它当成要学的权重即可，翻不翻转只是把同一组数重排一下，对表达能力毫无影响。于是工程上一律用更直观的互相关（下标用加号，不必翻转），却沿用「卷积」这个名字。</p>  <div class="callout warn"><span class="label"></span>
+    <p>这个区别在两处会咬你：① 自己实现时如果要和 <code>scipy.signal.convolve2d</code>（真卷积）对拍，必须先把核翻转，或改用 <code>correlate2d</code>（互相关）才一致；② 卷积满足交换律、互相关不满足。notebook 第 1–2 节会把这两件事都<strong>跑出来对拍</strong>：你写的互相关 == <code>correlate2d</code>，你写的「翻转核再互相关」== <code>convolve2d</code>。本课此后所说的「卷积」均指框架惯例的互相关。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="padstride"><span class="num">3</span>padding、stride 与输出尺寸公式</h2>
+  <p>互相关把核滑遍全图，但「滑遍」有两个旋钮：边缘怎么处理（<span class="term">padding</span>）、每次滑多远（<span class="term">stride</span>）。它们共同决定输出的尺寸，也是调通任何卷积网络维度的第一关。</p>  <p>不加 padding 时，核中心无法对准图像最边上的像素（核会探出界），于是<strong>输出比输入小</strong>：一个 <code>k×k</code> 核扫一张 <code>n×n</code> 图，每个方向少 <code>k-1</code>。这叫 <span class="term">valid</span> 卷积。若希望输出与输入<strong>同尺寸</strong>，就在四周补一圈零，补 <code>p=(k-1)/2</code> 圈（奇数核），这叫 <span class="term">same</span> 卷积。补零还顺带缓解了边缘像素被采样次数偏少的问题。</p>  <p><span class="term">stride</span> 是核每次滑动的步长。<code>stride=1</code> 逐像素扫；<code>stride=2</code> 隔一个扫，输出尺寸大约减半——这是除池化之外的另一种<strong>降采样</strong>方式（现代架构常用 stride 卷积替代池化）。把三者合到一起，一维方向的<strong>输出尺寸公式</strong>是（务必背熟）：</p>  <div class="math-block">\[\text{out} = \left\lfloor \frac{\text{in} + 2p - k}{s} \right\rfloor + 1\]</div>  <p>二维时对高、宽两个方向各自独立套用这个公式即可。<strong>地板取整</strong>意味着当 <code>(in+2p-k)</code> 不能被 <code>s</code> 整除时，最右/最下会丢掉一些放不下整核的像素——这是新手最常忽略、却最容易导致维度对不上的细节。</p>  <table>
+    <thead><tr><th>设置</th><th>padding p</th><th>输出尺寸（n×n 输入，k×k 核）</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td>valid</td><td>0</td><td><code>(n-k)/s + 1</code>（变小）</td><td>不补零，让特征图逐层缩小</td></tr>
+      <tr><td>same（s=1）</td><td>(k-1)/2</td><td><code>n</code>（不变）</td><td>保持空间尺寸，便于堆叠/残差</td></tr>
+      <tr><td>stride 降采样</td><td>视情况</td><td><code>≈ n/s</code></td><td>用 stride>1 替代池化做下采样</td></tr>
+    </tbody>
+  </table>  <p>padding 的「补什么」也有讲究，不止补零一种。<strong>零填充</strong>最常用、最简单，但它隐含一个假设——图像外面是黑的，这会在边缘引入一圈人为的「暗边」伪信号；<strong>反射填充</strong>（reflect）把边缘像素镜像出去、<strong>复制填充</strong>（replicate）把边缘像素直接延伸，两者都避免了凭空造黑边，在图像生成、超分辨率等对边缘敏感的任务里更常用。对分类任务零填充足够好，所以成了默认。记住这点：padding 不只是「凑尺寸」的机械操作，它也在悄悄规定「图像边界之外是什么」这一先验。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>调维度时的口诀：<strong>先定 padding 模式，再套输出公式，最后检查地板取整有没有丢边</strong>。notebook 练习 1 让你把这个公式实现成函数并验证各种边界情形（含不整除时的截断），从此再不会被 <code>RuntimeError: size mismatch</code> 卡住。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="channels"><span class="num">4</span>多通道卷积与参数量</h2>
+  <p>真实图像有多个<span class="term">channel</span>（RGB 三通道），卷积层也输出多张特征图。把单通道互相关推广到多通道，是理解卷积层参数量的关键一步。</p>  <p>一个卷积层有 <code>C_out</code> 个核，每个核的形状是 <code>(C_in, k_h, k_w)</code>——注意核的通道深度必须等于输入通道数 <code>C_in</code>。计算一个输出通道时，把这个核与输入的所有 <code>C_in</code> 个通道分别做互相关，再<strong>沿通道求和</strong>（外加一个偏置），得到一张二维特征图：</p>  <div class="math-block">\[Y[o,i,j] = b_o + \sum_{c=0}^{C_{in}-1}\sum_{a}\sum_{b} X[c,\,i\cdot s+a,\,j\cdot s+b]\,K[o,c,a,b]\]</div>  <p>于是该层的<strong>参数量</strong>（权重 + 偏置）是：</p>  <div class="math-block">\[\#\text{params} = \underbrace{C_{out}\times C_{in}\times k_h \times k_w}_{\text{权重}} + \underbrace{C_{out}}_{\text{偏置}}\]</div>  <p>关键观察：参数量<strong>完全不含输入的空间尺寸 H、W</strong>。换言之，同一个卷积层处理 <code>32×32</code> 还是 <code>1024×1024</code> 的图，参数一个不变——这正是参数共享的威力，也是 CNN 能扩展到大图的根本原因。对比全连接层，参数量与输入尺寸成正比，立刻爆炸。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：卷积核就像一套<strong>可复用的印章</strong>。你有 <code>C_out</code> 枚印章，每枚厚 <code>C_in</code> 层、边长 <code>k</code>。无论纸（图像）多大，印章数量和大小都不变，只是盖的次数随纸面变多。参数 = 印章本身的刻工，与纸大小无关。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>计算量（FLOPs）则与空间尺寸有关：约 <code>H_out × W_out × C_out × C_in × k_h × k_w</code> 次乘加。所以卷积是<strong>参数省、计算未必省</strong>——参数随核大小，计算随输出像素数 × 核大小。这个区分在模块 02 算 1×1 卷积如何省计算时会反复用到。</p></div>
+  </div>  <p>从全连接的角度再看一眼，会更懂卷积省在哪。把一个输出特征图上的某个像素，看成一个「只连到输入一个小窗口、且与同图其它像素共享权重」的神经元：全连接层里每个输出神经元有自己独立的、连向全部输入的权重；卷积层把这两件事都砍掉了——连接范围砍成局部窗口（稀疏连接），权重在所有空间位置之间砍成同一套（绑定权重）。正是这两刀，把参数从「输出数 × 输入数」这个天文数字，压到「核大小 × 通道数」这个常数级。理解了这层等价，你就明白卷积层<strong>本质是一个被施加了强结构约束的全连接层</strong>——约束即先验，先验即样本效率。</p>  <div class="callout danger"><span class="label"></span>
+    <p>最常见的维度 bug：以为「核是 3×3」就只有 9 个参数。错——一个核是 <code>(C_in, 3, 3)</code>，有 <code>9·C_in</code> 个数；一层有 <code>C_out</code> 个这样的核。算参数量永远是<strong>四个数连乘再加偏置</strong>。notebook 练习 3 专门练这个，并用它对照真实 VGG 层的参数量。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rf"><span class="num">5</span>感受野：CNN 的核心几何量</h2>
+  <p><span class="term">receptive field</span>（感受野）是 CNN 最重要的几何量：输出特征图上<strong>一个位置「看得到」的原始输入区域有多大</strong>。它决定了网络能否覆盖目标的尺度——要认出一张占据 100 像素的脸，最终特征的感受野就得 ≥100 像素，否则模型从未「完整看过」一张脸。</p>  <p>单层很简单：一个 <code>k×k</code> 卷积，输出每个点看的是输入的 <code>k×k</code> 区域。妙处在<strong>堆叠</strong>:第二层的每个点看第一层的 <code>k</code> 个点，而第一层每个点又看了输入的 <code>k</code> 个点，于是两层 <code>3×3</code> 卷积的感受野是 <code>5×5</code>，三层是 <code>7×7</code>。感受野随深度<strong>线性增长</strong>（每加一层 <code>3×3</code> 多 2），而一旦中间有 stride 或池化，增长就变成<strong>成倍跳跃</strong>。</p>  <div class="ascii">感受野随层堆叠增长（一维示意，全 3×3、stride 1）
+
+  输入   ● ● ● ● ● ● ●        每个 ● 是一个像素
+          \|/                 conv 3×3
+  层1     ◆ ◆ ◆ ◆ ◆          每个 ◆ 看输入 3 个 → RF=3
+           \|/                conv 3×3
+  层2      ■ ■ ■             每个 ■ 看层1 的 3 个 → 看输入 5 个 → RF=5
+            \|/               conv 3×3
+  层3       ▲                每个 ▲ 看层2 的 3 个 → 看输入 7 个 → RF=7
+
+  规律：RF_L = RF_{L-1} + (k-1)·jump_{L-1};  jump_L = jump_{L-1}·stride_L</div>  <p>逐层递推公式如上：维护一个 <strong>jump</strong>（当前层一个像素步长对应输入多少像素，初始 1，每遇 stride 乘上去）和 <strong>RF</strong>（初始 1，每层加 <code>(k-1)·jump</code>）。这也解释了一个重要的架构取舍：<strong>用两个 3×3 替代一个 5×5</strong>——两者感受野相同，但前者参数更少（<code>2·9 &lt; 25</code>）、还多了一层非线性。VGG 正是据此设计的。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>感受野有「理论」与「有效」之分。<span class="term">effective receptive field</span>（Luo 2016）发现：理论感受野虽大，但中心像素的实际影响呈<strong>高斯衰减</strong>，边缘贡献极小，有效感受野往往只有理论值的一小半。这解释了为何很深的网络仍可能「看不够大」，也是空洞卷积、全局池化、以及后来注意力（一步到位的全局感受野）想解决的问题。notebook 练习 2 让你从一串 <code>(k, s)</code> 层配置算出理论感受野。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pool"><span class="num">6</span>池化：降采样与平移不变性</h2>
+  <p><span class="term">pooling</span>（池化）在小窗口内做聚合——取最大或取平均——用来<strong>降采样、扩大感受野、提供局部平移不变性</strong>。它没有任何可学习参数，是个纯粹的形状与统计操作，却在经典 CNN 里无处不在。</p>  <p>两种主流池化：<span class="term">max pooling</span> 取窗口内最大值，保留最强响应（最显著的特征），对小位移最鲁棒；<span class="term">average pooling</span> 取窗口内平均，更平滑，常用于网络末端的<span class="term">global average pooling</span>（把每张特征图压成一个数，替代全连接分类头）。池化的输出尺寸同样服从那条公式（把 <code>k</code> 当池化窗、<code>s</code> 当池化步长，通常 <code>s=k</code> 即不重叠）。</p>  <p>池化带来的<strong>平移不变性</strong>是这样来的：在一个 <code>2×2</code> max 池化窗内，只要最大值还在窗里，输入平移一两个像素、输出纹丝不动。这与卷积的平移<em>等变</em>（输入移、输出跟着移）不同——池化是把局部的小移动「吸收」掉，让高层特征对精确位置不敏感，利于分类（你不在乎数字 7 偏左还是偏右）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：max 池化像「这一小片里最亮的点有多亮，我只记这个」；avg 池化像「这一小片的平均亮度」。前者抓显著特征、抗噪抗位移，后者保留整体强度、更平滑。降采样后特征图变小，后续每个核就能<em>相对地</em>看到更大的输入范围——这就是池化扩大感受野的方式。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，max 池化 <code>Y[i,j]=max_{(a,b)∈window} X[i·s+a, j·s+b]</code>；avg 池化把 max 换成均值。两者的关键差异在<strong>反向传播</strong>：max 池化的梯度只回流到当时取得最大值的那个位置（argmax），其余位置梯度为 0；avg 池化把梯度<strong>均分</strong>给窗口内每个位置。下一节展开这个反向。</p></div>
+  </div>  <p>还有一个常被混淆的点值得点破：<strong>「等变」与「不变」不是对立，而是分工</strong>。卷积负责<em>等变</em>——它要精确地告诉你「边缘在哪、移动到哪」，因为定位信息对后续处理有用；池化（尤其末端的全局池化）负责<em>不变</em>——到了要做分类决策时，你已不在乎数字 7 偏左还是偏右，只想要一个稳定的判断。一个好的 CNN 因此是「前段保持等变、逐层积累空间信息，末段转成不变、输出鲁棒决策」的流水线。把这条主线记住，你就能解释几乎任何 CNN 为什么前面用卷积、后面用全局池化收尾。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个常被忽视的现代趋势：<strong>池化正在被淘汰</strong>。许多新架构（从 ResNet 的部分变体到几乎所有 Transformer）用 <strong>stride 卷积</strong> 做下采样、用<strong>全局平均池化</strong>收尾，而少用甚至不用 max 池化——因为 max 池化丢信息且不可学。但理解池化仍是必修：它是经典 CNN 的标志性零件，也是理解「下采样」与「不变性」这对概念的最佳载体。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="backward"><span class="num">7</span>反向传播：从零推导卷积与池化的梯度</h2>
+  <p>会前向只是一半，能<strong>从零写对反向</strong>才算真懂——这也是本课的硬标准。我们要推导：给定损失对卷积输出的梯度 <code>dY</code>，如何算出对<strong>输入</strong> <code>dX</code> 和对<strong>核</strong> <code>dK</code> 的梯度。把卷积看成一堆乘加，链式法则自然给出答案。</p>  <p>先看对核的梯度。输出每个位置 <code>Y[i,j]</code> 都用到了 <code>K[a,b]</code>（乘以对应的输入窗口元素 <code>X[i+a,j+b]</code>）。链式法则把所有这些位置的贡献加起来：</p>  <div class="math-block">\[\frac{\partial L}{\partial K[a,b]} = \sum_{i,j} \frac{\partial L}{\partial Y[i,j]}\,X[i+a,\,j+b] = (X \star dY)[a,b]\]</div>  <p>漂亮——<strong>对核的梯度，本身就是「输入与 dY 做互相关」</strong>。再看对输入的梯度。<code>X[m,n]</code> 影响了哪些输出？所有「窗口覆盖到它」的 <code>Y[i,j]</code>。把它们的贡献累加，可以证明结果等价于<strong>dY 与翻转核做「全」卷积</strong>：</p>  <div class="math-block">\[\frac{\partial L}{\partial X[m,n]} = \sum_{a,b} \frac{\partial L}{\partial Y[m-a,\,n-b]}\,K[a,b] = (\,dY *_{\text{full}} K\,)[m,n]\]</div>  <p>即对输入的反向是一次<strong>把核翻转、对 dY 做带 padding 的全卷积</strong>（full convolution）。直觉上，前向是「核搜集邻域信息汇成一个输出」，反向就是「每个输出把自己的梯度<em>撒回</em>它当初看过的那片邻域」，撒的权重正是核（翻转是因为方向反了）。这两个公式是所有卷积自动微分的核心。</p>  <p>池化的反向更简单，是纯<strong>路由</strong>（routing）、不含乘法：<span class="term">max pooling</span> 把每个输出的梯度原样送回它窗口内的 argmax 位置，其余位置 0；<span class="term">average pooling</span> 把每个输出的梯度除以窗口大小后均分给窗口内所有位置。没有参数要更新，只是把梯度「分发」到正确的输入位置。</p>  <p>这里值得停下来体会一个贯穿全课的统一视角：<strong>前向是「信息汇聚」，反向就是「梯度按同样的连接结构反向流回」</strong>。卷积前向把一片邻域加权汇成一个输出，反向就把这个输出的梯度按相同权重撒回那片邻域；max 池化前向「只取窗口里最强的那个」，反向就「只奖励/惩罚那个最强的位置」；avg 池化前向「平等地平均」，反向就「平等地均分」。一旦你能从前向的连接图直接读出反向的梯度流，任何新算子的 backward 都不再需要死记公式——这正是 <span class="term">computational graph</span> 思维的威力，模块 03 的 BPTT、模块 04 的门控反向都会反复用到它。</p>  <div class="callout danger"><span class="label"></span>
+    <p>反向最容易写错的两个点：① 卷积对输入的梯度<strong>要翻转核</strong>（漏翻转会得到一个镜像错误的梯度，数值检验立刻失败）；② max 池化反向时若窗口内有<strong>并列最大值</strong>，要约定只给其中一个（或均分），否则梯度总量会被放大。notebook 第 4–5 节会用<strong>数值梯度检验</strong>把 conv 的 <code>dX/dK</code> 和两种池化的反向逐一验证到相对误差 < 1e-6——这是「真的写对了」的唯一硬证据。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>从经典卷积到今天</h3>  <p>卷积这个零件在过去十年被反复改造，了解这些演化能让你把本模块的基础接到前沿：</p>  <ul>
+    <li><strong>im2col 与高效实现</strong>：朴素的多重循环卷积慢得离谱。框架（cuDNN 之前）把每个卷积窗口拉成一列、拼成大矩阵，于是卷积变成一次稠密矩阵乘（GEMM），直接复用高度优化的 BLAS。代价是显存翻倍。notebook 会简述这个变换。</li>
+    <li><strong>可分离卷积</strong>（separable / depthwise）：把一个标准卷积拆成「逐通道空间卷积 + 1×1 跨通道卷积」两步（MobileNet），参数与计算量都大降，是移动端 CNN 的基石。</li>
+    <li><strong>空洞卷积</strong>（dilated / atrous）：在核元素间插空，不加参数地放大感受野，用于语义分割、WaveNet 等需要大感受野的任务，正面回应了第 5 节「有效感受野不够大」的痛点。</li>
+    <li><strong>stride 卷积取代池化</strong>：如第 6 节所述，可学习的 stride 卷积逐渐取代固定的 max 池化做下采样，让下采样也参与学习。</li>
+    <li><strong>卷积 vs 注意力</strong>：注意力（模块 05、C1）可视为「感受野一步到位覆盖全局、且权重由数据动态决定」的算子，而卷积是「固定局部、权重静态共享」。ConvNeXt（2022）反过来证明：把现代训练技巧用在纯卷积上，仍能逼平 Transformer——说明两者的差距更多在训练配方而非算子本身。</li>
+  </ul>  <p>把这些放在一起看，会发现一条主线：<strong>人们一直在调节卷积的两个先验——感受野的大小与形状（局部到全局）、权重的来源（静态共享到动态生成）</strong>。理解了本模块的「固定局部 + 静态共享」这个原点，你才能精确地说出后来每种变体到底松动了哪一条假设。这也是带着归纳偏置视角读架构论文的方式。</p>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读：LeCun 1998（LeNet，卷积奠基）、Luo 2016（有效感受野）、Howard 2017（MobileNet 可分离卷积）、Yu & Koltun 2016（空洞卷积）、Liu 2022（ConvNeXt）。完整出处见 <code>references.md</code>。下一模块把这些卷积零件组装成 LeNet→AlexNet→VGG→ResNet 的完整演化。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_cnn_architectures/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · CNN 架构演化</div></a>
+  </div>
+
+</div>
+</body>
+</html>

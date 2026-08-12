@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 奖励模型：Bradley-Terry 与 reward hacking</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 奖励模型：Bradley-Terry 与 reward hacking</h1>
+  <p class="subtitle">Reward Models —— 把"人觉得哪个更好"压缩成一个标量函数，以及这个压缩为什么注定漏水</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（SFT）、logistic 回归、PyTorch 基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_reward_model.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Christiano 2017、Stiennon 2020、Gao 2022、RewardBench</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么需要奖励模型：好坏难定义，但偏好易标注</a></li>
+      <li><a href="#bt">Bradley-Terry 模型：从成对偏好到训练损失</a></li>
+      <li><a href="#arch">RM 架构：LLM backbone + 标量 value head</a></li>
+      <li><a href="#fragile">RM 的脆弱性：它学到的是"标注者代理"</a></li>
+      <li><a href="#overopt">Reward hacking 与 overoptimization（重点）</a></li>
+      <li><a href="#evals">怎么评测一个 RM：RewardBench 与它的局限</a></li>
+      <li><a href="#prm">过程奖励 PRM vs 结果奖励 ORM（一节带过）</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么需要奖励模型：好坏难定义，但偏好易标注</h2>
+
+  <p>后训练的终极目标是让模型输出"人类想要的回答"。问题在于：<strong>"想要"无法写成损失函数</strong>。
+  "有帮助"、"诚实"、"得体"这些性质没有可微的解析形式，也很难让标注者为一段回答打出绝对分数——
+  同一段摘要，标注者 A 打 7 分、B 打 4 分，分数的尺度本身就不可比。</p>
+
+  <p>[Christiano 2017] 的关键洞见是：<strong>人类不擅长打绝对分，但非常擅长做相对比较</strong>。
+  给标注者看两段输出，问"哪个更好"，一致性远高于打分。这篇论文用不到 1000 条人类偏好比较，
+  就教会了 RL agent 做后空翻——一个研究者自己都写不出奖励函数的任务。
+  [Stiennon 2020] 把同样的配方搬到了语言任务（摘要），奠定了 RLHF 的三段式流水线。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>我们没法直接告诉模型"什么是好回答"，但可以收集大量"这两个里人选了左边"的记录，
+      然后训练一个打分器去拟合这些选择。打分器学会后，就成了人类偏好的<strong>可计算替身</strong>——
+      RL 阶段每生成一个回答，不用真人看，问替身要个分数就行。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设真实（不可观测的）人类效用为 $r^*(x, y)$。我们无法直接回归 $r^*$，
+      但可以观测其诱导的偏好分布 $p^*(y_w \succ y_l \mid x)$ 的样本。
+      <span class="term">奖励模型（Reward Model, RM）</span> $r_\phi(x,y)$ 通过最大化偏好数据的似然来逼近 $r^*$
+      （至多差一个逐 prompt 的常数偏移），从而把不可微的人类判断替换为可查询、可微的标量函数。</p>
+    </div>
+  </div>
+
+  <p>因此偏好数据的标准形态是三元组：</p>
+
+  <div class="ascii">
+  一条偏好样本 = (prompt, chosen, rejected)
+
+  prompt x ──► policy 采样 ──► y₁ = "巴黎是法国首都，位于塞纳河畔…"
+                          └──► y₂ = "首都的话呢我觉得应该是巴黎吧大概"
+                                       │
+                              标注者比较：y₁ ≻ y₂
+                                       │
+                                       ▼
+                     (x, chosen=y₁, rejected=y₂)  存入偏好数据集 D
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  注意这条流水线里被压缩掉的信息：标注者只留下了 1 bit（谁赢），丢掉了"赢多少"、"为什么赢"、
+  "两个是不是都很烂"。RM 的一切脆弱性（第 4、5 节）都源于这个极端有损的压缩。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="bt"><span class="num">2</span>Bradley-Terry 模型：从成对偏好到训练损失</h2>
+
+  <p><span class="term">Bradley-Terry（BT）模型</span> [Bradley &amp; Terry 1952] 最初是为分析不完全区组设计中的成对比较（如体育比赛胜负）提出的统计模型。
+  它假设每个对象 $i$ 有一个潜在"实力"分 $r_i$，两两对决的胜率只取决于实力差：</p>
+
+  <div class="math-block">
+  $$ P(a \succ b) \;=\; \frac{e^{r_a}}{e^{r_a} + e^{r_b}} \;=\; \frac{1}{1 + e^{-(r_a - r_b)}} \;=\; \sigma(r_a - r_b) $$
+  </div>
+
+  <p>其中 $\sigma$ 是 sigmoid。这正是 logistic 回归的形状：<strong>偏好概率只依赖分差，不依赖绝对值</strong>——
+  给所有 $r$ 加同一个常数，预测完全不变（所以 RM 的分数只有相对意义，没有绝对刻度）。</p>
+
+  <p>把它用于 RM 训练：假设标注者按 BT 模型从真实奖励生成偏好，即
+  $p^*(y_w \succ y_l \mid x) = \sigma\big(r^*(x,y_w) - r^*(x,y_l)\big)$。
+  我们用参数化的 $r_\phi$ 做最大似然估计。给定偏好数据集 $D = \{(x^{(i)}, y_w^{(i)}, y_l^{(i)})\}$，负对数似然为：</p>
+
+  <div class="math-block">
+  $$
+  \begin{aligned}
+  \mathcal{L}(\phi)
+  &= -\,\mathbb{E}_{(x,\,y_w,\,y_l)\sim D}\Big[\log P_\phi(y_w \succ y_l \mid x)\Big] \\
+  &= -\,\mathbb{E}_{(x,\,y_w,\,y_l)\sim D}\Big[\log \sigma\big(r_\phi(x, y_w) - r_\phi(x, y_l)\big)\Big]
+  \end{aligned}
+  $$
+  </div>
+
+  <p>这就是几乎所有 RM（[Stiennon 2020]、InstructGPT、Llama 系列……）使用的训练损失：
+  <strong>chosen 与 rejected 各前向一次，取两个标量分数之差，过 $-\log\sigma(\cdot)$</strong>。
+  梯度形式也很直观：</p>
+
+  <div class="math-block">
+  $$ \nabla_\phi \mathcal{L} = -\,\mathbb{E}\Big[\big(1 - \sigma(\Delta)\big)\,\nabla_\phi \Delta\Big],
+     \qquad \Delta = r_\phi(x,y_w) - r_\phi(x,y_l) $$
+  </div>
+
+  <p>当 RM 已经把 chosen 排在 rejected 之上很多（$\Delta$ 大，$\sigma(\Delta)\to 1$）时梯度趋零；
+  排反了（$\Delta&lt;0$）时梯度最大——损失自动聚焦在"还没分对"的样本上。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>与 Elo / arena 的同源性</strong>：评测课里的 Chatbot Arena 排名用的 Elo 评分，本质就是 BT 模型的在线近似——
+  Elo 的期望胜率公式 $E_a = 1/(1+10^{(R_b-R_a)/400})$ 与 $\sigma(r_a - r_b)$ 只差换底和缩放。
+  所以可以这样统一理解：<strong>RM 训练 = 给"回答"做 Elo；arena 排行榜 = 给"模型"做 RM</strong>。
+  同一套统计模型，作用在不同粒度的对象上。这也意味着两者共享同样的失效模式：分数只有相对意义、
+  对非传递偏好（A≻B≻C≻A）无法建模、对标注噪声敏感。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  数值实现细节：直接写 <code>-torch.log(torch.sigmoid(d))</code> 在 $d$ 很负时会下溢出 NaN。
+  正确写法是 <code>-F.logsigmoid(d)</code>，内部用 log-sum-exp 技巧保证稳定。notebook 练习 1 会让你亲手实现并验证。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="arch"><span class="num">3</span>RM 架构：LLM backbone + 标量 value head</h2>
+
+  <p>结构上，RM 是对 LLM 的一个极小改动：去掉（或绕过）词表大小的 LM head，
+  换成一个输出标量的线性层（<span class="term">value head</span>），通常取<strong>最后一个 token</strong> 位置的隐状态：</p>
+
+  <div class="ascii">
+                 ┌──────────────────────────────────────────┐
+   prompt + 回答 │  LLM backbone（从 SFT 模型初始化）           │
+   x ⊕ y ──────► │  Transformer × L 层                        │
+                 └──────────────────────────────────────────┘
+                        │ 隐状态 h₁ h₂ … h_T   (T×d)
+                        │            取最后一个 token 的 h_T ──┐
+                        ▼                                     ▼
+                  （LM head 弃用）                  value head: Linear(d → 1)
+                                                              │
+                                                              ▼
+                                                    r_φ(x, y) ∈ ℝ  标量分数
+  </div>
+
+  <p>三个设计决策的理由：</p>
+  <ul>
+    <li><strong>为什么取最后一个 token？</strong> causal attention 下，只有最后一个位置"看完了"整个 prompt+回答，
+    其隐状态是对全序列的总结。（双向模型可以用 [CLS]，但 RM 几乎都基于 causal LLM。）</li>
+    <li><strong>为什么从 SFT 模型初始化？</strong> 判断回答好坏所需的语言理解、事实知识、格式感知，
+    与生成回答所需的能力高度重叠。从 SFT checkpoint 起步，RM 只需学"评价"这一层薄薄的映射，
+    几万条偏好对就够；从头训则完全不可行。另一个工程原因：RM 与 policy 同源，
+    使 RL 阶段二者对文本的"理解坐标系"接近，奖励信号更平滑。</li>
+    <li><strong>为什么输出标量而不是分类？</strong> RL（模块 03）需要一个可作为 reward 的连续信号；
+    BT 损失也天然作用在标量差上。value head 初始权重一般小随机或零初始化，避免初期分数方差过大。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  从参数量视角看：一个 7B 的 RM，其中 6.999B 参数来自 backbone，value head 只有几千个参数。
+  <strong>RM 的能力上限由 backbone 决定，RM 的偏好取向由数据决定</strong>。
+  [Gao 2022] 的 scaling 实验正是沿这两个轴展开的：RM 参数量与偏好数据量。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="fragile"><span class="num">4</span>RM 的脆弱性：它学到的是"标注者代理"，不是真奖励</h2>
+
+  <p>训练完的 RM 在 held-out 偏好对上准确率常见 65–75%（人类标注者之间的一致率也差不多是这个水平），
+  看起来不错。但要记住它的本质：<strong>RM 是"标注者在标注分布上的行为"的代理（proxy），
+  不是真实效用 $r^*$</strong>。三类系统性失效：</p>
+
+  <table>
+    <thead><tr><th>失效模式</th><th>机制</th><th>典型表现</th></tr></thead>
+    <tbody>
+      <tr><td>分布外（OOD）失效</td><td>偏好数据采自某个 policy 的输出分布；RL 优化会把 policy 推出该分布，RM 在没见过的区域外推，分数无意义却照样可微可爬</td><td>RL 后期 policy 生成怪异文本，RM 仍给高分</td></tr>
+      <tr><td>长度偏好 length bias</td><td>标注者轻微偏爱更长、更详尽的回答（看起来更"认真"）；RM 把"长"学成了高分特征本身</td><td>RLHF 后模型回答显著变长、啰嗦、列表化</td></tr>
+      <tr><td>格式/风格偏好</td><td>markdown 标题、加粗、礼貌套话、"作为一个 AI"式免责声明与 chosen 标签相关</td><td>RM 给格式华丽但内容空洞的回答打高分</td></tr>
+    </tbody>
+  </table>
+
+  <p>关键在于：这些不是 bug，而是<strong>统计学习的正常行为</strong>。
+  如果标注数据里"长"与"被选中"真实相关，最大似然估计就<em>应该</em>把长度学进去。
+  RM 忠实地拟合了标注者——包括标注者的懒惰、疲劳和启发式。
+  指望 RM 比它的训练信号更接近真奖励，在没有额外归纳偏置时是不可能的。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  评测视角的警示：当你看到"我们的 RM 在测试集上 72% 准确率"时，要追问三件事——
+  ①测试集与训练集是否同分布（同 policy 采样）？②按长度差分桶后准确率如何（chosen 更短的那一桶往往掉到 50% 以下）？
+  ③在<strong>将要被优化的 policy 的输出分布</strong>上准确率如何？第三个才是 RLHF 真正关心的，却几乎没人报告。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="overopt"><span class="num">5</span>Reward hacking 与 overoptimization（重点）</h2>
+
+  <p>既然 RM 只是 proxy，那么对它持续优化会发生什么？答案是 Goodhart 定律的机器学习版本：
+  <strong>当一个度量成为优化目标，它就不再是好度量</strong>。
+  [Gao 2022] 用合成实验给出了这条规律的定量刻画。实验设置很巧妙：
+  用一个大 RM（6B）充当"<span class="term">gold reward</span>"（视为真奖励），
+  用它标注偏好数据训练小 proxy RM，然后对 proxy 优化 policy，同时用 gold RM 监控真实质量：</p>
+
+  <div class="ascii">
+  reward
+    ▲
+    │                                 proxy RM 分数（被优化的目标）
+    │                          ＿＿——————————————
+    │                    ＿——‾‾
+    │              ＿—‾‾
+    │          ＿—‾        gold reward（真实质量）
+    │        ／      ＿——————＿＿
+    │      ／    ＿—‾          ‾‾——＿＿
+    │    ／   ＿—‾                    ‾‾——＿＿  ← reward hacking 区
+    │  ／  ＿—‾                              ‾‾——＿
+    │ ／＿—‾
+    └─┴───────────────────────────────────────────► 优化压力
+      0          √KL(π‖π_SFT) 持续增大 ──►
+  </div>
+
+  <p><strong>proxy 分数单调上升，gold 分数先升后降</strong>——存在一个最优优化量，过了就是纯粹的
+  <span class="term">reward hacking</span>：policy 找到了 RM 的盲区（长度、格式、OOD 怪异模式），
+  在 proxy 上刷分，真实质量却在崩坏。这条分叉曲线是整个 RLHF 工程中最重要的一张图。</p>
+
+  <h3>用 KL 度量优化压力</h3>
+  <p>横轴怎么定义"优化了多少"？[Gao 2022] 用 policy 相对初始 SFT 模型的 KL 散度
+  $\mathrm{KL}(\pi \,\|\, \pi_{\text{SFT}})$ 作为统一的优化压力度量——
+  它衡量 policy 被"推离"了多远，且对 RL 和 best-of-n 两种优化方式都有定义。
+  对 <span class="term">best-of-n（BoN）采样</span>（采 $n$ 个回答取 RM 最高分），KL 有解析式：</p>
+
+  <div class="math-block">
+  $$ \mathrm{KL}_{\text{BoN}}(n) \;=\; \log n \;-\; \frac{n-1}{n} $$
+  </div>
+
+  <p>（推导要点：BoN 分布是对原分布按"是 $n$ 个样本中的最大者"重加权，
+  对连续分数其密度比为 $n F(s)^{n-1}$，代入 KL 定义积分即得，与原分布无关。）
+  令 $d = \sqrt{\mathrm{KL}}$，论文给出两种优化方式下 gold reward 的经验律：</p>
+
+  <div class="math-block">
+  $$ R_{\text{BoN}}(d) = d\,(\alpha_{\text{bon}} - \beta_{\text{bon}}\, d), \qquad
+     R_{\text{RL}}(d) = d\,(\alpha_{\text{RL}} - \beta_{\text{RL}} \log d) $$
+  </div>
+
+  <p>两条都是"先升后降"：线性项 $\alpha d$ 是真实改进，$-\beta d^2$ / $-\beta d\log d$ 项是 hacking 造成的衰减。
+  系数随 RM 规模/数据量变化的规律构成了 <span class="term">overoptimization scaling laws</span>：</p>
+
+  <table>
+    <thead><tr><th>发现</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>RM 参数量↑ ⇒ $\beta$↓，峰值后移、更高</td><td>更大的 RM 更难被 hack，可以安全地优化更久</td></tr>
+      <tr><td>偏好数据量↑ ⇒ overopt 更晚出现</td><td>数据覆盖更广，proxy 与 gold 偏差更小</td></tr>
+      <tr><td>同等 KL 下 RL 比 BoN 消耗"性价比"更低</td><td>RL 走到同样 KL 时拿到的 proxy 提升更少；BoN 是更"温和"的优化器</td></tr>
+      <tr><td>policy 模型变大，曲线形状基本不变</td><td>overopt 主要是 RM 的问题，不是 policy 的问题</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  这就是模块 03 里 PPO 目标中 KL 惩罚项 $-\beta\,\mathrm{KL}(\pi\|\pi_{\text{SFT}})$ 的存在理由：
+  它不是正则化的玄学，而是<strong>直接限制优化压力，把 policy 摁在 gold reward 曲线的峰值附近</strong>。
+  实践中早停（按验证集真实质量而非 proxy 分数）与 KL 惩罚是对抗 overopt 的两件基本武器。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  注意 [Gao 2022] 的"gold RM"本身也只是个大模型，不是真的人类效用——这是合成实验的方法论妥协。
+  真实场景里你没有 gold reward 可监控，只能靠人工抽检、独立评测集与多信号交叉验证来发现 hacking。
+  notebook 会让你在一个<strong>已知 gold reward 的合成世界</strong>里亲手复现这条分叉曲线。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="evals"><span class="num">6</span>怎么评测一个 RM：RewardBench 与它的局限</h2>
+
+  <p>RM 本身也需要评测。<span class="term">RewardBench</span> [Lambert 2024] 是第一个系统性的 RM 评测基准：
+  收集结构化的 (prompt, chosen, rejected) 三元组，按 RM 是否给 chosen 更高分计准确率，分四个维度：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>考察内容</th><th>典型难点</th></tr></thead>
+    <tbody>
+      <tr><td>Chat</td><td>常规对话质量比较</td><td>区分度低，多数 RM 都不错</td></tr>
+      <tr><td>Chat-Hard</td><td>对抗性构造：rejected 表面更华丽/更长</td><td>专打长度与格式偏好，许多 RM 在此崩盘</td></tr>
+      <tr><td>Reasoning</td><td>代码/数学：chosen 正确、rejected 有微妙错误</td><td>要求 RM 真的会做题，而非看风格</td></tr>
+      <tr><td>Safety</td><td>该拒绝时拒绝、不该拒绝时别过度拒绝</td><td>双向都要对，惩罚一刀切策略</td></tr>
+    </tbody>
+  </table>
+
+  <p>但要清醒：<strong>RewardBench 准确率高 ≠ 用它做 RLHF 效果好</strong>。原因回到第 4、5 节：</p>
+  <ul>
+    <li><strong>分布不匹配</strong>：RewardBench 的样本不是你的 policy 生成的。RLHF 中 RM 要在<em>自家 policy 的输出分布</em>上打分，且这个分布还会随训练漂移——静态基准测不到这一点。</li>
+    <li><strong>准确率不衡量可 hack 性</strong>：两个准确率相同的 RM，一个的盲区恰好在 policy 容易到达的区域，另一个不在，做 RLHF 时表现天壤之别。准确率是"分类视角"，而 RLHF 需要"被优化时的鲁棒性视角"。</li>
+    <li><strong>分差的刻度信息被丢弃</strong>：准确率只看排序，RL 用的是分数本身；分数的方差与平滑性影响优化，但不影响准确率。</li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  这与评测课的元教训一致：<strong>静态基准衡量的是"在该基准分布上的行为"，外推到下游使用要格外小心</strong>。
+  更可靠（但更贵）的 RM 评测是端到端的：用候选 RM 各做一遍小规模 RLHF / BoN，再人评最终 policy 的质量。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="prm"><span class="num">7</span>过程奖励 PRM vs 结果奖励 ORM（一节带过）</h2>
+
+  <p>本章讨论的 RM 都是 <span class="term">ORM（Outcome Reward Model）</span>：看完整个回答给一个总分。
+  对多步推理任务还有另一条路线——<span class="term">PRM（Process Reward Model）</span>：给推理链的<strong>每一步</strong>打分。</p>
+
+  <table>
+    <thead><tr><th></th><th>ORM 结果奖励</th><th>PRM 过程奖励</th></tr></thead>
+    <tbody>
+      <tr><td>打分粒度</td><td>整条回答一个标量</td><td>每个推理步骤一个分数</td></tr>
+      <tr><td>信号密度</td><td>稀疏（信用分配难）</td><td>密集（直接定位错误步骤）</td></tr>
+      <tr><td>标注成本</td><td>低（比较或判对错）</td><td>高（逐步标注）</td></tr>
+      <tr><td>失效风险</td><td>奖励"碰巧对的答案"（错误推理+正确结果）</td><td>奖励"看起来对的步骤"，且步骤级同样可被 hack</td></tr>
+    </tbody>
+  </table>
+
+  <p>[Lightman 2023] 在数学推理上证明 PRM 显著优于 ORM。但 PRM 与可验证奖励（RLVR）的取舍、
+  GRPO 时代"干脆不用学习型 RM"的转向，是模块 05 的主题，此处按下不表。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>RM ensemble 与不确定性</strong>：训多个 RM 取保守聚合（min / mean−λ·std），在 RM 们意见分歧的区域自动降低奖励——本质是用 epistemic uncertainty 标记 OOD 区，缓解 overopt。开放问题：ensemble 成员高度相关（同 backbone 同数据）时分歧被低估。</li>
+    <li><strong>Generative RM / LLM-as-judge 作为 RM</strong>：不用 value head，直接让 LLM 生成评语与分数（或比较结果），可利用 CoT 提升判断质量、提供可解释理由。代价：推理贵、引入 judge 自身的偏置（位置偏好、自我偏好），且"会说理"不等于"判得准"——如何评测 generative RM 本身又回到第 6 节的难题。</li>
+    <li><strong>抗 hack 的 RM 训练</strong>：长度去偏（训练时做长度均衡/回归校正）、对抗数据增广（主动挖 policy 已发现的 hack 样本回炉）、在线更新 RM（追着 policy 分布走）。开放问题：在线 RM 让"目标"本身不稳定，训练动力学难分析。</li>
+    <li><strong>评测视角的开放问题</strong>：能否设计一个<em>预测性</em>指标，在不跑完整 RLHF 的情况下预测某 RM 的可 hack 程度？目前最接近的做法是测 RM 在受控扰动（加长、加格式、加套话）下的分数敏感度——这正是 notebook 长度偏差实验的放大版。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>为什么 RLHF 收集成对偏好而不是绝对分数？从 BT 似然推出 RM 训练损失 $-\log\sigma(r_c - r_r)$。</li>
+      <li>RM 为什么从 SFT 模型初始化、为什么取最后一个 token 的隐状态接 value head？</li>
+      <li>画出 [Gao 2022] 的 proxy/gold 分叉曲线，解释横轴为什么用 $\sqrt{\mathrm{KL}}$，并写出 BoN 的 KL 解析式。</li>
+      <li>一个 RM 在 RewardBench 上准确率很高，为什么用它做 RLHF 仍可能翻车？给出至少两个理由。</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../01_sft/01_讲解.html"><div class="dir">← 上一章</div><div class="t">01 · SFT 与 loss masking</div></a>
+    <a class="next" href="../03_rlhf_ppo/03_讲解.html"><div class="dir">下一章 →</div><div class="t">03 · RLHF 与 PPO</div></a>
+  </div>
+
+</div>
+</body>
+</html>

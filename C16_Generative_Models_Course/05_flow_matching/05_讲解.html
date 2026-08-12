@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 流匹配 Flow Matching</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 流匹配 Flow Matching</h1>
+  <p class="subtitle">连续归一化流、用回归速度场训练（flow matching / rectified flow）、Euler ODE 采样，以及它如何把扩散统一进「学一个把噪声搬到数据的速度场」—— 基础生成模型课的终点与通往现代文生图的桥梁</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 04（扩散/score）、ODE 与数值积分（Euler）概念、重参数化、向量场直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_flow_matching.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Lipman et al. 2023（Flow Matching）、Liu et al. 2023（Rectified Flow）、Chen et al. 2018（Neural ODE）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#idea">流匹配的思想：学一个搬运分布的速度场</a></li>
+      <li><a href="#cnf">连续归一化流与它的困难</a></li>
+      <li><a href="#core">核心：回归速度场，不积分 ODE</a></li>
+      <li><a href="#build">从零实现速度场回归</a></li>
+      <li><a href="#ode">ODE 采样：沿速度场积分</a></li>
+      <li><a href="#unify">流匹配与扩散的统一</a></li>
+      <li><a href="#mainstream">为什么流匹配成了新主流</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="idea"><span class="num">1</span>流匹配的思想：学一个搬运分布的速度场</h2>
+  <p>我们已经走过四族模型，到了最后一站，也是最现代的一站——<strong>流匹配（Flow Matching，Lipman 等 2023）</strong>。它把扩散推到一个优雅的<strong>连续极限</strong>：与其像 DDPM 那样定义几百个离散的加噪/去噪步，不如直接学<strong>一个把噪声分布连续「搬运」到数据分布的速度场</strong>，生成时沿这个速度场积分一条 ODE 即可。这个视角不仅更简洁，还让采样可以用<strong>极少的步数</strong>（甚至一步），是当前文生图（如 Stable Diffusion 3、Flux）的主流框架。</p>  <p>先建立核心图像。想象数据空间里有一群粒子，初始时它们服从简单的<strong>噪声分布</strong> <code>p_0=\mathcal{N}(0,I)</code>；我们希望在时间 <code>t</code> 从 0 走到 1 的过程中，让这群粒子<strong>流动</strong>到服从<strong>数据分布</strong> <code>p_1=p_{data}</code>。支配每个粒子运动的，是一个<strong>速度场（velocity field）</strong> <code>v(x,t)</code>——它告诉位于 <code>x</code>、时刻 <code>t</code> 的粒子下一刻该往哪个方向、以多快速度移动。粒子的轨迹由常微分方程 <code>dx/dt=v(x,t)</code> 决定。<strong>学会了这个速度场，就学会了生成</strong>：从噪声采一个 <code>x_0</code>，沿 <code>v</code> 积分到 <code>t=1</code>，就得到一个数据样本。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：你想把一堆撒在地上的沙子（噪声分布）整理成一座沙雕（数据分布）。速度场就是一张<strong>处处标注「这里的沙子该往哪推」的地图</strong>。生成时，每粒沙子只要照着地图上自己脚下的箭头一小步一小步地挪，最终整堆沙子就自动汇成了沙雕的形状。流匹配要学的，就是这张箭头地图。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：流匹配学一个时变速度场 <code>v_\theta(x,t)</code>，使得由 ODE <code>dx/dt=v_\theta(x,t)</code> 定义的流（flow），把先验 <code>p_0</code> 推送（push-forward）成数据分布 <code>p_1</code>。这属于<strong>连续归一化流（CNF）</strong>的范畴——但流匹配的革命性在于，它能<strong>不积分 ODE</strong>就训练出这个速度场（下一节的「无模拟训练」），从而既有连续流的优雅，又有扩散的训练效率。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住流匹配与扩散的关系：<strong>扩散是「离散的、加噪声的」搬运，流匹配是「连续的、可确定的」搬运——但它们学的是同一种东西：把噪声移到数据的方向场</strong>。还记得模块 04 那条金线（去噪 AE → 预测噪声 → score → 速度场）吗？这一模块就是它的终点。事实上，扩散的「概率流 ODE」与流匹配的速度场可以互相换算——它们是同一枚硬币的两面。带着「这是扩散的连续/统一版」的视角读本章。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cnf"><span class="num">2</span>连续归一化流与它的困难</h2>
+  <h3>连续归一化流与它曾经的困难</h3>  <p>流匹配属于<strong>连续归一化流（continuous normalizing flow, CNF）</strong>这一脉。要理解它的突破，先得知道 CNF 曾经卡在哪里。</p>  <p>传统的<strong>归一化流</strong>（normalizing flow，Rezende & Mohamed 2015）用一串<strong>可逆</strong>变换把简单分布（高斯）映成复杂数据分布，靠<strong>变量替换公式</strong> <code>\log p_x(x)=\log p_z(z)-\log|\det\partial f/\partial z|</code> 精确算出似然。代价是网络必须可逆、且雅可比行列式要易算——这严重限制了结构（只能用耦合层等特殊设计，如 RealNVP、Glow）。</p>  <p>这里值得停一秒，体会那个雅可比行列式约束有多碍事。变量替换公式里的 <code>\log|\det\partial f/\partial z|</code> 一项，要求我们能<em>算出</em>变换的雅可比行列式——而一般神经网络的雅可比是个稠密大矩阵，算行列式要 <code>O(D^3)</code>、对高维数据（一张图几千上万维）根本承受不起。归一化流的全部架构智慧（耦合层、自回归流）本质都是在<strong>削足适履</strong>：刻意设计成让雅可比变成三角矩阵（行列式 = 对角线连乘，<code>O(D)</code> 可算）。代价是每一层的表达力都被这个「必须可逆且雅可比好算」的枷锁绑住，远不如一个自由的 MLP 灵活。<strong>「精确算似然」这个看似诱人的卖点，反而成了束缚结构的镣铐</strong>——这是理解后来扩散/流匹配为何宁可放弃精确似然也要换取架构自由的关键背景。</p>  <p><strong>连续归一化流</strong>（Chen 等 2018，Neural ODE）把离散的可逆层取极限，用一个 ODE <code>dx/dt=v_\theta(x,t)</code> 定义连续形变。它优雅得多（任意网络都能当 <code>v_\theta</code>，不需要精心设计可逆结构），但训练<strong>曾经极其昂贵</strong>：要算似然就得解一个 ODE（还要解伴随 ODE 求梯度），每次前向/反向都要数值积分整条轨迹，慢且不稳。这让 CNF 多年来停留在小规模。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>这就是流匹配登场的舞台：<strong>CNF 的形式很美（一个 ODE 就定义了生成），但「要积分 ODE 才能训练」这件事让它一直跑不快</strong>。流匹配的核心贡献，就是找到一种<strong>根本不用积分 ODE 就能训练速度场</strong>的办法（下一节）。它把 CNF 从「优雅但昂贵」变成「优雅且高效」，这正是它能在 2023 年后迅速成为主流的原因。下一节是全模块的技术核心，请重点读。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="core"><span class="num">3</span>核心：回归速度场，不积分 ODE</h2>
+  <h3>流匹配的核心：回归速度场，不积分 ODE</h3>  <p>流匹配最关键的洞察是：<strong>我们不必先有一个完整的生成过程再去优化它，而可以先「钦定」一条好走的路径，再训练速度场去匹配这条路径的速度</strong>。这把训练从「解 ODE」变成了「做回归」。</p>  <p>具体地，先选一条<strong>概率路径（probability path）</strong> <code>\{p_t\}_{t\in[0,1]}</code>，从先验 <code>p_0</code> 连续过渡到数据 <code>p_1</code>。最简单、也最常用的是<strong>直线路径</strong>（rectified flow，Liu 等 2023）：对一对 <code>(x_0,x_1)</code>（噪声、数据），让它们之间走直线：</p>  <div class="math-block">\[x_t=(1-t)\,x_0+t\,x_1,\qquad x_0\sim\mathcal{N}(0,I),\ x_1\sim p_{data},\ t\sim\mathcal{U}[0,1]\]</div>  <p>沿这条直线，粒子的速度是恒定的、且<strong>有解析解</strong>：对 <code>t</code> 求导，<code>dx_t/dt=x_1-x_0</code>。这就是<strong>目标速度</strong>！于是训练目标无比朴素——让网络 <code>v_\theta(x_t,t)</code> 回归这个目标速度：</p>  <div class="math-block">\[\mathcal{L}_{\text{FM}}=\mathbb{E}_{t,\,x_0,\,x_1}\Big[\big\|\,v_\theta\big((1-t)x_0+t x_1,\ t\big)-(x_1-x_0)\,\big\|^2\Big]\]</div>  <p>读懂它：随机抽一个噪声 <code>x_0</code>、一个数据 <code>x_1</code>、一个时刻 <code>t</code>；算出直线上的中间点 <code>x_t</code> 和该点的目标速度 <code>x_1-x_0</code>；让网络看着 <code>(x_t,t)</code><strong>预测这个速度</strong>；用 MSE 惩罚。<strong>没有 ODE 积分、没有对抗、没有 KL</strong>——又一个干净的回归任务，和 DDPM 的「预测噪声」如出一辙。这就是<strong>无模拟训练（simulation-free training）</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么对<em>每一对</em> <code>(x_0,x_1)</code> 走直线、回归 <code>x_1-x_0</code>，就能学到正确的、把整个噪声分布搬到整个数据分布的速度场？关键的数学保证是：虽然每条直线的方向 <code>x_1-x_0</code> 各不相同，但网络对所有经过同一点 <code>x_t</code> 的直线速度求了<strong>平均</strong>（MSE 回归的最优解就是条件期望），这个平均恰好等于那个能实现整条概率路径的、真正的<strong>边缘速度场</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：这就是<strong>条件流匹配（conditional flow matching, CFM）</strong>定理（Lipman 2023）。难算的边缘速度场 <code>v(x,t)=\mathbb{E}[\dot x_t|x_t=x]</code> 无法直接回归，但论文证明：回归<em>条件</em>速度场（每对 <code>(x_0,x_1)</code> 的 <code>x_1-x_0</code>）与回归边缘速度场<strong>有相同的梯度</strong>。于是我们可以用前者（极易采样）替代后者（难算），训练目标完全等价。这是流匹配能成立的理论基石。</p></div>
+  </div>  <p>这个「对穿过同一点的多条直线求平均」的机制，是流匹配最反直觉也最精妙的地方，值得用一个<strong>微例</strong>把它具象化。设想空间里有一个固定的中间点 <code>x</code>，恰好有两对噪声-数据点的直线都在某个时刻经过它：第一对的目标速度是 <code>x_1-x_0=(+2,0)</code>（指向右），第二对是 <code>(0,+2)</code>（指向上）。网络在 <code>x</code> 处只能输出<em>一个</em>速度向量，而 MSE 回归会逼它输出这两个目标的<strong>平均</strong> <code>(+1,+1)</code>（指向右上）。这个平均后的方向，正是「同时考虑了所有该往哪去的可能、加权折中」的<strong>边缘速度场</strong>——它才是真正能把整团噪声搬成整个数据分布的那个场。<strong>单条直线只知道一对点该怎么连，求平均后才浮现出搬运整个分布的全局方向</strong>。这就是为什么「对每对点回归一条简单直线」这件局部、廉价的事，累积起来能学到全局、昂贵的边缘速度场——也是条件流匹配定理在直觉层面的全部内容。</p>  <div class="callout paper"><span class="label"></span>
+    <p>这个「回归条件速度 = 学到边缘速度场」的等价，是流匹配的灵魂，地位等同于 DDPM 的「预测噪声 = 估计 score」。两者精神一致：<strong>把一个难以直接优化的生成目标，化简成一个对随机采样的小批量做回归的简单目标</strong>。notebook 会在 2D 上把目标速度 <code>x_1-x_0</code> 与网络预测对拍，验证这个回归确实学到了能搬运分布的速度场。详见 <code>references.md</code> 的 Lipman 2023、Liu 2023。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="build"><span class="num">4</span>从零实现速度场回归</h2>
+  <h3>从零实现：速度场回归</h3>  <p>把流匹配落到 numpy，零件少得惊人：一个速度场网络 <code>v_\theta(x,t)</code>、一条直线路径、一个 MSE 损失。训练循环：</p>  <pre><code># 每步：抽 (噪声 x0, 数据 x1, 时刻 t)
+x0 = randn(B, 2)              # 先验噪声
+x1 = sample_data(B)          # 数据（如 2D 月牙/八高斯）
+t  = rand(B, 1)              # [0,1] 时刻
+xt = (1 - t) * x0 + t * x1   # 直线上的点
+v_target = x1 - x0           # 目标速度（解析！恒定）
+loss = mean‖ v_theta(xt, t) - v_target ‖²</code></pre>  <p>和 DDPM 一样，速度场网络要<strong>把时刻 </strong><code>t</code><strong> 作为输入</strong>（不同时刻的速度场不同），玩具实现里把 <code>t</code> 拼接到 <code>x_t</code> 上即可。网络结构就是个小 MLP，输出维度与数据维度相同（2D 数据输出 2D 速度向量）。整个训练<strong>只有一个网络、一个 MSE 损失</strong>，比 VAE/GAN 简单，和 DDPM 一样朴素——这正是流匹配（和扩散）相比早期 CNF 的巨大优势：把「解 ODE 训练」降级成了「做回归」。</p>  <p>一个值得强调的对照：DDPM 的网络预测<strong>噪声</strong> <code>\epsilon</code>，流匹配的网络预测<strong>速度</strong> <code>x_1-x_0</code>。两者都是「在带噪/插值的中间点上，回归一个指向正确方向的向量」。事实上，对于高斯先验 + 合适的路径，二者可以<strong>互相换算</strong>——这就是为什么说流匹配统一了扩散。notebook 会从零实现速度场网络的前向、手写反向、训练，并验证损失稳定下降、预测速度逼近解析目标。</p>  <p>还有一个值得玩味的设计自由度：<strong>噪声 </strong><code>x_0</code><strong> 和数据 </strong><code>x_1</code><strong> 怎么配对</strong>。最简单的是<em>随机配对</em>（每个 minibatch 里随机凑一对），这就是本课用的做法，已经能学得很好。但如果用<strong>最优传输（OT）</strong>来配对——让相距近的噪声-数据点优先配在一起——路径就更不容易交叉、速度场更光滑、采样需要的步数更少（OT-CFM，第 8 节前沿）。这揭示了流匹配框架的灵活性：路径形状（直线/曲线）、端点配对（随机/OT）都是可设计的旋钮，而扩散在这方面是被噪声调度<em>锁死</em>的。本课先用最简单的「直线 + 随机配对」把机制看清。</p>  <div class="callout warn"><span class="label"></span>
+    <p>两个易错点：① 目标速度是 <code>x_1-x_0</code>（数据<strong>减</strong>噪声，指向数据方向），方向别写反——写成 <code>x_0-x_1</code> 会让采样朝噪声跑、彻底失败；② 中间点是 <code>(1-t)x_0+t x_1</code>，注意 <code>t=0</code> 在噪声端、<code>t=1</code> 在数据端（与扩散的时间方向相反，扩散 <code>t=0</code> 是数据），别把端点搞混。notebook 用解析目标对拍守住这些。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ode"><span class="num">5</span>ODE 采样：沿速度场积分</h2>
+  <h3>ODE 采样：沿速度场积分</h3>  <p>训练好速度场 <code>v_\theta</code> 后，生成就是解 ODE <code>dx/dt=v_\theta(x,t)</code>：从噪声 <code>x_0\sim\mathcal{N}(0,I)</code> 出发，沿速度场积分到 <code>t=1</code>，得到数据样本。最简单的数值积分器是<strong>欧拉法（Euler）</strong>：</p>  <div class="math-block">\[x_{t+\Delta t}=x_t+\Delta t\cdot v_\theta(x_t,t),\qquad t=0,\Delta t,2\Delta t,\dots,1\]</div>  <p>即「站在当前位置，朝当前速度方向走一小步 <code>\Delta t</code>，到新位置再问一次速度，再走一步」，重复 <code>N=1/\Delta t</code> 步到达 <code>t=1</code>。这和 DDPM 的反向采样形似（都是迭代地往「更像数据」的方向挪），但有个关键区别：流匹配的 ODE 采样是<strong>确定性</strong>的（给定 <code>x_0</code> 输出唯一，不加随机噪声），而 DDPM 反向每步要加噪声。确定性带来一个大好处——<strong>步数可以很少</strong>。</p>  <p>拿一个<strong>一维微例</strong>把欧拉采样走一遍，机制立刻透明。设我们用 <code>N=2</code> 步（<code>\Delta t=0.5</code>），从噪声采到 <code>x_0=-1.0</code>。第一步：在 <code>t=0</code> 处问网络速度，假设 <code>v_\theta(-1.0,\,0)=+1.6</code>，则 <code>x_{0.5}=-1.0+0.5\times 1.6=-0.2</code>。第二步：在 <code>t=0.5</code> 处再问速度，假设 <code>v_\theta(-0.2,\,0.5)=+1.2</code>，则 <code>x_{1.0}=-0.2+0.5\times 1.2=+0.4</code>。于是这个起点为 <code>-1.0</code> 的噪声粒子，两步就被速度场<em>流</em>到了数据样本 <code>+0.4</code>。注意每一步都<strong>重新在新位置查询速度</strong>（不是一路用初始速度直冲）——这正是欧拉法逼近曲线轨迹的方式，也是为什么路径越直、用越少步就越准：直线路径上速度处处相同，理论上一步（<code>x_1=x_0+v</code>）就能精确到达，这就是 rectified flow 拼命「拉直」路径的全部动机。把这个两步小算例和 DDPM 那个动辄几百步的反向链一对照，「流匹配采样为何能快」就不再是一句口号。</p>  <p>步数 <code>N</code> 是<strong>速度-质量的旋钮</strong>：步数越多积分越精确、样本越好，但越慢。流匹配（尤其直线路径的 rectified flow）的一大卖点是<strong>用很少的步数就能出好样本</strong>——因为直线路径「最直」，欧拉法这种一阶方法的积分误差最小。极端情形下，rectified flow 经过「拉直」（reflow）甚至能做到<strong>一步采样</strong>。这与 DDPM 动辄几百步形成鲜明对比，是流匹配在工业界（实时文生图）受青睐的核心原因。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>用更高阶的积分器（如 Heun，二阶）能在同样步数下更准，进一步减少所需步数。这是个纯数值方法的权衡：阶数越高每步越准但每步更贵。但即便最简单的欧拉法，配上直线路径，流匹配也已经能用远少于扩散的步数生成高质量样本。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：ODE 采样在求解初值问题 <code>x(0)=x_0\sim p_0,\ dx/dt=v_\theta</code>，终点 <code>x(1)</code> 的分布就是学到的生成分布。积分误差（欧拉法是 <code>O(\Delta t)</code> 每步）决定了它离真实 <code>p_1</code> 多近。路径越直、<code>v_\theta</code> 越光滑，误差越小、所需步数越少——这是 rectified flow 刻意「拉直路径」的动机。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>notebook 会在 2D 分布（如 8 个高斯组成的环、或两个月牙）上跑通完整的「速度场回归 → 欧拉 ODE 采样」，并用分布距离验证生成样本收敛到目标。你会亲眼看到一团高斯噪声，如何沿学到的速度场<em>流动</em>、逐渐分裂汇聚成目标的多个簇——而且只用十几步就相当不错。对比模块 04 的几十步 DDPM，你会直观感受到流匹配「采样高效」的威力。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="unify"><span class="num">6</span>流匹配与扩散的统一</h2>
+  <h3>流匹配与扩散的统一</h3>  <p>学到这里，可以把流匹配和扩散并排，看清它们其实是<strong>同一件事的两种表述</strong>——这是本模块（也是全课）的高潮。</p>  <table>
+    <thead><tr><th>维度</th><th>扩散 DDPM（模块 04）</th><th>流匹配（本模块）</th></tr></thead>
+    <tbody>
+      <tr><td>过程</td><td>离散 <code>T</code> 步加噪/去噪</td><td>连续时间 <code>t\in[0,1]</code> 的流</td></tr>
+      <tr><td>网络预测</td><td>噪声 <code>\epsilon</code></td><td>速度 <code>x_1-x_0</code></td></tr>
+      <tr><td>训练目标</td><td>预测噪声 MSE</td><td>回归速度 MSE</td></tr>
+      <tr><td>采样</td><td>反向链（随机，多步）</td><td>ODE 积分（确定，可少步）</td></tr>
+      <tr><td>路径</td><td>由噪声调度隐式决定</td><td><strong>显式选定</strong>（如直线）</td></tr>
+      <tr><td>本质</td><td>学 score / 去噪方向</td><td>学搬运分布的速度场</td></tr>
+    </tbody>
+  </table>  <p>它们的深层联系是：<strong>扩散的「概率流 ODE」（Song 2021）就是一个特定的流匹配速度场</strong>。任何扩散过程都对应一个确定性的 ODE，沿它积分能得到与扩散随机采样相同的边缘分布；而这个 ODE 的速度场，恰好可以由流匹配的框架学出来（用对应的概率路径）。反过来，流匹配可以选择各种概率路径，扩散对应的只是其中<em>一类特殊路径</em>。所以<strong>流匹配是更一般的框架，扩散是它的一个特例</strong>——这正是「流匹配统一扩散」的确切含义。</p>  <p>这个等价不是一句空泛的口号，它<strong>具体到「预测的两个量可以互相换算」</strong>。回想 DDPM 的网络吐出噪声 <code>\epsilon_\theta</code>，而流匹配的网络吐出速度 <code>v_\theta</code>。对于直线路径 <code>x_t=(1-t)x_0+t x_1</code>（且 <code>x_0</code> 是高斯噪声），目标速度恒为 <code>x_1-x_0</code>；而扩散里 <code>x_0</code> 扮演的正是噪声 <code>\epsilon</code> 的角色。于是「速度 = 数据 − 噪声」与「噪声 = 加在样本上的扰动」之间只差一个由当前时刻 <code>t</code> 和路径形状决定的<em>已知线性变换</em>——给定其一，可以代数地解出另一。换句话说，<strong>一个训练好的扩散模型，不需重训就能被改写成一个流匹配速度场，反之亦然</strong>；它们对同一份知识用了不同的「坐标」来记。理解这一点，你就真正看穿了「统一」二字：不是两套理论碰巧结论相似，而是<em>同一个对象</em>的两种参数化。这也解释了为什么近年很多文生图模型在扩散与流匹配两种实现间切换时，往往只需改训练目标的形式、网络主体几乎照搬。</p>  <p>把全课五族模型在脑海里连成一条线，你会看到一个优美的演进：<strong>AE（编码-解码骨架）→ VAE（加概率，能采样）→ GAN（放弃似然，对抗求锐利）→ 扩散（拆成多步去噪，既稳又锐）→ 流匹配（取连续极限，统一并高效化）</strong>。而那条贯穿始终的金线——<strong>去噪 AE 学 score → 预测噪声 → 速度场</strong>——在流匹配这里汇成终点：所有这些模型，本质都在学「如何把简单分布搬运成数据分布」，只是搬运的方式（一步/多步/确定/随机）和学习的目标（重建/对抗/噪声/速度）各异。理解了这条线，你就握住了生成模型的统一图景。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="mainstream"><span class="num">7</span>为什么流匹配成了新主流</h2>
+  <h3>为什么流匹配成了新主流</h3>  <p>流匹配（及其直线特例 rectified flow）在 2023 年后迅速成为文生图等领域的主流框架，背后有几个扎实的理由，值得收束一下。</p>  <ul>
+    <li><strong>训练稳定 + 高效</strong>：和扩散一样是简单的回归目标（无对抗、无 ODE 积分），继承了扩散「稳如监督学习」的优点，又比早期 CNF 高效得多。</li>
+    <li><strong>采样步数少</strong>：确定性 ODE + 直线路径让欧拉法的积分误差小，用远少于扩散的步数（十几步甚至几步）就能出好样本，对实时应用至关重要。</li>
+    <li><strong>框架统一、灵活</strong>：流匹配能选各种概率路径（扩散只是其一），可以针对任务设计「最好走」的路径（如最优传输路径），理论上更一般、实践上更可调。</li>
+    <li><strong>可拉直、可蒸馏</strong>：rectified flow 可以反复「拉直」路径（reflow）逼近一步生成；这条线直通「一步/几步生成」的前沿，是当前最快文生图模型的基础。</li>
+  </ul>  <p>这也呼应了模块 03 末尾那条「生成模型在融合、而非简单替代」的判断。回看五族模型的整体演进，你会发现它不是「新的全面碾压旧的」，而是<strong>每一族都在解决前一族的某个痛点，同时把前一族的好东西继承下来</strong>：VAE 继承 AE 的编码-解码、补上「能采样」；GAN 放弃似然换锐利；扩散用多步去噪同时拿到稳和锐；流匹配把扩散连续化、统一化、高效化。它们更像一个<em>逐步精炼</em>的家族谱系，而非一连串推倒重来。理解这一点，比记住「谁是当前 SOTA」更重要——因为 SOTA 会变，而这条演进的逻辑不会。</p>  <p>但也要把话说回来、保持清醒：流匹配<strong>不是万能</strong>。它和扩散在很多方面（训练目标、采样质量上限）是相通甚至等价的，所谓优势主要体现在<strong>采样效率和框架灵活性</strong>上，而非生成质量有本质飞跃。在很多场景，一个调好的扩散模型和一个流匹配模型质量相当——选哪个常常取决于工程考量（步数预算、是否需要确定性采样、是否要蒸馏）。把流匹配理解成「扩散的一个更灵活、更高效的现代化重写」，比把它当成颠覆性的新范式更准确。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一个实用的判断：<strong>需要极致质量、步数无所谓</strong> → 扩散/流匹配都行，调好即可；<strong>需要快（实时、少步、甚至一步）</strong> → 流匹配/rectified flow 是当前首选；<strong>需要可控、可蒸馏</strong> → 流匹配的灵活路径更有发挥空间。这些前沿（一步生成、最优传输路径、蒸馏）的深入展开在 C28，本课把地基——「速度场回归 + ODE 采样」——夯实，到 C28 就能轻松接住。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>最优传输与更直的路径</strong>：直线路径已很好，但用最优传输（OT）配对 <code>(x_0,x_1)</code> 能让路径更不交叉、更易积分、采样更少步。OT-CFM、minibatch OT 是活跃方向。</li>
+    <li><strong>一步生成与蒸馏</strong>：rectified flow 的 reflow、一致性模型（consistency models）等把多步流/扩散蒸馏成一步或几步生成，是当前「最快生成」的前沿。</li>
+    <li><strong>与扩散的统一理论</strong>：随机插值（stochastic interpolants，Albergo & Vanden-Eijnden 2023）等框架把扩散、流、桥（Schrödinger bridge）都纳入「在两分布间插值」的统一视角，是理论主线。</li>
+    <li><strong>离散与流形上的流匹配</strong>：把流匹配推广到离散数据（文本、图）、黎曼流形（如分子构象、地球数据）上，需要重新定义路径与速度，是正在开拓的方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Lipman et al. 2023（Flow Matching 奠基，重点读条件流匹配定理）、Liu et al. 2023（Rectified Flow，直线路径 + 一步生成）、Chen et al. 2018（Neural ODE / CNF 源头）。想看统一视角读 Albergo & Vanden-Eijnden 2023、Song et al. 2021（概率流 ODE）。清单见 <code>references.md</code>。<strong>恭喜你走完了基础生成模型课的五族模型！</strong>下一步是前沿扩散课 C28（DiT、score-based SDE、概率流 ODE、引导与蒸馏、一步生成等）——你在本课打下的 ELBO、噪声预测、速度场、ODE 采样的地基，会让那些前沿一点就通。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_diffusion/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 扩散模型 DDPM</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

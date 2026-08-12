@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 红队方法论</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 红队方法论</h1>
+  <p class="subtitle">Red-Teaming Methodology —— 把"找模型弱点"从一次性灵感拷问，变成可度量、可覆盖、可停止的评测流程学</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02 危险能力评估、基础概率统计（抽样/估计量）、pandas</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_redteam_methodology.ipynb（纯合成发现记录分析）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Perez 2022、Ganguli 2022、Mazeika 2024 (HarmBench)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>本模块的立场（务必先读）</strong>：红队（<span class="term">red-teaming</span>）在本课程里被定义为一门<strong>评测流程学</strong>——系统性地在<em>部署前</em>发现模型未知弱点的方法、覆盖度与统计。本模块只讲<strong>流程、组织、统计与质量度量</strong>；notebook 全程使用<strong>合成的"发现记录"数据</strong>做分析，不包含任何攻击内容、有害 payload 或可操作技巧。任何"危险动作"只作为被计数的良性占位字符串出现。</div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#position">红队在安全管线中的位置：已知 vs 未知失败模式</a></li>
+      <li><a href="#workflow">红队作业流程：从 scoping 到修复验证</a></li>
+      <li><a href="#human">人工红队的组织 [Ganguli 2022]</a></li>
+      <li><a href="#auto">自动化红队 [Perez 2022] 与 HarmBench 框架</a></li>
+      <li><a href="#coverage">覆盖度与停止规则（统计核心）</a></li>
+      <li><a href="#triage">严重度分级与 triage</a></li>
+      <li><a href="#regression">红队结果 → 评测资产：固化为回归测试集</a></li>
+      <li><a href="#frontier">红队质量度量与研究前沿</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="position"><span class="num">1</span>红队在安全管线中的位置：已知 vs 未知失败模式</h2>
+
+  <p>模块 02 讲的<span class="term">基准评测（benchmark eval）</span>回答的是一个<strong>封闭</strong>问题："在我<em>已经知道</em>要测的那些失败模式上，模型表现如何？"——题库固定、有标准答案、可重复打分。它的盲区也正在于此：<strong>题库之外的失败它一个都测不到</strong>。</p>
+
+  <p>红队补的就是这块。它回答一个<strong>开放</strong>问题："这个模型还有哪些<em>我们还没想到</em>的失败方式？"红队是一个<strong>主动搜索未知失败模式</strong>的过程，产出的不是一个分数，而是一批<strong>发现（findings）</strong>——每条发现描述一种新观察到的不良行为。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>基准评测像"按考纲刷题"：考纲覆盖的会做了，考纲没写的照样不会。红队像"故意出考纲外的怪题"，目的就是把那些没人写进考纲、但部署后真会出事的失败挖出来。挖出来之后，好的做法是把它<em>补进考纲</em>（第 7 节的回归测试集）。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设模型真实失败模式的全集为 $\mathcal{F}$。基准评测度量的是模型在<em>已知子集</em> $\mathcal{K}\subseteq\mathcal{F}$ 上的失败率，是<strong>估计</strong>问题。红队的目标是扩大 $\mathcal{K}$ ——即发现 $\mathcal{F}\setminus\mathcal{K}$ 中的元素，是<strong>搜索 / 发现</strong>问题。因为 $\mathcal{F}$ 不可观测，红队天然是一个带<em>未知总体</em>的抽样过程，这正是第 5 节用物种丰富度估计的原因。</p>
+    </div>
+  </div>
+
+  <h3>外部红队与内部红队：为什么两者互补</h3>
+
+  <table>
+    <thead><tr><th>维度</th><th>内部红队（in-house）</th><th>外部红队（external / third-party）</th></tr></thead>
+    <tbody>
+      <tr><td>对系统的了解</td><td>深——知道架构、训练数据、已知弱点，可做白盒探索</td><td>浅——多为黑盒，更接近真实部署后攻击者视角</td></tr>
+      <tr><td>独立性 independence</td><td>低——与开发团队同源，易受"我们已经修过了"的认知偏差影响</td><td>高——无利益绑定，更可能报告令人不快的发现</td></tr>
+      <tr><td>覆盖谱</td><td>覆盖团队已熟悉的风险面，深度优先</td><td>带来团队思维之外的新视角，广度优先</td></tr>
+      <tr><td>迭代速度</td><td>快——可频繁、贴近开发循环</td><td>慢——通常一次性 / 里程碑式</td></tr>
+      <tr><td>治理价值</td><td>持续质量保证</td><td>可信的第三方背书，进 system card / safety case</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>独立性是外部红队不可替代的核心价值。</strong> 内部团队再努力，也很难发现"自己整个团队都没想到的那一类问题"——共享的训练文化会形成共享的盲区。外部红队的意义不只是"多几双手"，而是<em>引入与开发团队不相关的先验</em>，从而扩大第 5 节意义下的发现谱。前沿实验室的 system card 通常同时报告内外两路红队结果。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="workflow"><span class="num">2</span>红队作业流程：从 scoping 到修复验证</h2>
+
+  <p>把红队当成"找个聪明人随便试试"是最常见的失败。研究科学家级的红队是一条<strong>有产出物、可审计、可复现</strong>的流程。下图是端到端全流程，每个环节都有明确的输入与<strong>交付物（artifact）</strong>：</p>
+
+  <div class="ascii">
+  ┌─────────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌────────────┐   ┌──────────┐
+  │  ① SCOPING  │──►│ ② 探索    │──►│ ③ 记录    │──►│ ④ TRIAGE │──►│ ⑤ 修复验证  │──►│ ⑥ 报告    │
+  │  范围+ROE   │   │ explore  │   │ document │   │ 分级筛选  │   │ fix+verify │   │ report   │
+  └─────────────┘   └──────────┘   └──────────┘   └──────────┘   └────────────┘   └──────────┘
+        │                │              │              │                │               │
+   产出:范围书       产出:原始        产出:结构化      产出:严重度+     产出:修复前后    产出:发现汇总
+   威胁模型         探索轨迹         发现记录         优先级队列       对照结果         +覆盖度报告
+   rules of         (raw logs)      (findings:      (likelihood     (含回归用例,     +残余风险
+   engagement                       复现/类别/严重)   ×impact)         见第7节)         +停止依据
+        │                                                                                  │
+        └────────────────────────◄── 反馈：新发现回流，刷新范围与威胁模型 ──────────────────┘
+  </div>
+
+  <table>
+    <thead><tr><th>环节</th><th>关键决策</th><th>交付物（artifact）</th></tr></thead>
+    <tbody>
+      <tr><td>① Scoping</td><td>测什么风险面、用什么访问权限（黑/灰/白盒）、<span class="term">rules of engagement (ROE)</span>：允许的探索边界、禁止动作、数据处理、上报通道</td><td>范围书 + 威胁模型 + ROE 文档</td></tr>
+      <tr><td>② 探索 Explore</td><td>在范围内系统性地探查模型行为，保留完整轨迹以便复现</td><td>原始探索日志（raw logs）</td></tr>
+      <tr><td>③ 记录 Document</td><td>把"看起来不对"的轨迹固化为结构化发现：<strong>最小复现 + 类别 + 严重度</strong>（见第 3 节记录规范）</td><td>findings 记录表</td></tr>
+      <tr><td>④ Triage 分级</td><td>去重、判真伪、按 likelihood×impact 评级排序，决定处理优先级</td><td>带优先级的发现队列</td></tr>
+      <tr><td>⑤ 修复验证</td><td>开发团队修复后，<strong>用原始最小复现重测</strong>，确认已修且未引入回退</td><td>修复前后对照 + 回归用例</td></tr>
+      <tr><td>⑥ 报告</td><td>汇总发现、覆盖度、残余风险与停止依据，供决策与 safety case 引用</td><td>红队报告 + 覆盖度报告</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>ROE（rules of engagement）不是官僚手续，而是评测有效性的前提。</strong> 它界定"哪些探索算数、哪些越界、发现如何安全上报"。没有 ROE，不同红队成员的产出无法对齐口径，覆盖度统计（第 5 节）和一致性度量（第 6 节）都会失真。在防御性评测语境下，ROE 还规定了<strong>所有危险动作只以良性占位形式记录、不留可操作内容</strong>——这也是本课程 notebook 的做法。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  注意那条<strong>回流箭头</strong>：红队不是一锤子买卖。每一批新发现都会刷新威胁模型，进而扩大下一轮 scoping 的范围。第 5 节的停止规则正是用来判断"这个回流循环什么时候可以停"。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="human"><span class="num">3</span>人工红队的组织 [Ganguli 2022]</h2>
+
+  <p>Ganguli et al. 2022 是人工红队规模化最系统的公开研究：他们组织了大量众包红队成员对话式地探查模型，并公开分析了"<strong>谁来红队、投入多少、如何记录</strong>"对发现质量的影响。三个对评测设计直接有用的结论：</p>
+
+  <h3>3.1 标注者多样性决定发现谱</h3>
+  <p>不同背景的红队成员，会撞见<strong>不同类型</strong>的失败。一个同质团队（背景、母语、专业相近）倾向于反复发现<em>同一片</em>失败区域，而忽略整片其他区域。<strong>多样性不是政治正确，而是覆盖度的直接驱动因素</strong>：它扩大了第 5 节意义下能被采样到的"弱点物种"集合。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>[Ganguli 2022]</strong> 的一个评测视角洞见：当你只看"总发现数"时，两个团队可能打平；但看"发现的<em>类别覆盖</em>"时，多样化团队往往显著更广。这意味着<strong>评测红队质量不能只数发现条数，必须看类别分布</strong>（见第 8 节信噪比与覆盖度）。</div>
+
+  <h3>3.2 努力—发现曲线（effort–discovery curve）</h3>
+  <p>随着投入的探索次数增加，<strong>累积发现数增长，但边际发现率递减</strong>——容易的弱点先被找到，越往后越难挖出新东西。这条曲线的形状是第 5 节所有统计工具的经验基础。</p>
+
+  <div class="math-block">
+  $$ \text{设第 }t\text{ 轮探索后累积不同弱点数 } S(t),\qquad \frac{dS}{dt}\;\downarrow\ \text{随 }t\text{ 单调递减（边际递减）} $$
+  </div>
+
+  <h3>3.3 记录规范：一条合格"发现"的三要素</h3>
+  <p>松散的自然语言描述无法做统计、无法复现、无法回归。Ganguli 式的记录把每条发现结构化为至少三要素：</p>
+  <ul>
+    <li><strong>最小复现（minimal reproduction）</strong>：能稳定重现该行为的最短输入 / 步骤。修复验证（流程⑤）和回归测试（第 7 节）全靠它。</li>
+    <li><strong>类别（category）</strong>：归入预定义的风险类别体系，使覆盖度可统计、可画热图（第 5 节覆盖矩阵）。</li>
+    <li><strong>严重度（severity）</strong>：初步影响评级，供 triage（第 6 节）排序。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  记录质量直接决定下游一切。一条"模型有时会乱说"的发现既不可复现、又无类别、又无严重度——它在统计上等于<strong>噪声</strong>，既不能进覆盖矩阵，也不能转成回归用例。<strong>"不可复现的发现 ≈ 没有发现"</strong>。这也是第 8 节"可复现率"成为红队质量核心度量的原因。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="auto"><span class="num">4</span>自动化红队 [Perez 2022] 与 HarmBench 框架</h2>
+
+  <p>人工红队贵、慢、难规模化。Perez et al. 2022（<em>Red Teaming Language Models with Language Models</em>）提出的范式是：<strong>用一个语言模型自动生成测试输入，去探查目标模型</strong>，再用一个分类器自动判定目标的回应是否触发了不良行为。整个回路无需人工逐条出题。</p>
+
+  <div class="ascii">
+   ┌────────────────┐   生成测试输入   ┌────────────────┐   回应   ┌──────────────────┐
+   │  生成器 LM      │ ───────────────►│  目标模型        │ ───────►│  分类器 / 评判器   │
+   │ (red-team LM)  │   test cases     │  (target)       │  output │ (是否触发不良行为)  │
+   └────────────────┘                  └────────────────┘          └──────────────────┘
+          ▲                                                                  │
+          └──────────── RL 信号：把"成功触发"作为奖励，优化生成器 ◄────────────┘
+  </div>
+
+  <p>Perez 2022 给出一个从弱到强的<strong>生成器谱系</strong>，多样性与有效性此消彼长：</p>
+
+  <table>
+    <thead><tr><th>生成范式</th><th>机制</th><th>多样性</th><th>有效性（触发率）</th></tr></thead>
+    <tbody>
+      <tr><td>Zero-shot 生成</td><td>直接让 LM 凭提示生成测试输入</td><td>高——分布广</td><td>低——大量无效样本</td></tr>
+      <tr><td>Few-shot 生成</td><td>用少量已知有效样本做示例引导</td><td>中</td><td>中——向已知方向偏移</td></tr>
+      <tr><td>监督微调 (SFT)</td><td>在筛出的有效样本上微调生成器</td><td>中低</td><td>较高</td></tr>
+      <tr><td>RL 驱动</td><td>把"触发不良行为"作为奖励训练生成器</td><td><strong>低——易模式坍缩</strong></td><td><strong>高</strong></td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>多样性—有效性权衡是自动化红队的中心矛盾。</strong> RL 驱动的生成器触发率最高，但极易<span class="term">模式坍缩（mode collapse）</span>——反复生成同一小撮高效输入，触发率漂亮却<em>覆盖度极差</em>。从评测视角看，<strong>只报告触发率而不报告多样性 / 覆盖度，是一个有误导性的指标</strong>。一个只会用一招打穿模型的自动红队，其实只发现了"一个"弱点。第 5 节的覆盖度统计正是用来戳破这种假象。</div>
+
+  <h3>HarmBench：把自动化红队评测标准化 [Mazeika 2024]</h3>
+  <p>Perez 给的是<em>方法</em>，HarmBench 给的是<strong>标准化评测框架</strong>——让不同的自动红队方法可以在同一套规则下横向比较。它的结构性贡献（从评测方法论角度）：</p>
+  <ul>
+    <li><strong>标准化行为集（behaviors）</strong>：一组固定的、版本化的待测行为定义，使"测了什么"在不同方法间一致。</li>
+    <li><strong>统一的评判器（classifier）</strong>：用同一个判定器裁定"是否触发"，消除各家自定义裁判带来的口径差异——这是<em>可比性</em>的前提。</li>
+    <li><strong>攻防双侧协议</strong>：既能评测攻击方法的有效性，也能评测防御 / 拒绝机制的鲁棒性，与模块 04 衔接。</li>
+    <li><strong>指标标准化</strong>：以一致口径报告成功率等指标，让排行榜有意义。</li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>评测科学家视角</strong>：HarmBench 的真正价值不在某个具体分数，而在它把"<em>评判口径</em>"固定下来。模块 02 我们反复强调——评测的可比性首先取决于<strong>裁判一致</strong>。两个自动红队若用不同分类器判"是否触发"，它们的成功率根本不可比。HarmBench 把分类器抽出来标准化，正是为了这一点。本模块 notebook 在第 6 节用 Cohen's κ 量化"裁判一致性"，呼应同一关切。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="coverage"><span class="num">5</span>覆盖度与停止规则（统计核心）</h2>
+
+  <p>这是本模块的统计核心，也是把红队从"手艺"变成"科学"的关键一跃。两个绕不开的问题：<strong>（a）我们已经覆盖了多少？还剩多少没发现？（b）什么时候可以停？</strong></p>
+
+  <h3>5.1 把发现重述为"物种采样"问题</h3>
+  <p>关键洞见：<strong>红队发现弱点，在数学上同构于生态学里"采样观察物种"</strong>。每一次探索 = 一次采样；撞见一个<em>新</em>弱点 = 观察到一个新物种；反复撞见同一个弱点 = 重复观察同一物种。于是生态学几十年的<span class="term">物种丰富度估计（species richness estimation）</span>工具可以直接搬过来。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>想象一片树林里有未知数量的鸟。你观鸟一整天，记下每种鸟出现几次。如果你<em>还在不断看到从没见过的新鸟</em>，说明远没看全；如果<em>连续很久只看到老面孔</em>，说明可能快看全了。红队完全一样：弱点就是鸟，探索就是观鸟。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设真实弱点池含 $S$ 个弱点，各以频率（被采样概率）出现，频率往往呈<strong>幂律 / 重尾</strong>分布——少数高频弱点很快被发现，长尾低频弱点极难撞见。观测到的不同弱点数 $S_{\text{obs}}$ 是 $S$ 的<em>有偏低估</em>（漏掉了尚未采样到的稀有种）。目标是从可观测的采样统计反推 $S$ 与剩余量 $S-S_{\text{obs}}$。</p>
+    </div>
+  </div>
+
+  <h3>5.2 Discovery curve 与 rarefaction</h3>
+  <p><strong>Discovery curve（发现曲线）</strong>：横轴累积探索次数，纵轴累积不同弱点数 $S_{\text{obs}}(t)$。它必然<em>上凸、边际递减</em>——这是 3.2 努力-发现曲线的统计形态。曲线<strong>趋平</strong>是"接近饱和"的经验信号，但<em>不能只看眼睛</em>（长尾可能让它假性趋平）。</p>
+  <p><strong>Rarefaction（稀释曲线）</strong>：把多名红队成员的发现<em>合并</em>后随机子抽样，画出"投入 $n$ 次探索期望能发现多少不同弱点"的曲线。它能公平比较"三人合并" vs "单人三倍努力"——前者通常更高，因为不同人覆盖不同区域（呼应 3.1 多样性）。</p>
+
+  <h3>5.3 Chao1 估计量</h3>
+  <p>怎样把"还剩多少"算出来而非靠眼睛？经典答案是 <span class="term">Chao1 估计量</span>，它的思想极漂亮：<strong>剩余未发现量主要由"只被发现过一次的稀有弱点"数量决定</strong>。</p>
+  <p>令 $f_1$ = 恰好被发现 <strong>1 次</strong>的弱点数（singletons），$f_2$ = 恰好被发现 <strong>2 次</strong>的弱点数（doubletons），$S_{\text{obs}}$ = 已观测到的不同弱点总数。Chao1 给出总弱点数的下界估计：</p>
+
+  <div class="math-block">
+  $$ \hat{S}_{\text{Chao1}} \;=\; S_{\text{obs}} \;+\; \frac{f_1^{\,2}}{2 f_2}, \qquad (f_2 > 0) $$
+  </div>
+
+  <p>当 $f_2 = 0$（还没有任何弱点被恰好发现两次，样本很小时常见），上式分母为零，改用<strong>偏差校正式（bias-corrected form）</strong>：</p>
+
+  <div class="math-block">
+  $$ \hat{S}_{\text{Chao1}}^{\,bc} \;=\; S_{\text{obs}} \;+\; \frac{f_1 (f_1 - 1)}{2 (f_2 + 1)} $$
+  </div>
+
+  <p>剩余未发现量的估计即 $\hat{S}_{\text{Chao1}} - S_{\text{obs}}$。直觉：<strong>singletons 越多（一堆弱点只撞见过一次），说明长尾里藏着越多还没撞见的——剩余越大</strong>；反之若几乎所有弱点都被反复撞见（$f_1$ 小），说明快挖干净了。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  为什么是 $f_1^2/(2f_2)$ 这种形式？$f_1$ 大、$f_2$ 小意味着"采样还很稀疏，新东西频频出现"，估计的隐藏量就大；$f_1$ 小意味着"罕见种基本都见过两次以上了"，隐藏量小。Chao1 是<strong>下界</strong>估计——真实 $S$ 只会更大不会更小，所以它给的"剩余量"是个<em>乐观下限</em>，报告时要讲清这一点。</div>
+
+  <h3>5.4 停止规则（stopping rule）</h3>
+  <p>有了估计量，停止决策就能从"感觉差不多了"变成可辩护的判据。一个稳健的复合停止规则同时要求两个条件：</p>
+  <div class="math-block">
+  $$ \textbf{停止 当且仅当：}\quad \underbrace{(\text{连续 } K \text{ 轮探索无新发现})}_{\text{经验饱和}} \;\wedge\; \underbrace{\Big(\hat{S}_{\text{Chao1}} - S_{\text{obs}} \le \tau\Big)}_{\text{估计剩余量足够小}} $$
+  </div>
+  <p>只看第一个条件会被长尾骗（恰好连续几轮没撞上稀有种 ≠ 真挖干净）；只看第二个条件忽略了实际采样的近期动态。<strong>两者合取</strong>才稳健：既要近期没新东西，又要统计上估计剩余量低于可接受阈值 $\tau$。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>停止规则要写进红队报告（流程⑥）并接受质疑。</strong> "我们停了，因为连续 30 轮无新发现，且 Chao1 估计剩余未发现弱点 ≤ 2"是一个可审计、可被 safety case（模块 07）引用的论断；"我们觉得测得差不多了"不是。停止规则把<strong>"评测充分性"变成可辩护的量</strong>——这正是研究科学家级红队与业余红队的分水岭。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="triage"><span class="num">6</span>严重度分级与 triage</h2>
+
+  <p>红队会产出大量发现，但<strong>修复资源有限</strong>。triage 的任务是把发现队列排序，让有限的修复预算投到风险最高处。标准做法是 <span class="term">likelihood × impact</span> 风险矩阵。</p>
+
+  <table>
+    <thead><tr><th>impact ＼ likelihood</th><th>低 (1)</th><th>中 (2)</th><th>高 (3)</th><th>极高 (4)</th></tr></thead>
+    <tbody>
+      <tr><td><strong>灾难 (4)</strong></td><td>中</td><td>高</td><td>严重</td><td>严重</td></tr>
+      <tr><td><strong>重大 (3)</strong></td><td>低</td><td>中</td><td>高</td><td>严重</td></tr>
+      <tr><td><strong>中等 (2)</strong></td><td>低</td><td>中</td><td>中</td><td>高</td></tr>
+      <tr><td><strong>轻微 (1)</strong></td><td>低</td><td>低</td><td>中</td><td>中</td></tr>
+    </tbody>
+  </table>
+
+  <p>一个简单可排序的标量分常用 likelihood 与 impact 的乘积（可再除以修复成本得到"性价比"优先级，见 notebook 练习 3）：</p>
+  <div class="math-block">
+  $$ \text{risk} = \text{likelihood} \times \text{impact}, \qquad
+     \text{priority} = \frac{\text{likelihood} \times \text{impact}}{\text{fix\_cost}} $$
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>severity 是人打的标签，因此它本身需要被质量控制。</strong> 两名红队成员对同一条发现可能给出不同严重度。在把 severity 用于排序前，必须先量化<strong>评分者间一致性（inter-rater reliability）</strong>。本模块用<span class="term">加权 Cohen's κ（weighted Cohen's kappa）</span>，因为严重度是<em>有序量</em>——"把 4 误判成 3"比"把 4 误判成 1"轻，加权 κ 用距离惩罚体现这一点，普通 κ 不能。κ 过低意味着分级标准不清，应先统一评级规范（回到 ROE）再排序。</div>
+
+  <div class="math-block">
+  $$ \kappa_w = 1 - \frac{\sum_{i,j} w_{ij}\, O_{ij}}{\sum_{i,j} w_{ij}\, E_{ij}}, \qquad
+     w_{ij} = \frac{(i-j)^2}{(k-1)^2}\ \text{(二次权重)} $$
+  </div>
+  <p>其中 $O$ 为观测混淆频率、$E$ 为边际独立下的期望频率、$k$ 为等级数。$\kappa_w=1$ 完全一致，$\kappa_w=0$ 等同随机。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="regression"><span class="num">7</span>红队结果 → 评测资产：固化为回归测试集</h2>
+
+  <p>红队最大的浪费，是<strong>发现修了一次、半年后又悄悄回退、却没人发现</strong>。解药是把每条高严重度发现的<em>最小复现</em>固化成一条<strong>结构化回归用例</strong>，纳入持续运行的回归测试集。这就完成了本章开头的闭环：<strong>红队发现的"未知失败" → 变成基准评测里的"已知失败" $\mathcal{K}$</strong>，从此被自动监控。</p>
+
+  <table>
+    <thead><tr><th>字段</th><th>含义</th><th>来源</th></tr></thead>
+    <tbody>
+      <tr><td><code>id</code></td><td>用例唯一标识</td><td>新分配</td></tr>
+      <tr><td><code>category</code></td><td>风险类别</td><td>来自发现记录（第 3 节）</td></tr>
+      <tr><td><code>repro_condition</code></td><td>复现条件（本课程用<strong>良性占位</strong>，如"输入 X 时应拒绝并输出 SAFE_REFUSAL"）</td><td>来自最小复现</td></tr>
+      <tr><td><code>expected_behavior</code></td><td>期望的安全行为（断言目标）</td><td>红队 + 安全策略</td></tr>
+      <tr><td><code>severity</code></td><td>严重度，决定是否纳入及告警级别</td><td>triage 结果</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>防御红线（务必遵守）</strong>：回归用例的 <code>repro_condition</code> 在真实管线里可能含敏感复现细节，应受访问控制并以良性化形式存储。<strong>本课程 notebook 全部用良性占位字符串</strong>（例如期望行为为输出 "SAFE_REFUSAL" / "HELLO"），<strong>不存储任何可操作的有害内容</strong>。回归用例的价值在于"能不能复现+断言期望行为"，而非记录攻击本身。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  修复后跑回归集，统计<strong>回归通过率</strong>（修复目标用例应从 fail→pass，其余用例应保持 pass）。一旦某条历史用例从 pass 变回 fail，就是<strong>回退（regression）</strong>，自动告警。这把"一次性红队"升级成"持续安全质量保证"——也是红队投入能复利积累的根本机制。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>红队质量度量与研究前沿</h2>
+
+  <h3>8.1 从评测视角度量"红队本身"的质量</h3>
+  <p>红队是评测手段，但红队本身也要被评测。三个核心质量度量：</p>
+  <table>
+    <thead><tr><th>度量</th><th>定义</th><th>为什么重要</th></tr></thead>
+    <tbody>
+      <tr><td><strong>覆盖度 coverage</strong></td><td>发现触及的风险类别 / 严重度格子占全矩阵的比例（覆盖矩阵热图的非空率）</td><td>戳破"总数漂亮但全挤在一个角落"的假象（第 4 节 RL 坍缩）</td></tr>
+      <tr><td><strong>可复现率 reproducibility</strong></td><td>记录的发现中能被独立按最小复现重现的比例</td><td>不可复现的发现 ≈ 噪声，无法进回归集（第 3 节）</td></tr>
+      <tr><td><strong>信噪比 signal-to-noise</strong></td><td>triage 后判为真且去重后的有效发现 ÷ 原始提交发现总数</td><td>衡量红队产出的纯度；自动红队刷量易拉低信噪比</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  这三个度量共同抵抗一个常见误区：<strong>把"发现条数"当成红队 KPI</strong>。一个刷出 1000 条重复、不可复现、全在同一类别的发现的红队，三项度量全低，实际价值远低于一个交出 50 条高可复现、跨类别、高信噪比发现的红队。<strong>数量是最差的红队指标。</strong></div>
+
+  <h3>8.2 研究前沿与开放问题</h3>
+  <ul>
+    <li><strong>自动红队的多样性坍缩</strong>：如何在保持高触发率的同时维持生成器的覆盖度？多样性正则、种群方法、新颖性奖励都是活跃方向，但"有效性—多样性"帕累托前沿尚无公认最优解 [Perez 2022 起]。</li>
+    <li><strong>覆盖度估计的可靠性</strong>：Chao1 等估计量假设"采样独立、频率结构稳定"。当红队成员之间互相启发（非独立采样），或模型在红队过程中被持续修复（总体在变动）时，这些假设被破坏，估计偏差如何刻画与校正仍是开放问题。</li>
+    <li><strong>停止规则的可辩护性</strong>：把"我们测够了"写进 safety case（模块 07）需要被监管与第三方接受的停止判据。什么样的覆盖度证据足以支撑部署决策，尚无行业标准。</li>
+    <li><strong>人机协同红队</strong>：自动红队负责广度铺量、人工红队负责深度与判断，最优的任务分工与交接（哪些自动发现值得人工深挖）是工程与方法学的双重前沿。</li>
+    <li><strong>红队的对抗性退化</strong>：当模型知道自己在被红队（与模块 05 sandbagging 相关），其行为可能与真实部署不同，使红队发现不可外推——评测完整性问题在红队语境下的体现。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>红队与基准评测在"测已知 vs 发现未知失败模式"上如何分工？外部红队的独立性为何不可替代？</li>
+      <li>画出红队六环节流程，并说出每个环节的交付物；ROE 为什么是覆盖度统计的前提？</li>
+      <li>为什么红队发现可建模为物种采样问题？写出 Chao1 估计量（含 $f_2=0$ 的修正式），并解释 singletons 为何主导剩余量估计。</li>
+      <li>一个稳健的停止规则需要哪两个合取条件？为什么"发现条数"是最差的红队质量指标，应该用哪三个度量替代？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../02_dangerous_capability_evals/02_讲解.html"><div class="dir">← 上一章</div><div class="t">02 · 危险能力评估设计</div></a>
+    <a class="next" href="../04_robustness_refusal/04_讲解.html"><div class="dir">下一章 →</div><div class="t">04 · 鲁棒性测量与拒绝校准</div></a>
+  </div>
+
+</div>
+</body>
+</html>

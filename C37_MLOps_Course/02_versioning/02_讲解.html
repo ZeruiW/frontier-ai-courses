@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 数据与模型版本</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 数据与模型版本</h1>
+  <p class="subtitle">从零写一个内容寻址版本库 —— 用内容哈希实现不可变快照、版本标签、血缘 DAG 与多层 diff；这是回滚与追溯的底座</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–01；哈希函数的概念、一点点图（DAG）与 pandas</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_versioning.ipynb（从零 CAS + lineage + diff + 真实 CSV 胶囊）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">DVC、Git internals、Pachyderm/OpenLineage、Breck 2019 数据校验</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">动机：回滚一个模型为何这么难</a></li>
+      <li><a href="#cas">内容寻址存储：put / get 与三条不变量</a></li>
+      <li><a href="#snapshot">快照与 manifest：给一组文件一个版本</a></li>
+      <li><a href="#tags">版本标签：可移动指针 vs 不可变真身</a></li>
+      <li><a href="#lineage">血缘 lineage：DAG、回溯与影响分析</a></li>
+      <li><a href="#diff">diff：manifest / schema / 行级三层</a></li>
+      <li><a href="#practice">把版本系统接进生命周期</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>动机：回滚一个模型为何这么难</h2>
+  <p>生产系统挂了，回滚到「上一个好版本」——这句话在传统软件里是一条 <code>git revert</code>。在 ML 系统里它要难得多，因为一个模型的「版本」不只是代码：它=<strong>代码 × 数据 × 超参 × 权重</strong>。你 revert 了代码，但训练它的那份数据还在原处吗？那份数据三周前被人「清洗」过一次吗？你手上这个 <code>model_final.npz</code>，到底是用哪份数据、哪段代码训出来的？<strong>如果答不上来，你就无法回滚，也无法复现，更无法在出事时定位根因。</strong></p>  <p>模块 01 让单次实验可复现；本模块解决<strong>资产层面的版本与追溯</strong>：怎么给数据集和模型一个<em>不可变、可寻址、可追溯</em>的版本，怎么记录「这个模型由哪些上游资产产生」（血缘 lineage），怎么对比两个版本之间到底变了什么（diff）。这正是 DVC、Git-LFS、模型注册表在做的事——而它们的内核，是一个朴素却深刻的想法：<strong>内容寻址</strong>。</p>  <p>先说清楚为什么不能直接用 Git。Git 是为<strong>代码</strong>（小的、文本的、行级有意义的文件）设计的：它把每个版本的全部文件压进仓库历史，对几 KB 的源码完美。但 ML 的数据集与模型权重动辄 GB 到 TB，且是<em>二进制</em>（行级 diff 无意义）。把一个 10GB 的数据集的 50 个版本塞进 Git，仓库会膨胀到几百 GB、克隆要几小时——Git 直接跪了。DVC 等工具的解法是<strong>分离关注点</strong>：大文件用内容寻址存到对象存储（S3/本地 cache），Git 里只留一个几十字节的<em>指针文件</em>（记着内容哈希）。于是你照常 <code>git commit</code> 这些轻量指针来版本化「指向哪份数据」，真实大数据交给 CAS。本模块实现的正是这个 CAS 内核。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>传统文件系统用<strong>名字</strong>找文件：<code>data/train.csv</code>。但名字会撒谎——同一个名字今天和明天的内容可能不同，不同名字的内容可能相同。内容寻址反过来：<strong>用内容本身的指纹（哈希）当地址</strong>。<code>blob/7d2a3f...</code> 这个地址<em>就是</em>那份内容的 SHA-256；内容变一个比特，地址就全变。于是「版本」不再是脆弱的名字，而是钉死在内容上的指纹。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，内容寻址存储（CAS）是一个映射 <code>store: bytes → hash</code>，满足 <code>store(b) = SHA256(b)</code> 且 <code>get(h)</code> 取回唯一的 <code>b</code>。两个性质随之而来：<strong>不可变性</strong>（地址由内容决定，改内容=换地址，旧地址永远指向旧内容）与<strong>天然去重</strong>（相同内容只存一份）。Git 的 blob/tree/commit、DVC 的 cache、IPFS 全建立在这一个等式上。本模块把它从零写出来。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住内容寻址的威力：<strong>它把「版本管理」这个流程问题，变成了「哈希」这个数学事实。</strong>你不需要一个中心服务器来「分配版本号」、不需要信任谁说「这是 v3」——任何人对同一份内容算哈希都得到同一个地址，版本的身份是<em>可独立验证的</em>。这种「身份即内容指纹」的设计，是分布式系统里对抗「谁说了算」的终极武器，也是本模块每个组件——快照、标签、血缘、diff——共同的地基。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cas"><span class="num">2</span>内容寻址存储：put / get 与三条不变量</h2>
+  <h3>2.1 内容寻址存储：put 与 get</h3>  <p>CAS 的接口小到只有两个动作。<code>put(data) → hash</code>：算内容哈希、把内容存到以哈希命名的位置、返回哈希；<code>get(hash) → data</code>：按哈希取回内容。关键不变量有三条：</p>  <ul>
+    <li><strong>确定性</strong>：<code>put(b)</code> 对同一 <code>b</code> 永远返回同一 hash（依赖规范化序列化，见模块 01 的 config hash）。</li>
+    <li><strong>完整性</strong>：<code>get(h)</code> 取回的内容，重新哈希必须 <code>== h</code>——地址即校验和，存储损坏会被立刻发现。</li>
+    <li><strong>去重</strong>：<code>put</code> 同一内容两次，只占一份存储；不同内容必得不同地址（碰撞概率 ~2⁻²⁵⁶，可忽略）。</li>
+  </ul>  <p>本模块用文件系统实现：<code>objects/&lt;hash[:2]&gt;/&lt;hash[2:]&gt;</code>（用前两位做子目录，避免单目录文件过多——这正是 Git 的 <code>.git/objects</code> 布局）。存的内容是 <strong>不可变的二进制 blob</strong>：一旦写入就再不修改，要「改」只能 put 新内容得到新地址。</p>  <p>为什么哈希函数的选择很关键？内容寻址依赖一个隐含假设：<strong>不同内容几乎不可能撞上同一个哈希</strong>（碰撞抵抗性）。如果两份不同内容算出同一地址，整个系统就崩了——你 get 一个地址可能拿回别人的内容。所以必须用密码学哈希（SHA-256），而非普通的 <code>hash()</code>（后者碰撞容易、且跨进程不稳定）。有趣的是 Git 历史上用 SHA-1，2017 年 SHA-1 被证明可构造碰撞后，Git 启动了向 SHA-256 的迁移——这正说明<strong>内容寻址系统的安全性，等于它所用哈希的碰撞抵抗性</strong>。本模块直接用 SHA-256，碰撞概率约 2⁻²⁵⁶，宇宙年龄内都撞不上。</p>  <div class="ascii">put(b"col=age\n23\n31")  -&gt;  hash = 7d2a3f9c...
+  写到 objects/7d/2a3f9c...   （前2位做子目录）
+
+get("7d2a3f9c...")        -&gt;  b"col=age\n23\n31"
+  读回后重新 hash 必须 == 7d2a3f9c...   （完整性自校验）
+
+put(同样内容) 再来一次     -&gt;  同一 hash，不重复占空间（去重）</div>  <div class="callout warn"><span class="label"></span>
+    <p>内容寻址的「不可变」是<strong>存储层</strong>的，不是<strong>人</strong>的。文件系统不会阻止你 <code>rm</code> 掉一个 blob——它保证的是「只要 blob 还在，它的内容就没被悄悄改过」。真正的不可变存储（合规级）还需要 WORM（write-once-read-many）介质或对象锁。本模块教的是<em>机制</em>；生产中要把这个机制配上访问控制与备份，才构成可信赖的版本系统。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="snapshot"><span class="num">3</span>快照与 manifest：给一组文件一个版本</h2>
+  <p>单个文件有了内容地址，一个<strong>数据集</strong>（多个文件）的版本怎么表示？答案是 <span class="term">manifest</span>（清单）：一个列出「文件名 → 内容哈希」的小字典，再对这个 manifest 自身算哈希，得到整个快照的<strong>版本 ID</strong>。</p>  <pre><code>manifest_v1 = {
+  'train.csv': '7d2a3f...',   # 每个文件 -&gt; 它的内容哈希
+  'test.csv':  '9c1e4b...',
+  'schema.json': 'a3f0d2...',
+}
+version_id = SHA256(canonical_json(manifest_v1))  =  'v:4f8e...'</code></pre>  <p>这个设计的优雅之处：<strong>快照是内容的内容</strong>。改了 train.csv → 它的哈希变 → manifest 变 → version_id 变。没改的 test.csv 仍指向同一个 blob，<strong>不重复存储</strong>。于是「数据集 v2」和「数据集 v1」共享所有未改动的文件，只为改动的部分多存一份——这就是 Git 提交一次只存 diff、却能完整重建任意历史版本的秘密。</p>  <p>这里藏着一个值得品味的递归结构：<strong>我们对「一组哈希」再做哈希</strong>。manifest 是文件哈希的集合，version_id 是 manifest 的哈希。这个「哈希的哈希」可以继续往上叠——多个数据集 + 多个模型可以再组成一个「发布包」，对它再哈希得到一个发布版本。Git 正是这样：blob（文件）→ tree（目录，含 blob 哈希）→ commit（含 tree 哈希 + 父 commit 哈希），层层内容寻址。这种<strong>默克尔树（Merkle tree）</strong>结构让你只需比较顶层的一个哈希，就能在 O(1) 时间判断两个庞大快照是否完全相同——区块链、IPFS、Git 共享的同一个数据结构。</p>  <p>「共享未改文件、只多存改动部分」这件事用一笔账算给你看。假设数据集有 3 个文件，各 1GB：</p>  <div class="ascii">v1 = { train: 7d2a(1G), test: 9c1e(1G), schema: a3f0(2KB) }   存了 ~2GB
+改了 train（清洗了几行）→ train 哈希变成 4b8f；test/schema 没动
+v2 = { train: 4b8f(1G), test: 9c1e(1G), schema: a3f0(2KB) }
+                ↑新blob       ↑复用v1     ↑复用v1
+实际新增存储 = 仅 train 的新版本 ≈ 1GB（而非整个 2GB 数据集再存一份）
+两个完整版本可独立取回，总占用 ≈ 3GB 而非 4GB</div>  <p>关键在于 <code>test.csv</code> 和 <code>schema.json</code> 没改，它们的内容哈希不变，于是 v1、v2 的 manifest 里这两项<em>指向同一个 blob</em>——CAS 天然只存一份。你「保留了两个完整、可独立回滚的版本」，代价却只有改动文件的增量。把这个机制推到几十个版本、每次只动一小部分文件，节省是数量级的——这正是 DVC/Git 能在「保留全部历史」与「不爆磁盘」之间两全的根本原因。注意这份红利<strong>完全免费且自动</strong>：你不需要写任何「去重逻辑」，只要坚持「地址=内容哈希」，相同内容就物理上不可能存两份。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="tags"><span class="num">4</span>版本标签：可移动指针 vs 不可变真身</h2>
+  <p>version_id（<code>v:4f8e...</code>）精确但不好记。所以加一层 <span class="term">version tag</span>：人类可读的别名指向某个 version_id。关键区分——<strong>哈希是不可变的真身，标签是可移动的指针</strong>：</p>  <table>
+    <thead><tr><th>概念</th><th>例子</th><th>可变性</th><th>类比 Git</th></tr></thead>
+    <tbody>
+      <tr><td>version_id（内容哈希）</td><td><code>v:4f8e2a...</code></td><td><strong>不可变</strong>：永远指那份内容</td><td>commit SHA</td></tr>
+      <tr><td>version tag（别名）</td><td><code>prod</code> / <code>v1.2</code> / <code>champion</code></td><td><strong>可移动</strong>：可重新指向新版本</td><td>branch / tag</td></tr>
+    </tbody>
+  </table>  <p>回滚因此变成一个<strong>秒级、确定、零拷贝</strong>的操作：把 <code>prod</code> 标签从坏版本的哈希指回上一个好版本的哈希即可——数据本身一个字节都不用动，因为两个版本的 blob 都还原封不动地躺在 CAS 里。这就是为什么内容寻址 + 标签是回滚的理想底座（接模块 03 的晋升/回滚）。</p>  <p>把这套机制和模块 01 连起来看，会发现一个漂亮的对称：模块 01 的 <code>config_hash</code> 是对<em>实验配置</em>做内容寻址，本模块的 <code>version_id</code> 是对<em>数据/模型资产</em>做内容寻址——<strong>同一个「规范化序列化 + 哈希」的思想，一次用在配置上，一次用在数据上</strong>。于是一个完全可复现的模型，可以被一个三元组钉死：<code>(config_hash, data_version_id, code_commit)</code>。这三个哈希一旦记进追踪器，任何人、任何时候都能<em>精确地</em>知道这个模型是什么、由什么产生——这正是「可复现」从口号变成可验证事实的那一刻。</p>  <div class="callout danger"><span class="label"></span>
+    <p>标签可移动带来一个真实风险：<strong>标签不是版本，只是指针</strong>。「我们部署的是 prod」这句话三个月后毫无信息量——那时 prod 早指向别的哈希了。审计与事故复盘必须记录<strong>当时 prod 指向的具体哈希</strong>，而不只是「prod」这个名字。本模块的版本库把每次标签移动都记进一个 append-only 的日志，正是为此。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="lineage"><span class="num">5</span>血缘 lineage：DAG、回溯与影响分析</h2>
+  <p>有了资产版本，下一个问题是<strong>它们之间的依赖</strong>：模型 <code>m:abc</code> 是用数据 <code>v:4f8e</code> 加代码 <code>c:1d4e</code> 训出来的。把这种「由…产生」的关系记下来，就是 <span class="term">lineage</span>（血缘/来源）。它天然是一张 <span class="term">DAG</span>（有向无环图）：节点是资产，边是依赖。</p>  <div class="ascii">      data:raw@v1 ──┐
+                    ├──▶ data:clean@v2 ──┐
+   code:clean@c1 ──┘                     ├──▶ model:clf@m3 ──▶ eval:report@e1
+                       code:train@c2 ────┘
+
+问「model:clf@m3 依赖什么」-&gt; 沿入边回溯 -&gt; {data:clean@v2, code:train@c2}
+           再往上            -&gt; {data:raw@v1, code:clean@c1}  （传递闭包）</div>  <p>血缘 DAG 支撑两类关键查询，都是事故响应的核心。<strong>向上游回溯（ancestors）</strong>：「这个上线模型用了哪些数据？」——出了偏见/泄漏事故，顺着入边找到所有上游数据与代码。<strong>向下游影响分析（descendants）</strong>：「这份数据被发现有问题，哪些模型受影响、必须重训？」——顺着出边找到所有下游产物。没有血缘，这两个问题都只能靠人肉考古。</p>  <p>DAG 的「无环」不是装饰：它保证可以<strong>拓扑排序</strong>（按依赖顺序重放整条流水线）、保证回溯一定终止。如果你的血缘出现环（A 依赖 B、B 又依赖 A），几乎一定是建模错了——本模块的 lineage 在加边时检测环并拒绝，把这条约束编码进 API。</p>  <p>血缘还回答一个监管与伦理层面越来越被追问的问题：<strong>数据的「知情权」与「被遗忘权」</strong>。当一个用户要求删除他的数据，你不仅要删原始记录，还要顺着血缘找出<em>所有用了这份数据训练的下游模型</em>——它们可能「记住」了该用户的信息，也需要处理（重训或下线）。没有血缘，这个合规要求根本无法落地：你不知道哪些模型碰过这份数据。这把看似工程化的 lineage 直接接到了 GDPR、数据治理这类高风险议题上，也是为什么严肃的生产系统把血缘当一等公民而非事后补记。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="diff"><span class="num">6</span>diff：manifest / schema / 行级三层</h2>
+  <p>回滚前你总想知道「这两版差在哪」。在 manifest 层面，diff 很直接——比较两个 manifest 的「文件名→哈希」映射：<strong>新增</strong>（v2 有 v1 没有的文件）、<strong>删除</strong>（v1 有 v2 没有）、<strong>修改</strong>（同名但哈希不同）、<strong>未变</strong>（同名同哈希）。注意修改的判定<em>免读内容</em>——只比哈希，这是内容寻址送的另一份大礼（对比 GB 级数据集只需比几十个哈希）。</p>  <p>更细的<strong>行级 diff</strong>（哪几行变了）则要真读内容，本模块用 pandas 实现一个数据集 diff：对齐主键、找出新增/删除/被修改的行。再加一层 <strong>schema diff</strong>（列增删、类型变化）——schema 变化往往比数据漂移更危险（上游悄悄改了格式会让训练静默出错），是模块 04 监控的近亲。</p>  <p>为什么说 schema 变化比数据漂移更阴险？看一个真实会发生的微例：上游把 <code>age</code> 列的类型从整数悄悄改成了字符串（"23" 而非 23），或者把缺失值从 <code>NaN</code> 换成了字符串 <code>"unknown"</code>。数据漂移检测（模块 04）盯的是<em>数值分布</em>，对这种<em>类型</em>变化常常视而不见；而你的训练代码可能不报错——它把 "23" 当成一个类别、把 "unknown" 当成一个新取值，<strong>静默地</strong>训出一个垃圾模型，acc 看着还行（因为大部分逻辑还在跑），直到上线才暴露。schema diff 在数据进入训练<em>之前</em>就拦住这类「结构变了但程序不崩」的事故：</p>  <div class="ascii">schema_v1: { age: int64,   income: float64, label: int64 }
+schema_v2: { age: object,  income: float64, label: int64, region: object }
+                   ↑类型变了(int→str)                      ↑新增列
+diff -&gt; CHANGED: age (int64 → object)   ⚠ 高危，训练会静默出错
+        ADDED:   region (object)        新特征，需决定是否纳入
+判定：age 类型变化触发「拦截」，要求人工确认是上游 bug 还是有意改动</div>  <p>这就是为什么成熟团队把 schema 当成一份要<em>显式声明、版本化、并在每次数据更新时校验</em>的契约（schema-as-contract，正是 Breck 2019 数据校验的核心）：与其等模型在线上变笨再回头考古，不如在数据入口处用 schema diff 做一道廉价的「类型海关」。</p>  <p>为什么要在版本系统里就做 diff，而不是等出事再查？因为 diff 是<strong>代码评审（code review）在数据世界的对应物</strong>。代码改动要走 PR、被人看过 diff 才合并；数据改动同样应该<em>可评审</em>——「这次数据更新动了哪些行、加了哪列、有没有引入异常值」应该在进入训练前被一双眼睛看过。成熟团队把数据 diff 接进 CI：每次数据更新自动生成一份 diff 报告（新增 N 行、删除 M 行、X 列类型变化、关键统计量漂移多少），让数据变更和代码变更一样<strong>有据可查、可拦截</strong>。这正好把本模块（diff）与下一模块（门禁）缝在一起。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把这三层 diff 记牢，它们是一条精度/成本递增的链：<strong>manifest diff</strong>（哪些文件变了，免读内容，最便宜）→ <strong>schema diff</strong>（结构变了吗，读元数据）→ <strong>行级 diff</strong>（具体哪行变了，读全部内容，最贵）。排查问题时由粗到细：先看哪个文件变了，再看它的 schema，最后才下钻到行。这个分层正是高效调试版本问题的正确顺序——也是一切大规模诊断的通用智慧：先用最便宜的信号缩小范围，再对幸存的小集合下钻昂贵的细查，绝不一上来就对全量做最贵的操作。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="practice"><span class="num">7</span>把版本系统接进生命周期</h2>
+  <p>版本系统不是孤立工具，它是<strong>把模块 01 的实验与模块 03 的门禁/回滚黏起来的胶水</strong>：实验产出的产物在这里被版本化、记上血缘，门禁据此决定晋升、出事据此秒级回滚。一个完整的资产流转长这样：</p>  <pre><code>repo = AssetRepo(root='./assets')
+dv = repo.add_data({'train.csv': train_bytes, 'test.csv': test_bytes})  # -&gt; version_id
+mv = repo.add_model(weights_bytes, lineage={'data': dv, 'code': 'c:1d4e'})
+repo.tag('champion', mv)                       # 当前生产模型
+# ... 训了个新模型 mv2，过了门禁（模块03）...
+repo.tag('champion', mv2)                      # 晋升：标签指向新哈希
+# 线上出事，秒级回滚：
+repo.tag('champion', mv)                       # 指回旧哈希，数据零拷贝
+assert repo.resolve('champion') == mv          # 确定性回滚</code></pre>  <p>注意每一步都在产生<strong>不可变的、带血缘的</strong>资产，标签只是在这些不可变真身之间移动的指针。这套机制让模块 03 的「晋升/回滚」、模块 05 的「重训出的新模型」都有了可靠的落点——它们操作的永远是确定的哈希，而非会撒谎的文件名。</p>  <p>再强调一个容易被低估的价值：<strong>内容寻址让「信任」可以去中心化</strong>。传统版本号（v1、v2）需要一个权威来分配和维护——谁说了算？版本号会不会被重用？而内容哈希<em>不需要任何权威</em>：你给我一份数据和一个哈希，我自己算一遍就能验证它没被篡改、就是那份内容。这对跨团队、跨组织协作（共享数据集、第三方模型）尤其重要：你不必信任对方的「版本号」，只需核对哈希。开源模型 hub（如 Hugging Face 的文件哈希校验）、软件供应链安全（SBOM、artifact signing）都建立在这同一个「内容指纹即可验证身份」的原则上。</p>  <p>同样把本模块的玩具组件对应到生产工具，看清你造的就是它们的内核：</p>  <table>
+    <thead><tr><th>本模块从零实现</th><th>它的本质</th><th>生产工具对应</th></tr></thead>
+    <tbody>
+      <tr><td><code>objects/&lt;hash[:2]&gt;/&lt;hash[2:]&gt;</code></td><td>内容寻址对象存储</td><td>DVC cache、Git <code>.git/objects</code></td></tr>
+      <tr><td>manifest（文件名→哈希）</td><td>快照=内容的内容</td><td>DVC 的 <code>.dvc</code> 指针、Git tree</td></tr>
+      <tr><td>version tag 可移动指针</td><td>别名 vs 不可变真身</td><td>Git branch/tag、模型注册表的 stage（prod/staging）</td></tr>
+      <tr><td>lineage DAG + 环检测</td><td>资产依赖图</td><td>OpenLineage、Pachyderm、MLflow Model Registry 血缘</td></tr>
+      <tr><td>manifest/schema/行级三层 diff</td><td>数据评审</td><td>DVC diff、Great Expectations、TFDV（Breck 2019）</td></tr>
+    </tbody>
+  </table>  <p>这张表想说的和模块 01 那张一样：<strong>DVC 不是魔法，它=「内容寻址 cache + Git 里的轻量指针 + 一点 pipeline 胶水」</strong>。你既然能从零写出这三块，再用 DVC 时就不会把它当黑盒，而会精确知道每个 <code>dvc add</code>、<code>dvc checkout</code> 底下在搬哪些 blob、改哪个指针。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>大文件的内容寻址成本</strong>：对 100GB 数据集每个版本算全量哈希、存全量副本都很贵。解法有分块内容寻址（chunk-level CAS，只对变化的块去重，如 restic/borg）、内容定义分块（CDC）——但「改一行触发多少重存」的最优分块仍是工程权衡。</li>
+    <li><strong>血缘的自动捕获</strong>：手动记 lineage 易漏易错。理想是从流水线执行中<em>自动</em>捕获「谁读了什么、写了什么」（OpenLineage、Pachyderm 的做法），但跨异构工具（Spark/pandas/SQL）统一捕获仍未解决。</li>
+    <li><strong>数据的语义版本</strong>：代码有语义化版本（major.minor.patch 表达兼容性）；数据呢？「这次数据更新是兼容的小修，还是会让所有下游模型失效的大改」目前只能靠人判断，缺乏自动的「数据兼容性」概念。</li>
+    <li><strong>可复现 ≠ 可重建</strong>：你存了数据哈希，但如果原始数据源（某个会变的 API、某张被删的表）没了，哈希只能<em>验证</em>你手上的副本对不对，不能<em>重新获取</em>。在动态数据源下做到真正可重建，是 data versioning 的深水区。</li>
+    <li><strong>版本爆炸与垃圾回收</strong>：自动化训练每天产生大量数据/模型版本，CAS 里很快堆满再无人引用的孤儿 blob。何时安全地垃圾回收（确保没有任何标签或血缘还指向它）、如何在「留着以备审计」与「省钱」间定策略，是生产 CAS 的长期运维难题——和 Git 的 <code>gc</code>、语言运行时的 GC 是同一类问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读：DVC 文档（内容寻址 + pipeline 的生产形态）、Pro Git「Git internals」一章（blob/tree/commit 的内容寻址原型）、Pachyderm/OpenLineage（自动血缘）、Breck 2019 数据校验（schema diff 的近亲）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_experiment_tracking/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 实验追踪</div></a>
+    <a class="next" href="../03_cicd_gates/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 评测门禁与 CI/CD</div></a>
+  </div>
+
+</div>
+</body>
+</html>

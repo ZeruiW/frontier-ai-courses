@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 增强的质量控制</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 增强的质量控制</h1>
+  <p class="subtitle">四类失效互相独立 · 多样性度量是警报器不是评分器（且可以被刷）· 三层去污染与「先增强后划分」的灾难 · 流水线顺序与分阶段丢弃率就是诊断报告 · 坍塌看板用相对变化告警</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–03；C43 模块 05（去污染）与 C10（标注质量）有帮助</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_quality_control.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Li et al. 2016（distinct-n）、Zhu et al. 2018（self-BLEU）、Lee et al. 2021（去重与去污染）、Shumailov et al. 2024（collapse）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么质量控制是一条流水线而不是一个指标</a></li>
+      <li><a href="#diversity">多样性度量：三个视角，各有盲区</a></li>
+      <li><a href="#contamination">去污染：三层检测，从精确到语义</a></li>
+      <li><a href="#pipeline">组装成流水线：顺序、丢弃率与可追溯</a></li>
+      <li><a href="#collapse">坍塌监测：把四个征兆做成看板</a></li>
+      <li><a href="#ledger">算一笔账：分阶段丢弃率就是诊断报告</a></li>
+      <li><a href="#fidelity">保真度检验：三层判据与「怎么为你的任务写一个」</a></li>
+      <li><a href="#ops">把质量控制变成流程：谁在什么时候跑它</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么质量控制是一条流水线而不是一个指标</h2>
+  <p>前三个模块产出了增强数据。这一模块回答：<strong>怎么在把它们喂给模型之前，把坏的挡在外面</strong>。</p>  <p>一个常见的错误做法是「算一个多样性分数，看着还行就用」。这行不通，因为<strong>增强数据的失效方式是多维的，而每个维度需要不同的检测手段</strong>：</p>  <div class="ascii">增强数据的四类失效，各需一套检测
+
+① 标签被破坏  (fidelity)      -&gt; 规则检查 / 关键成分一致性 / 模型一致性
+   症状: 训练集里混入错标数据；模型在决策边界上变差
+
+② 多样性不足  (diversity)     -&gt; distinct-n / self-BLEU / 嵌入覆盖 / 重复率
+   症状: 花了算力却等于把数据复制了几遍；正则化效果为零
+
+③ 测试集泄漏  (contamination) -&gt; n-gram 重叠 / 近重复检索 / 精确子串
+   症状: **评测分数虚高**，上线后效果远低于评测——最危险的一类
+
+④ 分布坍塌    (collapse)      -&gt; 多代趋势监测（模块 03 的四个征兆）
+   症状: 渐进的、不报错的、几代之后才显现
+
+关键：这四类**互相独立**。①好不代表②好（复制原样本：保真 100%、多样性零）；
+      ②好不代表③好（多样性高的合成数据照样可能撞上测试集）。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以质量控制必须是<strong>一条按顺序执行的流水线</strong>，而不是一个综合分数。顺序遵循两条原则：<strong>①先便宜后贵</strong>（零成本的规则检查在前，需要模型的在后）；<strong>②先致命后次要</strong>（污染与错标是致命的，多样性不足只是浪费）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个容易被忽略的设计要点：<strong>每个阶段都要记录「丢了多少、为什么丢」</strong>。这不是为了好看——<em>各阶段的丢弃率本身就是最有用的诊断信号</em>。「去重丢了 80%」说明生成器在同质化；「污染检查丢了 5%」说明教师模型见过你的测试集；「保真检查丢了 20%」说明增强强度太大。<strong>没有这份分阶段统计，你只知道「留下了 30%」，不知道该改哪一步。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">污染让指标变好——所以它最危险</span>
+    <p>四类失效里<strong>③ 测试集泄漏最危险</strong>，因为它的症状是「评测分数变好」——这与你期望的结果一致，所以<em>不会引起任何警觉</em>。其他三类都会以某种方式让指标变差或不变，而污染让指标变<strong>好</strong>。这种「奖励错误行为」的失效模式在工程里是最难发现的一类。<strong>所以去污染检查必须是强制的、自动的、每次都跑的，而不是「想起来才做」的。</strong>指令层合成（模块 03）尤其危险，因为教师模型很可能在预训练时见过你的测试集。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="diversity"><span class="num">2</span>多样性度量：三个视角，各有盲区</h2>
+  <table>
+    <thead><tr><th>度量</th><th>怎么算</th><th>方向</th><th>抓什么</th><th>盲区</th></tr></thead>
+    <tbody>
+      <tr><td><strong>distinct-n</strong></td><td>不同 n-gram 数 ÷ 总 n-gram 数</td><td>越高越多样</td><td>词面重复</td><td>对长度敏感（短文本天然更高）；只看局部</td></tr>
+      <tr><td><strong>self-BLEU</strong></td><td>每条与其余条的 n-gram 精确率均值</td><td><strong>越低越多样</strong></td><td>两两相似性</td><td>O(n²) 需采样；对同义改写不敏感</td></tr>
+      <tr><td><strong>嵌入覆盖</strong></td><td>嵌入投影后占据的网格/凸包体积</td><td>越高越广</td><td><strong>语义</strong>覆盖</td><td>依赖嵌入质量；网格划分是人为的</td></tr>
+      <tr><td><strong>重复率</strong></td><td>完全相同或近重复的比例</td><td>越低越好</td><td>彻底无效的副本</td><td>只抓最极端的情况</td></tr>
+      <tr><td><strong>类别/属性熵</strong></td><td>结构化属性（领域、标签、长度桶）的熵</td><td>越高越均衡</td><td><strong>可解释的</strong>偏斜</td><td>需要有结构化标注</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么需要多个度量？因为<strong>每个都有能被「刷」的盲区</strong>。distinct-n 可以靠随机插入罕见词刷高（但那不是有用的多样性）；self-BLEU 对「换同义词但结构相同」不敏感；嵌入覆盖可以靠生成一些语义离群的垃圾刷高。<em>三个一起看，才能区分「真多样」与「刷出来的多样」</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但更重要的一点是<strong>多样性度量的正确用途</strong>：<em>它们不是用来评价「这批数据好不好」的绝对分数，而是用来</em>①<strong>比较两个增强方案</strong>（同一度量下 A vs B）与 ②<strong>监测趋势</strong>（同一方案逐代/逐批的变化）。<em>「distinct-2 = 0.45」这个绝对数字本身没有意义</em>——它取决于文本长度、词表、n 的取值。模块 00 已经演示过：完全随机的文本多样性最高、而作为训练数据毫无价值。<strong>多样性高 ≠ 有用。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把多样性度量的定位说得更直白：<strong>它们是「警报器」而不是「评分器」</strong>。你不该问「distinct-2 到多少才算好」，而该问「distinct-2 相对上一批降了多少」。模块 03 的坍塌四征兆就是这个用法——<em>趋势有意义，绝对值没有</em>。这也解释了为什么本课坚持三重检验：多样性只负责报警「数据在同质化」，有效性才负责回答「这批数据有用吗」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="contamination"><span class="num">3</span>去污染：三层检测，从精确到语义</h2>
+  <p><span class="term">contamination</span>（污染）指训练数据里混入了评测集的内容。增强场景下有三条污染路径：</p>  <ul>
+    <li><strong>直接泄漏</strong>：增强的源数据本身包含了测试集样本（划分前就增强了——<em>这是最常见也最愚蠢的错误</em>）。</li>
+    <li><strong>间接泄漏</strong>：增强产生了与测试集样本高度相似的文本（回译/释义可能把测试集的近邻造出来）。</li>
+    <li><strong>教师泄漏</strong>：LLM 教师在预训练时见过测试集，于是合成数据里出现了测试集的内容或答案。<em>这条路径你完全无法控制，只能检测。</em></li>
+  </ul>  <table>
+    <thead><tr><th>检测层</th><th>方法</th><th>抓什么</th><th>成本</th><th>假阳性</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 精确匹配</strong></td><td>归一化后完全相同（去空格/标点/大小写）</td><td>直接泄漏</td><td>极低（哈希）</td><td>几乎无</td></tr>
+      <tr><td><strong>② n-gram 重叠</strong></td><td>共享 ≥1 个 <code>n</code>-gram（<code>n</code>=8~13）或重叠比例超阈值</td><td>间接泄漏、部分复制</td><td>低（倒排索引）</td><td>低（<code>n</code> 越大越低）</td></tr>
+      <tr><td><strong>③ 近重复检索</strong></td><td>MinHash/LSH 或嵌入近邻，相似度超阈值</td><td>改写后的泄漏</td><td>中</td><td>中（需人工抽查）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><code>n</code> 的选择是个经典权衡：<code>n</code> 太小（如 4）会有大量假阳性（常见短语「这家店的服务」在任何餐饮语料里都出现）；<code>n</code> 太大（如 20）会漏掉部分改写。<strong>社区常用 8–13</strong>（GPT-3 用 13-gram，Lee et al. 2021 用 8-gram 的变体）。<em>关键是要在<strong>归一化后</strong>比对</em>——去掉标点、统一空格、小写化，否则「这家店，很好」与「这家店 很好」会被判为不同。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个常被忽略的细节：<strong>检测方向要双向</strong>。你不但要检查「增强数据是否包含测试集内容」，还要检查「<em>增强数据是否与训练集的其他样本重复</em>」——后者不是污染但是浪费（重复数据不提供信息，还会让模型对那部分过拟合，Lee et al. 2021 的核心结论）。<em>所以去污染与去重应该用同一套工具、同一次扫描完成</em>，只是比对的目标集合不同。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一条必须写进流程的纪律：<strong>先划分数据集，再做任何增强</strong>。听起来是废话，但「先增强后划分」这个错误极其常见——因为增强脚本和划分脚本常常是分开写的，谁先跑取决于流水线的组织。<em>后果是同一条原样本的不同副本分别落进了训练集与测试集</em>，测试集实际上已经泄漏，而所有指标都会虚高。<strong>防护：把「增强只作用于训练集」写成一个断言，在增强脚本开头检查输入不含测试集 id。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">4</span>组装成流水线：顺序、丢弃率与可追溯</h2>
+  <div class="ascii">            增强数据（来自模块 01/02/03）
+                    │
+    ┌───────────────▼────────────────┐
+    │ ① 去污染（vs 测试集）          │  ← **必须第一个**，且不可跳过
+    │    精确匹配 -&gt; n-gram -&gt; 近重复 │     因为它抓的是「让指标变好」的失效
+    └───────────────┬────────────────┘  丢弃率高 =&gt; 教师见过你的测试集
+    ┌───────────────▼────────────────┐
+    │ ② 保真度（标签是否被破坏）      │  ← 零成本的规则检查在前
+    │    关键成分 -&gt; 规则标签 -&gt; 模型  │     丢弃率高 =&gt; 增强强度太大
+    └───────────────┬────────────────┘
+    ┌───────────────▼────────────────┐
+    │ ③ 去重（vs 训练集 + 增强内部）  │  ← 重复不是污染但是浪费
+    │    精确 -&gt; MinHash/相似度带      │     丢弃率高 =&gt; 生成器在同质化
+    └───────────────┬────────────────┘
+    ┌───────────────▼────────────────┐
+    │ ④ 多样性与坍塌监测（不丢弃）     │  ← 只报警，不过滤
+    │    distinct-n / self-BLEU / 覆盖 │     趋势下降 =&gt; 该混真实数据了
+    └───────────────┬────────────────┘
+                    ▼
+              可用的增强数据 + 一份分阶段统计报告
+
+每一步都记录：丢了多少条、为什么、样例。**这份报告比最终的保留率有用得多。**</div>  <table>
+    <thead><tr><th>顺序</th><th>为什么在这个位置</th></tr></thead>
+    <tbody>
+      <tr><td>污染在最前</td><td>它抓的是「让指标变好」的失效——最危险且最需要早发现；而且它的丢弃率是关于教师/数据来源的重要诊断</td></tr>
+      <tr><td>保真度在污染之后</td><td>它比污染便宜但不那么致命；先污染是因为「污染样本即使保真也不能用」</td></tr>
+      <tr><td>去重在保真之后</td><td>重复样本浪费算力但不致命；且没必要对已被丢弃的样本算去重</td></tr>
+      <tr><td>多样性最后且不过滤</td><td>它是<strong>报警器不是过滤器</strong>——你无法通过丢弃单条样本来提高整批的多样性</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>最后一行值得强调，因为它常被搞错：<strong>多样性是集合层面的属性，不能靠逐条过滤来改善</strong>。你可以丢掉「与已保留样本太像」的单条（那是去重），但「整批多样性不够」的解决办法是<em>改生成器</em>（提高温度、收紧去重阈值、加广度算子、混入真实数据），不是继续过滤。<em>把「过滤能解决的问题」与「只能靠改生成解决的问题」分清，能省掉很多无效的过滤器调参。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="collapse"><span class="num">5</span>坍塌监测：把四个征兆做成看板</h2>
+  <p>模块 03 演示了递归使用合成数据会坍塌，并给出四个早期征兆。这一节讲怎么把它<strong>工程化成一个持续运行的监测</strong>。</p>  <table>
+    <thead><tr><th>征兆</th><th>指标</th><th>告警条件（示例）</th><th>对应的动作</th></tr></thead>
+    <tbody>
+      <tr><td>多样性下降</td><td>distinct-2、唯一样本比</td><td>相对上一批下降 &gt; 10%</td><td>收紧去重阈值 / 提高生成温度</td></tr>
+      <tr><td>长度分布收窄</td><td>输出长度的标准差</td><td>相对下降 &gt; 15%</td><td>检查是否被教师的长度偏好主导</td></tr>
+      <tr><td>高频模式占比上升</td><td>最常见开头/句式/属性组合的占比</td><td>相对上升 &gt; 10%</td><td>加广度算子 / 换 few-shot 示例池</td></tr>
+      <tr><td>语义覆盖收缩</td><td>嵌入覆盖 / 聚类数</td><td>相对下降 &gt; 10%</td><td><strong>混入更多真实数据</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>四个征兆里<strong>最后一个的动作最重要也最难接受</strong>：混入更多真实数据意味着「你需要去标注」，而这恰恰是你做合成数据想避免的事。<em>但这是坍塌唯一可靠的解药</em>（Shumailov et al. 2024）。所以正确的心态是：<strong>合成数据是真实数据的乘数，不是替代品</strong>——它能把 1000 条真实数据的价值放大到 3000 条的效果，但不能让你完全不要真实数据。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>工程上还要注意一个细节：<strong>告警要用「相对变化」而不是「绝对阈值」</strong>。因为多样性指标的绝对值取决于文本长度、词表、领域——同一个 <code>distinct-2 = 0.4</code> 在不同任务上含义完全不同。<em>相对变化才是可跨任务复用的信号</em>。这与 C48 模块 04 用 burn rate（相对 SLO 归一化）而非绝对错误率做告警是同一个思路：<strong>把指标归一化到「相对自己的基线」，告警规则才能复用。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>坍塌监测有个反直觉的时序问题：<strong>你必须在坍塌造成损害<em>之前</em>发现它，但那时下游指标还没变差</strong>。也就是说，<em>你要基于「内在指标恶化」而不是「下游指标恶化」来采取行动</em>——这需要一点纪律，因为「下游指标还好着呢，为什么要停下来加真实数据？」是很自然的反驳。<strong>这正是把四个征兆做成自动看板而不是「偶尔看一眼」的理由</strong>：让它变成流程的一部分，而不是每次都要论证的决定。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">6</span>算一笔账：分阶段丢弃率就是诊断报告</h2>
+  <p>本模块最有价值的产出不是「保留了多少」，而是<strong>分阶段的丢弃率</strong>——它直接告诉你该改哪一步。</p>  <table>
+    <thead><tr><th>观察到的现象</th><th>诊断</th><th>该做什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>污染阶段丢弃率 &gt; 1%</strong></td><td>教师模型见过你的测试集，或数据划分有问题</td><td>换测试集 / 检查划分顺序 / 换教师</td></tr>
+      <tr><td>污染阶段丢弃率 = 0 且检测很松</td><td>可能是检测没生效（n 太大、忘了归一化）</td><td>先用「故意注入的测试集样本」验证检测器本身</td></tr>
+      <tr><td><strong>保真阶段丢弃率 &gt; 20%</strong></td><td>增强强度太大（α 太高、温度太高、教师偏差大）</td><td>降强度 / 加保护规则 / 换教师</td></tr>
+      <tr><td>保真阶段丢弃率 ≈ 0</td><td>增强太保守（可能等于没增强）</td><td>看多样性——若也很低，说明白花了算力</td></tr>
+      <tr><td><strong>去重阶段丢弃率 &gt; 70%</strong></td><td>生成器在同质化（模式惯性）</td><td>提高温度 / 加广度算子 / 换 few-shot 池</td></tr>
+      <tr><td>多样性趋势连续 3 批下降</td><td>开始坍塌</td><td><strong>混入真实数据</strong></td></tr>
+    </tbody>
+  </table>  <p>把这张表当成一张<strong>诊断流程图</strong>用：每次跑完增强管线，先看分阶段丢弃率，对照表格找到对应的动作。<em>这比盯着「最终保留了 35%」这个数字有用得多</em>——后者不告诉你该改什么。</p>  <div class="math-block">\[\text{有效产出率} = \prod_{i} (1 - d_i), \qquad \text{有效成本/可用条} = \frac{c_{gen}}{\prod_i (1-d_i)}\]</div>  <p>这个乘积形式有一个重要含义：<strong>各阶段的丢弃率是乘起来的，所以任何一个阶段过严都会让总成本爆炸</strong>。三个阶段各丢 50%，总保留率只有 12.5%——成本是 8 倍。<em>所以「把每个过滤器都调到最严」是错的；应该让每个过滤器只挡它该挡的那类问题，且尽量减少假阳性。</em></p>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的智慧：<strong>质量控制不是「算一个分数」，而是「一条记录了每一步为什么丢弃的流水线」</strong>——而那份分阶段的丢弃记录，比任何综合指标都更能告诉你该改什么。这条思路在数据工程（C43）、评测（C03/C10）、生产监控（C48）里是完全一样的：<em>可诊断性来自分解，不来自汇总</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fidelity"><span class="num">7</span>保真度检验：三层判据与「怎么为你的任务写一个」</h2>
+  <p>多样性与污染前面讲过了，这里补上第三块：<strong>怎么自动判断「这条增强样本的标签还对不对」</strong>。真实任务里没有模块 00 那种规则可判定的标签，所以需要一套可落地的近似。</p>  <table>
+    <thead><tr><th>层</th><th>判据</th><th>适用</th><th>成本</th><th>假阴（漏判）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 结构不变量</strong></td><td>关键成分集合是否保持：否定词计数、实体集、数字集、标注 span 是否仍在</td><td>所有任务</td><td><strong>几乎零</strong></td><td>抓不住「换了个近义词但语义变了」</td></tr>
+      <tr><td><strong>② 任务特定规则</strong></td><td>为你的任务手写的判定函数（如 NER：每个实体的类型与边界都在；QA：答案 span 逐字符仍在原文）</td><td>结构化输出任务</td><td>低</td><td>规则覆盖不到的情形</td></tr>
+      <tr><td><strong>③ 模型一致性</strong></td><td>已训练模型对原样本与增强样本的预测是否一致（只在「明显相反且都自信」时才判失败）</td><td>分类/排序</td><td>中</td><td>模型自己就错的样本</td></tr>
+      <tr><td><strong>④ 人工抽查</strong></td><td>每批随机抽 50–100 条人工判</td><td>全部（作为前三层的校准）</td><td>高</td><td>—</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第 ④ 层不是可选的，但它的用途常被误解：<strong>人工抽查不是用来「筛数据」的（量太小），而是用来<em>校准前三层</em>的</strong>。做法是：对同一批 100 条样本，同时记录自动判据的结论与人工结论，算出自动判据的假阳/假阴率。<em>知道了「我的自动检查漏掉了 15% 的破坏」，你才知道该把保真度门槛设在哪</em>——如果自动测出 0.98，真实可能只有 0.95。<strong>没有校准的自动判据，给出的数字不知道该怎么读。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第 ③ 层的 confirmation bias 问题值得再强调一次（模块 02 提过）：<strong>用模型筛数据会系统性地保留「模型已经会的」样本</strong>，也就是信息量最低的那些。所以它<em>只能做硬过滤</em>（两边预测相反且都很自信 → 丢），<strong>绝不能做排序筛选</strong>（按一致性打分取 top-k）。后者会让增强数据退化成「模型的自我复述」，与模块 03 的模式坍塌是同一类问题的不同表现。</p></div>
+  </div>  <h3>为你的任务写一个判定函数：三个问题</h3>  <ul>
+    <li><strong>标签由输入的哪些部分决定？</strong> 把它们列出来 → 这就是「结构不变量」的检查清单（也是模块 01 的保护表）。</li>
+    <li><strong>什么改动一定会改标签？</strong> 写成断言（如「否定词数量改变 → 判失败」）。宁可保守（多丢一些），因为丢弃便宜、错标昂贵。</li>
+    <li><strong>什么改动一定不会改标签？</strong> 这些可以放行（如只插标点、只换确定的中性同义词）。<em>把它们显式列出来能提高保留率、降低成本。</em></li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>这三个问题的顺序很重要：<strong>先想「什么一定会破坏」，再想「什么一定安全」，中间地带交给相似度带与人工抽查</strong>。很多人一上来就试图写一个「完美的判定函数」，结果卡在中间地带的模糊案例上。<em>而实际上两端的规则就能覆盖绝大多数样本，中间地带丢掉也不心疼</em>——因为生成新样本比精确判定单个样本便宜得多。这是「丢弃优于修正」在检验环节的又一次体现。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ops"><span class="num">8</span>把质量控制变成流程：谁在什么时候跑它</h2>
+  <p>前面讲的检测与流水线，只有变成<strong>默认执行的流程</strong>才有价值。一次性手动跑一遍、然后忘掉，等于没做——因为增强管线会被反复重跑（换教师、调参数、加数据），而每一次重跑都可能引入新问题。</p>  <table>
+    <thead><tr><th>时机</th><th>跑什么</th><th>失败时做什么</th><th>对应 C37/C48 的什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>增强脚本启动时</strong></td><td><code>assert_no_test_ids()</code>：输入不含测试集</td><td><strong>直接崩</strong>（这是 bug 不是警告）</td><td>前置断言</td></tr>
+      <tr><td><strong>每批增强产出后</strong></td><td>完整 QC 流水线 + 分阶段丢弃率 + 一行摘要</td><td>丢弃率超阈值 → 阻断入库并告警</td><td>CI 门禁（C37 模块 03）</td></tr>
+      <tr><td><strong>每次训练前</strong></td><td>抽一个 batch 打印检查（C50 模块 02 的四项检查）</td><td>人工确认后才继续</td><td>冒烟测试</td></tr>
+      <tr><td><strong>每代/每批之间</strong></td><td>坍塌看板的四个征兆（相对变化）</td><td>告警 → 混入真实数据</td><td>指标趋势告警（C48 模块 04）</td></tr>
+      <tr><td><strong>每次评测前</strong></td><td>重跑一次去污染（测试集可能换了）</td><td><strong>阻断评测</strong></td><td>评测门禁（C03/C10）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后一行值得强调：<strong>去污染要在「每次评测前」而不是「每次增强后」重跑</strong>。因为测试集本身会变（换了评测基准、加了新的评测集、或者用了公开基准）——<em>今天干净的数据，换个测试集就可能是污染的</em>。把去污染绑定在「评测」这个动作上而不是「数据生成」上，才是正确的耦合方式。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>另一条流程设计原则：<strong>区分「阻断」与「告警」</strong>。污染与保真度是<em>阻断级</em>（数据不能入库，因为它会让所有后续结论失效）；多样性与坍塌是<em>告警级</em>（数据仍可用，但趋势不对需要人来决策）。<em>把两者混在一起，要么阻断太多导致流程被绕过（工程师会关掉检查），要么全是告警导致没人看</em>。这与 C48 模块 04 区分「自动回滚」与「人工告警」是同一个设计问题。</p></div>
+  </div>  <h3>一份最小可行的 QC 配置</h3>  <pre><code>qc:
+  contamination:              # 阻断级
+    enabled: true             # ← 永远不要关
+    ngram_n: 8
+    max_drop_rate: 0.01       # 超过 1% 说明教师见过测试集，阻断并人工查
+  fidelity:                   # 阻断级
+    min_rate: 0.98            # 硬门槛（模块 01 论证过为什么这么严）
+    checks: [negation_count, entity_set, number_set, task_specific]
+  dedup:                      # 阻断级（但阈值宽松）
+    against: [test_set, train_set, within_batch]
+    similarity: 0.85
+  diversity:                  # 告警级
+    metrics: [distinct_2, self_bleu_2, embedding_coverage]
+    alert_on: relative_drop   # **相对变化**，不是绝对阈值
+    threshold: 0.10
+  collapse:                   # 告警级
+    window: 3
+    symptoms: [diversity, length_std, top_mode_share, coverage]
+  human_audit:
+    sample_per_batch: 50      # 用来**校准**自动判据，不是用来筛数据</code></pre>  <div class="callout intuition"><span class="label"></span>
+    <p>这份配置里最容易被删掉的是 <code>human_audit</code>——因为它是唯一需要人的一项。但删掉它的后果是：<strong>你的所有自动指标都失去了标定</strong>，「保真度 0.98」这个数字不知道对应真实的多少。<em>每批 50 条、十分钟的人工抽查，换来的是「所有自动数字都可信」——这是整条流水线里投入产出比最高的一项</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>多样性度量的可刷性</strong>：distinct-n、self-BLEU 都可以被针对性地刷高而不带来真实收益。<em>是否存在「不可刷」的多样性度量</em>（如与下游收益单调相关的）是个开放问题；目前只能靠多个度量交叉验证。</li>
+    <li><strong>去污染的语义层</strong>：n-gram 重叠抓不住「同一道题换个说法」。用嵌入近邻或 LLM 判断能抓到，但假阳性高且昂贵。<em>「什么程度的相似算污染」本身没有客观定义</em>——这与 C03 讲的基准污染是同一个开放问题。</li>
+    <li><strong>坍塌的可预测性</strong>：目前只能监测不能预测。「给定真实数据量、合成比例、代数，能否预测坍塌的时点」缺乏理论。Shumailov et al. 2024 给了简化模型但离可操作的预测还远。</li>
+    <li><strong>过滤器的联合优化</strong>：各阶段阈值是独立调的，但它们的效果不独立（严格的保真过滤会顺带提高多样性，因为破坏标签的样本往往也是离群的）。<em>联合调参的搜索空间大、且目标函数需要下游实验</em>，实践中几乎无人做。</li>
+    <li><strong>质量与数量的兑换率</strong>：「1000 条高质量 vs 5000 条含 10% 噪声」哪个更好？这在标注学习（learning with noisy labels）里有理论，但在增强数据的具体场景下缺乏可操作的判据。<em>本课的立场（保真度是硬门槛）是保守的，可能在某些任务上过于保守。</em></li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Li et al. 2016 <em>A Diversity-Promoting Objective Function for Neural Conversation Models</em>（distinct-n 的出处）、Zhu et al. 2018 <em>Texygen</em>（self-BLEU 的提出与多样性度量的系统讨论）、Lee et al. 2021 <em>Deduplicating Training Data Makes Language Models Better</em>（去重与去污染的方法与必要性，C43 模块 01/05 详读）、Shumailov et al. 2024 <em>AI models collapse…</em>（坍塌的机制）、Dodge et al. 2021 <em>Documenting Large Webtext Corpora</em>（数据文档与污染审计的实践）。相邻课程：C43（PB 级去重与去污染的工程实现）、C03/C10（基准污染与测量科学）、C14（合成数据与生成媒体评测）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_instruction_synthesis/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · LLM 驱动的指令数据合成</div></a>
+    <a class="next" href="../05_evaluation_ablation/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 增强的评测与消融</div></a>
+  </div>
+
+</div>
+</body>
+</html>

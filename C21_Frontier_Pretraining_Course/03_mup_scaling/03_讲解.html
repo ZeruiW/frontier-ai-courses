@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · μP 与超参迁移</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · μP 与超参迁移</h1>
+  <p class="subtitle">在小模型调好超参直接搬到大模型：SP 下尺度随宽度漂移的根源、μP 的 init/lr/attention-logit 缩放、coordinate check 验证 —— 亲手测出最优 lr 是否随宽度漂移</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">矩阵乘与方差传播、梯度下降、一点 Transformer（注意力）；模块 00</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_mup_scaling.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Yang 2021 (μP/μTransfer)、Tensor Programs IV–VI、Hoffmann 2022 (Chinchilla)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么不能在大模型上调参</a></li>
+      <li><a href="#drift">问题根源：SP 下尺度随宽度漂移</a></li>
+      <li><a href="#mup">μP 核心：让更新尺度与宽度无关</a></li>
+      <li><a href="#attn">attention logit 缩放：1/d 而非 1/√d</a></li>
+      <li><a href="#coord">coordinate check：验证 μP 对不对</a></li>
+      <li><a href="#transfer">μTransfer：小模型调参迁到大模型</a></li>
+      <li><a href="#scaling">μP 与 scaling laws 的配合</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么不能在大模型上调参</h2>
+  <p>到这里数据干净了、tokenizer 定了，下一个烧钱的坑是<strong>调超参</strong>。学习率、初始化、warmup——这些超参对最终 loss 影响巨大，但<strong>在大模型上调一次超参的代价是天文数字</strong>：训一个 70B 模型一遍就要烧掉几十万美元，你不可能网格搜十几个学习率。于是一个致命的问题浮现：<strong>能不能在便宜的小模型上把超参调好，再直接搬到大模型上用？</strong></p>  <p>朴素的答案是<strong>不能</strong>——在标准做法下，<em>最优超参会随模型变大而漂移</em>。小模型上最好的学习率，到大模型上可能太大（训崩）或太小（学得慢）。这迫使你要么在大模型上重新调（烧钱），要么凭经验瞎猜（风险）。这正是 <span class="term">μP</span>（maximal update parametrization，最大更新参数化，Yang 2021）要解决的问题。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>μP 的承诺听起来像魔法：<strong>用一套特殊的初始化与学习率缩放规则，让小模型上调好的超参，几乎原封不动地迁移到任意大的模型上</strong>。在 1000 万参数的模型上花几小时网格搜出最优学习率，直接用到 1000 亿参数的模型上——这就是 <span class="term">μTransfer</span>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：μP 是一组关于「乘法因子、初始化方差、学习率」如何随<strong>宽度</strong>（hidden dim $d$）缩放的规则，使得网络的<strong>每层激活尺度与每步更新对激活的改变量都保持 $O(1)$</strong>（与宽度无关）。其推论就是 <span class="term">hyperparameter transfer</span>：在这套参数化下，最优超参不随宽度移动，因而可跨宽度迁移。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么这件事如此值钱？因为它把「调参成本」从<strong>随模型规模暴涨</strong>变成<strong>一次性的小成本</strong>。没有 μP，每个新规模都要重新调参（在最贵的地方做最多的实验）；有了 μP，调参在最便宜的小模型上做一次，省下的算力可能是整个项目预算的一大块。这是 μP 被 GPT-4 级别的训练采用的现实理由——不是为了优雅，是为了<strong>省钱、降风险</strong>。</p>
+  </div>  <p>还有一层<strong>降风险</strong>的价值常被忽略：大模型训练是<strong>一次性</strong>的（你只训得起一遍），一旦学习率没选对，要么训崩、要么浪费整次训练。没有 μP，你是在<strong>赌</strong>——赌凭经验外推的学习率在大模型上恰好合适。μP 把这变成<strong>有依据的迁移</strong>：小模型上验证过的最优值，有理论保证在大模型上仍最优。对一次烧掉数百万美元、训几个月的项目，这种「不靠赌」的确定性本身就极其值钱。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="drift"><span class="num">2</span>问题根源：SP 下尺度随宽度漂移</h2>
+  <h3>问题根源：标准参数化下尺度随宽度漂移</h3>  <p>要理解 μP，先得看清<strong>标准参数化（SP，standard parametrization）</strong>为什么会让超参漂移。考虑一个隐藏层的输出 $h = W x$，$W \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$。标准做法把 $W$ 的每个元素初始化为方差 $\frac{1}{d_{\text{in}}}$（如 Kaiming/Xavier），这样 $h$ 的每个坐标在初始时是 $O(1)$——<strong>初始尺度没问题</strong>。</p>  <p>问题出在<strong>训练动态</strong>上。考虑网络的输出 $y = W_{\text{out}} h$，其中 $h \in \mathbb{R}^d$（$d$ 是宽度）。一步梯度更新后，输出的改变量 $\Delta y$ 是对 $d$ 个坐标的更新效应求和。在 SP 下用<strong>固定学习率</strong>时，这个和<strong>随宽度 $d$ 增长</strong>——网络越宽，同样的学习率造成的输出变化越剧烈。</p>  <div class="math-block">\[\text{SP, 固定 lr：} \quad \Delta y \sim O(d) \quad\Longrightarrow\quad \text{宽网络上同一 lr 太「猛」，最优 lr} \propto \frac{1}{d}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直觉：把宽度想成「投票人数」。输出是 $d$ 个隐藏单元的「投票汇总」。宽度翻倍，投票人翻倍，如果每个人的「改票幅度」（学习率）不变，那么汇总结果的波动就翻倍——网络越宽越「敏感」，于是你必须把学习率调小来补偿。这就是为什么 SP 下最优 lr 随宽度往下漂。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化（Tensor Programs 的结论）：在 SP + 固定 lr 下，宽度 $d\to\infty$ 时网络要么进入「惰性区」（kernel/NTK 区，特征几乎不学习），要么更新爆炸。两者都不是我们想要的「特征学习」区。最优 lr 随 $d$ 漂移正是这种尺度失配的外在表现——在某个宽度调好的 lr，换个宽度就不再是最优。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>这个漂移<strong>不是玄学，是可推导、可测量的</strong>。notebook 第 2 节会让你在一个玩具 MLP 上<strong>亲手测出</strong>：固定学习率下，一步更新造成的输出改变量 $\Delta y$ 随宽度近似线性增长（SP），且最优学习率随宽度近似按 $1/d$ 下移。看到这条曲线，你就理解了「为什么不能把小模型的 lr 直接用到大模型」——这正是 μP 要修复的病。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mup"><span class="num">3</span>μP 核心：让更新尺度与宽度无关</h2>
+  <h3>μP 的核心：让更新尺度与宽度无关</h3>  <p>μP 的解法是<strong>重新分配三样东西随宽度的缩放</strong>：① 各层的<strong>初始化方差</strong>、② 各层的<strong>学习率</strong>、③ 输出层的<strong>乘法因子</strong>。目标只有一个——让<strong>每层激活、以及每步更新对激活的改变量，都保持 $O(1)$，与宽度无关</strong>。这样尺度不漂，最优超参自然不漂。</p>  <h4>μP 的缩放规则（以 SGD 为例）</h4>  <table>
+    <thead><tr><th>层类型</th><th>初始化方差</th><th>学习率</th><th>直觉</th></tr></thead>
+    <tbody>
+      <tr><td>输入层（embedding / 第一层）</td><td>$O(1)$（不随 $d$）</td><td>$O(1)$</td><td>输入维度固定，正常初始化</td></tr>
+      <tr><td>隐藏层（fan_in = $d$）</td><td>$\frac{1}{d}$（即 $1/\text{fan\_in}$）</td><td>$O(d)$（SGD）/ $O(1)$（Adam）</td><td>lr 随宽度调，补偿更新求和效应</td></tr>
+      <tr><td>输出层 / readout（fan_in = $d$）</td><td>$\frac{1}{d^2}$ 或乘 $\frac{1}{d}$ 因子</td><td>$O(1/d)$</td><td>输出对宽度敏感，缩小初始与 lr</td></tr>
+      <tr><td>注意力 logit</td><td>—</td><td>用 $\frac{1}{d}$ 缩放（非 $\frac{1}{\sqrt d}$）</td><td>见第 4 节</td></tr>
+    </tbody>
+  </table>  <p>关键是<strong>输出层（readout）</strong>和<strong>隐藏层学习率</strong>的处理。SP 把所有层一视同仁；μP 认识到不同层在变宽时的角色不同——输出层把 $d$ 维特征压成少数输出，对宽度最敏感，要<strong>缩小其初始化与学习率</strong>；隐藏层的学习率则要<strong>随宽度调整</strong>（SGD 下放大、Adam 下保持），正好抵消「更新求和随宽度增长」的效应。这两处一调，$\Delta y$ 就从 $O(d)$ 变回 $O(1)$。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句话抓住 μP：<strong>它给每一层「按它在变宽时的角色」分配不同的初始化和学习率</strong>，让无论网络多宽，每一步训练对网络输出的「冲击力」都差不多。冲击力恒定 → 最优学习率恒定 → 可迁移。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>Yang 把这套缩放统一成 <span class="term">abc-parametrization</span>：用三组指数 $(a_l, b_l, c_l)$ 描述第 $l$ 层的「乘法因子 $d^{-a_l}$、初始化方差 $d^{-2b_l}$、学习率 $d^{-c_l}$」。SP 和 μP 是这个三参数空间里的两个特定点。μP 是其中<strong>唯一</strong>能在 $d\to\infty$ 时实现「每层都最大程度地学习特征（maximal feature learning）」而不爆炸的那一组——这也是 maximal update 名字的来源。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>μP 的完整缩放表（SGD 与 Adam 两版）见 Yang 2021《Tuning Large NNs via Zero-Shot HP Transfer》的 Table 3。其理论根基是 Tensor Programs 系列（Yang & Hu）。实现上有官方 <code>mup</code> 库帮你自动改 init/lr。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="attn"><span class="num">4</span>attention logit 缩放：1/d 而非 1/√d</h2>
+  <h3>attention logit 缩放：1/d 而非 1/√d</h3>  <p>μP 与标准 Transformer 有一个<strong>显式、容易记</strong>的差异：注意力分数的缩放。标准 Transformer 用 $\frac{QK^\top}{\sqrt{d}}$（$\frac{1}{\sqrt d}$）；μP 用 $\frac{QK^\top}{d}$（$\frac{1}{d}$）。为什么？</p>  <p>标准的 $\frac{1}{\sqrt d}$ 是<strong>为初始化设计</strong>的：初始时 $Q, K$ 的坐标相互独立、各 $O(1)$，点积 $q \cdot k = \sum_{i=1}^d q_i k_i$ 是 $d$ 个独立项之和，方差 $\propto d$、标准差 $\propto \sqrt d$。除以 $\sqrt d$ 正好把它拉回 $O(1)$，防止 softmax 在初始就饱和。</p>  <p>但 μP 关心的是<strong>训练之后</strong>（feature learning 区）。训练后 $Q, K$ 不再独立——它们学会了<strong>相关</strong>（这正是注意力在做的事：让相关的 query/key 对齐）。当 $q, k$ 相关时，$q \cdot k$ 不再是 $\sqrt d$ 量级，而是<strong>$\propto d$</strong>（$d$ 个同号项相加）。这时只有除以 $d$ 才能把 logit 拉回 $O(1)$；$\frac{1}{\sqrt d}$ 会让 logit 随宽度按 $\sqrt d$ 增长、把 softmax 推向饱和。</p>  <div class="math-block">\[\text{初始(独立)：} q\cdot k \sim \sqrt d \quad\text{vs}\quad \text{训练后(相关)：} q\cdot k \sim d \;\Rightarrow\; \text{μP 用 } \tfrac{1}{d}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直觉：$\frac{1}{\sqrt d}$ 是为「刚出生、各管各的」query/key 设计的；$\frac{1}{d}$ 是为「训练成熟、互相配合」的 query/key 设计的。μP 关心的是后者——因为我们要的是一个<em>训练好</em>的大模型在各宽度行为一致。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这也呼应 stability（模块 04）：注意力 logit 过大是 loss spike 的常见诱因之一。μP 的 $\frac{1}{d}$ 缩放与模块 04 的 <span class="term">QK-norm</span>（直接归一化 q、k）都是在控制<strong>注意力 logit 不随训练/宽度爆炸</strong>，只是一个从参数化角度、一个从归一化角度切入同一个问题。</p></div>
+  </div>  <p>notebook 第 4 节会让你<strong>亲手测出</strong>：当 $q, k$ 相关时，$q\cdot k$ 的尺度随 $d$ 线性增长，除以 $d$ 能让它在各宽度保持 $O(1)$，而除以 $\sqrt d$ 仍随 $\sqrt d$ 漂移。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见困惑：<strong>既然 μP 用 $1/d$，那标准 Transformer 的 $1/\sqrt d$ 是「错」的吗？</strong>不是——它们<strong>针对不同关切</strong>。$1/\sqrt d$ 在<em>固定宽度</em>下完全正确（让初始 logit 不饱和），绝大多数模型只在一个宽度训练，用它没问题。$1/d$ 只在你<strong>要跨宽度迁移超参</strong>时才必要——它保证训练后的 logit 尺度也不随宽度漂。换句话说，$1/d$ 是「为可迁移性付的一点代价」，不是对 $1/\sqrt d$ 的否定。理解「不同缩放服务不同目标」是吃透 μP 的关键。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="coord"><span class="num">5</span>coordinate check：验证 μP 对不对</h2>
+  <h3>coordinate check：验证 μP 实现对不对</h3>  <p>μP 的缩放规则容易写错（少乘一个因子、放错层）。<span class="term">coordinate check</span>（坐标检查）是<strong>验证 μP 实现是否正确</strong>的标准诊断工具，也是本模块 notebook 的核心实操。</p>  <p>做法：训练几步，对每一层记录<strong>激活、梯度、参数更新的「典型坐标量级」</strong>（如坐标的 RMS），然后<strong>画出这些量级随宽度变化的曲线</strong>。判据很简单：</p>  <ul>
+    <li><strong>μP 正确</strong> → 这些量级<strong>与宽度无关（曲线水平）</strong>：激活 $O(1)$、每步更新对激活的改变 $O(1)$，无论网络多宽。</li>
+    <li><strong>实现有 bug 或用了 SP</strong> → 某些量级<strong>随宽度系统性增长或衰减（曲线倾斜）</strong>：典型是输出或其更新随宽度发散。</li>
+  </ul>  <div class="ascii">坐标量级
+  (log)                              SP: 倾斜(随宽度漂移) ✗
+      │                       ╱╱╱╱╱╱╱
+      │                ╱╱╱╱╱╱╱
+      │         ╱╱╱╱╱╱╱
+      │  ───────────────────────────  μP: 水平(宽度无关) ✓
+      └────────────────────────────────→ 宽度 d (log)
+        16    64    256   1024  4096
+   判据: μP 正确 -&gt; 各层坐标量级在所有宽度上重合成一条水平线</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>coordinate check 就像给网络做「体检」：在几个不同宽度上量同一组指标（激活有多大、更新有多大），如果 μP 实现正确，这些指标在所有宽度上应该<strong>读数一致</strong>（像体温都该是 37°C）；哪个指标随宽度飘了，就说明那一层的缩放写错了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>具体量什么：最关键的是<strong>一步更新前后，每层激活的改变量 $\Delta h$ 的坐标 RMS</strong>。这个量直接对应「特征学习的强度」——μP 要它在所有宽度上都是 $O(1)$（既不消失也不爆炸）。其次量激活本身、梯度、各层参数更新。官方 <code>mup</code> 库自带 coordinate check 工具，画出来一眼就能看出对不对。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住 coordinate check 的精神：<strong>μP 的正确性不是「看公式对不对」，而是「测出来的尺度随宽度平不平」</strong>。这是一种<em>经验验证</em>——和本课反复强调的「对拍」同源：与其相信自己推导无误，不如直接测量、用「曲线是否水平」当客观判据。写 μP 不做 coordinate check，等于写代码不跑测试。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="transfer"><span class="num">6</span>μTransfer：小模型调参迁到大模型</h2>
+  <h3>把超参从小模型迁到大模型：μTransfer 流程</h3>  <p>有了 μP 和 coordinate check，完整的 <span class="term">μTransfer</span> 工作流是：</p>  <ol>
+    <li><strong>把模型改写成 μP</strong>：按缩放表调整各层的初始化方差、学习率、输出乘法因子、注意力用 $1/d$（用 <code>mup</code> 库自动做）。</li>
+    <li><strong>跑 coordinate check</strong>：在 2-3 个小宽度上验证各层坐标量级随宽度水平，确认 μP 实现无误。</li>
+    <li><strong>在小模型（小宽度）上网格搜超参</strong>：学习率、warmup、init scale 等。小模型训得快、便宜，可以搜十几组。</li>
+    <li><strong>把最优超参直接用到大模型</strong>：因为 μP 保证最优超参不随宽度漂移，小模型上的最优值（按 μP 规则缩放后）就是大模型的最优值。</li>
+    <li><strong>（可选）也迁移其他维度</strong>：μP 主要保证随宽度迁移；后续工作（Depth-μP）把它推广到深度。</li>
+  </ol>  <p>一个关键澄清：μTransfer 主要迁移的是<strong>随宽度</strong>的超参。深度、batch size、训练步数等其他维度的迁移需要额外处理（且研究仍在进行）。但宽度恰恰是预训练里最常被放大的维度（从小模型 scale 到大模型主要是加宽），所以「宽度可迁移」已经覆盖了最值钱的场景。</p>  <p>哪些超参能迁？经验上，<strong>学习率、初始化尺度、warmup 步数、Adam 的 $\beta$、注意力/输出乘法因子</strong>等都随宽度稳定可迁。但要<strong>固定不随宽度变的量</strong>：训练总 token 数（由 scaling law 另定）、batch size、序列长度、层数等不是 μP 迁移的对象。正确姿势是：把这些「非宽度维」在代理与目标模型间<strong>保持一致或按各自的法则单独定</strong>，只让 μP 负责宽度方向的超参——分清这条边界，是用对 μTransfer 的前提。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>整个流程像<strong>用小比例模型做风洞测试</strong>：飞机设计不会直接造真机去试飞，而是先用缩小的模型在风洞里测气动参数，再按相似律放大到真机。μP 就是神经网络的「相似律」——它保证小模型测出的最优超参，能按规则放大到大模型。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>省了多少？假设要在 70B 模型上从 12 个学习率里选最优。没有 μP：在 70B 上训 12 次，烧掉约 12 倍的大模型训练成本。有 μP：在一个 0.04B 的代理模型上训 12 次（成本约 70B 的 $\frac{0.04}{70}\approx 0.06\%$ 一次），再在 70B 上只训 1 次最优配置。调参开销从「12 个大模型」降到「1 个大模型 + 一点零头」——这就是 μP 的经济价值。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>μTransfer 不是<strong>万能</strong>。已知局限：① 主要保证随宽度迁移，深度/数据量等需另行处理；② 极端 batch size 或非常规架构下可能失效；③ 实现细节（哪些算「宽度维」、乘法因子放哪）容易出错——所以 coordinate check 是<strong>必做</strong>的安全网。把它当成「大幅缩小调参成本的强力工具」，而非「不用思考的银弹」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="scaling"><span class="num">7</span>μP 与 scaling laws 的配合</h2>
+  <h3>μP 与 scaling laws 的配合</h3>  <p>μP 解决「超参怎么迁移」，<span class="term">scaling law</span>（缩放定律）解决「规模怎么分配」——两者是预训练放大阶段的黄金搭档。</p>  <p><span class="term">Chinchilla</span>（Hoffmann 2022）的核心结论：给定算力 $C$，模型参数 $N$ 与训练 token $D$ 应<strong>等比例放大</strong>（约 $D \approx 20N$），且训练算力近似 $C \approx 6ND$。这告诉你<strong>该造多大的模型、喂多少数据</strong>；但它<em>不</em>告诉你这个模型该用什么学习率——那是 μP 的事。</p>  <table>
+    <thead><tr><th>问题</th><th>谁回答</th><th>结论形态</th></tr></thead>
+    <tbody>
+      <tr><td>模型该多大、喂多少 token</td><td><span class="term">Chinchilla</span> scaling law</td><td>$N : D \approx 1 : 20$，$C \approx 6ND$</td></tr>
+      <tr><td>最优学习率/init 是多少</td><td>μP + μTransfer</td><td>在小模型搜，按 μP 规则迁到大模型</td></tr>
+      <tr><td>loss 会降到多少</td><td>scaling law 外推</td><td>$L(N,D) = E + A/N^\alpha + B/D^\beta$</td></tr>
+    </tbody>
+  </table>  <p>实践中两者结合的工作流：① 用 μP 改写模型；② 在一系列小模型上做 coordinate check + 超参搜索，同时拟合 scaling law；③ 用 scaling law 决定大模型的 $N, D$，用 μTransfer 决定它的超参；④ 一次性训出大模型，loss 落在 scaling law 预测的位置。这套「小规模实验 → 外推 → 大规模一次成」的范式，是现代前沿预训练把风险和成本压到最低的关键，也是本课「数据→放大→稳住」主线里「放大」这一环的精髓。</p>  <div class="callout paper"><span class="label"></span>
+    <p>Hoffmann 2022（Chinchilla，资源分配）、Kaplan 2020（scaling law 起源）、Yang 2021（μP）配合阅读。DeepSeek LLM（Bi 2024）展示了在自己数据上同时做 scaling law 与超参 scaling 的完整工程。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>Depth-μP：随深度的迁移</strong>：μP 主要管宽度。Yang 2023（Tensor Programs VI）把它推广到深度——让超参也能随层数迁移。深度与宽度的联合迁移、残差缩放的正确形式，仍是活跃方向。</li>
+    <li><strong>μP 与 Adam/优化器的交互</strong>：μP 的缩放规则依赖优化器（SGD 与 Adam 不同）。新优化器（Lion、Sophia、Muon 等）的 μP 缩放怎么推、是否还能迁移，是开放问题。</li>
+    <li><strong>超越宽度的可迁移维度</strong>：batch size、context length、训练时长、甚至数据配比能否可靠迁移？每个维度都需要自己的「相似律」，目前只有部分有理论。</li>
+    <li><strong>μP 在真实大训练中的鲁棒性</strong>：理论保证在理想假设下成立，真实训练有 bf16、各种归一化、复杂架构。μP 在这些现实因素下能保持多准，需要更多大规模验证（部分前沿模型已采用但细节不公开）。</li>
+    <li><strong>自动化超参迁移工具链</strong>：把 μP 改写、coordinate check、scaling law 拟合、超参外推串成可靠的自动流水线，让「放大」从专家手艺变成标准流程，是工程上的前沿。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读：Yang 2021（μP/μTransfer）、Tensor Programs IV–VI（理论与 depth-μP）、Hägele 2024（WSD scaling）、Bi 2024（DeepSeek 的 scaling 实操）。想动手就装官方 <code>mup</code> 库，跑它的 coordinate check 例子。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_tokenizer/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · Tokenizer 设计</div></a>
+    <a class="next" href="../04_stability/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 训练稳定性</div></a>
+  </div>
+
+</div>
+</body>
+</html>

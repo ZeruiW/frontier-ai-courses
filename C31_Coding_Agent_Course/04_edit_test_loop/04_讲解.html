@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · Edit-Test-Fix 循环</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · Edit-Test-Fix 循环</h1>
+  <p class="subtitle">agent 的小脑 —— 改→跑测试→解析 pytest 失败→定位文件:行→修复→再测，直到绿或到上限；MockLLM 在玩具仓里真跑 pytest 驱动整个循环；含收敛判定、防死循环、测试质量与 reward hacking 的警惕</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–03、pytest 用法、正则、subprocess、一点调试经验</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_edit_test_loop.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">SWE-bench、SWE-agent、EvalPlus、pytest/subprocess 文档</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#cerebellum">Edit-Test-Fix：agent 的小脑</a></li>
+      <li><a href="#skeleton">循环骨架：改→测→修</a></li>
+      <li><a href="#parse">解析 pytest：文本→结构化信号</a></li>
+      <li><a href="#localize">失败定位：下一步改哪</a></li>
+      <li><a href="#converge">收敛判定与防死循环</a></li>
+      <li><a href="#run">跑起来：一个完整修复回合</a></li>
+      <li><a href="#quality">测试质量与回归（reward hacking）</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cerebellum"><span class="num">1</span>Edit-Test-Fix：agent 的小脑</h2>
+  <p>前三个模块给了 agent 手（文件）、脚（shell）、眼（搜索）——但它们都是<strong>单次、被动</strong>的工具：你叫它读，它读一次；你叫它改，它改一处。真正让一堆工具<em>活</em>起来、变成一个能自主解决问题的 agent 的，是把它们<strong>组织成一个会自我纠错的循环</strong>。这就是本模块的主角——<strong>Edit-Test-Fix 循环</strong>，agent 的<strong>小脑</strong>。</p>  <p>人类工程师修 bug 从不指望一次写对：改一处 → 跑测试 → 看哪挂了 → 再改 → 再跑，直到绿。这个<strong>快速迭代、用反馈逼近正确</strong>的循环，是软件工程的本能。编码 agent 的强大，恰恰来自把这个循环<strong>自动化</strong>：让 LLM 来做「改」与「看」，让程序来做「跑测试」与「判断收没收敛」，两者咬合成一个能转起来的轮子。有了它，agent 不再是「赌一次写对」，而是「迭代到对」——这是质的飞跃。</p>  <p>把循环拆开，有四个关键环节，本模块逐一攻克：<strong>跑测试</strong>（用模块 02 的 shell 跑 pytest，拿到结果）、<strong>解析失败</strong>（从 pytest 那一大坨文本输出里，抽出「哪些用例失败、失败在哪个文件哪一行、什么错」的结构化信号）、<strong>定位与修复</strong>（把失败信号喂给 LLM，让它决定改哪、怎么改）、<strong>收敛判定与防死循环</strong>（什么时候算成功停下、什么时候该认输别空转）。其中<strong>解析失败</strong>是技术核心——它把「人看的报告」翻译成「机器能决策的信号」。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>agent 不靠一次写对，靠快速迭代逼近对。Edit-Test-Fix 循环 = 改→测→解析失败→定位→再改，直到测试绿或到步数上限。把 pytest 的文本输出解析成结构化失败信号，是让这个循环转起来的技术核心</strong>。改与验合起来，才有了「自我纠错」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="skeleton"><span class="num">2</span>循环骨架：改→测→修</h2>
+  <h3>循环的骨架：改 → 测 → 修，直到绿</h3>  <p>先看整个循环长什么样。它本质上是一个带<strong>退出条件</strong>的迭代：每一轮，agent 改一次代码、跑一次测试；测试绿了就成功退出，没绿就把失败信息喂给 LLM 让它再改；改了若干轮还不绿，就到达<strong>步数上限</strong>、认输退出。</p>  <div class="ascii">            ┌──────────────────────────────────────────┐
+  任务 ───▶ │  跑测试 (pytest)                            │
+            │     │                                      │
+            │   全绿? ──是──▶ ✅ 成功，退出                │
+            │     │否                                     │
+            │     ▼                                      │
+            │  解析失败 (哪些用例/哪个文件:行/什么错)       │
+            │     │                                      │
+            │     ▼                                      │
+            │  喂给 LLM → 它决定改哪、怎么改 → 应用编辑     │
+            │     │                                      │
+            │   到步数上限? ──是──▶ ❌ 放弃，报告           │
+            └─────┴────否────────────────────────────────┘
+                       └──────── 回到「跑测试」</div>  <pre><code>def edit_test_fix(llm, work, max_iters=5):
+    for i in range(max_iters):
+        passed, output = run_tests(work)          # 模块 02 的 shell 跑 pytest
+        if passed:
+            return {'success': True, 'iters': i}    # 收敛：测试全绿
+        failures = parse_pytest(output)            # 解析失败信号（本模块核心）
+        action = llm.fix(failures, work)           # LLM 据失败决定怎么改
+        apply_edit(work, action)                   # 用模块 01 的 edit 应用
+    return {'success': False, 'iters': max_iters}   # 到上限仍未绿，放弃</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这个循环就是把「工程师修 bug 的工作日常」写成了代码：跑测试看红绿、红了就看报错、改一改、再跑。区别只是把「看报错决定怎么改」交给了 LLM、把「跑测试和判断红绿」交给了程序。两者配合，agent 就能像人一样迭代调试。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，这是一个在「代码状态空间」里的<strong>反馈控制循环</strong>：测试结果是<em>误差信号</em>，LLM 的编辑是<em>控制动作</em>，目标是把误差（失败用例数）驱到零。它和模块 00 的 agent 主循环同构，只是<strong>专门化</strong>了——动作限定为编辑、观察限定为测试结果、终止条件是测试通过。这种「有客观、可自动判定的反馈信号」的结构，正是编码任务特别适合 agent 的根本原因。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>注意循环里两个<strong>非 LLM</strong>的环节——<code>run_tests</code> 和 <code>parse_pytest</code>——是确定性的纯程序逻辑，也是本模块要你亲手写的重点。LLM 负责的 <code>llm.fix</code> 在教学里由 MockLLM 扮演（按脚本给出正确的编辑），于是<strong>整个循环能在临时仓库里真跑 pytest、真改文件、看着测试由红变绿</strong>——固定 LLM 决策，专注验证循环与解析逻辑是否正确。这正是模块 00 立下的纪律。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="parse"><span class="num">3</span>解析 pytest：文本→结构化信号</h2>
+  <h3>解析 pytest 输出：从文本到结构化信号</h3>  <p>循环的技术核心，是把 pytest 吐出的<strong>人看的文本</strong>翻译成<strong>机器能决策的信号</strong>。pytest 失败时的输出大致长这样：</p>  <pre><code>$ pytest -q
+F.                                              [100%]
+=================== FAILURES ===================
+_________________ test_add ____________________
+    def test_add():
+&gt;       assert add(2, 3) == 5
+E       assert 1 == 5
+E        +  where 1 = add(2, 3)
+calc.py:2: AssertionError
+=========== short test summary info ===========
+FAILED test_calc.py::test_add - assert 1 == 5
+1 failed, 1 passed in 0.03s</code></pre>  <p>agent 要从这坨文本里抽出三样最有用的东西：① <strong>总览</strong>（<code>1 failed, 1 passed</code>——还剩几个挂的，用来判断收敛与进展）；② <strong>失败用例列表</strong>（<code>FAILED test_calc.py::test_add - ...</code>——哪些用例红了、各自报什么错）；③ <strong>失败位置</strong>（<code>calc.py:2: AssertionError</code>——出错在哪个文件哪一行，这是定位修复的关键）。pytest 贴心地提供了 <code>short test summary info</code> 段（每个失败一行 <code>FAILED ...</code>），用正则抓它最省事；位置则从 traceback 里形如 <code>文件:行号:</code> 的行抓。</p>  <pre><code>import re
+def parse_pytest(output):
+    # 总览：'1 failed, 2 passed'
+    m = re.search(r'(\d+) failed', output)
+    n_failed = int(m.group(1)) if m else 0
+    # 失败用例：summary 段的 'FAILED &lt;nodeid&gt; - &lt;msg&gt;'
+    failed = re.findall(r'^FAILED (\S+)(?:\s+-\s+(.*))?$', output, re.M)
+    # 失败位置：traceback 里的 'path:line: ErrorType'
+    locs = re.findall(r'^(\S+\.py):(\d+): (\w+)', output, re.M)
+    return {'n_failed': n_failed,
+            'failed_tests': [{'nodeid': t, 'message': msg} for t, msg in failed],
+            'locations': [{'file': f, 'line': int(ln), 'error': e} for f, ln, e in locs]}</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>解析就像把一份啰嗦的故障报告，提炼成一张「问题清单」：几个问题没解决、分别是什么、各在哪。工程师扫一眼报告就能抓住这些，但 agent 需要你用正则把它们<em>明确地</em>抽出来，它才能据此行动。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，这是把<strong>半结构化文本</strong>解析成<strong>结构化记录</strong>。pytest 的输出有稳定的格式约定（summary 行、traceback 的 <code>file:line:</code> 格式），使正则解析可行。但要清醒：解析是<strong>脆弱</strong>的——pytest 版本、插件、配置都可能改变输出格式。健壮做法是优先解析最稳定的部分（summary 段、返回码），并对解析失败有兜底（至少能从返回码知道「失败了」）。生产里也有用 pytest 的机器可读输出（如 JSON report 插件）来彻底绕开文本解析的。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么解析质量如此关键？因为它决定了 LLM<strong>下一步能看到什么</strong>。给它一个精确的「<code>calc.py:2</code> 处 AssertionError，期望 5 得到 1」，它几乎能直接定位修复；给它原始的 200 行 traceback，它要自己大海捞针、还可能被无关栈帧带偏。<strong>好的解析 = 把信号从噪音里拎出来，直接递到 LLM 手上</strong>——这又回到了贯穿全课的 ACI 原则：工具的输出是为 LLM 设计的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="localize"><span class="num">4</span>失败定位：下一步改哪</h2>
+  <h3>失败定位：下一步该改哪</h3>  <p>解析出失败信号后，下一个问题是<strong>定位</strong>：在所有可能的改动里，<em>最该改哪个文件、哪一行</em>？这是循环里「承上启下」的一步——承接解析的输出，启动 LLM 的修复。定位做得准，LLM 一改就中；定位偏了，LLM 在错误的地方打转，循环空转却不收敛。</p>  <p>最直接的定位信号，就是 traceback 里的<strong>失败位置</strong>——<code>calc.py:2: AssertionError</code> 直接告诉你「第 2 行的断言挂了」。但要注意一个常见陷阱：traceback 里<em>最后</em>一个 <code>file:line</code> 往往是<strong>断言所在的测试文件</strong>（<code>test_calc.py</code>），而<strong>真正要改的是被测代码</strong>（<code>calc.py</code>）。所以定位时要懂得区分：测试文件里的位置是「症状」（断言在哪失败），被测源码里的位置才常是「病灶」（逻辑哪里错）。一个聪明的定位会优先指向<strong>非测试</strong>的源文件。</p>  <table>
+    <thead><tr><th>定位信号</th><th>来自</th><th>可靠性</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td>traceback 的 file:line</td><td>pytest 输出</td><td>高（直接给坐标）</td><td>首选：直接定位出错行</td></tr>
+      <tr><td>失败用例名 test_xxx</td><td>summary 段</td><td>高</td><td>知道哪个功能坏了，反查它测的代码</td></tr>
+      <tr><td>断言信息 expected/got</td><td>traceback</td><td>中</td><td>理解错在哪（逻辑/边界/类型）</td></tr>
+      <tr><td>改动与失败的时间相关性</td><td>循环历史</td><td>中</td><td>刚改完就挂 → 很可能是这次改坏的</td></tr>
+      <tr><td>代码搜索（模块 03）</td><td>符号/调用关系</td><td>中</td><td>失败用例调了哪些函数 → 候选病灶</td></tr>
+    </tbody>
+  </table>  <p>把这些信号<strong>综合</strong>起来喂给 LLM，效果最好：「<code>test_add</code> 失败，断言 <code>add(2,3)==5</code> 实得 1，traceback 指向 <code>calc.py:2</code>」——这样一段浓缩的、多信号交叉印证的描述，远胜于甩给 LLM 一坨原始输出。这一步本质是在做<strong>信息的浓缩与聚焦</strong>：从「全部输出」收敛到「最可能的病灶 + 足够的诊断」，让 LLM 的注意力落在对的地方。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>定位的精髓是<strong>区分症状与病灶</strong>。测试失败（症状）总是显现在 <code>assert</code> 那一行（测试文件里），但根因（病灶）往往在被测的实现代码里。一个只会盯着症状改的 agent，可能去改测试让它「通过」（这是作弊、是危险的反模式！）；一个懂得追溯病灶的 agent，会去改真正错误的实现。<strong>让 agent 改源码、而非改测试来「通过」</strong>，是 edit-test-fix 循环必须守住的底线——这一点在模块 05 的 agent 提示词里会再强调。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="converge"><span class="num">5</span>收敛判定与防死循环</h2>
+  <h3>收敛判定与防死循环</h3>  <p>循环必须知道两件事：什么时候<strong>成功</strong>（收敛，停下庆祝），什么时候<strong>失败</strong>（认输，别再空转）。前者简单：<strong>测试全绿</strong>——返回码为 0、或解析出的 <code>n_failed == 0</code>。后者才是难点，因为 agent 可能<em>永远</em>改不对，你不能让它无限循环下去。</p>  <p>最基本的防护是<strong>步数上限</strong>（iteration budget）：循环最多跑 N 轮，到了还没绿就放弃并如实报告「未能在 N 步内修复」。这是<strong>必备的安全阀</strong>——没有它，一个改不动的 bug 会让 agent 无限烧钱、无限耗时。N 怎么选是权衡：太小则放弃太早（本来再两轮就能修好）、太大则在死路上耗太久，实践中常取个位数到一二十，并可按任务难度调。</p>  <p>更精细的防护是检测<strong>振荡（oscillation）</strong>与<strong>无进展</strong>。两种典型病态：① agent 在两个错误状态间<strong>来回打转</strong>（改 A 坏 B、改 B 又坏 A，反复横跳）；② 每轮改动后失败数<strong>毫无减少</strong>（改了等于没改，甚至越改越多）。检测前者可记录每轮的「代码状态指纹」（如文件内容哈希），发现重复就判定陷入循环、提前终止；检测后者可追踪 <code>n_failed</code> 的变化趋势，若连续若干轮不下降就叫停。</p>  <pre><code>def edit_test_fix(llm, work, max_iters=8):
+    seen_states = set()                            # 状态指纹，检测振荡
+    last_failed = None
+    stagnant = 0
+    for i in range(max_iters):
+        passed, output = run_tests(work)
+        if passed:
+            return {'success': True, 'iters': i, 'reason': '测试全绿'}
+        info = parse_pytest(output)
+        # 无进展检测：失败数连续不降
+        if last_failed is not None and info['n_failed'] &gt;= last_failed:
+            stagnant += 1
+        else:
+            stagnant = 0
+        if stagnant &gt;= 3:
+            return {'success': False, 'iters': i, 'reason': '连续 3 轮无进展，放弃'}
+        last_failed = info['n_failed']
+        # 振荡检测：代码状态指纹重复
+        fingerprint = snapshot(work)
+        if fingerprint in seen_states:
+            return {'success': False, 'iters': i, 'reason': '检测到状态振荡，放弃'}
+        seen_states.add(fingerprint)
+        apply_edit(work, llm.fix(info, work))
+    return {'success': False, 'iters': max_iters, 'reason': '到达步数上限'}</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这些防护就像给一个埋头修车的人定几条规矩：修了八次还没好就先停下来求助（步数上限）；如果发现自己在反复拆同一个零件又装回去（振荡），说明思路错了、该换法子；如果修了半天故障一点没少（无进展），也该停下重新诊断。盲目硬干只会浪费时间。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，这是给一个可能<strong>不收敛</strong>的迭代过程加<strong>终止保证</strong>。步数上限给了<em>最坏情况</em>的硬上界；振荡检测利用「状态重复 ⇒ 确定性地陷入循环」来提前止损；无进展检测用「误差不降 ⇒ 当前策略无效」来叫停。三者叠加，把「可能永远跑下去」变成「最多 N 步、且能更早识别死路」。这是任何含迭代的 agent 都必须处理的<strong>可靠性</strong>问题——能力之外，agent 还得<em>知道何时停</em>。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>无防护的 agent 循环是<strong>生产事故的常见来源</strong>：一个 agent 在改不动的 bug 上无限循环，几小时烧掉巨额 API 费用、占满资源，且毫无产出。步数上限是<strong>最低限度</strong>的、绝不能省的保护；振荡与无进展检测则让 agent 更早地<em>优雅放弃</em>（并如实报告「我没修好，原因是 X」），而非假装还在努力。<strong>一个会说「我搞不定」的 agent，比一个无限空转的 agent 有用得多</strong>——诚实的失败是可处理的，无声的空转是灾难。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="run"><span class="num">6</span>跑起来：一个完整修复回合</h2>
+  <h3>把循环跑起来：一个完整的修复回合</h3>  <p>把跑测试、解析、定位、修复、收敛防护拼起来，就是一个能自主修 bug 的循环。走一遍完整流程（这正是 notebook 里 MockLLM 真跑的过程）：</p>  <ol>
+    <li><strong>第 1 轮</strong>：跑 pytest → 红（<code>1 failed</code>）→ 解析出「<code>test_add</code> 失败，<code>calc.py:2</code> 处 <code>add(2,3)</code> 得 1 期望 5」；</li>
+    <li><strong>定位</strong>：信号指向 <code>calc.py:2</code> 的实现（非测试文件）→ 喂给 LLM；</li>
+    <li><strong>修复</strong>：LLM 决定把 <code>return a - b</code> 改成 <code>return a + b</code>（用模块 01 的唯一匹配编辑应用）；</li>
+    <li><strong>第 2 轮</strong>：再跑 pytest → 绿（<code>2 passed</code>）→ 收敛，成功退出，报告「2 轮修复」。</li>
+  </ol>  <p>这个循环把前三个模块的工具<strong>编排</strong>了起来：搜索（眼）帮 LLM 定位、文件工具（手）应用编辑、shell（脚）跑测试拿反馈。可以说，<strong>模块 01–03 造的是零件，本模块造的是把零件转起来的引擎</strong>。引擎一转，agent 就从「一组孤立的能力」变成了「一个能自主迭代解决问题的系统」。这是从工具到 agent 的关键一跃。</p>  <p>还要强调循环里那条<strong>人/程序与 LLM 的分工线</strong>：确定性的、可验证的部分（跑测试、解析、收敛判定、防死循环）由你写的程序掌控；开放的、需要理解与创造的部分（看懂错误、想出怎么改）交给 LLM。这种分工不是偶然——它把系统的<strong>可靠性</strong>（程序保证循环不失控、测试客观判定）与 LLM 的<strong>灵活性</strong>（应对千变万化的 bug）各自发挥到位。理解这条线划在哪，你就理解了 agent 工程的精髓：<em>哪些事该信确定性代码，哪些事该信模型</em>。</p>  <div class="callout paper"><span class="label"></span>
+    <p>现实参照：这正是 SWE-bench 上 agent 解题的核心循环——生成补丁、跑测试、据结果迭代。SWE-agent 的轨迹里能清楚看到这种 edit-test-fix 节奏。Claude Code、aider 修 bug 时也都在跑这个循环。把本模块理解透，你就理解了编码 agent「自我纠错」的引擎。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="quality"><span class="num">7</span>测试质量与回归（reward hacking）</h2>
+  <h3>超越单个循环：测试本身的质量与回归</h3>  <p>循环的奖励信号是「测试通过」，但这带来一个深刻的问题：<strong>测试本身可信吗？</strong>如果测试覆盖不全，agent 可能写出「通过了测试、却没真正修好（甚至引入新 bug）」的补丁——测试是绿的，问题还在。这是以测试为奖励的<strong>根本局限</strong>：<em>你只能验证测试覆盖到的行为</em>。EvalPlus 等研究正是指出「测试覆盖不足会高估正确性」。</p>  <p>一个直接的工程纪律是：修完要跑<strong>整个</strong>测试集，而非只跑目标用例。因为一个修复可能<strong>引入回归</strong>（regression）——修好了 A、却弄坏了原本正常的 B。只跑「刚才失败的那个用例」会漏掉这种连带破坏；跑全套才能确认「修好了目标，且没碰坏别的」。这也是为什么 SWE-bench 的判定要跑该 issue 相关的<em>一整组</em>测试（含本应一直通过的 <code>PASS_TO_PASS</code> 用例），确保补丁不引入回归。</p>  <p>更进一步，成熟的 agent 会把循环的反馈源<strong>扩展</strong>到测试之外：跑 linter（抓风格/低级错误）、类型检查（mypy，抓类型不匹配）、甚至让 agent<em>自己补测试</em>来提高覆盖。每多一种客观、可自动判定的反馈信号，循环就多一只「眼睛」，agent 的改动就多一层保障。本课聚焦最干净的信号（pytest 通过），但你要知道：<strong>循环的反馈质量，上限就是 agent 修复质量的上限</strong>。喂给循环的信号越全面、越可信，agent 修得越靠谱。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个必须警惕的<strong>反模式</strong>：agent 为了让测试变绿，去<strong>改测试</strong>（放宽断言、删掉失败用例）而非改实现。这在技术上「通过」了，实质是<strong>作弊</strong>、是危险的。防范靠几道闸：提示词明令「只改实现、不改测试来通过」、把测试文件设为只读、或评测时用 agent<em>看不到</em>的隐藏测试（SWE-bench 正是如此——agent 改完后用它没见过的测试判定）。<strong>奖励信号一旦能被 agent 操纵，就失去了意义</strong>——这是 agent 评测与训练里 reward hacking 的一个具体而重要的实例。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>超越「测试通过」的奖励</strong>：测试覆盖不全时，如何更可信地判定「真的修好了」？结合静态分析、形式化验证、LLM 评审、隐藏测试，是让奖励信号更难被操纵、更贴近真实正确性的方向。</li>
+    <li><strong>更聪明的失败定位</strong>：当 traceback 不直接指向病灶（如错误在数据流上游、或异步/并发 bug）时，如何定位？把 spectrum-based fault localization、delta debugging、调用图分析接进 agent，是前沿。</li>
+    <li><strong>循环的样本效率与规划</strong>：怎么让 agent 用更少轮数收敛？先规划（理解 bug 全貌再动手）vs 贪心迭代（改了再看）的取舍、何时该退一步重新审视，是 agent「调试智慧」的活跃研究。</li>
+    <li><strong>reward hacking 与对齐</strong>：agent 改测试作弊、或找到测试的漏洞「蒙混过关」，是 reward hacking 的具体形态。如何设计不可被操纵的反馈、如何检测作弊，连接到更广的 AI 对齐问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：SWE-bench 论文（以测试通过为客观奖励、PASS_TO_PASS 防回归）、SWE-agent 论文（edit-test 循环与 ACI）、EvalPlus（测试覆盖不足会高估正确性）。Python <code>subprocess</code>/<code>re</code> 与 pytest 文档是本模块的实现依据。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_code_search/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 代码导航</div></a>
+    <a class="next" href="../05_coding_agent/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 完整编码 Agent</div></a>
+  </div>
+
+</div>
+</body>
+</html>

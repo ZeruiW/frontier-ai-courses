@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 连接器与训练范式</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 10</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 连接器与训练范式</h1>
+  <p class="subtitle">Connectors &amp; Training Paradigms —— 把视觉特征"翻译"成 LLM 能读的 token，以及如何分阶段训练它</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（ViT/patch token）、02（CLIP 对齐）、03（VLM 架构骨架）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span><span class="badge gpu">GPU可选</span> 04_connectors.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">LLaVA-1.5、BLIP-2 (Q-Former)、Flamingo、Idefics2、MM1、Prismatic</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 30 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#duties">连接器的三大职责：维度对齐 / 语义桥接 / token 数控制</a></li>
+      <li><a href="#mlp">线性 / MLP projector：最简、保 token、易训</a></li>
+      <li><a href="#qformer">Q-Former 内部机制：learnable query 与 ITC/ITM/ITG</a></li>
+      <li><a href="#perceiver">Perceiver Resampler：变长重采样为固定长度</a></li>
+      <li><a href="#fusion">注入方式：deep fusion vs shallow fusion</a></li>
+      <li><a href="#training">训练范式：两阶段对齐 + 视觉指令微调</a></li>
+      <li><a href="#ablation">消融实证：编码器 / 分辨率 / 连接器 / 数据，谁影响最大？</a></li>
+      <li><a href="#eval">评测视角：连接器瓶颈如何表现为下游短板</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="duties"><span class="num">1</span>连接器的三大职责：维度对齐 / 语义桥接 / token 数控制</h2>
+
+  <p>模块 01 末尾留下的"桥梁"问题，正是本章的主角。视觉编码器吐出 $N\times d_v$ 的 patch 特征（如 CLIP ViT-L/14@336 输出 $576\times1024$），而 LLM 的输入是 $d_{llm}$ 维的词嵌入序列（如 Vicuna-7B 的 $4096$）。中间这块把视觉特征变成"LLM 能读的 token"的模块，就是 <span class="term">connector</span>（也叫 projector / adapter / bridge）。它要同时干三件事：</p>
+
+  <div class="ascii">
+  视觉编码器输出                    Connector 三职责                       LLM 输入
+  ┌──────────────┐    ①维度对齐 d_v→d_llm    ┌──────────────┐
+  │ N × d_v      │ ───────────────────────► │ M × d_llm    │ ──► 与文本 token
+  │ (576×1024)   │    ②语义桥接 视觉空间→词嵌入空间│ (M×4096)     │     拼接 / 注入
+  │  patch 特征  │    ③token 数控制 N→M (M≤N?) └──────────────┘
+  └──────────────┘
+                          权衡线: M 大→细节全/占上下文; M 小→省/丢细节
+  </div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>视觉编码器说的是"图像语"，向量维度也和 LLM 对不上。连接器就是个翻译官：先把向量改成 LLM 听得懂的长度，再把"图像语"的意思转成"词嵌入语"，顺便决定要说多少句话（token 数）——说太多浪费 LLM 的注意力预算，说太少又漏掉关键细节。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>形式化地，connector 是映射 $g_\phi:\mathbb{R}^{N\times d_v}\!\to\!\mathbb{R}^{M\times d_{llm}}$。三个职责对应三个约束：(1) <em>维度对齐</em> 保证输出落在 LLM 词嵌入维度 $d_{llm}$；(2) <em>语义桥接</em> 要求输出分布与 LLM 训练时见过的词嵌入分布尽量同构，否则 LLM 把视觉 token 当成 OOD 噪声；(3) <em>token 数</em> $M$ 决定序列长度与 self-attention 的 $O(M^2)$ 成本。$M=N$（保留全部 patch）还是 $M\ll N$（压缩）是本章贯穿的核心设计选择。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  连接器是 VLM 里参数最少、却最常被低估的组件。它通常只占总参数的 &lt;1%，但它决定了视觉编码器辛苦提取的信息有多少能真正"传达"给 LLM。连接器选错或训练不足，编码器再强也白搭——这正是 <span class="term">Prismatic</span> [Karamcheti 2024] 等系统化消融要回答的问题。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="mlp"><span class="num">2</span>线性 / MLP projector：最简、保 token、易训</h2>
+
+  <p>最朴素的连接器：对<strong>每个</strong> patch token 独立地做一次投影，把 $d_v$ 维映到 $d_{llm}$ 维，token 数原封不动（$M=N$）。这就是 <span class="term">LLaVA</span> 的做法。</p>
+
+  <div class="math-block">
+  $$ h_i = W x_i + b,\qquad x_i\in\mathbb{R}^{d_v},\; W\in\mathbb{R}^{d_{llm}\times d_v},\; i=1,\dots,N $$
+  </div>
+
+  <p>初代 LLaVA [Liu 2023] 用单层线性 $W$。<span class="term">LLaVA-1.5</span> [Liu 2023b] 的一个关键改动是把它升级为<strong>两层 MLP + GELU</strong>，仅此一项就带来可观的下游提升：</p>
+
+  <div class="math-block">
+  $$ h_i = W_2\,\sigma\!\big(W_1 x_i + b_1\big) + b_2,\qquad \sigma=\text{GELU},\; W_1\in\mathbb{R}^{d_{llm}\times d_v},\; W_2\in\mathbb{R}^{d_{llm}\times d_{llm}} $$
+  </div>
+
+  <table>
+    <thead><tr><th>性质</th><th>MLP projector 的表现</th></tr></thead>
+    <tbody>
+      <tr><td>维度对齐</td><td>✅ 直接由 $W_1$ 完成 $d_v\to d_{llm}$</td></tr>
+      <tr><td>语义桥接</td><td>⚠️ 仅靠 token 级非线性，无跨 token 交互；依赖 CLIP 编码器已与语言近似对齐（见模块 02）</td></tr>
+      <tr><td>token 数控制</td><td>❌ 不压缩，$M=N$。336 分辨率 = 576 token；高分辨率切片后可达数千 token</td></tr>
+      <tr><td>训练难度</td><td>✅ 参数少、无注意力、梯度稳定，stage-1 几小时即可对齐</td></tr>
+      <tr><td>信息保真</td><td>✅ 保留全部 patch，细粒度任务（OCR、文档、定位）友好</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>LLaVA-1.5</strong> [Liu 2023b, arXiv:2310.03744] 的核心信息之一：<em>简单的 MLP projector + 高质量学术数据，就能逼近当时复杂架构</em>。这把领域共识推向"连接器不必复杂，复杂度应放在数据与分辨率上"。后续 <span class="term">MM1</span>、<span class="term">Idefics2</span> 的消融（第 7 节）进一步证实：在保留全部 token 的设定下，连接器类型对最终性能影响很小。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="qformer"><span class="num">3</span>Q-Former 内部机制：learnable query 与 ITC/ITM/ITG</h2>
+
+  <p><span class="term">Q-Former</span>（Querying Transformer）是 <span class="term">BLIP-2</span> [Li 2023, arXiv:2301.12597] 提出的连接器，目标是<strong>用一组可学习的 query 把变长图像特征压成固定数量（论文用 32 个）的 token</strong>，同时充当视觉空间与语言空间之间的"信息瓶颈"。</p>
+
+  <h3>结构：两套注意力交织的 Transformer</h3>
+  <p>Q-Former 维护 $K$ 个可学习向量 <span class="term">learnable queries</span> $Q\in\mathbb{R}^{K\times d}$（$K=32$）。每个 block 里：</p>
+  <ul>
+    <li><strong>self-attention</strong>：query 之间互相交流（必要时还能与文本 token 交互，用于不同预训练目标）。</li>
+    <li><strong>cross-attention</strong>：query 作为 $Q$，冻结的图像特征作为 $K/V$，让 query"主动从图像里提取需要的信息"。</li>
+  </ul>
+
+  <div class="ascii">
+  冻结的图像特征 (N×d_v, 如 257×1024)
+        │  作为 Key / Value
+        ▼
+  ┌───────────────────────────────────────────────┐
+  │  Q-Former block × L                             │
+  │   ┌─────────────┐    ┌──────────────────────┐  │
+  │   │ Self-Attn   │ →  │ Cross-Attn           │  │
+  │   │ (queries↔   │    │ Q=queries            │  │
+  │   │  queries)   │    │ K,V=image features   │  │
+  │   └─────────────┘    └──────────────────────┘  │
+  └───────────────────────────────────────────────┘
+        ▲                          │
+        │ 32 个 learnable queries   ▼
+        └──────────────────  输出 32 × d  ──► 线性投影到 d_llm ──► 喂 LLM
+  </div>
+
+  <p>注意：图像特征本身不变长地"穿过"Q-Former，真正离开的只有 $K=32$ 个 query 的输出。无论输入图像产生多少 patch，输出永远是 32 个 token——这就是<strong>固定长度压缩</strong>。cross-attention 的形式仍是熟悉的：</p>
+
+  <div class="math-block">
+  $$ \text{CrossAttn}(Q,K,V)=\text{softmax}\!\left(\frac{(QW_Q)(KW_K)^\top}{\sqrt{d_k}}\right)(VW_V),\quad Q\in\mathbb{R}^{32\times d},\; K{=}V\in\mathbb{R}^{N\times d} $$
+  </div>
+
+  <h3>预训练目标：ITC / ITM / ITG</h3>
+  <p>BLIP-2 第一阶段（vision-language representation learning）用三个目标联合训练 Q-Former，靠不同的 <strong>attention mask</strong> 复用同一组 query：</p>
+
+  <table>
+    <thead><tr><th>目标</th><th>全称</th><th>做什么</th><th>mask 策略</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">ITC</span></td><td>Image-Text Contrastive</td><td>对齐 query 输出与文本 [CLS]，InfoNCE 拉近正样本</td><td>query 与文本互不可见（单模态）</td></tr>
+      <tr><td><span class="term">ITM</span></td><td>Image-Text Matching</td><td>二分类：图文是否匹配，学细粒度对齐</td><td>双向，query 与文本全可见</td></tr>
+      <tr><td><span class="term">ITG</span></td><td>Image-grounded Text Generation</td><td>由 query 提取的视觉信息生成描述文本</td><td>因果 mask，文本只能看见 query</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  ITC 提供<em>对齐</em>信号（query 学会抓住与文本语义相关的视觉内容），ITM 提供<em>细粒度判别</em>，ITG 逼 query 提取<em>生成所需的足够信息</em>。三者合力，使 32 个 query 输出成为一个"已经和语言对齐过"的紧凑视觉摘要。BLIP-2 的第二阶段再把这 32 个 token 接到冻结 LLM 上做生成对齐。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  Q-Former 强压缩（$N\to32$）省了大量 LLM 上下文，但<strong>是信息瓶颈也是细节杀手</strong>：固定 32 token 难以承载高分辨率文档/密集文字。这也是为什么 2024 年后主流（LLaVA-1.5、Qwen2-VL、InternVL）多回到"保留更多 token 的 MLP/轻压缩"路线，Q-Former 式重压缩更多见于追求低成本或多帧视频的场景。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="perceiver"><span class="num">4</span>Perceiver Resampler：变长重采样为固定长度</h2>
+
+  <p><span class="term">Perceiver Resampler</span> 是 <span class="term">Flamingo</span> [Alayrac 2022, arXiv:2204.14198] 用的连接器，思想源自 <span class="term">Perceiver / Perceiver IO</span> [Jaegle 2021, arXiv:2107.14795]。它和 Q-Former 同属"learnable latent + cross-attention"家族，但更纯粹：<strong>用固定数量的 latent query，通过 cross-attention 把任意长度的视觉特征重采样成固定长度</strong>，与输入长度完全解耦。</p>
+
+  <div class="ascii">
+  变长视觉特征 (T×N×d, T=视频帧数, 帧内 N patch, 可变)
+        │ flatten + 加时间/位置编码
+        ▼
+  ┌──────────────────────────────────────────────┐
+  │  Perceiver Resampler block × L                 │
+  │    R 个 learnable latents  (如 R=64)           │
+  │    Cross-Attn: Q=latents,  K,V=[latents; 视觉]  │
+  │    FeedForward                                 │
+  └──────────────────────────────────────────────┘
+        │
+        ▼
+  固定 R × d 个 visual token  ──►  注入 LLM 的 gated cross-attn 层
+  </div>
+
+  <p>关键性质：<strong>长度无关（length-agnostic）</strong>。无论输入是 49 个 patch、256 个 patch，还是多帧视频拼起来的上千个特征，输出永远是 $R$ 个 latent token。这对 Flamingo 处理<em>交错图文 + 多帧视频</em>的任意长度输入至关重要。配套 notebook 会用 49 vs 256 两种输入长度验证输出恒为 64。</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>Q-Former (BLIP-2)</th><th>Perceiver Resampler (Flamingo)</th></tr></thead>
+    <tbody>
+      <tr><td>latent / query 数</td><td>32（固定）</td><td>64（固定，可配）</td></tr>
+      <tr><td>专门的预训练目标</td><td>有（ITC/ITM/ITG）</td><td>无独立目标，随整个 VLM 端到端训</td></tr>
+      <tr><td>cross-attn 的 K/V</td><td>仅图像特征</td><td>[latents; 图像特征] 拼接（Flamingo 设计）</td></tr>
+      <tr><td>典型注入方式</td><td>shallow（前缀拼接，接冻结 LLM）</td><td>deep（gated cross-attn 插入 LLM 各层）</td></tr>
+      <tr><td>面向</td><td>单图压缩摘要</td><td>多帧 / 交错图文的变长输入</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>Perceiver IO</strong> [Jaegle 2021] 的核心贡献是用一小撮 latent 做信息瓶颈，把注意力成本从 $O(N^2)$ 降到 $O(N\!\cdot\!R)$（$R\ll N$），从而能吃任意模态、任意长度的输入。Flamingo 把它专门化为视觉重采样器；Idefics、OpenFlamingo 等开源复现沿用此设计。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="fusion"><span class="num">5</span>注入方式：deep fusion vs shallow fusion</h2>
+
+  <p>连接器把视觉特征变成 $M\times d_{llm}$ 之后，还有一个正交的设计维度：<strong>这些视觉 token 在哪里、以何种方式进入 LLM？</strong> 两条主流路线：</p>
+
+  <h3>Shallow fusion（前缀拼接）—— LLaVA 路线</h3>
+  <p>把视觉 token 当成"普通的输入 token"，直接拼在文本 token 前面，组成一条序列喂进 LLM 的<strong>输入层</strong>，之后全靠 LLM 自身的 self-attention 做跨模态融合。LLM 架构<em>不改一行</em>。</p>
+
+  <h3>Deep fusion（门控交叉注意力）—— Flamingo 路线</h3>
+  <p>在<strong>冻结的</strong> LLM 各层之间插入新的 <span class="term">gated cross-attention</span> 层：文本作为 $Q$，视觉 latent 作为 $K/V$，并用一个初始化为 0 的可学习门 $\tanh(\alpha)$ 控制视觉信息的注入强度。</p>
+
+  <div class="math-block">
+  $$ h \leftarrow h + \tanh(\alpha)\cdot \text{CrossAttn}\big(Q{=}h,\; K{=}V{=}\text{visual}\big),\qquad \alpha\ \text{初始化为}\ 0 $$
+  </div>
+
+  <p>$\alpha=0$ 的初始化是关键：训练起点时门关闭，LLM 行为与纯文本时一模一样，保证不破坏预训练语言能力，再缓慢学着"开门"引入视觉。</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>Shallow fusion（前缀拼接，LLaVA）</th><th>Deep fusion（gated cross-attn，Flamingo）</th></tr></thead>
+    <tbody>
+      <tr><td>LLM 是否改结构</td><td>不改，纯靠 self-attn</td><td>插入新 cross-attn 层（新增参数）</td></tr>
+      <tr><td>视觉 token 占上下文</td><td>占（吃 LLM 序列长度）</td><td>不占输入序列（在层内注入）</td></tr>
+      <tr><td>计算成本</td><td>序列变长，self-attn $O((M{+}L)^2)$</td><td>每层多一次 cross-attn，但序列不变长</td></tr>
+      <tr><td>实现复杂度</td><td>极低，几乎零侵入</td><td>高，需改 LLM forward 并管理门控</td></tr>
+      <tr><td>训练数据需求</td><td>少（指令数据即可）</td><td>大（海量交错图文）</td></tr>
+      <tr><td>对长视觉输入</td><td>序列爆炸，需先压缩</td><td>天然友好（重采样 + 层内注入）</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  2023 年后开源社区压倒性地倒向 <strong>shallow fusion + MLP projector</strong>（LLaVA 系），因为它简单、复用现成 LLM、调试容易、数据需求低。deep fusion 的优势主要在<em>变长/多图/视频</em>与<em>保护语言能力</em>场景；Idefics2 [Laurençon 2024] 的消融甚至发现，在数据充足时 fully-autoregressive（shallow）架构反超 cross-attention（deep）架构——见第 7 节。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="training"><span class="num">6</span>训练范式：两阶段对齐 + 视觉指令微调</h2>
+
+  <p>有了连接器，怎么训？现代 VLM 几乎统一采用<strong>两阶段（two-stage）训练</strong>，由 LLaVA 系奠定范式：</p>
+
+  <div class="ascii">
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ Stage 1 · 特征对齐 (feature alignment / pre-training)                 │
+  │   冻结: Vision Encoder ❄  +  LLM ❄                                    │
+  │   只训: Connector 🔥                                                   │
+  │   数据: 大量 图-文 caption 对 (如 CC3M/LAION 子集 ~558K)              │
+  │   目标: 让 connector 学会把视觉特征投到 LLM 词嵌入空间 (语义桥接)     │
+  └─────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ Stage 2 · 视觉指令微调 (visual instruction tuning)                    │
+  │   冻结: Vision Encoder ❄ (通常仍冻; 也有解冻或微调高层的变体)         │
+  │   解冻: Connector 🔥  +  LLM 🔥 (全量) 或 LLM 上 LoRA 🔥             │
+  │   数据: 高质量多轮 图文指令 (LLaVA-Instruct-150K + 学术 VQA/OCR 等)   │
+  │   目标: 学会遵循指令、对话、推理 (模块 05 深入)                        │
+  └─────────────────────────────────────────────────────────────────────┘
+  </div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>第一阶段像"对暗号"：编码器和 LLM 都按住不动，只让中间的翻译官学会怎么把图像的话翻成 LLM 听得懂的词。用便宜的"图片配一句描述"数据就够了。第二阶段才教模型真正"听话办事"——看图回答问题、多轮对话，这时可以放开 LLM 一起学。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>Stage-1 仅优化 $\phi$（connector 参数），损失是对 caption 的自回归语言建模 $-\sum_t\log p_\theta(w_t\mid w_{&lt;t},\,g_\phi(v))$，其中 $\theta$（LLM）与视觉编码器冻结。这把 connector 推向一个"视觉条件 ≈ 合理词嵌入前缀"的解。Stage-2 解冻 $\theta$（或注入 LoRA $\Delta\theta$）与 $\phi$ 联合优化指令数据，使模型在保留语言能力的同时获得指令遵循与视觉推理能力。</p>
+    </div>
+  </div>
+
+  <h3>冻结策略与数据配比的工程要点</h3>
+  <ul>
+    <li><strong>为什么 stage-1 冻 LLM？</strong> 若一开始就用未对齐的随机投影视觉 token 去更新 LLM，会把高质量的语言权重往 OOD 方向拽，损害语言能力（灾难性遗忘）。先把 connector 训到"视觉 token 看起来像合理词嵌入"，再解冻 LLM 更安全。</li>
+    <li><strong>视觉编码器多数全程冻结。</strong> 解冻它收益有限且容易过拟合小指令集；少数工作（如 Prismatic 的部分配置、Qwen2-VL）会微调编码器或其高层。</li>
+    <li><strong>LoRA vs 全量微调。</strong> stage-2 用 <span class="term">LoRA</span> 可在 24GB 单卡训 7B VLM，效果接近全量（模块 05 详述）；全量微调上限略高但成本大。</li>
+    <li><strong>数据配比。</strong> stage-2 需混入足量纯文本/学术 VQA 以防遗忘并提升泛化；纯靠 GPT 生成的对话数据易"过度健谈"、幻觉上升。配比是经验活，MM1 对此有系统消融（第 7 节）。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  本章 notebook 的 stage-1 演示是<strong>教学简化版</strong>：用 <code>gpt2</code> 的词嵌入维度作目标、构造一个简单回归/对齐目标、只训 connector 几步看 loss 下降。它演示的是<em>plumbing（数据流与梯度只流经 connector）</em>，不是真实的 caption 语言建模训练。真实 stage-1 需要海量图文对与多卡，超出单 notebook 范围。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="ablation"><span class="num">7</span>消融实证：编码器 / 分辨率 / 连接器 / 数据，谁影响最大？</h2>
+
+  <p>"造一个好 VLM，钱该花在哪？" 2024 年三项系统化消融给出了高度一致的答案。做 model evaluation 时，这些结论是<strong>归因 VLM 能力差异的先验</strong>。</p>
+
+  <table>
+    <thead><tr><th>研究</th><th>核心设定</th><th>关键结论</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">Prismatic VLMs</span><br>[Karamcheti 2024]</td><td>控制变量扫 connector / 编码器 / 训练配方</td><td>① 视觉编码器选择影响巨大，<strong>SigLIP/DINO 融合特征 &gt; 单 CLIP</strong>；② 单阶段训练（去掉 stage-1 单独对齐）也能 work，挑战了"必须两阶段"的教条；③ connector（线性 vs MLP）影响相对较小。</td></tr>
+      <tr><td><span class="term">Idefics2</span><br>[Laurençon 2024]</td><td>"What matters when building VLMs?"，逐项对照</td><td>① 在数据/参数匹配下，<strong>fully-autoregressive（shallow）架构 &gt; cross-attention（deep）架构</strong>；② <strong>视觉编码器质量 + 分辨率</strong>是最大杠杆；③ learned pooling（如 Perceiver）能在保性能下减 token。</td></tr>
+      <tr><td><span class="term">MM1</span><br>[McKinzie 2024]</td><td>大规模 pre-training 消融，分清各因素重要性排序</td><td>重要性排序：<strong>图像分辨率 &gt; 视觉 token 数 / 编码器 ≫ 连接器架构（VL connector 设计影响很小）</strong>；预训练数据需<em>交错图文 + caption + 纯文本</em>混合以兼顾 few-shot 与零样本。</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>三家共识，一句话：</strong> 影响 VLM 性能的杠杆，<em>分辨率 ≳ 视觉编码器 &gt; 数据配比 ≫ 连接器架构</em>。连接器要"够用且训练充分"，但把工程预算砸在连接器的花式设计上回报很低；真正的高 ROI 在<strong>提高分辨率、选/融合更强的视觉编码器、调好数据配比</strong>。这直接反驳了"复杂连接器更强"的直觉。</div>
+
+  <div class="callout danger"><span class="label"></span>
+  注意别过度外推：以上结论是在<em>各家自己的训练规模与数据</em>下得到的，"连接器影响小"成立的前提是<strong>采用保留较多 token 的连接器并训练充分</strong>。若用 Q-Former 式强压缩，连接器（及其 token 数）就重新变成瓶颈——这正是下一节评测视角的切入点。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">8</span>评测视角：连接器瓶颈如何表现为下游短板</h2>
+
+  <p>做 VLM 评测的核心技能，是把一个失败<strong>归因到具体组件</strong>。连接器（尤其是 token 数）作为信息瓶颈，会以可预测的方式表现为特定的下游能力短板：</p>
+
+  <table>
+    <thead><tr><th>连接器特征</th><th>下游表现 / 失败模式</th><th>对应基准</th></tr></thead>
+    <tbody>
+      <tr><td>强压缩（如 32 token）</td><td>细粒度任务崩：OCR、密集文字、小目标计数、空间定位差</td><td>TextVQA、DocVQA、OCRBench、MMStar 细粒度子集</td></tr>
+      <tr><td>token 数充足但分辨率低</td><td>整体语义可，但小字/图表/远处物体看不清</td><td>DocVQA、ChartQA、InfographicVQA</td></tr>
+      <tr><td>语义桥接不足（stage-1 训练不够）</td><td>视觉 token 像 OOD 噪声，模型"无视图片"、幻觉高</td><td>POPE（物体幻觉，模块 08）、MME</td></tr>
+      <tr><td>连接器与编码器分辨率不匹配</td><td>位置/空间关系错乱</td><td>MMBench 空间推理、CV-Bench</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>评测诊断三连问</strong>：(1) 该 VLM 的视觉编码器是什么、分辨率多少？(2) 连接器是哪类、保留多少 token？(3) 失败集中在<em>需要细粒度像素信息</em>的任务（→ 怀疑分辨率/token 瓶颈）还是<em>需要推理</em>的任务（→ 怀疑 LLM）？能把"看不懂图"的失败<em>分流</em>到编码器/连接器 vs LLM，是模块 07/08 评测工作的关键判别力。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  一个常见误判：把"模型答错图里的小字"归咎于 LLM 推理弱，其实根因常在<strong>连接器压缩过度或分辨率不足</strong>，细节根本没传到 LLM。验证方法：放大/裁剪相关区域单独喂入，若答对，则瓶颈在视觉前端（编码器+连接器+分辨率）而非 LLM。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>token 数自适应。</strong> 固定 token（32/64/576）对所有图像一视同仁是否浪费？根据图像复杂度<em>动态</em>分配 token 数（如 LLaVA-NeXT 的多分辨率切片、Qwen2-VL 的 naive dynamic resolution，模块 06）是当前热点。评测视角：动态 token 是否在文档类任务上真正缩小了与高 token 数的差距？</li>
+    <li><strong>压缩与保真的帕累托前沿。</strong> 在给定 token 预算下，什么连接器能保留最多任务相关信息？这本质是<em>有损视觉压缩</em>问题，缺乏统一的信息论度量。</li>
+    <li><strong>单阶段 vs 两阶段之争。</strong> Prismatic 显示单阶段也可行，但两阶段在防遗忘上更稳。最优训练课程（curriculum）、各阶段数据配比仍无定论，且强依赖编码器是否已对齐。</li>
+    <li><strong>连接器是否终将消失？</strong> encoder-free（Fuyu/EVE）与 early-fusion（Chameleon，模块 09）路线把"视觉块直接进 LLM"，连接器退化为一层 patch embedding。规模化后这条路是否更优？</li>
+    <li><strong>评测的归因难题。</strong> 现有基准多给端到端分数，难以把误差<em>解耦</em>到编码器/连接器/LLM。设计能单独探测"连接器信息保真度"的诊断基准，是评测研究的开放方向。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>连接器的三大职责是什么？为什么 token 数 $M$ 是核心设计权衡？</li>
+      <li>对比 MLP projector、Q-Former、Perceiver Resampler：各自如何处理 token 数？Q-Former 的 ITC/ITM/ITG 分别学什么？</li>
+      <li>deep fusion 与 shallow fusion 的区别？Flamingo 的门 $\tanh(\alpha)$ 初始化为 0 有何用意？</li>
+      <li>两阶段训练里 stage-1 为什么要冻结 LLM 只训 connector？stage-2 解冻什么？</li>
+      <li>Prismatic/Idefics2/MM1 的共识：影响 VLM 性能的杠杆排序是怎样的？为什么"连接器影响小"有前提？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../03_architectures/03_讲解.html"><div class="dir">← 上一章</div><div class="t">03 · VLM 架构演进</div></a>
+    <a class="next" href="../05_instruction_tuning/05_讲解.html"><div class="dir">下一章 →</div><div class="t">05 · 视觉指令微调与对齐</div></a>
+  </div>
+
+</div>
+</body>
+</html>

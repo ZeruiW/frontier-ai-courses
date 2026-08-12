@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Tokenizer 设计</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · Tokenizer 设计</h1>
+  <p class="subtitle">文本与模型的接口：BPE/Unigram/WordPiece 对比、词表大小↔序列长度↔fertility 三角权衡、数字/代码/多语处理 —— 从零训练 BPE merges</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">字符串处理、频率统计、一点概率（似然）；模块 00/01</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_tokenizer.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Sennrich 2016 (BPE)、Kudo 2018 (Unigram)、Kudo&Richardson 2018 (SentencePiece)、Rust 2021</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">tokenizer 是文本与模型的接口</a></li>
+      <li><a href="#bpe">BPE：反复合并最高频对</a></li>
+      <li><a href="#alts">Unigram 与 WordPiece</a></li>
+      <li><a href="#tradeoff">核心权衡：词表 ↔ 序列长度 ↔ fertility</a></li>
+      <li><a href="#hard">难处理的：数字、代码、多语</a></li>
+      <li><a href="#encode">编码与解码：合并表怎么用</a></li>
+      <li><a href="#eval">评估一个 tokenizer 的好坏</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>tokenizer 是文本与模型的接口</h2>
+  <p><span class="term">tokenizer</span>（分词器）是<strong>文本与模型之间的接口</strong>：模型只认识整数 id，tokenizer 负责把原始字符串切成一串离散 token、再映射成 id。这个看似机械的预处理，其实是一个<strong>被严重低估的设计决策</strong>——它决定了每段文本占多长的序列、未登录词怎么办、数字和代码怎么表示、不同语言公不公平。选错 tokenizer，等于在每一步训练和推理上都交一笔<em>隐形税</em>。</p>  <p>为什么不直接按字符（或字节）切？因为序列会太长。一篇文章按字符切是几千个 token，模型的注意力是 $O(n^2)$，序列长一倍、算力翻四倍。那为什么不按整词切？因为词表会爆炸（英语就有数十万词，还有无穷的拼写变体、专名、数字），且永远有<span class="term">OOV</span>（未登录词）没法表示。<strong>子词分词</strong>（subword tokenization）是这两个极端的中点：常见词整体成一个 token、罕见词拆成有意义的子词片段。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：tokenizer 是给文本「打包装箱」。箱子太小（按字符）→ 要很多箱子（序列长、运费高）；箱子型号太多（按整词）→ 仓库装不下（词表爆炸）且遇到没见过的东西没箱子装（OOV）。子词分词是<strong>一套精心设计的标准箱型</strong>：常用东西有专属箱子，罕见东西用通用小箱拼装。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：tokenizer 是一个函数 $T: \Sigma^* \to V^*$，把字符串映射到词表 $V$ 上的 token 序列。好的 $T$ 要同时优化几个互相牵制的目标：<strong>压缩率</strong>（序列尽量短）、<strong>覆盖率</strong>（不出 OOV）、<strong>词表大小</strong>（embedding 参数量）、<strong>语义合理性</strong>（切分对齐语言单位）。这几个目标构成一个权衡空间，没有免费的最优解。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>tokenizer 是<strong>训练前就冻结、之后几乎改不了</strong>的决策——它定下后，所有数据都按它编码、embedding 表按它的词表建，中途换 tokenizer 等于推倒重训。所以它必须<strong>一次选对</strong>。这也是为什么前沿实验室会在 tokenizer 上反复实验：它是少数「一锤子买卖」的预训练超参之一。</p>
+  </div>  <p>一个常被忽视的事实：tokenizer 的影响会<strong>乘进每一步</strong>。压缩率差 10%，意味着同样的语料多花 10% 的 token——训练时多 10% 的算力、推理时每次请求多 10% 的延迟与成本、context 窗口少装 10% 的内容。在一个要训几个月、服务几年的模型上，这 10% 的复利是巨大的。所以 tokenizer 不是「预处理小事」，而是<strong>贯穿模型整个生命周期的成本系数</strong>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="bpe"><span class="num">2</span>BPE：反复合并最高频对</h2>
+  <h3>BPE：从字符反复合并最高频对</h3>  <p><span class="term">BPE</span>（Byte-Pair Encoding，字节对编码）是 GPT 系列用的分词法，由 Sennrich 2016 引入 NLP（源自 Gage 1994 的压缩算法）。它的训练算法朴素到优美：<strong>从字符开始，反复找出语料里出现频率最高的相邻 token 对，把它合并成一个新 token，记录这条合并规则，直到词表达到目标大小</strong>。</p>  <div class="ascii">初始(按字符): l o w &lt;/w&gt;  l o w e r &lt;/w&gt;  n e w e s t &lt;/w&gt;  w i d e s t &lt;/w&gt;
+语料词频:     low×5  lower×2  newest×6  widest×3
+
+统计相邻对频率 -&gt; 最高频是 (e,s)=9 [newest 6 + widest 3]
+  合并 #1: (e,s)→es      ... n e w es t   w i d es t
+统计 -&gt; 最高频 (es,t)=9
+  合并 #2: (es,t)→est    ... n e w est   w i d est
+统计 -&gt; 最高频 (l,o)=7   [low 5 + lower 2]
+  合并 #3: (l,o)→lo      ... lo w   lo w e r
+  ... 继续到词表大小达标
+
+产出: 有序合并表 [(e,s),(es,t),(l,o),...]  ← 编码时按这个顺序贪心合并</div>  <p>注意两个关键点。其一，<strong>合并表是有序的</strong>：编码新文本时，必须<strong>按训练时的合并顺序</strong>依次尝试合并，顺序乱了结果就错。其二，BPE 是<strong>确定且贪心</strong>的——每步只看当前最高频对，不回头优化全局，所以训练飞快（这是它流行的原因之一）。</p>  <h4>byte-level BPE：彻底消灭 OOV</h4>  <p>现代做法是 <span class="term">byte-level BPE</span>（GPT-2 起）：不在 Unicode 字符上、而在 <strong>UTF-8 字节</strong>（只有 256 个基元）上做 BPE。好处是<strong>任何文本——任何语言、emoji、乱码、二进制——都能无损编码，永远不会出现 unknown token</strong>。代价是非 ASCII 文本（如中文，一个字 3 字节）起步时 token 更碎，靠合并再拼回来。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>byte-level 的精神是：<strong>退到最底层的通用基元（字节），就再也没有「没见过」的东西</strong>。任何文件本质都是字节流，256 个字节值能拼出一切。BPE 再在这之上学出高频组合，把常见模式压短。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这也解释了一个常见现象：英文 token 看起来像词或词根（因为 ASCII 字符直接是字节），但中文/日文的 token 常是「字节碎片」拼的——因为模型先看到 3 个 UTF-8 字节，再靠学到的 merge 把它们组合。这正是下一节 <span class="term">fertility</span> 对非英语不公平的根源。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>BPE 的贪心<strong>不保证最优切分</strong>：因为只按频率合并、不考虑语言学边界，会切出一些反直觉的 token（把常见但无意义的字符组合合并）。更糟的是<strong>数字</strong>：早期 BPE 把 “100” “200” “1000” 各自合成不同 token，模型很难学会算术（它看不到数字的位值结构）。对策是<strong>数字按单个数位切</strong>（每个 0-9 一个 token），让模型看到 “1”“0”“0” 的结构——LLaMA、GPT-4 等都这么做。这是 tokenizer 设计直接影响下游能力（算术、代码）的典型例子。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="alts"><span class="num">3</span>Unigram 与 WordPiece</h2>
+  <h3>Unigram 与 WordPiece：另外两条路线</h3>  <p>BPE 是「自底向上合并」，但它不是唯一选择。两个重要的对手是 <span class="term">Unigram LM tokenizer</span>（Kudo 2018）和 <span class="term">WordPiece</span>（BERT 用）。理解三者的差异，是 tokenizer 设计的核心知识。</p>  <table>
+    <thead><tr><th>维度</th><th>BPE</th><th>WordPiece</th><th>Unigram LM</th></tr></thead>
+    <tbody>
+      <tr><td>方向</td><td>自底向上：从字符合并</td><td>自底向上：从字符合并</td><td>自顶向下：从大词表剪枝</td></tr>
+      <tr><td>合并/保留准则</td><td>频率最高的相邻对</td><td>似然增益最大的对 $\frac{f(xy)}{f(x)f(y)}$</td><td>剪掉对语料似然损害最小的 token</td></tr>
+      <tr><td>训练算法</td><td>贪心计数合并</td><td>贪心（似然准则）</td><td>EM 迭代 + 剪枝</td></tr>
+      <tr><td>分词（编码）</td><td>按合并表贪心</td><td>最长前缀匹配</td><td>最大似然切分（可采样多种）</td></tr>
+      <tr><td>代表模型</td><td>GPT 系、LLaMA、RoBERTa</td><td>BERT、DistilBERT</td><td>T5、ALBERT、多语模型</td></tr>
+    </tbody>
+  </table>  <h4>Unigram：从大到小的概率剪枝</h4>  <p>Unigram 反着来：先建一个<strong>过大的候选词表</strong>（所有高频子串），给每个 token 一个概率 $p(t)$，假设一句话的概率是其切分中各 token 概率之积（unigram 假设）。用 <span class="term">EM</span> 估计这些概率，然后<strong>反复剪掉「删了它对语料总似然损害最小」的一批 token</strong>，直到词表降到目标大小。</p>  <div class="math-block">\[\text{切分 } \mathbf{s}=(t_1,\dots,t_k) \text{ 的概率} = \prod_{i=1}^{k} p(t_i), \quad \text{编码取 } \arg\max_{\mathbf{s}} \prod_i p(t_i)\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>BPE 像「攒积木」：从最小块开始，把常一起出现的粘成大块。Unigram 像「砍预算」：先列出所有可能的词条，再把性价比最低的一个个砍掉，留下最值钱的一批。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>Unigram 的两个独特优势：① 编码时它取<strong>全局最大似然切分</strong>（用 Viterbi），比 BPE 的贪心更可能切出合理边界；② 它能<strong>对同一文本采样多种切分</strong>（subword regularization），训练时当数据增强，提升鲁棒性。代价是训练比 BPE 慢（要跑 EM）。</p></div>
+  </div>  <p>WordPiece 介于两者之间：合并方向同 BPE，但准则不是纯频率，而是<strong>看合并后能多大提升语料的语言模型似然</strong>（近似 $\frac{f(xy)}{f(x)f(y)}$，即这对字符「绑在一起」比「各自独立」更有信息量）。实践中 BPE 与 Unigram 是当前主流，WordPiece 主要存在于 BERT 系。<span class="term">SentencePiece</span>（Kudo & Richardson）这个库把 BPE 与 Unigram 都实现了，且语言无关（把空格也当普通符号 <code>▁</code> 处理），是多语模型的事实标准。</p>  <div class="callout paper"><span class="label"></span>
+    <p>Sennrich 2016（BPE 引入 NLP）、Kudo 2018（Unigram + subword regularization）、Kudo & Richardson 2018（SentencePiece）是分词三件套必读；想理解 WordPiece 看 Wu 2016（GNMT）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">4</span>核心权衡：词表 ↔ 序列长度 ↔ fertility</h2>
+  <h3>核心权衡：词表大小 ↔ 序列长度 ↔ fertility</h3>  <p>tokenizer 设计的中心问题是<strong>选多大的词表</strong>。这不是孤立的数字，而是一个<strong>三角权衡</strong>的支点。先定义两个关键指标：</p>  <ul>
+    <li><span class="term">fertility</span>（繁殖率）：平均每个<strong>词</strong>被切成多少个 token。fertility=1 表示每词一个 token（理想），>1 表示词被切碎。</li>
+    <li><span class="term">compression ratio</span>（压缩率）：原始字节数 ÷ token 数，即<strong>平均每个 token 顶多少字节</strong>。越高越好（同样 context 装更多文本）。</li>
+  </ul>  <p>词表越大，常见词越能整体成 token → fertility 越低、序列越短、压缩率越高。听起来词表越大越好？不——<strong>代价在三处</strong>：</p>  <table>
+    <thead><tr><th>词表增大的影响</th><th>好处 / 坏处</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>fertility ↓ / 压缩率 ↑</td><td>✅ 好处</td><td>序列变短，训练/推理的注意力计算省（$O(n^2)$）</td></tr>
+      <tr><td>embedding 参数量 ↑</td><td>❌ 坏处</td><td>embedding + 输出层 $= 2 \times V \times d$，词表 256k 时这部分能占小模型参数的一大块</td></tr>
+      <tr><td>每个 token 见的次数 ↓</td><td>❌ 坏处</td><td>固定语料下词表越大，每个 token 的训练样本越稀疏，罕见 token 学不好</td></tr>
+      <tr><td>softmax 计算 ↑</td><td>❌ 坏处</td><td>输出层在 $V$ 上做 softmax，$V$ 大则每步更贵</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>词表大小像「字典厚度」：字典越厚，每个概念越可能有专属词条（表达精炼、句子短）；但字典太厚，很多词条你一辈子用不了几次（学不熟），而且随身带着它（embedding 参数）很重。要的是<strong>覆盖常用、又不臃肿</strong>的那个厚度。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>数学上看总成本：序列长度 $\propto 1/\text{压缩率}$（影响算力），embedding 参数 $\propto V$（影响模型大小与稀疏性）。压缩率随 $V$ 增长但<strong>边际递减</strong>（高频词早被收进去了，再加的都是低频长尾），而 embedding 成本随 $V$ 线性增长。两条曲线一升一降，存在一个<strong>甜点区</strong>——现代 LLM 多落在 $V \in [32\text{k}, 256\text{k}]$，且近年随模型变大、context 变长而<em>上移</em>（大模型摊得起 embedding，且更看重短序列）。</p></div>
+  </div>  <p>notebook 会让你在真实英文文本上从零训 BPE，画出<strong>压缩率随词表大小的边际递减曲线</strong>，并算 fertility——亲眼看到「加词表的收益越来越小」这条决定甜点区的曲线。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="hard"><span class="num">5</span>难处理的：数字、代码、多语</h2>
+  <h3>难处理的东西：数字、代码、多语</h3>  <p>通用 tokenizer 在三类内容上会栽跟头，每一类都直接影响某项下游能力：</p>  <h4>数字：位值结构被打碎</h4>  <p>如果 “127” 是一个 token、“128” 是另一个完全无关的 token，模型就看不到「它们只差 1」。这让算术、计数变得极难。解法是<strong>把数字按单个数位切</strong>（“1”“2”“7”），让模型看到位值结构。LLaMA、GPT-4、PaLM 都对数字做特殊处理。这是 tokenizer 设计直接决定模型能不能学会算术的硬例子。</p>  <h4>代码：空白与缩进是语义</h4>  <p>代码里连续的空格/制表符（缩进）是<strong>语法</strong>。朴素 tokenizer 把 4 个空格切成 4 个 token，浪费且割裂缩进。代码友好的 tokenizer 会把常见的缩进模式（如 “    ” 四空格、“        ” 八空格）合成单 token。Code Llama、StarCoder 等都优化了对空白与常见代码模式的处理，显著提升代码压缩率与能力。</p>  <h4>多语：fertility 的不公平</h4>  <p>这是 tokenizer 最严重的<strong>公平性问题</strong>。一个主要在英文上训的 BPE，对英文 fertility≈1.3，但对<strong>中文、阿拉伯文、印地语等可能 fertility 高达 2-4</strong>：同样语义的一句话，非英语要花<em>几倍</em>的 token。后果是双重的：① 这些语言的用户<strong>付几倍的 token 费、context 装得少</strong>（Petrov 2023）；② 训练时这些语言<strong>信号更稀疏</strong>，学得更差（Rust 2021）。</p>  <div class="ascii">同一句「我爱机器学习」级别的语义，不同 tokenizer 的 token 数(示意):
+  英文 tokenizer 处理英文:   ████ 4 tokens
+  英文 tokenizer 处理中文:   ██████████████ 14 tokens   ← 3-4x fertility 惩罚
+  多语 tokenizer 处理中文:   ██████ 6 tokens             ← 专门分配词表后改善
+  代价: 多语 tokenizer 要更大词表，英文上略有损失(权衡)</div>  <div class="callout danger"><span class="label"></span>
+    <p>tokenizer 的语言不公平是<strong>结构性、且会传导到成本与能力</strong>的：API 按 token 计费时，小语种用户为同样的内容付几倍钱；context 窗口按 token 算时，小语种能放进的实际内容少几倍；训练时小语种 token 稀疏，能力天然落后。多语模型（BLOOM、mT5）必须<strong>在词表里给各语言留足配额</strong>，但这又挤占英文、增大词表——这是个没有完美解的权衡（C12 负责任 AI 关切）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="encode"><span class="num">6</span>编码与解码：合并表怎么用</h2>
+  <h3>编码与解码：合并表怎么用</h3>  <p>训练产出合并表后，<strong>编码</strong>（encode）新文本的算法是：先把文本拆成最小单元（字节/字符），然后<strong>按合并表的顺序</strong>反复扫描、把能合并的相邻对合并，直到没有可合并的为止。</p>  <pre><code># BPE 编码伪代码
+def encode(text, merges):        # merges 是有序列表 [(a,b), ...]
+    tokens = list(text)          # 起步：拆成字符/字节
+    for (a, b) in merges:        # 严格按训练时的合并顺序
+        tokens = merge_all_occurrences(tokens, a, b)
+    return tokens
+# 关键：merges 的顺序 == 训练时学到的顺序，不能乱</code></pre>  <p>一个微妙但重要的点：编码必须<strong>按训练合并顺序</strong>，因为后面的合并依赖前面的结果（“es” 要先合出来，“est” 才能合）。解码（decode）则简单——token 序列直接拼回字符串（byte-level 的话把字节拼起来再 UTF-8 解码）。<strong>好的 tokenizer 应当是无损可逆的</strong>：encode 再 decode 要还原原文（包括空格），这正是 SentencePiece 用 <code>▁</code> 显式标记空格的原因。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>编码像「按菜谱步骤做菜」：菜谱（合并表）的步骤有先后，跳步或乱序就做坏了。每一步「把这两样合到一起」，严格照训练时学的顺序来。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>效率上，朴素 encode 对每条 merge 扫一遍文本是 $O(|\text{merges}| \times n)$，慢。真实实现（HuggingFace tokenizers、tiktoken）用<strong>优先队列 / 字典树</strong>等数据结构把它优化到接近线性，这样推理时分词不成为瓶颈。本课 notebook 实现朴素版（看清逻辑），并验证 encode→decode 可逆。</p></div>
+  </div>  <p>还有一个<strong>决定性细节</strong>：BPE 通常<strong>先按空格/标点把文本切成「词」（pre-tokenization），再在每个词内部做 BPE</strong>，不允许跨词合并。这避免了把 “the cat” 合成一个 token 这种荒唐结果，也让空格的归属明确（GPT 系把前导空格并进词首 token，用 <code>Ġ</code> 标记）。pre-tokenization 的规则（怎么切词、空格怎么算、数字怎么处理）本身就是 tokenizer 设计的一部分，且直接影响数字/代码的表现——这就是为什么「数字按位切」其实是在 pre-tokenization 阶段强制把数字串拆开。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话记住编码：<strong>先按词切开、每个词拆到最碎，再按学过的顺序一步步粘回去</strong>。训练学的是「该粘哪些、按什么顺序粘」；编码就是机械地执行这套粘合规则。理解了这点，BPE 就没有黑魔法了。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>评估一个 tokenizer 的好坏</h2>
+  <h3>评估一个 tokenizer 的好坏</h3>  <p>怎么判断 tokenizer A 比 B 好？不能只看一个数。一套实用的评估维度：</p>  <table>
+    <thead><tr><th>指标</th><th>怎么算</th><th>越好的方向</th></tr></thead>
+    <tbody>
+      <tr><td>压缩率 / fertility</td><td>字节÷token / token÷词</td><td>压缩率高、fertility 低（在目标语料上）</td></tr>
+      <tr><td>词表利用率</td><td>训练后实际用到的 token 占比</td><td>高（没有大量死 token 浪费 embedding）</td></tr>
+      <tr><td>跨语言公平</td><td>各语言 fertility 的方差</td><td>小（不系统性歧视某语言）</td></tr>
+      <tr><td>数字/代码处理</td><td>算术、代码任务的下游表现</td><td>数字按位切、代码空白合并</td></tr>
+      <tr><td>无损可逆</td><td>encode∘decode == 原文</td><td>必须成立（含空格、特殊字符）</td></tr>
+      <tr><td>下游 loss/能力</td><td>用它训小模型测验证 loss</td><td>最终裁判，但贵</td></tr>
+    </tbody>
+  </table>  <p>一个<strong>反直觉</strong>但重要的点：<strong>压缩率高不总是好</strong>。更激进的合并能压更短，但可能把语义边界压没了（把 “unhappiness” 合成一个 token，模型就看不到 “un-” 的否定结构）。压缩率是<em>代理指标</em>，最终标准永远是<strong>下游能力</strong>——但下游评估贵，所以实践中先用压缩率/fertility 快速筛选，再用小模型验证候选。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>别只盯着「压得多短」。一个把所有东西都压成一个 token 的极端 tokenizer 压缩率无穷大，但模型啥也学不到。要的是<strong>既短、又保留语言结构、又对各语言公平</strong>的平衡。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这呼应了机器学习里反复出现的教训：<strong>代理指标（压缩率）≠ 真实目标（下游能力）</strong>。优化代理到极致常会偏离真实目标（Goodhart 定律）。tokenizer 评估的正确姿势是<strong>多指标 + 最终下游验证</strong>，而非单点最大化压缩率。</p></div>
+  </div>  <p>notebook 第 5 节会让你实现 fertility、压缩率、词表覆盖率三个评估函数，在英文文本上对比不同词表大小的 tokenizer，亲手得出「甜点区」。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>tokenizer-free / byte 级模型</strong>：能不能彻底不要 tokenizer，直接在字节上建模？MEGABYTE、ByT5、以及 2024 的 BLT（Byte Latent Transformer）等尝试用层次化结构处理长字节序列。诱惑是消灭一切 tokenizer 的偏见与不公平，挑战是字节序列太长、算力吃不消——这是活跃前沿。</li>
+    <li><strong>数字与算术的表示</strong>：按位切只是权宜。怎么让模型真正理解数值（位值、大小、运算）仍未解决；有工作尝试专门的数字编码、或反转数字顺序（让模型从低位开始算，更符合进位逻辑）。</li>
+    <li><strong>多语公平的根本解</strong>：在固定词表预算下，怎么分配给各语言才公平？按使用人口？按数据量？按 fertility 均衡？这是个有价值取向的优化问题，没有技术上的唯一答案（Petrov 2023、BLOOM 的 ROOTS 实践）。</li>
+    <li><strong>tokenizer 与模型联合优化</strong>：tokenizer 现在是训练前冻结的，但它显然影响最终能力。能不能让它<em>可学习</em>、或随训练自适应？这会打破「一锤子买卖」的限制，但工程上极难（换 token 就要重建 embedding）。</li>
+    <li><strong>压缩率与能力的真实关系</strong>：更高压缩率到底帮多少？最近有研究发现压缩率与下游能力相关但不单调——存在「压得太狠反伤能力」的拐点。把这条关系刻画清楚，能让 tokenizer 选择从经验走向定量。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读：Rust 2021（tokenizer 对多语的影响）、Petrov 2023（语言间不公平）、ByT5 / MEGABYTE / BLT（tokenizer-free 方向）。想动手就用 SentencePiece / HuggingFace tokenizers 在你自己的语料上训一个，对比 fertility。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_data_curation/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 数据清洗与去重</div></a>
+    <a class="next" href="../03_mup_scaling/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · μP 与超参迁移</div></a>
+  </div>
+
+</div>
+</body>
+</html>

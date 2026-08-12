@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 下游微调三范式</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 下游微调三范式</h1>
+  <p class="subtitle">序列分类（[CLS] vs mean pooling）· token 分类与 BIO 约束解码（Viterbi）· span 抽取与联合搜索 · 判别式学习率与灾难性遗忘 · 指标陷阱（MCC / 实体级 F1 / EM 归一化）· 种子方差</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–02、softmax 与交叉熵、动态规划（维特比会从零讲）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_finetuning.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Devlin et al. 2019（BERT 的四种下游范式）、Rajpurkar et al. 2016（SQuAD）、Wang et al. 2019（GLUE）、Howard & Ruder 2018（ULMFiT 的判别式学习率）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#three">三种任务范式：头怎么接决定了一切</a></li>
+      <li><a href="#cls">① 序列分类：[CLS] 还是平均池化</a></li>
+      <li><a href="#token">② token 分类：BIO 标注与约束解码</a></li>
+      <li><a href="#span">③ span 抽取：两个 softmax 与联合搜索</a></li>
+      <li><a href="#recipe">微调配方：那些让分数差 3 分的细节</a></li>
+      <li><a href="#metrics">评估：选错指标比模型差更糟</a></li>
+      <li><a href="#ledger">算一笔账：三种范式的成本与选型</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="three"><span class="num">1</span>三种任务范式：头怎么接决定了一切</h2>
+  <p>预训练给了你一个东西：<strong>一个把 token 序列映射成上下文相关向量序列的函数</strong> <code>f: (x_1..x_n) → (h_1..h_n)</code>。微调要做的就是在它上面接一个「头」，把 <code>h</code> 变成任务需要的输出。</p>  <p>绝大多数 NLU 任务落在三种范式里，它们的区别只在<strong>用哪些 <code>h</code>、输出什么形状</strong>：</p>  <div class="ascii">                    [CLS] 这  家  店  的  服  务  很  好 [SEP]
+                      h0  h1  h2  h3  h4  h5  h6  h7  h8  h9
+                      │   │   │   │   │   │   │   │   │   │
+
+① 序列分类 (sequence classification)
+   用 h0（[CLS]）或所有 h 的平均 → 一个 C 类 softmax
+        h0 ──▶ [Linear C] ──▶ P(正面/负面)          输出: 1 个标签
+   任务: 情感、意图、NLI、句对匹配、内容审核
+
+② token 分类 (token classification)
+   每个 h_i 独立过同一个头 → 每个位置一个标签
+        h1..h8 ──▶ [Linear K] ──▶ BIO 标签序列       输出: n 个标签
+   任务: NER、词性标注、分块、槽位填充
+   ⚠️ 关键约束: 标签序列有**语法**（I-PER 不能跟在 B-LOC 后面）→ 需要约束解码
+
+③ span 抽取 (extractive QA)
+   两个头，各自在序列上做一次 softmax，选出答案的起止位置
+        h ──▶ [Linear 1] ──▶ start_logits ──softmax over positions──▶ 起点
+        h ──▶ [Linear 1] ──▶ end_logits   ──softmax over positions──▶ 终点
+   任务: SQuAD 式抽取问答、信息抽取
+   ⚠️ 关键约束: end &gt;= start，且长度有上限 → 需要联合搜索最优 span</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>三种范式的<strong>参数量差异小到可以忽略</strong>——分类头就是一个 <code>768×C</code> 的矩阵，几万个参数，相比 110M 的主干微不足道。这带来一个重要认识：<em>微调的绝大部分工作发生在主干里，头只是把表示「翻译」成任务格式</em>。这也解释了为什么同一个预训练模型能在几十种任务上都表现良好——它学到的是通用表示，不是任务特定的技能。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但三种范式的<strong>输出空间结构</strong>差异巨大，这才是设计的重点。① 输出空间是 <code>C</code> 个互斥类，无结构；② 输出空间是 <code>K^n</code>，但有<strong>硬性语法约束</strong>（BIO 的合法转移），朴素逐位置 argmax 会产生非法序列；③ 输出空间是 <code>O(n²)</code> 个 span，有<strong>顺序约束</strong>（end≥start），独立取两个 argmax 可能得到 end&lt;start 的无效答案。<em>后两者都需要在解码时施加约束，这是本模块最有实操价值的部分。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个非常常见的实现错误：<strong>token 分类时忘记处理子词</strong>。tokenizer 会把「Washington」切成 <code>Wash ##ing ##ton</code> 三个 token，但标注数据里它只有一个标签 <code>B-LOC</code>。标准做法是：<em>只对每个词的第一个子词计损失，其余子词的标签设为 -100</em>（HF 的 <code>word_ids()</code> 就是为此存在的）。忘了这一步，模型会学到把同一个实体的后续子词标成 O，评估时 F1 莫名其妙地低。这个坑几乎每个人都踩过一次。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cls"><span class="num">2</span>① 序列分类：[CLS] 还是平均池化</h2>
+  <p>最简单的范式，但有一个值得较真的细节：<strong>句子的向量表示该怎么取</strong>？</p>  <table>
+    <thead><tr><th>池化方式</th><th>做法</th><th>什么时候好</th><th>注意</th></tr></thead>
+    <tbody>
+      <tr><td><strong>[CLS]</strong></td><td>取首位隐状态（BERT 还过一层 <code>tanh(W·h)</code> 的 pooler）</td><td><strong>微调时</strong>——梯度会教会 [CLS] 汇总信息</td><td><em>未微调时很差</em>，因为没有预训练目标在用它（RoBERTa 去掉 NSP 后尤甚）</td></tr>
+      <tr><td><strong>mean pooling</strong></td><td>对所有非 padding 位置的 <code>h</code> 求平均</td><td><strong>不微调直接取表示时</strong>（检索、相似度）</td><td>必须用 attention mask 加权，否则 padding 会稀释</td></tr>
+      <tr><td><strong>max pooling</strong></td><td>逐维取最大</td><td>关键词触发型任务（如毒性检测）</td><td>对长文本不稳定</td></tr>
+      <tr><td><strong>attention pooling</strong></td><td>学一个查询向量对所有 <code>h</code> 做注意力加权</td><td>任务需要「找重点」时</td><td>多几千参数，通常小幅提升</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>实践经验：<strong>要微调就用 [CLS]，不微调就用 mean pooling</strong>。原因在模块 01 说过——<code>[CLS]</code> 之所以能代表整句，是因为有目标在训练它；如果你只是拿一个预训练模型直接抽向量（不训练），<code>[CLS]</code> 从未被任何梯度教过要汇总什么，效果常常显著差于简单平均。这个反直觉的事实在做检索时是致命的（模块 05 展开）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个几何层面的问题：<strong>BERT 的句向量空间高度各向异性</strong>——所有向量挤在一个狭窄的锥体里，导致任意两个句子的余弦相似度都很高（0.7+），失去区分度。缓解手段有白化（whitening）、去除高频方向、或者用对比学习重新训练（SimCSE）。<em>直接把 BERT 的 [CLS] 当句向量做检索，是一个经典的、效果很差的做法</em>——但因为它「看起来合理」，被反复重新发明。</p></div>
+  </div>  <h3>句对任务：两种编码方式</h3>  <p>NLI、语义相似度、检索这类任务涉及<em>两个</em>句子，有两种截然不同的做法，它们的取舍在模块 05 会算成一笔账，这里先建立概念：</p>  <ul>
+    <li><strong>cross-encoder（交叉编码）</strong>：把两句拼成 <code>[CLS] A [SEP] B [SEP]</code> 一起过模型。两句的每个 token 之间都能互相注意 → <em>精度最高</em>。代价：无法预计算，<code>N</code> 个候选就要跑 <code>N</code> 次前向。</li>
+    <li><strong>bi-encoder（双塔）</strong>：两句<em>分别</em>编码成向量，用余弦相似度打分。可以离线预计算所有文档向量、在线只算查询 → <em>快几个数量级</em>。代价：两句之间没有交互，精度低一截。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这个二分，它在整个 NLP 系统设计里反复出现：<strong>「交互带来精度，独立带来可预计算」</strong>。检索系统的标准架构就是这两者的组合——双塔做召回（从百万里选 100），交叉编码做精排（对 100 个重排）。<em>这不是妥协，是在成本-精度前沿上的正确取点</em>，模块 05 会把这个前沿画出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="token"><span class="num">3</span>② token 分类：BIO 标注与约束解码</h2>
+  <p>NER 这类任务要给每个 token 一个标签。标签体系通常是 <span class="term">BIO</span>（也叫 IOB2）：</p>  <div class="ascii">句子:   张   三   在   北   京   工   作
+BIO :  B-PER I-PER  O  B-LOC I-LOC  O   O
+        │     │     │    │     │
+        │     │     │    │     └─ Inside-LOC: 「北京」的后续 token
+        │     │     │    └─────── Begin-LOC:  一个地点实体的开始
+        │     │     └──────────── Outside:    不属于任何实体
+        │     └────────────────── Inside-PER
+        └──────────────────────── Begin-PER
+
+**合法性约束（这是关键）**：
+  ✓ O      → B-X 或 O            ✗ O     → I-X   （实体不能凭空「继续」）
+  ✓ B-X    → I-X 或 B-Y 或 O     ✗ B-PER → I-LOC （类型不能中途变）
+  ✓ I-X    → I-X 或 B-Y 或 O     ✗ I-LOC → I-PER
+
+朴素逐位置 argmax **不知道这些约束**，会产出 O → I-PER 这种非法序列。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么非法序列是个真问题？因为下游要把标签序列<em>解析成实体列表</em>。遇到 <code>O I-PER I-PER</code>，解析器要么报错、要么用启发式补救（当作 <code>B-PER</code>？丢弃？），无论哪种都会让评估指标失真、让产品行为不可预测。<strong>而且这不是罕见情况——朴素解码在真实数据上产生非法转移的比例通常在百分之几，足以影响实体级 F1。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>解决办法是<strong>约束解码</strong>：把「找最优标签序列」建模成在一个带非法转移屏蔽的图上找最高分路径，用 <span class="term">Viterbi</span> 动态规划求解。复杂度 <code>O(n·K²)</code>，<code>K</code> 是标签数（通常几十），完全可以接受。<em>更进一步，可以把转移分数也变成可学习参数——那就是 CRF 层（C17 讲过 CRF 本身，这里是把它接在 BERT 上）</em>。BERT+CRF 是 NER 的经典组合，虽然近年发现在强预训练模型上 CRF 的增益变小了（表示已经足够好），但<strong>约束解码本身仍然必要</strong>——它保证输出合法，这是零成本的正确性保证。</p></div>
+  </div>  <h3>Viterbi：三行递推</h3>  <p>设 <code>e[i][k]</code> 是位置 <code>i</code> 标签 <code>k</code> 的发射分数（模型输出的 logit），<code>T[j][k]</code> 是从标签 <code>j</code> 转移到 <code>k</code> 的分数（非法转移设为 <code>−∞</code>）。定义 <code>δ[i][k]</code> = 以位置 <code>i</code> 标签 <code>k</code> 结尾的最优路径分数：</p>  <div class="math-block">\[\delta[0][k] = e[0][k], \qquad \delta[i][k] = e[i][k] + \max_j \big(\delta[i-1][j] + T[j][k]\big)\]</div>  <p>回溯指针记录每步的 <code>argmax j</code>，最后从 <code>argmax_k δ[n-1][k]</code> 倒推出整条路径。notebook 会把它实现出来，并<strong>与暴力枚举所有 <code>K^n</code> 条路径对拍</strong>——在小规模下两者必须给出完全相同的最优路径。</p>  <div class="callout warn"><span class="label"></span>
+    <p>评估 NER 时的另一个坑：<strong>token 级 F1 与实体级 F1 不是一回事，而且前者会系统性地高估</strong>。「北京」被标成 <code>B-LOC O</code>（第二个 token 错了），token 级 F1 = 50%，但实体级 F1 = 0（这个实体根本没被正确抽出来）。<em>产品关心的是实体级</em>——用户要的是「北京」这个实体，不是「一半正确」。<code>seqeval</code> 库算的就是实体级，notebook 会把两种指标都实现并展示它们的差距。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="span"><span class="num">4</span>③ span 抽取：两个 softmax 与联合搜索</h2>
+  <p>抽取式问答（SQuAD 范式）的输出是原文中的一个连续片段。做法是<strong>两个独立的位置分类器</strong>：</p>  <pre><code>start_logits = h @ W_start   # (n,) —— 每个位置作为「答案起点」的分数
+end_logits   = h @ W_end     # (n,) —— 每个位置作为「答案终点」的分数
+
+# 训练：两个交叉熵之和
+loss = CE(start_logits, gold_start) + CE(end_logits, gold_end)</code></pre>  <p>训练很直接，<strong>推理才是重点</strong>。天真的做法是分别取两个 argmax，但这会产生三类无效答案：</p>  <table>
+    <thead><tr><th>问题</th><th>例子</th><th>为什么发生</th></tr></thead>
+    <tbody>
+      <tr><td><code>end &lt; start</code></td><td>start=8, end=3</td><td>两个分类器<strong>独立</strong>，没有任何机制保证顺序</td></tr>
+      <tr><td>跨越 [SEP] 或落进问题区</td><td>答案片段包含了问题的 token</td><td>位置分类器在整个序列上做 softmax，包括问题部分</td></tr>
+      <tr><td>答案过长</td><td>抽出 200 个 token 作为答案</td><td>没有长度约束；通常真实答案 &lt; 30 token</td></tr>
+    </tbody>
+  </table>  <p>正确做法是<strong>联合搜索</strong>：在满足约束的 <code>(i,j)</code> 对里最大化 <code>start_logit[i] + end_logit[j]</code>：</p>  <div class="math-block">\[(\hat{i}, \hat{j}) = \arg\max_{\substack{i \le j \le i + L_{max} \\ i, j \in \text{context}}} \big( s_i + e_j \big)\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>朴素实现是双重循环 <code>O(n²)</code>，对 <code>n=384</code> 是 15 万次比较，还能接受。但有个 <code>O(n·L_max)</code> 的写法：对每个 <code>i</code>，只看窗口 <code>[i, i+L_max]</code> 内的 <code>j</code>。更巧的是可以用<strong>后缀最大值</strong>做到 <code>O(n)</code>：预计算 <code>suffix_max[i] = max_{j≥i} e_j</code> 及其 argmax，然后对每个 <code>i</code> 直接查表。notebook 会实现这三种并对拍。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个实践中必须处理的问题：<strong>不可回答的问题</strong>（SQuAD 2.0 引入）。做法是把 <code>[CLS]</code> 位置当作「无答案」的特殊 span，即 <code>(0,0)</code>。推理时比较「最优有答案 span 的分数」与「<code>s_0 + e_0</code>」，后者更高就输出「无法回答」。<em>这个设计很优雅——不需要额外的分类头，复用同一套 logits</em>。阈值需要在验证集上调（因为两类分数的尺度不同）。</p></div>
+  </div>  <h3>长文档：滑窗与跨窗合并</h3>  <p>BERT 只能吃 512 token，但很多文档更长。标准解法是<strong>滑动窗口</strong>：用 <code>stride</code>（如 128）切成重叠的多个片段，每段独立预测，最后合并。合并时的关键是<em>分数要可比</em>——不同窗口的 softmax 是各自归一化的，直接比概率不对，应该比<strong>未归一化的 logit 之和</strong>。这是个很容易写错的细节。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>span 抽取范式的一个重要优点，在 LLM 时代反而更明显了：<strong>它的输出天然是「原文中的片段」，不可能编造</strong>。生成式 QA 会幻觉，抽取式不会——答案要么在原文里，要么模型说不知道。<em>在合规、法律、医疗等对可溯源性要求高的场景，这个性质本身就是选择抽取式的充分理由</em>，即使生成式的「灵活性」看起来更强。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="recipe"><span class="num">5</span>微调配方：那些让分数差 3 分的细节</h2>
+  <p>微调看起来简单（加个头、跑几个 epoch），但配方不对会显著掉分，而且失败模式很隐蔽。</p>  <table>
+    <thead><tr><th>细节</th><th>推荐做法</th><th>不这么做会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><strong>学习率</strong></td><td>2e-5 ~ 5e-5（比从头训练小 100 倍）</td><td>太大（1e-3）会<strong>灾难性遗忘</strong>，几步就把预训练知识冲掉；太小则学不动</td></tr>
+      <tr><td><strong>warmup</strong></td><td>前 6~10% 步数线性升温</td><td>开头的大梯度会破坏预训练权重</td></tr>
+      <tr><td><strong>epoch 数</strong></td><td>2~4（小数据集 3~5）</td><td>超过 5 个 epoch 在小数据上必过拟合</td></tr>
+      <tr><td><strong>判别式学习率</strong></td><td>底层学习率更小（如逐层 ×0.95 衰减）</td><td>底层学的是通用特征，改动它们收益小、破坏大</td></tr>
+      <tr><td><strong>随机种子</strong></td><td><strong>跑多个种子取均值±方差</strong></td><td>小数据集上 BERT 微调的种子方差可达 2~3 分——单次结果不可信</td></tr>
+      <tr><td><strong>最大长度</strong></td><td>按任务的实际长度分布设，不要无脑 512</td><td>attention 是 O(L²)，无脑 512 可能浪费 10 倍算力</td></tr>
+      <tr><td><strong>类别不平衡</strong></td><td>加权损失或重采样；用 macro-F1 而非 accuracy</td><td>99:1 的数据上，全预测多数类就有 99% accuracy</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>种子方差这一条特别值得强调</strong>，因为它直接影响你能不能相信自己的实验结论。Dodge et al. 2020 系统研究发现：在 GLUE 的小数据集（如 RTE、MRPC）上，仅改变随机种子，BERT 微调的最终分数波动可达 2–3 个点，甚至有些种子会「训崩」（退化到多数类基线）。<em>这意味着「我的方法比 baseline 高 1 分」这种结论，如果只跑了一个种子，很可能纯属噪声</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>工程上的做法：<strong>至少 3–5 个种子，报告均值与标准差，用配对检验判断显著性</strong>（C03/C10 有完整的统计方法）。这不是学术洁癖——在工业界，一个「涨了 1 分」的模型上线后没有效果，浪费的是真实的时间与信任。C40（研究方法论）把这件事作为实验设计的核心纪律。</p></div>
+  </div>  <h3>灾难性遗忘：为什么学习率要这么小</h3>  <p>预训练权重是在数十亿 token 上学到的，而微调数据可能只有几千条。如果学习率太大，几个 batch 的梯度就足以把权重推离预训练的「好区域」，模型退化成一个在小数据上过拟合的随机初始化网络。<strong>判别式学习率</strong>（discriminative fine-tuning，Howard &amp; Ruder 2018）的思路是：底层学的是词法/句法等通用特征，应该几乎不动；顶层学的是语义/任务相关特征，可以多动。</p>  <div class="math-block">\[\eta_{\ell} = \eta_{top} \cdot \gamma^{(L - \ell)}, \qquad \gamma \approx 0.95\]</div>  <div class="callout intuition"><span class="label"></span>
+    <p>更极端的做法是<strong>只训练头、冻结主干</strong>（linear probing）。它极快、极省显存、不可能遗忘，但通常比全量微调低几个点。<em>这两者之间有一整条谱系</em>：冻结主干 → 只解冻顶部几层 → 判别式学习率全量微调 → 均一学习率全量微调。数据越少，越应该往「冻结」那端靠。<strong>而 LoRA 等参数高效方法（C02/C50）本质上是在这条谱系上开的一条新路——让全部层都能更新，但只更新一个低秩子空间</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="metrics"><span class="num">6</span>评估：选错指标比模型差更糟</h2>
+  <table>
+    <thead><tr><th>任务</th><th>常用指标</th><th>为什么不用 accuracy</th><th>陷阱</th></tr></thead>
+    <tbody>
+      <tr><td>情感二分类（均衡）</td><td>accuracy / F1</td><td>—</td><td>—</td></tr>
+      <tr><td>毒性检测（1% 正例）</td><td><strong>PR-AUC / macro-F1</strong></td><td>全预测「无毒」就有 99% accuracy</td><td>ROC-AUC 在极度不平衡时也会虚高</td></tr>
+      <tr><td>CoLA（语法可接受性）</td><td><strong>MCC</strong>（马修斯相关系数）</td><td>类别不平衡且两类都重要</td><td>MCC 在 [-1,1]，0 表示随机</td></tr>
+      <tr><td>NER</td><td><strong>实体级 micro-F1</strong></td><td>token 级会系统性高估</td><td>必须用 seqeval 式的实体匹配</td></tr>
+      <tr><td>抽取式 QA</td><td><strong>EM + F1</strong>（token 重叠）</td><td>EM 太严（差一个标点就 0 分）</td><td>要做答案归一化（去冠词、标点、大小写）</td></tr>
+      <tr><td>语义相似度（STS）</td><td><strong>Spearman 相关</strong></td><td>这是回归不是分类</td><td>Pearson 对非线性单调关系不敏感</td></tr>
+    </tbody>
+  </table>  <p>其中 <strong>MCC</strong> 值得单独说，因为它是 GLUE 里 CoLA 任务的指标，很多人第一次见。它综合了混淆矩阵的全部四个格子：</p>  <div class="math-block">\[\text{MCC} = \frac{TP \cdot TN - FP \cdot FN}{\sqrt{(TP+FP)(TP+FN)(TN+FP)(TN+FN)}}\]</div>  <p>它的好处是<strong>对类别不平衡鲁棒</strong>：只有当模型在两个类上都做得好时 MCC 才高，而 accuracy 和单一 F1 都可以被多数类刷高。notebook 会用一个不平衡数据集对比这几个指标的表现，你会看到 accuracy 0.95 而 MCC 0.0 的情况——<em>模型什么也没学到，但 accuracy 看起来很棒</em>。</p>  <div class="callout danger"><span class="label">先归一化，再算 EM</span>
+    <p>QA 评估的一个具体陷阱：<strong>EM（exact match）对答案归一化极其敏感</strong>。金标答案是「the White House」，模型输出「White House」——不归一化的话 EM = 0。SQuAD 的官方评估脚本会做四步归一化：转小写、去标点、去冠词（a/an/the）、压缩空格。<em>自己实现评估时忘了这一步，会低估模型 5–10 个点</em>，然后你会以为模型很差，去做一堆无用的优化。notebook 会把归一化函数实现出来，量化它的影响。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">7</span>算一笔账：三种范式的成本与选型</h2>
+  <p>把三种范式的计算特征放在一起。假设 <code>n=128</code>、<code>d=768</code>、12 层。</p>  <table>
+    <thead><tr><th>范式</th><th>头的参数量</th><th>推理前向次数</th><th>解码复杂度</th><th>输出空间大小</th></tr></thead>
+    <tbody>
+      <tr><td>序列分类（C 类）</td><td><code>768×C</code> ≈ 1.5k（C=2）</td><td>1</td><td><code>O(C)</code></td><td><code>C</code></td></tr>
+      <tr><td>token 分类（K 标签）</td><td><code>768×K</code> ≈ 7k（K=9）</td><td>1</td><td><strong><code>O(nK²)</code></strong>（Viterbi）</td><td><code>K^n</code>（受约束）</td></tr>
+      <tr><td>span 抽取</td><td><code>768×2</code> ≈ 1.5k</td><td>1（长文档要 ⌈L/stride⌉ 次）</td><td><strong><code>O(n·L_max)</code></strong> 或 <code>O(n)</code></td><td><code>O(n²)</code></td></tr>
+    </tbody>
+  </table>  <p>三点观察：</p>  <ul>
+    <li><strong>头的参数量都可以忽略</strong>（几千 vs 主干 110M）。微调的成本几乎完全由主干决定，与任务类型无关。</li>
+    <li><strong>推理都只要一次前向</strong>——这是 encoder 范式相对生成式的核心优势。生成式做同样的任务要自回归解码几十到几百步（模块 05 会算这笔账）。</li>
+    <li><strong>解码复杂度虽然不同，但都远小于前向</strong>。Viterbi 的 <code>O(nK²)</code> = 128×81 ≈ 1 万次操作，而一次 BERT 前向是 ~10¹⁰ FLOPs。<em>所以约束解码是「免费」的正确性保证，没有理由不做。</em></li>
+  </ul>  <p>最后给一个选型的决策树，它比任何模型对比表都实用：</p>  <div class="ascii">任务的输出是什么？
+├─ 一个标签（整段/整对）
+│    └─▶ ① 序列分类。微调用 [CLS]；不微调抽向量用 mean pooling。
+│         句对任务：要精度用 cross-encoder，要速度用 bi-encoder。
+│
+├─ 每个 token 一个标签
+│    └─▶ ② token 分类 + **约束解码**（Viterbi/CRF）。
+│         子词只在首片计损失；评估用**实体级** F1。
+│
+├─ 原文中的一个片段
+│    └─▶ ③ span 抽取（双 softmax + 联合搜索）。
+│         长文档滑窗；不可回答用 [CLS] 作为 (0,0) span。
+│
+└─ 自由文本（改写、摘要、翻译）
+     └─▶ 不是本模块的范式 —— 需要生成，见模块 04（encoder-decoder）
+         或 decoder-only LLM（模块 05 会算成本账）。</div>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的智慧：<strong>微调的技术含量不在「接个头」，而在「输出空间的结构约束怎么在解码时被强制执行」以及「评估指标是否真的度量了你关心的东西」</strong>。头的代码十行就写完了，但忘记 Viterbi 会让你输出非法序列、忘记归一化会让 EM 低估十个点、忘记跑多种子会让你相信一个不存在的改进。<em>这些细节不体现在论文的方法章节里，但决定了你的模型能不能上线。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>CRF 层在强预训练模型上还有没有用</strong>：早期 BiLSTM-CRF 时代 CRF 增益明显，但 BERT+CRF 相对 BERT+softmax 的增益已经很小（部分数据集上甚至为负）。<em>约束解码</em>（保证合法性）与<em>学习转移分数</em>（CRF）是两件事，前者仍必要，后者的价值在缩小——这个边界尚未被系统刻画。</li>
+    <li><strong>指令化的 NLU</strong>：把分类/NER/QA 全部转成「文本到文本」的生成任务（T5 的路线，模块 04），或者用 LLM 的 few-shot / 结构化输出来做。它牺牲效率换取零样本能力与统一接口，但在有标注数据的场景下精度通常不如专门微调。<em>这个取舍点随模型能力提升在移动</em>，模块 05 会正面讨论。</li>
+    <li><strong>微调的稳定性</strong>：小数据集上的种子方差问题（Dodge et al. 2020）至今没有彻底解决。重初始化顶层、更长 warmup、混合精度的数值问题、以及 Adam 的 bias correction 都被提出过，但缺乏统一理论。</li>
+    <li><strong>参数高效微调的边界</strong>：LoRA/adapter/prefix-tuning 在多大程度上能匹配全量微调，取决于任务与数据量，尚无可靠的先验判据。对 encoder 的 NLU 任务，这方面的系统研究比对 decoder 少得多。</li>
+    <li><strong>结构化预测的现代化</strong>：嵌套实体、重叠 span、篇章级关系抽取这些超出 BIO 表达力的任务，需要更丰富的输出结构（span-based、图结构、seq2seq 生成）。哪种表示在什么条件下最优，仍是活跃方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Devlin et al. 2019 <em>BERT</em> 第 4 节（四种下游范式的原始定义）、Rajpurkar et al. 2016/2018 <em>SQuAD 1.1/2.0</em>（span 抽取范式与「不可回答」的设计）、Wang et al. 2019 <em>GLUE</em>（多任务基准与各任务的指标选择理由）、Howard &amp; Ruder 2018 <em>ULMFiT</em>（判别式学习率与逐层解冻）、Dodge et al. 2020 <em>Fine-Tuning Pretrained Language Models: Weight Initializations, Data Orders, and Early Stopping</em>（种子方差的系统研究，做实验前必读）、Lample et al. 2016 <em>Neural Architectures for NER</em>（BiLSTM-CRF 与 BIO 约束）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_pretraining_objectives/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 预训练目标与配方的改良</div></a>
+    <a class="next" href="../04_encoder_decoder/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · Encoder-Decoder</div></a>
+  </div>
+
+</div>
+</body>
+</html>

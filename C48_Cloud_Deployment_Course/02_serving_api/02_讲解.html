@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 推理服务 API</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 推理服务 API</h1>
+  <p class="subtitle">OpenAI 兼容契约 · liveness/readiness 语义分离 · SSE 流式与 TTFT/TPOT · 背压超时限流幂等四道护栏 · Erlang-C 算清一个副本扛多少 QPS</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–01、HTTP 基础、一点点概率（泊松过程/指数分布）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_serving_api.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">OpenAI Chat Completions API、SSE (RFC 8895 起草稿/WHATWG)、vLLM OpenAI server、排队论 Erlang-C</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#boundary">服务边界：一个 LLM 服务到底该暴露什么</a></li>
+      <li><a href="#openai">OpenAI 兼容协议：为什么它成了事实标准</a></li>
+      <li><a href="#streaming">流式：SSE 的分块协议与首 token 延迟</a></li>
+      <li><a href="#batching">服务端批处理：把请求攒成 batch</a></li>
+      <li><a href="#guards">背压、超时、限流、幂等：四道护栏</a></li>
+      <li><a href="#queueing">队列论：一个副本到底扛多少 QPS</a></li>
+      <li><a href="#grpc">HTTP vs gRPC：什么时候值得换</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="boundary"><span class="num">1</span>服务边界：一个 LLM 服务到底该暴露什么</h2>
+  <p>镜像有了，进程能跑了。现在要回答一个看起来很平淡、实际决定了后面一切的问题：<strong>这个服务对外长什么样</strong>？</p>  <p>很多人以为这只是「写个 HTTP 接口」。但服务边界（<span class="term">service contract</span>）是整个部署链路上<strong>最难改</strong>的东西——镜像可以天天重建，K8s 配置可以随时改，但一旦有客户端接了你的 API，改它就要走废弃周期、双写、迁移。<em>契约是你唯一真正意义上「一次定型」的决策</em>。</p>  <p>一个生产级 LLM 服务至少要暴露四类端点，而且它们的<strong>语义必须严格分离</strong>：</p>  <table>
+    <thead><tr><th>端点</th><th>语义</th><th>谁在调</th><th>搞混的后果</th></tr></thead>
+    <tbody>
+      <tr><td><code>POST /v1/chat/completions</code></td><td>业务：推理</td><td>客户端 / 网关</td><td>—</td></tr>
+      <tr><td><code>GET /healthz</code>（liveness）</td><td>「进程还活着吗」——只测进程本身，<strong>不测依赖</strong></td><td>kubelet</td><td>把依赖检查写进 liveness → 下游抖动导致整片 Pod 被重启，故障放大</td></tr>
+      <tr><td><code>GET /ready</code>（readiness）</td><td>「现在能接流量吗」——权重加载完了吗、队列满没满</td><td>kubelet / Service 端点控制器</td><td>不实现 readiness → 模型没加载完流量就打进来，全部超时</td></tr>
+      <tr><td><code>GET /metrics</code></td><td>可观测：QPS、延迟分位、队列深度、GPU 利用、token 吞吐</td><td>Prometheus</td><td>没有指标 → 出问题只能重启和猜</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>liveness 和 readiness 的区别一句话说清：<strong>liveness 失败 = 重启我；readiness 失败 = 别给我流量（但别重启我）</strong>。模型加载中，应该是「not ready 但 alive」——你要的是等它加载完，不是把它杀了重来（杀了重来还得再加载三分钟，形成重启风暴）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：liveness 应当只检测<strong>不可自愈的进程内状态</strong>（死锁、事件循环卡死、堆内存耗尽）；readiness 检测<strong>可恢复的、随时间变化的服务能力</strong>（权重是否就绪、并发队列是否饱和、下游是否可达）。判据：<em>如果重启能修复它，放 liveness；如果等待或减流能修复它，放 readiness</em>。这条判据能消掉生产里 90% 的探针配置错误。</p></div>
+  </div>  <div class="callout danger"><span class="label">readiness 是 LLM 服务的头号杀手</span>
+    <p>LLM 服务最经典的一次事故长这样：readiness 探针直接返回 200（图省事），Deployment 滚动更新，新 Pod 起来 3 秒就被标记 ready、进入 Service 端点，同时旧 Pod 被终止。但新 Pod 的模型权重还要加载 3 分钟。<strong>于是这 3 分钟里，所有流量都被路由到一个还不能推理的 Pod 上，服务 100% 不可用</strong>——而且监控上看，Pod 全是 Running 状态，一切「正常」。这个坑之所以致命，是因为它在小模型（加载 2 秒）上永远不会暴露，只在你换成大模型上线时炸。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="openai"><span class="num">2</span>OpenAI 兼容协议：为什么它成了事实标准</h2>
+  <p>2023 年之后，几乎所有推理框架（vLLM、SGLang、TGI、Ollama、llama.cpp、TensorRT-LLM）都提供了 <span class="term">OpenAI-compatible API</span>。这不是巧合，也不是抄袭，而是一个典型的<strong>协议网络效应</strong>：客户端生态（LangChain、LlamaIndex、各种 SDK、无数业务代码）已经围绕这套 schema 建好了，谁兼容谁就免费获得整个生态。</p>  <p>对你的现实意义是：<strong>除非有极强理由，你的服务就应该说这套协议</strong>。它带来三个具体好处——客户端零改造即可切换后端（自建 vs 云 API）、可以直接用现成的网关/代理/缓存中间件、压测和监控工具开箱可用。</p>  <pre><code>POST /v1/chat/completions
+{
+  "model": "llama-3-8b-instruct",
+  "messages": [{"role": "system", "content": "..."},
+               {"role": "user",   "content": "解释一下 LSH"}],
+  "max_tokens": 512,
+  "temperature": 0.7,
+  "stream": true,
+  "stop": ["\n\n"]
+}
+
+# 非流式响应
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "created": 1712345678,
+  "model": "llama-3-8b-instruct",
+  "choices": [{"index": 0,
+               "message": {"role": "assistant", "content": "LSH 是…"},
+               "finish_reason": "stop"}],
+  "usage": {"prompt_tokens": 42, "completion_tokens": 187, "total_tokens": 229}
+}</code></pre>  <p>这套 schema 里有三个字段值得单独说，因为它们承载的信息远比看起来重要：</p>  <ul>
+    <li><strong><code>finish_reason</code></strong>：<code>stop</code>（正常结束）/ <code>length</code>（撞上 max_tokens 被截断）/ <code>content_filter</code>。<em>生产上必须把它打进指标</em>——<code>length</code> 比例突然上升，通常意味着上游 prompt 变了或用户在问更复杂的问题，是容量与质量的双重预警信号。</li>
+    <li><strong><code>usage</code></strong>：计费、成本归因、容量规划的唯一数据源。流式响应默认<em>不</em>带 usage（OpenAI 后来加了 <code>stream_options.include_usage</code>），自建服务一定要补上，否则你无法回答「哪个业务方烧了多少 token」。</li>
+    <li><strong><code>model</code></strong>：回显的应该是<em>实际服务的模型标识</em>，而不是请求里传的字符串。把权重的内容摘要拼进去（如 <code>llama-3-8b@sha256-abc12</code>），一次事故回溯时你会感谢自己。</li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <p>兼容不等于等价。<strong>OpenAI 协议里有大量语义是「服务端自由裁量」的</strong>：<code>temperature=0</code> 是否真的确定性（批处理下的浮点归约顺序会让它不确定）、<code>logprobs</code> 的定义、<code>seed</code> 是否被尊重、<code>n&gt;1</code> 怎么实现。<em>把你的实际语义写进文档</em>，否则客户端会按 OpenAI 的行为假设来写代码，然后在你这里得到微妙的不一致。尤其 <code>temperature=0</code> 不保证逐字节可复现这一点，几乎每个自建服务都会被问到。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="streaming"><span class="num">3</span>流式：SSE 的分块协议与首 token 延迟</h2>
+  <h3>为什么 LLM 服务必须支持流式</h3>  <p>一个生成 500 token 的请求，非流式要等 15 秒才返回第一个字节；流式则 300 毫秒就能吐出第一个 token。<strong>同样的总时长，用户感知天差地别</strong>。这不是优化，是 LLM 产品的基本要求。</p>  <p>于是 LLM 服务的延迟指标必须拆成两个，这是它和普通 web 服务最大的不同：</p>  <table>
+    <thead><tr><th>指标</th><th>全称</th><th>含义</th><th>典型目标</th><th>被什么支配</th></tr></thead>
+    <tbody>
+      <tr><td><strong>TTFT</strong></td><td>Time To First Token</td><td>从请求到第一个 token</td><td>&lt; 500 ms</td><td>排队时间 + prefill（与 prompt 长度成正比）</td></tr>
+      <tr><td><strong>TPOT / ITL</strong></td><td>Time Per Output Token / Inter-Token Latency</td><td>后续每个 token 的间隔</td><td>&lt; 50 ms</td><td>decode 步耗时（与 batch size、KV 长度相关）</td></tr>
+      <tr><td>端到端</td><td>E2E latency</td><td>= TTFT + TPOT × 输出长度</td><td>看场景</td><td>以上两者 + 输出长度分布</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么必须拆开？因为<strong>它们的优化方向是冲突的</strong>。增大批处理能提高吞吐、降低单位成本，但会让请求排队更久 → TTFT 变差。所以 SLO 必须分别定：「P95 TTFT &lt; 800 ms 且 P95 TPOT &lt; 60 ms」。只定一个「P95 端到端 &lt; 10 秒」是没有意义的——它会被输出长度分布完全主导，一个爱写长文的用户就能把你的指标搞崩。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说，端到端延迟 <code>L = W_queue + T_prefill(n_prompt) + n_out × T_decode(B, L_kv)</code>。其中 <code>T_prefill</code> 近似与 prompt token 数线性（compute-bound），<code>T_decode</code> 与批大小 <code>B</code> 弱相关（memory-bound，批越大单 token 摊薄越好但绝对时延略增）。<strong>把 <code>n_out</code> 从指标里剥离</strong>正是拆分 TTFT/TPOT 的意义——前两项是服务端能控的，<code>n_out</code> 是用户输入决定的。</p></div>
+  </div>  <h3>SSE：一个极简却处处是坑的协议</h3>  <p>流式几乎都用 <span class="term">SSE</span>（Server-Sent Events）而不是 WebSocket，因为它是单向的、基于普通 HTTP 的、能穿过绝大多数代理。协议本身简单到可以在一页纸内讲完：</p>  <div class="ascii">HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+X-Accel-Buffering: no          ← 关键！告诉 nginx 不要缓冲，否则流式全废
+
+data: {"choices":[{"delta":{"role":"assistant"},"index":0}]}
+
+data: {"choices":[{"delta":{"content":"LSH"},"index":0}]}
+
+data: {"choices":[{"delta":{"content":" 是"},"index":0}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}
+
+data: [DONE]
+
+规则：每条事件以 "data: " 开头、以 **空行** 结束；[DONE] 是 OpenAI 的收尾约定（不是 SSE 标准）。</div>  <div class="callout danger"><span class="label">SSE 的三个必踩之坑</span>
+    <p>SSE 在生产里的三大坑，每一个都会让「本地 curl 正常、上线后不流式」：<strong>①中间层缓冲</strong>——nginx/Ingress 默认会缓冲响应体，攒够一批才转发，流式变成伪流式。必须设 <code>proxy_buffering off</code> 或响应头 <code>X-Accel-Buffering: no</code>。<strong>②超时</strong>——很多网关默认 60 秒空闲超时，长生成会被拦腰砍断；要么调大 <code>read_timeout</code>，要么定期发心跳注释行 <code>: ping</code>。<strong>③客户端断连不传播</strong>——用户关掉页面了，你的 GPU 还在为他生成 2000 个 token。必须检测断连并<em>取消</em>后端生成，否则被恶意刷会白烧算力。这三条在任何 SSE 教程里都不会写，但在生产里每条都会遇到。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="batching"><span class="num">4</span>服务端批处理：把请求攒成 batch</h2>
+  <p>GPU 的算力只有在<strong>批量</strong>下才能被喂满。单条请求做 decode 时，GPU 大部分时间在等显存搬运权重（memory-bound），算力利用率可能只有百分之几。把 32 条请求的 decode 步合并成一次矩阵乘，权重只搬一次，<strong>吞吐可以涨十几倍而单步延迟只涨一点</strong>。</p>  <p>这里必须区分两个层次的批处理，它们常被混为一谈：</p>  <table>
+    <thead><tr><th>层次</th><th>谁做</th><th>怎么做</th><th>本课关心什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>请求级批处理</strong><br>（static / dynamic batching）</td><td>服务框架</td><td>攒够 N 条或等够 T 毫秒，一起送进引擎；整批一起出结果</td><td>攒批窗口 T 与 TTFT 的权衡</td></tr>
+      <tr><td><strong>迭代级批处理</strong><br>（continuous batching）</td><td>推理引擎（vLLM/TGI）</td><td>每个 decode step 重组 batch，完成的请求立刻退出、新请求立刻插入</td><td>C24 的内容；本课只关心它对容量模型的影响</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>现代 LLM 引擎都做 continuous batching，所以<strong>服务层通常不该再自己攒批</strong>——那只会白白增加 TTFT。服务层要做的是相反的事：<em>尽快把请求交给引擎</em>，让引擎的调度器去决定怎么组批。这是一个很多人写自建服务时会搞反的地方。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但服务层仍要控制一个关键量：<strong>并发准入（admission control）</strong>。引擎的 KV 缓存是有限的，能同时容纳的序列数 <code>B_max ≈ KV显存 / (每序列KV占用)</code>。超过这个数，引擎要么排队要么抢占（preemption，把某些序列的 KV 换出重算）。服务层应当在<em>入口</em>就把并发限制在 <code>B_max</code> 附近并对超出部分快速失败或排队，而不是让请求涌进引擎导致抖动。这就是下一节限流的意义。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把这件事想成一个<strong>两级队列</strong>：服务层的准入队列（你控制，可以拒绝、可以排序、可以给不同租户不同配额）和引擎内部的调度队列（引擎控制，追求 GPU 利用率）。<em>准入队列的职责是保护引擎不被打爆，并把「拒绝」这个动作发生在最便宜的地方</em>——在入口拒绝一个请求几乎零成本，在引擎里因为 KV 不足而抢占重算则要浪费已经算过的 token。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="guards"><span class="num">5</span>背压、超时、限流、幂等：四道护栏</h2>
+  <p>服务的健壮性几乎完全由这四件事决定，而它们都是「平时看不出用处、出事时决定生死」的东西。</p>  <h3>① 背压（backpressure）：拒绝比排队更负责任</h3>  <p>当到达率超过服务能力，你只有两个选择：<strong>排队</strong>（延迟无限增长，最终所有人超时，还白烧了算力）或<strong>拒绝</strong>（部分人立刻收到 429，其余人正常）。<em>后者几乎总是对的</em>。这就是背压：把压力沿调用链往上游传，让上游降速或降级，而不是自己憋着。</p>  <pre><code># 有界队列 = 最朴素也最有效的背压
+MAX_QUEUE = 64          # ≈ 引擎的 B_max，超出即拒绝
+if queue.qsize() &gt;= MAX_QUEUE:
+    return 429, {'error': 'server overloaded', 'retry_after': 2}   # 快速失败
+# 关键：Retry-After 头让客户端知道该等多久，而不是立刻重试加剧雪崩</code></pre>  <h3>② 超时：每一层都必须有，且必须递减</h3>  <p>超时的黄金规则是<strong>上游超时 &gt; 下游超时</strong>。如果网关 30 秒超时、服务 60 秒超时，那么网关放弃后服务还在算 30 秒——纯浪费。反过来配（网关 60 秒、服务 30 秒）才对：服务先放弃，网关能收到明确的错误而不是连接挂死。</p>  <h3>③ 限流：令牌桶与「按什么限」</h3>  <p><span class="term">token bucket</span>（令牌桶）是最常用的限流器：桶以固定速率 <code>r</code> 补令牌、容量 <code>b</code>，每个请求取一个令牌，取不到就拒。它的好处是<strong>允许短时突发（最多 b 个）但长期速率被限在 r</strong>——这比固定窗口计数器（会在窗口边界产生 2 倍突发）平滑得多。</p>  <div class="callout warn"><span class="label"></span>
+    <p>LLM 服务限流有个特殊之处：<strong>按请求数限流几乎没意义</strong>。一个请求可能生成 10 个 token，也可能生成 4000 个，资源消耗差 400 倍。正确做法是<strong>按 token 限流</strong>（OpenAI 的 TPM = tokens per minute 就是这么来的），或者按「预估 token」预扣、结束后按实际用量结算。同时限 RPM 和 TPM 双维度是工业界的标准做法。只限 RPM 的服务，一定会被长生成请求打爆。</p>
+  </div>  <h3>④ 幂等：重试安全的前提</h3>  <p>客户端超时后会重试。如果你的服务不幂等，一次网络抖动就会变成两次扣费、两次生成。做法是接受一个 <code>Idempotency-Key</code> 头，服务端在短窗口内缓存 (key → 结果)，同 key 重复请求直接返回缓存结果。<em>对 LLM 服务，这还能省下一整次生成的算力</em>。</p>  <table>
+    <thead><tr><th>护栏</th><th>没有它会怎样</th><th>关键参数</th><th>常见错误</th></tr></thead>
+    <tbody>
+      <tr><td>背压</td><td>队列无限增长 → 全员超时 → 雪崩</td><td>队列上限 ≈ 引擎 B_max</td><td>无界队列；不返回 Retry-After</td></tr>
+      <tr><td>超时</td><td>连接堆积、算力空烧</td><td>各层超时递减；LLM 要按最长生成设</td><td>上下游超时配反</td></tr>
+      <tr><td>限流</td><td>单个租户打爆全服务</td><td>RPM + TPM 双限，per-tenant</td><td>只限 RPM，被长生成绕过</td></tr>
+      <tr><td>幂等</td><td>重试导致重复生成与重复扣费</td><td>幂等窗口（几分钟）</td><td>只在网关做，服务层不做</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="queueing"><span class="num">6</span>队列论：一个副本到底扛多少 QPS</h2>
+  <p>现在到了本模块最有价值的一节：<strong>把「配几个副本」从拍脑袋变成算数</strong>。这是容量规划的核心，也是模块 04 自动扩缩的理论基础。</p>  <p>最小可用的模型是 <span class="term">M/M/c</span>：请求按泊松过程到达（速率 λ）、服务时间服从指数分布（速率 μ）、有 <code>c</code> 个并发服务位。它的关键结论只有一个，但足够指导实践：</p>  <div class="math-block">\[\rho = \frac{\lambda}{c\mu}, \qquad W_q = \frac{C(c, \lambda/\mu)}{c\mu - \lambda}\]</div>  <p>其中 <code>C(c, a)</code> 是 <span class="term">Erlang-C</span> 公式给出的「到达时需要排队的概率」。你不需要背这个公式（notebook 会实现它），需要记住的是<strong>它画出来的那条曲线的形状</strong>：</p>  <div class="ascii">平均排队等待 W_q
+    │
+    │                                              ╱  ← ρ→1 时垂直爆炸
+    │                                            ╱
+    │                                        ╱
+    │                                  ╱
+    │                        ╱
+    │            ╱
+    │ ─────
+    └──────────────────────────────────────────────── ρ
+     0.3    0.5    0.6    0.7    0.8    0.9   0.95  1.0
+                            ↑                  ↑
+                     生产目标区间          «死亡地带»
+                     （还有余量吸收抖动）  （多 5% 流量就崩）</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这条曲线解释了生产里最常见的一类困惑：「我的服务平均 CPU 才 70%，为什么延迟这么差？」——因为<strong>延迟不是利用率的线性函数，是它的双曲函数</strong>。从 70% 到 85% 你只多榨了 21% 的吞吐，但排队时间可能翻三倍。反过来，容量规划留 30% 余量看起来「浪费」，实际买的是<em>延迟的稳定性和吸收突发的能力</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个更强的结论：<strong>并发数 <code>c</code> 越大，同样利用率下排队越少</strong>（规模经济）。<code>c=1, ρ=0.8</code> 时 <code>W_q = 4/μ</code>；<code>c=10, ρ=0.8</code> 时 <code>W_q ≈ 0.57/μ</code>。这就是「一个 10 副本的池」优于「10 个 1 副本的独立服务」的数学原因——<em>共享排队队列比分散排队高效得多</em>。这条直接反对「给每个租户单独起一套服务」的架构。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>M/M/c 的假设在 LLM 服务上并不严格成立，用它时要知道偏差在哪：<strong>①服务时间不是指数分布</strong>——LLM 的生成长度分布通常是长尾的（重尾），实际排队会比 M/M/c 预测的<em>更糟</em>；<strong>②服务位不独立</strong>——continuous batching 下多个请求共享 GPU，服务率随并发变化，更接近一个处理器共享（processor sharing）模型；<strong>③到达不是泊松</strong>——真实流量有强自相关和日周期。所以把 M/M/c 当成<em>乐观下界</em>和<em>形状指导</em>，不要当成精确预测。真实容量数字必须靠压测标定，但压测该压哪些点、结果该怎么外推，靠的正是这个模型。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="grpc"><span class="num">7</span>HTTP vs gRPC：什么时候值得换</h2>
+  <p>经常有人问：LLM 服务该用 HTTP/JSON 还是 gRPC？答案取决于<strong>你在哪一段</strong>。</p>  <table>
+    <thead><tr><th>维度</th><th>HTTP/1.1 + JSON + SSE</th><th>gRPC (HTTP/2 + protobuf)</th></tr></thead>
+    <tbody>
+      <tr><td>序列化开销</td><td>JSON 解析在超长 prompt 下不可忽视</td><td>protobuf 快 2–5 倍，体积小 30–60%</td></tr>
+      <tr><td>流式</td><td>SSE，单向，穿透性好</td><td>原生双向流，更干净（可中途取消、可反向推送）</td></tr>
+      <tr><td>生态</td><td>浏览器直连、curl 可调、无数中间件</td><td>需要 grpc-web 或网关才能给浏览器用</td></tr>
+      <tr><td>可观测</td><td>所有网关/APM 开箱支持</td><td>需要专门的拦截器与工具</td></tr>
+      <tr><td>调试</td><td>极其容易</td><td>需要 <code>grpcurl</code> 和 proto 文件</td></tr>
+      <tr><td>适合</td><td><strong>南北向</strong>：面向外部客户端的边缘 API</td><td><strong>东西向</strong>：内部服务间、网关到推理引擎、分布式推理节点间</td></tr>
+    </tbody>
+  </table>  <p>务实的结论：<strong>边缘用 OpenAI 兼容的 HTTP/JSON（生态压倒一切），内部高频链路可以考虑 gRPC</strong>。而且这两者不冲突——常见架构是网关说 HTTP、网关到后端说 gRPC。</p>  <p>有一个场景 gRPC 优势是决定性的：<strong>分布式推理</strong>。当模型大到要跨节点做张量并行/流水并行时，节点间要传递激活值（大块二进制张量）。用 JSON 传 float 数组是灾难性的（base64 膨胀、解析慢），这里 protobuf + HTTP/2 甚至更底层的 NCCL/RDMA 才是正解。不过那已经是 C39 的领域了。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>选协议时别问「哪个更快」，问<strong>「瓶颈在哪」</strong>。一个 TTFT 500 ms 的 LLM 服务，JSON 解析花 2 ms 还是 0.5 ms 完全无关紧要——瓶颈是 GPU。<em>只有当序列化开销占端到端延迟的可测比例时，换协议才有意义</em>。绝大多数 LLM 边缘服务不满足这个条件，所以用 HTTP/JSON 换生态是明显划算的交易。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>SLO 感知的调度</strong>：现在的引擎调度器主要优化吞吐，但不同请求的 SLO 不同（交互式对话要低 TTFT，批量摘要只要吞吐）。如何在同一个引擎里做多 SLO 类别的准入与优先级调度（抢占、降级、公平性保证），是活跃的研究方向（如 Sarathi-Serve、VTC 的公平调度）。</li>
+    <li><strong>前缀缓存与路由的协同</strong>：多轮对话的 prompt 有大量公共前缀，命中 KV 前缀缓存可省掉整个 prefill。但这要求负载均衡器<em>不再是无状态轮询</em>，而要把同一会话路由到持有其缓存的副本（缓存亲和路由），同时又不能破坏负载均衡。这个「亲和 vs 均衡」的张力是当前 LLM 网关设计的核心难题。</li>
+    <li><strong>prefill/decode 分离</strong>：prefill 是 compute-bound、decode 是 memory-bound，混在一起互相干扰（prefill 会拖长正在 decode 的请求的 TPOT）。把两者拆到不同的实例池、用高速网络传 KV（DistServe、Splitwise、Mooncake），能同时改善 TTFT 和 TPOT，但引入了 KV 传输的带宽与一致性问题。这正在成为大规模服务的主流架构。</li>
+    <li><strong>语义级缓存</strong>：不同措辞但语义相同的请求能否复用结果？embedding 相似度阈值怎么定、错误命中的代价如何控制、缓存对个性化与时效性内容的破坏，都还没有好答案。</li>
+    <li><strong>协议标准化的下一步</strong>：OpenAI 兼容是事实标准但不是规范标准，各家实现的边角语义不一致（logprobs、tool_calls 的流式增量格式、结构化输出的约束表达）。是否会出现一个真正的中立规范（类似 OpenTelemetry 之于可观测），目前仍未定。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：vLLM 的 OpenAI server 实现（<code>vllm/entrypoints/openai/</code>，最好的兼容层参考实现）、Kwon et al. 2023 <em>Efficient Memory Management for LLM Serving with PagedAttention</em>（理解 <code>B_max</code> 从哪来）、Agrawal et al. 2024 <em>Sarathi-Serve</em>（TTFT/TPOT 的权衡与 chunked prefill）、Zhong et al. 2024 <em>DistServe</em>（prefill/decode 分离）、Gross <em>Fundamentals of Queueing Theory</em> 第 2–3 章（Erlang-C 的推导）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_containerization/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 容器化：可复现的运行时</div></a>
+    <a class="next" href="../03_kubernetes/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · Kubernetes 编排</div></a>
+  </div>
+
+</div>
+</body>
+</html>

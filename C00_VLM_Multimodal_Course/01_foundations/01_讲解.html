@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 多模态基础与视觉编码器</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 10</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 多模态基础与视觉编码器</h1>
+  <p class="subtitle">Foundations &amp; Vision Encoders —— 一切 VLM 的起点：让机器把"看见"变成可计算的向量</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">Transformer / self-attention、PyTorch 基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span><span class="badge gpu">GPU可选</span> 01_vision_encoders.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">ViT (2020)、MAE、DINOv2</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 30 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么需要多模态？问题的本质</a></li>
+      <li><a href="#cnn-vit">视觉编码器的两条路：CNN 与 ViT</a></li>
+      <li><a href="#vit-deep">ViT 拆解：图像如何变成 token 序列</a></li>
+      <li><a href="#math">前向数学：从像素到表征</a></li>
+      <li><a href="#pretrain">视觉编码器的训练范式：监督 / 自监督 / 对比</a></li>
+      <li><a href="#which">为什么 VLM 几乎都用 CLIP 式编码器？</a></li>
+      <li><a href="#bridge">桥梁：视觉特征如何接入 LLM（预告）</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么需要多模态？问题的本质</h2>
+
+  <p>大语言模型（<span class="term">LLM</span>）只能消费离散的文本 token。但世界的大部分信息以像素、声波、视频的形式存在。
+  <strong>多模态学习要解决的核心矛盾是：不同模态的数据结构天差地别，却要在同一个模型里被联合理解与推理。</strong></p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>文字是一串符号，图像是一片连续的颜色网格，两者长得完全不一样。要让一个模型同时懂图和懂字，
+      第一步就是把图也"翻译"成模型熟悉的那种一串向量 —— 这个翻译器就是<strong>视觉编码器</strong>。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设图像 $x\in\mathbb{R}^{H\times W\times 3}$，文本 $t$ 为离散 token 序列。视觉编码器
+      $f_\theta:\mathbb{R}^{H\times W\times 3}\!\to\!\mathbb{R}^{N\times d}$ 把图像映射为 $N$ 个 $d$ 维 token，
+      使其与语言表征处于可对齐的向量空间，从而被统一的 Transformer 处理。</p>
+    </div>
+  </div>
+
+  <p>所以一个现代视觉-语言模型（<span class="term">VLM</span> / <span class="term">LMM, Large Multimodal Model</span>）的最简骨架可以拆成三块：</p>
+
+  <div class="ascii">
+   像素图 ──►┌──────────────┐   视觉特征   ┌───────────┐   视觉 token   ┌──────────────┐
+            │ Vision       │ ───────────► │ Connector │ ─────────────► │              │
+            │ Encoder      │  N×d_v       │ (投影/对齐)│   N×d_llm      │     LLM      │ ──► 文本输出
+            │ (ViT)        │              └───────────┘                │  (decoder)   │
+            └──────────────┘                                           └──────────────┘
+   文本 ──────────────────────────────────────── tokenizer ──────────────► (与视觉 token 拼接)
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  本模块只攻第一块 —— <strong>视觉编码器</strong>。它的质量几乎决定了 VLM 视觉能力的上限：编码器看不到的细节，后面再强的 LLM 也救不回来。Connector 在模块 03/04，LLM 融合在模块 03 展开。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="cnn-vit"><span class="num">2</span>视觉编码器的两条路：CNN 与 ViT</h2>
+
+  <p>历史上视觉表征有两代主流骨干：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>CNN（如 ResNet）</th><th>ViT（Vision Transformer）</th></tr></thead>
+    <tbody>
+      <tr><td>归纳偏置 inductive bias</td><td>强：局部性 + 平移等变（卷积核滑动）</td><td>弱：几乎不假设空间结构，全靠数据学</td></tr>
+      <tr><td>感受野</td><td>逐层堆叠才变大（局部→全局）</td><td>第一层就是全局（self-attention 连接所有 patch）</td></tr>
+      <tr><td>数据需求</td><td>中小数据也能学好</td><td>数据少时弱于 CNN，数据大时反超</td></tr>
+      <tr><td>扩展性 scaling</td><td>较差</td><td>极好 —— 这是它成为 VLM 标配的关键</td></tr>
+      <tr><td>与 LLM 的契合度</td><td>需要额外 flatten</td><td>天然输出 token 序列，无缝接 Transformer</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>为什么现代 VLM 几乎全用 ViT？</strong> 两个原因：①它的输出本来就是一串 token，和 LLM 的接口天然对齐；②它随数据/参数规模平滑变强，而 VLM 训练数据动辄数十亿图文对，正好喂饱这个"数据饥渴"的架构。CNN 的强归纳偏置在小数据时是优势，在大数据时反而是束缚。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="vit-deep"><span class="num">3</span>ViT 拆解：图像如何变成 token 序列</h2>
+
+  <p>ViT 的核心洞见极其简单：<strong>把图像切成小方块（patch），每块当成一个"词"，然后就当成一句话喂给标准 Transformer。</strong>[Dosovitskiy 2020]</p>
+
+  <div class="ascii">
+  输入图 224×224×3
+       │  切成 16×16 的小块 → 共 (224/16)² = 14×14 = 196 个 patch
+       ▼
+  ┌────┬────┬────┐        每个 patch: 16×16×3 = 768 个数
+  │ p1 │ p2 │ …  │  ───►  线性投影 (Linear 768→d) ───► 196 个 d 维 token
+  ├────┼────┼────┤
+  │ …  │    │p196│        前面再拼一个 [CLS] token ───► 197 个 token
+  └────┴────┴────┘
+       │  + 位置编码 (position embedding，因为 attention 本身不知道顺序)
+       ▼
+  ┌──────────────────────────────────────────────┐
+  │   L 层 Transformer Encoder (MHSA + MLP)        │
+  └──────────────────────────────────────────────┘
+       │
+       ▼
+  197 个 d 维输出向量：
+    • [CLS] 向量 → 全图的全局表征（用于分类 / 对比学习）
+    • 196 个 patch 向量 → 局部表征（VLM 真正喂给 LLM 的就是这些！）
+  </div>
+
+  <h3>四个关键组件</h3>
+  <ul>
+    <li><strong>Patch Embedding</strong>：把每个 $P\times P$ 像素块拉平再线性投影成 $d$ 维向量。工程上等价于一个 kernel=stride=$P$ 的卷积。</li>
+    <li><strong>Position Embedding</strong>：self-attention 是<em>置换不变</em>的（打乱 patch 顺序结果不变），所以必须显式加位置信息，否则模型不知道哪块在左上、哪块在右下。</li>
+    <li><strong>[CLS] token</strong>：一个可学习的额外 token，经过若干层后聚合全图信息，常用作图像的<em>全局向量</em>。</li>
+    <li><strong>多头自注意力 MHSA</strong>：让每个 patch 都能"看到"其他所有 patch，第一层就建立全局关系。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  对 VLM 而言，<strong>真正重要的不是 [CLS] 全局向量，而是那 196 个 patch token</strong>。早期对比模型（CLIP）只用 [CLS] 做图文对齐；但生成式 VLM（LLaVA 等）需要细粒度信息回答"图左下角写了什么字"，所以喂给 LLM 的是<strong>全部 patch token</strong>。这也是为什么"一张图 = 几百个视觉 token"，吃掉大量 LLM 上下文 —— 模块 06 会讲如何压缩。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="math"><span class="num">4</span>前向数学：从像素到表征</h2>
+
+  <p>给定图像 $x\in\mathbb{R}^{H\times W\times C}$，切成 $N=HW/P^2$ 个 patch，每个展平为 $x_p^{(i)}\in\mathbb{R}^{P^2C}$。</p>
+
+  <div class="math-block">
+  $$ z_0 = [\,x_{\text{cls}};\; x_p^{(1)}E;\; x_p^{(2)}E;\;\dots;\; x_p^{(N)}E\,] + E_{pos} $$
+  </div>
+  <p>其中 $E\in\mathbb{R}^{(P^2C)\times d}$ 是 patch 投影矩阵，$E_{pos}\in\mathbb{R}^{(N+1)\times d}$ 是位置编码。随后每层 $\ell$：</p>
+
+  <div class="math-block">
+  $$ z'_\ell = \mathrm{MHSA}(\mathrm{LN}(z_{\ell-1})) + z_{\ell-1}, \qquad
+     z_\ell = \mathrm{MLP}(\mathrm{LN}(z'_\ell)) + z'_\ell $$
+  </div>
+
+  <p>其中单头自注意力是 VLM 的灵魂操作，务必烂熟于心：</p>
+  <div class="math-block">
+  $$ \mathrm{Attn}(Q,K,V) = \mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V,
+     \qquad Q=z W_Q,\; K=zW_K,\; V=zW_V $$
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  $QK^\top/\sqrt{d_k}$ 算的是每个 patch 对其他 patch 的"关注度"，softmax 归一成权重，再对 $V$ 加权求和。
+  <strong>这套 $Q/K/V$ 机制是后面所有跨模态融合的基础</strong> —— 模块 03 的 cross-attention 只不过是"$Q$ 来自文本、$K/V$ 来自图像"的同一公式。先把它吃透。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="pretrain"><span class="num">5</span>视觉编码器的训练范式：监督 / 自监督 / 对比</h2>
+
+  <p>同样是 ViT 结构，用<strong>不同目标预训练</strong>出来的编码器，能力差异巨大。三大范式：</p>
+
+  <table>
+    <thead><tr><th>范式</th><th>代表</th><th>监督信号</th><th>学到的表征特点</th></tr></thead>
+    <tbody>
+      <tr><td>监督分类 supervised</td><td>ViT (ImageNet)</td><td>人工类别标签</td><td>偏向"是什么类别"，语义粗，受标签体系限制</td></tr>
+      <tr><td>自监督 self-supervised</td><td>MAE、DINOv2</td><td>无标签（重建/自蒸馏）</td><td>空间细节丰富、密集预测强，但缺语言语义</td></tr>
+      <tr><td>图文对比 contrastive</td><td><strong>CLIP、SigLIP</strong></td><td>海量图文对（弱监督）</td><td>表征天然与语言对齐 —— VLM 首选</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>MAE</strong> [He 2022]：随机遮住 75% 的 patch，让模型重建被遮的像素 —— 逼它学会理解图像结构。
+  <strong>DINOv2</strong> [Oquab 2023]：自蒸馏，学到极强的密集/几何特征，常用于分割、深度。
+  这两者语义强但"不懂语言"；下一模块的 CLIP 才把视觉空间和语言空间对齐起来。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="which"><span class="num">6</span>为什么 VLM 几乎都用 CLIP 式编码器？</h2>
+
+  <p>这是一个被反复实证的工程结论 [Karamcheti 2024, Prismatic VLMs]：构建 VLM 时，<strong>用语言对齐过的视觉编码器（CLIP / SigLIP）作为视觉骨干，比用纯监督或纯自监督的编码器效果更好、更省对齐成本。</strong></p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>CLIP 的视觉特征"出厂时就和文字在同一个频道上"，所以接到 LLM 上时，连接器几乎不用费劲翻译。
+      而 ImageNet 编码器说的是"类别语"，DINO 说的是"几何语"，接 LLM 时还得额外学一层翻译。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>CLIP 视觉空间已通过对比目标与文本嵌入空间近似对齐，connector 只需学一个近似线性的映射即可桥接；
+      而非对齐编码器需 connector 同时完成<em>空间对齐</em>与<em>语义桥接</em>，在有限指令数据下更难收敛。
+      近期也有工作融合 CLIP+DINO 特征以兼顾语义与空间细节。</p>
+    </div>
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  这不是铁律。研究前沿正在挑战它：①<strong>encoder-free</strong> 路线（Fuyu）直接把像素块投进 LLM，省掉独立编码器；②<strong>融合多编码器</strong>（CLIP 管语义 + DINO 管细节）成为 2024 后的常见配方。评测一个 VLM 的视觉短板时，先问"它的视觉编码器是什么、分辨率多少"往往直击要害。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="bridge"><span class="num">7</span>桥梁：视觉特征如何接入 LLM（预告）</h2>
+
+  <p>视觉编码器吐出 $N\times d_v$ 的特征后，还差最后一步：把它变成 LLM 能"读"的东西。LLM 的输入是 $d_{llm}$ 维的词嵌入序列，所以需要一个 <span class="term">connector</span> 把 $d_v\to d_{llm}$ 并对齐语义。这正是模块 03/04 的主题。三种主流做法先混个脸熟：</p>
+
+  <ul>
+    <li><strong>线性 / MLP 投影</strong>（LLaVA）：最简单，一个 MLP 把每个视觉 token 投到 LLM 维度，token 数不变。</li>
+    <li><strong>Q-Former</strong>（BLIP-2）：用少量可学习 query"问出"固定数量（如 32 个）视觉 token，大幅压缩。</li>
+    <li><strong>Perceiver Resampler</strong>（Flamingo）：把变长视觉特征重采样成固定数量 latent，再用 cross-attention 注入 LLM。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  记住一个贯穿全课的权衡：<strong>保留的视觉 token 越多 → 细节越全但越占 LLM 上下文、越慢；压得越狠 → 越省但越容易丢细节</strong>。这条权衡线会在架构（03）、分辨率（06）、评测（07）里反复出现。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>编码器是否必要？</strong> Encoder-free（Fuyu、EVE）能否在规模化后追平甚至超过有编码器的方案？接口更简洁，但训练更难。</li>
+    <li><strong>分辨率瓶颈</strong>：CLIP 预训练多在 224/336，细粒度任务（文档、图表、小字）严重受限。原生/任意分辨率（模块 06）是当前热点。</li>
+    <li><strong>语义 vs 空间的取舍</strong>：如何在一个编码器里同时拿到 CLIP 的语义对齐和 DINO 的空间精度？多编码器融合的最优配方仍未定论。</li>
+    <li><strong>评测视角</strong>：很多"VLM 看不懂图"的失败，根因在视觉编码器分辨率/特征不足，而非 LLM 推理弱。做评测时要能把失败<em>归因</em>到编码器还是 LLM —— 这是模块 07/08 的核心技能。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>ViT 如何把一张图变成 token 序列？[CLS] 和 patch token 对 VLM 各有什么用？</li>
+      <li>写出 self-attention 的公式，并说明它为何是后续跨模态融合的基础。</li>
+      <li>监督 / 自监督 / 对比三种预训练范式各学到什么样的表征？</li>
+      <li>为什么 VLM 偏爱 CLIP 式编码器？这个结论在什么情况下会被挑战？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../00_setup/00_overview.html"><div class="dir">← 上一章</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_contrastive_clip/02_讲解.html"><div class="dir">下一章 →</div><div class="t">02 · 对比对齐 CLIP / SigLIP</div></a>
+  </div>
+
+</div>
+</body>
+</html>

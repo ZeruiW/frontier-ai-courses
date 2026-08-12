@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 检索入上下文</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 检索入上下文</h1>
+  <p class="subtitle">agent 的 RAG —— toy embedding 检索、余弦相似、top-k、注入预算、重排；从零写一个检索器，把窗口外的海量知识按相关性、按预算精准注入有限的上下文窗口</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00 / 01（窗口即预算、token 计数）、向量与点积的基本概念、Python 列表与排序</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_retrieval.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">RAG (Lewis 2020)、DPR (Karpukhin 2020)、FAISS (Johnson 2017)、Lost in the Middle (Liu 2023)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么需要检索：把窗口外的知识按需拉进来</a></li>
+      <li><a href="#embed">embedding：把文本变成可比较的向量</a></li>
+      <li><a href="#cosine">余弦相似度：只看方向不看长度</a></li>
+      <li><a href="#topk">top-k：取最相近的 k 个</a></li>
+      <li><a href="#budget">注入预算：top-k 之上的硬约束</a></li>
+      <li><a href="#rerank">重排：两段式召回，把噪声排到后面</a></li>
+      <li><a href="#relevance">相关性：检索到底在优化什么</a></li>
+      <li><a href="#frontier">从线性扫描到向量库；研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么需要检索：把窗口外的知识按需拉进来</h2>
+  <p>到这里，我们已经会管理窗口里<strong>已有的</strong>东西：超了按优先级裁（01）、历史压成摘要（02）、该长期记住的移到文件里（03）。但还有一类信息从一开始就<strong>不可能全放进窗口</strong>——<em>外部海量知识</em>：一个产品的全部文档、一个代码库的全部文件、一个知识库的几十万条目。它们动辄上百万 token，窗口再大也装不下，而且大部分内容与<em>当前这一步</em>毫不相关。</p>  <p>解决办法是<strong>检索（retrieval）</strong>：不把全部知识塞进窗口，而是<strong>在每一步只把与当前查询最相关的少量片段拉进来</strong>。这就是 agent 版的 <span class="term">RAG（retrieval-augmented generation）</span>——Lewis 等 2020 提出的范式：先从外部知识库检索相关片段，再把它们拼进上下文让模型据此作答。一句话：<strong>给模型外接一个图书馆，但每次只取它当下需要的那几页</strong>。</p>  <p>回到全课的世界观——窗口是有限预算。检索是把<strong>「窗口外的海量知识」按预算精准注入「窗口内」</strong>的那座桥：上游是可能无限大的知识库，下游是只有几千 token 的注入额度，检索器要在两者之间做<em>相关性优先的取舍</em>。它和模块 03 的文件记忆是一对孪生：记忆解决「agent 自己产生、要长期留」的状态，检索解决「外部已有、要按需取」的知识；而它们<em>召回时</em>用的都是同一套「按相关性取少量、而非全量回灌」的纪律。</p>  <p>为什么不干脆把窗口开到无限大、全塞进去？<strong>两个理由，都致命</strong>。其一是<strong>成本与延迟</strong>：窗口里每个 token 都要被模型处理、都要花钱，把一百万 token 的知识库每次全喂进去，又慢又贵到不可行。其二、也是更隐蔽的——<strong>塞得多反而答得差</strong>：Liu 等 2023 的《Lost in the Middle》证明，把大量内容塞进长上下文时，埋在中段的关键信息会被模型<em>系统性地忽略</em>。所以『把全部知识塞进窗口』不仅做不到、即便做到也不是好主意。<strong>正确的做法是检索——只取当下最相关的少量，让窗口里尽是高相关、低噪声的内容</strong>。这把检索从『窗口装不下时的无奈妥协』提升为『即便装得下也该做的主动选择』，正呼应全课的核心信念：有效上下文（少而精）胜过大窗口（多而杂）。</p>  <p>本模块的目标是<strong>从零写出一个检索器</strong>：把文本变成向量（<span class="term">embedding</span>）、用<span class="term">余弦相似度</span>比较查询与候选、取最相近的 <span class="term">top-k</span>、必要时再<span class="term">重排（reranking）</span>提相关性、最后在 <span class="term">注入预算</span> 的硬约束下把它们拼进上下文。我们用 toy embedding（词频向量）在 CPU 上把整条链路端到端跑通——你会看到，真实系统不过是把『词频向量』换成『学习到的 embedding』、把『线性扫描』换成『向量库的近似最近邻』，控制流一模一样。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>检索 = 在海量外部知识里，按相关性挑出当前最该看的几页，塞进有限的窗口预算</strong>。难点不在『调用一个 embedding 模型』那一行，而在它两侧：<em>怎么把相关性量化（embedding+余弦）、怎么在 top-k 与预算之间取舍、怎么把噪声排到后面（重排）</em>。把这套控制流写对，换什么 embedding 模型都立刻能用。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="embed"><span class="num">2</span>embedding：把文本变成可比较的向量</h2>
+  <h3>embedding：把文本变成可比较的向量</h3>  <p>检索的第一步，是把<strong>文本变成向量</strong>，使得「语义相近的文本 → 向量也相近」。这样『找相关片段』就变成了『找向量空间里离查询最近的点』——一个可以精确计算的几何问题。这种映射叫 <span class="term">embedding</span>（嵌入）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把每段文本想象成地图上的一个点：讲『天气』的文档都聚在地图的一角，讲『财务』的聚在另一角。你的问题也落成一个点，那么『最相关的文档』就是『地图上离你这个点最近的几个点』。embedding 就是这张地图的坐标系。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>真实系统用<strong>学习到的 embedding 模型</strong>（如 DPR，Karpukhin 2020；或各家的 embedding API）把文本编码成几百到几千维的稠密向量，这些向量是在海量语料上训练出来的，能捕捉深层语义。本课用一个<strong>toy embedding</strong>替代它：<em>词频/词袋向量</em>——把文本里每个词哈希到固定维度的某一格、计数。它只看『词面重合』、不懂同义词，但足以把『检索的控制流』讲清楚、且完全确定可断言。</p></div>
+  </div>  <pre><code># toy embedding：把每个词哈希到 dim 维向量的某一格并计数（确定性、纯标准库）
+import re, hashlib
+def embed(text, dim=32):
+    vec = [0.0] * dim
+    for tok in re.findall(r'[\w]+', text.lower()):   # 切词
+        idx = int(hashlib.md5(tok.encode()).hexdigest(), 16) % dim
+        vec[idx] += 1.0                                # 词频计数
+    return vec</code></pre>  <p>注意这里的关键性质：<strong>确定性</strong>——同一段文本永远得到同一个向量。这让检索结果可复现、可 assert，是本课能『对拍』的前提。真实 embedding 模型也具备这个性质（同输入同输出），所以这一点上 toy 与真实是一致的；不同的只是『向量好不好』——toy 只懂词面，真实懂语义。<strong>本课教的是检索的骨架，不是 embedding 的质量</strong>，后者是 references 里 DPR 等工作的领域。</p>  <p>一个值得点出的 toy 局限：词频向量靠<strong>哈希到固定维度</strong>，维度小时不同的词会被哈希到<em>同一格</em>（碰撞），让两段本不相关的文本看起来有点像。维度越大碰撞越少、但向量越稀疏越占内存——这正是真实 embedding 用『几百到几千维稠密向量』而非『几万维稀疏词袋』的原因之一：稠密向量用更少的维度承载更丰富的语义，且天然没有『词必须字面相同才相近』的限制（同义词、改写都能落在相近位置）。本课在小语料上把维度设得够用即可，但你要记住：<strong>toy 向量只懂『字面重合』，真实向量懂『语义相近』</strong>——这就是为什么 toy 检索器在『同义改写』的查询上会失灵，而真实 RAG 不会。这一差距不影响我们学控制流，但决定了上线时该选什么 embedding。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="cosine"><span class="num">3</span>余弦相似度：只看方向不看长度</h2>
+  <h3>余弦相似度：只看方向，不看长度</h3>  <p>有了向量，怎么衡量『两段文本有多像』？最常用的是 <span class="term">cosine similarity</span>（余弦相似度）：两个向量夹角的余弦。它衡量两个向量<strong>方向</strong>是否一致，而<strong>不看长度</strong>：</p>  <div class="math-block">\[\cos(a,b)=\frac{a\cdot b}{\lVert a\rVert\,\lVert b\rVert}=\frac{\sum_i a_i b_i}{\sqrt{\sum_i a_i^2}\,\sqrt{\sum_i b_i^2}}\in[-1,1]\]</div>  <p>分子是<strong>点积</strong>（对应维相乘再求和），分母是两个向量各自的<strong>模长</strong>（L2 范数）相乘。结果范围 $[-1,1]$：1 表示方向完全一致（最相关），0 表示正交（无关），负数表示方向相反。检索时取余弦最大的若干个。</p>  <p>为什么用余弦而不是直接用点积或欧氏距离？<strong>因为要把『长度』的影响除掉</strong>。一篇长文档词多、向量模长大，若直接用点积，长文档会仅因为『长』就得分高，与相关性无关。余弦先把两个向量都<em>归一化到单位长度</em>再比，于是『一篇短小精准的文档』和『一篇冗长但同样切题的文档』能被公平比较——比的是<em>内容方向</em>而非<em>篇幅</em>。</p>  <div class="callout danger"><span class="label">余弦必须守住除零</span>
+    <p>从零实现余弦时<strong>最致命的 bug 是除零</strong>：如果一个向量全是 0（比如一段文本里的词一个都没哈希命中、或空字符串），它的模长就是 0，<code>a·b / (|a|·|b|)</code> 会<strong>除以 0 崩溃</strong>。必须显式判断：任一向量模长为 0 时直接返回相似度 0（视作『无法比较 → 不相关』）。这类边界在玩具语料上偶尔才触发、在真实语料上随时会触发，所以<em>必须从一开始就守住</em>——notebook 第 2 节会专门用一个零向量来验证它不崩。</p>
+  </div>  <p>一个值得记住的简化：当向量是<strong>非负</strong>的（本课词频向量恒非负），余弦落在 $[0,1]$，0 表示『没有任何共同词』。这让 toy 检索的结果非常直观——共同词越多、相对篇幅越契合，余弦越高。notebook 会手算一个小例子，让你对『为什么这两段更像』有数值上的体感。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="topk"><span class="num">4</span>top-k：取最相近的 k 个</h2>
+  <h3>top-k：取最相近的 k 个</h3>  <p>把查询向量与库里<strong>每一个</strong>候选向量都算一次余弦，按相似度从高到低排序，取最前面的 <span class="term">top-k</span> 个——这就是最基本的检索。k 是一个关键旋钮：</p>  <ul>
+    <li><strong>k 太小</strong>：可能<em>漏掉</em>本该看的相关片段（召回不足），模型缺信息、答不全；</li>
+    <li><strong>k 太大</strong>：把不那么相关的也拉进来，既<em>引入噪声</em>稀释模型注意力（回想 context rot），又<em>撑爆注入预算</em>挤占其他上下文。</li>
+  </ul>  <p>所以选 k 是<strong>相关性与预算之间的权衡</strong>，没有放之四海皆准的值——取决于片段大小、查询难度、窗口余量。实践中常先取一个偏大的 top-N（比如 20）做<em>召回</em>，再用更精的打分把它收窄到 top-k（比如 3），这就是下一节的重排。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>像在图书馆查资料：你不会把整个书架搬回座位（k 太大、桌子放不下还看不过来），也不会只拿一本就开写（k 太小、信息不够）。你会先粗略抽出十来本相关的，再翻一翻挑出真正要用的三五本带走。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从零实现 top-k 很简单：对每个候选算相似度得到 <code>(score, doc)</code> 列表，按 score 降序 <code>sort</code>，切片取前 k。<strong>正确性怎么验证？</strong> 用<em>暴力扫描当 oracle</em>：构造一个『谁该排第一』显而易见的小语料（查询与某文档共享最多词），断言 top-k 的结果与『把所有候选算一遍再排序』完全一致。这是本课检索器的对拍裁判。</p></div>
+  </div>  <p>一个实现细节：排序要<strong>稳定且确定</strong>。当两个候选得分相同，谁在前？为了让结果可复现、可 assert，应当用一个确定的 tie-breaker（比如原始下标），而不是依赖字典/集合的偶然顺序。<em>不确定的排序会让 assert 时灵时不灵</em>——这正是从零写一遍才会撞见、撞见才会记住的坑。</p>  <p>k 到底取多少？没有公式，但有一套<strong>可操作的判断</strong>：先估<em>单个片段的平均 token 数</em>与<em>注入预算</em>，两者一除就是『预算最多容得下几个』——这是 k 的天花板（再大也注入不进去）。再看任务：<em>事实问答</em>（答案常落在一两个片段里）k 可以小（3–5）；<em>综合/比较类</em>（要博采多个来源）k 要大些（8–15）并配合重排。实践里常见的反模式是<strong>把 k 设得很大『以防万一』</strong>——结果既撑预算、又因为无关片段稀释了模型注意力（回想 Liu 2023 的 lost-in-the-middle：埋在一堆片段中间的关键信息反而被忽略）而<em>降低</em>了答案质量。<strong>k 不是越大越好；让进窗口的片段少而精，几乎总比多而杂强</strong>。这也是下一节『重排』存在的根本理由：与其放大 k，不如把召回的少数几个排得更准。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="budget"><span class="num">5</span>注入预算：top-k 之上的硬约束</h2>
+  <h3>注入预算：top-k 之上的硬约束</h3>  <p>光有 top-k 还不够。检索回来的片段要拼进上下文，而上下文是<strong>有预算的</strong>（回想模块 01：窗口要分给系统/工具/历史/记忆/检索/输出）。留给检索结果的那块配额，叫 <span class="term">注入预算</span>（injection budget）。它是 top-k 之上的<strong>硬约束</strong>：</p>  <div class="ascii">  查询 query
+      │  embed
+      ▼
+  [q向量]  ──对每个候选算余弦──►  打分排序  ──►  top-k 候选(可能仍超预算)
+                                                      │ 按注入预算逐个累加 token
+                                                      ▼
+                            注入这些(预算内的前几个) ──► 拼进 system / 一条 user 消息
+                                                      └─ 超出预算的丢弃: 召回了≠注入得了</div>  <p>注意<strong>『召回了』不等于『注入得了』</strong>：检索可能返回 k 个，但若把它们全拼进去会超出注入预算，就只能<em>按相关性从高到低逐个累加 token，装不下的丢弃</em>。所以真正进上下文的，是『top-k 里、且累计 token 不超预算的前几个』。这一步把『相关性排序』和『预算约束』缝到一起——是检索器与模块 01 预算器的接口。</p>  <p>实现上，注入是一个<strong>贪心装包</strong>：候选已按相关性排好序，从最相关的开始，逐个把它的 token 数累加，只要不超注入预算就纳入、超了就停（或跳过该条试下一条更短的，看策略）。本课用『累加超预算即停』的最简策略——它保证<em>注入的永远是最相关的那批，且总 token 必有界</em>。notebook 会断言：注入结果的总 token ≤ 预算，且确实是按相关性优先纳入的。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见错误是<strong>只做 top-k、不管注入预算</strong>：取了 k=5 就直接全拼进去，结果某次召回的片段特别长，把上下文撑爆（『爆』）或挤掉了系统提示与历史（『丢』）。正确做法是<strong>永远让注入受预算约束</strong>——top-k 决定『候选哪些』，注入预算决定『最终塞几个』。两道关卡缺一不可，这正是把『能用的 demo 检索』变成『生产里不爆的检索』的关键。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rerank"><span class="num">6</span>重排：两段式召回，把噪声排到后面</h2>
+  <h3>重排：两段式召回，把噪声排到后面</h3>  <p>toy 词频向量（乃至真实的向量检索）有个通病：它快、但<strong>糙</strong>。它靠『词面/粗语义重合』召回，难免把一些<em>沾边但不真正切题</em>的片段也排得挺前。<strong>重排（reranking）</strong>就是补这一刀：用一个更强（也更慢、更贵）的打分器，对初步召回的候选<strong>重新排序</strong>，把真正最相关的提到最前。</p>  <p>标准做法是<strong>两段式</strong>：</p>  <ol>
+    <li><strong>召回（retrieve）</strong>：用便宜的向量检索从<em>海量</em>候选里粗筛出 top-N（N 偏大，如 20）——追求<em>召回率</em>，宁可多带几个；</li>
+    <li><strong>重排（rerank）</strong>：用更精的打分器对这 N 个<em>精排</em>，输出 top-k（k 小，如 3）——追求<em>精确率</em>，把真正相关的顶上来。</li>
+  </ol>  <p>为什么不一上来就用精排打分器扫全库？<strong>因为太贵</strong>：精排器（真实里常是 cross-encoder，把『查询+候选』一起喂进模型打分）对每个候选都要跑一次较重的计算，扫几十万条会慢到不可用。所以用『便宜检索召回少量 + 昂贵精排收窄』的分工：便宜的负责<em>从海量里捞出可能相关的一小撮</em>，昂贵的只在这一小撮上发力。这是检索系统几乎通用的两段式架构。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>像招聘：HR 先用关键词从上千份简历里粗筛出二十份（快、宁滥勿缺），再让资深面试官细看这二十份、排出最合适的三个（准、但费时）。让面试官读上千份简历是不现实的——分工才高效。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>本课用一个<strong>toy 重排器</strong>演示机制：先用余弦召回 top-N，再用一个『更精的打分』（比如『共同词数』『关键词加权』这类比纯余弦更贴近相关性的信号）重排出 top-k。重点不是这个打分多聪明，而是<strong>两段式的控制流</strong>：召回放宽、重排收紧。notebook 会构造一个『纯余弦会把噪声排第二、但重排能把它压下去』的小例子，断言重排后的顺序更优。</p></div>
+  </div>  <p>真实里召回与重排用的是<strong>两种不同结构的模型</strong>，这解释了为什么必须分两段。召回用 <span class="term">bi-encoder</span>（双塔）：查询和文档<em>各自独立</em>编码成向量，文档向量可以<strong>离线预先算好、存进向量库</strong>，查询时只编码查询、再做最近邻——所以快、能扫海量库。重排用 <span class="term">cross-encoder</span>（交叉编码）：把<em>查询 + 候选拼在一起</em>整体喂进模型打一个相关性分，能捕捉两者的细粒度交互（哪个词回应了哪个词），所以<strong>更准但更慢</strong>——而且因为每个『查询×候选』对都要现算、无法预存，绝不可能扫全库。于是分工自然浮现：<strong>bi-encoder 负责从海量里快速捞出一小撮候选，cross-encoder 只在这一小撮上精算</strong>。本课的 toy reranker（coverage×brevity）虽简单，但扮演的正是 cross-encoder 这个角色——一个比向量相似更精、但只在召回池上跑的打分器。</p>  <p>一个实践提示：重排不是免费的，它增加延迟与成本。<strong>是否值得，取决于召回质量与任务对相关性的敏感度</strong>。召回已经很准时，重排收益小；召回噪声多、或答案对『正好那一段』很敏感时，重排往往是性价比最高的一刀。这与 references 里 HyDE / 查询改写等『提相关性』手段是同一类工程权衡。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="relevance"><span class="num">7</span>相关性：检索到底在优化什么</h2>
+  <h3>相关性：检索到底在优化什么</h3>  <p>退一步看：检索器<strong>到底在追求什么</strong>？答案是 <span class="term">relevance</span>（相关性）——召回的片段与查询的契合程度。它有两个常被一起说的维度：</p>  <table>
+    <thead><tr><th>指标</th><th>问的问题</th><th>失败的样子</th></tr></thead>
+    <tbody>
+      <tr><td><strong>召回率 recall</strong></td><td>该召回的相关片段，召回了多少？</td><td>漏掉了关键那一段 → 模型缺信息、答不全（k 太小常致此）</td></tr>
+      <tr><td><strong>精确率 precision</strong></td><td>召回的片段里，真正相关的占多少？</td><td>混进一堆无关片段 → 噪声稀释注意力、还占预算（k 太大/不重排常致此）</td></tr>
+    </tbody>
+  </table>  <p>两者通常此消彼长：<em>放宽 k 提召回但伤精确，收紧 k 提精确但伤召回</em>。前面的两段式架构正是为了<strong>先用召回保住『该有的都在』，再用重排保住『排在前的都准』</strong>，在两个维度上各取所长。理解这对张力，你就懂了检索系统所有旋钮（k、N、重排、注入预算）背后的统一目标：<strong>让注入窗口的那几个片段，既覆盖该覆盖的、又尽量不带无关的</strong>。</p>  <p>怎么<strong>验证</strong>相关性？工业上用带标注的评测集算 recall@k、precision@k、以及 <span class="term">nDCG</span> 等。前两个只看『相关的有没有进 top-k』，而 nDCG 还看<strong>排序好不好</strong>——把最相关的排在第 1 位，比把它排在第 k 位价值更高（因为模型对上下文开头的利用率更高，又是 lost-in-the-middle 的回声）。这点很重要：检索不仅要『召回对的』，还要『把对的排在前面』，因为注入预算可能只容得下排在最前的那几个。本课在玩具规模上用一个更朴素但同样有效的办法：<strong>构造『正确答案显而易见』的小例子</strong>——比如查询明显属于某个主题，就断言『该主题的文档排在前、其它主题的排在后』、或『精准文档排在灌水文档之前』。这把抽象的『相关性』落成可 assert 的具体顺序，是本课一贯的对拍精神。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把检索的全部旋钮收成一句话：<strong>召回（含 k、N）决定『候选池够不够全』，重排决定『排序准不准』，注入预算决定『最终塞几个』</strong>。三者合起来服务同一个目标——让进窗口的那几个片段相关性最高、噪声最少。这也是为什么检索是『把外部知识按预算注入窗口』这件事的核心引擎。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>从线性扫描到向量库；研究前沿与开放问题</h2>
+  <h3>从线性扫描到向量库；研究前沿与开放问题</h3>  <p>本课的检索器对每个查询都<strong>线性扫描全库</strong>（对每个候选算一次余弦），复杂度 $O(N)$。库小时这没问题、而且讲清了原理；但真实知识库动辄百万千万条，线性扫描就太慢了。</p>  <p>于是有了<strong>向量库 / 索引</strong>（vector store / index）：用<span class="term">近似最近邻（ANN）</span>数据结构（如 FAISS，Johnson 2017；以及 HNSW 等）把『找最近的 k 个向量』从 $O(N)$ 降到近似 $O(\log N)$。代价是<em>近似</em>——偶尔会漏掉真正的最近邻，换来的是几个数量级的加速。但请注意：<strong>ANN 只是把『线性扫描』这一步换成『近似快查』，本课的控制流——embed → 相似度 → top-k → 重排 → 按预算注入——一行都不用改</strong>。这正是为什么本课用线性扫描讲原理：把骨架学对了，换索引只是替换其中一个零件。</p>  <ul>
+    <li><strong>embedding 质量与领域适配</strong>：通用 embedding 在专业领域（法律、医疗、代码）常召回不准。如何用领域数据微调 embedding、或用 hybrid（稀疏 BM25 + 稠密向量）取长补短，是活跃方向（references 的 DPR / BM25）。</li>
+    <li><strong>查询改写与 HyDE</strong>：用户的查询常和文档的措辞对不上。先让模型把查询改写、或生成一个『假想答案』再去检索（HyDE，Gao 2023），能显著提相关性——把『检索』和『生成』耦合得更紧。</li>
+    <li><strong>chunking（切块）策略</strong>：长文档怎么切成片段，深刻影响召回。切太大召回不精、占预算；切太小割裂语义。按语义边界切、带重叠切、层次化切，各有取舍，仍无定论。</li>
+    <li><strong>检索的可信与可归因</strong>：注入的片段是否真支撑了模型的回答？把答案里的每句话归因到具体检索片段（citation），是让 RAG 可验证、可审计的关键基础设施。</li>
+    <li><strong>agentic retrieval</strong>：不再一次性检索，而是让 agent 多轮检索——读了一批再决定下一步查什么（即『即时上下文加载』）。这把检索从静态前置步骤变成 agent 循环的一环，与本系列其它课相通。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：RAG（Lewis 2020，检索增强的奠基）、DPR（Karpukhin 2020，稠密检索）、FAISS（Johnson 2017，大规模 ANN）、HyDE（Gao 2023，查询改写提相关性）、以及 Anthropic 的 _Effective context engineering_（把检索放进上下文工程的全局图）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_memory/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 文件记忆</div></a>
+    <a class="next" href="../05_prompt_caching/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · Prompt 缓存与长会话</div></a>
+  </div>
+
+</div>
+</body>
+</html>

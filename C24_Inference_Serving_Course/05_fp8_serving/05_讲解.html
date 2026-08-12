@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · fp8 与量化服务</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · fp8 与量化服务</h1>
+  <p class="subtitle">fp8（E4M3/E5M2）的比特布局与表示范围、把 KV cache 量化到 fp8/int8、per-tensor/channel/token 的 scale 选择、离群值（outlier）为何毁掉量化 —— 在带宽受限的 decode 上用更少比特换更高吞吐</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00（decode 带宽受限）、模块 01（KV cache）、浮点表示（IEEE754）基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_fp8_serving.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Micikevicius et al. 2022 (FP8 Formats)、Dettmers et al. 2022 (LLM.int8())</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么量化：decode 受带宽支配</a></li>
+      <li><a href="#float">浮点解剖：指数 vs 尾数</a></li>
+      <li><a href="#fp8">FP8 两种格式：E4M3 / E5M2</a></li>
+      <li><a href="#scale">量化的数学：scale 与误差</a></li>
+      <li><a href="#granularity">scale 粒度：tensor/channel/token</a></li>
+      <li><a href="#outlier">离群值：为何量化 LLM 难</a></li>
+      <li><a href="#kvquant">KV cache 量化实践</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么量化：decode 受带宽支配</h2>
+  <p>欢迎来到本课的最后一根支柱：<span class="term">quantization</span>（量化）。前四个模块都在「怎么安排计算」上做文章——分页省显存、连续批处理省空转、投机解码省步数、前缀复用省重算。这一模块换一个维度：<strong>在每一次不可避免的数据搬运里，让每个数占更少的比特</strong>。</p>  <p>回忆模块 00 钉死的那条铁律：<strong>decode 阶段是带宽受限的</strong>。每生成一个 token，GPU 都要把<em>整个模型权重 + 当前全部 KV cache</em>从显存读一遍，却只做了一个 token 的计算。于是 decode 的速度几乎正比于<strong>每步要搬多少字节</strong>。这给了量化一个无比直接的着力点：把权重和 KV 从 FP16（2 字节）降到 FP8/INT8（1 字节），<strong>每次搬运的字节直接减半</strong>，decode 吞吐近乎翻倍——而且不用改任何调度逻辑。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>量化是一笔<strong>用精度换带宽（和显存）</strong>的交易。位数少了，能搬得快、装得多；代价是每个数变「粗」了，引入<em>量化误差</em>。这门模块的全部内容，就是搞清楚这笔交易的两端：能省多少（带宽/显存），会损多少（误差），以及怎么让损失小到模型几乎无感。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>两个主要量化对象：<strong>权重</strong>（weight，所有请求共享、读一次服务整个 batch，量化它直接减小每步必读的字节）与 <strong>KV cache</strong>（每请求私有、随上下文线性增长，量化它同时省显存和 decode 带宽）。本模块聚焦数值机制本身，并以 KV 量化为落点——它和模块 01 的分页 KV 正好接得上：分页解决「KV 放哪」，量化解决「KV 每格占几个比特」。</p></div>
+  </div>  <p>还要分清量化省的是哪一笔开销，才不会用错地方。<strong>权重量化</strong>省的是每个 decode 步必读的权重字节，对所有请求一视同仁；<strong>KV 量化</strong>省的是 KV 的显存与每步读取，收益随上下文变长而放大。而 prefill 是<strong>算力</strong>受限的（模块 00），量化对它的 TTFT 帮助有限——这条边界要记牢，它决定了量化与前几个模块是<em>互补叠加</em>而非互相替代：投机解码减步数、批处理提并发、PD 分离隔阶段、量化减字节，各打一处浪费。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>decode 受带宽支配，而带宽 ∝ 字节数，所以把数值位数砍半几乎等于把 decode 提速一倍</strong>。量化不是锦上添花的小优化，而是带宽受限场景下<em>性价比最高</em>的一类加速——它不改算法、不改调度，只把数据表示换得更紧凑。难点全在「砍位数」与「保精度」的平衡，这正是后面七节要拆的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="float"><span class="num">2</span>浮点解剖：指数 vs 尾数</h2>
+  <h3>浮点的解剖：指数管范围，尾数管精度</h3>  <p>要理解 FP8 为什么有两种格式、为什么量化会出错，得先把一个浮点数<strong>拆开</strong>看。任何浮点数都写成这个形式：</p>  <div class="math-block">\[x=(-1)^{s}\times 2^{\,e-\text{bias}}\times (1.m)_2\]</div>  <p>三个部件各司其职：<strong>符号位 s</strong>（1 位，定正负）、<strong>指数 e</strong>（exponent，定这个数大概在哪个量级）、<strong>尾数 m</strong>（mantissa/fraction，定在这个量级里的精细取值）。关键直觉是一句话：<strong>指数位决定动态范围（能表示多大到多小），尾数位决定相对精度（每个数有几位有效数字）</strong>。给定总位数固定，多给指数就少给尾数——范围与精度此消彼长。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把浮点想成科学计数法 <code>± 1.xxxx × 2^n</code>。指数 <code>n</code> 是「数量级旋钮」，调它能从极小跳到极大；尾数 <code>1.xxxx</code> 是「精细旋钮」，决定在某个量级里能分多少档。指数位越多，旋钮能拨的范围越大；尾数位越多，每个量级里的刻度越密。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>一个重要推论：浮点的<strong>绝对精度不是均匀的</strong>。在量级 <code>2^n</code> 附近，相邻可表示数的间距是 <code>2^(n-mant)</code>——量级越大、间距越大。也就是说浮点在小数附近很密、在大数附近很疏，它保的是<em>相对精度</em>（有效数字位数）而非绝对精度。这点在量化里至关重要：离群值（极大的数）所在的量级，刻度本就极疏。</p></div>
+  </div>  <table>
+    <thead><tr><th>格式</th><th>总位数</th><th>指数位</th><th>尾数位</th><th>动态范围</th><th>相对精度</th></tr></thead>
+    <tbody>
+      <tr><td>FP32</td><td>32</td><td>8</td><td>23</td><td>极大（~10^38）</td><td>极高（~7 位十进制）</td></tr>
+      <tr><td>FP16</td><td>16</td><td>5</td><td>10</td><td>小（max≈65504）</td><td>中（~3 位十进制）</td></tr>
+      <tr><td>BF16</td><td>16</td><td>8</td><td>7</td><td>大（同 FP32 范围）</td><td>低（~2 位十进制）</td></tr>
+      <tr><td><strong>FP8 E4M3</strong></td><td>8</td><td>4</td><td>3</td><td>较小（max=448）</td><td>尚可</td></tr>
+      <tr><td><strong>FP8 E5M2</strong></td><td>8</td><td>5</td><td>2</td><td>较大（max=57344）</td><td>差</td></tr>
+    </tbody>
+  </table>  <p>注意 FP16 与 BF16 的对比就是这条原理的活教材：同样 16 位，FP16 给尾数 10 位（精度高但范围小，max 才 65504，训练易溢出），BF16 给尾数只 7 位但指数 8 位（范围等同 FP32，故训练稳，代价是精度低）。FP8 把同样的两难压缩到 8 位上，于是<strong>必须</strong>提供两种配方——这就是下一节的 E4M3 与 E5M2。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="fp8"><span class="num">3</span>FP8 两种格式：E4M3 / E5M2</h2>
+  <h3>FP8 两种格式：E4M3 与 E5M2</h3>  <p>FP8 只有 8 个比特，连「范围」和「精度」都要二选一地分配，于是标准（Micikevicius et al. 2022）定义了<strong>两种</strong>格式，名字直接写出了配比：</p>  <ul>
+    <li><strong>E4M3</strong>：1 符号 + <strong>4 指数</strong> + <strong>3 尾数</strong>。指数少→范围小（最大可表示 <code>448</code>），尾数多→精度较高。多用于<strong>前向</strong>：权重、激活、KV——这些值分布相对集中，更看重精度。</li>
+    <li><strong>E5M2</strong>：1 符号 + <strong>5 指数</strong> + <strong>2 尾数</strong>。指数多→范围大（最大可表示 <code>57344</code>），尾数少→精度低。多用于<strong>反向</strong>：梯度——梯度动态范围极大（有的极小有的很大），更看重范围、不溢出。</li>
+  </ul>  <p>两个最大可表示值（<code>E4M3=448</code>、<code>E5M2=57344</code>）值得记住——它们是后面 notebook 里 fp8 cast 的<strong>饱和上限</strong>，超过就被钳到这个值。（细节上 E4M3 为了多挤一个档位，对特殊值的编码做了非标准处理，没有 ±inf、只有一个 NaN；E5M2 则保留 IEEE 风格的 inf/NaN。这些边角不影响本课的核心机制，但解释了为什么 E4M3 的 max 是 448 而非 256 的整数次幂。）</p>  <div class="ascii">FP8 8 个比特的两种切法（S=符号 E=指数 M=尾数）
+
+  E4M3:  [S][E E E E][M M M]      范围小(max=448)、精度较高 -&gt; 前向/权重/激活/KV
+  E5M2:  [S][E E E E E][M M]      范围大(max=57344)、精度低 -&gt; 反向/梯度
+
+  同样 8 位，E5M2 比 E4M3 多 1 个指数位、少 1 个尾数位：
+     -&gt; 动态范围 ×约 128（多一个指数位），但每量级刻度数 ÷2（少一个尾数位）。
+     这就是「范围 vs 精度」在 8 位上的硬性取舍。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么前向用精度高的 E4M3、反向用范围大的 E5M2？因为权重和激活的数值分布相对<em>集中</em>（去掉离群值后大多落在几个量级内），范围够用、更想要精度；而梯度的数值<em>天差地别</em>（深层与浅层、不同参数差好几个数量级），首要任务是别溢出/下溢，于是宁可牺牲精度换范围。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>推理服务主要在<strong>前向</strong>，所以本模块的主角是 E4M3 与 INT8。一个常被问到的问题：FP8 和 INT8 都是 8 位，差别在哪？INT8 是<strong>均匀</strong>量化（所有刻度等间距），FP8 是<strong>非均匀</strong>量化（小数附近密、大数附近疏）。对动态范围大的数据 FP8 更友好；对范围已被 scale 归一化的数据，两者各有胜负——这正是下两节要算清的。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>别把 FP8 当成「免费的 FP16」。8 位只有 256 个可表示值（扣掉符号约 128 个正值档位），<strong>精度是实打实地下降</strong>了。FP8 能几乎无损，靠的不是位数够，而是<strong>配合得当的 scale</strong>（下一节）把数据<em>缩放到</em>这 256 个档位用得最充分的区间。脱离 scale 谈 FP8 量化，必然踩坑。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="scale"><span class="num">4</span>量化的数学：scale 与误差</h2>
+  <h3>量化的数学：scale 与误差</h3>  <p>量化的核心是一个缩放 + 取整的过程。以最常见的<strong>对称 INT8</strong>为例（INT8 是理解一切量化的最干净模型），它把浮点张量映射到整数 <code>[-127, 127]</code>：</p>  <div class="math-block">\[\text{scale}=\frac{\max|x|}{127},\qquad q=\operatorname{round}\!\left(\frac{x}{\text{scale}}\right),\qquad \hat{x}=q\times \text{scale}\]</div>  <p>三步走：<strong>定 scale</strong>（用张量绝对值最大者除以 127，让最大的数恰好用满 ±127 的档位）、<strong>量化</strong>（除以 scale 再四舍五入到整数 <code>q</code>）、<strong>反量化</strong>（乘回 scale 得到近似值 <code>\hat x</code>）。存储时只存 8 位整数 <code>q</code> 和一个 scale，用时再 <code>\hat x = q \times scale</code> 还原。</p>  <p>量化误差有多大？因为是四舍五入到间距为 scale 的整数网格，<strong>每个数的误差不超过半个 scale</strong>：</p>  <div class="math-block">\[|\,\hat{x}-x\,|\le \frac{\text{scale}}{2}=\frac{\max|x|}{254}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这条误差界揭示了量化的根本权衡。scale 由<strong>最大值</strong>决定：最大的那个数把 scale 撑大，于是<em>所有</em>数的误差上限都跟着变大。换句话说，一个特别大的离群值，会<strong>连累整个张量</strong>的量化精度——这正是第 6 节离群值灾难的数学根源。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>反过来看是另一个权衡：<strong>截断 vs 步长</strong>。scale 取小了（比如用分位数而非最大值），最大的几个数会被钳到 ±127（截断误差），但绝大多数正常数的步长更细（量化误差更小）；scale 取大了（用最大值），没有截断但步长粗。校准（calibration）的本质，就是在这条线上为给定数据找最优 scale——常用取 99.9% 分位数，牺牲极少数离群值换大多数值的精度。</p></div>
+  </div>  <p>FP8 的误差结构类似，但因为是<strong>非均匀</strong>网格，误差是<em>相对</em>的——在量级 <code>2^n</code> 处的步长是 <code>2^(n-mant)</code>，所以大数误差大、小数误差小（误差正比于数值本身）。这让 FP8 对<strong>动态范围大</strong>的数据比 INT8 更稳：小数不会被大数的 scale 压没。notebook 里你会亲手实现 INT8 与 FP8 两种 cast，并验证各自的误差界。</p>  <p>把 INT8 与 FP8 的差别再点透一句，方便你按数据选格式：<strong>INT8 是等间距网格，整段量程精度一致</strong>，最适合「分布已被 scale 归一化到一个窄区间、且没有极端离群」的数据；<strong>FP8 是等比间距网格，对数值大小自适应</strong>，最适合「动态范围大、大小值并存」的数据，因为它不会让一个大值把小值的精度碾平。现实里两者常配合 scale 一起用——先用 scale 把数据搬到格式最甜的区间，再落到 INT8 或 FP8 网格。所以真正的旋钮从来不只是「几位」，而是<strong>「什么格式 × 什么 scale × 什么粒度」</strong>三者的组合，这也是下两节的主题。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="granularity"><span class="num">5</span>scale 粒度：tensor/channel/token</h2>
+  <h3>scale 的粒度：per-tensor / per-channel / per-token</h3>  <p>既然「一个 scale 被最大值绑架」是量化的命门，自然的对策是：<strong>别让整个张量共用一个 scale</strong>。把张量切成更小的组、每组一个自己的 scale，离群值就只连累它所在的那一小组，而非全局。这就是 scale 的<strong>粒度</strong>（granularity）：</p>  <table>
+    <thead><tr><th>粒度</th><th>一个 scale 管多少数</th><th>抗离群值</th><th>元数据/kernel 开销</th><th>典型用途</th></tr></thead>
+    <tbody>
+      <tr><td><strong>per-tensor</strong></td><td>整个张量共用 1 个</td><td>最差（全局被最大值绑架）</td><td>最小（存 1 个数）</td><td>权重（分布较稳时）</td></tr>
+      <tr><td><strong>per-channel</strong></td><td>每个通道/列 1 个</td><td>好（离群通道被隔离）</td><td>中（每通道 1 个）</td><td>权重逐输出通道</td></tr>
+      <tr><td><strong>per-token</strong></td><td>每个 token（行）1 个</td><td>很好（离群 token 被隔离）</td><td>较大（每 token 1 个）</td><td>激活 / KV cache</td></tr>
+    </tbody>
+  </table>  <p>粒度的逻辑很直白：<strong>scale 越细，离群值的「污染半径」越小</strong>。per-tensor 时一个离群值毁掉全张量；per-channel 时它只毁掉自己那一列；per-token 时只毁掉自己那一行。代价是 scale 本身的数量与 kernel 的复杂度上升——每个 scale 要存、要在反量化时按正确的组取用，太细会让元数据和访存开销吃掉量化省下的好处。所以是个<strong>精度 vs 开销</strong>的权衡，不是越细越好。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：per-tensor 像全班按最高分定一条分数线，一个学霸把线拉高、全班都显得差；per-channel/per-token 像分组各定各的线，学霸只影响自己组。分得越细越公平，但要维护的「分数线」也越多。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>实践中的常见组合：<strong>权重用 per-channel</strong>（每个输出通道一个 scale，离线算好、零运行时开销）、<strong>激活与 KV 用 per-token</strong>（每个 token 动态算 scale，正好隔离掉某些 token 维度的离群）。这套组合是把量化做到「几乎无损」的关键工程选择，notebook 里你会量化对比三种粒度在同一带离群张量上的误差。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这条因果：<strong>离群值是量化精度的头号杀手，而更细的 scale 粒度是隔离离群值最直接的武器</strong>。后面看到的 per-token KV 量化、per-channel 权重量化、乃至更细的 group/block 量化（如 MXFP 的 32 元素一组），本质都是同一招——把 scale 切细，限制每个离群值能波及的范围。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="outlier"><span class="num">6</span>离群值：为何量化 LLM 难</h2>
+  <h3>离群值：为什么量化 LLM 这么难</h3>  <p>如果 LLM 的激活都乖乖服从一个集中的分布，量化会非常容易。问题是它们<strong>不乖</strong>。Dettmers et al. 2022（LLM.int8()）发现一个惊人的现象：大模型的激活里存在少数<span class="term">outlier</span>（离群）维度，其数值比其余维度大<strong>一两个数量级</strong>，且系统性地出现在固定的几个特征维上。</p>  <p>结合上一节的误差界，灾难一目了然：per-tensor 的 scale = <code>max|x|/127</code>，被这些离群值撑得极大。于是<strong>绝大多数正常值</strong>（小一两个数量级）除以这个大 scale 后，全都落到 <code>0、±1</code> 这极少数几个整数档位上——<strong>信息几乎全损</strong>。模型不是因为「8 位不够」而崩，而是因为离群值让 8 位里只有两三位被正常值用到。</p>  <div class="ascii">离群值如何绑架 per-tensor scale（INT8，档位 -127..127）
+
+  正常维度:  -2.1  0.8  -1.3  0.5  ...   (大多落在 [-3, 3])
+  离群维度:  ............ 100.0 ........  (个别维度爆表)
+
+  per-tensor scale = max|x|/127 = 100/127 ≈ 0.79
+    -&gt; 正常值 0.8 量化: round(0.8/0.79)=1   反量化 0.79   (相对误差巨大!)
+    -&gt; 正常值 -1.3量化: round(-1.3/0.79)=-2 反量化 -1.58
+    正常值全被挤进 {-2,-1,0,1,2} 这几个档 -&gt; 精度崩塌
+
+  若 per-token/per-channel：离群维单独一个大 scale，正常维各用自己的小 scale -&gt; 得救</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>离群值的可怕之处在于它的「以一损百」：哪怕只有 0.1% 的元素是离群的，它们也能通过 per-tensor scale 把另外 99.9% 的元素全部量化坏。这就是为什么朴素地把 LLM 激活做 per-tensor INT8 几乎必然掉点，而同样的方法在 CNN 上却工作良好——LLM 的激活离群现象格外严重。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>两条主流解法：其一，<strong>更细的粒度</strong>（上一节）——per-token/per-channel 把离群值关进小笼子；其二，<strong>混合精度分解</strong>（LLM.int8() 的做法）——把离群维度单独拎出来用 FP16 算、其余维度用 INT8，再把结果拼起来，让离群值完全不进低精度通道。两条路都在回答同一个问题：怎么不让少数极端值毁掉多数正常值。</p></div>
+  </div>  <p>notebook 里你会亲手复现这个灾难：构造一个绝大多数服从 <code>N(0,1)</code>、但少数维度取 <code>~100</code> 的张量，做 per-tensor INT8 量化，测量<strong>正常维度</strong>的相对误差——你会看到它在有离群值时比无离群值时<em>大出一个数量级以上</em>，亲眼坐实「离群值绑架全局 scale」这件事。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="kvquant"><span class="num">7</span>KV cache 量化实践</h2>
+  <h3>KV cache 量化：把模块 01 的账再砍一半</h3>  <p>现在把数值机制落到本课的主线——<span class="term">KV cache quantization</span>。回忆模块 01：KV cache 是显存命门，且 decode 每步都要把它全部读一遍。所以把 KV 从 FP16 存成 INT8/FP8，是<strong>一石二鸟</strong>：</p>  <ul>
+    <li><strong>省显存</strong>：KV 占用直接减半（FP16→8 位），同样显存能装下<strong>两倍</strong>的并发或<strong>两倍</strong>的上下文长度——直接放大模块 01 分页带来的容量红利。</li>
+    <li><strong>省带宽</strong>：decode 每步读 KV 的字节减半，而 decode 是带宽受限的，于是这部分开销近乎提速一倍。上下文越长、KV 占比越大，这个收益越显著。</li>
+  </ul>  <p>KV 量化的工程要点和前几节完全对得上。KV 的离群通常出现在<strong>特定的 token 或特定的通道</strong>上，所以实践中常用 <strong>per-token</strong> 或 <strong>per-channel</strong> 的 scale（而非 per-tensor）来隔离它们；K 和 V 的分布特性不同，有时分别用不同粒度。KVQuant 等工作正是沿这条路，把 KV 压到 <code>4 比特甚至更低</code> 来支撑超长上下文，关键就是精细的 scale 与离群处理。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>和模块 01 的分页接起来看：分页决定 KV「放在哪个物理块」，量化决定「每个 KV 元素占几个比特」。两者正交、可叠加——一个块原本存 16 个 FP16 token 的 KV，量化到 INT8 后同一个块能存 32 个 token 的 KV，或者块更小、碎片更少。现代引擎（vLLM、TensorRT-LLM）正是把分页 KV 与 KV 量化一起上的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>量化 KV 会损失多少？关键看它如何传导到<strong>注意力输出</strong>。KV 的量化误差经过 softmax 和加权求和后会被部分平均掉，所以最终输出的偏差通常远小于 KV 本身的逐元素误差——这也是 KV 量化能几乎无损的原因之一。notebook 会把一段小 KV 量化到 INT8，测量量化后注意力输出相对 FP32 的偏差，并验证它随比特数/scale 粒度按预期变化。</p></div>
+  </div>  <div class="callout danger"><span class="label">量化不是万能药</span>
+    <p>一个务必清楚的边界：量化 KV 省的是<strong>decode 的 KV 读取带宽与显存</strong>，而非 prefill 的算力。prefill 是算力受限的（模块 00），量化主要帮不上 prefill 的 TTFT。所以量化与前几个模块是<strong>互补</strong>而非替代：投机解码减步数、分页/连续批处理提并发、PD 分离隔离阶段、量化减每步字节——它们攻击的是推理不同侧面的浪费，组合起来才是完整的引擎优化。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>仅权重量化（weight-only, W4A16）</strong>：AWQ、GPTQ 把权重压到 4 比特、激活仍用 FP16。在带宽受限的 decode 上，光减小权重读取就能显著提速，且精度损失可控；AWQ 按激活重要性保护关键权重通道、GPTQ 逐层最小化量化误差，是当前部署最广的两条路线。</li>
+    <li><strong>微缩放与块级格式（MXFP / microscaling）</strong>：把 scale 的粒度细到每 32 个元素一组共享一个小指数 scale（block scaling），在硬件原生支持下逼近「细粒度但低开销」的理想点。是 FP8 之后、面向 FP4/FP6 的新一代数值格式方向。</li>
+    <li><strong>KV 极低比特与混合</strong>：KVQuant 等把 KV 压到 4 比特以下以支撑百万级上下文，难点在离群 token/通道的处理、以及 K 与 V 用不同策略；与模块 01 的分页、模块 04 的前缀复用如何协同（量化后的前缀块如何共享）仍在演进。</li>
+    <li><strong>量化 × 其他支柱的组合</strong>：量化与投机解码（draft/target 都量化、量化是否影响接受率）、与 PD 分离（量化后的 KV 传输更省带宽）、与训练（量化感知训练 QAT、FP8 训练）的组合，是把单点技术拼成端到端最优系统的活跃前沿。</li>
+    <li><strong>更激进的 FP4 与硬件协同设计</strong>：新一代硬件原生支持 FP4/FP6 与块级 scale，算法与硬件协同（什么粒度、什么格式能被 Tensor Core 高效消费）正在快速演化，决定下一代推理引擎的数值底座。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Micikevicius et al. 2022（FP8 Formats，本模块 fp8 的权威定义）、Dettmers et al. 2022（LLM.int8()，离群值灾难与解法）；延伸读 AWQ、GPTQ（仅权重量化）、KVQuant（KV 极低比特）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_prefix_disagg/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · Prefix Cache 与 PD 分离</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

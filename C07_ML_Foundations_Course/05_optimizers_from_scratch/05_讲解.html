@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 优化器从零：SGD → AdamW</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 7</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 优化器从零：SGD → AdamW</h1>
+  <p class="subtitle">从最朴素的梯度下降，一步步加动量、加自适应学习率，推到训练所有大模型都在用的 AdamW。本章每个优化器都给出更新式、直觉、以及它修复了前一个的哪个具体痛点；最后讲收敛性与一套可操作的调参/诊断流程。</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（梯度）、03（逻辑回归）、指数移动平均</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_optimizers_from_scratch.ipynb（UCI 乳腺癌，从零实现五个优化器并对比收敛曲线）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Kingma &amp; Ba 2015 (Adam)；Loshchilov &amp; Hutter 2019 (AdamW)；Sutskever 2013 (momentum)；Goodfellow et al. <em>DL</em> ch.8</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 75 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么优化器值得单独一章</a></li>
+      <li><a href="#sgd">SGD 与 mini-batch 噪声</a></li>
+      <li><a href="#momentum">动量：给下降加惯性</a></li>
+      <li><a href="#adaptive">自适应：AdaGrad → RMSProp → Adam</a></li>
+      <li><a href="#bias">偏差校正：为什么要除以 $1-\beta^t$</a></li>
+      <li><a href="#adamw">AdamW：解耦的 weight decay</a></li>
+      <li><a href="#schedule">学习率调度：warmup 与 cosine</a></li>
+      <li><a href="#converge">收敛性、鞍点与隐式正则</a></li>
+      <li><a href="#frontier">调参诊断与研究前沿</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么优化器值得单独一章</h2>
+  <p>同一个模型、同一份数据，换个优化器或学习率，结果可能从「loss 不降」直接变成「SOTA」。优化器不是损失曲面的旁观者，它<strong>主动塑造</strong>了你最终落在哪个极小值——而不同极小值的泛化能力可以差很远。这就是为什么「换个优化器涨了两个点」既常见、又危险：你不知道这两个点是真本事还是优化器的运气。</p>
+
+  <p>对一个面向评测与研究的工程师，吃透优化器有三层直接收益。第一，<strong>诊断训练曲线</strong>：loss 剧烈震荡通常是 lr 太大；loss 卡在一条水平线可能是鞍点或 lr 太小；loss 训到后期就是不再降，往往是该衰减 lr 了。第二，<strong>读懂论文的训练配置</strong>：一行「AdamW, lr=3e-4, $\beta=(0.9,0.95)$, cosine, 2000 warmup steps, wd=0.1」里每个词都有含义，看懂它你才能判断一个结果可不可复现、可不可信。第三，<strong>识破被优化器偷偷影响的结论</strong>——比较两个方法时，如果其中一个调过优化器、另一个用默认，这个比较就是不公平的。</p>
+
+  <p>本章坚持「从零手写」的路线，是因为优化器的更新式短到可以默写、但其中每个细节（为什么是 EMA 而不是和、为什么要除以 $1-\beta^t$、为什么 weight decay 要解耦）都藏着一个真实痛点。你只有亲手把五个优化器写成不到二十行的 numpy、再在同一条真实数据的 loss 曲线上把它们叠在一起看，才会真正理解「Adam 比 SGD 收敛快」到底快在哪一段、代价是什么。notebook 正是这样组织的：同一个逻辑回归任务，五个优化器各跑一遍，画出对比曲线。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  优化器的演化是一条清晰的故事线：<strong>SGD（只看当前梯度）→ 加动量（记住过去方向）→ 加自适应步长（每个参数不同步长）→ Adam（动量 + 自适应）→ AdamW（修对正则化）。</strong>
+  每一步都精确地解决前一步的一个具体痛点——记住这条线，五个优化器就串成了一个故事，而不是五个孤立公式。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="sgd"><span class="num">2</span>SGD 与 mini-batch 噪声</h2>
+  <p>梯度下降的核心更新就一行：$\theta\leftarrow\theta-\eta\nabla L$。全量梯度（用整个训练集算）每步太贵，<span class="term">随机梯度下降</span>（SGD）改用一个 mini-batch 估计梯度。这个估计是<strong>无偏</strong>的（$\mathbb E[g_{\text{batch}}]=\nabla L_{\text{full}}$），但带方差——方差随 batch size 增大而约以 $1/B$ 下降。</p>
+  <div class="math-block">
+  $$ \theta_{t+1}=\theta_t-\eta\,g_t,\qquad g_t=\nabla_\theta L_{\text{batch}}(\theta_t),\qquad \mathbb E[g_t]=\nabla_\theta L_{\text{full}}(\theta_t) $$
+  </div>
+  <p>反直觉的是，这个噪声常常<strong>有益</strong>：它让优化轨迹带随机扰动，能帮助参数从尖锐的局部极小或鞍点附近逃出去，并倾向于停在更平坦的极小值（第 8 节会讲为什么平坦极小泛化更好）。所以 SGD 的噪声不是纯粹的缺点，而是一种隐式的探索机制——这也是为什么「full-batch 训练」反而经常泛化更差。代价则是收敛路径震荡、需要配学习率调度来后期收紧。</p>
+  <p>batch size 因此是一个<strong>双重旋钮</strong>：它既决定每步的计算量与并行效率（大 batch 更能喂饱 GPU），又决定梯度噪声的大小（大 batch 噪声小、轨迹更直）。一个常被忽视的耦合是 batch size 与 lr 的关系——经验上 batch 翻倍、lr 大致也要相应放大（线性或平方根缩放规则），因为大 batch 的梯度更可信、可以走更大的步。这就是为什么「我把 batch 调大了结果反而不收敛」很常见：你动了 batch 却没动 lr，等于偷偷改变了有效步长。</p>
+  <div class="callout warn"><span class="label"></span>
+  学习率 $\eta$ 是<strong>最重要的超参数</strong>，没有之一。太大 → 发散或剧烈震荡；太小 → 慢到天荒地老、或卡在平台爬不动。
+  真实数据若不标准化（如量纲差异巨大的特征），固定 lr 会让大量纲方向的梯度爆、小量纲方向几乎纹丝不动——这正是模块 00 反复强调标准化的根本原因：<strong>标准化让损失曲面更接近各向同性的碗，单一 lr 才能同时照顾所有方向</strong>。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="momentum"><span class="num">3</span>动量：给下降加惯性</h2>
+  <p>纯 SGD 在「狭长峡谷」型的损失曲面里会反复横跳：梯度主要指向峡谷两壁（陡），沿谷底（缓）的有效进展很慢。<span class="term">动量</span>（momentum）累积历史梯度的指数移动平均（EMA），像一个有惯性的小球：沿一致方向（谷底）持续加速，而来回横跳的分量因方向相反被互相抵消。</p>
+  <div class="math-block">
+  $$ v_{t}=\beta v_{t-1}+g_t,\qquad \theta_{t+1}=\theta_t-\eta\, v_t\qquad(\beta\approx 0.9) $$
+  </div>
+  <p>$\beta=0.9$ 大致意味着「记住过去约 10 步的梯度」（EMA 的有效窗口约 $1/(1-\beta)$）。在一致方向上，速度可以累积到约 $1/(1-\beta)=10$ 倍单步梯度——这就是动量能显著加速的量化来源。换句话说，动量等价于把有效学习率在一致方向上放大了约 $1/(1-\beta)$ 倍，所以<strong>加了动量往往要把 lr 相应调小一点</strong>，否则容易冲过头。这是一个常被忽略的耦合：动量的 $\beta$ 和学习率 $\eta$ 不是独立的两个旋钮。</p>
+  <p><span class="term">Nesterov 动量</span>更进一步：先按当前惯性「前瞻」一步走到 $\theta_t-\eta\beta v_{t-1}$，<em>在那个前瞻点</em>算梯度再更新。直觉是小球先冲到前面看看坡度、再决定怎么拐，因此对即将到来的曲率变化反应更快——当它快冲过头时，前瞻点的梯度已经开始往回拉，于是能更早刹车。理论上 Nesterov 在凸光滑问题上达到最优的 $O(1/t^2)$ 收敛率，比普通动量更优。</p>
+  <div class="dual">
+    <div class="plain">
+      <h4>直白说</h4>
+      <p>普通 SGD 像一个没有惯性的点，每步只看脚下当前的坡。动量给它装了惯性：一直往一个方向走就越走越快，左右乱晃的部分自己抵消掉。于是它能顺着谷底冲，而不是在两边山壁间来回弹。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨说</h4>
+      <p>动量把更新方向从瞬时梯度换成梯度的 EMA $v_t=\sum_{k\le t}\beta^{t-k}g_k$。在二次型损失上可证明它把条件数 $\kappa$ 的收敛迭代数从 $O(\kappa)$ 降到 $O(\sqrt\kappa)$（Nesterov 加速）。$\beta$ 越大记忆越长、越平滑，但也越容易冲过头（overshoot）。</p>
+    </div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="adaptive"><span class="num">4</span>自适应：AdaGrad → RMSProp → Adam</h2>
+  <p>动量解决了「方向」，但所有参数仍共用一个 $\eta$。可不同参数的合适步长其实不同：稀疏特征（很少被激活）的梯度偶尔很大、应该大步走，频繁特征则应小步精修。<strong>自适应方法</strong>用每个参数自己的<strong>梯度平方累积</strong>去缩放它的步长。</p>
+  <ul>
+    <li><strong>AdaGrad</strong>：分母用历史梯度平方<em>和</em>的平方根。优点是天然给稀疏特征大步长；致命缺点是分母<strong>只增不减</strong>，训练越久步长越趋零，深度学习里常常没训完就「饿死」了。</li>
+    <li><strong>RMSProp</strong>：把「累积和」换成<strong>指数移动平均</strong> $v_t=\beta_2 v_{t-1}+(1-\beta_2)g_t^2$，分母不再无限增长，步长能长期维持——一个改动救活了自适应思路。</li>
+    <li><strong>Adam</strong> = 动量（一阶矩 $m_t$）+ RMSProp（二阶矩 $v_t$）+ 偏差校正：</li>
+  </ul>
+  <p>这里的二阶矩 $v_t$ 用的是梯度<strong>逐元素平方</strong>（不是真正的二阶导 Hessian）——所以 Adam 是「伪二阶」方法：它用梯度平方的 EMA 当作每个参数曲率的廉价代理，而非去算昂贵的 Hessian。这个近似是它能在百万参数上跑得动的关键：真正的二阶方法要存 / 求逆 $O(d^2)$ 的 Hessian，对大模型完全不可行。理解这一点，你就明白为什么 Shampoo、Sophia 这类「更接近真二阶」的优化器要费很大力气去做结构化近似（第 9 节）。</p>
+  <div class="math-block">
+  $$
+  \begin{aligned}
+  m_t&=\beta_1 m_{t-1}+(1-\beta_1)g_t, & v_t&=\beta_2 v_{t-1}+(1-\beta_2)g_t^2\\
+  \hat m_t&=m_t/(1-\beta_1^t), & \hat v_t&=v_t/(1-\beta_2^t)\\
+  \theta_{t+1}&=\theta_t-\eta\,\hat m_t/(\sqrt{\hat v_t}+\epsilon) & & (\beta_1{=}0.9,\ \beta_2{=}0.999,\ \epsilon{=}10^{-8})
+  \end{aligned}
+  $$
+  </div>
+  <p>直觉上，$\hat m_t/\sqrt{\hat v_t}$ 是一个「<strong>信噪比缩放</strong>」：分子是梯度的平均方向，分母是梯度的典型幅度，相除后每个参数的有效步长大致被归一化到 $\eta$ 量级——这让 Adam 对不同尺度的参数和梯度都相对鲁棒，因此「拿来就能用」、几乎不用为每层单独调 lr。这正是它成为深度学习默认优化器的工程原因。</p>
+  <p>把四个优化器并排看，它们的差异可以浓缩成「用不用一阶矩（动量）× 用不用二阶矩（自适应步长）」的两个开关：</p>
+  <table>
+    <thead><tr><th>优化器</th><th>一阶矩（动量）</th><th>二阶矩（自适应步长）</th><th>主要痛点 / 定位</th></tr></thead>
+    <tbody>
+      <tr><td>SGD</td><td>✗</td><td>✗</td><td>简单、泛化好，但慢、对 lr 敏感</td></tr>
+      <tr><td>Momentum</td><td>✓</td><td>✗</td><td>加速峡谷、抑制横跳</td></tr>
+      <tr><td>AdaGrad / RMSProp</td><td>✗</td><td>✓</td><td>每参数自适应；AdaGrad 步长会饿死，RMSProp 修复</td></tr>
+      <tr><td>Adam / AdamW</td><td>✓</td><td>✓</td><td>二者兼得 + 偏差校正，深度学习默认</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="bias"><span class="num">5</span>偏差校正：为什么要除以 $1-\beta^t$</h2>
+  <p>偏差校正（bias correction）是 Adam 里最容易被当成「玄学常数」、其实有干净推导的一步。$m_t$、$v_t$ 都初始化为 0，前几步严重偏小（被那个 0 拖着），如果直接拿去当步长，初期会几乎不动。校正项 $1/(1-\beta^t)$ 正是把这个偏差精确抵消。</p>
+  <div class="callout intuition"><span class="label"></span>
+  <strong>微例（推一遍校正系数）。</strong>设梯度的真实期望恒为 $g$。展开一阶矩：$m_t=(1-\beta_1)\sum_{k=1}^{t}\beta_1^{\,t-k}g_k$。对它取期望（用 $\mathbb E[g_k]=g$）：$\mathbb E[m_t]=g\,(1-\beta_1)\sum_{k=1}^{t}\beta_1^{\,t-k}=g\,(1-\beta_1^{\,t})$。
+  也就是说 $m_t$ 系统性地偏小了一个因子 $(1-\beta_1^{\,t})$——于是定义 $\hat m_t=m_t/(1-\beta_1^{\,t})$，期望恰好回到 $g$，无偏。二阶矩 $v_t$ 同理除以 $(1-\beta_2^{\,t})$。注意 $t$ 大时 $\beta^t\to 0$，校正系数 $\to 1$，所以偏差校正<strong>只在训练初期起作用</strong>，后期自动淡出。</div>
+  <p>这就解释了一个常见现象：去掉偏差校正后，<strong>前期收敛明显变慢</strong>（步子被 0 初始化压住了），但训久之后两者趋同。notebook 里你会亲手关掉校正项、对比前 100 步的 loss 曲线，直观看到这个差异。面试里若被问「Adam 的偏差校正在干什么、能不能去掉」，能把上面这个期望展开写出来，就是满分回答。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="adamw"><span class="num">6</span>AdamW：解耦的 weight decay</h2>
+  <p>Adam 的原始论文把 L2 正则当成损失的一部分，于是正则的梯度 $\lambda\theta$ 被加进了 $g_t$。问题来了：这个 $\lambda\theta$ 随后会和真实梯度一起<strong>被自适应分母 $\sqrt{\hat v}$ 缩放</strong>。结果是梯度大的参数（$\hat v$ 大、分母大）受到的正则被缩小，梯度小的参数受到的正则被放大——正则强度变得依赖梯度历史，完全不是我们想要的「对所有权重一视同仁地拉向 0」。</p>
+  <p><span class="term">AdamW</span> 的修复极简：把 weight decay 从梯度里<strong>拿出来</strong>，直接作用在参数上，不经过自适应分母：</p>
+  <div class="math-block">
+  $$ \theta_{t+1}=\theta_t-\eta\Big(\underbrace{\hat m_t/(\sqrt{\hat v_t}+\epsilon)}_{\text{自适应更新}}\;+\;\underbrace{\lambda\,\theta_t}_{\text{解耦的衰减}}\Big) $$
+  </div>
+  <p>这个「解耦」让正则化对所有参数一致生效，实测泛化更好、超参更可迁移。<strong>今天几乎所有大模型（GPT、LLaMA 系列等）都用 AdamW</strong>，它是训练配置里最常见的默认。理解了这个区别，你看到论文写「Adam」还是「AdamW」就能立刻知道它们的正则行为差在哪。</p>
+  <p>还有一个实践细节值得记住：weight decay <strong>通常不施加在偏置和归一化层的参数上</strong>，只作用于权重矩阵。原因是偏置和 LayerNorm 的 scale/shift 参数维度很低、且把它们往 0 拉没有抗过拟合的意义，反而可能损害表达能力。各大训练框架的默认实现都会做这个「参数分组」。这类「公式之外的工程惯例」恰恰是面试中区分「读过论文」和「真训过模型」的地方。</p>
+  <div class="callout intuition"><span class="label"></span>
+  记忆口诀：<strong>Adam 把 weight decay 混进梯度、被自适应分母污染了；AdamW 把它拎出来单独加。</strong>
+  名字里的 W 就是「decoupled <em>W</em>eight decay」。L2 正则和 weight decay 在纯 SGD 下等价、在 Adam 下<em>不</em>等价——这个「在自适应优化器里两者不再等价」的点本身就是经典面试题。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="schedule"><span class="num">7</span>学习率调度：warmup 与 cosine</h2>
+  <p>固定学习率几乎从不是最优。现代训练普遍用<span class="term">学习率调度</span>：前期 warmup 升温、之后 cosine 衰减。</p>
+  <div class="ascii">
+   lr
+   │      ╱‾‾‾╲___              warmup: 前期线性升（防早期大梯度炸）
+   │     ╱        ‾‾‾‾╲___      cosine: 之后余弦衰减（后期精修）
+   │    ╱                  ‾‾╲_
+   └────┴──────────────────────► step
+       warmup        cosine decay
+  </div>
+  <p><strong>Warmup</strong>：训练初期参数还是随机的、梯度大且方向不可靠，Adam 的二阶矩 $v$ 也还没被几步梯度「热身」到可信（估计方差大），此时直接用峰值 lr 极易把参数一步推飞。先从接近 0 线性升到峰值，给优化器一个稳定的起步。这正是为什么大模型训练几乎都带几百到几千步的 warmup——它和 Adam 早期方差大的问题直接相关。</p>
+  <p><strong>Cosine decay</strong>：升到峰值后按 $\eta_t=\tfrac12\eta_{\max}\big(1+\cos(\pi\,t/T)\big)$ 平滑降到接近 0。后期小 lr 让参数在最优附近精细收敛、减少噪声带来的抖动，通常能多榨出可观的最终性能。相比「阶梯式」step decay，余弦衰减没有突变、更平滑，已成为大模型预训练的事实标准。notebook 里你会实现 warmup + cosine 调度，并对比「固定 lr」与「带调度」两条收敛曲线，直观看到调度带来的差距。</p>
+  <div class="callout danger"><span class="label"></span>
+  调度的一个隐藏陷阱：cosine 衰减的总步数 $T$ <strong>必须事先定好</strong>并和实际训练步数一致。如果你设了 $T=100\text{k}$ 却只训了 50k 步就停，lr 还停在峰值的一半、模型根本没「收尾」；反过来 $T$ 设小了，lr 会过早归零、后半程几乎不更新。复现别人结果时，warmup 步数和 cosine 总长是最容易被忽略却又决定成败的两个数。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="converge"><span class="num">8</span>收敛性、鞍点与隐式正则</h2>
+  <p>对<strong>凸</strong>问题（如逻辑回归），梯度下降在合适 lr 下保证收敛到全局最优，理论很干净。但神经网络的损失是<strong>高度非凸</strong>的——直觉上似乎该担心「卡在糟糕的局部极小」。然而高维空间的真相反而让人安心：高维里<strong>鞍点远多于局部极小</strong>（一个临界点要成为局部极小，Hessian 的所有特征值都得为正，维度越高越罕见）。所以深度学习的主要障碍其实是<strong>鞍点附近的平台</strong>（梯度接近 0、进展极慢），而不是被困在坏极小里。</p>
+  <p>这也解释了前面几个组件为什么有用：动量帮助小球带惯性冲过平台；mini-batch 噪声给临界点附近一个随机扰动、把参数从鞍点踢开；自适应步长在平台上放大有效步长。它们合起来对抗的，主要就是鞍点。另一个值得知道的事实是：神经网络的损失曲面虽非凸，但大量经验和理论（如 mode connectivity 的工作）显示，<strong>不同的好极小之间常常由一条 loss 几乎不变的低谷相连</strong>，并不是彼此孤立的深坑。这进一步缓解了「会不会卡在一个坏极小」的担忧——实践中，只要 lr 调对、训练够久，SGD/Adam 几乎总能找到泛化不错的解。</p>
+  <div class="callout intuition"><span class="label"></span>
+  <strong>隐式正则与平坦极小。</strong>SGD 不只是「找一个极小」，它<em>偏好</em>平坦的极小值——这被称为隐式正则化（implicit regularization）。直觉：平坦极小处，参数小幅扰动 loss 也几乎不变，对应的模型对数据/权重的微小变化更鲁棒，因而泛化更好；尖锐极小则相反，训练 loss 很低但稍一扰动就崩。大 batch 减少了 SGD 噪声，更容易掉进尖锐极小，这被认为是「大 batch 泛化差」（generalization gap）的一个解释。这个视角把「优化」和「泛化」（模块 06）直接连了起来：你怎么优化，部分决定了你泛化得多好。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>调参诊断与研究前沿</h2>
+  <p>先给一套可直接上手的<strong>调参与诊断流程</strong>，再谈前沿。</p>
+  <table>
+    <thead><tr><th>现象</th><th>最可能的原因</th><th>第一步动作</th></tr></thead>
+    <tbody>
+      <tr><td>loss 上天 / 变 NaN</td><td>lr 太大、没 warmup、梯度爆炸</td><td>降 lr 一个量级、加 warmup、加梯度裁剪</td></tr>
+      <tr><td>loss 卡在一条平台</td><td>lr 太小、鞍点、数据/标签有问题</td><td>升 lr 试探、检查数据管线、看梯度范数</td></tr>
+      <tr><td>loss 后期不再降</td><td>该衰减 lr 了</td><td>启用 cosine / step decay</td></tr>
+      <tr><td>train 降得好、val 不降</td><td>过拟合（模块 06）</td><td>加正则 / 早停 / 更多数据</td></tr>
+    </tbody>
+  </table>
+  <p><strong>调参顺序</strong>：永远先调 lr（按量级扫 1e-2 → 1e-5，找到不炸又不太慢的那档），再依次调 batch size、warmup 步数、weight decay。<strong>lr 错了，其它怎么调都白搭</strong>——这是最高优先级的旋钮。一个高效的做法是先用很短的训练做「lr range test」：让 lr 从极小指数增长，画出 loss 随 lr 的曲线，loss 开始下降最快的那一段就是合适的量级，loss 开始上扬处就是上限。这能在几分钟内把 lr 锁定到正确数量级，省去盲目试错。</p>
+  <ul>
+    <li><strong>符号 / 二阶优化器</strong>：Lion（只用梯度符号、内存省一半）、Sophia（轻量二阶，用对角 Hessian 估计）、Shampoo（结构化二阶预条件），在大模型上探索比 AdamW 更快的收敛——但 AdamW 至今仍是最稳、最被信任的默认。</li>
+    <li><strong>超参迁移（muP / μTransfer）</strong>：用一种参数化方式让最优 lr 在不同模型宽度下保持一致，于是可以在小模型上调好 lr 直接迁到大模型，省下天价的大模型调参成本。</li>
+    <li><strong>大 batch 训练</strong>：LARS / LAMB 等逐层自适应优化器让 batch size 扩到上万仍能收敛，是大规模分布式训练的关键；但前述「大 batch 泛化差」的张力仍是开放问题。</li>
+  </ul>
+  <div class="callout paper"><span class="label"></span>
+  Kingma &amp; Ba 2015 <em>Adam</em>；Loshchilov &amp; Hutter 2019 <em>Decoupled Weight Decay Regularization (AdamW)</em>；
+  Sutskever et al. 2013（momentum 的重要性）；Goodfellow et al. <em>Deep Learning</em> ch.8（优化全景）。详见 <a href="../references.md">论文清单</a>。</div>
+  <div class="callout intuition"><span class="label"></span>
+  学完本章，你应该能：手写 SGD / Momentum / RMSProp / Adam / AdamW 五个优化器的更新式、推导 Adam 偏差校正为何除以 $1-\beta^t$、解释 AdamW 的解耦 weight decay 与 Adam 的区别、实现 warmup + cosine 调度，并用一张诊断表把训练曲线的异常对应到具体动作。下面去 notebook，在真实乳腺癌数据上从零实现这五个优化器并对比它们的收敛曲线。</div>
+
+  <div class="pager">
+    <a href="../04_unsupervised_learning/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 无监督学习</div></a>
+    <a class="next" href="05_optimizers_from_scratch.ipynb"><div class="dir">Notebook →</div><div class="t">打开配套练习</div></a>
+  </div>
+</div>
+</body>
+</html>

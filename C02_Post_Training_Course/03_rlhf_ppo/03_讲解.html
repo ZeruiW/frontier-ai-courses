@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · RLHF 与 PPO</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · RLHF 与 PPO</h1>
+  <p class="subtitle">Reinforcement Learning from Human Feedback —— 把奖励模型的判断变成策略的行为：本课程推导最重的一章</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（SFT）、模块 02（奖励模型与 BT loss）、概率梯度基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_rlhf_ppo.ipynb（玩具 RLHF 全流程复现）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Schulman 2017 (PPO)、Ouyang 2022、Bai 2022、Zheng 2023</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 90 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#pipeline">RLHF 三段式：SFT → RM → RL</a></li>
+      <li><a href="#objective">RLHF 目标函数：reward 减 KL</a></li>
+      <li><a href="#pg">Policy Gradient 从零推：REINFORCE 与 baseline</a></li>
+      <li><a href="#ppo">PPO 核心：importance ratio 与 clipped surrogate</a></li>
+      <li><a href="#gae">GAE：advantage 估计的 bias–variance 旋钮</a></li>
+      <li><a href="#token">token 级实现细节：LLM-PPO ≠ 经典 RL</a></li>
+      <li><a href="#stability">训练不稳定性实务：为什么 PPO 出了名地难调</a></li>
+      <li><a href="#eval">评测视角：RLHF 之后必须测什么</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">1</span>RLHF 三段式：SFT → RM → RL</h2>
+
+  <p>InstructGPT [Ouyang 2022] 确立的 <span class="term">RLHF</span>（Reinforcement Learning from Human Feedback）三段式，至今仍是对齐流水线的参照系：</p>
+
+  <div class="ascii">
+  阶段一 SFT（模块 01）        阶段二 RM（模块 02）           阶段三 RL（本章）
+ ┌─────────────────┐      ┌──────────────────────┐     ┌─────────────────────────────┐
+ │ 预训练模型        │      │ SFT 模型采样多个回答    │     │           PPO 训练循环        │
+ │   + 人工示范数据   │ ───► │   人类标注偏好排序      │ ──► │  ┌────────┐ 生成 y           │
+ │   = π_SFT        │      │   BT loss 训练 r_φ    │     │  │ Policy │────────┐         │
+ └─────────────────┘      └──────────────────────┘     │  │ π_θ 🔥 │        ▼         │
+                                                       │  └────────┘   ┌─────────┐    │
+   PPO 阶段同时驻留 4 个模型：                             │  ┌────────┐   │ RM r_φ ❄│──► r│
+                                                       │  │ Ref    │   └─────────┘    │
+   🔥 = 参与训练   ❄ = 冻结                               │  │ π_ref ❄│──► per-token KL  │
+                                                       │  └────────┘                  │
+                                                       │  ┌────────┐                  │
+                                                       │  │ Value  │──► V(s_t) → GAE  │
+                                                       │  │  V_ψ 🔥 │      → advantage │
+                                                       │  └────────┘                  │
+                                                       └─────────────────────────────┘
+  </div>
+
+  <p>四个模型各司其职，<strong>显存账</strong>是理解 RLHF 工程代价的第一步（以 7B 模型、bf16 + Adam 为例）：</p>
+
+  <table>
+    <thead><tr><th>模型</th><th>训练？</th><th>作用</th><th>显存近似（每参数）</th><th>7B 量级</th></tr></thead>
+    <tbody>
+      <tr><td>Policy $\pi_\theta$</td><td>🔥 是</td><td>被优化的目标模型，rollout 时负责生成</td><td>权重 2B + 梯度 2B + Adam 状态 ~12B ≈ 16 字节</td><td>~112 GB</td></tr>
+      <tr><td>Reference $\pi_{\text{ref}}$</td><td>❄ 否</td><td>KL 锚点（通常 = SFT 模型的冻结副本）</td><td>仅推理 ~2 字节</td><td>~14 GB</td></tr>
+      <tr><td>Reward Model $r_\phi$</td><td>❄ 否</td><td>给完整回答打分（序列级标量）</td><td>仅推理 ~2 字节</td><td>~14 GB</td></tr>
+      <tr><td>Value Model $V_\psi$</td><td>🔥 是</td><td>估计每个 token 位置的期望回报，供 advantage 用</td><td>训练态 ~16 字节</td><td>~112 GB</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  合计约 <strong>250 GB+ 显存（未计激活与 KV cache）</strong>，还要在「生成（推理引擎）↔ 训练（反传）」两种模式间切换权重。这是 RLHF 基础设施昂贵、也是模块 04 的 DPO（把四个模型砍到两个、去掉在线采样）大受欢迎的根本原因。Value model 常用 RM 权重初始化；也有实现让 value head 共享 policy 主干以省显存，代价是两个目标互相干扰 [Zheng 2023]。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="objective"><span class="num">2</span>RLHF 目标函数：reward 减 KL</h2>
+
+  <p>RLHF 的优化目标不是裸的「最大化 RM 分数」，而是带 <span class="term">KL 惩罚</span>（KL penalty）的约束式目标 [Ouyang 2022]：</p>
+
+  <div class="math-block">
+  $$ \max_{\theta}\;\; \mathbb{E}_{x\sim\mathcal{D},\, y\sim\pi_\theta(\cdot|x)}\Big[\, r_\phi(x,y) \,\Big]
+     \;-\; \beta\,\mathbb{D}_{\mathrm{KL}}\!\Big[\pi_\theta(y|x)\,\big\|\,\pi_{\text{ref}}(y|x)\Big] $$
+  </div>
+
+  <p>实现上常把 KL 折进奖励，得到等价的「整形奖励」（shaped reward）：</p>
+
+  <div class="math-block">
+  $$ R(x,y) \;=\; r_\phi(x,y)\;-\;\beta\,\log\frac{\pi_\theta(y|x)}{\pi_{\text{ref}}(y|x)} $$
+  </div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>RM 只是人类偏好的<strong>有缺陷的代理</strong>。如果让 policy 不计代价地刷 RM 分数，它会找到 RM 的盲区——输出冗长、空洞、谄媚甚至乱码的内容，RM 给高分但人类觉得很差。KL 项就是一根缰绳：你可以离开 SFT 模型去找更好的回答，但每走远一步都要付费，走得越远（越「不像正常语言模型会说的话」）罚得越狠。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>$r_\phi$ 仅在其训练分布（SFT 模型的输出附近）上是 $r_{\text{human}}$ 的良好估计。无约束最大化会把 $\pi_\theta$ 推出该分布，进入 RM 的外推区域，proxy reward 与 true reward 解耦——即 <span class="term">reward hacking</span> / reward overoptimization，且 proxy–true 差距随 KL 距离系统性增大 [Gao 2022]。KL 正则把搜索限制在 $\pi_{\text{ref}}$ 的信任邻域内，同时保持语言流畅性与输出多样性（防 mode collapse）。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  把 $\beta$ 理解为 <strong>「KL 预算」的价格</strong>：$\beta\!\to\!0$ 时 policy 自由刷分，必然 hack；$\beta$ 过大时 policy 被钉死在 $\pi_{\text{ref}}$ 上学不到东西。notebook 的核心实验就是复现这条曲线：$\beta=0$ 收敛到 hack 回答、KL 飙升；$\beta$ 适中收敛到真正的好回答。另外 InstructGPT 还混入预训练梯度（PPO-ptx）以缓解能力回退 [Ouyang 2022]——这是「对齐税」话题的伏笔（§8 与模块 06）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="pg"><span class="num">3</span>Policy Gradient 从零推：REINFORCE 与 baseline</h2>
+
+  <p>有了目标 $J(\theta)=\mathbb{E}_{y\sim\pi_\theta}[R(y)]$，问题来了：<strong>采样这个动作是离散的、不可导的</strong>，梯度怎么求？答案是 <span class="term">log-derivative trick</span>（似然比技巧）：</p>
+
+  <div class="math-block">
+  $$ \nabla_\theta J(\theta)
+     = \nabla_\theta \sum_y \pi_\theta(y)\,R(y)
+     = \sum_y \pi_\theta(y)\,\frac{\nabla_\theta \pi_\theta(y)}{\pi_\theta(y)}\,R(y)
+     = \mathbb{E}_{y\sim\pi_\theta}\Big[ R(y)\,\nabla_\theta \log \pi_\theta(y) \Big] $$
+  </div>
+
+  <p>这就是 <span class="term">REINFORCE</span>：采样 $y$，按回报 $R(y)$ 加权地提升 $\log\pi_\theta(y)$。直觉：<strong>好的回答→提升它的概率；坏的回答→降低它的概率；权重就是回报本身</strong>。它是无偏估计，但有一个致命问题——<strong>方差极高</strong>。</p>
+
+  <p>设想所有回报都是正数（比如 RM 分数在 5~6 之间）：REINFORCE 会对<em>每一个</em>采到的回答都说「提升概率」，只是幅度略有不同。真正的学习信号藏在「比平均好多少」里，却被巨大的共同偏移淹没。解法是减去一个 <span class="term">baseline</span> $b$：</p>
+
+  <div class="math-block">
+  $$ \nabla_\theta J(\theta) = \mathbb{E}\Big[ \big(R(y)-b\big)\,\nabla_\theta \log \pi_\theta(y) \Big],
+     \qquad\text{无偏性：}\;
+     \mathbb{E}\big[ b\,\nabla_\theta \log \pi_\theta(y) \big]
+     = b\,\nabla_\theta \underbrace{\sum_y \pi_\theta(y)}_{=\,1} = 0 $$
+  </div>
+
+  <p>只要 $b$ 不依赖于动作 $y$，减去它<strong>不改变期望、只降低方差</strong>。方差最优的 baseline 近似于回报的期望，即状态价值函数 $V(s)$。由此引出核心量 <span class="term">advantage</span>：</p>
+
+  <div class="math-block">
+  $$ A(s,a) \;=\; Q(s,a) - V(s) \;\approx\; \text{「这个动作比该状态下的平均水平好多少」} $$
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  这条线索贯穿整个后训练谱系：<strong>policy gradient 的一切变体都在回答「advantage 怎么估计」</strong>。PPO 用 value model + GAE（§4–5）；模块 05 的 GRPO 干脆用「同一 prompt 采一组回答、组内减均值」当 baseline，把 value model 整个省掉。notebook 会让你亲眼看到无 baseline 与有 baseline 的梯度方差差距。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="ppo"><span class="num">4</span>PPO 核心：importance ratio 与 clipped surrogate</h2>
+
+  <p>REINFORCE + baseline 仍有两个工程死穴：①每个样本只能用一次梯度就得重采（<span class="term">on-policy</span>，而 LLM 的「采样」是昂贵的生成）；②一次大步长更新可能毁掉策略，且坏策略采出坏数据、形成死亡螺旋。<span class="term">PPO</span>（Proximal Policy Optimization）[Schulman 2017] 用两件武器解决它。</p>
+
+  <h3>4.1 importance ratio：用旧数据评估新策略</h3>
+
+  <p>想用旧策略 $\pi_{\theta_{\text{old}}}$ 采的数据更新新策略 $\pi_\theta$（同一批 rollout 反复用几个 epoch），就要做重要性采样校正：</p>
+
+  <div class="math-block">
+  $$ \mathbb{E}_{a\sim\pi_\theta}\big[A(s,a)\big]
+     = \mathbb{E}_{a\sim\pi_{\theta_{\text{old}}}}\!\Big[\frac{\pi_\theta(a|s)}{\pi_{\theta_{\text{old}}}(a|s)}\,A(s,a)\Big],
+     \qquad
+     r_t(\theta)\;=\;\frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)} = e^{\,\log\pi_\theta - \log\pi_{\theta_{\text{old}}}} $$
+  </div>
+
+  <p>由此得到代理目标（surrogate objective）$L^{\text{IS}}(\theta)=\mathbb{E}_t[\,r_t(\theta)A_t\,]$。但 importance sampling 只在两个分布接近时方差可控——$r_t$ 偏离 1 越远，估计越不可信，而最大化 $L^{\text{IS}}$ 恰恰<em>鼓励</em> $r_t$ 越推越大。前身 TRPO 用显式约束 $\mathbb{D}_{\mathrm{KL}}[\pi_{\theta_{\text{old}}}\|\pi_\theta]\le\delta$ 解决，但需要二阶优化，工程笨重。</p>
+
+  <h3>4.2 clipped surrogate：一行 min 近似 trust region</h3>
+
+  <div class="math-block">
+  $$ L^{\text{CLIP}}(\theta) \;=\; \mathbb{E}_t\Big[\,
+     \min\!\Big( r_t(\theta)\,A_t,\;\; \mathrm{clip}\big(r_t(\theta),\,1-\epsilon,\,1+\epsilon\big)\,A_t \Big) \Big],
+     \qquad \epsilon \approx 0.2 $$
+  </div>
+
+  <p>逐情形拆开看（这张表必须烂熟）：</p>
+
+  <table>
+    <thead><tr><th>情形</th><th>ratio 区间</th><th>生效项</th><th>梯度</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>$A_t&gt;0$，温和提升</td><td>$r_t \le 1+\epsilon$</td><td>$r_t A_t$</td><td>正常</td><td>好动作，继续提升概率</td></tr>
+      <tr><td>$A_t&gt;0$，提升过头</td><td>$r_t &gt; 1+\epsilon$</td><td>$(1{+}\epsilon)A_t$（常数）</td><td><strong>= 0</strong></td><td>已经赚够了，掐断激励，不再推</td></tr>
+      <tr><td>$A_t&lt;0$，温和压低</td><td>$r_t \ge 1-\epsilon$</td><td>$r_t A_t$</td><td>正常</td><td>坏动作，继续压低概率</td></tr>
+      <tr><td>$A_t&lt;0$，压低过头</td><td>$r_t &lt; 1-\epsilon$</td><td>$(1{-}\epsilon)A_t$（常数）</td><td><strong>= 0</strong></td><td>罚够了，掐断梯度</td></tr>
+      <tr><td>$A_t&lt;0$ 但 $r_t&gt;1{+}\epsilon$（更新方向错了）</td><td>—</td><td>$\min$ 取 $r_t A_t$（更负）</td><td><strong>不被 clip</strong></td><td>外侧 min 保证「变得更差」永远有梯度去纠正</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>为什么 clip 能近似 trust region？</strong> 关键在 $\min$ 的方向性：它构造了原目标的<strong>悲观下界</strong>（pessimistic lower bound）——凡是「让目标变好」的方向，收益被 $1\pm\epsilon$ 封顶，于是把 $r_t$ 推离 1 不再有利可图，策略更新被软性束缚在旧策略附近；而凡是「让目标变坏」的方向，惩罚不设上限、梯度永不消失。优化一个下界的最大化器，效果上等价于带 KL 信任域的保守更新，却只需一阶优化器和一行 <code>torch.clamp</code> [Schulman 2017]。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>别混淆 LLM-PPO 里的两个 KL！</strong> ① $\pi_\theta$ vs $\pi_{\theta_{\text{old}}}$：clip 控制的对象，目的是<em>优化稳定</em>，每个 rollout 周期后 $\pi_{\theta_{\text{old}}}$ 就更新；② $\pi_\theta$ vs $\pi_{\text{ref}}$：目标函数里的 $\beta$ KL 惩罚（§2），目的是<em>防 reward hacking</em>，$\pi_{\text{ref}}$ 全程冻结。面试与 debug 中这是高频混淆点。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="gae"><span class="num">5</span>GAE：advantage 估计的 bias–variance 旋钮</h2>
+
+  <p>$L^{\text{CLIP}}$ 里的 $A_t$ 从哪来？朴素的两个极端都不好用：用整条轨迹的实际回报（Monte Carlo）无偏但方差大；用单步 TD 估计 $r_t+\gamma V(s_{t+1})-V(s_t)$ 方差小但继承了 value 函数的偏差。<span class="term">GAE</span>（Generalized Advantage Estimation）用参数 $\lambda$ 在两者之间连续插值。定义单步 TD 残差：</p>
+
+  <div class="math-block">
+  $$ \delta_t \;=\; r_t + \gamma V(s_{t+1}) - V(s_t) $$
+  </div>
+
+  <p>GAE 是 TD 残差的指数加权和，并满足一个便于实现的反向递推：</p>
+
+  <div class="math-block">
+  $$ \hat{A}_t^{\mathrm{GAE}(\gamma,\lambda)} \;=\; \sum_{l=0}^{\infty} (\gamma\lambda)^l\,\delta_{t+l}
+     \qquad\Longleftrightarrow\qquad
+     \hat{A}_t \;=\; \delta_t + \gamma\lambda\,\hat{A}_{t+1} $$
+  </div>
+
+  <ul>
+    <li>$\lambda=0$：$\hat{A}_t=\delta_t$，纯单步 TD —— <strong>低方差、高偏差</strong>（完全信任 value model）。</li>
+    <li>$\lambda=1$：$\hat{A}_t=\sum_l \gamma^l r_{t+l} - V(s_t)$，纯 Monte Carlo —— <strong>无偏（给定轨迹）、高方差</strong>。</li>
+    <li>实务常用 $\lambda\in[0.9, 1.0]$；LLM-PPO 中因为回答长度有限、奖励集中在末端，常取 $\gamma=1,\ \lambda\approx0.95$ [Zheng 2023]。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  把 $\lambda$ 读作「我多信任 value model」：value 估得准就调低 $\lambda$ 吃低方差红利；value 不准（RLHF 早期、reward 刚换、value 刚随机初始化时）就调高 $\lambda$ 少受其偏差拖累。这也是为什么很多实现先 freeze policy 几步「热身」value model。notebook 练习 2 会让你手算一个 3 步序列并实现这个递推。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="token"><span class="num">6</span>token 级实现细节：LLM-PPO ≠ 经典 RL</h2>
+
+  <p>把 PPO 套到语言模型上，MDP 的映射是：<strong>state = prompt + 已生成前缀，action = 下一个 token，一条回答 = 一个 episode</strong>。这个映射带来一系列与 Atari/MuJoCo 截然不同的实现细节 [Zheng 2023]：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>经典 RL（Atari/MuJoCo）</th><th>LLM-PPO</th></tr></thead>
+    <tbody>
+      <tr><td>动作空间</td><td>几个到几十个离散动作 / 低维连续</td><td>整个词表（30k–150k 类）</td></tr>
+      <tr><td>状态转移</td><td>环境动力学，未知且随机</td><td>确定性拼接：$s_{t+1}=s_t \oplus a_t$，「环境」是模型自己</td></tr>
+      <tr><td>episode 长度</td><td>数百到数万步</td><td>一条回答，几十到几千 token</td></tr>
+      <tr><td>奖励密度</td><td>常有过程奖励</td><td><strong>稀疏</strong>：RM 只在最后一个 token 给一个标量</td></tr>
+      <tr><td>每步代价</td><td>模拟器，便宜</td><td>rollout = 自回归生成，极贵，常占墙钟 50%+ </td></tr>
+      <tr><td>初始策略</td><td>随机</td><td>SFT 模型——已经很强，怕的是「练坏」而非「练不会」</td></tr>
+    </tbody>
+  </table>
+
+  <p>五个 token 级关键实现（trl / 各家内部框架基本一致）：</p>
+
+  <ul>
+    <li><strong>per-token KL 折进 reward</strong>：序列级 RM 分数只加在最后一个生成 token 上；其余每个 token 的即时奖励是 $-\beta\big(\log\pi_\theta(a_t|s_t)-\log\pi_{\text{ref}}(a_t|s_t)\big)$。这样 KL 惩罚被 GAE 自然地分摊回每个 token 的 advantage —— 练习 3 实现的就是它：
+      <div class="math-block">
+      $$ r_t \;=\; -\,\beta\,\mathrm{KL}_t \;+\; \underbrace{r_\phi(x,y)\cdot\mathbb{1}[t=T]}_{\text{只在最后一个 token}} $$
+      </div>
+    </li>
+    <li><strong>value head</strong>：在 policy（或独立 value model）顶部加一个 <code>hidden_size → 1</code> 的线性头，对<em>每个 token 位置</em>输出 $V(s_t)$ —— 价值是对「前缀」的估值，所以是逐位置的。</li>
+    <li><strong>advantage whitening</strong>：对一个 batch 内的 $\hat A_t$ 做 $(\hat A - \mu)/\sigma$ 标准化，稳定不同 batch 间的梯度尺度——廉价但被反复证明关键的技巧 [Zheng 2023]。</li>
+    <li><strong>只对生成段计算</strong>：prompt 部分的 token 不是 policy 的「动作」，必须 mask 掉——logprob、KL、value loss、advantage 一律只算 response 段。与模块 01 的 SFT loss masking 同源。</li>
+    <li><strong>value loss 同样 clip</strong>：$V$ 的更新也常做 clipped 形式并与 policy loss 加权合并（系数 ~0.5），再加 entropy bonus 防止过早收敛到确定性策略。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="stability"><span class="num">7</span>训练不稳定性实务：为什么 PPO 出了名地难调</h2>
+
+  <p>PPO 的工程恶名来自一个事实：它是<strong>四个模型、两个优化器、十几个耦合超参数组成的反馈闭环</strong>，任何一环失衡都会通过「policy 采样 → 数据分布 → 下一轮训练」的回路自我放大。高频故障模式：</p>
+
+  <ul>
+    <li><strong>KL 爆炸</strong>：$\beta$ 过小或 lr 过大，policy 飞速逃离 $\pi_{\text{ref}}$，生成质量肉眼可见地崩坏（重复、乱码），而 RM 分数可能还在「上涨」——典型的 reward hacking 进行时。处置：调大 $\beta$ / 用自适应 KL 控制器（KL 超目标值就加 $\beta$，低于就减）/ 降 lr / 减少每批数据的复用 epoch。</li>
+    <li><strong>KL 坍缩</strong>：$\beta$ 过大或 reward 信号太弱，policy 钉死在 $\pi_{\text{ref}}$，reward 曲线一条直线。RLHF 等于白做。</li>
+    <li><strong>reward 方差与漂移</strong>：RM 分数的尺度是任意的（BT loss 只约束差值），不同 prompt 难度差异巨大。必须做 reward normalization / whitening，否则 value model 永远追不上目标 [Zheng 2023]。</li>
+    <li><strong>batch 配比失衡</strong>：rollout batch（如 512 条回答）→ 切成 minibatch → 复用 $K$ 个 PPO epoch。$K$ 太大时 $\pi_\theta$ 已远离 $\pi_{\theta_{\text{old}}}$，大量 token 落入 clip 区、梯度静默消失，表面在训练实际没学习。监控指标：<code>clip_fraction</code>（被 clip 的 token 比例，健康值 &lt;0.2~0.3）。</li>
+    <li><strong>value 滞后</strong>：reward 一变（比如换 RM、加规则惩罚），value 估计全错 → advantage 全错 → policy 乱走。所以换奖励后要给 value 热身期。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>最危险的不是 loss 变成 NaN，而是「指标好看、模型变坏」。</strong> RM 分数上升、KL 在预算内、loss 平稳下降——同时模型学会了奉承、套话和万能拒绝。PPO 的 dashboard 没有任何一条曲线直接测「人类真实满意度」。这就是为什么 §8 的评测必须独立于训练指标存在，也是评测岗位在 RLHF 团队里的真实价值。</div>
+
+  <div class="callout paper"><span class="label"></span>
+  [Zheng 2023] <em>Secrets of RLHF Part I</em> 系统消融了这些技巧，结论值得记住：reward 归一化/裁剪、advantage whitening、value loss clip、合适的 KL 系数这几件「小事」共同决定成败；PPO-max 配方与 vanilla PPO 在 LLM 上的差距是「能训出来」与「必然崩」的差距。[Bai 2022] 则给出工程侧另一条经验：RLHF 训练越久、KL 越大，越要警惕 helpfulness 与 harmlessness 的此消彼长。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">8</span>评测视角：RLHF 之后必须测什么</h2>
+
+  <p>RLHF 优化的是「RM 心中的好」，所以评测的天职是抓住「RM 的好」与「真实的好」之间的裂缝。RLHF 之后的必测清单：</p>
+
+  <ul>
+    <li><strong>谄媚（sycophancy）</strong>：人类标注者系统性偏好顺从、赞同的回答，RM 学到这个偏好，PPO 把它放大。测法：同一问题配上用户的不同立场前缀，看答案是否随立场翻转。</li>
+    <li><strong>长度偏置（length bias）</strong>：RM 普遍偏好更长回答，PPO 后输出长度往往显著膨胀。测法：胜率评测必须做长度控制（length-controlled win rate，模块 06 详述），否则你测的是「变长了」不是「变好了」。</li>
+    <li><strong>拒绝率漂移（refusal drift）</strong>：harmlessness 信号过强时，模型对良性请求也开始拒绝（over-refusal）。必须同时跑「应拒（有害提示）」与「不应拒（边界但良性提示）」两套集合，盯住两个方向的错误率 [Bai 2022]。</li>
+    <li><strong>能力保持</strong>：固定一组 SFT 时代的能力基准（数学/代码/知识），PPO 前后对照，量化对齐税（alignment tax）。InstructGPT 用 PPO-ptx 缓解的正是这个 [Ouyang 2022]。</li>
+  </ul>
+
+  <p><strong>KL 预算是把这些现象串起来的单一标尺</strong>：KL 越大，policy 离 SFT 分布越远——RM 分数越高，但 hacking 风险、风格漂移、能力遗忘同步上升 [Gao 2022]。成熟团队会把「proxy RM 分数 / 独立 held-out RM 分数 / 人评胜率」三条曲线对着 KL 画在一张图上：proxy 一路上升而 held-out 与人评先升后降的「倒 U」拐点，就是该停训的位置。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  作为评测科学家，拿到一个 RLHF 模型先问三个数：<strong>训了多少 KL？clip_fraction 多少？长度膨胀了多少？</strong> 这三个数比 reward 曲线更诚实。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>PPO 简化潮</strong>：四模型架构太贵，最大的简化目标是 value model。GRPO（模块 05）用「同 prompt 一组回答的组内均值」做 baseline，直接删掉 value model；各类 REINFORCE 复兴方案（leave-one-out baseline 等）论证：LLM 的单 episode、末端稀疏奖励场景里，bandit 式估计已经够用，经典 RL 的 credit assignment 机制可能是多余的。开放问题：在长程 agent 任务（奖励真正多步延迟）上，这些简化是否会重新失效？</li>
+    <li><strong>REINFORCE 回归 vs PPO 坚守</strong>：简化派赢在便宜和好调，PPO 派赢在数据复用与 off-policy 容忍度。评测视角：两类算法在相同 KL 预算下的 per-FLOP 对齐收益，仍缺乏公认的公平比较协议。</li>
+    <li><strong>在线 vs 离线</strong>：PPO 在线采样贵但始终在自己的分布上学习；DPO 家族（模块 04）离线、便宜，但受困于训练数据与当前 policy 的分布错配。iterative/online DPO 试图折中。开放问题：在线性（on-policyness）本身值多少分？多大程度可以被高质量离线数据替代？</li>
+    <li><strong>reward hacking 的早期检测</strong>：能否从 KL 轨迹、token 熵谱、生成长度漂移等训练内信号在线预警 hacking，而不是等人评发现？目前各实验室主要靠 held-out RM 加人工抽检，这是评测方法学的真空地带。</li>
+    <li><strong>从偏好 RM 到可验证奖励</strong>：数学/代码等可自动判分的任务正在绕开 RM 直接用规则奖励（RLVR，模块 05）。开放问题：可验证域上 RL 学到的「能力」能否迁移回不可验证域，以及如何评测这种迁移。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>写出 RLHF 的完整目标函数，并解释去掉 KL 项后训练会如何失败（结合 reward hacking 机理）。</li>
+      <li>从 log-derivative trick 出发推导 REINFORCE，并证明减 baseline 不改变梯度期望、只降方差。</li>
+      <li>写出 PPO 的 clipped surrogate，逐情形说明 $A&gt;0$ / $A&lt;0$、ratio 在区间内/外时 min 与 clip 各起什么作用，以及它为何近似 trust region。</li>
+      <li>LLM-PPO 中 per-token reward 如何构造（KL 在哪、RM 分数在哪）？两个 KL（vs old / vs ref）各管什么？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../02_reward_models/02_讲解.html"><div class="dir">← 上一章</div><div class="t">02 · 奖励模型</div></a>
+    <a class="next" href="../04_dpo_family/04_讲解.html"><div class="dir">下一章 →</div><div class="t">04 · DPO 家族：推导与实跑</div></a>
+  </div>
+
+</div>
+</body>
+</html>

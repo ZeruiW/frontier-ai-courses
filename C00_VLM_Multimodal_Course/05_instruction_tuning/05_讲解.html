@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 视觉指令微调与对齐</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 10</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 视觉指令微调与对齐</h1>
+  <p class="subtitle">Visual Instruction Tuning &amp; Alignment —— 从"会对齐"到"会对话、会听话、少说谎"</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">VLM 架构（03/04）、connector、自回归 LM、交叉熵损失</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge gpu">GPU</span> 05_instruction_tuning.ipynb（4-bit，~8–12GB）</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">LLaVA (2023)、LoRA、QLoRA、DPO、RLHF-V</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 75 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#birth">从"会对齐"到"会对话"：visual instruction tuning 的诞生</a></li>
+      <li><a href="#data">SFT 数据构造：detail / conversation / complex reasoning 三类</a></li>
+      <li><a href="#lora">高效微调：LoRA 与 QLoRA 的数学</a></li>
+      <li><a href="#dpo">偏好对齐：RLHF 流程与 DPO 推导</a></li>
+      <li><a href="#vlm-align">VLM 特有的对齐：抑制幻觉</a></li>
+      <li><a href="#practice">训练实操要点：超参、冻结、灾难性遗忘</a></li>
+      <li><a href="#eval">评测视角：能力提升 vs 幻觉变化</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="birth"><span class="num">1</span>从"会对齐"到"会对话"：visual instruction tuning 的诞生</h2>
+
+  <p>到模块 04 为止，我们已经能把视觉编码器、connector、LLM 拼成一个 VLM，并用海量图文对做<strong>对齐预训练</strong>（pretraining / feature alignment）。但这样的模型只是"会描述图"——你给它一张图，它倾向于吐出一句 caption，<strong>不会跟你对话、不会follow你的指令、不会做多轮推理</strong>。它对齐了模态，却没学会"听话"。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>对齐预训练教会模型"图和字是怎么对应的"。但它从没见过"用户问一个问题、助手给一个有用回答"这种格式。
+      指令微调（<span class="term">instruction tuning</span>）就是用一堆"图 + 指令 + 理想回答"的样例，把模型从"会描述"调教成"会对话、会照做"。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>预训练优化的是图文条件语言建模 $p_\theta(\text{caption}\mid\text{image})$，分布偏向短描述。
+      指令微调（<span class="term">SFT, Supervised Fine-Tuning</span>）在 $(\text{image},\,\text{instruction},\,\text{response})$ 三元组上做监督学习，
+      只对 response 的 token 计交叉熵，把模型的输出分布对齐到"helpful assistant"这一行为模式上。</p>
+    </div>
+  </div>
+
+  <p>真正点燃这条路线的是 <span class="term">LLaVA</span> [Liu 2023, <em>Visual Instruction Tuning</em>]。它的关键洞见不是模型结构（结构极简：CLIP 编码器 + 一个线性/MLP 投影 + Vicuna LLM），而是<strong>数据的来源</strong>：</p>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>LLaVA 的核心 trick——用纯文本 GPT-4 自举生成视觉指令数据。</strong> 当时的 GPT-4 还看不见图，怎么让它生成"看图对话"？
+  办法是把图像<strong>符号化</strong>：把 COCO 的人工标注——captions（5 句描述）+ bounding boxes（物体类别 + 坐标框）——以纯文本喂给 GPT-4，
+  让它"假装看过这张图"，据此生成对话、详细描述、复杂推理。GPT-4 从没见过像素，却能基于这些符号写出高质量的视觉指令数据。这是一次经典的<strong>能力蒸馏</strong>（用强文本模型的推理能力，蒸馏出多模态训练数据）。</div>
+
+  <div class="ascii">
+   COCO 人工标注（纯文本符号化表示）
+   ┌────────────────────────────────────────────┐
+   │ Captions:  "A man is riding a bike on..."    │
+   │ Boxes:     person:[0.41,0.52,0.18,0.30]      │
+   │            bicycle:[0.38,0.61,0.22,0.25] ... │
+   └───────────────────┬──────────────────────────┘
+                       │  喂给纯文本 GPT-4（看不见图！）
+                       ▼
+        ┌──────────────────────────────────┐
+        │   GPT-4 生成三类指令数据           │
+        │   ① conversation  多轮问答         │
+        │   ② detail description  详细描述   │
+        │   ③ complex reasoning  复杂推理    │
+        └───────────────────┬───────────────┘
+                            ▼
+           (真实图像 image, 指令 Q, 回答 A) 三元组
+                            │  对真实 VLM 做 SFT
+                            ▼
+                  会对话、会推理的 LLaVA
+  </div>
+
+  <p>这套"两阶段"训练范式（先对齐预训练、再指令微调）此后成为几乎所有开源 VLM 的标准配方。本模块讲的就是<strong>第二阶段以及之后的偏好对齐</strong>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="data"><span class="num">2</span>SFT 数据构造：detail / conversation / complex reasoning 三类</h2>
+
+  <p>LLaVA 把视觉指令数据刻意分成三类，因为它们训练出的<strong>能力维度不同</strong>。研究科学家在评测一个 VLM 时，常常要反推它的 SFT 数据配比，因为配比直接决定能力画像。</p>
+
+  <table>
+    <thead><tr><th>类型</th><th>形式</th><th>训练出的能力</th><th>评测/失败模式视角</th></tr></thead>
+    <tbody>
+      <tr><td><strong>conversation</strong> 对话</td><td>多轮 Q&amp;A，问物体、数量、位置、动作等可从图直接读出的事实</td><td>多轮对话、指令跟随、感知问答</td><td>占比过高 → 模型只会"看图说事实"，弱推理</td></tr>
+      <tr><td><strong>detail description</strong> 详细描述</td><td>单轮，要求详尽描述整张图</td><td>长文本生成、覆盖度</td><td>占比过高 → 模型话痨、爱编造细节（幻觉来源之一）</td></tr>
+      <tr><td><strong>complex reasoning</strong> 复杂推理</td><td>单轮，需要分步推理、常识、推断意图（"为什么"、"接下来会发生什么"）</td><td>推理、常识、因果</td><td>最稀缺也最贵；占比过低 → 推理类 benchmark（如 MMMU）拉胯</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  这三类的本质区别在于<strong>答案需要多少"图外知识"</strong>。conversation 几乎只需读图；detail description 需要语言组织能力；complex reasoning 需要把图像信息和 LLM 的世界知识做联合推理。后两者更依赖 LLM 底座的强度，前者更依赖视觉编码器的细粒度。</div>
+
+  <h3>多轮对话的格式与 loss masking</h3>
+
+  <p>多轮数据按 chat 模板拼成一条序列：<code>&lt;image&gt; User: Q1 \n Assistant: A1 \n User: Q2 \n Assistant: A2 ...</code>。
+  关键细节：<strong>只对 Assistant 的回答 token 计算 loss</strong>，User 的提问、image placeholder、系统提示一律 mask 掉（label 设为 <code>-100</code>，被交叉熵忽略）。否则模型会去"学习生成用户的问题"，浪费容量且降质。</p>
+
+  <div class="math-block">
+  $$ \mathcal{L}_{\text{SFT}} = -\sum_{i=1}^{L}\, \mathbb{1}[\,i\in\mathcal{A}\,]\,\log p_\theta\!\left(y_i \mid y_{<i},\, x_{\text{img}},\, x_{\text{instr}}\right) $$
+  </div>
+  <p>其中 $\mathcal{A}$ 是 assistant 回答 token 的下标集合，$\mathbb{1}[\cdot]$ 就是 label mask。这是 SFT 区别于普通语言建模的核心：<strong>只在"该回答的地方"学习</strong>。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  视觉 token 永远不进 loss——它们是 condition，不是 target。一个常见 bug 是 image placeholder 在标签里没被正确替换/mask，导致 loss 异常或维度错位。读任何 VLM 训练代码，第一件事就是确认 <code>labels</code> 在哪些位置被设成 <code>-100</code>。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="lora"><span class="num">3</span>高效微调：LoRA 与 QLoRA 的数学</h2>
+
+  <p>一个 7B VLM 全参微调（full fine-tuning）需要存优化器状态、梯度、激活，单卡显存动辄上百 GB。研究迭代要快、要省，于是<strong>参数高效微调</strong>（<span class="term">PEFT, Parameter-Efficient Fine-Tuning</span>）成为标配。其中最重要的是 LoRA。</p>
+
+  <h3>LoRA：低秩增量 [Hu 2021]</h3>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>微调时权重的<strong>变化量</strong> $\Delta W$ 其实"信息含量很低"——它躺在一个低维子空间里。
+      与其更新整个大矩阵，不如只学一个又瘦又小的"补丁"$BA$，原权重 $W_0$ 冻住不动。要训练的参数瞬间降到原来的零点几个百分点。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>假设权重更新具有低<span class="term">内在秩</span>（low intrinsic rank）。对线性层 $W_0\in\mathbb{R}^{d\times k}$，
+      把更新约束为低秩分解 $\Delta W = BA$，其中 $B\in\mathbb{R}^{d\times r}$、$A\in\mathbb{R}^{r\times k}$、秩 $r\ll\min(d,k)$。
+      训练时只更新 $A,B$，$W_0$ 冻结。</p>
+    </div>
+  </div>
+
+  <div class="math-block">
+  $$ h = W_0 x + \Delta W x = W_0 x + \frac{\alpha}{r}\,B A\,x,
+     \qquad B\in\mathbb{R}^{d\times r},\; A\in\mathbb{R}^{r\times k},\; r\ll\min(d,k) $$
+  </div>
+
+  <p>几个必须理解的点：</p>
+  <ul>
+    <li><strong>秩 $r$</strong>：低秩瓶颈宽度。$r$ 越大表达力越强、参数越多；典型取 $8/16/32/64$。VLM 上常比纯 LLM 略大些。</li>
+    <li><strong>缩放 $\alpha$</strong>：把增量缩放为 $\frac{\alpha}{r}BA$。$\alpha/r$ 是有效学习强度；调 $r$ 时常同比例调 $\alpha$（如保持 $\alpha=2r$），使更新幅度大致不变。</li>
+    <li><strong>初始化</strong>：$A$ 用高斯随机、$B$ 初始化为 <strong>0</strong>，于是训练开始时 $\Delta W=BA=0$，模型行为等于原模型——保证微调从"无害"起步。</li>
+    <li><strong>可训练参数量</strong>：$r(d+k)$，相比全参 $dk$ 通常是<strong>0.1%–1%</strong> 量级。</li>
+    <li><strong>推理可合并</strong>：$W = W_0 + \frac{\alpha}{r}BA$ 可预先合并，<strong>推理零额外延迟</strong>（区别于 adapter）。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  在 VLM 里，LoRA 通常加在 LLM 的注意力投影（<code>q_proj/k_proj/v_proj/o_proj</code>）和 MLP（<code>gate/up/down_proj</code>）上；视觉编码器常<strong>整体冻结</strong>，connector（投影层）则<strong>全参训练</strong>（它小，且是模态桥梁，值得全量更新）。"哪些模块挂 LoRA、哪些冻结、哪些全训"是 VLM 微调的核心设计选择。</div>
+
+  <h3>QLoRA：4-bit 量化基座 + LoRA [Dettmers 2023]</h3>
+
+  <p>LoRA 把<em>可训练参数</em>降下来了，但冻结的 $W_0$ 仍以 fp16 占着显存。QLoRA 进一步把<strong>基座本身量化到 4-bit</strong>，让 7B 模型在单张消费级卡上也能微调。三个关键技术：</p>
+
+  <table>
+    <thead><tr><th>技术</th><th>做了什么</th><th>为什么有效</th></tr></thead>
+    <tbody>
+      <tr><td><strong>NF4</strong>（4-bit NormalFloat）</td><td>一种为<strong>近似正态分布</strong>的权重设计的 4-bit 数据类型，量化分位点按正态分布信息论最优摆放</td><td>神经网络权重近似 $\mathcal{N}(0,\sigma^2)$，NF4 比普通 int4/fp4 量化误差更小</td></tr>
+      <tr><td><strong>双重量化</strong>（double quantization）</td><td>把量化用的 scale/缩放常数<strong>再量化一次</strong></td><td>量化常数本身也占显存（每 block 一个），二次量化省下约 0.4 bit/参数</td></tr>
+      <tr><td><strong>paged optimizer</strong></td><td>用 NVIDIA 统一内存，把优化器状态在显存↔内存间分页换出</td><td>避免长序列/峰值时的 OOM 崩溃</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout paper"><span class="label"></span>
+  关键点：QLoRA 训练时，<strong>前向计算会把 4-bit 权重临时反量化（dequantize）回 bf16 参与矩阵乘</strong>，梯度只流向 fp/bf16 的 LoRA 参数 $A,B$；4-bit 基座始终冻结、不接收梯度。所以"4-bit"省的是<strong>存储</strong>，计算精度由反量化保证。论文证明 QLoRA 微调 65B 模型可在单张 48GB 卡完成，几乎不掉点。本章 notebook 用的就是这条路线（<code>BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4")</code>）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="dpo"><span class="num">4</span>偏好对齐：RLHF 流程与 DPO 推导</h2>
+
+  <p>SFT 教模型"模仿好的回答"，但它只见过正样本，不知道"什么是更差的回答、为什么差"。<strong>偏好对齐</strong>（preference alignment）用<em>成对比较</em>（人类/模型更喜欢 A 还是 B）进一步打磨输出质量、有用性、安全性，并——对 VLM 尤其重要——<strong>抑制幻觉</strong>。</p>
+
+  <h3>经典 RLHF 三段式</h3>
+  <div class="ascii">
+   ① SFT          得到 π_ref（参考策略，也是初始策略）
+       │
+   ② Reward Model  用人类偏好对 (y_w ≻ y_l) 训练一个打分器 r_φ(x,y)
+       │           （Bradley-Terry：P(y_w≻y_l)=σ(r(x,y_w)-r(x,y_l))）
+       ▼
+   ③ PPO          强化学习最大化 r_φ，同时用 KL 拉住别跑太远：
+                  max_π  E[r_φ(x,y)] − β·KL(π ‖ π_ref)
+  </div>
+
+  <p>RLHF 效果好，但工程上痛：要训练并维护一个独立的 reward model，PPO 训练不稳、超参敏感、要同时在显存里放 4 个模型（policy / ref / reward / value）。<span class="term">DPO</span> [Rafailov 2023] 的贡献是：<strong>把这套 RL 流程化简成一个等价的、可直接用偏好对做监督的分类损失</strong>，绕开显式 reward model 和 PPO。</p>
+
+  <h3>DPO 推导：从 RLHF 目标到一个分类损失</h3>
+
+  <p>第一步，KL 约束下的 RLHF 目标有<strong>闭式最优解</strong>。最大化 $\mathbb{E}[r(x,y)]-\beta\,\mathrm{KL}(\pi\|\pi_{\text{ref}})$ 的最优策略为：</p>
+  <div class="math-block">
+  $$ \pi^*(y\mid x) = \frac{1}{Z(x)}\,\pi_{\text{ref}}(y\mid x)\,\exp\!\Big(\tfrac{1}{\beta}\,r(x,y)\Big) $$
+  </div>
+
+  <p>第二步，反解出奖励——把 $r$ 用策略表示（这就是 <strong>隐式奖励</strong>，DPO 的灵魂）：</p>
+  <div class="math-block">
+  $$ r(x,y) = \beta\,\log\frac{\pi^*(y\mid x)}{\pi_{\text{ref}}(y\mid x)} + \beta\log Z(x) $$
+  </div>
+
+  <p>第三步，代入 Bradley-Terry 偏好模型 $P(y_w\succ y_l)=\sigma\big(r(x,y_w)-r(x,y_l)\big)$。配分函数 $Z(x)$ 只依赖 $x$，在<strong>差值中抵消</strong>。于是偏好概率只用策略本身就能写出，得到 DPO 损失：</p>
+
+  <div class="math-block">
+  $$ \mathcal{L}_{\text{DPO}}(\theta) = -\,\mathbb{E}_{(x,y_w,y_l)}\Big[\log\sigma\Big(\beta\log\frac{\pi_\theta(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)} - \beta\log\frac{\pi_\theta(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}\Big)\Big] $$
+  </div>
+
+  <p>把隐式奖励记为 $\;r_\theta(x,y)=\beta\log\dfrac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)}$，则损失就是一个标准的二分类（logistic）目标：</p>
+  <div class="math-block">
+  $$ \mathcal{L}_{\text{DPO}} = -\,\mathbb{E}\big[\log\sigma\big(r_\theta(x,y_w)-r_\theta(x,y_l)\big)\big] $$
+  </div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>DPO 不再训一个独立的打分器。它直接说：<strong>语言模型自己就是奖励模型</strong>——一个回答"相对参考模型变得多大概率"就是它的隐式奖励。
+      训练目标很朴素：让 chosen 回答的概率相对参考模型涨、rejected 的相对降，二者拉开差距。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>$\beta$ 控制偏离 $\pi_{\text{ref}}$ 的强度（等价于 RLHF 里的 KL 系数）：$\beta$ 大 → 更保守、贴近参考；$\beta$ 小 → 更激进。
+      梯度 $\nabla_\theta\mathcal{L}\propto -\sigma\big(\hat r_l-\hat r_w\big)\big[\nabla\log\pi_\theta(y_w)-\nabla\log\pi_\theta(y_l)\big]$，
+      即"模型当前越搞错偏好（$\hat r_l>\hat r_w$），更新越大"，是自带难例加权的对比学习。</p>
+    </div>
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  实践三个坑：①$\pi_{\text{ref}}$ 通常就是 SFT 模型并<strong>全程冻结</strong>，每步要算它在 chosen/rejected 上的 logprob（显存里得放第二个模型，或用 LoRA 时直接禁用 adapter 当作 ref）。②DPO 前一般要先做一轮 SFT，否则 $\pi_{\text{ref}}$ 太弱、偏好信号无意义。③可能出现"chosen 和 rejected 概率<strong>同时下降</strong>、只是 rejected 降更多"的退化——监控两者的绝对 logprob，而非只看 margin。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="vlm-align"><span class="num">5</span>VLM 特有的对齐：抑制幻觉</h2>
+
+  <p>在纯文本 LLM 里，对齐主要追求 helpful/harmless。到了 VLM，对齐多了一个<strong>压倒性的目标：抑制 object hallucination（物体幻觉）</strong>——模型描述出图里根本没有的物体、属性、关系。这是 VLM 评测（模块 07/08）最关注的失败模式之一。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>为什么 VLM 爱幻觉？</strong> 三个结构性原因：①SFT 数据里 detail description 充斥着"丰富但未必都被图支持"的描述，模型学会了"宁可多说"的语言先验；②LLM 底座的强语言先验会"脑补"常见共现物体（看到餐桌就说有叉子）；③视觉信号在长序列里被语言 token 稀释，模型逐渐"不看图、凭语言惯性往下说"。</div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲：为什么对齐能减少幻觉</h4>
+      <p>幻觉的回答和忠实的回答，往往用 SFT 的交叉熵看起来"都挺像样"，模型分不清。
+      偏好对齐直接给它成对样本："这个忠实于图的回答 &gt; 这个编造了物体的回答"，
+      手把手教它<strong>压低脑补、抬高据图直说</strong>的概率。这是 SFT 给不了的负反馈。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>SFT 是最大似然，只在正样本上施压，无法显式惩罚"高似然但不忠实"的输出（语言先验导致的幻觉恰恰高似然）。
+      偏好对齐引入<strong>对比/负向</strong>信号：DPO 的隐式奖励直接降低 rejected（幻觉）相对 $\pi_{\text{ref}}$ 的概率，
+      在分布上削弱与图像不一致的生成路径。</p>
+    </div>
+  </div>
+
+  <h3>三条代表性路线</h3>
+  <table>
+    <thead><tr><th>方法</th><th>核心思想</th><th>偏好对怎么来</th></tr></thead>
+    <tbody>
+      <tr><td><strong>RLHF-V</strong> [Yu 2024]</td><td><strong>细粒度</strong>人工纠正：标注者把模型回答中幻觉的<em>片段级</em>错误改对</td><td>(原回答=rejected, 段级纠正后=chosen)，密集、精准、信号干净</td></tr>
+      <tr><td><strong>POVID</strong></td><td>免人工：用 GPT-4V 注入错误 / 加噪图像，<strong>自动合成</strong>幻觉负样本</td><td>chosen=真实回答；rejected=故意诱发幻觉的回答</td></tr>
+      <tr><td><strong>mDPO</strong></td><td>给 DPO 加<strong>图像维度</strong>的偏好：同一文本下，对齐的图(chosen) vs 扰乱/无关的图(rejected)，逼模型"真的看图"</td><td>构造 (image_w, image_l) 视觉偏好对，缓解 DPO 只学文本先验</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>标准 DPO 用在 VLM 上有个隐患</strong>：偏好对里 chosen/rejected 共享同一张图，文本差异大、图像无差异，模型可能学成"只看文本、忽略图像"的捷径——反而<strong>削弱视觉依赖</strong>。mDPO 正是针对这点：额外加一组只改图、不改文本的偏好对，强制梯度流经视觉路径。评测对齐过的 VLM 时，要专门验证"它是真的更看图了，还是只是文本风格变了"。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="practice"><span class="num">6</span>训练实操要点：超参、冻结、灾难性遗忘</h2>
+
+  <p>这一节是把上面的原理落到"调得动、调得对"的工程经验。研究科学家做评测时，理解这些超参如何影响行为，才能解释"为什么这个 checkpoint 这么表现"。</p>
+
+  <h3>学习率与 warmup</h3>
+  <ul>
+    <li><strong>LoRA 学习率远高于全参</strong>：LoRA 典型 $1\text{e-}4 \sim 2\text{e-}4$；全参微调通常 $1\text{e-}5 \sim 2\text{e-}5$。因为 LoRA 只动少量新参数，可以也需要更大步长。</li>
+    <li><strong>connector 和 LLM 常用不同学习率</strong>：connector（新随机初始化）需要更大 lr，LLM（已预训练）需要更小 lr，避免一上来就破坏预训练知识。</li>
+    <li><strong>warmup + cosine decay</strong>：前 3% 步线性 warmup，避免初期大梯度毁掉对齐；之后余弦衰减。VLM SFT 通常只跑 1 个 epoch（数据已是高质量蒸馏，多跑易过拟合 + 加重幻觉）。</li>
+  </ul>
+
+  <h3>冻结 vs 全参：一张决策表</h3>
+  <table>
+    <thead><tr><th>组件</th><th>对齐预训练阶段</th><th>指令微调阶段</th><th>理由</th></tr></thead>
+    <tbody>
+      <tr><td>Vision Encoder</td><td>冻结</td><td>冻结（或最后几层小 lr 解冻）</td><td>保护 CLIP 学到的视觉表征；解冻易过拟合且贵</td></tr>
+      <tr><td>Connector（投影）</td><td><strong>训练</strong></td><td><strong>训练</strong></td><td>模态桥梁，必须学；它小，全参训也便宜</td></tr>
+      <tr><td>LLM</td><td>冻结</td><td>训练（全参 or LoRA）</td><td>预训练只对齐特征；指令阶段才教 LLM "听话"</td></tr>
+    </tbody>
+  </table>
+
+  <h3>灾难性遗忘与模态偏置</h3>
+  <div class="callout warn"><span class="label"></span>
+  <strong>纯文本能力退化</strong>：在多模态指令数据上微调 LLM，常导致它的纯文本能力（数学、代码、长文本推理）显著下降——这是 <span class="term">catastrophic forgetting</span> 在 VLM 上的典型表现。缓解手段：①在 SFT 数据里<strong>混入纯文本指令数据</strong>（LLaVA-1.5 等的常见配方）；②用 LoRA 而非全参（低秩增量天然限制了对原能力的破坏）；③更小学习率 + 单 epoch。</div>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>模态偏置 / 语言捷径</strong>（modality bias / language shortcut）：模型倾向于不看图、只靠语言先验和问题本身作答。诊断方法很硬核——<strong>把图换成噪声或无关图，看准确率掉多少</strong>。掉得越少，说明模型越没在"看图"。很多 benchmark 的高分其实是语言先验刷出来的（MMStar [Chen 2024] 专门审计了这点，模块 07 详述）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>评测视角：分别评测"能力提升"与"幻觉变化"</h2>
+
+  <p>指令微调和对齐做完，<strong>必须分两条线评测</strong>，因为它们可能此消彼长——对齐降幻觉的同时可能降有用性/丰富度（"对齐税"）。把这两件事混在一个指标里看，会得出完全错误的结论。</p>
+
+  <table>
+    <thead><tr><th>评测线</th><th>问什么</th><th>代表 benchmark（→ 模块）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>能力提升</strong></td><td>感知、推理、知识、指令跟随是否变强？</td><td>MMMU、MMBench、MME、MM-Vet、MathVista（→ 07）</td></tr>
+      <tr><td><strong>幻觉变化</strong></td><td>是否更少描述不存在的物体？是否更忠实于图？</td><td>POPE、HallusionBench（→ 08）</td></tr>
+      <tr><td><strong>能力保持</strong></td><td>纯文本能力是否退化？是否还看图（非语言捷径）？</td><td>纯文本基准回归 + 图像扰动对照（→ 07/08）</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>对齐税（alignment tax）的评测意识</strong>：一个 DPO 降了 POPE 幻觉率的 checkpoint，可能同时让回答变短、变保守，在 MM-Vet 这类"奖励丰富有用回答"的 benchmark 上掉点。报告对齐效果时，<strong>幻觉↓ 和 能力↓ 必须一起报</strong>，单独报任何一边都是误导。这正是模块 07/08 要训练的评测纪律。</div>
+
+  <div class="callout paper"><span class="label"></span>
+  评测幻觉的两种范式先记住：<strong>POPE</strong> [Li 2023] 把幻觉转成<em>判别式</em>问题——"图里有没有 X？"（yes/no），用采样策略（random/popular/adversarial）专门戳语言先验，可量化、可复现。<strong>HallusionBench</strong> [Guan 2024] 则用精心设计的图文陷阱测<em>语言先验 vs 视觉证据</em>的冲突。两者都在模块 08 展开。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>数据质量 vs 数量</strong>：LLaVA 用 GPT-4 蒸馏数据，但蒸馏会继承教师的偏见和幻觉。如何<strong>检测并过滤合成指令数据中的幻觉</strong>、用更弱监督拿到更忠实的数据，仍是开放问题。评测视角：训练数据的幻觉率是否可预测下游模型的幻觉率？</li>
+    <li><strong>DPO 之后的对齐算法</strong>：KTO、IPO、ORPO、SimPO 等不断改进 DPO 的稳定性、对 $\beta$ 的敏感性、对偏好对质量的鲁棒性。在 VLM 上哪种最抗"语言捷径"尚无定论。</li>
+    <li><strong>对齐税的来源</strong>：为什么降幻觉常伴随有用性下降？是数据分布问题还是目标函数固有的？能否设计同时优化忠实性与有用性的目标（多目标对齐）？</li>
+    <li><strong>过程级 vs 结果级偏好</strong>：RLHF-V 的片段级纠正提示——<strong>更细粒度的偏好信号（token/段级）</strong>可能比整段偏好更高效。如何低成本获取过程级监督？</li>
+    <li><strong>评测的可信度</strong>：很多"对齐让 VLM 变好"的结论建立在易被语言先验刷分的 benchmark 上。<strong>建设抗捷径、真正考视觉依赖的评测</strong>（MMStar 方向）是评测研究科学家的核心战场（→ 07/08）。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>LLaVA 如何用一个<em>看不见图</em>的纯文本 GPT-4 自举生成视觉指令数据？三类数据各训出什么能力？</li>
+      <li>写出 LoRA 的 $\Delta W=\frac{\alpha}{r}BA$，解释 $r$、$\alpha$、$B$ 零初始化的作用；QLoRA 的 NF4 / 双重量化 / paged optimizer 各解决什么？</li>
+      <li>从 KL 约束的 RLHF 目标推出 DPO 损失，写出隐式奖励 $r_\theta=\beta\log(\pi_\theta/\pi_{\text{ref}})$，并说明 $Z(x)$ 为何抵消、$\beta$ 控制什么。</li>
+      <li>为什么偏好对齐能减少 object hallucination？标准 DPO 用在 VLM 上有什么隐患，mDPO 怎么补？评测对齐效果为什么必须同时报"幻觉↓"和"能力↓"？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../04_connectors_training/04_讲解.html"><div class="dir">← 上一章</div><div class="t">04 · 连接器与训练范式</div></a>
+    <a class="next" href="../06_highres_video/06_讲解.html"><div class="dir">下一章 →</div><div class="t">06 · 高分辨率、任意分辨率与视频</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · LSTM 与 GRU</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · LSTM 与 GRU</h1>
+  <p class="subtitle">门控网络如何治朴素 RNN 的梯度消失 —— 一条加性流动的 cell state（恒定误差环 = 梯度高速公路）+ 几个学出来的门；LSTM 三门、GRU 两门，从零实现并用数值梯度对拍反向</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 03（RNN、BPTT、梯度消失/爆炸的雅可比连乘根源）、链式法则、sigmoid/tanh 导数</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_lstm_gru.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Hochreiter &amp; Schmidhuber 1997 (LSTM)、Cho et al. 2014 (GRU)、Greff et al. 2017、colah blog</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">RNN 的病与门控的药</a></li>
+      <li><a href="#overview">LSTM 总览：cell state 传送带 + 三门</a></li>
+      <li><a href="#update">遗忘/输入门与 cell state 更新</a></li>
+      <li><a href="#cec">为什么 cell state 缓解梯度消失（CEC）</a></li>
+      <li><a href="#output">输出门与隐藏态：存储与读取解耦</a></li>
+      <li><a href="#gru">GRU：把 LSTM 简化到两个门</a></li>
+      <li><a href="#impl">前向 + 反向的实现要点</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>RNN 的病与门控的药</h2>
+  <p>上一模块我们把朴素 RNN 从零写了出来，也亲眼看到了它的<strong>致命病</strong>：随时间反向传播时，梯度要穿过一长串循环雅可比的连乘 <code>∏ diag(1-h²) Wₕᵀ</code>，这个连乘的谱半径要么小于 1（梯度<strong>指数消失</strong>，远距离时间步学不到），要么大于 1（梯度<strong>指数爆炸</strong>，训练发散）。结果就是：朴素 RNN 实际上只能记住最近十几步，越远越无力——这正是它在长序列任务上节节败退的根源。</p>  <p>梯度爆炸有个简单的创可贴——梯度裁剪（上一模块讲过）。但<strong>梯度消失没有这么轻巧的补丁</strong>：你不能把一个已经衰减到 0 的梯度「裁」回来。问题的本质在结构里——只要隐藏状态的更新是「<em>乘性</em>」的（每一步都用 <code>Wₕ</code> 乘一遍、再过一个把导数压在 (0,1) 的 tanh），梯度就注定在连乘中衰减。要根治，必须<strong>改变状态在时间上传递的方式</strong>。</p>  <p>举个具体场景体会为什么这是结构问题。设想一句话：<em>「我在法国长大……（中间几十个词）……所以我说一口流利的__」</em>。要填对最后那个词（法语），模型必须把开头「法国」这条信息<strong>无损地携带几十步</strong>。朴素 RNN 做不到：开头那个词的信息每经一步就被 <code>Wₕ</code> 乘、被 tanh 压一次，到句尾早已稀释殆尽；与之对应，句尾的误差想回传去纠正「当初该更重视法国」也传不回去（梯度消失的另一面）。这类<strong>长距离依赖</strong>正是门控网络要攻克的目标。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：朴素 RNN 像用「传话游戏」记事——每个人把上一个人的话重新理解、转述一遍给下一个人。传几十轮后，最初的话早已面目全非。问题出在「每一步都要重新加工」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>LSTM 与 GRU 的核心思想是<strong>加一条「加性」的记忆通路</strong>：让信息可以<em>近似原封不动</em>地沿时间流过去（用加法更新而非反复矩阵乘），同时用一组可学习的「<span class="term">gate</span>」（门）来控制<em>什么时候写入、什么时候保留、什么时候读出</em>。乘性的反复加工换成加性的传送带 + 选择性的门——这就是治梯度消失的药方。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>门控网络（gated RNN）= 一条让信息加性流动的记忆通路 + 几个学出来的开关</strong>。加性通路让梯度有一条<em>近似恒等</em>的高速公路可走（不再被反复连乘衰减），门则让网络自己决定记住多久、何时更新、读出多少。LSTM 用三个门 + 一条 cell state，GRU 用两个门把它简化——本质是同一招的两种配方。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="overview"><span class="num">2</span>LSTM 总览：cell state 传送带 + 三门</h2>
+  <p>LSTM（<span class="term">Long Short-Term Memory</span>，Hochreiter & Schmidhuber 1997）的设计可以浓缩成一句话：<strong>在隐藏状态之外，再维护一条受门保护的记忆传送带——cell state</strong>。朴素 RNN 只有一个状态 <code>h</code>；LSTM 有两个：携带长期记忆的 <span class="term">cell state</span> <code>c</code>，和对外输出的隐藏态 <code>h</code>。前者是「内部账本」，后者是「对外汇报」。</p>  <p>信息在 cell state 上的流动是<strong>加性</strong>的，且由三个门把守。下图是一个 LSTM cell 的内部结构——把它看成一条从左流到右的传送带，三个门在不同位置控制货物的上下：</p>  <div class="ascii">      cell state（记忆传送带，加性流动 = 梯度高速公路）
+  c_{t-1} ───────►(× f)───────►(+ i⊙g)──────────────►  c_t
+               遗忘门擦除      输入门写入        │
+                                                ▼ tanh
+  h_{t-1} ─┐                                  (× o) 输出门
+           ├─► [i,f,o,g 四个仿射 + 激活]          │
+  x_t   ───┘                                      ▼
+                                               h_t（对外隐藏态）</div>  <p>四个量都由「当前输入 <code>x_t</code> 和上一隐藏态 <code>h_{t-1}</code>」经各自的仿射变换 + 激活算出：三个门 <code>i, f, o</code> 用 <span class="term">sigmoid</span>（输出 0–1，当「阀门开度」），候选记忆 <code>g</code> 用 <span class="term">tanh</span>（输出 −1–1，当「待写入的新值」）。记住这个分工——<strong>sigmoid 当门、tanh 当值</strong>——是读懂所有门控公式的钥匙。</p>  <p>值得一提的是这套设计的<strong>历史地位</strong>：LSTM 1997 年就被提出，却在沉寂十余年后、随着 2010 年代算力与数据的到位才大放异彩——它几乎独占了 2014–2017 年序列建模的统治地位（语音识别、机器翻译、手写生成），直到 Transformer 接棒。理解它不只是「学一个旧模型」：<em>门控</em>这个思想本身（用学出来的、依数据动态变化的标量去逐元素调制信息流）是深度学习里最有生命力的设计模式之一，后来在高速公路网络（Highway Networks）、GRU、乃至现代状态空间模型里反复出现。把 LSTM 吃透，等于拿到了理解一大类模型的钥匙。</p>  <div class="callout warn"><span class="label"></span>
+    <p>不要被「三个门 + 一个候选 = 四组权重」吓到。它们结构完全一样，都是 <code>σ/tanh(W_x x_t + W_h h_{t-1} + b)</code>，只是各有各的 <code>W, b</code>。实现时常把四组仿射<strong>堆成一个大矩阵</strong>一次算完（<code>(4H, D)</code> 的 <code>W_x</code>、<code>(4H, H)</code> 的 <code>W_h</code>），再切成四段——这既是工程惯例（一次大矩阵乘比四次小的快），也是 PyTorch <code>nn.LSTM</code> 内部的做法。notebook 第 1 节就这么实现。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="update"><span class="num">3</span>遗忘/输入门与 cell state 更新</h2>
+  <p>现在把 cell state 的更新写成数学。设隐藏维度 <code>H</code>，输入维度 <code>D</code>，⊙ 表示逐元素相乘。一步 LSTM 的前向是：</p>  <div class="math-block">\[\begin{aligned}i_t &= \sigma(W_{xi}x_t + W_{hi}h_{t-1} + b_i) &\text{（输入门 input gate）}\\f_t &= \sigma(W_{xf}x_t + W_{hf}h_{t-1} + b_f) &\text{（遗忘门 forget gate）}\\o_t &= \sigma(W_{xo}x_t + W_{ho}h_{t-1} + b_o) &\text{（输出门 output gate）}\\g_t &= \tanh(W_{xg}x_t + W_{hg}h_{t-1} + b_g) &\text{（候选记忆 candidate）}\end{aligned}\]</div>  <p>有了门，cell state 的更新就是本模块<strong>最重要的一行公式</strong>——一次「擦掉一些旧的、写入一些新的」：</p>  <div class="math-block">\[\boxed{\,c_t = f_t \odot c_{t-1} \;+\; i_t \odot g_t\,}\]</div>  <p>逐项读懂它：<code>f_t ⊙ c_{t-1}</code> 是<strong>遗忘</strong>——遗忘门 <code>f</code> 在某分量上接近 1 就完整保留旧记忆，接近 0 就清空它；<code>i_t ⊙ g_t</code> 是<strong>写入</strong>——输入门 <code>i</code> 决定候选记忆 <code>g</code> 有多少被写进 cell state。两者相加，就完成了对这条传送带的一次「选择性更新」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 cell state 想成一块白板。遗忘门是橡皮擦（擦掉哪些旧字、擦多干净），输入门 + 候选是粉笔（写上哪些新字、写多重）。每个时间步，网络都自己决定擦什么、写什么——而<strong>没被擦也没被覆盖的内容，就这样原样留到了下一步</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>关键在「<strong>加法</strong>」二字。朴素 RNN 是 <code>h_t = tanh(W h_{t-1} + ...)</code>——旧状态每步都被 <code>W</code> 乘、被 tanh 压。LSTM 的 cell state 是 <code>c_t = f ⊙ c_{t-1} + ...</code>——当 <code>f≈1</code> 时，旧记忆几乎<em>原封不动</em>地加到新状态里，不经过任何矩阵乘或饱和非线性。下一节我们会看到，正是这个加法让梯度有了高速公路。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cec"><span class="num">4</span>为什么 cell state 缓解梯度消失（CEC）</h2>
+  <p>这是本模块的<strong>理论核心</strong>，请慢读。回忆朴素 RNN 梯度消失的根源：梯度从 <code>h_t</code> 传到 <code>h_{t-k}</code> 要乘上 <code>k</code> 个循环雅可比 <code>∂h_t/∂h_{t-1} = diag(1-h²) Wₕᵀ</code>，连乘后指数衰减。LSTM 的妙处在于，梯度可以改走 cell state 这条路。考察相邻两步 cell state 的雅可比：</p>  <div class="math-block">\[\frac{\partial c_t}{\partial c_{t-1}} = \operatorname{diag}(f_t)\]</div>  <p>看清楚这个结果有多关键：<code>c_t = f_t ⊙ c_{t-1} + i_t ⊙ g_t</code> 对 <code>c_{t-1}</code> 求偏导，那个加性的第二项 <code>i_t ⊙ g_t</code> 这一支与 <code>c_{t-1}</code> 直接无关（它依赖 <code>h_{t-1}</code> 是另一条更弱的路），主通路上 <code>∂c_t/∂c_{t-1}</code> 就是一个<strong>对角矩阵 diag(f_t)</strong>——没有 <code>Wₕ</code>、没有 tanh 的导数压缩。于是梯度沿 cell state 传 <code>k</code> 步，主项是：</p>  <div class="math-block">\[\frac{\partial c_t}{\partial c_{t-k}} \;\approx\; \prod_{j=1}^{k}\operatorname{diag}(f_{t-j+1}) \;=\; \operatorname{diag}\!\Big(\textstyle\prod_j f_{t-j+1}\Big)\]</div>  <p>如果网络学到把遗忘门开到接近 1（<code>f≈1</code>），这个连乘就接近<strong>恒等</strong>——梯度几乎<em>不衰减</em>地穿过几十、上百步。Hochreiter 把这条近似恒等的梯度通路称为 <span class="term">Constant Error Carousel</span>（恒定误差环，CEC），它正是「<strong>Long</strong> Short-Term Memory」里 Long 的来源。对比朴素 RNN 那个被 <code>Wₕ</code> 与 tanh 反复缩水的乘性连乘，diag(f) 的连乘是一条<strong>梯度高速公路</strong>——和上一族里 ResNet 残差连接 <code>∂(F(x)+x)/∂x = I + ∂F/∂x</code> 的恒等支是同一个数学魔法。</p>  <div class="callout danger"><span class="label">缓解 ≠ 根治</span>
+    <p>务必理解 LSTM 是<strong>缓解</strong>而非<strong>根治</strong>梯度消失。只有当遗忘门 <code>f≈1</code> 时高速公路才畅通；若网络学到 <code>f</code> 小，记忆照样会衰减（这有时正是想要的——该忘就忘）。正因如此，实践中常把遗忘门的偏置 <code>b_f</code> <strong>初始化为正数（如 1 或 2）</strong>，让训练初期 <code>f</code> 默认接近 1、先保住长程梯度，再慢慢学该忘什么。notebook 的梯度流实验会让你亲眼看到 <code>b_f</code> 这个旋钮的威力——加不加它，远端梯度差好几个数量级。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="output"><span class="num">5</span>输出门与隐藏态：存储与读取解耦</h2>
+  <p>cell state 是 LSTM 的「内部记忆」，但它不直接对外。每一步真正输出、并传给下一步参与门计算的，是隐藏态 <code>h_t</code>。它由<strong>输出门</strong>从 cell state 里「读」出来：</p>  <div class="math-block">\[h_t = o_t \odot \tanh(c_t)\]</div>  <p>先把 cell state 过一个 tanh 压到 (−1, 1)（防止累加多步后 <code>c</code> 数值过大），再由输出门 <code>o_t</code> 逐分量决定<strong>暴露多少</strong>给外界。这一步把「<em>我记得什么</em>」（cell state）与「<em>我现在要说什么</em>」（hidden state）<strong>解耦</strong>了——网络可以在 cell 里默默存着某个信息很多步，却在大部分步把输出门关小、不暴露它，直到需要时才打开。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>延续白板的比喻：cell state 是写满笔记的整块白板，输出门是一块可移动的遮罩——它决定此刻把白板的哪些部分露给观众看。你可以记着一长串笔记，却只在关键时刻亮出相关的那几行。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这个解耦是 LSTM 表达力的重要来源。它让「<strong>存储</strong>」和「<strong>读取</strong>」成为两个独立可控的动作：信息可以长期驻留 cell state（受遗忘门保护），而输出门独立地控制何时、以何种强度把它读进对外的计算流。Karpathy 等人可视化 LSTM 时，确实发现某些 cell 分量会稳定地充当「引号是否打开」「行还剩多长」这类长程开关——正是这种存读解耦让它们成为可能。</p></div>
+  </div>  <p>把五行公式连起来，一个 LSTM cell 的完整前向就是：由 <code>(x_t, h_{t-1})</code> 算出 <code>i,f,o,g</code> → 更新 <code>c_t = f⊙c_{t-1}+i⊙g</code> → 读出 <code>h_t = o⊙tanh(c_t)</code>。三个门、一条传送带、一次读出——<strong>notebook 第 1 节会把这整套从零写成十几行 numpy，并验证门都落在 (0,1)、候选落在 (−1,1)</strong>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="gru"><span class="num">6</span>GRU：把 LSTM 简化到两个门</h2>
+  <p>LSTM 有效，但「两个状态 + 三个门 + 四组权重」略显臃肿。GRU（<span class="term">Gated Recurrent Unit</span>，Cho 等 2014）是它的<strong>精简版</strong>：只用一个状态 <code>h</code>（合并了 cell 与 hidden）、只用两个门，参数更少、常常跑得一样好。GRU 的前向是：</p>  <div class="math-block">\[\begin{aligned}z_t &= \sigma(W_{xz}x_t + W_{hz}h_{t-1} + b_z) &\text{（更新门 update gate）}\\r_t &= \sigma(W_{xr}x_t + W_{hr}h_{t-1} + b_r) &\text{（重置门 reset gate）}\\\tilde h_t &= \tanh\big(W_{xh}x_t + W_{hh}(r_t \odot h_{t-1}) + b_h\big) &\text{（候选状态）}\\h_t &= (1-z_t)\odot h_{t-1} + z_t \odot \tilde h_t &\text{（加性更新）}\end{aligned}\]</div>  <p>两个门各司其职：<strong>重置门</strong> <code>r_t</code> 控制算候选状态时<em>忽略多少旧状态</em>——<code>r≈0</code> 就几乎只看当前输入（适合「翻篇、开始新内容」）；<strong>更新门</strong> <code>z_t</code> 控制<em>用多少新候选替换旧状态</em>——<code>z≈0</code> 就几乎原样保留 <code>h_{t-1}</code>（这就是 GRU 的「梯度高速公路」：<code>h_t≈h_{t-1}</code> 时 <code>∂h_t/∂h_{t-1}≈I</code>）。</p>  <p>GRU 与 LSTM 的对应关系值得记一张表——理解了对应，两个模型就是一个思想的两种实现：</p>  <table>
+    <thead><tr><th>维度</th><th>LSTM</th><th>GRU</th></tr></thead>
+    <tbody>
+      <tr><td>状态数</td><td>2（cell state c + hidden h）</td><td>1（只有 hidden h）</td></tr>
+      <tr><td>门数</td><td>3（输入 i / 遗忘 f / 输出 o）</td><td>2（更新 z / 重置 r）</td></tr>
+      <tr><td>加性记忆通路</td><td><code>c_t = f⊙c_{t-1} + i⊙g</code></td><td><code>h_t = (1-z)⊙h_{t-1} + z⊙h̃</code></td></tr>
+      <tr><td>梯度高速公路条件</td><td><code>f≈1</code></td><td><code>z≈0</code></td></tr>
+      <tr><td>输入门与遗忘门</td><td>独立两个门 i, f</td><td>耦合成一个：写入 z、保留 (1-z)</td></tr>
+      <tr><td>参数量（同 H,D）</td><td>≈ 4×(HD+H²+H)</td><td>≈ 3×(HD+H²+H)，约少 1/4</td></tr>
+      <tr><td>何时偏好</td><td>需要存读解耦、超长依赖、容量更大</td><td>数据/算力较少、要更快更轻</td></tr>
+    </tbody>
+  </table>  <p>这两条加性更新公式（LSTM 的 <code>c_t=f⊙c_{t-1}+i⊙g</code> 与 GRU 的 <code>h_t=(1-z)⊙h_{prev}+z⊙h̃</code>）长得不一样，但<strong>骨架是同一个</strong>：「保留系数 ⊙ 旧值 + 写入系数 ⊙ 新值」。这正是 ResNet 残差连接 <code>y=x+F(x)</code> 在时间维上的近亲——都用一条加性捷径让信息（与梯度）可以近似无损地跨越很多层/很多步。看穿这个共同骨架，你就抓住了「为什么这些结构都能训得很深/很长」的统一答案：<em>给梯度一条不经反复矩阵乘与饱和非线性的恒等通路</em>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>GRU 把 LSTM 的「输入门 + 遗忘门」合成了一个更新门：<strong>写入新东西和保留旧东西此消彼长</strong>（<code>z</code> 和 <code>1-z</code>），不像 LSTM 那样可以「又多记又多写」（LSTM 的 i 与 f 独立，可同时大）。它还砍掉了独立的输出门（直接拿 <code>h</code> 对外）。少一个门、少一个状态、少约 1/4 参数——这就是 GRU 的全部「简化」。实践中 LSTM 与 GRU 谁更好高度依赖任务，没有定论；GRU 更轻、收敛常更快，LSTM 容量略大、超长依赖可能更稳，常见做法是两个都试、看验证集。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="impl"><span class="num">7</span>前向 + 反向的实现要点</h2>
+  <p>从零实现门控单元，前向直白（照抄公式即可），<strong>反向是真正考验对链式法则掌握的地方</strong>。好在结构是规整的：每个门/候选都是「仿射 → 激活」，反向就是「激活导数 → 仿射的转置」。把两个激活导数记牢，反向就有了骨架：</p>  <div class="math-block">\[\sigma'(z) = \sigma(z)\,(1-\sigma(z)) = s(1-s), \qquad \tanh'(z) = 1 - \tanh^2(z) = 1 - t^2\]</div>  <p>以 LSTM 单步反向为例，给定从上层来的 <code>dh_t</code> 和从下一时间步来的 <code>dc_{t}^{next}</code>，倒着推：</p>  <ol>
+    <li><code>do = dh ⊙ tanh(c)</code>；<code>dc = dc_next + (dh ⊙ o) ⊙ (1-tanh²(c))</code>（<strong>两条梯度在 c 处汇合</strong>：一条来自下一步的 cell state，一条来自本步 h 经 tanh 回传——漏掉任一条都是经典 bug）</li>
+    <li><code>df = dc ⊙ c_{prev}</code>，<code>dc_prev = dc ⊙ f</code>（cell state 往前一步传的梯度，正是第 4 节的 diag(f)），<code>di = dc ⊙ g</code>，<code>dg = dc ⊙ i</code></li>
+    <li>各门/候选的<strong>仿射前梯度</strong>：<code>dz_i = di⊙i⊙(1-i)</code>、<code>dz_f = df⊙f⊙(1-f)</code>、<code>dz_o = do⊙o⊙(1-o)</code>、<code>dz_g = dg⊙(1-g²)</code></li>
+    <li>把四段堆成 <code>dz</code>，则 <code>dW_x = dz xᵀ</code>、<code>dW_h = dz h_{prev}ᵀ</code>、<code>db = dz</code>、<code>dx = W_xᵀ dz</code>、<code>dh_prev = W_hᵀ dz</code></li>
+  </ol>  <div class="callout warn"><span class="label"></span>
+    <p>最容易写错的两处，盯紧了：(1) <strong>c 处的梯度汇合</strong>——它同时收下「下一时间步沿 cell state 传回的 <code>dc_next</code>」和「本步 h 经输出门、经 tanh 回传的 <code>dh⊙o⊙(1-tc²)</code>」，二者相加才是完整的 <code>dc</code>；(2) 在多步 BPTT 里，<strong>同一组共享权重的梯度要在所有时间步求和</strong>（和上一模块 RNN 一样的坑）。GRU 还多一处：重置门让候选依赖 <code>r⊙h_{prev}</code>，所以 <code>h_prev</code> 的梯度有<em>三条</em>来源（更新门、重置门、候选里的 <code>r⊙h_{prev}</code>），都要累加。</p>
+  </div>  <p>怎么确认反向写对了？<strong>数值梯度检验</strong>（模块 00 备好的工具）：构造一个标量损失，用中心差分 <code>(f(x+ε)-f(x-ε))/(2ε)</code> 估每个参数的梯度，和你的解析梯度比，相对误差 < 1e-5 就放心。notebook 第 3 节会对 LSTM 单步反向逐参数做这件事（<code>dx, dh_prev, dc_prev, dW_x, dW_h, db</code> 全部对拍），GRU 反向也作为 worked 一并验证——<em>这是本模块代码的定盘星，不靠「感觉对了」</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>门控到底需要几个门？</strong>—— GRU 证明 3 门可砍到 2 门。Greff 等 2017《LSTM: A Search Space Odyssey》系统消融了各门的作用，发现遗忘门与输出门激活函数最关键；更激进的 minimal-gated、JANET（只留遗忘门）等表明门控有很大简化空间，但哪种最优仍依任务而定。</li>
+    <li><strong>门控 RNN vs 注意力</strong>—— LSTM/GRU 用一个定长状态压缩全部历史，仍是「定长瓶颈」（下一模块的主题）。注意力让模型直接回看所有历史，绕开了压缩——这是 RNN 让位于 Transformer 的根本原因。但定长状态 = 推理时 O(1) 显存、天然流式，是 RNN 至今的优势。</li>
+    <li><strong>状态空间模型（SSM）的复兴</strong>—— Mamba/S4 等近年工作把循环网络重新做成「带门控的线性 RNN」：去掉循环里的非线性，让状态更新成为可并行扫描（parallel scan）的线性递推，既保留 RNN 的 O(1) 推理，又能像 Transformer 一样并行训练。可以说是<em>门控思想 + 线性代数</em>对 LSTM 的现代化重写。</li>
+    <li><strong>初始化与归一化</strong>—— 遗忘门偏置初始化为正（Jozefowicz 等 2015）几乎是免费的提分技巧；把 LayerNorm 加进门控（LayerNorm-LSTM）能进一步稳定训练。这些「小调整」对长依赖学习的影响往往超过换模型本身。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Hochreiter & Schmidhuber 1997（LSTM 与恒定误差环 CEC 的奠基）、Cho 等 2014（GRU 与 encoder-decoder，同时是下一模块 seq2seq 的源头）、colah《Understanding LSTM Networks》（讲门控最清晰的图文）、Greff 等 2017（门作用的系统消融）。完整清单见 <code>references.md</code>。下一站把门控 RNN 搭成 encoder-decoder，并撞上「定长瓶颈」——注意力就此登场。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_rnn_from_scratch/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · RNN 与 BPTT</div></a>
+    <a class="next" href="../05_seq2seq_attention/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · seq2seq 与注意力</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 · 原生多模态与多模态智能体</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 09 / 10</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>09 · 原生多模态与多模态智能体</h1>
+  <p class="subtitle">Native Multimodality &amp; Multimodal Agents —— 从"拼接的 VLM"走向"统一感知-行动"的系统，以及如何评测它</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–08 全部（架构、训练、评测、安全）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge gpu">GPU</span><span class="badge api">API可选</span> 09_native_agents.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">GPT-4o、Gemini、Chameleon、CogAgent、Qwen2.5-VL</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#native">后期拼接 vs 原生多模态：GPT-4o / Gemini 范式转移</a></li>
+      <li><a href="#earlyfusion">早融合 any-to-any：Chameleon 与统一接口</a></li>
+      <li><a href="#imagegen">统一模型里的图像生成：自回归 vs 扩散解码</a></li>
+      <li><a href="#moe">稀疏专家 MoE 在多模态中的作用</a></li>
+      <li><a href="#grounding">智能体基础：GUI grounding 与 set-of-marks</a></li>
+      <li><a href="#computeruse">computer-use agent：感知-行动循环</a></li>
+      <li><a href="#agenteval">智能体评测：为什么比静态 benchmark 更难也更重要</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="native"><span class="num">1</span>后期拼接 vs 原生多模态：GPT-4o / Gemini 范式转移</h2>
+
+  <p>到模块 08 为止，我们讲的几乎都是<strong>后期拼接式</strong>（<span class="term">late-fusion</span> / bolt-on）VLM：一个预训练好的视觉编码器（CLIP/SigLIP）+ 一个预训练好的 LLM，中间用 connector 缝起来，再做指令微调。这条路工程上高效、复用强，但有结构性短板。<span class="term">原生多模态</span>（<span class="term">native multimodal</span>）指的是：模型<strong>从预训练第一天起就在多模态数据上联合训练</strong>，文本、图像、音频、视频共享同一套参数与表征空间，而非事后拼接。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>后期拼接像是先各自培养一个"画家"和一个"作家"，再请翻译让他们勉强对话。原生多模态则是<strong>从小让同一个大脑同时学看和学说</strong>，所以它对"看到什么该怎么说"的理解是长在一起的，反应也更快。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>令训练目标为联合似然 $\mathcal{L}=\mathbb{E}_{(x_{\text{txt}},x_{\text{img}},x_{\text{aud}})}\big[-\log p_\theta(\text{序列})\big]$，原生方案让<strong>所有模态在同一自回归（或扩散）目标下、用同一参数 $\theta$ 从随机初始化共同优化</strong>。后期拼接则先独立优化视觉/语言子目标，再以小规模对齐数据微调 connector，跨模态梯度信号被结构性截断，难以学到深层联合先验。</p>
+    </div>
+  </div>
+
+  <p><strong>GPT-4o</strong> [OpenAI 2024] 的 "o" 即 omni：单一模型原生处理文本、音频、图像，端到端音频对话延迟可低至约 320ms（接近人类对话），而旧的"语音转文字 → LLM → 文字转语音"级联管线延迟在秒级且丢失语气、笑声、多说话人等副语言信息。<strong>Gemini</strong> [Gemini Team 2023] 在技术报告中明确强调"natively multimodal, pre-trained from the start on different modalities"。</p>
+
+  <div class="ascii">
+  ╭─ 后期拼接 late-fusion（模块 01–08 的主线）────────────────────────╮
+  │  [冻结] CLIP ViT ──► connector ──► [预训练] LLM ──► 文本           │
+  │   各子系统独立训练，跨模态对齐靠少量指令数据后期缝合              │
+  ╰────────────────────────────────────────────────────────────────╯
+            梯度只在 connector 附近流动，深层联合先验难以形成
+
+  ╭─ 原生多模态 native（GPT-4o / Gemini）───────────────────────────╮
+  │  text/image/audio/video ──► 统一 tokenizer/编码 ──┐              │
+  │                                                    ▼              │
+  │            ┌──────────── 单一大模型 θ ────────────┐               │
+  │  从预训练即联合优化  ──► 文本 / 图像 / 音频  任意输出             │
+  │            └──────────────────────────────────────┘               │
+  ╰────────────────────────────────────────────────────────────────╯
+            端到端低延迟 · 跨模态推理更强 · any-to-any 成为可能
+  </div>
+
+  <table>
+    <thead><tr><th>维度</th><th>后期拼接 late-fusion</th><th>原生多模态 native</th></tr></thead>
+    <tbody>
+      <tr><td>训练起点</td><td>复用预训练编码器 + LLM，后期缝合</td><td>从预训练第一天起多模态联合训练</td></tr>
+      <tr><td>跨模态推理</td><td>受 connector 容量与对齐数据限制</td><td>共享参数，深层联合先验更强</td></tr>
+      <tr><td>延迟</td><td>常含级联管线（ASR→LLM→TTS）</td><td>端到端单次前向，延迟低</td></tr>
+      <tr><td>输出模态</td><td>多为文本（少数加生成头）</td><td>原生 any-to-any（文/图/音）</td></tr>
+      <tr><td>成本</td><td>低，工程复用强</td><td>高，需海量多模态预训练算力</td></tr>
+      <tr><td>代表</td><td>LLaVA、Qwen2-VL、InternVL</td><td>GPT-4o、Gemini、Chameleon</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  "原生"不是营销词，而是有<strong>可观测的能力差异</strong>：跨模态联合推理（如"听这段音频里背景的鸟叫，结合这张图判断拍摄季节"）、副语言信息保留、低延迟实时交互，是后期拼接很难补齐的。但代价是预训练算力呈数量级上升，且评测更复杂（见第 7 节）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="earlyfusion"><span class="num">2</span>早融合 any-to-any：Chameleon 与统一接口</h2>
+
+  <p>实现原生多模态最彻底的路线是<strong>早融合</strong>（<span class="term">early fusion</span>）：在<strong>输入层就把所有模态变成同一种 token</strong>，放进同一个序列里做自回归建模。<strong>Chameleon</strong> [Chameleon Team 2024] 把图像用一个学习到的图像 tokenizer（基于 VQ-VAE 思想）<strong>离散量化</strong>成 image token，与文本 token 共用一个词表、共用一个 Transformer、共用一个 next-token 目标 —— 模型完全不知道某个 token 来自文字还是图像。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>把图片也切碎成"词"，丢进和文字一样的句子里。模型只做一件事：预测下一个词。下一个词可能是文字，也可能是图块。这样它天然就能"图文交错地读、图文交错地写"。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>图像 $x_{\text{img}}$ 经离散 tokenizer $q(\cdot)$ 映射为码本索引序列 $(c_1,\dots,c_M)$，与文本 token 拼接成单一序列 $s$。模型对全序列做标准自回归分解 $p_\theta(s)=\prod_i p_\theta(s_i\mid s_{<i})$，损失为统一交叉熵。图像生成即在码本上自回归采样 $c_i$，再经解码器 $g(\cdot)$ 还原像素。</p>
+    </div>
+  </div>
+
+  <div class="ascii">
+  早融合 EARLY FUSION（Chameleon）            后融合 LATE FUSION（多数 VLM）
+  ─────────────────────────────             ──────────────────────────────
+  文本 ─► text tokens ─┐                     文本 ─► text embeds ──┐
+                       ├─► 单序列            图像 ─► ViT ─► proj ──┤
+  图像 ─► VQ tokens ───┘   ▼                                      ▼
+        共用词表/参数  ┌─────────┐           不同编码路径   ┌──────────┐
+                       │  单一    │           后期才汇合     │   LLM     │
+                       │ Transf.  │ ─► 文/图                 └──────────┘
+                       └─────────┘                              ▼
+        任意位置可出文字或图块                  几乎只出文本（除非加生成头）
+  </div>
+
+  <p><strong>Unified-IO</strong> [Lu et al. 2022] 更进一步把分割图、深度图、检测框、关键点等<strong>结构化输出全部序列化成离散 token</strong>，用一个统一的 seq-to-seq 接口处理数十种视觉/语言任务 —— 体现了"统一接口"（unified interface）的设计哲学：任务不再靠不同的 head，而靠不同的 token 序列来区分。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>Chameleon</strong> 的关键工程难点在于<strong>训练稳定性</strong>：当文本与图像 token 共享 softmax 时，两种模态的 logit 量级差异巨大，原始 Transformer 会发散。论文引入 query-key normalization 与对 norm 顺序的调整来稳定混合模态训练。这提示我们：早融合理论优雅，但把异质模态塞进同一目标会带来非平凡的优化病态（optimization pathology）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="imagegen"><span class="num">3</span>统一模型里的图像生成：自回归 vs 扩散解码</h2>
+
+  <p>原生模型既能"看图"又能"画图"，输入输出皆可多模态。生成图像主要有两条解码路线：</p>
+
+  <table>
+    <thead><tr><th>路线</th><th>机制</th><th>优点</th><th>代价</th><th>代表</th></tr></thead>
+    <tbody>
+      <tr><td>自回归 image tokens</td><td>把图像离散成 token，像生成文本一样逐 token 采样，再经解码器还原像素</td><td>与文本生成<strong>完全统一</strong>，单目标单模型；天然图文交错</td><td>逐 token 串行慢；量化有信息损失，高保真较难</td><td>Chameleon、Parti</td></tr>
+      <tr><td>扩散解码 diffusion</td><td>LLM 产出条件表征，外接（或内嵌）扩散模块从噪声迭代去噪出像素</td><td>图像保真度/细节高，业界主流生图质量</td><td>训练/接口更复杂；与自回归文本目标不同质，需缝合</td><td>Transfusion、多数 GPT-4o 级生图</td></tr>
+    </tbody>
+  </table>
+
+  <div class="math-block">
+  $$
+  \underbrace{p_\theta(c_i\mid c_{<i}, \text{txt})}_{\text{自回归：码本上的分类}}
+  \qquad\text{vs}\qquad
+  \underbrace{\mathbb{E}_{t,\epsilon}\big\|\epsilon-\epsilon_\theta(z_t,t,\text{cond})\big\|^2}_{\text{扩散：噪声预测的回归}}
+  $$
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  抓住本质区别：<strong>自回归是"在离散码本上分类"，扩散是"在连续像素/隐空间上回归去噪"</strong>。前者用一个目标统一文图、接口最干净；后者牺牲统一性换取保真度。近期 <em>Transfusion</em> 等工作尝试在同一 Transformer 里"文本走自回归、图像走扩散"，兼得两者 —— 这是 2024 后统一生成模型的活跃方向。评测多模态生成时，要分开看"文图交错的连贯性"和"单张图的保真度/可控性"，二者常此消彼长。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="moe"><span class="num">4</span>稀疏专家 MoE 在多模态中的作用</h2>
+
+  <p>原生多模态意味着同一个模型要同时承载文本、视觉、音频等异质能力，参数需求暴涨。<span class="term">Mixture-of-Experts (MoE)</span> 是前沿大模型应对这一矛盾的核心手段：用<strong>稀疏激活</strong>（sparse activation）把参数总量做大，但每个 token 只路由到少数几个专家，使<strong>计算量（FLOPs）几乎不随总参数线性增长</strong>。</p>
+
+  <div class="math-block">
+  $$
+  y=\sum_{i\in \mathrm{TopK}(g(x))} g_i(x)\, E_i(x),
+  \qquad g(x)=\mathrm{softmax}(W_g\,x)
+  $$
+  </div>
+
+  <p>其中 $E_i$ 是第 $i$ 个专家（通常是一个 FFN），$g(x)$ 是路由门控（router/gating），只取 Top-$K$（常 $K{=}1$ 或 $2$）个专家激活。于是总参数可达万亿级，而每 token 实际计算只相当于一个小得多的稠密模型。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>不是让一个全能巨人处理所有 token，而是养一群各有专长的专家，每个 token 来了只叫最相关的一两个专家出手。这样"团队"很大（参数多、知识广），但每次"出工"的人很少（算力省）。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>稠密模型的算力 $\propto$ 参数量；MoE 通过条件计算（conditional computation）解耦二者，算力 $\propto K\times$ 单专家规模。代价是：路由不均衡（load imbalance）需 auxiliary load-balancing loss 约束；显存仍要存下全部专家；分布式下专家并行（expert parallelism）带来通信开销。多模态场景中，专家可能<strong>隐式按模态/任务分化</strong>，这既是效率来源，也给可解释性与评测带来新问题。</p>
+    </div>
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>评测视角</strong>：MoE 模型的"有效容量"和"激活算力"解耦，导致用参数量横向比较两个模型变得不公平 —— 一个 8×7B MoE 与一个 7B 稠密模型，参数差近 8 倍但单 token 算力相近。报告/评测前沿多模态模型时，应同时给出<strong>总参数、激活参数、每 token FLOPs</strong>，否则结论会误导。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="grounding"><span class="num">5</span>智能体基础：GUI grounding 与 set-of-marks</h2>
+
+  <p>原生多模态让模型能"看懂屏幕"，这是迈向<strong>多模态智能体</strong>（multimodal agent）的前提。智能体最基础的能力是 <span class="term">GUI grounding</span>：<strong>把自然语言指令对应到屏幕上的具体坐标或控件</strong> —— 例如把"点击提交按钮"映射为屏幕坐标 $(x,y)$ 或一个边界框 $(x_1,y_1,x_2,y_2)$。</p>
+
+  <p>这本质是 referring expression grounding 在屏幕域上的特化，难点在于：①界面元素小而密集（图标、菜单项）；②文字渲染细，需高分辨率视觉（呼应模块 06）；③同一语义控件外观跨应用差异极大，需强泛化。<strong>SeeClick</strong> [Cheng et al. 2024] 专门提出 GUI grounding 预训练任务，显著提升了 agent 在真实界面上的定位准确率。</p>
+
+  <p>直接让模型回归像素坐标对很多 VLM 仍偏难。<span class="term">Set-of-Marks (SoM)</span> 提示法换了个思路：<strong>先用分割/检测在图上叠加带编号的可视标记，让模型只需回答"该点哪个编号"，把连续坐标回归问题降级为离散选择问题</strong>，大幅降低 grounding 难度、提升可靠性。</p>
+
+  <div class="ascii">
+  ── 直接坐标 grounding ──────────────        ── Set-of-Marks 提示 ──────────────
+  指令: "点击 提交"                            先叠加编号标记:
+       │                                        ┌─────────────────────┐
+       ▼  VLM 直接回归                          │ [1]文件  [2]编辑 [3]× │
+  ┌─────────────────────┐                       │                       │
+  │  (x=412, y=088)      │  ← 像素级回归         │   [4]搜索框            │
+  │  对小图标常常偏掉     │     易错             │           [5]提交 ◄──  │
+  └─────────────────────┘                       └─────────────────────┘
+                                                指令→ "点击 提交"
+                                                VLM 只需答: "5"  ← 离散选择，更稳
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  Set-of-Marks 是一个极具实践价值的"评测/工程"技巧：它把<strong>感知（定位在哪）与决策（该点什么）解耦</strong>。定位交给专门的检测/分割模块产生编号，VLM 只负责高层决策。做 agent 评测时，区分失败是"看不到/定位错"还是"决策错"，SoM 正好提供了这种归因切面。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="computeruse"><span class="num">6</span>computer-use agent：感知-行动循环</h2>
+
+  <p>把 grounding 嵌入一个闭环，就得到 <span class="term">computer-use agent</span>：模型<strong>看屏幕截图 → 推理当前该做什么 → 输出鼠标/键盘动作 → 环境执行 → 产生新截图</strong>，如此循环直到完成任务。这是经典的<strong>感知-行动循环</strong>（perception-action loop），也是强化学习里 agent 的标准形态，只不过策略由一个 VLM 充当。</p>
+
+  <div class="ascii">
+              ┌──────────────────── 感知-行动循环 perception-action loop ─────────────────┐
+              ▼                                                                            │
+       ┌────────────┐    截图(observation)   ┌──────────────┐   action(click/type/scroll)  │
+       │  环境/OS    │ ─────────────────────► │   VLM 策略    │ ────────────────────────────┘
+       │ (screen)    │                        │ 观察→推理→动作 │
+       └────────────┘ ◄───────────────────── └──────────────┘
+              ▲          执行动作，状态更新            │
+              │                                        ▼
+              └────────────── 直到任务完成 / 触发停止条件 / 安全护栏拦截 ────────────────
+  </div>
+
+  <p>代表工作：<strong>CogAgent</strong> [Hong et al. 2023] 用高低分辨率双路视觉专门处理 GUI 截图里的细小文字与图标；<strong>SeeClick</strong> 强化 grounding；<strong>Anthropic Computer Use</strong> [2024] 让 Claude 直接输出鼠标键盘动作操作真实桌面；<strong>Qwen2.5-VL</strong> [Bai et al. 2025] 把 GUI 操作、对象定位、文档解析作为原生能力训练，并支持结构化的动作/坐标输出。动作空间通常形如：</p>
+
+  <div class="math-block">
+  $$
+  a_t \in \{\,\texttt{click}(x,y),\ \texttt{type}(\text{text}),\ \texttt{scroll}(\Delta),\ \texttt{key}(k),\ \texttt{done}\,\}
+  $$
+  </div>
+
+  <div class="callout danger"><span class="label"></span>
+  让模型直接操作真实计算机是<strong>高风险</strong>能力：误删文件、误付款、被网页上的注入文本劫持（prompt injection 通过屏幕内容进入）、自我繁殖式操作等。本模块的 notebook<strong>只做教学模拟（toy 环境）</strong>，绝不触碰真实 OS。生产级 computer-use 必须配沙箱、动作白名单、人类确认（human-in-the-loop）与硬性停止条件 —— 这正是下一节"安全护栏"的内容。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="agenteval"><span class="num">7</span>智能体评测：为什么比静态 benchmark 更难也更重要</h2>
+
+  <p>模块 07/08 评的是"模型回答一个问题对不对"——单步、静态、确定。<strong>智能体评测</strong>评的是"模型能不能在多步交互中真正<em>完成一项任务</em>"——多步、动态、有状态、强随机。这呼应 METR 这类机构的核心关切：评估前沿模型的<strong>自主能力（autonomy）与潜在危险能力</strong>。</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>静态 benchmark（模块 07/08）</th><th>agentic 评测（本节）</th></tr></thead>
+    <tbody>
+      <tr><td>单位</td><td>单条 QA / 单步预测</td><td>完整任务（多步轨迹 trajectory）</td></tr>
+      <tr><td>主指标</td><td>准确率 accuracy</td><td>任务完成率 task success rate / 完成时长</td></tr>
+      <tr><td>状态</td><td>无状态，题目独立</td><td>有状态，误差跨步累积</td></tr>
+      <tr><td>可复现性</td><td>高（确定输入输出）</td><td>低（环境随机、长轨迹方差大）</td></tr>
+      <tr><td>失败归因</td><td>相对清晰（对/错）</td><td>难（感知错？规划错？执行错？环境变了？）</td></tr>
+      <tr><td>安全维度</td><td>主要看有害输出</td><td>还要看有害<strong>行动</strong>与不可逆后果</td></tr>
+    </tbody>
+  </table>
+
+  <p>几个评测核心维度：</p>
+  <ul>
+    <li><strong>任务完成率 (task success rate)</strong>：在一组真实任务上端到端成功的比例。需要可程序化判定的 success oracle，构造成本远高于一道选择题。</li>
+    <li><strong>多步可靠性 (multi-step reliability)</strong>：单步 95% 准确，10 步连乘只剩 $0.95^{10}\approx 60\%$。长时程任务对单步错误率极其敏感，这是 agent 落地的头号瓶颈。</li>
+    <li><strong>自主性评估 (autonomy evaluation)</strong>：模型在<strong>无人干预</strong>下能走多远、能否自我纠错与恢复（self-correction / recovery）。METR 用"模型能独立完成的任务时长（task horizon）"作为自主能力的可比刻度。</li>
+    <li><strong>安全护栏 (safety guardrails)</strong>：危险动作拦截率、对 prompt injection 的鲁棒性、是否遵守停止条件、不可逆操作前是否请求人类确认。评的不只是"说错话"，更是"做错事"。</li>
+  </ul>
+
+  <div class="math-block">
+  $$
+  \Pr[\text{任务成功}] \approx \prod_{t=1}^{T} \Pr[\text{第 }t\text{ 步正确}]
+  \;\xrightarrow{\;\text{长时程 }T\uparrow\;}\; \text{对单步错误率高度敏感}
+  $$
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>为什么 agentic 评测更重要</strong>：模型一旦能行动，其能力与风险都不再停留在"文本"层面，而是落到真实世界后果上。静态 benchmark 跑满分也无法保证 agent 安全可靠；反过来，agentic 评测的高方差、难复现、人工搭建环境成本高，又使它远比刷榜困难。可复现的任务环境、可信的 success oracle、对长时程方差的统计处理，是当前 agent 评测方法学的前沿。这是从 model evaluation 走向 <span class="term">system / agent evaluation</span> 的关键一跃。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>统一任意模态 (truly any-to-any)</strong>：能否用一个目标、一套参数无缝处理文/图/音/视频的输入与输出？早融合（Chameleon）优雅但有优化与保真度瓶颈，扩散+自回归混合（Transfusion 类）是热点，但"统一接口"与"单模态最优质量"之间的取舍仍未定论。</li>
+    <li><strong>长时程可靠性 (long-horizon reliability)</strong>：单步错误在长轨迹上指数累积，如何让 agent 自我监控、错误恢复、知道何时停下或求助？这是 agent 从 demo 走向生产的核心瓶颈。</li>
+    <li><strong>agent 安全 (agentic safety)</strong>：从屏幕/网页注入的 prompt injection、不可逆动作、自主性带来的失控风险，如何在不牺牲能力的前提下加护栏？危险能力评估（dangerous capability eval，呼应模块 08 与 METR）正成为前沿模型发布前的必经环节。</li>
+    <li><strong>评测方法学 (evaluation methodology)</strong>：如何构造可复现、可信、可扩展的 agentic benchmark？success oracle 自动化、长时程方差的统计严谨性、避免任务被训练数据污染，都是开放难题。</li>
+    <li><strong>统一表征的可解释性</strong>：MoE 专家是否、如何按模态/任务分化？原生联合表征里"跨模态推理"具体发生在哪？这关系到我们能否<strong>归因</strong>一个多模态 agent 的成功与失败 —— 评测的终极目标。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>原生多模态与后期拼接 VLM 在训练范式、能力、延迟上有何本质差异？举 GPT-4o / Gemini 为例。</li>
+      <li>早融合 any-to-any（Chameleon）如何把图像变成 token？相比扩散解码，自回归 image token 的取舍是什么？</li>
+      <li>MoE 为何能"扩参数不爆算力"？为什么用参数量横向比较 MoE 与稠密模型不公平？</li>
+      <li>什么是 GUI grounding 与 set-of-marks？computer-use agent 的感知-行动循环长什么样？</li>
+      <li>为什么 agentic 评测比静态 benchmark 更难也更重要？列出至少三个核心评测维度。</li>
+    </ol>
+  </div>
+
+  <div class="card" style="border-color:var(--accent-2); text-align:center;">
+    🎉 <strong>恭喜你完成全部 10 个模块！</strong><br>
+    从视觉编码器（01）到对比对齐（02）、架构（03）、连接器与训练（04）、指令微调（05）、高分辨率与视频（06）、评测（07）、幻觉与安全（08），直到今天的原生多模态与智能体（09）—— 你已走完一条研究科学家级的 VLM 评测主线。<br>
+    <a href="../index.html">← 回到课程主页 / 结课</a>
+  </div>
+
+  <div class="pager">
+    <a href="../08_hallucination_safety/08_讲解.html"><div class="dir">← 上一章</div><div class="t">08 · 幻觉、鲁棒性与安全评估</div></a>
+    <a class="next" href="../index.html"><div class="dir">下一章 →</div><div class="t">课程主页 / 结课 🎓</div></a>
+  </div>
+
+</div>
+</body>
+</html>

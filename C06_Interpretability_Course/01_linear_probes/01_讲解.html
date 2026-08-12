@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · Linear Probes：表示即向量</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · Linear Probes：表示即向量</h1>
+  <p class="subtitle">linear probing 从零 —— 如果"概念"是激活空间里的方向，那么一个线性分类器就是读取模型内部状态的最简显微镜；但读得到 ≠ 模型在用</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">线性代数（投影/内积）、logistic regression、Transformer 内部结构（C1 课程）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_linear_probes.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Alain &amp; Bengio 2016、Hewitt &amp; Liang 2019、Marks &amp; Tegmark 2023、Park 2023</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">动机：评测科学家为什么要打开黑盒</a></li>
+      <li><a href="#lrh">linear representation hypothesis：概念 ≈ 方向</a></li>
+      <li><a href="#math">probe 的数学：logistic probe 完整推导</a></li>
+      <li><a href="#meandiff">mean-difference probe vs trained probe</a></li>
+      <li><a href="#pitfalls">方法论陷阱：高准确率不等于因果证据</a></li>
+      <li><a href="#selectivity">probe 容量与 selectivity（control task）</a></li>
+      <li><a href="#audit">probing 在评测与审计中的应用</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>动机：评测科学家为什么要打开黑盒</h2>
+
+  <p>到目前为止（C3/C5 课程），我们评测模型的方式都是<strong>行为学的</strong>：给输入、看输出、算指标。
+  这套范式有一个结构性盲区——<strong>行为相同不代表机制相同</strong>。一个模型答对题，可能因为它真的推理了，
+  也可能因为它记住了答案；一个模型说"我不知道"，可能是诚实校准，也可能是 <span class="term">sandbagging</span>（C5 模块 05）。
+  当评测对象有动机（或被训练出倾向）让行为与内部状态脱钩时，只看行为的评测会系统性失效。</p>
+
+  <p><span class="term">mechanistic interpretability</span>（机制可解释性）提供另一条证据链：直接读取并干预模型的<strong>内部激活</strong>。
+  本课程八个模块从最简单的工具开始——<strong>linear probe（线性探针）</strong>：在模型某一层的激活上训练一个线性分类器，
+  检测某个概念（真/假、有害/无害、说谎/诚实）是否被编码、编码在哪、能否被操控。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>把模型某一层的激活想成一张"脑电图"：每条输入对应一个 $d$ 维向量（GPT-2 small 是 768 维，frontier 模型上万维）。
+      probe 要回答的问题是：仅凭这张脑电图，一个<strong>最笨的</strong>分类器（画一个超平面）能不能区分"模型正在处理真话"和"模型正在处理假话"？
+      如果能，说明这个信息<strong>线性可读</strong>地躺在激活里。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设 $h_\ell(x) \in \mathbb{R}^d$ 为模型第 $\ell$ 层对输入 $x$ 的激活（通常取 residual stream 上某个 token 位置）。
+      给定带标签数据集 $\{(h_\ell(x_i), y_i)\}_{i=1}^n$，$y_i \in \{0,1\}$ 表示概念是否存在，
+      probing 即训练分类器 $g_\theta: \mathbb{R}^d \to [0,1]$ 并在 held-out 集上评估。
+      $g$ 限定为线性函数时称 linear probe [Alain &amp; Bengio 2016, arXiv:1610.01644]。
+      probe 准确率被解读为"该层激活中概念 $y$ 的<em>线性可解码性</em>（linear decodability）"——注意措辞：是可解码性，不是因果作用，第 5 节会展开这个区别。</p>
+    </div>
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  对 evaluation 方向的研究者，probe 的吸引力在于它是<strong>白盒评测的最低成本入口</strong>：训练一个 probe 只需几百条样本、几秒 CPU 时间，
+  却可能暴露行为评测看不到的东西——例如模型输出"这是真的"时，内部"真假方向"上的激活却指向假（第 7 节的 deception probing）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="lrh"><span class="num">2</span>linear representation hypothesis：概念 ≈ 方向</h2>
+
+  <p>linear probe 之所以"够用"，依赖一个经验假设：<span class="term">linear representation hypothesis (LRH)</span>——
+  <strong>高层概念在神经网络的激活空间中近似表示为方向（direction）</strong>，概念的"强度"对应激活在该方向上的投影长度。</p>
+
+  <h3>2.1 证据谱系</h3>
+  <ul>
+    <li><strong>词向量类比</strong> [Mikolov 2013, arXiv:1301.3781]：$v(\text{king}) - v(\text{man}) + v(\text{woman}) \approx v(\text{queen})$。
+    "性别"这个概念表现为一个可加减的<em>差向量</em>——这是 LRH 最早、最著名的经验证据。</li>
+    <li><strong>中间层线性可读</strong> [Alain &amp; Bengio 2016, arXiv:1610.01644]：在图像分类网络每一层插 linear probe，
+    发现类别信息的线性可解码性随深度单调上升——深度网络在逐层"理顺"表示，把非线性纠缠的特征展开成线性可分的形态。</li>
+    <li><strong>LLM 中的具体概念方向</strong>：真假陈述方向 [Marks &amp; Tegmark 2023, arXiv:2310.06824]、
+    空间/时间坐标 [Gurnee &amp; Tegmark 2023, arXiv:2310.02207]、Othello 棋盘状态 [Nanda 2023, arXiv:2309.00941]、
+    拒绝方向（refusal direction）[Arditi 2024, arXiv:2406.11717]——都能用一个方向解码甚至操控。</li>
+    <li><strong>形式化</strong> [Park 2023, arXiv:2311.03658]：<em>The Linear Representation Hypothesis and the Geometry of Large Language Models</em>
+    把"线性表示"拆成三个可分别检验的含义——(a) <em>subspace</em>：概念对应嵌入空间的一个（低维）子空间；
+    (b) <em>measurement</em>：概念值可由线性函数（probe）读出；(c) <em>intervention</em>：沿该方向移动激活能可预测地改变模型输出中的概念。
+    并指出欧氏内积不是天然正确的度量——需要用一个<em>因果内积</em>（causal inner product，由 unembedding 的协方差定义）才能让"语义无关的概念方向正交"成立。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  LRH 是<strong>经验近似而非定理</strong>。已知反例：[Engels 2024, arXiv:2405.14860] 发现星期/月份等循环概念用<strong>二维环面</strong>而非一维方向表示；
+  superposition 理论 [Elhage 2022, <em>Toy Models of Superposition</em>] 预言特征数远多于维度时，特征方向相互<strong>非正交挤压</strong>，
+  单个方向的读数会被干扰特征污染。本课模块 05（SAE）正面处理这个问题。当前模块先在 LRH 成立的合成世界里把工具练熟。</div>
+
+  <h3>2.2 本模块的实验设计：合成激活</h3>
+  <p>配套 notebook 不加载真实模型（保持纯 numpy、CPU 秒级），而是<strong>构造一个我们知道全部真相的合成激活空间</strong>：
+  在 $d=64$ 维空间里，激活由四部分叠加——共同均值 $\mu_0$、概念信号 $\pm\frac{\alpha}{2} v_{\text{true}}$（$v_{\text{true}}$ 是我们埋入的真概念方向）、
+  一个与标签无关但方差很大的<strong>干扰方向</strong> $v_{\text{distract}}$、以及<strong>各向异性</strong>高斯噪声（特征值谱衰减，模拟真实 residual stream 中
+  少数方向方差极大的现象 [Rudman 2023 各向异性观测]）。一切结论都可以对照 ground truth 验证——这是学方法论的正确顺序：先在已知真相的沙盒里校准直觉，再上真模型。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="math"><span class="num">3</span>probe 的数学：logistic probe 完整推导</h2>
+
+  <h3>3.1 模型与训练目标</h3>
+  <p>linear probe 就是激活空间上的 logistic regression。给定激活 $h \in \mathbb{R}^d$，probe 预测：</p>
+  <div class="math-block">
+  $$ p_\theta(y=1 \mid h) = \sigma(w^\top h + b), \qquad \sigma(z) = \frac{1}{1+e^{-z}} $$
+  </div>
+  <p>参数 $\theta = (w, b)$，$w \in \mathbb{R}^d$ 即 <strong>probe 方向</strong>（其单位化 $\hat w$ 是我们对概念方向的估计），$b$ 是偏置。
+  训练目标是带 $L_2$ 正则的负对数似然（交叉熵）：</p>
+  <div class="math-block">
+  $$ \mathcal{L}(w,b) = -\frac{1}{n}\sum_{i=1}^{n}\Big[ y_i \log \sigma(w^\top h_i + b) + (1-y_i)\log\big(1-\sigma(w^\top h_i + b)\big) \Big] + \lambda \lVert w \rVert_2^2 $$
+  </div>
+
+  <h3>3.2 梯度推导</h3>
+  <p>记 $z_i = w^\top h_i + b$，$p_i = \sigma(z_i)$。利用 $\sigma'(z) = \sigma(z)(1-\sigma(z))$，单样本损失对 $z_i$ 的导数化简得到优美的形式：</p>
+  <div class="math-block">
+  $$ \frac{\partial \mathcal{L}_i}{\partial z_i} = p_i - y_i
+     \quad\Longrightarrow\quad
+     \nabla_w \mathcal{L} = \frac{1}{n} H^\top (p - y) + 2\lambda w, \qquad
+     \frac{\partial \mathcal{L}}{\partial b} = \frac{1}{n}\sum_i (p_i - y_i) $$
+  </div>
+  <p>其中 $H \in \mathbb{R}^{n\times d}$ 按行堆叠激活。两点重要性质：</p>
+  <ul>
+    <li><strong>凸性</strong>：$\mathcal{L}$ 对 $(w,b)$ 是凸函数（$\lambda&gt;0$ 时强凸），梯度下降必收敛到全局最优——
+    所以 probe 训练没有"调参玄学"，结果可复现，这正是它适合做<em>测量仪器</em>的原因。</li>
+    <li><strong>$\lambda$ 的双重身份</strong>：$L_2$ 不只防过拟合；当数据线性可分时，无正则的 logistic loss 会让 $\lVert w\rVert \to \infty$（损失趋零但永不为零），
+    $\lambda&gt;0$ 保证最优解有限。第 6 节会看到 $\lambda$ 还控制 probe 的"记忆容量"，直接影响 selectivity。</li>
+  </ul>
+
+  <h3>3.3 评估指标</h3>
+  <p>held-out 集上报告 <strong>accuracy</strong>（$\mathbb{1}[p_i &gt; 0.5]$ 与 $y_i$ 的符合率）与 <strong>AUC</strong>。AUC 有一个免积分的等价定义（Mann–Whitney 统计量）：</p>
+  <div class="math-block">
+  $$ \mathrm{AUC} = \Pr\big(s(h^+) &gt; s(h^-)\big), \qquad h^+ \sim \text{正类},\; h^- \sim \text{负类},\; s(h) = w^\top h + b $$
+  </div>
+  <p>即"随机抽一对正负样本，probe 给正样本更高分的概率"——只依赖分数的<strong>排序</strong>，对阈值与类别不平衡不敏感，是 probe 报告的首选指标。notebook 练习 2 会用秩统计量从零实现它。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="meandiff"><span class="num">4</span>mean-difference probe vs trained probe</h2>
+
+  <p>训练 logistic probe 之外，还有一个零训练的替代：<span class="term">mean-difference probe</span>（也称 difference-of-means / mass-mean probe）——
+  直接拿两类激活的均值差作方向：</p>
+  <div class="math-block">
+  $$ w_{\text{md}} = \mu^+ - \mu^-, \qquad \mu^\pm = \frac{1}{n^\pm}\sum_{i: y_i = \pm} h_i $$
+  </div>
+
+  <p>两者的统计学关系值得记住。若两类激活服从同协方差高斯 $\mathcal{N}(\mu^\pm, \Sigma)$，则 Bayes 最优线性判别方向是
+  <span class="term">LDA</span> 方向 $w^* = \Sigma^{-1}(\mu^+ - \mu^-)$，且 logistic regression 的总体最优解与之同向。所以：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>mean-difference probe</th><th>trained (logistic) probe</th></tr></thead>
+    <tbody>
+      <tr><td>计算成本</td><td>两次均值，零训练</td><td>梯度下降（仍是秒级）</td></tr>
+      <tr><td>噪声各向同性时（$\Sigma = \sigma^2 I$）</td><td>与 Bayes 最优方向一致</td><td>同左（多了估计方差）</td></tr>
+      <tr><td>噪声各向异性时</td><td><strong>有偏</strong>：不修正 $\Sigma$，方向被高方差噪声维度拉偏，分类准确率次优</td><td>渐近逼近 $\Sigma^{-1}\Delta\mu$，准确率更高；但 $w$ 会混入"为了抵消噪声协方差"的成分，<strong>不再纯指概念方向</strong></td></tr>
+      <tr><td>样本极少时</td><td>更稳（只估 $2d$ 个数）</td><td>易过拟合，依赖 $\lambda$</td></tr>
+      <tr><td>用于因果干预（steering/ablation）</td><td>[Marks &amp; Tegmark 2023] 报告 mean-diff 方向做激活干预<strong>泛化更好</strong>、更接近"模型真正使用的方向"</td><td>方向混入判别性噪声补偿成分，干预效果可能更差</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  一句话总结这张表：<strong>要分类准确率，用 trained probe；要"概念方向"本身（拿去做干预、做几何分析），mean-difference 往往更忠实。</strong>
+  "最准的探针"与"最忠实的方向估计"是两个不同的优化目标——这个区别在文献里反复出现（[Marks &amp; Tegmark 2023] §4，[Belinkov 2022, arXiv:2102.12452] 综述）。
+  notebook 第 3 节会在各向异性噪声下复现：logistic probe 准确率更高，但 mean-diff 方向与 $v_{\text{true}}$ 的余弦相似度更高。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="pitfalls"><span class="num">5</span>方法论陷阱：高准确率不等于因果证据</h2>
+
+  <p>这是本模块最重要的一节。probe 文献的核心教训可以浓缩为一句话：
+  <strong>probe 准确率高，只证明信息<em>存在于</em>激活中（相对于 probe 的函数类线性可解码），不证明模型<em>使用</em>该信息。</strong></p>
+
+  <h3>5.1 correlational vs causal</h3>
+  <p>probe 是<strong>相关性证据</strong>。三种典型的"probe 读得到但模型不用"的情形：</p>
+  <ul>
+    <li><strong>输入残留</strong>：激活是输入的（近似可逆的）函数，输入里有的信息低层激活里几乎都有。在 embedding 层 probe 出"句子主语的性别"准确率 95%，
+    只说明输入文本带这个信息，与模型的下游计算无关。</li>
+    <li><strong>伴生相关（spurious correlate）</strong>：probe 可能锁定一个与标签相关的<em>代理特征</em>。例如真假陈述数据集中假陈述平均更长，
+    probe 可能部分在读"长度方向"。[Marks &amp; Tegmark 2023] 为此精心构造了 negation/conjunction 对照集来排除表面特征。</li>
+    <li><strong>死信息（epiphenomenal encoding）</strong>：信息线性存在但位于模型后续计算的"零空间"里，下游层从不读取它。行为上等价于不存在，probe 却报告高准确率。</li>
+  </ul>
+
+  <p>因果证据需要<strong>干预（intervention）</strong>：把激活沿概念方向修改（steering）或把该方向投影消除（<span class="term">projection ablation</span>）：</p>
+  <div class="math-block">
+  $$ h' = (I - \hat v \hat v^\top)\, h \qquad (\text{把 } h \text{ 在 } \hat v \text{ 上的分量清零}) $$
+  </div>
+  <p>若 ablation 后模型相应行为消失（且其他能力保持），才构成"模型使用该方向"的证据。这正是 [Park 2023] 三分法里 measurement 与 intervention 的区别，
+  也是本课模块 02（activation patching）的主题。notebook 练习 4 让你在合成数据上实现 projection ablation，并验证 ablation 后任何 probe 都掉回随机水平。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>评测语境下这个区别是生死攸关的。</strong>假设你用 deception probe 审计模型，probe 说"内部没有欺骗信号"——
+  如果 probe 只是相关性工具，这句话的含义是"<em>我这个线性探针</em>没找到"，而不是"模型没在欺骗"。
+  反方向同样危险：probe 报警也可能在读伴生特征（比如话题敏感度）而非欺骗本身。把 probe 结果写进 safety case（C5 模块 07）之前，必须辅以干预实验与 control 对照。</div>
+
+  <h3>5.2 Alain &amp; Bengio 的原始警告</h3>
+  <p>有趣的是，probe 的开山论文 [Alain &amp; Bengio 2016] 自己就强调了"probe 不参与模型计算"：他们刻意用<strong>不回传梯度</strong>的线性分类器，
+  把 probe 定位为"温度计"——测量而不扰动。后来社区一度滥用更强的 probe（MLP probe 甚至 attention probe），引出了下一节的容量问题。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="selectivity"><span class="num">6</span>probe 容量与 selectivity：control task</h2>
+
+  <p>第二个陷阱：<strong>probe 自身的容量（capacity）是混淆变量</strong>。probe 越强（参数越多、非线性越强、训练越久、正则越弱），
+  越能从激活里"挤出"任何信息——包括<strong>纯靠记忆训练样本</strong>得到的伪信号。极端情形：$n \le d+1$ 时，
+  $d$ 维空间里的随机标签数据几乎必然线性可分（Cover 定理），probe 训练准确率可达 100%，哪怕标签是抛硬币生成的。</p>
+
+  <p>[Hewitt &amp; Liang 2019, arXiv:1909.03368] 提出的解法是 <span class="term">control task</span>：
+  构造一个<strong>结构与真任务相同、但标签与概念无关（随机分配且固定）</strong>的对照任务，定义：</p>
+  <div class="math-block">
+  $$ \mathrm{selectivity} = \mathrm{acc}_{\text{task}} - \mathrm{acc}_{\text{control}} $$
+  </div>
+  <ul>
+    <li>高 task 准确率 + 高 control 准确率 → probe 在靠容量记忆，task 高分<strong>不可信</strong>（selectivity 低）；</li>
+    <li>高 task 准确率 + 随机水平 control → 高分来自激活中真实存在的结构（selectivity 高）。</li>
+  </ul>
+  <p>他们在 POS tagging 等任务上发现：MLP probe 准确率比 linear probe 高，但 selectivity 反而更低——多出来的准确率主要是容量买来的。
+  结论：<strong>报告 probe 结果必须同时报告 control 基线</strong>；并且 probe 应该选"足够简单 + 适当正则"的那一个，而不是准确率最高的那一个。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  实战 checklist（跑任何 probing 实验前过一遍）：① held-out 评估而非训练集；② $n$ 与 $d$ 的比值是否使随机标签可分（$n \lesssim d$ 是红区）；
+  ③ control task selectivity 报了吗；④ 伴生特征（长度、话题、风格）排除了吗；⑤ 结论措辞是"线性可解码"还是越界写成了"模型表征/使用"？
+  notebook 第 4 节与练习 3 在合成数据上完整复现 ①–③：同一份激活、随机标签，小样本 + 弱正则的 probe 训练准确率轻松上 0.95，测试集立刻打回 0.5。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="audit"><span class="num">7</span>probing 在评测与审计中的应用</h2>
+
+  <h3>7.1 真假陈述方向：geometry of truth</h3>
+  <p>[Marks &amp; Tegmark 2023, arXiv:2310.06824] 在 Llama-2 系列上用精心控制的真/假陈述数据集（城市地理、数字比较及其否定/合取变体）发现：
+  中层 residual stream 中存在一个<strong>跨数据集泛化的"真值方向"</strong>；mean-difference 方向不仅分类好，
+  做激活干预还能把模型对陈述真假的判断翻转。同期 [Burns 2022, arXiv:2212.03827]（CCS）则展示了<strong>无监督</strong>地从激活中找真值方向：
+  利用"陈述与其否定的概率应互补"这一逻辑一致性约束，不需要任何标签。这条线对评测的意义：
+  <strong>模型"知道"的可能比它"说"的多</strong>——内部真值读数与外部输出的差值，本身就是诚实性（honesty）的一个测量目标。</p>
+
+  <h3>7.2 deception / sleeper agent probing</h3>
+  <p>Anthropic 在 sleeper agents 后续工作（<em>Simple probes can catch sleeper agents</em>, 2024）展示了一个惊人结果：
+  对植入后门的模型，用极其简单的 prompt 对（如 "Human: Are you doing something dangerous? Assistant: yes/no"）构造 mean-difference 方向，
+  即可在模型实际触发后门<em>之前</em>以高 AUC 区分"将要写入漏洞代码"的内部状态——哪怕 probe 训练数据与后门内容毫无关系。
+  这类 <span class="term">defection probe</span> 是"白盒监控"（C5 模块 06 AI Control 的 monitor 角色）的雏形：
+  部署时对每个 forward pass 顺带做一次内积，几乎零成本。当然，第 5 节的警告依然成立：这是相关性监控，能被适应性对手绕过的程度仍是开放问题。</p>
+
+  <h3>7.3 persona vectors 与表征工程</h3>
+  <p>[Chen 2025, arXiv:2507.21509]（Anthropic persona vectors）把"人格特质"（谄媚 sycophancy、撒谎倾向、邪恶 persona）提取为激活空间方向：
+  用对比 prompt 诱导特质开/关，取 mean-difference 得到 persona vector，进而：(a) <strong>监控</strong>——部署中投影值漂移预警人格漂移；
+  (b) <strong>干预</strong>——减去方向抑制特质，训练中加方向做"疫苗"（preventative steering）防止微调引入坏特质；
+  (c) <strong>数据审计</strong>——用投影值反查哪些训练样本会推高坏特质。更早的 [Zou 2023, arXiv:2310.01405]（representation engineering）
+  把这套"读方向 + 控方向"系统化为 RepE 框架。对 evaluation 研究者，这意味着一类新的评测交付物：
+  <strong>不只报告行为分数，还报告内部方向上的投影分布及其随训练/部署的漂移。</strong></p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>superposition 与 probe 的极限</strong>：若特征以非正交方式叠加存储 [Elhage 2022]，单一方向的 probe 读数必然带干扰串扰。
+    sparse autoencoder（模块 05）试图先把叠加拆开再读；probe 与 SAE 的精度/成本权衡是当前热点（probe 便宜但糙，SAE 贵但细）。</li>
+    <li><strong>非线性表示</strong>：[Engels 2024] 的环形特征、onion 状多层编码等反例提示 LRH 只是一阶近似。何时必须升级到子空间/流形 probe，
+    何时升级反而引入容量混淆（第 6 节），缺乏系统判据。</li>
+    <li><strong>概念方向的可信度量</strong>：同一概念、不同数据集训出的方向余弦相似度常常只有 0.5–0.8。方向的"采样方差"如何报告？
+    [Park 2023] 的因果内积指出欧氏几何本身可能就是错的度量——实践中却几乎人人在用余弦相似度。</li>
+    <li><strong>对抗鲁棒性</strong>：白盒监控 probe 一旦写进 control 协议，就成了优化目标——模型（或攻击者）能否学会把"危险计算"移出 probe 可见的线性子空间？
+    probe 监控的 red-teaming 方法论（C5 课程的镜像问题）刚刚起步。</li>
+    <li><strong>评测标准化</strong>：probing 报告目前没有公认规范。最低限度应包含：层位扫描曲线、control task selectivity、
+    held-out 与分布外泛化、干预验证（ablation/steering 的行为效应）。把这四件套变成 probing 评测的"统计显著性报告"惯例，是 evaluation 社区可以直接贡献的方向。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>linear representation hypothesis 的三个层次（subspace / measurement / intervention）分别是什么？probe 验证的是哪一层？</li>
+      <li>写出 logistic probe 的损失函数与梯度；$\lambda$ 在"可分数据"与"probe 容量"两个问题上分别扮演什么角色？</li>
+      <li>什么时候用 mean-difference probe、什么时候用 trained probe？各向异性噪声下两者的方向估计谁更忠实？</li>
+      <li>"probe 准确率 92%"这句话能推出什么、不能推出什么？要升级为因果结论需要补哪些实验？</li>
+      <li>selectivity 怎么定义？为什么 $n \lesssim d$ 时随机标签也能被线性 probe 完美拟合？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../00_setup/00_overview.html"><div class="dir">← 上一章</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_logit_lens/02_讲解.html"><div class="dir">下一章 →</div><div class="t">02 · Activation Patching 与因果干预</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · Prompt 缓存与长会话</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · Prompt 缓存与长会话</h1>
+  <p class="subtitle">把每轮都重发的稳定前缀缓存下来 —— 前缀匹配（一字节即失效）、缓存命中与 usage 三字段、TTL 与盈亏平衡、静默失效源、缓存友好排序、长会话成本账；从零模拟 prompt cache 并算清省了多少钱</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–04、Messages API 的 system/messages 形状、对「token 即成本」的基本认识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_prompt_caching.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Anthropic Prompt caching 文档、Effective context engineering、Messages API</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么长会话要缓存稳定前缀</a></li>
+      <li><a href="#prefix">前缀匹配：一个字节都不能动</a></li>
+      <li><a href="#usage">缓存命中与未命中：三个 token 字段</a></li>
+      <li><a href="#ttl">TTL：缓存活多久与盈亏平衡</a></li>
+      <li><a href="#invalid">缓存键与静默失效源</a></li>
+      <li><a href="#ordering">缓存友好的排序：比断点更重要</a></li>
+      <li><a href="#cost">长会话的成本账</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么长会话要缓存稳定前缀</h2>
+  <p>到这里，前四个模块已经让一个 agent 在有限窗口里<strong>装得下（01 截断）、压得住（02 compaction）、记得久（03 文件记忆）、查得到（04 检索）</strong>。现在浮现出第五个、也是最后一个约束——<strong>贵</strong>。一个能长时间运行的 agent，每一轮都要把<em>完整的上下文重新发给模型</em>（Messages API 是无状态的），而其中绝大部分——系统提示、工具定义、长文档、已经发生过的历史——<strong>每一轮几乎一模一样</strong>。模型每轮都把这一大坨稳定内容从头处理一遍，token 费就这么烧掉了。</p>  <p><span class="term">prompt caching</span>（提示缓存）正是为这件事而生：把请求里<strong>稳定不变的前缀</strong>在服务端缓存起来，后续请求只要前缀一致就<strong>直接命中、免去重新处理</strong>，既省时间又省钱（命中部分约只花全价的 0.1×）。Anthropic 用一个叫 <code>cache_control: {type:"ephemeral"}</code> 的标记告诉 API「缓存到这里为止的前缀」。对一个聊上千轮、或反复就同一份长文档问问题的 agent，缓存能把输入成本压掉一个量级——这就是上下文工程的经济学。</p>  <p>但缓存有一条<strong>近乎残酷的纪律</strong>：它是<strong>前缀匹配</strong>的——缓存键由「渲染后的 prompt 到断点为止的<em>精确字节</em>」决定，<strong>任意一个字节的改变，都会让那个位置以及之后的缓存全部失效</strong>。系统提示里多了一个时间戳、工具列表换了个顺序、JSON 没排序——命中率就会神秘地永远是 0，账单照样很贵，而且没有任何报错告诉你哪里错了。本模块要做的，就是把这套机制<strong>从零模拟一遍</strong>：前缀如何命中、TTL 如何过期、成本如何按 token 一笔笔算清、以及哪些「静默失效源」会悄悄毁掉它。</p>  <p>先把本模块与前四个的关系摆正：前四个模块都在回答「<em>怎么把对的内容放进窗口</em>」，而本模块回答的是「<em>既然每轮都要重发这些内容，怎么别重复付钱</em>」。这两件事并不冲突，反而互补——你越是用心地把稳定的系统提示、工具、知识库固化下来（为了让 agent 行为可靠），这些内容就越适合被缓存（因为它们稳定）。换句话说，<strong>好的上下文工程天然就是缓存友好的</strong>：把该冻结的冻结、把每轮变的隔离到末尾，既让 agent 更可控、又让它更便宜。本模块就是把这层「经济收益」显式地算出来，并教你别在不经意间把它漏掉。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>prompt 缓存 = 把每轮都重发的那一大坨稳定前缀，在服务端「记住」，下次照搬不重算</strong>。省钱的前提是<em>前缀真的稳定到一个字节都不变</em>；本模块的全部工程，都是在保证「稳定内容在前、易变内容在后」并算清这样做到底省了多少。难点不在「开启缓存」那一个参数，而在让前缀真正可复用、并理解它的账。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="prefix"><span class="num">2</span>前缀匹配：一个字节都不能动</h2>
+  <h3>前缀匹配：一个字节都不能动</h3>  <p>要理解缓存，先得理解模型眼里一次请求长什么样。Anthropic 把请求按固定顺序<strong>渲染成一长串内容</strong>：先 <code>tools</code>（工具定义）、再 <code>system</code>（系统提示）、最后 <code>messages</code>（对话历史 + 本轮输入）。缓存就建立在这串渲染结果的<strong>前缀</strong>上：</p>  <div class="ascii">  渲染顺序（缓存就看这条线的前缀）：
+  ┌─ tools ─────────┬─ system ──────────┬─ messages ───────────────────────┐
+  │ [工具定义...]   │ [系统提示...]     │ [历史 turn1..N] [本轮 user 输入]  │
+  └─────────────────┴───────────────────┴──────────────────────────────────┘
+        稳定·几乎不变       稳定·几乎不变          前面稳定 / 末尾每轮才变
+                                  ▲ cache_control 断点常打在这里(最后一个稳定块)
+  规则：从开头到断点的【精确字节】算一个缓存键；这之后任意一字节变 → 该键及之后全部失效</div>  <p>所以 <span class="term">cache breakpoint</span>（缓存断点，即 <code>cache_control</code> 标记）的作用是：「请把从开头到我这里为止的前缀缓存下来」。每个请求最多 4 个断点。关键推论只有一句但极其重要——<strong>稳定的内容必须放在前面、每轮才变的内容必须放在最后</strong>。系统提示、工具定义这类「跨轮不变」的放前面缓存；当前问题、时间戳这类「每轮都变」的放在断点之后。顺序反了，缓存就废了。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把它想成图书馆的「预留架」：管理员（API）会把你常借的那一摞书（稳定前缀）原样留在架上，下次你来直接取、不用重新从书库找。但前提是这一摞<strong>一本都不能换、顺序也不能动</strong>——只要中间换了一本，从那本往后的整摞都得重新去书库取一遍。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，缓存键 = <code>hash(渲染前缀的精确字节)</code>。命中要求新请求的前缀与已缓存的<strong>逐字节相同</strong>。这就是为什么「把工具定义的 JSON 用 <code>sort_keys=True</code> 固定序列化」「系统提示里不放任何会变的东西」如此重要——它们都是在保护这串字节的稳定性。本模块 notebook 用一个对前缀做哈希的 <code>PromptCache</code> 把这条规则精确复现。</p></div>
+  </div>  <p>还有一个常被忽视、却直接决定缓存「能不能用」的细节：<strong>最小可缓存长度</strong>。前缀必须够长（实践中以「至少约一千多个 token」为门槛，随模型而异）才允许被缓存——太短的前缀缓存收益还不够抵消管理开销，API 会直接不缓存它。这意味着<em>把一个三行的系统提示打上断点是没用的</em>：真正值得缓存的，是系统提示 + 工具定义 + 长文档/few-shot 示例这种<strong>成规模的稳定块</strong>。所以缓存的设计与「把哪些稳定内容固化进前缀」是同一件事——前缀越大且越稳定，缓存的杠杆越大；零碎的小前缀既难达门槛、收益也薄。另一个推论是：<strong>断点的位置应当尽量靠后（在稳定区的末尾）</strong>，让一个断点覆盖尽可能长的前缀，而不是把 4 个断点零散地插在中间——断点是「缓存到此」的界桩，界桩越靠后、被圈进缓存的稳定内容越多。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="usage"><span class="num">3</span>缓存命中与未命中：三个 token 字段</h2>
+  <h3>缓存命中与未命中：三个 token 字段</h3>  <p>一次请求的输入 token，会被缓存机制<strong>拆成三份</strong>分别计费，体现在响应的 <code>usage</code> 里：</p>  <table>
+    <thead><tr><th>usage 字段</th><th>含义</th><th>大致单价</th><th>什么时候出现</th></tr></thead>
+    <tbody>
+      <tr><td><code>cache_creation_input_tokens</code></td><td>这次【写进】缓存的 token（缓存未命中、首次处理这段前缀）</td><td>约 1.25× 基础价（5min TTL）</td><td>前缀第一次出现、或缓存已过期</td></tr>
+      <tr><td><code>cache_read_input_tokens</code></td><td>这次【从缓存读】的 token（命中已有前缀）</td><td>约 0.1× 基础价</td><td>前缀命中、未过期</td></tr>
+      <tr><td><code>input_tokens</code></td><td>未缓存、按全价处理的 token（断点之后那段每轮变的）</td><td>1× 基础价（全价）</td><td>总是有（至少含本轮输入）</td></tr>
+    </tbody>
+  </table>  <p>一条恒等式要记死：<strong>这三者之和 = 完整 prompt 的 token 总数</strong>。换句话说，缓存不会改变「模型看了多少 token」，只改变「每段 token 各按什么价收费」。所以验证缓存有没有真生效，不是看响应内容（内容一样），而是看 <code>cache_read_input_tokens</code> 是否大于 0：<em>若它在重复请求里始终是 0，缓存就没命中</em>——这是排查缓存问题的第一个、也是最可靠的信号。</p>  <p>把命中翻译成钱：第一次请求把前缀<strong>写入</strong>缓存，付 1.25× 的写入价（比全价还略贵一点点）；之后每次命中只付 0.1× 的<strong>读取</strong>价。所以缓存是一笔<strong>先投入、后省钱</strong>的买卖——一次写入的额外开销，要靠后续多次命中的便宜来摊薄。这就引出了 TTL 与盈亏平衡。</p>  <p>这三个字段还给了你一个<strong>免翻账单就能量化缓存健康度</strong>的办法：定义<em>缓存命中率</em> = <code>cache_read / (cache_read + cache_creation + input)</code> 在一段会话上的累计值。一个排好序、前缀稳定的长会话，这个比例会随轮数升高（写入只发生一两次、之后全是读取）；若它<strong>迟迟上不去甚至为 0</strong>，几乎必然是前缀里混了静默失效源（下一节）。把这个比例作为一等监控指标，比事后看账单早得多——本模块 notebook 的练习会让你在一串请求上把它算出来，并据此判断缓存到底有没有在工作。</p>  <div class="callout warn"><span class="label"></span>
+    <p>最常见的错误认知：「开了缓存就一定更便宜」。<strong>不对</strong>。如果一段前缀只被用一次（写入后再没命中），你反而<em>多付了 0.25×</em>的写入溢价、一分钱没省回来。缓存只在「同一前缀会被复用多次」时才划算——本模块最后会把这笔账算到分。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ttl"><span class="num">4</span>TTL：缓存活多久与盈亏平衡</h2>
+  <h3>TTL：缓存活多久</h3>  <p>缓存条目不是永久的，它有 <span class="term">TTL</span>（time to live，存活时间）。Anthropic 给两档：<strong>默认 5 分钟</strong>（写入约 1.25× 基础价）与可选的 <strong>1 小时</strong>（写入约 2× 基础价）。过了 TTL，缓存条目失效——下一次同样的前缀会被当成「新的」重新写入（再付一次写入价）。</p>  <p>这对长会话有一个具体而恼人的后果：<strong>如果两次请求的间隔超过了 TTL，缓存会在那段间隙里悄悄过期</strong>。比如用户问完一个问题去喝了杯咖啡（6 分钟），回来再问——5 分钟的缓存早没了，这一轮又是一次全额写入。所以「会话有多紧凑」直接决定缓存的实际收益：连珠炮式的对话命中率高，断断续续的对话命中率低。</p>  <div class="math-block">\[\text{命中} \iff \text{前缀逐字节相同} \;\land\; (t_{\text{now}} - t_{\text{written}}) \le \text{TTL}\]</div>  <p>于是有了 <span class="term">break-even</span>（盈亏平衡）的算法：因为写入比读取贵，得复用够多次才回本。粗略地，<strong>5 分钟档约 2 次请求即平衡</strong>（一次写 1.25× + 一次读 0.1× = 1.35×，已低于不缓存的两次全价 2×）；<strong>1 小时档约需 3 次</strong>（写 2× 更贵，要更多次读取摊薄）。选哪档，是「会话紧凑程度」与「写入溢价」之间的权衡：紧凑高频用 5 分钟，稀疏但仍会回来的长任务用 1 小时把缓存「续命」。</p>  <p>TTL 还有一个<strong>可以主动利用</strong>的性质：每一次命中（读取）通常会<em>刷新</em>该缓存条目的存活时间——也就是说，只要请求间隔不超过 TTL，频繁使用的前缀会被<strong>一直续命</strong>下去，不会因为「会话开始得早」就过期。这把「会话紧凑程度」与「缓存收益」更紧地绑在一起：连续的多轮对话会让前缀缓存始终新鲜，而一旦出现一段超过 TTL 的沉默，下一轮就要重新写入、计时器从头开始。所以在长任务里，与其纠结选 5 分钟还是 1 小时，不如先问<em>两次请求之间最长会隔多久</em>：间隔稳定在几分钟内，5 分钟档足矣且写入更便宜；间隔可能拉到十几分钟到一小时的稀疏长任务，才用 1 小时档花更高的写入价去「保住」缓存。</p>  <div class="callout danger"><span class="label">TTL 不是越长越好</span>
+    <p>一个真实会咬人的坑：把 TTL 当成「越长越好」而无脑选 1 小时。<strong>1 小时档的写入是 2×</strong>——若你的前缀其实变化频繁（每轮都 miss），你就在用 2× 的价格反复写一个根本命中不了的缓存，比不开缓存（1×）贵一倍。<em>TTL 的选择必须先建立在「前缀确实稳定、确实会被复用」之上</em>；前缀不稳，先去修前缀，而不是调 TTL。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="invalid"><span class="num">5</span>缓存键与静默失效源</h2>
+  <h3>缓存键与静默失效源</h3>  <p>既然命中要求「前缀逐字节相同」，那么任何<strong>悄悄改变前缀字节的东西</strong>都会让缓存永远 miss——而且<strong>不报任何错</strong>。这类东西有个名字叫 <span class="term">silent invalidator</span>（静默失效源），是 prompt 缓存最隐蔽、最浪费钱的 bug。最常见的四种：</p>  <ul>
+    <li><strong>系统提示里的时间戳</strong>：把 <code>当前时间: {now()}</code> 拼进系统提示。每一秒都不同，前缀每次都变，缓存永远 miss。</li>
+    <li><strong>随机 ID / UUID</strong>：在前缀里塞 <code>request_id = uuid4()</code> 之类。每次唯一，同样毁掉前缀。</li>
+    <li><strong>未排序的 JSON</strong>：工具定义或结构化内容用 <code>json.dumps(d)</code> 而不带 <code>sort_keys=True</code>，字典遍历顺序一变，序列化字节就变。</li>
+    <li><strong>随用户/请求变化的工具集</strong>：工具列表渲染在最前（位置 0），动态地按用户增删或重排工具，会让 tools 段的字节变化，进而让 system、messages 的缓存一起失效。</li>
+  </ul>  <p>发现它们的办法只有一个、也极其有效：<strong>盯 &lt;code&gt;cache_read_input_tokens&lt;/code&gt;</strong>。对两次本应命中的请求，如果它在第二次仍是 0，就把两次的「渲染前缀」拿出来逐字节 diff，多半能当场抓到那个变动的字节。修法对应也简单：把时间戳/UUID/每轮变的东西<strong>移到断点之后</strong>（messages 末尾）、JSON 一律 <code>sort_keys=True</code>、工具集固定且确定顺序。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：你以为自己每天点的是「同一份套餐」（命中），但每次菜单上都偷偷多印了一行当天日期——在后厨眼里这就是一份「新套餐」，得从头做（miss）。把日期那行从套餐里挪到小票最后，套餐本身才稳定、才能复用。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，本模块 notebook 会让你写一个能<strong>识别并定位静默失效源</strong>的小工具：对一串请求计算命中率，若异常偏低，就对相邻请求的前缀做 diff、指出第一个不一致的位置。这正是真实排查「我开了缓存为什么不省钱」的标准动作。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ordering"><span class="num">6</span>缓存友好的排序：比断点更重要</h2>
+  <h3>缓存友好的排序：比断点更重要</h3>  <p>初学者常以为缓存的关键是「断点打在哪」。其实更根本的是<strong>内容按稳定性排序</strong>——<span class="term">cache-aware ordering</span>。因为前缀匹配是从头开始的，只有「最稳定的在最前、最易变的在最后」，前缀才有尽可能长的、可复用的稳定段。断点只是在这条已经排好序的线上标一个「缓存到此」，它无法挽救一个排错了序的 prompt。</p>  <p>一个实用的三层排序（从前到后，即从最该缓存到最不该缓存）：</p>  <table>
+    <thead><tr><th>层</th><th>放什么</th><th>变化频率</th><th>缓存价值</th></tr></thead>
+    <tbody>
+      <tr><td>1 最前</td><td>冻结的系统提示、确定顺序的工具定义</td><td>几乎永不变</td><td>最高（每轮都能命中）</td></tr>
+      <tr><td>2 中间</td><td>跨会话稳定的长文档 / 知识库 / few-shot 示例</td><td>会话内不变</td><td>高（同一会话多轮命中）</td></tr>
+      <tr><td>3 最后</td><td>对话历史的最新几轮、本轮用户输入、任何时间戳/ID</td><td>每轮都变</td><td>不缓存（断点之后）</td></tr>
+    </tbody>
+  </table>  <p>有了这个排序，断点的放法就很自然：打在<strong>第 1 层与第 2 层的末尾</strong>（最多 4 个，按需用）。这样无论后面 messages 怎么增长，前面那两段稳定前缀每轮都能命中。反过来，哪怕你打了断点，只要把一个时间戳放进了第 1 层，断点之后的一切就都白搭——所以<strong>先排序、再打点</strong>，顺序不能颠倒。</p>  <p>这条原则还解释了上下文工程里几个看似不相关的最佳实践为什么都成立：<em>为什么系统提示要「冻结」不要动态拼接</em>（保第 1 层稳定）、<em>为什么动态信息要注入到 messages 末尾而非塞进 system</em>（放到断点之后）、<em>为什么换模型/换工具会让缓存全失效</em>（它们在最前，一动则全线崩）。把「按稳定性排序」这一条吃透，缓存的绝大多数问题都迎刃而解。</p>  <p>这里还藏着一个与前几个模块<strong>直接打架</strong>的张力，值得点明：<span class="term">RAG</span>（模块 04）的检索结果是<em>每轮都可能不同</em>的，如果把它拼在系统提示后、断点之前，就会每轮改变前缀字节、毁掉缓存。正确的协调办法是把<strong>检索结果也放到断点之后</strong>（当作每轮可变的内容），让稳定的系统提示 + 工具 + 固定知识库留在断点之前持续命中；只有当某份检索内容<em>在整个会话里都不变</em>（如一份选定的长文档）时，才值得把它纳入稳定前缀并缓存。同理，compaction（模块 02）一旦改写了断点之前的历史，缓存即失效——所以实践中常把「压缩」限制在断点之后的区域，或在压缩后把新的稳定前缀<strong>重新缓存一次</strong>（吃一次写入价，换之后多轮的读取价）。可见五个模块并非各自为政：<strong>缓存这一层会反过来约束截断、压缩、检索该把内容放在哪</strong>——这正是「上下文工程是一个整体」的最好例证。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="cost"><span class="num">7</span>长会话的成本账</h2>
+  <h3>长会话的成本账</h3>  <p>现在把所有零件合起来，算一笔真实的账——这是本模块的落点，也是上下文工程经济动机的全部。设一个 agent 的稳定前缀（系统提示 + 工具 + 一份长文档）共 <code>P</code> 个 token，每轮新增的可变部分（本轮输入 + 上一轮回答）共 <code>V</code> 个 token，会话共 <code>N</code> 轮，且各轮间隔都在 TTL 内（缓存不过期）。把单价记为：全价 1×、写入 1.25×、读取 0.1×（只看输入侧）。</p>  <p>不开缓存：每轮都全价处理整段输入。第 <code>i</code> 轮的输入约是 <code>P + i·V</code>（前缀 + 累积的历史）。开缓存：第 1 轮把 <code>P</code> 写入（1.25×）、之后每轮 <code>P</code> 都只读（0.1×），可变部分始终全价。把稳定前缀那部分单独看，最能体现差异：</p>  <div class="math-block">\[\text{前缀部分}\;\;\text{不缓存} = N\cdot P\cdot 1.0 \qquad\text{缓存} = P\cdot 1.25 + (N-1)\cdot P\cdot 0.1\]</div>  <p>代入一组实感数字：<code>P = 10000</code>（一份不小的系统提示 + 长文档）、<code>N = 50</code> 轮。前缀部分不缓存要花 <code>50 × 10000 × 1.0 = 500000</code> 个「全价 token」；缓存只要 <code>10000 × 1.25 + 49 × 10000 × 0.1 = 12500 + 49000 = 61500</code> 个——<strong>省了约 88%</strong>。会话越长、前缀越大，省得越多。这就是为什么任何严肃的长跑 agent 都把 prompt 缓存当成标配。</p>  <p>把可变部分也算进来，结论不变只是更完整：可变部分 <code>V</code> 无论开不开缓存都按全价付（它每轮都新），所以缓存的全部节省都来自前缀那一项。这反过来给了一条<strong>很实用的判断</strong>：<em>缓存的收益正比于「前缀占总输入的比例」乘以「会话轮数」</em>。前缀占比越高（系统提示/工具/长文档很大、而每轮新增很少）、会话越长，缓存越划算；反之，若每轮都灌入大量新内容、前缀只是一小撮，缓存能省的就有限。所以决定「要不要、值不值得开缓存」时，先估这两个量，而不是凭感觉。</p>  <p>还要把一个现实变量纳入账本：<strong>缓存命中率不会是 100%</strong>。真实会话里总有偶发的前缀变动（一次失效源、一次超 TTL 的停顿）让某些轮 miss。把命中率记为 <code>h</code>，则前缀部分的期望成本约是 <code>P·[ (1-h)·1.25 + h·0.1 ]</code> 每轮——<em>命中率每掉一成，账单就明显抬一截</em>。这把前面所有内容串成一条因果链：<strong>排序与失效源决定命中率 h，h 决定成本</strong>。所以「省钱」从来不是单独调一个缓存开关，而是<strong>把前缀工程做扎实让 h 尽量高</strong>——这也是为什么本模块把「前缀稳定性」讲在「成本」之前。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把成本账记成一句话：<strong>缓存把「稳定前缀」的成本从『每轮全价』变成『一次写入 + 多次几乎白嫖』</strong>。前缀越大、复用越多次，节省越接近 90%。而这一切的前提，仍然是前缀<em>逐字节稳定</em>——所以本模块前半讲的「排序与失效源」，正是后半「省钱」能成立的地基。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>缓存与上下文管理的相互作用</strong>：compaction（模块 02）和上下文编辑会改写历史——一旦改写发生在断点之前，缓存就失效。如何让「压缩历史」与「保住缓存前缀」共存（例如只压断点之后的部分、或把压缩结果作为新的稳定前缀重新缓存）是活跃的工程问题。</li>
+    <li><strong>更长 TTL 与跨会话缓存</strong>：当前 TTL 以分钟/小时计。能否安全地跨会话、跨用户复用更稳定的前缀（如共享的系统提示与知识库）而不串数据，是降本的下一个方向，也涉及隔离与隐私。</li>
+    <li><strong>缓存感知的提示设计自动化</strong>：手工保证「稳定在前、易变在后」容易出错。能否由工具自动分析 prompt 的变化频率、自动重排并放置断点、自动报警静默失效源（就像本模块的 diff 工具的强化版），是 agent 框架正在补的能力。</li>
+    <li><strong>缓存命中率的可观测性</strong>：生产中要持续监控 <code>cache_read</code> 占比、定位是哪个改动拉低了命中率。把缓存命中做成一等的可观测指标（而非事后翻账单），是 infra 侧的基础设施缺口。</li>
+    <li><strong>缓存与其他省钱手段的组合</strong>：prompt 缓存（省重复前缀）、batch（省 50%、非实时）、模型选择（Haiku vs Opus）、检索（少注入=少 token）四者如何在一个成本预算下联合优化，目前还多靠经验拍板，缺乏系统的成本模型。</li>
+    <li><strong>正确性与缓存的张力</strong>：为了命中而「冻结」系统提示，可能与「按情境动态调整指令」的需求冲突。Opus 4.8 的「会话中途 system 消息」（放进 messages 而非改 top-level system）正是为调和这对张力而生——既注入新指令、又不破坏前缀缓存，是这条线上的最新进展。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Anthropic _Prompt caching_ 文档（接口、前缀匹配、usage 字段、TTL、静默失效源——本模块的权威依据）、_Effective context engineering for AI agents_（缓存在上下文工程中的位置）、_Messages API_（usage 与无状态语义）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_retrieval/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 检索入上下文</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

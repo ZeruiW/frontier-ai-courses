@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · torch.compile 图捕获与编译</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · torch.compile 图捕获与编译</h1>
+  <p class="subtitle">tracing vs scripting、IR、算子融合、常量折叠、死代码消除、JIT —— 从零写一个玩具 tracer 捕获计算图并做融合/折叠/DCE，每步对拍语义不变，对照 torch.compile / TorchDynamo / TorchInductor</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（autograd/计算图）、模块 00 的瓶颈三分法、一点点编译原理常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_torch_compile.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Ansel 等 2024（PyTorch 2）、Tillet 2019（Triton）、torch.fx 论文</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#eager">eager 的天花板：为什么要编译</a></li>
+      <li><a href="#capture">两种捕获：tracing vs scripting</a></li>
+      <li><a href="#ir">IR：图长什么样</a></li>
+      <li><a href="#fusion">优化 pass 一：算子融合</a></li>
+      <li><a href="#foldce">优化 pass 二三：常量折叠与 DCE</a></li>
+      <li><a href="#stack">真实流水：Dynamo 与 Inductor</a></li>
+      <li><a href="#reality">工程现实与陷阱</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eager"><span class="num">1</span>eager 的天花板：为什么要编译</h2>
+  <p>模块 01 你写出了 autograd——它工作在<strong>即时执行（eager）</strong>模式下：每写一个算子就立刻执行、立刻拿到结果。这是 PyTorch 多年的默认，灵活、好调试。但它有一个根本的性能天花板，理解这个天花板，就理解了 <code>torch.compile</code> 为什么存在。</p>  <p>eager 模式的问题在于它<strong>一次只看见一个算子</strong>。当你写 <code>y = (a + b).relu() * c</code>，框架依次启动三个内核：一个做加法、一个做 relu、一个做乘法。每个内核都要<em>从主存读入</em>输入、<em>写回</em>中间结果，下一个内核再<em>读回</em>。可这中间结果（<code>a+b</code> 和它的 relu）<strong>根本没必要落主存</strong>——它本可以一直待在寄存器里，被下一步直接消费。eager 看不到「下一步」，所以省不掉这些往返。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：eager 像一个只听一句、做一句的厨工——你说「切洋葱」他切完放下，你说「炒洋葱」他再拿起来。他从不<strong>提前知道整道菜的流程</strong>，所以没法把「切完直接下锅」连起来，白白多了无数次拿起放下。而编译器像看过整张菜谱的大厨，能把能连的步骤<em>融合</em>成一气呵成的动作。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：eager 模式下每个算子是一次独立的内核启动，中间张量在 <span class="term">HBM</span>（主存）来回读写。回忆 C36/模块 00 的脊点——逐元素算子是<strong>访存受限</strong>的，时间几乎全花在这些读写上。把一串逐元素算子<strong>融合</strong>成一个内核，中间结果留在片上、不落 HBM，就能把 <code>k</code> 次往返压成 1 次。这是编译器最重要、最普适的优化。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话讲清 <code>torch.compile</code> 的价值：<strong>它把你的一段 Python 函数「整体看一遍」，捕获成一张计算图，再在图上做融合、常量折叠、死代码消除等优化，最后生成少数几个高效内核</strong>——用图模式的全局视野，补上 eager「只见树木不见森林」的损失。本模块就用 numpy 写一个玩具版：先 trace 出图，再在图上做这些优化 pass，并验证优化前后结果不变。</p>
+  </div>  <p>要强调的是：<code>torch.compile</code>（PyTorch 2.0 引入）的设计目标是<strong>既要图模式的性能、又尽量不丢 eager 的易用性</strong>。它不要求你重写代码，只在你的函数外包一层 <code>torch.compile(fn)</code>，第一次调用时自动捕获、编译，之后复用。这种「默认 eager、按需编译」的折中，正是它与早期纯静态图框架（TF 1.x）的关键区别，也是模块 03 JAX 函数式路线的对照。</p>  <p>给个量级感受 eager 浪费在哪。一个逐元素链 <code>y=(a+b).relu()*c</code>（设张量 N 个元素、fp32）：eager 下 add 读 2N 写 N、relu 读 N 写 N、mul 读 2N 写 N——总共约 <strong>8N 次主存读写</strong>、3 次内核启动。融合成一个内核后，只需读 <code>a,b,c</code> 共 3N、写 <code>y</code> 共 N——<strong>4N 次读写、1 次启动</strong>。对访存受限的逐元素算子，读写次数减半≈速度翻倍；内核启动从 3 降到 1，又省掉两次启动开销（对小张量，启动开销甚至能主导）。<strong>一个简单的融合，同时打了访存受限和开销受限两类瓶颈</strong>——这就是编译器最日常、最普适的收益。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="capture"><span class="num">2</span>两种捕获：tracing vs scripting</h2>
+  <h3>两种捕获方式：tracing vs scripting</h3>  <p>要在图上优化，第一步得先把「一段会执行算子的代码」变成「一张静态的图」。这一步叫<strong>图捕获</strong>，有两条根本不同的路线：</p>  <table>
+    <thead><tr><th>方式</th><th>怎么捕获</th><th>优点</th><th>致命弱点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>tracing</strong> 追踪</td><td>用具体输入<em>实际跑一遍</em>，记录所经过的算子序列</td><td>实现简单、只记真实走过的路、天然支持任意算子</td><td>把数据相关的<strong>控制流烤死</strong>：if/循环只记录本次走的分支；看不到 Python 副作用</td></tr>
+      <tr><td><strong>scripting</strong> 脚本化</td><td>解析源代码（AST），把程序结构直接翻译成图</td><td>保留 if/for 等<strong>控制流</strong>，覆盖更全</td><td>只支持 Python 的一个子集；实现复杂、报错晦涩</td></tr>
+    </tbody>
+  </table>  <p>用一个例子看清差别。设函数里有 <code>if x.sum() &gt; 0: return x*2 else: return x*3</code>。<strong>tracing</strong>用某个具体 <code>x</code> 跑一遍：若这次 <code>x.sum()&gt;0</code>，它只会记下 <code>x*2</code>这一条路，得到的图<em>永远</em>走 <code>*2</code>，即使下次传入负的 x 也错；它<strong>看不见那个 if</strong>，因为 Python 的 if 在 trace 时已经被求值掉了。而 <strong>scripting</strong>读源码，能把 if 本身翻译进图，保留分支语义。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>记住一句话：<strong>tracing 记录的是「这一次具体执行」，scripting 翻译的是「代码本身」</strong>。tracing 像给一次烹饪过程拍延时摄影——拍到什么是什么，临场决定（控制流）就丢了；scripting 像把菜谱逐字翻译成另一种语言——结构都在，但只能翻译它认得的句式。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>现代实践的答案是<strong>两者结合 + 优雅回退</strong>。<code>torch.compile</code> 的前端 <span class="term">TorchDynamo</span> 以 tracing 为主（在 CPython 字节码层拦截），但遇到无法 trace 的部分（数据相关分支、外部调用、打印）就<strong>graph break</strong>——把图在此切断、那一段退回 eager 执行、之后再开新图。这让它既能编译大部分热代码，又不会因为一句 print 就整个失败。JAX 则要求你用 <code>lax.cond</code>/<code>lax.scan</code> 显式写控制流（模块 03）。</p></div>
+  </div>  <p>本模块的玩具编译器走 <strong>tracing</strong> 路线（最能讲清「捕获成图」的本质，也是 Dynamo/JAX 的主路）。我们会重载算子，让它们在执行的同时把自己<strong>记录进一张图</strong>，而不是直接算出数值——这正是 tracing 的核心机制：<em>用「记录」替换「执行」</em>。理解了这一步，你就理解了为什么 tracing 看不见 Python 控制流——因为被记录的只有你的算子，不包括 Python 的 if。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="ir"><span class="num">3</span>IR：图长什么样</h2>
+  <h3>IR：图到底长什么样</h3>  <p>捕获出来的图，存成什么数据结构？这就是<span class="term">IR</span>（中间表示）——介于你的源码与最终内核之间的、便于分析和变换的形式。深度学习编译器的 IR 通常是<strong>算子级的有向无环图</strong>：</p>  <ul>
+    <li><strong>PyTorch</strong> 的 <code>torch.fx</code>：把模块 trace 成一张 <code>GraphModule</code>，节点是 <code>call_function</code>/<code>call_module</code>/<code>placeholder</code>（输入）/<code>output</code>，可用 Python 直接遍历和改写。</li>
+    <li><strong>JAX</strong> 的 <code>jaxpr</code>：把纯函数表示成一串带显式输入输出的 primitive 方程，可打印（<code>jax.make_jaxpr(f)</code>）——模块 03 会看它。</li>
+    <li><strong>XLA</strong> 的 <code>HLO</code>：更靠近硬件的中层 IR，XLA 在其上做融合、布局、内存规划。</li>
+  </ul>  <p>不管哪种，IR 的共同形态都是「一串带编号的指令，每条说明：用什么算子、吃哪些前序结果、产出什么」。这其实就是编译原理里的<strong>三地址码 / SSA</strong>在张量世界的版本。我们的玩具 IR 也长这样：</p>  <pre><code># 玩具 IR：每个 Node = (输出名, 算子, [输入名...], 可选常量)
+# 源程序: y = relu(a + b) * 2.0
+%0 = placeholder 'a'
+%1 = placeholder 'b'
+%2 = add        %0, %1
+%3 = relu       %2
+%4 = mul        %3, const(2.0)
+%5 = output     %4</code></pre>  <p>把程序变成这种<strong>显式的指令列表 + 依赖关系</strong>，是一切图优化的前提。因为现在「哪个值被谁用」「哪个子表达式是常量」「哪个节点没人要」都<em>一目了然、可程序化判定</em>了——而在原始的 Python 代码里，这些信息是隐式的、要靠分析才能得到。本模块 notebook 会从零定义这个 IR、写一个 tracer 生成它，然后在它上面跑三个经典优化 pass。</p>  <p>一个值得点明的设计选择：这种 IR 几乎都是 <strong>SSA</strong>（静态单赋值）形式——每个值只被赋值一次（<code>%0,%1,%2…</code> 各出现一次在等号左边）。为什么？因为 SSA 让「这个值是从哪来的」有<strong>唯一确定的答案</strong>（没有变量被反复覆盖的歧义），于是数据流分析（谁依赖谁、常量怎么传播、死代码是谁）变得极其干净——这是几十年编译器经验沉淀下来的形式，张量图直接继承了它。我们玩具 IR 的「每个节点一个新名字、永不复用」就是 SSA 的体现，正是它让后面三个 pass 能用十几行写清楚。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么编译器要先转成 IR 再优化，而不直接改源码？因为源码有太多与计算无关的噪音（变量名、临时表达式、语法糖），而 IR 是<strong>规范化</strong>的——同一个计算无论你怎么写，都归一成同样的节点序列。在规范形式上，「两个子图是否相同」「这个节点是否可删」这类问题才有干净的答案。IR = 把计算<em>剥到只剩骨架</em>，正好呼应本课「numpy 复刻只留骨架」的方法论。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fusion"><span class="num">4</span>优化 pass 一：算子融合</h2>
+  <h3>优化 pass 之一：算子融合</h3>  <p>有了图，第一个、也是最值钱的优化是<span class="term">operator fusion</span>（算子融合）：把多个相邻算子合并成一个内核，中间结果<strong>不落主存</strong>。最经典的是<strong>逐元素链融合</strong>——一串逐元素算子（add、mul、relu、exp……）可以合并成一个「对每个元素依次做这串运算」的内核，全程只读一次输入、写一次输出。</p>  <div class="ascii">融合前（eager）：3 个内核，中间结果两次落主存
+  [add]──写t1──&gt;[relu]──写t2──&gt;[mul]──&gt;out      读写主存 ~ 6 次张量大小
+
+融合后：1 个内核，中间结果留在寄存器
+  [add;relu;mul]──&gt;out                          读写主存 ~ 2 次张量大小
+  对每个元素: out[i] = relu(a[i]+b[i]) * c[i]   一次读入、一次写出</div>  <p>融合的收益直接来自模块 00 的瓶颈三分法：逐元素算子是<strong>访存受限</strong>的，其时间几乎全花在主存读写上。把 <code>k</code> 个逐元素算子融成 1 个，中间 <code>k-1</code> 个张量的读写就省了——理论上可接近 <code>k</code> 倍加速。这也是 FlashAttention（C36）的灵魂：它本质就是把注意力的一长串算子融成一个内核、避免 n×n 中间矩阵落主存。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>融合能合并的，主要是<strong>逐元素</strong>和某些<strong>规约</strong>算子（它们的「单元素工作」能拼接）。两个大矩阵乘之间通常不能简单融合（各自是复杂的分块内核），但 matmul 之后紧跟的逐元素操作（加偏置、激活）几乎总能融进 matmul 的尾部（epilogue fusion）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>融合的边界由<strong>数据依赖与算子类型</strong>决定。一个安全的融合规则：若节点 B 的唯一消费链都是逐元素、且 B 的输入形状相容，则可把 B 融入其生产者。真实编译器（Inductor）的融合规则复杂得多（要考虑内存复用、寄存器压力、规约的特殊性），但核心判据都是「中间结果能否不落主存」。</p></div>
+  </div>  <p>本模块 notebook 会实现一个最小的融合 pass：识别图中<strong>连续的逐元素算子链</strong>，把它们打包成一个<code>fused_elementwise</code>节点，并验证<strong>融合后求值与融合前逐位相同</strong>（融合只改执行方式，绝不改语义）。你会亲手看到「3 个节点变成 1 个、结果不变」——这正是 <code>torch.compile</code> 在 GPU 上自动做的事（生成一个 Triton 内核替代三次内核启动）。</p>  <p>那个被自动生成出来的内核长什么样？给个旁注：<code>torch.compile</code> 把 <code>relu(a+b)*c</code> 这条逐元素链编译成的 Triton 内核，骨架就是「每个线程取一组元素、在寄存器里把三步连着算完、只写一次」——和我们玩具 <code>fused_elementwise</code> 节点的语义一模一样，只是落到了 GPU 上：</p>  <pre><code># torch.compile 为逐元素链生成的 Triton 内核（简化示意）
+@triton.jit
+def fused_add_relu_mul(a_ptr, b_ptr, c_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    pid  = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)   # 本线程块负责的元素下标
+    mask = offs &lt; n
+    a = tl.load(a_ptr + offs, mask=mask)        # 各读一次（进寄存器）
+    b = tl.load(b_ptr + offs, mask=mask)
+    c = tl.load(c_ptr + offs, mask=mask)
+    t = tl.maximum(a + b, 0.0) * c              # 三步全在寄存器里连算，中间不落 HBM
+    tl.store(out_ptr + offs, t, mask=mask)      # 只写一次</code></pre>  <p>看 <code>load</code>/<code>store</code> 的次数就懂了收益从哪来：三次 <code>load</code>、一次 <code>store</code>（4N 访存），中间的 <code>a+b</code> 和它的 relu <strong>从不离开寄存器</strong>。这正是把玩具图优化「中间结果不落主存」这条原则，落实到一段真实可跑的 GPU 代码上——你写的 numpy 融合 pass，工业级对应物就是这种自动生成的 Triton。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="foldce"><span class="num">5</span>优化 pass 二三：常量折叠与 DCE</h2>
+  <h3>优化 pass 之二、之三：常量折叠与死代码消除</h3>  <p>融合之外，还有两个朴素但通用的图清理 pass，它们来自经典编译原理、在张量图上同样适用：</p>  <h4>常量折叠 constant folding</h4>  <p>如果一个子表达式<strong>只依赖常量</strong>，那它的值在<em>编译期</em>就能算出来，运行时不必重复计算。例如图里有 <code>c = 2.0 * 3.0</code>，折叠后直接把 <code>c</code> 替换成常量 <code>6.0</code>，删掉那个乘法节点。在深度学习里，缩放因子、形状推导、<code>1/sqrt(d)</code> 这类常量运算都能在编译期折掉。</p>  <h4>死代码消除 dead code elimination (DCE)</h4>  <p>如果一个节点的产出<strong>没有被任何输出依赖</strong>（直接或间接），它就是<em>死代码</em>——算了也没人用，可以删。死代码常在融合、折叠之后冒出来（某些中间节点被绕过后就成了孤儿），所以 DCE 通常作为优化的<strong>收尾 pass</strong>反复跑。判定方法很干净：从 output 节点反向标记所有可达节点，没被标记的全删。</p>  <pre><code># 三个 pass 串起来（本模块 notebook 实现）
+graph = trace(fn, example_inputs)   # 1. 捕获成 IR
+graph = constant_fold(graph)        # 2. 编译期算掉纯常量子图
+graph = fuse_elementwise(graph)     # 3. 融合逐元素链
+graph = dead_code_elim(graph)       # 4. 删没人用的节点
+assert eval_graph(graph, inputs) == fn(inputs)   # 语义不变！</code></pre>  <div class="callout danger"><span class="label">优化的铁律</span>
+    <p>所有图优化都必须遵守一条铁律：<strong>优化只能改「怎么算」，绝不能改「算出什么」</strong>。融合后的结果、折叠后的结果、删掉死代码后的结果，都必须与原图<em>逐位一致</em>（浮点误差内）。一个改变了语义的「优化」是 bug，不是优化。所以本模块每个 pass 之后都立刻<code>assert eval_graph(优化后) == eval_graph(原图)</code>对拍——这正是真实编译器测试的核心纪律（差分测试）。</p>
+  </div>  <p>这三个 pass（融合、折叠、DCE）加上公共子表达式消除（CSE，同一子表达式只算一次），构成了图编译器的<strong>基本工具箱</strong>。真实的 TorchInductor 在它们之上还做布局优化、内存规划、调度、自动生成 Triton/C++ 内核，但所有这些都建立在「图 + 一组保语义的变换 pass」这个骨架上——而这个骨架，你在本模块就会亲手写出来。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="stack"><span class="num">6</span>真实流水：Dynamo 与 Inductor</h2>
+  <h3>把它跑起来：TorchDynamo 与 Inductor 的真实流水</h3>  <p>把玩具放回真实语境。<code>torch.compile(model)</code> 背后是一条多级流水线：</p>  <table>
+    <thead><tr><th>阶段</th><th>组件</th><th>做什么</th></tr></thead>
+    <tbody>
+      <tr><td>① 捕获</td><td><strong>TorchDynamo</strong></td><td>在 CPython 字节码层拦截 Python，把可 trace 的部分抓成 FX 图；遇阻则 graph break 退回 eager</td></tr>
+      <tr><td>② 微分</td><td><strong>AOTAutograd</strong></td><td>提前把反向也捕获成图（不再运行时动态建图），前向反向一起优化</td></tr>
+      <tr><td>③ 降低+优化</td><td><strong>TorchInductor</strong></td><td>在图上做融合、调度、内存规划等 pass（本模块玩具版的工业级对应）</td></tr>
+      <tr><td>④ 生成代码</td><td><strong>Triton / C++</strong></td><td>GPU 上生成 Triton 内核、CPU 上生成 C++/OpenMP；首次编译、之后缓存复用</td></tr>
+    </tbody>
+  </table>  <p>几个与本模块直接呼应的工程概念：<strong>guard</strong>——编译产物记录了它依赖的前提（输入形状、dtype 等），下次调用先查 guard 是否成立，成立则复用、不成立则<strong>重编译</strong>。所以<strong>形状频繁变化会触发反复重编译</strong>、抵消收益，对策是 <code>dynamic=True</code>（按动态形状编译一次）或对输入做 padding。这也解释了为什么编译型框架偏爱固定形状。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>你只需写 <code>model = torch.compile(model)</code>，剩下的捕获、融合、生成内核全自动。第一次调用慢（在编译），之后快（复用编译产物）。这就是「默认 eager、按需编译」的体验。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>graph break 越少，编译收益越大。实践中要尽量避免在热路径里写数据相关的 Python 控制流、<code>.item()</code>（强制同步取标量值）、打印等会打断 trace 的操作。用 <code>torch._dynamo.explain</code> 能看到一段代码产生了多少 graph break、卡在哪——这是调编译性能的入口。</p></div>
+  </div>  <p>一个值得建立的认知：<code>torch.compile</code> 把「以前要手写 CUDA/Triton 内核才能做的融合」<strong>自动化</strong>了。C36 里你手写 FlashAttention 的融合逻辑；而对很多逐元素/规约模式，<code>torch.compile</code> 已能自动生成接近手写水平的融合内核。这不意味着手写内核没用了——前沿/极致场景仍需手写（FlashAttention 这种结构性创新编译器还想不出来），但日常的「把一串小算子融起来」已被编译器接管。理解编译器在做什么，才知道何时该信它、何时该自己上。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="reality"><span class="num">7</span>工程现实与陷阱</h2>
+  <h3>工程现实与陷阱</h3>  <p>本模块的玩具编译器抓住了「捕获成图 + 保语义 pass」的骨架，但真实编译型执行有不少坑，了解它们能让你用好 <code>torch.compile</code>：</p>  <ul>
+    <li><strong>控制流的代价</strong>：tracing 烤死控制流是根本限制。数据相关的 if/循环要么 graph break（退回 eager、丢失融合），要么用结构化控制流原语（JAX 的 <code>lax.cond</code>/<code>scan</code>）显式写——后者能进图但要改代码风格。</li>
+    <li><strong>动态形状</strong>：变长序列、变 batch 会触发重编译。<code>dynamic=True</code> 让编译器生成对形状泛化的代码（一次编译多形状复用），但有时比静态形状慢。padding 到固定桶（bucket）是常见折中。</li>
+    <li><strong>数值差异</strong>：融合、重排、用不同精度的中间累加，可能让编译后结果与 eager<em>不逐位相同</em>（但应在容差内）。这在做回归测试时要注意——别用 <code>atol=0</code> 比对 eager 与 compiled。</li>
+    <li><strong>调试变难</strong>：编译后栈帧、错误信息不再对应你的源码行。需要 <code>TORCH_LOGS</code>、<code>torch._dynamo.explain</code> 等工具看中间图与 graph break，这是编译型框架共同的调试税。</li>
+    <li><strong>首次编译开销</strong>：编译本身要时间（有时几十秒）。短任务/频繁变形状的场景，编译开销可能<em>收不回来</em>——这时 eager 反而更划算。编译不是免费午餐，要看摊销。</li>
+  </ul>  <p>一个统一的判断：<code>torch.compile</code>（及一切图编译）的收益来自<strong>把多次执行的开销摊薄到一次编译上</strong>。所以它最适合<em>形状稳定、反复执行、算子较碎</em>的训练/推理热循环；对一次性、形状多变、本就是少数大内核（已经算力受限）的场景，收益有限甚至为负。知道收益从哪来，就知道何时该用、何时该关——这比记住 API 重要得多。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>编译器 vs 手写内核的边界</strong>：编译器能自动融合逐元素/规约，但结构性创新（FlashAttention、稀疏、定制 attention）仍需手写。两者的边界在哪、能否让编译器「发明」出 FlashAttention 式的算法，是开放问题。</li>
+    <li><strong>动态形状的高效编译</strong>：变长是 LLM 推理的常态（不同序列长）。如何编译一次就对所有形状高效（而非每个形状重编译或退化到最坏），是 torch.compile/XLA 的活跃方向。</li>
+    <li><strong>捕获完整程序</strong>：graph break 损失收益。让 trace 覆盖更多 Python（含控制流、数据结构、自定义类）而不牺牲正确性，是 Dynamo 持续在做的；JAX 用纯函数约束换全覆盖，是另一条路。</li>
+    <li><strong>跨算子的全局优化</strong>：融合是局部的。更激进的优化（重写整个计算图、自动选并行策略、算子重排以改善内存峰值）需要全局视角与代价模型，与模块 04 的显存、C08 的并行交叉。</li>
+    <li><strong>可移植性与多后端</strong>：同一图要高效跑在 GPU/TPU/CPU/各种加速器上。MLIR、OpenXLA、Triton 都在试图建立可移植的编译栈，但「一次编译、处处高效」仍未解决。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Ansel 等 2024《PyTorch 2》（torch.compile 的 Dynamo+Inductor 权威论文）、Tillet 等 2019《Triton》（Inductor 生成的内核语言）、torch.fx 论文（图捕获与变换）、Frostig 等 2018《Compiling ML programs via high-level tracing》（tracing 编译方法论）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_autograd/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 自动微分内核</div></a>
+    <a class="next" href="../03_jax_xla/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · JAX/XLA 函数式与变换</div></a>
+  </div>
+
+</div>
+</body>
+</html>

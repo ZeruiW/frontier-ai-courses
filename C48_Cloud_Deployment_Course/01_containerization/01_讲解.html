@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 容器化：可复现的运行时</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 容器化：可复现的运行时</h1>
+  <p class="subtitle">分层文件系统与内容寻址 · 层缓存的链式失效 · 多阶段构建 · 模型权重放哪 · 运行时契约六条 —— 把「在我机器上能跑」彻底消灭</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、Linux 文件系统与进程基础、一点点哈希常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_containerization.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">OCI Image Spec、Docker/BuildKit 文档、Merkle DAG 与内容寻址存储</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么是容器：把「在我机器上能跑」彻底消灭</a></li>
+      <li><a href="#layers">镜像的本质：分层文件系统与内容寻址</a></li>
+      <li><a href="#cache">层缓存：Dockerfile 的书写顺序就是性能</a></li>
+      <li><a href="#multistage">多阶段构建：把编译期和运行期彻底分开</a></li>
+      <li><a href="#weights">模型权重要不要进镜像：一个必须想清楚的决策</a></li>
+      <li><a href="#runtime">运行时契约：一个容器化的服务必须遵守的六条</a></li>
+      <li><a href="#ledger">算一笔账：镜像大小如何变成用户体验</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么是容器：把「在我机器上能跑」彻底消灭</h2>
+  <p>我们从容器开篇，因为它是整条部署链路的<strong>原子</strong>——后面所有的编排、发布、扩缩，操作的对象都是镜像。搞不清镜像是什么，K8s 就只能靠背 YAML。</p>  <p>「在我机器上能跑」这句臭名昭著的话，背后是<strong>三层依赖</strong>都没有被固化。理解这三层，就理解了容器为什么必要，也理解了容器<em>不</em>解决什么。</p>  <table>
+    <thead><tr><th>层次</th><th>包含什么</th><th>不固化会怎样</th><th>谁来固化</th></tr></thead>
+    <tbody>
+      <tr><td><strong>代码层</strong></td><td>你的 Python 源码、配置</td><td>版本漂移</td><td>Git commit / tag</td></tr>
+      <tr><td><strong>依赖层</strong></td><td>torch 2.4.1、transformers 4.44、numpy 2.1</td><td>「本地 torch 2.3 能跑，线上 2.5 报错」</td><td>lockfile（requirements.txt 钉死版本 / uv.lock / poetry.lock）</td></tr>
+      <tr><td><strong>系统层</strong></td><td>glibc 版本、CUDA driver/runtime、libgomp、ffmpeg、时区、locale</td><td>「本地 Ubuntu 22.04 能跑，线上 CentOS 7 找不到 GLIBC_2.32」</td><td><strong>容器镜像</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>虚拟机也能固化系统层，为什么用容器？因为容器<strong>共享宿主内核</strong>——不用启动一个完整操作系统，启动时间从分钟级降到亚秒级，镜像从 GB 级的整盘快照变成分层可复用的增量。对于「一天发布十次、一分钟扩十个副本」的服务，这个差别是决定性的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>技术上，容器 = <span class="term">namespace</span>（隔离视图：PID/网络/挂载/用户）+ <span class="term">cgroup</span>（限制资源：CPU/内存/设备）+ <span class="term">分层联合文件系统</span>（overlayfs：镜像层只读、容器层可写）。它<strong>不是</strong>虚拟化——没有 hypervisor、没有客户机内核。所以容器<em>不</em>提供强安全隔离（模块 03 会讲这对多租户意味着什么），也<strong>不</strong>屏蔽内核版本与 GPU driver 的差异。</p></div>
+  </div>  <div class="callout danger"><span class="label">容器不解决的那半层</span>
+    <p>一个 LLM 场景特有、且极其常见的踩坑：<strong>容器隔离不了 GPU driver</strong>。镜像里可以装 CUDA <em>runtime</em>（用户态库，如 <code>libcudart.so</code>、cuDNN），但 <em>driver</em>（内核态，<code>nvidia.ko</code>）必须来自宿主机，通过 <code>nvidia-container-toolkit</code> 挂进容器。这意味着：<strong>镜像里的 CUDA runtime 版本必须 ≤ 宿主 driver 支持的版本</strong>。「本地 driver 550 跑 CUDA 12.4 镜像没问题，生产集群 driver 525 只支持到 12.0，容器起来就 <code>CUDA driver version is insufficient</code>」——这是新手最常见的上线失败原因之一。容器解决了三层里的两层半，剩下那半层要靠集群的 driver 版本纪律。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="layers"><span class="num">2</span>镜像的本质：分层文件系统与内容寻址</h2>
+  <h3>一个镜像不是一个文件，是一叠只读层</h3>  <p>镜像的核心数据结构简单得出人意料：<strong>一个有序的只读层列表，加上一份描述如何运行它的元数据（config）</strong>。每一层是一个 tar 包，记录相对上一层的<em>文件系统增量</em>（新增/修改/删除）。运行时用 <span class="term">overlayfs</span> 把它们叠起来，上层覆盖下层，最上面再盖一个可写层给容器用。</p>  <div class="ascii">镜像（只读，可被多个容器共享）           容器（每个实例独有）
+┌───────────────────────────────┐
+│ L4  COPY app/  → /app         │  sha256:9c1f…   12 MB
+├───────────────────────────────┤
+│ L3  pip install -r req.txt    │  sha256:44ab…  2.1 GB   ← torch 在这
+├───────────────────────────────┤
+│ L2  apt-get install git curl  │  sha256:0e77…   86 MB
+├───────────────────────────────┤
+│ L1  FROM python:3.11-slim     │  sha256:e3b0…  130 MB
+└───────────────────────────────┘
+              ▲ overlayfs 联合挂载（上层覆盖下层）
+              │
+        ┌─────┴─────────────────┐
+        │  可写层 (container)   │  ← 容器里写的一切都在这，删容器即消失
+        └───────────────────────┘
+
+关键性质：L1~L3 完全相同的两个镜像，在节点上只存一份、只拉一次。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么要分层？<strong>为了复用</strong>。你有 20 个模型服务，都基于同一个 <code>pytorch:2.4-cuda12.1</code> 底座。如果镜像是整块的，节点要存 20 份 6 GB；分层之后，那 6 GB 的底座只存一份，每个服务只多存自己那几十 MB 的代码层。拉取时同理——底座已经在节点上了就直接跳过。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>每一层由其内容的 <code>sha256</code> 摘要唯一标识（<span class="term">content-addressable storage</span>，内容寻址）。镜像 manifest 是一个层摘要的有序列表，整个结构是一棵 <span class="term">Merkle DAG</span>。这带来三个性质：<strong>去重</strong>（同摘要 = 同内容 = 只存一份）、<strong>完整性校验</strong>（摘要不匹配即数据损坏或被篡改）、<strong>可缓存</strong>（层是不可变的，缓存永不失效）。<code>docker pull</code> 本质是「按摘要拉取本地缺失的层」。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>分层有个反直觉的坑：<strong>删除文件不会让镜像变小</strong>。<code>RUN pip install torch && rm -rf /root/.cache/pip</code> 写成两条 <code>RUN</code> 就是灾难——第一层已经把 2 GB 缓存写进了不可变的层，第二层只是记录了一个「白出（whiteout）」标记说「这些文件在我这层不可见」。<em>下层的字节还在镜像里，还要被传输和存储</em>。这就是为什么你会看到 Dockerfile 里那些用 <code>&amp;&amp;</code> 串成一长条的 <code>RUN</code>——它们必须在<strong>同一层内</strong>完成「装了再删」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cache"><span class="num">3</span>层缓存：Dockerfile 的书写顺序就是性能</h2>
+  <p>镜像构建的速度几乎完全由<strong>层缓存命中率</strong>决定，而命中率几乎完全由<strong>你写 Dockerfile 的顺序</strong>决定。这是本模块最有实操价值的一节。</p>  <p>缓存规则只有一条，但要精确理解：<strong>第 i 层的缓存有效，当且仅当（a）第 i−1 层缓存有效，且（b）第 i 条指令本身及其输入没变</strong>。一旦某一层失效，它<em>后面所有层</em>全部失效并重建。这是一条链，不是一张表。</p>  <pre><code># ❌ 反面教材：每改一行代码，torch 就要重装一遍
+FROM python:3.11-slim
+COPY . /app                          # ← 代码一变，这层就失效
+RUN pip install -r /app/requirements.txt   # ← 于是这层也失效，重装 2 GB
+
+# ✅ 正确写法：把「变得慢的」放前面，「变得快的」放后面
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .              # ← 只有依赖清单变了才失效
+RUN pip install --no-cache-dir -r requirements.txt   # ← 通常命中缓存
+COPY . .                             # ← 代码变了只重建这一层（几 MB）</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句口诀：<strong>越少变的放越前面</strong>。系统包 → Python 依赖 → 模型配置 → 应用代码。一天要改 50 次的应用代码放在最后一层，那 50 次构建每次只重建几 MB，一秒完成；如果放在最前面，每次重装 torch，一次五分钟——一天就是四个小时。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：设第 i 条指令的重建成本为 <code>c_i</code>、每日变更概率为 <code>p_i</code>。由于失效会级联，第 i 层变更导致的重建成本是 <code>Σ_{j≥i} c_j</code>，日期望构建成本为 <code>E = Σ_i p_i · Σ_{j≥i} c_j</code>（近似，忽略同日多层同变）。要最小化 <code>E</code>，应让 <strong>高 <code>p</code> 的指令尽量靠后</strong>——这正是「越少变的放越前」的数学表述。notebook 会把这个和式实现出来，并对两种顺序做对比。</p></div>
+  </div>  <p>再补三条工程上极其常用、但文档里散落各处的技巧：</p>  <ul>
+    <li><strong><code>.dockerignore</code> 不是可选项</strong>：<code>COPY . .</code> 会把 <code>.git/</code>（可能几 GB）、<code>__pycache__</code>、本地 <code>checkpoints/</code> 全部塞进构建上下文和镜像层。更隐蔽的危害是：这些文件的任何变动（哪怕只是 <code>git fetch</code> 更新了 <code>.git</code>）都会让 <code>COPY</code> 层失效，缓存全废。</li>
+    <li><strong>BuildKit 的 <code>--mount=type=cache</code></strong>：<code>RUN --mount=type=cache,target=/root/.cache/pip pip install ...</code> 让 pip 缓存在<em>构建之间</em>持久化，但<strong>不进入镜像层</strong>。这是「装了再删」问题的现代解法，比 <code>&amp;&amp;&nbsp;rm -rf</code> 更干净。</li>
+    <li><strong>钉死版本，包括基础镜像</strong>：<code>FROM python:3.11-slim</code> 是个会漂移的可变标签，某天上游重建了它，你的构建就复现不了。生产上应写 <code>FROM python:3.11-slim@sha256:abcd…</code> 用摘要钉死。同理 <code>apt-get install git</code> 也会随时间装到不同版本。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>把缓存这件事想成<strong>一条流水线上的检查点</strong>：每个检查点保存了「到此为止的完整文件系统状态」。构建时从头走，一路命中检查点就跳过，遇到第一个不匹配的就从那里开始重跑，后面的检查点全部作废。<em>你能控制的唯一变量，就是把易变的步骤排到流水线末端</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="multistage"><span class="num">4</span>多阶段构建：把编译期和运行期彻底分开</h2>
+  <h3>为什么一个推理镜像不该带编译器</h3>  <p>很多依赖需要在安装时编译（<code>flash-attn</code>、<code>xformers</code>、自定义 CUDA 算子），这要求镜像里有 <code>gcc</code>、<code>nvcc</code>、CUDA 开发头文件、<code>make</code>……这些东西加起来轻松几个 GB，而<strong>运行时一个都用不上</strong>。<span class="term">multi-stage build</span>（多阶段构建）就是为此而生：在一个「胖」阶段里编译，只把产物拷进一个「瘦」阶段。</p>  <pre><code># ── 阶段 1：builder（带完整工具链，几 GB，不会进最终镜像）──
+FROM nvidia/cuda:12.1.0-devel-ubuntu22.04 AS builder
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+        python3.11 python3-pip build-essential ninja-build \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+# 把依赖装进一个独立前缀，方便整体拷走
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ── 阶段 2：runtime（只有运行时库，最终镜像）──
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends python3.11 \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+COPY --from=builder /install /usr/local     # ← 只拷贝编译产物
+COPY app/ /app/
+WORKDIR /app
+USER 1000:1000                              # ← 非 root 运行
+EXPOSE 8000
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+CMD ["--model", "/models/current", "--port", "8000"]</code></pre>  <table>
+    <thead><tr><th></th><th>单阶段（devel base）</th><th>多阶段（runtime base）</th></tr></thead>
+    <tbody>
+      <tr><td>基础镜像</td><td><code>cuda:12.1-devel</code> ≈ 6.5 GB</td><td><code>cuda:12.1-runtime</code> ≈ 2.4 GB</td></tr>
+      <tr><td>工具链</td><td>gcc/nvcc/头文件全在</td><td>全部留在 builder 阶段</td></tr>
+      <tr><td>最终镜像</td><td>≈ 9–11 GB</td><td>≈ 4–5 GB</td></tr>
+      <tr><td>冷启动拉取（500 MB/s）</td><td>≈ 20 s</td><td>≈ 9 s</td></tr>
+      <tr><td>攻击面</td><td>编译器 + 包管理器可被利用</td><td>显著更小</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>镜像小一半，意味着<strong>扩容快一半</strong>。这在自动扩缩场景里是直接的用户体验：流量突增时，新副本要先把镜像拉下来才能服务，镜像 10 GB 和 4 GB 的差别就是「两分钟后缓解」和「五十秒后缓解」的差别。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说，冷启动时间 <code>T_cold = T_schedule + T_pull + T_init + T_load_weights + T_warmup</code>。<code>T_pull</code> 只在节点缓存未命中时发生，且与镜像<em>未缓存层</em>的字节数成正比。多阶段构建压的是 <code>T_pull</code>；把权重移出镜像（下一节）压的也是它；<code>T_load_weights</code> 与 <code>T_warmup</code>（CUDA graph 捕获、编译）则是 LLM 特有的大头，模块 04 讨论扩缩时会重新算这笔账。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>多阶段的常见错误：<strong>拷贝粒度过粗</strong>。<code>COPY --from=builder / /</code> 等于什么都没省。要明确知道产物在哪——Python 用 <code>--prefix</code> 或 venv 收拢，C/C++ 用 <code>make DESTDIR=</code>。另一个坑是<strong>运行时缺少动态库</strong>：builder 里编出来的 <code>.so</code> 链接了 devel 镜像才有的库，拷到 runtime 镜像后 <code>ImportError: libcudnn.so.8: cannot open shared object file</code>。解决办法是构建完在 runtime 阶段跑一次 <code>python -c "import torch; torch.cuda.is_available()"</code> 的冒烟测试——<em>把这条写进 CI</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="weights"><span class="num">5</span>模型权重要不要进镜像：一个必须想清楚的决策</h2>
+  <p>这是 LLM 部署<strong>独有</strong>、且在通用 Docker 教程里绝对找不到的问题。一个 70B 模型的权重是 140 GB（fp16），远大于任何合理的镜像。权重放哪，直接决定了你的发布节奏和扩容速度。</p>  <table>
+    <thead><tr><th>方案</th><th>怎么做</th><th>优点</th><th>代价</th><th>适用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>打进镜像</strong></td><td><code>COPY model/ /models/</code></td><td>一次拉取即可服务；版本与代码强绑定、天然可复现</td><td>镜像巨大（>100 GB 不现实）；换模型必须重建镜像；registry 存储爆炸</td><td>小模型（&lt;5 GB）、边缘设备、强合规场景</td></tr>
+      <tr><td><strong>启动时从对象存储拉</strong></td><td>initContainer 从 S3/GCS 下载到 emptyDir</td><td>镜像小；换模型只改环境变量</td><td>每个 Pod 都要拉一遍（140 GB × N 副本的出网流量）；冷启动慢</td><td>中等规模、副本数不多</td></tr>
+      <tr><td><strong>共享只读卷</strong></td><td>PVC(ReadOnlyMany) / NFS / Lustre 挂载</td><td>全节点共享一份；扩副本几乎零下载</td><td>需要共享存储基建；读带宽可能成瓶颈</td><td>自建集群、多副本</td></tr>
+      <tr><td><strong>节点本地缓存</strong></td><td>DaemonSet 预热到宿主 hostPath，Pod 挂载</td><td>首次拉一次、之后同节点所有 Pod 秒起</td><td>需要缓存管理与淘汰策略</td><td>大规模生产的主流做法</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>经验法则：<strong>权重 &lt; 5 GB 且不常换 → 打进镜像；否则分离</strong>。分离之后要接受一个后果：镜像不再能唯一决定行为，你必须<em>另外</em>把「模型版本」也当成一等公民管起来（写进环境变量、记进指标、打进日志）。否则「线上这个副本到底跑的哪个 checkpoint」会变成一个没人答得上来的问题。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>分离带来的是<strong>可复现性的分裂</strong>：镜像摘要 + 权重摘要共同构成部署的完整身份。生产上应把二者都固化——权重用内容哈希寻址（<code>s3://models/llama3-8b/sha256-abc…/</code>），Pod 的 annotation 里记下这个摘要，指标里带上 <code>model_version</code> label。这样一次 incident 回溯时，你能精确回答「当时那 5% 金丝雀流量吃的是哪份权重」。</p></div>
+  </div>  <div class="callout danger"><span class="label">权重拉取的隐形账单</span>
+    <p>一个真实会咬人的场景：<strong>N 个副本同时从对象存储拉同一份 140 GB 权重</strong>。假设扩容 20 个副本，就是 2.8 TB 的出网流量，不仅慢（对象存储单连接带宽有限、并发拉取还会互相挤），账单上的<em>数据传输费</em>也可能超过 GPU 本身的费用（跨区拉取尤甚）。这就是节点本地缓存和共享只读卷方案存在的根本原因。<strong>算这笔账</strong>：20 副本 × 140 GB × $0.09/GB（跨区出网典型价）≈ $252，<em>每次扩容</em>。notebook 会把这笔账做成可调参的模型。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="runtime"><span class="num">6</span>运行时契约：一个容器化的服务必须遵守的六条</h2>
+  <p>镜像构建对了只是一半。容器在编排系统里是<strong>被随时创建、随时杀死</strong>的，它必须遵守一套契约，否则 K8s 的自愈、滚动更新、扩缩全部会以诡异的方式失灵。这六条是血泪总结。</p>  <table>
+    <thead><tr><th>契约</th><th>为什么</th><th>怎么做</th><th>违反的症状</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 前台运行、日志走 stdout/stderr</strong></td><td>编排系统靠主进程存活判断容器状态；日志靠标准流采集</td><td>不要 daemonize、不要写日志文件</td><td>容器立即退出；或日志在容器里没人看得到</td></tr>
+      <tr><td><strong>② PID 1 要能转发信号</strong></td><td>缩容/更新时 K8s 发 SIGTERM，PID 1 若吞掉信号就只能等 SIGKILL 强杀</td><td>用 <code>ENTRYPOINT ["exec", …]</code> 数组形式；或加 <code>tini</code> 作 init</td><td>Pod 终止总是卡满 30 秒 grace period</td></tr>
+      <tr><td><strong>③ 优雅停机</strong></td><td>被杀时正在处理的请求要放完，尤其 LLM 长生成可能几十秒</td><td>捕获 SIGTERM → 停止接新请求 → 等在途完成 → 退出；<code>terminationGracePeriodSeconds</code> 要 &gt; 最长生成时间</td><td>滚动更新时用户看到大量 502/连接中断</td></tr>
+      <tr><td><strong>④ 健康端点分离</strong></td><td>「进程活着」≠「能服务」，LLM 加载权重要几分钟</td><td><code>/healthz</code>（存活）与 <code>/ready</code>（就绪）必须是两个语义不同的端点</td><td>模型还没加载完流量就打进来，全部超时（模块 03 详述）</td></tr>
+      <tr><td><strong>⑤ 配置从环境变量/挂载来</strong></td><td>同一镜像要能跑在 dev/staging/prod</td><td>12-factor：配置外置，绝不 hardcode，绝不把密钥写进镜像</td><td>为改一个 URL 重建镜像；密钥泄漏在 registry 里</td></tr>
+      <tr><td><strong>⑥ 非 root、只读根文件系统</strong></td><td>容器逃逸的第一道防线；也逼你想清楚哪些路径需要可写</td><td><code>USER 1000</code>、<code>readOnlyRootFilesystem: true</code> + 显式挂载 <code>emptyDir</code> 给 <code>/tmp</code></td><td>安全扫描不过；一次逃逸拿到宿主 root</td></tr>
+    </tbody>
+  </table>  <p>其中第 ③ 条对 LLM 服务<strong>特别要命</strong>，值得单独展开。普通 web 服务的请求几十毫秒就结束，grace period 给 30 秒绰绰有余；但一个 LLM 请求生成 2000 token、每 token 30 ms，就是 60 秒。默认 30 秒的 <code>terminationGracePeriodSeconds</code> 会在生成到一半时 SIGKILL，用户看到的是流式输出<em>戛然而止</em>。</p>  <pre><code># 优雅停机的最小正确实现（伪代码，真实 vLLM/FastAPI 都有对应钩子）
+import signal, asyncio
+
+shutting_down = False
+inflight = 0
+
+def on_sigterm(signum, frame):
+    global shutting_down
+    shutting_down = True          # ① 立刻让 /ready 返回 503
+
+signal.signal(signal.SIGTERM, on_sigterm)
+
+async def readyz():
+    # ② K8s 看到 not ready -&gt; 把本 Pod 从 Service 端点摘除 -&gt; 不再有新流量
+    return 503 if shutting_down else 200
+
+async def main_loop():
+    while not (shutting_down and inflight == 0):
+        await asyncio.sleep(0.1)   # ③ 等在途请求自然放完
+    sys.exit(0)                    # ④ 主动退出，不用等 SIGKILL</code></pre>  <div class="callout intuition"><span class="label"></span>
+    <p>这四步的顺序不能变，理由是<strong>摘流量必须先于停服务</strong>。很多人写成「收到 SIGTERM 立刻关端口」，结果 K8s 的端点更新是<em>最终一致</em>的（kube-proxy/Ingress 需要几百毫秒到几秒同步），这期间仍有新请求被路由过来、撞上已关闭的端口 → 连接拒绝。正确做法是先让就绪探针失败、<strong>睡一小会儿（<code>preStop: sleep 5</code>）等端点传播</strong>、再停止接新请求。这个 <code>sleep 5</code> 是生产 K8s 里最常见也最不直观的一行配置。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">7</span>算一笔账：镜像大小如何变成用户体验</h2>
+  <p>把本模块所有决策的收益汇成一笔账。冷启动时间是自动扩缩响应速度的下界，而它由五项构成：</p>  <div class="math-block">\[T_{cold} = T_{sched} + \underbrace{\frac{S_{uncached}}{B}}_{\text{拉镜像}} + T_{init} + \underbrace{\frac{W}{B_{w}}}_{\text{加载权重}} + T_{warmup}\]</div>  <table>
+    <thead><tr><th>项</th><th>典型值（7B 模型）</th><th>受什么影响</th><th>本模块的杠杆</th></tr></thead>
+    <tbody>
+      <tr><td><code>T_sched</code> 调度</td><td>1–5 s</td><td>集群空闲资源、调度器压力</td><td>模块 03</td></tr>
+      <tr><td><code>S_uncached/B</code> 拉镜像</td><td>0 s（缓存命中）～ 40 s</td><td>镜像大小、节点是否已有该层</td><td><strong>多阶段构建、层复用</strong></td></tr>
+      <tr><td><code>T_init</code> 进程启动</td><td>3–10 s</td><td>Python 导入、CUDA 上下文初始化</td><td>精简依赖</td></tr>
+      <tr><td><code>W/B_w</code> 加载权重</td><td>10–60 s</td><td>权重大小、存储介质与并发</td><td><strong>权重放置策略、本地缓存</strong></td></tr>
+      <tr><td><code>T_warmup</code> 预热</td><td>5–30 s</td><td>CUDA graph 捕获、torch.compile、首批 kernel autotune</td><td>预热请求、编译缓存</td></tr>
+    </tbody>
+  </table>  <p>读这张表的方式是：<strong>总冷启动通常在 30–120 秒量级，其中镜像拉取和权重加载合计占一半以上，而这两项都是本模块能控制的</strong>。这个数字直接决定了模块 04 里 HPA 的可行策略——如果冷启动要 90 秒，那么「等 CPU 利用率超阈值再扩容」必然来不及，你必须预测式扩容或保留热备。<em>部署链路上游的决策，会一路约束下游的可选项</em>，这是本课反复出现的结构。</p>  <p>再算一个常被忽略的账：<strong>层复用率</strong>。假设你有 20 个模型服务，都基于同一个 4 GB 的 runtime 底座、各自 200 MB 应用层。若共享底座，节点上只需 4 + 20×0.2 = 8 GB；若每个服务各建各的底座（比如各自 <code>FROM</code> 了不同的 base tag），就是 20×4.2 = 84 GB。<strong>10 倍的节点磁盘差异，和同样倍数的拉取带宽差异</strong>。这就是为什么成熟团队会强制所有服务 <code>FROM</code> 同一个内部 base 镜像——它不是洁癖，是省钱和提速。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的工程智慧：<strong>镜像是一个内容寻址的、不可变的、可增量传输的数据结构；你的每一个 Dockerfile 决策，都是在这个数据结构上做「什么该复用、什么该隔离」的划分</strong>。划得好，20 个服务共享一份底座、改代码一秒构建、扩容九秒完成；划不好，每个服务各背 10 GB、改一行等五分钟、扩容两分钟。<em>同样的技术，10 倍的差距，全在划分。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>镜像懒加载（lazy pulling）</strong>：容器启动其实只需要少数文件，但传统 pull 要下载全部层。<em>eStargz / SOCI / Nydus</em> 等格式支持按需拉取，把冷启动从「下载 4 GB」变成「下载启动路径上的 200 MB」，实测可省 60–80%。对 LLM 镜像（大量文件从不被读）收益尤其大，但索引构建与 registry 兼容性仍在演进。</li>
+    <li><strong>权重的内容寻址分发</strong>：把模型权重也当成内容寻址对象（类似镜像层）来分发、去重、P2P 传播（Dragonfly / Kraken）。20 个副本拉同一份权重时从 P2P 网络互传而非都打对象存储，可把扩容出网流量降一个数量级。开放问题是权重更新的一致性与安全签名。</li>
+    <li><strong>容器与 GPU 的隔离粒度</strong>：容器共享内核使 GPU 隔离只能靠 driver 层（MPS/MIG/时间片），缺乏内存与故障隔离。轻量 VM（Kata、gVisor、Firecracker）能补强，但 GPU 直通与冷启动开销仍是难题。多租户 LLM 推理平台的隔离方案尚无定论。</li>
+    <li><strong>可复现构建（reproducible builds）</strong>：同样的 Dockerfile 两次构建产出的镜像摘要通常不同（时间戳、包索引漂移、非确定性写入）。<em>Nix / Bazel rules_docker / apko</em> 追求逐字节可复现，这对供应链安全（SLSA）与合规审计意义重大，但在有大量 C/CUDA 编译的 ML 栈上落地仍很痛。</li>
+    <li><strong>无服务器 GPU 推理</strong>：scale-to-zero 的 LLM 服务要求冷启动进入秒级，这逼着整个栈重构——快照恢复（CRIU / checkpoint 整个 CUDA 上下文）、权重常驻内存池、模型多路复用。学术与工业都在冲这个方向，但「冷启动 &lt; 1 s 且成本更低」尚未被普遍做到。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：OCI Image Specification（镜像格式与 Merkle DAG 的权威定义）、Docker BuildKit 文档（缓存挂载与多阶段的现代用法）、Kubernetes 官方 <em>Configure Liveness/Readiness Probes</em> 与 <em>Pod Lifecycle</em>（优雅停机的准确语义）、Google SRE Book 第 4 章（错误预算）。工程对标：NVIDIA container toolkit 文档、eStargz/SOCI 论文与实现。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_serving_api/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 推理服务 API</div></a>
+  </div>
+
+</div>
+</body>
+</html>

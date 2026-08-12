@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 张量与流水并行</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 张量与流水并行</h1>
+  <p class="subtitle">当模型一层都放不下单卡时：张量并行把单层横向劈开（列切→行切→一次 all-reduce）、流水并行把层序列纵向切段（micro-batch 填满流水线压 bubble、1F1B 省激活），再组合成 3D 并行 —— 全用 numpy 模拟多 rank 并与单卡对拍</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（all-reduce / 点对点）、模块 02（DP/分片）、矩阵分块乘法、Transformer 的 FFN 与注意力结构</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_tensor_pipeline_parallel.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Shoeybi 2019 (Megatron-LM)、Huang 2019 (GPipe)、Narayanan 2021 (1F1B/3D)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么需要模型并行：TP 与 PP 两条路</a></li>
+      <li><a href="#colsplit">张量并行：列切分（免通信）</a></li>
+      <li><a href="#rowsplit">行切分 + all-reduce：一块只通信一次</a></li>
+      <li><a href="#pp">流水线并行：切层成 stage 与 bubble 问题</a></li>
+      <li><a href="#microbatch">micro-batch 与 bubble 公式</a></li>
+      <li><a href="#onefoneb">1F1B 调度：压低激活显存峰值</a></li>
+      <li><a href="#threed">3D 并行：DP × TP × PP 组合</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么需要模型并行：TP 与 PP 两条路</h2>
+  <p>到目前为止（模块 02）我们假设了一个隐含前提：<strong>整个模型至少能塞进单卡</strong>——数据并行（DP）、ZeRO、FSDP 都是在「每张卡能放下模型，只是想用更多卡分摊 batch 与显存」的框架下做文章。但当模型大到<strong>连一层都放不进单卡</strong>时，这套假设彻底失效。一个 GPT-3 规模的 FFN 权重矩阵就是 <code>12288 × 49152</code> 的两块，单是这一层的参数加上它的激活与梯度，就可能撑爆一张 80GB 的卡。这时唯一的出路是把<strong>模型本身</strong>切开，分散到多张卡上——这就是<span class="term">model parallelism</span>（模型并行）。</p>  <p>模型并行有两条正交的路，本模块各讲一条。第一条是<span class="term">tensor parallelism</span>（张量并行，TP）：把<strong>单个算子内部</strong>的张量（权重矩阵）沿某个维度切开，让多张卡<em>协作算完同一层</em>。第二条是<span class="term">pipeline parallelism</span>（流水并行，PP）：把模型的<strong>层序列</strong>切成若干段（stage），每段放一张卡，数据像在流水线上一样<em>逐段流过</em>。一句话区分：<strong>TP 是「把一层横向劈开给多卡」，PP 是「把多层纵向切段给多卡」</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：一份大文件要多人处理。TP 像「一页纸太大，几个人各撕一条同时誊写、最后拼起来」——大家干的是<em>同一页</em>；PP 像「装配流水线，第一个人做第一道工序传给第二个人」——每人负责<em>不同工序</em>。两者可以叠加：流水线上的每一道工序又可以由几个人合力完成。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：设模型有 <code>L</code> 层、每层参数 <code>φ</code>。DP 复制全部 <code>Lφ</code> 到每卡（显存不降）；TP 把每层的 <code>φ</code> 切成 <code>φ/t</code> 份（<code>t</code>=TP 度），显存随 <code>t</code> 下降但每层都要通信；PP 把 <code>L</code> 层切成 <code>L/p</code> 段（<code>p</code>=PP 度），每卡只存自己那几层，stage 间只在边界传激活。三者各切一个维度，可组合成 3D 并行。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住选择的第一性原理：<strong>先用能放下模型的最省通信的方式，再加并行扩规模</strong>。TP 通信最密集（每层每次前/反向都通信），所以只在<strong>带宽极高的节点内（NVLink）</strong>用、度数通常 ≤ 8；PP 通信最稀疏（只在 stage 边界传激活），可跨节点；DP 通信居中（每步一次梯度 all-reduce）且可与反向重叠。这条「TP 在内、PP 居中、DP 在外」的排布会在第 7 节量化展开，是分布式工程师的核心手感。</p>
+  </div>  <p>本模块仍然<strong>用 numpy 在单进程内模拟多 rank</strong>：把 TP 的「按列/按行切权重」实现成对 numpy 数组沿轴切片、把跨卡求和实现成对 rank 列表求和（即模块 01 的 all-reduce）、把 PP 的「bubble」实现成对调度时隙的计数。每个并行实现都<strong>与单卡参考对拍到 1e-10</strong>，证明切分逻辑数值正确；真实的 Megatron-LM / PyTorch 代码作为对照展示。学完你会确信：这些听起来高深的并行策略，本质都是<em>线性代数的分块 + 几次集合通信</em>的组合。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="colsplit"><span class="num">2</span>张量并行：列切分（免通信）</h2>
+  <h3>从一个 MLP 块说起：列切分（column parallel）</h3>  <p>张量并行的精髓，在 Megatron-LM（Shoeybi 2019）对 Transformer 的 FFN 块的处理上展现得淋漓尽致。一个标准 FFN 块是两个线性层夹一个非线性：<code>Z = GeLU(X·A)·B</code>，其中 <code>X</code> 是 <code>[s, h]</code> 的输入（<code>s</code>=序列长×batch，<code>h</code>=hidden），<code>A</code> 是 <code>[h, 4h]</code> 升维，<code>B</code> 是 <code>[4h, h]</code> 降维。问题是：怎么把 <code>A</code> 和 <code>B</code> 切到 <code>t</code> 张卡上，且<strong>让通信尽可能少</strong>？</p>  <p>第一层的关键洞察是：把 <code>A</code> 沿<strong>列</strong>（输出维）切成 <code>A = [A_1, A_2, …, A_t]</code>，每块 <code>[h, 4h/t]</code>。那么 <code>X·A = [X·A_1, X·A_2, …]</code>——矩阵乘沿输出列的切分是<strong>完全独立</strong>的，rank <code>i</code> 只需自己的 <code>A_i</code> 和<strong>完整的 &lt;code&gt;X&lt;/code&gt;</strong>，算出 <code>Y_i = X·A_i</code>（<code>[s, 4h/t]</code>）。更妙的是 GeLU 是<strong>逐元素</strong>的，<code>GeLU(X·A)</code> 的第 <code>i</code> 块就是 <code>GeLU(Y_i)</code>，所以非线性也能各算各的、<strong>无需任何通信</strong>：</p>  <div class="math-block">\[X A = X\,[A_1 \mid A_2 \mid \cdots \mid A_t] = [X A_1 \mid X A_2 \mid \cdots \mid X A_t],\qquad \mathrm{GeLU}(XA) = [\,\mathrm{GeLU}(XA_1)\mid \cdots \mid \mathrm{GeLU}(XA_t)\,]\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>列切分之所以「免费」（前向不通信），是因为我们切的是<strong>输出维度</strong>：每张卡负责算出最终结果的不同几列，这些列之间互不依赖。再加上 GeLU 逐元素、不跨列混合，于是每张卡可以一路算到非线性之后都不用找别人要数据。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说：设 <code>A=[A_1|A_2]</code> 按列分块，则 <code>XA=[XA_1|XA_2]</code> 自动按列分块（矩阵乘的分块法则）。逐元素函数 <code>f</code> 满足 <code>f([U|V])=[f(U)|f(V)]</code>。故 <code>GeLU(XA)=[GeLU(XA_1)|GeLU(XA_2)]</code>，rank <code>i</code> 独立持有第 <code>i</code> 块 <code>Y_i=GeLU(XA_i)</code>，零通信。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>列切分必须<strong>配一个完整的 &lt;code&gt;X&lt;/code&gt;</strong>：每张卡都要有整份输入。这意味着输入 <code>X</code> 在进入这个 TP 块前，要么已经在每卡上复制（DP 维度天然如此），要么需要一次 all-gather。在 Megatron 的实现里，这对应前向的 <code>f</code> 算子是恒等（identity），把广播留给框架——记住「列切分的前向不通信，是因为输入已是完整的」这个前提。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rowsplit"><span class="num">3</span>行切分 + all-reduce：一块只通信一次</h2>
+  <h3>行切分（row parallel）+ all-reduce：让一个块只通信一次</h3>  <p>现在每张卡手上是 <code>Y_i = GeLU(X·A_i)</code>（<code>[s, 4h/t]</code>），第二层要算 <code>Z = Y·B</code>。如果把 <code>B</code> 也按列切，就得先把分散的 <code>Y_i</code> 拼回完整的 <code>Y</code>（一次 all-gather），不划算。Megatron 的神来之笔是：把 <code>B</code> 沿<strong>行</strong>（输入维）切成 <code>B = [B_1; B_2; …; B_t]</code>（竖着摞），每块 <code>[4h/t, h]</code>。这样 <code>Y_i</code> 的列数恰好对上 <code>B_i</code> 的行数，每张卡算一个<strong>部分和</strong> <code>Z_i = Y_i·B_i</code>（<code>[s, h]</code>，已是输出的完整形状），而真正的结果是这些部分和之<strong>和</strong>：</p>  <div class="math-block">\[Y B = [Y_1 \mid \cdots \mid Y_t]\begin{bmatrix}B_1\\ \vdots\\ B_t\end{bmatrix} = \sum_{i=1}^{t} Y_i B_i \;\xrightarrow{\;\text{all-reduce}\;}\; Z\ (\text{每卡一致})\]</div>  <p>这个<strong>求和</strong>正是模块 01 的 <span class="term">all-reduce</span>！于是一个完整 FFN 块的通信账是：列切分（第一层，0 次）→ GeLU（0 次）→ 行切分（第二层，部分和）→ <strong>1 次 all-reduce</strong>（把部分和加起来得到所有卡都一致的 <code>Z</code>）。<strong>整个 MLP 块前向只通信一次</strong>；反向传播对称地也只需一次 all-reduce（对输入梯度求和）。这种「列切→行切→一次 all-reduce」的配对，是 Megatron 把通信压到最低的核心设计。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么这样切最省？因为<strong>两次切分的方向是「互补」的</strong>：第一层切输出（结果天然分散在各卡），第二层切输入（恰好消费分散的结果），中间的分散状态一路保持、<em>不需要拼回</em>，只在最后把部分和汇总一次。如果两层切同一个方向，中间就得来回 gather/scatter，通信翻倍。<strong>让数据保持分片、推迟汇总到不得不汇总的那一刻</strong>——这是所有高效并行的通用智慧，和模块 02 的 ZeRO「推迟 all-gather」如出一辙。</p>
+  </div>  <p>自注意力（self-attention）的张量并行同理，只是切分维度更自然：把 <code>Q/K/V</code> 投影沿<strong>注意力头</strong>切分——每张卡负责一部分头的完整 <code>Q_iK_i^T V_i</code> 计算（头之间本就独立），输出投影 <code>W_O</code> 按行切，最后一次 all-reduce 汇总。所以一个 Transformer 层（attention + FFN）在 Megatron 下前向共 <strong>2 次 all-reduce</strong>（attention 一次、FFN 一次），反向 2 次。<code>L</code> 层就是 <code>2L</code> 次——这正是 TP 通信密集、必须放在 NVLink 内的原因。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>注意力按头切几乎是「天造地设」：多头注意力本来就是若干个独立的注意力并排，把头分给不同卡，每张卡算自己那几个头，互不干扰，最后拼起来再投影。这也解释了为什么 TP 度通常取「能整除头数」的值（如 8 张卡分 64 个头，每卡 8 个头）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：<code>MHA(X)=Concat(head_1,…,head_n)W_O</code>。把 <code>n</code> 个头分到 <code>t</code> 卡，rank <code>i</code> 算 <code>head</code> 子集并持有对应的 <code>W_O</code> 行块 <code>W_{O,i}</code>，得部分和 <code>(Concat_i)W_{O,i}</code>，all-reduce 求和即得 <code>MHA(X)</code>。结构与 FFN 的列切→行切完全一致。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pp"><span class="num">4</span>流水线并行：切层成 stage 与 bubble 问题</h2>
+  <h3>流水线并行：把层序列切成 stage</h3>  <p>张量并行解决了「单层放不下」，但它通信太密（每层 2 次 all-reduce），TP 度做不大。当模型层数极多（如 96、128 层）、总参数远超单节点显存时，第二条路登场：<span class="term">pipeline parallelism</span>。思路朴素得多——把模型的 <code>L</code> 层<strong>纵向切成 &lt;code&gt;p&lt;/code&gt; 段</strong>（stage），stage 0 放第 0~L/p 层、stage 1 放下一段……每段放一张卡（或一组 TP 卡）。前向时，输入数据进 stage 0，算完把<strong>激活</strong>通过点对点（point-to-point）通信传给 stage 1，如此逐段流过；反向时梯度沿相反方向逐段回传。</p>  <p>PP 的通信代价极小：<strong>只在 stage 边界传一次激活</strong>（前向）和一次梯度（反向），且是点对点（send/recv），不是昂贵的集合通信。一个 <code>[s, h]</code> 的激活张量在边界传一次，相比 TP 每层 all-reduce 整个隐层，通信量小了好几个数量级。这就是为什么 <strong>PP 可以跨节点</strong>——边界带宽要求低，普通 InfiniBand 甚至以太网都扛得住。</p>  <div class="ascii">朴素流水线（naive / GPipe 之前的 sequential）—— 同一时刻只有一个 stage 在干活：
+
+  时间 →     t0    t1    t2    t3    t4    t5    t6    t7
+  stage0  [ F ] [ . ] [ . ] [ . ] [ . ] [ . ] [ B ] ...
+  stage1  [ . ] [ F ] [ . ] [ . ] [ . ] [ B ] [ . ]
+  stage2  [ . ] [ . ] [ F ] [ . ] [ B ] [ . ] [ . ]
+  stage3  [ . ] [ . ] [ . ] [FB ] [ . ] [ . ] [ . ]
+           F=前向  B=反向  .=空闲(idle)！
+  4 个 stage，任一时刻 ≥3 个在发呆 —— 利用率仅 1/p</div>  <div class="callout danger"><span class="label">bubble 问题</span>
+    <p>朴素流水线有个致命病：<strong>bubble（流水线气泡）</strong>。因为 stage 之间有数据依赖（stage 1 必须等 stage 0 算完才能开始），在「填充」和「排空」流水线的阶段，大部分 stage 在空转。如果整个 batch 当成一个整体走流水线，<strong>利用率只有 &lt;code&gt;1/p&lt;/code&gt;</strong>——切成 4 段反而每张卡只有 25% 的时间在干活，比单卡还慢！这显然不可接受，下一节的 micro-batch 就是为了治这个病。</p>
+  </div>  <p>这里要厘清一个常见误解：PP 切的是<strong>层</strong>，不是<strong>数据</strong>。所有 stage 处理的是<em>同一份</em>数据的不同阶段（像流水线工序），而不是像 DP 那样各处理不同的数据分片。所以 PP<strong>不减少</strong>单次前向的总计算量，它只是把模型<em>摊</em>到多卡以装下；真正的加速来自把 bubble 压下去之后、多个 stage 能<strong>并发</strong>处理不同 micro-batch。理解这一点，才能理解下一节为什么要把 batch 切碎。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="microbatch"><span class="num">5</span>micro-batch 与 bubble 公式</h2>
+  <h3>micro-batch 与 bubble 公式</h3>  <p>治 bubble 的办法是<span class="term">micro-batching</span>：把一个 batch 切成 <code>m</code> 个<strong>micro-batch</strong>，让它们<strong>接连不断地</strong>灌进流水线。当 stage 0 算完第 1 个 micro-batch 传给 stage 1 后，它<strong>立刻开始算第 2 个</strong>，而不是干等。这样流水线一旦填满，所有 stage 就都在同时处理不同的 micro-batch——正是工厂流水线的精髓。这是 GPipe（Huang 2019）的核心贡献。</p>  <div class="ascii">GPipe 风格（m=4 个 micro-batch 填充流水线，前向部分）：
+
+  时间 →     t0   t1   t2   t3   t4   t5   t6
+  stage0   [F1] [F2] [F3] [F4]  .    .    .
+  stage1    .   [F1] [F2] [F3] [F4]  .    .
+  stage2    .    .   [F1] [F2] [F3] [F4]  .
+  stage3    .    .    .   [F1] [F2] [F3] [F4]
+           填充期↑(bubble)   ↑稳态:4 stage 全忙    ↑排空期(bubble)
+  micro-batch 越多，中间「全忙」的稳态期越长，两头 bubble 占比越小</div>  <p>bubble 的占比可以精确算出来。设 <code>p</code> 个 stage、<code>m</code> 个 micro-batch，每个 micro-batch 在每个 stage 上耗时 1 个单位。填满流水线需要 <code>p-1</code> 步（填充），排空又需 <code>p-1</code> 步；而做完所有有用功需要 <code>m + p - 1</code> 步（最后一个 micro-batch 走完全程）。bubble 时间占比为：</p>  <div class="math-block">\[\text{bubble fraction} = \frac{p-1}{m + p - 1}\]</div>  <p>这个公式是 PP 调优的命根子。代入数字：<code>p=4, m=1</code>（朴素）→ bubble <code>3/4=75%</code>（利用率 25%，印证上一节）；<code>p=4, m=8</code> → bubble <code>3/11≈27%</code>；<code>p=4, m=32</code> → bubble <code>3/35≈8.6%</code>。<strong>micro-batch 越多，bubble 越小</strong>，但代价是激活显存随 <code>m</code> 增长（GPipe 要同时存 <code>m</code> 份激活等反向用）——这个权衡正是 1F1B 调度要破解的。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把 bubble 公式记成一句话：<strong>流水线越深（p 大）气泡越多，micro-batch 越多（m 大）气泡越被稀释</strong>。经验法则是让 <code>m ≥ 4p</code>（甚至 <code>8p</code>），把 bubble 压到 10% 出头。这也解释了为什么 PP 度不能太大——<code>p</code> 翻倍，要维持同样的 bubble 就得 <code>m</code> 也翻倍，激活显存跟着涨，迟早撑爆。所以 <code>p</code> 一般是个位数，靠 micro-batch 喂饱它。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="onefoneb"><span class="num">6</span>1F1B 调度：压低激活显存峰值</h2>
+  <h3>1F1B 调度：把激活显存压下来</h3>  <p>GPipe 把所有 micro-batch 的前向全做完、再统一做反向（<code>F F F F … B B B B</code>），这导致它必须<strong>同时保存 &lt;code&gt;m&lt;/code&gt; 份激活</strong>（每个 micro-batch 的前向激活都要留着等它的反向用）。当 <code>m</code> 大时这是巨大的显存负担。<span class="term">1F1B</span>（one-forward-one-backward，PipeDream/Megatron 采用）通过<strong>重排调度顺序</strong>解决了这个问题：流水线填满后，每个 stage<strong>交替地做一次前向、一次反向</strong>（<code>F B F B …</code>），让每个 micro-batch 的反向<strong>尽早执行</strong>、从而尽早释放它的激活。</p>  <div class="ascii">1F1B（p=4）：填充后进入 F/B 交替稳态，激活峰值从 m 份降到约 p 份
+
+  stage0  F1 F2 F3 F4 B1 F5 B2 F6 B3 ...   (做完 F 立刻穿插 B)
+  stage1     F1 F2 F3 B1 F4 B2 F5 B3 ...
+  stage2        F1 F2 B1 F3 B2 F4 B3 ...
+  stage3           F1 B1 F2 B2 F3 B3 ...   (最深 stage 最先开始 1F1B)
+  关键：B1 在 stage0 上很早就执行 → micro-batch 1 的激活早早释放</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>GPipe 像「把所有零件先全组装完，再统一质检」——半成品堆满仓库（激活显存爆）。1F1B 像「组装一个就质检一个」——仓库里始终只有少量半成品。两者的总工作量和 bubble 占比<strong>几乎一样</strong>，但 1F1B 的<strong>显存峰值</strong>低得多，所以能支持更深的流水线和更大的模型。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说：稳态下每个 stage 在任意时刻只需保存「已前向但未反向」的 micro-batch 激活。GPipe 这个数是 <code>m</code>（全部）；1F1B 是 <code>≈ p - rank</code>（最多 <code>p</code>）。当 <code>m ≫ p</code>（为压 bubble 必须如此）时，显存节省达 <code>m/p</code> 倍。bubble 公式 <code>(p-1)/(m+p-1)</code> 两者相同。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>更进一步的 <span class="term">interleaved 1F1B</span>（Megatron 的「虚拟流水线」）把每张卡负责的层<strong>再切成几个不连续的小段</strong>（virtual stage），让一张卡在流水线里出现多次。这等效于增大了 <code>p</code> 而<em>不</em>增加物理卡数，把 bubble 公式里的填充开销进一步摊薄（bubble 降到约 <code>(p-1)/(v·m+p-1)</code>，<code>v</code> 是虚拟段数），代价是更多的点对点通信次数。前沿的 zero-bubble PP 甚至想把 bubble 干到接近 0，见第 8 节。</p>
+  </div>  <p>一个工程提醒：1F1B 的调度逻辑比 GPipe 复杂得多，要精确编排每个 stage 在每个时隙做哪个 micro-batch 的前向还是反向、何时 send/recv。这正是 Megatron-LM、DeepSpeed 这类框架的核心价值——把这套精密的流水线调度<strong>封装好</strong>，用户只需指定 <code>pipeline_model_parallel_size</code> 和 micro-batch 数。本模块 notebook 会用 numpy 把这套调度的<strong>时隙账</strong>（谁忙谁闲、bubble 多少、激活峰值多少）模拟出来，让你看清 1F1B 凭什么省显存。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="threed"><span class="num">7</span>3D 并行：DP × TP × PP 组合</h2>
+  <h3>3D 并行：DP × TP × PP 的组合</h3>  <p>现实中的超大模型训练，从来不是单用一种并行，而是把三者<strong>组合成一个三维网格</strong>——这就是 <span class="term">3D parallelism</span>（Narayanan 2021 在 Megatron-LM 上系统化）。每张卡同时属于三个维度：它是某个 TP 组的一员（和组内卡协作算每一层）、某条流水线的某个 stage、以及某个 DP 副本。总卡数 <code>world_size = dp × tp × pp</code>。比如 <code>dp=8, tp=8, pp=12</code> 就是 768 张卡的训练。</p>  <p>三个维度的排布<strong>不是随意的</strong>，而要顺着「通信频率 vs 互联带宽」匹配。核心原则见下表——这张表是分布式训练工程师反复用到的「摆放心法」：</p>  <table>
+    <thead><tr><th>维度</th><th>通信模式</th><th>频率</th><th>放在哪</th><th>典型度数</th></tr></thead>
+    <tbody>
+      <tr><td><strong>TP</strong> 张量并行</td><td>all-reduce 整个隐层</td><td>每层 2 次（极密）</td><td><strong>节点内 NVLink</strong></td><td>≤ 8（=单机卡数）</td></tr>
+      <tr><td><strong>PP</strong> 流水并行</td><td>点对点传激活</td><td>每 stage 边界 1 次（稀疏）</td><td>跨节点 InfiniBand</td><td>数段~数十段</td></tr>
+      <tr><td><strong>DP</strong> 数据并行</td><td>梯度 all-reduce</td><td>每 step 1 次（可重叠）</td><td>最外层（跨节点）</td><td>剩下的卡数</td></tr>
+    </tbody>
+  </table>  <p>于是经典摆法是 <strong>「TP 在内、PP 居中、DP 在外」</strong>：先把 8 张卡用 NVLink 绑成一个 TP 组（吃掉最密的通信），再把若干节点用 PP 串成流水线（边界通信稀疏、容忍跨节点延迟），最后用 DP 复制整套来扩 batch（每步一次梯度同步、还能和反向重叠）。<code>rank</code> 到 <code>(dp, pp, tp)</code> 坐标的映射通常让 TP 维变化最快（相邻 rank 在同一节点内）：<code>tp = rank % tp_size</code>、<code>pp = (rank // tp_size) % pp_size</code>、<code>dp = rank // (tp_size · pp_size)</code>。这套坐标系是后面建通信组（process group）的基础，模块 05 会接着讲。</p>  <div class="callout warn"><span class="label"></span>
+    <p>3D 并行的配置是个<strong>约束满足问题</strong>，错配会立刻 OOM 或慢成龟速。常见陷阱：(1) <code>dp·tp·pp</code> 必须恰好等于 <code>world_size</code>，不能多不能少；(2) <code>tp_size</code> 别超过单节点卡数（否则 TP 通信被迫走慢速跨节点链路，性能断崖）；(3) <code>pp_size</code> 要能整除层数、且留够 micro-batch 压 bubble；(4) global batch = <code>dp × micro_batch × num_microbatch</code> 要符合训练超参。本模块 notebook 的练习就是写一个合法的 <code>rank ↔ (dp,pp,tp)</code> 映射并验证往返一致。</p>
+  </div>  <p>有了 3D 还能再叠：序列/上下文并行切序列维（省激活，见下节）、专家并行（expert parallelism）切 MoE 的专家、ZeRO（模块 02）叠在 DP 维上分片优化器状态。现代框架（Megatron-Core、DeepSpeed、NeMo）把这些维度做成可<strong>自由组合的旋钮</strong>。但旋钮越多，搜索最优配置越难——这把我们带到本模块的最后一节：自动并行与前沿方向。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>序列并行 / 上下文并行（sequence / context parallelism）</strong>：TP 没切到的 LayerNorm、Dropout、残差等逐元素算子的激活仍在每卡复制；序列并行（Korthikanti 2022）把它们沿序列维切开，进一步省激活显存。上下文并行（如 Ring Attention）则把超长序列的注意力沿序列维分块跨卡，是百万 token 上下文的关键。</li>
+    <li><strong>zero-bubble pipeline（近零气泡流水线）</strong>：把反向再拆成「算输入梯度」与「算权重梯度」两部分，用权重梯度的计算去填 bubble，理论上能把 PP 的 bubble 压到接近 0（Qi 2023）。这是 PP 调度的最新前沿。</li>
+    <li><strong>自动并行（auto-parallelism）</strong>：3D+ 的配置空间巨大，手调既难又易错。Alpa（Zheng 2022）、GSPMD 等把「怎么切、怎么放」formulate 成优化问题，自动搜索最优并行策略。让编译器而非人来决定并行方案，是长期方向。</li>
+    <li><strong>专家并行与 MoE（expert parallelism）</strong>：MoE 模型把 FFN 换成多个专家 + 路由，专家并行把不同专家放不同卡，引入 all-to-all 通信（模块 01）。如何与 TP/PP/DP 协同、如何均衡专家负载，是当前大模型工程的热点。</li>
+    <li><strong>通信-计算重叠（overlap）</strong>：TP 的 all-reduce、PP 的 send/recv、DP 的梯度同步，能否被前后的计算「藏住」，直接决定扩展效率。算子级的重叠（如把 all-reduce 拆块与 matmul 流水）是榨干硬件的最后一公里，也接续模块 05 的扩展效率主题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Shoeybi 2019《Megatron-LM》（张量并行的奠基，列切/行切/一次 all-reduce 的来源）、Huang 2019《GPipe》（micro-batch 与 bubble）、Narayanan 2021《Efficient Large-Scale Language Model Training》（1F1B、interleaved、3D 并行的系统化）、Korthikanti 2022（序列并行）、Zheng 2022《Alpa》（自动并行）。完整清单与导读见 <code>references.md</code>。下一站模块 04 处理「这么多卡跑这么久，挂了怎么办」——checkpoint 与容错。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_data_parallel_fsdp/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 数据并行与 FSDP</div></a>
+    <a class="next" href="../04_checkpointing_faulttol/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · Checkpoint 与容错</div></a>
+  </div>
+
+</div>
+</body>
+</html>

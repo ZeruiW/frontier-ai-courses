@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · Accelerate、Hub 与推理 API</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · Accelerate、Hub 与推理 API</h1>
+  <p class="subtitle">prepare 藏起来的分布式切分 · gather_for_metrics 的去重 · unwrap 与 module. 前缀 · safetensors 为何比 pickle 安全 · 客户端四层防护（退避抖动/双限/幂等/超时）与成本归因</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–04；C39（分布式训练原理）、C48 模块 02（服务契约）有帮助但不必需</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_accelerate_hub_api.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">accelerate 文档、Hub 文档与 safetensors 规范、OpenAI API Reference、Google SRE 的重试与退避实践</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#accelerate">Accelerate：四行改造与它藏起来的东西</a></li>
+      <li><a href="#hub">Hub 与 safetensors：分发、版本与安全</a></li>
+      <li><a href="#client">调远端模型：重试、限流、幂等</a></li>
+      <li><a href="#observability">把调用做成可观测的：日志、指标与降级</a></li>
+      <li><a href="#ledger">算一笔账：限流下的吞吐与上下文预算</a></li>
+      <li><a href="#frontier">生态动态与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="accelerate"><span class="num">1</span>Accelerate：四行改造与它藏起来的东西</h2>
+  <p><code>accelerate</code> 的定位是：<strong>让同一份训练代码在单卡 / 多卡 / 多机 / TPU / 混合精度下都能跑，而你只改四行</strong>。<code>Trainer</code> 内部就是用它。</p>  <pre><code>from accelerate import Accelerator
+
+accelerator = Accelerator(gradient_accumulation_steps=4)      # ① 建
+model, optimizer, dataloader, scheduler = accelerator.prepare( # ② prepare 四件套
+    model, optimizer, dataloader, scheduler)
+
+for batch in dataloader:
+    with accelerator.accumulate(model):                        # ③ 累积上下文
+        loss = model(**batch).loss
+        accelerator.backward(loss)                             # ④ 替代 loss.backward()
+        optimizer.step(); scheduler.step(); optimizer.zero_grad()
+
+# 保存时要先解包
+accelerator.wait_for_everyone()
+unwrapped = accelerator.unwrap_model(model)
+accelerator.save_model(unwrapped, "out")</code></pre>  <table>
+    <thead><tr><th>这一行</th><th>它替你做了什么</th></tr></thead>
+    <tbody>
+      <tr><td><code>Accelerator()</code></td><td>读环境（<code>accelerate config</code> / 环境变量）决定后端：单卡 / DDP / FSDP / DeepSpeed / TPU；初始化进程组</td></tr>
+      <tr><td><code>prepare(model)</code></td><td><code>.to(device)</code>；多卡时包 DDP/FSDP；混合精度时挂 autocast</td></tr>
+      <tr><td><code>prepare(dataloader)</code></td><td><strong>换掉 sampler 做分布式切分</strong>（每个 rank 只拿 1/N）；把 batch 自动搬到设备</td></tr>
+      <tr><td><code>prepare(optimizer)</code></td><td>包一层以配合梯度缩放（fp16 的 GradScaler）与梯度累积</td></tr>
+      <tr><td><code>accelerator.backward(loss)</code></td><td>fp16 时先 scale 再 backward；累积期间跳过梯度同步（省通信）</td></tr>
+      <tr><td><code>accumulate(model)</code></td><td>自动管理「什么时候该同步梯度」——累积中间步用 <code>no_sync()</code> 避免无用的 all-reduce</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最容易被忽略、也最重要的是 <strong><code>prepare(dataloader)</code> 换掉了 sampler</strong>。这意味着<em>你的 <code>batch_size</code> 是每个进程的</em>——8 卡时实际有效 batch 是 8 倍。<strong>这与 <code>TrainingArguments</code> 的 <code>per_device_train_batch_size</code> 是同一件事</strong>（模块 03 的乘法关系）。写裸 <code>accelerate</code> 代码时忘了这一点，就会「换台机器超参全变」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第二个隐藏行为是<strong>累积期间的梯度同步优化</strong>。DDP 默认在每次 <code>backward</code> 后就 all-reduce 梯度，但梯度累积时中间几步的同步是<em>纯浪费</em>（最终只用累加值）。<code>accelerator.accumulate()</code> 会在非同步步用 <code>model.no_sync()</code> 跳过通信——<strong>在 <code>grad_accum=8</code> 时能省掉 7/8 的梯度通信量</strong>。这是个不小的加速，而且完全对用户透明。自己写 DDP 循环忘了这个是常见的性能损失来源（C39 有完整的通信量分析）。</p></div>
+  </div>  <h3>四类日常操作的正确写法</h3>  <ul>
+    <li><strong>打印/日志只在主进程</strong>：<code>accelerator.print(...)</code>（或 <code>if accelerator.is_main_process:</code>）。否则 8 卡会打 8 遍。</li>
+    <li><strong>保存前解包</strong>：<code>accelerator.unwrap_model(model)</code>。直接保存 DDP 包装后的模型会得到带 <code>module.</code> 前缀的键名——加载时全部 <code>missing_keys</code>（模块 01 那个坑）。</li>
+    <li><strong>收集指标</strong>：<code>accelerator.gather_for_metrics(preds)</code>。它比裸 <code>gather</code> 多做一件事——<em>去掉分布式采样为了整除而重复的样本</em>，否则最后几条会被重复计入。</li>
+    <li><strong>同步点</strong>：<code>accelerator.wait_for_everyone()</code>。在保存、评估、写文件前后需要，否则 rank 0 还没写完别的 rank 就去读。</li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <strong><code>gather_for_metrics</code> vs <code>gather</code></strong> 是个具体且容易出错的区别。分布式采样器为了让每个 rank 拿到<em>相同数量</em>的样本，会在数据集末尾重复少量样本（padding the dataset）。裸 <code>gather</code> 会把这些重复样本也收上来，导致评估指标有微小偏差（数据集小、卡多时偏差更明显）。<code>gather_for_metrics</code> 知道原始长度并裁掉重复部分。<em>症状是「多卡评估结果与单卡略有不同」——很容易被误认为是随机性。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hub"><span class="num">2</span>Hub 与 safetensors：分发、版本与安全</h2>
+  <p>模型要给别人用（或给自己的推理服务用），就要经过 Hub 或某个等价的存储。这里有三件需要讲清的事。</p>  <h3>① revision：可变标签 vs commit sha</h3>  <pre><code># ❌ 不可复现：main 分支随时会变
+model = AutoModel.from_pretrained("org/model")
+
+# ✅ 可复现：钉死 commit
+model = AutoModel.from_pretrained("org/model",
+                                  revision="a1b2c3d4e5f6...")   # 或 tag "v1.2"
+
+# 记录到实验日志里（C37/C40）
+from huggingface_hub import HfApi
+sha = HfApi().model_info("org/model").sha
+print(f"loaded revision={sha}")</code></pre>  <p>Hub 的缓存<strong>按 commit sha 分目录</strong>（<code>snapshots/&lt;sha&gt;/</code>），所以钉死 revision 既保证可复现，也保证缓存命中稳定。<em>用 <code>main</code> 的项目在上游更新权重后会静默换模型</em>——这是「昨天还好今天变差」的一个真实来源。</p>  <h3>② safetensors：为什么它比 pickle 重要</h3>  <table>
+    <thead><tr><th></th><th><code>pytorch_model.bin</code>（pickle）</th><th><code>model.safetensors</code></th></tr></thead>
+    <tbody>
+      <tr><td>格式</td><td>Python pickle 字节流</td><td>header JSON + 连续张量字节</td></tr>
+      <tr><td><strong>加载时执行代码</strong></td><td><strong>会</strong>（<code>__reduce__</code> 可运行任意命令）</td><td><strong>不会</strong>（纯数据解析）</td></tr>
+      <tr><td>零拷贝 / mmap</td><td>❌ 需要反序列化到内存</td><td>✅ 可直接内存映射</td></tr>
+      <tr><td>部分加载</td><td>❌ 要读整个文件</td><td>✅ 按 tensor 名单独读</td></tr>
+      <tr><td>加载速度（大模型）</td><td>慢</td><td><strong>快 2–5 倍</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">pickle 是可执行的</span>
+    <p><strong>从不可信来源加载 <code>.bin</code> 等于运行陌生人的脚本</strong>。pickle 的反序列化会调用对象的 <code>__reduce__</code>，构造一个恶意 pickle 让它执行 <code>os.system(...)</code> 是教科书级的攻击。<code>safetensors</code> 从格式上消除了这个可能。同样的道理适用于 <code>trust_remote_code=True</code>——它会执行 repo 里的 <code>modeling_*.py</code>。<em>两者都只对可信来源使用</em>。生产上应该：只从组织内部 registry 或已审计的 repo 加载、强制 <code>use_safetensors=True</code>、并对权重文件做哈希校验。这与 C48 模块 01 的镜像供应链安全是同一类问题。</p>
+  </div>  <h3>③ 上传：模型卡片不是可选项</h3>  <p><code>push_to_hub</code> 很简单，但一个只有权重没有说明的 repo 三个月后连你自己都用不了。<strong>模型卡片至少要写清六件事</strong>：</p>  <ul>
+    <li><strong>基座与 revision</strong>：从哪个 checkpoint 的哪个 commit 微调而来。</li>
+    <li><strong>数据</strong>：训练数据是什么、多少条、怎么构造的、有什么已知偏差。</li>
+    <li><strong>超参</strong>：有效 batch、lr、epoch、LoRA 配置（直接贴 <code>TrainingArguments</code>）。</li>
+    <li><strong>评测</strong>：在什么集合上、什么指标、多少个种子、与什么基线比。</li>
+    <li><strong>输入格式</strong>：<em>必须写清 chat template 或 prompt 格式</em>——这是使用者最需要、最常缺失的信息。</li>
+    <li><strong>限制与许可</strong>：不适用的场景、基座模型的许可传递性。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>关于许可有一条实操提醒：<strong>微调模型的许可通常受基座许可约束</strong>。Llama 系有自己的社区许可（含使用量与命名条款），Gemma、Qwen 等各有条款。「我只是训了个 adapter」不改变这一点——adapter 离开基座无法工作，所以基座的条款照样适用。<em>商用前务必读一遍基座的许可，这不是形式主义</em>（C12/C45 有关于合规的系统讨论）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="client"><span class="num">3</span>调远端模型：重试、限流、幂等</h2>
+  <p>JD 里的「OpenAI APIs」不只是「会写 <code>client.chat.completions.create</code>」。<strong>把一个 API 调用做成生产可用的东西，需要四层防护</strong>——这与 C48 模块 02 讲的服务端护栏是同一套原理的客户端镜像。</p>  <table>
+    <thead><tr><th>层</th><th>解决什么</th><th>关键点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 重试与退避</strong></td><td>瞬时故障（429、5xx、网络抖动）</td><td><strong>指数退避 + 抖动</strong>；只重试<em>可重试</em>的错误；尊重 <code>Retry-After</code></td></tr>
+      <tr><td><strong>② 客户端限流</strong></td><td>不把自己的配额打爆、不给服务端加压</td><td>令牌桶，<strong>RPM 与 TPM 双限</strong>（模块与 C48 一致）</td></tr>
+      <tr><td><strong>③ 幂等</strong></td><td>重试不产生重复副作用/重复扣费</td><td><code>Idempotency-Key</code>（或自建缓存）</td></tr>
+      <tr><td><strong>④ 超时与预算</strong></td><td>不让一个请求挂死整个流程</td><td>分层超时；总预算（token/金额）上限与熔断</td></tr>
+    </tbody>
+  </table>  <h3>重试：哪些能重试、退避怎么算</h3>  <div class="math-block">\[\text{delay}_k = \min\left(\text{cap},\; \text{base} \cdot 2^{k}\right) \times U(0.5, 1.5)\]</div>  <table>
+    <thead><tr><th>状态码</th><th>含义</th><th>能重试吗</th><th>怎么做</th></tr></thead>
+    <tbody>
+      <tr><td><code>429</code></td><td>限流</td><td>✅</td><td><strong>优先用响应里的 <code>Retry-After</code></strong>，没有才用退避</td></tr>
+      <tr><td><code>500 / 502 / 503 / 504</code></td><td>服务端错误</td><td>✅</td><td>指数退避</td></tr>
+      <tr><td><code>408</code> / 连接超时</td><td>超时</td><td>✅（若幂等）</td><td>退避 + 幂等键</td></tr>
+      <tr><td><code>400</code></td><td>请求本身有问题</td><td>❌</td><td>重试一万次也一样错——<strong>要报出来</strong></td></tr>
+      <tr><td><code>401 / 403</code></td><td>认证/权限</td><td>❌</td><td>配置问题</td></tr>
+      <tr><td><code>404</code></td><td>模型不存在</td><td>❌</td><td>配置问题</td></tr>
+      <tr><td><code>context_length_exceeded</code></td><td>上下文超限</td><td>❌（但可降级）</td><td>截断输入或换更大上下文的模型后<em>重新</em>请求</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <strong>抖动（jitter）不是可选的</strong>。如果一批客户端同时遇到 429、又都用相同的确定性退避，它们会<em>同步地</em>在同一时刻重试，形成周期性的洪峰——这叫「惊群」（thundering herd），会让服务端更难恢复。加一个 <code>U(0.5, 1.5)</code> 的随机因子就能把重试打散。<em>这是分布式系统里最便宜、最常被忽略的一行代码。</em>
+  </div>  <h3>流式：客户端侧要处理的三件事</h3>  <ul>
+    <li><strong>增量拼接</strong>：每个 chunk 的 <code>delta.content</code> 可能为 <code>None</code>（第一个 chunk 通常只有 <code>role</code>），累加时要跳过。</li>
+    <li><strong>usage 不在流里</strong>：默认流式响应<em>不带 usage</em>，要计费/统计得开 <code>stream_options={"include_usage": True}</code>（最后一个 chunk 带 usage）。<em>不开的话你无法回答「这次调用花了多少 token」。</em></li>
+    <li><strong>断连要取消</strong>：客户端放弃后要真正关闭连接（用 <code>with</code> 或显式 <code>close()</code>），否则服务端还在为你生成——这既浪费你的配额也浪费服务端算力（C48 模块 02 的第三个 SSE 坑的另一侧）。</li>
+  </ul>  <h3>tool calling 与结构化输出</h3>  <p>两个常被混淆的能力：</p>  <ul>
+    <li><strong>tool / function calling</strong>：模型输出「我要调用哪个函数、参数是什么」，<em>你</em>去执行并把结果回传，模型继续。它是一个<strong>多轮协议</strong>——注意要把 <code>tool_calls</code> 的助手消息与对应的 <code>tool</code> 角色结果消息都追加回 <code>messages</code>，否则下一轮模型会困惑。</li>
+    <li><strong>结构化输出 / JSON schema</strong>：约束模型的输出必须符合一个 schema。<em>它不是 tool calling</em>——没有函数要执行，只是保证格式。用 <code>response_format={"type":"json_schema", ...}</code>。<strong>比「在 prompt 里请求 JSON 然后自己解析」可靠得多</strong>，但仍要处理「schema 合法而语义错误」的情况。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>一条关于成本的实操建议：<strong>把 token 计数与花费做成可观测的</strong>。每次调用记录 <code>model / prompt_tokens / completion_tokens / 业务标签</code>，聚合成「每个功能每天花多少钱」。<em>没有这个数据，你无法回答「哪个功能在烧钱」，也就无法优化</em>。这与 C48 模块 05 的成本归因是同一件事，只是在客户端侧做。加上「缓存命中的 prompt 便宜很多」这一点（prompt caching），把系统提示固定在前缀能显著省钱——这是最便宜的一个优化。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="observability"><span class="num">4</span>把调用做成可观测的：日志、指标与降级</h2>
+  <p>四层防护解决的是「单次调用怎么活下来」。但一个真实系统还需要回答三个运营问题：<strong>现在健康吗、刚才为什么慢、这个月钱花在哪</strong>。这三个问题的答案全部来自「你在调用现场记了什么」。</p>  <table>
+    <thead><tr><th>记什么</th><th>字段</th><th>用来回答什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>身份</strong></td><td><code>model</code>（服务端回显的实际模型）、<code>request_id</code>、<code>业务标签</code></td><td>「哪个功能、用的哪个模型」——成本归因与故障定位的第一层</td></tr>
+      <tr><td><strong>用量</strong></td><td><code>prompt_tokens</code> / <code>completion_tokens</code> / <code>cached_tokens</code></td><td>「花了多少钱」；缓存命中率</td></tr>
+      <tr><td><strong>时延</strong></td><td>TTFT、总时长、<strong>排队/重试耗时单独记</strong></td><td>「慢在哪」——是服务端慢还是自己在退避等待</td></tr>
+      <tr><td><strong>结果</strong></td><td><code>finish_reason</code>、状态码、重试次数</td><td><code>length</code> 比例上升 = 输出被截断，是质量与容量的双重预警（C48 模块 02）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>其中<strong>「重试耗时要单独记」</strong>是最容易漏、也最容易造成误判的一条。假设你观测到 P95 端到端延迟是 8 秒，很自然会去优化 prompt 或换更快的模型——但如果其中 6 秒是你自己在退避等待（因为撞了限流），那么真正的问题是<em>并发控制</em>，而不是模型速度。<strong>把「服务端耗时」与「客户端等待耗时」分成两个指标</strong>，能立刻区分这两种完全不同的问题。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><code>finish_reason</code> 的监控价值同样被低估。它只有几个取值（<code>stop</code> / <code>length</code> / <code>tool_calls</code> / <code>content_filter</code>），但 <code>length</code> 的比例是个极好的<strong>领先指标</strong>：它上升意味着输出被 <code>max_tokens</code> 截断——可能是用户在问更复杂的问题、可能是 prompt 变了、也可能是模型开始啰嗦。<em>无论哪种，都意味着「用户看到的答案是不完整的」，而这在错误率与延迟指标上完全看不出来。</em></p></div>
+  </div>  <h3>降级：当上游不可用时</h3>  <p>重试解决瞬时故障，但如果上游<em>持续</em>不可用（配额耗尽、区域故障、模型下线），无限重试只会让你的服务一起挂掉。这时需要<strong>降级链</strong>：</p>  <ul>
+    <li><strong>换模型</strong>：主模型不可用 → 退到更小/更便宜/另一家的模型。前提是你的 prompt 不依赖某个模型的特殊行为（这也是「别过度依赖单一模型的怪癖」的实际理由）。</li>
+    <li><strong>降质量</strong>：把 <code>max_tokens</code> 调小、关掉思考链、跳过重排——换取在配额内完成。</li>
+    <li><strong>用缓存/兜底答案</strong>：语义相近的历史回答、或一个诚实的「暂时不可用」。</li>
+    <li><strong>熔断（circuit breaker）</strong>：连续失败 N 次后<em>直接快速失败一段时间</em>，不再发请求。这既保护上游、也让你的服务快速返回而不是全体挂在超时上（C48 模块 02 的背压在客户端的镜像）。</li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <p>降级链有一个必须显式决定的问题：<strong>降级后的结果要不要标记</strong>？如果用小模型的回答与主模型的回答混在一起、事后无法区分，那么你的离线评测会被污染（「上周质量下降」其实是那天降级了 20% 的流量）。<em>把降级层级作为一个字段记进日志与返回值</em>，这一个字段能省掉未来无数次归因困惑。</p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把这一节浓缩成一句可执行的建议：<strong>写一个统一的 <code>call_llm()</code> 封装，把重试、限流、幂等、超时、日志、降级全部放进去，然后<em>禁止业务代码直接调 SDK</em></strong>。这样所有防护与观测都是默认开启的，而不是靠每个调用点自觉。这是本课模块 05 最实际的产出——notebook 里的客户端骨架就是它的雏形。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">5</span>算一笔账：限流下的吞吐与上下文预算</h2>
+  <div class="math-block">\[\text{最大吞吐(请求/分)} = \min\left(\texttt{RPM},\; \frac{\texttt{TPM}}{\bar{n}_{tokens}}\right)\]</div>  <table>
+    <thead><tr><th>配额</th><th>平均 token/请求</th><th>RPM 限制</th><th>TPM 限制</th><th><strong>实际瓶颈</strong></th></tr></thead>
+    <tbody>
+      <tr><td>RPM=60, TPM=60k</td><td>500</td><td>60</td><td>120</td><td><strong>RPM</strong>（60/分）</td></tr>
+      <tr><td>RPM=60, TPM=60k</td><td>2000</td><td>60</td><td>30</td><td><strong>TPM</strong>（30/分）</td></tr>
+      <tr><td>RPM=3500, TPM=90k</td><td>1500</td><td>3500</td><td>60</td><td><strong>TPM</strong>（60/分）</td></tr>
+    </tbody>
+  </table>  <p>这张表说明一个常被误解的点：<strong>大多数时候真正的瓶颈是 TPM 而不是 RPM</strong>。看到「RPM=3500」以为可以每秒发 58 个请求，实际上 TPM 只允许 60 个请求/分钟——<em>差 58 倍</em>。所以客户端限流必须双维度，且要按<strong>预估 token</strong>预扣、结束后按实际结算（C48 模块 02 的练习就是这个）。</p>  <p>第二笔账是<strong>上下文预算</strong>，它在多轮对话里会随轮数增长：</p>  <div class="math-block">\[L_{available}(t) = L_{model} - L_{system} - \sum_{i<t}(L_{user,i} + L_{assist,i}) - L_{reserve}\]</div>  <table>
+    <thead><tr><th>策略</th><th>做法</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>滑窗</strong></td><td>只保留最近 N 轮</td><td>丢失早期信息（用户会发现「它忘了」）</td></tr>
+      <tr><td><strong>摘要压缩</strong></td><td>把早期对话摘要成一段</td><td>额外的 LLM 调用成本 + 摘要失真</td></tr>
+      <tr><td><strong>检索式</strong></td><td>把历史存进向量库，按需检索</td><td>复杂度高（C11/C33 的内容）</td></tr>
+      <tr><td><strong>硬失败</strong></td><td>超了就报错让用户开新会话</td><td>体验差但最诚实</td></tr>
+    </tbody>
+  </table>  <p><strong>无论选哪种，都必须先能算出这个数字</strong>。最糟的做法是不算——然后在某个长对话上突然收到 <code>context_length_exceeded</code>，或者更隐蔽地被服务端静默截断。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句话：<strong>模型训练完只是一半，「把它安全地送出去」和「可靠地调用别人的模型」是另一半，而这一半的技术含量全在「失败处理」上</strong>——保存时要解包、加载时要钉 revision、格式要用 safetensors、调用要重试退避限流幂等、上下文要算预算。<em>这些都不难，但少任何一个，系统就会在某个你没预料到的时刻出问题。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">6</span>生态动态与开放问题</h2>
+  <ul>
+    <li><strong>分布式配置的表达层</strong>：FSDP/DeepSpeed 的参数散落在 <code>accelerate config</code>、<code>TrainingArguments</code>、JSON 配置与环境变量里，同一个概念（如 ZeRO 阶段、参数分片粒度）在不同层有不同名字。这是当前最真实的工程摩擦，社区在推动收敛但尚未完成。</li>
+    <li><strong>模型供应链安全</strong>：safetensors 解决了格式层的代码执行，但 <code>trust_remote_code</code>、自定义 tokenizer、以及权重本身的后门（数据投毒、权重篡改）仍是开放问题。模型签名与 SBOM（软件物料清单）式的溯源正在探索，尚无普遍实践（C44 有攻防视角的讨论）。</li>
+    <li><strong>API 协议的边角语义</strong>：OpenAI 兼容已是事实标准，但 <code>logprobs</code> 的定义、流式增量的 <code>tool_calls</code> 拼装方式、结构化输出的约束表达、<code>seed</code> 是否被尊重，各家实现不一致。跨供应商切换时这些边角会咬人。</li>
+    <li><strong>prompt 缓存的定价与语义</strong>：各家的前缀缓存策略（命中条件、TTL、折扣比例）不同且会变，让「怎么组织 prompt 最省钱」成了一个随时间移动的目标。缓存命中还会影响延迟分布，使容量规划更复杂。</li>
+    <li><strong>可复现性的现实边界</strong>：即使钉死 revision 与随机种子，服务端模型更新、批处理下的浮点归约顺序、以及 kernel 版本变化都会让输出改变。<em>「LLM 应用的可复现」目前只能是「统计上可复现 + 输入输出留档」</em>，这与 C40 的实验纪律有持续的张力。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：accelerate 文档的 <em>Quicktour</em>、<em>Migrating to Accelerate</em> 与 <em>Distributed Evaluation</em>（<code>gather_for_metrics</code> 的语义在那里）；huggingface_hub 的 <em>Download files</em>（revision 与缓存布局）与 safetensors 格式规范；OpenAI API Reference 的 <em>Chat</em>、<em>Streaming</em>、<em>Function calling</em>、<em>Structured Outputs</em>、<em>Rate limits</em> 五节；AWS Architecture Blog 的 <em>Exponential Backoff and Jitter</em>（抖动为什么必需，附量化对比）。原理侧：C39（分布式通信）、C48 模块 02/05（服务契约与成本）、C33（上下文与记忆管理）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_peft_trl/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · PEFT 与 TRL</div></a>
+  </div>
+
+</div>
+</body>
+</html>

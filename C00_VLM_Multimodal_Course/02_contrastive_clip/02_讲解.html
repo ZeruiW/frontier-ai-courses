@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 对比对齐：CLIP / SigLIP</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 10</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 对比对齐：CLIP / SigLIP</h1>
+  <p class="subtitle">Contrastive Alignment —— 用海量图文对，把"看见"和"读到"压进同一个向量空间</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（ViT / 视觉编码器）、softmax 与交叉熵、PyTorch 基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge gpu">GPU友好</span><span class="badge cpu">CPU可跑</span> 02_clip_siglip.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">CLIP [Radford 2021]、SigLIP [Zhai 2023]、Modality Gap [Liang 2022]</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 30 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#problem">问题：如何让视觉与语言落到同一向量空间</a></li>
+      <li><a href="#contrastive">对比学习总览：正负样本与图文弱监督</a></li>
+      <li><a href="#clip-arch">CLIP 双塔架构：两个编码器 → 联合空间</a></li>
+      <li><a href="#infonce">InfoNCE 损失详细推导：温度、对称交叉熵</a></li>
+      <li><a href="#zeroshot">零样本分类：prompt 工程与 ensembling</a></li>
+      <li><a href="#siglip">SigLIP：sigmoid pairwise loss 替换 softmax</a></li>
+      <li><a href="#modality-gap">模态鸿沟 modality gap：现象、成因与影响</a></li>
+      <li><a href="#limits">CLIP 的局限：评测视角下的系统性弱点</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="problem"><span class="num">1</span>问题：如何让视觉与语言落到同一向量空间</h2>
+
+  <p>模块 01 解决了"图像如何变成向量"——一个 ViT 把图变成 $N$ 个 patch token。但那些向量活在<strong>视觉自己的空间</strong>里，和文本嵌入空间毫无关系：一张猫图的特征和单词 <code>"cat"</code> 的嵌入，数值上没有任何可比性。本模块要解决的核心问题是：</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>如何训练出两个编码器，使得"一张图"和"描述它的文字"在同一个向量空间里彼此靠近，而与无关图文彼此远离？</strong> 一旦做到这点，"图文是否匹配"就退化成"两个向量的夹角有多小"——一个简单的点积就能回答。这就是 <span class="term">CLIP</span>(Contrastive Language-Image Pre-training) 的全部出发点。</div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>给模型看几亿对"图 + 配文"。训练目标只有一句话：让配对的图和文在向量空间里挨得近，不配对的推开。学完之后，模型从没见过的类别、从没标过的图，只要你用一句话描述，它就能判断这句话和图配不配——这就是<strong>零样本</strong>。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设图像编码器 $f_\theta$、文本编码器 $g_\phi$，分别把图像 $x$、文本 $t$ 映到 $\mathbb{R}^{d}$ 的单位球面上。对比目标在共享空间中最大化匹配对 $(x_i,t_i)$ 的互信息下界 [van den Oord 2018]，使得 $\langle f_\theta(x_i), g_\phi(t_i)\rangle$ 在所有 $j\neq i$ 的负对中最大。对齐后，分类、检索、跨模态匹配统一为<strong>最近邻/最大点积</strong>问题。</p>
+    </div>
+  </div>
+
+  <p>这一步为什么如此关键？因为模块 01 末尾的结论——<strong>VLM 几乎都用 CLIP 式编码器做视觉骨干</strong>——其根因就在这里：CLIP 的视觉特征"出厂即与语言对齐"，下游 connector 几乎不用重新翻译。本模块就是把那个"对齐"是怎么训出来的，从损失函数到失败模式彻底讲透。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="contrastive"><span class="num">2</span>对比学习总览：正负样本与图文弱监督</h2>
+
+  <p><span class="term">Contrastive Learning</span> 的范式可以浓缩成一句话：<strong>不要求模型预测一个绝对标签，只要求它把"相似的"拉近、"不相似的"推远。</strong> 它学的是一个度量空间的几何结构，而非一个分类边界。</p>
+
+  <table>
+    <thead><tr><th>概念</th><th>含义</th><th>在 CLIP 里是什么</th></tr></thead>
+    <tbody>
+      <tr><td>锚点 anchor</td><td>当前样本</td><td>batch 里第 $i$ 张图（或第 $i$ 条文本）</td></tr>
+      <tr><td>正样本 positive</td><td>应被拉近的对象</td><td>与该图配对的那条 caption</td></tr>
+      <tr><td>负样本 negative</td><td>应被推远的对象</td><td>同 batch 内其余所有文本（共 $B-1$ 个）</td></tr>
+      <tr><td>监督信号</td><td>谁和谁配对</td><td>"图文对来自同一条网页数据"这一弱标注</td></tr>
+    </tbody>
+  </table>
+
+  <p>CLIP 最深刻的设计选择，是把<strong>"图文是否成对"本身当作监督信号</strong>——这是一种<span class="term">weak supervision</span>（弱监督）。互联网上天然存在数十亿条"图 + alt-text / 配文"，无需任何人工标注类别。CLIP 用了 4 亿对（WIT 数据集），ALIGN [Jia 2021] 用了约 18 亿对噪声图文。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>为什么用图文对、而不是人工类别？</strong> ImageNet 的 1000 类是一个<em>封闭、有限、人为</em>的标签体系，模型学到的语义被锁死在这 1000 个词里。而自然语言是<em>开放</em>的——"一只戴着帽子的橘猫坐在键盘上"是 ImageNet 永远无法表达的标签。用语言当监督，模型获得的是<strong>开放词表的语义空间</strong>，这正是零样本能力的来源。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  对比学习的负样本主要来自 <strong>batch 内</strong>（in-batch negatives）。这意味着 <strong>batch size 越大，每个样本面对的负样本越多，对比信号越强</strong>。CLIP 用了 32768 的超大 batch。这条"batch size 是对比学习一等公民"的事实，正是第 6 节 SigLIP 要攻克的痛点。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="clip-arch"><span class="num">3</span>CLIP 双塔架构：两个编码器 → 联合空间</h2>
+
+  <p>CLIP 是典型的 <span class="term">dual-encoder</span>（双塔 / two-tower）架构：图像和文本各走一条独立的塔，互不交叉，只在最后用一个点积相遇。[Radford 2021]</p>
+
+  <div class="ascii">
+   图像 x ──►┌──────────────┐  [CLS]/pool  ┌──────────────┐  W_i      ┌──────────┐
+            │ Image Encoder│ ───────────► │  image embed │ ────────► │          │
+            │ (ViT / RN)   │   d_v 维      │   投影到 d    │  L2 归一化 │  z_img   │──┐
+            └──────────────┘              └──────────────┘           └──────────┘  │
+                                                                                    │  cosine
+                                                                                    ▼ similarity
+   文本 t ──►┌──────────────┐   EOT pool   ┌──────────────┐  W_t      ┌──────────┐  │  s = z_img · z_txt
+            │ Text Encoder │ ───────────► │  text embed  │ ────────► │          │  │     × exp(t)
+            │ (Transformer)│   d_t 维      │   投影到 d    │  L2 归一化 │  z_txt   │──┘
+            └──────────────┘              └──────────────┘           └──────────┘
+                                                                          ▲
+                                                       温度 logit_scale = exp(t) 可学习
+  </div>
+
+  <p>逐块拆解这条流水线：</p>
+  <ul>
+    <li><strong>Image Encoder</strong> $f_\theta$：ViT-B/32、ViT-L/14 或改造的 ResNet。取全局表征（ViT 的 <code>[CLS]</code> / 注意力池化），得到 $d_v$ 维向量。</li>
+    <li><strong>Text Encoder</strong> $g_\phi$：一个 Transformer（CLIP 用 GPT 式 causal Transformer），取序列末尾 <code>[EOT]</code> 位置的表征作为句向量，得到 $d_t$ 维。</li>
+    <li><strong>投影到联合空间</strong>：各接一个线性投影 $W_i\in\mathbb{R}^{d_v\times d},\ W_t\in\mathbb{R}^{d_t\times d}$，把两塔输出投到<strong>同一个 $d$ 维联合嵌入空间</strong>（projection / embedding space）。</li>
+    <li><strong>L2 归一化</strong>：把两个向量都投到单位球面 $\lVert z\rVert_2=1$。归一化后，点积 $z_{\text{img}}\!\cdot\!z_{\text{txt}}$ 就等于<strong>余弦相似度</strong> $\cos\angle$，范围 $[-1,1]$。</li>
+    <li><strong>温度缩放</strong>：相似度乘以可学习标量 $\exp(t)$（代码里叫 <code>logit_scale</code>）再送入损失——见第 4 节。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>双塔 vs 融合塔（fusion / single-stream）的根本权衡</strong>：双塔下图文<em>不交互</em>，每张图、每条文都能<strong>离线预计算并缓存向量</strong>，检索时只做向量内积——极快、可扩展到十亿级图库（这是 CLIP 能做大规模检索的工程前提）。代价是图文之间没有 token 级 cross-attention，<strong>细粒度对齐能力弱</strong>（第 8 节的局限即源于此）。融合塔（如 ALBEF / BLIP 的 image-text matching head）精度更高但无法预缓存。VLM 视觉骨干选双塔，正是看中可扩展性。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="infonce"><span class="num">4</span>InfoNCE 损失详细推导：温度、对称交叉熵</h2>
+
+  <p>这是本模块的数学核心，务必逐步推清楚。CLIP 用的对比损失是 <span class="term">InfoNCE</span>（Noise-Contrastive Estimation 的多分类形式）[van den Oord 2018] 的对称版本。</p>
+
+  <h3>4.1 构造相似度矩阵（logits）</h3>
+  <p>取一个大小为 $B$ 的 batch，得到归一化后的图像嵌入 $\{z^{\text{img}}_i\}_{i=1}^B$ 与文本嵌入 $\{z^{\text{txt}}_j\}_{j=1}^B$，各 $\lVert z\rVert_2=1$。堆成矩阵 $I\in\mathbb{R}^{B\times d}$（行 = 图）、$T\in\mathbb{R}^{B\times d}$（行 = 文）。定义相似度 logits 矩阵：</p>
+
+  <div class="math-block">
+  $$ \text{logits} \;=\; \exp(t)\cdot I\,T^{\top} \;\in\;\mathbb{R}^{B\times B},
+     \qquad \text{logits}_{ij} \;=\; \exp(t)\,\big\langle z^{\text{img}}_i,\, z^{\text{txt}}_j\big\rangle. $$
+  </div>
+
+  <p>$\text{logits}_{ij}$ 就是第 $i$ 张图与第 $j$ 条文的余弦相似度，乘上温度因子 $\exp(t)$。<strong>对角线 $\text{logits}_{ii}$ 是真实配对（正样本），所有非对角元素是负样本。</strong></p>
+
+  <div class="ascii">
+            txt_0   txt_1   txt_2   ...   txt_{B-1}
+   img_0  [ s00 ]   s01     s02     ...     s0,B-1      ← 第 0 行：图0 该匹配 txt_0
+   img_1    s10   [ s11 ]   s12     ...     s1,B-1      ← 对角线 = 正样本
+   img_2    s20     s21   [ s22 ]   ...     s2,B-1
+    ...                            ...
+                              第 j 列：txt_j 该匹配 img_j
+
+   行方向 softmax → image-to-text 检索        列方向 softmax → text-to-image 检索
+   每行的正确答案是对角元 (label = 行号)        每列的正确答案是对角元 (label = 列号)
+  </div>
+
+  <h3>4.2 对称交叉熵</h3>
+  <p>关键洞见：<strong>把"找出哪条文本配第 $i$ 张图"看成一个 $B$ 类分类问题</strong>——类别就是 batch 里的 $B$ 条文本，正确类别是第 $i$ 类（对角）。于是对每一行做 softmax + 交叉熵。<strong>图→文方向</strong>（image-to-text，对 logits 的<em>行</em>做 softmax）：</p>
+
+  <div class="math-block">
+  $$ \mathcal{L}_{\text{i}\to\text{t}}
+     \;=\; -\frac{1}{B}\sum_{i=1}^{B}
+     \log\frac{\exp\!\big(\exp(t)\,\langle z^{\text{img}}_i, z^{\text{txt}}_i\rangle\big)}
+              {\sum_{j=1}^{B}\exp\!\big(\exp(t)\,\langle z^{\text{img}}_i, z^{\text{txt}}_j\rangle\big)}. $$
+  </div>
+
+  <p>分子是正确配对的相似度，分母遍历该行所有 $B$ 个候选。对称地，<strong>文→图方向</strong>（text-to-image，对<em>列</em>做 softmax）：</p>
+
+  <div class="math-block">
+  $$ \mathcal{L}_{\text{t}\to\text{i}}
+     \;=\; -\frac{1}{B}\sum_{j=1}^{B}
+     \log\frac{\exp\!\big(\exp(t)\,\langle z^{\text{img}}_j, z^{\text{txt}}_j\rangle\big)}
+              {\sum_{i=1}^{B}\exp\!\big(\exp(t)\,\langle z^{\text{img}}_i, z^{\text{txt}}_j\rangle\big)}. $$
+  </div>
+
+  <p>最终损失是两个方向的<strong>对称平均</strong>：</p>
+  <div class="math-block">
+  $$ \boxed{\;\mathcal{L}_{\text{CLIP}} \;=\; \tfrac{1}{2}\big(\mathcal{L}_{\text{i}\to\text{t}} + \mathcal{L}_{\text{t}\to\text{i}}\big)\;} $$
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  代码里这就是 <strong>两次 <code>F.cross_entropy</code></strong>：以 <code>labels = arange(B)</code>（对角线的下标）为目标，一次喂 <code>logits</code>（行方向 = 图→文），一次喂 <code>logits.T</code>（列方向 = 文→图），两者平均。配套 notebook 会手算这一步逐项验证。原论文的伪代码正是如此（<code>loss = (loss_i + loss_t)/2</code>）。</div>
+
+  <h3>4.3 温度 $\tau$ / logit_scale 的作用与可学习性</h3>
+  <p>温度有两种等价写法。用乘性温度 $\exp(t)$（CLIP 的写法）或用除性温度 $\tau$，二者关系为 $\exp(t)=1/\tau$。展开看它对 softmax 锐度的控制：</p>
+
+  <div class="math-block">
+  $$ p_{ij} \;=\; \frac{\exp\!\big(\langle z_i, z_j\rangle/\tau\big)}{\sum_{k}\exp\!\big(\langle z_i, z_k\rangle/\tau\big)},
+     \qquad \tau = \exp(-t). $$
+  </div>
+
+  <ul>
+    <li><strong>$\tau$ 小（$\exp(t)$ 大）→ 分布尖锐</strong>：模型对"最相似的那个"极度自信，强烈惩罚难负样本（hard negatives），梯度集中。但太小会数值不稳、训练震荡。</li>
+    <li><strong>$\tau$ 大（$\exp(t)$ 小）→ 分布平滑</strong>：所有候选近乎等权，对比信号变弱，难以拉开正负样本。</li>
+    <li>因为余弦相似度被钳在 $[-1,1]$，若不放大，正负样本 logits 差距太小，softmax 几乎均匀、学不动——<strong>温度的本质作用是把窄区间 $[-1,1]$ 放大到 softmax 有意义的尺度。</strong></li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  CLIP 把 $t$ 设为<strong>可学习参数</strong>，让模型自己找最优锐度，省去调参；但为防数值爆炸，会把 <code>logit_scale</code> 用 <code>clamp</code> 限制上限（论文取 $\exp(t)\le 100$，即 $\tau\ge 0.01$）。初始值常设为 $\ln(1/0.07)\approx 2.6592$（$\tau_0=0.07$）。<strong>这个温度的初始化/演化，正是第 7 节"模态鸿沟"成因之一</strong>——记住这个伏笔。</div>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>InfoNCE 的理论意义</strong> [van den Oord 2018]：最小化 InfoNCE 等价于最大化正配对之间互信息 $I(x;t)$ 的一个变分下界，下界随负样本数 $B-1$ 增大而收紧。<strong>这就是 batch size 越大、对比表征越好的理论根据</strong>，也解释了 CLIP 为何不惜代价堆到 32768 的 batch。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="zeroshot"><span class="num">5</span>零样本分类：prompt 工程与 ensembling</h2>
+
+  <p>对齐训练完成后，<span class="term">zero-shot classification</span> 几乎是"免费"得到的能力。原理：把每个候选类别写成一句话、编码成文本向量，再看图像向量和谁最近。</p>
+
+  <div class="ascii">
+   候选类别: ["cat", "dog", "car"]
+       │  套模板 prompt: "a photo of a {class}"
+       ▼
+   ["a photo of a cat", "a photo of a dog", "a photo of a car"]
+       │  Text Encoder + 投影 + L2 归一化
+       ▼
+   3 个文本向量 z_txt[0..2]
+                                    待分类图 ──► Image Encoder ──► z_img
+       │                                                              │
+       └────────────► 余弦相似度 s_k = exp(t)·(z_img · z_txt[k]) ◄─────┘
+                                    │  对 k 做 softmax
+                                    ▼
+                        P(cat)=0.92, P(dog)=0.06, P(car)=0.02  ← argmax = "cat"
+  </div>
+
+  <p>注意两个工程细节，它们对零样本准确率影响显著：</p>
+
+  <h3>5.1 Prompt 模板</h3>
+  <p>直接用裸类名 <code>"cat"</code> 效果差，因为训练时的 caption 几乎都是完整句子。套上 <code>"a photo of a {class}"</code> 让文本分布更接近训练分布，CLIP 论文报告这一步在 ImageNet 上提升约 1.3 个点。针对领域还能定制：卫星图用 <code>"a satellite photo of a {class}"</code>，宠物数据集用 <code>"a photo of a {class}, a type of pet"</code>。这种"让推理输入贴近预训练分布"的思路是 prompt 工程的核心。</p>
+
+  <h3>5.2 Prompt Ensembling</h3>
+  <p>更强的做法是<span class="term">prompt ensembling</span>：对同一类用多个模板（CLIP 用了 80 个，如 <code>"a photo of a {c}."</code>、<code>"a blurry photo of a {c}."</code>、<code>"a sculpture of a {c}."</code>），<strong>在归一化后的嵌入空间里把它们平均成一个"类原型"向量</strong>，再归一化：</p>
+
+  <div class="math-block">
+  $$ \bar{z}^{\text{txt}}_c \;=\; \frac{1}{M}\sum_{m=1}^{M} g_\phi\big(\text{prompt}_m(c)\big),
+     \qquad \hat{z}^{\text{txt}}_c \;=\; \frac{\bar{z}^{\text{txt}}_c}{\lVert \bar{z}^{\text{txt}}_c\rVert_2}. $$
+  </div>
+
+  <p>平均能抵消单个模板的措辞噪声，CLIP 报告 ensembling + 模板工程在 ImageNet 上累计提升约 3.5 个点。<strong>这是零样本评测里"零成本涨点"的标准操作，做 VLM 评测时务必意识到分数对 prompt 极其敏感</strong>——同一个模型换 prompt 可能差好几个点，跨论文比较时要对齐 prompt 协议。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="siglip"><span class="num">6</span>SigLIP：sigmoid pairwise loss 替换 softmax</h2>
+
+  <p><span class="term">SigLIP</span>(Sigmoid Loss for Language Image Pre-training) [Zhai 2023] 只改了一处——<strong>把 softmax 对比损失换成对每个图文对独立的 sigmoid 二分类损失</strong>——却在工程上带来质变。</p>
+
+  <h3>6.1 损失公式对比</h3>
+  <p>CLIP 的 softmax 损失需要<strong>对整行/整列做归一化</strong>（分母遍历全 batch）。SigLIP 把每个 $(i,j)$ 对当成一个独立的二分类：是配对（标签 $+1$）还是不配对（标签 $-1$）。设 $z_{ij}=\langle z^{\text{img}}_i, z^{\text{txt}}_j\rangle$，标签 $y_{ij}=+1$ 当 $i=j$ 否则 $-1$，可学习温度 $t'$ 与偏置 $b$：</p>
+
+  <div class="math-block">
+  $$ \mathcal{L}_{\text{SigLIP}}
+     \;=\; -\frac{1}{B}\sum_{i=1}^{B}\sum_{j=1}^{B}
+     \log\frac{1}{1+\exp\!\big(-y_{ij}\,(t'\,z_{ij} + b)\big)}. $$
+  </div>
+
+  <p>对照 CLIP 的 softmax 损失（第 4 节），二者结构差异一目了然：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>CLIP (softmax / InfoNCE)</th><th>SigLIP (sigmoid)</th></tr></thead>
+    <tbody>
+      <tr><td>每个 logit 的归一化</td><td>需要整行/整列 softmax（全局归一化）</td><td>每对独立 sigmoid，<strong>无跨样本归一化</strong></td></tr>
+      <tr><td>正负样本耦合</td><td>正样本概率依赖<em>所有</em>负样本（分母）</td><td>每对的 loss 互相独立</td></tr>
+      <tr><td>分布式实现</td><td>需 all-gather 全部嵌入算 softmax 分母，通信重</td><td>可分块计算两两 loss，<strong>通信友好</strong></td></tr>
+      <tr><td>batch size 依赖</td><td>强依赖大 batch（分母即负样本数）</td><td>较小 batch 也能良好工作，大 batch 收益更平缓</td></tr>
+      <tr><td>数值稳定性</td><td>大 batch softmax 易上/下溢，需技巧</td><td>sigmoid 数值更稳</td></tr>
+      <tr><td>额外参数</td><td>仅可学习温度 logit_scale</td><td>可学习温度 $t'$ + 偏置 $b$（应对正负极度不平衡）</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>核心直觉：去掉了全局 softmax 分母。</strong> CLIP 算一个正样本的概率必须知道整行所有负样本（分母里全有），所以分布式训练得把所有卡的嵌入 all-gather 到一起——通信和显存随 batch 平方增长。SigLIP 把损失拆成两两独立的小项，每张卡只算自己那块的 pairwise loss，再求和——<strong>大 batch 不再是瓶颈，反而能轻松推到百万级</strong>。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>偏置 $b$ 为什么必要？</strong> batch 里正样本只有 $B$ 个（对角），负样本有 $B^2-B$ 个，<strong>极度不平衡</strong>。训练初期所有 sigmoid 都倾向输出"不配对"，loss 被海量负样本主导。SigLIP 引入可学习偏置 $b$（初始化为较大负值，如 $-10$）抵消这种不平衡，让训练初期稳定。这是 softmax 版本不需要的——softmax 自带相对归一化，天然平衡。</div>
+
+  <div class="callout paper"><span class="label"></span>
+  SigLIP [Zhai 2023] 的一个反直觉发现：sigmoid 损失下，<strong>batch size 的收益很快饱和</strong>——32k 已接近最优，继续加到 256k 提升甚微。这颠覆了"对比学习 batch 越大越好"的直觉，说明那条规律其实是 <em>softmax 归一化</em> 的产物，而非对比学习本身的必然。对算力受限的研究者，SigLIP 让小 batch 也能训出强编码器。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="modality-gap"><span class="num">7</span>模态鸿沟 modality gap：现象、成因与影响</h2>
+
+  <p>一个反直觉但极其重要的现象，做 VLM 评测必须知道：即便经过对比对齐，<strong>图像嵌入和文本嵌入在联合空间里并没有真正"混在一起"，而是各自聚成一团、被一条明显的间隙分开</strong>。这就是 <span class="term">modality gap</span>（模态鸿沟）[Liang 2022]。</p>
+
+  <div class="ascii">
+   理想中的"对齐空间"（想象）          实际 CLIP 空间（Liang 2022 实测）
+   ┌────────────────────────┐        ┌────────────────────────┐
+   │   img  txt  img         │        │  img img img            │
+   │  txt  img  txt  img     │        │ img img img             │   ← 图像簇
+   │   img txt  txt          │        │──────────gap────────────│   ← 一条间隙
+   │  txt  img txt img       │        │            txt txt txt  │
+   │   (图文充分交错混合)      │        │           txt txt txt   │   ← 文本簇
+   └────────────────────────┘        └────────────────────────┘
+   配对图文 cos 高，但两模态整体各占一个"锥"，间隙在所有方向上稳定存在
+  </div>
+
+  <h3>7.1 现象</h3>
+  <p>把大量图像嵌入和文本嵌入一起降维（PCA / t-SNE）可视化，会清楚看到<strong>两个分离的簇</strong>。即使配对的图文余弦相似度不低（如 0.3），同模态内部的相似度往往更高——两个无关图像可能比"图和它的正确配文"还像。配套 notebook 第 7 步会亲手复现这个分簇散点图。</p>
+
+  <h3>7.2 成因</h3>
+  <p>[Liang 2022] 把成因归结为三点，可记为"<strong>初始化 + 温度 + 优化</strong>"：</p>
+  <ul>
+    <li><strong>初始化（cone effect）</strong>：随机初始化的深网络，其输出天然落在嵌入空间的一个<em>狭窄锥形</em>区域里；两个独立初始化的编码器，从一开始就落在两个不同的锥，相隔一段距离。这个间隙在训练前就存在。</li>
+    <li><strong>温度</strong>：第 4 节那个低温 $\tau$（高 $\exp(t)$）。低温让损失只在乎"配对比非配对相对更近"，<strong>并不要求两模态在绝对位置上重合</strong>——只要对角元相对最大即可。于是优化没有动力去消除那条间隙。</li>
+    <li><strong>优化</strong>：对比损失在保持间隙的情况下就能取得很低的值（局部最优盆地），梯度下降一旦进入就不再离开。论文用实验证明：人为把间隙缩小到 0，损失反而上升——<strong>间隙是被优化目标主动维持的</strong>。</li>
+  </ul>
+
+  <h3>7.3 对检索 / 对齐的影响</h3>
+  <ul>
+    <li><strong>检索</strong>：跨模态检索（图搜文 / 文搜图）时，由于两模态各占一锥，绝对距离意义不大，只能靠<em>相对</em>排序——这也是为什么检索常用余弦排序而非绝对阈值。</li>
+    <li><strong>下游 VLM</strong>：把 CLIP 视觉特征喂进 LLM 时，特征带着这个"模态偏移"，connector 需要隐式吸收它。</li>
+    <li><strong>可操控性</strong>：[Liang 2022] 发现沿"间隙方向"平移嵌入，能影响下游零样本的公平性/性能——间隙是一个可干预的量，而非纯粹的瑕疵。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>评测启示</strong>：不要假设"CLIP 把图文嵌到同一点"。它嵌到的是<em>同一个空间里彼此可比较排序、但分属两团</em>的位置。当你看到"图文余弦相似度只有 0.2~0.3"时不要惊慌——这是模态鸿沟下的正常量级，关键看<strong>相对排序</strong>而非绝对值。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="limits"><span class="num">8</span>CLIP 的局限：评测视角下的系统性弱点</h2>
+
+  <p>CLIP 强在<strong>整体语义对齐</strong>，但有一类系统性弱点，根因在于：<strong>对比目标只优化"全图 ↔ 整句"的粗粒度匹配，不要求理解句子的组合结构</strong>。双塔架构没有 token 级跨模态交互（第 3 节），文本塔也常退化成"词袋"。这些弱点会<strong>直接传导到以 CLIP 为视觉骨干的下游 VLM</strong>。</p>
+
+  <table>
+    <thead><tr><th>弱点</th><th>表现</th><th>代表评测 / 来源</th></tr></thead>
+    <tbody>
+      <tr><td>细粒度 fine-grained</td><td>难区分近似类别（犬种、鸟种、车型）</td><td>CUB / FGVC 等细粒度数据集零样本掉点</td></tr>
+      <tr><td>计数 counting</td><td>"三只猫" vs "两只猫"几乎不分</td><td>下游 VLM 计数错误大量源于此</td></tr>
+      <tr><td>空间关系 spatial</td><td>"A 在 B 左边"与"B 在 A 左边"嵌入几乎相同</td><td>Winoground、VSR</td></tr>
+      <tr><td>读字 OCR / text rendering</td><td>低分辨率下读不出图中文字</td><td>224/336 分辨率瓶颈（模块 06）</td></tr>
+      <tr><td>组合性 compositionality</td><td>对调属性/关系词，相似度几乎不变（词袋行为）</td><td><strong>Winoground</strong> [Thrush 2022]、<strong>SugarCrepe</strong> [Hsieh 2023]、ARO</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>词袋假说（bag-of-words behavior）</strong>：研究反复发现，CLIP 文本塔对句子的处理近乎<em>无视词序</em>。<code>"a red cube on a blue sphere"</code> 和 <code>"a blue cube on a red sphere"</code> 会被编码成几乎相同的向量——颜色和物体对调了，CLIP 看不出区别。<strong>Winoground</strong>（图文都只换词序/绑定，考组合推理）上，CLIP 类模型的 group score 长期接近甚至低于随机水平；<strong>SugarCrepe</strong> 进一步修正了早期基准的人造偏置，确认这是真实缺陷而非测试瑕疵。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>为什么这些局限会传导到下游 VLM？</strong> 如果视觉骨干本身就把"红立方在蓝球上"和"蓝立方在红球上"编码成同一个特征，那么无论后面 LLM 多强，它拿到的<strong>视觉证据已经丢失了组合信息</strong>——"编码器看不到的，LLM 救不回来"（模块 01 的论断在此应验）。做 VLM 评测时，遇到组合/空间/计数类的系统性失败，应<strong>把怀疑指向视觉编码器的对比训练目标</strong>，而不只是归咎于 LLM 推理。这是模块 07/08 失败归因的关键线索。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>SigLIP 2</strong> [Tschannen 2025]：在 sigmoid 损失基础上加入 caption 解码、自蒸馏、在线难负样本等多目标，并支持原生任意分辨率（NaFlex）。作为新一代 VLM 视觉骨干，它在密集/定位任务上比初代更强——这正是下游 VLM 选骨干时的现实考量。</li>
+    <li><strong>EVA-CLIP</strong> [Sun 2023]：用 MIM 预训练初始化 + 改进优化，把 CLIP 高效 scale 到十亿参数，证明对比对齐能与自监督初始化叠加增益。</li>
+    <li><strong>如何注入组合性？</strong> 既然词袋行为源于对比目标本身，能否用难负样本挖掘（hard negative mining，把对调词序的句子当负样本）、或引入区域/token 级对齐来修复？这是 compositionality 方向的开放问题。</li>
+    <li><strong>对比 vs 生成式预训练</strong>：CLIP（对比）擅长对齐但弱于细节；CoCa/CapPa（加 caption 生成目标）和纯生成式编码器各有优劣。作为 VLM 骨干到底哪条路更好，尚无定论。</li>
+    <li><strong>评测视角的开放问题</strong>：现有零样本 benchmark 对 prompt 极度敏感（第 5 节），跨论文比较常因 prompt 协议不一而失真；模态鸿沟（第 7 节）让"对齐质量"难以用单一标量度量。<strong>如何设计稳健、可复现、能解耦"编码器对齐能力"与"prompt 工程"的评测协议</strong>，是 evaluation 研究者的真问题。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>写出 CLIP 的对称 InfoNCE 损失，并解释温度 <code>logit_scale</code>/$\tau$ 为什么必须存在、为什么设成可学习。</li>
+      <li>SigLIP 的 sigmoid 损失相比 softmax 改了什么？为什么这让大 batch 分布式训练更友好、还需要一个偏置 $b$？</li>
+      <li>什么是模态鸿沟？它的三个成因（初始化 / 温度 / 优化）分别如何贡献？对检索意味着什么？</li>
+      <li>CLIP 的"词袋行为"是什么？为什么它会传导成下游 VLM 在空间/组合/计数任务上的系统性失败？用什么 benchmark 测它？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../01_foundations/01_讲解.html"><div class="dir">← 上一章</div><div class="t">01 · 多模态基础与视觉编码器</div></a>
+    <a class="next" href="../03_architectures/03_讲解.html"><div class="dir">下一章 →</div><div class="t">03 · VLM 架构演进</div></a>
+  </div>
+
+</div>
+</body>
+</html>

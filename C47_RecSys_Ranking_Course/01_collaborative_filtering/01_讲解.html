@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 协同过滤</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 协同过滤</h1>
+  <p class="subtitle">不用任何物品内容，只靠「谁和谁交互过」的协同信号就能推荐 —— item/user-based CF、cosine/Pearson/调整余弦相似度、邻域加权、隐式反馈与冷启动，从零写 item-based CF 并做 Top-N 评估</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、向量内积与余弦、稀疏矩阵概念</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_collaborative_filtering.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Sarwar 2001、Linden 2003 (Amazon)、Hu 2008 (隐式)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#idea">核心思想：协同信号 &gt; 内容</a></li>
+      <li><a href="#two_views">user-based vs item-based</a></li>
+      <li><a href="#similarity">相似度：cosine / Pearson / 调整余弦</a></li>
+      <li><a href="#predict">从相似度到预测：邻域加权</a></li>
+      <li><a href="#implicit">隐式反馈下的 CF</a></li>
+      <li><a href="#coldstart">冷启动：CF 的死穴</a></li>
+      <li><a href="#scale">复杂度与工业取舍</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="idea"><span class="num">1</span>核心思想：协同信号 &gt; 内容</h2>
+  <p>协同过滤（<span class="term">collaborative filtering, CF</span>）是推荐系统最古老、也最深刻的思想。它的核心假设一句话就能说清：<strong>口味相似的人会喜欢相似的东西</strong>——而要判断「口味相似」，<strong>根本不需要知道物品是什么</strong>。</p>  <p>这是一个反直觉的洞察。你也许以为推荐电影需要懂电影（类型、导演、演员），推荐商品需要懂商品（品类、价格、品牌）。协同过滤说：<em>不必</em>。只要有一张「谁看过/买过/评过什么」的交互表，纯粹从<strong>行为的协同模式</strong>里就能推荐。「喜欢《盗梦空间》的人也喜欢《星际穿越》」——这个结论不需要任何人告诉系统这两部都是 Nolan 的烧脑科幻，它直接从「大量同时喜欢这两部的用户」这个<strong>协同信号</strong>里浮现出来。这就是 collaborative（协同）一词的含义：用群体的智慧填补个体的空白。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：你想知道一家新餐厅好不好，最靠谱的办法不是研究菜单成分，而是<strong>问几个和你口味最像的朋友</strong>去过没、觉得怎样。协同过滤就是把这件事自动化、规模化——从几百万用户里找出和你最像的那群，看他们喜欢什么。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，CF 只用<strong>用户-物品交互矩阵</strong> $R\in\mathbb{R}^{m\times n}$（$m$ 用户、$n$ 物品，大量缺失）。它要么直接基于<strong>邻域</strong>（neighborhood / memory-based：找相似用户或相似物品来预测，本模块），要么学一个<strong>隐因子模型</strong>（model-based：把 $R$ 分解成低维表示，模块 02）。本模块讲前者——它最直观、可解释（「因为你看过 X，而喜欢 X 的人也喜欢 Y」），且至今仍是工业召回的一路（Amazon 的 item-to-item）。</p></div>
+  </div>  <p>这个思想有一段值得记住的历史。1992 年 Xerox PARC 的 Tapestry 系统首次提出 collaborative filtering 一词（用于邮件过滤）；1994 年 GroupLens 把它用于新闻推荐；2003 年 Amazon 的 item-to-item CF 论文（Linden）把它推上工业巅峰，撑起电商推荐；2006-2009 年 Netflix Prize 百万美元竞赛又把它推向矩阵分解的新高度。可以说，<strong>整部推荐系统史的前半段就是协同过滤的进化史</strong>。即使到了深度学习时代，CF 的核心假设——协同信号——依然是所有推荐模型的根基。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么协同过滤如此重要、值得放在第一个算法模块？因为它确立了推荐的<strong>第一性原理</strong>：<strong>推荐的信号主要藏在交互模式里，而非物品内容里</strong>。后面所有更复杂的模型（矩阵分解、双塔、序列推荐）本质都在更好地<em>利用同一个协同信号</em>——只是从「数邻居」升级到「学表示」。把 CF 想透，后面就都是它的进化。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="two_views"><span class="num">2</span>user-based vs item-based</h2>
+  <h3>两种视角：user-based vs item-based</h3>  <p>邻域 CF 有两个对偶的视角，区别在于<strong>拿谁找邻居</strong>：</p>  <table>
+    <thead><tr><th>维度</th><th>user-based CF（基于用户）</th><th>item-based CF（基于物品）</th></tr></thead>
+    <tbody>
+      <tr><td>思路</td><td>找和你口味最像的 k 个用户，看他们喜欢啥</td><td>你喜欢的物品，它们的相似物品也推给你</td></tr>
+      <tr><td>相似度算在</td><td>用户之间（行 vs 行）</td><td>物品之间（列 vs 列）</td></tr>
+      <tr><td>预测 $\hat r_{ui}$</td><td>相似用户对 $i$ 评分的加权平均</td><td>用户 $u$ 评过的、与 $i$ 相似物品的加权平均</td></tr>
+      <tr><td>稳定性</td><td>用户兴趣易漂移，相似度要常更新</td><td><strong>物品相似度稳定</strong>，可离线预计算</td></tr>
+      <tr><td>可扩展性</td><td>用户数 $m$ 大时邻居计算贵（$m$ 常 > $n$）</td><td><strong>更可扩展</strong>（物品数 $n$ 通常小于用户数）</td></tr>
+      <tr><td>工业代表</td><td>早期 GroupLens</td><td><strong>Amazon item-to-item</strong>（Linden 2003）</td></tr>
+    </tbody>
+  </table>  <p>user-based 是 CF 的原始形态（GroupLens 1994）：要给你推荐，先算你和其他所有用户的相似度，取最像的 k 个，把他们对某物品的评分加权平均作为你的预测。直观，但有两个工业痛点：① <strong>用户数通常远大于物品数</strong>（淘宝几亿用户、几亿商品，但单个品类的活跃商品有限），用户两两相似度矩阵 $O(m^2)$ 算不起；② 用户兴趣<strong>漂移快</strong>，今天爱看科幻明天追剧，相似度要频繁重算。</p>  <p>Sarwar 2001 和 Linden 2003（Amazon）的关键洞察是：<strong>换成物品视角，一切都顺了</strong>。物品之间的相似度（「喜欢 A 的人也喜欢 B 的程度」）<strong>远比用户相似度稳定</strong>——《盗梦空间》和《星际穿越》的相似关系几年都不变。于是可以<strong>离线</strong>把物品相似度矩阵 $S\in\mathbb{R}^{n\times n}$ 算好存起来，线上来一个用户，只需查他评过的物品对应的相似物品、加权求和，是 $O(1)$ 量级的查表。这就是 Amazon 著名的「<em>Customers who bought this also bought</em>（看了又看 / 买了又买）」，撑起了早期电商推荐的半壁江山。<strong>本模块的 worked 实现就以 item-based CF 为主</strong>。</p>  <div class="callout paper"><span class="label"></span>
+    <p>item-based CF 的两篇必读：Sarwar 2001《Item-Based Collaborative Filtering》（提出并论证调整余弦、可扩展性）、Linden 2003《Amazon.com Recommendations: Item-to-Item》（工业落地的教科书案例）。见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="similarity"><span class="num">3</span>相似度：cosine / Pearson / 调整余弦</h2>
+  <h3>相似度怎么算：cosine、Pearson、adjusted cosine</h3>  <p>CF 的灵魂是<strong>相似度</strong>。两个物品（或用户）的相似度，本质是把它们的「评分向量」拿来比。最常用三种：</p>  <h4>① 余弦相似度（cosine）</h4>  <p>把每个物品看成它在<strong>用户空间</strong>里的评分向量 $r_{\cdot i}\in\mathbb{R}^m$（第 $u$ 维是用户 $u$ 对物品 $i$ 的评分，未评为 0），两物品相似度 = 夹角余弦：</p>  <div class="math-block">\[\text{cos}(i, j) = \frac{r_{\cdot i}\cdot r_{\cdot j}}{\|r_{\cdot i}\|\,\|r_{\cdot j}\|} = \frac{\sum_u r_{ui} r_{uj}}{\sqrt{\sum_u r_{ui}^2}\sqrt{\sum_u r_{uj}^2}}\]</div>  <p>只看<strong>方向</strong>不看模长——评分模式一致（都被同一批人打高分）的物品相似度高。简单、快、是默认选择。缺点：没考虑「不同用户打分基准不同」。</p>  <h4>② 皮尔逊相关（Pearson）= 中心化余弦</h4>  <p>有人是「好好先生」（什么都打 4-5 星），有人是「严苛评论家」（很少超过 3 星）。裸余弦会被这种<strong>评分基准差异</strong>污染。Pearson 先减去均值再算余弦：</p>  <div class="math-block">\[\text{pearson}(i, j) = \frac{\sum_{u\in U_{ij}} (r_{ui}-\bar r_i)(r_{uj}-\bar r_j)}{\sqrt{\sum_{u\in U_{ij}}(r_{ui}-\bar r_i)^2}\sqrt{\sum_{u\in U_{ij}}(r_{uj}-\bar r_j)^2}}\]</div>  <p>其中 $U_{ij}$ 是同时评过 $i,j$ 的用户集，$\bar r_i,\bar r_j$ 是物品均值。中心化让相似度反映「<strong>一起偏离均值的程度</strong>」——这才是真正的「品味相关」。注意它只在<strong>共同评分</strong>的用户上算（co-rated）。</p>  <h4>③ 调整余弦（adjusted cosine，Sarwar 2001 推荐）</h4>  <p>item-based CF 里更该消除的是<strong>用户</strong>的基准差异（同一个用户给所有电影打的分有个人偏好）。调整余弦减去<strong>用户均值</strong> $\bar r_u$：</p>  <div class="math-block">\[\text{adjcos}(i, j) = \frac{\sum_{u\in U_{ij}} (r_{ui}-\bar r_u)(r_{uj}-\bar r_u)}{\sqrt{\sum_{u\in U_{ij}}(r_{ui}-\bar r_u)^2}\sqrt{\sum_{u\in U_{ij}}(r_{uj}-\bar r_u)^2}}\]</div>  <p>Sarwar 2001 实测它在 item-based CF 上显著优于裸余弦和 Pearson——因为它正确地把「用户个人打分尺度」这个混淆因素扣掉了。<strong>这是 item-based CF 的推荐选择</strong>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见陷阱：<strong>共同评分用户太少时，相似度极不可靠</strong>。两个物品只被 1 个用户同时评过，余弦可能恰好是 1.0，但这毫无统计意义。工业做法是<strong>收缩（shrinkage）</strong>：把相似度乘以 $\frac{n_{ij}}{n_{ij}+\lambda}$（$n_{ij}$ 是共同评分数，$\lambda$ 是收缩系数），共同评分越少越往 0 压。notebook 练习会实现它——这是把 CF 从「玩具」变「能用」的关键细节之一。</p>
+  </div>  <p>用一个 3 用户的微例把「裸余弦 vs 调整余弦」的差别坐实。两个物品 $i,j$ 被同三个用户评过，评分如下（同时给出每个用户的均值 $\bar r_u$）：</p>  <table>
+    <thead><tr><th>用户</th><th>$r_{ui}$（物品 $i$）</th><th>$r_{uj}$（物品 $j$）</th><th>用户均值 $\bar r_u$</th></tr></thead>
+    <tbody>
+      <tr><td>A（好好先生）</td><td>5</td><td>4</td><td>4.5</td></tr>
+      <tr><td>B（中庸）</td><td>3</td><td>3</td><td>3.0</td></tr>
+      <tr><td>C（严苛）</td><td>2</td><td>1</td><td>1.5</td></tr>
+    </tbody>
+  </table>  <p><strong>裸余弦</strong>：分子 $5{\cdot}4+3{\cdot}3+2{\cdot}1=31$，分母 $\sqrt{25{+}9{+}4}\,\sqrt{16{+}9{+}1}=\sqrt{38}\sqrt{26}\approx31.43$，得 $\cos\approx0.986$——高得几乎像「同一个物品」，但这其实大半是<strong>三人打分基准不同</strong>制造的假相似（A 处处高、C 处处低，自然「同涨同跌」）。<strong>调整余弦</strong>先各减用户均值：$i$ 的中心化向量是 $(0.5,0,0.5)$，$j$ 的是 $(-0.5,0,-0.5)$。分子 $0.5{\cdot}(-0.5)+0+0.5{\cdot}(-0.5)=-0.5$，分母 $\sqrt{0.5}\sqrt{0.5}=0.5$，得 $\text{adjcos}=-1.0$——<strong>扣掉用户基准后，两物品其实是负相关</strong>（在每个人自己的尺度里，喜欢 $i$ 的相对更不喜欢 $j$）。这个微例一眼说清 Sarwar 2001 为何力荐调整余弦：<em>裸余弦把「用户慷慨程度」误当成了「物品相似度」，调整余弦把这个混淆因素扣干净了</em>。notebook 会复算这组数并验证两种相似度的符号差异。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="predict"><span class="num">4</span>从相似度到预测：邻域加权</h2>
+  <h3>从相似度到预测：邻域加权</h3>  <p>有了物品相似度矩阵 $S$，怎么预测用户 $u$ 对未评物品 $i$ 的评分？<strong>用 $u$ 评过的、与 $i$ 最相似的 k 个物品，按相似度加权平均</strong>：</p>  <div class="ascii">item-based CF 预测「用户 u 对物品 i 的评分」
+
+  u 评过的物品:  [电影A:5★]  [电影B:4★]  [电影C:2★]  [电影D:5★] ...
+                    │           │           │           │
+   与目标 i 的相似度 s:  0.8        0.1        -0.3        0.7   &lt;- 只取 top-k 正相似
+                    │                                    │
+                    └──── 取相似度最高的 k 个邻居 ────────┘
+                              (A:0.8, D:0.7, ...)
+                                      │
+            预测 = Σ(s · r) / Σ s  =  (0.8×5 + 0.7×5)/(0.8+0.7) = 5.0
+                    -&gt; u 很可能也喜欢 i（它像 u 打高分的 A、D）</div>  <div class="math-block">\[\hat r_{ui} = \frac{\sum_{j\in N_k(i;u)} s_{ij}\, r_{uj}}{\sum_{j\in N_k(i;u)} |s_{ij}|}\]</div>  <p>其中 $N_k(i;u)$ 是「用户 $u$ 评过的物品中，与 $i$ 相似度最高的 k 个」。分子是相似度加权的评分和，分母归一化。<strong>只取 top-k 邻居</strong>（而非所有物品）有两个好处：降噪（远邻居的低相似度是噪声）、提速。$k$ 是 CF 最重要的超参数。</p>  <p>更精确的版本会先减去基准（用户均值或全局均值）再加权、最后加回，类似 Pearson 预测公式：$\hat r_{ui}=\bar r_u + \frac{\sum_j s_{ij}(r_{uj}-\bar r_u)}{\sum_j|s_{ij}|}$。这能进一步消除用户基准的影响，通常更准。notebook worked 会实现带 top-k 的 item-based 预测，并在真实数据上评估。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白讲整个 item-based CF 的预测流程：① 离线把所有物品两两的相似度算好（一张 $n\times n$ 表）；② 线上要预测「用户 $u$ 对物品 $i$」，就看 $u$ 历史上评过哪些物品、它们和 $i$ 有多像、$u$ 给它们打了几分；③ 像的、打分高的物品多 → 预测 $u$ 也会喜欢 $i$。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，这是一个<strong>局部加权回归</strong>：用 $i$ 的 k 近邻（在物品相似度度量下）作为「局部模型」，对 $u$ 的已知评分做相似度加权插值。它无参数、可解释、增量友好（新评分来了只需局部更新），但表达力有限——它捕捉不了「需要多个物品组合才能体现」的复杂模式，那是矩阵分解（模块 02）的舞台。</p></div>
+  </div>  <p>一个<strong>务必注意的实现细节</strong>：相似度可正可负（尤其调整余弦/Pearson 中心化后），但加权预测时<strong>应只用正相似度邻居</strong>。为什么？正相似度物品代表「和 $i$ 品味一致」，它们的评分能正向预测 $u$ 对 $i$ 的态度；而负相似度物品代表「品味相反」，若简单地把负权重也加进来再用 $|s|$ 归一化，会让预测被这些「反向邻居」拉乱，实测会比全局均值基线还差。经典 Sarwar 2001 的 item-based CF 正是用正相似邻居加权——notebook 的 worked 实现会演示这个差别（不筛正邻居时 RMSE 反而恶化）。这是从「公式对」到「真能用」之间最容易踩的坑。</p>  <p>生成<strong>Top-N 推荐</strong>（而非预测单个评分）就是：对用户 $u$ 所有未评物品算 $\hat r_{ui}$，取最高的 N 个。这才是工业推荐真正要的输出——一个排好序的列表，用 Recall@N / nDCG@N 评估（模块 00、04）。</p>  <div class="callout danger"><span class="label">流行度基线</span>
+    <p>评估任何 CF（乃至任何推荐模型）时，<strong>第一件事是先跑「按全局流行度排序」这个平凡基线</strong>——不看任何个性化，就把交互最多的物品推给所有人。它便宜到一行代码，却<strong>强得惊人</strong>：因为热门物品本来就被很多人喜欢，Recall@N 往往不低。无数论文/项目的尴尬真相是：<em>精心调的 CF 在某些数据集上并不显著超过流行度基线</em>。所以铁律是——<strong>不和流行度基线比的推荐指标都是耍流氓</strong>。你的模型只有「明显跑赢流行度」才算真的学到了个性化；跑不赢，说明它学到的多半只是「把热门排前面」。notebook 的 Top-N 评估会强制带上这个基线做对照，让你对「个性化到底贡献了多少」有诚实的数字。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="implicit"><span class="num">5</span>隐式反馈下的 CF</h2>
+  <h3>隐式反馈下的协同过滤</h3>  <p>前面讲的是<strong>显式</strong>评分（1-5 星）。但现代工业主要是<strong>隐式</strong>反馈：点击、观看、购买——<strong>只有正例，没有评分值</strong>。CF 怎么适配？</p>  <p>第一步，把交互矩阵<strong>二值化</strong>：交互过记 1，未交互记 0（或缺失）。此时余弦相似度有个漂亮的解释——两个物品的余弦相似度 ≈ <strong>同时与它们交互的用户数，按各自流行度归一化</strong>：</p>  <div class="math-block">\[\text{cos}(i,j) = \frac{|U_i \cap U_j|}{\sqrt{|U_i|}\sqrt{|U_j|}}\]</div>  <p>其中 $U_i$ 是交互过物品 $i$ 的用户集。分子是「共同用户数」，分母按两物品各自的流行度开方归一——这正是 Amazon「买了又买」的数学本质：<strong>两个商品被同一批人买的频率，扣除各自有多热门</strong>。（分母不归一就会偏向推荐爆款，因为爆款和谁的交集都大。）</p>  <p>第二步，隐式反馈有<strong>强弱之分</strong>：看了 10 遍 vs 划走前看了 1 秒，都是「交互」但置信度天差地别。Hu 2008（iALS）提出<strong>置信度加权</strong>：把交互强度 $r_{ui}$（次数/时长）转成置信度 $c_{ui}=1+\alpha r_{ui}$，让模型更信任高置信度的正例。这个思想模块 02/03 的隐式版本会继续用。</p>  <div class="callout danger"><span class="label">流行度偏置</span>
+    <p>隐式 CF 最大的陷阱是<strong>流行度偏置</strong>。热门物品和<em>所有</em>东西的共现都多，不归一化就会让推荐结果全是爆款——所有人都被推《泰坦尼克号》，毫无个性化。上面公式里的 $\sqrt{|U_i||U_j|}$ 分母就是为了压制这个。即便如此，隐式 CF 仍倾向热门（因为长尾物品交互太少、相似度估计不可靠）。对抗流行度偏置（去偏、采样、长尾加权）是隐式推荐贯穿始终的战斗，模块 05 会正面处理。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="coldstart"><span class="num">6</span>冷启动：CF 的死穴</h2>
+  <h3>冷启动：CF 的阿喀琉斯之踵</h3>  <p>协同过滤有一个<strong>结构性死穴</strong>：它完全依赖历史交互，所以对<strong>没有交互历史的新实体束手无策</strong>。这就是 <span class="term">cold start</span>（冷启动）问题，分三种：</p>  <ul>
+    <li><strong>新物品冷启动</strong>：刚上架的商品/刚发布的视频，没人交互过，相似度全是 0，永远不会被 CF 推出去——而它恰恰最需要曝光。</li>
+    <li><strong>新用户冷启动</strong>：刚注册的用户，没有历史，找不到相似用户、也没有「评过的物品」去找相似物品，CF 无从下手。</li>
+    <li><strong>系统冷启动</strong>：整个系统刚上线，交互矩阵几乎全空，CF 整体失效。</li>
+  </ul>  <p>根本原因：CF 只看<strong>协同信号（谁和谁交互）</strong>，不看<strong>内容信号（物品/用户是什么）</strong>。新实体没有协同信号，CF 就瞎了。解法都是<strong>引入内容</strong>：</p>  <table>
+    <thead><tr><th>策略</th><th>做法</th><th>代表</th></tr></thead>
+    <tbody>
+      <tr><td>content-based</td><td>用物品内容特征（类型/标签/文本）算相似度，不靠交互</td><td>基于内容的推荐</td></tr>
+      <tr><td>hybrid 混合</td><td>CF + content 加权融合，冷的时候靠内容、热了靠 CF</td><td>工业标配</td></tr>
+      <tr><td>双塔 side feature</td><td>把物品/用户的内容特征喂进双塔（模块 03），新实体也有 embedding</td><td>现代主流</td></tr>
+      <tr><td>热门/探索</td><td>新用户先推大众热门，用 bandit/探索快速试探兴趣</td><td>exploration</td></tr>
+    </tbody>
+  </table>  <p>值得强调：<strong>冷启动不是 CF 的 bug，而是「纯协同」范式的边界</strong>。它精准地划出了 CF 能力的疆域——有协同信号的地方它强大且可解释，没有的地方必须靠内容补位。这也是为什么现代工业系统几乎都是<strong>混合</strong>的：召回多路（CF 一路、内容一路、双塔一路），各补各的短板。理解冷启动，你就理解了为什么没有单一模型能通吃推荐。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="scale"><span class="num">7</span>复杂度与工业取舍</h2>
+  <h3>CF 的复杂度与工业取舍</h3>  <p>把 CF 落到工业规模，要算清几笔账。设 $m$ 用户、$n$ 物品、平均每用户评 $\bar d$ 个物品：</p>  <table>
+    <thead><tr><th>环节</th><th>复杂度</th><th>工业对策</th></tr></thead>
+    <tbody>
+      <tr><td>算物品相似度矩阵</td><td>朴素 $O(n^2 \bar d)$（稠密 $n^2$ 不可行）</td><td>只算有共现的物品对（稀疏）、MinHash/LSH 近似</td></tr>
+      <tr><td>存相似度矩阵</td><td>$O(n^2)$ 太大</td><td><strong>每个物品只存 top-k 相似物品</strong>（截断）</td></tr>
+      <tr><td>线上预测一个用户</td><td>$O(\bar d \cdot k)$（查评过物品的相似邻居）</td><td>预计算 + 查表，毫秒级</td></tr>
+      <tr><td>更新</td><td>增量：新交互只影响局部相似度</td><td>定期全量重算 + 实时增量</td></tr>
+    </tbody>
+  </table>  <p>核心权衡是<strong>「相似度矩阵 $n^2$ 装不下也算不动」</strong>。两个救命技巧：① <strong>稀疏性</strong>——绝大多数物品对从无共现，相似度天然是 0，只需对有共现的对计算（用倒排：每个用户的物品列表两两配对累加）；② <strong>top-k 截断</strong>——每个物品只保留最相似的 k 个邻居，把 $n\times n$ 压成 $n\times k$。这两招让 item-based CF 在亿级物品上依然可行，是它生命力的来源。</p>  <p>与模型类方法（MF、双塔）相比，邻域 CF 的优势是<strong>可解释、易调试、冷启动友好（对老物品）、增量更新简单</strong>；劣势是<strong>表达力有限、相似度矩阵难维护、对稀疏更敏感</strong>。工业实践中二者常<strong>互补共存</strong>：CF 做一路召回（尤其「相关物品」「看了又看」这类强可解释场景），MF/双塔做另一路（捕捉深层模式、处理冷启动）。<strong>没有银弹，只有漏斗里各司其职的多路召回</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句话记住 CF 的工业地位：它是<strong>最便宜、最可解释、上线最快</strong>的一路召回。当产品要「因为你看了 A 所以推 B」这种能给用户讲清楚理由的推荐时，item-based CF 几乎是不二之选——用户能理解，运营能干预，工程能调试。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但也要清醒：邻域 CF 的相似度是<strong>一阶的、两两的</strong>，它捕捉不到「需要三四个物品的组合才能体现」的高阶兴趣模式，也无法把用户/物品的丰富特征（年龄、地域、文本、图像）纳进来。当你需要这些时，就该升级到学表示的模型（模块 02 的矩阵分解、模块 03 的双塔）——它们把「相似」从手工定义的相似度，变成<em>从数据端到端学出来的</em>几何关系。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>邻域方法的复兴：SLIM / EASE^R</strong>：Steck 2019 的 EASE^R 把 item-based CF 写成一个带闭式解的线性自编码器（学一个物品-物品权重矩阵），简单到只有一行公式，却在多个基准上击败深度模型——提醒我们「邻域思想」远未过时。</li>
+    <li><strong>CF 与图的统一</strong>：交互矩阵就是用户-物品二部图，CF 的「共现」即图上的二跳邻居。LightGCN（He 2020）用图卷积传播协同信号，是 CF 的图神经网络化（接 C46 图 ML）。</li>
+    <li><strong>相似度的可信度量</strong>：共现少时相似度不可靠，收缩、贝叶斯估计、置信区间如何系统化？长尾物品的相似度估计仍是难题。</li>
+    <li><strong>流行度去偏</strong>：CF 天然放大流行度，如何在召回阶段就去偏而不牺牲相关性，是活跃方向（接模块 05 的去偏）。</li>
+    <li><strong>增量与实时 CF</strong>：用户兴趣秒级变化，相似度矩阵如何低延迟增量更新、如何处理 session 内的实时协同，是工业系统的工程前沿（接模块 05 序列推荐）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Sarwar 2001（item-based CF 奠基）、Linden 2003（Amazon 工业落地）、Hu 2008（隐式反馈 iALS）。进阶看 Steck 2019（EASE^R，邻域复兴）、He 2020（LightGCN）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_matrix_factorization/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 矩阵分解</div></a>
+  </div>
+
+</div>
+</body>
+</html>

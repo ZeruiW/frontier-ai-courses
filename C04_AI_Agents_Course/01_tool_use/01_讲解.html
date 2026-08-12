@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · Tool Use 与 function calling</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 9</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · Tool Use 与 function calling</h1>
+  <p class="subtitle">Tool Use &amp; Function Calling —— 让语言模型从"只会说"变成"能做事"：一切 agent 的最小构件</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">LLM chat API（messages 格式）、JSON Schema 基础、Python</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span><span class="badge api">API可选</span> 01_tool_use.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Toolformer (2023)、ToolLLM (2023)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">LLM 为什么需要工具：参数化知识的三条边界</a></li>
+      <li><a href="#anatomy">function calling 机制解剖：四阶段时序</a></li>
+      <li><a href="#native">原生 tool API 对比：OpenAI 与 Anthropic</a></li>
+      <li><a href="#prompted">prompted tool calling：没有原生支持时怎么办</a></li>
+      <li><a href="#schema">schema 设计即接口设计</a></li>
+      <li><a href="#errors">错误处理：回喂与修复循环</a></li>
+      <li><a href="#metrics">工具调用的可靠性度量</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>LLM 为什么需要工具：参数化知识的三条边界</h2>
+
+  <p>一个纯语言模型只做一件事：在给定上下文下预测下一个 token。它的全部"知识"都冻结在权重里
+  （<span class="term">parametric knowledge</span>）。这带来三条无法靠堆参数解决的硬边界：</p>
+
+  <ul>
+    <li><strong>时效边界</strong>：训练数据有截止日期（knowledge cutoff）。"今天 arXiv 上有什么新论文"在权重里根本不存在，
+    任何回答都只能是幻觉。</li>
+    <li><strong>计算边界</strong>：Transformer 用注意力做模式匹配，不是图灵机意义上的精确计算器。
+    多位数乘法、长链算术、日期推算的错误率随位数显著上升——模型在"背"算术，而不是在"算"算术。</li>
+    <li><strong>行动边界</strong>：模型的输出是文本。不接外设的情况下，它读不了你的文件、查不了数据库、发不了请求——
+    它能<em>描述</em>动作，但不能<em>执行</em>动作。</li>
+  </ul>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>工具调用就是给模型一部"可以打出去的电话"：模型自己知道答不了的时候，
+      不再硬编一个答案，而是按约定格式喊一声"帮我查一下 X / 算一下 Y"，外部程序执行后把结果递回来，
+      模型再基于真实结果继续作答。模型负责<strong>决策</strong>（调不调、调哪个、传什么参数），
+      程序负责<strong>执行</strong>。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设模型为条件分布 $p_\theta(y_t \mid y_{&lt;t}, x)$。工具调用把生成过程改写为<strong>带外部查询的解码</strong>：
+      解码途中模型可发射一个结构化调用 $c=(f, a)$（工具名 $f$、参数 $a$），运行时执行 $r=f(a)$ 并把 $r$ 注入上下文，
+      后续 token 条件于 $p_\theta(y_t \mid y_{&lt;t}, x, c, r)$。模型的权重没有变，
+      变的是<strong>上下文中出现了训练分布之外、但真实可靠的证据</strong>。这是后续所有 agent 行为的原子操作。</p>
+    </div>
+  </div>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>Toolformer</strong> [Schick 2023] 是"让 LM 自学用工具"的里程碑：不靠人工标注，让模型自己在语料中插入候选 API 调用
+  （计算器、QA、翻译、日历、检索），执行后用一个<strong>自监督过滤准则</strong>决定保留哪些调用——只保留"调用结果真的让后文更好预测"的样本：
+  <div class="math-block">
+  $$ L_i^{+} \;=\; L_i\big(\text{call}\,\rightarrow\,\text{result}\big), \qquad
+     L_i^{-} \;=\; \min\!\big(L_i(\varnothing),\; L_i(\text{call only})\big) $$
+  $$ \text{保留该调用} \iff L_i^{-} - L_i^{+} \;\ge\; \tau $$
+  </div>
+  其中 $L_i$ 是位置 $i$ 之后 token 的加权交叉熵损失。在过滤后的语料上微调，模型就学会了"何时该调、调什么"。
+  这个准则本身就是一种<strong>工具有用性的可度量定义</strong>——评测视角下非常值得借鉴。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  本课程把 agent 拆成层层递进的积木：<strong>本模块 = 单次工具调用</strong>；模块 02 把它套进"推理-行动"循环（ReAct）；
+  模块 03 给循环加上沙箱与 harness；模块 06 回头系统性地<em>度量</em>这一切。把单次调用的机制吃透，后面每一层都是在它之上加控制流。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="anatomy"><span class="num">2</span>function calling 机制解剖：四阶段时序</h2>
+
+  <p>所有厂商的 function calling 实现，剥掉字段名差异后都是同一个协议，分四个阶段：</p>
+
+  <ol>
+    <li><strong>声明（schema 注入）</strong>：开发者在请求中提供工具列表，每个工具 = <code>name</code> + <code>description</code> +
+    参数的 <span class="term">JSON Schema</span>。这些 schema 会被序列化进模型的上下文（对模型来说工具列表就是 prompt 的一部分）。</li>
+    <li><strong>决策（结构化输出）</strong>：模型不再只输出自然语言，而是可以输出一个结构化调用块——工具名 + 符合 schema 的参数对象，
+    并以特殊的停止原因（<code>tool_calls</code> / <code>tool_use</code>）结束本轮生成。</li>
+    <li><strong>执行（运行时）</strong>：<strong>模型从不执行任何代码</strong>。你的程序解析调用块、校验参数、真正运行函数，拿到结果（或错误）。</li>
+    <li><strong>回填（结果注入）</strong>：把结果以约定格式（OpenAI 的 <code>role:"tool"</code> 消息 / Anthropic 的
+    <code>tool_result</code> 块）追加进对话历史，再次请求模型。模型基于真实结果继续——要么给出最终答案，要么发起下一次调用。</li>
+  </ol>
+
+  <div class="ascii">
+  开发者/运行时                      模型 (LLM API)
+  ────────────────                  ──────────────
+  ① 请求: messages=[user 问题]
+     tools=[{name, description,
+             JSON Schema}]  ──────►  读到工具清单 + 问题
+                                        │ 判断: 需要外部能力
+  ② 响应: stop_reason=tool_use  ◄──────┤ 输出结构化调用块
+     { name: "calculator",            │ {"expression": "127*893"}
+       input: {...}, id: "toolu_x" }  │
+        │
+  ③ 运行时执行:                        （模型此刻什么都不做，
+     校验参数 → calculator(...)          等待下一次请求）
+     → result = "113411"
+        │
+  ④ 请求: 原历史 + assistant(调用块)
+     + tool_result(id=toolu_x,
+       content="113411")     ──────►  看到真实结果
+                                        │ 信息已足够
+     响应: stop_reason=end_turn ◄──────┘ 生成最终自然语言答案
+     "127 × 893 = 113,411"
+
+     （若仍需要工具 → 回到 ②，循环直至 end_turn 或 max_turns）
+  </div>
+
+  <div class="callout warn"><span class="label"></span>
+  两个最常见的初学者误解：①以为"API 帮我执行了函数"——没有，除少数<strong>服务端工具</strong>（如 code execution、web search）外，
+  自定义工具永远由<strong>你的代码</strong>执行，模型只产生"调用意图"；②忘记把<strong>assistant 的调用块原样放回历史</strong>再附上结果——
+  调用块里的 <code>id</code> 是结果与调用配对的唯一凭据，丢了它 API 会直接报错。这也是为什么说 function calling 是一个
+  <strong>协议</strong>而不只是一个参数。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="native"><span class="num">3</span>原生 tool API 对比：OpenAI 与 Anthropic</h2>
+
+  <p>两家的原生接口语义同构、字段不同。对照看一遍请求/响应结构，以后读任何 agent 框架的源码都不会迷路。</p>
+
+  <h3>OpenAI：<code>tools</code> / <code>tool_calls</code> / <code>role:"tool"</code></h3>
+
+  <pre><code># 请求
+resp = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "巴黎现在天气如何？"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "查询指定城市的当前天气",
+            "parameters": {                      # JSON Schema
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }],
+)
+
+# 响应（模型决定调用工具时）
+msg = resp.choices[0].message
+# resp.choices[0].finish_reason == "tool_calls"
+# msg.tool_calls == [ToolCall(id="call_abc",
+#     function=Function(name="get_weather",
+#                       arguments='{"city": "Paris"}'))]   # ← JSON 字符串!
+args = json.loads(msg.tool_calls[0].function.arguments)
+
+# 回填：assistant 消息（含 tool_calls）+ role="tool" 消息
+messages += [
+    msg,   # 含 tool_calls 的 assistant 消息必须原样放回
+    {"role": "tool", "tool_call_id": "call_abc", "content": "15°C，小雨"},
+]</code></pre>
+
+  <h3>Anthropic：<code>tools</code> / <code>tool_use</code> 块 / <code>tool_result</code> 块</h3>
+
+  <pre><code># 请求
+resp = client.messages.create(
+    model="claude-opus-4-8",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "巴黎现在天气如何？"}],
+    tools=[{
+        "name": "get_weather",
+        "description": "查询指定城市的当前天气",
+        "input_schema": {                        # 注意: input_schema 而非 parameters
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    }],
+)
+
+# 响应：resp.stop_reason == "tool_use"
+# resp.content == [TextBlock("我来查一下..."),
+#                  ToolUseBlock(type="tool_use", id="toolu_abc",
+#                               name="get_weather",
+#                               input={"city": "Paris"})]   # ← 已解析的对象!
+
+# 回填：assistant 内容原样放回 + user 消息携带 tool_result 块
+messages += [
+    {"role": "assistant", "content": resp.content},
+    {"role": "user", "content": [{
+        "type": "tool_result",
+        "tool_use_id": "toolu_abc",
+        "content": "15°C，小雨",          # 出错时可加 "is_error": True
+    }]},
+]</code></pre>
+
+  <table>
+    <thead><tr><th>维度</th><th>OpenAI</th><th>Anthropic</th></tr></thead>
+    <tbody>
+      <tr><td>工具定义</td><td><code>tools=[{"type":"function","function":{...,"parameters"}}]</code></td><td><code>tools=[{..., "input_schema"}]</code>（顶层平铺）</td></tr>
+      <tr><td>调用出现在</td><td><code>message.tool_calls</code>（专用字段）</td><td><code>content</code> 中的 <code>tool_use</code> 块（与文本块混排，可同时带思考文字）</td></tr>
+      <tr><td>停止信号</td><td><code>finish_reason="tool_calls"</code></td><td><code>stop_reason="tool_use"</code></td></tr>
+      <tr><td>参数形态</td><td><code>arguments</code> 是 <strong>JSON 字符串</strong>，需 <code>json.loads</code></td><td><code>input</code> 是<strong>已解析对象</strong></td></tr>
+      <tr><td>结果回传</td><td><code>{"role":"tool", "tool_call_id", "content"}</code></td><td>user 消息内的 <code>tool_result</code> 块（含 <code>tool_use_id</code>，可选 <code>is_error</code>）</td></tr>
+      <tr><td>强制调用</td><td><code>tool_choice={"type":"function","name":...}</code></td><td><code>tool_choice={"type":"tool","name":...}</code></td></tr>
+      <tr><td>schema 强约束</td><td><code>strict: true</code>（约束解码保证合法 JSON）</td><td><code>strict: true</code>（structured outputs）</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>并行调用（parallel tool calls）</strong>：两家的模型都可能在<strong>一轮响应里发出多个调用</strong>——
+  OpenAI 的 <code>tool_calls</code> 是列表，Anthropic 的 <code>content</code> 可含多个 <code>tool_use</code> 块。
+  协议要求：<strong>每个调用 id 都必须有一个对应的结果</strong>，并且在<strong>同一条回填消息</strong>里一起返回，缺一个就报错。
+  运行时可以并发执行这些调用（互不依赖时显著降延迟），也可以关掉该行为
+  （OpenAI <code>parallel_tool_calls=False</code>；Anthropic 在 <code>tool_choice</code> 中设
+  <code>disable_parallel_tool_use: true</code>）——评测时常需要关掉以获得确定性的单步轨迹。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="prompted"><span class="num">4</span>prompted tool calling：没有原生支持时怎么办</h2>
+
+  <p>原生 function calling 依赖两件事：模型经过<strong>专门的调用格式微调</strong>，且 API 层做了<strong>结构化解析</strong>（甚至约束解码）。
+  当你用的是没有这层支持的开源小模型、或在做不依赖特定 API 的评测 harness 时，就退化为
+  <span class="term">prompted tool calling</span>：用 system prompt 约定输出格式，自己解析。</p>
+
+  <pre><code>SYSTEM = """你可以使用以下工具：
+{tools_json}
+
+需要调用工具时，只输出一个 JSON（用 ```json 围栏包裹）：
+```json
+{"tool": "&lt;工具名&gt;", "args": {&lt;参数&gt;}}
+```
+拿到工具结果后，若信息已足够，直接输出最终答案（不要再输出 JSON）。"""</code></pre>
+
+  <p>然后对模型的原始输出做<strong>鲁棒提取</strong>：剥掉 markdown 围栏、跳过前后的自然语言"废话"、
+  做花括号配对截取候选 JSON、<code>json.loads</code> 失败再尝试宽松解析。配套 notebook 会从零实现这条解析链。</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>原生 function calling</th><th>prompted tool calling</th></tr></thead>
+    <tbody>
+      <tr><td>格式保证</td><td>专门微调 + API 解析；<code>strict</code> 模式下约束解码<strong>保证</strong>合法 JSON</td><td>仅靠指令遵循，格式正确率与模型能力强相关，小模型可能只有 70–95%</td></tr>
+      <tr><td>典型失败</td><td>参数语义错误（格式几乎不错）</td><td>围栏不闭合 / 夹带解说文字 / 单引号伪 JSON / 幻觉工具名 / 直接拒绝输出 JSON</td></tr>
+      <tr><td>解析成本</td><td>SDK 给出结构化对象</td><td>需要自写 robust extractor + 重试逻辑</td></tr>
+      <tr><td>可移植性</td><td>绑定厂商字段</td><td>任何能续写文本的模型都能用</td></tr>
+      <tr><td>评测含义</td><td>测的是"决策 + 参数"能力</td><td>额外混入"格式遵循"能力，需把两者<strong>分开归因</strong></td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>ToolLLM</strong> [Qin 2023] 证明了开源模型可以通过微调追上这条差距：作者从 RapidAPI 收集了
+  16,464 个真实 REST API，用 ChatGPT 自动构造多工具指令数据（ToolBench），并提出 <span class="term">DFSDT</span>
+  （基于深度优先搜索的决策树，允许回溯换 API）替代单链 CoT；微调出的 ToolLLaMA 在其自动评测器 ToolEval 上接近 ChatGPT 的工具使用水平。
+  对评测者的启示有二：①工具使用能力是<strong>可注入</strong>的（数据工程问题，不是涌现魔法）；
+  ②大规模 API 评测必须配<strong>自动评估器 + API 检索器</strong>，人工逐条核对不可扩展。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  为什么本课程的 notebook 默认走 prompted 路线（Qwen2.5-1.5B-Instruct）？因为它把原生 API 帮你藏起来的所有失败模式<strong>暴露</strong>出来了——
+  你会亲手遇到格式漂移、解析失败、幻觉工具，并亲手写校验与修复循环。理解了底层，再用原生 API 就只是换字段名。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="schema"><span class="num">5</span>schema 设计即接口设计</h2>
+
+  <p>模型"看到"的工具只有 schema——名字、描述、参数定义。<strong>schema 写得多好，调用正确率的上限就有多高</strong>，
+  这与给人类工程师设计 API 是同一门学问，只是用户换成了一个靠文本理解接口的模型。三条经验规律：</p>
+
+  <ul>
+    <li><strong>description 决定"何时调用"</strong>。只写"查天气"不如写清触发条件："当用户询问当前或未来天气时调用；
+    不要用于历史气候统计"。对工具调用偏保守的新一代模型，把<strong>触发条件写进 description</strong> 能直接提升应调未调（recall）。</li>
+    <li><strong>参数命名与类型决定"怎么调用"</strong>。<code>q</code> 不如 <code>search_query</code>；
+    自由字符串不如 <code>enum</code>。能用枚举约束的（单位、模式、语言代码），一律枚举——
+    模型不可能拼错一个枚举值的字段语义，但完全可能把自由字符串写成同义词。</li>
+    <li><strong>required 划定责任边界</strong>。必填项太多 → 模型被迫编造参数（幻觉）；
+    必填项太少 → 工具内部默认值悄悄接管语义，失败难以归因。原则：模型必须从用户话语里得到的信息才设 required，其余给默认值。</li>
+  </ul>
+
+  <pre><code># 反例 ❌                                  # 正例 ✅
+{                                          {
+  "name": "conv",                            "name": "unit_convert",
+  "description": "转换",                      "description": "在长度/重量单位间换算数值。
+  "parameters": {                                 当用户给出'X 公里是多少英里'类问题时调用。",
+    "type": "object",                          "parameters": {
+    "properties": {                              "type": "object",
+      "v": {"type": "string"},                   "properties": {
+      "u": {"type": "string"}                      "value": {"type": "number",
+    }                                                "description": "待换算的数值"},
+  }                                                "from_unit": {"type": "string",
+}                                                    "enum": ["m", "km", "mile", "kg", "lb"]},
+                                                   "to_unit": {"type": "string",
+                                                     "enum": ["m", "km", "mile", "kg", "lb"]}
+                                                 },
+                                                 "required": ["value", "from_unit", "to_unit"]
+                                               }
+                                             }</code></pre>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>评测视角的归因陷阱</strong>：一个 agent 在某工具上失败率高，先别下结论"模型弱"。
+  用同一模型 + 重写过的 schema 跑 A/B，经常能看到正确率移动 10–30 个百分点——
+  这说明你度量的其实是 <em>模型 × 接口</em> 的联合系统。SWE-agent [Yang 2024]（模块 04）把这个思想推到极致：
+  专门为 LM 设计的 <span class="term">Agent-Computer Interface</span> 本身就是性能的一等公民。
+  报告 agent 评测结果时，工具 schema 必须作为实验配置的一部分被固定和公开。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="errors"><span class="num">6</span>错误处理：回喂与修复循环</h2>
+
+  <p>工具调用的三类典型故障，对应三道防线。共同原则：<strong>错误不终止循环，而是作为信息回喂（feed back）给模型</strong>，
+  给它一次自我修复的机会——LLM 对高质量错误信息的修复率出奇地高，对含糊错误信息则几乎为零。</p>
+
+  <table>
+    <thead><tr><th>故障类</th><th>发生点</th><th>防线与回喂内容</th></tr></thead>
+    <tbody>
+      <tr><td>① 参数校验失败</td><td>执行前</td><td>对照 schema 检查必填项/类型/枚举（notebook 练习 2 实现 <code>validate_args</code>）。
+        回喂：<code>"ERROR: 参数 from_unit 取值 'kilometer' 不在枚举 ['m','km','mile'] 中"</code> ——指名道姓、给出合法选项。</td></tr>
+      <tr><td>② 工具执行异常</td><td>执行中</td><td><code>try/except</code> 捕获，绝不让异常炸掉 agent 循环。
+        回喂：异常类型 + 可操作的修复提示（"除数为零，请检查表达式"），而非整页 traceback。</td></tr>
+      <tr><td>③ 幻觉工具</td><td>解析后</td><td>调用名不在注册表（registry）中。
+        回喂：<code>"ERROR: 工具 'web_search' 不存在。可用工具: ['calculator', 'unit_convert', ...]"</code> ——把可用清单再报一遍。</td></tr>
+    </tbody>
+  </table>
+
+  <p>修复循环的形状（注意与第 2 节的主循环是同一个循环，错误只是另一种 <code>tool_result</code>）：</p>
+
+  <pre><code>调用 → 校验失败/执行异常/工具不存在
+     → 构造结构化错误信息，作为该调用 id 的结果回喂
+       （OpenAI: role="tool" 的 content 写错误文本；
+        Anthropic: tool_result 加 "is_error": true）
+     → 模型读到错误 → 修正参数 / 换工具 / 改为直接回答
+     → 直到成功或触发 max_turns 保险丝</code></pre>
+
+  <div class="callout danger"><span class="label"></span>
+  <strong>必须设 <code>max_turns</code></strong>。模型可能陷入"调用失败 → 原样重试 → 再失败"的死循环，
+  每一圈都在烧 token 和时间。生产与评测 harness 都要有回合上限 + 预算上限双保险（模块 03 的 harness 会正式化这件事；
+  成本-准确率联合报告见 [Kapoor 2024]）。另外注意安全面：错误信息会进入模型上下文，
+  若工具输出来自不可信外部源，这条回喂通道就是 prompt injection 的入口——模块 08 展开。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="metrics"><span class="num">7</span>工具调用的可靠性度量</h2>
+
+  <p>把"这个模型工具用得好不好"变成可测量的问题，至少要拆成三层指标，逐层归因：</p>
+
+  <ul>
+    <li><strong>调用格式正确率</strong>（format correctness）：输出能否被解析为合法调用（JSON 可解析、字段齐全、工具名存在）。
+    纯语法层，prompted 路线的第一道坎。</li>
+    <li><strong>参数正确率</strong>（argument correctness）：解析成功的调用中，工具名与参数是否语义正确。
+    可用精确匹配、schema 校验通过率，或更稳健的<strong>执行等价</strong>（执行后结果一致）来判。</li>
+    <li><strong>多步任务成功率</strong>（end-to-end success）：整条轨迹最终是否完成任务——这是模块 06 的主战场。</li>
+  </ul>
+
+  <p>三层指标的统计处理。单层指标是伯努利试验：$N$ 次独立采样中 $k$ 次成功，</p>
+
+  <div class="math-block">
+  $$ \hat{p} = \frac{k}{N}, \qquad \mathrm{SE}(\hat{p}) = \sqrt{\frac{\hat{p}(1-\hat{p})}{N}} $$
+  </div>
+
+  <p>$N=10$ 时标准误最大可达 $0.16$——所以 notebook 里"跑 10 次"的小实验只能看趋势，报告论文级结论需要 $N$ 上百并给置信区间。
+  更要命的是<strong>多步复利效应</strong>：若每步成功率为 $p$ 且近似独立，长度 $T$ 的任务成功率为</p>
+
+  <div class="math-block">
+  $$ P(\text{task}) \approx p^{T} \qquad\Rightarrow\qquad 0.99^{50} \approx 0.605,\quad 0.95^{50} \approx 0.077 $$
+  </div>
+
+  <p>单步 95% 听起来很高，50 步任务就只剩 8%。这就是为什么 agent 评测对单步工具可靠性如此敏感，
+  也是为什么"把任务长度作为自变量"成为 METR 时间跨度方法 [Kwa 2025] 的核心设计。
+  另一个为模块 06 埋线的指标是 τ-bench [Yao 2024] 提出的 <span class="term">pass^k</span>：
+  同一任务独立跑 $k$ 次<strong>全部成功</strong>的概率（$\text{pass}^k = \mathbb{E}_{\text{task}}\big[\binom{c}{k}/\binom{n}{k}\big]$，
+  $n$ 次试验 $c$ 次成功）——它度量的是<strong>可靠性</strong>而非"碰运气的最好成绩"，与 pass@k 恰好是对偶的两个方向。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  做评测时的实操清单：①固定温度与随机种子策略并写进报告；②格式错误与语义错误<strong>分开计数</strong>（否则你不知道该修 parser 还是换模型）；
+  ③同一指标在原生 / prompted 两条路线上不可直接比较——它们度量的能力组合不同（见第 4 节表格）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>工具学习的训练范式之争</strong>：自监督插入（Toolformer [Schick 2023]）、大规模 SFT（ToolLLM [Qin 2023]）、
+    还是 RL 直接以任务成功为奖励？RL 路线正在成为前沿实验室主流，但奖励黑客（reward hacking）会以"看起来调了工具"的形式出现——
+    评测上需要执行级验证而非格式级验证。</li>
+    <li><strong>API 海量化与工具检索</strong>：当可用工具从 3 个变成 16,000 个 [Qin 2023]，schema 无法全部塞进上下文。
+    工具检索（tool retrieval / tool search）把"选工具"变成一个检索问题——评测时检索器的召回率成为系统瓶颈的新候选，
+    归因又多了一层。</li>
+    <li><strong>MCP 标准化趋势</strong>：Model Context Protocol（Anthropic 2024 年开源，2025 年起被各家客户端与框架广泛采纳）
+    把"工具提供方"与"agent 框架"解耦成客户端-服务器协议：工具一次封装、处处可用。
+    对评测的影响是双向的——生态统一让跨模型横评更公平；但第三方 MCP server 也引入了新的供应链与注入攻击面（模块 08）。</li>
+    <li><strong>schema 的自动优化</strong>：既然 schema 质量显著影响正确率（第 5 节），能否让模型自动改写工具描述并以调用正确率为目标迭代？
+    初步工作显示可行，但存在对特定模型过拟合的风险——"为 GPT 调优的 schema"未必利好 Claude，横评时要警惕。</li>
+    <li><strong>开放问题：格式能力与决策能力的解耦度量</strong>。约束解码可以把格式正确率推到 100%，
+    但它是否会损伤决策质量（模型被迫在不该调用时也输出合法调用）？目前缺少系统性研究，是一个适合 evaluation 研究者切入的空白。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>画出 function calling 的四阶段时序图，并指出"模型从不执行工具"在协议里体现为哪些字段交接。</li>
+      <li>OpenAI 与 Anthropic 的 tool API 在调用表示、参数形态、结果回传上各有什么差异？并行调用时协议要求是什么？</li>
+      <li>prompted tool calling 相比原生路线多出哪些失败模式？评测时为什么要把格式正确率与参数正确率分开统计？</li>
+      <li>写出多步任务成功率的复利公式，并解释它如何把"单步工具可靠性"与模块 06 的长任务评测联系起来。</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../00_setup/00_overview.html"><div class="dir">← 上一章</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_react_agent/02_讲解.html"><div class="dir">下一章 →</div><div class="t">02 · 从零写 ReAct Agent</div></a>
+  </div>
+
+</div>
+</body>
+</html>

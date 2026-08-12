@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 变分推断</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 变分推断</h1>
+  <p class="subtitle">把推断变成优化：从一族简单分布里挑最像后验的那个 —— ELBO 把『最小化算不出的 KL』换成『最大化算得出的下界』、平均场假设独立可分解、CAVI 坐标上升（与 Gibbs 对偶）、重参数化让梯度穿过采样、以及 VI 快但有偏 vs MCMC 慢但无偏的权衡</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（后验/证据）、模块 02（对照 MCMC）、KL 散度、梯度/期望</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_variational_inference.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Blei et al. 2017、Jordan et al. 1999、Kingma & Welling 2014 (VAE)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#idea">另一条路：把推断变成优化</a></li>
+      <li><a href="#elbo">ELBO 推导：VI 的数学心脏</a></li>
+      <li><a href="#meanfield">平均场近似与 KL 方向</a></li>
+      <li><a href="#cavi">CAVI：坐标上升（与 Gibbs 对偶）</a></li>
+      <li><a href="#bbvi">黑盒 VI 与重参数化技巧</a></li>
+      <li><a href="#vsmcmc">VI vs MCMC：偏差-速度权衡</a></li>
+      <li><a href="#practice">实践要点：监控 ELBO 与常见坑</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="idea"><span class="num">1</span>另一条路：把推断变成优化</h2>
+  <p>上一模块的 MCMC 用<strong>采样</strong>攻克无闭式后验：渐近精确，但慢、要诊断收敛、高维下可能混合困难。这一模块给出一条<strong>哲学上完全不同</strong>的路—— <span class="term">variational inference</span>（变分推断，VI）：<strong>不采样，而把求后验变成一个优化问题</strong>。</p>  <p>核心想法朴素得惊人：既然真后验 $p(\theta\mid D)$ 算不出来，那就<strong>从一族简单的、我们会算的分布 $q_\phi(\theta)$ 里，挑一个最像它的</strong>。「简单分布」比如一个对角高斯（只有均值和方差几个参数）；「最像」用 KL 散度度量。于是推断 = 调 $\phi$ 使 $q_\phi$ 尽量贴近后验。</p>  <div class="math-block">\[q^*(\theta) = \arg\min_{q\in\mathcal Q}\ \mathrm{KL}\big(q(\theta)\,\Vert\,p(\theta\mid D)\big)\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>MCMC 像「派一个探子在后验地形里游走很久，画出地图」——慢但忠实。VI 像「拿一个标准形状的模板（比如一个椭圆高斯），挪动、缩放它去套住后验地形的主峰」——快，但模板套不出地形所有的褶皱（非高斯、多峰、相关）。<strong>VI 用「近似的形状」换「巨大的速度」</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，VI 把推断（一个积分/采样问题）转化为优化（一个梯度下降问题），于是能直接吃下深度学习的全部工具链——随机梯度、mini-batch、GPU、自动微分。这让 VI 能扩展到 MCMC 望尘莫及的规模（百万级数据、百万维参数），代价是它给出的是一个<strong>有偏的近似后验</strong>（除非真后验恰好落在 $\mathcal Q$ 里，否则永远有 KL 间隙）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话定位两条路：<strong>MCMC 渐近无偏但慢、VI 快但有偏</strong>。数据小、要精确不确定性、能等 → MCMC；数据大、要快、近似够用 → VI。它们不是对手而是互补——现代系统常用 VI 快速得到近似后验，再（可选地）用 MCMC 精修，或干脆让两者在同一框架里协作。本模块就把 VI 的内核（ELBO、平均场、CAVI）从零拆开，并亲手验证它的近似与 MCMC、与解析后验对得上。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="elbo"><span class="num">2</span>ELBO 推导：VI 的数学心脏</h2>
+  <p>VI 要最小化 $\mathrm{KL}(q\Vert p(\theta\mid D))$，但这里有个<strong>先有鸡还是先有蛋</strong>的难题：KL 的定义里含有那个我们算不出来的后验 $p(\theta\mid D)$（它需要归一化常数 $p(D)$）。所以不能直接优化 KL。VI 的关键一步，是把这个难题<strong>代数地绕过去</strong>——推出 <span class="term">ELBO</span>（evidence lower bound，证据下界）。</p>  <p>从对数证据 $\log p(D)$ 出发（它是个常数，不依赖 $q$）。对任意分布 $q(\theta)$，乘 1（即 $\int q\,d\theta=1$）并插入恒等式：</p>  <div class="math-block">\[\log p(D) = \int q(\theta)\log p(D)\,d\theta = \int q(\theta)\log\frac{p(\theta,D)}{p(\theta\mid D)}\,d\theta\]</div>  <p>把被积的 log 乘除一个 $q(\theta)$ 拆开（关键的一步代数）：</p>  <div class="math-block">\[\log p(D) = \underbrace{\int q(\theta)\log\frac{p(\theta,D)}{q(\theta)}\,d\theta}_{\displaystyle \mathcal L(q)\ \text{（ELBO）}} \;+\; \underbrace{\int q(\theta)\log\frac{q(\theta)}{p(\theta\mid D)}\,d\theta}_{\displaystyle \mathrm{KL}(q\,\Vert\,p(\theta\mid D))\ \ge 0}\]</div>  <p>这个分解是整个 VI 的<strong>数学心脏</strong>，盯住它看三秒。左边 $\log p(D)$ 是常数。右边两项：一项是 ELBO $\mathcal L(q)$（只含联合分布 $p(\theta,D)=p(D\mid\theta)p(\theta)$ 与 $q$，<strong>全都算得出来</strong>！），另一项是我们想最小化的 KL（含算不出的后验）。既然左边是常数：</p>  <div class="math-block">\[\boxed{\;\log p(D) = \mathcal L(q) + \mathrm{KL}(q\Vert p(\theta\mid D)),\qquad \mathcal L(q) = \log p(D) - \mathrm{KL}(q\Vert p)\;}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>因为 KL ≥ 0，ELBO 永远 ≤ $\log p(D)$——这就是它叫「证据下界」的原因。而且因为 $\log p(D)$ 固定，<strong>把 ELBO 抬高多少，就把 KL 压低多少</strong>。于是<strong>最大化 ELBO ⟺ 最小化 KL</strong>——我们成功地把「最小化一个算不出的 KL」换成了「最大化一个算得出的 ELBO」。这就是 VI 能落地的全部秘密。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>ELBO 还有一个极有启发性的等价写法（把 $p(\theta,D)=p(D\mid\theta)p(\theta)$ 代入并拆开）：$\mathcal L(q)=\underbrace{\mathbb{E}_q[\log p(D\mid\theta)]}_{\text{期望对数似然（拟合数据）}}-\underbrace{\mathrm{KL}(q(\theta)\Vert p(\theta))}_{\text{偏离先验的惩罚}}$。读作：<strong>ELBO = 让 q 解释数据 − 让 q 别离先验太远</strong>。第一项拉 $q$ 去拟合数据，第二项把 $q$ 拽向先验（正则）——这正是「拟合 vs 复杂度」的权衡，也是 VAE 损失函数的来源（重构项 − KL 项）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>ELBO 一石三鸟：①它是优化目标（最大化它 = 做推断）；②它是 $\log$ 证据的下界（收敛后的 ELBO 值可当 $\log p(D)$ 的近似，用于<strong>模型比较</strong>）；③它的两项分解（拟合 − 偏离先验）给出清晰的诊断视角。整个 VI 工程都围绕「写出 ELBO、最大化 ELBO」展开。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="meanfield"><span class="num">3</span>平均场近似与 KL 方向</h2>
+  <p>有了优化目标 ELBO，还差一步：在<strong>哪个分布族 $\mathcal Q$ 里</strong>找 $q$？族越大越能贴近真后验，但优化越难。最经典、最常用的选择是 <span class="term">mean-field approximation</span>（平均场近似）——假设近似后验在各变量（组）上<strong>完全独立、可分解</strong>：</p>  <div class="math-block">\[q(\theta) = \prod_{j=1}^{m} q_j(\theta_j)\]</div>  <p>即把多个参数的联合近似，拆成每个参数各自的边缘近似的乘积。这个假设的威力在于：它把一个高维联合优化，拆成对每个因子 $q_j$ 的、可以<strong>轮流求解</strong>的子问题（下一节的 CAVI）。代价是它<strong>彻底忽略了后验里变量之间的相关性</strong>——因为乘积形式天然假设独立。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>平均场像用一堆<strong>贴着坐标轴的椭圆</strong>去近似一个真正<strong>斜着</strong>的后验。如果真后验是一条沿对角线的窄带（强相关），平均场只能用一个又扁又正（轴对齐）的椭圆去套——它会抓住后验的中心位置，却<strong>系统性地低估方差</strong>（因为它不敢沿对角线伸展，怕越出真后验的窄带）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这个「低估方差」是平均场最重要的已知偏差，根源在于 VI 用的是 <strong>$\mathrm{KL}(q\Vert p)$</strong>（而非 $\mathrm{KL}(p\Vert q)$）。$\mathrm{KL}(q\Vert p)=\mathbb{E}_q[\log\frac qp]$ 对「$q$ 有质量但 $p$ 没有」的区域惩罚极重（那里 $\log\frac qp\to+\infty$），所以 $q$ <strong>不敢扩张到 $p$ 密度低的地方</strong>——结果是 $q$ 缩进 $p$ 的某个高密度核心，即 <span class="term">mode-seeking</span>（抓众数）、<strong>方差偏小</strong>。多峰时 $q$ 还会只抓一个峰。</p></div>
+  </div>  <div class="callout danger"><span class="label">VI 会低估不确定性</span>
+    <p>两个方向的 KL 给出截然不同的近似行为，务必记牢：<strong>VI 用 $\mathrm{KL}(q\Vert p)$（mode-seeking，抓一个峰、低估方差、更紧凑）</strong>；而 EP（expectation propagation）等用 $\mathrm{KL}(p\Vert q)$（mass-covering，铺满所有质量、高估方差、覆盖多峰）。VI 的「低估不确定性」是它最该被警惕的代价——如果你的下游决策对<em>低估风险</em>敏感（医疗、金融、安全），VI 的过度自信可能酿成大错。这也是为什么需要可靠不确定性时仍要回到 MCMC。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cavi"><span class="num">4</span>CAVI：坐标上升（与 Gibbs 对偶）</h2>
+  <p>平均场假设下，怎么真正解出最优的各个 $q_j$？答案是 <span class="term">CAVI</span>（coordinate ascent variational inference，坐标上升变分推断）——一次固定其他所有因子、把单个因子更新到它的<strong>最优形式</strong>，轮流扫，ELBO 单调上升直到收敛。它和上一模块的 Gibbs 采样<strong>形式上是对偶的</strong>（一个取期望、一个采样）。</p>  <h4>CAVI 的核心更新公式</h4>  <p>可以证明（对 ELBO 关于单个 $q_j$ 做变分、拉格朗日约束 $\int q_j=1$），固定其余因子时，最优的 $q_j^*$ 满足：</p>  <div class="math-block">\[\boxed{\;\log q_j^*(\theta_j) = \mathbb{E}_{q_{-j}}\big[\log p(\theta, D)\big] + \text{const}\;}\]</div>  <p>读这个公式：第 $j$ 个因子的最优对数形式，等于<strong>把完整的联合对数密度 $\log p(\theta,D)$，对其余所有因子求期望</strong>（只剩 $\theta_j$ 是变量），再归一化。$\mathbb{E}_{q_{-j}}$ 表示对 $\prod_{i\ne j}q_i$ 求期望。和 Gibbs 的对比一目了然：</p>  <table>
+    <thead><tr><th></th><th>Gibbs 采样（模块 02）</th><th>CAVI（本模块）</th></tr></thead>
+    <tbody>
+      <tr><td>更新对象</td><td>单个变量的一个**样本**</td><td>单个因子的整个**分布**</td></tr>
+      <tr><td>更新规则</td><td>从 $p(\theta_j\mid\theta_{-j},D)$ **采样**</td><td>$\log q_j^*=\mathbb{E}_{q_{-j}}[\log p(\theta,D)]$ **取期望**</td></tr>
+      <tr><td>其余变量</td><td>用当前**样本值**</td><td>用当前**分布**（求期望）</td></tr>
+      <tr><td>产物</td><td>渐近精确的样本</td><td>有偏的近似分布</td></tr>
+      <tr><td>收敛判据</td><td>$\hat R$、ESS</td><td>ELBO 单调收敛</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>CAVI 像 Gibbs 的「确定性版本」：Gibbs 每步<em>掷骰子</em>采一个值，CAVI 每步<em>解析地算出</em>整个最优分布。因为不掷骰子，CAVI 通常收敛得比 Gibbs 快得多、且确定性（同初值同结果），但它优化的是有偏的平均场目标，到不了真后验。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>和共轭的联系：当模型属于<strong>条件共轭</strong>（每个完全条件都在指数族内）时，$\mathbb{E}_{q_{-j}}[\log p(\theta,D)]$ 算出来恰好是某个标准分布的对数核，于是 $q_j^*$ 是标准分布（高斯、Gamma…），更新退化为<strong>更新它的参数</strong>。这就是为什么 CAVI 在共轭模型上如此干净——和 Gibbs 用同一批完全条件，只是把「采样」换成「取期望更新参数」。notebook 会在高斯均值+精度模型上完整推导并实现 CAVI 更新。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>CAVI 的一个保证很安心：<strong>每次因子更新都（弱）单调地抬高 ELBO</strong>（坐标上升的性质），所以 ELBO 曲线必然单调不降、最终收敛。这给了一个免费的<strong>自检</strong>——把每轮 ELBO 打出来，若它下降了，必有 bug。这是 VI 实现中最重要的调试工具，notebook 会全程监控 ELBO 单调性。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bbvi"><span class="num">5</span>黑盒 VI 与重参数化技巧</h2>
+  <p>CAVI 很优美，但它要求你<strong>对每个模型手推 $\mathbb{E}_{q_{-j}}[\log p]$</strong>——非共轭模型里这个期望常常没有闭式解，逐模型推导也极其费力。能不能像 MCMC 的 MH 那样，有一个<strong>通用、不需逐模型推导</strong>的 VI？这就是 <span class="term">black-box VI</span>（黑盒 VI，BBVI）的目标：只要能算 $\log p(\theta,D)$，就能用随机梯度直接最大化 ELBO。</p>  <p>难点在于 ELBO 含对 $q_\phi$ 的期望 $\mathcal L(\phi)=\mathbb{E}_{q_\phi}[\log p(\theta,D)-\log q_\phi(\theta)]$，而我们要对<strong>期望所依赖的分布参数 $\phi$ 求梯度</strong>——梯度要「穿过」采样这一步。两类主流估计器：</p>  <h4>(a) Score-function / REINFORCE 估计器</h4>  <p>利用恒等式 $\nabla_\phi\mathbb{E}_{q_\phi}[f]=\mathbb{E}_{q_\phi}[f(\theta)\,\nabla_\phi\log q_\phi(\theta)]$，对任意 $f$ 都成立，<strong>不要求 $f$ 可微</strong>（适用离散变量）。代价是<strong>梯度方差大</strong>，需要控制方差技巧（baseline、Rao-Blackwell）才实用。</p>  <h4>(b) 重参数化技巧 reparameterization trick</h4>  <p>当 $\theta$ 连续且 $q_\phi$ 可重参数化时，把随机性<strong>挪出参数</strong>：写 $\theta=g_\phi(\epsilon)$，其中 $\epsilon$ 来自一个<em>不含 $\phi$</em>的固定分布。最常用的高斯情形：</p>  <div class="math-block">\[\theta = \mu + \sigma\odot\epsilon,\qquad \epsilon\sim\mathcal N(0,I),\qquad \phi=(\mu,\sigma)\]</div>  <p>于是 $\mathbb{E}_{q_\phi}[f(\theta)]=\mathbb{E}_{\epsilon}[f(g_\phi(\epsilon))]$，期望对的分布（标准高斯）<strong>不再依赖 $\phi$</strong>，梯度可以直接穿过 $g_\phi$ 求（链式法则）：$\nabla_\phi\mathbb{E}_\epsilon[f(g_\phi(\epsilon))]=\mathbb{E}_\epsilon[\nabla_\phi f(g_\phi(\epsilon))]$。这个估计器<strong>方差小得多</strong>，是 VAE 与现代 VI 的主力。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>重参数化的精髓：<strong>把「带参数的随机采样」改写成「固定随机噪声 + 确定性变换」</strong>。$\theta=\mu+\sigma\epsilon$ 里，随机的只是 $\epsilon$（与 $\mu,\sigma$ 无关），$\mu,\sigma$ 进了确定性的那部分——于是梯度能像穿过普通网络层一样穿过它。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这也是 <span class="term">amortized inference</span>（摊销推断）的基础：VAE 不为每个数据点单独优化 $\phi$，而是训练一个<strong>推断网络</strong> $q_\phi(\theta\mid x)$，对任意 $x$ 直接输出 $(\mu(x),\sigma(x))$。推断成本被「摊销」到一次网络前传——这把 VI 从「每个数据点解一个优化」变成「学一个推断函数」，是生成模型规模化的关键。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>Kingma & Welling 2014（VAE）把重参数化 + 摊销推断 + 神经网络 $q$ 三者拼起来，开启了深度生成模型时代。Ranganath 2014（BBVI）用 score-function 让 VI 即插即用。Hoffman 2013（SVI）加 mini-batch 让 VI 扩展到海量数据。这三篇是从「手推 CAVI」走向「自动、可扩展 VI」的里程碑，见 <code>../references.md</code>。本课 notebook 会从零实现重参数化的高斯 VI，对拍解析后验。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="vsmcmc"><span class="num">6</span>VI vs MCMC：偏差-速度权衡</h2>
+  <p>把 VI 和 MCMC 并排放，是理解贝叶斯计算全景的关键。它们不是「谁更好」，而是占据<strong>偏差-速度权衡</strong>的两端，按问题选用：</p>  <table>
+    <thead><tr><th>维度</th><th>MCMC（模块 02）</th><th>VI（本模块）</th></tr></thead>
+    <tbody>
+      <tr><td>产物</td><td>后验的**样本**</td><td>后验的**近似分布** $q_\phi$</td></tr>
+      <tr><td>精度</td><td>渐近**无偏**（跑够久→真后验）</td><td>**有偏**（受限于 $\mathcal Q$，永远有 KL 间隙）</td></tr>
+      <tr><td>速度</td><td>慢（需大量迭代 + 诊断）</td><td>快（梯度优化、可 mini-batch）</td></tr>
+      <tr><td>可扩展性</td><td>差（大数据/高维吃力）</td><td>好（百万数据/参数）</td></tr>
+      <tr><td>不确定性</td><td>忠实（含相关、多峰）</td><td>常**低估方差**、平均场丢相关、易漏峰</td></tr>
+      <tr><td>收敛判据</td><td>$\hat R$、ESS（难）</td><td>ELBO 单调收敛（易）</td></tr>
+      <tr><td>何时用</td><td>小/中数据、要精确不确定性</td><td>大数据、要快、近似够用</td></tr>
+    </tbody>
+  </table>  <p>一个常被忽略的点：VI 的<strong>收敛容易判断</strong>（看 ELBO 单调到平），但「收敛了」<strong>不等于「准了」</strong>——它只是收敛到了<em>平均场最优</em>，而那个最优本身就偏离真后验（KL 间隙）。MCMC 反过来：收敛难判断（要 $\hat R$/ESS），但一旦真收敛就是<strong>无偏</strong>的。所以 VI 的风险是「自信地给一个偏的答案」，MCMC 的风险是「没收敛却以为收敛了」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>实用决策树：① 数据小、维度低、要可靠的不确定性（医疗、科学推断）→ MCMC（NUTS）。② 数据大、模型复杂（深度生成、推荐）、近似够用、要快 → VI。③ 想兼得 → 用 VI 初始化 MCMC，或用 normalizing flow 扩大 $\mathcal Q$ 缩小 VI 的偏差。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>两者正在<strong>融合</strong>而非取代：normalizing-flow VI 用可逆神经网络让 $q$ 任意灵活（逼近 MCMC 的精度而保留 VI 的速度）；Hamiltonian VI、用 MCMC 步精修 $q$、用 $q$ 当 MCMC 的好提议（NeuTra）——前沿在打通这两条路。理解了本模块的 ELBO 与上模块的细致平衡，你就握住了读懂这些混合方法的两把钥匙。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这张对照表的灵魂：<strong>MCMC 用时间换精度，VI 用精度换速度</strong>。它们是贝叶斯计算的两块基石，几乎所有现代近似推断方法都是这两者的变体或杂交。本课让你把两块基石都从零搭一遍，正是为了能看懂、能选择、能组合它们。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="practice"><span class="num">7</span>实践要点：监控 ELBO 与常见坑</h2>
+  <p>把 VI 真正跑对，有几个反复踩坑的实践要点，单列一节：</p>  <h3>7.1 永远监控 ELBO</h3>  <p>ELBO 在 CAVI 下必然单调不降、在随机梯度 VI 下应总体上升。<strong>画 ELBO 曲线是 VI 的头号调试工具</strong>：CAVI 里若 ELBO 下降 → 更新公式有 bug；SGVI 里若 ELBO 不升或剧烈震荡 → 学习率太大或梯度估计有问题。本模块 notebook 全程把 ELBO 打出来验证单调性。</p>  <h3>7.2 用对数空间与正确的约束</h3>  <p>方差/精度等正参数，$q$ 要么用对数参数化（优化 $\log\sigma$ 而非 $\sigma$，自动保正），要么用 Gamma 等支撑在正轴的因子。约束没处理好（采出负方差）是 VI 崩溃的常见原因。</p>  <h3>7.3 KL 项要算对</h3>  <p>ELBO 的 KL 惩罚项 $\mathrm{KL}(q(\theta)\Vert p(\theta))$ 对常见分布有闭式（两个高斯的 KL 有简洁公式），优先用闭式而非采样估计，能大幅降方差。两个高斯 $\mathrm{KL}(\mathcal N(\mu_q,\sigma_q^2)\Vert\mathcal N(\mu_p,\sigma_p^2))$ 的闭式是 VI 实现里最常用的工具之一，notebook 会从零实现并验证它非负、自身对自身为 0。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句话：<strong>VI 的 bug 大多藏在三个地方——ELBO 没单调、正参数变负、KL 算错</strong>。把 ELBO 打出来看单调性，能抓住其中绝大部分。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有初始化与局部最优：平均场 ELBO 是非凸的（尤其混合模型），CAVI 可能收敛到不同局部最优，实践中多次随机初始化取 ELBO 最高的。这与 K-means、EM 的多次重启同理——事实上 EM 正是 VI 在「后验是点质量」时的特例。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个微妙陷阱：ELBO 的绝对值<strong>没有跨模型可比性的直接意义</strong>（它是 $\log p(D)$ 的下界，但间隙大小未知）。用 ELBO 做模型比较要小心——间隙不同会误导。同一模型内监控收敛用 ELBO 没问题，跨模型比较则更应依赖留出预测（held-out predictive）或更严谨的边际似然估计。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>VI 是当前概率机器学习最活跃的领域之一，因为「快速近似复杂后验」是大规模贝叶斯与深度生成模型的命脉：</p>  <ul>
+    <li><strong>更灵活的 q：normalizing flows</strong>：用一串可逆变换把简单分布（高斯）变形成任意复杂分布，让 $q$ 摆脱平均场/高斯的束缚、逼近真后验的相关与多峰，同时保留 VI 的可优化性。是缩小 VI 偏差的主路。</li>
+    <li><strong>摊销推断的鸿沟（amortization gap）</strong>：用推断网络 $q_\phi(z\mid x)$ 换速度，但网络对某些 $x$ 可能输出次优的 $q$，产生额外偏差。半摊销 VI（先摊销再逐点精修）是活跃方向。</li>
+    <li><strong>VI 与 MCMC 的杂交</strong>：把 MCMC 步嵌进变分目标（如 MCVAE、Hamiltonian VI）、用 flow 学好的 MCMC 提议（NeuTra）——目标是兼得 VI 的速度与 MCMC 的精度。</li>
+    <li><strong>其他散度与稳健 VI</strong>：用 $\alpha$-散度、$\chi$-散度、或 importance-weighted ELBO（IWAE）替代标准 KL，缓解 mode-seeking、改善方差估计；以及对模型误设更稳健的 VI。</li>
+    <li><strong>结构化与可扩展 VI</strong>：保留部分后验相关的结构化平均场、用自然梯度（natural gradient VI）加速、SVI 的大数据扩展——让 VI 在保持速度的同时减少「平均场丢相关」的代价。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读（见 <code>../references.md</code>）：Blei, Kucukelbir & McAuliffe 2017（VI 现代综述，本模块主线）、Jordan 1999（平均场奠基）、Kingma & Welling 2014（VAE / 重参数化）、Ranganath 2014（BBVI）、Hoffman 2013（SVI）。至此，贝叶斯推断的两大近似武器（采样 / 优化）你都从零造过一遍。接下来两个模块转向两类自带后验、威力强大的概率模型：高斯过程与概率图模型。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_mcmc/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 马尔可夫链蒙特卡洛</div></a>
+    <a class="next" href="../04_gaussian_processes/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 高斯过程</div></a>
+  </div>
+
+</div>
+</body>
+</html>

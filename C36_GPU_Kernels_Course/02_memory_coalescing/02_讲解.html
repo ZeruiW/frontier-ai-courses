@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 内存层级与合并访问</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 内存层级与合并访问</h1>
+  <p class="subtitle">register / shared / global(HBM) 三级金字塔，合并访问把 32 个线程的取数合成一条事务，shared memory 复用与 bank 冲突 —— 访存受限世界的基本功</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（执行模型/warp）、行优先数组布局、一点点 CPU cache 常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_memory_coalescing.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">CUDA Best Practices Guide、Harris《Efficient Matrix Transpose》、Williams 2009（Roofline）、Horace He（Brrrr）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#hierarchy">内存层级金字塔</a></li>
+      <li><a href="#coalescing">合并访问：warp 与 cache line 的舞蹈</a></li>
+      <li><a href="#layout">行优先布局与线程映射</a></li>
+      <li><a href="#shared">共享内存：片上的案板</a></li>
+      <li><a href="#bank">bank 冲突与 padding 魔法</a></li>
+      <li><a href="#transpose">案例：矩阵转置（访存受限的缩影）</a></li>
+      <li><a href="#fusion">算子融合：内核之间也要少碰 HBM</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hierarchy"><span class="num">1</span>内存层级金字塔</h2>
+  <p>上一模块我们学会了把成千上万个线程组织成 thread/warp/block/grid，并靠延迟隐藏把数百周期的访存延迟藏起来。但这里有个隐含的前提没说破：<strong>延迟之所以需要被藏，是因为数据离算术单元很远</strong>。这一模块就来正面拆解「远」这件事——GPU 的内存不是一块均质的大池子，而是一座<strong>金字塔</strong>：越靠顶端越快越小、越靠底端越慢越大。性能工程的绝大部分，就是在这座金字塔上搬运与复用数据的艺术。</p>  <p>从快到慢、从小到大，主要有五层：</p>  <table>
+    <thead><tr><th>层级 (EN)</th><th>作用域</th><th>相对延迟</th><th>相对容量</th><th>本课 numpy 模拟</th></tr></thead>
+    <tbody>
+      <tr><td><strong>register</strong> 寄存器</td><td>单个 thread 私有</td><td>~1（最快）</td><td>极小（每线程几十~上百个）</td><td>循环里的局部变量</td></tr>
+      <tr><td><strong>shared memory / L1</strong> 共享内存</td><td>一个 block 共享</td><td>~20–30×</td><td>小（每 SM 几十~两百 KB）</td><td>一个临时小数组 tile</td></tr>
+      <tr><td><strong>L2 cache</strong> 二级缓存</td><td>全 GPU 共享（硬件管理）</td><td>~200×</td><td>中（几十 MB）</td><td>（透明，不显式建模）</td></tr>
+      <tr><td><strong>global / HBM</strong> 全局内存</td><td>所有线程可见、内核间持久</td><td>~400–800×</td><td>大（几十 GB）</td><td>传入函数的大 numpy 数组</td></tr>
+      <tr><td><strong>host</strong> 主机内存</td><td>CPU 侧，经 PCIe/NVLink</td><td>~10000×+</td><td>巨大</td><td>（不在本课范围）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把它想成厨房：寄存器是你手里正在切的那一刀的食材（伸手就拿）；shared memory 是你面前的案板（一臂之内，整组人共用）；global memory 是后院的大冰箱（每次去取都要走一趟，很慢）。做菜快不快，关键不在刀工，而在<strong>少跑冰箱、把常用食材先搬上案板反复用</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：每下降一层，延迟大约涨一个数量级、带宽降一截，但容量涨几个数量级。一次 <span class="term">HBM</span> 访问要 ~400–800 个时钟周期，而一次寄存器访问几乎免费。因此内核的性能极少取决于「算了多少」，而几乎总取决于「在每一层之间搬了多少字节」——尤其是对最慢的 HBM 的读写量。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话定调本模块（也是整门课）的主线：<strong>把数据搬到尽量靠上的层级，并在那里尽量多地复用它，从而少碰 HBM</strong>。模块 03 的分块矩阵乘、模块 04 的融合 softmax、模块 05 的 FlashAttention，全是这一句话的不同实现。本模块先打地基：怎么<em>高效地</em>从 HBM 取数（合并访问），以及怎么<em>高效地</em>用好那块案板（shared memory 与 bank 冲突）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="coalescing"><span class="num">2</span>合并访问：warp 与 cache line 的舞蹈</h2>
+  <p>先看金字塔的底层 global memory。一个常见误解是「读 N 个数就是 N 次内存访问」。真相是：访存硬件以 <span class="term">cache line</span>（一条缓存行，典型 32 或 128 字节）为最小搬运单位。你哪怕只要 1 个 4 字节的 float，硬件也会把它所在的整条 128 字节 cache line 全搬回来。<strong>一次这样的搬运叫一个内存事务（memory transaction）</strong>。</p>  <p>关键来了：硬件以 <strong>warp（32 线程）</strong> 为单位发起访存。当一个 warp 的 32 个线程同时各取一个 float，硬件会看这 32 个地址<strong>落在几条 cache line 上</strong>：</p>  <div class="ascii">合并访问 coalesced —— 32 线程读连续的 32 个 float（128 字节，正好一条 line）
+  线程:  t0  t1  t2  ...  t31
+  地址:  0   4   8   ... 124        （字节）
+  cache line: [====== 1 条 128B line 全包 ======]
+  =&gt; 1 次内存事务，带宽 100% 用上
+
+非合并 strided —— 32 线程各隔 128 字节取一个 float
+  线程:  t0      t1      t2     ...
+  地址:  0       128     256    ...
+  cache line: [line0] [line1] [line2] ... 32 条
+  =&gt; 32 次事务，每条 line 只用了 4/128 = 3% =&gt; 带宽浪费 32 倍</div>  <p>数学上很直白。设 warp 访问的字节地址集合为 $A$，cache line 大小为 $L$，则事务数就是这些地址覆盖的不同 line 数：</p>  <div class="math-block">\[\#\text{transactions} = \big|\{\, \lfloor a / L \rfloor : a \in A \,\}\big|\]</div>  <p>而<strong>带宽有效率</strong>（真正用上的字节 ÷ 实际搬运的字节）= <code>有用字节 / (事务数 × L)</code>。合并访问下 32 个 float 用 1 条 line，有效率接近 100%；跨步访问下用 32 条 line，有效率掉到 ~3%。注意：<strong>两种写法搬的「有用数据」一样多、算的 FLOPs 一样多，但慢的那个把 97% 的带宽喂给了「顺带搬来又用不上」的字节</strong>。这就是为什么访存受限内核里，合并访问几乎是第一优化目标。</p>  <h4>一笔事务账：四种访问模式</h4>  <p>把公式落到具体数字上，感受不同访问模式的代价。设 cache line = 128 字节（32 个 float），一个 warp 的 32 个线程各取一个 float：</p>  <table>
+    <thead><tr><th>访问模式</th><th>32 线程的地址</th><th>覆盖 line 数 = 事务数</th><th>带宽有效率</th></tr></thead>
+    <tbody>
+      <tr><td>完美合并</td><td>0,4,8,…,124（连续）</td><td>1</td><td><strong>100%</strong></td></tr>
+      <tr><td>对齐但错位半条</td><td>64,68,…,188（跨两条 line）</td><td>2</td><td>50%</td></tr>
+      <tr><td>步长 2 跨步</td><td>0,8,16,…,248</td><td>2</td><td>50%</td></tr>
+      <tr><td>步长 32 跨步</td><td>0,128,256,…</td><td>32</td><td><strong>3%</strong>（灾难）</td></tr>
+    </tbody>
+  </table>  <p>看第二行：地址其实连续，只是<strong>起点没对齐到 128 字节边界</strong>，于是 32 个 float 横跨了两条 cache line，事务数翻倍、有效率减半。这说明合并不光要<em>连续</em>，还要<strong>对齐</strong>——这也是为什么 CUDA 的内存分配器默认按 256/512 字节对齐，以及为什么给结构体做 padding 对齐能提速。第三、四行则显示：步长越大，浪费越狠，步长一旦 ≥ line 宽（32 个 float），每个线程就独占一条 line，退化成 32 倍带宽浪费——这正是「按列遍历行优先矩阵」的下场。</p>  <div class="callout warn"><span class="label"></span>
+    <p>合并是<strong>warp 内</strong>的概念。不要求一个线程自己访问连续——要求的是同一 warp 的 32 个线程<em>彼此之间</em>访问连续（或同 line）的地址。所以优化合并，永远是在问：「相邻的 threadIdx，会碰到相邻的地址吗？」</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="layout"><span class="num">3</span>行优先布局与线程映射</h2>
+  <p>上一模块埋了一个伏笔：<strong>线程到数据的映射决定了相邻线程碰到哪些地址</strong>。现在兑现它。矩阵在内存里是一维线性排布的，最常见的是 <span class="term">row-major</span>（行优先，C 与 numpy 默认）：同一行的元素相邻，换行则跳一整行。元素 <code>M[r][c]</code> 的线性下标是：</p>  <div class="math-block">\[\text{offset}(r, c) = r \times \text{ncols} + c \qquad(\text{行优先})\]</div>  <p>于是同一个矩阵、同样的运算，按行还是按列分配线程，访存行为天差地别：</p>  <table>
+    <thead><tr><th>线程映射</th><th>warp 内相邻线程访问</th><th>地址模式</th><th>事务数（32 线程）</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>按行（threadIdx → 列 c）</td><td><code>M[r][0..31]</code></td><td>连续（步长 4B）</td><td>1</td><td><strong>合并</strong> ✅</td></tr>
+      <tr><td>按列（threadIdx → 行 r）</td><td><code>M[0..31][c]</code></td><td>跨步（步长 ncols×4B）</td><td>32</td><td><strong>非合并</strong> ❌</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>同一份数据、同一个 for 循环的结果，只因为「让相邻线程负责相邻的列」还是「负责相邻的行」，速度可能差几十倍。这不是算法变了，纯粹是<strong>访问顺序</strong>顺没顺着数据在内存里的摆放方向。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：合并要求 warp 的访问步长（相邻线程地址之差）等于元素大小。行优先矩阵按行遍历时步长 = 4 字节（合并）；按列遍历时步长 = <code>ncols × 4</code> 字节（每线程独占一条 line，非合并）。列优先矩阵则恰好相反。</p></div>
+  </div>  <p>这条规律直接决定了实战取向：<strong>数据的内存布局（layout）与线程的映射必须协同设计</strong>。改不了布局，就改线程映射顺着布局走；两者都改不了（如必须按列归约一个行优先矩阵），就得把数据先搬进 shared memory 重排——这正是下一节与矩阵转置案例的动机。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这个一句话判据：<strong>让 threadIdx 的最低维（变化最快的那维）对应数据在内存里变化最快的那维</strong>（行优先就是最后一维 / 列）。做到这点，合并访问基本自动成立；做不到，再快的算法也会被带宽拖死。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="shared"><span class="num">4</span>共享内存：片上的案板</h2>
+  <p>从 HBM 高效取数只是第一步。真正的加速来自<strong>复用</strong>：把一块数据从 global 搬上来后，让 block 内的多个线程反复使用它，而不是每次都回 HBM 取。承担这个「案板」角色的，就是 <span class="term">shared memory</span>（SMEM）。</p>  <p>shared memory 是<strong>程序员显式管理</strong>的片上高速存储，与 L1 共用同一块 SRAM，延迟比 global 低一两个数量级。它有两大用途：①<strong>数据复用</strong>——把要被多次读的数据先搬进来（分块矩阵乘的核心，见模块 03）；②<strong>线程间协作</strong>——一个 block 内的线程通过它交换数据（规约、转置）。它的作用域恰好是一个 block，呼应上一模块「能协作的边界就是 block」。</p>  <p>用 shared memory 有一条<strong>铁律</strong>：写入和读取之间必须插一个同步屏障 <code>__syncthreads()</code>。否则线程 A 可能去读线程 B 还没写完的格子——这是 GPU 上最经典的<span class="term">race condition</span>（竞态）之一。</p>  <pre><code>// CUDA 风格：把一块 tile 搬进 shared，复用之
+__shared__ float tile[32][32];
+tile[ty][tx] = global_in[...];   // 各线程协作填满 tile
+__syncthreads();                 // 铁律：等所有人都写完！
+// ... 现在 block 内任意线程都能快速读 tile[*][*] 反复用 ...</code></pre>  <div class="callout danger"><span class="label">竞态陷阱</span>
+    <p>漏写 <code>__syncthreads()</code> 是 GPU 新手最常见、也最难查的 bug：程序<strong>大多数时候碰巧是对的</strong>（线程恰好按预期顺序跑完），偶尔给出错误结果，且在不同输入/不同 GPU 上表现不一。更糟的是把它放进发散的分支里（只有部分线程到达屏障）会直接死锁。本课 notebook 用「先写后读」的显式两阶段来模拟这条纪律。</p>
+  </div>  <h4>shared memory 是稀缺资源</h4>  <p>shared memory 和 L1 cache 共用同一块物理 SRAM（每个 SM 总共也就上百 KB，Hopper 约 228 KB、Ampere 约 164 KB），二者按内核需求<strong>此消彼长</strong>。这件事的后果在模块 01 的占用率木桶里已经埋好：<strong>一个 block 用的 shared 越多，一个 SM 能同时驻留的 block 就越少</strong>。举例：SM 有 100 KB shared，若每 block 用 50 KB，则最多并存 2 个 block；若每 block 用 8 KB，可并存 12 个——后者 warp 多得多，延迟藏得更好。</p>  <p>于是「往 shared 里多搬数据复用」与「保持足够 block 并存以藏延迟」是一对<strong>天然矛盾</strong>：搬得越多复用越省 HBM，但占用率越低越藏不住延迟。这正是下一模块分块矩阵乘里<em>tile 该开多大</em>的核心张力——大 tile 复用率高但 shared 吃紧、占用率低，小 tile 反之。记住这条贯穿全课的取舍：<strong>片上空间是有限的，每一次「搬上来复用」都在和「保持并行度」抢同一块 SRAM</strong>。没有免费的复用。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把 shared memory 想成厨房里那块案板：它快、就在手边，但面积有限。你可以把更多食材摊上去（多复用），但摊得太满就挤不下第二个厨师班组（block）一起开工（占用率掉）。高手的功夫，正是在「案板上摆多少」与「同时几个班组」之间找平衡——这门手艺贯穿模块 03 到 05。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bank"><span class="num">5</span>bank 冲突与 padding 魔法</h2>
+  <p>shared memory 快，但它内部还有一道暗礁：<span class="term">bank conflict</span>（bank 冲突）。为了支撑 warp 的并行访问，shared memory 被切成 <strong>32 个 bank</strong>（恰好对应一个 warp 的 32 条 lane），连续的 4 字节字依次落到 bank 0,1,2,…,31,0,1,…（取模 32）。</p>  <p>规则是：一个 warp 的 32 次访问，如果分别落在 32 个<strong>不同</strong>的 bank，硬件一拍全部并行完成（理想）。但如果有多个线程访问<strong>同一个 bank 的不同地址</strong>，这些访问只能<strong>串行化</strong>——<strong>k 个线程撞同一 bank</strong> 就慢 k 倍（k-way conflict）。设线程访问的字索引（不是字节）为 $w_i$，bank 编号为：</p>  <div class="math-block">\[\text{bank}(w_i) = w_i \bmod 32\]</div>  <p>最经典的翻车现场：一块 <strong>32 列宽</strong> 的 shared tile，让一个 warp 的 32 个线程去读<strong>同一列、不同行</strong>。第 $t$ 行第 $c$ 列的字索引是 <code>t*32 + c</code>，于是 bank = <code>(t*32 + c) % 32 = c</code>——对所有 32 行都是同一个 bank <code>c</code>！<strong>32 个线程全撞在一个 bank 上，32-way 冲突，慢 32 倍</strong>。</p>  <div class="ascii">32 宽 tile，warp 读一整列（t=0..31, 列 c 固定）
+  字索引 = t*32 + c   =&gt;  bank = (t*32 + c) % 32 = c  （与 t 无关！）
+  =&gt; 32 个线程全在 bank c =&gt; 32-way conflict（串行 32 次）
+
+补一列 padding，改成 33 宽 tile（每行多存一个废字）
+  字索引 = t*33 + c   =&gt;  bank = (t*33 + c) % 32 = (t + c) % 32  （随 t 走遍 0..31）
+  =&gt; 32 个线程落在 32 个不同 bank =&gt; 0 冲突（一拍完成）</div>  <p>解法优雅得近乎魔法：把 tile 的列数从 32 <strong>padding 到 33</strong>（每行多留一个用不上的字）。此时字索引变成 <code>t*33 + c</code>，bank = <code>(t*33 + c) % 32 = (t + c) % 32</code>——随着行号 $t$ 从 0 到 31，bank 恰好遍历 0..31，<strong>32 个线程落在 32 个不同 bank，冲突彻底消失</strong>。代价只是每行浪费 4 字节 shared memory。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>padding 消冲突的本质，是用一个与 32 <strong>互质</strong>的行步长（33）打散地址，让「同列不同行」的访问错开到不同 bank。这个 <code>+1</code> 技巧在转置、规约、各种 shared 上的列向访问里反复出现，是 GPU 工程师的肌肉记忆。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="transpose"><span class="num">6</span>案例：矩阵转置（访存受限的缩影）</h2>
+  <p>现在把前五节拼成一个完整案例：<strong>矩阵转置</strong> <code>B = A^T</code>。它看似平凡（不含任何浮点运算，纯搬数据），却是<strong>纯访存受限</strong>的教科书题，把合并访问、shared memory、bank 冲突全考一遍。</p>  <h3>朴素转置：必有一端非合并</h3>  <p>最直接的写法：线程 (r,c) 读 <code>A[r][c]</code>、写 <code>B[c][r]</code>。问题在于读和写没法<strong>同时</strong>合并：让相邻线程读连续的 <code>A[r][0..31]</code>（读合并 ✅），那么它们就要写到 <code>B[0..31][r]</code>——这是 B 的一整列，跨步写，<strong>写非合并 ❌</strong>（慢 32 倍）。反过来让写合并，则读非合并。朴素转置注定有一端在浪费带宽。</p>  <h3>分块转置：两端都合并</h3>  <p>解法是<strong>借道 shared memory</strong>：把 A 的一个 32×32 tile<strong>合并地读</strong>进 shared，在片上完成转置（这里只是改变读 tile 的方向），再把结果<strong>合并地写</strong>回 B 的对应 tile。关键在于：对 global 的两次访问（读 A、写 B）都是按行连续的，于是<strong>读写双双合并</strong>；转置发生在快速的 shared memory 内部。</p>  <div class="ascii">分块转置的数据流（tile = 32×32）
+  global A ──(按行合并读)──▶ shared tile ──(片上转置)──▶ ──(按行合并写)──▶ global B
+            ✅ coalesced                   仅 SMEM 内             ✅ coalesced
+
+  若 shared tile 是 32 宽：片上那次列向访问 =&gt; 32-way bank conflict
+  =&gt; 把 tile 声明成 [32][33]（padding）=&gt; bank 冲突消失</div>  <p>但分块转置在 shared 内部不可避免地有一次<strong>列向访问</strong>（转置就是行列互换），正好踩中第 5 节的 32-way bank 冲突。于是收尾一招：把 shared tile 声明成 <code>[32][33]</code>，padding 一列，bank 冲突归零。<strong>至此三件套——合并读、合并写、无 bank 冲突——全部到位</strong>，朴素版的所有浪费都被消除。notebook 会用 numpy 把这个数据搬运过程逐步模拟出来，并对拍 <code>A.T</code> 验证正确。</p>  <div class="callout paper"><span class="label"></span>
+    <p>矩阵转置是 NVIDIA 官方反复用来教合并访问与 bank 冲突的标准案例（见 references 中的《An Efficient Matrix Transpose in CUDA C/C++》与 Best Practices Guide）。它的价值在于：<strong>一个零 FLOP 的算子，性能完全由内存访问模式决定</strong>——这正是访存受限世界的纯粹缩影。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fusion"><span class="num">7</span>算子融合：内核之间也要少碰 HBM</h2>
+  <p>最后一块拼图，把视角从「一个内核内部怎么访存」抬到「内核之间怎么少访存」。考虑一串逐元素运算，比如 <code>y = relu(a*x + b)</code>。如果朴素地用三个独立内核（乘、加、relu）依次做：</p>  <div class="ascii">未融合：每个内核都要完整地读一遍、写一遍 HBM
+  x ─读▶ [×a] ─写▶ tmp1 ─读▶ [+b] ─写▶ tmp2 ─读▶ [relu] ─写▶ y
+  HBM 流量 ≈ 3 个内核 × (读 n + 写 n) = 6n 个元素的读写
+
+融合成一个内核：中间结果留在寄存器，永不落 HBM
+  x ─读▶ [×a; +b; relu 一气呵成] ─写▶ y
+  HBM 流量 ≈ 读 n + 写 n = 2n  =&gt; 省掉 2/3 的带宽</div>  <p>每个内核都得把数据从 HBM 读进来、算完再写回去。三个内核就是<strong>三趟来回 HBM</strong>，而中间张量 <code>tmp1</code>、<code>tmp2</code> 纯属「写出去只为下一个内核读回来」的浪费。<span class="term">operator fusion</span>（算子融合）把它们合并成<strong>一个</strong>内核：读一次 x、在寄存器里一口气算完 <code>a*x+b</code> 再 relu、写一次 y。HBM 流量从 ~6n 砍到 ~2n。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>融合就是「别为了下一步把半成品塞回大冰箱，攥在手里直接接着做」。逐元素算子算得飞快，瓶颈全在搬数据，所以省下的每一趟 HBM 来回都是纯赚。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：未融合的 HBM 字节数 ≈ <code>n_ops × 2 × n × dtype_bytes</code>，融合后 ≈ <code>2 × n × dtype_bytes</code>（只读一次输入、写一次输出，中间量驻留寄存器/shared）。算术强度因此提高约 <code>n_ops</code> 倍，把一个深度访存受限的链条往算力受限方向推。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这个预告：<strong>融合 = 不让中间结果落 HBM</strong>。它和「分块 = 把数据搬进 shared 复用」是同一个思想（少碰 HBM）的两个面。模块 04 的融合 softmax 把「求 max、求和、归一」融进一遍扫描；模块 05 的 FlashAttention 把整个注意力（QKᵀ、softmax、×V）融成一个内核、永不 materialize n×n 分数矩阵——都是这一节的极致形态。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>合并访问与 shared memory 是 1.0 时代的基本功，但带宽与算力的差距逐年拉大（<strong>the memory wall / 带宽墙</strong>），逼出了一批更激进的技术：</p>  <ul>
+    <li><strong>异步拷贝（async copy）</strong>：Ampere 的 <code>cp.async</code>、Hopper 的 <span class="term">TMA</span>（Tensor Memory Accelerator）让 global→shared 的搬运<strong>不阻塞计算</strong>，配合双缓冲（double buffering）实现「算当前 tile 的同时预取下一 tile」，把搬运延迟彻底藏进计算。FlashAttention-3 的提速很大程度来自此。</li>
+    <li><strong>向量化访存（vectorized load）</strong>：用 <code>float4</code>/128-bit 一条指令搬 4 个 float，减少指令数、更易打满每条 cache line，是逼近峰值带宽的常用手段。</li>
+    <li><strong>L2 驻留控制</strong>：Ampere 起可把热数据「钉」在 L2（persisting access），让被反复读的张量绕过 HBM，是软件可控缓存的一小步。</li>
+    <li><strong>软件流水（software pipelining）</strong>：把「取数—计算—写回」显式排成多级流水，让各阶段重叠。CUTLASS 与现代 GEMM/注意力内核的核心结构，本质是把本模块的「搬上来复用」做到极致并与计算交织。</li>
+  </ul>  <p>但万变不离其宗：这些前沿技术优化的仍然是同一件事——<strong>减少对 HBM 的等待与读写量</strong>。理解了本模块的合并访问、shared 复用、bank 冲突，你就握住了读懂它们的钥匙；它们只是把「少碰 HBM」做得更自动、更异步、更彻底。</p>  <div class="callout paper"><span class="label"></span>
+    <p>延伸必读（见 <code>../references.md</code>）：NVIDIA《CUDA C++ Best Practices Guide》（合并/shared/bank 的权威规则）、《How to Access Global Memory Efficiently》与《Using Shared Memory in CUDA C/C++》（图文直觉）、Williams 2009《Roofline》（带宽 vs 算力的统一视角，模块 03 展开）、Horace He《Making Deep Learning Go Brrrr》（访存受限世界观）。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_execution_model/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · GPU 执行模型</div></a>
+    <a class="next" href="../03_tiled_matmul/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 分块矩阵乘</div></a>
+  </div>
+
+</div>
+</body>
+</html>

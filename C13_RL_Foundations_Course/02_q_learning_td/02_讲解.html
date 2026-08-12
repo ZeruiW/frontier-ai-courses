@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 时序差分与 Q-learning</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 时序差分与 Q-learning</h1>
+  <p class="subtitle">无模型学习：TD(0) 自举、Q-learning（off-policy，目标取 max 逼近 Q*）与 SARSA（on-policy，用实际动作）的本质区别、ε-greedy 探索、Robbins-Monro 收敛条件 —— 拿掉「已知模型」假设，只靠采样学到最优</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（MDP/Bellman/价值迭代）、随机近似/期望直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_q_learning_td.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Sutton & Barto 第 6 章、Sutton 1988、Watkins & Dayan 1992</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#modelfree">无模型学习：MC 与 TD</a></li>
+      <li><a href="#td0">TD(0) 预测与 TD 误差</a></li>
+      <li><a href="#control">从预测到控制：Q 与 ε-greedy</a></li>
+      <li><a href="#qlearning">Q-learning：off-policy 控制</a></li>
+      <li><a href="#sarsa">SARSA 与 on/off-policy 之别</a></li>
+      <li><a href="#convergence">收敛条件：Robbins-Monro 与探索</a></li>
+      <li><a href="#run">GridWorld 与 Cliff Walking</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="modelfree"><span class="num">1</span>无模型学习：MC 与 TD</h2>
+  <p>模块 01 解了 MDP，但有一个<strong>奢侈的前提</strong>：我们知道完整的环境模型 $(P,R)$——每个动作转移到哪、概率多少、奖励几何，全都摆在面前。现实里这几乎从不成立。一个下棋的 agent 不会被告知「这步棋之后对手以 0.37 概率走这、0.21 概率走那」；一个机器人不知道关节力矩到位置的精确动力学。本模块的核心问题是：<strong>不知道 $P$ 和 $R$，只能与环境交互、观察一条条 (状态, 动作, 奖励, 下一状态) 的样本，怎么学到最优策略？</strong>这就是<span class="term">model-free</span>（无模型）学习。</p>  <p>有两条朴素的思路。第一条是<strong>蒙特卡洛</strong>（Monte Carlo, MC）：想知道某状态的价值？就从它出发跑完一整条回合，把真实的折扣回报 $G_t$ 记下来，多跑几次取平均。$G_t$ 是 $V^\pi(s)$ 的<strong>无偏</strong>样本（它的期望恰是定义里的期望回报）。MC 简单、无偏，但有两个硬伤：<strong>必须等回合结束</strong>才能更新（持续任务根本没有结束），且回报 $G_t$ 把一整条轨迹的随机性全攒在一起，<strong>方差极大</strong>。</p>  <p>第二条思路，也是本模块的主角，是<span class="term">temporal difference</span>（时序差分，TD）。它的洞察是把模块 01 的 Bellman 自举搬到无模型场景：<strong>不必等回合结束，走一步就能学</strong>。回忆 Bellman 期望方程说 $V^\pi(s)=\mathbb{E}[r+\gamma V^\pi(s')]$——既然价值等于「即时奖励 + 折扣后继价值」的期望，那我每走一步，就得到了这个期望的一个<strong>样本</strong>：$r+\gamma V(s')$。用它当作 $V(s)$ 的更新目标，就是 TD。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方。要估计「从家到公司平均要多久」：MC 的做法是每天完整走到公司、记下总时长、多天取平均（必须到了才知道，且天气堵车全攒一块）。TD 的做法是——走到地铁站时就更新估计：「到这里花了 10 分钟，而我一向觉得从地铁站到公司还要 25 分钟，所以全程大概 35 分钟」，<strong>不必真的走到</strong>就能修正预期。每经过一个路标都这样校正一次。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，TD<strong>同时借用了 DP 和 MC</strong>：像 DP 一样<em>自举</em>（用 $V(s')$ 的当前估计），像 MC 一样<em>采样</em>（用真实经历的 $r,s'$ 而非模型 $P$）。这个组合让它既不需要模型、又不必等回合结束。代价是引入了<strong>偏差</strong>（自举的 $V(s')$ 本身不准），但换来了<strong>大幅降低的方差</strong>——这正是 RL 里反复出现的 bias-variance 权衡，模块 04 的 GAE 会把它做成一个连续旋钮。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住 MC 与 TD 的分野：<strong>MC 等到看见真实结局才学（无偏、高方差、慢）；TD 走一步、用对未来的当前猜测来学（有偏、低方差、可在线）</strong>。DP、TD 都<em>自举</em>，MC 不自举；DP、MC 不一定需要在线，TD 天然在线。本模块先用 TD 做<strong>预测</strong>（估给定策略的 $V$），再升级到 TD 做<strong>控制</strong>（学最优策略，即 Q-learning 与 SARSA）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="td0"><span class="num">2</span>TD(0) 预测与 TD 误差</h2>
+  <h3>TD(0)：最基础的时序差分预测</h3>  <p>先解决<strong>预测</strong>问题：给定一个固定策略 $\pi$，估计它的状态价值 $V^\pi$（不求最优，只求评估）。<span class="term">TD(0)</span>（单步 TD）的更新规则是：</p>  <div class="math-block">\[V(s_t) \leftarrow V(s_t) + \alpha\,\big[\,\underbrace{r_{t+1} + \gamma V(s_{t+1})}_{\text{TD 目标}} - \underbrace{V(s_t)}_{\text{当前估计}}\,\big]\]</div>  <p>中括号里的量是 RL 里最重要的一个信号，叫 <span class="term">TD error</span>（TD 误差），记作 $\delta_t=r_{t+1}+\gamma V(s_{t+1})-V(s_t)$。它度量「<strong>自举目标与当前估计的差距</strong>」——如果实际经历的「奖励 + 后继价值」比我原本估的高，说明我低估了这个状态，$\delta>0$，就上调 $V(s_t)$；反之下调。$\alpha$ 是学习率，控制每步挪多少。</p>  <p>为什么这个更新是对的？因为 TD 目标 $r+\gamma V(s')$ 的<strong>期望</strong>恰好是 Bellman 期望方程的右端 $\mathbb{E}[r+\gamma V^\pi(s')]=V^\pi(s)$。于是 TD(0) 本质是在用<strong>随机近似</strong>（stochastic approximation）求解 Bellman 期望方程的不动点：每个样本是真值的一个带噪估计，按 Robbins-Monro 步长平均下去，就收敛到 $V^\pi$。这是 Sutton 1988 的奠基结果。</p>  <div class="ascii">TD(0) 预测（估计给定策略 π 的 V^π）
+  初始化 V(s) ← 0
+  for each episode:
+      s ← 初始状态
+      while s 非终止:
+          a ← π(s)                          ← 按被评估的策略选动作
+          观察 r, s'                          ← 与环境交互(无需模型!)
+          δ ← r + γ V(s') − V(s)             ← TD 误差
+          V(s) ← V(s) + α δ                  ← 朝目标挪一小步
+          s ← s'</div>  <div class="callout intuition"><span class="label"></span>
+    <p>TD 误差 $\delta$ 是贯穿后面所有模块的<strong>通用货币</strong>：模块 03–04 你会看到它（确切说是 $Q$ 版的 advantage）出现在策略梯度里；GAE 干脆就是把一串 $\delta$ 按几何权重加起来。把它理解透——<strong>$\delta$ = 惊喜程度 = 实际比预期好多少</strong>——是理解现代 RL 的关键。多巴胺的神经科学研究甚至发现，大脑里似乎真有一个编码 TD 误差的信号（reward prediction error），这是 TD 理论一个迷人的旁证。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="control"><span class="num">3</span>从预测到控制：Q 与 ε-greedy</h2>
+  <h3>从预测到控制：动作价值 Q 与 ε-greedy</h3>  <p>预测告诉你「这个策略多好」，但我们要的是<strong>控制</strong>——找到<em>最优</em>策略。这里有个关键障碍：要改进策略需要知道 $\arg\max_a Q(s,a)$，但若只学了 $V$，从 $V$ 选动作得算 $\arg\max_a\sum_{s'}P(s'\mid s,a)[r+\gamma V(s')]$——又冒出了模型 $P$！这正是模块 01 第 2 节埋的伏笔：<strong>无模型控制必须学 $Q$ 而非 $V$</strong>。</p>  <p>学了 $Q(s,a)$ 就能直接 $\arg\max_a Q(s,a)$ 选动作，完全绕开模型。但这带来第二个障碍——<strong>探索</strong>。如果一直只选当前 $Q$ 最高的动作（纯贪心），那些初始估计偏低、其实更好的动作就永远没机会被尝试、被修正，agent 会卡死在次优策略里。但 RL 的数据是 agent<em>自己生成</em>的（模块 00 讲的根本难点），不去某个状态-动作，就永远学不到它。</p>  <p>最简单的解法是 <span class="term">ε-greedy</span>：以 $1-\varepsilon$ 概率选当前最优动作（<strong>利用</strong> exploitation），以 $\varepsilon$ 概率随机选一个动作（<strong>探索</strong> exploration）：</p>  <div class="math-block">\[\pi(a\mid s) = \begin{cases} 1-\varepsilon+\varepsilon/|\mathcal{A}| & a = \arg\max_{a'} Q(s,a') \\ \varepsilon/|\mathcal{A}| & \text{其他} \end{cases}\]</div>  <p>实践中 $\varepsilon$ 常<strong>随训练衰减</strong>（如从 1.0 线性降到 0.1）：早期多探索（什么都不懂，广撒网），后期多利用（学得差不多了，收敛到好策略）。这个「探索调度」本身是门学问——衰减太快会过早锁死次优、太慢则浪费样本。模块 05 会把探索这个 RL 灵魂问题单独拎出来，讲 UCB、Thompson 等比 ε-greedy 聪明得多的方案。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见 bug：<strong>终止状态的处理</strong>。Q-learning/SARSA 的更新目标里，若 $s'$ 是终止态，则其后没有未来，目标应是<strong>纯 $r$ 而不带 $\gamma Q(s')$</strong>（终止态价值为 0）。写成 $\text{target}=r+(1-\text{done})\cdot\gamma\max_{a'}Q(s',a')$。忘了这个 $(1-\text{done})$，价值会从终止态「漏」回去，整个 $Q$ 表系统性偏高。notebook 里我们显式处理 done，并 assert 学到的 $Q$ 对拍 DP 真值。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="qlearning"><span class="num">4</span>Q-learning：off-policy 控制</h2>
+  <h3>Q-learning：off-policy 控制</h3>  <p><span class="term">Q-learning</span>（Watkins 1989）是 RL 最著名的算法，也是 DQN（C41）的直接祖先。它的更新规则只比 TD(0) 多一个 $\max$：</p>  <div class="math-block">\[Q(s_t,a_t) \leftarrow Q(s_t,a_t) + \alpha\,\big[\,r_{t+1} + \gamma \max_{a'} Q(s_{t+1},a') - Q(s_t,a_t)\,\big]\]</div>  <p>关键在目标里的 $\max_{a'}Q(s_{t+1},a')$——它用「下一状态<strong>能达到的最好</strong>动作价值」来自举，直接对应 Bellman<strong>最优</strong>方程（而非期望方程）。这意味着不管你实际用什么策略去采样（行为策略，behavior policy，通常是 ε-greedy 的探索策略），$Q$ 都在朝<strong>最优</strong> $Q^*$ 逼近——它学的目标策略（target policy）是贪心策略，与采样策略<em>不同</em>。这种「行为策略 ≠ 目标策略」就叫 <span class="term">off-policy</span>（异策略）。</p>  <p>off-policy 是 Q-learning 的超能力：<strong>可以从任何来源的数据里学最优策略</strong>——别人的演示、历史日志、随机探索，甚至旧策略采的数据（经验回放 experience replay，DQN 的核心，C41 详讲）。Watkins & Dayan 1992 证明：在 Robbins-Monro 步长（$\sum\alpha_t=\infty,\sum\alpha_t^2<\infty$）+ 所有 $(s,a)$ 被无限次访问（充分探索）的条件下，Q-learning 以概率 1 收敛到 $Q^*$。</p>  <div class="ascii">Q-learning（off-policy 控制）
+  初始化 Q(s,a) ← 0
+  for each episode:
+      s ← 初始状态
+      while s 非终止:
+          a ← ε-greedy(Q, s)                       ← 行为策略(探索)
+          观察 r, s'
+          target ← r + γ max_a' Q(s', a')          ← 目标策略=贪心(max!)
+          Q(s,a) ← Q(s,a) + α[target − Q(s,a)]
+          s ← s'
+  最优策略: π*(s) = argmax_a Q(s,a)</div>  <div class="callout intuition"><span class="label"></span>
+    <p>Q-learning 的 <code>max</code> 是它「乐观」的来源：它总假设下一步会做最优动作，哪怕当前行为策略因为探索而做了傻事。这让它学的是「如果之后都最优会怎样」，即 $Q^*$。代价是这个 $\max$ 会带来<strong>过高估计偏差</strong>（maximization bias）——对带噪的 $Q$ 取 max 会系统性偏高，这是 Double Q-learning / Double DQN（C41）要修的问题，本模块的表格干净环境里影响很小，但值得记住这个伏笔。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sarsa"><span class="num">5</span>SARSA 与 on/off-policy 之别</h2>
+  <h3>SARSA：on-policy 控制，以及它与 Q-learning 的本质区别</h3>  <p><span class="term">SARSA</span>（Rummery & Niranjan 1994）是 Q-learning 的孪生兄弟，更新规则只差一个地方——把 $\max_{a'}$ 换成「<strong>实际选的下一动作</strong>」$a'$：</p>  <div class="math-block">\[Q(s_t,a_t) \leftarrow Q(s_t,a_t) + \alpha\,\big[\,r_{t+1} + \gamma\, Q(s_{t+1},a_{t+1}) - Q(s_t,a_t)\,\big]\]</div>  <p>名字 SARSA 就来自它用到的五元组 $(s_t,a_t,r_{t+1},s_{t+1},a_{t+1})$。这里的 $a_{t+1}$ 是<strong>行为策略实际选的</strong>下一动作（同样 ε-greedy 抽出来的），不是 max。于是 SARSA 学的是「<strong>当前这个（含探索的）策略</strong>」的价值——目标策略 == 行为策略，这就是 <span class="term">on-policy</span>（同策略）。它评估并改进的是它<em>正在执行</em>的那个策略，包括其中探索带来的风险。</p>  <p>一个 $\max$ 与「实际动作」的差别，看似微不足道，行为却<strong>天差地别</strong>。经典的 <strong>Cliff Walking（悬崖行走）</strong>实验把这点演示得淋漓尽致：一条沿悬崖边的最短路 vs 一条绕远的安全路。</p>  <table>
+    <thead><tr><th>对比</th><th>Q-learning (off-policy)</th><th>SARSA (on-policy)</th></tr></thead>
+    <tbody>
+      <tr><td>目标里用什么</td><td>$\max_{a'}Q(s',a')$（最优动作）</td><td>$Q(s',a')$（实际选的动作）</td></tr>
+      <tr><td>学的是谁的价值</td><td>贪心目标策略 $Q^*$</td><td>当前执行的 ε-greedy 策略</td></tr>
+      <tr><td>数据来源</td><td>任意行为策略（可复用旧数据）</td><td>必须是当前策略产生的数据</td></tr>
+      <tr><td>Cliff Walking 行为</td><td>学到最优(贴悬崖)路；但探索中常掉崖，在线回报更低</td><td>学到更安全(绕远)路；在线回报更高</td></tr>
+      <tr><td>谁更适合</td><td>想要最优策略、可离线学（→DQN）</td><td>在线学且探索有真实代价（安全攸关）</td></tr>
+    </tbody>
+  </table>  <p>Cliff Walking 的教训值得反复体会：<strong>Q-learning 找到的是「假设之后都完美」的最优路，SARSA 找到的是「考虑到我还会探索犯错」的稳健路</strong>。前者数学上最优（无探索时回报最高），但若 ε 探索有真实代价（掉崖 −100），在线表现反而差；后者把探索的风险<em>内化</em>进了策略，选了更宽容的路线。这不是谁对谁错，而是<strong>「学最优」与「在线安全」目标不同</strong>——这个区别在 safe RL、真实机器人、RLHF（探索 = 生成可能有害的回复）里都至关重要。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="convergence"><span class="num">6</span>收敛条件：Robbins-Monro 与探索</h2>
+  <h3>收敛条件：为什么 TD/Q-learning 能学对</h3>  <p>TD 与 Q-learning 不是启发式的「凑」，它们有严格的收敛保证，根植于<strong>随机近似理论</strong>（Robbins-Monro 1951）。核心是把「迭代 Bellman 备份」从「用精确模型」放松成「用带噪样本」。</p>  <p>收敛需要两组条件。第一组是<span class="term">Robbins-Monro conditions</span>（步长条件）：</p>  <div class="math-block">\[\sum_{t=1}^{\infty}\alpha_t = \infty \qquad \text{且} \qquad \sum_{t=1}^{\infty}\alpha_t^2 < \infty\]</div>  <p>直觉：$\sum\alpha_t=\infty$ 保证步长不会归零得太快、能走到任意远（不会因为早早收缩而卡在错误估计上）；$\sum\alpha_t^2<\infty$ 保证步长最终趋零、把样本噪声平均掉（不会永远震荡）。经典满足者是 $\alpha_t=1/t$（如增量平均）。实践中常用小常数 $\alpha$（如 0.1）——严格说不满足第二条（不收敛到点，而是在最优附近抖动），但对非平稳问题反而更好（能持续适应变化），是工程上的常见取舍。</p>  <p>第二组条件是<strong>充分探索</strong>：每个 $(s,a)$ 对都被访问无限多次（GLIE：Greedy in the Limit with Infinite Exploration）。这就是为什么需要 ε-greedy——纯贪心会让某些动作永不被试，那里的 $Q$ 永远学不准。ε 衰减到 0（但衰减够慢，保证累计探索无限）即满足 GLIE，此时 SARSA 也收敛到最优（因为策略最终变贪心）。</p>  <div class="callout danger"><span class="label">致命三要素</span>
+    <p>再次强调这些保证的<strong>边界</strong>：它们成立于<em>表格型 + 精确表示</em>。一旦用函数逼近（神经网络）近似 $Q$，加上自举与 off-policy，三者凑齐就是「<strong>致命三要素</strong>」（deadly triad），TD/Q-learning 可能<strong>发散</strong>（Tsitsiklis & Van Roy 1997 给出反例）。本模块表格型，三要素缺了函数逼近，故安然收敛。这正是本课「先在表格里夯实」的意义：当 C41 里 DQN 训练崩了，你能立刻定位——不是 Q-learning 错了，是函数逼近 + 自举 + off-policy 的组合引入了不稳定，需要经验回放、目标网络等专门技巧去驯服。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="run"><span class="num">7</span>GridWorld 与 Cliff Walking</h2>
+  <h3>把它跑起来：GridWorld 与 Cliff Walking</h3>  <p>notebook 会在两个环境上验证本模块的全部算法。第一个是模块 01 的随机 GridWorld（但现在 agent<strong>不知道</strong> $P,R$，只能 step 采样）：</p>  <ul>
+    <li><strong>TD(0) 预测</strong>：固定最优策略，用 TD(0) 估其 $V$，对拍模块 01 的解析 $V^\pi$（在被访问的状态上应逼近）。</li>
+    <li><strong>Q-learning 控制</strong>：用 ε-greedy 探索 + 衰减，学 $Q$，验证学到的贪心策略<strong>达到最优价值</strong>（其策略价值对拍 DP 的 $V^*$）。注意我们用<em>exploring starts</em>（每回合随机起点）保证所有状态被充分访问。</li>
+    <li><strong>SARSA 控制</strong>：同环境跑 SARSA，对比它与 Q-learning 学到的策略。</li>
+  </ul>  <p>第二个是经典的 <strong>Cliff Walking</strong>（Sutton & Barto 例 6.6）：4×12 网格，左下起点、右下目标，底边中间是悬崖（掉下去 −100 并送回起点）。每步 −1。这个环境专门为暴露 on/off-policy 差异而设计：最短路紧贴悬崖（危险但最优），安全路绕到顶行（远但稳）。我们会跑 Q-learning 与 SARSA，画出各自的<strong>在线回报曲线</strong>——你会清楚看到 SARSA 的在线回报更高（走安全路、少掉崖），而 Q-learning 学到的贪心路更短（但探索中常掉崖拉低在线回报）。这是理解「学最优 ≠ 在线最优」的最佳实验。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>实现 Q-learning 时有个值得玩味的细节：<strong>学习率 $\alpha$ 与回合数、探索衰减是一组耦合的旋钮</strong>。$\alpha$ 太大，$Q$ 被最近的样本主导、噪声大、可能不收敛；太小则学得慢、回合数不够就没学透。ε 衰减太快，远处状态没探够；太慢，后期还在乱走、策略评估不准。这些超参的相互作用，正是 RL「调参玄学」的来源之一——而在表格环境里你能通过对拍真值清楚地看到每个旋钮的效果，这是复杂环境给不了的诊断能力。notebook 的练习会让你亲手调这些旋钮并观察对收敛的影响。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>函数逼近下的稳定性</strong>：deadly triad 让深度 TD 可能发散。DQN（C41）用经验回放打破样本相关性、用目标网络稳住自举目标；后续 Double DQN 修过高估计、Dueling、Rainbow 等是一整条工程化主线。理解它们都要先懂本模块的表格版。</li>
+    <li><strong>过高估计偏差</strong>：$\max$ 算子对带噪 $Q$ 系统性偏高。Double Q-learning（van Hasselt 2010）用两套 $Q$ 解耦「选动作」与「估价值」来缓解，是表格层面就能讲清、深度层面更重要的问题。</li>
+    <li><strong>n-step 与资格迹</strong>：TD(0) 只自举一步，MC 自举到底，中间的 n-step TD 与 TD(λ)（资格迹）在 bias-variance 间取舍——这正是模块 04 的 GAE 的前身，本模块的 TD 误差是它们共同的原子。</li>
+    <li><strong>探索的智能化</strong>：ε-greedy 是最笨的探索（盲目随机）。基于不确定性的探索（UCB 类）、基于好奇心/内在奖励的探索（count-based、RND）是前沿；模块 05 先在老虎机里把探索的理论讲透。</li>
+    <li><strong>离线 RL</strong>：完全从固定数据集学、不再与环境交互（offline/batch RL）是热点（机器人、医疗、推荐里在线交互昂贵或危险）。它把 off-policy 推到极致，面临「分布外动作高估」的核心难题，是 Q-learning off-policy 性质的当代延伸。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Sutton & Barto 第 6 章（TD、Q-learning、SARSA、Cliff Walking）；Sutton 1988（TD 奠基）；Watkins & Dayan 1992（Q-learning 与收敛证明）；Tsitsiklis & Van Roy 1997（deadly triad 反例）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_mdp_bellman/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · MDP 与 Bellman 方程</div></a>
+    <a class="next" href="../03_policy_gradient/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 策略梯度与 REINFORCE</div></a>
+  </div>
+
+</div>
+</body>
+</html>

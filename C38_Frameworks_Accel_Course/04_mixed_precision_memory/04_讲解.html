@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 混合精度与显存</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 混合精度与显存</h1>
+  <p class="subtitle">fp16/bf16、loss scaling、上溢/下溢、激活显存账、gradient checkpointing —— 用 numpy 模拟 fp16 舍入与溢出、选 loss scale、算 checkpoint 的时间-显存权衡与显存峰值，对照 autocast/GradScaler</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00 的 IEEE 754 速览与瓶颈三分法、反向传播、一点点显存常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_mixed_precision_memory.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Micikevicius 2018（混合精度）、Chen 2016（checkpointing）、Kalamkar 2019（bf16）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么要混合精度与省显存</a></li>
+      <li><a href="#formats">IEEE 754：fp16 vs bf16</a></li>
+      <li><a href="#scaling">Loss scaling：救回下溢的梯度</a></li>
+      <li><a href="#recipe">混合精度的完整配方</a></li>
+      <li><a href="#memory">激活显存与显存账</a></li>
+      <li><a href="#ckpt">Gradient checkpointing：算力换显存</a></li>
+      <li><a href="#reality">工程现实与陷阱</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么要混合精度与省显存</h2>
+  <p>前三个模块讲的是「怎么算对、怎么算快」。这个模块换一个维度——<strong>在固定的硬件上，怎么把模型训得起、训得省</strong>。答案有两条主线：用更低的数值精度（混合精度）省显存、提算力；以及精打细算激活显存、必要时用重算换显存（gradient checkpointing）。两条线都围绕一个现实约束：<strong>显存（与带宽）是稀缺资源</strong>。</p>  <p>先讲精度。深度学习长期默认 <span class="term">fp32</span>（单精度，32 位）。但现代加速器在<strong>半精度</strong>（16 位）上算得快得多、显存与带宽只用一半。于是<strong>混合精度训练</strong>成了标配：大部分计算用 fp16/bf16，关键处保 fp32。但天下没有免费午餐——降精度会带来<strong>数值风险</strong>（溢出、下溢、舍入误差），理解并驯服这些风险，正是本模块前半的核心。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：fp32 像用高精度的尺子量东西，准但笨重；fp16 像用刻度粗一点的尺子，轻快但量不了太大或太小的东西（范围窄），还容易读不准最后一位（精度低）。混合精度的智慧是：<strong>大批量的粗活用粗尺子（快），少数要命的精细活换回精尺子（准）</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：一个浮点数把位分给<strong>指数</strong>（决定<span class="term">dynamic range</span>动态范围）和<strong>尾数</strong>（决定相对精度）。fp16 是 1+5+10（范围窄、精度尚可），bf16 是 1+8+7（范围与 fp32 同、精度低）。范围窄是 fp16 训练的命门——梯度太小会<strong>下溢成 0</strong>（梯度消失），这就是 loss scaling 要解决的问题。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块前半：<strong>混合精度 = 用低精度算（快、省显存）+ 用技巧补偿低精度的数值缺陷（loss scaling、fp32 主权重）</strong>。本模块 notebook 会用 numpy<strong>模拟 fp16 的舍入与溢出</strong>，亲手看到梯度如何下溢消失、loss scaling 如何把它救回来——这些在真实 GPU 上是 <code>autocast</code>+<code>GradScaler</code> 自动做的，但你要看清它在做什么。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="formats"><span class="num">2</span>IEEE 754：fp16 vs bf16</h2>
+  <h3>IEEE 754：fp16 vs bf16 的取舍</h3>  <p>要理解混合精度的风险，得先看清三种格式如何分配它们的 16/32 个比特：</p>  <table>
+    <thead><tr><th>格式</th><th>符号+指数+尾数</th><th>动态范围（约）</th><th>机器精度 eps（约）</th><th>特点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>fp32</strong></td><td>1 + 8 + 23</td><td>1e±38</td><td>1e-7</td><td>范围精度都够，但占 4 字节</td></tr>
+      <tr><td><strong>fp16</strong></td><td>1 + 5 + 10</td><td><strong>6e-5 ~ 65504</strong></td><td>1e-3</td><td><strong>范围窄</strong>！梯度易上溢/下溢 → 需 loss scaling</td></tr>
+      <tr><td><strong>bf16</strong></td><td>1 + 8 + 7</td><td>1e±38（同 fp32）</td><td>8e-3</td><td>范围大（<strong>通常免 loss scaling</strong>），但精度低</td></tr>
+    </tbody>
+  </table>  <p>关键对比是 fp16 与 bf16：两者都是 16 位，但<strong>把比特花在了不同地方</strong>。fp16 多给尾数（精度），却只留 5 位指数——能表示的最大数约 65504，最小正规数约 6e-5，范围窄得危险。bf16 干脆把指数对齐到 fp32 的 8 位（范围几乎相同），代价是尾数只剩 7 位（精度低）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么 bf16 后来居上成了大模型训练的主流？因为训练里最怕的不是「精度差一点」，而是「数值溢出/下溢导致 NaN 或梯度消失」。bf16 的大范围让它<strong>基本不溢出、不需要 loss scaling</strong>，训练稳得多；精度低一点，神经网络的鲁棒性大多能扛住。<em>范围比精度更重要</em>——这是混合精度的一条重要经验。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：动态范围 ≈ 2^(指数位决定)，机器精度 eps ≈ 2^(-尾数位)。fp16 指数 5 位 → 范围 ~2^15 量级（故 max≈65504）；bf16 指数 8 位 → 范围 ~2^127（与 fp32 同）。深度学习的梯度常常很小（1e-4 ~ 1e-8），在 fp16 的 6e-5 下限附近就开始<strong>成片下溢成 0</strong>；bf16 则游刃有余。这就是为什么 fp16 必须配 loss scaling，而 bf16 通常不必。</p></div>
+  </div>  <p>一个常被忽略的细节会在 notebook 里现身：fp16 还有<strong>次正规数（subnormal）</strong>。最小<em>正规</em>数是 ~6.1e-5，但靠损失精度，fp16 能用次正规表示到更小的 ~6e-8——所以 <code>1e-7</code> 的梯度其实<em>勉强活着</em>（次正规），而 <code>1e-8</code> 才真正被冲成 0。这解释了为什么「fp16 下溢」不是一刀切在 6e-5，而是个渐变的过程：先损失精度（进入次正规）、再彻底归零。工程上这无关紧要（次正规又慢又不准），结论不变——小梯度在 fp16 里岌岌可危，需要 loss scaling 把它们拉回正规范围。</p>  <p>把「为什么小更新会被吃掉」用 fp16 的尾数位算一遍，机制就具体了。fp16 尾数 10 位，意味着在 <code>1.0</code> 附近，能分辨的最小间隔（一个 ulp）≈ <code>2^-10 ≈ 1e-3</code>；更一般地，在量级 <code>2^e</code> 处，相邻可表示数的间隔是 <code>2^(e-10)</code>。所以任何<strong>比当前值小约 1000 倍以上的加项，都落进同一个量化格、被直接舍掉</strong>：</p>  <div class="ascii">fp16 的「大数吃小数」(尾数 10 位 → 相对分辨率 ~1e-3)：
+  0.1  + 1e-7   --fp16--&gt;  0.1     ❌ 1e-7 远小于 0.1 的 ulp(~1e-4)，被吃
+  1.0  + 5e-4   --fp16--&gt;  1.0     ❌ 5e-4 &lt; 1.0 的 ulp(~1e-3)，被吃
+  1.0  + 2e-3   --fp16--&gt;  1.002   ✅ 超过一个 ulp，留住了
+启示: 参数(~0.1) + 微小更新(lr·grad ~1e-7) 在 fp16 里 == 没更新
+      → 必须在 fp32 主权重上累积更新（见第 4 节）</div>  <p>这正是后面「fp32 主权重」配方的数值动因：更新量 <code>lr·grad</code> 常比权重小 4~7 个数量级，在 fp16 里<strong>整段落在权重的一个 ulp 之内</strong>，加了等于没加；只有把更新累积在 fp32（尾数 23 位、ulp 小得多）上，这些微小增量才不会被舍入吞掉。一个「精度不够」的细节，直接决定了混合精度的整套架构。</p>  <p>本模块 notebook 会用 numpy 的 <code>float16</code> 实测这些边界：把一个 fp32 数转成 fp16 看舍入误差、把一个小梯度转 fp16 看它如何下溢成 0、把一个大数转 fp16 看它如何上溢成 inf、再现上面的「大数吃小数」。你会亲眼看到「同一个数，fp32 没事、fp16 出事」——这是混合精度一切技巧的动机。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="scaling"><span class="num">3</span>Loss scaling：救回下溢的梯度</h2>
+  <h3>Loss scaling：把梯度从下溢里救回来</h3>  <p>fp16 训练最致命的问题是<strong>梯度下溢</strong>：反向传播算出的梯度常常很小（量级 1e-4 到 1e-7），落在 fp16 的最小正规数（~6e-5）附近或以下，于是被<strong>舍入成 0</strong>——梯度消失，参数不再更新，训练悄悄失败（不报错！）。<span class="term">loss scaling</span>（损失缩放）是一个简单而精妙的对策。</p>  <p>核心思路：反向传播是<strong>线性</strong>的（梯度对 loss 线性）。所以如果在反向<em>之前</em>把 loss 乘一个大常数 <code>S</code>（如 1024、65536），那么所有梯度都会同比<strong>放大 S 倍</strong>——把它们从 fp16 的下溢区<strong>推到可表示的范围</strong>里。等梯度算完、转回 fp32 之后，再<strong>除以 S</strong>还原，更新参数。一放一缩，数值上完全等价，却避开了下溢。</p>  <div class="math-block">\[\text{反向前：}\ L' = S\cdot L\ \Rightarrow\ \nabla' = S\cdot\nabla\quad(\text{放大，逃离下溢})\qquad\text{更新前：}\ \nabla = \nabla'/S\quad(\text{还原})\]</div>  <div class="ascii">梯度量级 ~1e-8（fp16 含次正规, 下限 ~6e-8, 更小则冲成 0）：
+  不缩放:  1e-8  --转fp16--&gt;  0.0      ❌ 梯度消失，参数不动
+  ×S=65536: 6.6e-4 --转fp16--&gt; 6.6e-4   ✅ 落在可表示范围
+            反向后 /S 还原 --&gt;  1e-8    ✅ 数值等价，但没丢</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>记一句话：<strong>loss scaling 把梯度临时『撑大』到 fp16 看得见的范围，算完再缩回来</strong>。放大和缩小相互抵消，对最终更新量没有影响——它纯粹是为了让中间的 fp16 表示不丢信息。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>S 怎么选？太小，下溢没救够；太大，梯度会<strong>上溢成 inf</strong>（fp16 上限 65504）。实践用<strong>动态 loss scaling</strong>（<code>GradScaler</code> 的默认）：遇到梯度出现 inf/nan（S 太大溢出了）就<strong>跳过本步更新、把 S 减半</strong>；连续若干步正常就<strong>把 S 翻倍</strong>试探更大的安全值。这样 S 自动跟着训练动态调整。</p></div>
+  </div>  <p>注意 bf16 通常<strong>不需要</strong>loss scaling——它的大动态范围让 1e-7 量级的梯度也能直接表示，不会下溢。这是 bf16 相对 fp16 在工程上的一大便利，也是它成为主流的原因之一。本模块 notebook 会模拟：一个小梯度在 fp16 下如何消失、loss scaling 如何救回、S 过大如何又上溢，并实现一个<strong>动态 loss scaler</strong>（遇 inf 减半、平稳翻倍）的判断逻辑。</p>  <div class="callout danger"><span class="label">下溢与上溢的双悬崖</span>
+    <p>loss scaling 走在<strong>两道悬崖之间</strong>：下面是下溢（S 太小，梯度成片归 0、训练停滞却<em>不报错</em>），上面是上溢（S 太大，梯度超 65504 变 <code>inf</code>，再与有限值相减还会冒出 <code>nan</code>）。动态 scaler 的精妙正在于<strong>把 S 顶到「快上溢但还没溢」的位置</strong>——一旦本步梯度里检出 <code>inf</code>/<code>nan</code> 就<strong>丢弃这步、S 减半</strong>（梯度已被污染，更新它只会把 nan 写进权重）；连续稳定若干步就 S 翻倍，重新逼近上界。实现时务必<strong>先检查 inf/nan、确认干净后再 unscale 并更新</strong>；顺序反了，nan 会先一步污染参数，整个训练当场报废。这是 fp16 训练最容易翻车、也最值得在 notebook 里亲手复现的一处。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="recipe"><span class="num">4</span>混合精度的完整配方</h2>
+  <h3>混合精度的完整配方</h3>  <p>把上面拼起来，就是 Micikevicius 等 2018 提出、至今通用的<strong>混合精度训练配方</strong>。它不是「全部用 fp16」，而是一套精心的混合：</p>  <ol>
+    <li><strong>fp32 主权重（master weights）</strong>：保留一份 fp32 的参数副本。这是<em>权威</em>的参数。</li>
+    <li><strong>前向/反向用半精度</strong>：把权重转成 fp16/bf16 副本，用它算前向和反向（快、省显存、省带宽）。</li>
+    <li><strong>loss scaling（仅 fp16）</strong>：反向前乘 S、还原时除 S，防梯度下溢（bf16 通常跳过这步）。</li>
+    <li><strong>在 fp32 主权重上更新</strong>：把（还原后的）梯度转 fp32，在 fp32 主权重上做优化器更新。</li>
+  </ol>  <div class="callout danger"><span class="label">为什么要 fp32 主权重</span>
+    <p>为什么必须保留 fp32 主权重、在它上面更新？因为参数更新量 <code>lr · grad</code> 常常<strong>比权重本身小几个数量级</strong>（如权重 0.1、更新 1e-7）。如果直接在 fp16 权重上加这个微小更新，会被 fp16 的<strong>舍入吃掉</strong>——<code>0.1 + 1e-7</code> 在 fp16 里就等于 <code>0.1</code>，等于没更新。保留 fp32 主权重，让这些微小更新在 fp32 里<em>累积</em>起来，才不会丢失。这是混合精度里最容易被忽略、却最关键的一环。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：你用「粗尺子」（fp16）干快活（前向反向），但把「真账本」（fp32 主权重）记在精尺子上。每次更新都更新真账本，再从真账本复制一份粗尺子版去算下一轮。这样既享受了 fp16 的速度，又不让微小的更新在粗尺子上丢掉。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>显存代价：fp32 主权重 + fp16 计算副本，参数显存其实<em>略增</em>（多了一份）。但激活（前向中间结果，往往是显存大头）用 fp16 减半，且 fp16 算力翻倍、带宽减半，总体仍是大赚。这也引出本模块后半的主题——<strong>激活显存</strong>才是大模型显存的真正大头，需要专门的招数（checkpointing）来对付。</p></div>
+  </div>  <p>PyTorch 把这套配方封装成 <code>torch.autocast</code>（自动为每个算子选精度：matmul/conv 用半精度、softmax/loss/规约用 fp32）+ <code>GradScaler</code>（自动 loss scaling）。你只需几行就能开启混合精度，但理解它内部在做这四步，才知道出问题时（NaN、不收敛）该查哪里——这正是本模块要给你的。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="memory"><span class="num">5</span>激活显存与显存账</h2>
+  <h3>激活显存与显存账</h3>  <p>训练一个模型，显存到底花在哪？算一笔<strong>显存账</strong>，是判断「能不能放进卡」「该怎么省」的基础。训练时的显存峰值由四部分构成：</p>  <table>
+    <thead><tr><th>显存项</th><th>大小（量级）</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><strong>参数 parameters</strong></td><td>P</td><td>模型权重本身</td></tr>
+      <tr><td><strong>梯度 gradients</strong></td><td>P</td><td>每个参数一个梯度，与参数同样大</td></tr>
+      <tr><td><strong>优化器状态 optimizer state</strong></td><td>2P ~ 3P</td><td>Adam 存一阶+二阶矩（2P），加 fp32 主权重，可达 3P</td></tr>
+      <tr><td><strong>激活 activations</strong></td><td><strong>∝ batch × seq × layers</strong></td><td>前向中间结果，为反向保留 —— 常是大头，且随 batch/序列/层数线性增长</td></tr>
+    </tbody>
+  </table>  <p>一个反直觉但关键的事实：对大模型、长序列、大 batch，<strong>激活显存常常超过参数+梯度+优化器状态的总和</strong>。因为参数相关的部分（前三项）是固定的（≈4P~5P），而激活随 <code>batch × seq_len × hidden × layers</code> 增长——序列一长、batch 一大，激活就爆炸。这就是为什么长上下文、大 batch 训练特别吃显存。</p>  <div class="math-block">\[\text{显存峰值}\ \approx\ \underbrace{P + P + kP}_{\text{参数+梯度+优化器(固定)}}\ +\ \underbrace{A(\text{batch},\text{seq},\text{layers})}_{\text{激活(可变,常是大头)}}\]</div>  <p>算一笔具体的账，体会比例。一个 <code>P=1B</code>（10 亿参数）的模型，用 Adam、fp32 训练：参数 4GB、梯度 4GB、Adam 两个矩 8GB——光<strong>参数相关就 16GB</strong>（≈16P 字节，因为 fp32 是 4 字节、Adam 是 2 份矩）。这还没算激活。若 batch=8、序列=2048、48 层，激活轻松再吃几十 GB——于是一张 40GB 的 A100 连个 1B 模型都未必训得动。这正是为什么大模型训练<strong>必须</strong>上混合精度（参数项减半、激活减半）+ checkpointing（激活再砍）+ 分片（参数项摊到多卡）的组合拳。</p>  <p>显存峰值发生在<strong>反向传播开始的那一刻</strong>：此时参数、梯度、优化器状态都在场，且前向产生的<em>全部</em>激活都还留着（反向要用）。理解这个峰值的构成，就知道每种省显存手段在省哪一块：混合精度把激活（和计算副本）减半；<strong>梯度检查点</strong>专砍激活这一项；ZeRO/FSDP（C08）把参数+梯度+优化器状态分片到多卡。本模块 notebook 会把这笔账用 numpy 算出来——给定模型规模、batch、序列长，估算显存峰值，并看每种手段省了多少。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="ckpt"><span class="num">6</span>Gradient checkpointing：算力换显存</h2>
+  <h3>Gradient checkpointing：用算力换显存</h3>  <p>既然激活是显存大头，能不能<strong>少存激活</strong>？<span class="term">gradient checkpointing</span>（梯度检查点 / 激活重算）给出了一个漂亮的答案：<strong>反向需要哪个激活，就在反向时重新算它，而不是前向时存它</strong>。</p>  <p>朴素反向需要<em>所有</em>层的前向激活（用来算梯度），显存 O(L)（L 层）。checkpointing 的做法是：前向只保存少数几个<strong>检查点</strong>处的激活（如每 √L 层存一个），其余丢弃；反向走到某段时，从最近的检查点<strong>重新前向</strong>算出该段的激活，用完再丢。这样激活显存从 O(L) 降到 O(√L)，代价是<strong>多做约一次额外的前向计算</strong>。</p>  <div class="ascii">朴素: 前向存下全部 L 层激活           显存 O(L)，反向不重算
+  [x0]→[x1]→[x2]→...→[xL]   全部留着
+
+checkpoint: 只存 √L 个检查点          显存 O(√L)，反向重算段内
+  [x0]→ . → . →[x_ck]→ . → . →[xL]   只留●，反向时从●重算○
+  时间代价 ≈ 多一次前向；显存省 ≈ √L 倍</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：与其把做菜每一步的半成品都摆在台面上占地方（存全部激活），不如只留几个关键节点的半成品，需要中间某步时<strong>从最近的节点重做几步</strong>。台面（显存）清爽了，代价是有些步骤要做两遍（多花时间）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上是经典的<strong>时间-空间权衡</strong>（Chen 等 2016）。设 L 层，每 <code>k</code> 层放一个检查点：激活显存 ∝ <code>k + L/k</code>（段内激活 + 检查点数），在 <code>k=√L</code> 时最小，得 O(√L)。额外计算 ≈ 一次前向（每段重算一遍）。这是用大约 33% 的额外时间，换来平方根级的显存节省——对训得起更大模型/更长序列，极其划算。</p></div>
+  </div>  <p>checkpointing 其实是一条<strong>光谱</strong>的一端，另一端是「全存」（朴素反向）。两端之间，你可以选择存多少：存得多则显存大、重算少；存得少则显存小、重算多。更激进的一端是<strong>可逆网络</strong>（RevNet）——把层设计成数学上可逆，于是激活能从<em>输出反推</em>出来、几乎不用存（连检查点都省）；代价是网络结构受限、反推也是计算。再加上前沿的<strong>激活量化存储</strong>（把激活压成 fp8/int8 存、反向时解压），整个谱系都是同一个主题的变奏：<strong>在「存 vs 算 vs 压」之间为激活找最省的表示</strong>。checkpointing 是其中最简单通用、收益最稳的一招，故成了标配。</p>  <p>本模块 notebook 会实现这个权衡的计算：给定层数 L 和检查点间隔 <code>k</code>，算出<strong>激活显存</strong>与<strong>额外计算量</strong>，并验证 <code>k=√L</code> 附近显存最省；还会用一个玩具的「分段重算」模拟，确认<strong>重算得到的激活与原始前向逐位一致</strong>（重算不改结果，只换执行方式——和模块 02 融合的「保语义」一个道理）。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="reality"><span class="num">7</span>工程现实与陷阱</h2>
+  <h3>工程现实与陷阱</h3>  <p>混合精度与显存优化在生产中有不少坑，了解它们能让你训练更稳：</p>  <ul>
+    <li><strong>哪些算子该留 fp32</strong>：<code>autocast</code> 默认让 matmul/conv 走半精度，但 softmax、loss、LayerNorm、规约（求和大量数）留 fp32——因为这些对精度/范围敏感，半精度会累积误差或溢出。理解这个清单，才知道为什么 autocast 不是「全 fp16」。</li>
+    <li><strong>loss scaling 调不好</strong>：S 太小仍下溢、太大则上溢。动态 scaler 偶尔会因连续溢出反复跳步、训练停滞。bf16 免这个麻烦，是它更省心的原因。</li>
+    <li><strong>checkpointing 的非确定性</strong>：重算若涉及 dropout/随机，必须<strong>用相同随机种子重放</strong>，否则重算的激活与原前向不一致、梯度算错。框架（<code>torch.utils.checkpoint</code>）会处理 RNG 状态，但自定义时要小心。</li>
+    <li><strong>显存碎片与缓存</strong>：实测显存常高于理论账（分配器碎片、缓存未释放）。OOM 不一定是「总量超了」，可能是碎片化。<code>torch.cuda.empty_cache</code>、调分配器策略是手段。</li>
+    <li><strong>精度与收敛</strong>：极少数模型在 fp16/bf16 下收敛变差（敏感的归一化、极端 logits）。对策是把敏感模块强制 fp32、或用 fp8 时配更精细的 per-tensor scaling（前沿）。</li>
+  </ul>  <p>一个统一的判断：<strong>混合精度和 checkpointing 都是『用一种便宜资源换一种贵资源』</strong>——混合精度用「一点精度」换「算力+显存+带宽」，checkpointing 用「一点算力（重算）」换「大量显存」。做哪个取舍，取决于你卡在哪：缺算力就别过度 checkpoint，缺显存就上 checkpoint + 混合精度。这又回到模块 00 的瓶颈三分法——先知道瓶颈，再选省哪种资源。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>fp8 与更低精度训练</strong>：Hopper 起支持 fp8（E4M3/E5M2）。如何在 8 位下稳定训练（per-tensor/per-block scaling、混合 fp8/bf16）是前沿。再往下还有 int4/fp4 推理（与 C27 量化交叉）。</li>
+    <li><strong>显存-计算权衡的自动化</strong>：checkpointing 放哪几层、用什么精度，目前多靠经验。能否让编译器/调度器<em>自动</em>在给定显存预算下选最优重算策略（与模块 02 编译、C08 并行交叉），是活跃方向。</li>
+    <li><strong>激活压缩与可逆网络</strong>：除了重算，还能压缩激活（量化存储）或用<strong>可逆网络</strong>（激活可从输出反推、几乎不存）来省激活显存。各有精度/适用性的权衡。</li>
+    <li><strong>分布式显存</strong>：ZeRO/FSDP 把参数+梯度+优化器状态分片到多卡，配合 checkpointing 和混合精度，是训练超大模型的组合拳（C08 详述）。如何最优地协同这几种手段仍在演进。</li>
+    <li><strong>数值稳定性的理论</strong>：低精度训练何时收敛、何时发散，缺乏好的理论刻画。loss scaling 的最优策略、bf16 的精度损失对最终模型质量的影响，仍多靠实证。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Micikevicius 等 2018《Mixed Precision Training》（fp16 + 主权重 + loss scaling 的奠基配方）、Chen 等 2016《Training Deep Nets with Sublinear Memory Cost》（checkpointing 原始论文）、Kalamkar 等 2019《A Study of BFLOAT16》（bf16 为何免 loss scaling）、Horace He《Making DL Go Brrrr》（瓶颈三分）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_jax_xla/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · JAX/XLA 函数式与变换</div></a>
+    <a class="next" href="../05_profiling_debugging/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 性能剖析与调试</div></a>
+  </div>
+
+</div>
+</body>
+</html>

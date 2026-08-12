@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 结构化工具调用</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 结构化工具调用</h1>
+  <p class="subtitle">给 LLM 装上手 —— JSON Schema 工具定义、参数解析与校验、并行工具调用、错误处理与重试；从零写工具注册表 + 校验器 + 分发器，对接 MockLLM 跑通一个 ReAct 回路</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、JSON 与 JSON Schema 基本概念、Python 函数与异常</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_function_calling.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Anthropic tool use 文档、ReAct (Yao 2022)、Toolformer (Schick 2023)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么工具调用是 agent 的承重墙</a></li>
+      <li><a href="#deftool">工具定义：带 schema 的菜单</a></li>
+      <li><a href="#roundtrip">一次工具调用的完整往返</a></li>
+      <li><a href="#validate">参数校验：第一道防线</a></li>
+      <li><a href="#dispatch">分发：路由到真实函数</a></li>
+      <li><a href="#parallel">并行工具调用</a></li>
+      <li><a href="#retry">错误处理与重试</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么工具调用是 agent 的承重墙</h2>
+  <p>一个 LLM 本身只会做一件事：给定一段文本，预测接下来的文本。它不能联网、不能读你的文件、不能跑代码、不能查数据库——它<strong>没有手</strong>。<strong>工具调用（function calling / tool use）</strong>就是给它装上手：约定一种格式，让模型在该用外部能力时，输出一个<em>结构化的工具调用</em>（工具名 + 参数），由我们的代码执行后把结果喂回去。</p>  <p>这件事看似简单，却是<strong>整个 agent 大厦的承重墙</strong>。模型要改变世界、要获取训练数据之外的新信息，唯一通道就是工具调用。搜索、代码执行、文件读写、数据库、浏览器、乃至下一模块 MCP 接进来的任意系统——在模型眼里都是「工具」。所以把这一次「模型说要调工具 → 我们执行 → 结果回喂」的往返做扎实、做鲁棒，是后面一切的地基。</p>  <p>这里有一个常被忽视的概念分层，先说清楚：模型<strong>永远不直接执行任何东西</strong>。它只是输出一段文本，这段文本恰好被格式化成「我想调 get_weather，参数是 city=北京」。真正去执行 <code>get_weather</code> 的，是<em>我们写的代码</em>（scaffold）；模型只是<strong>提出请求</strong>，执行与否、怎么执行、结果如何回传，全在我们掌控。理解这条边界至关重要：它意味着安全护栏、参数校验、权限控制都发生在<em>模型之外</em>（我们这一侧），模型再怎么「想」调危险工具，只要我们的分发器不放行，就调不成——这是模块 05 安全防线的根基，也是为什么本课把 scaffold 而非模型当主角。</p>  <p>本模块的目标是<strong>从零写出工具调用的完整 scaffold</strong>：工具如何定义（含参数的 JSON Schema）、模型的调用如何被解析、参数如何校验、如何分发到真实函数、如何处理<strong>并行调用</strong>、以及如何在出错时<strong>重试而非崩溃</strong>。我们用 MockLLM 当模型，把整条链路端到端跑通——你会看到，真实 Anthropic / OpenAI 的接口不过是给这套逻辑换了字段名。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>工具调用 = 给 LLM 一份「菜单」（工具定义），它点菜（输出调用），你下厨（执行），再把菜端回去（结果回喂）</strong>。本模块的全部工程，都是在让这套点菜-下厨-上菜的流程<em>不出错、能并发、出错能恢复</em>。难点不在「调用模型」那一行 API，而在它两侧的解析、校验与分发。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="deftool"><span class="num">2</span>工具定义：带 schema 的菜单</h2>
+  <h3>工具定义：给模型一份带 schema 的菜单</h3>  <p>一个工具定义包含三部分，缺一不可：<strong>名称</strong>（模型用它指代要调谁）、<strong>自然语言说明</strong>（模型靠它判断何时该调、参数什么意思）、以及<strong>参数的 JSON Schema</strong>（约束参数的类型、必填、取值）。三者里说明与 schema 的质量，直接决定模型调得对不对。</p>  <pre><code># 一个工具定义（贴近 Anthropic 形状；OpenAI 把 input_schema 叫 parameters）
+{
+  "name": "get_weather",
+  "description": "查询某城市当前天气。当用户询问天气时调用。",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "city": {"type": "string", "description": "城市名，如 北京"},
+      "unit": {"type": "string", "enum": ["c", "f"], "description": "温标"}
+    },
+    "required": ["city"]
+  }
+}</code></pre>  <p>这段 <span class="term">JSON Schema</span> 是契约：它告诉模型「city 是必填字符串、unit 只能是 c 或 f」，也告诉我们的校验器「该挡住什么」。注意 <code>required</code> 与 <code>enum</code> ——前者保证必填字段不缺，后者把取值锁死在合法集合里。一个写得好的 schema，能从源头大幅减少模型给出非法参数的概率（配合 strict 结构化输出更甚）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把工具定义想成给新来的实习生写的「报销单填写说明」：哪些栏必填、金额要填数字、币种只能选人民币或美元。说明写得越清楚、表单约束越严，实习生填错的概率越低，你事后核对的负担越小。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，工具定义是模型 prompt 的一部分（通常拼在 system 或专门的 tools 字段里）。模型据此决定 <code>tool_choice</code>：是不调（none）、自己看着办（auto）、必须调某个（any/tool）。本课的 MockLLM 用规则模拟这个决策，但<strong>解析、校验、分发</strong>这些下游环节与真实模型完全一致——这正是 scaffold 可迁移的原因。</p></div>
+  </div>  <p>一个容易被忽视的点：<strong>工具定义是写给模型看的，不是写给人看的</strong>。description 要从「模型在什么情形下、凭什么判断该调它、参数怎么填」的角度写，而不是堆术语。Anthropic / OpenAI 的最佳实践都强调：把「何时调用」写进 description，比只写「这个工具做什么」能显著提升调用准确率——这一点在 notebook 的真实 schema 胶囊里会有体感。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="roundtrip"><span class="num">3</span>一次工具调用的完整往返</h2>
+  <h3>一次工具调用的完整往返</h3>  <p>有了菜单，看一次完整的「点菜-上菜」长什么样。以 Anthropic 形状为例，一次往返跨<strong>两条消息</strong>：</p>  <div class="ascii">① 我们 -&gt; 模型：  [用户问题] + [工具定义清单]
+② 模型 -&gt; 我们：  assistant 消息，content 里含一个 tool_use 块
+        { type:'tool_use', id:'tu_01', name:'get_weather', input:{city:'北京'} }
+③ 我们执行 get_weather(city='北京') -&gt; '晴 26°C'
+④ 我们 -&gt; 模型：  user 消息，content 里含一个 tool_result 块
+        { type:'tool_result', tool_use_id:'tu_01', content:'晴 26°C' }
+⑤ 模型 -&gt; 我们：  assistant 消息（文本）：『北京今天晴，26 度』  -&gt; 结束</div>  <p>几个关键约定要记死：<strong>①</strong> 每个 tool_use 块有唯一 <code>id</code>；<strong>②</strong> 回传的 tool_result 必须用 <code>tool_use_id</code> 和它配对（多调用时靠它对号入座）；<strong>③</strong> 工具执行失败时，tool_result 带 <code>is_error: true</code> 把错误<em>作为内容回传给模型</em>，让模型决定改参数重试还是换路——而不是在我们这边抛异常中断。</p>  <p>这条往返就是 <span class="term">ReAct</span> 范式（Yao 2022）的最小单元：模型「想」（可能先输出一段思考）、「行动」（输出 tool_use）、看「观察」（tool_result）、再想……把它放进一个循环，就是一个能多步使用工具的 agent。本模块的 notebook 会把这个循环从零写出来，跑通「问 → 调工具 → 拿结果 → （可能再调）→ 回答」。</p>  <p>回头看模块 00 那张感知-动作循环图，这条往返恰好填满了它的一整圈：<strong>tool_use 是「动作」、tool_result 是「观察」、模型的下一次输出是基于新观察的再决策</strong>。一次往返是一圈，多次往返就是 agent 多步地与世界交互。所以掌握这一节，等于掌握了 agent 循环里<em>信息如何在模型与环境之间流动</em>的全部骨架——后面的 MCP（换一种方式接入工具）、computer use（换一种观察与动作）、agentic RL（用这些往返产生的轨迹训练模型），都没有跳出这个骨架，只是替换了其中某一段。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个新手常踩的坑：把工具执行的异常直接抛出去中断整个 agent。正确做法是<strong>捕获异常、包成带 is_error 的 tool_result 回喂给模型</strong>。模型看到「city 参数无效」这样的错误信息，往往能自己改对再调一次。<em>让错误成为模型的观察，而非程序的崩溃</em>——这是 agent 鲁棒性的分水岭。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="validate"><span class="num">4</span>参数校验：第一道防线</h2>
+  <h3>参数校验：scaffold 的第一道防线</h3>  <p>模型给的参数<strong>不可全信</strong>：它可能漏填必填字段、给错类型（该是数字给了字符串）、给出枚举外的值、甚至调用一个根本不存在的工具（工具幻觉）。在把参数交给真实函数执行<em>之前</em>，必须用 schema 校验它们。校验不过，应当回一个清晰的错误让模型改，而不是让非法参数进到 <code>os.remove(path)</code> 里酿成事故。</p>  <p>一个最小但够用的 JSON Schema 校验器要查这几件事：</p>  <ul>
+    <li><strong>工具存在</strong>：模型给的 name 在注册表里吗？不在 → 报「未知工具」（挡住工具幻觉）。</li>
+    <li><strong>必填齐全</strong>：<code>required</code> 里的字段都给了吗？缺 → 报「缺少字段 X」。</li>
+    <li><strong>类型正确</strong>：每个字段的值匹配它声明的 <code>type</code> 吗（string/integer/number/boolean/object/array）？</li>
+    <li><strong>枚举合法</strong>：声明了 <code>enum</code> 的字段，给的值在集合里吗？</li>
+    <li><strong>无多余字段</strong>（可选，严格模式）：给了 schema 里没声明的字段吗？</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>校验器就是门口的保安：检查证件（必填）、看证件类型对不对（type）、确认人在白名单上（enum/已知工具）。不合格的当场拦下并说清原因（「缺工牌」），而不是放进去再出事。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，校验是把模型输出的 <code>input</code> 对象与工具的 <code>input_schema</code> 逐字段比对。JSON Schema 本身远比这复杂（嵌套、anyOf、format……），但 agent 实践里<strong>80% 的价值来自这五项基础检查</strong>。本模块 notebook 从零实现它们；真实系统则常用现成的 schema 校验库或模型的 strict 模式从生成侧保证。</p></div>
+  </div>  <p>一个关于类型校验的小陷阱值得单独点出：在 Python 里 <code>bool</code> 是 <code>int</code> 的子类，<code>isinstance(True, int)</code> 为真。所以校验 integer / number 时若不先把 bool 排除，模型给的 <code>True</code> 会被误当成合法整数放行。这类「看似对、实则错」的边界，正是为什么校验器要从零亲手写一遍才有体感——notebook 的第 2 节会专门处理它。类似的暗礁还有：JSON 里没有整数/浮点之分（都是 number），所以 integer 校验在跨语言时要格外小心；以及空字符串、null 是否算「缺失」也需明确约定。</p>  <p>校验的产物不只是「过/不过」，更重要的是<strong>可读的错误信息</strong>。「city 字段缺失」「unit 必须是 c 或 f 之一，你给了 k」这种信息回喂给模型，命中率远高于一句笼统的「参数错误」。把校验器设计成「失败时返回精确诊断」，等于给了模型自我修正的钩子——这与人类看到清晰报错才改得快，是同一个道理。<strong>好的错误信息是 agent 自愈能力的一半</strong>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="dispatch"><span class="num">5</span>分发：路由到真实函数</h2>
+  <h3>分发：把调用路由到真实函数</h3>  <p>校验通过后，要把「工具名 + 参数」路由到对应的 Python 函数执行——这叫<strong>分发（dispatch）</strong>。核心数据结构是一个<span class="term">工具注册表</span>：把「工具名 → (可执行函数, schema)」存成一张表，模型给名字，我们查表执行。</p>  <pre><code># 工具注册表 + 分发（极简）
+REGISTRY = {}                     # name -&gt; {'fn':..., 'schema':...}
+def register(name, fn, schema):
+    REGISTRY[name] = {'fn': fn, 'schema': schema}
+
+def dispatch(call):               # call = {'name':..., 'input':{...}}
+    name = call['name']
+    if name not in REGISTRY:
+        return {'is_error': True, 'content': f'未知工具: {name}'}
+    ok, err = validate(call['input'], REGISTRY[name]['schema'])
+    if not ok:
+        return {'is_error': True, 'content': err}
+    try:
+        result = REGISTRY[name]['fn'](**call['input'])
+        return {'is_error': False, 'content': str(result)}
+    except Exception as e:        # 执行期错误也包成 tool_result
+        return {'is_error': True, 'content': f'{type(e).__name__}: {e}'}</code></pre>  <p>注意分发器的<strong>纪律</strong>：无论是未知工具、校验失败、还是执行抛异常，它都<strong>不向上抛错</strong>，而是统一返回一个 tool_result（带 is_error 标记）。这把「错误」从「程序崩溃」降级为「模型的一次观察」，让上层的 agent 循环可以平滑地继续——模型据此重试或换路。这是把脆弱的 demo 变成鲁棒 agent 的关键转变。</p>  <p>注册表这个抽象还带来一个工程上的好处：<strong>解耦</strong>。工具的「定义」（给模型看的 schema）、「实现」（真正执行的函数）、「调度」（循环逻辑）被分到三处，互不纠缠。加一个新工具，只需写函数 + schema、register 一下，循环代码一行不改；换掉某个工具的实现（比如把假天气换成真 API），注册表外的一切照旧。这种「统一的调用形状 + 可插拔的工具」正是规模化的关键——当工具从 3 个涨到 300 个时，是注册表而非 if-else 链让系统不崩。下一模块的 MCP 把这个思想推到极致：连「工具从哪来」都标准化成一套协议。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>注册表 + 分发器 = 把 LLM 的「自然语言意图」翻译成「确定性的函数执行」的那座桥。它有意把每个工具都收敛成同一个调用形状（名字 + 参数对象 → tool_result），于是无论 3 个工具还是 300 个，循环逻辑都不变——这也是 MCP（下一模块）能把工具规模化的前提。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="parallel"><span class="num">6</span>并行工具调用</h2>
+  <h3>并行工具调用</h3>  <p>模型常在<strong>一次响应里同时请求多个互不依赖的工具调用</strong>——比如「同时查北京和上海的天气」。这叫 <span class="term">parallel tool calls</span>，是省往返、降延迟的重要能力。处理它有两条铁律：</p>  <ol>
+    <li><strong>并发执行</strong>：多个无依赖的调用可以同时跑（本课用顺序执行模拟，逻辑相同；真实系统用线程/异步并发）。</li>
+    <li><strong>结果合并回传</strong>：把本轮<em>所有</em>调用的 tool_result 放进<strong>同一条</strong> user 消息里一次性回传。</li>
+  </ol>  <div class="callout danger"><span class="label">并行结果必须合在一条消息</span>
+    <p>最容易出错、也最隐蔽的一点（Anthropic 文档明确警示）：<strong>绝不要把多个 tool_result 拆成多条消息分开回传</strong>。一次响应里的 N 个 tool_use，必须对应一条 user 消息里的 N 个 tool_result。拆开回传会<em>悄悄训练模型以后少做并行调用</em>——它「学到」并行的结果会被割裂，于是退回低效的串行。错误不报，但能力慢慢退化，极难排查。</p>
+  </div>  <p>分发器只要能接收一个调用列表、对每个调用复用单次分发逻辑、把结果按 <code>tool_use_id</code> 一一配对返回即可。配对靠 id：模型给的每个 tool_use 有唯一 id，回传的每个 tool_result 用 tool_use_id 指回去——这样即使结果乱序、即使有的成功有的失败，模型也能<strong>对号入座</strong>知道哪个结果对应哪个调用。</p>  <p>并行还带来一个错误处理的细节：<strong>部分失败</strong>。三个调用里一个失败两个成功，正确做法是把三个 tool_result 都回传（失败那个带 is_error），<em>一个都不能少</em>——漏掉失败那个，模型会以为它从没发生，逻辑就乱了。notebook 会专门验证「部分失败时结果数量与配对仍然正确」。</p>  <p>一个值得建立的判断：<strong>不是所有调用都该并行</strong>。并行的前提是「互不依赖」——同时查两座城市的天气可以并行，但「先查用户 id，再用这个 id 查订单」就有依赖、必须串行。现实里模型自己会判断哪些能并行、哪些要串行（并把有依赖的拆成多轮）。scaffold 这一侧的职责很纯粹：<strong>模型说要并行的（一次响应里的多个 tool_use），就忠实地并发执行并合并回传</strong>；至于该不该并行，是模型的决策、是提示工程与训练的范畴，不在本模块的工程边界内。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="retry"><span class="num">7</span>错误处理与重试</h2>
+  <h3>错误处理与重试</h3>  <p>真实工具会失败：网络抖动、服务 5xx、超时、限流。这类<strong>瞬时错误</strong>往往再试一次就好；而参数非法、未知工具这类<strong>确定性错误</strong>重试一万次也没用。区分这两类、对前者重试、对后者直接回错让模型改，是 agent 工程的基本功。</p>  <p>重试的标准做法是<span class="term">指数退避（exponential backoff）</span>：第一次失败等 1 个单位、第二次等 2 个、第三次等 4 个……每次翻倍，再叠加一点随机抖动，避免大量 agent 在同一时刻一起重试把服务再次打垮（惊群）。</p>  <div class="math-block">\[\text{wait}_k = \text{base}\times 2^{\,k}\times(1+\text{jitter}),\qquad k=0,1,2,\dots\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打电话占线：第一次马上重拨、第二次等一会、第三次等更久——而不是疯狂连拨。对方真的不存在（号码错了）就别拨了，先去核对号码。区分『占线（可重试）』和『空号（别重试）』是关键。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上要做两个判断：<strong>可重试性</strong>（错误属于瞬时类吗？通常按错误类型/HTTP 状态码判：5xx/超时可重试，4xx 参数类不可）与<strong>重试上限</strong>（试 N 次仍失败就放弃，把最终错误回喂给模型）。本课用一个确定性的「前 K 次失败、第 K+1 次成功」的假工具来验证重试逻辑——无需真网络，就能断言「恰好重试了几次」「最终成功」。</p></div>
+  </div>  <p>把重试放在哪一层也有讲究：放在<strong>分发器内部</strong>（对单个工具调用透明重试），还是放在<strong>agent 循环外部</strong>（让模型看到失败、自己决定重试）？两者并用最稳——瞬时基础设施错误在分发层透明吞掉（模型不必关心网络抖动），而任务层面的失败（工具说「找不到该用户」）则回喂给模型，由它在更高层决策。本模块 notebook 实现分发层的退避重试；模型层的「反思后重试」在模块 04 的 Reflexion 思路里再深入。</p>  <p>最后强调一个贯穿全模块的设计哲学：<strong>agent 工程的鲁棒性，几乎全部来自「正确地对待错误」</strong>。未知工具、参数非法、执行抛异常、瞬时故障——这些不是「异常情况」，而是 agent 运行中的<em>常态</em>。一个能用的 agent 与一个 demo 的区别，往往不在顺利路径写得多漂亮，而在每一类错误是否都有明确归属：哪些挡在执行外（校验失败）、哪些透明重试（瞬时）、哪些回喂给模型自愈（任务级失败）、哪些直接终止（重试用尽）。把这张「错误处置表」想清楚、用 assert 一条条验证它确实生效，就是本模块最该带走的工程素养。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>从提示到训练（Toolformer 之后）</strong>：工具使用最初靠提示，Schick 2023 证明它可被训练进模型本身；如今前沿模型把工具调用作为原生能力训练。如何让模型在<em>成百上千个工具</em>里准确选择（而非塞满上下文），催生了 tool search、检索式工具加载等方向。</li>
+    <li><strong>结构化输出的可靠性</strong>：strict 模式 / 受约束解码能从生成侧保证参数合法，但与思维链、流式、复杂 schema 的兼容仍在演进。「既要模型自由推理、又要输出严格符合 schema」是活跃的工程前沿。</li>
+    <li><strong>动作空间的设计</strong>：固定 JSON 工具调用 vs 让模型直接写可执行代码当动作（CodeAct, Wang 2024）。代码动作表达力更强、能组合，但执行与安全更复杂——动作空间该多结构化，没有定论。</li>
+    <li><strong>并行与依赖</strong>：模型如何判断哪些调用可并行、哪些有依赖必须串行？让模型生成「调用计划图」（DAG）而非线性调用序列，是提升复杂任务效率的探索方向。</li>
+    <li><strong>工具调用的可观测与归因</strong>：当一个 agent 调了几十个工具后给出错误结果，是哪一步的工具用错了？把工具调用做成可追踪、可归因的，是评测与调试 agent 的基础设施难题（与模块 05 相通）。</li>
+    <li><strong>工具安全与权限</strong>：模型可能被诱导调用危险工具（删除、转账、外发），或被工具返回里的注入劫持。如何在分发层施加最小权限、对高危动作要求确认、把工具返回当数据而非指令——是把工具调用从「能用」推向「敢放生产」的关键，模块 05 专门展开。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Anthropic tool use 文档（接口与并行/错误约定）、ReAct（Yao 2022，循环范式）、Toolformer（Schick 2023，工具能力可训练）、CodeAct（Wang 2024，代码动作）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_mcp/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · MCP 模型上下文协议</div></a>
+  </div>
+
+</div>
+</body>
+</html>

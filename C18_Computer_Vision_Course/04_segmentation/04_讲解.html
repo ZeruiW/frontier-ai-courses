@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 图像分割</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 图像分割</h1>
+  <p class="subtitle">语义 vs 实例、Dice/mIoU、Otsu 阈值/连通域标记、U-Net 编解码思想、类不平衡——纯 numpy 从零实现指标与最简分割管线</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01 形态学、模块 03 的 IoU；集合运算；numpy</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_segmentation.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Long FCN、Ronneberger U-Net、He Mask R-CNN、Milletari V-Net（Dice）、Chen DeepLab</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#task">分割任务：每像素一个标签</a></li>
+      <li><a href="#metric">分割指标：IoU 与 Dice</a></li>
+      <li><a href="#simple">最简分割：阈值与连通域</a></li>
+      <li><a href="#unet">编解码与 U-Net 的核心思想</a></li>
+      <li><a href="#imbalance">类不平衡与分割损失</a></li>
+      <li><a href="#metricnum">把指标算对：批量与边界情形</a></li>
+      <li><a href="#pipeline">完整分割管线与实例化</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="task"><span class="num">1</span>分割任务：每像素一个标签</h2>
+  <p><span class="term">semantic segmentation</span>（语义分割）把识别的粒度推到了极致：不再给整图一个标签（分类）、也不再给物体一个框（检测），而是给<strong>每一个像素</strong>都分配一个类别标签，最终输出一张与输入图<strong>同分辨率</strong>的标签图。它回答的问题是最细的——「这张图上的每一个点，到底属于什么」。这类「输出和输入同样稠密」的任务统称<strong>稠密预测</strong>（dense prediction），分割是其中最典型的代表，深度估计、光流、超分辨率也都属于这一家族，共享同一套编解码骨架。</p>  <p>分割本身又分两个层次，区别在于<strong>是否区分同类的不同个体</strong>。<span class="term">semantic segmentation</span>（语义分割）只关心类别：草地上的三只羊会被全部标成「羊」、连成一整片，分不出彼此；而 <span class="term">instance segmentation</span>（实例分割）则要把每个个体单独切出来——羊1、羊2、羊3 各自一张 <span class="term">mask</span>（掩码），即使它们紧挨在一起。二者还能合并成<strong>全景分割</strong>（panoptic segmentation：不可数的背景按语义标、可数的前景物体按实例标，一张图同时给出两种粒度）。本课聚焦语义分割的指标与最简方法，并在最后用连通域把语义掩码切成实例，让你亲手走通「从语义到实例」这关键一步，建立对三种粒度的完整直觉。</p>  <div class="ascii">三种输出粒度对比（同一张图）：
+  分类:   '有羊'                    （整图一个标签）
+  检测:   [羊:框1][羊:框2][羊:框3]   （每个物体一个框）
+  语义分割: 每像素∈{羊,草,天空}        （羊都连成一片，不分个体）
+  实例分割: 羊1掩码 羊2掩码 羊3掩码    （每个个体一张掩码）</div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住分割：它就是「<strong>逐像素分类</strong>」——可以想成对图上每一个像素都做一次模块 02 讲的分类，只不过要做成千上万次、且要保持空间连贯。它的核心张力在于两个目标的拉扯：既要<strong>语义对</strong>（这一大片到底是不是羊，这需要看大范围的上下文），又要<strong>边界准</strong>（羊和草的分界精确到哪一个像素，这需要高分辨率的细节）。看大范围会丢细节、保细节又看不远——这对矛盾贯穿本模块，也是 U-Net（第 4 节）要解决的核心问题。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="metric"><span class="num">2</span>分割指标：IoU 与 Dice</h2>
+  <p>分割的好坏，本质上由「预测掩码」与「真值掩码」的重合程度来衡量，而衡量两个像素集合重合度的两个核心指标，都建立在最朴素的集合运算（交、并）之上。第一个是<strong>逐类 IoU</strong>——它和模块 03 检测里的 IoU 是同一个量、同一套直觉，区别只在于这里作用于<em>像素集合</em>而非边界框。它等价于用 TP/FP/FN（真正例/假正例/假负例像素数）写出来的形式：</p>  <div class="math-block">\[\mathrm{IoU}_c=\frac{|P_c\cap G_c|}{|P_c\cup G_c|}=\frac{TP}{TP+FP+FN}\]</div>  <p>其中 <code>P_c</code>、<code>G_c</code> 分别是预测和真值中被标为类别 c 的像素集合，交集就是预测对的像素（TP）。第二个常用指标是 <span class="term">Dice coefficient</span>（Dice 系数，也叫 F1 在像素上的对应），它给交集加了双倍权重：</p>  <div class="math-block">\[\mathrm{Dice}_c=\frac{2|P_c\cap G_c|}{|P_c|+|G_c|}=\frac{2\,TP}{2\,TP+FP+FN}\]</div>  <p>IoU 和 Dice 用的是同一套 TP/FP/FN，因此两者<strong>单调一一对应</strong>：<strong>Dice = 2·IoU/(1+IoU)</strong>——知道一个就能算出另一个，排序也完全一致，不存在「IoU 高但 Dice 低」的情况。它们真正的区别在权重：<strong>Dice 把交集 TP 算了两遍</strong>，相对地降低了 FP/FN 的惩罚，所以对<strong>前景很小、类别极不平衡</strong>的场景更敏感、更温和。这正是为什么病灶往往只占几个像素的医学分割（V-Net 等）普遍偏爱 Dice；而 Cityscapes、PASCAL VOC 这类自然图像基准则用 <span class="term">mIoU (mean IoU)</span>（各类 IoU 的平均）作为总指标。两者你都要会算、会读。</p>  <table>
+    <thead><tr><th>指标</th><th>公式</th><th>特点</th><th>常见场景</th></tr></thead>
+    <tbody>
+      <tr><td>逐类 IoU</td><td>TP/(TP+FP+FN)</td><td>严格，惩罚假正/假负对称</td><td>语义分割</td></tr>
+      <tr><td>mIoU</td><td>各类 IoU 平均</td><td>抗类不平衡的总指标</td><td>Cityscapes/VOC</td></tr>
+      <tr><td>Dice</td><td>2TP/(2TP+FP+FN)</td><td>对小前景更友好</td><td>医学影像</td></tr>
+      <tr><td>pixel accuracy</td><td>对的像素/总像素</td><td>会被大背景类主导，易骗人</td><td>仅作辅助</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p><strong>像素准确率（pixel accuracy）几乎不能单独用来评分割</strong>，这是初学者最常踩的坑。设想一张图 95% 的像素是背景，那么一个什么都不会、「无脑全预测背景」的模型，像素准确率就高达 95%，看起来很漂亮，实际却一个前景物体都没分割出来。这和模块 02 分类、模块 03 检测里反复出现的类不平衡，是同一个陷阱的不同化身。正确做法是<strong>必须报告 mIoU 或 per-class 的 IoU/Dice</strong>——它们只看前景的重合度、不被海量背景稀释，才能真实反映分割质量。只给一个像素准确率，是不专业的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="simple"><span class="num">3</span>最简分割：阈值与连通域</h2>
+  <p>不靠深度网络，最简单的分割方法是 <span class="term">thresholding (Otsu)</span>（阈值分割）：选定一个灰度阈值，比它亮的像素算前景、比它暗的算背景，一刀切完事。真正的难点不在切，而在<strong>怎么自动选出那个阈值</strong>。Otsu（大津法）给了一个优雅的准则：把图像直方图想成前景、背景两堆像素，遍历所有可能的阈值，选使<strong>两类之间的类间方差最大</strong>（在总方差固定下，这等价于让两类各自的类内方差之和最小）的那一个——直觉就是让前景和背景被分得<em>最开</em>、最不混。</p>  <div class="math-block">\[t^*=\arg\max_t\ \omega_0(t)\,\omega_1(t)\,\big(\mu_0(t)-\mu_1(t)\big)^2\]</div>  <p>式中 <code>ω_0,ω_1</code> 是阈值 t 把像素切成两类后各自的占比、<code>μ_0,μ_1</code> 是两类的灰度均值；两类占比之积乘以均值差的平方，正好度量了「两堆分得有多开」。Otsu 只能处理「前景与背景灰度本身可分」的简单图（光照不均、纹理复杂就会失效），但它无需任何参数、计算极快，是理解分割的最佳起点，实践中也常作为深度分割的预处理或后处理的一环。</p>  <p>阈值给出的只是一张<strong>语义掩码</strong>——它告诉你哪些像素是前景，但同类的不同物体若挨在一起，仍连成一片、分不出个数。要把语义掩码切成一个个<strong>实例</strong>，就用 <span class="term">connected components</span>（连通域标记）：把二值前景里彼此<strong>相邻</strong>的像素聚成一组、每组给一个唯一编号。这里有个关键选择——<strong>邻接定义</strong>：4 邻接只算上下左右四个方向相邻，8 邻接还把四个对角也算相邻。实现上常用<strong>并查集</strong>（union-find，扫描时合并相邻像素的集合）或<strong>泛洪填充</strong>（flood fill，从一个种子像素 BFS/DFS 蔓延），两者都能在近线性时间标完整张图。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>连通域标记就像给「连在一起的一整片」涂上同一个颜色：从任意一个还没涂色的前景像素出发，把所有能走到（相邻、且同样是前景）的像素都涂成同一个编号；涂不动了，再换一个还没涂的前景像素、用一个新编号重来。全部涂完后，用了几个编号就有几个独立物体——这就是实例计数。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>一个容易被忽略的细节是邻接定义会直接改变结果：4 邻接和 8 邻接给出的实例数可能不同，比如只在对角相连的两小块，在 8 邻接下被算作一个连通体、在 4 邻接下却算两个。选哪种取决于任务语义（细胞计数常用 8 邻接以免把一个细胞拆开）。连通域是<strong>从语义分割走到实例分割</strong>的最朴素桥梁；真实的实例分割（如 Mask R-CNN）则不靠它，而是直接为每个检测框单独预测一张掩码。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块的实践串成一条清晰的链条：<strong>Otsu 阈值（得到语义掩码）→ 形态学开运算（去掉散点毛刺，直接复用模块 01）→ 连通域标记（把语义掩码切成一个个实例）→ 算 IoU/Dice/mIoU（对真值评估）</strong>。这条全程纯 numpy 的管线，恰好把模块 01 的低层视觉和本模块的分割评估串成了一个有机整体——每一环你都亲手写过、都能 assert 验证。notebook 会从零实现连通域标记，并在已知物体数的合成图上验证实例计数完全正确。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="unet"><span class="num">4</span>编解码与 U-Net 的核心思想</h2>
+  <p>深度语义分割天生要解决一个结构性矛盾，理解它就理解了整个 U-Net 家族的设计动机。一方面，<strong>要判断一个像素属于什么类，需要很大的感受野</strong>——只看一个像素的颜色无法区分「天空的蓝」和「水的蓝」，必须看周围一大片上下文，而扩大感受野的标准手段是反复<strong>下采样</strong>（池化/strided conv），代价是分辨率越降越低。另一方面，<strong>逐像素预测又要求输出保持高分辨率</strong>，不能把空间细节丢光，否则边界全糊。这两个需求在分辨率上直接冲突。<span class="term">encoder-decoder</span>（编码器-解码器）结构就是为化解这个矛盾而生的标准答案：</p>  <div class="ascii">编码器-解码器 (U-Net 形)：
+  输入 ──► [conv下采样] ──► [conv下采样] ──► 瓶颈(高层语义,低分辨率)
+   高分辨率   │  跳连↘        │  跳连↘            │
+             │              │                  ▼
+  输出 ◄── [conv上采样] ◄── [conv上采样] ◄──────┘
+         逐像素标签   ↑融合编码器细节   ↑融合编码器细节
+        (= 输入分辨率)  (skip connection 把高分辨率特征接过来)</div>  <p><span class="term">FCN</span>（Fully Convolutional Networks，Long 2015）是深度语义分割的开山之作，它的关键一步是把分类网络末端的全连接层换成卷积层，于是网络不再要求固定输入尺寸、能直接输出一张逐像素的预测图——「把分类网改造成稠密预测网」。但 FCN 上采样太粗、边界糊。<span class="term">U-Net</span>（Ronneberger 2015）在编解码骨架上补了灵魂一笔——<span class="term">U-Net / skip connection</span>（跳连）：把编码器每一层的<strong>高分辨率特征，横跨过去直接拼接到解码器对应层</strong>。这样一来，解码器在每一级都同时拿到了两样东西：从瓶颈传上来的「高层语义（知道这是什么）」，和从跳连接过来的「未经下采样的精细边界（知道边在哪）」。两者一融合，第 1 节那个「语义 vs 分辨率」的矛盾就被漂亮地化解了。正因如此，U-Net 至今仍是医学影像分割乃至一切稠密预测任务（深度估计、超分、扩散模型去噪网络）的奠基结构。</p>  <p>解码器要把瓶颈处的低分辨率特征一步步放大回原图尺寸，这一步叫 <span class="term">transposed convolution / upsampling</span>（转置卷积 / 上采样），有几种实现：<strong>转置卷积</strong>（可学习的放大，权重训练得到，但易产生棋盘格伪影）、<strong>双线性插值</strong>（固定、平滑、无参数）、以及 <strong>unpooling</strong>（记住下采样时最大值的位置再放回去）。现代分割（如 DeepLab）还用<strong>空洞卷积</strong>（atrous/dilated conv）在不下采样的前提下扩大感受野，是另一条调和「语义 vs 分辨率」的思路。本课不训练 U-Net（那需要深度学习框架与 GPU），而是聚焦从零实现<strong>分割指标和最简分割管线</strong>，并把 U-Net 为何这样设计讲透——理解结构动机比堆代码更重要。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把 U-Net 浓缩成一句话：<strong>下采样负责「看懂」（聚拢上下文、提炼语义），上采样负责「画准」（恢复到原分辨率），跳连负责把「看懂」过程中被丢掉的高分辨率细节重新还回来</strong>。这个「编码—解码 + 跳连」骨架极其通用，后来被几乎所有稠密预测任务原样借用——深度估计、光流、图像超分、乃至扩散模型里负责去噪的那个网络，骨架都是它。学透 U-Net，等于一次性看懂了一大类网络。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="imbalance"><span class="num">5</span>类不平衡与分割损失</h2>
+  <p>分割训练有一个比分类更尖锐、且几乎无法回避的难题：<span class="term">class imbalance</span>（类不平衡）极端。在大多数图里，<strong>背景像素常占 90% 甚至 99% 以上</strong>，而前景——尤其是小目标和只有一两像素宽的边界——占比微乎其微。如果直接用朴素的逐像素交叉熵，海量的背景像素会主导整个损失和梯度，模型很快发现「不管三七二十一全预测背景」就能把损失压得很低，于是前景被彻底忽略、分割结果一塌糊涂。这就是为什么分割普遍不用裸交叉熵，而要换成专门对抗不平衡的损失：</p>  <ul>
+    <li><strong>加权交叉熵</strong>（weighted CE）：给少数类（前景）乘上更大的权重，平衡各类对梯度的贡献。最简单直接，但权重需要按类频率调，是个超参。</li>
+    <li><strong>Dice loss</strong>（= 1 − Dice）：直接把评测指标 Dice 当损失来优化，<strong>天然对类不平衡鲁棒</strong>——因为它的分子分母里只含前景的 TP/FP/FN，背景再多也不进入计算、不会稀释信号。是医学分割的标配损失（出自 V-Net）。</li>
+    <li><strong>Focal loss</strong>：源自检测里的 RetinaNet，通过一个调制因子<strong>压低「一眼就分对」的容易像素</strong>（绝大多数背景）的权重，让模型把学习火力集中到难分的边界像素上，对分割同样有效。</li>
+  </ul>  <div class="math-block">\[\mathcal{L}_{\text{Dice}}=1-\frac{2\sum_i p_i g_i+\epsilon}{\sum_i p_i+\sum_i g_i+\epsilon}\]</div>  <p>这个公式有两个关键细节。其一是<strong>软 Dice</strong>：它把模型输出的预测概率 <code>p_i∈[0,1]</code>（而非 0/1 硬掩码）直接代入，于是损失对参数<strong>可微</strong>、能反向传播——硬阈值会让梯度处处为零、无法训练。其二是分子分母里都加了一个小常数 <code>ε</code>，专门防止当预测和真值都为空（小图里某类完全不出现）时出现 <code>0/0</code> 的除零崩溃。实践中常把交叉熵和 Dice loss <strong>相加</strong>，兼顾「每个像素分类对」（CE）和「整块区域重合好」（Dice）两个目标。</p>  <div class="callout danger"><span class="label"></span>
+    <p>类不平衡是分割里<strong>最常见的隐形失败源</strong>，危险就在于它会被平均值掩盖：你看到的 mIoU 也许还不错，但拆开逐类看，某个小前景类（比如「交通灯」「行人」）的 IoU 可能干脆是 0——它被几个大类（路面、天空）的高分在平均里悄悄稀释掉了，你光看总分完全察觉不到这个类已经全军覆没。所以评测分割模型时<strong>务必逐类看 per-class IoU/Dice</strong>，并特别盯住那些小目标、稀有类。只盯一个 mIoU 均值，会漏掉「小类全崩」这种严重问题——这正是评测科学家该替团队把关的地方。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="metricnum"><span class="num">6</span>把指标算对：批量与边界情形</h2>
+  <p>分割指标的公式看着简单（就是 TP/FP/FN 的几个比值），但真正<strong>从零实现到一个数据集上</strong>时，魔鬼全在细节里。IoU 和 Dice 在「某类不存在」「掩码全空」「多类怎么平均」「多图怎么汇总」这些边界情形上稍有不慎，就会算出 NaN 或悄悄用错口径，得到一个看似合理、实则错误的分数。本节把 notebook 里必须正确处理的几个陷阱集中列出来——它们是分割评测出错的高发区，也是评测科学家审别人代码时第一眼要查的地方。</p>  <table>
+    <thead><tr><th>情形</th><th>正确处理</th><th>错了会怎样</th></tr></thead>
+    <tbody>
+      <tr><td>某类在图中完全不存在(P=G=∅)</td><td>约定 IoU=1 或跳过该类不计入均值</td><td>算出 0/0=NaN，污染 mIoU</td></tr>
+      <tr><td>预测全空 / 真值全空</td><td>Dice 分母加 ε，或定义为 1</td><td>除零崩溃</td></tr>
+      <tr><td>多类 mIoU</td><td>逐类算 IoU 再平均(macro)</td><td>把所有类混算成一个，被大类主导</td></tr>
+      <tr><td>批量多图</td><td>逐图逐类累加 TP/FP/FN 再算</td><td>先平均每图 IoU 再平均≠正确口径</td></tr>
+    </tbody>
+  </table>  <p>有一个最容易被忽视、却会让两套实现对不上数的口径选择：<strong>到底是先把全数据集的 TP/FP/FN 累加起来、再算一次 IoU（micro / dataset-level），还是每张图各算一个 IoU、再把这些 IoU 平均（per-image）</strong>？这两种算法在数值上<em>不相等</em>，而文献里两种都有人用。Cityscapes 等主流基准用前者（micro），因为它更稳——不会让一张只有几个前景像素的小图，因为分母小而把噪声放大成一个极端的 IoU、再去污染平均值。结论很明确：<strong>比较不同方法时，IoU/mIoU 的汇总口径必须完全一致</strong>，否则数字没有可比性。</p>  <p>还要分清 <span class="term">mIoU (mean IoU)</span> 里的「mean」到底对谁平均——它是<strong>对类别</strong>平均（macro，每个类不论大小都占等权一票），而不是对像素平均。这个设计是刻意为抗类不平衡服务的：每类等权，小类（哪怕只有几十个像素）的 IoU 也不会被大类（几十万像素）在平均里淹没掉，从而逼着模型把每一类都做好。notebook 会从零实现逐类 IoU、mIoU、Dice 三个指标，并专门构造空类、全空预测等边界用例来测试它们不会崩成 NaN。</p>  <div class="callout warn"><span class="label"></span>
+    <p>NaN 是分割指标实现里的头号杀手：只要有某个类在某张图里完全不存在，IoU 的分子分母同时为 0，就会算出 <code>0/0</code>，而<strong>一个 NaN 混进去，整个 mIoU 的平均值就全变成 NaN</strong>、前功尽弃。所以动手实现指标时，第一件要想清楚的事永远是<strong>空集怎么处理</strong>——是跳过该类不计入平均、约定 IoU=1、还是给分母加一个小 ε。这个决定必须显式、一致，不能留给浮点运算去碰运气。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">7</span>完整分割管线与实例化</h2>
+  <p>现在把本模块所有零件串成一条<strong>纯 numpy、端到端、可验证</strong>的分割加评估管线。它的每一步都复用了你前面亲手写过的东西——Otsu 阈值得到语义掩码、模块 01 的形态学开运算清理散点、连通域标记切出实例、最后用 IoU/Dice/mIoU 对真值打分。整条流水从一张灰度图一路走到一组分割指标，中间没有任何黑盒：</p>  <div class="ascii">纯 numpy 分割管线：
+  灰度图 ──►【Otsu 阈值】──► 二值语义掩码
+                              │
+                              ▼
+        【形态学开运算】去散点(模块01) ──► 干净掩码
+                              │
+                              ▼
+        【连通域标记】4/8 邻接 ──► 实例掩码(每个物体一个编号)
+                              │
+                              ▼
+        【IoU / Dice / mIoU】对真值评估 ──► 指标</div>  <p>这条管线虽简单，却完整覆盖了「语义分割 → 实例化 → 评估」的全流程，且每个零件你都从零写过。真实系统把前两步换成 U-Net（学到的语义掩码），把连通域换成实例分支（Mask R-CNN），但<strong>评估那一段——IoU/Dice/mIoU——和你写的完全一样</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>可以把这条管线当成「分割的 hello world」：用最朴素的零件，跑通从一张原始图到一组评估指标的全程，先在脑子里建立一个完整、不留黑盒的心智模型。等以后换上深度模型（U-Net、Mask R-CNN），你会清楚地知道屏幕上每一个数字是怎么算出来的、在什么情况下该信哪个指标、哪个指标又会骗人。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从评测科学家的视角看，这条管线最大的价值在于它<strong>处处可验证</strong>：每一步的输出都能用 assert 严格检查——掩码必须是二值、连通域算出的实例数必须等于已知的物体数、IoU 必须落在 [0,1]、Dice 必须严格满足 Dice=2·IoU/(1+IoU)。先在这种已知真值的合成数据上把每个指标写对、把每条数学性质验过，再拿去评估真实分割模型，你才不会被一个悄悄变成 NaN 的 mIoU、或一个用错口径的分数蒙混过去。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>再点一条贯穿模块 02–04 的评测主线，值得反复回味：<strong>分类看混淆矩阵、检测看 mAP、分割看 mIoU/Dice</strong>——三个任务的指标名字各不相同，但拆到底层，全都是 TP（真正例）、FP（假正例）、FN（假负例）这三个计数的不同组合方式。一旦把这套「先数对 TP/FP/FN、再按需要组合」的逻辑彻底吃透，你会发现几乎所有 CV 评测口径都触类旁通、不必再死记硬背一堆公式。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>分割在过去十年从 FCN/U-Net 的卷积编解码，一路演进到 Transformer 与「分割一切」的基础模型，但远未走到尽头。标注昂贵（逐像素描边是最贵的标注之一）、边界评测粗糙、3D 与视频的时序一致性，都是仍在攻坚的方向。下面几条是当前最活跃的前沿，理解它们能帮你判断手头任务该用经典管线、训一个 U-Net、还是直接调用基础模型：</p>  <ul>
+    <li><strong>统一分割（panoptic / SAM）</strong>：全景分割统一语义+实例；Segment Anything（SAM）用 prompt 实现零样本分割任意物体，把分割推向「基础模型」范式。</li>
+    <li><strong>Transformer 分割</strong>：SegFormer、Mask2Former 用注意力替代卷积编解码，统一语义/实例/全景，是当下 SOTA 路线。</li>
+    <li><strong>少标注分割</strong>：分割标注极贵（逐像素描边），弱监督（只用图像级标签/框/点）、半监督、自监督预训练分割是热点。</li>
+    <li><strong>评测口径的精细化</strong>：mIoU 对边界误差不敏感（大块对了边界糊也高分），boundary IoU、PQ（全景质量）等更细的指标被提出；如何评「边界准不准」仍有空间。</li>
+    <li><strong>3D / 视频 / 医学分割</strong>：体数据（CT/MRI）、视频时序一致分割各有挑战，Dice 等指标向 3D 推广。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：<strong>Long FCN</strong>（深度语义分割开山）、<strong>Ronneberger U-Net</strong>（编解码 + 跳连，本模块核心）、<strong>He Mask R-CNN</strong>（实例分割）、<strong>Milletari V-Net</strong>（Dice loss）、<strong>Chen DeepLab</strong>，详见 <code>references.md</code>。下一模块跳出「有标签」的世界——自监督地学视觉表示。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_detection/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 目标检测</div></a>
+    <a class="next" href="../05_self_supervised/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 自监督视觉</div></a>
+  </div>
+
+</div>
+</body>
+</html>

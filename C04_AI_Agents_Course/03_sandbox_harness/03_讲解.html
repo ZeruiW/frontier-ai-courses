@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 沙箱、轨迹与 agent harness</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 9</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 沙箱、轨迹与 agent harness</h1>
+  <p class="subtitle">Sandbox, Trajectory &amp; Harness —— 评测基础设施：把"agent 跑了一次"变成可隔离、可审计、可复现的科学实验</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–02（tool use / ReAct 循环）、Python subprocess 基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_sandbox_harness.ipynb（纯标准库，无需模型）</div></div>
+    <div class="item"><div class="k">核心资料</div><div class="v">METR Task Standard / Vivaria (2024)、UK AISI Inspect (2024)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么 agent 必须进沙箱</a></li>
+      <li><a href="#ladder">隔离层级阶梯：subprocess → container → VM → air-gapped</a></li>
+      <li><a href="#metr">METR Task Standard 解剖：任务即标准包</a></li>
+      <li><a href="#trajectory">轨迹即证据：事件模型与完整性要求</a></li>
+      <li><a href="#replay">确定性与重放：录制-重放测试法</a></li>
+      <li><a href="#timeout">超时、重试与部分失败：评测口径要先定</a></li>
+      <li><a href="#metering">资源计量：token、成本与墙钟时间</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么 agent 必须进沙箱</h2>
+
+  <p>模块 02 里你写的 ReAct agent 还只能调用我们手工注册的安全工具。但真正有用的 agent ——编码 agent、计算机操作 agent ——必须能<strong>执行任意代码</strong>。这一步跨出去，性质就变了：</p>
+
+  <p><strong>能执行代码的 agent = 能搞坏环境的 agent。</strong>它可以删文件、占满磁盘、发起网络请求、修改自己的评测脚本。这不需要假设任何"恶意"——模型只要在解一个任务时犯傻（比如把清理命令的路径写错），宿主机就遭殃。因此<span class="term">沙箱（sandbox）</span>不是可选的工程优化，而是 agent 评测的前提条件。</p>
+
+  <p>容易被忽略的是：沙箱的动机有两个，<strong>安全只是其一，另一半是科学性</strong>。评测对环境提出了三条硬要求：</p>
+
+  <ul>
+    <li><strong>隔离（isolation）</strong>：agent 的副作用不能逃出边界——既保护宿主机，也保护评测本身（agent 不能读到评分脚本或参考答案）。</li>
+    <li><strong>可重置（resettable）</strong>：第 $i$ 次 run 不能看到第 $i-1$ 次 run 留下的文件、进程、缓存。否则各次 run 不再独立，pass@k、方差估计全部失真。</li>
+    <li><strong>可复现（reproducible）</strong>：今天跑和三个月后跑，环境逐字节一致（固定镜像、固定依赖版本），分数才可比、回归才可查。</li>
+  </ul>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>沙箱就是一个"随便弄坏、坏了就扔"的隔离工作区：agent 在里面想干嘛干嘛，干完我们把它整个删掉、按同一份模板重建一个全新的。这样每次实验的起点一模一样，agent 闯了祸也波及不到外面。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>沙箱定义了一个状态空间受限的环境 $E$、一条副作用不可穿越的隔离边界，以及一个重置算子 $\mathrm{reset}:E\to E_0$，保证每个 episode 都从同一初始状态 $E_0$ 出发。这使得多次 run 的结果可视为对同一分布的独立采样，统计量（成功率、方差、置信区间）才有定义。</p>
+    </div>
+  </div>
+
+  <div class="callout danger"><span class="label"></span>
+  不重置环境是 agent 评测最常见的低级灾难之一：上一次 run 留下的中间产物让下一次 run "莫名其妙地成功"（状态泄漏），或者残留进程占着端口让后续全部失败。更隐蔽的是<strong>评测信息泄漏</strong>——如果评分函数、参考答案或其他任务的解放在 agent 可读的路径里，能力分数会被系统性高估。设计沙箱时要把"agent 会主动翻文件系统"当作默认假设。</div>
+
+  <p>承载这一切的程序叫 <span class="term">harness</span>（评测脚手架）：它负责搭环境、把任务指令交给 agent、转发工具调用、记录所有事件、计时计费、调用评分函数、回收环境。本章的 notebook 会带你从零写一个最小但五脏俱全的 harness。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="ladder"><span class="num">2</span>隔离层级阶梯：subprocess → container → VM → air-gapped</h2>
+
+  <p>隔离不是有或无，而是一道阶梯。每上一级，防御面更宽、成本更高。选哪级取决于<strong>威胁模型</strong>：你评的是温顺的小模型写排序算法，还是 frontier 模型的自主复制能力？</p>
+
+  <div class="ascii">
+  隔离强度 ──────────────────────────────────────────────────────────►
+
+  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+  │ subprocess  │  │  container   │  │      VM      │  │  air-gapped  │
+  │ + timeout   │  │   (Docker)   │  │ (hypervisor) │  │  (物理隔离)   │
+  │ + rlimit    │  │ namespace +  │  │  独立 kernel  │  │  无网络/独立  │
+  │ + tmpdir    │  │   cgroups    │  │              │  │    硬件      │
+  └─────────────┘  └──────────────┘  └──────────────┘  └──────────────┘
+   共享: 一切        共享: 宿主kernel   共享: 物理硬件      共享: 几乎无
+   防: 跑飞/刷屏     防: 文件系统/网络   防: kernel 漏洞    防: 数据外渗
+   本章 notebook     SWE-bench/Inspect  METR Vivaria      最高风险评测
+  </div>
+
+  <table>
+    <thead><tr><th>层级</th><th>机制</th><th>防住什么</th><th>漏掉什么</th><th>成本</th></tr></thead>
+    <tbody>
+      <tr><td><strong>subprocess</strong><br>+ timeout/rlimit</td><td>子进程 + 超时 kill + 资源上限 + 临时工作目录</td><td>死循环、输出爆炸、超时挂死；配合 tmpdir 实现"可重置"</td><td>几乎不防恶意：子进程仍以你的用户身份访问全盘文件与网络</td><td>≈0，毫秒级启动</td></tr>
+      <tr><td><strong>container</strong><br>(Docker)</td><td>Linux namespace（fs/pid/net 视图隔离）+ cgroups（CPU/内存配额）</td><td>文件系统越界、端口冲突、资源滥用；镜像 = 可复现环境的标准载体</td><td>与宿主<strong>共享 kernel</strong>：内核漏洞、配置失误（privileged、挂载 docker.sock）可致逃逸</td><td>低，秒级启动</td></tr>
+      <tr><td><strong>VM</strong></td><td>hypervisor 硬件虚拟化，guest 跑独立 kernel</td><td>绝大多数容器逃逸路径；可整机快照/回滚</td><td>hypervisor 逃逸（罕见但存在）、侧信道；网络若放行仍可外联</td><td>中，启动慢、资源占用大</td></tr>
+      <tr><td><strong>air-gapped</strong></td><td>物理断网、独立硬件、人工传递数据</td><td>数据外渗、自主复制、对外攻击——网络向的威胁基本封死</td><td>人这个环节（社会工程、操作失误）、隐蔽信道</td><td>极高，运维以"次"计</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  记一条选型口诀：<strong>subprocess 防事故，container 防越界，VM 防逃逸，air-gap 防外渗。</strong>本章 notebook 用 subprocess 级沙箱教 harness 的<em>结构</em>（接口、轨迹、重放在任何隔离级别上都一样）；生产评测中 SWE-bench 用 Docker 一题一容器 [Jimenez 2023]，METR 的 Vivaria 在虚拟机里跑任务并精细控制网络访问 [METR 2024]。</div>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>网络是单独一根轴</strong>，与上述阶梯正交：一个 Docker 容器若放行了外网，模型可以下载工具、查题解，甚至把数据发出去——隔离级别再高也被这条通道击穿。所以 METR Task Standard 把网络权限做成任务的<strong>显式声明</strong>（见下一节），评测报告也必须注明任务是否允许联网，否则分数不可比。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="metr"><span class="num">3</span>METR Task Standard 解剖：任务即标准包</h2>
+
+  <p>有了沙箱，下一个问题是：<strong>"一个任务"到底是什么？</strong>如果每个研究者都用自己的脚本、自己的目录约定、自己的评分写法，任务就无法交换、无法复跑、无法审计。METR 给出的答案是 <span class="term">Task Standard</span> [METR 2024]：把任务定义成一个自包含的标准包——</p>
+
+  <div class="ascii">
+  一个 Task Standard 任务包
+  ┌────────────────────────────────────────────────────────┐
+  │  环境镜像 (Dockerfile / 基础镜像)                          │
+  │    └── 依赖、数据、初始文件 —— 可复现的 E₀                  │
+  │  TaskFamily (Python 类)                                  │
+  │    ├── get_tasks()           # 一族任务的参数化变体          │
+  │    ├── get_instructions(t)   # 给 agent 的自然语言指令       │
+  │    ├── start(t)              # 启动时布置环境(写入文件等)     │
+  │    ├── score(t, submission)  # 评分函数 → [0,1] 或 None     │
+  │    └── get_permissions(t)    # 资源/权限声明(如 full_internet)│
+  └────────────────────────────────────────────────────────┘
+        ▲ 任务作者只写这个包                  ▼ 平台(Vivaria)负责其余
+  搭环境 · 注入指令 · 转发 agent 行动 · 记录轨迹 · 计分 · 回收
+  </div>
+
+  <p>四个组成部分各司其职：</p>
+  <ul>
+    <li><strong>镜像</strong>：环境的可复现载体。固定到镜像 digest，三个月后重跑就是逐字节同一个环境。</li>
+    <li><strong>instructions</strong>：agent 看到的任务说明。注意它是任务包的一部分而不是评测者临场写的 prompt——指令措辞会显著影响成绩，必须版本化。</li>
+    <li><strong>评分函数</strong>：<code>score(t, submission)</code> 在环境内部检查产物（跑测试、对比输出），返回 $[0,1]$ 分数；返回 <code>None</code> 表示需要人工评分。评分逻辑与任务同包，杜绝"换个评分脚本分数就变"。</li>
+    <li><strong>资源声明</strong>：需要 GPU 吗？允许联网吗？需要哪些环境变量（如 API key）？显式声明使平台能统一执行最小权限原则。</li>
+  </ul>
+
+  <p><strong>为什么标准化任务格式对评测机构至关重要？</strong>因为评测机构的核心资产是"任务 × 模型 × 时间"的矩阵：同一批任务要跑在不断更新的模型上，纵向比较能力增长 [Kwa 2025]。如果任务格式不标准——</p>
+  <ul>
+    <li>每接入一个新 agent/模型都要为每个任务做适配，$O(\text{任务}\times\text{agent})$ 的工程量爆炸；标准化后是 $O(\text{任务}+\text{agent})$；</li>
+    <li>外部贡献的任务无法质检（QA 一个任务 = 检查它符合 Task Standard 接口并在参考解上得满分）；</li>
+    <li>历史分数不可信（无法证明今天的环境与当年一致）。</li>
+  </ul>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>METR Task Standard / Vivaria</strong> [METR 2024]：Task Standard 定义任务包格式；<strong>Vivaria</strong> 是配套的开源运行平台——启动任务环境、接入 agent、记录完整轨迹、支持人类基线实验与人工接管。<strong>UK AISI Inspect</strong> [UK AISI 2024] 是另一套主流开源框架：任务 = <code>dataset + solver + scorer</code>，内置 Docker 沙箱与统一的评测日志（eval log）格式及查看器。两者是当前 agent 评测基础设施的两个参考实现，notebook 里我们手写的迷你 harness 正是它们的同构缩影。</div>
+
+  <table>
+    <thead><tr><th>概念</th><th>METR Task Standard / Vivaria</th><th>UK AISI Inspect</th></tr></thead>
+    <tbody>
+      <tr><td>任务定义</td><td><code>TaskFamily</code> Python 类 + Docker 镜像</td><td><code>Task(dataset, solver, scorer)</code></td></tr>
+      <tr><td>环境隔离</td><td>每 run 一个隔离环境（VM/容器），权限显式声明</td><td>sandbox 配置（默认 Docker），每 sample 一个容器</td></tr>
+      <tr><td>评分</td><td><code>score(t, submission)</code>，环境内执行</td><td><code>scorer</code> 组件（含 model-graded 选项）</td></tr>
+      <tr><td>轨迹记录</td><td>Vivaria 记录完整 run 轨迹，支持回看与人工接管</td><td>结构化 eval log + Inspect View 可视化</td></tr>
+      <tr><td>典型用途</td><td>frontier 危险能力 / 长时程任务评测</td><td>政府与社区的通用 eval 框架</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="trajectory"><span class="num">4</span>轨迹即证据：事件模型与完整性要求</h2>
+
+  <p>agent 评测的原始产出不是一个分数，而是一条<span class="term">轨迹（trajectory）</span>：episode 中发生的全部事件的有序记录。分数只是轨迹的一个汇总统计量。把轨迹当成<strong>证据（evidence）</strong>来设计——它要经得起事后审计：为什么这个 run 算成功？模型真的自己解出来的，还是评分函数有漏洞、还是环境泄漏了答案？</p>
+
+  <p>工程上，轨迹最常用的形态是<strong>追加写的 JSONL 事件流</strong>：每行一个事件，写完即落盘（崩溃也只丢最后一行）。最小事件模型四种类型：</p>
+
+  <table>
+    <thead><tr><th>事件类型</th><th>必记字段</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td><code>llm_call</code></td><td>模型 id、<strong>完整输入 messages</strong>、采样参数（temperature/seed/max_tokens）、<strong>完整输出</strong>、token 用量、时延</td><td>重放的素材；审计模型"看到了什么、说了什么"</td></tr>
+      <tr><td><code>tool_call</code></td><td>工具名、完整参数、发起它的 step、时延</td><td>还原 agent 的行动序列；安全审查（它试图执行什么命令？）</td></tr>
+      <tr><td><code>observation</code></td><td>工具返回（stdout/stderr/退出码）、是否截断、是否超时</td><td>还原 agent 的信息输入；调试环境问题</td></tr>
+      <tr><td><code>score</code></td><td>评分器版本、分数、判分依据、最终答案</td><td>结果本体；支持事后用新评分器重算</td></tr>
+    </tbody>
+  </table>
+
+  <p>外加 episode 级元数据（任务 id、镜像 digest、harness 版本、开始/结束时间戳）。<strong>完整性要求：进出模型的每一个 token 都可审计。</strong>这不是洁癖，而是三类下游需求决定的：</p>
+  <ul>
+    <li><strong>归因调试</strong>：失败是模型不会、解析器写炸、还是环境坏了？没有完整轨迹只能猜（模块 06 详述失败归因）。</li>
+    <li><strong>重放与重评分</strong>：第 5 节的录制-重放、以及"评分函数修了个 bug，历史 run 全部重算"都要求轨迹无损。</li>
+    <li><strong>安全审查</strong>：评 frontier 模型危险能力时，轨迹是向外界证明"评测确实这样发生过"的唯一凭据。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  <strong>"给模型截断" ≠ "给日志截断"。</strong>工具输出太长时，harness 通常截断后再喂给模型（防上下文爆炸）——但日志里应同时记录<strong>原始输出（或其哈希+存档引用）和实际喂给模型的截断版</strong>。只存截断版，重放时无法验证截断逻辑本身没改变行为；只存原始版，你不知道模型实际看到了什么。notebook 练习 1 就是实现这个截断器。</div>
+
+  <p>代价是<strong>隐私与体积</strong>：完整轨迹可能含密钥（环境变量被 <code>env</code> 打出来）、用户数据、专有代码；长时程任务一条轨迹可达 GB 级。常见权衡手段：写入前对已知 secrets 做脱敏（redaction）、大对象内容寻址存储（轨迹里只存哈希）、对 observation 分层存储（热存截断版、冷存原始版）——但 <code>llm_call</code> 的输入输出永远全量保留，那是证据链的主干。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="replay"><span class="num">5</span>确定性与重放：录制-重放测试法</h2>
+
+  <p>harness 本身是软件，也会有 bug。怎么测一个依赖 LLM 的系统？每次跑真模型既贵又不稳定。答案是<span class="term">重放（replay）</span>：<strong>用日志里录好的 LLM 输出替代真实调用，重新执行整条循环</strong>。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>录一次真实 run，把模型每一步说的话存下来。之后测试时不再调真模型，而是用一个"复读机"按顺序吐出录好的回复。如果 harness 没变，重跑的每一步观察、最终答案都应该和录的那次一字不差；改了解析器之后重放结果变了，就说明你的改动影响了行为——这就是免费的回归测试。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>设轨迹 $\tau=(a_1,o_1,a_2,o_2,\dots,a_T)$，其中 $a_t$ 为模型输出、$o_t$ 为环境观察。若环境转移 $o_t=f(\text{state}_{t-1},a_t)$ 是确定的，则注入录制的 $\{a_t\}$ 序列必复现 $\{o_t\}$ 与终态。重放校验即检查 $\forall t:\ o_t^{\text{replay}}=o_t^{\text{log}}$；首个失配位置 $t^\*$ 精确定位非确定性或行为变更的引入点。</p>
+    </div>
+  </div>
+
+  <p>重放成立的前提是<strong>除 LLM 外一切皆确定</strong>。现实中非确定性来源很多，要逐一识别和控制：</p>
+
+  <table>
+    <thead><tr><th>非确定性来源</th><th>表现</th><th>控制手段</th></tr></thead>
+    <tbody>
+      <tr><td>LLM 采样</td><td>temperature&gt;0 时每次输出不同；即使 T=0，浮点归约顺序/批处理差异也不保证逐位一致</td><td>评测时记录采样参数与 seed；测试 harness 时直接用重放替身，绕开真实推理</td></tr>
+      <tr><td>时间戳 / 随机数</td><td>agent 脚本里 <code>time.time()</code>、<code>random()</code> 产生不同输出</td><td>固定 seed、冻结时钟（注入假时间源），或在比对时排除易变字段</td></tr>
+      <tr><td>并发</td><td>并行工具调用完成顺序不定，观察交错顺序变化</td><td>评测中序列化工具调用，或记录并在重放时强制原顺序</td></tr>
+      <tr><td>外部 API / 网络</td><td>搜索结果、网页内容随时间漂移</td><td>录制-重放外部响应（VCR 式 mock）、镜像静态站点、或干脆断网</td></tr>
+      <tr><td>环境本身</td><td>依赖版本漂移、文件遍历顺序</td><td>镜像固定 digest；代码中显式 <code>sorted()</code></td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  重放还有第二个妙用：<strong>把"贵的"和"便宜的"分开迭代</strong>。轨迹录一次（贵，调真模型），此后解析器重构、日志格式迁移、评分函数修复都在重放上验证（免费、毫秒级）。Inspect 的 eval log、Vivaria 的 run 记录都支持这种工作流 [UK AISI 2024; METR 2024]。notebook 里你会亲手实现 <code>ReplayLLM</code> 并用 assert 验证重放一致性。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="timeout"><span class="num">6</span>超时、重试与部分失败：评测口径要先定</h2>
+
+  <p>长时程 agent run 里，"失败"不是一个点而是一个谱：模型答错、单步卡死、整个任务超时、API 限流、harness 崩溃、评分器抛异常……<strong>每一种怎么计分，必须在跑评测之前定好</strong>，否则数字出来后怎么算都像在挑对自己有利的口径。</p>
+
+  <h3>两级超时</h3>
+  <ul>
+    <li><strong>步级超时（per-step）</strong>：单次工具调用的上限（如 60s）。超时后 kill 该调用，把"超时"作为 observation 还给 agent——agent 还有机会换策略。这是环境反馈的一部分。</li>
+    <li><strong>任务级超时（per-task）</strong>：整个 episode 的墙钟/token 预算（如 8 小时或 200 万 token）。打满即终止 episode。这是评测口径的一部分——METR 的 time-horizon 方法学里，预算本身就是自变量 [Kwa 2025]。</li>
+  </ul>
+
+  <h3>重试会污染统计口径</h3>
+  <p>关键区分：<strong>基础设施重试</strong>（HTTP 500、限流退避——重试后输入完全相同）可以做且应该做，它修复的是测量仪器；<strong>episode 级重试</strong>（失败了重跑一次任务取最好结果）则直接改变了被测量的量。设单次尝试成功率为 $p$，允许 $k$ 次独立尝试取最好：</p>
+
+  <div class="math-block">
+  $$ P(\text{至少一次成功}) \;=\; 1-(1-p)^k \;\;\xrightarrow{\;p=0.3,\,k=5\;}\;\; 0.83 $$
+  </div>
+
+  <p>把 0.83 当作"成功率"报告，等于偷偷把指标从 pass@1 换成了 pass@5。正式的口径用无偏估计量写清楚：对某任务做 $n$ 次采样、$c$ 次成功，则</p>
+
+  <div class="math-block">
+  $$ \widehat{\text{pass@}k} \;=\; 1-\frac{\binom{n-c}{k}}{\binom{n}{k}}
+     \qquad\text{vs}\qquad
+     \widehat{\text{pass}^{\wedge}k} \;=\; \frac{\binom{c}{k}}{\binom{n}{k}} $$
+  </div>
+
+  <p><span class="term">pass@k</span>（$k$ 次中至少一次成功）衡量<em>能力上限</em>，随 $k$ 单调上升；<span class="term">pass^k</span>（$k$ 次全部成功，τ-bench 提出）衡量<em>可靠性</em>，随 $k$ 单调下降 [Yao 2024]。同一组 run，两个口径讲两个故事——报告里必须写明 $n$、$k$、采样温度与重试政策。</p>
+
+  <h3>部分失败的计分政策</h3>
+  <table>
+    <thead><tr><th>失败类型</th><th>例子</th><th>建议处理</th></tr></thead>
+    <tbody>
+      <tr><td>agent 失败</td><td>答案错误、放弃、超预算</td><td>计 0 分——这是被测能力的一部分</td></tr>
+      <tr><td>环境/基础设施错误</td><td>容器起不来、API 持续 5xx</td><td>标 <code>error</code> 并<strong>剔除后重跑</strong>，不计 0——否则系统性低估</td></tr>
+      <tr><td>harness bug</td><td>解析器把合法动作判为非法</td><td>修复后整批重跑；轨迹是发现它的唯一手段</td></tr>
+      <tr><td>评分器异常</td><td><code>score()</code> 抛异常</td><td>标 <code>error</code> 人工复核；绝不能静默当 0 分</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger"><span class="label"></span>
+  最危险的模式是<strong>把基础设施错误静默计为 0 分</strong>：模型 A 评测那周 API 不稳定，模型 B 那周一切正常——榜单上 A 输了，实际上输的是运维。轨迹里必须区分 <code>failed</code>（agent 没做到）与 <code>error</code>（我们没测成），并在报告中给出 error 率。Kapoor et al. 对 agent 评测的标准化缺失有系统批评 [Kapoor 2024]。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="metering"><span class="num">7</span>资源计量：token、成本与墙钟时间</h2>
+
+  <p>两个 agent 都得 80 分，一个花 \$0.4、6 分钟，另一个花 \$40、4 小时——"同分"显然不是同等能力。<strong>准确率必须与成本联合报告</strong> [Kapoor 2024]，而联合报告的前提是 harness 在轨迹里逐事件计量资源：</p>
+
+  <ul>
+    <li><strong>token</strong>：每次 <code>llm_call</code> 记录 input/output token 数（API 会返回 usage；本地模型用 tokenizer 数）。注意 agent 循环里上下文滚雪球，input token 通常远大于 output。</li>
+    <li><strong>金钱成本</strong>：按价目表折算。设第 $i$ 次调用输入 $n_i^{\text{in}}$、输出 $n_i^{\text{out}}$ 个 token，单价 $p_{\text{in}},p_{\text{out}}$（每 token）：</li>
+  </ul>
+
+  <div class="math-block">
+  $$ C \;=\; \sum_{i=1}^{N}\Big( n_i^{\text{in}}\,p_{\text{in}} + n_i^{\text{out}}\,p_{\text{out}} \Big)
+     \;+\; C_{\text{compute}}(\text{沙箱机时}) $$
+  </div>
+
+  <ul>
+    <li><strong>墙钟时间</strong>：episode 总时长，并拆分为模型时间（等 LLM 返回）与工具时间（等命令执行）。两者的比例直接告诉你优化方向，也是与人类基线对比的基础——METR 的 time horizon 把"人类完成该任务所需时间"作为任务难度的标尺 [Kwa 2025]。</li>
+  </ul>
+
+  <p>实现上零额外成本：第 4 节的事件模型里每个事件本来就带 <code>duration_s</code> 和 usage 字段，成本汇总只是对 JSONL 的一次聚合扫描（notebook 练习 2 实现 <code>cost_summary</code>）。这些数字在模块 06 会变成正式的评测维度：成本-准确率帕累托前沿、预算约束下的能力曲线。<strong>现在不记，将来没法补。</strong></p>
+
+  <div class="callout intuition"><span class="label"></span>
+  把计量做进 harness 而不是事后估算，还有一个理由：<strong>预算执行</strong>。任务级 token 预算、成本上限都需要 harness 实时累加才能在越界时终止 episode——这本身就是第 6 节"任务级超时"的资源版。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>沙箱逃逸面的系统化</strong>：容器逃逸、通过放行的网络通道外渗、利用评分函数本身的漏洞"作弊得分"——agent 评测的攻击面还没有像 web 安全那样的成熟分类法。评测视角：危险能力评测的可信度上限就是其沙箱的强度；报告里应披露隔离级别与网络策略。间接注入类攻击（环境内容反向操纵 agent）见模块 08 [Greshake 2023]。</li>
+    <li><strong>长时程任务的状态快照</strong>：8 小时的 run 跑挂了只能从头再来？VM/容器快照（checkpoint/restore）允许从中途恢复、甚至从同一中间状态<em>分叉</em>出多条延续来估计条件成功率。但快照与"可复现"存在张力：恢复点的内存状态难以逐位验证。Vivaria 的人工接管功能是这个方向的工程雏形 [METR 2024]。</li>
+    <li><strong>推理不确定性 vs 重放</strong>：T=0 也不保证逐位一致（批处理、浮点归约顺序），跨硬件更难。开放问题：评测报告应该要求什么粒度的"可复现"——逐位、逐事件、还是仅统计意义上的？</li>
+    <li><strong>轨迹格式的跨机构标准</strong>：Inspect eval log、Vivaria run 格式、各 lab 内部格式互不兼容，导致第三方无法复核。一个被广泛采纳的"轨迹交换格式"会像 ONNX 之于模型一样改变评测生态——目前 Inspect 的 log 格式是最接近事实标准的候选 [UK AISI 2024]。</li>
+    <li><strong>感知到被评测的模型</strong>：若模型能从环境特征识别出"这是沙箱/评测"，可能系统性改变行为（如 sandbagging，刻意藏拙 [van der Weij 2024]）。沙箱做得越"标准"，越容易被识别——逼真性与标准化的矛盾尚无好解。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>沙箱对 agent 评测的三条硬要求是什么？隔离阶梯的四级各防住/漏掉什么？</li>
+      <li>METR Task Standard 把任务标准化成哪四个组成部分？为什么标准化对评测机构是 $O(m+n)$ vs $O(m\times n)$ 的差别？</li>
+      <li>轨迹的四类核心事件各记什么字段？为什么"给模型截断"不等于"给日志截断"？</li>
+      <li>重放测试的原理与前提是什么？episode 级重试为什么会污染 pass@1？写出 pass@k 与 pass^k 的估计量。</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../02_react_agent/02_讲解.html"><div class="dir">← 上一章</div><div class="t">02 · 从零写 ReAct Agent</div></a>
+    <a class="next" href="../04_coding_agents/04_讲解.html"><div class="dir">下一章 →</div><div class="t">04 · 编码 Agent 解剖：SWE-bench</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 高斯过程</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 高斯过程</h1>
+  <p class="subtitle">函数上的贝叶斯：把先验放在所有可能的函数上 —— 核（RBF/Matern）编码平滑度、GP 后验由条件高斯给出（均值穿过数据、方差在稀疏处膨胀且不依赖 y）、Cholesky 是数值基石、对数边际似然自动选超参（奥卡姆剃刀）、后验均值 = 核岭回归但多给了不确定性</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（贝叶斯/边际似然）、多元高斯与条件分布、线性代数（Cholesky）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_gaussian_processes.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Rasmussen & Williams《GPML》第 2/4/5 章、Duvenaud kernel cookbook、Titsias 2009</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#dist_fn">函数上的分布：GP 的定义</a></li>
+      <li><a href="#kernels">核函数：GP 的灵魂</a></li>
+      <li><a href="#posterior">从先验到后验：条件高斯</a></li>
+      <li><a href="#cholesky">Cholesky 实现：数值基石</a></li>
+      <li><a href="#marglik">边际似然与超参优化</a></li>
+      <li><a href="#relations">与核回归/贝叶斯线性/神经网络的关系</a></li>
+      <li><a href="#practice">GP 的实践与建模</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dist_fn"><span class="num">1</span>函数上的分布：GP 的定义</h2>
+  <p>前三个模块都在推断<strong>有限个参数</strong>（硬币概率、高斯均值、混合权重）。这一模块做一件听起来不可思议的事：直接对<strong>函数本身</strong>做贝叶斯推断——把先验放在「所有可能的函数」上，用数据更新成「与数据相符的函数」的后验。这就是 <span class="term">Gaussian process</span>（高斯过程，GP）。</p>  <p>为什么要对函数做推断？回归问题的本质是「找一个函数 $f$ 拟合数据」。参数方法（线性回归、神经网络）先固定函数的<strong>形式</strong>（如 $f(x)=w^\top x$），再推断参数 $w$——这就把先验偷偷限制在了那个形式里。GP 反其道而行：<strong>不假设函数形式，直接在函数空间上放先验</strong>，让数据决定函数长什么样，并且<strong>自动给出预测的不确定性</strong>——在数据密集处自信、在数据稀疏处诚实地说「我不知道」。</p>  <p>看似要操作无限维（一个函数有无穷多个点），GP 却靠高斯分布的一个<strong>魔法性质</strong>把它变得可算——这就是它的定义：</p>  <div class="callout intuition"><span class="label"></span>
+    <p><strong>高斯过程 = 函数上的高斯分布</strong>。严格说：一个随机函数 $f$ 是 GP，当且仅当它在<em>任意有限个输入点</em> $\{x_1,\dots,x_n\}$ 上的函数值 $[f(x_1),\dots,f(x_n)]$ 服从一个<strong>多元高斯</strong>。于是我们永远只需操作有限维高斯（我们会算），却能对无限维的函数推断。这个「任意有限子集都是高斯」的性质叫 <span class="term">marginalization property</span>（边缘化一致性），是 GP 一切可行性的根。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：GP 是一台「画函数的机器」，由两个旋钮控制：<strong>均值函数</strong>（函数平均在哪条线附近）和<strong>核函数</strong>（任意两点的函数值有多『联动』）。核决定了画出的函数有多平滑、波动多快。给它喂几个数据点，它就只画那些『穿过（或接近）这些点』的函数，并告诉你在没数据的地方这些函数有多发散（不确定性）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：GP 由均值函数 $m(x)=\mathbb{E}[f(x)]$ 与<strong>核（协方差）函数</strong> $k(x,x')=\mathrm{Cov}(f(x),f(x'))$ 完全确定，记 $f\sim\mathcal{GP}(m,k)$。实践中常取 $m\equiv0$（数据中心化后），于是<strong>一切信息都编码在核里</strong>。核 $k(x,x')$ 回答「输入 $x$ 与 $x'$ 的函数值应该有多相关」——离得近的输入，函数值应高度相关（函数连续平滑）；离得远的，相关性衰减。这个「相关结构」就是我们对函数的先验信念。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="kernels"><span class="num">2</span>核函数：GP 的灵魂</h2>
+  <p>核函数 $k(x,x')$ 是 GP 的灵魂——它一手决定了先验函数的平滑度、尺度、周期等一切性质。换核 = 换对函数的先验信念。最常用的几个：</p>  <h4>RBF / 平方指数核（最常用）</h4>  <div class="math-block">\[k_{\text{RBF}}(x,x') = \sigma_f^2 \exp\!\left(-\frac{\lVert x-x'\rVert^2}{2\ell^2}\right)\]</div>  <p>两点距离越近，核值越接近 $\sigma_f^2$（高度相关）；距离超过长度尺度 $\ell$ 后，核值快速衰减到 0（不再相关）。两个超参：<strong>长度尺度 $\ell$</strong>控制函数波动的快慢（$\ell$ 大 → 平缓、长程相关；$\ell$ 小 → 抖动、短程相关），<strong>信号方差 $\sigma_f^2$</strong>控制函数振幅。RBF 给出<strong>无限可微</strong>的极平滑函数。</p>  <h4>Matern 核（更鲁棒的家族）</h4>  <p>RBF 的「无限光滑」常常过于理想。Matern 核用一个平滑度参数 $\nu$ 调节函数的可微次数，更贴近真实数据。两个最常用的特例有简洁闭式（$r=\lVert x-x'\rVert$）：</p>  <div class="math-block">\[k_{\nu=3/2}(r) = \sigma_f^2\Big(1+\tfrac{\sqrt3\,r}{\ell}\Big)\exp\!\Big(-\tfrac{\sqrt3\,r}{\ell}\Big),\quad k_{\nu=5/2}(r)=\sigma_f^2\Big(1+\tfrac{\sqrt5 r}{\ell}+\tfrac{5r^2}{3\ell^2}\Big)\exp\!\Big(-\tfrac{\sqrt5 r}{\ell}\Big)\]</div>  <p>Matern 函数是 $\lceil\nu\rceil-1$ 次可微：$\nu=1/2$ 退化为指数核（连续但处处不可微，很粗糙）、$\nu=3/2$（一次可微）、$\nu=5/2$（二次可微，实践最常用）、$\nu\to\infty$ 趋于 RBF。Matern 不像 RBF 那样假设函数无限光滑，对真实物理过程往往更合适、数值上也更稳。</p>  <table>
+    <thead><tr><th>核</th><th>平滑度</th><th>样本函数</th><th>适用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>RBF / SE</strong></td><td>$C^\infty$（无限可微）</td><td>极平滑</td><td>信号确实很光滑时；默认起点</td></tr>
+      <tr><td><strong>Matern 5/2</strong></td><td>$C^2$（二次可微）</td><td>中等平滑</td><td>多数实际任务的稳妥默认</td></tr>
+      <tr><td><strong>Matern 3/2</strong></td><td>$C^1$（一次可微）</td><td>较粗糙</td><td>信号有棱角/物理过程</td></tr>
+      <tr><td><strong>Matern 1/2 = 指数</strong></td><td>$C^0$（连续不可微）</td><td>很粗糙</td><td>布朗运动式信号</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>核必须是<strong>半正定</strong>的（任意点集上算出的核矩阵 $K$ 半正定），这等价于「它是某个特征空间里的内积」（Mercer 定理）。不是随便一个对称函数都能当核——自己设计核要保证半正定性。好消息：核<strong>可组合</strong>——两个核之和、之积仍是核。于是可以「RBF×周期核」表达「局部变化的周期信号」、「长 $\ell$ RBF + 短 $\ell$ RBF」表达「趋势 + 局部波动」。这种核工程（kernel engineering）是把领域知识注入 GP 的主要途径（Duvenaud 的 kernel cookbook）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="posterior"><span class="num">3</span>从先验到后验：条件高斯</h2>
+  <p>有了核就有了 GP 先验。现在看 GP 的核心操作：<strong>用观测数据把先验条件化成后验</strong>。这一步纯粹是「多元高斯的条件分布公式」的应用——这正是 GP 把无限维推断化为有限维代数的关键。</p>  <p>设训练输入 $X=\{x_i\}$、含噪观测 $y_i=f(x_i)+\varepsilon_i$、$\varepsilon_i\sim\mathcal N(0,\sigma_n^2)$，要预测测试点 $X_*$ 处的函数值 $f_*$。由 GP 定义，训练值与测试值的联合是高斯：</p>  <div class="math-block">\[\begin{bmatrix} y \\ f_* \end{bmatrix} \sim \mathcal N\!\left(0,\ \begin{bmatrix} K + \sigma_n^2 I & K_* \\ K_*^\top & K_{**} \end{bmatrix}\right)\]</div>  <p>其中 $K_{ij}=k(x_i,x_j)$（训练点间核矩阵）、$K_*=k(X,X_*)$（训练-测试）、$K_{**}=k(X_*,X_*)$（测试点间）。对这个联合高斯用条件分布公式，得到<strong>GP 后验</strong>（精确闭式）：</p>  <div class="math-block">\[\boxed{\ \begin{aligned} \bar f_* &= K_*^\top (K+\sigma_n^2 I)^{-1} y \\ \mathrm{Cov}(f_*) &= K_{**} - K_*^\top (K+\sigma_n^2 I)^{-1} K_* \end{aligned}\ }\]</div>  <p>盯住这两个式子，它们揭示了 GP 的全部魔力：</p>  <ul>
+    <li><strong>后验均值 $\bar f_*$</strong> 是训练目标 $y$ 的<strong>线性加权平均</strong>，权重由「测试点与各训练点的核相似度」决定——离测试点越近的训练点，权重越大。这就是「向邻居借力」的预测。</li>
+    <li><strong>后验方差</strong> = 先验方差 $K_{**}$ <strong>减去</strong>「数据带来的信息」$K_*^\top(K+\sigma_n^2 I)^{-1}K_*$。注意它<strong>完全不依赖观测值 $y$</strong>！方差只随「测试点离训练点多远」变化：靠近训练点 → 方差小（自信）；远离 → 方差回升到先验（不确定）。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句话：<strong>GP 后验均值穿过（带噪时接近）数据点，后验方差在数据稀疏处自动膨胀</strong>。这正是我们想要的「诚实回归」——它不仅给预测值，还给出『这个预测有多可信』，且在外推区主动报警。神经网络的点预测做不到这一点。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>一个深刻的观察：后验方差不依赖 $y$，意味着<strong>不确定性的几何完全由输入分布与核决定</strong>——你甚至不用看标签，光看测试点离训练点的远近就能知道哪里会不确定。这是 GP 在<strong>主动学习 / 贝叶斯优化</strong>里的基础：用后验方差找「最该去采样的点」（最不确定处），无需先有标签。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>噪声项 $\sigma_n^2$ 的作用值得单独点出。它有双重身份：①<strong>建模观测噪声</strong>——把 GP 从「硬穿过每个点的插值」变成「平滑拟合带噪数据的回归」；②<strong>数值正则</strong>——给 $K$ 的对角线加 $\sigma_n^2$ 改善了求逆的条件数（$K$ 常因近重复输入而接近奇异）。$\sigma_n^2\to0$ 时 GP 退化为精确插值（均值穿过每个点、训练点方差为 0）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cholesky"><span class="num">4</span>Cholesky 实现：数值基石</h2>
+  <p>后验公式里有 $(K+\sigma_n^2 I)^{-1}$。<strong>绝对不要直接求逆</strong>——显式求逆数值不稳、且浪费。GP 的标准实现用 <span class="term">Cholesky decomposition</span>（Cholesky 分解）把对称正定矩阵分解为 $K+\sigma_n^2 I=LL^\top$（$L$ 下三角），再用两次三角回代解线性系统。这是 GP 代码的数值基石，Rasmussen & Williams 教材的算法 2.1。</p>  <h4>标准 GP 回归算法（数值稳定版）</h4>  <pre><code># 给定 K(训练核矩阵), y, 噪声 sigma_n^2, K_*, K_**
+L = cholesky(K + sigma_n^2 * I)          # K+σ²I = L Lᵀ, O(n³) 一次
+alpha = solve_triangular(Lᵀ, solve_triangular(L, y))   # alpha = (K+σ²I)⁻¹ y
+f_mean = K_*ᵀ @ alpha                    # 后验均值
+v = solve_triangular(L, K_*)             # 用于方差
+f_var = diag(K_**) - sum(v**2, axis=0)   # 后验方差
+log_marginal = -0.5 yᵀα - sum(log diag(L)) - (n/2) log(2π)   # 边际似然(见 §5)</code></pre>  <p>为什么 Cholesky 是对的选择？三点：①<strong>数值稳定</strong>——三角回代比求逆稳健得多，且要求 $K+\sigma_n^2 I$ 正定（恰好它就是，所以 Cholesky 总能做）；②<strong>一份分解多处复用</strong>——$L$ 同时用于解 $\alpha$（均值）、解 $v$（方差）、算 $\log\det$（边际似然），一举三得；③<strong>$\log$ 行列式白送</strong>——$\log\lvert K+\sigma_n^2 I\rvert=2\sum_i\log L_{ii}$，对边际似然至关重要，避免了直接算行列式的溢出与不稳。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>Cholesky 之于 GP，就像反向传播之于神经网络——它是让理论公式真正能在计算机上稳定跑起来的那个工程内核。本模块 notebook 会完整地用 numpy 手写这条 Cholesky 路径，并与「直接套公式（含显式求逆）」对拍，验证两者数值一致、但 Cholesky 更稳。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>复杂度：Cholesky 分解是 $O(n^3)$、存储 $O(n^2)$（$n$ 为训练点数）。这是 GP 的<strong>阿喀琉斯之踵</strong>——$n$ 上万就吃不消了。后验均值用 $\alpha$ 后是 $O(n)$/测试点、方差是 $O(n^2)$/测试点。$O(n^3)$ 瓶颈催生了稀疏 GP、诱导点近似等一整支研究（第 8 节），但本课的玩具规模（$n\sim$ 几十到几百）下精确 Cholesky 完全够用、且能看清机制。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>即便有噪声项，$K+\sigma_n^2 I$ 偶尔仍因近重复输入或极小 $\sigma_n^2$ 而数值不正定，导致 Cholesky 失败。标准补救是加 <span class="term">jitter</span>（抖动）——给对角线再加一个极小量（如 $10^{-6}$）。这是 GP 实现的常规防护，不是作弊，而是抵消浮点舍入。notebook 会演示无 jitter 时 Cholesky 如何崩、加上后如何稳。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="marglik"><span class="num">5</span>边际似然与超参优化</h2>
+  <p>核有超参 $\theta=(\ell,\sigma_f,\sigma_n)$——长度尺度、信号方差、噪声方差。它们怎么定？这正是 GP 最优雅的部分：用贝叶斯的<strong>边际似然</strong>（model evidence）自动选，无需交叉验证。</p>  <p>回忆模块 01/03 的<span class="term">log marginal likelihood</span>（对数边际似然）$\log p(y\mid X,\theta)$——把函数 $f$ 积掉后、数据在超参 $\theta$ 下的似然。对 GP 它有<strong>精确闭式</strong>（因为一切都是高斯）：</p>  <div class="math-block">\[\log p(y\mid X,\theta) = \underbrace{-\tfrac12 y^\top (K_\theta+\sigma_n^2 I)^{-1} y}_{\text{数据拟合}} \;\underbrace{-\tfrac12 \log\lvert K_\theta+\sigma_n^2 I\rvert}_{\text{复杂度惩罚}} \;-\;\tfrac n2\log 2\pi\]</div>  <p>这个式子是 GP 的<strong>奥卡姆剃刀</strong>活生生的体现，三项各司其职：</p>  <ul>
+    <li><strong>数据拟合项</strong> $-\frac12 y^\top(K+\sigma_n^2 I)^{-1}y$：惩罚「拟合得差」。$\ell$ 太大（函数太平）拟合不了波动的数据，这项变糟。</li>
+    <li><strong>复杂度惩罚项</strong> $-\frac12\log\lvert K+\sigma_n^2 I\rvert$：惩罚「模型太灵活」。$\ell$ 太小（函数太抖、能拟合任何东西）会让 $\lvert K\rvert$ 变大，这项变糟。</li>
+    <li><strong>两项自动权衡</strong>：最大化边际似然就是在「拟合数据」与「保持简单」之间找平衡点——<strong>自动选出恰好够用的复杂度</strong>，既不欠拟合也不过拟合。</li>
+  </ul>  <p>于是超参优化就是<strong>最大化对数边际似然</strong>：$\hat\theta=\arg\max_\theta\log p(y\mid X,\theta)$（称 type-II 最大似然 / 经验贝叶斯）。实践中用梯度上升（边际似然对 $\theta$ 的梯度有闭式），本课玩具规模下直接<strong>网格搜索</strong>就能看清地形。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这是 GP 相对许多模型的一大优势：<strong>超参选择内建于模型，不需要单独切出验证集做交叉验证</strong>。边际似然已经『把 $f$ 积掉』，自动惩罚了过拟合——所以即使在全部数据上优化超参，也不会像优化普通参数那样过拟合（在合理范围内）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要小心：边际似然<strong>非凸</strong>，常有多个局部最优，对应不同的「数据解释」。经典例子：同一份数据，一个局部最优说「低噪声 + 短长度尺度（信号波动快）」，另一个说「高噪声 + 长长度尺度（信号平缓，波动都是噪声）」。梯度优化可能落入次优解，实践中多起点优化。notebook 会用网格画出边际似然关于 $(\ell,\sigma_n)$ 的地形，直观看到这种多峰。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把边际似然地形画出来看，是理解 GP 超参的最佳方式：它通常在 $(\ell,\sigma_f,\sigma_n)$ 空间里有一个（或几个）山峰，峰顶就是「数据支持的最佳函数复杂度」。<strong>长度尺度 $\ell$ 是最关键的超参</strong>——它直接决定了 GP 认为「函数变化有多快」，进而决定外推行为与不确定性增长的速度。选错 $\ell$（尤其太小）会让 GP 在数据间过度自信地乱画。notebook 练习会让你网格搜 $\ell$ 并观察拟合的变化。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="relations"><span class="num">6</span>与核回归/贝叶斯线性/神经网络的关系</h2>
+  <p>GP 不是孤立的——它和好几个熟悉的方法有深刻联系。看清这些联系，能把 GP 放进更大的图景，也帮你判断何时该用它。</p>  <h3>6.1 GP 后验均值 = 核岭回归</h3>  <p>GP 的后验均值 $\bar f_*=K_*^\top(K+\sigma_n^2 I)^{-1}y$ 与<span class="term">kernel ridge regression</span>（核岭回归）的预测<strong>完全相同</strong>（岭正则 $\lambda$ 对应噪声 $\sigma_n^2$）。也就是说：<strong>核岭回归恰好是 GP 只取后验均值、丢弃方差的版本</strong>。</p>  <p>但 GP<strong>多给了一样核岭回归没有的东西——后验方差（不确定性）</strong>。这是关键区别：核岭回归给你一条预测曲线，GP 给你一条曲线<em>加上</em>每点的置信带。在外推、主动学习、风险决策里，那条置信带价值连城。换句话说，GP = 核岭回归 + 贝叶斯不确定性。</p>  <h3>6.2 GP 与贝叶斯线性回归 / 神经网络</h3>  <p>GP 可由<strong>贝叶斯线性回归在特征空间</strong>导出：对 $f(x)=w^\top\phi(x)$、$w\sim\mathcal N(0,I)$ 做贝叶斯推断，预测分布恰是 GP，核 $k(x,x')=\phi(x)^\top\phi(x')$。RBF 核对应<strong>无限维特征</strong>——所以 GP 是「无限宽的贝叶斯线性模型」。</p>  <p>更惊人的联系（Neal 1996）：<strong>无限宽的贝叶斯神经网络（单隐层）收敛到一个 GP</strong>。近年 NTK / NNGP 把这推广到深网络——这把 GP 与深度学习从理论上接通了，也让 GP 成为理解神经网络泛化的一个分析工具。</p>  <table>
+    <thead><tr><th>方法</th><th>给点预测?</th><th>给不确定性?</th><th>与 GP 的关系</th></tr></thead>
+    <tbody>
+      <tr><td><strong>核岭回归</strong></td><td>✅</td><td>❌</td><td>= GP 后验均值（丢方差）</td></tr>
+      <tr><td><strong>贝叶斯线性回归</strong></td><td>✅</td><td>✅</td><td>= 有限特征的 GP</td></tr>
+      <tr><td><strong>GP</strong></td><td>✅</td><td>✅</td><td>本体（无限维贝叶斯线性）</td></tr>
+      <tr><td><strong>无限宽 BNN</strong></td><td>✅</td><td>✅</td><td>→ GP（Neal 1996 / NNGP）</td></tr>
+    </tbody>
+  </table>  <div class="callout paper"><span class="label"></span>
+    <p>这些联系不是花絮——它们告诉你 GP 在「方法谱系」里的精确位置：<strong>它是把『核 + 贝叶斯不确定性』做到极致的非参数回归</strong>。想深入：Rasmussen & Williams《GPML》第 2 章（GP 与权空间/函数空间的等价）、第 6 章（与核方法、样条的联系）。当你需要『带可靠不确定性的回归、且数据量不大（几百到几千）』时，GP 往往是最优雅的选择。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="practice"><span class="num">7</span>GP 的实践与建模</h2>
+  <p>把 GP 用好，有几条实践经验值得单列：</p>  <h3>7.1 数据预处理</h3>  <p>GP 对尺度敏感。标准做法：<strong>输入标准化</strong>（每维零均值单位方差，让长度尺度 $\ell$ 有可比的意义）、<strong>输出中心化</strong>（减均值，配合零均值 GP 假设）。多维输入常用 <span class="term">ARD</span>（自动相关性判定）——每维一个独立的 $\ell_d$，让 GP 自动学出「哪些维重要」（$\ell_d$ 大的维几乎被忽略）。</p>  <h3>7.2 均值函数的选择</h3>  <p>零均值 GP 在<strong>远离数据处会回归到 0</strong>（先验均值）——若你的函数有明显趋势，外推会很差。补救：用一个<strong>非零均值函数</strong>（如线性趋势 $m(x)=\beta^\top x$，GP 建模残差），或用带趋势的核组合。这是 GP 外推的常见坑。</p>  <h3>7.3 何时用 GP、何时不用</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>用 GP：①数据量中等（几十到几千）；②要可靠的不确定性（贝叶斯优化、主动学习、安全攸关）；③函数平滑、低维输入；④小数据下要稳健。这些场景 GP 几乎是最优雅的选择。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>别硬上 GP：①数据量很大（$O(n^3)$ 吃不消，需稀疏近似或换模型）；②超高维输入（核的距离在高维失去意义，维度灾难）；③函数高度不规则/不连续（核假设的平滑性不成立）；④需要表示学习（GP 不学特征，深网络更合适）。</p></div>
+  </div>  <p>一个常被低估的强项：GP 是<strong>贝叶斯优化</strong>（Bayesian optimization）的引擎——用 GP 对「昂贵黑箱函数」（如神经网络超参→验证精度）建模，用后验均值+方差构造采集函数（如 Expected Improvement）决定下一个最该试的点。这让 GP 成为自动调参、实验设计、材料发现等领域的核心工具，正是因为它<strong>同时给出预测与不确定性</strong>——采集函数需要两者。</p>  <div class="callout danger"><span class="label">不确定性的边界</span>
+    <p>最后一个实践提醒，攸关安全决策：GP 的不确定性<strong>只在核假设成立时才可信</strong>。如果真实函数远比核假设的更崎岖（选了太大的 $\ell$），GP 会在数据间<strong>过度自信</strong>（给出过窄的置信带），让你误以为预测很可靠。GP 的不确定性是「在我假设的函数类内的不确定性」，不是「对一切可能的诚实无知」——这与所有贝叶斯方法「不确定性受先验/模型设定支配」是同一条警示。把 GP 的置信带写进风险敏感决策前，务必检查核设定与残差。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>GP 是成熟而仍活跃的领域，前沿主要围绕「打破 $O(n^3)$ 瓶颈」与「让 GP 更灵活/更深」：</p>  <ul>
+    <li><strong>稀疏 GP 与诱导点</strong>：用 $m\ll n$ 个「诱导点」（inducing points）概括数据，把复杂度从 $O(n^3)$ 降到 $O(nm^2)$（Titsias 2009 的变分稀疏 GP、SVGP）。这是 GP 扩展到大数据的主路，且把模块 03 的变分推断用了进来。</li>
+    <li><strong>可扩展精确 GP</strong>：用结构化核（Kronecker、Toeplitz）、共轭梯度 + 矩阵-向量乘（GPyTorch 的 BBMM）、GPU 并行，把精确 GP 推到百万级数据。</li>
+    <li><strong>深度 GP 与深核学习</strong>：把多个 GP 叠成层（deep GP）以表达更复杂的函数；或用神经网络学核的特征映射（deep kernel learning），结合表示学习与 GP 不确定性。</li>
+    <li><strong>非高斯似然</strong>：分类、计数等任务的似然非高斯，后验不再闭式——用变分（模块 03）、EP、或拉普拉斯近似处理，把 GP 推广到分类、泊松回归等。</li>
+    <li><strong>GP 与深度学习的桥梁</strong>：NNGP / NTK 把无限宽神经网络与 GP 等价起来，使 GP 成为分析深网络训练与泛化的理论工具；以及把 GP 的不确定性嫁接到深度模型（如最后一层 GP）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读（见 <code>../references.md</code>）：Rasmussen & Williams《GPML》（GP 权威教科书，免费，本模块全程对标其第 2/4/5 章）、Duvenaud 的 kernel cookbook（核工程）、Titsias 2009（变分稀疏 GP）。至此你掌握了一类自带不确定性的强大非参数模型。最后一个模块转向另一类强大的概率模型——用图结构让高维联合分布的推断可处理的概率图模型。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_variational_inference/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 变分推断</div></a>
+    <a class="next" href="../05_graphical_models/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 概率图模型</div></a>
+  </div>
+
+</div>
+</body>
+</html>

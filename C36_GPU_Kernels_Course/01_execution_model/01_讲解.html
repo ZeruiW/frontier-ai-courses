@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · GPU 执行模型</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · GPU 执行模型</h1>
+  <p class="subtitle">thread/warp/block/grid 四级层级、SIMT 与分支发散、用延迟隐藏与 occupancy 把数百周期的访存延迟藏起来 —— 写对内核的第一块地基</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、基本的并行/进程概念、一点点 CPU 缓存常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_execution_model.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">CUDA C++ Programming Guide、PMPP 第 3–4 章、Volkov 2010</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#philosophy">CPU vs GPU：延迟 vs 吞吐</a></li>
+      <li><a href="#hierarchy">四级层级 thread/warp/block/grid</a></li>
+      <li><a href="#mapping">线程到数据的映射</a></li>
+      <li><a href="#simt">SIMT 与分支发散</a></li>
+      <li><a href="#latency">延迟隐藏：GPU 真正的魔法</a></li>
+      <li><a href="#occupancy">Occupancy 占用率</a></li>
+      <li><a href="#config">执行配置的取舍</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="philosophy"><span class="num">1</span>CPU vs GPU：延迟 vs 吞吐</h2>
+  <p>CPU 和 GPU 是两种针对<strong>不同目标</strong>的处理器，理解它们的分歧是理解一切 GPU 性能行为的起点。CPU 优化<em>单个任务的延迟</em>：少数几个强核、巨大的多级缓存、复杂的乱序执行、分支预测、推测执行，把海量晶体管砸在「让一条指令流尽可能快地跑完」上。GPU 优化的是<em>海量任务的吞吐</em>：把同样多的晶体管砸在成百上千个相对简单的核心上，几乎砍掉乱序与大缓存，靠<strong>同时处理成千上万个线程</strong>来填满算术单元。两者没有谁更先进，只是面向不同的工作负载。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>CPU 像一支精锐小队，每个人都很强、装备齐全、能独立决策，适合啃硬骨头（串行、分支多、彼此依赖的任务）。GPU 像一支十万人的军团，单兵简单、统一指挥，但人数压倒一切——只要任务能拆成大量互不依赖的小份，它就所向披靡。深度学习的矩阵运算恰好是这种「大量同质、互不依赖」的工作，所以与 GPU 天作之合。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：GPU 用<strong>线程级并行</strong>掩盖延迟。当某个线程因等待 HBM（数百周期）停顿时，硬件<em>零开销</em>切换到另一个就绪线程继续算（不像 CPU 上下文切换那样昂贵，因为每个线程的寄存器一直驻留在片上）。只要<em>在飞的线程足够多</em>，算术单元就不会闲着——这叫<span class="term">latency hiding</span>，是理解 GPU 一切性能行为的总纲，第 5 节专门展开。</p></div>
+  </div>  <p>这个分歧带来一个直接推论：<strong>在 GPU 上，让单个线程「更聪明」几乎没用，让线程「更多、更协调、更省带宽」才有用</strong>。CPU 程序员习惯的优化（减少分支、优化单线程热路径）在 GPU 上常常南辕北辙；GPU 的优化语言是<em>并行度、内存合并、数据复用</em>。本课就是在重新训练这套直觉。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话记住 GPU 的设计哲学：<strong>不靠让单个线程变快，而靠永远有别的线程可算</strong>。由此可推出 GPU 上三种最典型的性能病：「线程不够多」（占用率低、藏不住延迟，本模块）、「线程之间互相等待或发散」（同步与分支发散，本模块）、「线程访存方式浪费带宽」（非合并访问，下一模块）。本课的前两个模块就是这三种病的诊断与处方。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hierarchy"><span class="num">2</span>四级层级 thread/warp/block/grid</h2>
+  <h3>四级层级：thread → warp → block → grid</h3>  <p>CUDA 把并行组织成严格的四层。理解这四层各自的<strong>作用域与能力</strong>，是写对内核的地基：</p>  <table>
+    <thead><tr><th>层级</th><th>是什么</th><th>能共享 / 协作什么</th><th>本课 numpy 模拟</th></tr></thead>
+    <tbody>
+      <tr><td><strong>thread</strong> 线程</td><td>最小执行单元，通常算一个输出元素</td><td>只有自己的寄存器（私有）</td><td>循环体里的一次迭代</td></tr>
+      <tr><td><strong>warp</strong> 线程束</td><td><strong>32</strong> 个线程，硬件调度的真实粒度</td><td>锁步执行同一指令；可用 shuffle 交换寄存器</td><td>长度 32 的切片</td></tr>
+      <tr><td><strong>block</strong> 线程块/CTA</td><td>一组 warp（如 256 线程 = 8 warp）</td><td><strong>shared memory</strong> + <code>__syncthreads()</code> 同步</td><td>外层循环的一块 + 一个临时数组</td></tr>
+      <tr><td><strong>grid</strong> 网格</td><td>一次内核启动的所有 block</td><td>只能经 global memory（慢）间接通信</td><td>最外层遍历所有块</td></tr>
+    </tbody>
+  </table>  <p>一个内核启动时，你指定 grid 维度与 block 维度（CUDA 写作 <code>kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(...)</code>）。硬件把每个 block 整体派到某个 SM 上、<strong>直到结束都不迁移</strong>，block 内的线程再按 warp 被调度执行。线程靠内置变量定位自己：<code>blockIdx</code>（我在第几个 block）、<code>threadIdx</code>（我在 block 内第几个），组合出全局下标。</p>  <p>这套层级不是随意的命名游戏，而是<strong>能力随作用域递减</strong>的精心设计，对应硬件的物理结构：同一 block 的线程在同一 SM 上、能共享那块 SM 的片上 shared memory、能用屏障互相同步——所以 block 是你组织「协作」的单位；而不同 block 可能在不同 SM 上、甚至不同时间执行，它们之间<em>不能</em>直接同步，只能经慢速的 global memory 间接通信。记住这条「能协作的边界恰好是 block」，是后面所有内核设计（尤其分块矩阵乘与 FlashAttention 把工作切给 block）的根本约束：<strong>凡是需要线程紧密协作的计算，都必须塞进一个 block 之内</strong>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么 warp 偏偏是 32？这是 NVIDIA 的硬件选择（AMD 是 64，叫 wavefront）。把它当成一个<em>物理常数</em>记住即可：硬件按 32 条 lane 一组取指、执行、访存。后面你会反复看到 32 这个数字冒出来——合并访问凑满一条 cache line、warp shuffle 规约、block 尺寸取 32 的倍数——根源都在这里。</p>  <p>这四级层级还<strong>一一对应着内存层级</strong>（下一模块的主题），不是巧合而是协同设计：thread 对应私有的<strong>寄存器</strong>（最快）；block 对应一块<strong>shared memory</strong>（block 内共享，块间不可见）；grid 对应所有线程可见的<strong>global memory / HBM</strong>（最慢最大）。于是「把数据放在哪一级内存」与「让哪一级的线程协作」是同一个决策的两面。本课后面所有高性能内核的套路，本质都是<em>把数据从 global 搬到 shared 或寄存器、让 block 内的线程在那里反复复用它</em>——执行层级与内存层级，从这一刻起就该合在一起想。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mapping"><span class="num">3</span>线程到数据的映射</h2>
+  <h3>线程到数据的映射：最简内核 vector add</h3>  <p>写内核的第一步永远是回答：<strong>每个线程负责哪个数据元素？</strong>最经典的映射（一维）是：</p>  <div class="math-block">\[\text{idx} = \text{blockIdx.x}\times\text{blockDim.x} + \text{threadIdx.x}\]</div>  <p>即「我前面有 blockIdx 个完整 block，每个 block 有 blockDim 个线程，再加上我在本 block 内的偏移」。于是向量加法 <code>c[i]=a[i]+b[i]</code> 的内核就是：每个线程算出自己的 <code>idx</code>，搬两个数、加起来、写回一个数。</p>  <pre><code># CUDA 风格伪代码
+__global__ void vadd(float* a, float* b, float* c, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n)            // 边界保护：n 不是 blockDim 整数倍时
+        c[idx] = a[idx] + b[idx];
+}
+// 启动：grid = ceil(n / 256), block = 256</code></pre>  <div class="callout warn"><span class="label"></span>
+    <p>那行 <code>if (idx &lt; n)</code> 不是可选项。grid 通常向上取整成 block 尺寸的整数倍，于是<strong>最后一个 block 会有多出来的线程</strong>，它们的 idx 越界。漏掉边界保护 = 越界读写 = 错误结果或崩溃。Triton 里对应的是 <code>tl.load(ptr+offs, mask=offs&lt;n)</code> 的 <code>mask</code> 参数。</p>
+  </div>  <p>注意这里<strong>没有循环</strong>：程序员只描述「一个线程做什么」，硬件并行地把这段代码在所有 idx 上跑一遍。这种「写单线程、跑全网格」的视角叫 <span class="term">SPMD</span>（单程序多数据），是 CUDA/Triton 共同的心智模型。本课的 numpy 模拟做的恰好是「把这个隐式的并行展开成显式的循环」——我们用 <code>for block_id ... for thread_id ...</code> 枚举每一个线程，跑出与硬件并行完全相同的那组操作，从而能逐元素验证正确性。</p>  <p>这个映射看似简单，却是一切的源头：<strong>它决定了相邻线程会碰到哪些地址</strong>。在上面的一维映射里，相邻 threadIdx 访问相邻的 <code>a[idx]</code>——这正是下一模块「合并访问」想要的理想布局。反过来，如果你把映射写成让相邻线程跳着访问（比如按列遍历一个行优先矩阵），同样正确的结果会慢上数倍。所以「线程怎么映射到数据」不只是为了算对，更是性能的第一决定因素——记住这个伏笔。</p>  <h4>二维映射：处理矩阵时的下标</h4>  <p>当数据是二维（图像、矩阵）时，映射要在两个方向上各算一次。CUDA 允许 block 与 grid 本身是二维的，于是行、列下标分别为 <code>row = blockIdx.y*blockDim.y + threadIdx.y</code> 与 <code>col = blockIdx.x*blockDim.x + threadIdx.x</code>，再用模块 02 的行优先公式 <code>offset = row*ncols + col</code> 落到线性内存。这里藏着一个<strong>约定俗成但极关键</strong>的细节：让 <code>threadIdx.x</code>（变化最快的那一维）对应矩阵的<strong>列</strong>，而不是行。原因下一模块才完整展开，但直觉现在就能给：行优先布局下同一行的元素在内存里相邻，让相邻线程（x 相邻）去碰相邻的列，一个 warp 的 32 次访存就落在连续地址上、合成一次事务；若反过来让 x 对应行，相邻线程就跳着 <code>ncols</code> 个元素访问，带宽立刻浪费几十倍。<strong>同一段算对的代码，仅仅 x/y 谁配行谁配列写反，性能就差一个数量级</strong>——这是 GPU 与 CPU 编程最不同的直觉之一。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一维就像给一条长队的每个人编号；二维则像给电影院的每个座位编「第几排第几座」。难点不在编号本身，而在「让编号变化最快的那一维，顺着数据在内存里摆放的方向走」——顺着摆，访存就快；逆着摆，再对的逻辑也慢。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，多维线程下标只是把同一个 SPMD 思想升维：每个线程仍只描述「我这一格做什么」，硬件在 <code>(x,y)</code> 的笛卡尔积上并行展开。本课 numpy 模拟里，二维内核就是双重 for 循环 <code>for by,bx ... for ty,tx ...</code>，与一维同理可逐元素对拍。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>新手常把行列下标的 x/y 配反，代码逻辑完全正确、结果也对，但性能莫名其妙差几十倍，且 profiler 之外极难看出来。<strong>记死这条：threadIdx.x（最低维）永远配数据在内存里变化最快的那一维</strong>（行优先就是列）。这不是风格偏好，而是合并访问的硬约束，下一模块会从 cache line 角度证明它。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="simt"><span class="num">4</span>SIMT 与分支发散</h2>
+  <h3>SIMT 与分支发散</h3>  <p>warp 是<strong>锁步</strong>执行的：32 个线程在每个时钟共享同一条指令，只是各自的数据不同。这叫 <span class="term">SIMT</span>（单指令多线程）。它带来巨大的调度效率，但也埋了一个陷阱——<strong>分支发散</strong>。</p>  <p>当一个 warp 内的线程在 <code>if (cond)</code> 上分道扬镳（一些为真、一些为假），硬件<em>没法</em>让它们真的并行走两条路。它只能：先执行 if 分支、用掩码关掉条件为假的线程（它们空转），再执行 else 分支、关掉条件为真的线程。两条路径被<strong>串行化</strong>了。</p>  <div class="ascii">理想（无发散）：warp 32 线程全走同一支          1 份时间
+  if  ████████████████████████████████  (32/32 active)
+
+发散：半数走 if、半数走 else                   2 份时间（串行）
+  if  ████████████████░░░░░░░░░░░░░░░░  (16 active, 16 空转)
+  else░░░░░░░░░░░░░░░░████████████████  (16 active, 16 空转)</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>发散的代价 ≈ 该 warp 走过的不同分支条数。warp 内全走同一支 → 不罚；32 条线程走 32 条不同的路（极端）→ 慢 32 倍。所以要让<strong>相邻的、会被分到同一 warp 的线程，尽量走相同分支</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>注意发散是 <strong>warp 内</strong> 的概念：不同 warp 走不同分支毫无代价（它们本就独立调度）。常见优化是按数据重排，让同一分支的元素聚到同一 warp；编译器也会把短分支转成 <span class="term">predication</span>（带掩码执行两边再选结果）来避免真正的跳转。</p></div>
+  </div>  <p>哪些代码会引入发散？典型来源有：依赖 <code>threadIdx</code> 的条件分支（如 <code>if (threadIdx.x % 2 == 0)</code>）、数据相关的分支（不同线程的数据走不同 if）、以及<strong>不等长的循环</strong>（warp 要等走得最久的那条线程，其余空转）。缓解之道相应有三：把数据<em>重排</em>让同类聚到同一 warp（notebook 练习 2 会做）、用算术/掩码代替分支（让两边都算再选，即 predication）、以及把发散<em>抬到 warp 边界之外</em>（让分支条件恰好以 32 为粒度变化，使每个 warp 内部一致）。</p>  <p>本模块 notebook 会用一个「按 warp 统计活跃线程比例」的模拟，量化发散到底浪费了多少——你会亲眼看到：同样的「一半走 if、一半走 else」，把它们<strong>按 warp 对齐</strong>排布则零惩罚，<strong>奇偶交错</strong>排布则慢一倍，分支比例完全相同、仅仅布局不同。</p>  <h4>一笔发散账：同样的工作，布局决定快慢</h4>  <p>把上面的话换成数字。设一个 block 有 128 线程（4 个 warp），一半元素走 if、一半走 else，两支各耗时 1 个单位。<strong>布局 A（块对齐）</strong>：让前 64 个线程走 if、后 64 个走 else，则 warp0、warp1 整组走 if，warp2、warp3 整组走 else——<em>每个 warp 内部都一致</em>，零发散，总耗时就是 1。<strong>布局 B（奇偶交错）</strong>：让偶数线程走 if、奇数走 else，则<em>每个</em> warp 里都是 16 走 if、16 走 else，4 个 warp 全部发散，每个都要串行跑完 if 再跑 else，总耗时 2。<strong>分支比例一模一样（都是 50/50），仅仅因为「谁和谁分到同一个 warp」不同，就慢了一倍</strong>。这就是为什么「把同类数据排到一起、让分支以 32 为粒度变化」是对付发散的第一招。</p>  <p>再把它推到极端，能看清代价的上界。一个 warp 若 32 条线程走 32 条<em>互不相同</em>的路径（比如一个 <code>switch</code> 落到 32 个不同分支），硬件得把这 32 条路<strong>依次</strong>串行一遍，等效慢 32 倍——退化成了纯标量执行，SIMT 的并行优势荡然无存。所以发散的代价区间是 <code>[1×, 32×]</code>，恰好等于<strong>该 warp 实际走过的不同路径条数</strong>；优化发散，本质就是把这个「路径条数」往 1 压。</p>  <div class="callout danger"><span class="label">反直觉陷阱</span>
+    <p>一个隐蔽的发散来源是<strong>提前 return / break</strong>：看似「让算完的线程早点退出省时间」，但只要 warp 内还有一条线程没退出，整个 warp 就得继续占着调度名额陪跑——早退的线程只是空转，省不下时间，反而可能因为控制流复杂而增加开销。在 warp 锁步的世界里，<em>快慢由 warp 里最慢的那条线程决定</em>，这与 CPU 上「各线程各自为政」的直觉截然相反。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="latency"><span class="num">5</span>延迟隐藏：GPU 真正的魔法</h2>
+  <h3>延迟隐藏：GPU 真正的魔法</h3>  <p>单次访问 HBM 要数百个时钟周期。如果 GPU 像 CPU 那样傻等，算术单元会绝大部分时间闲置。GPU 的解法是<strong>超额订阅（oversubscription）</strong>：在每个 SM 上塞远多于其执行单元数的 warp，谁卡在访存就切到别人算。</p>  <div class="math-block">\[\text{要藏住的延迟}\ L \ \lesssim\ (\text{在飞 warp 数})\times(\text{每 warp 两次相关访存间的独立工作})\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>想象一个厨师（算术单元）和很多道菜（warp）。一道菜进烤箱（等访存）的几分钟里，厨师不干等，转头切配下一道菜。只要同时在做的菜够多，厨师永远有活干，烤箱的等待时间被<strong>完全藏住</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这就是<strong>吞吐 vs 延迟</strong>的根本区别：GPU 不缩短任何单次访存的延迟，而是用并行把延迟<em>摊销</em>掉。要藏住延迟 L，需要足够的「在飞内存事务」——这既可以靠更多 warp（提高占用率），也可以靠每个 warp 内更多互相独立的访存（指令级并行 ILP）。</p></div>
+  </div>  <p>这里有个微妙但关键的点：要藏住延迟，光有「很多 warp」还不够，还得有「很多<strong>互相独立</strong>的访存在飞」。一个 warp 连发好几个互不依赖的 load（指令级并行 ILP），和好几个 warp 各发一个 load，效果是类似的——都给了硬件「在等这批数据时还有别的数据在路上」。这就是为什么 Volkov 2010 那篇名文能反直觉地证明：<em>即便占用率不高，靠每个线程更多的独立访存也能跑满带宽</em>。延迟隐藏的真正货币是<strong>在飞内存事务的总数</strong>，占用率只是凑够它的一种（最常见的）途径。</p>  <h4>Little 定律：需要多少并行才藏得住</h4>  <p>「在飞事务要够多」能不能算出个数？能，这正是排队论里的 <span class="term">Little's Law</span>。它说：要让一条延迟为 <code>L</code>、吞吐为 <code>T</code> 的流水线满载，必须维持 <code>L×T</code> 个并发请求在飞：</p>  <div class="math-block">\[\text{所需在飞事务数}\ =\ \text{延迟}\ L\ \times\ \text{吞吐}\ T\]</div>  <p>代入真实数字感受一下量级：设 HBM 延迟 <code>L≈400</code> 周期、某 SM 每周期能消化 <code>T≈4</code> 个访存请求，则要喂饱它需要约 <code>400×4=1600</code> 个内存请求同时在飞。若每个 warp 平均只有 1 个独立 load 在途，就需要约 <code>1600/32≈50</code> 个 warp 常驻——这往往超过一个 SM 能容纳的 warp 上限！<strong>这就从第一性原理解释了「为什么占用率经常不够」</strong>，也解释了 Volkov 的破局之道：与其堆 warp 数，不如让<em>每个 warp 自带多个独立 load</em>（提高 ILP），同样能把在飞事务数凑到 1600。两条路通向同一个目标。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>这条原理解释了本课后面所有「为什么这样更快」：分块把数据搬进 shared 后<strong>复用</strong>，等于减少了需要藏的访存、也提供了大量独立计算去填充等待；FlashAttention 把注意力<strong>融合</strong>成一个内核，避免了中间结果落 HBM 再读回的来回延迟。优化访存，本质都是在帮延迟隐藏这台机器更好地运转——要么减少要藏的延迟，要么提供更多东西去填充等待。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="occupancy"><span class="num">6</span>Occupancy 占用率</h2>
+  <h3>Occupancy：把延迟隐藏量化</h3>  <p><span class="term">occupancy</span>（占用率）= 一个 SM 上实际驻留的活跃 warp 数 ÷ 该 SM 支持的最大 warp 数。它是「在飞 warp 够不够多」的直接度量。占用率受三种资源<strong>木桶效应</strong>制约，谁先用完谁封顶：</p>  <ul>
+    <li><strong>寄存器</strong>：每线程用的寄存器越多，一个 SM 能装下的线程（warp）越少。寄存器是最常见的占用率杀手。</li>
+    <li><strong>shared memory</strong>：每 block 用得越多，能并存的 block 越少。模块 03 分块时 tile 越大、shared 用得越多，就要在「复用」与「占用率」间权衡。</li>
+    <li><strong>block 尺寸 / 线程上限</strong>：SM 对常驻 block 数、线程数有硬上限；block 太小会浪费这些名额。</li>
+  </ul>  <p>计算占用率就是对这几项分别算「这个资源最多支持几个 block」，取<strong>最小值</strong>，再换算成 warp 比例。notebook 里会把这个木桶计算从零写出来。举个具体例子：某 SM 支持 64 warp、64K 寄存器。若内核 block=256 线程（8 warp）、每线程用 32 寄存器，则寄存器允许 <code>65536/(32×256)=8</code> 个 block，而 warp 上限允许 <code>64/8=8</code> 个 block——两者都给 8，占用率 <code>8×8/64=100%</code>。但若每线程用到 128 寄存器，寄存器只够 <code>65536/(128×256)=2</code> 个 block，占用率立刻掉到 <code>2×8/64=25%</code>。<strong>寄存器用量翻 4 倍，占用率掉到四分之一</strong>——这就是为什么内核里随手多用几个临时变量、或编译器为优化而展开循环，都可能悄悄拖垮占用率。</p>  <div class="callout danger"><span class="label">常见误区</span>
+    <p>一个被反复误解的点（Volkov 2010）：<strong>占用率不是越高越好，也不是性能的充要条件</strong>。100% 占用率若内核访存模式糟糕仍然慢；50% 占用率若每个 warp 有足够 ILP 也能跑满带宽。占用率是<em>达到足够延迟隐藏的一个手段</em>，不是优化目标本身。把它当成「够用就行」的阈值，而非越大越好的分数。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="config"><span class="num">7</span>执行配置的取舍</h2>
+  <h3>把它跑起来：执行配置的取舍</h3>  <p>有了这些概念，启动一个内核时的 <code>grid</code> 与 <code>block</code> 怎么选？几条经验法则：</p>  <table>
+    <thead><tr><th>旋钮</th><th>太小的后果</th><th>太大的后果</th><th>经验起点</th></tr></thead>
+    <tbody>
+      <tr><td>block 尺寸</td><td>warp 太少、占用率低、难藏延迟；浪费 SM 名额</td><td>每线程寄存器被挤少、可能 spill</td><td>128 ~ 256 线程（4~8 warp）</td></tr>
+      <tr><td>grid 尺寸</td><td>block 数 < SM 数 → 有 SM 闲置（尾部效应）</td><td>几乎无害（block 会排队）</td><td>≥ SM 数的若干倍，覆盖全部数据</td></tr>
+      <tr><td>每线程工作量</td><td>线程太多太碎、启动/调度开销占比高</td><td>并行度不足、负载不均</td><td>让一个线程算几个元素（grid-stride）</td></tr>
+    </tbody>
+  </table>  <p>最后一行的 <span class="term">grid-stride loop</span> 是个常用模式：不为每个元素开一个线程，而是开适量线程（通常刚好填满所有 SM）、每个线程在内部用 <code>for i in range(idx, n, grid_size)</code> 跨步处理多个元素。它有几个连带好处：线程数与数据量解耦（同一内核能处理任意大小输入而不必改 grid）、天然负载均衡、还便于线程复用已加载到寄存器的常量。notebook 会从零实现它并验证结果不变。</p>  <p>现实中最优配置依赖具体内核、输入形状、甚至 GPU 型号，没有放之四海皆准的答案。所以 Triton 干脆提供 <code>@triton.autotune</code>：把候选配置（block 尺寸、num_warps、流水级数）列出来，运行时对每个形状实测、缓存最快的一组。这恰恰印证了本课的次序——<strong>先把正确的并行结构搭好（结构错了再调旋钮也白搭），再把执行配置交给 autotune 去搜</strong>。本课负责前者，autotune 负责后者。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见的新手陷阱：以为「线程开得越多越好」。线程过多会摊薄每线程的寄存器、增加调度开销，且当数据量固定时多出的线程只是空转。正确的心态是<em>开足以填满硬件、藏住延迟的线程量</em>，而非无脑最大化——这与「占用率够用即可」是同一条智慧。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>异步与 warp 专门化</strong>：Hopper 起，内核越来越多地把「搬数据的 warp」和「算数据的 warp」分工（warp specialization），用异步拷贝（TMA）让延迟隐藏从「靠 warp 数」转向「靠显式流水」。FlashAttention-3 是代表。</li>
+    <li><strong>占用率之外的延迟隐藏理论</strong>：到底需要多少并行才能藏住给定延迟？Little 定律给了上界，但寄存器/ILP/访存模式如何共同决定，仍缺乏好用的预测模型，实践高度依赖 profiler。</li>
+    <li><strong>可移植性</strong>：warp 大小（NVIDIA 32、AMD 64）、SM 资源各代不同，最优执行配置不可移植。Triton/编译器试图自动适配，但跨架构的「一次写好处处快」仍是开放问题。</li>
+    <li><strong>调度的不确定性</strong>：block 在 SM 上的调度顺序无保证，跨 block 通信只能经 global memory + 原子操作，这限制了某些算法（如全局规约、协作组）的表达，是协作组（cooperative groups）等机制要解决的。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：CUDA C++ Programming Guide（执行模型权威定义）、PMPP 教材第 3–4 章（线程映射与执行）、Volkov 2010（低占用率也能高性能）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_memory_coalescing/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 内存层级与合并访问</div></a>
+  </div>
+
+</div>
+</body>
+</html>

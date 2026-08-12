@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 概率统计与信息论</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 7</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 概率统计与信息论</h1>
+  <p class="subtitle">MLE/MAP、假设检验、熵与 KL——把「模型 loss 是 2.3」「模型 A 比 B 好」「分布偏移了」这些日常判断，全部翻译成可计算、可推导、可证伪的统计量。这一章是评测科学与 LLM 训练共用的底层语言。</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">期望/方差、正态分布、对数运算、模块 01（梯度）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_probability_statistics_info.ipynb（Palmer Penguins + tiny-shakespeare）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Cover &amp; Thomas <em>Elements of Information Theory</em>；Wasserman <em>All of Statistics</em>；Shannon 1948</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 80 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么这章是评测与训练的共同语言</a></li>
+      <li><a href="#mle">MLE：从数据反推参数（含高斯闭式解推导）</a></li>
+      <li><a href="#map">MAP 与正则化的等价：把 weight decay 变成先验</a></li>
+      <li><a href="#test">假设检验：差异是真的，还是噪声？</a></li>
+      <li><a href="#perm">置换检验与 bootstrap：不假设分布</a></li>
+      <li><a href="#entropy">熵、交叉熵、KL：三个量一组公式</a></li>
+      <li><a href="#kldir">KL 的方向性：forward vs reverse 与 mode 行为</a></li>
+      <li><a href="#llmloss">LLM loss 就是交叉熵，PPL 就是它的指数</a></li>
+      <li><a href="#frontier">陷阱、研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么这章是评测与训练的共同语言</h2>
+
+  <p>评测里每一个判断，剥开外壳都是一个统计命题。「模型 A 比 B 好」是一次<strong>假设检验</strong>；「模型 loss 是 2.3」是一个<strong>交叉熵</strong>数值；「训练分布和部署分布偏移了」是一个 <strong>KL 散度</strong>；「这个 78% 准确率的误差棒有多宽」问的是一个<strong>抽样分布</strong>。如果不把这些命题翻译成可计算的统计量，所谓「评测」就退化成看排行榜名次、凭感觉下结论——而名次在小样本下极不稳定。</p>
+
+  <p>更重要的是，<strong>同一套信息论量直接定义了神经网络的训练目标</strong>。语言模型的 loss 就是下一 token 的交叉熵，scaling laws 画的就是「交叉熵 vs 参数/数据量」的曲线。所以这一章既是评测科学的地基，也是理解训练动力学的钥匙：你弄懂了交叉熵、KL、似然，就同时弄懂了「模型在学什么」和「我们在量什么」。后面 C3 评测课的统计严谨性模块、C1 的 scaling laws，都直接站在本章肩上。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  一句话串起本章：<strong>MLE 问「哪个参数最可能生成了我看到的数据」，交叉熵问「我的模型对真实数据有多惊讶」，KL 问「两个分布差多远」，假设检验问「我看到的差异是不是噪声」。</strong>
+  而那条最重要的等式是：<strong>神经网络训练 = 最小化交叉熵 = 最大似然</strong>——三个名字，一件事。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="mle"><span class="num">2</span>MLE：从数据反推参数（含高斯闭式解推导）</h2>
+
+  <p><span class="term">最大似然估计</span>（MLE）的思想极简：在所有可能的参数 $\theta$ 里，挑那个让「我手里这批数据出现」的概率最大的。由于样本独立，联合似然是连乘 $\prod_i p(x_i\mid\theta)$；连乘数值上易下溢且难求导，取对数把它变成连加，于是优化对象是<strong>对数似然</strong>：</p>
+
+  <div class="math-block">
+  $$ \hat\theta_{\text{MLE}}=\arg\max_\theta\sum_i\log p(x_i\mid\theta) $$
+  </div>
+
+  <p>取对数是合法的，因为 $\log$ 单调，不改变最优点位置；而它把「连乘」变「连加」、把指数族分布的指数拉下来，求导瞬间简单。这是为什么实践里几乎永远优化 log-likelihood 而非 likelihood——同一个工程理由也解释了为什么 loss 总是写成对数形式。还有一层数值原因：上千个 $(0,1)$ 之间的概率连乘会迅速下溢到浮点 0，而取对数后变成求和，数值上稳得多。这两个理由——求导简单 + 数值稳定——是「为什么 ML 里到处是 log」的完整答案。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  <strong>必背微例：手推高斯 MLE。</strong>设 $x_i\sim\mathcal N(\mu,\sigma^2)$，对数似然
+  $\ell=-\frac n2\log(2\pi\sigma^2)-\frac1{2\sigma^2}\sum_i(x_i-\mu)^2$。
+  对 $\mu$ 求导置零：$\frac{\partial\ell}{\partial\mu}=\frac1{\sigma^2}\sum_i(x_i-\mu)=0\Rightarrow\hat\mu=\bar x$。
+  再对 $\sigma^2$ 求导置零：$\frac{\partial\ell}{\partial\sigma^2}=-\frac n{2\sigma^2}+\frac1{2\sigma^4}\sum_i(x_i-\hat\mu)^2=0\Rightarrow\hat\sigma^2=\frac1n\sum_i(x_i-\hat\mu)^2$。
+  注意分母是 $n$ 不是 $n-1$——<strong>MLE 的方差是有偏的</strong>（系统性偏小，因为用了估计出的 $\hat\mu$ 而非真 $\mu$）。这道推导是面试高频题，能从对数似然一路推到两个闭式解是基本功。</div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白说</h4>
+      <p>你有一堆数，假设它们来自某条钟形曲线。MLE 就是问：钟形曲线的中心和胖瘦取多少，才能让我手里这堆数显得最「正常」（最可能被生成）？答案是中心取平均数，胖瘦取（有偏的）样本方差。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨说</h4>
+      <p>MLE 在温和正则条件下具有优良的渐近性质：<strong>渐近无偏</strong>、<strong>一致</strong>（$n\to\infty$ 时收敛到真值）、<strong>渐近有效</strong>（方差达到 <span class="term">Cramér–Rao 下界</span>，即没有任何无偏估计能比它更精）。但「渐近」是关键限定词——有限样本下 MLE 可以有偏，高斯方差的 $/n$ 就是活例子；样本越少偏差越明显。</p>
+    </div>
+  </div>
+
+  <p>notebook 里你会在真实的<strong>企鹅体重</strong>（Palmer Penguins，Gentoo/Adélie 两个物种）上手算高斯 MLE，验证 $\hat\mu=\bar x$、$\hat\sigma^2$ 用 <code>np.var</code> 默认的 $/n$，并对比 $/(n-1)$ 的无偏估计——亲眼看到两者在真实样本量下差多少。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="map"><span class="num">3</span>MAP 与正则化的等价：把 weight decay 变成先验</h2>
+
+  <p>MLE 只看数据。如果我们对参数事先有信念（比如「权重不该太大」），就给 $\theta$ 加一个<strong>先验</strong> $p(\theta)$，转而最大化后验 $p(\theta\mid x)\propto p(x\mid\theta)\,p(\theta)$——这就是 <span class="term">最大后验估计</span>（MAP）。取对数后，先验变成了对数似然上的一个加性惩罚项：</p>
+
+  <div class="math-block">
+  $$ \hat\theta_{\text{MAP}}=\arg\max_\theta\Big[\underbrace{\log p(x\mid\theta)}_{\text{数据拟合}}+\underbrace{\log p(\theta)}_{\text{先验/正则}}\Big] $$
+  </div>
+
+  <p>这里藏着 ML 里最优美的对应之一。取零均值高斯先验 $p(\theta)\propto e^{-\lambda\|\theta\|^2/2}$，则 $\log p(\theta)=-\frac\lambda2\|\theta\|^2+\text{const}$——<strong>高斯先验的 MAP 精确等价于 L2 正则（weight decay）</strong>。取拉普拉斯先验 $p(\theta)\propto e^{-\lambda\|\theta\|_1}$，则惩罚项是 $-\lambda\|\theta\|_1$——<strong>拉普拉斯先验的 MAP 就是 L1 正则（lasso）</strong>，它的尖峰先验偏好稀疏解。</p>
+
+  <table>
+    <thead><tr><th>先验 $p(\theta)$</th><th>对数先验（惩罚项）</th><th>等价的正则</th><th>解的特性</th></tr></thead>
+    <tbody>
+      <tr><td>零均值高斯 $\mathcal N(0,\tau^2)$</td><td>$-\frac{1}{2\tau^2}\|\theta\|_2^2$</td><td>L2 / ridge / weight decay</td><td>权重收缩、抗共线性、解唯一</td></tr>
+      <tr><td>拉普拉斯（双指数）</td><td>$-\lambda\|\theta\|_1$</td><td>L1 / lasso</td><td>稀疏解、自动特征选择</td></tr>
+      <tr><td>均匀（无信息）</td><td>常数</td><td>无正则</td><td>退化回纯 MLE</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  下次有人问「weight decay 到底是什么」，标准答案不是「让权重变小的 trick」，而是：<strong>对权重施加零均值高斯先验后的 MAP 估计</strong>。这一句话把「正则化」从一堆启发式提升成了贝叶斯推断——你不是在凑，你是在表达一个先验信念。L1/L2 的稀疏 vs 收缩之别，本质就是拉普拉斯尖峰先验 vs 高斯圆滑先验之别。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="test"><span class="num">4</span>假设检验：差异是真的，还是噪声？</h2>
+
+  <p>评测里最常见的问题长这样：「模型 A 在 200 道题上平均分 71.2，B 70.4，A 真的更好吗？」假设检验给出框架：先立<span class="term">零假设</span> $H_0$（两者无差异），算一个检验统计量，再问——<strong>如果 $H_0$ 为真，纯靠抽样随机性看到这么极端（或更极端）结果的概率是多少？</strong>这个概率就是 <span class="term">p 值</span>。p 值很小，说明「在没差异的世界里这几乎不可能发生」，于是拒绝 $H_0$。</p>
+
+  <p>两样本 <strong>t 检验</strong>比较两组均值，统计量 $t=\dfrac{\bar x_A-\bar x_B}{\text{标准误}}$。但有一个常被忽视的功效问题：<strong>配对设计远比独立设计敏感</strong>。让 A、B 做<em>同一批</em>题，逐题配对求差，能消掉「题目本身难易」这个巨大的方差来源，于是同样的真实差异更容易被检出。评测里能配对（同 prompt、同评分标准）就一定要配对——这点 C3 会反复强调。<span class="term">功效</span>（power）是「真有差异时正确检出的概率」；样本太小，功效低，真实差异常被噪声淹没。</p>
+
+  <p>这里要区分两类错误，它们是假设检验的全部张力所在。<strong>第一类错误</strong>（假阳性）：$H_0$ 其实成立，你却拒绝了它——宣称「A 更好」但其实没差异。显著性水平 $\alpha$（常取 0.05）就是你愿意承担的第一类错误率上限。<strong>第二类错误</strong>（假阴性）：真有差异你却没检出，发生率记作 $\beta$，而功效 $=1-\beta$。两者此消彼长：把 $\alpha$ 调得很严（如 0.001）能少犯假阳性，但功效随之下降、更容易漏掉真差异。<strong>功效分析</strong>就是在实验前回答「要多少样本才能以足够功效检出我关心的最小效应」——评测里「这个 benchmark 要多少题才够」本质就是一次功效分析，绝不能拍脑袋定 100 题就开跑。</p>
+
+  <div class="callout danger"><span class="label"></span>
+  p 值<strong>不是</strong>「A 更好的概率」，也<strong>不是</strong>「差异有多大」。它只是「假设没差异时，看到这么大差异的概率」——一个关于数据的条件概率，不是关于假设的概率。两个常见误用：①把 $p=0.04$ 当成「96% 确信 A 更好」（错，这是把 $p$ 反过来读）；②看到 $p<0.05$ 就宣称「效果显著」却不报<strong>效应量</strong>（差异 0.1 分即便显著也可能毫无实用价值）。小样本（200 题）下尤其危险——别被一次 leaderboard 名次忽悠。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="perm"><span class="num">5</span>置换检验与 bootstrap：不假设分布</h2>
+
+  <p>t 检验假设数据近似正态、方差齐性。当你不愿意（或不能）假设分布形态时，用<span class="term">置换检验</span>（permutation test）：它只依赖一个极弱的假设——<strong>在 $H_0$ 下，组标签是可交换的</strong>（exchangeable）。做法是把两组的标签反复随机打乱，每次重算均值差，得到一个「如果分组纯属随机会长什么样」的零分布，再看真实均值差落在它的多极端处。</p>
+
+  <div class="ascii">
+   真实:   Δ_obs = mean(A) - mean(B)
+   零分布: 把所有样本的组标签洗牌 N 次（如 10000），每次算 Δ_perm
+   p 值  = #{ |Δ_perm| ≥ |Δ_obs| } / N
+   ─────────────────────────────────────────────────────
+   不需要任何分布假设，只需要「在 H0 下标签可交换」即可
+  </div>
+
+  <p>它的近亲是 <span class="term">bootstrap</span>：从样本<em>有放回</em>重采样很多次、每次算指标，得到指标的经验分布，取分位数就是置信区间（详见模块 07）。两者都用「重采样」绕开了分布假设，是评测里给任何分数配误差棒、判断显著性的主力工具。notebook 练习里你会在真实企鹅体重上手写 <code>perm_test</code>，用一万次洗牌判断两个物种的体重差异是否显著。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  置换检验也不是万能。它检验的是「两组<em>同分布</em>」这个 $H_0$，而不仅仅是「均值相等」——若两组方差差别巨大，拒绝 $H_0$ 可能源于方差而非均值。另外洗牌次数 $N$ 太小会让 p 值本身有抖动（$N=10000$ 时 p 值的分辨率约 $10^{-4}$）。报告时要写清 $N$ 与统计量的选择。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="entropy"><span class="num">6</span>熵、交叉熵、KL：三个量一组公式</h2>
+
+  <p>三个量、一组公式，是理解 LLM loss 与分布距离的钥匙。建议把它们当成一个整体记忆：</p>
+
+  <div class="math-block">
+  $$
+  \begin{aligned}
+  H(p) &= -\sum_x p(x)\log p(x) && \text{熵：分布自身的不确定性（最优编码的平均码长）}\\
+  H(p,q) &= -\sum_x p(x)\log q(x) && \text{交叉熵：用 }q\text{ 的码本编码真分布 }p\text{ 的平均代价}\\
+  D_{\mathrm{KL}}(p\,\|\,q) &= \sum_x p(x)\log\frac{p(x)}{q(x)} = H(p,q)-H(p) && \text{KL：用 }q\text{ 而非 }p\text{ 多付出的代价}
+  \end{aligned}
+  $$
+  </div>
+
+  <p>这组关系里最值得记住的是 <strong>交叉熵 = 熵 + KL</strong>：$H(p,q)=H(p)+D_{\mathrm{KL}}(p\|q)$。由于 $H(p)$ 是真分布的固有不确定性、与模型 $q$ 无关，<strong>最小化交叉熵就等价于最小化 KL</strong>——这就是为什么训练用交叉熵当 loss、却说「在让模型分布逼近真分布」。两者只差一个与模型无关的常数 $H(p)$，所以梯度完全一样。这个等式还告诉你交叉熵的下界：当 $q=p$ 时 KL 为 0，交叉熵降到 $H(p)$——<strong>语言模型的 loss 永远不可能低于数据本身的熵</strong>，这个不可约下界（自然语言的内在不确定性）正是 scaling laws 曲线趋于平台的理论原因之一。</p>
+
+  <p>两条必背性质：<span class="term">吉布斯不等式</span>保证 $D_{\mathrm{KL}}\ge 0$，且 $=0$ 当且仅当 $p=q$（用 Jensen 不等式两行可证：$-D_{\mathrm{KL}}=\sum p\log\frac qp\le\log\sum p\frac qp=\log\sum q=0$）；以及 <strong>KL 不对称</strong>，$D(p\|q)\ne D(q\|p)$，所以它不是真正的「距离」（不满足对称性，也不满足三角不等式），方向必须讲清楚——这正是下一节的主题。若需要一个对称的版本，可用 Jensen–Shannon 散度（两个方向的平均，对称且有界），它是 GAN 原始目标的理论基础。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  编码视角能让这三个量瞬间有画面：熵 $H(p)$ 是「用最优码本编码来自 $p$ 的消息，平均每条要多少 bit」；交叉熵 $H(p,q)$ 是「我用了为 $q$ 设计的码本去编码实际来自 $p$ 的消息，平均码长」；KL 就是「用错码本多付的 bit 数」。模型预测越准（$q$ 越接近 $p$），多付的越少，loss 越低。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="kldir"><span class="num">7</span>KL 的方向性：forward vs reverse 与 mode 行为</h2>
+
+  <p>因为 KL 不对称，「让 $q$ 逼近 $p$」有两种写法，行为截然不同——这是面试和实践都常踩的坑。设 $p$ 是真分布、$q_\theta$ 是我们要学的模型。</p>
+
+  <ul>
+    <li><strong>forward KL</strong> $D_{\mathrm{KL}}(p\|q)$：期望对 $p$ 取。凡是 $p(x)>0$ 的地方，若 $q(x)\to0$ 则 $\log\frac{p}{q}\to\infty$，惩罚爆炸。所以 $q$ <strong>不敢在 $p$ 有质量的地方留空</strong>——结果是 <span class="term">mode-covering</span>（覆盖所有模式，宁可糊成一大坨也不漏）。最大似然训练正是在最小化 forward KL。</li>
+    <li><strong>reverse KL</strong> $D_{\mathrm{KL}}(q\|p)$：期望对 $q$ 取。凡是 $q(x)>0$ 的地方都要求 $p(x)$ 别太小，否则受罚；但 $p$ 有质量而 $q$ 没去的地方<em>不受罚</em>。所以 $q$ <strong>倾向缩到 $p$ 的某一个高峰里</strong>——结果是 <span class="term">mode-seeking</span>（抓一个模式抓得很准，但忽略其他模式）。变分推断、许多 RL/蒸馏目标用的是 reverse KL。</li>
+  </ul>
+
+  <table>
+    <thead><tr><th>方向</th><th>期望对谁取</th><th>行为</th><th>典型用途</th></tr></thead>
+    <tbody>
+      <tr><td>forward $D(p\|q)$</td><td>真分布 $p$</td><td>mode-covering（铺开、不敢留空）</td><td>最大似然 / 语言模型训练</td></tr>
+      <tr><td>reverse $D(q\|p)$</td><td>模型 $q$</td><td>mode-seeking（抓单峰、可能漏模式）</td><td>变分推断 / 部分蒸馏与 RL 目标</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  实践陷阱：当你看到论文里写「最小化 KL 让学生逼近教师」，<strong>一定要确认是哪个方向</strong>。同样是「拉近两个分布」，forward 会让学生模糊地覆盖教师的所有输出，reverse 会让学生自信地坍缩到教师的一个高概率模式——在生成多样性、安全对齐、蒸馏质量上后果完全不同。把方向写反，是审稿和复现时最隐蔽的 bug 之一。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="llmloss"><span class="num">8</span>LLM loss 就是交叉熵，PPL 就是它的指数</h2>
+
+  <p>把上面的交叉熵套到语言模型上，一切就具体了。每个位置的真实分布 $p$ 是 <strong>one-hot</strong>（真实 token 概率为 1，其余为 0），模型给出概率分布 $q$。one-hot 下交叉熵 $H(p,q)=-\sum_x p(x)\log q(x)$ 只剩一项——<strong>真实 token 的负对数概率</strong> $-\log q(\text{真实 token})$。对所有位置求平均，就是语言模型的训练 loss：</p>
+
+  <div class="math-block">
+  $$ \text{Loss}=-\frac1N\sum_{i=1}^{N}\log q(t_i\mid t_{<i}),\qquad \text{PPL}=e^{\text{Loss}} $$
+  </div>
+
+  <p><span class="term">困惑度</span>（perplexity）就是平均交叉熵的指数。它的直觉很美：<strong>模型在每一步平均像是在多少个等概率候选里犹豫</strong>。PPL=10 ≈ 平均像在 10 个等可能选项里盲猜；PPL 降到 5，等于把「犹豫的有效选项数」砍了一半。因为 PPL 是 loss 的单调变换，最小化 loss 就是最小化 PPL——这就是为什么困惑度是语言模型最经典的内在评测指标，也是 scaling laws 曲线纵轴的常见形态之一。notebook 里你会在 <strong>tiny-shakespeare</strong> 上从零搭一个 bigram 语言模型，亲手算出它的交叉熵和困惑度——这就是最小可运行的 LLM 评测。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  Shannon 1948 <em>A Mathematical Theory of Communication</em> 定义了熵与信道容量，是整个信息论的源头；
+  Cover &amp; Thomas <em>Elements of Information Theory</em> 是标准教材。现代 LLM 的 scaling laws（Kaplan 2020、Hoffmann 2022）画的正是「交叉熵 loss vs 参数/数据」——本章定义了那条曲线的纵轴。详见 <a href="../references.md">论文清单</a>。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>陷阱、研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>0 概率陷阱</strong>：交叉熵里若 $q(x)=0$ 而 $p(x)>0$，loss 直接 $+\infty$。语言模型必须保证<em>永不</em>给任何 token 零概率——softmax 天然满足，但 n-gram 模型需要 smoothing（加一平滑、Kneser–Ney）。同理 KL 在 $q$ 有零而 $p$ 非零处发散。</li>
+    <li><strong>log 底数：nats vs bits</strong>。自然对数得 nats，$\log_2$ 得 bits，换底只差常数 $\ln 2$。两者都对，但报告时务必说清——把 nats 当 bits 读会让 PPL 与压缩率全错一个因子。</li>
+    <li><strong>多重比较</strong>：跑 20 个 benchmark，纯靠运气也约有一个出现 $p<0.05$。不校正就到处宣称「显著」是统计学最常见的自欺。<span class="term">Bonferroni</span>（把阈值除以比较次数）保守但简单，<span class="term">FDR / Benjamini–Hochberg</span> 控制错误发现率、功效更高——C3 会展开。</li>
+    <li><strong>前沿：把统计严谨带进 LLM 评测</strong>。当评测对象是随机生成、评分本身带噪（LLM-as-judge）、题目高度相关时，经典 iid 假设失效。如何给 LLM 评测分数报正确的置信区间、做有效的配对检验、估计「需要多少题才有功效」，是当下评测科学的活跃方向。</li>
+    <li><strong>前沿：校准与不确定性</strong>。模型说「我 90% 确定」时真有 90% 对吗？这把交叉熵与<span class="term">校准</span>（模块 06）连起来——一个 loss 很低的模型仍可能严重过自信，而过自信会污染它的自评与作为 judge 的可信度。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  学完本章，你应该能：从对数似然手推高斯 MLE 的 $\hat\mu,\hat\sigma^2$ 并解释方差为何有偏；说清 weight decay = 高斯先验 MAP、L1 = 拉普拉斯先验 MAP；用配对 t 检验或置换检验判断两个模型的差异是否显著、并正确解释 p 值；写出熵/交叉熵/KL 三式与 $H(p,q)=H(p)+D_{\mathrm{KL}}$、区分 forward/reverse KL 的 mode 行为；并算出一个语言模型的交叉熵与困惑度。这套语言是 C3 评测科学与 C1 训练动力学的共同地基。下面去 notebook，在真实企鹅与 tiny-shakespeare 上把它们全部跑一遍。</div>
+
+  <div class="pager">
+    <a href="../01_matrix_calculus_backprop/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 矩阵微积分与 backprop</div></a>
+    <a class="next" href="02_probability_statistics_info.ipynb"><div class="dir">Notebook →</div><div class="t">打开配套练习</div></a>
+  </div>
+</div>
+</body>
+</html>

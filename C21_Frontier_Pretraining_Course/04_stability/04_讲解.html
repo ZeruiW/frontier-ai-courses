@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 训练稳定性</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 训练稳定性</h1>
+  <p class="subtitle">让几个月的训练别在深夜突然崩掉：loss spike 成因与检测、grad clipping、z-loss、QK-norm、warmup-decay schedule、bf16/fp32、初始化 —— 模拟 spike 并演示各修法</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">梯度下降与 Adam、softmax、浮点表示基础；模块 00/03</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_stability.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Chowdhery 2022 (PaLM)、Zhang 2022 (OPT)、Wortsman 2023、Dehghani 2023 (QK-norm)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">loss spike：大训练的噩梦</a></li>
+      <li><a href="#clip">梯度裁剪：最基础的护栏</a></li>
+      <li><a href="#logit">z-loss 与 QK-norm：控制 logit 漂移</a></li>
+      <li><a href="#warmup">warmup 与学习率调度</a></li>
+      <li><a href="#precision">混合精度：bf16 为什么比 fp16 稳</a></li>
+      <li><a href="#init">初始化与深度缩放</a></li>
+      <li><a href="#spike">检测与处理 spike：应急流程</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>loss spike：大训练的噩梦</h2>
+  <p>现在数据干净、tokenizer 定好、超参也用 μP 迁好了。你按下「开始训练」，接下来是几个星期、烧掉数百万美元的连续训练。然后某个深夜——<strong>loss 突然从 2.1 暴涨到 8.0，再也回不来了</strong>。这就是 <span class="term">loss spike</span>（损失尖峰），大规模预训练最让人胆寒的故障。本模块讲<strong>怎么让训练别崩、崩了怎么救</strong>。</p>  <p>小模型很少 spike，但模型一大、训练一长，spike 几乎是<strong>必然</strong>会遇到的。PaLM（540B）、OPT（175B）的训练日志里都记录了反复的 loss 发散、手动回滚、调学习率、换优化器的惊险时刻。OPT 团队甚至公开了完整 logbook——读它你会震惊于「训一个大模型有多脆弱」：硬件故障、数值溢出、坏数据、优化器状态崩坏，任何一个都可能让几周的算力打水漂。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：训练大模型像<strong>开一辆赛车跑几千公里不停</strong>。小毛病（小模型）在家门口开开没事；但长途高速（大模型长训）下，任何一个零件的薄弱点都会被放大成事故。本模块就是这辆赛车的<strong>安全系统</strong>：安全带（梯度裁剪）、限速器（warmup）、稳定杆（z-loss/QK-norm）、故障预警（spike 检测）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，训练是在高维非凸损失面上做随机梯度下降。<strong>不稳定</strong>源于若干处的尺度失控：梯度范数突然爆炸（坏 batch、罕见样本）、注意力 logit 漂移到饱和、输出 logit 发散、低精度数值溢出、初始化或学习率与深度/宽度失配。每一类不稳定都有对应的护栏，本模块逐个拆解：它们各自<strong>治的是什么病</strong>、为什么有效、代价是什么。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>为什么 spike 这么可怕？因为它常常<strong>不可逆</strong>：loss 一旦发散，模型权重可能已经被一个坏梯度推到了损失面的坏区域，后续训练再也回不到原来的轨道。在一次性的大训练里，这意味着<strong>要么从最近的 checkpoint 回滚（损失几小时到几天进度），要么整个训练作废</strong>。所以稳定性不是「锦上添花」，而是<strong>保住整次训练投资的底线</strong>——这也是为什么前沿团队在护栏和监控上投入巨大。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="clip"><span class="num">2</span>梯度裁剪：最基础的护栏</h2>
+  <h3>梯度裁剪：最基础的护栏</h3>  <p>最常见的不稳定来源是<strong>梯度爆炸</strong>：某个 batch（往往含罕见 token 或异常样本）产生了一个范数极大的梯度，一步更新就把权重推飞。<span class="term">gradient clipping</span>（梯度裁剪）是对此最简单有效的护栏：<strong>当全局梯度范数超过阈值时，等比例缩小整个梯度向量</strong>。</p>  <div class="math-block">\[g \leftarrow g \cdot \min\left(1, \frac{\tau}{\lVert g \rVert_2}\right) \qquad (\tau \text{ 是裁剪阈值，典型 } 1.0)\]</div>  <p>关键在<strong>等比例</strong>缩放：裁剪只改梯度的<strong>大小</strong>、不改<strong>方向</strong>。范数没超阈值时完全不动；超了就把整个向量按比例缩回到阈值长度。这保证了「方向（优化信息）保留，幅度（破坏力）受控」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>想象梯度是一脚油门。正常情况轻踩没事；但偶尔一个坏样本让你<strong>一脚踩到底</strong>（梯度范数爆炸），车就失控了。梯度裁剪是<strong>限速器</strong>：踩多猛都不让你超过某个速度，但你想去的方向（油门指向）不变。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>注意是<strong>全局</strong>范数裁剪（把所有参数的梯度拼成一个大向量算范数），不是逐层、逐参数裁剪——这样保持各参数梯度的<strong>相对比例</strong>（方向）不变。逐参数裁剪会扭曲梯度方向，反而有害。<span class="term">global grad norm</span>（全局梯度范数）这条曲线也是最重要的监控信号：它突然飙升常常<strong>先于</strong> loss spike 出现，是预警。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>裁剪阈值 $\tau$ 是个权衡：太小（如 0.1）会<strong>过度裁剪</strong>——正常梯度也被砍，训练变慢；太大（如 100）则<strong>形同虚设</strong>，挡不住真正的爆炸。典型值 $\tau=1.0$。更聪明的做法是<strong>自适应裁剪</strong>（按梯度范数的历史分布动态定阈值），能在不拖慢正常训练的前提下挡住异常。但裁剪只是<strong>治标</strong>——它挡住单次爆炸，但若梯度反复爆炸，说明更深层的问题（lr 太大、数据有毒、初始化不对）没解决，需要配合其他手段。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="logit"><span class="num">3</span>z-loss 与 QK-norm：控制 logit 漂移</h2>
+  <h3>z-loss 与 QK-norm：控制 logit 漂移</h3>  <p>第二类不稳定来自<strong>logit 漂移</strong>：训练过程中某些 logit（注意力分数、或最终输出 logit）会<strong>缓慢但持续地增大</strong>，最终把 softmax 推向饱和区（梯度消失或数值溢出），引发不稳定。两个针对性的护栏是 z-loss 和 QK-norm。</p>  <h4>z-loss：拉住输出 logit</h4>  <p><span class="term">z-loss</span>（PaLM 用）给损失加一个小的辅助项，惩罚 softmax 归一化项 $\log Z$ 的平方（$Z = \sum_i e^{z_i}$ 是配分函数）：</p>  <div class="math-block">\[\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}} + \lambda_z (\log Z)^2 \qquad (\lambda_z \approx 10^{-4})\]</div>  <p>直觉：$\log Z$ 反映 logit 的整体<strong>绝对量级</strong>。CE 损失只关心 logit 之间的<em>相对</em>大小（softmax 对所有 logit 同时加常数不变），所以它<strong>不约束 logit 的绝对尺度</strong>——logit 可以整体越漂越大而 CE 毫无察觉。z-loss 补上这个约束：把 $\log Z$（也就是 logit 量级）轻轻拉回合理范围，既稳住数值、又有轻微正则效果。</p>  <h4>QK-norm：拉住注意力 logit</h4>  <p><span class="term">QK-norm</span>（query-key normalization，ViT-22B 等用）直接在算注意力分数前对 query 和 key 向量做归一化（如 RMSNorm）：</p>  <div class="math-block">\[\text{attn logit} = \frac{\hat q \cdot \hat k}{\tau}, \quad \hat q = \frac{q}{\lVert q \rVert}, \; \hat k = \frac{k}{\lVert k \rVert}\]</div>  <p>归一化后 $\hat q \cdot \hat k \in [-1, 1]$（就是余弦相似度），注意力 logit 的尺度<strong>被硬性钉死</strong>，无论 $q, k$ 在训练中怎么增长都不会让 logit 爆炸。这从根上消除了「注意力 logit 漂移→softmax 饱和」这条不稳定路径——呼应模块 03 的 $1/d$ 缩放（两者都在控制注意力 logit 尺度，一个用归一化、一个用参数化）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>z-loss 和 QK-norm 都在干同一件事：<strong>不让某个 logit 偷偷越长越大</strong>。z-loss 管输出 logit（用一个软惩罚拉着），QK-norm 管注意力 logit（用硬归一化锁死）。它们是大模型稳定训练的两个常见「稳定杆」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么 logit 漂移会致命？softmax 在 logit 很大时进入<strong>饱和区</strong>：输出接近 one-hot，梯度趋近 0（学不动），且 $e^{\text{large}}$ 易数值溢出。更糟的是这是个<strong>正反馈</strong>：logit 越大 → 越饱和 → 梯度行为越异常 → 越容易把 logit 推得更大。z-loss/QK-norm 打断这个正反馈环。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>z-loss 见 Chowdhery 2022（PaLM）；QK-norm 见 Dehghani 2023（ViT-22B）；两者的小模型复现见 Wortsman 2023《Small-scale Proxies for Large-scale Transformer Training Instabilities》——后者系统测了各种稳定手段的效果，是本模块方法论的直接对应。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="warmup"><span class="num">4</span>warmup 与学习率调度</h2>
+  <h3>warmup 与学习率调度</h3>  <p><span class="term">warmup</span>（预热）是几乎所有大模型训练的标配：训练开始的若干步，把学习率从 0<strong>线性升到峰值</strong>，而不是一上来就用峰值 lr。为什么？因为<strong>冷启动时一切都不可靠</strong>。</p>  <p>训练刚开始时：① 权重是随机的，梯度方向噪声大；② Adam 的二阶矩估计 $v$ 还没积累够样本，不可信（早期 $\hat v$ 偏小，导致实际步长偏大）。这两点叠加，一上来用大 lr 极易让第一步就把权重推飞、或让 Adam 的自适应步长失控——这是早期 spike 的高发期。warmup 给系统一个<strong>热身期</strong>，让梯度和优化器状态稳定下来后再加速。</p>  <p>完整的学习率调度（<span class="term">learning rate schedule</span>）通常是<strong>warmup 上升 + 衰减</strong>两段。衰减形状有几种主流选择：</p>  <table>
+    <thead><tr><th>调度</th><th>形状</th><th>特点</th></tr></thead>
+    <tbody>
+      <tr><td>cosine decay</td><td>warmup 后沿余弦曲线降到≈0</td><td>最常用，平滑，但训练长度要预先定死</td></tr>
+      <tr><td>linear decay</td><td>warmup 后线性降到 0</td><td>简单，效果接近 cosine</td></tr>
+      <tr><td>WSD (Warmup-Stable-Decay)</td><td>warmup→长期恒定→末段快速衰减</td><td>可中途加数据/延长，末段衰减再「冲刺」，近年流行</td></tr>
+      <tr><td>inverse sqrt</td><td>$\propto 1/\sqrt{\text{step}}$</td><td>Transformer 原论文用，对训练长度不敏感</td></tr>
+    </tbody>
+  </table>  <div class="ascii">学习率
+ peak ┤      ╱‾‾╲___
+      │     ╱       ‾‾‾╲___        cosine: 平滑降到 0
+      │    ╱             ‾‾‾╲___
+      │   ╱                     ‾‾‾  ← ≈0
+    0 ┤__╱  ↑warmup 结束
+      └────────────────────────────→ step
+       warmup     decay (cosine / linear / WSD)</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>warmup 像<strong>汽车冷启动先热车</strong>：发动机刚启动时直接地板油会伤车（早期 spike）；先怠速热一会儿（warmup），各部件到工作温度了再加速，平稳又安全。衰减则像<strong>快到终点时收油</strong>，让模型在小步长下精细收敛。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>WSD（Warmup-Stable-Decay）值得特别说：传统 cosine 要求<strong>预先定死训练总步数</strong>（余弦曲线得知道终点在哪）。WSD 把中间设成<strong>恒定 lr</strong>，想训多久训多久，最后想停时再做一段快速衰减——这让「中途加数据」「延长训练」「从同一恒定段切出多个不同长度的模型」都成为可能，是近年很受欢迎的灵活调度（Hägele 2024）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话记住调度：<strong>慢启动（warmup 防早期 spike）、中间快跑（峰值 lr 高效学习）、收尾减速（衰减精细收敛）</strong>。这三段对应训练的三个阶段，每段的 lr 设计都在回应那个阶段的特点。调度形状是少数对最终 loss 有显著影响、却常被新手忽略的超参之一。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="precision"><span class="num">5</span>混合精度：bf16 为什么比 fp16 稳</h2>
+  <h3>混合精度：bf16 为什么比 fp16 稳</h3>  <p>大模型训练用<span class="term">mixed precision</span>（混合精度）省显存、提速：大部分计算用 16 位浮点，关键累加用 32 位。但<strong>用哪种 16 位</strong>——fp16 还是 bf16——直接关系稳定性。</p>  <table>
+    <thead><tr><th>格式</th><th>位分配（符号/指数/尾数）</th><th>动态范围</th><th>精度</th><th>稳定性</th></tr></thead>
+    <tbody>
+      <tr><td>fp32</td><td>1 / 8 / 23</td><td>极大（$\sim 10^{38}$）</td><td>高</td><td>基准</td></tr>
+      <tr><td>fp16</td><td>1 / 5 / 10</td><td>小（$\sim 10^{4}$，易溢出）</td><td>较高（10 位尾数）</td><td>易上溢/下溢，需 loss scaling</td></tr>
+      <tr><td>bf16</td><td>1 / 8 / 7</td><td>大（同 fp32！）</td><td>低（7 位尾数）</td><td><strong>不易溢出，大模型首选</strong></td></tr>
+    </tbody>
+  </table>  <p>关键洞察：<span class="term">bf16</span> 牺牲精度（只有 7 位尾数）换<strong>动态范围</strong>——它的指数位和 fp32 一样多，所以<strong>能表示的数的范围和 fp32 一样大，几乎不会溢出</strong>。fp16 虽然尾数多 3 位（更精确），但指数只有 5 位，范围小，大 logit 或大梯度容易<strong>上溢成 inf</strong>（一旦出现 inf/NaN，训练立即崩），所以 fp16 训练必须配合 <strong>loss scaling</strong>（把 loss 乘大再缩回）这种麻烦机制。bf16 的大范围让它<strong>免去 loss scaling、天然更稳</strong>。</p>  <h4>为什么还需要 fp32 master weights</h4>  <p>即便前向/反向用 bf16，优化器仍要维护一份 <span class="term">fp32 master weights</span>（fp32 主权重副本）。原因：bf16 只有 7 位尾数，当权重很大（如 1000）而梯度更新很小（如 0.01）时，<strong>小更新会被舍入吞掉</strong>——加完还是 1000，模型实际没更新。fp32 的 23 位尾数能留住这些微小更新，累加到 fp32 副本里，避免「训了等于没训」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>bf16 vs fp16 的取舍：<strong>宁可粗一点（bf16 尾数少），也不要动不动溢出（fp16 范围小）</strong>。训练里偶尔的精度损失能被平均掉，但一个 inf 就能瞬间毁掉整个训练——所以大模型几乎一边倒地选 bf16。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>fp32 master weights 是<strong>两全其美</strong>的设计：计算（前向反向）用快的 bf16 省显存提速，但权重的「真值」存在精确的 fp32 副本里累加更新。每步：bf16 算梯度 → 在 fp32 副本上更新 → 把 fp32 副本舍入成 bf16 供下一步计算。微小更新不丢，速度也不慢——这是现代混合精度训练的标准配方。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>精度问题的隐蔽性在于<strong>它不一定立刻崩，而是悄悄拖慢或带偏</strong>。fp16 溢出会直接 NaN（明显），但 bf16 的精度损失（小更新被吞）是<strong>无声</strong>的——训练看起来在跑，loss 却降得莫名其妙地慢。这正是 fp32 master weights 不可省的原因。debug 大训练时，<strong>先怀疑精度</strong>（看有没有 NaN、看 loss 是否反常停滞）是基本功。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="init"><span class="num">6</span>初始化与深度缩放</h2>
+  <h3>初始化与深度缩放</h3>  <p>最后一类稳定性问题在训练<em>还没开始</em>时就埋下了——<span class="term">initialization scale</span>（初始化尺度）。初始化错了，第一步就可能爆炸或信号消失。</p>  <p>基本原则（模块 03 也提过）：权重初始方差按 $\frac{1}{\text{fan\_in}}$ 设置，让每层激活初始尺度 $O(1)$、既不爆炸也不消失。但<strong>深层网络</strong>有个额外问题：<span class="term">residual scaling</span>（残差缩放）。</p>  <p>Transformer 是残差结构：$x_{l+1} = x_l + f(x_l)$。每过一层，残差分支 $f$ 的输出都<strong>加</strong>到主干上。若不加控制，激活方差会<strong>随深度线性累积</strong>——$L$ 层后方差约是初始的 $L$ 倍，深层模型的激活越来越大，梯度也随之失稳。</p>  <div class="math-block">\[\text{若每层残差方差为 } \sigma^2，\text{则 } L \text{ 层后 } \mathrm{Var}(x_L) \approx L\sigma^2 \;\Rightarrow\; \text{需按 } \frac{1}{\sqrt{2L}} \text{ 缩小初始化}\]</div>  <p>标准对策是把残差分支的初始化（或输出投影）按 $\frac{1}{\sqrt{2L}}$（$L$ 是层数）缩小，抵消累积效应，让激活方差不随深度爆炸。GPT-2、Megatron 等都用这类深度缩放。这也呼应了 <span class="term">Pre-LN</span> vs Post-LN 的结构选择——Pre-LN（LayerNorm 放在残差分支<em>内部</em>之前）天然更稳定、几乎不需要 warmup，是现代 Transformer 的主流，正是因为它从结构上控制了残差累积。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>残差累积像<strong>滚雪球</strong>：每层都往主干加一点，层数一多，雪球（激活）越滚越大。$\frac{1}{\sqrt{2L}}$ 缩放就是<strong>让每层加的那一点正比地变小</strong>，使总和无论多少层都保持可控。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>Pre-LN 之所以更稳：它在每个残差分支<em>进入</em>时先归一化，保证 $f(x_l)$ 的输入尺度恒定，于是残差累积是<strong>受控的线性增长</strong>而非失控。Post-LN（原始 Transformer）把 LN 放在残差<em>相加之后</em>，梯度回传时要穿过 LN，深层易梯度消失/爆炸，必须靠精心的 warmup 才能训起来。结构选择（Pre vs Post-LN）本身就是一个稳定性决策。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把初始化和稳定性连起来看：<strong>好的初始化 + 深度缩放 + Pre-LN，是让训练「天生稳定」的地基</strong>；而 grad clip / z-loss / QK-norm / warmup 是「运行时的护栏」。地基打牢了，护栏要兜底的事就少。前沿模型的稳定性来自这<strong>两层防护的叠加</strong>，而非任何单一技巧——这是本模块最重要的总览。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="spike"><span class="num">7</span>检测与处理 spike：应急流程</h2>
+  <h3>检测与处理 spike：真实训练的应急流程</h3>  <p>即便有了所有护栏，大训练仍可能 spike。所以还需要<strong>检测</strong>和<strong>应急处理</strong>的运维流程。这是 PaLM、OPT 等真实训练反复打磨出的经验。</p>  <h4>检测：监控什么</h4>  <ul>
+    <li><strong>loss 曲线</strong>：最直接，但 spike 发生时往往已经晚了（损失已经发散）。</li>
+    <li><strong>global grad norm</strong>：最有价值的<strong>先行指标</strong>——它的突然飙升常常<em>先于</em> loss spike 出现，给你预警窗口。</li>
+    <li><strong>logit / 激活的最大值</strong>：监控有没有数值在往溢出方向漂。</li>
+    <li><strong>参数/梯度里的 NaN/inf</strong>：一旦出现立即报警，这是已经崩了的信号。</li>
+  </ul>  <h4>处理：spike 来了怎么办</h4>  <ol>
+    <li><strong>回滚（rollback）</strong>：从 spike 之前的 checkpoint 恢复——这是为什么要<strong>频繁存 checkpoint</strong>（PaLM 的核心做法）。</li>
+    <li><strong>跳过坏数据</strong>：PaLM 发现 spike 常与特定 data batch + 优化器状态的组合相关，回滚后<strong>跳过那批数据</strong>再继续，往往就平稳过去了。</li>
+    <li><strong>临时降 lr</strong>：在 spike 高发段临时把学习率调小，过了再恢复。</li>
+    <li><strong>加强护栏</strong>：收紧 grad clip 阈值、加大 z-loss 权重、上 QK-norm。</li>
+  </ol>  <p>PaLM 团队的一个<strong>反直觉发现</strong>值得记住：他们最初以为 spike 是「坏数据」单独造成的，但发现<strong>同样的数据 batch 在训练早期不会 spike、到某个阶段才会</strong>——说明 spike 是<strong>数据与当前模型/优化器状态的相互作用</strong>，不是数据本身有毒。所以「回滚 + 跳过这批数据」有效，但「永久删除这批数据」未必必要。这种细致的归因，是大训练运维从「慌乱救火」走向「有章可循」的体现。</p>  <div class="callout danger"><span class="label"></span>
+    <p>最痛的教训：<strong>没频繁存 checkpoint = 赌上整次训练</strong>。spike 不可逆，唯一的退路就是回滚到之前的 checkpoint。存得太稀（如每天一次），spike 时就要损失近一天的进度（可能是几万美元算力）。存得勤（如每几百步）则存储/IO 开销大。这个权衡的答案是<strong>宁可多存</strong>——checkpoint 的存储成本远低于丢失训练进度的成本。notebook 会让你实现一个 spike 检测器，模拟这套监控逻辑。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>用小代理研究大模型不稳定</strong>：Wortsman 2023 证明很多大模型的不稳定（attention logit 增长、output 发散）能在<strong>小模型上复现并研究</strong>，这让稳定性研究不必每次都烧大模型。哪些不稳定能被小代理预测、哪些不能，仍在探索——这正是本课「小规模复现机制」方法论的前沿应用。</li>
+    <li><strong>自动化稳定性诊断</strong>：能否让训练系统<strong>自动检测 spike 前兆并干预</strong>（自动回滚、自动跳数据、自动调 lr），而非靠人盯日志？把运维经验固化成可靠的自动护栏，是工程前沿。</li>
+    <li><strong>新优化器的稳定性</strong>：Adam 之外的优化器（Lion、Sophia、Muon、Shampoo）各有不同的稳定性特征。新优化器是否更/更不易 spike、需要什么护栏，是活跃方向。</li>
+    <li><strong>超长训练与 WSD 的稳定性</strong>：随着训练 token 数推向 10T+、训练时长以月计，长期稳定性（如恒定 lr 段会不会缓慢漂移）成为新课题，WSD 等灵活调度的稳定性边界仍在摸索。</li>
+    <li><strong>低精度的极限</strong>：FP8 训练（FlashAttention-3、Transformer Engine）把精度推到更低，稳定性挑战更大——需要更精细的缩放与误差补偿。bf16 之下还能稳到什么程度，是硬件与算法的共同前沿。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读：Chowdhery 2022（PaLM 的 spike 处理）、Zhang 2022（OPT logbook，真实训练的脆弱性）、Wortsman 2023（小代理研究不稳定）、Takase 2023（Spike No More）、Hägele 2024（WSD）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_mup_scaling/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · μP 与超参迁移</div></a>
+    <a class="next" href="../05_data_mixtures/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 数据配比与合成数据</div></a>
+  </div>
+
+</div>
+</body>
+</html>

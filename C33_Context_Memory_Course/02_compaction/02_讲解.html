@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Compaction 与摘要</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · Compaction 与摘要</h1>
+  <p class="subtitle">把历史压小而不丢魂 —— 到阈值就把远期旧消息摘要成一块、原样保留近期原文；触发阈值、切分、关键信息保留、压缩比、滚动摘要与漂移；从零写一个 compaction 器，旁附真实服务端 compaction 形状</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、模块 01（token 计数与预算/截断）、Python 字符串与正则基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_compaction.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Anthropic Effective context engineering、Compaction/Context editing 文档、Wu 2022 Recursive Summarization</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么压缩历史，而不是丢弃</a></li>
+      <li><a href="#anatomy">一次 compaction 的解剖</a></li>
+      <li><a href="#trigger">触发阈值：何时该压</a></li>
+      <li><a href="#split">切分：摘要远期、保留近期</a></li>
+      <li><a href="#rolling">滚动摘要与摘要漂移</a></li>
+      <li><a href="#retain">关键信息保留：可验证的不变量</a></li>
+      <li><a href="#ratio">压缩比：压完省了多少</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么压缩历史，而不是丢弃</h2>
+  <p>模块 01 教会了我们在超预算时<strong>丢</strong>——按优先级裁掉最不重要的消息。但「丢」是有损的：被丢掉的那段对话里若藏着用户早先定下的约束、一个已经确认的决策、一个关键的 id，丢了就是<strong>失忆</strong>。对一个要聊上千轮的 agent，单靠丢弃迟早会把重要的东西也丢掉。本模块给出更聪明的一招：<span class="term">compaction</span>（压缩/紧致化）——<strong>当历史接近窗口上限时，把较早的消息用模型摘要成一小块，替换掉原文</strong>，从而腾出空间继续，同时尽量保住信息。</p>  <p>为什么 compaction 值得单独成章？因为在一个长会话里，<strong>对话历史是上下文窗口里增长最快、占用最大的那一块</strong>。系统提示和工具定义是固定的，检索和记忆是按需的少量，唯有历史<em>每一轮都在变长</em>——用户说一句、模型答一段、调一次工具又回一堆结果，token 单调累加。于是几乎所有长程 agent 最终都要回答同一个问题：<strong>历史涨满了怎么办？</strong>丢弃（模块 01）是下策，压缩（本模块）是上策，移到窗口外（模块 03 记忆、模块 04 检索）是另一条路。三者常常并用。</p>  <p>把 compaction 和「直接丢弃」摆在一起看，差别一目了然：丢弃是把旧消息<em>整段删除</em>，信息归零；compaction 是把旧消息<em>摘要成更短的文本</em>，信息有损但保留主干。代价是：摘要要花一次模型调用（有成本、有延迟），且摘要本身可能丢细节、甚至失真。所以 compaction 不是免费的银弹，而是一个<strong>用「一次摘要的开销 + 一点信息损失」换「大量空间」</strong>的交易。本模块就是把这笔交易做对：何时触发、压什么、保什么、压多狠、连续压多次会怎样。</p>  <p>还要厘清 compaction 与后两个模块的分工，否则容易混淆。compaction 处理的是<strong>「此刻还在窗口里、但太占地方的对话历史」</strong>——它把这段历史<em>就地压小</em>，结果（摘要块）仍然留在窗口内、每轮都看得到。而文件记忆（模块 03）处理的是<strong>「该长期记住、但不必每轮都在场」的知识</strong>——把它<em>移到窗口之外</em>，需要时才召回。检索（模块 04）则是把<strong>窗口外的海量外部知识</strong>按需拉进来。三者常配合：compaction 把旧对话压成摘要的同时，可以把其中的关键事实<em>顺手写进文件记忆</em>（双保险——摘要可能漂移，但记忆里有结构化原文），需要时再检索回来。理解这条分工，你才不会把「压缩历史」和「外部记忆」当成一回事。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>compaction = 当历史快塞满窗口时，把『远期的旧消息』打包摘要成一块、把『近期的原文』原样留下，于是历史从『线性增长』变成『有界』</strong>。难点不在「调模型做摘要」那一行，而在它周围的决策：<em>阈值定在哪、哪些算旧、摘要里必须保住什么、压缩比落在哪、连续触发会不会越压越糊</em>。这些正是本模块用 assert 一条条钉死的东西。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="anatomy"><span class="num">2</span>一次 compaction 的解剖</h2>
+  <h3>一次 compaction 的解剖</h3>  <p>先把一次压缩的全过程画出来——这张图是本模块的总纲，后面每一节都在加固它的某一环：</p>  <div class="ascii">  对话历史随每轮单调增长 ......................................... 直到接近窗口上限
+  [sys][m1][m2][m3][m4][m5][m6][m7][m8][m9]   ← 已占窗口的 ~75%, 触发!
+        └─────── 旧消息(远期) ───────┘ └─近期─┘
+                    │ 交给模型摘要                │ 原样保留(对下一步最关键)
+                    ▼                            ▼
+  [sys] [📦 摘要块: 保住关键约束/决策/ID] [m7][m8][m9]   ← 占用骤降, 可继续对话
+        ▲ 钉住·必保      ▲ 把远期压成一块, 信息有损但保主干</div>  <p>拆成四个决策，正好对应本模块的四道练习：<strong>①触发</strong>——历史涨到多满才压（阈值，第 3 节）；<strong>②切分</strong>——哪些算「旧」该摘要、哪些算「近期」该保留原文（第 4 节）；<strong>③保留</strong>——摘要里必须保住哪些关键信息、怎么验证没丢（第 6 节）；<strong>④度量</strong>——压完省了多少、压缩比是否合理（第 7 节）。再加上「连续压多次」的滚动摘要（第 5 节），就是一个完整、鲁棒的 compaction 器。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把它想成整理一个越记越满的笔记本：写满了不是把前几页撕掉（丢弃），而是把前面几页的要点<strong>浓缩成一页摘要</strong>贴在前面，再把最近几页原样留着（因为正在用）。这样笔记本永远写得下，且前面的要点没全丢。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，compaction 是一个对消息序列的变换 $f$：把 $[m_1,\dots,m_n]$ 变成 $[\text{summary}(m_1,\dots,m_k)] + [m_{k+1},\dots,m_n]$，其中前 $k$ 条是「旧」、后 $n-k$ 条是「近期」。约束是变换后的总 token 显著小于变换前，且「关键信息集合」在变换后仍可被检出。系统提示等钉住项不参与摘要、原样保留。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="trigger"><span class="num">3</span>触发阈值：何时该压</h2>
+  <h3>触发阈值：何时该压</h3>  <p>compaction 不是每轮都做（那太贵），而是<strong>到了某个水位线才触发</strong>。最常见的触发条件是<span class="term">token 比例阈值</span>：当「历史 token 数 / 窗口」超过某个比例（如 70%–80%）就启动一次压缩。也有按消息条数触发的，但按 token 更贴合「窗口是预算」的本质。</p>  <p>阈值的选择是一个<strong>两难</strong>：</p>  <ul>
+    <li><strong>定太高</strong>（如 95%）：来不及。一次用户长输入 + 一次大工具结果就可能从 90% 直接冲破 100%，<em>还没来得及压就先爆了</em>。而且没给「摘要这一步本身也要占 token」留余地。</li>
+    <li><strong>定太低</strong>（如 40%）：过度压缩。窗口明明还很空就频繁把原文换成摘要，<em>白白损失信息、白白花摘要的钱</em>，还可能因为反复摘要引入漂移（第 5 节）。</li>
+  </ul>  <p>实践中常取 70%–80% 之间，并配合一条<strong>「压完要降到目标水位以下」</strong>的规则——比如压到 50%，这样压一次能管很多轮，而不是压完还在阈值边缘、下一轮立刻又触发（抖动）。本模块 notebook 让你实现「<code>used/window &gt;= 触发阈值</code> 就压，且压到 <code>目标水位</code> 以下」并用 assert 验证它既不早压也不晚压。</p>  <p>还有一个常被问到的问题：触发后，是把<strong>旧消息全压成一块</strong>，还是只压到「刚好降回目标水位」为止？两种都有人用，但<strong>全压（把所有非近期的旧消息一次压完）通常更优</strong>。原因有二：其一，摘要是一次有成本的模型调用，与其每次只压一点、频繁触发，不如一次压透、长时间不用再压；其二，「只压一部分」会留下「半摘要半原文的旧消息」混在一起，下一次滚动摘要时边界混乱、更易漂移。所以实践中的常见配方是：<em>到 70%–80% 触发 → 把近期 r 条之外的旧消息全部压成一块 → 通常一下就降到 50% 以下</em>，简单且稳。本模块 notebook 即按这个配方实现，并 assert「压一次后水位确实显著下降且短期内不再触发」。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个隐蔽的坑：<strong>别忘了给输出预留（max_tokens）和摘要本身留余量</strong>。触发阈值应当算在「<em>窗口 − 输出预留</em>」这块可用预算上，而不是整个窗口。否则你以为还有 20% 空间，其实那 20% 早被 max_tokens 占了——压缩触发得太晚，照样爆。这与模块 01「先扣输出预留」是同一条纪律。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="split"><span class="num">4</span>切分：摘要远期、保留近期</h2>
+  <h3>切分：摘要远期、原样保留近期</h3>  <p>触发后，第一个问题是：<strong>哪些消息该被摘要，哪些该原样留着？</strong>答案几乎总是——<strong>摘要远期、保留近期</strong>。原因是<em>近期上下文对下一步决策最关键</em>：用户刚说的话、刚拿到的工具结果、刚做的决定，模型马上要用；把这些摘要掉会直接损害连贯性，让 agent「忘了上一句」。</p>  <p>所以标准切法是：保留最近 $r$ 条消息（或最近 $r$ 个 token）的原文不动，把更早的所有消息合并、交给模型摘要成一块「压缩记忆」，插在系统提示之后、近期消息之前。系统提示等<span class="term">钉住项</span>（pinning）不参与摘要——它们是 agent 的「宪法」，永远原样保留。</p>  <pre><code># compaction 的骨架（保留近期 r 条, 摘要其余）
+def compact(messages, llm, keep_recent=3):
+    pinned = [m for m in messages if m.get('pinned')]      # 系统提示等, 永不摘要
+    rest   = [m for m in messages if not m.get('pinned')]
+    if len(rest) &lt;= keep_recent:
+        return messages                                   # 还不值得压
+    old, recent = rest[:-keep_recent], rest[-keep_recent:]
+    blob = '\n'.join(m['content'] for m in old)
+    summary = {'role': 'user', 'content': '[压缩记忆] ' + llm.summarize(blob)}
+    return pinned + [summary] + recent                    # 钉住 + 摘要块 + 近期原文</code></pre>  <p>注意这个骨架的两个要点：<strong>①</strong> 摘要块本身作为一条普通消息插回序列（常标上 <code>[压缩记忆]</code> 之类的前缀，让模型知道这是浓缩历史而非新对话）；<strong>②</strong> <code>keep_recent</code> 控制保留多少近期原文——太小会损连贯性，太大则压不出多少空间。这个参数和触发阈值一起，决定了 compaction 的「手感」。</p>  <p>还有一个边界要处理好：<strong>旧消息不够多时不该压</strong>。如果去掉钉住项和近期保留项后没剩几条，压它们既省不了多少空间、又白花一次摘要，得不偿失。骨架里的 <code>if len(rest) &lt;= keep_recent: return messages</code> 就是这道闸——<em>值不值得压，先算一下再动手</em>。</p>  <p>一个容易被忽视、却会破坏对话合法性的细节：<strong>切分不能切断「工具调用 ↔ 工具结果」这种成对的消息</strong>。Messages API 要求一个 <code>tool_use</code> 必须紧跟它对应的 <code>tool_result</code>；如果切分点恰好落在两者之间，把 tool_use 摘要掉、却把 tool_result 当近期原文留下，回传时就会出现「有结果却没有对应调用」的非法结构，请求直接报错。所以稳妥的切分要<strong>按「对话回合」而非「单条消息」对齐</strong>：要么把一对 tool_use/tool_result 整体划入旧消息（一起摘要），要么整体留在近期（一起保留），不能拆散。这类「结构合法性」约束在玩具实现里容易忽略，但一上真实 API 就会立刻咬人——本模块 notebook 在切分时即按回合成组处理。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="rolling"><span class="num">5</span>滚动摘要与摘要漂移</h2>
+  <h3>滚动摘要：连续压多次会怎样</h3>  <p>一次 compaction 之后，对话继续，历史又会涨；涨到阈值又触发——于是 compaction 不是一锤子买卖，而是<strong>反复发生</strong>的。这就引出 <span class="term">rolling summary</span>（滚动摘要）：每次触发时，把「<strong>上一份摘要 + 这一批新变旧的消息</strong>」一起再摘要成新的一份。</p>  <p>滚动摘要的好处是<strong>摘要本身有界</strong>：它不会随对话无限变长，因为每次都是「旧摘要 + 增量」再压成一份等长的新摘要。坏处是它会<strong>逐渐失真</strong>——这就是著名的 <span class="term">summary drift</span>（摘要漂移），本质是<em>传话游戏</em>：信息被反复转述，每一轮都丢一点、歪一点，几十轮后最初的细节可能面目全非。</p>  <div class="math-block">\[S_0=\varnothing,\qquad S_{t+1}=\mathrm{summarize}\big(S_t \,\Vert\, \text{(本轮变旧的消息)}\big)\]</div>  <p>注意这个递推式里 $S_t$（上一份摘要）<strong>反复作为输入被再次摘要</strong>——这正是漂移的数学根源：经过 $t$ 轮，最初的信息已经被转述了 $t$ 次。一个有用的直觉是把它类比有损压缩的「反复转码」：一张 JPEG 存一次、读出来再存一次、如此几十遍，画质会越来越糊，因为每次有损压缩都在前一次的损失之上再损失。文本摘要同理。这也是为什么<em>把关键事实从递推链里「拎出来」单独保原文</em>如此重要——被拎出来的那些不参与转码，自然不会糊。</p>  <p>缓解漂移有两条思路，本模块都会碰到：<strong>①结构化抽取而非自由摘要</strong>——对「关键类别」（约束、决策、待办、关键 id）做<em>固定字段的抽取</em>并在每轮原样带上，而不是任由模型自由转述（自由摘要最容易丢东西）；<strong>②关键事实保留原文</strong>——把最重要的几条事实以原文形式钉在摘要里，不让它们进入「传话」链。这正是研究界 <em>recursive summarization</em>（Wu 等 2022，递归摘要长文本：先摘段、再摘摘要）在对话场景里的翻版——分层压缩能 scale，但每多压一层就多一分丢信息的风险。</p>  <div class="callout danger"><span class="label">摘要漂移会沉默地丢关键信息</span>
+    <p>滚动摘要最危险的失败模式是<strong>「沉默地丢关键信息」</strong>：摘要照常生成、对话照常进行，没有任何报错，但用户在第 5 轮定下的硬约束（如「预算上限 1000 元」）在第 50 轮的摘要里已经不见了——agent 于是若无其事地违反它。这种 bug 不会让程序崩溃，只会让 agent 慢慢「变傻」，极难排查。<strong>对抗它的唯一办法是把关键信息的保留做成可验证的不变量</strong>——下一节就把它变成一个 assert。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="retain"><span class="num">6</span>关键信息保留：可验证的不变量</h2>
+  <h3>关键信息保留：把「不丢」变成可验证的不变量</h3>  <p>compaction 的全部价值，系于一件事：<strong>压完之后，该记住的还在不在？</strong>「该记住的」通常是这几类——用户的<strong>硬性约束</strong>（预算、截止时间、口味偏好）、已经<strong>确定的决策</strong>、待办事项、以及关键的<strong>实体/ID</strong>（订单号、文件名、用户 id）。一个好的摘要 prompt 会显式要求模型「务必保留这些类别」。</p>  <p>但「要求模型保留」是不够的——模型可能听话也可能不听话（尤其滚动多轮后）。工程上必须把它变成一个<strong>能自动检查的不变量</strong>。本课用一个干净的可断言判据：<strong>在旧消息里埋入一组关键 id（如 </strong><code>FACT#42</code><strong>、</strong><code>FACT#7</code><strong>），compaction 之后，这组 id 必须仍能在（摘要 + 保留的消息）里被检出</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把关键信息想成「不能丢的行李牌号」。整理行李（压缩）时，别的可以打包压扁，但每个行李牌号必须誊抄到清单上。事后清点：每个牌号都还在清单或行李上——没丢；少一个——立刻报警。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，定义关键集合 $K=\{\text{id}_1,\dots\}$（从原始消息中抽取），以及压缩后可见文本 $V=\text{摘要}\cup\text{保留消息}$。保留判据是 $K \subseteq \mathrm{ids}(V)$，即每个关键 id 都能在压缩后文本里被检出。把它写成 <code>assert key_ids &lt;= ids_in(compacted)</code>，compaction 就有了「不沉默丢关键信息」的护栏。</p></div>
+  </div>  <p>实现上有个务实技巧让这个不变量真的成立：<strong>摘要器对关键 id 做专门的「直通」抽取</strong>——先用正则从旧消息里扫出所有形如 <code>FACT#\d+</code> 的 id，把它们<em>原样</em>拼进摘要块（而非指望自由摘要碰巧带上）。这正是上一节「结构化抽取 + 关键事实保留原文」的落地。于是即便摘要的散文部分有损，关键 id 这条「行李牌号清单」永远完整。notebook 的练习 3 让你实现并 assert 这一点：构造埋了 id 的历史，压缩后断言每个 id 都还在。</p>  <p>把这个判据用对，还要想清楚<strong>「关键」到底指什么</strong>——因为不是所有信息都值得当行李牌号死保。一个实用的分层是：<strong>必保</strong>（用户的硬约束、不可逆的决策、外部实体 id——丢了会让 agent 做错事）、<strong>尽量保</strong>（任务的中间结论、用户偏好——丢了会降质但不致命）、<strong>可丢</strong>（寒暄、被推翻的旧方案、纯过程性的来回——丢了反而更干净）。compaction 的理想行为是<em>对第一类做直通保留、对第二类放进自由摘要、对第三类直接丢弃</em>。这也解释了为什么「关键信息保留」要和「压缩」配套设计：压缩负责把第二、三类压小或丢掉，保留判据负责守住第一类一个都不少。把这条分层想清楚，你的 compaction 器才既压得够狠、又不会闯祸。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="ratio"><span class="num">7</span>压缩比：压完省了多少</h2>
+  <h3>压缩比：压完到底省了多少</h3>  <p>最后一个决策是<strong>度量</strong>：一次 compaction 到底压掉了多少？标准指标是 <span class="term">compression ratio</span>（压缩比）：</p>  <div class="math-block">\[\text{compression ratio} = \frac{\text{摘要后的 token 数}}{\text{摘要前(被摘要那部分)的 token 数}}\]</div>  <p>比值越小，压得越狠、省的空间越多，但丢信息的风险也越大。这里有一个<strong>合理区间</strong>的概念：</p>  <table>
+    <thead><tr><th>压缩比</th><th>含义</th><th>风险</th></tr></thead>
+    <tbody>
+      <tr><td>≈ 1.0 或更大</td><td>几乎没压缩（甚至摘要比原文还长）</td><td>白花一次摘要、没腾出空间——摘要器或阈值有问题</td></tr>
+      <tr><td>0.2 – 0.5</td><td>把旧历史压到原来的两到五成</td><td>通常合理：明显腾空间，主干信息可保</td></tr>
+      <tr><td>< 0.1</td><td>压到不足一成</td><td>可能压过头：散文细节大量丢失，漂移风险高</td></tr>
+    </tbody>
+  </table>  <p>所以压缩比既是<strong>效果度量</strong>（省了多少空间），也是<strong>健康检查</strong>（太接近 1 说明没压动、太接近 0 说明压过头）。一个成熟的 compaction 器会在压完后顺手算一下压缩比，落在区间外就告警——这跟模块 05 用 <code>usage</code> 字段核对缓存命中是同一种「<em>用可观测量给自己的机制做体检</em>」的工程素养。</p>  <p>有一个关于压缩比的常见误解要澄清：<strong>压缩比不是越小越好</strong>。它衡量的是「压得多狠」，不是「压得多好」——一个把十轮关键讨论压成一句「用户聊了些需求」的摘要，压缩比极低（很省空间），却把信息丢了个精光，是<em>最坏</em>的压缩。所以压缩比必须和上一节的「关键信息保留」判据<strong>配对使用</strong>：前者保证省了空间、后者保证没丢该留的；只看压缩比会奖励「压过头」，只看保留会容忍「没压动」，两者一起才定义「压得好」。这也是为什么本模块把这两节相邻安排。</p>  <p>notebook 的练习 4 让你从零算压缩比：给定被摘要的旧消息与生成的摘要块，算出 <code>count(摘要)/count(旧消息)</code> 并断言它落在合理区间。配合前面的触发、切分、保留三个不变量，你就有了一个<strong>既会压、又压得对、还知道自己压得怎么样</strong>的 compaction 器。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>服务端 compaction（真实对照）</strong>：Anthropic 在长会话里提供<em>服务端 compaction</em>（beta <code>compact-2026-01-12</code>）——接近窗口上限时 API 自动把更早的上下文摘要成一个 compaction 块。其最关键的使用纪律是：<strong>每轮要把整个 </strong><code>response.content</code><strong>（含 compaction 块）原样 append 回 messages</strong>，只取文本会<em>悄悄丢掉压缩状态</em>。本模块的手写 compaction 器即其最小内核，notebook 末尾会给出真实形状对照。</li>
+    <li><strong>compaction vs 上下文编辑（context editing）</strong>：还有一条不摘要、而是<em>直接清除</em>旧工具结果/思考块的路线（Anthropic 的 context editing，<code>clear_tool_uses</code>）。摘要保信息但花一次模型调用，清除省钱但更有损——何时摘要、何时清除、何时混用，是活跃的工程取舍。</li>
+    <li><strong>摘要漂移的度量与抑制</strong>：滚动摘要多轮后到底丢了多少、歪了多少，目前缺乏好的自动度量。把「关键信息保留率」做成可监控指标、用结构化记忆（模块 03）兜住硬事实、必要时回溯原文，是抑制漂移的方向。</li>
+    <li><strong>压缩的时机与粒度</strong>：按 token 阈值触发是粗粒度的；更聪明的做法会看「哪些旧片段已经不再被引用」再针对性压缩（与检索/记忆相通）。把 compaction 从「一刀切旧消息」做成「按相关性选择性压缩」，是减少信息损失的前沿。</li>
+    <li><strong>handoff / 续接</strong>：当一个会话即便压缩也撑不住时，用「压缩摘要 + 关键状态」作为<em>新会话</em>的起点，把超长任务<strong>跨多个上下文窗口</strong>接力推进。如何设计交接包（带什么、不带什么）以让新会话无缝续上，是长程 agent 的开放课题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Anthropic 的 _Effective context engineering for AI agents_（compaction 的动机与位置）、_Compaction_ / _Context editing_ 官方文档（<code>compact-2026-01-12</code> 与 <code>clear_tool_uses</code> 的真实接口与 append-content 铁律）、Wu 2022 _Recursively Summarizing Books_（递归摘要、漂移）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_token_budget/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · Token 预算与截断</div></a>
+    <a class="next" href="../03_memory/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 文件记忆</div></a>
+  </div>
+
+</div>
+</body>
+</html>

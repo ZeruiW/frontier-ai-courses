@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Grokking 与涌现</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · Grokking 与涌现</h1>
+  <p class="subtitle">grokking 延迟泛化、weight decay 把记忆解迁移到泛化解、涌现能力与相变、Schaeffer 的「度量假象」之争 —— 用可靠玩具复现训练早过拟合、测试后跳变，以及同一能力换度量就从跳变变平滑</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（隐式正则/最小范数/epoch-wise 双下降）、线性代数（零空间/SVD）、softmax/交叉熵概念</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_grokking_emergence.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Power 2022、Nanda 2023、Wei 2022、Schaeffer 2023、Kaplan 2020</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#grokking">Grokking：泛化为何延迟</a></li>
+      <li><a href="#wd">引擎：weight decay 与范数</a></li>
+      <li><a href="#toy">忠实可复现的 grokking 玩具</a></li>
+      <li><a href="#emergence">从 grokking 到涌现</a></li>
+      <li><a href="#mirage">涌现是度量造成的假象吗</a></li>
+      <li><a href="#phase">相变、缩放律与「突变」</a></li>
+      <li><a href="#eval">接回评测：别被突变骗到</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="grokking"><span class="num">1</span>Grokking：泛化为何延迟</h2>
+  <p>上一模块的 epoch-wise 双下降已经暗示：<strong>训练时间是一个有反直觉拐点的轴</strong>。这一模块把这件事推向最戏剧化的极致——<span class="term">grokking</span>（顿悟）。它最早由 Power 等 2022 在小型算法数据集（如模算术）上发现，画面是这样的：模型<strong>很早</strong>就把训练集背得滚瓜烂熟（训练准确率冲到 100%），但测试准确率<strong>长时间</strong>卡在随机水平，仿佛永远学不会；然后，在远远超过「训练集已满分」的某个时刻，测试准确率<strong>突然</strong>跃升到接近完美。</p>  <p>这个现象之所以震撼，是因为它把两件我们习惯混为一谈的事<strong>在时间上彻底分开</strong>了：<em>拟合训练数据</em>与<em>学到可泛化的结构</em>。经典直觉里，训练损失降到 0 就意味着「学完了」，可以停了（early stopping 的依据）。grokking 说：不，模型可能只是<strong>背下了答案</strong>，真正的规律要等很久之后才浮现。如果你在训练损失刚归零时就停，你会永远错过那次顿悟。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：一个学生考前把习题册答案全背了下来，小测（训练集）次次满分，但遇到没见过的新题（测试集）就抓瞎。然后某天，他突然<strong>想通了背后的公式</strong>，从此任何新题都会做。grokking 就是模型从「背答案」突然切换到「懂公式」的那一刻——而且这一刻可能来得非常晚。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：设训练步数为 $t$。grokking 的特征是存在 $t_{\text{mem}}\ll t_{\text{gen}}$，使得训练精度在 $t_{\text{mem}}$ 后 $\approx 1$，而测试精度在 $[t_{\text{mem}}, t_{\text{gen}}]$ 区间内 $\approx$ 随机基线，仅在 $t_{\text{gen}}$ 后才跃升。$t_{\text{gen}}/t_{\text{mem}}$ 可达 $10^2\sim10^3$。关键是这<strong>不是优化没收敛</strong>——训练损失早已平稳在 0，是泛化本身被延迟了。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>grokking 给评测科学家的第一课：<strong>「训练损失收敛」绝不等于「模型学好了」</strong>。在小数据/强正则/特定结构的任务上，泛化可能戏剧性地滞后于记忆。这直接动摇了「看训练损失决定何时停」的朴素做法，也提醒我们：一条看似平台期的测试曲线，可能只是顿悟前的黎明。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="wd"><span class="num">2</span>引擎：weight decay 与范数</h2>
+  <h3>grokking 的引擎：weight decay 与范数</h3>  <p>grokking 最关键、也最实用的发现是：<strong>它由 weight decay（权重衰减）驱动</strong>。Power 2022 与后续 Nanda 2023 都指出，去掉 weight decay，grokking 往往<em>根本不发生</em>——模型停在记忆解上，测试精度永远不起来。理解这一点，要从「同一个训练集有多个解」说起。</p>  <p>在过参数化模型里，能把训练集拟合到 100% 的解<strong>不止一个</strong>，而是一个连续的解集合。这些解大致分两类：</p>  <table>
+    <thead><tr><th>解的类型</th><th>在训练集上</th><th>在测试集上</th><th>范数（粗略）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>记忆解</strong> memorizing</td><td>完美拟合（背下来）</td><td>随机水平（不泛化）</td><td><strong>大</strong>（用复杂的高频结构硬记每个点）</td></tr>
+      <tr><td><strong>泛化解</strong> generalizing</td><td>完美拟合（也对）</td><td>接近完美（真懂了）</td><td><strong>小</strong>（用简洁的结构表达真规律）</td></tr>
+    </tbody>
+  </table>  <p>关键洞察：<strong>记忆解的范数通常远大于泛化解</strong>。背下每个训练点需要在参数里塞进很多互相抵消的复杂结构（高范数）；而真正的规律往往是简洁的（低范数）。梯度下降从大初始化出发，会<strong>先</strong>冲向一个离起点近、容易达到的记忆解（训练损失迅速归零）；而 weight decay 持续地、缓慢地施加一个<em>把范数往下压</em>的力。在训练损失已经为 0 的平台期，这个力悄悄地把解<strong>从高范数的记忆解挪向低范数的泛化解</strong>——直到越过某个临界，测试精度突然起飞。</p>  <div class="math-block">\[\underbrace{\nabla_w \mathcal{L}_{\text{train}}(w)}_{\to 0\ \text{在平台期}}\ +\ \underbrace{\lambda\, w}_{\text{weight decay: 持续压低范数}}\quad\Rightarrow\quad \text{解沿「等训练损失面」滑向低范数区}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>没有 weight decay，模型背完答案就<strong>躺平</strong>了——训练损失已是 0，梯度没了，没有任何力推动它继续改变，于是永远停在记忆解、永远不泛化。weight decay 是那个「即使考满分也逼你继续把方法简化」的教练，正是它把模型从死记硬背逼向真正理解。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：在训练损失的零水平集（一个流形）上，梯度沿该流形的分量为 0，但 weight decay 项 $\lambda w$ 仍提供一个指向原点的漂移。于是参数在零损失流形上沿<strong>范数下降方向</strong>移动，最终趋近该流形上范数最小的点——若那恰是泛化解，就发生 grokking。这与上一模块「最小范数解泛化好」是同一个隐式正则原理，只是这里它在<em>时间维</em>上缓慢上演。</p></div>
+  </div>  <div class="callout danger"><span class="label">weight decay 决定成败</span>
+    <p>这解释了一个反复让人误判的现象：<strong>两次训练，唯一区别是 weight decay，一次 grok 一次不 grok</strong>。看到模型「训练满分但死活不泛化」，先检查 weight decay（以及训练得够不够久）。本模块 notebook 会<strong>并排跑 WD 开/关两条曲线</strong>，让你亲眼看到：开 WD 测试误差从 46 暴跌到 0.1、解的方向与真解的余弦相似度从 0.08 跳到 0.95；关 WD 则一切冻结在记忆解上。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="toy"><span class="num">3</span>忠实可复现的 grokking 玩具</h2>
+  <h3>忠实而可复现的 grokking 玩具</h3>  <p>真实的神经网络 grokking（如模算术上的 Transformer）需要 Adam、特定初始化、上万到十万步，且相当挑参数，难以在 CPU 玩具上<em>可靠</em>复现到「assert 必过」。但 grokking 的<strong>核心机制</strong>——记忆解(高范数)与泛化解(低范数)并存、weight decay 把解从前者迁移到后者——可以用一个<strong>过参数化线性回归</strong>精确、可靠地呈现。我们抓机制，不被架构细节淹没（与本课一贯的玩具方法论一致）。</p>  <p>构造如下：输入维度 $d=60$、训练样本 $n=55$（轻度过参数化，$d>n$ 使记忆成为可能，但 $n$ 又大到泛化解可被恢复）。真目标由一个<strong>低范数</strong>的「泛化权重」$w_{\text{gen}}$ 给出（$y=Xw_{\text{gen}}$）。我们故意把模型<strong>初始化在一个记忆解</strong>上：</p>  <div class="math-block">\[w_0 = w_{\text{gen}} + c_1 v_1 + c_2 v_2,\qquad v_i\in \mathrm{null}(X_{\text{train}})\]</div>  <p>这里 $v_i$ 是训练特征的<strong>零空间</strong>方向（满足 $X_{\text{train}}v_i=0$）。沿零空间方向加任何分量，都<strong>不改变训练预测</strong>（因为 $Xv_i=0$），所以 $w_0$ 完美拟合训练集（训练误差从第 0 步就是 0，对应「记忆瞬间完成」）；但这些零空间分量是测试集上的纯噪声，所以测试误差巨大、不泛化——这就是一个货真价实的<strong>记忆解</strong>。</p>  <div class="ascii">grokking 的几何：在「训练误差=0」的流形上滑行
+
+   训练误差=0 的流形(所有插值解)
+   ┌─────────────────────────────────┐
+   │  w0(记忆解, 高范数, 测试差) ●     │
+   │            │ weight decay 压低范数 │
+   │            ▼  (训练误差全程=0)     │
+   │      w_gen(泛化解, 低范数, 测试好)●│  &lt;- 流形上范数最小点
+   └─────────────────────────────────┘
+   关 WD: 没有向下的力 -&gt; 永远停在 w0(不 grok)
+   开 WD: 持续压低范数 -&gt; 滑向 w_gen -&gt; 测试误差骤降(grok!)</div>  <p>然后用「梯度下降（拟合训练）+ weight decay」训练。梯度项在训练误差为 0 后几乎消失，于是 weight decay 项主导：它纯粹地把零空间分量（记忆部分）按 $(1-\eta\lambda)^t$ 几何衰减掉，解沿零损失流形滑向 $w_{\text{gen}}$。notebook 会记录三条曲线：训练误差（全程 ≈ 0）、测试误差（46 → 0.1，延迟暴跌）、以及 $\cos(w,w_{\text{gen}})$（0.08 → 0.95，方向<em>对齐</em>真解的那一刻就是顿悟）。这后一条正对应 Nanda 的 <span class="term">progress measure</span>——一个在最终指标跳变前就平滑变化、揭示「顿悟其实是平滑进展累积过阈」的内部量。</p>  <p>为什么这个玩具<strong>忠实</strong>而不只是「凑出一条曲线」？因为它复现的是 grokking 的<em>因果机制</em>而非表面现象：① 记忆与泛化是<strong>两个真实存在、训练误差都为 0 的解</strong>（不是人为标签）；② 泛化解的范数<strong>确实</strong>小于记忆解（可验证）；③ weight decay<strong>确实</strong>是把解从前者推向后者的力（关掉它就停在记忆解，这正是 Power 2022 的核心实验结论）；④ 有一个在最终跳变前就平滑变化的<strong>progress measure</strong>（cos 对齐，对应 Nanda 2023）。这四点是真实 grokking 的本质特征，我们一个不少地复现了，只是把「难以可靠收敛的神经网络优化」替换成「可靠收敛的线性优化」，让 assert 必过。</p>  <div class="callout warn"><span class="label"></span>
+    <p>诚实声明：这是 grokking 机制的<strong>可控模拟</strong>（线性、构造化初始化），不是端到端神经网络 grokking 的复现。它保证 assert 可靠、机制忠实；要看真实 Transformer 在模算术上自发 grok（并长出傅里叶回路），请跑 references 里 Nanda 2023 的开源代码。本课负责把<em>为什么会 grok</em>讲到你能手算，那是理解真实现象的地基。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="emergence"><span class="num">4</span>从 grokking 到涌现</h2>
+  <h3>从 grokking 到涌现：同一个谜题的放大版</h3>  <p>把视角从「单个模型的训练时间」切换到「不同规模模型的对比」，就遇到了 2022 年最热的争论之一：<span class="term">emergent abilities</span>（涌现能力）。Wei 等 2022 报告：许多能力（多步算术、特定推理、指令跟随）在小模型上几乎为零，模型规模越过某个阈值后<strong>突然</strong>出现，曲线呈阶跃状。这被描述为规模带来的<strong>质变</strong>，一时被视为大模型「智能涌现」的证据。</p>  <p>grokking 与涌现表面不同（一个是时间维、一个是规模维），但共享同一个让人不安的特征：<strong>一个看似平滑的底层过程，在某个指标上表现为突然的跳变</strong>。这立刻引出一个尖锐的问题——<em>这个跳变是「能力」本身的真实质变，还是我们「测量能力的方式」制造的假象</em>？这正是 Schaeffer 2023 的切入点。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>Wei 看到的是：把「模型规模」当横轴、「任务做对的比例」当纵轴，曲线长期贴地、然后陡然抬升，像水突然烧开。直觉结论：大就是不一样，能力是涌现的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>Schaeffer 的反问：你用的「做对的比例」是什么度量？如果是 <span class="term">exact-match accuracy</span>（多步任务必须<strong>每一步全对</strong>才算成功），那它是一个<strong>高度非线性、近乎不连续</strong>的度量——它会把底层能力的平滑提升，机械地放大成表观的跳变。换一个<strong>连续</strong>度量（如 token 级对数似然、编辑距离），同样的模型族可能呈现<em>平滑、可预测</em>的增长。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>两篇必读、且代表争论两方：Wei et al. 2022《Emergent Abilities of Large Language Models》（提出涌现）与 Schaeffer, Miranda & Koyejo 2023《Are Emergent Abilities of LLMs a Mirage?》（NeurIPS best paper，论证许多涌现是度量假象）。本模块 notebook 复现 Schaeffer 的核心实验，见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mirage"><span class="num">5</span>涌现是度量造成的假象吗</h2>
+  <h3>涌现是不是「度量造成的假象」？</h3>  <p>Schaeffer 的论证可以用一个一句话的数学事实点破：<strong>把一个平滑函数复合上一个不连续/强非线性的度量，结果就可能看起来不连续</strong>。具体到「多步任务」：假设模型完成单步的正确率 $p_c$ 随规模<em>平滑</em>上升。但任务要求连续 $k$ 步<strong>全对</strong>，于是 exact-match 成功率是：</p>  <div class="math-block">\[\text{ExactMatch} = p_c^{\,k}\]</div>  <p>当 $p_c$ 从 0.1 平滑爬到 0.9，$p_c^k$（比如 $k=5$）会长期贴近 0（$0.5^5\approx0.03$），直到 $p_c$ 接近 1 才骤然抬头（$0.9^5\approx0.59$）——一条<strong>貌似涌现的阶跃曲线</strong>。但这跳变<em>完全</em>来自度量的 $k$ 次幂放大，底层能力 $p_c$ 一直在平滑增长。换成<strong>连续度量</strong>（如直接看 $p_c$，或 per-token logprob），曲线平滑得可以外插。</p>  <div class="ascii">同一个平滑上升的底层能力 p_c，两种度量两种故事
+
+  连续度量(单步正确率 p_c)         不连续度量(5步全对 = p_c^5)
+  1┤            ___---            1┤                  /
+   │        __--                   │                 /
+   │     _--                       │                /  &lt;- 「涌现」
+   │   _-                          │              _/
+   │ _-                            │ ____________/
+  0└────────────────▶规模        0└────────────────▶规模
+   平滑、可预测、可外插             长期贴地、末端骤升(假象)</div>  <p>这个论证<strong>不是说涌现都是假的</strong>，而是说：<strong>在断言「质变」之前，必须先排除「是不是度量制造了跳变」</strong>。Schaeffer 给出可操作的判据：① 换连续度量看曲线是否变平滑；② 看跳变是否恰好出现在不连续度量的阈值处；③ 用更细的指标（部分正确得分）能否解析出平滑进展。notebook 会把这套判据用同一组数据跑出来——你会看到同一条底层能力曲线，在 exact-match 下「涌现」、在连续度量下「平滑」，并 <code>assert</code> 前者中段贴地、末端骤升，后者全程单调平滑。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>实践启示：下次看到「我们的新方法在某规模突然涌现出能力 X」，先别激动也别全盘否定，问三句话——你用的什么度量？它连续吗？换个连续度量这条曲线还跳吗？这三问能筛掉一大半「假涌现」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更深一层：这是 <span class="term">Goodhart's law</span> 在评测科学里的体现——<strong>度量一旦被当成现象本身，就会误导</strong>。涌现之争的真正遗产不是「涌现存不存在」，而是确立了一条方法论：<em>报告任何「能力曲线」时，度量的连续性与对齐性必须被一并审视</em>，否则你可能在研究自己的度量、而非模型。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把 grokking 和涌现并置的终极教训：<strong>「突然」是最该警惕的词</strong>。无论是训练时间维的顿悟跳变，还是规模维的能力涌现，一个表观的「突变」背后，可能是（a）一个真实但被延迟/被阈值化的平滑过程（grokking 的范数迁移、$p_c$ 的平滑增长），也可能是（b）度量本身的不连续。区分二者，是评测科学家的核心功夫。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="phase"><span class="num">6</span>相变、缩放律与「突变」</h2>
+  <h3>相变、缩放律与「突变」的统一视角</h3>  <p>grokking 的跳变、涌现的阶跃，都常被冠以 <span class="term">phase transition</span>（相变）之名——类比水到 100°C 突然沸腾。这个类比有用，但要小心：<strong>物理相变是真实的奇点，而深度学习里的「相变」很多是平滑过程的表观放大</strong>。把两者分清，需要 <span class="term">scaling laws</span>（缩放律）作参照。</p>  <p>缩放律告诉我们：语言模型的<strong>损失</strong>（一个连续、平均化的度量）随参数量/数据量/算力呈<strong>平滑的幂律</strong>下降 [Kaplan 2020, Hoffmann 2022]，可以跨数量级外插。这与「涌现的阶跃」并存，恰恰是 Schaeffer 论点的有力旁证：<strong>底层（损失）是平滑的，表观的能力跳变多半来自把这条平滑曲线喂给了不连续的下游度量</strong>。</p>  <table>
+    <thead><tr><th>视角</th><th>横轴</th><th>看到的曲线</th><th>是真相变吗</th></tr></thead>
+    <tbody>
+      <tr><td>损失 / 缩放律</td><td>规模（log）</td><td>平滑幂律下降</td><td>否——平滑可外插</td></tr>
+      <tr><td>exact-match 能力</td><td>规模</td><td>长期贴地、突然抬升</td><td>多半否——度量放大</td></tr>
+      <tr><td>grokking 测试精度</td><td>训练步数</td><td>平台后突然跃升</td><td>多半否——范数缓慢迁移过阈</td></tr>
+      <tr><td>真正的算法相变（少数）</td><td>某参数</td><td>内部回路突然形成</td><td>可能是——需机制证据（Nanda）</td></tr>
+    </tbody>
+  </table>  <p>那有没有「真」的相变？Nanda 2023 用机制可解释性给了一个更细致的答案：grokking 期间，网络内部<strong>确实</strong>在某个时刻形成了一个泛化回路（模算术里是傅里叶/三角恒等式回路），从这个意义上有结构上的质变。但即便如此，他定义的 <strong>progress measure</strong>（如特定频率成分的强度）在最终精度跳变<em>之前</em>就已平滑增长——也就是说，<strong>跳变是平滑进展累积到阈值的结果，不是凭空的奇点</strong>。这与本课的玩具完全一致：我们的 $\cos(w,w_{\text{gen}})$ 就是一个平滑爬升的 progress measure，它平滑地预示了测试误差的下降。</p>  <div class="callout paper"><span class="label"></span>
+    <p>延伸（见 <code>references.md</code>）：Nanda 2023《Progress measures for grokking》（机制视角 + progress measure）、Kaplan 2020 与 Hoffmann 2022（缩放律）、Liu 2022（grokking 的有效理论）。这些合起来给出「突变」的统一解读：先找平滑的底层量（损失、progress measure、范数），再看表观跳变是不是它过阈或被度量放大的产物。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>接回评测：别被突变骗到</h2>
+  <h3>接回评测：怎么不被「突变」骗到</h3>  <p>本模块的两个现象——grokking 与涌现——都是<strong>评测解读的高危区</strong>，因为它们都制造「突变」的表象，而突变最容易诱发错误结论。把教训落到具体的评测实践：</p>  <ul>
+    <li><strong>不要只看训练损失决定停</strong>：grokking 证明泛化可能远滞后于训练损失归零。在小数据/强正则任务上，训练到「损失为 0」远不够，要看测试曲线是否还在演化（甚至在长平台期之后）。</li>
+    <li><strong>报告能力曲线时，附上连续度量</strong>：只报 exact-match accuracy 的「涌现曲线」是不充分的、甚至误导的。同时报 per-token logprob、Brier 分数或编辑距离等连续度量，让读者判断跳变是真是假（Schaeffer 的核心建议）。</li>
+    <li><strong>警惕「阈值刚好对上」</strong>：若一个能力的「涌现点」恰好落在你用的不连续度量的阈值附近（如「≥某分才算会」），高度怀疑是度量假象。换阈值或换度量再看。</li>
+    <li><strong>找 progress measure</strong>：与其盯着会跳变的最终指标，不如找一个在跳变前就平滑变化的代理量（内部表示的某种结构、范数、某子任务的连续得分）。它能让你<em>提前</em>看到「顿悟」在酝酿，也能区分真进展与噪声。</li>
+  </ul>  <p>更一般地，grokking 和涌现把本课的中心纪律推到了极致：<strong>现象的形状高度依赖你测量它的方式</strong>。一条曲线是平滑还是跳变，可能不取决于模型，而取决于度量。这不是技术细节，而是评测科学的根本——它决定你是在研究模型，还是在研究自己的尺子。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话带走：<strong>看到「突然学会」或「突然涌现」，先问两件事——它训练/扩展得够久够大了吗（grokking 式延迟）？我换个连续度量它还跳吗（涌现式假象）？</strong>把这两问变成反射，你就很难被「突变」骗到。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>grokking 的普适性与触发条件</strong>：grokking 在小算法数据集上最明显，它在大规模真实任务上以何种形式存在、需要什么条件（数据量、正则、初始化、优化器）触发，仍在研究中。它与 epoch-wise 双下降是否同源也未完全厘清。</li>
+    <li><strong>涌现的判定标准</strong>：哪些「涌现」是真质变、哪些是度量假象，缺乏统一判据。Schaeffer 给了强反例，但不能否证<em>所有</em>涌现；某些能力（如上下文学习的出现）是否有不可被连续度量化的真跳变，是开放问题。</li>
+    <li><strong>progress measure 的自动发现</strong>：Nanda 手工找到了模算术的 progress measure；能否<em>自动</em>为任意任务发现「在最终指标跳变前就平滑变化的内部量」，是机制可解释性与评测交叉的前沿。</li>
+    <li><strong>从机制预测能力出现</strong>：终极目标是<em>在能力出现之前</em>就从训练动力学/内部结构预测它何时、为何出现。这需要把 grokking 的范数迁移、回路形成与缩放律统一进一个预测性理论，目前远未达到。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读清单（详见 <code>references.md</code>）：Power 2022（grokking 发现）、Nanda 2023（机制 + progress measure）、Wei 2022（涌现）、Schaeffer 2023（涌现假象，best paper）、Kaplan 2020/Hoffmann 2022（缩放律）。下一模块从「模型行为」转向「喂给模型的数据」——预训练数据流水线。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_generalization_double_descent/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 泛化与双下降</div></a>
+    <a class="next" href="../03_data_pipeline/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 数据流水线</div></a>
+  </div>
+
+</div>
+</body>
+</html>

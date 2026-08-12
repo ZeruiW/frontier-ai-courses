@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 手写 Attention 与 Transformer Block</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 手写 Attention 与 Transformer Block</h1>
+  <p class="subtitle">Scaled Dot-Product Attention → Multi-Head → Pre-LN Block → MiniGPT —— 从一行公式到一个完整的 GPT 骨架</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（token 序列）、线性代数（矩阵乘/方差）、PyTorch nn.Module</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_attention_transformer.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Vaswani 2017、Xiong 2020 (Pre-LN)、nanoGPT</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">注意力解决什么问题：变长序列的内容寻址</a></li>
+      <li><a href="#sdpa">Scaled Dot-Product Attention 完整推导</a></li>
+      <li><a href="#causal">Causal Mask：decoder-only 的自回归约束</a></li>
+      <li><a href="#mha">多头注意力 MHA：子空间并行与参数量</a></li>
+      <li><a href="#ffn">FFN/MLP：4× 扩展、GELU 与参数大头</a></li>
+      <li><a href="#residual">残差与 LayerNorm：Pre-LN vs Post-LN 与残差流</a></li>
+      <li><a href="#block">完整 GPT Block 组装与张量形状追踪</a></li>
+      <li><a href="#pos">位置编码：attention 为什么需要它</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>注意力解决什么问题：变长序列的内容寻址</h2>
+
+  <p>模块 01 把文本变成了一串 token id，embedding 层再把它们变成向量序列 $x_1,\dots,x_T\in\mathbb{R}^{d}$。
+  现在的问题是：<strong>如何让第 $t$ 个位置的表征用上前面所有位置的信息，且 $T$ 是变化的？</strong>
+  这是序列建模的核心难题，attention 之前的主流答案是 RNN/LSTM。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>RNN 把整个历史压进一个固定大小的隐状态，像传话游戏一样一格一格往后传 —— 传得越远丢得越多，而且必须逐步串行算。
+      <span class="term">Attention</span> 换了一种思路：每个位置直接对<strong>所有</strong>历史位置发起一次"按内容查询"——
+      "谁的内容和我现在需要的相关？"——相关者多贡献、无关者少贡献，一步矩阵乘法到位，不经过中间转述。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>Attention 实现的是<span class="term">内容寻址</span>（content-based addressing）：输出是值向量的凸组合
+      $o_t=\sum_{s} \alpha_{ts} v_s$，权重 $\alpha_{ts}$ 由查询 $q_t$ 与键 $k_s$ 的相似度经 softmax 归一化得到，
+      天然适配任意长度 $T$。任意两位置间的交互路径长度为 $O(1)$（RNN 为 $O(T)$），且对 $T$ 维全并行 [Vaswani 2017]。</p>
+    </div>
+  </div>
+
+  <table>
+    <thead><tr><th>维度</th><th>RNN / LSTM</th><th>Self-Attention</th></tr></thead>
+    <tbody>
+      <tr><td>历史信息的载体</td><td>固定维度隐状态（有损压缩）</td><td>全部位置的 K/V 向量（无压缩，按需取用）</td></tr>
+      <tr><td>长程依赖路径</td><td>$O(T)$ 步，梯度逐步衰减</td><td>$O(1)$ 步，任意两位置直连</td></tr>
+      <tr><td>训练并行性</td><td>时间维串行（$h_t$ 依赖 $h_{t-1}$）</td><td>时间维全并行（一次矩阵乘）</td></tr>
+      <tr><td>每层计算复杂度</td><td>$O(T\,d^2)$</td><td>$O(T^2 d)$ —— 二次方代价，模块 06 的主题</td></tr>
+      <tr><td>寻址方式</td><td>按位置顺序隐式传递</td><td>按内容显式查询</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  把这张表读成一笔交易：attention 用 <strong>$O(T^2)$ 的计算与显存</strong>，买来了<strong>无损历史 + 常数路径 + 全并行</strong>。
+  在 GPU 时代这笔交易极其划算 —— 可并行意味着可 scaling，这是 Transformer 取代 RNN 的根本原因。
+  而 $T^2$ 的账单要到长上下文推理时才真正到期（KV cache，模块 06）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="sdpa"><span class="num">2</span>Scaled Dot-Product Attention 完整推导</h2>
+
+  <h3>2.1 QKV 投影：一份输入，三种角色</h3>
+  <p>输入序列堆叠为矩阵 $X\in\mathbb{R}^{T\times d}$。用三个可学习矩阵把每个位置投影成三种角色：</p>
+
+  <div class="math-block">
+  $$ Q = XW_Q,\quad K = XW_K,\quad V = XW_V,\qquad W_Q,W_K\in\mathbb{R}^{d\times d_k},\; W_V\in\mathbb{R}^{d\times d_v} $$
+  </div>
+
+  <ul>
+    <li><strong>Query $q_t$</strong>：位置 $t$ "想找什么"（查询向量）；</li>
+    <li><strong>Key $k_s$</strong>：位置 $s$ "能提供什么"（被检索的索引）；</li>
+    <li><strong>Value $v_s$</strong>：位置 $s$ "实际交付什么"（被聚合的内容）。</li>
+  </ul>
+
+  <p>相关性用点积度量：$\text{score}_{ts} = q_t^\top k_s$。为什么 K 和 V 要分开？因为"匹配用的特征"和"传递的内容"未必相同 ——
+  解耦索引与内容，是 attention 比简单加权平均更有表达力的关键。</p>
+
+  <h3>2.2 为什么除以 $\sqrt{d_k}$：点积方差推导</h3>
+  <p>这是面试与论文中最常被追问的细节，值得完整推一遍。设 $q,k\in\mathbb{R}^{d_k}$ 的各分量独立同分布，
+  零均值、单位方差（初始化时近似成立）。点积 $q^\top k=\sum_{i=1}^{d_k} q_i k_i$ 的均值与方差：</p>
+
+  <div class="math-block">
+  $$ \mathbb{E}[q^\top k] = \sum_{i=1}^{d_k}\mathbb{E}[q_i]\,\mathbb{E}[k_i] = 0 $$
+  $$ \mathrm{Var}(q^\top k) = \sum_{i=1}^{d_k} \mathrm{Var}(q_i k_i)
+     = \sum_{i=1}^{d_k} \mathbb{E}[q_i^2]\,\mathbb{E}[k_i^2] = d_k $$
+  </div>
+
+  <p>即点积的标准差随 $\sqrt{d_k}$ 增长。$d_k=64$ 时分数典型幅度已达 $\pm 8$ 以上，直接喂给 softmax 会怎样？
+  softmax 在大幅度输入下趋于 one-hot：最大分量权重 $\to 1$，其余 $\to 0$。注意 softmax 的雅可比 $\frac{\partial \alpha_i}{\partial z_j} = \alpha_i(\delta_{ij}-\alpha_j)$，
+  当 $\alpha$ 接近 one-hot 时该雅可比几乎处处为零 —— <strong>梯度消失，训练初期就学不动</strong>。
+  除以 $\sqrt{d_k}$ 把分数方差拉回 $1$，使 softmax 工作在梯度健康的区间 [Vaswani 2017]。</p>
+
+  <h3>2.3 softmax 归一化与加权求和</h3>
+  <div class="math-block">
+  $$ \mathrm{Attention}(Q,K,V) = \mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V $$
+  $$ \alpha_{ts} = \frac{\exp\!\big(q_t^\top k_s/\sqrt{d_k}\big)}{\sum_{s'}\exp\!\big(q_t^\top k_{s'}/\sqrt{d_k}\big)},
+     \qquad o_t = \sum_{s} \alpha_{ts}\, v_s $$
+  </div>
+
+  <p>softmax 沿 <strong>key 维</strong>（每行）归一化：每个 query 的注意力权重 $\alpha_{t,\cdot}$ 构成一个概率分布，
+  输出 $o_t$ 是所有 value 的<span class="term">凸组合</span>。整个算子里<strong>唯一的非线性就是这个 softmax</strong>，其余全是线性代数。</p>
+
+  <div class="callout warn"><span class="label"></span>
+  实现时三个高频错误：① softmax 的维度写错（应当是 scores 的<strong>最后一维</strong>，即 key 维）；
+  ② 忘记 $\sqrt{d_k}$ 缩放，小模型上看似能训、规模一大就发散；
+  ③ 缩放用的是<strong>每个头的维度</strong> $d_k=d/h$，不是模型维度 $d$。notebook 里我们会与
+  <code>F.scaled_dot_product_attention</code> 逐数值对拍，任何一处写错都过不了 assert。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="causal"><span class="num">3</span>Causal Mask：decoder-only 的自回归约束</h2>
+
+  <p>GPT 类模型的训练目标是自回归语言建模：$p(x)=\prod_t p(x_t\mid x_{&lt;t})$。
+  预测第 $t$ 个 token 时<strong>绝不能看到 $t$ 之后的内容</strong>，否则模型学会"抄答案"，训练 loss 漂亮、生成时完全失效。
+  但 attention 的矩阵乘 $QK^\top$ 默认让每个位置看到所有位置 —— 必须显式屏蔽未来。</p>
+
+  <p>做法：在 softmax <strong>之前</strong>，给所有 $s&gt;t$（上三角）的分数加上 $-\infty$：</p>
+
+  <div class="math-block">
+  $$ \tilde{S}_{ts} = \frac{q_t^\top k_s}{\sqrt{d_k}} + M_{ts},\qquad
+     M_{ts} = \begin{cases} 0 & s \le t \\ -\infty & s > t \end{cases} $$
+  </div>
+
+  <p>$\exp(-\infty)=0$，被屏蔽位置的权重精确为零，且每行剩余权重仍然归一 —— 这就是"mask 实现为 $-\infty$ 加法"的原因：
+  它把约束干净地塞进了 softmax 的归一化里，而不是事后把权重清零再手动重归一。</p>
+
+  <div class="ascii">
+  允许的注意力模式（T=5，行=query t，列=key s）：✔ 可看，─ 被 mask 成 -inf
+
+            s=1   s=2   s=3   s=4   s=5
+   t=1   │  ✔     ─     ─     ─     ─   │   位置1只能看自己
+   t=2   │  ✔     ✔     ─     ─     ─   │
+   t=3   │  ✔     ✔     ✔     ─     ─   │   下三角矩阵
+   t=4   │  ✔     ✔     ✔     ✔     ─   │   torch.tril(torch.ones(T,T))
+   t=5   │  ✔     ✔     ✔     ✔     ✔   │   位置5可以看全部历史
+  </div>
+
+  <div class="callout intuition"><span class="label"></span>
+  Causal mask 还带来一个训练效率上的妙处：一条长度 $T$ 的序列，<strong>一次前向就同时构成 $T$ 个监督样本</strong>
+  （每个位置都在用自己的前缀预测下一个 token），且互不泄漏。这是 decoder-only 架构训练吞吐极高的原因之一，模块 03 训练时会直接看到。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="mha"><span class="num">4</span>多头注意力 MHA：子空间并行与参数量</h2>
+
+  <h3>4.1 子空间并行假设</h3>
+  <p>单头 attention 每个位置只输出一个权重分布 —— 它"这一层只能重点关注一种关系"。
+  <span class="term">Multi-Head Attention</span> 的假设是：序列中并存多种关系（句法依赖、共指、位置邻近、语义相似……），
+  与其用一个大头混着学，不如<strong>把表征切成 $h$ 个低维子空间，让每个头在自己的子空间里独立做一套 attention</strong> [Vaswani 2017]：</p>
+
+  <div class="math-block">
+  $$ \mathrm{head}_i = \mathrm{Attention}(XW_Q^{(i)},\, XW_K^{(i)},\, XW_V^{(i)}),\qquad
+     W^{(i)}_{Q,K,V}\in\mathbb{R}^{d\times d_h},\;\; d_h = d/h $$
+  $$ \mathrm{MHA}(X) = \mathrm{Concat}(\mathrm{head}_1,\dots,\mathrm{head}_h)\, W_O,\qquad W_O\in\mathbb{R}^{d\times d} $$
+  </div>
+
+  <h3>4.2 头维度切分：不增加计算量的并行</h3>
+  <p>关键工程事实：$h$ 个头<strong>不是</strong> $h$ 倍计算量。每个头的维度是 $d_h=d/h$，
+  实现上先用一个 $d\times d$ 的大矩阵算出 $Q$（$K,V$ 同理），再 reshape 成 $[B, h, T, d_h]$ ——
+  切头只是 <code>view + transpose</code>，总 FLOPs 与单个 $d$ 维大头基本相同。
+  每个头输出 $T\times d_h$，沿特征维拼回 $T\times d$，最后过输出投影 $W_O$ 让各头信息交融。</p>
+
+  <h3>4.3 参数量精确计算</h3>
+  <div class="math-block">
+  $$ \#\text{params}_{\text{MHA}} = \underbrace{3(d\cdot d + d)}_{W_Q,W_K,W_V\ (\text{含 bias})}
+     + \underbrace{d\cdot d + d}_{W_O} = 4d^2 + 4d $$
+  </div>
+  <p>注意参数量<strong>与头数 $h$ 无关</strong> —— $h$ 只决定这 $4d^2$ 如何被划分成子空间，不改变总量。
+  这个公式在 notebook 里会与 <code>sum(p.numel())</code> 逐项 assert。</p>
+
+  <div class="callout paper"><span class="label"></span>
+  [Vaswani 2017] <em>Attention Is All You Need</em> 同时给出了本章的三块基石：scaled dot-product attention、
+  multi-head 机制、以及 "attention + FFN + 残差 + LayerNorm" 的 block 结构。原文是 encoder-decoder 架构（机器翻译）；
+  GPT 系把它裁成 decoder-only —— 只保留带 causal mask 的 self-attention，删掉 cross-attention。
+  各头是否真的学到可解释的分工，是可解释性研究的长期话题：实践中能找到位置头、句法头、以及检索式的 induction head，
+  但也有大量头可被剪枝而几乎不掉点。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="ffn"><span class="num">5</span>FFN/MLP：4× 扩展、GELU 与参数大头</h2>
+
+  <p>每个 block 的后半段是一个逐位置前馈网络（<span class="term">FFN</span>，也叫 MLP）：先升维 4 倍、过非线性、再降回来：</p>
+
+  <div class="math-block">
+  $$ \mathrm{FFN}(x) = \mathrm{GELU}(xW_1 + b_1)\,W_2 + b_2,\qquad
+     W_1\in\mathbb{R}^{d\times 4d},\; W_2\in\mathbb{R}^{4d\times d} $$
+  </div>
+
+  <p>三个要点：① FFN 对每个位置<strong>独立同构</strong>地作用，不做任何跨位置交互 —— 跨位置的信息搬运全部由 attention 负责，
+  FFN 负责对搬运来的信息做逐 token 的非线性变换（主流可解释性观点把它视为键值式的"知识存取"层）；
+  ② $4\times$ 是 [Vaswani 2017] 沿用至今的工程默认值，并非理论最优（现代变体如 SwiGLU 用 $\tfrac{8}{3}d$ 补偿门控参数，模块 07）；
+  ③ GPT-2/nanoGPT 用 <span class="term">GELU</span> 而非 ReLU：$\mathrm{GELU}(x)=x\,\Phi(x)$（$\Phi$ 为标准正态 CDF），
+  处处平滑、负区有非零梯度，深网络里优化更稳。</p>
+
+  <h3>为什么 FFN 占参数大头：逐组件参数量表</h3>
+  <p>取 $d$=模型宽度，$h$=头数，$V$=词表大小，$T_{\max}$=上下文长度，$L$=层数。每层各组件（含 bias）：</p>
+
+  <table>
+    <thead><tr><th>组件</th><th>参数量公式</th><th>占每层比例（近似）</th></tr></thead>
+    <tbody>
+      <tr><td>MHA（$W_{Q,K,V}$ + $W_O$）</td><td>$4d^2 + 4d$</td><td>$\approx 1/3$</td></tr>
+      <tr><td>FFN（$W_1$ + $W_2$）</td><td>$8d^2 + 5d$</td><td>$\approx 2/3$</td></tr>
+      <tr><td>2 × LayerNorm（$\gamma,\beta$）</td><td>$4d$</td><td>可忽略</td></tr>
+      <tr><td><strong>每层合计</strong></td><td>$\approx 12d^2$</td><td>—</td></tr>
+      <tr><td>Token embedding（与 lm_head 权重 tying）</td><td>$Vd$</td><td rowspan="2">小模型中占比大，<br>随 $L,d$ 增大被稀释</td></tr>
+      <tr><td>Position embedding（learned）</td><td>$T_{\max}d$</td></tr>
+    </tbody>
+  </table>
+
+  <p>结论：<strong>FFN 以 $8d^2$ 对 MHA 的 $4d^2$，稳定占据 Transformer 主体参数的约 2/3</strong>。
+  整模型近似 $\#\text{params}\approx 12Ld^2 + (V+T_{\max})d$ —— 这正是模块 05 scaling laws 里 $N$ 的来源，
+  也解释了为什么 MoE（模块 07）选择稀疏化 FFN 而不是 attention：钱（参数）在哪里，就在哪里做手术。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="residual"><span class="num">6</span>残差与 LayerNorm：Pre-LN vs Post-LN 与残差流</h2>
+
+  <h3>6.1 两种放置方式</h3>
+  <p>attention 和 FFN 都包在"残差 + 归一化"里，但 <span class="term">LayerNorm</span> 放在子层之前还是之后，差异远比看起来大：</p>
+
+  <div class="math-block">
+  $$ \textbf{Post-LN（原始 Transformer）:}\quad x \leftarrow \mathrm{LN}\big(x + \mathrm{Sublayer}(x)\big) $$
+  $$ \textbf{Pre-LN（GPT-2 / nanoGPT 及之后）:}\quad x \leftarrow x + \mathrm{Sublayer}\big(\mathrm{LN}(x)\big) $$
+  </div>
+
+  <p>[Xiong 2020] 从梯度角度给出了解释：Post-LN 中 LayerNorm 挡在残差主干上，输出层附近梯度幅度大、
+  且随深度恶化，必须配合 <strong>learning-rate warmup</strong> 并小心调参，否则深层模型直接发散；
+  Pre-LN 中存在一条从输出直达每一层输入的<strong>恒等路径</strong>（identity path），梯度表现良好，
+  可以去掉 warmup、用更大学习率稳定训练。这是所有现代 GPT 系模型采用 Pre-LN 的原因（代价是有效深度略减、
+  最终性能在可比设置下有时略逊于调好的 Post-LN —— 工程上稳定性赢了）。注意 Pre-LN 还需要在<strong>所有 block 之后补一个最终 LN</strong>（<code>ln_f</code>），
+  否则残差流的幅度未经归一直接进 lm_head。</p>
+
+  <table>
+    <thead><tr><th></th><th>Post-LN</th><th>Pre-LN</th></tr></thead>
+    <tbody>
+      <tr><td>残差主干</td><td>每层被 LN 打断</td><td>恒等直通，从不被打断</td></tr>
+      <tr><td>深层梯度</td><td>顶层大、底层小，易爆/易消失</td><td>各层均匀，尺度健康 [Xiong 2020]</td></tr>
+      <tr><td>warmup</td><td>必需，且对超参敏感</td><td>可省略或大幅缩短</td></tr>
+      <tr><td>采用者</td><td>原始 Transformer (2017)、BERT</td><td>GPT-2、nanoGPT、LLaMA（换 RMSNorm，模块 07）及几乎所有现代 LLM</td></tr>
+    </tbody>
+  </table>
+
+  <h3>6.2 残差流视角（为可解释性埋线）</h3>
+  <p>Pre-LN 结构下有一个极有用的心智模型：把贯穿全网的残差主干看成一条<span class="term">残差流</span>（residual stream）——
+  一条 $d$ 维的"共享总线"。每个 attention 头、每个 FFN 都只是<strong>从总线上读取（经 LN），计算后把增量写回（加法）</strong>；
+  没有任何组件能"重写"总线，只能往上叠加。于是第 $L$ 层后的表征可以严格展开为：</p>
+
+  <div class="math-block">
+  $$ x_L = x_0 + \sum_{\ell=1}^{L}\Big[\mathrm{MHA}_\ell\big(\mathrm{LN}(\cdot)\big) + \mathrm{FFN}_\ell\big(\mathrm{LN}(\cdot)\big)\Big] $$
+  </div>
+
+  <p>模型的最终预测是<strong>所有子层贡献的线性叠加</strong>（直到最后的 ln_f 和 lm_head）。
+  机械可解释性（mechanistic interpretability）的大量工具 —— logit lens、activation patching、circuit 分析 ——
+  都建立在"读写残差流"这个视角上。做 model evaluation 时它同样关键：想知道"哪一层让模型决定说谎"，
+  本质上就是在问"哪个子层往残差流里写入了那个方向"。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="block"><span class="num">7</span>完整 GPT Block 组装与张量形状追踪</h2>
+
+  <p>把前面所有零件拼起来。约定批大小 $B$、序列长 $T$、模型宽 $C$（即 $d$）、头数 $h$、词表 $V$：</p>
+
+  <div class="ascii">
+  token ids [B,T]
+      │
+      ▼
+  ┌─ token embedding [V,C] ─┐
+  │            +            │──►  x [B,T,C]
+  └─ pos embedding  [T,C] ──┘
+      │
+      ▼  × L 层
+  ╔════════════════ Block（Pre-LN）═════════════════╗
+  ║  x ──┬──► LN1 ──► Multi-Head Attention ──►(+)──┐ ║
+  ║      │     (causal, h 个头, 每头 C/h 维)    │  ║
+  ║      └────────────── 残差 ─────────────────┘  ║
+  ║                                        │       ║
+  ║  x'──┬──► LN2 ──► FFN (C→4C→GELU→C) ──►(+)──┐  ║
+  ║      └────────────── 残差 ──────────────────┘  ║
+  ╚═════════════════════════════════════════════════╝
+      │
+      ▼
+   ln_f（最终 LayerNorm）
+      │
+      ▼
+   lm_head [C,V]（与 token embedding 权重 tying）
+      │
+      ▼
+   logits [B,T,V] ──► 每个位置对"下一个 token"的预测分布
+  </div>
+
+  <p>张量形状追踪表 —— 写代码时心里要随时有这张表，notebook 会逐层打印验证：</p>
+
+  <table>
+    <thead><tr><th>步骤</th><th>操作</th><th>输出形状</th></tr></thead>
+    <tbody>
+      <tr><td>输入</td><td>token ids</td><td>[B, T]</td></tr>
+      <tr><td>embedding</td><td>tok_emb(idx) + pos_emb(0..T-1)</td><td>[B, T, C]</td></tr>
+      <tr><td>QKV 投影</td><td>Linear(C → 3C) 后切分</td><td>3 × [B, T, C]</td></tr>
+      <tr><td>切头</td><td>view → [B,T,h,C/h] → transpose(1,2)</td><td>[B, h, T, C/h]</td></tr>
+      <tr><td>注意力分数</td><td>$QK^\top/\sqrt{C/h}$ + causal mask</td><td>[B, h, T, T]</td></tr>
+      <tr><td>softmax · V</td><td>weights @ V</td><td>[B, h, T, C/h]</td></tr>
+      <tr><td>合头</td><td>transpose → contiguous → view</td><td>[B, T, C]</td></tr>
+      <tr><td>输出投影 $W_O$</td><td>Linear(C → C)，残差相加</td><td>[B, T, C]</td></tr>
+      <tr><td>FFN</td><td>C → 4C → GELU → C，残差相加</td><td>[B, T, C]</td></tr>
+      <tr><td>lm_head</td><td>ln_f 后 Linear(C → V)</td><td>[B, T, V]</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout intuition"><span class="label"></span>
+  注意一个贯穿全网的事实：<strong>除 attention 分数 [B,h,T,T] 外，所有中间张量都保持 [B,T,C]</strong>。
+  这正是残差流视角的形状版本：总线宽度恒为 $C$，各子层只是借走、加工、归还。
+  <strong>权重 tying</strong>（lm_head 与 token embedding 共享 $V\times C$ 矩阵）既省下一份大参数，
+  也强制"输入词向量空间"与"输出预测空间"一致 —— GPT-2 与 nanoGPT 的默认做法 [Karpathy 2022]。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="pos"><span class="num">8</span>位置编码：attention 为什么需要它</h2>
+
+  <p>一个容易被忽略的数学事实：<strong>self-attention 本身是置换等变的</strong>。
+  设 $P$ 为任意置换矩阵，则 $\mathrm{Attention}(PQ, PK, PV) = P\,\mathrm{Attention}(Q,K,V)$ ——
+  把输入序列打乱，输出只是同样地被打乱，<strong>每个 token 的表征完全不变</strong>。
+  也就是说，不加位置信息的 Transformer 把句子看成一个<em>词袋</em>："狗咬人"和"人咬狗"没有区别。
+  必须显式注入位置信息，主流两条路：</p>
+
+  <table>
+    <thead><tr><th></th><th>Sinusoidal（[Vaswani 2017] 原始方案）</th><th>Learned（GPT-2 / nanoGPT 方案）</th></tr></thead>
+    <tbody>
+      <tr><td>形式</td><td>$PE_{(t,2i)}=\sin(t/10000^{2i/d})$，$PE_{(t,2i+1)}=\cos(\cdot)$，固定不学</td><td>一张可学习的 $T_{\max}\times d$ embedding 表</td></tr>
+      <tr><td>参数量</td><td>0</td><td>$T_{\max}\cdot d$</td></tr>
+      <tr><td>超出训练长度</td><td>可计算任意位置（但效果无保证）</td><td>查不到表，硬上限 $T_{\max}$</td></tr>
+      <tr><td>编码的是</td><td>绝对位置（不同频率的正弦组合，线性变换可表达相对偏移）</td><td>绝对位置（完全靠数据学）</td></tr>
+    </tbody>
+  </table>
+
+  <p>两者实测差距不大 [Vaswani 2017]，本课程跟随 nanoGPT 用 learned。
+  它们的共同短板是都编码<strong>绝对位置</strong>，而语言更在意<strong>相对位置</strong>（"前一个词"比"第 1024 号位置"更本质），
+  且外推到更长上下文都不可靠 —— 现代模型几乎全部转向把<strong>相对旋转</strong>直接作用在 Q/K 上的 <span class="term">RoPE</span>，留到模块 07 展开。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>$O(T^2)$ 能否绕开？</strong> FlashAttention 不改数学只改访存（模块 06）；线性 attention 与 SSM（Mamba，模块 07）直接改算子。
+    开放问题是这类替代在<strong>检索式能力</strong>（如 in-context 精确回忆）上是否存在本质损失 —— 评测上要用 needle-in-a-haystack、
+    associative recall 这类针对性任务，而非只看平均困惑度。</li>
+    <li><strong>注意力头的功能分工</strong>：induction heads 等 circuit 已被定位，但"多少头是冗余的、剪掉后哪些行为退化"仍无系统答案。
+    对 evaluator 的含义：聚合分数掉 0.5% 的剪枝，可能集中摧毁某一种能力 —— 需要按能力分桶评测。</li>
+    <li><strong>Pre-LN 之后</strong>：残差流幅度随深度持续增长，催生了 RMSNorm、QK-Norm、sandwich-norm 等变体；
+    超深模型（百层以上）的归一化最优配方仍在演化（模块 07）。</li>
+    <li><strong>FFN 是"知识库"吗？</strong> 键值记忆假说支持定点知识编辑（如 ROPE/ROME 系工作），但编辑的副作用（涟漪效应）
+    评测仍不成熟 —— 改掉一条事实后，如何系统度量被波及的推理链？</li>
+    <li><strong>评测视角</strong>：本章每个组件都对应一类可测的失败模式 —— mask 错位 → 数据泄漏型虚高分；位置编码外推失败 → 长上下文性能悬崖；
+    softmax 饱和 → 训练不稳定。读懂内核，才能把 benchmark 异常<em>归因</em>到机制。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>从点积方差出发，推导为什么 attention 分数要除以 $\sqrt{d_k}$？不除会引发什么训练问题？</li>
+      <li>causal mask 为什么实现为 softmax 前加 $-\infty$，而不是 softmax 后把权重置零？</li>
+      <li>给定 $d, h, V, T_{\max}, L$，写出整个 GPT 的参数量公式，并说明为什么 FFN 占大头、参数量为何与 $h$ 无关。</li>
+      <li>Pre-LN 相比 Post-LN 解决了什么问题 [Xiong 2020]？"残差流"视角如何帮助可解释性与评测归因？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../01_tokenization/01_讲解.html"><div class="dir">← 上一章</div><div class="t">01 · Tokenization：从零实现 BPE</div></a>
+    <a class="next" href="../03_train_minigpt/03_讲解.html"><div class="dir">下一章 →</div><div class="t">03 · 从零训练 mini-GPT</div></a>
+  </div>
+
+</div>
+</body>
+</html>

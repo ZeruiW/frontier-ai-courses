@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · QK/OV 电路与 Induction Heads</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 8</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · QK/OV 电路与 Induction Heads</h1>
+  <p class="subtitle">把 attention head 拆成"看哪里"与"搬什么"两条独立电路，然后手工构造一个会 in-context copy 的两层 transformer——机制可解释性第一个被完整理解的算法</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（residual stream 视角）、attention 前向计算、线性代数</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_induction_heads.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Elhage 2021 (Mathematical Framework)、Olsson 2022 (arXiv:2209.11895)、Jain &amp; Wallace 2019 (arXiv:1902.10186)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么从 attention head 下手：电路视角的入口</a></li>
+      <li><a href="#qkov">数学框架：QK 电路与 OV 电路的因式分解</a></li>
+      <li><a href="#onelayer">1 层 attention-only transformer 只能做 skip-trigram</a></li>
+      <li><a href="#composition">2 层的质变：composition 与 induction head 的构造</a></li>
+      <li><a href="#evidence">Induction heads 与 in-context learning 的证据链</a></li>
+      <li><a href="#pitfalls">attention pattern 分析的实务与陷阱</a></li>
+      <li><a href="#eval">对评测的意义（评测视角）</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么从 attention head 下手：电路视角的入口</h2>
+
+  <p>前两个模块用 probe 与 logit lens 回答"模型的中间表示<em>编码了什么</em>"。本模块换问题：<strong>模型用什么<em>算法</em>计算？</strong>
+  <span class="term">circuit（电路）</span>是机制可解释性的中心抽象——由若干组件（head、neuron）经 residual stream 连接而成、实现某个可描述算法的子图。
+  而 attention head 是电路分析最好的入口，原因有三：</p>
+
+  <ul>
+    <li><strong>head 之间天然可加分解</strong>：multi-head attention 的输出是各 head 输出之和，每个 head 独立读写 residual stream（模块 02 的"通信总线"视角），不像 MLP 神经元之间纠缠在非线性里。</li>
+    <li><strong>固定 attention pattern 后，head 是线性的</strong>：唯一的非线性是 softmax。把 pattern 当作"已经算好的常数"，剩下的 value→output 路径就是纯矩阵乘法，可以闭式分析。</li>
+    <li><strong>已经有一个完整的成功案例</strong>：<span class="term">induction head</span>——第一个被从权重层面完整理解、又被证明与宏观能力（in-context learning）强相关的电路 [Elhage 2021; Olsson 2022]。本章就围绕它展开，notebook 里你会用纯 numpy <strong>手工写出它的全部权重</strong>。</li>
+  </ul>
+
+  <div class="callout intuition"><span class="label"></span>
+  Induction head 做的事一句话能说清：序列中出现过 <code>… A B … A</code>，在第二个 <code>A</code> 处预测 <code>B</code>。
+  即"找到当前 token 上一次出现的位置，把它<em>后面那个</em> token 抄过来"。这是一个对 token 取值完全通用的<strong>算法</strong>，
+  不是对特定 n-gram 的记忆——这正是它与 in-context learning 关系暧昧的根源（第 5 节）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="qkov"><span class="num">2</span>数学框架：QK 电路与 OV 电路的因式分解</h2>
+
+  <p>以下沿用 [Elhage 2021] <em>A Mathematical Framework for Transformer Circuits</em> 的记号，分析 <strong>attention-only</strong> transformer（无 MLP、无 LayerNorm——这是一个刻意的理论简化，结论再外推）。
+  记 token one-hot 序列 $t$，embedding $x_0 = W_E t$，最终 logits $= W_U x_L$。单个 attention head $h$ 对 residual stream 的贡献可以写成两步：</p>
+
+  <div class="math-block">
+  $$ A = \mathrm{softmax}^{*}\!\big( x^\top W_Q^\top W_K \, x \big) \qquad\text{（每个目标位置一行，causal mask 后按行 softmax）} $$
+  $$ h(x) = \big( A \otimes W_O W_V \big)\, x \;=\; W_O W_V \, x \, A^\top $$
+  </div>
+
+  <p>这个写法的关键观察：$W_Q, W_K$ <strong>只</strong>出现在 $A$ 里，$W_V, W_O$ <strong>只</strong>出现在值的搬运里。
+  四个矩阵从不单独起作用，永远以两个乘积出现，因此 head 的本质参数不是 $(W_Q,W_K,W_V,W_O)$，而是两个低秩矩阵：</p>
+
+  <div class="math-block">
+  $$ W_{QK} \equiv W_Q^\top W_K \in \mathbb{R}^{d\times d}, \qquad
+     W_{OV} \equiv W_O W_V \in \mathbb{R}^{d\times d}, \qquad
+     \mathrm{rank} \le d_{\text{head}} $$
+  </div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>一个 head 干两件互相独立的事：<strong>QK 电路决定"看哪里"</strong>——给每对（查询位置，候选位置）打分；
+      <strong>OV 电路决定"搬什么"</strong>——一旦决定看某个位置，把那里的信息做一个固定的线性变换搬回来。
+      "看哪"和"搬什么"由不同的参数控制，可以分开逆向：你可以问"这个 head 在找什么样的 key"，
+      也可以独立地问"它抄到的东西会把 logits 往哪推"。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>在 1 层模型中，query/key/value 都来自 $x_0 = W_E t$，logits 经 $W_U$ 读出，于是 head 的行为完全由两个<strong>端到端 token 矩阵</strong>刻画：</p>
+      <p>$$ \underbrace{W_E^\top W_Q^\top W_K W_E}_{\text{full QK circuit},\; |V|\times|V|}
+      \qquad
+      \underbrace{W_U W_O W_V W_E}_{\text{full OV circuit},\; |V|\times|V|} $$</p>
+      <p>full QK 的 $(t_q, t_k)$ 元 = "查询 token 为 $t_q$ 时给 key token $t_k$ 的注意力分数"；
+      full OV 的 $(t_{out}, t_{in})$ 元 = "注意到 token $t_{in}$ 时给输出 token $t_{out}$ 的 logit 贡献"。
+      两个 $|V|\times|V|$ 矩阵都是<strong>不依赖输入的静态权重性质</strong>——电路分析可以不跑任何前向、直接读权重。</p>
+    </div>
+  </div>
+
+  <div class="callout paper"><span class="label"></span>
+  [Elhage 2021] 还给出 residual stream 的核心形象：每层 head/MLP 都是从总线<strong>读出一个低秩子空间、写回另一个低秩子空间</strong>的算子，
+  整个 transformer 的端到端映射可展开为指数多条"路径"之和（path expansion）。电路分析 = 找出其中少数承载行为的高权重路径。
+  注意它的适用边界：严格结论只对 attention-only 模型成立，MLP 与 LayerNorm 会破坏线性性，实际模型上是"近似一阶图景"。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="onelayer"><span class="num">3</span>1 层 attention-only transformer 只能做 skip-trigram</h2>
+
+  <p>有了因式分解，可以回答一个干净的理论问题：<strong>1 层 attention-only 模型的表达能力上限是什么？</strong>证明思路（[Elhage 2021] §"One-Layer Models"）：</p>
+
+  <p>把 logits 沿路径展开。1 层模型只有两类路径：直连路径 $W_U W_E$（一个 bigram 统计表），以及每个 head 一条的路径：</p>
+
+  <div class="math-block">
+  $$ \text{logits} = \underbrace{W_U W_E\, t}_{\text{bigram}} \;+\; \sum_{h}\; \big(A^h \otimes W_U W_{OV}^h W_E\big)\, t $$
+  </div>
+
+  <p>关键在第二项的结构：对目标位置 $i$、被注意位置 $j$，head 的贡献由<strong>三个 token、两张静态表</strong>完全决定——
+  $A^h_{ij}$ 由 full QK 表查 $(t_i,\ t_j)$ 得到，logit 贡献由 full OV 表查 $t_j$ 列得到。也就是说每个 head 实现的是一族规则：</p>
+
+  <div class="ascii">
+  [源 token t_j] …(中间隔任意距离)… [当前 token t_i]  ⟹  提升某些 [输出 token] 的 logit
+        ▲                              ▲                        ▲
+     由 QK 表选中                  由 QK 表发起               由 OV 表决定
+
+  即 skip-trigram： "A … B → C"。例（真实 1 层模型中逆向出的规则）：
+    "perfect … are → perfect"     "keep … in → mind"
+  </div>
+
+  <p>为什么到此为止？因为 <strong>query 和 key 都直接来自 $W_E t$，无法引用"别的位置算出来的东西"</strong>。
+  注意力打分只能基于（当前 token 身份，候选 token 身份，相对位置），不能表达"注意<em>上一个 A 的下一个位置</em>"——
+  那需要 key 里含有"我的前一个位置是 A"这种<strong>由别的 head 加工过的信息</strong>。1 层没有"别的 head 在先"，所以 1 层模型只是一台庞大的 skip-trigram 查表机，
+  做不了 induction。这个不可能性论证给了我们一个精确的问题：第二层到底添了什么？</p>
+
+  <div class="callout warn"><span class="label"></span>
+  顺带一个真实模型中的趣味推论：1 层模型的 skip-trigram 表是<strong>批发式</strong>的——QK 与 OV 是两张独立的表，
+  规则 "A…B→C" 与 "A…B'→C'" 共享 OV 列，于是会捆绑出 <code>keep … in → mind</code> 和 <code>keep … in → keep</code> 这类"买一送一"的错误规则。
+  模型的某些怪异行为，根源是权重结构强加的耦合，而非数据。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="composition"><span class="num">4</span>2 层的质变：composition 与 induction head 的构造</h2>
+
+  <p>第二层的 head 的 $Q/K/V$ 读的是 $x_1 = x_0 + \sum_h h(x_0)$——里面含有第一层 head 的输出。
+  于是出现三种 <span class="term">composition（组合）</span> [Elhage 2021]：</p>
+
+  <table>
+    <thead><tr><th>类型</th><th>第一层输出进入第二层的哪个矩阵</th><th>效果</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">Q-composition</span></td><td>$W_Q$（query 一侧）</td><td>"从哪里发问"被上一层修改</td></tr>
+      <tr><td><strong>K-composition</strong></td><td>$W_K$（key 一侧）</td><td><strong>"什么样的位置算匹配"被上一层修改 —— induction head 用的就是它</strong></td></tr>
+      <tr><td><span class="term">V-composition</span></td><td>$W_V$（value 一侧）</td><td>搬运的内容是上一层加工过的，两个 OV 串联成"虚拟 head"（virtual attention head）</td></tr>
+    </tbody>
+  </table>
+
+  <h3>induction head 的两步构造</h3>
+
+  <p>目标算法：当前 token 是 $A$，找到序列里上一个 $A$ 的<strong>下一个位置</strong>，把那里的 token 抄成预测。两层各司其职：</p>
+
+  <div class="ascii">
+  序列:        …   A    B    …    A    →  预测 B
+  位置:            s   s+1        i
+
+  Layer 1 · previous-token head（纯位置的 QK）
+     位置 s+1 注意位置 s，OV 把 token A 的身份搬到 s+1 的 residual stream，
+     写进一个专用子空间："我的前一个 token 是 A"。
+
+  Layer 2 · induction head（K-composition）
+     query(i)  = 当前 token 身份 A          ← 来自 embedding（原始信息）
+     key(s+1)  = "前一个 token 是 A"        ← 来自 Layer 1 的输出！
+     匹配 ⟹ i 注意 s+1 ⟹ OV 把 s+1 处的 token B 抄进 logits。
+  </div>
+
+  <p>形式化：设第一层 previous-token head 的 QK 只看 position embedding，构造 $W_{QK}^{(1)}$ 使位置 $i$ 与位置 $i-1$ 的打分最大
+  （positional one-hot 下就是一个下移一格的 shift 矩阵乘大系数 $\beta$）；其 OV 把 token 子空间复制到一个空闲子空间 $S$。
+  第二层令 $W_Q^{(2)}$ 读 token 子空间、$W_K^{(2)}$ 读 $S$，则打分矩阵在 token 基下是 $\beta\, I_{|V|}$——"当前 token == 你前一个 token"时打高分；
+  其 OV 取 $W_U W_{OV}^{(2)} W_E \approx I_{|V|}$（copy 矩阵：注意谁就提升谁的 logit）。
+  这套权重<strong>每一个矩阵都可以手写出来</strong>——notebook 的主线就是写出它们、并在随机重复序列上验证第二遍 top-1 全对。</p>
+
+  <div class="callout intuition"><span class="label"></span>
+  两个判据把"是不是 induction head"操作化（notebook 会实现）：
+  <strong>induction score</strong> = 在重复序列上，attention pattern 在 $(i,\ i-T+1)$ 对角线（$T$ 为重复周期）上的平均质量；
+  <strong>copy score</strong> = OV 电路把被注意 token 映回它自身 logit 的程度（full OV 对角占优）。两个都接近 1 才算。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="evidence"><span class="num">5</span>Induction heads 与 in-context learning 的证据链</h2>
+
+  <p>[Olsson 2022] <em>In-context Learning and Induction Heads</em> (arXiv:2209.11895) 提出一个大胆假设：
+  <strong>induction heads 是 transformer 中 in-context learning（ICL）的主要机制来源</strong>。
+  这里 ICL 被操作化为一个可连续测量的量：<span class="term">ICL score</span> = 上下文第 500 个 token 的 loss 减第 50 个 token 的 loss——
+  越负说明模型越能利用长上下文。论文给出六条证据，强度递减：</p>
+
+  <ul>
+    <li><strong>共生的相变（phase change）</strong>：训练早期某个窗口内（约 2.5–5B token），induction heads 突然形成，
+    ICL score 在<strong>同一窗口</strong>从平庸跳到接近最终值，训练 loss 曲线上留下一个肉眼可见的<strong>bump（拐点）</strong>。
+    对 6 个不同规模的小模型，这个共生在训练过程中精确对齐。</li>
+    <li><strong>结构上的因果干预（小模型 smoking gun）</strong>：把架构改成更容易形成 induction head（给 attention-only 模型加 smeared key），
+    相变提前发生，ICL 提前出现——"操纵机制 ⟹ 能力跟着动"，这是相关性之外最强的一条。</li>
+    <li><strong>消融实验</strong>：在小模型中 knock out induction heads，ICL score 的损失远大于随机消融同样多的 head。</li>
+    <li><strong>跨模型普遍性</strong>：从 toy 模型到当时最大的模型（13B/40 层级别），induction heads 普遍存在，且 prefix-matching / copying 的 pattern 可机械检测。</li>
+    <li><strong>不只字面复制</strong>：大模型中的 induction heads 同时表现出"模糊匹配"——<code>A* B* … A → B</code>，其中 $A^*\!\sim\!A$ 是语义相近而非完全相同的 token（soft induction / translation 等行为），暗示同一机制可平滑泛化到更抽象的模式补全。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  诚实地标注证据强度（论文自己也这么做）：对<strong>小型 attention-only 模型</strong>，"induction heads 构成 ICL 的多数来源"接近被证明；
+  对<strong>大模型</strong>，证据是相关性 + 普遍性 + 机制类比，<em>不是</em>因果证明——MLP 参与后无法干净消融，"模糊匹配"的 head 也不再是教科书电路。
+  把"induction heads 解释了 GPT-4 的 ICL"当作已证结论，是文献里常见的过度引用。作为评测科学家，这种"证据链强度分级"的习惯本身就值得学。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="pitfalls"><span class="num">6</span>attention pattern 分析的实务与陷阱</h2>
+
+  <p>induction head 的成功容易让人以为"画 attention 热图 = 解释模型"。这条路上有著名的坑：</p>
+
+  <p><strong>① Attention is not Explanation</strong> [Jain &amp; Wallace 2019, arXiv:1902.10186]：在文本分类任务上，
+  attention 权重与梯度类特征重要性的相关性很弱；并且常能构造出<strong>分布完全不同但输出几乎不变</strong>的对抗性 attention（adversarial attention）。
+  随后 [Wiegreffe &amp; Pinter 2019, arXiv:1908.04626] 反驳指出其实验设定的问题（事后单独扰动 attention 不等于模型真的能学到那个 attention），
+  结论修正为"attention 不必然是、但也不必然不是解释——取决于你怎么验证"。这场辩论的方法论遗产比结论重要：
+  <strong>声称某组件承载某功能，必须配因果检验</strong>（消融/patching，模块 04），不能只看权重热图。</p>
+
+  <p><strong>② pattern ≠ 信息流</strong>。注意力权重大，不代表搬运的信息重要：value 可能近零（被 OV 投影掉），
+  也可能写入的子空间下游根本不读。改进的度量是 <span class="term">value-weighted attention</span>（用 $\|A_{ij}\, W_{OV} x_j\|$ 代替 $A_{ij}$）
+  或直接做 attribution。反过来，常见的 <span class="term">attention sink</span>（大量质量堆在 BOS/首 token）多半是"无处可看时的停车位"，不是功能信号。</p>
+
+  <p><strong>③ 选择效应</strong>。在海量 head 里用 induction score 之类的指标筛选，再展示 top 例子，容易讲出过拟合的故事。
+  对策与 probe 一章相同：held-out 序列上复测、设随机 head 基线（notebook 练习里随机 pattern 的 score 就是这个基线）、报告全分布而非 cherry-pick。</p>
+
+  <p><strong>④ LayerNorm 与 softmax 的非线性</strong>。"full QK/OV 是静态权重性质"严格说只在 attention-only + 无 LN 的玩具里成立；
+  真实模型里 LN 的 scale 依赖输入，QK 打分还叠加 positional 机制（rotary 等），读权重得到的是一阶近似。手工电路（本模块）之所以教学上珍贵，正因为它把这些近似全部去掉，让你见过一次"完全干净"的电路长什么样，再回头看真实模型时知道哪里是泥。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>对评测的意义（评测视角）</h2>
+
+  <p>为什么 model evaluation 的 research scientist 要懂 induction head？因为一批评测现象在机制层面同源：</p>
+
+  <ul>
+    <li><strong>ICL 能力从哪来、何时出现</strong>：few-shot 评测的成绩有相当一部分由"模式补全"机制承载。机制视角解释了为什么 ICL 在训练早期<strong>跳变式</strong>出现（相变）而非平滑增长——
+    对 capability forecasting 是个警示：<strong>能力可以不连续涌现，外推 loss 曲线会错过它</strong>；loss 上的 bump 这类训练动力学信号值得纳入监控。</li>
+    <li><strong>长上下文评测的"作弊路径"</strong>：needle-in-a-haystack、长文复述类基准，很大程度上测的是 induction 式检索+copy，而非理解。
+    设计长上下文评测时要问：这道题能否被"找重复、抄后缀"解掉？若能，它测的是 induction 电路的健康度，不是推理。</li>
+    <li><strong>prompt injection 与 induction 的关系</strong>：injection 的有效性部分依赖模型对上下文中指令模式的强力补全与复制倾向——
+    与 induction/copy 机制同根。机制上"模型天生爱抄上下文"意味着：纯行为层面的 injection 防御评测，应预期这是一个<strong>深层先验</strong>而非表层 bug。</li>
+    <li><strong>重复退化（repetition loop）</strong>：贪心解码下模型滑入循环复读，induction 电路是嫌疑机制之一（重复一旦开始，copy 电路自我强化）。
+    评测生成质量时看到 loop，机制假设能指导你设计区分性实验（如扰动周期）。</li>
+    <li><strong>白盒评测指标</strong>：induction score / prefix-matching score 是廉价、可跨模型机械计算的"机制存在性"指标——
+    在 checkpoint 序列上跟踪它们，是"机制层面的能力监控"最早的可行例子，也是模块 07（interp × evals）的伏笔。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>Function vectors / task vectors</strong>：induction head 的精神后继。[Todd 2023, arXiv:2310.15213] 发现 ICL 中少数 attention heads 的输出聚合成一个
+    <span class="term">function vector</span>——把它加进另一个上下文的 residual stream，能在零示例下触发同一任务；[Hendel 2023, arXiv:2310.15916] 的 task vector 视角类似：
+    ICL 把"任务"压缩成单个向量再执行。这把"in-context 学到的东西在哪"从 pattern 层推进到了表示层。</li>
+    <li><strong>从字面 copy 到抽象规则</strong>：soft/semantic induction（匹配语义而非字面）、在算术与形式语言上发现的结构化 head，提示 induction 可能是一族<strong>模式补全算子</strong>的最简成员。"大模型的 ICL = 多少 induction 变体 + 多少别的机制"仍是开放问题。</li>
+    <li><strong>相变的理论</strong>：为什么 induction 电路的形成是突然的？两层电路需要"先有 previous-token head 才有 K-composition 的梯度信号"，
+    这类<strong>组件互锁导致的 plateau→跳变</strong>动力学已有 toy 理论，但通用的"何种电路必然相变"还没有答案——这直接关系到危险能力是否会无预警涌现。</li>
+    <li><strong>架构外推</strong>：induction 行为在 state-space models（Mamba 等）与 RNN 变体中如何实现？associative recall 任务已成为新架构的标配基准——一个 interp 发现反向定义了架构评测项，这是机制研究反哺评测的范例。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>$W_{QK}$ 与 $W_{OV}$ 分别控制什么？full QK / full OV 电路矩阵（$W_E^\top W_Q^\top W_K W_E$、$W_U W_O W_V W_E$）的行列各是什么含义？</li>
+      <li>为什么 1 层 attention-only 模型只能实现 skip-trigram？证明用到的关键结构事实是什么？</li>
+      <li>induction head 的两层构造中，previous-token head 与 K-composition 各完成哪半步？</li>
+      <li>[Olsson 2022] 的证据链里哪条最强、哪条只是相关性？对大模型结论的诚实表述是什么？</li>
+      <li>为什么"attention 热图"不能直接当解释？至少给出两个机制层面的理由与对应的改进度量。</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../02_logit_lens/02_讲解.html"><div class="dir">← 上一章</div><div class="t">02 · Residual Stream 与 Logit Lens</div></a>
+    <a class="next" href="../04_activation_patching/04_讲解.html"><div class="dir">下一章 →</div><div class="t">04 · Activation Patching：因果干预</div></a>
+  </div>
+
+</div>
+</body>
+</html>

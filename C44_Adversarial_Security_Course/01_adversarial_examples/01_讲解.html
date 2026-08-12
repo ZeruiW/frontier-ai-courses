@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 对抗样本：FGSM、PGD 与对抗训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 对抗样本：FGSM、PGD 与对抗训练</h1>
+  <p class="subtitle">推理期完整性攻击的核心 —— 用人眼看不出的微小扰动让模型分错；从零实现 FGSM/PGD、用对抗训练（min-max）把鲁棒精度拉回来，并戳穿梯度遮蔽式的虚假鲁棒</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、梯度与链式法则（反向传播）、logistic/MLP 基础、范数（L∞/L2）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_adversarial_examples.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Szegedy 2013、Goodfellow 2014 (FGSM)、Madry 2017 (PGD)、Athalye 2018</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what">对抗样本：模型边界的局部脆弱</a></li>
+      <li><a href="#fgsm">FGSM：单步攻击与线性假说</a></li>
+      <li><a href="#pgd">PGD：迭代攻击与投影</a></li>
+      <li><a href="#advtrain">对抗训练：min-max 防御</a></li>
+      <li><a href="#transfer">可迁移性：黑盒攻击为何可行</a></li>
+      <li><a href="#masking">评测陷阱：梯度遮蔽与虚假鲁棒</a></li>
+      <li><a href="#notebook">从玩具到现实：notebook 怎么练</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what"><span class="num">1</span>对抗样本：模型边界的局部脆弱</h2>
+  <p>2013 年，Szegedy 等人发现一件反直觉的事：给一张被神经网络以 99% 置信度正确分类的图片，加上一个<strong>人眼完全看不出</strong>的微小扰动，网络就会以同样高的置信度把它分成完全不相干的类别。这种样本叫 <span class="term">adversarial example</span>（对抗样本），它揭示了一个深刻问题：<strong>模型在训练分布上的高精度，并不意味着它在每个输入的邻域内都稳定</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：分类器在输入空间里画了决策边界。正常样本离边界远远的，安全。但边界其实<strong>七拐八绕、贴得离样本很近</strong>——在某些你想不到的方向上，只要轻轻推一点点，样本就越过边界被分错了。对抗攻击就是<em>精确地找到那个最省力的推动方向</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：给定模型 $f$、输入 $x$、真标签 $y$，对抗样本是在威胁模型 $\lVert\delta\rVert_p \le \epsilon$ 内使损失最大（或预测翻转）的扰动：$x_{adv}=x+\delta^*,\ \delta^*=\arg\max_{\lVert\delta\rVert_p\le\epsilon} L\big(f(x+\delta),y\big)$。关键在于<strong>范数预算 ε</strong>把「不可察觉」量化了，使攻击与防御都可比较、可度量。</p></div>
+  </div>  <p>为什么这是安全问题而不只是趣味现象？因为它是<strong>推理期的完整性攻击</strong>：攻击者不碰你的训练、不偷你的模型，只要能<em>构造输入</em>，就能让自动驾驶把停车牌看成限速牌、让内容审核放过违规图片、让恶意软件检测器漏报。本模块在玩具分类器上从零实现两种核心攻击（FGSM、PGD）与最可靠的防御（对抗训练），并戳穿鲁棒性评测里最常见的陷阱。</p>  <p>这里要厘清一个常见误解：对抗样本<strong>不是</strong>「模型见得太少、训练不够」造成的。哪怕模型在干净测试集上达到接近完美的精度、泛化得很好，它依然几乎必然存在对抗样本。原因在于<strong>准确率和鲁棒性是两个不同的指标</strong>：前者问「随机抽一个样本能不能分对」，后者问「以该样本为中心的 ε-球内<em>最坏</em>的那个点能不能分对」。一个模型可以在前者上满分、在后者上不堪一击——因为自然分布几乎不会采样到那些精心构造的最坏点。把这两个指标分开，是理解整个对抗鲁棒性领域的第一把钥匙。</p>  <p>还有一个尺度上的直觉值得建立：对抗扰动的「不可察觉」是相对<strong>范数</strong>而言的。在图像上，L∞ 预算 ε=8/255 意味着每个像素最多改动 8 个灰阶——肉眼几乎看不出，模型却可能彻底改判。本课的玩具是二维数据，没有「像素」，但 ε 的角色完全一样：它界定了「攻击者被允许的改动有多大」，而<strong>一切鲁棒性数字都必须挂在某个 ε 上</strong>（第 4 节的预算曲线会把这点钉死）。脱离 ε 谈「模型鲁棒吗」，和脱离载重谈「桥结实吗」一样没有意义。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本质：<strong>对抗样本利用的是模型决策边界的局部几何，而非数据本身的难度</strong>。样本一点没变难（人眼一眼认出），变的是它被<em>精心挪到了边界另一侧</em>。所以防御的目标不是「学得更准」，而是「让边界离样本更远、邻域内更平滑」——这正是对抗训练在做的事。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fgsm"><span class="num">2</span>FGSM：单步攻击与线性假说</h2>
+  <h3>FGSM：单步快速攻击与线性假说</h3>  <p>最快的攻击是 <span class="term">FGSM (Fast Gradient Sign Method)</span>（Goodfellow 2014）。思路极简：损失 $L$ 对输入 $x$ 的梯度 $\nabla_x L$ 指向「让损失上升最快」的方向；在 <span class="term">Lp norm / threat model</span> 为 L∞ 的预算下，单步走到边界的最优扰动就是沿梯度的<strong>符号</strong>方向走满 ε：</p>  <div class="math-block">\[x_{adv} = x + \epsilon \cdot \mathrm{sign}\big(\nabla_x L(f(x), y)\big)\]</div>  <p>为什么取符号而不是梯度本身？因为 L∞ 预算约束的是<strong>每个分量的最大改动幅度</strong>。要在「每维最多改 ε」的盒子里让线性项 $\nabla_x L^\top \delta$ 最大，最优解就是每一维都顶着边界、方向与该维梯度同号——这正是 $\epsilon\cdot\mathrm{sign}(\nabla_x L)$。一步到位，故称 fast。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>FGSM 背后是 Goodfellow 的<strong>线性假说</strong>：对抗样本的根源不是模型「学坏了」（过拟合），而是模型局部太<em>线性</em>。在高维输入里，即使每一维只改动 ε 这么一点点，线性响应 $w^\top\delta$ 累加起来也能很大——维度越高，这个累加效应越夸张。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上对线性模型 $f(x)=w^\top x$：扰动带来的改变 $w^\top\delta$，在 $\lVert\delta\rVert_\infty\le\epsilon$ 下最大为 $\epsilon\lVert w\rVert_1=\epsilon\sum_i|w_i|$。维度 $d$ 越大，$\lVert w\rVert_1$ 越大，同样的 ε 造成的 logit 改变越大。这解释了<strong>高维模型为何天生更脆弱</strong>，也解释了为什么 FGSM 这么简单却这么有效。</p></div>
+  </div>  <p><strong>一个 30 秒的 worked 微例</strong>，把「高维放大」算给你看：设一个线性分类器权重 $w$ 有 $d=1000$ 维、每维大小约 $0.1$，攻击预算 $\epsilon=0.01$（每像素只改百分之一，肉眼绝对无感）。FGSM 走 $\delta=\epsilon\cdot\mathrm{sign}(w)$，带来的 logit 改变量是 $w^\top\delta=\epsilon\lVert w\rVert_1=\epsilon\sum_i|w_i|\approx 0.01\times(1000\times0.1)=1.0$。一个看似微不足道的 0.01 扰动，竟把 logit 推动了整整 1.0——足以越过许多类间的决策间隔。把维度换成 ImageNet 级的 $d\!\approx\!150000$，同样的 ε 造成的推动还要再大两个数量级。<strong>这就是「高维 + 近线性 = 天生脆弱」的算术本质</strong>：扰动在每一维上都微小，但 $d$ 个微小量<em>同号相加</em>就不微小了。</p>  <p>线性假说当年是反直觉的：在它之前，大家以为对抗样本是深度网络高度非线性、训练过拟合出的「怪洞」。Goodfellow 反过来论证——恰恰是<strong>过于线性</strong>（ReLU、maxout 等为优化友好而设计的近线性结构）让扰动沿梯度方向<em>可加地</em>累积。一个佐证是：连<strong>简单的线性/逻辑回归模型</strong>都有对抗样本（本课的练习就在玩具模型上造出它们）。这把对抗脆弱性的根源从「模型太复杂」改写为「高维 + 近线性」，也直接启发了 FGSM 这个<em>沿梯度符号一步到位</em>的攻击形式。</p>  <p>FGSM 的局限是<strong>只走一步</strong>：它假设损失在 ε 范围内近似线性，沿符号方向直线前进。当损失曲面弯曲时，单步可能不是最优——走过头、或没走到真正的最坏点。这就引出了下一节的迭代版本 PGD。但 FGSM 仍极有价值：它是理解对抗样本机理的最佳入口，也是对抗训练早期的常用（虽弱）内层攻击。此外，FGSM 也提醒我们攻击的<strong>梯度是对输入求的</strong>（$\nabla_x L$），而非平时训练时对参数求的（$\nabla_\theta L$）——这是一切对抗攻击代码的关键区别，notebook 第 1 节会用数值梯度专门校验这一点。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="pgd"><span class="num">3</span>PGD：迭代攻击与投影</h2>
+  <h3>PGD：迭代攻击与投影</h3>  <p><span class="term">PGD (Projected Gradient Descent)</span>（Madry 2017）是 FGSM 的多步强化版，被公认为一阶攻击的<strong>事实标准强基线</strong>。它把「一大步」拆成「多小步」，每步沿梯度符号走一小段 $\alpha$，再<strong>投影</strong>回 ε-球内，必要时随机起点多次重启：</p>  <div class="math-block">\[x^{(t+1)} = \Pi_{\mathcal{B}_\epsilon(x)}\Big( x^{(t)} + \alpha \cdot \mathrm{sign}\big(\nabla_x L(f(x^{(t)}), y)\big) \Big)\]</div>  <p>式中 $\Pi_{\mathcal{B}_\epsilon(x)}$ 是 <span class="term">projection (clip)</span>：把越出 ε-球的点拉回边界。在 L∞ 下，投影就是逐元素 <code>clip(x_adv, x-ε, x+ε)</code>，再 clip 到合法输入域。<strong>投影保证每一步之后扰动仍在威胁模型内</strong>——这是「在约束集里做梯度上升」的标准套路。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>FGSM 是闭着眼睛朝一个方向冲一大步；PGD 是睁着眼睛小步走、每走一步重新看梯度、走出格了就拉回来。在弯曲的损失面上，PGD 能<strong>贴着曲面爬到更高（更坏）的点</strong>，所以它找到的对抗样本几乎总比 FGSM 强。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>几个关键超参：步长 $\alpha$（通常取 $\epsilon / $ 步数的几倍）、迭代步数（越多越强、越贵）、<strong>随机起点重启</strong>（在 ε-球内随机扰动初始化、多跑几次取最坏，用来逃离不好的局部极值）。Madry 把用 PGD 找到的最坏点定义为「这个样本在 ε 内的真实危险程度」，并据此做对抗训练。</p></div>
+  </div>  <p>把 PGD 放进优化的语言里，它就是<strong>投影梯度上升（projected gradient ascent）</strong>在约束集 $\mathcal{B}_\epsilon(x)$ 上求内层 $\max$ 的标准算法：梯度上升负责「往损失更高处走」，投影负责「始终留在可行域（ε-球 ∩ 合法输入域）内」。用<strong>符号</strong>梯度而非原始梯度，是因为威胁模型是 L∞——这一步与 FGSM 同理；若威胁模型是 L2，对应的就是「归一化梯度 + 投影到 L2 球」。理解这个「上升 + 投影」骨架，你就能把 PGD 改造到任意范数、任意约束，notebook 练习 2 会让你手写这关键的一步。</p>  <p>一个实践细节常被忽略却很重要：<strong>随机重启</strong>为什么有用？因为损失面在 ε-球内可能有多个局部极大值，从单一起点（如原点）出发的 PGD 可能卡在较浅的那个、低估了真实最坏情况。从球内不同随机点各跑一遍、取<em>损失最高</em>的结果，就更接近真正的 $\max$。这也呼应第 6 节的主题：<strong>评测用的攻击越强（更多步、更多重启），得到的鲁棒性数字越可信</strong>——弱 PGD 和 FGSM 一样会制造虚假的安全感。</p>  <div class="callout warn"><span class="label"></span>
+    <p>评测鲁棒性时，<strong>PGD 的强度直接决定结论可信度</strong>：步数太少、步长不当、不重启，都会高估鲁棒性（攻击太弱所以「看起来挡住了」）。社区共识是用<strong>足够多步数 + 多次随机重启</strong>的 PGD，或干脆用免调参的 <span class="term">AutoAttack</span> 作默认基线。下一节会看到，弱攻击是虚假安全感的头号来源。</p>
+  </div>  <p>把三种主流的「攻击者用什么找最坏点」并排比较，能一眼看清「评测该用哪种攻击」与「为什么弱攻击不可信」：</p>  <table>
+    <thead><tr><th>攻击</th><th>步数 / 成本</th><th>找到的扰动强度</th><th>适用场景</th></tr></thead>
+    <tbody>
+      <tr><td><strong>FGSM</strong>（单步符号）</td><td>1 步，最便宜</td><td>弱（假设损失线性，曲面弯就走偏）</td><td>讲解机理、对抗训练的廉价内层近似</td></tr>
+      <tr><td><strong>PGD</strong>（多步投影+重启）</td><td>数十步×多重启，中等</td><td>强（一阶事实标准）</td><td>评测与对抗训练的标准内层 $\max$</td></tr>
+      <tr><td><strong>AutoAttack</strong>（攻击集合）</td><td>最贵</td><td>最强（免调参、含多种互补攻击）</td><td>发表前的「最终验收」基线</td></tr>
+    </tbody>
+  </table>  <p>读这张表的正确姿势是<strong>反过来读</strong>：如果你的防御只挡得住 FGSM（最弱那行），那几乎说明不了问题——它很可能是下一节的梯度遮蔽假象；只有挡住了 PGD 乃至 AutoAttack（更强的行），鲁棒性主张才站得住。这也是「<strong>用最强的攻击来评测、用够强的攻击来训练</strong>」这条铁律的来源。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="advtrain"><span class="num">4</span>对抗训练：min-max 防御</h2>
+  <h3>对抗训练：把鲁棒性写成 min-max</h3>  <p>有了能找到最坏扰动的 PGD，最可靠的经验防御自然浮现：<strong>既然攻击者会找最坏点，那就直接在最坏点上训练</strong>。Madry 把它形式化为一个<strong>鞍点（min-max）问题</strong>——这是本模块最重要的一个式子：</p>  <div class="math-block">\[\min_{\theta}\ \mathbb{E}_{(x,y)\sim\mathcal{D}}\Big[\ \max_{\lVert\delta\rVert_p\le\epsilon}\ L\big(f_\theta(x+\delta),\,y\big)\ \Big]\]</div>  <p>内层 $\max$ 是攻击：对每个训练样本用 PGD 找到 ε 内最坏的扰动；外层 $\min$ 是防御：更新参数 $\theta$ 去最小化这些<strong>最坏情况</strong>下的损失。直觉上，模型不再只学「把干净样本分对」，而是学「把每个样本的整个 ε-邻域都分对」——等价于<strong>把决策边界从样本周围推远、把邻域内的预测抹平</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>普通训练是「考过去的题」；对抗训练是「考老师能出的最难的变体题」。每个 epoch 先让 PGD 这个「出题人」把每道题改成最坑的样子，再让模型去做对。久而久之，模型对这一类刁难免疫——这就是鲁棒性的来源。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>代价也很实在：① 每步训练要先跑一遍 PGD，<strong>训练成本翻几倍</strong>；② <strong>干净精度通常略降</strong>（鲁棒性与准确率存在权衡，Tsipras 2018）；③ 只对<em>训练时所用的那种威胁模型</em>（如 L∞, ε）鲁棒，换个范数或更大 ε 仍可能被攻破。尽管如此，对抗训练至今是<strong>唯一大体经得起自适应攻击考验</strong>的经验防御。</p></div>
+  </div>  <p>min-max 鞍点为什么是「对的」防御目标？因为它直接把<strong>攻击者的能力写进了训练目标</strong>：内层 $\max$ 就是攻击者（在 ε 内尽力作恶），外层 $\min$ 就是防御者（把最坏情况压到最低）。训练出的模型对「ε-球内一切扰动」鲁棒，而不是对「某个特定攻击」鲁棒——这是它能扛住自适应攻击的根本原因（只要内层 $\max$ 用足够强的 PGD 近似）。反过来，这也暴露了它的边界：<strong>它只对训练时假设的那个威胁模型负责</strong>。用 L∞、ε=0.5 训出的鲁棒模型，面对 L2 攻击或 ε=1.0 仍可能脆弱——防御的「保护范围」从来不超过你写进 $\max$ 的那个约束集。</p>  <p>除了经验防御，还有 <span class="term">certified robustness</span>（可认证鲁棒性）一条线：如随机平滑（randomized smoothing），用数学<strong>证明</strong>某样本在半径 $r$ 内不会被攻破。它给出的保证更弱（半径小）但<em>不会被更强的攻击推翻</em>，与对抗训练形成「经验强但无保证 vs 有保证但偏保守」的互补。notebook 会从零实现对抗训练，并验证它把 PGD 下的鲁棒精度显著拉回来。为什么需要「可认证」这条线？因为经验防御有个挥之不去的隐忧——<strong>今天扛住了所有已知攻击，不代表明天不被新攻击攻破</strong>（第 6 节的历史反复如此）。认证给出的是<em>数学保证</em>，一旦证明半径 $r$ 内安全，就<strong>永远</strong>安全，不存在「被更强攻击推翻」的风险——代价是保证的半径通常远小于经验鲁棒能扛的 ε，且计算昂贵。两条路如何取长补短，是当前研究的活跃前沿。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="transfer"><span class="num">5</span>可迁移性：黑盒攻击为何可行</h2>
+  <h3>可迁移性：黑盒攻击为何可行</h3>  <p>一个对防御极为不利的性质是 <span class="term">transferability</span>（可迁移性）：针对模型 A 生成的对抗样本，常常也能骗过结构、训练数据都不同的模型 B。这意味着攻击者<strong>根本不需要白盒访问目标</strong>——他可以自己训一个 <span class="term">surrogate / substitute model</span>（替身），在替身上白盒生成对抗样本，再<strong>迁移</strong>去攻击黑盒目标。</p>  <p>为什么会迁移？主流解释（Ilyas 2019 等）是：对抗脆弱性源于数据里真实存在但<strong>非鲁棒的特征</strong>——这些特征对预测有用，却对微小扰动敏感。不同模型在同一份数据上训练，会学到<em>相似的非鲁棒特征与相似的决策边界</em>，因此同一个扰动能同时骗过它们。换句话说，对抗样本利用的是<strong>数据/任务层面的脆弱性</strong>，而不仅是某个模型的怪癖。</p>  <p>Ilyas 2019《对抗样本不是 bug，是特征》这个标题本身就是一记重锤：它论证非鲁棒特征是数据中<em>真实存在、对泛化有用</em>的统计规律，模型学它们是<strong>理性的</strong>（能提高干净精度），只是这些特征恰好对人类无意义、对扰动脆弱。这解释了两件事：① 为什么对抗样本能迁移（不同模型都在学同一批非鲁棒特征）；② 为什么对抗训练要付出干净精度代价（它逼模型<em>放弃</em>一部分有用但非鲁棒的特征）。把对抗脆弱性看成「数据的属性」而非「模型的缺陷」，是这个领域近年最重要的视角转变之一。</p>  <p>可迁移性还为防御者提供了一个<strong>评测工具</strong>：即便你的防御让白盒梯度失效（下一节的梯度遮蔽），攻击者仍可用<em>迁移攻击</em>（在替身上生成、迁移过来）绕过。因此，一个严肃的鲁棒性评估<strong>必须包含迁移攻击这条黑盒基线</strong>——如果一个「鲁棒」模型挡得住白盒 PGD 却挡不住从普通模型迁移来的对抗样本，那它多半是梯度遮蔽的假象。可迁移性既是威胁，也是照妖镜。</p>  <div class="callout danger"><span class="label">黑盒威胁</span>
+    <p>可迁移性把对抗样本从「白盒玩具」变成<strong>现实的黑盒威胁</strong>：攻击者对你部署的模型一无所知，仍可在公开模型或自训替身上造出对抗样本打过来。这也意味着<strong>「不开源、不暴露梯度」并不能保证安全</strong>——这是安全工程里反复出现的教训：隐藏（security by obscurity）不等于防御。模块 03 的模型窃取会把「自训替身」这条路走得更彻底。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="masking"><span class="num">6</span>评测陷阱：梯度遮蔽与虚假鲁棒</h2>
+  <h3>评测陷阱：梯度遮蔽与虚假鲁棒</h3>  <p>这是本模块最重要的一节，也是安全工程的通用教训。Athalye 2018 的著名工作 <em>Obfuscated Gradients Give a False Sense of Security</em> 发现：当年大量声称鲁棒的防御，其实并没有变鲁棒，只是<strong>把梯度搞坏了</strong>，让基于梯度的攻击失败而已——这叫 <span class="term">gradient masking / obfuscated gradients</span>（梯度遮蔽）。</p>  <p>梯度遮蔽有几种典型表现：① 防御里含不可导操作（如量化、随机化），使 $\nabla_x L$ 算不出或失真；② 梯度数值爆炸/消失；③ 决策面被弄得极其崎岖，使梯度只反映局部噪声而非真实的「往哪推能翻」。这些都会让 FGSM/PGD<em>找不到</em>对抗样本，于是防御「看起来」鲁棒——但样本其实就在不远处，只是梯度没指过去。</p>  <p>Athalye 这项工作之所以是里程碑，在于它的<strong>破坏力与系统性</strong>：在当年某顶会被接收的若干防御里，作者用对应的自适应攻击<em>逐一攻破了绝大多数</em>，并总结出诊断梯度遮蔽的红旗信号——例如「单步攻击(FGSM)比多步(PGD)还强」「无界扰动也打不到 100% 成功率」「黑盒迁移攻击反而比白盒强」，这些反常都暗示<strong>不是模型鲁棒，而是梯度坏了</strong>。把这些红旗背下来，你就有了一套快速识别「假鲁棒」的体检清单。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>好比有人把门锁上了，你拿原来的钥匙（梯度）打不开，就以为「这门很安全」。但其实窗户大开着——换个攻击方式（绕过遮蔽、用近似梯度、用迁移攻击）照样进得去。<strong>攻击失败 ≠ 防御有效</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>Athalye 给出的诊断与对策：用 <span class="term">adaptive attack</span>（自适应攻击）——针对防御机理专门设计的攻击。例如对随机化防御做 <em>EOT</em>（对随机性求期望梯度）、对不可导操作做 <em>BPDA</em>（反向时用可导近似替代）。一旦用对的自适应攻击，那批「鲁棒」防御几乎全部破功。<strong>这是评测方法论的铁律：必须用自适应攻击评估防御</strong>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一张鲁棒性评测自检表（做任何防御主张前过一遍）：① 报告了在哪个范数、哪个 ε 下测的吗？② 用的是 PGD（足够步数+重启）或 AutoAttack 这类强攻击，还是只挡了 FGSM？③ 做了<strong>自适应攻击</strong>（针对你的防御机理）吗？④ 鲁棒精度随 ε 增大平滑下降（正常）还是断崖式不变（梯度遮蔽的红旗）？⑤ 干净精度与鲁棒精度并列报告了吗？notebook 第 4 节会亲手演示：一个「随机化输入」的玩具防御能让朴素 PGD 失效（虚假鲁棒），而一个简单的自适应思路立刻戳破它。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="notebook"><span class="num">7</span>从玩具到现实：notebook 怎么练</h2>
+  <h3>从玩具到现实：本模块 notebook 怎么练</h3>  <p>配套 notebook 在一个二维 two-moons 数据上的玩具 2 层 MLP（纯 numpy、非线性边界）上，把上面的理论逐一变成可运行、可验证的代码——用 MLP 而非线性模型，是因为线性分类器的边界只是超平面、对抗训练能改善的空间有限，小 MLP 才能清楚复现对抗训练的收益（也更贴近 Madry 的神经网络设定）：</p>  <ul>
+    <li><strong>FGSM</strong>：从零算损失对输入的梯度、取符号、走一步，打印出「干净精度 95% → FGSM 后 X%」的攻击效果；</li>
+    <li><strong>PGD</strong>：实现多步迭代 + L∞ 投影 + 随机重启，验证它比 FGSM 更强（鲁棒精度更低）；</li>
+    <li><strong>扰动预算曲线</strong>：扫不同 ε，画出鲁棒精度随 ε 单调下降——理解「报告 ε」为何不可省；</li>
+    <li><strong>对抗训练</strong>：实现 min-max 训练（内层 PGD 生成、外层更新），验证它把 PGD 下的鲁棒精度<em>显著拉回</em>（代价是干净精度略降）；</li>
+    <li><strong>梯度遮蔽演示</strong>：构造一个「输入加随机噪声」的假防御让朴素攻击失效，再用自适应思路戳破它。</li>
+  </ul>  <p>每一步都有 <code>assert</code> 兜底（如 <code>assert robust_acc_advtrain &gt; robust_acc_plain</code>），保证你看到的不是「感觉变好了」而是<strong>可度量的改进</strong>。玩具规模让你能把每个算子看穿；而你在这里理解的 FGSM/PGD/对抗训练<strong>结构</strong>，与 CIFAR/ImageNet 上真实论文里的完全一致，只差数据规模与网络深度。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>鲁棒性-准确率权衡</strong>：对抗训练几乎总要牺牲干净精度（Tsipras 2018）。这个权衡是本质的还是可缓解的？用更多数据、更好架构能否两全？仍是活跃问题。</li>
+    <li><strong>跨威胁模型泛化</strong>：对 L∞ 鲁棒的模型未必对 L2、空间形变、语义扰动鲁棒。如何获得对<em>多种、乃至未知</em>威胁模型都稳健的模型，远未解决。</li>
+    <li><strong>认证 vs 经验</strong>：随机平滑等认证方法给出可证半径但偏小、且有计算代价；经验防御（对抗训练）强但可能被更强的新攻击推翻。两条路如何收敛是核心议题。</li>
+    <li><strong>大模型与多模态</strong>：LLM 上的「对抗后缀」（Zou 2023 的 GCG）把对抗样本搬到了离散文本与越狱场景；视觉-语言模型的对抗图片可触发有害输出。经典对抗样本理论如何延伸到这些场景是前沿。</li>
+    <li><strong>评测的军备竞赛</strong>：每出一个防御，往往很快被自适应攻击攻破（Athalye/Tramèr 反复证明）。如何建立<em>一次评测就可信、不被后续攻击推翻</em>的鲁棒性度量标准，是方法论上的圣杯。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Szegedy 2013（发现对抗样本）、Goodfellow 2014（FGSM + 线性假说）、Madry 2017（PGD + 对抗训练）、Athalye 2018（梯度遮蔽与自适应攻击）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · AI 安全威胁模型全景</div></a>
+    <a class="next" href="../02_poisoning_backdoor/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 数据投毒与后门</div></a>
+  </div>
+
+</div>
+</body>
+</html>

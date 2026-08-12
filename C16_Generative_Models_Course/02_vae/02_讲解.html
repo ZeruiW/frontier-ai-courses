@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 变分自编码器 VAE</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 变分自编码器 VAE</h1>
+  <p class="subtitle">ELBO 完整推导（重建 + KL）、重参数化技巧让梯度穿过采样、高斯 KL 闭式解、后验坍塌与 β-VAE —— 给隐空间加上概率结构与先验，第一次让模型能真正【采样】生成</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（AE）、概率（高斯/KL/期望）、变分推断概念、反向传播</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_vae.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Kingma & Welling 2013、Rezende et al. 2014、Higgins et al. 2017</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#ae-to-vae">从 AE 到 VAE：两处改造让它能采样</a></li>
+      <li><a href="#intractable">不可解的积分与变分下界</a></li>
+      <li><a href="#elbo">ELBO 两项：重建 + KL</a></li>
+      <li><a href="#reparam">重参数化技巧</a></li>
+      <li><a href="#kl-closed">高斯 KL 的闭式解</a></li>
+      <li><a href="#collapse">后验坍塌：VAE 的典型病</a></li>
+      <li><a href="#beta-vae">β-VAE 与解耦表示</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ae-to-vae"><span class="num">1</span>从 AE 到 VAE：两处改造让它能采样</h2>
+  <p>上一模块我们把自编码器学透了，也看清了它的死穴：<strong>它采不了样</strong>。编码器把每个 <code>x</code> 映成隐空间里的一个<em>点</em> <code>z</code>，这些点<em>碰巧</em>形成的分布形状未知、稀疏、还有空洞——你根本不知道该从哪儿抽 <code>z</code> 才能解码出合理的新样本。变分自编码器（VAE，Kingma & Welling 2013）就是来补这个洞的，它的两处关键改造把「重建器」升级成了真正的「生成器」。</p>  <p>第一处改造：<strong>编码器不再输出一个点，而是输出一个分布</strong>。给定 <code>x</code>，编码器吐出一个高斯分布 <code>q_\phi(z|x)=\mathcal{N}(\mu(x),\sigma^2(x))</code> 的均值和方差——也就是说，同一个 <code>x</code> 对应隐空间里的一小团<em>概率云</em>而非一个点。第二处改造：<strong>给隐空间规定一个已知的先验</strong> <code>p(z)=\mathcal{N}(0,I)</code>，并在训练时用一个 KL 项把所有这些概率云<em>拉向</em>这个先验。两处合起来的效果是：训练完，整个隐空间被规整成一个标准正态的形状、填满无洞——于是<strong>从 </strong><code>\mathcal{N}(0,I)</code><strong> 随便抽一个 </strong><code>z</code><strong>、丢进解码器，就能生成一个新样本</strong>。这正是 AE 做不到的。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 AE 比作把每本书压缩成书架上的一个<strong>精确坐标</strong>；坐标之间是空的，你报一个随机坐标多半指向虚无。VAE 则把每本书压缩成一小<strong>团云</strong>，并要求所有云加起来正好铺满整个书架（标准正态）——这样你闭眼往书架上一指（从先验采样），指到的地方总有书（解码出合理样本）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：VAE 是一个<strong>隐变量生成模型</strong> <code>p_\theta(x)=\int p_\theta(x|z)p(z)\,dz</code>，先验 <code>p(z)=\mathcal{N}(0,I)</code>、解码器 <code>p_\theta(x|z)</code>。难点在这个积分对高维 <code>z</code> 算不出来、最大似然无从下手。VAE 的破解之道是<strong>变分推断</strong>：引入一个可学的近似后验 <code>q_\phi(z|x)</code>（就是那个概率编码器），把不可解的最大似然换成一个可优化的下界——ELBO。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住 VAE 与 AE 的差别：<strong>AE 学「点到点」的确定映射，VAE 学「分布到分布」的概率映射，并用 KL 把隐空间规整成可采样的先验</strong>。多出来的那个 KL 项，正是「能采样」这个超能力的全部代价与来源。读这一章时，始终盯着这个对照：每一处数学，都是为了让随机采样 <code>z\sim\mathcal{N}(0,I)</code> 解码出来的东西像真的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="intractable"><span class="num">2</span>不可解的积分与变分下界</h2>
+  <h3>不可解的积分：为什么需要变分下界</h3>  <p>先把困境讲清楚。我们想最大化数据的对数似然 <code>\log p_\theta(x)=\log\int p_\theta(x|z)p(z)dz</code>。这个积分遍历整个高维隐空间，没有闭式、也无法穷举——直接最大似然这条路堵死了。</p>  <p>一个自然的念头是用采样近似：<code>p_\theta(x)\approx\frac1K\sum_k p_\theta(x|z_k),\ z_k\sim p(z)</code>。但这在高维下<strong>方差大到没用</strong>：从先验随机抽的 <code>z</code> 绝大多数解码出来和 <code>x</code> 八竿子打不着（<code>p_\theta(x|z)\approx 0</code>），只有极少数「对得上 <code>x</code>」的 <code>z</code> 贡献了几乎全部概率。盲目从先验采样等于大海捞针。</p>  <p>变分推断的洞见是：<strong>与其从先验瞎抽 </strong><code>z</code><strong>，不如从一个「知道 x 长什么样」的分布 </strong><code>q_\phi(z|x)</code><strong> 来抽</strong>——它专门在「能解码出 <code>x</code>」的那片隐空间里采样，效率天壤之别。引入这个 <code>q_\phi</code> 后，对数似然可以恒等地拆成两块：</p>  <div class="math-block">\[\log p_\theta(x)=\underbrace{\mathbb{E}_{q_\phi(z|x)}\!\left[\log\frac{p_\theta(x,z)}{q_\phi(z|x)}\right]}_{\text{ELBO}\ \mathcal{L}(x)}+\underbrace{\mathrm{KL}\!\left(q_\phi(z|x)\,\big\|\,p_\theta(z|x)\right)}_{\ge 0}\]</div>  <p>右边第二项是近似后验与真后验的 KL 散度，永远 <code>\ge 0</code>。所以第一项 ELBO 是对数似然的一个<strong>下界</strong>（Evidence Lower BOund，证据下界，其中「证据」指 <code>\log p_\theta(x)</code>）。这给了我们一条可行的路：<strong>最大化 ELBO</strong>。它有双重功效——既把对数似然往上顶（生成更好），又因为缩小了 ELBO 与真似然的差距而让 <code>q_\phi</code> 更逼近真后验（推断更准）。一举两得，这正是 VAE 训练的全部目标。</p>  <p>这里值得停下来体会变分推断的<strong>范式转换</strong>之美：原本「计算难算的后验 <code>p(z|x)</code>」是一个<em>推断</em>问题（要做积分、要用贝叶斯公式），现在被转化成「调参数 <code>\phi</code> 让 <code>q_\phi</code> 尽量贴近它」的一个<em>优化</em>问题（梯度下降就行）。把推断变成优化——这是变分方法的核心思想，也是它能搭上深度学习这趟车的根本原因：<strong>只要能写成「最大化某个可微目标」，就能交给 SGD</strong>。ELBO 正是那个可微目标。后面你会看到，扩散模型同样有一个类 ELBO 的变分界，本质上走的是同一条「把难算的似然换成可优化的下界」的路。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>还有一个角度能瞬间记住 ELBO：把它写成 <code>\mathcal{L}=\log p_\theta(x)-\mathrm{KL}(q_\phi(z|x)\|p_\theta(z|x))</code>。因为那个 KL <code>\ge 0</code>，所以 <strong>ELBO 永远 ≤ 真对数似然，且二者的差恰好是「近似后验偏离真后验多少」</strong>。于是「最大化 ELBO」同时在做两件事：把下界顶高（≈把真似然顶高），以及把这个 gap 压小（≈让编码器更准）。这也解释了 ELBO 的名字——它就是那个被我们死死往上顶的「下界」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="elbo"><span class="num">3</span>ELBO 两项：重建 + KL</h2>
+  <h3>ELBO 的两项：重建 + KL，各管什么</h3>  <p>把 ELBO 里的联合分布 <code>p_\theta(x,z)=p_\theta(x|z)p(z)</code> 代入并整理，它会漂亮地分成两项——这是整门 VAE 最核心的公式，务必看懂每一项的含义：</p>  <div class="math-block">\[\mathcal{L}(x)=\underbrace{\mathbb{E}_{q_\phi(z|x)}\big[\log p_\theta(x|z)\big]}_{\text{重建项 (越大越好)}}-\underbrace{\mathrm{KL}\big(q_\phi(z|x)\,\|\,p(z)\big)}_{\text{KL 正则项 (越小越好)}}\]</div>  <p><strong>重建项</strong> <code>\mathbb{E}_{q}[\log p_\theta(x|z)]</code>：从编码器给出的后验里采一个 <code>z</code>、解码、看能多大程度还原 <code>x</code>。它就是上一模块的重建损失换了层概率外壳——高斯解码下<em>正好</em>退化成 MSE，伯努利解码下退化成 BCE（还记得模块 01 的「损失 ⇔ 似然假设」吗？这里直接收获）。它鼓励<strong>隐编码要保留足够信息以重建数据</strong>。</p>  <p><strong>KL 正则项</strong> <code>\mathrm{KL}(q_\phi(z|x)\|p(z))</code>：度量编码器输出的后验离先验 <code>\mathcal{N}(0,I)</code> 有多远，把它往先验拉。它就是 VAE 区别于普通 AE 的<strong>那一个新增项</strong>，作用是<strong>把隐空间规整成先验的形状，使得从先验采样可行</strong>。没有它，VAE 就退化回一个采不了样的 AE。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>两项在<strong>拔河</strong>：重建项想让每个 <code>x</code> 的编码云又小又精确（信息多、好重建），KL 项想让每朵云都摊平成标准正态（规整、可采样）。训练就是在这两个诉求间找平衡——既能重建、又能采样。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这个拔河有深刻的信息论含义：KL 项相当于给隐编码施加了一个<strong>信息瓶颈</strong>（每朵云摊得越开、携带的信息越少）。重建项要信息、KL 项限制信息，二者的平衡点决定了隐空间用多少「比特」描述每个样本。这也解释了 β-VAE（第 7 节）调 KL 权重为什么能控制表示——它在调这个信息预算。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个极易混淆的符号陷阱：ELBO 是要<strong>最大化</strong>的，所以实现里通常最小化<strong>负 ELBO</strong>：<code>\text{loss}=-\mathbb{E}_q[\log p(x|z)]+\mathrm{KL}=\text{重建损失}+\text{KL}</code>。注意 KL 前面是<strong>加号</strong>（因为最大化 ELBO = 最小化它的相反数，而 ELBO 里 KL 是减号）。符号搞反 → 模型会去<em>最大化</em> KL、把隐空间推离先验，彻底训坏。这是 VAE 实现的头号 bug，notebook 里我们会用 gradient check 守住它。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="reparam"><span class="num">4</span>重参数化技巧</h2>
+  <h3>重参数化技巧：让梯度穿过随机采样</h3>  <p>ELBO 的重建项里有一步<strong>采样</strong> <code>z\sim q_\phi(z|x)=\mathcal{N}(\mu_\phi(x),\sigma_\phi^2(x))</code>。问题来了：采样是个随机操作，<strong>梯度没法穿过它</strong>——你没法对「掷一次骰子」求导，于是编码器参数 <code>\phi</code> 收不到梯度，整个模型训不了。这是 VAE 一度的拦路虎。</p>  <p>破解它的，是一个简单到令人拍案的技巧——<strong>重参数化（reparameterization trick）</strong>。与其直接从 <code>\mathcal{N}(\mu,\sigma^2)</code> 采样，不如把随机性<em>挪到外面</em>：</p>  <div class="math-block">\[z=\mu_\phi(x)+\sigma_\phi(x)\odot\epsilon,\qquad \epsilon\sim\mathcal{N}(0,I)\]</div>  <p>数学上这两种写法采出的 <code>z</code> 分布<strong>完全相同</strong>，但结构天差地别：现在随机性全在 <code>\epsilon</code> 里，而 <code>\epsilon</code> 与参数 <code>\phi</code><strong>无关</strong>；<code>\mu_\phi,\sigma_\phi</code> 是确定的、可微的网络输出。于是 <code>z</code> 成了「确定函数 + 外部随机噪声」，梯度可以顺着 <code>\mu,\sigma</code> 一路畅通地传回编码器。我们把「掷骰子」这件不可导的事，外包给了一个与参数无关的 <code>\epsilon</code>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：你想优化一台<strong>会随机抖动</strong>的机器，但抖动让你没法测它对旋钮的响应。重参数化等于把抖动源<strong>拔出来</strong>、单独供给（外部噪声 <code>\epsilon</code>），机器本身就变回一台确定的、可调的机器——抖动还在（采样的随机性没丢），但它不再挡在「旋钮→输出」的求导路径上。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：重参数把 <code>\nabla_\phi\mathbb{E}_{q_\phi}[f(z)]</code> 这个「对分布参数求期望的梯度」改写成 <code>\mathbb{E}_{\epsilon}[\nabla_\phi f(\mu_\phi+\sigma_\phi\epsilon)]</code>，把求导和期望<strong>交换了次序</strong>，于是可以用单样本蒙特卡洛无偏估计。相比 score-function/REINFORCE 估计器，它方差小得多，这是 VAE 能稳定训练的关键技术原因。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>重参数化技巧不是 VAE 专属，它是<strong>整个生成模型领域的通用零件</strong>。模块 04 扩散的前向闭式 <code>x_t=\sqrt{\bar\alpha_t}x_0+\sqrt{1-\bar\alpha_t}\epsilon</code>、模块 05 流匹配的条件路径采样，本质都是同一个「把随机性写成 <code>\mu+\sigma\epsilon</code> 的确定可微形式」。在这里彻底理解它，后面会一眼认出它的各种化身。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="kl-closed"><span class="num">5</span>高斯 KL 的闭式解</h2>
+  <h3>高斯 KL 的闭式解：不必采样</h3>  <p>ELBO 还有一个让 VAE 既高效又稳定的福利：当后验 <code>q_\phi(z|x)=\mathcal{N}(\mu,\sigma^2)</code>、先验 <code>p(z)=\mathcal{N}(0,I)</code> 都是高斯时，它们之间的 KL 散度有<strong>解析闭式解</strong>，根本不用采样估计：</p>  <div class="math-block">\[\mathrm{KL}\big(\mathcal{N}(\mu,\sigma^2)\,\|\,\mathcal{N}(0,1)\big)=\tfrac12\sum_{j=1}^{d}\big(\mu_j^2+\sigma_j^2-1-\log\sigma_j^2\big)\]</div>  <p>这个式子每一项都有直观含义，值得逐项品：<strong>μ²</strong> 项把后验均值往原点 <code>0</code> 拉（别偏离先验中心）；<strong>σ²−1</strong> 项和 <strong>−log σ²</strong> 项联手把后验方差往 <code>1</code> 拉（别太尖也别太散，恰好匹配先验的单位方差）。整项在 <code>\mu=0,\sigma=1</code> 时取最小值 <code>0</code>——也就是后验完全等于先验时 KL 为零。它精确地量化了「这朵编码云离标准正态有多远」。</p>  <p>拿几个数把这个式子算一遍，三项各自的脾气就立刻显形（单维，公式 <code>\tfrac12(\mu^2+\sigma^2-1-\log\sigma^2)</code>）。<strong>情形一</strong>：后验恰好等于先验，<code>\mu=0,\sigma=1</code>，代入得 <code>\tfrac12(0+1-1-\log 1)=0</code>——KL 为零，符合「贴合先验则零惩罚」。<strong>情形二</strong>：均值跑偏，<code>\mu=2,\sigma=1</code>，得 <code>\tfrac12(4+1-1-0)=2</code>——是 <code>\mu^2</code> 项在罚它偏离原点。<strong>情形三</strong>：方差过小（编码云太尖、想塞进很多信息），<code>\mu=0,\sigma=0.1</code>，得 <code>\tfrac12(0+0.01-1-\log 0.01)=\tfrac12(0.01-1+4.6)\approx 1.8</code>——这次是 <code>-\log\sigma^2</code> 项在重罚「云收得太尖」。<strong>三项各司其职：均值偏了 μ² 罚，方差太尖 −logσ² 罚，方差太散 σ² 罚</strong>。亲手算这三个数，比死记公式有用得多——你会真正理解 KL 是怎样从四面八方把每朵编码云「整形」成标准正态的。</p>  <p>闭式解的好处是双重的：① <strong>无采样、零方差</strong>，KL 项的梯度是精确的，不像重建项那样靠蒙特卡洛估计（这也是为什么 VAE 训练比纯采样估计的方法稳）；② <strong>便宜</strong>，就是几个逐元素运算。实现上还有个数值小技巧：网络直接输出 <code>\log\sigma^2</code>（log-variance）而非 <code>\sigma</code>，这样 <code>\sigma=\exp(\tfrac12\log\sigma^2)</code> 自动恒正、且 <code>\log\sigma^2</code> 项现成可用，避免对 <code>\sigma</code> 取 log 时的数值问题。notebook 会把这个闭式 KL 与蒙特卡洛估计对拍，验证它正确。</p>  <p>这个闭式解还让我们能<strong>逐维度地诊断</strong>隐空间。因为 KL 对各维是独立求和的，我们可以单看每一维的 KL 贡献：某维 KL 很大，说明编码器在用它编码 <code>x</code> 的信息（它偏离了先验去携带信息）；某维 KL≈0，说明这一维被「关掉」了、退化成纯先验噪声、不携带信息。这个<strong>逐维 KL</strong>是观察 VAE 实际用了几维隐空间的利器——你常会发现一个 <code>d</code> 维 VAE 只「点亮」了其中几维，其余自动坍向先验。这也直接关联第 6 节的后验坍塌（极端情形是<em>所有</em>维都被关掉）。</p>  <div class="callout paper"><span class="label"></span>
+    <p>这个闭式 KL 加上重参数化，就是 VAE 论文（Kingma & Welling 2013）的两大技术支柱：<strong>KL 项用闭式精确算，重建项用重参数化让梯度可穿过单样本采样</strong>。两者合起来，让 ELBO 变成一个普通的、可用 SGD 端到端优化的损失——这正是 VAE 相比此前变分方法的革命性简化。notebook 第 1-4 节会把这两块从零拼起来（含对整条 ELBO 反向的数值梯度检验），训练出一个真能从先验采样的 VAE。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="collapse"><span class="num">6</span>后验坍塌：VAE 的典型病</h2>
+  <h3>后验坍塌：VAE 的典型病</h3>  <p>VAE 有一个出了名的失败模式叫<strong>后验坍塌（posterior collapse）</strong>：训练着训练着，KL 项掉到几乎为零，编码器对所有 <code>x</code> 都输出 <code>q_\phi(z|x)\approx p(z)=\mathcal{N}(0,I)</code>——也就是隐编码 <strong>完全不携带关于 </strong><code>x</code><strong> 的信息了</strong>。解码器干脆无视 <code>z</code>，靠自己硬生生「记住」数据的平均样貌来重建。隐变量名存实亡，VAE 退化成一个普通（而且很弱）的解码器。</p>  <p>为什么会这样？根子在 ELBO 的两项失衡。KL 项总能通过「让后验=先验」轻松归零（拿到 KL 的全部好处）；如果解码器<strong>足够强</strong>（比如表达力很高的自回归解码器），它可以不靠 <code>z</code> 也把重建做得不错——于是模型发现一条<em>偷懒捷径</em>：把 KL 清零、重建项靠强解码器扛。两项都「划算」，但代价是隐空间废了。</p>  <p>诊断坍塌最锋利的工具，正是第 5 节那个<strong>逐维 KL</strong>——因为高斯 KL 是各维独立相加的，我们可以把总 KL 拆开、单看每一维贡献了多少。设想一个 4 维 VAE，训练后各维的平均 KL 是 <code>[1.8,\,0.9,\,0.02,\,0.01]</code>（单位 nat）：前两维 KL 明显大于零，说明编码器在<em>用</em>它们携带 <code>x</code> 的信息（为此不惜偏离先验、付出 KL 代价）；后两维 KL <code>\approx 0</code>，说明它们已<strong>退化成纯先验噪声</strong>、对重建毫无贡献——这两维就是「坍塌」了。于是「这个 VAE 实际只点亮了几维」一望即知。<strong>把所有维的 KL 全部砸到接近 0，就是后验坍塌的极端形态</strong>：整个隐空间没有一维在工作。这个逐维 KL 直方图，是判断 VAE 是否健康、隐空间被用了几成的最直接体检指标——notebook 会把它画出来，让你亲眼看到健康 VAE 与坍塌 VAE 的 KL 谱长得多么不同。</p>  <table>
+    <thead><tr><th>诱因</th><th>为什么导致坍塌</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td>解码器过强</td><td>不靠 z 也能重建，z 成累赘</td><td>限制解码器容量 / 加跳连约束</td></tr>
+      <tr><td>KL 权重过大</td><td>KL 主导，把后验直接压成先验</td><td>KL annealing：训练初期 KL 权重从 0 渐升</td></tr>
+      <tr><td>训练初期 KL 惩罚太急</td><td>z 还没学到有用信息就被清零</td><td>free bits：给每维 KL 留一个免罚额度</td></tr>
+    </tbody>
+  </table>  <p>常见对策有几类，notebook 会复现最经典的<strong>KL annealing</strong>：训练初期把 KL 项的权重 <code>\beta</code> 从 <code>0</code> 慢慢升到 <code>1</code>，给编码器一个「先学会用 <code>z</code> 重建、再逐步规整隐空间」的窗口期，避免一上来就被 KL 掐死。另一类是 <strong>free bits</strong>：给每个隐维度的 KL 留一个免罚额度 <code>\lambda</code>，只惩罚超出部分，从而保证每维至少携带一点信息。这些技巧的共同精神是：<em>别让 KL 项在隐编码学到东西之前就把它清零</em>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>后验坍塌是个绝佳的提醒：<strong>ELBO 降得好看，不代表模型学对了</strong>。一个坍塌的 VAE，ELBO 可能很高（KL≈0、重建尚可），但它根本没在用隐变量、采样多样性极差。诊断它要单独盯着 <strong>KL 项的数值</strong>（坍塌时趋零）和<strong>隐编码的互信息/采样多样性</strong>，而不能只看总损失。这与模块 01「低重建误差≠好表示」、模块 03 GAN「loss 不可信」是同一类教训：生成模型的评估永远不能只看一个标量。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="beta-vae"><span class="num">7</span>β-VAE 与解耦表示</h2>
+  <h3>β-VAE 与解耦：调一个旋钮控制隐空间</h3>  <p>既然 ELBO 是「重建 − KL」，一个自然的推广是给 KL 项乘一个权重 <code>\beta</code>，这就是 <strong>β-VAE</strong>（Higgins 等 2017）：</p>  <div class="math-block">\[\mathcal{L}_\beta(x)=\mathbb{E}_{q_\phi(z|x)}\big[\log p_\theta(x|z)\big]-\beta\,\mathrm{KL}\big(q_\phi(z|x)\,\|\,p(z)\big)\]</div>  <p><code>\beta=1</code> 就是标准 VAE。<strong>β&gt;1</strong> 加重 KL 惩罚：更强地逼后验贴近各向同性的先验，副产品是鼓励隐空间各维<strong>互相独立、解耦</strong>——不同维度倾向于对应数据的不同独立生成因子（如人脸的姿态、光照、表情），这对可解释和可控生成很有价值。代价是重建变模糊、且更容易后验坍塌（KL 太重）。<strong>β&lt;1</strong> 则相反：弱化正则、重建更锐利，但隐空间规整度下降、采样质量可能变差。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>β 是一个<strong>旋钮</strong>，在「重建保真」和「隐空间规整/解耦」之间滑动。把它拧大，模型更像一个「理解了数据有哪几个独立因子」的科学家（解耦但模糊）；拧小，更像一个「忠实复刻细节」的工匠（锐利但纠缠）。没有普适最优值，取决于你要表示还是要画质。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>回到第 5 节的伏笔：调 <code>\beta</code> 在数学上等价于调高斯重建项里那个隐含的方差 <code>\sigma^2</code>（<code>\beta</code> 大 ≈ 假设数据噪声大 ≈ 重建项相对变轻）。所以 β-VAE 并不神秘——它只是把模块 01 就埋下的「重建损失编码了噪声假设」这件事，提到台前变成一个可显式调节的超参数。</p></div>
+  </div>  <p>β-VAE 也揭示了一个更普遍的视角：<strong>VAE 是一族由信息瓶颈强度参数化的模型</strong>。<code>\beta</code> 控制隐编码允许携带多少信息——大 <code>\beta</code> = 窄瓶颈 = 少信息 = 强压缩/强解耦/糊重建。这把 VAE、信息瓶颈理论、率失真（rate-distortion）权衡统一了起来，是理解「为什么 VAE 的样本天生偏模糊」的关键：它在用有限的隐信息预算去覆盖整个分布，必然牺牲单样本的锐度。这也正是下一模块 GAN 用完全不同的思路（对抗、放弃似然）去换取锐利样本的动机。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>更强的后验与先验</strong>：标准 VAE 的高斯后验太简单，限制了表达力。用归一化流做更灵活的后验（IAF、模块 05 的流）、或用可学的先验（VampPrior、混合先验）能收紧 ELBO、改善样本。这是 VAE 与流模型的交汇点。</li>
+    <li><strong>VAE 样本为何偏模糊</strong>：理论上与高斯似然假设、ELBO 的均值寻求倾向、以及有限隐信息预算（β-VAE 视角）都有关。如何在保持 VAE 稳定训练优点的同时获得 GAN/扩散级的锐度，仍是活跃方向（如 VAE-GAN 混合、用更好的解码器似然）。</li>
+    <li><strong>离散隐变量与 VQ-VAE</strong>：把连续隐空间换成离散码本（VQ-VAE，van den Oord 2017），重参数化失效、改用直通估计（straight-through）。它是把图像/音频 token 化、再交给自回归或扩散建模的关键基础设施，连接了表示学习与现代生成。</li>
+    <li><strong>VAE 作为潜在空间的提供者</strong>：现代高分辨率生成（如 Stable Diffusion 的 latent diffusion）先用一个 VAE 把数据压到低维潜在空间，再在那里跑扩散。VAE 在此退居幕后做「感知压缩」，是让高清生成可行的功臣——这也是模块 04/05 与本模块的现实接口。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Kingma & Welling 2013（VAE 奠基：ELBO + 重参数）、Rezende et al. 2014（同期独立工作）、Higgins et al. 2017（β-VAE）、Bowman et al. 2016（后验坍塌与 KL annealing）。想深入读 Kingma & Welling 2019 综述。清单见 <code>references.md</code>。下一模块 GAN 会走一条与 VAE 截然相反的路：<strong>彻底放弃似然与 ELBO，用一个对抗的判别器来定义「像不像真的」</strong>——用训练的不稳定，换取样本的锐利。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_autoencoders/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 自编码器</div></a>
+    <a class="next" href="../03_gan/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 生成对抗网络 GAN</div></a>
+  </div>
+
+</div>
+</body>
+</html>

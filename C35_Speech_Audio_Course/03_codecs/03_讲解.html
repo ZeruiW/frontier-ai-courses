@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 神经音频编解码</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 神经音频编解码</h1>
+  <p class="subtitle">把波形压成离散 token —— 矢量量化 VQ、残差矢量量化 RVQ、码本利用率、比特率与重建权衡：从零实现量化机制并对拍重建误差随级数单调下降，这是神经编解码与语音 LM 的地基</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（特征）、最近邻/k-means、一点点率失真直觉；卷积网络（编解码器，概念即可）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_codecs.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">van den Oord 2017 (VQ-VAE)、Zeghidour 2021 (SoundStream)、Défossez 2022 (EnCodec)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#intro">为什么把波形压成离散 token</a></li>
+      <li><a href="#vq">矢量量化 VQ：换成最近的码字</a></li>
+      <li><a href="#rvq">残差矢量量化 RVQ：小码本叠大精度</a></li>
+      <li><a href="#util">码本利用率：RVQ 的阿喀琉斯之踵</a></li>
+      <li><a href="#bitrate">比特率：折算成每秒多少比特</a></li>
+      <li><a href="#pipeline">从波形到 token：完整编解码链路</a></li>
+      <li><a href="#discrete">离散 vs 连续：为什么非得离散化</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="intro"><span class="num">1</span>为什么把波形压成离散 token</h2>
+  <p>模块 02 把语音变成了文字。本模块走另一条路——<strong>把波形压成离散整数 token，而且还能还原回声音</strong>。这就是<span class="term">codec</span>（编解码器）干的事；用神经网络做编码器/解码器、用<strong>矢量量化</strong>做离散化的，叫<strong>神经音频编解码</strong>。它是 2020 年后语音/音频生成爆发的隐形地基——没有它，就没有 EnCodec、AudioLM、VALL-E、Moshi。</p>  <p>为什么需要它？回忆模块 00 的那笔账：原始波形又长又冗余（16 kHz 每秒 16000 个浮点数）。要让语言模型像处理文本一样处理音频（模块 05），必须先把这条连续的长序列变成<strong>又短又离散的整数序列</strong>——因为语言模型吃的是<em>离散 token</em>（有限词表上的 softmax、交叉熵、采样）。神经编解码正是这座桥：编码器把波形压成每秒几十个向量，再用矢量量化把每个向量替换成<strong>码本里最近的一个码字的整数下标</strong>；这串下标就是音频的『文字』，解码器再据此还原波形。</p>  <p>本模块从零实现两个核心机制：<span class="term">vector quantization (VQ)</span>（矢量量化，最近邻替换）与 <span class="term">residual VQ (RVQ)</span>（残差矢量量化，用多个小码本逐级逼近）。再把它们和<strong>码本利用率、比特率、重建质量</strong>的权衡串起来——这是读懂 EnCodec/SoundStream 设计的钥匙。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>把连续向量『四舍五入』到一本码书里最近的词，用词的编号代替向量</strong>。VQ 是一次四舍五入；RVQ 是『四舍五入后，再对余下的误差四舍五入一次，反复几轮』——用几本小码书叠出一本巨大码书的精度。这串编号就是音频的 token，喂给模块 05 的语音 LM。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="vq"><span class="num">2</span>矢量量化 VQ：换成最近的码字</h2>
+  <h3>矢量量化 VQ：把向量换成最近的码字</h3>  <p><span class="term">vector quantization (VQ)</span>的定义朴素到极点：给定一本<span class="term">codebook</span>（码本）$C=\{c_1,\dots,c_K\}$（$K$ 个 $d$ 维向量），把任意输入向量 $x$ 替换成码本中<strong>欧氏距离最近</strong>的那个码字，并记下它的下标：</p>  <div class="math-block">\[k^*(x)=\arg\min_{k\in\{1,\dots,K\}} \lVert x - c_k\rVert_2^2,\qquad q(x)=c_{k^*}\]</div>  <p>编码 = 算出下标 $k^*$（一个 $0$ 到 $K-1$ 的整数）；解码 = 查表取 $c_{k^*}$。于是一个连续的 $d$ 维向量被压成 <strong>$\log_2 K$ 比特</strong>（如 $K=1024$ 就是 10 比特）。这就是离散化的全部秘密——用<span class="term">codeword / code index</span>（整数下标）代替连续向量。</p>  <p>码本从哪来？经典做法是对训练数据做 <strong>k-means 聚类</strong>（码字 = 聚类中心）；神经做法（<span class="term">VQ-VAE</span>）让码本成为<strong>可学习参数</strong>，和编码器/解码器一起端到端训练。后者有个著名难题：$\arg\min$ 不可导，梯度传不回编码器。VQ-VAE 的解法是<strong>直通梯度（straight-through estimator）</strong>——前向用量化值、反向假装量化是恒等映射，把解码器的梯度直接拷给编码器；再加一个 <strong>commitment loss</strong> 把编码器输出拉向它选中的码字。本课聚焦量化机制本身（最近邻 + 重建），训练细节留给 references 里的 VQ-VAE 论文。</p>  <p>这里要澄清一个常见误解：VQ 的『最近邻』是在<strong>编码器输出的隐空间</strong>里做的，不是在原始波形上。也就是说，编码器（一串卷积下采样）先把一段波形压成一个低维向量序列 $z$，VQ 才对 $z$ 做量化。为什么不直接量化波形？因为相邻波形采样点高度冗余、且单个采样点没有语义；而编码器学到的 $z$ 已经<em>把局部声学组织成了有意义的特征</em>，在这个空间做量化，码字才对应『有意义的声学单元』（类似音素片段），重建才高效。本课为聚焦量化，用『幅度谱特征 + 线性』当编码器的占位（真实系统是卷积），但这个『先编码到隐空间、再量化』的两段结构是通用的——记住它，你就不会把 VQ 误解成『对原始信号四舍五入』。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>VQ 就像把调色盘上无穷多种颜色，限制成一盒 256 色蜡笔：每种实际颜色都用最接近的那支蜡笔代替，记录的只是蜡笔编号。蜡笔越多（码本越大）越接近原色，但编号需要的位数也越多。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>量化误差 $\lVert x-q(x)\rVert^2$ 即重建失真。在固定码本下，最近邻规则是<strong>使单步失真最小</strong>的选择（这正是 Lloyd/k-means 的依据）。失真随 $K$ 增大而下降，但比特率 $\log_2 K$ 随之上升——这是<strong>率失真权衡</strong>的最朴素形态。RVQ（下节）正是为了打破『要精度就得指数增大单个码本』的困境。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rvq"><span class="num">3</span>残差矢量量化 RVQ：小码本叠大精度</h2>
+  <h3>残差矢量量化 RVQ：用小码本叠出大精度</h3>  <p>VQ 有个致命的<strong>规模问题</strong>：要把失真减半，往往需要把码本<em>平方级</em>增大。想要 $2^{30}$ 级的精度？单码本就得存 10 亿个向量——存不下、也学不动。<span class="term">residual VQ (RVQ)</span>（残差矢量量化）用一个漂亮的递归绕开它：<strong>先量化向量，再量化『上一步量化剩下的误差（残差）』，反复 $N$ 轮</strong>。</p>  <div class="math-block">\[r_0=x;\quad k_i=\arg\min_k\lVert r_{i-1}-c^{(i)}_k\rVert^2,\quad r_i=r_{i-1}-c^{(i)}_{k_i};\quad \hat x=\sum_{i=1}^{N} c^{(i)}_{k_i}\]</div>  <p>每一级 $i$ 有自己的小码本 $C^{(i)}$（各 $K$ 个码字），量化的是<strong>前一级的残差</strong>。重建是各级选中码字之和。于是 $N$ 个大小为 $K$ 的码本，能表达 $K^N$ 种组合——用 $N\cdot\log_2 K$ 比特达到接近单个 $K^N$ 码本的精度，而存储/计算只是 $N\cdot K$。这就是 <span class="term">SoundStream</span> 与 <span class="term">EnCodec</span> 能在低比特率高保真的核心。</p>  <p>RVQ 还白送一个杀手级特性：<strong>可变比特率</strong>。因为重建是各级之和、且每级都在缩小残差，你可以在推理时<strong>只用前 $n&lt;N$ 级</strong>（丢掉高级别的细节码），立刻得到一个更低比特率、质量略降的版本——<em>无需重新训练</em>。这让同一个编解码模型能在 1.5 kbps 到 24 kbps 之间平滑调节（EnCodec 正是这样做的）。每一级 <span class="term">quantizer / codebook level</span> 都在『再精细一点』。</p>  <div class="ascii">输入向量 x
+  │  级1: 找最近码字 c1, 记下标 k1
+  ├──────────────► 残差 r1 = x - c1     （还原 x ≈ c1，粗）
+  │  级2: 量化 r1 -&gt; c2, 下标 k2
+  ├──────────────► 残差 r2 = r1 - c2    （还原 x ≈ c1+c2，细一点）
+  │  级3: 量化 r2 -&gt; c3, 下标 k3
+  └──────────────► 残差 r3 = r2 - c3    （还原 x ≈ c1+c2+c3，更细）
+
+  token = [k1, k2, k3]   重建 = c1+c2+c3   只用[k1]或[k1,k2]=更低比特率</div>  <div class="callout intuition"><span class="label"></span>
+    <p><strong>worked 微例（残差范数逐级缩小）</strong>：设要量化的向量 $x=[0.8,\ 0.0]$（二维，便于手算）。级 1 码本含 $\{[0.3,0],[0,0.8],[0,0]\}$，离 $x$ 最近的是 $c_1=[0.3,0]$（距离 $0.5$，另两者为 $1.13$ 与 $0.8$），残差 $r_1=x-c_1=[0.5,\ 0]$，范数 $0.5$。级 2 码本含 $\{[0.4,0],[0,0.3],[0,0]\}$，量化<em>残差</em> $r_1=[0.5,0]$，最近的是 $c_2=[0.4,0]$（距离 $0.1$），残差 $r_2=r_1-c_2=[0.1,\ 0]$，范数 <strong>$0.1$</strong>。于是重建从『只用级 1』的 $\hat x=[0.3,0]$（误差 $0.5$）改善到『用两级』的 $\hat x=c_1+c_2=[0.7,0]$（误差 $0.1$）——<strong>残差范数 $0.5\to0.1$ 单调下降</strong>，正是 notebook 要 assert 的不变量。注意第二级量化的是<em>残差而非原向量</em>，这是 RVQ 与『并行用两个独立码本』的本质区别。</p>
+  </div>  <p>再算一笔<strong>存储/精度账</strong>，看清 RVQ 为何划算。想要 $K^N=1024^3\approx10^9$ 级精度：<strong>单码本</strong>方案要存 $10^9$ 个 $d$ 维向量（天文数字，存不下也学不动）、每次量化要和 $10^9$ 个码字比距离；<strong>RVQ</strong>方案用 $N=3$ 个各 $K=1024$ 的小码本，只存 $3\times1024=3072$ 个向量、每帧只需 $3\times1024$ 次距离计算，却用 $3\times\log_2 1024=30$ 比特表达了同样 $2^{30}$ 种组合。存储与计算从 $O(K^N)$ 降到 $O(N\cdot K)$——<strong>指数级的便宜</strong>。代价是 RVQ 是<em>贪心逐级</em>的（每级各自取最近邻），不保证达到那个理想单码本的全局最优，但实践中已足够接近，这正是 SoundStream/EnCodec 可行的根基。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>RVQ 的精髓是<strong>『逐级修正误差』</strong>：第一级画个轮廓，第二级补上第一级画歪的部分，第三级再补第二级的残差……像素描时反复加阴影。关键性质——重建误差<strong>随级数单调下降</strong>（每级都在减小残差范数），这正是 notebook 要对拍验证的不变量。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="util"><span class="num">4</span>码本利用率：RVQ 的阿喀琉斯之踵</h2>
+  <h3>码本利用率：RVQ 的阿喀琉斯之踵</h3>  <p>RVQ 理论上很美，但实践有个常见病：<span class="term">codebook collapse</span>（码本坍缩）——大量码字<strong>从不被选中</strong>，只有少数码字反复使用。极端情形下 $K=1024$ 的码本实际只用了几十个码字，相当于白白浪费了 $\log_2$ 的比特预算、重建也变差。衡量它的指标是 <span class="term">codebook utilization</span>（码本利用率）= 被用到的码字占码本的比例。</p>  <p>为什么会坍缩？训练初期若某些码字离数据近、常被选中，它们的梯度更新更多、变得更『好用』，于是更常被选中——<strong>富者愈富的正反馈</strong>。而从没被选中的码字拿不到梯度、永远是初始的随机向量、永远不被选——<strong>死码字</strong>。这是 VQ 训练的结构性难题。</p>  <table>
+    <thead><tr><th>缓解手段</th><th>做法</th><th>出处/效果</th></tr></thead>
+    <tbody>
+      <tr><td>EMA 更新码本</td><td>用选中向量的指数滑动平均更新码字（而非梯度）</td><td>VQ-VAE-2 / SoundStream，更稳</td></tr>
+      <tr><td>死码字重启</td><td>把长期没用的码字重置到当前 batch 的某个向量附近</td><td>常见技巧，救活死码字</td></tr>
+      <tr><td>k-means 初始化</td><td>用数据的 k-means 中心初始化码本</td><td>起点就贴近数据分布</td></tr>
+      <tr><td>因子化 / 低维码本</td><td>在低维空间量化再投影回去</td><td>DAC，显著提升利用率</td></tr>
+      <tr><td>量化 dropout</td><td>训练时随机只用前 n 级</td><td>让各级都被充分训练 + 支持可变比特率</td></tr>
+    </tbody>
+  </table>  <p>本课 notebook 会<strong>量化测量</strong>码本利用率：构造数据、跑 VQ、统计每个码字被选中的次数、算利用率与<strong>困惑度（perplexity）</strong>（有效码字数 $=\exp(熵)$）。你会亲眼看到：码本远大于数据多样性时利用率暴跌——这把抽象的『坍缩』变成一个你能算、能监控的数字。</p>  <div class="callout warn"><span class="label"></span>
+    <p>码本利用率是评估神经编解码时<strong>最该看、却最常被忽略</strong>的指标。两个编解码在重建 PSNR 上可能接近，但利用率低的那个<em>实际有效比特率</em>更低、给下游语音 LM 的 token 分布更畸形（少数 token 霸占），训练语音 LM 时更难。报告编解码质量时，务必连同利用率一起报。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bitrate"><span class="num">5</span>比特率：折算成每秒多少比特</h2>
+  <h3>比特率：把一切折算成每秒多少比特</h3>  <p>神经编解码的核心卖点是<strong>低比特率高保真</strong>。比特率怎么算？把链路上每个离散化环节的比特数乘起来：</p>  <div class="math-block">\[\text{bitrate} \;=\; \underbrace{\frac{f_s}{\text{hop}}}_{\text{帧率(token/秒)}} \times \underbrace{N}_{\text{RVQ 级数}} \times \underbrace{\log_2 K}_{\text{每级比特}} \quad\text{(bps)}\]</div>  <p>举 EnCodec 的一个真实配置感受一下：编码器把 24 kHz 音频下采样到约 75 帧/秒（hop≈320），用 $N=8$ 级 RVQ、每级码本 $K=1024$（10 比特）。比特率 $=75\times8\times10=6000$ bps $=6$ kbps——一秒钟的高保真音频只要 6 kbit，而 24 kHz×16 bit 的原始 PCM 是 384 kbps，<strong>压缩 64 倍</strong>。靠只用前几级 RVQ，同一模型还能给出 1.5/3/12/24 kbps 等多档。</p>  <p>这里有一个<strong>贯穿三个量的权衡三角</strong>，是本模块要建立的核心直觉：</p>  <table>
+    <thead><tr><th>你想要</th><th>怎么调</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td>更低比特率</td><td>减帧率 / 减级数 N / 减码本 K</td><td>重建质量下降</td></tr>
+      <tr><td>更高保真</td><td>加级数 N / 加码本 K / 加帧率</td><td>比特率上升、token 序列更长</td></tr>
+      <tr><td>更短 token 序列（利于语音 LM）</td><td>减帧率、减级数</td><td>重建质量下降 / 信息瓶颈</td></tr>
+    </tbody>
+  </table>  <p>注意第三行——它把本模块和模块 05 连了起来：给语音 LM 的 token 序列<strong>越短越好建模</strong>（自回归长度短、上下文够用），但越短意味着压得越狠、保真越难。这个张力催生了 <span class="term">acoustic token</span>（声学 token，细节多、序列长）与 <span class="term">semantic token</span>（语义 token，内容多、序列短）的<strong>分工</strong>——AudioLM 用语义 token 管长程结构、声学 token 补细节，正是对这个权衡的工程回应（模块 05 详谈）。</p>  <p>把比特率公式和模块 01 的特征前端对照，能看清<strong>整条压缩链路的『信息漏斗』</strong>。原始 24 kHz×16 bit = 384 kbps 的波形，先被编码器<strong>下采样</strong>（时间维：从 24000 采样/秒降到 75 帧/秒，约 320 倍），每帧再被 RVQ<strong>量化</strong>成 $N\times\log_2 K$ 比特（幅度维：连续向量降到几十比特）。两步压缩相乘，就是那 64 倍的总压缩比。这和模块 01 把波形变成每秒 100 帧 log-mel 是<em>同一种思想</em>（都在降时间分辨率 + 压每帧信息），区别只在：模块 01 的输出是<strong>连续</strong>特征（喂给判别式模型如 Whisper），模块 03 的输出是<strong>离散</strong>token（喂给生成式语言模型）。记住这个对照：<strong>『下采样降时间维 + 量化/投影降特征维』是把音频变小的通用两板斧</strong>，无论目标是识别还是生成。</p>  <div class="callout paper"><span class="label"></span>
+    <p>EnCodec（Défossez 2022）与 SoundStream（Zeghidour 2021，均见 <code>references.md</code>）是本模块的工程目标。它们在 VQ-VAE 的离散表示之上，加 RVQ（可变比特率）、多尺度谱判别器（对抗损失提音质）、流式因果卷积，做出了能实用的低比特率神经编解码。DAC（Kumar 2023）则专攻码本利用率。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">6</span>从波形到 token：完整编解码链路</h2>
+  <h3>从波形到 token：完整的编解码链路</h3>  <p>把本模块零件接成真实编解码的样子（编码器/解码器在真实系统里是卷积网络，本课用『特征提取 + 线性』占位，聚焦量化这一核心环节）：</p>  <div class="ascii">编码  波形 x[n]
+   │  编码器(卷积下采样)  → 隐向量序列 z (T', d), T'≪ 采样数
+   │  RVQ: 逐级量化 z → 下标 [k1..kN] 每帧
+   ▼
+     离散 token 序列 (T', N) 整数  ──► 传输/存储；或喂给语音 LM(模块05)
+
+解码  token (T', N)
+   │  查表求和 ẑ = Σ_i c^(i)[k_i]
+   │  解码器(转置卷积上采样) → 波形 x̂[n]
+   ▼
+     重建波形 x̂   （训练目标：x̂ ≈ x，时域+谱域损失 + 对抗）</div>  <p>notebook 会逐段实现可验证的部分：VQ 最近邻（对拍：量化值确实是码本中最近的）、RVQ 多级（对拍：重建误差随级数<strong>单调下降</strong>、且各级残差范数递减）、码本利用率（对拍：码本远大于数据多样性时利用率下降）、比特率（对拍：公式与直接计数一致）。编码器/解码器的卷积部分本课不实现（那是标准 CNN，C0x 已覆盖），但你会清楚地看到：<strong>整个神经编解码的『神经』在卷积、而『编解码』的灵魂在 RVQ</strong>——这正是本课聚焦量化的原因。</p>  <p>一个值得记住的视角转换：传统编解码（MP3、Opus）是<strong>信号处理专家手工设计</strong>的（心理声学掩蔽、变换编码）；神经编解码是<strong>数据驱动端到端学</strong>的。后者在极低比特率（<6 kbps）显著胜出，且产出的离散 token 天然适合喂给语言模型——这后一点（『编解码顺便给了你音频的词表』）才是它真正改变游戏规则的地方。</p>  <p>最后强调本课在编解码这一环的<strong>聚焦取舍</strong>，免得你觉得『只实现了量化』是偷工减料。一个完整神经编解码有四大件：编码器（卷积下采样）、<strong>量化器（RVQ）</strong>、解码器（转置卷积上采样）、判别器（对抗损失提音质）。其中编码器/解码器是标准卷积网络（C0x 已覆盖）、判别器是标准 GAN 训练，二者都<em>不是音频编解码特有的</em>；真正<strong>独属于音频 token 化、且最常被问、最易写错</strong>的，是量化器——VQ 的最近邻、RVQ 的残差递推、码本利用率、比特率换算。所以本课把全部笔墨给量化，是<em>刻意把有限精力投在『不可替代且高频』的核心</em>上。你把 RVQ 吃透，再去读 EnCodec 源码，会发现其余部分都是你已熟悉的卷积与 GAN——这正是『抓主要矛盾』的学习策略。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="discrete"><span class="num">7</span>离散 vs 连续：为什么非得离散化</h2>
+  <h3>离散 vs 连续：为什么非得离散化</h3>  <p>一个自然的质疑：编码器输出的连续向量 $z$ 本身已经很紧凑了，为什么非要再<strong>有损地</strong>量化成离散 token？直接让下游模型吃连续向量不行吗？答案揭示了离散化的深层价值：</p>  <ul>
+    <li><strong>语言模型范式</strong>：自回归 LM 建立在<em>离散词表上的分类</em>之上（softmax + 交叉熵 + 采样）。连续向量没有『下一个 token 的概率分布』可言。要复用文本 LLM 的全套机器（模块 05），就必须离散。</li>
+    <li><strong>可压缩/可传输</strong>：整数下标可无损熵编码、定长传输；连续向量要么浮点（贵）要么还得量化。</li>
+    <li><strong>正则化与抗噪</strong>：量化是一种强信息瓶颈，逼编码器把信息组织成离散单元，常带来更稳健、更可控的表示（VQ-VAE 的初衷之一）。</li>
+    <li><strong>可组合与可解释</strong>：离散单元更接近『音素/声学事件』这类可枚举的概念，便于分析、编辑、拼接。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>离散化像是把连续的语流切成『音块』，每块给个编号。虽然丢了点细节（量化误差），但换来一本『音频字典』——有了字典，就能像写文章一样『写音频』（语音 LM），能数频次、能查替换、能压缩传输。这点损失买来的能力，是连续表示给不了的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>当然，离散化是<strong>有损</strong>的，且 $\arg\min$ 带来训练困难（梯度、坍缩）。也有人探索<em>连续</em>的音频生成（如基于扩散的声码器、连续 latent 的流模型），在某些任务上避开离散化的损失。离散 vs 连续是音频生成当前一条活跃的分界线——但就『把音频纳入 LLM』而言，离散 token 仍是主流答案，这也是本课聚焦它的原因。</p></div>
+  </div>  <p>顺带厘清一个容易混淆的边界：<strong>RVQ 的『级数 N』和『码本大小 K』是两个正交的旋钮</strong>，初学常把它们搅在一起。$K$ 控制<em>每一级的精细度</em>（一级里能区分多少个方向），$N$ 控制<em>叠几层</em>（用多少级残差逼近）。二者都增大都能降失真，但代价不同：增大 $K$ 让每级比特数 $\log_2 K$ 线性增、码本存储/最近邻搜索成本增；增大 $N$ 让 token<strong>序列变长</strong>（每帧多 $N$ 个整数）、自回归建模更难（模块 05）。真实系统的调法通常是：$K$ 固定在 1024 左右（10 比特，最近邻还算快），靠调 $N$（2/4/8/16…）实现可变比特率。理解这个<strong>『$K$ 调精度、$N$ 调档位且影响序列长』</strong>的分工，你才能读懂 EnCodec 为何那样配参、以及它如何把『压缩质量』与『下游 token 长度』分开权衡。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这条因果链：<strong>想用语言模型生成音频（模块 05）→ 必须有离散 token → 必须有矢量量化 → RVQ 让它低比特率高保真</strong>。本模块是模块 05 的<em>前置条件</em>——没有 token 化，就没有语音 LLM。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>码本利用率与坍缩</strong>：尽管有 EMA、重启、因子化码本（DAC）等手段，如何稳定地把利用率推到接近 100% 仍是工程难点，直接影响下游语音 LM 的 token 分布质量。</li>
+    <li><strong>语义 vs 声学 token</strong>：声学 token 保真但序列长、缺语义结构；语义 token 紧凑但丢声学细节。如何用单一 tokenizer 同时兼顾（如 Mimi 的语义+声学联合），是当前热点。</li>
+    <li><strong>低帧率 token</strong>：给语音 LM 的 token 越少越好建模。把帧率从 75 Hz 压到 12.5 Hz 甚至更低、同时保真，是 Moshi/Mimi 等实时模型的核心追求。</li>
+    <li><strong>离散 vs 连续之争</strong>：扩散/流模型用连续 latent 避开量化损失，在音质上可能更优；但离散 token 更契合 LLM 范式。两条路线的边界与融合仍在演进。</li>
+    <li><strong>评测标准</strong>：神经编解码缺乏统一评测。重建质量（PSNR/PESQ/主观 MOS）、码本利用率、比特率、以及『token 对下游语音 LM 的友好度』应一并报告，但后者尚无公认指标。</li>
+  </ul>  <div class="card"><strong>✅ 本章你应该能回答：</strong>  <ol>
+    <li>为什么要把波形离散成 token？写出 VQ 的最近邻量化规则；$K$ 与比特率/失真的关系？</li>
+    <li>RVQ 如何用 N 个小码本达到 $K^N$ 的精度？写出残差递推；为什么重建误差随级数单调下降？</li>
+    <li>RVQ 的『可变比特率』特性怎么来的？为什么只用前 n 级就能降比特率而无需重训？</li>
+    <li>什么是码本坍缩？如何度量码本利用率？列举两种缓解手段。</li>
+    <li>写出比特率公式；声学 token 与语义 token 的权衡是什么？它如何连接到模块 05？</li>
+  </ol></div>  <div class="callout paper"><span class="label"></span>
+    <p>延伸阅读（详见 <code>references.md</code>）：van den Oord 2017（VQ-VAE，离散表示奠基）、Zeghidour 2021（SoundStream，RVQ 编解码）、Défossez 2022（EnCodec）、Kumar 2023（DAC，码本利用率）、Gray 1984（VQ 经典综述）。下一模块走生成方向：把谱图还原成能听的波形。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_asr/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · ASR 与 Whisper</div></a>
+    <a class="next" href="../04_tts/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · TTS 与声码器</div></a>
+  </div>
+
+</div>
+</body>
+</html>

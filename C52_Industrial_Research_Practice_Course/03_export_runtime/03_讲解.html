@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 模型导出与推理运行时</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 模型导出与推理运行时</h1>
+  <p class="subtitle">ONNX 的图/opset/动态轴/权重四要素 · 不设动态轴就被写死 · 算子不支持的四条出路 · 静默回退（转了但没变快）· 多形状对拍与边界测试 · 量化容差要按量化误差设</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–02；C27（量化原理）与 C24（推理引擎）有帮助但不必需</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_export_runtime.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">ONNX 规范与 operator sets、torch.onnx 文档、TensorRT / CoreML / TFLite 的转换指南</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">导出：把模型交给一个不认识 Python 的运行时</a></li>
+      <li><a href="#ir">ONNX：一张图、一个算子集、一个版本号</a></li>
+      <li><a href="#unsupported">算子不支持：四条出路</a></li>
+      <li><a href="#verify">导出后必须做的三件事</a></li>
+      <li><a href="#runtimes">四个目标运行时：各自的约束</a></li>
+      <li><a href="#quant">导出时的精度降级：三种粒度</a></li>
+      <li><a href="#artifacts">导出产物的版本管理</a></li>
+      <li><a href="#ledger">算一笔账：导出的收益与代价</a></li>
+      <li><a href="#frontier">生态动态与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>导出：把模型交给一个不认识 Python 的运行时</h2>
+  <p>训练框架与推理运行时是两种不同的东西。<strong>训练框架为「灵活与可微」优化，推理运行时为「延迟、吞吐、内存、可移植」优化</strong>——它们几乎在每个设计点上做了相反的选择。</p>  <table>
+    <thead><tr><th></th><th>训练框架（PyTorch/TF）</th><th>推理运行时（ORT/TensorRT/TFLite/CoreML）</th></tr></thead>
+    <tbody>
+      <tr><td>需要 Python</td><td>✅ 是</td><td><strong>❌ 否</strong>（这常常是硬要求）</td></tr>
+      <tr><td>动态性</td><td>任意 Python 控制流</td><td><strong>有限</strong>（受支持的图算子）</td></tr>
+      <tr><td>算子集</td><td>几千个，随版本增长</td><td><strong>几百个，且按版本冻结</strong></td></tr>
+      <tr><td>优化</td><td>有限（保留可微性与可调试性）</td><td><strong>激进</strong>：融合、常量折叠、布局重排、精度降级</td></tr>
+      <tr><td>部署形态</td><td>Python 进程 + 大依赖</td><td><strong>一个 <code>.so</code> / <code>.tflite</code> / <code>.mlmodel</code></strong></td></tr>
+      <tr><td>典型体积</td><td>几 GB（含 torch）</td><td>几 MB（运行时）+ 权重</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>「不需要 Python」这一栏往往是<strong>决定性的硬约束</strong>而不是优化项：移动端 App 不能装 Python；嵌入式设备内存装不下；C++/Java 服务不想引入 Python 依赖；某些合规环境禁止解释器。<em>所以「模型能不能导出」经常不是性能问题，而是「能不能上线」的问题</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>而导出的核心难点可以一句话概括：<strong>你要把「一段 Python 代码」变成「一张固定的图」，而 Python 的表达力远超任何图 IR</strong>。模块 01 讲的追踪语义在这里全部适用——<em>控制流会被固化、形状会被写死、Python 副作用会消失</em>。区别只是：在 <code>tf.function</code> 里这些是性能问题，在导出里这些是<strong>正确性问题</strong>（因为图会被交出去，再也不会重新追踪）。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>所以导出最危险的失败模式是：<strong>「导出成功、跑通了、但换个输入就错」</strong>。追踪时 batch=1、seq=128，导出的图里这两个数字被写死；线上来了 batch=8 就报形状错（好情况），或者某个 <code>if</code> 分支被固化成了追踪时那条（坏情况——不报错、结果错）。<em>本模块的核心就是把这些「导出时看不出、上线才炸」的问题提前暴露出来。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ir"><span class="num">2</span>ONNX：一张图、一个算子集、一个版本号</h2>
+  <p><span class="term">ONNX</span> 是当前事实上的交换格式。它的模型结构简单到可以在一页纸内说清：</p>  <div class="ascii">ONNX Model
+├── ir_version          IR 格式本身的版本
+├── opset_import        **算子集版本**（如 ai.onnx v17）← 兼容性的核心
+├── producer_name       谁导出的（pytorch 2.4.1）
+└── graph
+    ├── input   [ {name, type: tensor(float), shape: [batch, seq, 768]} ]
+    │                                              ↑ 可以是符号（动态轴）
+    ├── output  [ {name, type, shape} ]
+    ├── initializer  权重（常量张量）
+    └── node[]  拓扑排序的算子列表
+         └── {op_type: "MatMul", input: [...], output: [...], attribute: {...}}
+
+关键性质：
+  · **静态拓扑**：节点与边在导出时固定；控制流要用 If/Loop/Scan 算子表达
+  · **算子按 opset 版本冻结**：同一个 op 在不同 opset 里语义可能不同
+  · **形状可以是符号**：["batch", "seq"] 而不是 [1, 128] —— 这就是动态轴
+  · **权重内联**：initializer 就在文件里（所以 ONNX 文件很大）</div>  <table>
+    <thead><tr><th>概念</th><th>是什么</th><th>搞错了会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><strong>opset 版本</strong></td><td>算子集的版本号。每个 op 有「自哪个 opset 起可用/语义变更」</td><td>目标运行时不支持该 opset → 加载失败；或算子语义变了 → 数值错</td></tr>
+      <tr><td><strong>动态轴</strong></td><td>把某些维度声明为符号（<code>"batch"</code>）而非常数</td><td><strong>不设 → 形状被写死 → 换 batch 就崩</strong></td></tr>
+      <tr><td><strong>initializer</strong></td><td>内联在文件里的权重</td><td>大模型的 ONNX 文件超过 2GB 会触发 protobuf 限制，要用外部数据</td></tr>
+      <tr><td><strong>自定义算子</strong></td><td>标准算子集之外的 op</td><td>运行时不认识 → 需要自己注册实现，或改模型避开</td></tr>
+      <tr><td><strong>形状推断</strong></td><td>从输入形状推出每个中间张量的形状</td><td>推断失败 → 某些优化无法进行、或运行时报错</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>opset 版本是最常见的兼容性问题来源</strong>，而且它有一个反直觉的性质：<em>不是「越新越好」</em>。导出时用了 opset 18，但目标运行时（可能是一年前的版本、或某个嵌入式的 ORT 精简版）只支持到 15，就直接加载失败。<strong>正确做法是先确定目标运行时支持的 opset 上限，再据此导出</strong>——而不是导出后才发现。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>动态轴</strong>是第二个高频坑，且更隐蔽。<code>torch.onnx.export</code> 默认会把追踪时的形状<em>全部写死</em>。如果你用 <code>(1, 128)</code> 的样例输入导出，得到的图只接受 <code>(1, 128)</code>。<em>好一点的运行时会报「形状不匹配」，差一点的会静默走一条错误的路径</em>。<strong>凡是会变的维度（batch、序列长、图像尺寸）都必须显式声明为动态轴</strong>——而这需要你提前想清楚「什么会变」。</p></div>
+  </div>  <pre><code>torch.onnx.export(
+    model, (example_input,), "model.onnx",
+    opset_version=17,                          # ← 先查目标运行时支持到几
+    input_names=["input_ids", "attention_mask"],
+    output_names=["logits"],
+    dynamic_axes={                             # ← **凡是会变的维度都要声明**
+        "input_ids":      {0: "batch", 1: "seq"},
+        "attention_mask": {0: "batch", 1: "seq"},
+        "logits":         {0: "batch"},
+    },
+    do_constant_folding=True,
+)</code></pre>
+
+  <!-- ========================================================= -->
+  <h2 id="unsupported"><span class="num">3</span>算子不支持：四条出路</h2>
+  <p>导出时最常见的报错是「<code>Exporting the operator X to ONNX opset version N is not supported</code>」。<strong>遇到它有四条出路，成本递增</strong>——重要的是知道<em>先试哪一条</em>。</p>  <table>
+    <thead><tr><th>出路</th><th>做什么</th><th>成本</th><th>什么时候用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 换算子</strong></td><td>用等价的、被支持的算子重写这一段</td><td><strong>最低</strong></td><td>首选。多数「不支持」的算子都有等价写法</td></tr>
+      <tr><td><strong>② 提高 opset</strong></td><td>该算子在更高 opset 里已支持</td><td>低（若运行时也支持）</td><td>查一下算子的「since version」</td></tr>
+      <tr><td><strong>③ 分解</strong></td><td>把复合算子拆成基础算子的组合</td><td>中（要自己写并验证数值）</td><td>如自定义激活、特殊归一化</td></tr>
+      <tr><td><strong>④ 自定义算子</strong></td><td>注册 symbolic 函数 + 在运行时实现 kernel</td><td><strong>最高</strong>（要写 C++ 并跟着运行时版本维护）</td><td>真的无法避开（如自研 kernel）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>出路 ① 常常被跳过，但它成功率最高</strong>。很多「不支持」其实是用了某个 Python 便利写法：<code>tensor.item()</code>（把 tensor 变 Python 标量——会固化）、花式索引、<code>torch.unique</code>、<code>nonzero</code>（输出形状依赖数据，图 IR 很难表达）。<em>把它们改写成形状确定的算子组合，通常几行就能解决</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>特别值得记住的一类是<strong>「输出形状依赖输入<em>数值</em>」的算子</strong>——<code>nonzero</code>、<code>unique</code>、<code>masked_select</code>、动态 <code>topk</code>。它们在图 IR 里天然困难，因为形状推断做不了。<em>解法通常是把它们移出模型</em>：模型输出固定形状的 mask/分数，由调用方在 Python/C++ 侧做筛选。<strong>「把动态部分挪到模型之外」是导出工程里最有效的一招。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>还有一个诊断技巧：<strong>先导出模型的一小块，二分定位到底是哪个算子不支持</strong>。整模型导出报错时，错误信息常常指向一个很深的调用栈，看不出是模型的哪一层。<em>把模型按层切开、逐块导出，几分钟就能定位</em>。这与模块 02 的「逐层对拍」是同一个思路——<strong>把整体失败分解成可定位的局部失败</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="verify"><span class="num">4</span>导出后必须做的三件事</h2>
+  <p>导出成功 ≠ 导出正确。有三个检查<strong>必须</strong>做，缺一个都可能上线炸。</p>  <h3>① 数值对拍（在多组形状上）</h3>  <p>用模块 02 的方法学，但有一个关键差别：<strong>必须在<em>多组不同形状</em>上对拍，而不只是导出时用的那一组</strong>。因为形状被写死或动态轴设错的问题，只有换形状才暴露。</p>  <pre><code>for batch, seq in [(1, 128), (1, 7), (8, 512), (3, 333)]:   # 含奇数、极值、非对齐
+    x = make_input(batch, seq)
+    ref = torch_model(x).numpy()
+    got = ort_session.run(None, {"input_ids": x})[0]
+    assert np.allclose(ref, got, rtol=1e-3, atol=1e-4), f"failed at {batch}x{seq}"</code></pre>  <h3>② 形状边界测试</h3>  <p>显式测试<strong>边界与非常规形状</strong>：batch=1、序列长为 1、序列长为奇数、序列长不是 8 的倍数、超过训练时见过的最大长度。<em>很多运行时（尤其 TensorRT）对对齐有隐含要求，只在非对齐形状上暴露</em>。</p>  <h3>③ 算子覆盖与运行时兼容</h3>  <p>把导出图里用到的<strong>全部 op_type 与 opset</strong>列出来，与目标运行时的支持列表求交集。<em>这一步能在部署前几分钟发现「这个算子在 TensorRT 上不支持、会回退到 CPU」这类性能陷阱</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第 ③ 点里的「<strong>回退</strong>」值得展开。TensorRT 遇到不支持的算子时不会报错，而是把图切成多个子图，<em>不支持的部分交给别的后端（甚至 CPU）执行</em>。结果是模型能跑、数值也对，但<strong>性能可能比不优化还差</strong>（因为多了大量设备间数据搬运）。<em>症状是「转了 TensorRT 但没变快」，而日志里那行「N subgraphs」才是原因。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>同类的隐性回退在各个运行时都有：ONNX Runtime 的 execution provider 会按优先级回退（CUDA → CPU）；CoreML 会把不支持的层放到 CPU 而不是 ANE；TFLite 的 delegate 也会部分回退。<strong>所以「导出后的性能验证」必须与「数值验证」同等对待</strong>，而且要看运行时的<em>分区日志</em>而不只是端到端延迟。</p></div>
+  </div>  <div class="callout danger"><span class="label">别用 batch=1 做样例输入</span>
+    <p>一个必须显式测试的边界：<strong><code>batch=1</code> 与 <code>batch&gt;1</code> 可能走完全不同的代码路径</strong>。某些算子在 batch=1 时被优化掉、某些 kernel 只在 batch≥N 时启用、某些 padding 逻辑只在多样本时触发。<em>「用 batch=1 导出并验证，上线用 batch=8」是一个非常常见且危险的组合</em>。<strong>导出时的样例输入应该用一个「中间的、非特殊的」形状</strong>（如 batch=2、seq=17），这样更容易暴露对特殊值的隐含依赖。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="runtimes"><span class="num">5</span>四个目标运行时：各自的约束</h2>
+  <table>
+    <thead><tr><th>运行时</th><th>目标平台</th><th>输入格式</th><th>最大特点</th><th>主要约束</th></tr></thead>
+    <tbody>
+      <tr><td><strong>ONNX Runtime</strong></td><td>跨平台（CPU/CUDA/DirectML/…）</td><td>ONNX</td><td>最通用；execution provider 可插拔</td><td>优化程度不如专用运行时</td></tr>
+      <tr><td><strong>TensorRT</strong></td><td>NVIDIA GPU</td><td>ONNX（或自建网络）</td><td><strong>最快</strong>：层融合、精度校准、kernel autotune</td><td>构建慢（几分钟到几十分钟）；<strong>引擎与 GPU 型号/驱动绑定</strong></td></tr>
+      <tr><td><strong>CoreML</strong></td><td>Apple 设备</td><td>mlpackage（从 ONNX/PyTorch 转）</td><td>能用 ANE（神经引擎），极省电</td><td>算子集受限；ANE 只支持部分算子与精度</td></tr>
+      <tr><td><strong>TFLite</strong></td><td>移动/嵌入式</td><td>tflite（从 TF/ONNX 转）</td><td>体积极小；delegate 生态成熟</td><td>算子集最受限；动态形状支持弱</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>TensorRT 的「引擎与硬件绑定」</strong>是个必须提前知道的工程约束：构建出来的 <code>.engine</code> 文件<em>只能在同型号 GPU + 兼容驱动上运行</em>。换一张卡（甚至同型号不同驱动大版本）就要重新构建。<em>所以生产上要么在目标机器上构建、要么为每种硬件配置各构建一份并纳入发布流程</em>。而构建本身要几分钟到几十分钟——<strong>这直接影响 C48 讲的冷启动与镜像策略</strong>（引擎要预构建进镜像还是启动时构建，是个真实的取舍）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>CoreML 的 ANE 约束</strong>是另一类：ANE（Apple Neural Engine）极省电、极快，但它只支持有限的算子与精度（主要是 fp16 与特定的卷积/矩阵形状）。<em>模型会「成功转换」，但实际跑在 CPU 或 GPU 上而不是 ANE</em>——性能与功耗都差一个档次。<strong>验证方式是看 Xcode 的性能报告里每层的实际计算单元</strong>，而不是看端到端延迟。这与 TensorRT 的静默回退是同一类问题。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>四个运行时的选择其实由<strong>目标硬件</strong>决定，没什么可纠结的：NVIDIA GPU → TensorRT（或 ORT-CUDA 求省事）；Apple → CoreML；Android/嵌入式 → TFLite；<em>不确定或要跨平台 → ONNX Runtime</em>。<strong>真正需要决策的不是「用哪个」，而是「为了用它，模型要做哪些妥协」</strong>——去掉哪些算子、接受多少精度损失、能不能容忍构建时间。<em>这个妥协清单应该在训练模型<em>之前</em>就知道，而不是训完才发现导不出去。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="quant"><span class="num">6</span>导出时的精度降级：三种粒度</h2>
+  <p>导出常常伴随精度降级（fp32 → fp16/int8）。原理在 C27 讲过，这里只讲<strong>导出场景下的三种做法与它们的验证要求</strong>。</p>  <table>
+    <thead><tr><th>做法</th><th>怎么做</th><th>精度损失</th><th>需要什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>fp16 转换</strong></td><td>权重与计算都转 fp16</td><td>通常极小</td><td>无需数据；但要检查是否有溢出（激活值 &gt; 65504）</td></tr>
+      <tr><td><strong>训练后动态量化</strong></td><td>权重 int8、激活运行时统计</td><td>小-中</td><td>无需数据；CPU 上收益最大</td></tr>
+      <tr><td><strong>训练后静态量化</strong></td><td>权重与激活都 int8，用<strong>校准集</strong>确定激活范围</td><td>中</td><td><strong>需要几百条代表性数据</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>静态量化的「校准集」是最容易做错的一步</strong>。它的作用是统计每层激活的数值范围，从而确定量化的 scale。<em>如果校准集的分布与线上分布不同，量化范围就是错的</em>——常见错误包括：只用训练集头几条（可能全是同一类别）、用了预处理不一致的数据、样本太少（&lt;100）覆盖不到长尾。<strong>校准集应该是「线上分布的一个小样本」，几百条即可，但必须有代表性。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>fp16 的坑则是<strong>溢出</strong>：fp16 的最大值约 65504，而某些层（尤其是注意力的 <code>QK^T</code> 在未缩放时、或某些归一化的中间量）可能超过它，产生 <code>inf</code> 然后传播成 <code>nan</code>。<em>这个问题在训练时被 loss scaling 掩盖，导出到纯 fp16 推理时才暴露</em>。<strong>检查方法：用极端输入（大幅值、长序列）跑一遍，看有没有 inf/nan</strong>——而不是只用正常样本验证。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>量化后的对拍<strong>容差要按量化误差而不是浮点误差来设</strong>。int8 量化的相对误差在 1% 量级，用 <code>rtol=1e-5</code> 去对拍必然「失败」——但那不是 bug。<em>正确做法是：①对拍<strong>最终任务指标</strong>（准确率/BLEU）而非逐元素数值；②逐层看的是「误差是否在预期量级」而不是「是否 allclose」；③重点检查有没有<strong>异常层</strong>（某一层误差比其他层大一个数量级——通常是它的激活分布有长尾）</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="artifacts"><span class="num">7</span>导出产物的版本管理</h2>
+  <p>导出会产生一批新的二进制产物，而它们<strong>与训练 checkpoint 有完全不同的生命周期</strong>——这一点常被忽略，直到某天没人说得清线上跑的 <code>model.onnx</code> 是从哪个 checkpoint 来的。</p>  <table>
+    <thead><tr><th>产物</th><th>由什么决定</th><th>什么时候必须重建</th></tr></thead>
+    <tbody>
+      <tr><td><code>model.onnx</code></td><td>checkpoint + 导出参数（opset、动态轴）</td><td>换 checkpoint；改导出配置；升 opset</td></tr>
+      <tr><td><code>model.engine</code>（TensorRT）</td><td>ONNX + <strong>GPU 型号 + 驱动 + TRT 版本</strong></td><td>上面任何一项变化——<em>包括换一张同型号但驱动不同的卡</em></td></tr>
+      <tr><td>量化校准表</td><td>校准集 + 模型结构</td><td>换校准集；模型结构变；输入分布漂移</td></tr>
+      <tr><td><code>.tflite</code> / <code>.mlpackage</code></td><td>源模型 + 转换器版本</td><td>转换器升级（算子映射可能变）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第二行是运维上最麻烦的一个：<strong>TensorRT 引擎与硬件绑定，意味着「一份 checkpoint」会变成「N 份引擎」</strong>（N = 硬件配置种类数）。它们必须与源 ONNX 一起被追踪，否则很快就会出现「这台机器上的引擎是三个月前构建的，用的是哪版模型没人记得」。<em>而引擎是二进制的，看不出来。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>解法很朴素但必须做：<strong>给每个产物附一份 manifest，记录它的全部输入</strong>——源 checkpoint 的哈希、导出参数、opset、构建时的 GPU 型号与驱动版本、运行时版本、以及验证时用的形状集合与容差。<em>把 manifest 与产物放在一起（或嵌进文件的 metadata），并在服务启动时校验</em>。这与 C48 讲的镜像标签策略是同一个思路：<strong>凡是不可读的二进制产物，都必须有一份可读的来源说明</strong>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个能省很多事的约定：<strong>把「导出 + 验证」做成一条流水线，而不是两个手工步骤</strong>。导出脚本的最后一步就是跑多形状对拍与算子覆盖检查，<em>任何一项不过就不产出文件</em>。这样「存在一个 <code>.onnx</code> 文件」本身就意味着「它通过了验证」——<strong>用「产物的存在性」编码「验证已通过」这个事实</strong>，比依赖人记得跑验证可靠得多。这个模式在 C48 的镜像构建、C43 的数据管线里都出现过。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">8</span>算一笔账：导出的收益与代价</h2>
+  <div class="math-block">\[\text{加速比} = \frac{t_{eager}}{t_{runtime}}, \qquad \text{值得} \iff N \cdot (t_{eager} - t_{runtime}) > C_{export} + C_{build} \cdot n_{hw}\]</div>  <table>
+    <thead><tr><th>运行时</th><th>典型加速比</th><th>构建时间</th><th>工程成本</th><th>何时值得</th></tr></thead>
+    <tbody>
+      <tr><td>ONNX Runtime (CPU)</td><td>1.5–3×</td><td>秒级</td><td>低</td><td><strong>几乎总是</strong>（尤其 CPU 推理）</td></tr>
+      <tr><td>ONNX Runtime (CUDA)</td><td>1.1–1.5×</td><td>秒级</td><td>低</td><td>想去掉 Python 依赖时</td></tr>
+      <tr><td>TensorRT fp16</td><td>2–5×</td><td><strong>几分钟–几十分钟</strong></td><td>中（要处理算子回退）</td><td>GPU 推理量大、硬件固定</td></tr>
+      <tr><td>TensorRT int8</td><td>3–8×</td><td>更长（要校准）</td><td><strong>高</strong>（要校准集 + 精度验证）</td><td>延迟/成本敏感且能接受精度损失</td></tr>
+      <tr><td>TFLite / CoreML</td><td>N/A（唯一选项）</td><td>分钟级</td><td>中-高（算子受限）</td><td><strong>移动/嵌入式：不是优化是必需</strong></td></tr>
+    </tbody>
+  </table>  <p>三点观察：</p>  <ul>
+    <li><strong>CPU 推理上导出的收益最大</strong>（1.5–3×），因为 PyTorch 的 CPU 路径优化远不如专用运行时。<em>而很多「小模型 + CPU 部署」的场景（C49 模块 05 讲的 encoder 方案）恰好在这一档。</em></li>
+    <li><strong>GPU 上 ORT 的收益有限</strong>（1.1–1.5×），因为 PyTorch 的 CUDA 路径已经很好。<em>此时导出的主要动机往往是「去掉 Python 依赖」而非速度。</em></li>
+    <li><strong>TensorRT 的构建时间要乘以硬件种类数</strong>——引擎与 GPU 型号绑定。如果你有三种 GPU，就是三份引擎、三次构建、三份产物要管理。<em>这个运维成本常被低估。</em></li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的智慧：<strong>导出不是「把模型另存为另一种格式」，而是「把一段 Python 程序编译成一个受限 IR 上的静态图」——所以 Python 里那些方便的动态性，都要在导出前被消除或移出模型</strong>。想清楚这一点，导出的所有坑（形状写死、控制流固化、算子不支持、静默回退）就都成了同一个问题的不同表现。<em>而最有效的通用招数只有一条：把动态部分挪到模型之外。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>生态动态与开放问题</h2>
+  <ul>
+    <li><strong>导出路径的更替</strong>：PyTorch 正从 TorchScript-based 的 <code>torch.onnx.export</code> 迁移到基于 <code>torch.export</code>/Dynamo 的新路径（<code>dynamo=True</code>）。新路径对动态形状与控制流的支持更好，但成熟度与算子覆盖仍在追赶。<em>短期内两条路径并存，选哪条要看具体模型。</em></li>
+    <li><strong>动态形状的 IR 表达</strong>：符号形状、形状约束的传播与验证，是所有 IR 的共同难题。ONNX 的符号维只是「名字相同即相等」，无法表达 <code>seq &lt;= 512</code> 或 <code>seq % 8 == 0</code> 这类约束——而这些约束恰恰是运行时优化需要的。</li>
+    <li><strong>LLM 的导出</strong>：自回归生成含 KV 缓存的有状态循环，用静态图表达非常别扭。目前主流做法是<em>绕过导出</em>——直接用 vLLM/TensorRT-LLM 这类专用引擎从权重构建，而不是走通用 IR。「通用 IR 能否表达高效的 LLM 推理」目前是否定的。</li>
+    <li><strong>MLIR / StableHLO 生态</strong>：试图提供比 ONNX 更通用、更可组合的中间表示（支持训练图、自定义方言、渐进 lowering）。工业采用仍集中在编译器内部，作为<em>交换格式</em>尚未取代 ONNX。</li>
+    <li><strong>导出正确性的自动验证</strong>：目前靠人工写多形状对拍。<em>能否自动生成覆盖边界的测试形状、自动检测静默回退、自动比对分区结果</em>，缺少标准工具——这也是本模块要你手写检查器的原因。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：ONNX 官方的 <em>Operators</em> 文档（每个 op 的「since version」与语义变更，兼容性问题的一手来源）与 <em>IR specification</em>；PyTorch 的 <em>torch.onnx</em> 文档（尤其 <em>Limitations</em> 与 <em>Frequently Asked Questions</em> 两节，把追踪的坑列得很清楚）；NVIDIA 的 <em>TensorRT Developer Guide</em>（重点看 layer fusion 与 INT8 calibration 两章，以及「engine 与硬件绑定」的说明）；Apple 的 <em>Core ML Tools</em> 文档（ANE 支持的算子与精度约束）。相邻课程：C27（量化算法）、C24（推理引擎内部）、C48（部署与冷启动）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_weight_porting/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 框架迁移与权重对齐</div></a>
+    <a class="next" href="../04_gpu_workflow/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 真机 GPU 工作流</div></a>
+  </div>
+
+</div>
+</body>
+</html>

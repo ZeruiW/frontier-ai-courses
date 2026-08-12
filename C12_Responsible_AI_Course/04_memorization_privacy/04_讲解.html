@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 记忆化与隐私</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 记忆化与隐私</h1>
+  <p class="subtitle">模型会逐字背下训练数据并被提取出来 —— 用 canary 暴露度量化记忆、用成员推断（loss 阈值 / LiRA）量化隐私泄露、用去重与差分隐私缓解，并诚实报告残余风险</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、概率 / 对数似然、ROC / AUC</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_memorization_privacy.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Carlini 2019（Secret Sharer）、Carlini 2021（提取）、Shokri 2017（MIA）、Carlini 2022（LiRA）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">记忆化为何是隐私问题</a></li>
+      <li><a href="#canary">canary 与暴露度</a></li>
+      <li><a href="#extract">可提取记忆 vs 仅仅记住</a></li>
+      <li><a href="#mia">成员推断攻击（MIA）</a></li>
+      <li><a href="#loss">loss 阈值攻击与它的 ROC</a></li>
+      <li><a href="#lira">LiRA：平均 AUC 会骗你</a></li>
+      <li><a href="#mitigate">缓解：去重与差分隐私</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>记忆化为何是隐私问题</h2>
+  <p>到目前为止，本课度量的都是模型对<strong>不同人群</strong>的不公（公平、毒性、多语）。这一模块换一类伤害——模型对<strong>训练它的那些人</strong>的隐私威胁：大语言模型会逐字（或近逐字）地<strong>背下</strong>训练语料里的片段，并在适当的提示下把它们<em>吐出来</em>。</p>  <p>这件事的严重性在于它<strong>一箭三雕</strong>地触发三类风险：① <strong>隐私</strong>——训练数据里的真实姓名、地址、电话、邮件被原样复现（Carlini 2021 真的从 GPT-2 提取出了在世个人的联系方式）；② <strong>版权</strong>——逐字复现受版权保护的文本、代码；③ <strong>评测污染</strong>——模型把测试集的答案背了下来，导致基准分数虚高（这正好把本课和前几门能力评测课接上：记忆是数据污染的微观机制）。</p>  <p>记忆化的关键观念是把它<strong>当成一个可测量的量</strong>，而不是一个有/无的开关。Carlini 2021 给了一个分级定义 <span class="term">k-eidetic memorization</span>：一段在训练集中只出现 ≤ k 次、却能被模型逐字复现的字符串。k 越小越触目惊心——<em>只出现一两次就被背下</em>意味着模型在做的远不止 “学习统计规律”。本模块就是要把 “模型记住了多少”“外人能提取多少”“某条数据在不在训练集” 这三个问题，全部变成 numpy 能算出的数字。</p>  <p>为什么记忆几乎<strong>不可避免</strong>？因为训练目标（最大化训练数据的似然）和 “逐字记住训练数据” 在数学上是<em>同向</em>的——把一段文本的概率压到极高，最极端的方式就是把它背下来。模型容量越大、某段数据重复越多、训练越久，这种 “顺手就记住了” 的压力就越强。所以记忆不是 bug，而是<strong>最大似然训练的副产品</strong>；问题不在于 “能不能完全消除”（不能），而在于<strong>如何度量它、评估它能被利用到什么程度、并用代价可控的手段把高风险的那部分压下去</strong>。这正是隐私评测区别于 “我们做了脱敏所以没问题” 这种空头承诺的地方。</p>  <p>还要厘清一个常见混淆：记忆<strong>不等于</strong>过拟合的传统定义。一个在测试集上泛化良好（低泛化误差）的模型，依然可能逐字记住了训练集里成千上万条罕见样本——<em>泛化与记忆可以并存</em>。Feldman 2020 甚至论证：对长尾分布，记住罕见样本是达到最优泛化的<strong>必要</strong>手段。这就埋下了本模块反复出现的张力：有用的记忆（学到知识）与有害的记忆（背下隐私）共享同一套机制，无法靠 “别记那么多” 一刀切，只能靠精细的度量与针对性缓解。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>记忆 = 模型对见过的数据给出反常的高置信（低损失）</strong>。无论是 canary 暴露度、提取攻击，还是成员推断，底层信号都是同一个——<em>见过的样本，损失低得不正常</em>。把这个信号量化、并诚实地评估它能被攻击者利用到什么程度，就是隐私评测的全部。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="canary"><span class="num">2</span>canary 与暴露度</h2>
+  <h3>canary 与暴露度：往训练集里埋探针</h3>  <p>怎么测一个模型 “记住了多少”？最干净的做法是<strong>主动埋探针</strong>。<span class="term">Secret Sharer</span>（Carlini 2019）的思路：往训练语料里插入一条<strong>随机生成、与任何真实数据无关</strong>的唯一字符串，叫 <span class="term">canary</span>（金丝雀，取自矿工用金丝雀探测毒气的典故），例如 <code>The secret code is 8 2 7 3 5 1</code>。训练后看模型对这条 canary 的偏好有多反常——偏好越反常，记得越牢。</p>  <p>怎么量化 “偏好反常”？关键是和一群<strong>同格式的随机候选</strong>比。设 canary 的填空槽有 <em>R</em> 种可能取值（比如 6 位数字就有 $10^6$ 种），把真实 canary 和所有候选按模型给的对数似然（log-likelihood）从高到低排序，真 canary 的名次记作 <span class="term">rank</span>。暴露度定义为：</p>  <div class="math-block">\[\mathrm{exposure}(c) \;=\; \log_2 |R| \;-\; \log_2 \mathrm{rank}(c)\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>如果模型没记住 canary，它对真 canary 和随机候选一视同仁，真 canary 的名次大致落在正中间（$\mathrm{rank}\approx|R|/2$），暴露度 ≈ 1，接近 “纯属偶然”。如果模型把 canary 背得滚瓜烂熟，真 canary 会排到第 1 名（$\mathrm{rank}=1$），暴露度 = $\log_2|R|$ 达到最大。暴露度就是 “这个串被模型偏爱的程度” 的对数尺度。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么取对数？因为 rank 的分布在 “没记住” 时近似均匀，暴露度 $=\log_2|R|-\log_2\mathrm{rank}$ 在零假设下近似服从一个良性分布，使 “暴露度显著高于 $\log_2|R|$ 的一半” 成为一个有统计意义的判据。Carlini 2019 证明暴露度还能换算成 “需要枚举多少候选才能靠模型把 canary 提取出来”，把一个抽象的记忆量直接接到<strong>提取攻击的代价</strong>上。</p></div>
+  </div>  <p>canary 法的精妙之处在于它<strong>绕开了 “真值” 难题</strong>。要测真实 PII 被记住多少很麻烦：你得先知道训练集里有哪些 PII、它们各自重复了几次，而这些往往不可得。canary 则是<em>你自己埋下的、完全受控的探针</em>——你知道它的确切内容、确切插入次数、确切候选空间，于是暴露度成了一个<strong>可校准、可比较</strong>的标准刻度。想知道 “重复 10 次会被记住到什么程度”？埋一条重复 10 次的 canary，量它的暴露度即可。这就是为什么 Secret Sharer 成了记忆审计的事实标准：它把 “模型会不会泄露我的数据” 这种焦虑，变成了一个有受控实验、有数字、可复现的科学问题。</p>  <p>本模块 notebook 会用一个玩具计数模型完整复现：插入一条 canary，构造 $|R|$ 个同格式候选，算每个候选的损失、给真 canary 排名、套上面的公式得到暴露度——并验证 “插入次数越多，暴露度越高” 这条 Carlini 反复观测到的规律。一个实现细节值得留意：完整候选空间 $|R|=10^6$ 太大无法穷举，我们用一批随机候选<em>估计</em> rank（真 canary 在样本中的相对位次按比例放大到 $|R|$），平局对半分，使未记住的 canary 自然落在暴露度 ≈ 1 处——这正是从样本估计总体排名的标准做法。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="extract"><span class="num">3</span>可提取记忆 vs 仅仅记住</h2>
+  <h3>可提取记忆 vs 仅仅记住</h3>  <p>记住不等于<strong>可提取</strong>。<span class="term">extractable memorization</span>（Carlini 2021）要求更强：不仅模型内部编码了这段数据，而且存在一个<strong>现实可行的提示</strong>能把它问出来。这才是攻击者真正能利用、隐私上真正危险的那部分。区分二者很重要——一段被记住但永远问不出来的数据，隐私风险远低于一段随手就能套出来的数据。</p>  <p>Carlini 2021 的提取流程是：用大量种子提示让模型生成，再用一个<strong>成员资格信号</strong>（如极低的困惑度 perplexity、或多个模型 / 多种温度下的一致性）给生成结果打分，挑出最可能是逐字记忆的样本去核对。他们由此从 GPT-2 提取出数百条逐字训练样本，含真实 PII。更惊人的是 Nasr 2023 的<strong>发散攻击</strong>（divergence attack）：让对齐后的 ChatGPT 重复某个词上千次，模型会 “跑飞” 进而吐出训练数据——证明<strong>对齐（alignment）并不消除记忆，只是盖住了入口</strong>。</p>  <p>这里的区分对评测的实际含义是：暴露度（上一节）衡量的是模型<strong>固有</strong>的记忆程度，它不随攻击手段变化、是模型一旦训练好就钉死的属性；而 “能提取多少” 衡量的是<strong>当前攻击</strong>把这份记忆兑现成实际泄露的能力，它会随攻击技术进步而<em>单调上升</em>。两者之间的差，就是 “模型确实记住了、但今天还没人能问出来” 的那部分——它不是安全余量，而是<strong>尚未兑现的风险</strong>。一个负责任的隐私报告必须把这两个数都给出来，并明确：提取攻击给的是<em>下界</em>，明天更强的攻击只会让这个下界往上抬，绝不会往下掉。</p>  <div class="callout warn"><span class="label"></span>
+    <p>评测上的教训：<strong>“我们没提取到” 不等于 “模型没记住”，更不等于 “安全”</strong>。提取是<em>攻击者能力的下界</em>——你的红队没问出来，不代表更强的攻击者问不出来。负责任的隐私评测要同时报告 “记住了多少”（暴露度，模型固有属性）与 “当前攻击能提取多少”（随攻击进步而上升的下界），并把二者的差距视为<strong>未知风险</strong>而非安全余量。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mia"><span class="num">4</span>成员推断攻击（MIA）</h2>
+  <h3>成员推断攻击（MIA）：你在不在训练集？</h3>  <p>隐私的另一条主线是 <span class="term">membership inference attack</span>（成员推断，MIA，Shokri 2017）：给定一条具体样本和对模型的访问权，判断<strong>这条样本是否在模型的训练集中</strong>。它既是攻击，也是<strong>审计工具</strong>——如果攻击成功率显著高于抛硬币，就证明模型泄露了 “谁在训练集里” 这一成员信息。</p>  <p>为什么这是隐私问题？设想一个用 “某医院糖尿病患者病历” 微调的模型。若攻击者能确认 “张三的记录在训练集里”，他就推断出<strong>张三是糖尿病患者</strong>——即使模型从没吐出张三的病历原文。成员资格本身就是敏感信息。MIA 因此是衡量隐私泄露最通用的标尺，也是差分隐私（DP）想要形式化封堵的攻击。</p>  <p>MIA 之所以被当作隐私的<strong>通用度量</strong>，还有一个更深的原因：它是几乎所有隐私威胁的<em>公分母</em>。数据提取要先能区分 “这段是不是训练数据”（本质是成员推断）；属性推断（推出某人的敏感属性）通常以成员推断为前置；连差分隐私的形式化定义，骨子里就是 “限制任何成员推断攻击的成功率”。所以把 MIA 的 ROC 测准，等于给一个模型的隐私泄露上了一把通用的标尺——这也是为什么本模块把它和模块 00 的混淆矩阵基建直接对接：<strong>member / non-member 就是两个类，模型 loss 就是分数，隐私攻击的强弱最终落成一条 ROC 曲线</strong>。</p>  <div class="ascii">成员推断的威胁模型
+
+   攻击者：拿到 目标样本 x + 对模型的查询权（至少能拿到 loss/置信度）
+        │
+        ▼
+   信号：模型在 x 上的 loss（或 perplexity / 置信度）
+        │   见过的样本(member)   → loss 偏低
+        │   没见过(non-member)   → loss 偏高
+        ▼
+   判决：loss &lt; 阈值 ⇒ 判为 member   →  扫阈值画 ROC / 算 AUC
+        │
+        ▼
+   泄露程度：AUC 越高于 0.5、低 FPR 区 TPR 越高，隐私泄露越严重</div>  <p>注意 MIA 与本课模块 00 立下的度量基建完全同构：member / non-member 就是两个 “类”，模型 loss 就是分数，扫阈值就得到 ROC——隐私攻击的成败，落到最后还是一张混淆矩阵。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="loss"><span class="num">5</span>loss 阈值攻击与它的 ROC</h2>
+  <h3>loss 阈值攻击：最简 MIA 与它的 ROC</h3>  <p>最简单的 MIA 是 <span class="term">loss-threshold attack</span>：训练样本上模型损失通常更低（模型见过、拟合过它们），于是规则就是 “<strong>loss 小于阈值 τ 则判为成员</strong>”。这是 MIA 的入门基线，也是理解 “隐私泄露 = 两个损失分布可分离” 的最直观方式。</p>  <p>把成员的损失分布记作 $p_{\mathrm{in}}(\ell)$、非成员的记作 $p_{\mathrm{out}}(\ell)$。扫遍阈值 τ，真阳率与假阳率分别是：</p>  <div class="math-block">\[\mathrm{TPR}(\tau)=\Pr_{\mathrm{in}}[\ell<\tau],\qquad \mathrm{FPR}(\tau)=\Pr_{\mathrm{out}}[\ell<\tau]\]</div>  <p>把 $(\mathrm{FPR}(\tau),\mathrm{TPR}(\tau))$ 连成 ROC 曲线，曲线下面积 <span class="term">AUC</span> 有一个免积分的等价定义（Mann–Whitney 统计量）：随机抽一个成员、一个非成员，成员损失更低（更像成员）的概率。AUC = 0.5 表示攻击毫无信息（完美隐私），越接近 1 泄露越严重。notebook 会用纯 rank 统计从零实现 AUC，不依赖任何库。</p>  <p>这套流程和本课模块 00 立下的度量基建<strong>一模一样</strong>，只是换了语义：把 “成员” 当正类、“非成员” 当负类，把 “loss 越低越像成员” 当分数，扫阈值就得到混淆矩阵、ROC、AUC。换句话说，隐私攻击的成败<em>最终落成一张你已经会算的混淆矩阵</em>——这也是为什么本课坚持先把混淆矩阵基建打牢：公平、毒性、隐私三类看似无关的伦理问题，到了度量层面共用同一套工具。唯一要小心的是<strong>方向</strong>：毒性里分数高代表 “更像正类（有毒）”，而 MIA 里 loss<em>低</em>才代表 “更像成员”，所以实现 AUC 时要把成员性分数取成 $-\ell$，否则 AUC 会算反（得到 $1-\mathrm{AUC}$）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直觉：两个损失分布离得越开，阈值就越能把成员和非成员分开，AUC 越高。模型对训练数据 “过拟合” 得越狠（见过的损失压得越低），这两个分布就拉得越开，隐私泄露越严重。这也解释了为何小数据、多 epoch、大模型更易泄露——它们都加剧了对训练样本的过拟合。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，loss 阈值法假设 $p_{\mathrm{in}}$ 与 $p_{\mathrm{out}}$ 只差一个全局平移，对<em>每条样本一视同仁</em>地用同一个阈值。这正是它的弱点：有些样本天生就好预测（损失低但并非因为被记住），有些天生难（损失高却可能是成员）。下一节的 LiRA 正是冲着这个弱点来的。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="lira"><span class="num">6</span>LiRA：平均 AUC 会骗你</h2>
+  <h3>LiRA：为什么平均 AUC 会骗你</h3>  <p>Carlini 2022（<span class="term">LiRA</span>，Likelihood Ratio Attack）指出旧 MIA 评测的一个致命问题：<strong>用平均 AUC（或平均准确率）汇报攻击，会掩盖真实的隐私风险</strong>。原因是隐私伤害是<strong>个体化</strong>的——攻击者只要能<em>高置信地</em>确认<strong>少数几个人</strong>在训练集里，对那几个人就是灾难，哪怕对其余大多数人攻击都失败、平均 AUC 看起来温和。</p>  <p>正确的度量是看 ROC 的<strong>低假阳率区</strong>：在 FPR = 0.1% 这种 “几乎不冤枉无辜” 的工作点上，TPR 有多高？这才对应 “攻击者敢于断言、且很少出错” 的真实威胁。LiRA 的做法是为<strong>每条样本</strong>训练许多 <span class="term">shadow model</span>（影子模型，模仿目标模型行为的替身），分别在 “该样本是成员 / 非成员” 两种情况下估计其损失分布，再对目标做<strong>似然比检验</strong>。这把 “一刀切的全局阈值” 升级成 “针对每条样本校准的检验”，在低 FPR 区的 TPR 比 loss 阈值法高出几个数量级。</p>  <p>为什么 “每条样本校准” 这么关键？因为 loss 阈值法的隐含假设——所有样本共用一个阈值——对<em>难易不均</em>的样本是灾难性的。一句常见套话（“the cat sat on the mat”）天生 loss 就低，哪怕模型从没见过它；一个罕见的人名地址天生 loss 就高，哪怕模型背得滚瓜烂熟。用全局阈值，前者会被误判成成员（假阳），后者会被漏判（假阴）。LiRA 的破解是<strong>问一个相对的问题</strong>：对<em>这一条具体样本</em>，模型在它上面的 loss，相比 “如果它没被训练过” 的预期 loss，低得是否反常？这个 “与自己的反事实比” 的相对信号，剔除了样本固有难易的干扰，正是它在低 FPR 区碾压全局阈值的原因。本模块 notebook 用一小撮重复多次的罕见样本演示了这个尾部效应的雏形——它们整体 AUC 不高，却在极低 FPR 处被 100% 抓出。</p>  <div class="callout danger"><span class="label">平均数会骗人</span>
+    <p>这是本模块最重要的评测教训，且和模块 04 的精神完全一致：<strong>永远不要用一个平均数下隐私结论</strong>。一个 “平均 AUC = 0.55，看起来还行” 的模型，完全可能在 FPR = 0.1% 处对某些异常样本（罕见姓名、独特病历）有 90% 的 TPR——对那些人隐私已被击穿。报告 MIA 必须给出<strong>对数尺度的 ROC</strong>并明确低 FPR 区的 TPR；只报平均 AUC 是不负责任的，正如模块 01 只报整体准确率会掩盖子群崩盘。</p>
+  </div>  <p>notebook 会在玩具数据上把这一点演示透：构造一小撮 “异常易记” 的样本，显示它们即使在整体 AUC 不高时，也能在极低 FPR 处被高置信识别——亲眼看到平均数如何掩盖尾部风险。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="mitigate"><span class="num">7</span>缓解：去重与差分隐私</h2>
+  <h3>缓解：去重最划算，差分隐私最彻底</h3>  <p>既然记忆是隐私的根源，怎么压它？两条主线，代价与彻底程度不同：</p>  <table>
+    <thead><tr><th>缓解手段</th><th>机制</th><th>代价</th><th>效果</th></tr></thead>
+    <tbody>
+      <tr><td>训练数据去重 deduplication</td><td>删掉语料里重复 / 近重复的文本</td><td>一次性数据清洗，几乎不损能力（反而常提升）</td><td>强：重复次数↓→记忆↓，提取风险大幅下降</td></tr>
+      <tr><td>差分隐私 DP-SGD</td><td>训练时裁剪梯度 + 加噪声，证明性地限制单样本影响</td><td>效用明显下降、训练变慢、超参敏感</td><td>最彻底：对 ε 给出可证明的成员推断上界</td></tr>
+      <tr><td>输出过滤 / n-gram 拦截</td><td>生成时屏蔽与训练集逐字匹配的片段</td><td>只挡逐字复现，绕过容易（改一个词即可）</td><td>弱：治标，应对版权逐字复现尚可</td></tr>
+      <tr><td>早停 / 正则</td><td>减少对训练样本的过拟合</td><td>可能牺牲性能</td><td>中：缩小 in/out 损失分布间隔</td></tr>
+    </tbody>
+  </table>  <p>为什么<strong>去重</strong>被反复强调为 “性价比之王”？因为记忆强烈依赖<strong>重复次数</strong>：Lee 2022、Kandpal 2022、Carlini 2022 一致发现，一段文本在训练集里出现得越多，被逐字记住的概率越高（近似超线性）。去重把高频重复的样本砍到低频，直接掐断最易被提取的那部分记忆——而且去重还顺带提升模型质量（减少对重复内容的过度加权）。<em>一次数据清洗，隐私和性能双赢</em>，这就是为什么它几乎是当前所有大模型训练的标配第一步。</p>  <p>差分隐私（<span class="term">differential privacy</span>）则提供<strong>可证明</strong>的保证：形式上要求 “单条样本的有无，对输出分布的影响被 ε 限制”，从而给成员推断的成功率一个数学上界。代价是 DP-SGD 的噪声会拖累效用、且对长尾、低资源数据伤害更大（又和模块 03 的公平问题缠在一起）。负责任评测要报告的不是 “我们用了 DP”，而是<strong>缓解后的残余风险</strong>：去重后 canary 暴露度降了多少、DP 后 MIA 在低 FPR 区的 TPR 降到哪——这才对部署决策有意义。</p>  <p>把缓解<strong>当成一次评测前后对照</strong>来做，是本模块想留给你的工作流：先在缓解前测一组基线（一批 canary 的暴露度、MIA 的 ROC 尤其低 FPR 区的 TPR），施加缓解（去重 / 早停 / DP），再测同一组指标，报告<strong>下降幅度与残余值</strong>。notebook 的去重实验就是这个工作流的最小版——去重前后各算一次 canary 暴露度，用差值量化缓解的实际效果。这比 “我们采取了隐私保护措施” 这种无法证伪的说法有用得多：<em>一个能写出 “暴露度从 6.4 降到 2.0、残余 MIA AUC 0.52” 的报告，才真正进入了可问责的隐私评测</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>记忆的规模律</strong>：Carlini 2022 给出记忆随模型规模、数据重复次数、上下文长度单调上升的经验规律，但 “多大的模型 + 多少重复 = 多少记忆” 仍缺乏可预测的闭式模型，给隐私审计带来不确定性。</li>
+    <li><strong>提取攻击的天花板</strong>：Nasr 2023 的发散攻击表明对齐模型仍可被提取，攻击仍在快速进步。今天的 “提取不到” 是会过期的安全声明——如何报告一个随时间贬值的风险下界，本身就是开放问题。</li>
+    <li><strong>MIA 的真实威胁标定</strong>：LiRA 之后，社区转向低 FPR 区的 TPR，但不同数据分布、不同访问权限（仅 logits？仅文本？仅 API？）下的可比报告规范尚未统一，使跨论文的隐私结论难以横向比较。</li>
+    <li><strong>记忆 vs 泛化的纠缠</strong>：有用的泛化和有害的记忆共享同一套机制（Feldman 2020），彻底消除记忆可能损害能力。在 “记住有益知识” 与 “背下私密数据” 之间寻找可控权衡，是开放的科学问题。</li>
+    <li><strong>与公平 / 多语的交叉</strong>：DP 的噪声、去重的阈值都对长尾 / 低资源数据更不利——隐私缓解可能加剧模块 01/03 的群体不公。把隐私、公平、效用放进同一张帕累托前沿评测，是社会技术评测的前沿。</li>
+  </ul>  <p>把这一模块的方法论收束成一句话：<strong>隐私不是一个能用 “做了 / 没做” 回答的合规项，而是一组要测量、要报告残余值的连续量</strong>。它和本课其余模块共享同一种评测纪律——不轻信平均数（LiRA 的教训，呼应模块 01 的子群崩盘）、把含混的担忧（“会不会泄露”）翻译成受控可复现的数字（canary 暴露度、MIA 的低 FPR TPR）、并诚实标注这些数字是<em>下界还是上界、固有属性还是当前攻击能力</em>。掌握了这套纪律，你面对任何新的记忆 / 隐私威胁时，第一反应都会是：<em>我能埋什么探针？我该报哪个工作点的什么数？缓解后还剩多少？</em>——而这正是负责任评测科学家与 “走个隐私流程” 的根本区别。</p>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Carlini 2019《The Secret Sharer》（canary 与暴露度，本模块的实现蓝本）、Carlini 2021《Extracting Training Data from LLMs》（提取攻击奠基）、Shokri 2017（MIA 开山）、Carlini 2022《MIA From First Principles》（LiRA，重塑评测标准）、Lee 2022（去重缓解）。完整清单见 <code>references.md</code>。</p>
+  </div>
+  <div class="card"><strong>✅ 本章你应该能回答：</strong>  <ol>
+    <li>k-eidetic memorization 是什么？记忆化为何同时是隐私、版权、评测污染问题？</li>
+    <li>写出 canary 暴露度的定义；“没记住” 与 “完全记住” 分别对应怎样的 rank 与暴露度？</li>
+    <li>可提取记忆与 “仅仅记住” 有何区别？为什么 “我们没提取到” 不能推出 “安全”？</li>
+    <li>loss 阈值 MIA 怎么做？为什么报告平均 AUC 会掩盖真实隐私风险（LiRA 的核心批评）？应该看 ROC 的哪个区域？</li>
+    <li>为什么去重是性价比最高的记忆缓解？差分隐私给出的是什么样的保证、代价是什么？</li>
+  </ol></div>
+
+  <div class="pager">
+    <a class="prev" href="../03_multilingual_eval/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 多语言与跨语言评测</div></a>
+    <a class="next" href="../05_harms_taxonomy/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 危害分类学与社会影响</div></a>
+  </div>
+
+</div>
+</body>
+</html>

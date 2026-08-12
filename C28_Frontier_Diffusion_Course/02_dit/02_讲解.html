@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Diffusion Transformer (DiT)</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · Diffusion Transformer (DiT)</h1>
+  <p class="subtitle">把 latent 切成 patch token、用 Transformer 当去噪骨干 —— patchify、adaLN-zero 条件注入、与 U-Net 的对比、扩散的 scaling law，SD3/Flux/SoRA 的共同大脑</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01、Transformer 与自注意力（C15/C20）、ViT、LayerNorm</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_dit.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Peebles & Xie 2023 (DiT)、ViT、SD3 (MM-DiT)、SoRA 技术报告</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">从 U-Net 到 Transformer 骨干</a></li>
+      <li><a href="#patchify">Patchify：图像变 token 序列</a></li>
+      <li><a href="#timeemb">时间步嵌入：告诉网络现在多噪</a></li>
+      <li><a href="#adaln">adaLN-zero：条件注入核心</a></li>
+      <li><a href="#vsunet">DiT vs U-Net：范式更替</a></li>
+      <li><a href="#scaling">Scaling law：为何成大模型骨干</a></li>
+      <li><a href="#toy">把玩具跑起来：搭一个 DiT block</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>从 U-Net 到 Transformer 骨干</h2>
+  <p>模块 01 把扩散搬进了 latent 空间，但还没碰「去噪网络长什么样」。早期 Stable Diffusion 的去噪骨干是 <span class="term">U-Net</span>——一个带跳跃连接的编码-解码卷积网络，扩散从 DDPM 起就用它。U-Net 有很强的归纳偏置（局部性、平移等变），擅长纹理，在中小规模上效果好。但当人们想把模型<strong>做大、做通用</strong>时，U-Net 暴露了两个短板：<strong>scaling 行为不平滑</strong>（堆大了收益递减、难调），以及<strong>长程依赖弱</strong>（卷积感受野有限，全局结构靠少数注意力层勉强补）。</p>  <p>Peebles & Xie 2023 的 <span class="term">Diffusion Transformer (DiT)</span> 做了一件「显然但有效」的事：<strong>把去噪骨干从卷积 U-Net 整个换成标准 Transformer</strong>。既然 Transformer 在语言、在视觉分类（ViT）上都被证明能随规模平滑变强，为什么不让它当扩散的大脑？DiT 的回答是肯定的——它不仅可行，还揭示了<strong>扩散模型也有干净的 scaling law</strong>：质量随计算量可预测地提升。这一发现直接催生了 SD3、Flux、以及视频模型 SoRA——它们的骨干全是 DiT 的变体。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句话：DiT 把「图像去噪」重新表述成「序列处理」。先把 latent 切成一串小块（token），像处理一句话一样用 Transformer 处理它们，最后拼回去。Transformer 不挑数据类型——文字、图块、视频帧块，只要变成 token 序列，同一套注意力机制都能处理。这种通用性正是它能 scale、能跨模态的根源。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地：DiT 用 <span class="term">patchify</span> 把 <code>H×W×C</code> 的 latent 切成 <code>(H/p)·(W/p)</code> 个 token，走 <code>N</code> 层标准 Transformer block（自注意力 + MLP），用 <span class="term">adaLN</span> 注入时间步与条件，最后 <span class="term">unpatchify</span> 投回 latent 形状。整个网络没有卷积、没有 U-Net 的跳连，就是一个序列模型——但作用在图块上。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么这件「显然」的事直到 2023 才被做对、做火？因为它需要两个前置条件凑齐：① latent 扩散（模块 01）把空间压小，使注意力的 <code>O(n²)</code> 成本可承受；② 一个稳定的条件注入方式（adaLN-zero），让深 Transformer 在扩散这种敏感任务上训得动。DiT 的贡献与其说是「想到用 Transformer」，不如说是<strong>把它真正调稳、并量出 scaling law</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="patchify"><span class="num">2</span>Patchify：图像变 token 序列</h2>
+  <h3>Patchify：把图像变成 token 序列</h3>  <p>Transformer 吃的是 token 序列，而 latent 是 <code>H×W×C</code> 的张量。第一步 <span class="term">patchify</span> 把后者变成前者，做法和 <span class="term">ViT</span> 完全相同：</p>  <ol>
+    <li>把 latent 切成 <code>p×p</code> 的<strong>不重叠小块</strong>（patch）。若 latent 是 <code>32×32×4</code>、<code>p=2</code>，则切出 <code>16×16=256</code> 个块。</li>
+    <li>把每个 <code>p×p×C</code> 的块<strong>展平</strong>成长度 <code>p²·C</code> 的向量。</li>
+    <li>用一个<strong>线性层</strong>把每个展平向量投到 Transformer 的隐藏维 <code>d</code>，得到一个 token。</li>
+    <li>给每个 token 加上<strong>位置嵌入</strong>（标明它在图中的 2D 位置），因为注意力本身对顺序无感。</li>
+  </ol>  <div class="math-block">\[\text{token 数}\;n=\frac{H}{p}\times\frac{W}{p},\qquad \text{每 token 维度}\;d;\qquad \text{patchify}:\ \mathbb{R}^{H\times W\times C}\to\mathbb{R}^{n\times d}\]</div>  <p><strong>patch 大小 </strong><code>p</code><strong> 是核心超参</strong>，它直接决定序列长度 <code>n</code>，从而决定算力：<code>p</code> 越小、token 越多、越精细，但注意力成本按 <code>n²</code> 涨。DiT 论文系统扫了 <code>p∈{2,4,8}</code>：<code>p=2</code> 质量最好但最贵，<code>p=8</code> 便宜但糙。这正是「token 数 = 算力旋钮」的体现，和语言模型里序列长度的地位一样。</p>  <p>输出端有个对称的 <span class="term">unpatchify</span>：网络最后把每个 token 投回 <code>p²·C</code> 维、reshape 成 <code>p×p×C</code> 的块、按位置拼回 <code>H×W×C</code> 的 latent。patchify 进、unpatchify 出，保证去噪网络的输入输出形状一致（都是一个 latent），符合扩散「预测同形状噪声」的要求。这一进一出是 DiT 把「序列模型」套到「图像去噪」上的胶水。</p>  <p>这里藏着一个深刻的对比，呼应模块 01 的算力账。卷积的成本随像素数<strong>线性</strong>增长，而自注意力随 token 数<strong>平方</strong>增长。所以「把图切成多少 token」对 Transformer 骨干是生死攸关的——这也是为什么 DiT 几乎只在 latent 空间用（token 已经少了几十倍），且 patch 不能太小。换句话说，patchify 不只是「把图喂进 Transformer 的格式转换」，它还是<em>控制注意力爆炸的闸门</em>：<code>p</code> 把 <code>H×W</code> 个像素位置压成 <code>(H/p)(W/p)</code> 个 token，注意力成本随之降 <code>p⁴</code> 倍。理解这一点，才理解 DiT 设计里每个超参背后的算力权衡。</p>  <div class="callout warn"><span class="label"></span>
+    <p>位置嵌入不是可选项。把图切成 token 后，序列里 token 的顺序是人为拉平的，注意力<em>看不出</em>哪个块在左上、哪个在右下——若不加位置信息，模型会把图当成一袋无序的块，生成全是乱的。DiT 用固定的 2D 正弦位置编码（不学习），ViT 多用可学习的。本质都是<strong>把空间结构显式注入到本无空间概念的注意力里</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="timeemb"><span class="num">3</span>时间步嵌入：告诉网络现在多噪</h2>
+  <h3>时间步嵌入：让网络知道「现在多噪」</h3>  <p>扩散去噪网络是<strong>同一套权重处理所有噪声级别</strong>的：第 1 步（几乎纯噪声）和第 999 步（几乎干净）都用它。所以网络必须知道「现在是第几步、噪声有多大」，否则无从下手。这个信息通过 <span class="term">时间步嵌入</span> 注入。</p>  <p>做法和 Transformer 的位置编码同源：把标量时间步 <code>t</code> 先用<strong>正弦编码</strong>映射成一个高维向量（不同频率的 sin/cos），再过一个小 MLP 得到时间步嵌入 <code>emb_t∈R^d</code>。正弦编码的好处是：它把一个标量平滑地展开成多尺度的特征，让网络既能分辨相邻步（高频分量），又能感知大范围的噪声趋势（低频分量）。</p>  <div class="math-block">\[\text{PE}(t)_{2i}=\sin\!\Big(\frac{t}{10000^{2i/d}}\Big),\quad \text{PE}(t)_{2i+1}=\cos\!\Big(\frac{t}{10000^{2i/d}}\Big);\qquad \text{emb}_t=\text{MLP}(\text{PE}(t))\]</div>  <p>如果有额外条件（类别标签、文本），通常也编码成一个向量 <code>emb_c</code>，与时间步嵌入<strong>相加或拼接</strong>成一个统一的「条件向量」<code>c = emb_t + emb_c</code>。DiT 的关键设计是：这个条件向量<em>不</em>作为额外 token 塞进序列（那样会增加序列长度、且注入方式生硬），而是通过下一节的 <strong>adaLN</strong> 去调制每一层——这是 DiT 区别于「把条件当 token」的 U-ViT 等方案的核心选择。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把时间步嵌入想成给网络的「闹钟」：它告诉网络现在几点（去噪进行到哪一步），网络据此调整行为——早期（高噪）专注勾勒大轮廓，后期（低噪）专注修细节。没有这个闹钟，同一套权重不知道该粗画还是细修，必然学不好。所有扩散骨干（U-Net 也一样）都有时间步嵌入，DiT 只是把它和条件合并、经 adaLN 注入。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="adaln"><span class="num">4</span>adaLN-zero：条件注入核心</h2>
+  <h3>adaLN-zero：DiT 的条件注入核心</h3>  <p>这是 DiT 最关键、也最该理解的设计。问题是：怎么把条件向量 <code>c</code>（时间步 + 类别/文本）注入 Transformer 的每一层？DiT 的答案是 <span class="term">adaptive normalization (AdaLN)</span>——用条件去<strong>调制归一化层的缩放和平移</strong>。</p>  <p>标准 LayerNorm 是 <code>LN(h)=γ·norm(h)+β</code>，其中 <code>γ,β</code> 是学到的固定参数。AdaLN 把它们改成<strong>由条件向量预测</strong>的：<code>γ,β = MLP(c)</code>。于是每一层的归一化行为都随当前时间步与条件<em>动态变化</em>——这是一种轻量却强大的条件注入（FiLM 思想：feature-wise linear modulation）。DiT 进一步对每个 block 的注意力和 MLP 子层各预测一组 <code>(γ,β)</code>，还额外预测一个<strong>残差缩放系数</strong> <code>α</code>：</p>  <div class="math-block">\[h \leftarrow h + \alpha_1\cdot\text{Attn}\big(\gamma_1\!\odot\!\text{norm}(h)+\beta_1\big),\qquad h \leftarrow h + \alpha_2\cdot\text{MLP}\big(\gamma_2\!\odot\!\text{norm}(h)+\beta_2\big)\]</div>  <p>现在到 <strong>adaLN-zero</strong> 这个画龙点睛之笔：<strong>把残差缩放 </strong><code>α</code><strong> 的预测层初始化为零</strong>，使训练一开始每个 block 的 <code>α≈0</code>，于是 <code>h ← h + 0 = h</code>——<strong>每个 block 初始就是恒等映射</strong>。整个 DiT 一开始等价于「什么都不做」，再从这个干净起点逐渐学会贡献。这个技巧（借鉴自 ResNet 的 zero-init 残差、GAN 的 zero-init）让<em>非常深的 DiT 也能稳定训练</em>，是 DiT 能 scale 到几十层的关键。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>通俗讲：adaLN-zero 让网络「先安静，再发言」。如果一开始每层都乱调归一化，深网络的信号会被搅乱、训练发散。让每层从「恒等（不干扰）」起步，再慢慢学着调制，就像新员工先观察再插手，稳得多。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地：zero-init 残差使初始输出方差不随深度累积爆炸（每层贡献从 0 开始），梯度也更干净。它把「深度」从训练负担变成可用容量，配合 Transformer 的残差结构，是 DiT 论文中<em>唯一</em>让训练稳定性显著提升的架构选择（他们对比过 in-context、cross-attention、adaLN、adaLN-zero，后者明显最好）。</p></div>
+  </div>  <div class="callout danger"><span class="label">zero-init 的威力</span>
+    <p>别小看「初始化成零」这个细节。DiT 论文的消融实验显示：同样的 adaLN，零初始化 vs 普通初始化，FID 差距巨大。这类「让模块初始为恒等」的 zero-init 技巧在现代深度模型里反复出现（LoRA 的 B 矩阵零初始、各种残差适配器）——记住这个模式，它远比看起来重要。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="vsunet"><span class="num">5</span>DiT vs U-Net：范式更替</h2>
+  <h3>DiT vs U-Net：一次范式更替</h3>  <p>把 DiT 和 U-Net 正面对比，看清这次骨干更替换来了什么、代价是什么：</p>  <table>
+    <thead><tr><th>维度</th><th>U-Net（SD1/2）</th><th>DiT（SD3/Flux/SoRA）</th></tr></thead>
+    <tbody>
+      <tr><td>基本算子</td><td>卷积 + 少量注意力</td><td>纯注意力 + MLP</td></tr>
+      <tr><td>归纳偏置</td><td><strong>强</strong>（局部性、平移等变）</td><td><strong>弱</strong>（几乎无空间先验）</td></tr>
+      <tr><td>长程依赖</td><td>靠少数注意力层勉强补</td><td><strong>天生全局</strong>（每层全连接注意力）</td></tr>
+      <tr><td>条件注入</td><td>cross-attention（文本）</td><td><strong>adaLN-zero</strong>（时间步/类别）</td></tr>
+      <tr><td>scaling 行为</td><td>堆大收益递减、难调</td><td><strong>平滑可预测</strong>（有 scaling law）</td></tr>
+      <tr><td>小数据 / 小模型</td><td>更省、更稳</td><td>需更多数据才发力</td></tr>
+      <tr><td>算力瓶颈</td><td>卷积为主</td><td>注意力 <code>O(n²)</code>，靠 latent 化压</td></tr>
+    </tbody>
+  </table>  <p>核心权衡是<strong>归纳偏置 vs 可扩展性</strong>。U-Net 的卷积自带「图像是局部的、平移不变的」先验，小数据下这是免费的好处——不用从数据里学这些规律。但先验也是<em>枷锁</em>：它限制了模型能表达的函数，大数据下反而拖后腿。Transformer 偏置弱、几乎从零学一切，小数据下吃亏，但<strong>数据和规模一上来，它能学到比人手设计的先验更好的规律</strong>——这正是「大数据下弱偏置胜出」的 bitter lesson 在扩散骨干上的复现。</p>  <p>这也解释了为什么 DiT 几乎总和 latent 扩散（模块 01）绑定出现：DiT 的注意力是 <code>O(n²)</code> 的，在像素空间 token 数爆炸、算不动；搬进 latent 后 token 数降几十倍，注意力才可承受。<strong>latent 化让 DiT 可行，DiT 又让扩散能 scale</strong>——两者是相互成就的前沿组合，合起来就是 SD3/Flux 的基本盘。</p>  <p>还有一个常被问到的实务点：DiT 丢掉了 U-Net 标志性的「跳跃连接」，会不会丢失多尺度信息？答案是<strong>不会，因为机制不同</strong>。U-Net 需要跳连，是因为卷积下采样会逐层丢失空间分辨率，必须用跳连把高分辨率特征「接力」到解码端。而 DiT<em>从不下采样</em>——所有 token 自始至终保持同一分辨率、每层都能通过全局注意力直接访问任意位置，多尺度信息天然保留在序列里，无需跳连补救。这是「卷积金字塔」与「等分辨率 Transformer」两种范式的根本差异：前者靠层级结构 + 跳连传递信息，后者靠全局注意力一步到位。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>不必把这看成「DiT 全面碾压 U-Net」。在小数据、小算力、或强结构先验有用的场景（如医学影像），U-Net 仍可能更优。DiT 的胜出是<strong>在「大数据 + 大算力 + 追求通用」这个前沿设定下</strong>的——而这恰好是领先实验室所处的设定。选骨干和选别的架构一样，看的是你的数据与算力规模。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="scaling"><span class="num">6</span>Scaling law：为何成大模型骨干</h2>
+  <h3>Scaling law：DiT 为何成为大模型骨干</h3>  <p>DiT 论文最有影响力的结果，不是「Transformer 能当扩散骨干」，而是<strong>扩散模型有干净的 scaling law</strong>：生成质量（FID）随模型计算量（Gflops）平滑、可预测地下降。</p>  <p>Peebles 用一个统一的「计算量」指标（由深度、宽度、patch 数共同决定的每次前向 Gflops）横扫了不同大小的 DiT，发现：<strong>不管你用什么方式增加计算</strong>（加深、加宽、减小 patch 增加 token），只要总 Gflops 上去了，FID 就跟着降，且不同配置几乎落在<em>同一条曲线</em>上。这意味着扩散和语言模型一样，进入了「<strong>可预测地花钱买质量</strong>」的时代——这对工业界是巨大的吸引力。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>通俗讲：scaling law 把「炼丹」变成了「投资」。以前堆大模型像赌博，不知道值不值；有了 scaling law，你能预测「再花 2 倍算力，FID 大概降到多少」，从而理性地决定投多少。这种可预测性，是 DiT 取代 U-Net 成为大模型骨干的<strong>商业理由</strong>（不只是技术理由）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地：U-Net 不是不能 scale，而是它的 scaling 不如 Transformer 平滑、各组件（深度/宽度/分辨率）耦合、最优配置难找。Transformer 的均匀结构（堆同样的 block）让 scaling 干净——这与语言模型的经验一致，也是为什么「把成功的 Transformer scaling 经验搬到扩散」如此自然且有效。</p></div>
+  </div>  <p>这条 scaling law 直接通往 <strong>SoRA</strong>。视频是图像的时间堆叠，token 数更多、算力需求更大——正是 scaling 友好的骨干才扛得住。SoRA 把 DiT 的 2D patch 推广成<strong>时空 patch</strong>（把视频切成时空小立方体当 token），用同一套「patchify + Transformer + scaling」的配方，把图像生成的成功复制到视频。<em>没有 DiT 的 scaling 论证，就不会有 SoRA 这种「大力出奇迹」的视频模型</em>——这是模块 02 影响力的最佳注脚。</p>  <p>把这条线索拉到本课全局：scaling law 之所以重要，是因为它把「该不该换骨干」从审美之争变成了<strong>可量化的工程决策</strong>。U-Net 时代，提升质量靠各种手工技巧（更好的注意力位置、更巧的跳连），收益难预测、不可复制；DiT 时代，提升质量主要靠<em>加算力</em>，路径清晰、可投资。这正是为什么短短两年内，几乎所有领先实验室都把骨干切换到了 DiT——不是因为它在小基准上分数更高，而是因为它给出了<strong>一条可预测地通往更强模型的路</strong>。这也是本课反复强调「前沿」二字的含义：前沿不只是更好的结果，更是更可扩展的方法。</p>  <div class="callout paper"><span class="label"></span>
+    <p>DiT 还有个多模态变体 <span class="term">MM-DiT</span>（SD3 用）：把图像 token 和文本 token 拼在一起做<strong>联合双流注意力</strong>，让文本和图像深度互相 attend，比 U-Net 时代单向的 cross-attention 对齐更好。这是模块 04（可控生成）的架构基础之一。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="toy"><span class="num">7</span>把玩具跑起来：搭一个 DiT block</h2>
+  <h3>把玩具跑起来：从零搭一个 DiT block</h3>  <p>配套 notebook 用纯 numpy 把 DiT 的每个零件从零搭出来，在一个<strong>玩具小图</strong>（如 8×8×3 的张量当 latent）上验证：</p>  <ol>
+    <li><strong>patchify / unpatchify</strong>：把小图切块、展平、投影成 token 序列，再逆回去。验证 <code>unpatchify(patchify(x))</code> 形状还原、且线性投影可逆时数值还原。</li>
+    <li><strong>正弦时间步嵌入</strong>：实现多频 sin/cos 编码，验证不同 <code>t</code> 得到不同嵌入、且相近 <code>t</code> 嵌入也相近（平滑）。</li>
+    <li><strong>adaLN 调制</strong>：用条件向量预测 <code>γ,β,α</code>，验证 <strong>adaLN-zero 初始时 block 是恒等映射</strong>（最关键的性质）。</li>
+    <li><strong>一个完整 DiT block</strong>：自注意力（从零实现）+ adaLN + 残差，跑一遍前向，验证形状一致、且 zero-init 时输出 == 输入。</li>
+  </ol>  <p>通过这个玩具，你会亲手确认本模块的核心论点：<strong>图像能被无损地序列化成 token 再拼回</strong>（patchify 对拍）、<strong>时间步被平滑编码</strong>（嵌入连续性）、以及最重要的——<strong>adaLN-zero 让深 DiT 从恒等起步</strong>（零初始化时整个 block 输出等于输入，对拍 <code>atol</code> 级一致）。这些都是真实 DiT 稳定可 scale 的根基。</p>  <div class="callout paper"><span class="label"></span>
+    <p>notebook 的注意力和 MLP 是玩具实现（小维度、不训练），但 patchify、adaLN-zero、时间步嵌入的逻辑与真实 DiT 逐行对应。想深入直接读 Peebles & Xie 2023 (DiT) 与其官方代码 <code>DiT/models.py</code>，以及 SD3 的 MM-DiT。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>更高效的注意力</strong>：DiT 的 <code>O(n²)</code> 注意力在高分辨率/视频上仍是瓶颈。线性注意力、窗口注意力、token 合并/剪枝、以及把 FlashAttention（C36/C08）用上，都是让 DiT 扩到更大序列的活跃方向。</li>
+    <li><strong>条件注入的演化</strong>：从 adaLN（DiT）到 MM-DiT 的联合注意力（SD3），条件注入仍在演化。如何最高效地融合文本/图像/多模态条件，是当前架构竞争的焦点。</li>
+    <li><strong>DiT 的 scaling 极限</strong>：图像 DiT 的 scaling law 已较清楚，但视频/3D/多模态的 scaling 行为、最优 patch 与深宽比配比，仍在摸索。SoRA 之后这是最热的方向。</li>
+    <li><strong>架构与目标的协同</strong>：DiT 骨干 + flow matching 目标（模块 03）+ 少步蒸馏（模块 05）的组合，哪种搭配最优？SD3 给了一组答案，但设计空间远未穷尽。</li>
+    <li><strong>统一的生成骨干</strong>：能否用一个 DiT 同时做图像、视频、音频、甚至跨模态生成？「一切皆 token + 一个大 Transformer」的愿景正在被推进，DiT 是其图像/视频侧的承载，与语言模型的 Transformer 在底层架构上正在收敛。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Peebles & Xie 2023《Scalable Diffusion Models with Transformers (DiT)》（骨干 + adaLN-zero + scaling law）；进阶看 SD3《Scaling Rectified Flow Transformers》（MM-DiT）、ViT（patchify 来源）、SoRA 技术报告（时空 DiT）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_latent_diffusion/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · Latent Diffusion 与 Stable Diffusion</div></a>
+    <a class="next" href="../03_flow_matching/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · Flow Matching 与 Rectified Flow</div></a>
+  </div>
+
+</div>
+</body>
+</html>

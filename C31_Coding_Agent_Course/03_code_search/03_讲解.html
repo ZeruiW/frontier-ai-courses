@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 代码导航</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 代码导航</h1>
+  <p class="subtitle">agent 的眼 —— grep(正则搜内容) + glob(搜文件名) + ripgrep 式智能遍历(滤 gitignore/二进制) + 符号搜索(直达定义) + 相关性排序与上下文行；让 agent 在大仓库里用最少 token 看见最相关的代码，找对「该改哪」</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–02、Python re/glob/os.walk、正则基础、一点 ast 更佳</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_code_search.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">SWE-agent (ACI)、ripgrep 设计、aider repo map、re/glob/ast 文档</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#eyes">代码导航：agent 的眼</a></li>
+      <li><a href="#grep">grep：按正则搜内容</a></li>
+      <li><a href="#glob">glob：按文件名搜</a></li>
+      <li><a href="#walk">智能遍历：滤掉噪音</a></li>
+      <li><a href="#symbol">符号搜索：直达定义</a></li>
+      <li><a href="#rank">相关性排序与上下文行</a></li>
+      <li><a href="#assemble">拼成 agent 的眼</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eyes"><span class="num">1</span>代码导航：agent 的眼</h2>
+  <p>模块 01、02 给了 agent 手和脚。但一个真实代码库有成百上千个文件、几十万行代码——agent 拿到一句「修复登录时的空指针 bug」，第一个、也是最关键的问题是：<strong>到底该改哪个文件、哪一行？</strong>它不可能把整个仓库都塞进上下文窗口去读。它需要一双<strong>眼睛</strong>——能在海量代码里<em>快速定位</em>到相关位置的能力。这就是<strong>代码导航</strong>（代码搜索）。</p>  <p>代码导航解决的是 agent 工作流里<strong>最被低估、却最决定成败</strong>的一步。SWE-agent 的研究反复表明：agent 失败，往往不是不会改，而是<strong>没找对地方</strong>——它在错误的文件上瞎忙，或根本没看到真正相关的代码。把「在哪改」这一步做好，等于给后面的「怎么改」（模块 04/05）喂对了料；做砸了，再聪明的编辑也是缘木求鱼。</p>  <p>代码导航有两件互补的基本工具：<strong>grep</strong>（按<em>内容</em>搜——「哪里用到了 <code>login</code> 这个函数」）和 <strong>glob</strong>（按<em>文件名</em>搜——「项目里有哪些 <code>*.py</code>」）。在它们之上，还要叠三层让搜索<strong>对 agent 真正有用</strong>的能力：像 <span class="term">ripgrep</span> 那样<strong>智能遍历</strong>（跳过 .gitignore、二进制、隐藏目录）、<strong>符号搜索</strong>（直接定位函数/类的<em>定义处</em>而非所有出现）、以及<strong>相关性排序 + 上下文行</strong>（把最可能相关的结果、连同周边代码，排在前面喂给 LLM）。本模块把这五样从零写出来。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>agent 不能整库通读，它靠搜索来「看见」代码。grep 搜内容、glob 搜文件名；智能遍历滤掉噪音、符号搜索直达定义、相关性排序把对的结果排前面——目标是用最少的 token，让 LLM 看见最相关的代码</strong>。搜索质量 = agent 的视力。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="grep"><span class="num">2</span>grep：按正则搜内容</h2>
+  <h3>grep：按正则在内容里搜</h3>  <p>grep 是代码搜索的主力：给一个<strong>正则表达式</strong>（或一个字面字符串），在文件内容里<strong>逐行</strong>找匹配，返回命中的 <code>文件:行号:该行内容</code>。Python 标准库的 <code>re</code> 模块提供正则引擎，遍历文件逐行 <code>re.search</code> 即可实现。它回答 agent 最常问的问题：「<code>login</code> 这个名字在哪里出现过？」「谁调用了这个 API？」</p>  <pre><code>import re, os
+def grep(work, pattern, files):
+    '''在给定文件里逐行搜 pattern，返回 [(path, lineno, line), ...]。'''
+    rx = re.compile(pattern)
+    hits = []
+    for path in files:
+        full = os.path.join(work, path)
+        for i, line in enumerate(open(full, encoding='utf-8', errors='replace'), 1):
+            if rx.search(line):
+                hits.append((path, i, line.rstrip('\n')))
+    return hits</code></pre>  <p>有一个<strong>生死攸关的安全细节</strong>：当你要搜的是一个<em>字面字符串</em>（比如用户给的 <code>a.b[0]</code>），而不是正则时，必须先用 <code>re.escape</code> 转义它。否则其中的 <code>.</code>、<code>[</code>、<code>*</code> 等会被当成正则元字符——<code>a.b</code> 会匹配 <code>axb</code>、<code>[0]</code> 会被当成字符集，搜出一堆牛头不对马嘴的结果，甚至因非法正则（如未闭合的 <code>(</code>）直接抛异常。<strong>「把输入当字面量搜」和「把输入当正则搜」是两种模式，必须分清</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>grep 就像在一摞文件里用「查找」功能找一个词——但它更强：能用通配/模式（正则）找「所有形如 X 的东西」。agent 靠它把「我想找跟登录有关的代码」变成一次精确的、能列出所有命中位置的检索。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，grep 是把一个<strong>正则语言</strong>里的模式，在文本的每一行上做<strong>成员判定</strong>（这行是否含一个匹配该模式的子串）。正则的表达力（字符类、量词、分组、锚点）让它能精确刻画「函数定义」「特定调用形式」等结构性模式。但正则不懂语法——它看到的只是字符流，这也是它的局限（第 5 节的符号搜索会部分弥补）。<strong>用户输入是字面量时务必 re.escape</strong>，是把「数据」和「代码（模式）」分开的安全纪律，和 SQL 注入、shell 注入同理。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>两个 grep 常见坑：① 不转义字面量（上面说的），把数据误当模式；② 用 <code>errors='replace'</code> 或先做二进制检测来兜住非 UTF-8 文件——直接 <code>open().read()</code> 碰到二进制或异常编码会抛 <code>UnicodeDecodeError</code> 崩掉整个搜索。给 agent 用的工具要<strong>对脏数据健壮</strong>：一个文件读不了，跳过它、继续搜其余的，而不是整体失败。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="glob"><span class="num">3</span>glob：按文件名搜</h2>
+  <h3>glob：按文件名/路径模式搜</h3>  <p>grep 搜内容，glob 搜<strong>文件名</strong>。它用通配符匹配路径：<code>*</code> 匹配任意字符（不含路径分隔符）、<code>?</code> 匹配单个字符、<code>**</code> 递归匹配任意层目录。<code>**/*.py</code> 就是「任意子目录下所有 .py 文件」。它回答：「这个项目有哪些 Python 文件？」「测试都放在哪？」——是 agent<strong>建立仓库全局观</strong>的第一步。</p>  <pre><code>import glob, os
+def glob_files(work, pattern):
+    '''按通配模式列出工作区里的文件（相对路径）。'''
+    full_pattern = os.path.join(work, pattern)
+    matches = glob.glob(full_pattern, recursive=True)   # ** 需 recursive=True
+    # 转回相对工作区的路径，且只保留文件
+    return sorted(os.path.relpath(m, work) for m in matches if os.path.isfile(m))</code></pre>  <p>grep 和 glob 是<strong>互补</strong>的，常常配合使用：先用 glob 圈定<em>搜索范围</em>（比如「只搜 <code>src/**/*.py</code>，别碰测试和文档」），再用 grep 在这个范围内搜内容。这种「先缩范围、再搜内容」的组合，既快（不扫无关文件）又准（结果不被噪音稀释）。一个成熟的代码搜索工具，往往把两者揉成一个接口：<code>search(pattern, include='*.py', exclude='test_*')</code>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>如果 grep 是「在文件里找词」，glob 就是「按名字找文件」。你想看「所有配置文件」用 glob（<code>**/*.cfg</code>），你想看「哪里读了这个配置项」用 grep。两者一个管<em>文件层</em>、一个管<em>内容层</em>，合起来 agent 才能既见树木又见森林。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，glob 是在<strong>路径的字符串空间</strong>上做模式匹配，其通配语法是正则的一个<em>受限子集</em>（专为文件名设计，如 <code>*</code> 不跨 <code>/</code>）。<code>**</code> 的递归语义让它能表达「任意深度」。它与 grep 的分工——<strong>一个匹配路径、一个匹配内容</strong>——对应文件系统的两个正交维度：在哪（路径）与是什么（内容）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>glob 还是 agent<strong>不迷路</strong>的关键。面对陌生仓库，agent 的第一步常是 <code>glob('**/*.py')</code> 看看代码长什么样、<code>glob('**/test_*.py')</code> 找到测试在哪、<code>glob('**/README*')</code> 找文档。这相当于先拿到一张<strong>地图</strong>，再决定往哪走——比一头扎进单个文件高效得多。aider 的 repo map 就是这个思路的升级版。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="walk"><span class="num">4</span>智能遍历：滤掉噪音</h2>
+  <h3>智能遍历：像 ripgrep 那样滤掉噪音</h3>  <p>朴素的「遍历所有文件」对 agent 是个灾难。一个真实仓库里塞满了<strong>你不想搜的东西</strong>：<code>node_modules/</code>（几万个依赖文件）、<code>__pycache__/</code>、<code>.git/</code>、构建产物 <code>dist/</code>、虚拟环境 <code>.venv/</code>、还有图片/二进制。搜到这些不仅<strong>慢</strong>（多扫几十倍文件），更糟的是<strong>用噪音淹没信号</strong>——LLM 在几百条来自 <code>node_modules</code> 的命中里，根本看不到那一条真正相关的。</p>  <p>现代搜索工具 <span class="term">ripgrep</span> 的杀手锏正是<strong>默认就聪明</strong>：它自动遵守 <code>.gitignore</code>、跳过隐藏文件/目录、跳过二进制文件。我们用标准库模拟这套行为——遍历时<strong>剪枝</strong>（不进忽略的目录）、<strong>过滤</strong>（跳过二进制和忽略的文件）：</p>  <pre><code>def walk_code(work, ignore_dirs={'.git','__pycache__','node_modules','.venv','dist'}):
+    '''遍历工作区，跳过忽略目录、隐藏目录、二进制文件，产出可搜的文本文件相对路径。'''
+    for root, dirs, files in os.walk(work):
+        # 原地修改 dirs 来剪枝：不递归进这些目录（os.walk 的关键技巧）
+        dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith('.')]
+        for fn in files:
+            if fn.startswith('.'):
+                continue
+            full = os.path.join(root, fn)
+            if is_binary(full):                     # 跳过二进制（见下）
+                continue
+            yield os.path.relpath(full, work)
+
+def is_binary(path, chunk=1024):
+    '''粗判二进制：前 1KB 含 NUL 字节即认为是二进制。'''
+    with open(path, 'rb') as f:
+        return b'\x00' in f.read(chunk)</code></pre>  <p>两个实现要点。其一，<strong>原地修改 &lt;code&gt;dirs[:]&lt;/code&gt;</strong> 是 <code>os.walk</code> 的经典技巧：<code>os.walk</code> 会接着遍历 <code>dirs</code> 列表里的子目录，把不想进的目录从这个列表里<em>删掉</em>（必须用切片赋值 <code>dirs[:]=...</code> 原地改，而非重新绑定 <code>dirs=...</code>），就能<strong>整棵子树剪掉、根本不进去</strong>——比进去再过滤快得多。其二，<strong>二进制检测</strong>用「前若干字节是否含 NUL 字节（<code>\x00</code>）」这个简单而有效的启发式：文本文件几乎不含 NUL，可执行文件、图片则常含。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>智能遍历的本质是<strong>把领域知识编进工具</strong>：「依赖目录、构建产物、二进制不值得搜」这条人人都懂的常识，被固化成默认行为，于是 agent 不必每次都琢磨「该搜哪、别搜哪」。这正是 ripgrep 比裸 grep 好用的原因，也是 ACI 设计的精髓——<strong>把对的默认行为做进工具，让 LLM 少做无谓决策、少被噪音干扰</strong>。好工具替你（和 LLM）想好了常见情况。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="symbol"><span class="num">5</span>符号搜索：直达定义</h2>
+  <h3>符号搜索：直达定义，而非所有出现</h3>  <p>grep 搜 <code>login</code> 会返回<strong>所有</strong>出现——定义、调用、注释、字符串里的、变量名里的……几十上百条。但 agent 常常想要的是一个更精确的问题：「<code>login</code> 这个函数/类是在<strong>哪里定义</strong>的？」这就是<strong>符号搜索</strong>。</p>  <p>最轻量的实现：用<strong>针对定义的正则</strong>。在 Python 里，函数定义形如 <code>def login(</code>、类定义形如 <code>class Login</code>——给这些模式专门写正则，就能从一堆出现里挑出<em>定义处</em>：</p>  <pre><code>def find_definition(work, name, files):
+    '''找符号 name 的定义处（Python 的 def/class）。'''
+    # \b 词边界确保精确匹配名字；def/class 后必跟该名字
+    pat = re.compile(rf'^\s*(def|class)\s+{re.escape(name)}\b')
+    hits = []
+    for path in files:
+        for i, line in enumerate(open(os.path.join(work, path), encoding='utf-8', errors='replace'), 1):
+            if pat.search(line):
+                hits.append((path, i, line.strip()))
+    return hits</code></pre>  <p>正则法简单够用，但有天花板：它不懂作用域、不懂导入、会漏掉动态定义、也分不清同名的不同符号。<strong>更精确的符号搜索靠 AST</strong>（抽象语法树）：Python 的 <code>ast</code> 模块能把源码解析成结构化的树，遍历它就能可靠地找出所有 <code>FunctionDef</code>、<code>ClassDef</code> 节点及其精确行号，甚至区分方法与顶层函数、处理嵌套。再往上是 <span class="term">ctags</span> / <span class="term">LSP</span>（语言服务器协议）——IDE 用的那套，能跨文件做「跳转到定义」「找所有引用」「重命名」。本课用正则 + 略提 AST，让你理解这条精度阶梯。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>grep 像在书里找一个词的所有出现，符号搜索像直接翻到「这个词的词条定义」。agent 想理解 <code>login</code> 是什么、怎么工作的，最快的路不是看它被调用的 50 个地方，而是直接跳到它<em>被定义</em>的那一处去读实现。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，符号搜索是在代码的<strong>结构</strong>（而非纯文本）上查询。正则法是用文本模式<em>近似</em>结构（<code>^\s*def\s+name</code> 近似「函数定义」），简单但脆弱；AST 法是在真正的语法树上做精确查询，健壮但需要语言专属的解析器。这条「文本近似 → 语法精确」的光谱，对应着代码工具从 grep 到 LSP 的演进。<code>\b</code> 词边界是正则法的关键——它防止 <code>login</code> 误匹配 <code>login_v2</code> 或 <code>relogin</code>。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>现实参照：aider 用 tree-sitter（一种增量解析器）从代码里抽取符号、构建喂给模型的 repo map；很多 agent 把 ctags/LSP 接进来做精确跳转。本节的正则法是这条路的入门级——理解它，你就懂了为什么「结构化地看代码」比「纯文本搜」更强。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rank"><span class="num">6</span>相关性排序与上下文行</h2>
+  <h3>相关性排序与上下文行：把对的结果喂给 LLM</h3>  <p>搜索的最后一关，是面对<strong>命中太多</strong>时怎么办。一次 grep 可能返回 80 条命中，但 LLM 的上下文窗口装不下、也不该装下全部——你得<strong>排序</strong>，把<em>最可能相关</em>的排在前面，只把前若干条喂给它。排序质量，直接决定 LLM 看到的是金子还是沙子。</p>  <p>怎么给一条命中打<strong>相关性分</strong>？常见信号有：</p>  <table>
+    <thead><tr><th>信号</th><th>为什么相关</th><th>打分倾向</th></tr></thead>
+    <tbody>
+      <tr><td>是定义处（def/class）</td><td>定义比调用更可能是要找/要改的核心</td><td>大幅加分</td></tr>
+      <tr><td>文件名/路径含查询词</td><td><code>login.py</code> 里搜 login，比随便某文件更相关</td><td>加分</td></tr>
+      <tr><td>命中密度高</td><td>一个文件里命中越多，越可能是相关模块</td><td>加分</td></tr>
+      <tr><td>在测试/文档目录</td><td>搜实现 bug 时，测试/注释里的命中优先级低</td><td>减分</td></tr>
+      <tr><td>路径越浅</td><td>顶层模块常比深层工具更核心</td><td>略加分</td></tr>
+    </tbody>
+  </table>  <pre><code>def score_hit(path, lineno, line, query):
+    s = 0.0
+    if re.search(rf'^\s*(def|class)\s+{re.escape(query)}\b', line): s += 10   # 定义处
+    if query.lower() in os.path.basename(path).lower():               s += 3    # 文件名含词
+    if '/test' in path or path.startswith('test') or 'docs/' in path: s -= 2    # 测试/文档降权
+    s -= path.count('/') * 0.1                                                  # 越深略降
+    return s
+
+def search_ranked(work, query, files, top=10, context=2):
+    hits = grep(work, re.escape(query), files)
+    ranked = sorted(hits, key=lambda h: score_hit(h[0], h[1], h[2], query), reverse=True)
+    return ranked[:top]      # 只取最相关的前 top 条</code></pre>  <p>光有排序还不够，还要给每条命中配上<strong>上下文行</strong>（context lines）——命中行的前后各若干行，就像 <code>grep -C 3</code>。因为孤零零一行 <code>return self.login(user)</code> 对 LLM 信息量有限，但带上前后几行（这是哪个函数、传了什么、附近还有什么），它才能判断「这是不是我要找的地方」。<strong>命中位置 + 周边代码</strong> 一起喂，才是对 LLM 真正有用的搜索结果。这又是上下文窗口的权衡：上下文行越多越清楚、但越费 token，要在「看得清」与「装得下」间取平衡。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把这一关想成给 LLM 当<strong>搜索引擎的排序算法</strong>：Google 不会把一百万个结果全甩给你，而是把最相关的十条排在第一页。agent 的代码搜索也一样——<strong>排序 + 截断 + 上下文，决定了 LLM 这「第一页」看到什么</strong>。这一步做好，LLM 往往一眼就找到该改的地方；做砸了，它在噪音里淘半天还可能淘错。视力好坏，就差在这最后的排序上。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="assemble"><span class="num">7</span>拼成 agent 的眼</h2>
+  <h3>把代码导航拼成 agent 的「眼」</h3>  <p>把五样拼起来，agent 就有了一双能在大仓库里精准定位的眼睛。一次典型的「定位 bug」会这样走：</p>  <ol>
+    <li><strong>建图</strong>：<code>glob('**/*.py')</code> / <code>walk_code()</code> 先看仓库有哪些代码文件（滤掉噪音）；</li>
+    <li><strong>搜内容</strong>：<code>grep('login')</code> 或 <code>find_definition('login')</code> 找到相关位置；</li>
+    <li><strong>排序</strong>：<code>search_ranked()</code> 把定义处、文件名匹配的命中排前面；</li>
+    <li><strong>带上下文</strong>：每条命中配前后若干行，让 LLM 看清周边；</li>
+    <li><strong>交给 LLM</strong>：只把最相关的前几条（含上下文）回填，由它决定「就改这里」。</li>
+  </ol>  <p>这双眼睛是模块 04/05 的前置：agent 拿到任务，先用搜索<strong>定位</strong>（在哪），再用文件工具<strong>读+改</strong>（怎么改），再用 shell<strong>验证</strong>（对没对）。搜索做得好，后面才顺；搜索做不好，agent 要么找不到、要么找错、要么被噪音淹没。可以说，<strong>代码导航是 agent「理解一个陌生代码库」的入口</strong>——它决定了 agent 能不能从「面对一堆文件」走到「知道该动哪一行」。</p>  <p>贯穿本模块的 ACI 哲学再次显现：每一层都在为<strong>「让 LLM 用最少 token 看见最相关代码」</strong>服务。智能遍历滤噪音、符号搜索提精度、相关性排序提信噪比、上下文行补清晰度、截断控成本——它们合起来回答的，是一个工程问题：<em>上下文窗口是稀缺资源，怎么花得最值</em>。把这个问题想透，你就理解了为什么顶级编码 agent 在搜索/检索上投入巨大——因为<strong>agent 的智能，一半在模型，一半在你喂给它看的东西</strong>。</p>  <div class="callout paper"><span class="label"></span>
+    <p>现实参照：ripgrep 是当代 agent 事实标准的搜索后端（默认遵守 gitignore、跳二进制）；aider 的 repo map 用符号抽取 + 排序把仓库结构压进上下文；SWE-agent 证明搜索/导航工具的质量显著影响成绩。把本模块五样理解透，你就懂了这些 agent「眼睛」的内核。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>语义检索 vs 词法搜索</strong>：grep/glob 是词法的（精确匹配字符）。当 agent 只知道「跟支付有关的代码」却说不出确切关键词时，基于 embedding 的语义检索（找语义相近的代码块）更管用。词法与语义如何结合（混合检索），是 agent 代码理解的活跃方向。</li>
+    <li><strong>repo map 与全局结构</strong>：如何把一个大仓库的结构（有哪些模块、谁依赖谁、关键符号）压成一小段喂给模型，让它有全局观而不超窗口？aider 的 repo map 是一种答案，但最优表示仍在探索。</li>
+    <li><strong>基于 LSP/tree-sitter 的精确导航</strong>：把 IDE 级的「跳转到定义」「找所有引用」「调用图」接进 agent，能让它像资深工程师那样理解代码，而非靠正则近似。工程整合成本与收益的平衡是难点。</li>
+    <li><strong>检索即推理</strong>：先进 agent 把搜索本身变成多轮推理——搜一次、看结果、refine 查询、再搜，像人调研一样迭代。怎么让 agent 学会「高效地搜」（而非一次搜不到就放弃），是 agent 能力的前沿。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：SWE-agent 论文（搜索/导航工具对成绩的影响）、ripgrep 项目说明（智能遍历的工程取舍）、aider 的 repo map 文档（符号抽取 + 排序）。Python <code>re</code>/<code>glob</code>/<code>ast</code>/<code>os.walk</code> 官方文档是本模块的标准库依据。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_shell_tool/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · Shell 工具</div></a>
+    <a class="next" href="../04_edit_test_loop/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · Edit-Test-Fix 循环</div></a>
+  </div>
+
+</div>
+</body>
+</html>

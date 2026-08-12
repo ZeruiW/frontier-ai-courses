@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 完整编码 Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 完整编码 Agent</h1>
+  <p class="subtitle">集大成 —— 把文件/shell/搜索/测试工具组装成 tool registry + agent 主循环（tool_use→执行→回填 tool_result）+ 系统提示，在玩具仓里端到端真跑 pytest 修一个 bug；SWE-bench 式评测；真实 Claude（Messages API）适配，无 key 自动回退</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–04 全部、工具调用概念、Anthropic Messages API 略知</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_coding_agent.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">SWE-agent、SWE-bench、Anthropic Tool use/Messages API、Building effective agents、ReAct</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#synthesis">集大成：把零件组装成 agent</a></li>
+      <li><a href="#registry">工具注册表：能力登记成表</a></li>
+      <li><a href="#loop">agent 主循环：tool_use→执行→tool_result</a></li>
+      <li><a href="#sysprompt">系统提示：行为纪律</a></li>
+      <li><a href="#e2e">端到端：真的修好一个 bug</a></li>
+      <li><a href="#eval">SWE-bench 式评测</a></li>
+      <li><a href="#realapi">接上真实 Claude（Messages API）</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="synthesis"><span class="num">1</span>集大成：把零件组装成 agent</h2>
+  <p>到这里，我们已经造好了一个编码 agent 的全部<strong>零件</strong>：文件工具（手，模块 01）、Shell 工具（脚，模块 02）、代码搜索（眼，模块 03）、Edit-Test-Fix 循环（小脑，模块 04）。本模块是<strong>集大成</strong>——把这些零件<strong>组装成一个完整的、能端到端解决任务的编码 agent</strong>，让它在一个玩具仓库里<em>真的</em>修好一个 bug、跑绿测试，并用 SWE-bench 式的视角评判它是否成功。</p>  <p>组装一个 agent，需要三样新东西，本模块逐一攻克：① <strong>工具注册表（tool registry）</strong>——把所有工具登记成一张「名字→实现+参数说明」的表，让 agent 能按名字查找、调用、捕获错误；② <strong>agent 主循环</strong>——模块 00 那个骨架的完整版：LLM 发起工具调用 → 分发执行 → 把结果回填 → 再问 LLM，直到任务完成；③ <strong>系统提示与评测</strong>——给 agent 定下行为纪律（先看再改、改完跑测试、别改测试作弊），并用「补丁是否让测试通过」客观地评判它。</p>  <p>这正是 Claude Code、SWE-agent、aider 这些真实编码 agent 的内核结构。它们当然比我们的玩具复杂得多——更多工具、更精巧的提示、更强的上下文管理、与真实大模型对接——但<strong>骨架是同一个</strong>：一组工具、一张注册表、一个循环、一套纪律、一个客观的成功判据。本模块结束时，你会拥有一个<em>不到两百行、不依赖任何框架、却真能修 bug</em>的完整编码 agent，并彻底理解它每一个齿轮如何咬合。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>把手/眼/脚/小脑组装成一个完整 agent = 工具注册表（按名字分发）+ agent 主循环（LLM 发起 tool_use→执行→回填 tool_result→再问）+ 系统提示（行为纪律）+ SWE-bench 式评测（补丁让测试通过 = 成功）</strong>。零件齐了，组装才是 agent。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="registry"><span class="num">2</span>工具注册表：能力登记成表</h2>
+  <h3>工具注册表：把能力登记成一张表</h3>  <p>前几个模块写了一堆工具函数（<code>read_file</code>、<code>edit_file</code>、<code>run_shell</code>、<code>code_search</code>……）。要让 agent 能<strong>自主</strong>地用它们，得先把它们组织成一张<strong>注册表</strong>：每个工具登记三样——<strong>名字</strong>（LLM 用它指名调用）、<strong>实现函数</strong>（实际执行的代码）、<strong>参数模式 schema</strong>（告诉 LLM 这工具要什么参数）。</p>  <pre><code>class ToolRegistry:
+    def __init__(self, work):
+        self.work = work
+        self.tools = {}        # name -&gt; {'fn': callable, 'schema': dict}
+    def register(self, name, fn, schema):
+        self.tools[name] = {'fn': fn, 'schema': schema}
+    def call(self, name, args):
+        '''按名字分发执行，捕获异常转成对 LLM 友好的错误字符串。'''
+        if name not in self.tools:
+            return f'错误：未知工具 {name}。可用：{list(self.tools)}'
+        try:
+            return self.tools[name]['fn'](self.work, **args)
+        except Exception as e:
+            return f'工具 {name} 执行出错：{type(e).__name__}: {e}'   # 不让异常崩掉循环
+    def schemas(self):
+        return [t['schema'] for t in self.tools.values()]   # 喂给 LLM 的工具清单</code></pre>  <p>注册表有两个<strong>关键设计</strong>。其一，<strong>分发时捕获一切异常</strong>：工具执行可能抛错（文件不存在、编辑匹配不上、命令超时），绝不能让一个工具的异常<strong>崩掉整个 agent 循环</strong>。要把异常<em>转成一条对 LLM 友好的错误字符串</em>回填——这样 LLM 看到「编辑失败：匹配了 3 处」，能自己纠正重试，循环继续。其二，注册表能吐出所有工具的 <strong>schema 清单</strong>，这正是要传给 LLM 的「你有哪些工具可用」——它据此知道能调什么、怎么填参数。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>工具注册表就像给 agent 一个「工具箱清单 + 说明书」：每件工具有名字、有功能说明、有「怎么用」（要哪些参数）。agent（LLM）看着这份清单决定「这一步该用哪件工具、怎么填参数」，然后注册表负责把它的请求翻译成实际的函数调用。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，注册表是一个从<strong>工具名到 (实现, 接口契约)</strong>的映射，外加一个<strong>分发器</strong>（dispatch）。它实现了<strong>LLM 的符号化请求</strong>（「调用 edit_file，参数 {...}」）与<strong>宿主的实际执行</strong>之间的解耦——LLM 只需知道名字和 schema，无需知道实现；宿主可自由替换实现而不影响 LLM。这与 RPC、插件系统、以及 MCP（模型上下文协议）是同构的设计——MCP 正是把这套「工具注册 + 分发」标准化成跨 agent 的协议。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>注册表里那行<strong>捕获一切异常、转成友好错误</strong>看似不起眼，却是 agent<strong>鲁棒性</strong>的命门。没有它，LLM 一个填错参数的工具调用就会让整个 agent 崩溃退出；有了它，错误变成 LLM 能看见、能学习、能纠正的<em>反馈</em>——agent 从「脆弱」变「有韧性」。这再次呼应全课主线：<strong>把错误做成对 LLM 友好的反馈，agent 才能自我纠正</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="loop"><span class="num">3</span>agent 主循环：tool_use→执行→tool_result</h2>
+  <h3>Agent 主循环：tool_use → 执行 → tool_result</h3>  <p>有了注册表，就能写<strong>agent 主循环</strong>——模块 00 那个骨架的完整版。它的节奏是：把任务和工具清单发给 LLM，LLM 要么<strong>请求调用工具</strong>（继续），要么<strong>给出最终答复</strong>（结束）；若请求工具，就分发执行、把结果回填进对话，再发给 LLM；如此往复，直到 LLM 说完成、或到达步数上限。</p>  <pre><code>def run_agent(llm, registry, task, max_steps=15):
+    messages = [{'role': 'user', 'content': task}]      # 对话历史
+    for step in range(max_steps):
+        action = llm.step(messages, registry.schemas())  # 问 LLM（真 Claude 或 Mock）
+        if action['type'] == 'final':                    # LLM 给最终答复 → 结束
+            return {'done': True, 'steps': step, 'answer': action['text']}
+        # 否则 action 是一次工具调用
+        name, args, tid = action['name'], action['args'], action.get('id')
+        result = registry.call(name, args)               # 分发执行（已捕获异常）
+        # 回填：记录 LLM 的工具请求 + 工具结果（贴合 Anthropic tool_use/tool_result 格式）
+        messages.append({'role': 'assistant', 'content': [
+            {'type': 'tool_use', 'id': tid, 'name': name, 'input': args}]})
+        messages.append({'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': tid, 'content': str(result)}]})
+    return {'done': False, 'steps': max_steps, 'answer': '(到达步数上限)'}</code></pre>  <p>注意消息回填的格式刻意<strong>贴合 Anthropic Messages API</strong>：LLM 的工具请求记为一个含 <code>tool_use</code> 块的 assistant 消息，工具结果记为一个含 <code>tool_result</code> 块（带 <code>tool_use_id</code> 与对应请求配对）的 user 消息。这样做的好处是：<strong>把 MockLLM 换成真实 Claude 时，这个循环几乎不用改</strong>——因为它累积的 messages 本就是真实 API 要的格式。这是模块 00「面向接口编程、真假 LLM 无缝切换」纪律的兑现。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>主循环就是 agent 的「工作节奏」：接到任务，反复地「想下一步干什么 → 干（调工具）→ 看结果 → 再想」，直到觉得任务完成。它和人解决问题的过程一模一样，只是把「想」交给了 LLM、把「干」交给了工具。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，主循环驱动一个<strong>交替的对话</strong>：assistant 轮（LLM 思考 + 可能的 tool_use）与 user 轮（tool_result 观察）交替累积。<code>stop_reason</code> 是这台状态机的转移信号——<code>tool_use</code> 则继续、<code>end_turn</code> 则终止。整个循环是模块 00「观察-决策-行动」回路的完整实现，工具注册表是其「行动空间」，messages 历史是其「状态」。这就是一个 agent 的全部——没有更多魔法。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>主循环里 <code>max_steps</code> 同样是<strong>不能省</strong>的安全阀（同模块 04 的步数上限）：LLM 可能陷入反复调工具却不收敛的状态，硬上限保证它最终会停。另外，长循环会让 messages 越积越长、逼近上下文窗口——生产 agent 要做<strong>历史压缩</strong>（总结早期步骤）、<strong>工具输出截断</strong>（模块 02 已做）、<strong>prompt caching</strong>（缓存不变的系统提示与工具定义）来对抗。本课玩具规模不必，但你要知道这些是真实 agent 绕不开的工程。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sysprompt"><span class="num">4</span>系统提示：行为纪律</h2>
+  <h3>系统提示：给 agent 定下行为纪律</h3>  <p>光有工具和循环还不够——agent 还需要知道<strong>该怎么用</strong>这些工具、遵守什么纪律。这由<strong>系统提示（system prompt）</strong>交代：它放在对话最前，为整个会话设定 agent 的角色与规则。一个编码 agent 的系统提示通常包含：</p>  <ul>
+    <li><strong>角色</strong>：「你是一个编码助手，任务是修复代码库里的 bug，让测试通过。」</li>
+    <li><strong>工作流纪律</strong>：「先用搜索/读文件<em>理解</em>代码，再用精确编辑<em>修改</em>，改完<strong>务必跑测试</strong>验证。」——把模块 01–04 的最佳实践写成规矩。</li>
+    <li><strong>安全/正确性红线</strong>：「<strong>只修复实现，绝不通过修改测试来让它通过</strong>」（防 reward hacking，模块 04 强调过）、「不执行危险命令」。</li>
+    <li><strong>工具用法提示</strong>：「编辑用的旧字符串必须在文件中唯一」「一次只改一处、改完即验」等——降低 LLM 用错工具的概率。</li>
+  </ul>  <p>系统提示的本质，是把你（工程师）关于「一个好的编码 agent 该怎么行事」的<strong>领域知识与纪律</strong>，用自然语言注入给 LLM。它和工具的 <code>description</code> 一脉相承——都是<strong>写给 LLM 的提示词</strong>，引导它把强大的能力用在对的地方、用对的方式。一个写得好的系统提示能显著提升 agent 的成功率与安全性；写得差（含糊、自相矛盾、漏掉关键纪律）则让 agent 行为飘忽、甚至危险。</p>  <pre><code>SYSTEM_PROMPT = """你是一个编码 agent，任务是修复给定代码库里的 bug，让测试通过。
+工作流：
+1. 先用 code_search / read_file 理解相关代码，再动手改。
+2. 用 edit_file 做精确修改（old 字符串须在文件中唯一）。
+3. 每次修改后用 run_tests 跑测试验证。
+纪律：
+- 只修复【实现代码】，绝不通过修改测试用例来让测试通过。
+- 测试全部通过后，简要说明你做了什么改动，然后结束。
+"""</code></pre>  <div class="callout intuition"><span class="label"></span>
+    <p>系统提示是 agent 的「岗前培训手册」：同样的工具、同样的模型，一份好手册能让 agent 像资深工程师那样<strong>先理解再动手、改完必验、守住底线</strong>；一份差手册则让它横冲直撞。尤其那条「<strong>不准改测试来通过</strong>」——它是把人类的诚信标准注入 agent 的关键一句，少了它，agent 可能学会「作弊式通过」这种危险捷径。<strong>提示词工程不是玄学，而是把工程纪律显式地讲给模型听</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="e2e"><span class="num">5</span>端到端：真的修好一个 bug</h2>
+  <h3>端到端：让 agent 真的修好一个 bug</h3>  <p>把注册表、主循环、系统提示拼起来，agent 就能端到端解决任务了。走一遍完整流程（这正是 notebook 里 MockLLM 真跑的过程）——任务是「<code>test_calc</code> 失败了，修复它」：</p>  <ol>
+    <li><strong>感知</strong>：agent 调 <code>run_tests</code> → 看到红、<code>test_add</code> 失败；调 <code>read_file('calc.py')</code> → 看到 <code>return a - b</code>；</li>
+    <li><strong>决策</strong>：LLM 判断 bug 在减号，应改为加号；</li>
+    <li><strong>行动</strong>：调 <code>edit_file('calc.py', 'return a - b', 'return a + b')</code> → 唯一匹配，改成功；</li>
+    <li><strong>验证</strong>：再调 <code>run_tests</code> → 绿、<code>test_add passed</code>；</li>
+    <li><strong>收尾</strong>：LLM 给最终答复「已修复 add 的符号错误，测试通过」→ 循环结束。</li>
+  </ol>  <p>这一连串里，<strong>每个工具调用都在玩具仓库里真实执行</strong>：真的跑 pytest、真的读文件、真的改文件、真的再跑 pytest 看它由红变绿。唯一被「固定」的是 LLM 每一步的决策（由 MockLLM 按合理脚本给出）。所以当 notebook 打印「✅ agent 修复成功，测试通过」，那是<strong>整个 agent 系统真的把 bug 修好了</strong>，不是演戏。这就是模块 00 立下的「MockLLM 端到端、真实但隔离」纪律的最终兑现。</p>  <p>退一步看这个 agent 的全貌：它把模块 01–04 的所有积累<strong>收束</strong>成了一个连贯的系统——搜索（眼）帮它定位、文件工具（手）帮它读改、shell（脚）帮它验证、循环（小脑）让它迭代、注册表+主循环把这一切串成自主行为、系统提示给它行为准则。这不到两百行的代码，就是一个<strong>麻雀虽小、五脏俱全</strong>的编码 agent。理解了它，你就理解了 Claude Code 这类产品的骨架——剩下的差别是规模与打磨，不是本质。</p>  <div class="callout paper"><span class="label"></span>
+    <p>现实参照：这个 perceive→decide→act→observe 的端到端流程，正是 SWE-agent 轨迹里 agent 解一道真实 GitHub issue 的过程；Claude Code 修 bug 时也跑同样的循环。把本模块的 agent 理解透，你就掌握了把零件组装成自主 agent 的完整方法。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">6</span>SWE-bench 式评测</h2>
+  <h3>SWE-bench 式评测：补丁让测试通过 = 成功</h3>  <p>造出 agent 后，怎么客观地<strong>评判</strong>它行不行？编码任务有一个得天独厚的优势——<strong>成功是可自动判定的</strong>：agent 生成的补丁，要么让测试通过，要么没有。这就是 <span class="term">SWE-bench</span> 评测的核心思想。</p>  <p>SWE-bench 的构造很巧妙：从真实 GitHub 仓库取一批「issue + 修复该 issue 的 PR」，把仓库回退到 PR 之前的状态（带着 bug），让 agent 读 issue、生成补丁；然后用<strong>那个 PR 自带的测试</strong>来判定——补丁让这些测试通过了，就算解决。关键在于：评测靠的是<strong>测试是否通过</strong>（客观、自动），而非把 agent 的补丁与人类的「标准补丁」逐字比对（那样会冤枉掉「写法不同但同样正确」的解）。</p>  <table>
+    <thead><tr><th>评测概念</th><th>含义</th><th>本课玩具版的对应</th></tr></thead>
+    <tbody>
+      <tr><td><span class="term">SWE-bench</span></td><td>真实 issue + PR 测试判定的基准</td><td>玩具仓库 + 它的测试</td></tr>
+      <tr><td>resolved / 解决</td><td>补丁让相关测试全部通过</td><td><code>run_tests</code> 返回绿</td></tr>
+      <tr><td><span class="term">pass@k</span></td><td>允许尝试 k 次，有一次过即算解决</td><td>agent 一次 rollout 是否修绿</td></tr>
+      <tr><td><strong>PASS_TO_PASS</strong></td><td>本应一直通过的测试（防回归）</td><td>修复后跑全套、原有用例仍绿</td></tr>
+      <tr><td><strong>FAIL_TO_PASS</strong></td><td>issue 对应、原本失败应被修绿的测试</td><td>目标失败用例由红转绿</td></tr>
+    </tbody>
+  </table>  <p>把这套思想搬到我们的玩具 agent，评测就极简而严格：给 agent 一个带 bug、测试为红的仓库，让它跑一轮；结束后<strong>跑一次测试</strong>——绿则 <code>resolved=True</code>，红则失败。更严谨些，还可检查它<strong>没有篡改测试文件</strong>（防作弊）、并跑<strong>全套</strong>测试（防它修好目标却弄坏别的，即 PASS_TO_PASS 回归）。<strong>一个客观、不可被轻易操纵的成功判据</strong>，是评测 agent（乃至训练 agent）的基石。</p>  <div class="callout danger"><span class="label"></span>
+    <p>评测最大的陷阱是<strong>奖励信号被污染</strong>。如果 agent 能看到判定用的测试、又被允许改它，它可能「修改测试让自己通过」——评测显示成功，实则作弊（reward hacking，模块 04 讲过）。SWE-bench 的防范是<strong>用 agent 改完后才施加的、它没见过的测试</strong>来判定。本课玩具版至少要做到：评测时<strong>校验测试文件未被改动</strong>。<strong>评测的可信度，等于成功判据不可被操纵的程度</strong>——这是 agent 评测科学的核心命题。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="realapi"><span class="num">7</span>接上真实 Claude（Messages API）</h2>
+  <h3>接上真实 Claude：Messages API 与 tool use</h3>  <p>最后一步，把 MockLLM 换成<strong>真实 Claude</strong>。由于我们全程面向接口编程，这一步只需实现一个<strong>同接口的 &lt;code&gt;ClaudeLLM.step()&lt;/code&gt;</strong>——它内部调 <strong>Anthropic Messages API</strong>、按 <code>tool_use</code>/<code>tool_result</code> 协议工作，主循环与注册表<strong>一个字都不用改</strong>。</p>  <p>真实适配的要点：① 把注册表的 schema 清单传给 <code>tools=</code> 参数；② 调 <code>client.messages.create(model='claude-sonnet-4-6', system=SYSTEM_PROMPT, tools=..., messages=...)</code>；③ 看返回的 <code>stop_reason</code>——是 <code>tool_use</code> 就从 content 里取出工具调用（名字、入参、id）返回给主循环执行；是 <code>end_turn</code> 就把文本作为最终答复返回。前面主循环回填的 messages 格式本就贴合它，于是无缝衔接。</p>  <pre><code>class ClaudeLLM:
+    def __init__(self, client, model='claude-sonnet-4-6', system=''):
+        self.client = client; self.model = model; self.system = system
+    def step(self, messages, tool_schemas):
+        resp = self.client.messages.create(
+            model=self.model, max_tokens=2048, system=self.system,
+            tools=tool_schemas, messages=messages)
+        if resp.stop_reason == 'tool_use':
+            for block in resp.content:
+                if block.type == 'tool_use':
+                    return {'type': 'tool', 'name': block.name,
+                            'args': block.input, 'id': block.id}
+        text = ''.join(b.text for b in resp.content if b.type == 'text')
+        return {'type': 'final', 'text': text}
+
+def get_llm(mock_script=None, model='claude-sonnet-4-6', system=''):
+    '''有 key+包 → 真 Claude；否则 → MockLLM。同一 step() 接口。'''
+    if os.environ.get('ANTHROPIC_API_KEY'):
+        try:
+            import anthropic
+            return ClaudeLLM(anthropic.Anthropic(), model=model, system=system)
+        except ImportError:
+            pass
+    return MockLLM(mock_script)            # 无 key 回退：教学/测试默认走这里</code></pre>  <p>这就是本课<strong>无 key 回退契约</strong>的最终形态：<code>get_llm()</code> 检测环境，有 key 且装了 <code>anthropic</code> 就给真 Claude，否则给 MockLLM——两者暴露同一个 <code>step(messages, tool_schemas)</code> 接口，所以你的整个 agent（注册表、主循环、系统提示、评测）<strong>既能在无 key 的课堂上用 MockLLM 端到端跑通，又能在有 key 时一行不改地切到真实 Claude 去解真实仓库</strong>。这正是「面向接口而非实现」的威力——它让本课的玩具 agent 与真实 agent 之间，只隔着一个工厂函数的选择。</p>  <div class="callout paper"><span class="label"></span>
+    <p>真实适配的权威依据：Anthropic《Tool use (function calling) with Claude》（<code>tools</code> 定义、<code>tool_use</code>/<code>tool_result</code> 往返、<code>stop_reason</code> 驱动循环）与《Messages API》文档。本节代码即按这两份文档写的骨架；接上真实 key 后，它就是一个能跑的真实编码 agent。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>规划与子任务分解</strong>：玩具 agent 是「反应式」的（看一步走一步）。真实复杂任务需要 agent 先<em>规划</em>（拆成子任务、排顺序、必要时回溯）。如何让 agent 在反应与规划间取得平衡、何时该停下来重新规划，是 agentic 系统的核心前沿。</li>
+    <li><strong>多 agent 协作</strong>：把一个大任务分给多个专门化 agent（一个读代码、一个写补丁、一个审查），或用一个 agent 调度其他 agent。协作的通信协议、责任划分、避免内耗，是活跃方向。</li>
+    <li><strong>长程任务与记忆</strong>：跨越很多步、超出上下文窗口的任务，需要 agent 有外部记忆（笔记、检索）、会总结压缩历史。如何让 agent 在长任务里不「失忆」、不偏离目标，仍是开放难题。</li>
+    <li><strong>可靠性、安全与对齐</strong>：能自主改代码、跑命令的 agent 一旦出错或被诱导，破坏力很大。权限最小化、人在回路、prompt injection 防御、不可操纵的评测——把 agent 做得既强大又可信，是贯穿能力与对齐的终极课题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Anthropic《Building effective agents》（agent 设计哲学：用最小脚手架、何时该用 agent）、SWE-agent（ACI 与完整 agent 架构）、SWE-bench（客观评测）、Anthropic《Tool use》/《Messages API》（真实对接）、ReAct（推理-行动范式）。这些合起来就是把本课玩具 agent 推向真实世界的完整地图。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_edit_test_loop/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · Edit-Test-Fix 循环</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

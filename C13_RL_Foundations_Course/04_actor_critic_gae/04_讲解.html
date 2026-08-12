@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · Actor-Critic 与 GAE</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · Actor-Critic 与 GAE</h1>
+  <p class="subtitle">用 critic 替代蒙特卡洛回报：advantage、TD 误差作为 advantage 的无偏估计、GAE(λ) 的几何级数推导与 bias-variance 旋钮（λ=0→TD、λ=1→MC）、A2C 完整环路 —— 这是 PPO 的骨架、RLHF 的内核</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（TD 误差）、模块 03（策略梯度/baseline）、几何级数</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_actor_critic_gae.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Schulman 2016 (GAE)、Konda & Tsitsiklis 2000、Mnih 2016、Schulman 2017 (PPO)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#ac">actor-critic：价值与策略的联姻</a></li>
+      <li><a href="#advantage">advantage 与 TD 误差的关系</a></li>
+      <li><a href="#gae">GAE：bias-variance 的旋钮</a></li>
+      <li><a href="#tradeoff">bias-variance 权衡：GAE 的灵魂</a></li>
+      <li><a href="#a2c">A2C：组装完整算法</a></li>
+      <li><a href="#run">toy chain 上的 A2C + GAE</a></li>
+      <li><a href="#family">actor-critic 家族与实践要点</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ac"><span class="num">1</span>actor-critic：价值与策略的联姻</h2>
+  <p>模块 03 的 REINFORCE 无偏但方差大，baseline 缓解了一部分。但 baseline 那里我们用的是<strong>蒙特卡洛回报</strong> $G_t$——必须跑完整条回合才能算，且 $G_t$ 仍是整条剩余轨迹随机性的累积，方差天然偏大。本模块把这个最后的短板补上：用一个<strong>学出来的价值函数</strong>（critic）来替代蒙特卡洛回报，既不必等回合结束、又进一步降方差。这就是 <span class="term">actor-critic</span>（演员-评论家）。</p>  <p>名字很形象。<strong>actor（演员）</strong>是策略 $\pi_\theta$——负责<em>做动作</em>，它用模块 03 的策略梯度更新。<strong>critic（评论家）</strong>是价值函数 $V_\phi$——负责<em>评判</em>，它用模块 02 的 TD 学习更新，给 actor 提供「这一步比平均好多少」的低方差信号。两者协作：actor 演出一步，critic 立刻打分（用 TD 误差），actor 据此微调，critic 也据此修正自己的评判。这是模块 01 提过的「广义策略迭代」（GPI）的又一个实例——评估（critic）与改进（actor）互相驱动。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把它想成「运动员 + 教练」。运动员（actor）做动作，教练（critic）在旁边实时点评「这步不错 / 这步亏了」。运动员不必等整场比赛打完看最终比分（那是 REINFORCE 的做法、反馈又慢又糙），每做一个动作就得到教练即时、稳定的反馈。而教练自己也在比赛中不断提升评判水平。两者一起成长，比单打独斗快得多。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，actor-critic 把策略梯度里的加权项从蒙特卡洛回报 $G_t$ 换成基于 critic 的 advantage 估计 $\hat A_t$。最简单的版本用单步 TD 误差当 advantage：$\hat A_t=\delta_t=r_t+\gamma V_\phi(s_{t+1})-V_\phi(s_t)$。策略梯度变成 $\nabla_\theta J\approx\mathbb{E}[\sum_t\nabla_\theta\log\pi_\theta(a_t\mid s_t)\,\delta_t]$。这就同时实现了「在线（不必等回合结束）」与「低方差（$\delta$ 只含一步随机性 + 自举）」——但代价是引入了偏差（critic 不准）。下面几节就是把这个 bias-variance 权衡讲透、并做成一个可调的旋钮。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>actor-critic 是<strong>价值方法与策略方法的联姻</strong>：它要 critic（价值方法）不是为了从 critic 导出策略（那是 Q-learning 的路子），而是<strong>借 critic 来给策略梯度降方差</strong>。这个分工很关键：actor 负责<em>表达和优化策略</em>（处理连续动作、随机性、探索），critic 负责<em>提供低方差的学习信号</em>。现代主流算法（A2C、PPO、SAC、以及 RLHF）几乎全是 actor-critic 架构——理解它，就理解了深度 RL 的主流范式。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="advantage"><span class="num">2</span>advantage 与 TD 误差的关系</h2>
+  <h3>advantage：为什么它是最好的加权信号</h3>  <p>回到核心问题：策略梯度 $\nabla_\theta J=\mathbb{E}[\nabla\log\pi\cdot\Psi_t]$ 里，加权项 $\Psi_t$ 该用什么？模块 03 用过 $G_t$（回报）和 $G_t-b$（带 baseline）。理论上 $\Psi_t$ 可以是好几种等价（期望相同）但方差不同的量：</p>  <table>
+    <thead><tr><th>$\Psi_t$ 的选择</th><th>是什么</th><th>偏差</th><th>方差</th></tr></thead>
+    <tbody>
+      <tr><td>$G_t$（总回报）</td><td>整条轨迹回报</td><td>无偏</td><td>最高</td></tr>
+      <tr><td>$G_t$（reward-to-go）</td><td>从 $t$ 起的回报</td><td>无偏</td><td>高</td></tr>
+      <tr><td>$G_t - b(s_t)$</td><td>回报减 baseline</td><td>无偏</td><td>中</td></tr>
+      <tr><td>$Q^\pi(s_t,a_t)$</td><td>动作价值</td><td>无偏（若 Q 准）</td><td>中</td></tr>
+      <tr><td>$A^\pi(s_t,a_t)=Q-V$</td><td><strong>优势函数</strong></td><td>无偏（若 A 准）</td><td><strong>最低</strong></td></tr>
+    </tbody>
+  </table>  <p>理论上的最优选择是 <span class="term">advantage</span>（优势函数）$A^\pi(s,a)=Q^\pi(s,a)-V^\pi(s)$——它度量「在状态 $s$，动作 $a$ 比该状态的<strong>平均水平</strong>好多少」。用 advantage 当加权项，策略梯度的含义最干净：<strong>把比平均好的动作概率推高、比平均差的推低</strong>，而「平均」这个基准（$V$）被自动扣掉了。这正是模块 03 baseline 思想的理论归宿——最优的 baseline 就是 $V^\pi$，减掉它得到的就是 advantage。</p>  <p>但 advantage 我们<strong>不知道</strong>——$Q^\pi$ 和 $V^\pi$ 都得估。关键洞察是：<strong>TD 误差 $\delta_t$ 是 advantage 的一个无偏估计</strong>（当 $V=V^\pi$ 时）：</p>  <div class="math-block">\[\mathbb{E}\big[\delta_t \mid s_t,a_t\big] = \mathbb{E}\big[r_t + \gamma V^\pi(s_{t+1}) \mid s_t,a_t\big] - V^\pi(s_t) = Q^\pi(s_t,a_t) - V^\pi(s_t) = A^\pi(s_t,a_t)\]</div>  <p>这个等式是 actor-critic 的<strong>理论支柱</strong>：我们只需学一个 $V_\phi$（比学 $Q$ 简单，少一维），用 $\delta_t=r_t+\gamma V_\phi(s_{t+1})-V_\phi(s_t)$ 当 advantage，就能得到（近似）无偏、低方差的策略梯度信号。$\delta_t$ 只含<em>一步</em>的真实随机性（$r_t,s_{t+1}$）加上自举的 $V$，方差远小于含整条轨迹的 $G_t$。代价：若 $V_\phi\ne V^\pi$（critic 不准），$\delta_t$ 就有偏。这个「方差小但有偏（依赖 critic 准确度）」与「方差大但无偏（蒙特卡洛）」的张力，就是下一节 GAE 要调和的。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="gae"><span class="num">3</span>GAE：bias-variance 的旋钮</h2>
+  <h3>GAE：把 bias-variance 做成一个旋钮</h3>  <p>单步 TD 误差 $\delta_t$（方差最低、偏差最高，因为最依赖 critic）和蒙特卡洛 advantage $G_t-V(s_t)$（方差最高、无偏）是两个极端。中间还有<strong>n-step</strong>的连续谱：</p>  <div class="math-block">\[\hat A_t^{(n)} = \underbrace{r_t + \gamma r_{t+1} + \dots + \gamma^{n-1} r_{t+n-1} + \gamma^n V(s_{t+n})}_{n\text{-step return}} - V(s_t)\]</div>  <p>$n=1$ 是 $\delta_t$（最依赖 critic、低方差高偏差），$n=\infty$ 是蒙特卡洛（不依赖 critic、高方差无偏）。选哪个 $n$？<span class="term">Generalized Advantage Estimation</span>（GAE，Schulman 2016）给出一个优雅的答案：<strong>不选，全都要——对所有 $n$-step advantage 做指数加权平均</strong>，权重由一个参数 $\lambda\in[0,1]$ 控制。它有一个极其简洁的递归形式：</p>  <div class="math-block">\[\hat A_t^{\text{GAE}(\gamma,\lambda)} = \sum_{l=0}^{\infty}(\gamma\lambda)^l\,\delta_{t+l} = \delta_t + \gamma\lambda\,\hat A_{t+1}^{\text{GAE}}\]</div>  <p>第一个等号是定义（TD 误差的几何加权和），第二个等号是它的<strong>递归实现</strong>——从后往前一遍扫描就能算出整条轨迹的 advantage，$O(T)$，极其高效（notebook 会推导并验证两者等价）。这个 $\lambda$ 就是 bias-variance 的连续旋钮：</p>  <ul>
+    <li><strong>$\lambda=0$</strong>：$\hat A_t=\delta_t$，退化为单步 TD advantage（<strong>最低方差、最高偏差</strong>，最依赖 critic 准确度）。</li>
+    <li><strong>$\lambda=1$</strong>：$\hat A_t=\sum_l\gamma^l\delta_{t+l}=G_t-V(s_t)$，退化为蒙特卡洛 advantage（<strong>最高方差、无偏</strong>，望远镜望到底，几乎不靠 critic）。</li>
+    <li><strong>$0&lt;\lambda&lt;1$</strong>：在两者间连续插值，通常 $\lambda=0.95$ 左右是最佳折中（实践默认值）。</li>
+  </ul>  <p>为什么是 $(\gamma\lambda)^l$ 这个权重？直觉：越远的 $\delta_{t+l}$ 越含更多未来的随机性（方差大），用 $(\gamma\lambda)^l$ 给它们<strong>指数递减的权重</strong>——近处的 $\delta$（低方差）权重大、远处的（高方差）权重小，从而在「用多步真实信息降偏差」与「不要引入太多远期方差」间取得平衡。$\lambda$ 越大，越信任远处的 $\delta$（越像蒙特卡洛）；$\lambda$ 越小，越只信眼前一步（越像 TD）。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>GAE 的 $\lambda$ 和模块 02 提过的 TD(λ)/资格迹是<strong>同一个思想</strong>——用几何权重融合所有 $n$-step 回报，只不过 GAE 把它用在 advantage 估计上、且写成了便于实现的递归。记住这个统一视角：$\gamma$ 是「未来奖励的折扣」（环境/任务给定），$\lambda$ 是「自举多步 vs 一步的偏好」（算法的方差控制旋钮）。两者都出现在 $(\gamma\lambda)^l$ 里，但意义完全不同——$\gamma$ 关乎<em>你多在乎未来</em>，$\lambda$ 关乎<em>你多信任 critic</em>。混淆这两个是常见的概念错误。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">4</span>bias-variance 权衡：GAE 的灵魂</h2>
+  <h3>bias-variance 权衡：GAE 的灵魂</h3>  <p>GAE 之所以重要，是因为它把 RL 里无处不在的<strong>偏差-方差权衡</strong>做成了一个可调、可理解的旋钮。把这个权衡彻底想清楚，是本模块的核心收获。</p>  <p>先理解两端的本质。<strong>蒙特卡洛（$\lambda=1$）</strong>用真实的整条回报，不依赖任何价值估计，所以<strong>无偏</strong>——它看到的是「真实发生了什么」。但真实轨迹充满随机性（环境随机转移、策略随机选动作），整条累积下来<strong>方差巨大</strong>，尤其长视界、强随机环境下，$G_t$ 的抖动能淹没真实信号。</p>  <p><strong>单步 TD（$\lambda=0$）</strong>只看一步真实奖励 + 自举的 $V(s_{t+1})$，随机性被截断在一步内，所以<strong>方差极低</strong>。但它把「之后会怎样」完全交给了 critic 的估计 $V$——如果 $V$ 不准（训练初期总是不准），这个偏差会传导进每一步的 advantage，且因为自举会<strong>自我强化</strong>（错误的 $V$ 产生错误的 $\delta$，又用来更新 $V$）。这是它<strong>有偏</strong>的来源。</p>  <p><strong>中间的 $\lambda$</strong>巧妙地两头取好处：用近处几步的真实奖励（可信、降偏差），但不一路用到底（避免累积太多远期方差），远处则渐渐交给 critic。$\lambda=0.95$ 之所以是常见甜点，是因为它在大多数任务上让「多步真实信息带来的偏差下降」恰好压过「多步随机性带来的方差上升」。但最优 $\lambda$ 依任务而定——critic 越准，可以用越小的 $\lambda$（更信任它）；环境越随机，可能要用更小的 $\lambda$（少引入轨迹方差）。</p>  <div class="ascii">GAE 的 λ 旋钮：在偏差与方差之间连续滑动
+
+  λ=0 ────────────────────────────────────────────── λ=1
+  单步 TD                    λ≈0.95                  蒙特卡洛
+  ▲ 最依赖 critic            ▲ 实践甜点              ▲ 不靠 critic
+  偏差: 高 ◄──────────────────────────────────────► 偏差: 0(无偏)
+  方差: 低 ◄──────────────────────────────────────► 方差: 高
+
+  critic 越准 → 可用更小 λ(更信它)   环境越随机 → 倾向更小 λ(少引入轨迹方差)</div>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见误解：以为「无偏总是更好」，所以 $\lambda=1$（蒙特卡洛）最优。<strong>错</strong>。在样本有限的现实里，<strong>方差才是策略梯度的主要敌人</strong>——一个有点偏但方差小的估计，常常比无偏但方差爆炸的估计学得<em>快得多、稳得多</em>。这正是 GAE（以及整个自举思想）的价值：<strong>用可控的、随训练减小的偏差，换取大幅降低的方差</strong>。理解这一点，你就理解了为什么深度 RL 几乎从不用纯蒙特卡洛、而是用 GAE($\lambda\approx0.95$) + critic。notebook 会数值展示：方差随 $\lambda$ 单调上升（实测 $\lambda=0$ 到 $\lambda=1$ 方差涨约 100×）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="a2c"><span class="num">5</span>A2C：组装完整算法</h2>
+  <h3>A2C：把 actor、critic、GAE 拼成一个算法</h3>  <p>有了 actor（策略梯度）、critic（TD 价值学习）、GAE（advantage 估计），把它们组装起来就是 <span class="term">A2C</span>（Advantage Actor-Critic，Mnih 2016 的同步版）——一个完整、实用的策略梯度算法。流程是：</p>  <div class="ascii">A2C（Advantage Actor-Critic）一轮迭代
+  1. 用当前策略 π_θ 采一批轨迹(rollout)
+  2. 用 critic V_φ 算每步 TD 误差 δ_t = r_t + γV_φ(s_{t+1}) − V_φ(s_t)
+  3. 用 GAE 把 δ 聚成 advantage:  Â_t = Σ_l (γλ)^l δ_{t+l}   (一遍反向扫描)
+  4. critic 目标(回报):  R_t = Â_t + V_φ(s_t)        ← 即 TD(λ) 回报
+  5. 更新 actor:   θ ← θ + η_a · Σ_t Â_t · ∇_θ log π_θ(a_t|s_t)
+  6. 更新 critic:  φ ← φ − η_c · ∇_φ Σ_t (V_φ(s_t) − R_t)²    ← 回归到 TD(λ) 回报
+  (可选) 加熵正则 + β·∇H(π) 防塌缩</div>  <p>几个实现要点值得记住。<strong>critic 的回归目标</strong>用 $R_t=\hat A_t+V_\phi(s_t)$（即 TD(λ) 回报）——注意这个目标要<strong>当作常数</strong>（不对它求 critic 的梯度，即 stop-gradient），否则 critic 会「作弊」地把目标拉向自己。<strong>actor 的 advantage</strong>同样对 actor 是常数（advantage 由 critic 提供，不参与 actor 的梯度）。这两个 stop-gradient 是 actor-critic 正确实现的关键，新手极易搞错。</p>  <p>A2C 相比 REINFORCE 的进步是<strong>全方位</strong>的：方差更低（GAE + critic）、可在线/小批量更新（不必等长回合）、样本利用更好。它的异步多 worker 版叫 A3C，是深度 RL 早期的里程碑。而把 A2C 的「裸更新」换成「用裁剪限制每次更新幅度」就是 <strong>PPO</strong>——当今最主流的策略梯度算法，也是 RLHF（C22）的默认选择。换句话说，<strong>你在本模块拼出的 A2C，就是 PPO 的骨架</strong>：PPO = A2C(actor-critic + GAE) + 信赖域式的裁剪。把 A2C 理解透，PPO 论文里就没有新原理，只有「怎么更稳地更新」这一个工程问题。</p>  <div class="callout danger"><span class="label">stop-gradient 陷阱</span>
+    <p>最致命、也最隐蔽的实现 bug 是<strong>没做 stop-gradient</strong>。critic 的回归目标 $R_t=\hat A_t+V_\phi(s_t)$ 里<em>含 $V_\phi$ 自己</em>——如果你让梯度穿过这个目标里的 $V_\phi$，critic 就会「作弊」：与其把预测拉向真实回报，不如把<em>目标</em>拉向当前预测（两边一起动、loss 假装下降），结果 critic 学到一个<strong>退化解</strong>、advantage 全错、actor 跟着崩。在 numpy 里我们手动只更新 $V[s]\leftarrow V[s]+\alpha(R_t-V[s])$、把 $R_t$ 当<strong>常数</strong>（天然 stop-gradient）；在 PyTorch 里必须显式 <code>.detach()</code> 目标。同理 actor 的 advantage 也要 detach（它是 critic 给的信号，不该回传到 critic）。<strong>这两个 detach 漏一个，深度 actor-critic 就训不出来</strong>——而在表格实现里它是天然正确的，正好让你先建立对「什么该当常数」的清晰认知。</p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>actor 和 critic 的学习率（$\eta_a,\eta_c$）通常<strong>critic 比 actor 大</strong>（如 critic 0.3、actor 0.1）。原因：critic 需要先大致学准，才能给 actor 提供有用的 advantage 信号——若 critic 落后于 actor，actor 会被错误的 advantage 误导。这是 actor-critic 的一个微妙稳定性问题（两个相互依赖的学习过程的耦合），也是它有时比纯策略梯度更难调的原因。在表格环境里你能清楚看到 critic 学准的过程；到了深度 RL，这个耦合 + 函数逼近会让调参更微妙——又一个「先在表格夯实」的理由。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="run"><span class="num">6</span>toy chain 上的 A2C + GAE</h2>
+  <h3>把它跑起来：toy chain 上的 A2C + GAE</h3>  <p>notebook 会在链 MDP（模块 03 的环境）上跑通完整的 A2C，并把 GAE 的所有关键性质数值验证：</p>  <ul>
+    <li><strong>GAE 递归 == 显式几何和</strong>：验证 $\hat A_t=\delta_t+\gamma\lambda\hat A_{t+1}$ 这个 $O(T)$ 递归，与按定义 $\sum_l(\gamma\lambda)^l\delta_{t+l}$ 的显式求和逐位相等。</li>
+    <li><strong>$\lambda=0$ 退化为 TD</strong>：验证 GAE($\lambda=0$) 逐位等于单步 TD 误差 $\delta_t$。</li>
+    <li><strong>$\lambda=1$ 退化为 MC</strong>：验证 GAE($\lambda=1$) 逐位等于蒙特卡洛 advantage $G_t-V(s_t)$。</li>
+    <li><strong>方差随 $\lambda$ 单调上升</strong>：在固定策略 + 准确 critic 下，采大量 advantage 估计，验证其方差随 $\lambda$ 从 0 到 1 单调增大（实测约 100×），而均值（真 advantage）基本不变——这是 bias-variance 权衡的铁证。</li>
+    <li><strong>A2C 收敛</strong>：完整训练 actor + critic，验证策略学会向右、回报上升，且 critic 的 $V$ 估计逼近真值。</li>
+  </ul>  <p>这套实现把本模块的理论落成可运行、可复现的代码。特别是 GAE 的反向扫描递归——短短几行，却是 PPO 等现代算法每次更新都在跑的核心子程序。你在 numpy 里把它写对、验证它在两个极端退化正确、看到方差随 $\lambda$ 的变化，就真正掌握了这个深度 RL 的关键组件。换到 C41 的 PPO，这段 GAE 代码几乎可以原样搬过去（只是 $V$ 从表格换成网络输出）。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>实现 GAE 时最容易错的地方是<strong>轨迹末尾的自举值</strong>（last value / bootstrap value）：若回合自然终止（到达目标），$s_T$ 是终止态，$V(s_T)=0$；若回合是被<em>截断</em>（达到最大步数但没真正结束），则应该用 critic 估计 $V_\phi(s_T)$ 来自举（因为后面还有未来，只是我们没跑）。混淆这两种情况（终止 vs 截断）是 RL 实现里一个经典 bug，会让接近回合末尾的 advantage 系统性错误。notebook 里我们显式区分 done 与 truncated，并 assert 终止态的自举值为 0。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="family"><span class="num">7</span>actor-critic 家族与实践要点</h2>
+  <h3>actor-critic 家族与实践要点</h3>  <p>actor-critic 是一个大家族，本模块的 A2C 是最基础的一支。把家族谱系理清，能帮你定位各种现代算法：</p>  <table>
+    <thead><tr><th>算法</th><th>在 A2C 基础上加了什么</th><th>解决的问题</th></tr></thead>
+    <tbody>
+      <tr><td>A3C</td><td>多 worker 异步并行采样</td><td>打破样本相关性、加速</td></tr>
+      <tr><td>A2C</td><td>（本模块）同步 actor-critic + GAE</td><td>基线版本</td></tr>
+      <tr><td>TRPO/PPO</td><td>用 KL 约束 / 裁剪限制更新步长</td><td>防过早塌缩、稳定大步更新</td></tr>
+      <tr><td>SAC</td><td>最大熵目标 + 双 Q critic + 重参数化</td><td>样本效率、连续控制、探索</td></tr>
+      <tr><td>DDPG/TD3</td><td>确定性 actor + Q critic（off-policy）</td><td>连续动作的 off-policy 学习</td></tr>
+      <tr><td>GRPO</td><td>去掉 critic，用组内相对回报当 advantage</td><td>LLM RL 省去价值网络（C22）</td></tr>
+    </tbody>
+  </table>  <p>实践要点（也是未来调 PPO 的 checklist）：<strong>① critic 学习率通常大于 actor</strong>（critic 先学准才能帮 actor）；<strong>② advantage 常做标准化</strong>（减均值除标准差，稳定梯度尺度，模块 03 讲过其代价）；<strong>③ 熵正则几乎必加</strong>（防塌缩）；<strong>④ 区分 done 与 truncated</strong>（自举值处理）；<strong>⑤ stop-gradient</strong>（critic 目标与 actor 的 advantage 都当常数）。这五条踩过任何一条都会让 actor-critic 学不好——而在表格环境里它们的影响都清晰可见、可对拍验证。</p>  <p>一个值得强调的现代趋势：<strong>GRPO</strong>（DeepSeek）在 LLM 的 RL 微调里<strong>干脆去掉了 critic</strong>——它对同一个 prompt 采样一组（group）回复，用<strong>组内回报的相对排名/标准化</strong>当 advantage，省去了训练价值网络的开销和不稳定。这其实是回到了「baseline」的最朴素形式（模块 03）：组内平均回报就是一个经验 baseline，组内 advantage = 个体回报 − 组平均。看，最前沿的 LLM RL 方法，本质仍是本课模块 03–04 这些地基的重新组合——这再次印证：<strong>地基不牢，上层全是玄学；地基扎实，前沿一望即懂</strong>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>critic 的偏差与稳定性</strong>：actor 与 critic 相互依赖，critic 的偏差会误导 actor、actor 改变分布又影响 critic 的训练数据——这个耦合的稳定性、收敛性在函数逼近下仍无完整理论。目标网络、双 critic（TD3/SAC）是工程上的缓解。</li>
+    <li><strong>自适应 λ 与 γ</strong>：GAE 的 $\lambda$、折扣 $\gamma$ 目前多靠手调或网格搜索。自动、自适应地调节它们（甚至 meta-learning 它们）是活跃方向，关系到算法能否少调参地迁移到新任务。</li>
+    <li><strong>去 critic 化</strong>：GRPO 等证明在某些场景（尤其 LLM）可以不用 critic、用组内 baseline 替代，省开销又更稳。什么时候 critic 不可或缺、什么时候可省，是当前（尤其 LLM RL）的热点问题。</li>
+    <li><strong>off-policy actor-critic</strong>：A2C 是 on-policy 的（数据用一次就丢）。把 actor-critic 做成 off-policy（复用数据、提样本效率）需要重要性采样修正（Degris 2012）或确定性策略（DDPG），但稳定性更难——离线 RL 把这推到极致。</li>
+    <li><strong>从 A2C 到 PPO 再到 LLM</strong>：PPO 的裁剪机制为何有效、其与信赖域的精确关系、在 LLM 上的种种适配（token-level vs sequence-level advantage、KL 的作用）仍在被深入研究。本模块的 A2C + GAE 是读懂这一切的入场券。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Schulman 2016（GAE 原始论文，本模块核心）；Konda & Tsitsiklis 2000（actor-critic 理论奠基）；Mnih 2016（A3C/A2C）；Schulman 2017（PPO，A2C 的工程化巅峰）。Sutton & Barto 第 13 章。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_policy_gradient/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 策略梯度与 REINFORCE</div></a>
+    <a class="next" href="../05_bandits_exploration/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 多臂老虎机与探索</div></a>
+  </div>
+
+</div>
+</body>
+</html>

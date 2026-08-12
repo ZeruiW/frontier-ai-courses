@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · 训练成本估算面试题：6ND / MFU / Chinchilla</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 07 / 07</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>07 · 训练成本估算面试题：6ND / MFU / Chinchilla</h1>
+  <p class="subtitle">把「训这个模型要多少卡、多久、多少钱」算到数量级正确——多条完整数字链 + 面试模板，本课的压轴 capstone。</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–03（参数量、显存、并行、ZeRO）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 07_training_cost_interview.ipynb（真实模型 + 硬件）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Kaplan 2020；Hoffmann 2022 (Chinchilla)；Brown 2020 (GPT-3)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#6nd">数学推导：训练 FLOPs ≈ 6ND（前向 2、反向 4）</a></li>
+      <li><a href="#mfu">直觉与口径：MFU——理论算力打几折</a></li>
+      <li><a href="#time">数学推导：时间与成本公式（成本与卡数无关）</a></li>
+      <li><a href="#gpt3">完整算例 A：训 GPT-3 要多少卡 / 多久 / 多少钱</a></li>
+      <li><a href="#chin">完整算例 B：Chinchilla 与给定预算反解最优模型</a></li>
+      <li><a href="#infer">陷阱：训练 6ND vs 推理 2N/token，别混</a></li>
+      <li><a href="#drill">面试 drill 模板：六步标准解法与量级速查表</a></li>
+      <li><a href="#frontier">研究前沿、陷阱清单与课程收尾</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="6nd"><span class="num">1</span>数学推导：训练 FLOPs ≈ 6ND（前向 2、反向 4）</h2>
+  <p>这是整个 C08 的<strong>面试压轴</strong>。无数系统/研究岗的面试都会落到同一道题：<em>「训这个模型大概要多少卡、跑多久、烧多少钱？」</em>答得出数量级，面试官立刻知道你有真实的工程直觉；答不出，前面背的所有架构知识都显得悬浮。这一课就把这道题拆成一条可复现的数字链，并配多个完整算例。</p>  <p>一切的起点是一个万能公式：训练一个 $N$ 参数的模型、过 $D$ 个 token，总计算量约</p>  <div class="math-block">\[\boxed{\ \text{Training FLOPs}\approx 6ND\ }\]</div>  <p>为什么是 6？拆成前向和反向两块。<strong>前向</strong>：Transformer 的主体计算是矩阵乘，每个参数对每个 token 参与一次<em>乘加</em>（multiply-accumulate），一次乘加 = 1 次乘法 + 1 次加法 = 2 FLOPs，所以前向 $\approx 2N$ FLOPs/token。<strong>反向</strong>：反向传播要算两类梯度——对激活的梯度（往前传，约 $2N$）和对权重的梯度（用来更新，约 $2N$），合计约 $4N$ FLOPs/token，恰是前向的两倍。前向 $2N$ + 反向 $4N$ = $6N$ FLOPs/token，乘以 $D$ 个 token，得 $6ND$。</p>  <table>
+    <thead><tr><th>计算块</th><th>FLOPs / token / 参数口径</th><th>来源</th></tr></thead>
+    <tbody>
+      <tr><td>前向 matmul</td><td>≈ 2N</td><td>每参数每 token 一次乘加 = 2 FLOPs</td></tr>
+      <tr><td>反向：对激活的梯度</td><td>≈ 2N</td><td>链式法则往前传</td></tr>
+      <tr><td>反向：对权重的梯度</td><td>≈ 2N</td><td>算 ∂L/∂W 用来更新</td></tr>
+      <tr><td>合计</td><td>≈ 6N</td><td>前向 2N + 反向 4N</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>6ND 是系统面试的<strong>万能钥匙</strong>。记住「前向 2、反向 4、合计 6」这三个数，再加上「硬件峰值」和「MFU」两个参数，你就能口算出 GPT-3、LLaMA、任何模型的训练量级。后面四节就是把 6ND 这块原料，依次加工成 FLOPs → 时间 → 钱。</p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>口径细节：这里的 $N$ <strong>严格说应取非 embedding 参数</strong>——embedding 查表不做每 token 的 matmul 主体，不吃 6ND 的账。但做<em>数量级</em>估算时，用总参数量也无妨（embedding 通常占比小）。面试时点一句「N 取非 embedding 更准」会显得你抠过细节。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mfu"><span class="num">2</span>直觉与口径：MFU——理论算力打几折</h2>
+  <p>有了 $6ND$ 这块计算量，下一步要把它换成时间，就必须面对一个残酷现实：<strong>GPU 标称的峰值算力，你永远跑不满。</strong></p>  <p>GPU datasheet 上的峰值（如 A100 bf16 312 TFLOP/s、H100 bf16 约 990 TFLOP/s）是<strong>理论上限</strong>，假设张量核心 100% 满载、数据永远就绪。真实训练里，通信（梯度 all-reduce、并行切分的数据交换）、内存带宽、kernel 启动开销、流水线气泡都会偷走时间。衡量「实际打了几折」的指标叫 <span class="term">MFU</span>（Model FLOPs Utilization）：</p>  <div class="math-block">\[\text{MFU}=\frac{\text{实际有效算力}}{\text{峰值算力}},\qquad \text{有效算力}=\text{峰值}\times\text{MFU}\times G\]</div>  <p>$G$ 是卡数。真实大模型训练的 MFU 通常落在 <strong>30%–55%</strong>——做得好的大规模训练能到 40%–50%，普通配置常在 30% 出头。这意味着一张 312 TFLOP/s 的 A100，有效产出可能只有 $312\times0.4\approx 125$ TFLOP/s。</p>  <div class="callout danger"><span class="label">MFU 是这道题的灵魂参数</span>
+    <p><strong>没有 MFU 的时间/成本估算是耍流氓。</strong>用峰值（即 MFU=100%）算出来的时间会严重<strong>低估</strong>——MFU 40% 意味着<strong>真实时间是理论的 2.5 倍</strong>（$1/0.4=2.5$）。面试报数字时必须主动说出你的 MFU 假设，比如「按 A100、MFU 40% 估」；只字不提 MFU 的答案，懂行的面试官会直接判你没算过真实训练。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>峰值算力像汽车仪表盘上的<em>最高时速 250 km/h</em>——理论上能到，但实际开在路上（红灯、堵车、上下坡）平均时速可能只有 100。MFU 就是「实际平均时速 ÷ 仪表盘最高速」。你要估一趟路开多久，得用实际平均速度，不能用仪表盘最高速。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>MFU 与硬件利用率 HFU（Hardware FLOPs Utilization）有别：HFU 把<em>重计算（activation recomputation）</em>等「有效但重复」的 FLOPs 也算进去，所以 HFU ≥ MFU。报训练效率时业界更常用 MFU，因为它对应「真正推进训练的有效计算」，是衡量系统好坏的更诚实的尺子。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="time"><span class="num">3</span>数学推导：时间与成本公式（成本与卡数无关）</h2>
+  <p>把前两节拼起来，就得到这道题的两条主公式。时间 = 计算量 ÷ 有效算力；成本 = 卡数 × 时间 × 单价。</p>  <div class="math-block">\[T=\frac{6ND}{\text{峰值}\times\text{MFU}\times G},\qquad \text{成本}=G\times T_{\text{小时}}\times \text{单价/卡时}\]</div>  <p>这里藏着一个非常漂亮、面试官爱考的洞察：<strong>把 $T$ 代进成本，卡数 $G$ 约掉了。</strong></p>  <div class="math-block">\[\text{成本}=G\cdot\frac{6ND}{\text{峰值}\cdot\text{MFU}\cdot G}\cdot\frac{\text{单价}}{3600}=\frac{6ND}{\text{峰值}\cdot\text{MFU}}\cdot\frac{\text{单价}}{3600}\]</div>  <p>（除以 3600 是因为单价按<em>卡时</em>计，而 $T$ 以秒为单位。）这条式子说：<strong>训练总成本与用多少卡无关</strong>——更多卡只是让训练<em>更快完成</em>，但总卡时（卡数 × 小时）守恒。买 2048 张卡比 1024 张快一倍，可账单一样（忽略并行通信损耗）。这是个反直觉但极重要的结论：卡数决定<em>墙钟时间</em>，不决定<em>总花费</em>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>类比：搬一堆砖，雇 10 个工人和雇 20 个工人，<strong>总工时（人 × 小时）一样</strong>，20 人只是搬得快。所以老板的人力账单不变（按工时付费），变的只是工期。训练同理——卡是工人，6ND 是那堆砖，MFU 是工人的实际效率。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="gpt3"><span class="num">4</span>完整算例 A：训 GPT-3 要多少卡 / 多久 / 多少钱</h2>
+  <p>现在上第一个完整算例，也是面试最经典的一道：<strong>训 GPT-3 要多少卡、多久、多少钱？</strong>GPT-3 的官方数字：$N=175\text{e}9$ 参数、$D=300\text{e}9$ token。我们一步步把数字链走完，<strong>每一步都给出数</strong>。</p>  <h4>第 1 步：算总计算量 C = 6ND</h4>  <div class="math-block">\[C=6ND=6\times 175\text{e}9\times 300\text{e}9=3.15\text{e}23\ \text{FLOPs}\]</div>  <h4>第 2 步：定硬件有效算力</h4>  <p>用 A100 bf16，峰值 $312\text{e}12$ FLOP/s，MFU 取 40%（大规模训练的合理值）：</p>  <div class="math-block">\[\text{有效/卡}=312\text{e}12\times 0.40=124.8\text{e}12\ \text{FLOP/s}\]</div>  <h4>第 3 步：选卡数 G，算时间 T</h4>  <p>取 $G=1024$ 张 A100：</p>  <div class="math-block">\[T=\frac{3.15\text{e}23}{124.8\text{e}12\times 1024}=\frac{3.15\text{e}23}{1.278\text{e}17}\approx 2.46\text{e}6\ \text{s}\]</div>  <p>换算：$2.46\text{e}6 \text{ s} \div 86400 \approx 28.5$ 天，约等于 $2.46\text{e}6/3600\approx 684$ 卡时/卡。</p>  <h4>第 4 步：算钱</h4>  <p>A100 云价按约 \$1.5/卡时（量级，实际 \$1–2 区间）：</p>  <div class="math-block">\[\text{成本}=1024\ \text{卡}\times 684\ \text{小时}\times \$1.5/\text{卡时}\approx \$1.05\text{e}6\]</div>  <p><strong>约 105 万美元、1024 张 A100、跑 28.5 天</strong>——这就是 GPT-3 训练的量级答案。验证一下「成本与卡数无关」：若改用 2048 张卡，时间减半到约 14 天，但 $2048\times 342\times 1.5$ 仍约 \$1.05M，账单不变。</p>  <table>
+    <thead><tr><th>步骤</th><th>公式</th><th>代入数值</th><th>结果</th></tr></thead>
+    <tbody>
+      <tr><td>C</td><td>6ND</td><td>6·175e9·300e9</td><td>3.15e23 FLOPs</td></tr>
+      <tr><td>有效/卡</td><td>峰值·MFU</td><td>312e12·0.4</td><td>124.8e12 FLOP/s</td></tr>
+      <tr><td>T</td><td>C/(有效·G)</td><td>3.15e23/(124.8e12·1024)</td><td>≈ 2.46e6 s ≈ 28.5 天</td></tr>
+      <tr><td>卡时/卡</td><td>T/3600</td><td>2.46e6/3600</td><td>≈ 684 小时</td></tr>
+      <tr><td>成本</td><td>G·T_hr·单价</td><td>1024·684·$1.5</td><td>≈ $1.05M</td></tr>
+    </tbody>
+  </table>  <div class="ascii">GPT-3 训练成本数字链（A100, MFU 40%, 1024 卡）
+  N=175e9 ─┐
+           ├─ ×6 ─→ C = 6ND = 3.15e23 FLOPs
+  D=300e9 ─┘                │
+                            ÷ (312e12 × 0.40 × 1024 卡)
+                            ▼
+              T ≈ 2.46e6 s ≈ 28.5 天 (684 卡时/卡)
+                            │  × 1024 卡 × $1.5/卡时
+                            ▼
+              成本 ≈ $1.05M  (与卡数无关：2048 卡 → 14 天，账单不变)</div>  <div class="callout warn"><span class="label"></span>
+    <p>这是<strong>理论训练</strong>的账。真实 GPT-3 的总花费更高，因为还要叠加：失败重启与 checkpoint 回滚、数据清洗与预处理的算力、海量调参与消融实验（真正训出来前跑过的所有小实验）。经验上<strong>真实账常是理论训练的几倍</strong>。面试时报完理论数字，补一句这个，显得你见过真账。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="chin"><span class="num">5</span>完整算例 B：Chinchilla 与给定预算反解最优模型</h2>
+  <p>第二个核心问题：给定算力预算 $C=6ND$，参数 $N$ 和数据 $D$ 该怎么分，才能让最终 loss 最低？这正是 <span class="term">scaling laws</span> 要回答的。Kaplan 等人 2020 的早期结论倾向「把算力多砸在参数上」；Hoffmann 等人 2022 的 <span class="term">Chinchilla</span> 论文做了更系统的拟合，给出了著名修正。</p>  <p>Chinchilla 的核心结论：<strong>$N$ 和 $D$ 应当同比例增长</strong>，compute-optimal 时大约 $D\approx 20N$（每个参数配约 20 个训练 token）。换成 scaling 关系：</p>  <div class="math-block">\[N_{\text{opt}}\propto C^{0.5},\quad D_{\text{opt}}\propto C^{0.5}\quad\Rightarrow\quad D_{\text{opt}}\approx 20\,N_{\text{opt}}\]</div>  <p>最实用的推论是<strong>给定预算反解最优模型大小</strong>。由 $C=6ND$ 和 $D=20N$ 联立，消去 $D$：</p>  <div class="math-block">\[C=6N\cdot 20N=120N^2\ \Rightarrow\ N_{\text{opt}}=\sqrt{\frac{C}{120}},\quad D_{\text{opt}}=20\,N_{\text{opt}}\]</div>  <h4>完整算例 B：给定 1000 张 H100 跑 30 天，最优模型多大？</h4>  <p>先算总算力 $C$。H100 bf16 峰值约 $990\text{e}12$ FLOP/s，MFU 取 40%，$G=1000$，时间 $30\times 86400=2.592\text{e}6$ s：</p>  <div class="math-block">\[C=990\text{e}12\times 0.40\times 1000\times 2.592\text{e}6\approx 1.03\text{e}24\ \text{FLOPs}\]</div>  <p>代入 Chinchilla 公式：</p>  <div class="math-block">\[N_{\text{opt}}=\sqrt{\frac{1.03\text{e}24}{120}}=\sqrt{8.55\text{e}21}\approx 9.2\text{e}10,\quad D_{\text{opt}}=20\times 9.2\text{e}10\approx 1.85\text{e}12\]</div>  <p>即<strong>约 92B 参数、配约 1.85T token</strong>是这笔预算下的 compute-optimal 配置。这类反解题面试很爱出：给你硬件和时间，问你「应该训多大的模型」——答案不是「越大越好」，而是这条 $\sqrt{C/120}$。</p>  <div class="callout danger"><span class="label">参数大 ≠ 更强，要看数据配没配齐</span>
+    <p><strong>GPT-3 是「训练不足」的活教材。</strong>它 175B 参数却只喂了 300B token，比值 $D/N\approx 1.7$，远低于 Chinchilla 的 20。按 compute-optimal，175B 模型应配约 $20\times 175\text{B}=3.5\text{T}$ token。Chinchilla 自己用 <strong>70B 参数 + 1.4T token</strong>（$D/N=20$）在<em>更少</em>的总算力下全面打败了 GPT-3——证明「参数不是越大越好，数据要配齐」。这对评测的启示：<strong>比较两个模型时先看它们是否各自 compute-optimal</strong>，否则比的是训练配置而非架构优劣。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="infer"><span class="num">6</span>陷阱：训练 6ND vs 推理 2N/token，别混</h2>
+  <p>一个面试高频混淆点，必须单独拎出来讲清：<strong>训练的 6ND 和推理的 2N 是两笔完全不同的账，别混。</strong></p>  <p>推理时只有前向、没有反向（不算梯度、不更新权重），所以<strong>推理一次前向 ≈ 2N FLOPs/token</strong>——恰好是 6ND 里前向那一块 $2N$。注意推理这里没有 $D$：$D$ 是<em>训练</em>要过的总 token 数；推理是<em>按 token 计费</em>的边际成本，每生成 1 个 token 约 2N FLOPs。</p>  <div class="math-block">\[\text{训练}\approx 6ND\ \text{(整个数据集)};\qquad \text{推理}\approx 2N\ \text{FLOPs/token}\]</div>  <table>
+    <thead><tr><th></th><th>训练</th><th>推理（单 token 前向）</th></tr></thead>
+    <tbody>
+      <tr><td>前向</td><td>2N/token</td><td>2N/token</td></tr>
+      <tr><td>反向</td><td>4N/token</td><td>无</td></tr>
+      <tr><td>系数</td><td>6N/token</td><td>2N/token</td></tr>
+      <tr><td>规模因子</td><td>× D（总 token）</td><td>× 每个生成 token</td></tr>
+      <tr><td>公式</td><td>6ND（一次性）</td><td>2N/token（边际）</td></tr>
+    </tbody>
+  </table>  <p>一个有用的数量级感：<strong>训练的总 FLOPs ≈ 推理一次前向的 3D 倍</strong>（$6ND / 2N = 3D$）。GPT-3 训练过了 300B token，相当于做了约 $3\times 300\text{e}9=9\text{e}11$ 次「单 token 前向」的计算量。但反过来想：一旦训好，<em>一次推理调用</em>只花 2N——这正是「训练贵、推理（单次）便宜，但推理量大了总账也惊人」的根源。</p>  <div class="callout warn"><span class="label"></span>
+    <p>面试陷阱原话：<em>「推理一次要多少算力？」</em>——答 $2N$ FLOPs/token，<strong>千万别脱口说 6N 或带上 D</strong>。把 6ND（训练、含反向、乘整个数据集）和 2N/token（推理、纯前向、按 token）这两个公式的「系数」和「规模因子」都说对，面试官就知道你脑子里这两笔账是分开的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="drill"><span class="num">7</span>面试 drill 模板：六步标准解法与量级速查表</h2>
+  <p>把整道题固化成一个<strong>六步模板</strong>，面试时照着走，绝不漏项：</p>  <ol>
+    <li><strong>定 N、D</strong>：参数量 $N$ 直接给或估；数据 $D$ 若题目没给，用 Chinchilla 取 $20N$。</li>
+    <li><strong>算 C = 6ND</strong>：一行算出总 FLOPs。</li>
+    <li><strong>定硬件</strong>：峰值算力（A100 312T / H100 ~990T bf16）+ MFU（默认取 40%，并<em>说出来</em>）。</li>
+    <li><strong>算时间 T</strong>：$T=C/(\text{峰值}\cdot\text{MFU}\cdot G)$，选定卡数 $G$，换算成天。</li>
+    <li><strong>算钱</strong>：$G\cdot T_{\text{hr}}\cdot$ 单价（A100 约 \$1–2/卡时）；或用与卡数无关的成本式校验。</li>
+    <li><strong>查显存</strong>：用模块 01/03 验证 $G$ 张卡放得下（权重 + 优化器状态 + 激活，ZeRO/并行切分）。</li>
+  </ol>  <p>第 6 步常被忽略却很关键：算得出时间和钱，但<strong>卡数 $G$ 还得满足显存约束</strong>——一个 175B 模型的权重 + Adam 优化器状态（fp32 动量与方差）+ 梯度，单卡根本放不下，必须靠数据并行 + ZeRO 分片 + 张量/流水线并行把状态摊到足够多卡上。时间够快但显存放不下，方案就是空中楼阁。</p>  <h4>量级速查表（背下来，面试现场对锚点）</h4>  <table>
+    <thead><tr><th>模型</th><th>N（参数）</th><th>D（token）</th><th>C ≈ 6ND</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-2</td><td>1.5B</td><td>≈ 10B</td><td>≈ 9e19</td><td>早期，D/N 小</td></tr>
+      <tr><td>GPT-3</td><td>175B</td><td>300B</td><td>≈ 3.15e23</td><td>训练不足（D/N≈1.7）</td></tr>
+      <tr><td>Chinchilla</td><td>70B</td><td>1.4T</td><td>≈ 5.9e23</td><td>compute-optimal（D/N=20）</td></tr>
+      <tr><td>LLaMA-2 7B</td><td>7B</td><td>2T</td><td>≈ 8.4e22</td><td>过训练（D/N≈286，为推理省成本）</td></tr>
+      <tr><td>LLaMA-2 70B</td><td>70B</td><td>2T</td><td>≈ 8.4e23</td><td>略多于 Chinchilla 配比</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>注意 LLaMA-2 那行——$D/N$ 高达约 286，远超 Chinchilla 的 20，是<strong>故意过训练（over-training）</strong>。为什么明知不是 compute-optimal 还这么做？因为 Meta 要的是一个<em>推理便宜</em>的小模型：用更多训练算力换更小的 $N$，部署时每 token 推理成本（$2N$）更低。这正是下一节前沿要展开的「以推理成本换训练成本」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿、陷阱清单与课程收尾</h2>
+  <p>6ND / MFU / Chinchilla 是这套账本的地基，但前沿一直在往上修正。把这些方向和它们改了地基的哪一块对上：</p>  <ul>
+    <li><strong>后 Chinchilla 的过训练</strong>（<span class="term">over-training</span>）：LLaMA-3、DeepSeek 等明知偏离 <span class="term">compute-optimal</span>，也要把小模型喂到远超 20N 的 token——因为部署阶段海量推理调用的总成本，会盖过训练阶段一次性的额外算力。Sardana &amp; Frankle 2023 把<em>推理成本</em>显式纳入 scaling law，给出「该训多小、过训多狠」的新最优点。</li>
+    <li><strong>MoE 的 FLOPs 账</strong>：<span class="term">mixture-of-experts</span> 模型每个 token 只激活一部分专家，「激活参数」远小于「总参数」。6ND 里的 $N$ 该用哪个？训练 FLOPs 用激活参数算更准——这让 MoE 能用很大的总参数量却只付较小的训练 / 推理 FLOPs，是另一种「以显存换算力」。</li>
+    <li><strong>数据墙</strong>（<span class="term">data wall</span>）：Chinchilla 要 $D=20N$，但高质量人类文本是有限的。当 $D$ 撞到天花板，再加算力只能往参数堆（回到 Kaplan 区间）或靠合成数据、多轮重复——scaling 的范式正在被重写。</li>
+    <li><strong>N 取非 embedding、MFU 必报</strong>：这两条不是前沿而是<em>永远的纪律</em>——前者让 6ND 更准，后者让时间 / 成本估算不至于乐观 2.5 倍。</li>
+  </ul>  <div class="callout danger"><span class="label"></span>
+    <p><strong>把全课的陷阱收成一张清单，面试前过一遍：</strong></p>  <ul>
+    <li>6ND 是<strong>训练</strong>；推理是<strong>2N/token</strong>。系数和规模因子都别混。</li>
+    <li>$N$ 取<strong>非 embedding</strong>更准；数量级估算用总参数可接受。</li>
+    <li>MFU <strong>必报</strong>——没有 MFU 的时间/成本是耍流氓；MFU 40% = 实际时间 ×2.5。</li>
+    <li>真实账 =<strong>理论的几倍</strong>（失败重启、数据预处理、调参试错）。</li>
+    <li>比较模型先看是否各自 <strong>compute-optimal</strong>，否则比的是配置不是架构。</li>
+  </ul>
+  </div>  <p><strong>恭喜你完成了 C08 训练 / 推理系统课。</strong>从模块 00 的参数量与显存，到 01 的 roofline，到 02–04 的并行与 ZeRO，到 05 的量化，到 06 的推理服务，再到这一课的成本账本——你现在握有一整套<strong>第一性原理的工程账本</strong>：拿到任何一个模型，都能在一张餐巾纸上估出它要多少卡、训多久、烧多少钱、推理多贵、显存放不放得下。这正是把「会调 API」和「懂系统」区分开的那条线。带着这套账本，去看任何模型吧。</p>  <div class="callout paper"><span class="label"></span>
+    <p><strong>核心参考：</strong></p>  <ul>
+    <li>Kaplan et al. 2020 — <em>Scaling Laws for Neural Language Models</em>。</li>
+    <li>Hoffmann et al. 2022 — <em>Training Compute-Optimal Large Language Models</em>（Chinchilla）。</li>
+    <li>Brown et al. 2020 — <em>Language Models are Few-Shot Learners</em>（GPT-3）。</li>
+    <li>Sardana &amp; Frankle 2023 — <em>Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws</em>。</li>
+  </ul>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../06_inference_serving/06_讲解.html"><div class="dir">← 上一模块</div><div class="t">06 · 推理服务</div></a>
+    <a class="next" href="07_training_cost_interview.ipynb"><div class="dir">下一模块 →</div><div class="t">打开配套练习</div></a>
+  </div>
+
+</div>
+</body>
+</html>

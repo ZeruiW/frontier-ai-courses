@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 数据并行与 FSDP</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 数据并行与 FSDP</h1>
+  <p class="subtitle">从 DDP 的梯度 all-reduce，到 ZeRO-1/2/3 把优化器状态、梯度、参数逐级分片，再到 FSDP 让单卡装不下的模型成为可能 —— 用 numpy 在单进程里模拟多 rank、把每一步对拍单卡</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（集合通信原语）、反向传播与 Adam、一点显存常识（C08）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_data_parallel_fsdp.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Rajbhandari 2020 (ZeRO)、Zhao 2023 (PyTorch FSDP)、ZeRO-Infinity 2021</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么数据并行：复制模型、切分数据</a></li>
+      <li><a href="#ddp">DDP 与梯度 all-reduce</a></li>
+      <li><a href="#memory">显存账：16P 字节花在哪</a></li>
+      <li><a href="#zero1">ZeRO-1：分片优化器状态</a></li>
+      <li><a href="#zero2">ZeRO-2：再分片梯度</a></li>
+      <li><a href="#zero3">ZeRO-3 / FSDP：分片参数本身</a></li>
+      <li><a href="#tradeoff">权衡与选型：通信换显存</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么数据并行：复制模型、切分数据</h2>
+  <p>上一模块我们把集合通信原语（all-reduce / reduce-scatter / all-gather）从零拆开了。现在用它们搭起分布式训练里<strong>最基础、也最先该上手的一种并行：数据并行（data parallelism, DP）</strong>。它的思想朴素得近乎天真——<em>既然一块卡装得下模型、只是数据吃不完，那就多买几块卡，每块都放一份完整模型，把一个大 batch 切成几份各算各的，最后把梯度对齐</em>。绝大多数分布式训练任务，从两卡到几千卡，骨架都是数据并行。</p>  <p>把它和单卡训练摆在一起看，差别只在一步。单卡每个 step 是：取一个 batch → 前向 → 反向得到梯度 → 优化器更新参数。数据并行把它复制到 <span class="term">world_size</span> 个 <span class="term">rank</span> 上，唯一的新增动作是反向之后、更新之前，插入一次<strong>梯度同步（all-reduce 求平均）</strong>，让所有 rank 拿到完全一致的梯度、从而走出完全一致的下一步。</p>  <div class="ascii">单卡:   batch ──► forward ──► backward ──► [grad] ──► optimizer.step()
+
+数据并行(W=4):
+  rank0:  shard0 ─► fwd ─► bwd ─► g0 ┐
+  rank1:  shard1 ─► fwd ─► bwd ─► g1 ├─► all-reduce 求平均 ─► ḡ ─► step()  (每 rank 同步)
+  rank2:  shard2 ─► fwd ─► bwd ─► g2 │     (唯一的新增动作)
+  rank3:  shard3 ─► fwd ─► bwd ─► g3 ┘</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：每块卡都是一个完整的「单卡训练」，只是各看 batch 的一部分；它们靠每步交换一次梯度来保持「步调一致」，于是 W 块卡看起来就像一块拥有 W 倍 batch、W 倍吞吐的超级卡。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨说：DP 不改变优化的数学，只改变<strong>有效 batch 大小</strong>。W 个 rank、每 rank 本地 batch 为 b，等价于单卡 batch=Wb。理想情况下吞吐随 W 线性增长，但每步要为梯度同步付一次通信代价，这正是 DP 可扩展性的天花板所在。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>数据并行解决的是<strong>「算力/吞吐」不够</strong>的问题，不解决<strong>「显存装不下模型」</strong>的问题——因为每块卡仍存一份完整模型。后者要靠本模块后半段的 ZeRO/FSDP（分片）或下一模块的张量/流水并行。先把这条分界线钉死：<em>DP 复制模型、切分数据；ZeRO/TP/PP 切分模型本身</em>。</p>  <p>还有一个常被混淆的点要先厘清：数据并行里的「切 batch」和单卡里的<strong>梯度累积（gradient accumulation）</strong>是两件互补的事。梯度累积是在<em>一块卡上</em>把一个大 batch 拆成若干 micro-batch 顺序前向反向、累加梯度后才更新一次，用时间换显存；数据并行是把 batch 拆到<em>多块卡上</em>并行算、用卡换时间。二者可以叠加：<code>有效 batch = world_size × 每卡 micro-batch × 累积步数</code>。理解这条乘式，是后面排查「为什么我加了卡 loss 曲线却变了」的基础——多半是有效 batch 变了而学习率没跟着调。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ddp"><span class="num">2</span>DDP 与梯度 all-reduce</h2>
+  <p>数据并行在 PyTorch 里的标准实现叫 <span class="term">DistributedDataParallel (DDP)</span>。它的正确性基石是一条简单的等式：<strong>把各 rank 的梯度求平均，恰好等于在拼起来的大 batch 上算的梯度</strong>。只要损失对样本是<em>求和或求平均</em>的（几乎所有损失都是），这条等式就严格成立。</p>  <p>设损失是逐样本损失的平均，rank r 持有数据分片 <code>D_r</code>（各含 b 个样本）。rank r 本地算的梯度是它那 b 个样本梯度的平均；对 W 个 rank 的本地梯度再求平均，分母配平后正好是全部 Wb 个样本梯度的平均：</p>  <div class="math-block">\[\bar g \;=\; \frac{1}{W}\sum_{r=0}^{W-1} g_r \;=\; \frac{1}{W}\sum_{r=0}^{W-1}\Big(\frac{1}{b}\sum_{i\in D_r}\nabla \ell_i\Big) \;=\; \frac{1}{Wb}\sum_{i=1}^{Wb}\nabla \ell_i \;=\; g_{\text{single batch}=Wb}\]</div>  <p>所以 DDP 的同步用的就是模块 01 的 <span class="term">all-reduce</span>（求和后再除以 W，或直接用 all-reduce 的 average 变体）。每个 rank 在 all-reduce 之后持有<strong>完全相同</strong>的平均梯度，于是各自的 <code>optimizer.step()</code> 走出完全相同的参数——所有 rank 的模型副本逐位一致，这一点必须保证，否则副本会悄悄漂移。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一个新手常踩的坑：忘了除以 W，或在某些 rank 上漏算了某些参数的梯度（比如带控制流的模型某个分支没走到）。前者让学习率隐形放大 W 倍，后者让 all-reduce 在不同 rank 上对不齐、直接 hang 死或算错。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>工程上 DDP 不会等所有梯度都算完才发一次巨型 all-reduce，而是把参数分成若干 <span class="term">bucket</span>，反向传播一边算梯度、一边对<strong>已就绪的 bucket</strong> 异步发起 all-reduce，让<strong>通信与反向计算重叠</strong>。这是 DDP 把通信开销藏进计算的关键，也是它比朴素「算完再同步」快得多的原因。</p></div>
+  </div>  <p>把通信与反向重叠这件事再讲透一点，因为它是 DDP 性能的命脉。反向传播是<strong>从最后一层往第一层</strong>逐层算梯度的，所以最后几层的梯度最先就绪。DDP 把参数倒序装进若干 bucket（默认每个约 25MB），某个 bucket 里的梯度一旦全部就绪，就<strong>立刻在后台 NCCL 流上发起这个 bucket 的 all-reduce</strong>，与此同时前面几层的反向计算还在 GPU 的计算流上继续。理想情况下，当第一层的梯度也算完时，后面 bucket 的通信早已完成大半——通信几乎被<strong>完全藏进</strong>反向计算里。</p>  <p>bucket 的大小是个真实的调参旋钮：桶太小，则发起的 all-reduce 次数多、每次都摊一遍固定的启动延迟（latency-bound），小消息打不满带宽；桶太大，则要等很久才凑满一个桶、重叠的机会变少，且第一个桶迟迟发不出去。<em>桶大小本质是在「通信次数（延迟）」与「重叠程度」之间找平衡</em>——这正是模块 01 里「带宽-延迟成本模型」在 DDP 上的直接应用。</p>  <div class="callout warn"><span class="label"></span>
+    <p>DDP 要求每个 rank 在每一步<strong>参与完全相同的一组集合通信调用、顺序也一致</strong>。一旦某个 rank 因数据相关的控制流跳过了某次 all-reduce，其余 rank 会永远等它——这是分布式训练里最常见的 <code>hang</code>（卡死）。带动态控制流的模型要么用 <code>find_unused_parameters=True</code>，要么保证各 rank 计算图结构一致。一个隐蔽的同源 bug：用了梯度累积时，前 K−1 个 micro-step<strong>不该</strong>触发 all-reduce（否则白白同步 K 次），要用 <code>model.no_sync()</code> 上下文把它们的同步关掉，只在最后一步同步。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="memory"><span class="num">3</span>显存账：16P 字节花在哪</h2>
+  <p>要理解 ZeRO/FSDP 为什么存在，先得把<strong>一块卡上训练显存到底花在哪</strong>算清楚——这正是 C08「成本模型」那门课的核心，这里快速复述、并补上工程细节。以参数量 <code>P</code> 计，混合精度 + Adam 训练的常驻显存（不含激活）大致是：</p>  <table>
+    <thead><tr><th>项目 (EN)</th><th>精度</th><th>字节/参数</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>fp16/bf16 参数 (model weights)</td><td>16-bit</td><td>2P</td><td>前向/反向实际用的低精度权重</td></tr>
+      <tr><td>fp16/bf16 梯度 (gradients)</td><td>16-bit</td><td>2P</td><td>反向算出、待 all-reduce/更新</td></tr>
+      <tr><td>fp32 主参数 (master weights)</td><td>32-bit</td><td>4P</td><td>优化器更新的高精度副本，避免精度损失</td></tr>
+      <tr><td>Adam 一阶动量 m</td><td>32-bit</td><td>4P</td><td>优化器状态</td></tr>
+      <tr><td>Adam 二阶动量 v</td><td>32-bit</td><td>4P</td><td>优化器状态</td></tr>
+    </tbody>
+  </table>  <p>把它们加起来，就是那个著名的数字：</p>  <div class="math-block">\[M_{\text{model+opt}} \;=\; \underbrace{2P}_{\text{fp16 参数}} + \underbrace{2P}_{\text{fp16 梯度}} + \underbrace{4P}_{\text{fp32 主参数}} + \underbrace{4P + 4P}_{\text{Adam }m,v} \;=\; 16P \ \text{字节}\]</div>  <p>也就是说，一个 <strong>7B（70 亿参数）</strong> 模型，光是参数+梯度+优化器状态就要 <code>16 × 7e9 ≈ 112 GB</code>——单张 80GB 的 A100/H100<strong>根本装不下</strong>，这还没算激活。这就是 ZeRO/FSDP 要解决的核心矛盾：<em>这 16P 字节里，绝大部分（12P 的优化器状态+主参数）在 DDP 里被每块卡冗余地各存了一份</em>。</p>  <div class="callout danger"><span class="label">冗余即浪费</span>
+    <p>数据并行最浪费的地方正在于此：W 块卡存了 W 份完全相同的优化器状态与主参数。两卡就浪费一半、八卡就浪费 7/8。<strong>ZeRO 的全部洞察就一句话：这些每步只被本 rank 用到一次的状态，没必要每块卡都存——切开、各存一片、要用时再临时凑齐</strong>。</p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把 16P 拆成两类很有用：<strong>「算的时候必须在手边」</strong>的是 fp16 参数（2P，前向反向每层都要）；<strong>「只在 step 时用一下」</strong>的是梯度+主参数+Adam 状态（14P）。ZeRO 正是顺着这条线，从「最不常用」的优化器状态开始，一层层往下切。</p>  <p>还有一笔账 16P 里没算、但常常才是 OOM 的真凶——<strong>激活（activations）</strong>。前向时每一层的输出都要<em>缓存下来</em>供反向用，这部分显存正比于 <code>batch × seq_len × hidden × 层数</code>，长序列、大 batch 下能轻松超过参数本身。它和 16P 的关键区别是：<strong>激活随 batch/序列增长，而 16P 只随模型大小固定</strong>。对付激活有两条独立的路：<span class="term">activation checkpointing</span>（重计算，丢弃中间激活、反向时重新前向算一遍，用算力换显存，见模块 04）和把 batch 切小（梯度累积）。<strong>ZeRO/FSDP 切的是 16P 这部分，激活要靠 checkpointing 单独治</strong>——两者正交，大模型训练通常同时上。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="zero1"><span class="num">4</span>ZeRO-1：分片优化器状态</h2>
+  <p><span class="term">ZeRO</span>（Zero Redundancy Optimizer，Rajbhandari 等 2020）把上面的 16P 分三个阶段逐步分片，每阶段消掉一类冗余。<strong>ZeRO Stage 1：分片优化器状态</strong>（Adam 的 m、v 以及 fp32 主参数，共 12P）。每个 rank 只负责其中 <code>1/W</code> 的参数对应的优化器状态。</p>  <p>它的一个训练步是这样跑的（注意通信原语正好是模块 01 学的那几个）：</p>  <ol>
+    <li>前向 + 反向：每个 rank 用完整的 fp16 参数算出<strong>完整的</strong> fp16 梯度（这步和 DDP 一样）；</li>
+    <li><span class="term">reduce-scatter</span> 梯度：不做全量 all-reduce，而是让每个 rank 只<strong>收到自己负责那 1/W 分片</strong>的求和后梯度；</li>
+    <li>本地更新：每个 rank 用自己手里的 1/W 优化器状态，更新自己负责的那 1/W 主参数、再投影回 fp16；</li>
+    <li><span class="term">all-gather</span> 参数：把各 rank 更新好的 fp16 参数分片拼回完整参数，供下一步前向使用。</li>
+  </ol>  <p>显存账立竿见影：12P 的优化器状态被切成 <code>12P/W</code>，而 2P 参数 + 2P 梯度仍是全量。每 rank 常驻约：</p>  <div class="math-block">\[M_{\text{ZeRO-1}} \;\approx\; 2P + 2P + \frac{12P}{W} \;=\; 4P + \frac{12P}{W}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：ZeRO-1 把「最占地方又最少用」的优化器状态（12P）分给大家各管一段。W 越大，这 12P 摊得越薄；卡足够多时，每卡的优化器状态几乎可以忽略。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨说：通信量上，ZeRO-1 把 DDP 的一次 all-reduce（= reduce-scatter + all-gather）拆成了<strong>反向后的 reduce-scatter 梯度 + 更新后的 all-gather 参数</strong>，每 rank 收发的总字节数与 DDP 的 all-reduce<strong>基本相同</strong>（约 2P）。所以 ZeRO-1 几乎是<strong>免费的显存节省</strong>——这也是它该被默认开启的原因。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="zero2"><span class="num">5</span>ZeRO-2：再分片梯度</h2>
+  <p><strong>ZeRO Stage 2：在 Stage 1 的基础上，再分片梯度。</strong>观察到一个浪费：在 ZeRO-1 里，每个 rank 算出并暂存了<em>完整</em>的 2P 梯度，但它最终只用得上自己负责那 1/W 片去更新参数——其余 (W-1)/W 的梯度在 reduce-scatter 后就被丢弃了。既然如此，何必为它们一直占着显存？</p>  <p>ZeRO-2 的做法是：反向传播一边算梯度，一边对<strong>已算完的梯度立即 reduce-scatter</strong>，每个 rank 只<strong>累积、保留自己负责那 1/W 分片</strong>的梯度，算完一片就把对应的完整梯度释放掉。于是梯度的常驻显存从 2P 降到 <code>2P/W</code>：</p>  <div class="math-block">\[M_{\text{ZeRO-2}} \;\approx\; 2P + \frac{2P}{W} + \frac{12P}{W} \;=\; 2P + \frac{14P}{W}\]</div>  <p>注意此时仍有 2P 的 fp16 参数是全量的——因为前向反向每一层都要用完整参数算，这部分到 ZeRO-3 才会被切。ZeRO-2 在工程上很受欢迎：它把梯度+优化器状态（14P）全部摊薄，只留 2P 全量参数，显存收益大而实现相对 ZeRO-3 简单。</p>  <p>从 ZeRO-1 到 ZeRO-2，通信量<strong>依然没变</strong>：ZeRO-1 是「攒完整梯度→一次性 reduce-scatter」，ZeRO-2 是「每层梯度就绪就 reduce-scatter 它那一段」，搬的总字节数一样，只是把一次大通信拆成了许多次小通信、换来梯度显存从 2P 降到 2P/W。这又是一次和模块 01「同样的总量，不同的切法」的呼应：切法影响重叠与显存峰值，但不改变总通信量。代价是 ZeRO-2 的通信更碎（每层一次 reduce-scatter），对小模型可能因消息太小而打不满带宽——这也是为什么超大模型才更划算。</p>  <div class="callout warn"><span class="label"></span>
+    <p>ZeRO-2 的「边反向边 reduce-scatter」必须和反向的计算图次序对齐：梯度是<strong>按层从后往前</strong>陆续算出的，通信要挂在每层梯度就绪的钩子（hook）上。若实现把通信和某层计算的依赖搞错，会读到尚未算完的梯度——这类 bug 不报错，只是悄悄让结果偏掉，必须靠和单卡对拍来抓（本模块 notebook 的纪律）。另一个易错点：开了梯度累积时，ZeRO-2/3 的梯度分片要在累积期间<strong>本地累加</strong>、只在最后一步参与跨 rank 通信，否则会重复同步。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="zero3"><span class="num">6</span>ZeRO-3 / FSDP：分片参数本身</h2>
+  <p><strong>ZeRO Stage 3（即 PyTorch 的 FSDP）：连 fp16 参数本身也分片。</strong>这是最彻底的一步，也是 FSDP（Fully Sharded Data Parallel，Zhao 等 2023）的核心。现在每个 rank 平时只持有 <code>1/W</code> 的参数；只有当某一层<em>正要被用到</em>时，才临时把这一层的参数 all-gather 齐全，用完立刻丢弃。</p>  <p>一个 FSDP 训练步因此变成一连串「凑齐—计算—丢弃」：</p>  <div class="ascii">前向（逐 FSDP unit，例如逐层）:
+  for layer in model:
+     all-gather(layer.params)   # 临时凑齐这一层的完整参数 (1/W → 全量)
+     y = layer(x)               # 用完整参数前向
+     free(layer.params)         # 立刻丢弃，只留回自己那 1/W 分片
+
+反向（逐 unit，对称）:
+     all-gather(layer.params)   # 再凑一次（或前向时保留/重算）
+     grad = layer.backward(...)
+     reduce-scatter(grad)       # 每 rank 只留自己负责的 1/W 梯度分片
+     free(layer.params)</div>  <p>于是常驻显存里<strong>参数、梯度、优化器状态全部变成 1/W</strong>，峰值只额外多出<strong>当前正在计算的那一两层</strong>的全量参数（all-gather 的临时缓冲）：</p>  <div class="math-block">\[M_{\text{ZeRO-3/FSDP}} \;\approx\; \frac{2P + 2P + 12P}{W} + \underbrace{M_{\text{layer}}}_{\text{峰值临时缓冲}} \;=\; \frac{16P}{W} + O(\text{一层参数})\]</div>  <table>
+    <thead><tr><th>阶段</th><th>参数</th><th>梯度</th><th>优化器状态</th><th>每 rank 常驻（不含激活）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>DDP / ZeRO-0</strong></td><td>2P</td><td>2P</td><td>12P</td><td><code>16P</code></td></tr>
+      <tr><td><strong>ZeRO-1</strong></td><td>2P</td><td>2P</td><td><code>12P/W</code></td><td><code>4P + 12P/W</code></td></tr>
+      <tr><td><strong>ZeRO-2</strong></td><td>2P</td><td><code>2P/W</code></td><td><code>12P/W</code></td><td><code>2P + 14P/W</code></td></tr>
+      <tr><td><strong>ZeRO-3 / FSDP</strong></td><td><code>2P/W</code></td><td><code>2P/W</code></td><td><code>12P/W</code></td><td><code>16P/W + 一层</code></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白说：FSDP 把模型像拼图一样拆给每块卡各拿几块，谁也不留全图；算到哪一块就临时把那块拼出来，算完拆掉。代价是每用一层参数都要现场 all-gather 一次，通信变多；回报是显存几乎随卡数线性下降——这才让单卡装不下的大模型成为可能。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨说：FSDP 把模型按 <span class="term">FSDP unit</span>（一组要一起 all-gather 的参数，通常是一层或一个 transformer block）包装。为了不让通信暴露成串行等待，FSDP 会<strong>prefetch</strong>：在算第 i 层时就异步 all-gather 第 i+1 层的参数，把通信藏到计算背后——这又回到模块 01 的「通信-计算重叠」主题。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>ZeRO-1/2/3 是一条平滑的权衡曲线，不是三选一的开关：<strong>从 ZeRO-1 到 ZeRO-3，显存越省、通信越多</strong>。直觉记法——ZeRO-1 切「最少用的」(优化器状态)、ZeRO-2 再切「中等用的」(梯度)、ZeRO-3 切「最常用的」(参数，故通信代价最大)。卡多显存松就用低 stage，模型大显存紧就用高 stage。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">7</span>权衡与选型：通信换显存</h2>
+  <p>分片不是免费的——省下来的显存要用<strong>额外的通信</strong>去换。把账算清楚才能选对：DDP 每步只在反向后做一次 all-reduce（≈ 2P 的等效收发）；ZeRO-1/2 的通信量与 DDP 基本相同（all-reduce 被拆成 reduce-scatter+all-gather，总量不变）；<strong>ZeRO-3/FSDP 因为前向也要 all-gather 一遍参数</strong>，通信量约是 DDP 的 <code>1.5×</code>。</p>  <div class="math-block">\[\text{每步等效通信量}:\quad \text{DDP}\approx 2P,\quad \text{ZeRO-1/2}\approx 2P,\quad \text{ZeRO-3}\approx 3P\ (\approx 1.5\times\text{DDP})\]</div>  <p>选型的经验法则（先按显存能不能装下来定，再按通信带宽微调）：</p>  <table>
+    <thead><tr><th>场景</th><th>推荐</th><th>理由</th></tr></thead>
+    <tbody>
+      <tr><td>模型单卡装得下，只想加速</td><td><strong>DDP</strong>（或 + ZeRO-1）</td><td>通信最少；ZeRO-1 几乎免费再省优化器状态</td></tr>
+      <tr><td>模型偏大、单卡勉强</td><td><strong>ZeRO-2</strong></td><td>梯度+优化器状态摊薄，参数仍全量、通信不增</td></tr>
+      <tr><td>模型单卡装不下</td><td><strong>ZeRO-3 / FSDP</strong></td><td>唯一能把参数也摊开的 DP 方案，代价是 1.5× 通信</td></tr>
+      <tr><td>超大模型、多节点</td><td><strong>FSDP + TP/PP</strong>（3D 并行）</td><td>DP 解决不了的单层过大/层数过多，交给下一模块</td></tr>
+    </tbody>
+  </table>  <p>一个重要的中间档是 <span class="term">HSDP</span>（Hybrid Sharded Data Parallel）：<strong>节点内 FSDP 分片、节点间 DDP 复制</strong>。它利用了「节点内带宽（NVLink）远高于节点间带宽（InfiniBand）」的硬件现实——把昂贵的 all-gather 限制在高带宽的节点内，节点之间只做一次便宜的 all-reduce。这是大规模训练里 FSDP 落地的常见姿势。</p>  <div class="callout warn"><span class="label"></span>
+    <p>不要被「ZeRO-3 显存最省」诱惑而无脑全开。当模型本就能装下时，ZeRO-3 的 1.5× 通信会白白拖慢训练；当节点间带宽很低时，全局 FSDP 的 all-gather 可能成为瓶颈，HSDP 往往更快。<strong>先用显存约束筛掉装不下的方案，再在能装下的方案里挑通信最省的</strong>——这是选型的正确次序。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <p>数据并行与分片是分布式训练里最成熟的一块，但前沿仍在快速演进，主线是<strong>把「通信」这个新瓶颈继续往下压</strong>：</p>  <ul>
+    <li><strong>Offload 与 ZeRO-Infinity</strong>：把分片后的优化器状态、甚至参数进一步下放到 CPU 内存或 NVMe，用主机的大容量换 GPU 显存，让单机也能训超大模型（Rajbhandari 等 2021）。代价是 PCIe 带宽成为新瓶颈，需要精细的预取与重叠。</li>
+    <li><strong>通信压缩与低精度 all-reduce</strong>：梯度量化、稀疏化、误差反馈（error feedback）等，把每步同步的字节数直接砍掉，缓解带宽瓶颈；FSDP 也支持 bf16/fp8 通信。</li>
+    <li><strong>FSDP2 与 per-parameter 分片</strong>：PyTorch 新一代 FSDP 用 <code>DTensor</code> 做更细粒度、更可组合的分片，改善与 TP/PP 的组合、降低显存碎片与峰值。</li>
+    <li><strong>与专家并行（Expert Parallel / MoE）组合</strong>：MoE 模型把不同 expert 放到不同 rank，引入 <span class="term">all-to-all</span> 通信（模块 01 学过），与 FSDP/数据并行如何高效组合是当前热点。</li>
+    <li><strong>自动并行（auto-parallelism）</strong>：与其手调 DP/TP/PP/分片维度，不如让编译器（Alpa、GSPMD 等）在给定硬件拓扑下自动搜索最优并行方案——把本模块的选型表自动化。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>奠基与必读：Rajbhandari 等 2020《ZeRO》（分片三阶段的原始论文）、Zhao 等 2023《PyTorch FSDP》（生产级实现与工程权衡）、Rajbhandari 等 2021《ZeRO-Infinity》（offload 到 CPU/NVMe）。完整清单与延伸见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../01_collectives/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 集合通信原语</div></a>
+    <a class="next" href="../03_tensor_pipeline_parallel/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 张量与流水并行</div></a>
+  </div>
+
+</div>
+</body>
+</html>

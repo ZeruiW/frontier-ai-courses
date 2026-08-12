@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 溯源与去污染</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 溯源与去污染</h1>
+  <p class="subtitle">数据 lineage 谱系 · n-gram 基准去污染防泄漏 · 内容哈希可复现快照 + 清单 · 审计报告 —— 让一条 PB 级管线可追溯、可复现、可审计、无泄漏，是大规模数据工程的可信地基</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–04、哈希（SHA256）、集合、有向无环图（DAG）、一点点评测常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_provenance_decontam.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Brown et al. 2020（GPT-3 13-gram 去污染）、Carlini et al. 2022（记忆化）、Gebru et al.（Datasheets）、Dodge et al. 2021（Documenting C4）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么溯源去污染：可信/可溯/可复现</a></li>
+      <li><a href="#contam">数据污染：泄漏从哪来，为何致命</a></li>
+      <li><a href="#ngram">n-gram 重叠检测：去污染主力</a></li>
+      <li><a href="#lineage">数据 lineage：可回溯的 DAG</a></li>
+      <li><a href="#snapshot">内容哈希与可复现快照</a></li>
+      <li><a href="#audit">数据审计：可信变可查的报告</a></li>
+      <li><a href="#ledger">把账算到 PB 级：成本与权衡</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么溯源去污染：可信/可溯/可复现</h2>
+  <p>我们来到这门课的<strong>终点站</strong>。前四个模块把数据<em>做对、做快</em>——去重（01）、流式加载（02）、分词（03）、质量过滤（04）。但还差最后一环，也是把这一切变成<strong>可信任系统</strong>的关键：当你训出一个模型、它在 MMLU 上拿了 85 分，你怎么<em>证明</em>这 85 分不是因为训练集里混进了考题？当半年后有人质疑某段数据的来源，你怎么<em>回溯</em>它是哪个快照、经哪些处理步骤来的？当你要让别人复现你的结果，你怎么保证他拿到的是<em>逐字节相同</em>的那份数据？</p>  <p>这三个问题——<strong>可信、可溯、可复现</strong>——就是本模块的全部。它们听起来像「软」的工程规范，但在 PB 规模下，它们是<strong>硬的技术问题</strong>：万亿 token 里要检测出与基准的泄漏，是一个大规模子串匹配问题；给一份 50 TB 数据集打不可变快照，靠的是内容哈希与清单（manifest）；记录每份数据的来龙去脉，是一张需要工程化维护的有向无环图（DAG）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：一条没有溯源与去污染的数据管线，就像一家没有进货单、没有保质期、没有溯源码的食品厂——平时看不出问题，一旦出事（评测被质疑、版权诉讼、数据中毒），你完全无法回答「这批料哪来的、动过什么手脚、还有谁吃了同一批」。本模块就是给数据管线装上<strong>进货单（lineage）、防伪码（内容哈希）、质检报告（审计）</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化三件事。<strong>去污染</strong>：给定训练集 <code>T</code> 与评测基准集 <code>B</code>，找出并删除 <code>T</code> 中与 <code>B</code> 有足够重叠（如共享 <code>n≥13</code> 的连续 n-gram）的文档；<strong>溯源</strong>：维护一张 <code>(数据状态)→(处理步骤+代码版本+输入)</code> 的 DAG，使任一产物可回溯到原始来源；<strong>快照</strong>：用内容哈希 <code>h=SHA256(bytes)</code> 给每个 shard 打不可变指纹，清单记录全部哈希，使「同一份数据」可被逐字节重建。</p></div>
+  </div>  <div class="callout danger"><span class="label">污染几乎必然发生</span>
+    <p>本模块的核心命题一句话讲清：<strong>评测可信的前提是训练集没见过考题，而在 PB 级爬取下，无意的污染几乎必然发生</strong>——维基百科里有 MMLU 题目的来源文章、GitHub 上有人贴了 GSM8K 的解答、论坛里转载了基准的样例。Brown et al.（GPT-3）做污染分析时发现各基准都有不同程度的训练集重叠；不去污染，你报的分数可能<em>一半是模型能力、一半是背题</em>。去污染不是锦上添花，是评测结论成立的地基。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="contam"><span class="num">2</span>数据污染：泄漏从哪来，为何致命</h2>
+  <h3>数据污染：泄漏从哪来，为何致命</h3>  <p>先说清楚<span class="term">data contamination</span>（数据污染，又叫泄漏 leakage）到底是什么。它指<strong>评测基准的样本（或其改写）混进了训练数据</strong>，使模型在评测时实际上是在<em>背诵见过的答案</em>，而非展示泛化能力。结果是评测分数虚高，你以为模型很强，部署后却拉胯。</p>  <p>污染的来源比直觉的要多。<strong>直接来源</strong>：基准本身就是从网上选材的（MMLU 的题目来自考试题库、HellaSwag 来自 WikiHow），这些原始材料本就在 CommonCrawl 里。<strong>传播来源</strong>：基准发布后，被论文、博客、GitHub、论坛大量引用转载，连题带答案地散布到全网，下一次爬取就把它们收进来了。<strong>改写来源</strong>：有人把题目换个说法、翻译成别的语言重新发布，逐字匹配抓不到，但语义上仍是同一道题。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么 PB 规模让污染更难防？因为你爬得越多、越广，撞上基准材料的概率越大。小数据集可以人工核查来源，PB 级只能靠<strong>自动化检测</strong>。而且基准在不断增多（每年新出几十个），训练集也在不断更新（每月新快照），污染检测变成一个<em>持续的、双向增长的</em>工程任务，不是一次性体检。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>污染与模块 01 的记忆化是一对孪生问题。Carlini 等证明：一段文本在训练集里<strong>重复越多，被逐字背出的概率越高</strong>。污染正是「基准样本在训练集里重复了 ≥1 次」的特例——而且是最该防的那次重复，因为它直接破坏评测的有效性。去重（01）降低普遍记忆，去污染（05）专门狙击「记住了考题」这种最有害的记忆。</p></div>
+  </div>  <p>举个具体的链条感受一下污染是怎么悄悄发生的：MMLU 里有一道关于「法国首都」的题，它的素材来自某篇百科或考试题库——这篇素材本就在 CommonCrawl 的某次快照里（直接来源）；MMLU 发布后，有人在博客里贴出几道样例题讲解、有人把整个数据集镜像到 GitHub、有人在 Reddit 讨论某道题的答案（传播来源）；还有人把题目翻译成中文、或换个数字重新出了一道「同构题」发到论坛（改写来源）。下一次你爬全网做训练集，这三类内容<strong>全都会被收进来</strong>——你根本没主动去找基准，污染却自己找上门了。这正是为什么 PB 级爬取下<em>无意污染几乎必然</em>：你爬得越全，越躲不开这些已经渗透到全网的基准痕迹。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个容易踩的认知误区：<strong>去污染不是「让分数变低」，而是「让分数变真」</strong>。去污染后某基准分数掉了，不代表你的模型变差了，而是<em>揭穿了之前那部分虚高</em>。真正危险的是<strong>不做去污染就发布分数</strong>——你和读者都被误导，等到实际部署或被第三方复现时才暴露，代价更大。可信评测宁可分数难看，也不要分数虚假。这也是为什么去污染<strong>必须在训练前做</strong>：训练后才发现污染，要么重训（极贵）、要么带着虚高分数发布（更糟），都没有好的退路。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ngram"><span class="num">3</span>n-gram 重叠检测：去污染主力</h2>
+  <h3>n-gram 重叠检测：去污染的主力武器</h3>  <p>去污染的核心技术是 <span class="term">n-gram overlap</span>（n 元组重叠检测）。思路朴素而有效：<strong>如果一篇训练文档和某个基准样本共享了一段足够长的连续文字，就判定它被污染</strong>。「足够长」用 n-gram 的 <code>n</code> 来定——GPT-3 用 <code>13-gram</code>（连续 13 个词/token），共享任意一个 13-gram 即标记为污染。</p>  <div class="math-block">\[\text{contaminated}(d, B) = \big[\, \exists\, g \in \mathrm{ngrams}_n(d):\ g \in \textstyle\bigcup_{b \in B}\mathrm{ngrams}_n(b)\,\big]\]</div>  <p>为什么是 n-gram 而不是整篇比对？因为污染往往是<strong>局部</strong>的——一篇长论坛帖里只嵌了一道基准题，整篇的相似度很低，但那一段是逐字泄漏。n-gram 能抓住这种「长文档里的短泄漏」。<code>n</code> 的选择是一场权衡：<code>n</code> 太小（如 3-gram），常见短语（the quick brown）会造成大量误报；<code>n</code> 太大（如 50-gram），改写一两个词就能绕过，漏报增多。13-gram 是社区经验下的甜点。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>怎么做得快？把所有基准样本的 n-gram 预先建成一个<strong>哈希集合</strong>（或布隆过滤器），然后流式扫训练文档：对每篇文档滑动取 n-gram、查这个集合。查集合是 <code>O(1)</code>，所以检测一篇文档是 <code>O(文档长度)</code>，全部训练集是 <code>O(总 token 数)</code>——线性，可流式，易并行。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>复杂度账：设基准总 n-gram 数 <code>m</code>、训练总 token 数 <code>N</code>。建基准索引 <code>O(m)</code> 时间与空间；扫描训练集 <code>O(N)</code> 次集合查询。对比「每篇训练文档和每个基准样本两两比」的 <code>O(N·|B|)</code>，哈希集合把基准侧的 <code>|B|</code> 压成了 <code>O(1)</code> 查询——又是一次「用哈希分桶消掉一重循环」（呼应模块 01 的 LSH）。</p></div>
+  </div>  <p>基准索引用什么数据结构，也是个工程取舍。<strong>哈希集合（set）</strong>最直接、零误报，但要存下所有 n-gram 的完整哈希，内存随基准规模线性涨；当基准很多、n-gram 上亿时，常换成 <span class="term">Bloom filter</span>（布隆过滤器）——它用几个位代表一个元素，内存省一个数量级，代价是有极小的<em>假阳</em>（查到「可能在」时偶尔误判，但绝不漏「不在」）。对去污染这个场景，布隆过滤器的极小假阳是可接受的（顶多多删几篇本来干净的文档，宁可错杀），换来的内存节省让「把所有基准塞进单机内存供流式查询」成为可能。这又是一个「为规模而做的数据结构选择」，呼应模块 01/02 反复出现的内存-精度权衡。</p>  <p>但 n-gram 检测有它的边界，必须诚实面对。它是<strong>词面（lexical）</strong>的：能抓逐字重叠，抓不住<strong>改写、翻译、语义同义</strong>的污染。对付改写，工程上会叠加：① 更短的 n-gram + 重叠比例阈值（容忍少量改动）；② 模块 01 的近重复检测（MinHash/SimHash）抓「整体很像」的；③ 嵌入相似度抓语义级。本模块 notebook 会从零实现 n-gram 检测，并用一个<strong>已知污染的真值集</strong>对拍它的召回率——把去污染当成一个严肃的检测问题来量化，而不是「跑个脚本就完事」。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="lineage"><span class="num">4</span>数据 lineage：可回溯的 DAG</h2>
+  <h3>数据 lineage：把管线变成可回溯的 DAG</h3>  <p>去污染解决「有没有泄漏」，<span class="term">data lineage</span>（数据谱系/溯源）解决「这份数据到底怎么来的」。它记录每份数据从原始来源经过哪些处理步骤、用哪个版本的代码与配置、由哪些输入产生——本质是一张<strong>有向无环图（DAG）</strong>。</p>  <div class="ascii">一份训练 shard 的 lineage DAG（每个节点 = 一个数据状态 + 产生它的步骤）：
+
+  [CC-2024-10 原始快照]  (来源: commoncrawl.org, sha256=a1b2..)
+        │  step: extract_text   code: trafilatura@1.6   config: lang=en
+        ▼
+  [抽取后文本]  (sha256=c3d4..)
+        │  step: quality_filter code: pipeline@v2.3      config: gopher_rules
+        ▼
+  [过滤后文本]  (sha256=e5f6..)
+        │  step: dedup          code: minhash_lsh@v1.1   config: tau=0.8
+        ▼
+  [去重后文本]  (sha256=7890..)
+        │  step: decontaminate  code: ngram@v1.0         config: n=13, MMLU+GSM8K
+        ▼
+  [训练就绪 shard]  (sha256=ffff..)  &lt;- 每一步都可回溯到上游 + 用的代码/配置</div>  <p>为什么 lineage 在大规模下是硬需求而非可选项？因为 PB 级管线有几十个处理步骤、跑在几千台机器上、跨越几个月。当出问题时——某基准分数异常、发现一段不该有的数据、被质疑某来源的许可——你需要<strong>精确回答「这个产物是怎么来的」</strong>：哪个原始快照、哪个版本的过滤代码、哪次去重的阈值。没有 lineage，这些问题无法回答，调试与合规都无从下手。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>lineage 的最小实现：每个数据节点记 <code>(内容哈希, 产生它的步骤, 输入节点, 代码版本, 配置)</code>。把这些节点连成图，就能从任一产物<em>向上回溯</em>到原始来源，或从某次代码 bug<em>向下追踪</em>所有受影响的产物。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>它和<strong>可复现性</strong>是一体两面：lineage 记录了「怎么做的」，加上每步的代码版本与配置被固定，你就能<em>重新执行</em>这张图、得到逐字节相同的结果。反过来，没有 lineage 的「可复现」是空话——你都不知道当初做了什么，谈何复现。</p></div>
+  </div>  <p>一个常被忽略的工程价值：lineage 让<strong>增量重算</strong>成为可能。当某一步的代码修了个 bug，你不必从头重跑整条管线——顺着 DAG 找出「依赖这一步的所有下游节点」，只重算它们即可。在动辄几十万核时的预处理任务里，这种「只重算受影响部分」能省下巨量算力。lineage 因此不只是「记账」，更是大规模管线高效运维的基础设施（这条线会接到 C37 MLOps）。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="snapshot"><span class="num">5</span>内容哈希与可复现快照</h2>
+  <h3>内容哈希与可复现快照：让数据集不可变、可重建</h3>  <p>可复现性的物理基础是 <span class="term">content hash</span>（内容哈希）。给一份数据算 <code>SHA-256</code>，得到一个 64 位十六进制指纹：<strong>内容相同则哈希必然相同，内容差一个字节则哈希面目全非</strong>。这个简单性质支撑起三件大事：精确去重（模块 01）、完整性校验（下载的 shard 有没有损坏）、以及本节的主角——<strong>可复现快照</strong>。</p>  <p>一个 <span class="term">reproducible snapshot</span>（可复现快照）= 一份<strong>不可变</strong>的数据集版本。做法是给数据集里每个 shard 算内容哈希，把「shard 路径 → 哈希、大小、来源」全部记进一个 <span class="term">manifest</span>（清单）文件，再给清单本身算一个哈希作为整个快照的 ID。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>有了快照，「用了哪份数据」就从一句含糊的话（「2024 年 10 月那版」）变成一个<strong>可验证的哈希</strong>。任何人拿到清单，逐个校验 shard 哈希，就能确认手里的数据和你训练时<em>逐字节相同</em>；差一个字节，校验就失败。这就是可复现的底线。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>不可变（immutable）是关键纪律：快照一旦发布，其内容<strong>永不修改</strong>——要改就发新版本、新快照 ID。这避免了「同一个名字指向不同内容」的灾难（你以为复现的是 v1，其实数据已被悄悄改成 v2）。Git 的 commit hash、Docker 的 image digest、Dolma 的数据版本，用的都是这套「内容寻址 + 不可变」的思想。</p></div>
+  </div>  <p>没有快照会怎样？想象一个真实的事故：你半年前训了个不错的模型，现在想复现、做消融。你打开数据目录，发现它早被别人「就地更新」过几次——加了新爬取、删了几个坏 shard、改了过滤参数重跑了一部分。现在这份数据<strong>既不是当初训练用的那份，你也无法知道差在哪</strong>。你的实验结论建立在一份<em>已经消失的数据</em>上，复现无从谈起，调试更是抓瞎。这不是假想——它是没有快照纪律的团队反复踩的坑。内容哈希快照就是把「当初那份数据」永久钉死、可验证地取回。</p>  <p>把快照、lineage、去污染三者串起来，就是一份<strong>可信数据集</strong>的完整画像：快照 ID 唯一标识这份数据（可复现），lineage 记录它怎么来的（可溯源），去污染报告证明它没混进考题（可信评测）。这三样加上下一节的审计报告，构成了「负责任地发布一个大规模数据集」的工程标准——FineWeb、Dolma 之所以受信任，正因为它们把这套东西都公开了：你不仅能下载它们的数据，还能看到每一步的代码、每个版本的哈希、去污染与审计的结果。<strong>可信不是承诺出来的，是证据堆出来的</strong>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="audit"><span class="num">6</span>数据审计：可信变可查的报告</h2>
+  <h3>数据审计：把可信变成可查的报告</h3>  <p>最后一块是 <span class="term">data audit</span>（数据审计）：系统性地检查并<strong>产出一份可查的报告</strong>，回答关于数据集的关键问题——多少文档、多少 token、来源构成、语言分布、PII 残留、与哪些基准有污染、许可情况。规模越大，越要靠自动化审计，而非人工抽查。</p>  <p>审计报告该包含什么？把它想成数据集的「体检表 + 成分表」：</p>  <table>
+    <thead><tr><th>审计维度</th><th>查什么</th><th>怎么查（工程手段）</th><th>为何重要</th></tr></thead>
+    <tbody>
+      <tr><td><strong>规模</strong></td><td>文档数、token 数、各 shard 大小</td><td>扫清单聚合统计</td><td>成本/配比规划的基准</td></tr>
+      <tr><td><strong>来源构成</strong></td><td>各来源（web/code/书）占比</td><td>按 lineage 来源字段分组</td><td>数据配比透明（接 C21）</td></tr>
+      <tr><td><strong>污染</strong></td><td>与各基准的 n-gram 重叠数</td><td>本模块的去污染检测</td><td>评测可信的证据</td></tr>
+      <tr><td><strong>PII 残留</strong></td><td>邮箱/电话/密钥的残留量</td><td>正则抽样扫描（模块 04）</td><td>合规与隐私</td></tr>
+      <tr><td><strong>可复现</strong></td><td>快照 ID、清单哈希、种子</td><td>记录内容哈希与配置</td><td>他人能否重建</td></tr>
+    </tbody>
+  </table>  <p>审计报告有两个读者，对应两种形态。<strong>机器读</strong>的是结构化的 JSON/表格，进监控系统、做回归检查（这次快照的污染率比上次高了？报警）；<strong>人读</strong>的是 <span class="term">datasheet</span>（数据集卡片，Gebru et al.《Datasheets for Datasets》）——用自然语言记录构成、动机、已知偏差、适用范围与不适用场景，是数据透明与负责任发布的实践。二者缺一不可：JSON 给流水线把关，datasheet 给使用者知情。</p>  <p>审计在大规模下还有一层<strong>回归监控</strong>的意义。一条管线不是跑一次就完事，它会随新代码、新快照不断重跑——每次重跑都该自动产出审计报告，并和<em>上一次</em>对比：文档数是不是异常掉了一半（某步过滤出 bug）？污染率是不是突然升高（新爬取引入了基准）？PII 残留是不是回涨（脱敏规则失效）？把这些做成自动化的回归检查，管线就从「跑完祈祷没事」变成「出问题立刻报警」。这正是审计与 C37（MLOps）的接口——数据管线和模型一样，需要持续集成式的质量门禁，而审计报告就是那道门禁的检查项。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的工程智慧：<strong>一条管线的产出是否可信，不取决于你「觉得」它干净，而取决于你能不能拿出证据</strong>——去污染报告证明没泄漏、lineage 证明来源清白、快照哈希证明可复现、审计报告把这些汇成可查的一页。这套「拿证据说话」的纪律，不只用于训练数据，在任何需要<em>可信、可溯、可复现</em>的数据系统（金融、医疗、科研）里都是同一套地基。学会它，你交付的就不只是数据，而是<strong>可被信任的数据</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ledger"><span class="num">7</span>把账算到 PB 级：成本与权衡</h2>
+  <h3>把账算到 PB 级：可信管线的成本与权衡</h3>  <p>溯源与去污染不是免费的，得算清它们在 PB 级的开销与权衡，才知道该做到什么程度：</p>  <table>
+    <thead><tr><th>机制</th><th>时间复杂度</th><th>空间/存储</th><th>在万亿 token 的代价</th><th>省不省得起</th></tr></thead>
+    <tbody>
+      <tr><td>n-gram 去污染</td><td><code>O(N) 扫描</code></td><td><code>O(m)</code> 基准索引</td><td>线性一遍，可流式</td><td>✅ 必做，开销小</td></tr>
+      <tr><td>lineage 记录</td><td><code>O(步骤数)</code></td><td><code>O(节点数)</code> 元数据</td><td>元数据极小（KB/shard）</td><td>✅ 几乎免费</td></tr>
+      <tr><td>内容哈希快照</td><td><code>O(N) 一遍哈希</code></td><td><code>O(shard 数)</code> 清单</td><td>SHA256 ~GB/s，一遍即可</td><td>✅ 便宜</td></tr>
+      <tr><td>全量审计</td><td><code>O(N) 多遍</code></td><td><code>O(报告)</code></td><td>每维度一遍扫描</td><td>⚠️ 多遍，可抽样</td></tr>
+      <tr><td>语义去污染</td><td><code>O(N) 编码 + 近邻</code></td><td><code>O(N·d)</code> 嵌入</td><td>要跑模型，最贵</td><td>🔶 看预算，可选</td></tr>
+    </tbody>
+  </table>  <p>读这张表：去污染、lineage、内容哈希都是<strong>线性或更小</strong>的开销，相对于训练本身（万亿 token 训几个 epoch）几乎可忽略——<strong>它们便宜到没有不做的理由</strong>。真正要权衡的是审计的深度（全量还是抽样）和要不要上语义级去污染（要跑嵌入模型，成本上一个台阶）。一个务实的配置：n-gram 去污染 + lineage + 内容哈希快照<em>全做</em>，审计<em>抽样 + 关键维度全量</em>，语义去污染<em>仅对高价值基准</em>。</p>  <p>最后回到本课的主线，把六个模块连起来看：<strong>去重（01）让数据不冗余，加载（02）让数据喂得动，分词（03）让数据高效，过滤（04）让数据高质，溯源去污染（05）让数据可信</strong>。五条主线背后是同一个命题——<em>规模如何改变正确的做法</em>：O(n²) 去重在 1e12 不可行（01）、全量打乱在 50 TB 不可行（02）、串行分词在万亿 token 不可行（03）、把贵的过滤放前面不可行（04）、靠人工核查污染与来源在 PB 级不可行（05）。每一条，答案都是用一种<strong>线性或近线性、可流式、可并行、可验证</strong>的工程，替换掉那个朴素但不可扩展的做法。这就是大规模数据工程的全部手艺。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>语义去污染</strong>：n-gram 抓不住改写/翻译/同义的污染。用嵌入近邻或 LLM 判别做语义级去污染是方向，但「多相似才算污染」缺乏公认标准，且大规模跑嵌入成本高、阈值难定。</li>
+    <li><strong>去污染的军备竞赛</strong>：基准方为防污染开始用「私有测试集」「动态生成题」「加水印/canary 字符串」；训练方则要检测这些。检测与规避的拉锯（Carlini 等讨论的 evasion）是持续的开放问题。</li>
+    <li><strong>污染对分数的真实影响</strong>：发现污染后，到底该删样本、还是只在报告里标注、还是重训？污染率与分数虚高的定量关系（删 vs 不删差多少分）仍缺乏系统研究，各家做法不一。</li>
+    <li><strong>lineage 的标准化</strong>：目前各机构的 lineage/provenance 格式各异，缺乏跨组织通用标准（类比软件供应链的 SBOM）。数据供应链的可追溯性正成为监管关注点，标准化是必然趋势。</li>
+    <li><strong>可复现的现实张力</strong>：PB 级数据集要长期保存所有快照成本高昂；外部来源（网页）会消失或变化，使「逐字节重建」事实上不可能。如何在「完全可复现」与「存储现实」间取舍，是工程与科学规范的拉锯。</li>
+    <li><strong>许可与版权溯源</strong>：训练数据的许可合规（哪些能用、署名要求、退出机制）越来越受法律关注。把许可信息纳入 lineage、做到「每段数据可追溯到其许可」，是合规驱动的新工程需求。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Brown et al. 2020（GPT-3 §污染分析，13-gram 去污染）、Carlini et al. 2022（记忆化量化与去污染陷阱）；审计与透明：Dodge et al. 2021（Documenting C4）、Gebru et al.（Datasheets for Datasets）、Mitchell et al.（Model Cards）；可复现：Pineau et al. 2021；工程对标 Dolma（Soldaini 2024，开源数据工具包含去污染/审计/许可）。本模块也直接服务于 C03/C10（评测可信）与 C37（MLOps 管线运维）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../04_quality_filtering/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 大规模质量过滤</div></a>
+    <span></span>
+  </div>
+
+</div>
+</body>
+</html>

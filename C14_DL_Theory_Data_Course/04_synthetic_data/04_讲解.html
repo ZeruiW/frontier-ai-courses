@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 合成数据与模型坍塌</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 合成数据与模型坍塌</h1>
+  <p class="subtitle">自举/蒸馏生成、model collapse（递归自训练导致分布坍塌）、质量-多样性权衡、真实数据锚定与累积 —— 用迭代高斯自训练复现方差几何收缩, 并演示锚定/过滤如何遏制坍塌</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、概率统计（高斯/方差/有偏估计）、模块 03（数据流水线/分布偏移）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_synthetic_data.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Shumailov 2024、Alemohammad 2023、Gerstgrasser 2024、Zelikman 2022、Wang 2023</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#synth">合成数据与递归的诅咒</a></li>
+      <li><a href="#variance">最小内核：方差收缩</a></li>
+      <li><a href="#modes">早期 vs 晚期坍塌</a></li>
+      <li><a href="#anchor">解药一：真实数据锚定与累积</a></li>
+      <li><a href="#filter">解药二：过滤及其陷阱</a></li>
+      <li><a href="#measure">度量合成数据：质量与多样</a></li>
+      <li><a href="#eval">接回评测：合成时代的挑战</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="synth"><span class="num">1</span>合成数据与递归的诅咒</h2>
+  <p>上一模块讲了怎么处理<em>真实</em>数据。但当下一个现实问题逼近：<strong>真实的高质量数据正在被用尽</strong>，而模型生成文本/图像的能力越来越强，于是出现了一个诱人的想法——<strong>让模型生成数据来训练模型</strong>。这就是 <span class="term">synthetic data</span>（合成数据）。它能缓解数据稀缺、定制分布、做能力蒸馏，已是前沿训练的重要组成。但它藏着一个深刻的反噬，是本模块的核心：<span class="term">model collapse</span>（模型坍塌）。</p>  <p>合成数据有几种典型来源，对应不同的用途与风险：</p>  <table>
+    <thead><tr><th>来源</th><th>做法</th><th>用途</th><th>主要风险</th></tr></thead>
+    <tbody>
+      <tr><td><strong>自训练 / 自举</strong> self-training</td><td>用模型自己的输出（过滤后）再训自己</td><td>扩数据、强化已有能力（STaR、Self-Instruct）</td><td>无真实锚定时递归坍塌</td></tr>
+      <tr><td><strong>蒸馏</strong> distillation</td><td>用强 teacher 的输出训弱/小 student</td><td>压缩、迁移能力</td><td>继承 teacher 的偏差与盲区</td></tr>
+      <tr><td><strong>程序化生成</strong></td><td>用规则/模拟器生成（如数学题、代码）</td><td>可验证正确的结构化数据</td><td>覆盖面窄、与真实分布有 gap</td></tr>
+    </tbody>
+  </table>  <p>本模块聚焦最危险也最有理论味道的一类：<strong>递归自训练</strong>——用上一代模型生成的数据训练下一代，如此迭代。在「合成式互联网」（越来越多网络内容由 AI 生成、又被爬去训练下一代模型）的背景下，这<em>不是假想</em>，而是正在发生的现实。Shumailov 等 2024 在 Nature 上给它起了个醒目的名字：<strong>递归的诅咒（the curse of recursion）</strong>。</p>  <p>需要先澄清一个常见误解：合成数据本身<strong>不是</strong>坏东西。在有真实数据锚定、有质量过滤、用得克制的前提下，它是缓解数据墙、做能力蒸馏、生成可验证结构化数据的利器——Self-Instruct、STaR 等都证明了合成数据<em>用得好</em>能实实在在提升能力。本模块要警示的是它的一种<strong>特定误用</strong>：在没有真实数据持续注入的情况下，把模型的输出当训练数据<strong>递归地、替换式地</strong>喂回去。区分「合成数据」（中性工具）与「无锚定的递归自训练」（危险用法）是理解本模块的前提——前者要善用，后者要警惕。</p>  <div class="callout danger"><span class="label">递归的诅咒</span>
+    <p>一句话点破本模块的核心警示：<strong>反复用模型自己生成的数据训练模型，分布会一代代退化——先丢掉罕见的尾部，最终塌成少数几个高频模式</strong>。这对评测科学家有双重含义：① 你评测的模型可能已被合成数据污染（多样性悄悄下降）；② 评测「合成数据质量」本身需要专门的多样性指标，因为坍塌首先伤的是多样性而非单样本质量。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="variance"><span class="num">2</span>最小内核：方差收缩</h2>
+  <h3>model collapse 的最小内核：方差收缩</h3>  <p>model collapse 听起来复杂，但它的<strong>数学内核简单到可以手算</strong>，甚至在一维高斯上就完整显形。考虑最简单的递归自训练：每一代，我们从上一代的模型（一个高斯）采 $N$ 个样本，用这 $N$ 个样本<strong>重新估计</strong>一个高斯，作为下一代模型，如此循环。</p>  <p>关键在于：用有限 $N$ 个样本估计方差，得到的样本方差是<strong>有偏的、系统性偏小</strong>的。无偏估计要除以 $N-1$，而最大似然估计除以 $N$，期望是真方差的 $\frac{N-1}{N}$ 倍。即便用无偏估计，采样本身的随机性叠加<em>再用估计的分布去采下一代</em>，会让方差在期望意义上<strong>逐代收缩</strong>：</p>  <div class="math-block">\[\mathbb{E}[\sigma^2_{g+1}\mid \sigma^2_g] = \frac{N-1}{N}\,\sigma^2_g \quad\Rightarrow\quad \mathbb{E}[\sigma^2_g] = \Big(\frac{N-1}{N}\Big)^{g}\sigma^2_0 \xrightarrow{g\to\infty} 0\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：每代你只看 $N$ 个样本就「总结」出分布，再照这个总结生成下一代。每次总结都会<strong>略微低估极端情况</strong>（小样本里很难抽到尾部）。下一代照着这个偏窄的总结生成，尾部更稀，再总结更窄……雪球滚下去，分布越缩越紧，最后大家长得几乎一模一样。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：这是<strong>估计误差的逐代累积</strong>。每代引入 $O(1/N)$ 的方差低估，$g$ 代后复利成 $((N-1)/N)^g$ 的几何衰减。$N$ 越小（每代样本越少）坍塌越快；$N\to\infty$（无限样本）才不坍塌——但现实中每代样本总是有限的。notebook 会用多链平均把这条几何衰减曲线测出来，并 <code>assert</code> 它与理论 $((N-1)/N)^g$ 吻合。</p></div>
+  </div>  <div class="ascii">递归自训练的方差收缩(N 个样本/代):
+  真分布 σ²=1
+   gen0 ●━━━━━━━━━●   宽
+   gen1 ●━━━━━━●      估计略窄(小样本抽不全尾部)
+   gen2 ●━━━━●        更窄
+   gen3 ●━━●          ...
+   genG ●            塌成一个点(多样性归零)
+   σ²_g ≈ ((N-1)/N)^g · σ²_0   -&gt;  0</div>  <p>这里有一个微妙但重要的点：坍塌<strong>不只是</strong>「除以 $N$ 还是 $N-1$」的估计偏差问题。即便每代都用<em>无偏</em>的方差估计，坍塁依然会发生——因为真正的驱动是<strong>采样噪声在递归中的累积</strong>：每代从一个<em>已经被估计扭曲</em>的分布采样，采出的有限样本又被用来估计下一代分布，误差像复利一样滚动。Shumailov 把误差来源拆成三类：统计近似误差（有限样本）、函数表达力误差（模型容量有限）、函数学习误差（优化不完美）——三者在递归中都会累积。我们的一维玩具聚焦最干净的第一类，但机制是通用的。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>这个一维玩具抓住了 model collapse 的<strong>第一性机制</strong>：<em>有限样本估计的误差，在递归中复利成分布退化</em>。真实模型坍塌更复杂（高维、多模态、神经网络的额外误差来源），但核心是同一个——用自己的有限输出反复重估自己，误差会累积，方差会收缩、尾部会消失。理解了一维，就理解了本质。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="modes"><span class="num">3</span>早期 vs 晚期坍塌</h2>
+  <h3>早期 vs 晚期坍塌：先丢尾部，再塌成少数模式</h3>  <p>Shumailov 等把坍塌分成两个阶段，理解这个区分对<strong>评测时及早发现坍塁</strong>至关重要：</p>  <ul>
+    <li><strong>早期坍塌（early collapse）</strong>：分布的<strong>尾部 / 罕见模式先消失</strong>，方差开始收缩。单看常见样本，模型似乎还正常——这正是危险之处：<em>早期坍塌很隐蔽，常见输出质量没明显下降，但多样性已经在悄悄流失</em>。</li>
+    <li><strong>晚期坍塌（late collapse）</strong>：分布<strong>塌成一个或少数几个尖峰</strong>，多样性近乎归零，模型反复输出高度相似的内容。这时问题已经很明显，但往往为时已晚。</li>
+  </ul>  <p>尾部为什么先丢？因为罕见事件在有限样本里<strong>最可能抽不到</strong>——一个出现概率 1% 的模式，在 $N=50$ 的样本里有约 $0.99^{50}\approx60\%$ 的概率<em>一次都没被抽到</em>。一旦某代没抽到它，下一代模型就再也不会生成它，它<strong>永久消失</strong>（除非真实数据把它带回来）。这是一个<strong>不可逆的棘轮</strong>：模式只会越丢越多。</p>  <div class="ascii">多模态分布的 mode dropping(早期坍塌的典型形态):
+  真分布: 4 个模式  ▁▁█▁▁█▁▁█▁▁█▁▁
+   gen0:  ▁▁█▁▁█▁▁█▁▁█▁▁   覆盖 4/4
+   gen2:  ▁▁█▁▁█▁▁▁▁▁█▁▁   丢了 1 个模式(小样本没抽到)
+   gen4:  ▁▁█▁▁▁▁▁▁▁▁█▁▁   只剩 2 个
+   genG:  ▁▁▁▁▁█▁▁▁▁▁▁▁▁   塌向单一模式
+  mode coverage: 1.0 -&gt; 0.5 -&gt; ...(单调下降, 不可逆)</div>  <p>notebook 会用一个<strong>4 模式高斯混合</strong>复现 mode dropping：从 4 个模式的真分布出发递归自训练，用「<span class="term">mode coverage</span>（仍被覆盖的模式比例）」度量多样性，看它如何从 1.0 单调跌向 0.5 以下——把「早期坍塌 = 多样性流失」变成一条可见、可 assert 的曲线。这也直接呼应下一模块（生成评测）的 <strong>recall / 多样性</strong> 指标：坍塌伤的正是 recall。</p>  <p>尾部先丢这件事，对评测和安全都有深远含义。语言里<strong>罕见但重要</strong>的内容——专业术语、少数语言、长尾事实、非主流观点——恰恰最容易在坍塌中先消失。一个坍塌的模型在常见话题上对答如流，却在长尾上越来越贫乏、越来越趋同。更隐蔽的是，这种贫乏<em>不会</em>在常规评测（多用常见样本）中暴露，反而可能因为「常见输出更流畅」而让分数看起来还在涨。这是 model collapse 最危险的地方：<strong>它在你最常看的地方伪装成进步，在你最少看的地方悄悄掏空多样性</strong>。要发现它，必须主动用长尾、罕见、需要多样性的探针去测。</p>  <div class="callout warn"><span class="label"></span>
+    <p>评测启示：<strong>只看单样本质量（保真度）会完全错过早期坍塌</strong>。一个坍塌中的生成模型，每个输出可能都「看起来不错」，但整体多样性已严重萎缩。必须用<em>分布级</em>的多样性指标（模式覆盖、recall、熵）才能抓住它——这是模块 05 要正面解决的「保真 vs 多样必须分开看」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="anchor"><span class="num">4</span>解药一：真实数据锚定与累积</h2>
+  <h3>解药之一：真实数据锚定与累积</h3>  <p>坍塌不是无法避免的。Gerstgrasser 等 2024 给出了一个<strong>关键的反转</strong>：坍塌是否致命，取决于你怎么用合成数据——<span class="term">accumulate vs replace</span>（累积 vs 替换）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>致命的做法是<strong>替换</strong>：每代<em>丢掉</em>旧数据，只用上一代的合成数据训练。这就是前面方差收缩的设定，分布一路退化。救命的做法是<strong>累积</strong>：把每代的合成数据<em>加到</em>已有数据（尤其真实数据）上，而不是替换。真实数据像一个<strong>锚</strong>，每代都把分布往回拉，阻止它漂走。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：只要每代训练集中<strong>真实数据的占比不衰减</strong>，分布退化就能被遏制。Gerstgrasser 证明：在累积设定下，即便不断加入合成数据，测试误差/分布距离<strong>有界、不发散</strong>，而非替换设定下的逐代恶化。直觉是：真实数据持续提供「尾部信息」，补偿合成数据丢失的部分。</p></div>
+  </div>  <p>notebook 会<strong>并排跑替换与累积两条链</strong>：替换链的方差按 $((N-1)/N)^g$ 几何收缩（坍塌），累积链（保留真实数据锚 + 累积合成）的方差<strong>基本维持不变</strong>（不坍塌）。同一套代码，唯一区别是「丢旧数据」还是「留旧数据」——把解药的有效性变成可见、可 assert 的对照。</p>  <table>
+    <thead><tr><th>策略</th><th>每代训练数据</th><th>方差行为</th><th>结局</th></tr></thead>
+    <tbody>
+      <tr><td><strong>替换</strong> replace</td><td>只用上一代合成数据</td><td>$((N-1)/N)^g$ 几何收缩</td><td><strong>坍塌</strong>（多样性归零）</td></tr>
+      <tr><td><strong>累积</strong> accumulate</td><td>真实数据 + 历代合成数据</td><td>基本维持</td><td><strong>不坍塌</strong>（分布有界）</td></tr>
+    </tbody>
+  </table>  <p>这个结论有一个让人稍稍宽心的现实推论：<strong>只要互联网上仍持续产生足量真实人类内容，且训练数据是「累积」而非「只用最新合成数据替换」，model collapse 就不是不可避免的末日</strong>。Gerstgrasser 的标题《Is Model Collapse Inevitable?》的答案是「否」——前提是累积。但这个宽心是有条件的：它要求真实数据的<em>绝对量</em>不衰减、且能被识别和保留。在 AI 生成内容快速增长、真假难辨的现实里，维持这个前提本身就是挑战（见第 8 节）。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话记住解药：<strong>别丢真实数据，别只吃自己的输出</strong>。真实数据是防坍塌的锚，累积（而非替换）是防坍塌的策略。这也解释了为什么实践中合成数据总是<em>混入</em>真实数据使用、而非完全替代——纯合成的递归是危险的，混合使用才安全。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="filter"><span class="num">5</span>解药二：过滤及其陷阱</h2>
+  <h3>解药之二：过滤、以及它自己的陷阱</h3>  <p>除了真实数据锚定，另一条对抗坍塌（甚至<em>反向</em>提升能力）的路径是 <span class="term">filtering</span>（过滤 / 策展）。STaR [Zelikman 2022] 是经典例子：让模型生成推理链，但<strong>只保留那些得到正确答案的</strong>，用这些经过滤的高质量样本自训练——结果模型越训越强，而非坍塌。</p>  <p>过滤为什么能扭转坍塌？因为它给递归循环注入了<strong>外部信号</strong>（正确性、可验证性、奖励），打破了「纯粹自我复制」的封闭。模型不再盲目相信自己的所有输出，而是只学<em>被外部判据认证为好</em>的那部分——这等价于一个隐性的质量锚。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>过滤就像写作时的自我修改：你写很多草稿（生成），但只留下<strong>自己读着确实更好</strong>的版本（过滤）。如果你的「判断好坏」的眼光是可靠的，反复这样做会越写越好；如果眼光本身有偏，就会越改越偏。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但过滤有它自己的陷阱：<strong>过滤本身会制造分布偏移</strong>。只保留「高质量 / 高置信 / 可验证」的样本，等于系统性地<em>砍掉难的、罕见的、有歧义的</em>部分——这正是 <span class="term">quality-diversity tradeoff</span>（质量-多样性权衡）：<strong>提高单样本质量往往以牺牲多样性为代价</strong>。过度过滤会让数据收缩到「容易且典型」的子集，是另一种形式的坍塌。</p></div>
+  </div>  <p>notebook 会复现这个权衡：对一个有「质量」和「多样性」两个维度的合成样本集，逐步收紧过滤阈值，看<strong>平均质量上升、但覆盖的多样性下降</strong>——两条反向的曲线。这与生成评测的 <strong>precision（保真）与 recall（多样）此消彼长</strong> 是同一个张力，也是为什么没有「免费的午餐」：纯靠过滤救坍塌，会从多样性那头付出代价。</p>  <p>那么过滤到底是救坍塌还是加速坍塌？答案取决于<strong>过滤信号来自哪里</strong>。若过滤依据是一个<em>外部的、可信的</em>判据（如数学题答案是否正确、代码能否通过测试、人类偏好），它给递归循环注入了模型<em>自身没有</em>的信息，能真正提升能力——这是 STaR 成功的关键。但若过滤依据是模型<em>自己的</em>置信度或自评分（用模型评模型），那它只是在强化模型已有的偏好和盲区，等于把坍塌从「多样性维度」搬到了「向自我偏好收缩」的维度，反而可能加速退化。<strong>外部信号过滤是解药，自我信号过滤是另一种毒</strong>——这个区分在 LLM-as-judge + 自训练的闭环里尤其要警惕。</p>  <div class="callout paper"><span class="label"></span>
+    <p>延伸（见 <code>references.md</code>）：Zelikman 2022《STaR》（过滤正确性的自训练，能变好）、Wang 2023《Self-Instruct》（自举生成指令）、Gerstgrasser 2024（累积 vs 替换）、Maini 2024《Rephrasing the Web》（改写真实数据兼顾质量与多样）。合起来看：合成数据用得好（过滤 + 真实锚定 + 累积）是利器，用得糙（纯递归替换）是毒药。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="measure"><span class="num">6</span>度量合成数据：质量与多样</h2>
+  <h3>怎么度量合成数据：质量与多样性</h3>  <p>既然坍塌的核心是<strong>多样性流失</strong>，那么评估合成数据就不能只看「单个样本像不像真的」，必须同时量<strong>分布层面的多样性与对真实分布的覆盖</strong>。这一节先建立度量直觉，为下一模块的 FID/IS/precision-recall 铺路。常用的几类度量：</p>  <table>
+    <thead><tr><th>度量维度</th><th>问什么</th><th>玩具度量</th><th>下模块对应</th></tr></thead>
+    <tbody>
+      <tr><td><strong>保真 / 质量</strong></td><td>单个合成样本像不像真的</td><td>落在真实分布支撑内的比例</td><td>precision / FID 的均值项</td></tr>
+      <tr><td><strong>多样性 / 覆盖</strong></td><td>合成是否覆盖真实的所有模式</td><td>mode coverage、熵、方差</td><td>recall / FID 的协方差项</td></tr>
+      <tr><td><strong>分布距离</strong></td><td>合成分布整体离真实多远</td><td>均值差 + 方差差、KS 距离</td><td>FID（Fréchet 距离）</td></tr>
+    </tbody>
+  </table>  <p>一个关键认识（也是贯穿本课的）：<strong>保真和多样是两个独立维度，单一标量会把它们混在一起、互相掩盖</strong>。一个坍塌的模型可能保真度很高（每个输出都很真）但多样性极低（只会生成几种）；一个噪声大的模型可能多样性高但保真度低。只报一个数（比如「质量分」）会让你看不出区别——必须<strong>至少两个维度分别报</strong>。这正是 model collapse 难被察觉的原因：它在保真维度上几乎无损，全部的损失都在多样性维度。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>想象评价一个临摹画家：「画得像不像」（保真）和「会画多少种东西」（多样）是两回事。一个只会精确临摹一张画的人，保真满分但多样为零。评合成数据同理——必须分开看这两件事。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说：理想的生成分布 $p_g$ 要在两个意义上接近真实 $p_r$：① 支撑集匹配（$p_g$ 的样本都在 $p_r$ 的支撑内 = 保真）；② 覆盖匹配（$p_r$ 的所有区域都被 $p_g$ 覆盖 = 多样）。这恰好是 precision 与 recall 的几何定义（模块 05）。坍塌对应 recall 崩溃而 precision 可能不变。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把这节的结论刻进去：<strong>评估合成数据（以及任何生成模型），永远至少分「保真」和「多样」两个维度看</strong>。这不仅是技术规范，更是抵御 model collapse 的监测手段——盯住多样性指标（mode coverage、recall、熵），才能在早期坍塌还隐蔽时就发现它。下一模块把这两个维度做成可计算的 FID / IS / precision-recall。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>接回评测：合成时代的挑战</h2>
+  <h3>接回评测：合成数据时代的评测挑战</h3>  <p>合成数据给评测带来几个新而棘手的问题，每一个都值得评测科学家警惕：</p>  <ul>
+    <li><strong>被污染的训练数据</strong>：如果模型的训练数据混入了大量（来源不明的）合成内容，它可能已经经历了某种程度的坍塌——多样性下降、对长尾的覆盖变差。评测时若只用常见样本，会完全看不到这种损害。要专门用<em>长尾 / 罕见</em>样本和多样性指标去探。</li>
+    <li><strong>评测合成数据本身</strong>：当合成数据成为产品（如合成训练集、数据增广服务），评测它的质量就是核心任务。必须用分布级指标（保真 + 多样），而非抽几条看「读着顺不顺」。</li>
+    <li><strong>自我评估的循环偏差</strong>：用模型评估模型（LLM-as-judge）+ 用模型生成数据，会形成闭环——模型的偏好和盲区被自我强化。这是一种评测维度的「递归诅咒」，需要外部 / 人类锚定打破。</li>
+    <li><strong>基准的可持续性</strong>：随着越来越多内容由 AI 生成并进入网络，未来的评测基准本身可能被合成内容污染，难以保证「测的是真实世界分布」。这是评测长期可信度的结构性挑战。</li>
+  </ul>  <p>这里和模块 03（数据流水线）有一个直接的呼应：<strong>去重在合成数据时代变得更微妙</strong>。传统去重是为了移除人类内容里的转载重复；但当训练数据混入合成内容，「重复」可能以更隐蔽的形式出现——大量合成样本虽然字面不同，却都来自同一个坍塌中的分布、表达着高度相似的「模式」。这种<em>语义级</em>的同质化，字面去重（MinHash）抓不到。检测它需要的恰恰是本模块的多样性指标（熵、mode coverage、recall）。换句话说，合成数据时代的「数据质量」不只是「去掉字面重复」，更是「监测分布是否在坍塌」——数据流水线与生成评测在这里合流了。</p>  <p>更一般地，model collapse 把本课的中心纪律推到一个新场景：<strong>当数据来源从「人类世界」变成「模型自己」，所有关于分布、多样性、污染的担忧都被放大并递归化</strong>。评测科学家的职责，是用分布级、多样性敏感的指标，在坍塌还隐蔽时就把它揪出来——而不是等到模型只会输出千篇一律的内容才发现。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话带走：<strong>合成数据好不好，关键看你有没有真实锚、是不是只看保真度</strong>。有真实数据锚定 + 累积使用 + 盯住多样性指标，合成数据是利器；丢了真实锚、纯递归、只看单样本质量，就是 model collapse 的温床。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>坍塁的临界条件</strong>：真实数据占比要维持在多少才能保证不坍塌？这个临界比例如何依赖模型、任务、合成质量？Gerstgrasser 给了累积设定的结论，但更一般的相界仍在研究。</li>
+    <li><strong>高维 / 真实模型的坍塌动力学</strong>：一维高斯的方差收缩是干净的，但真实 LLM / 扩散模型的坍塌涉及高维、多模态、神经网络的归纳偏差，其精确动力学（先丢什么、多快）远未完全刻画。</li>
+    <li><strong>好的合成数据配方</strong>：什么样的过滤 / 改写 / 混合策略能让合成数据稳定提升能力而不坍塌？STaR、Rephrasing 等给了案例，但缺乏统一理论来预测「这个合成方案会变好还是坍塌」。</li>
+    <li><strong>合成内容的可检测性</strong>：能否可靠区分 AI 生成与人类生成的内容（水印、统计特征），从而在数据流水线里把合成内容标记 / 配比？这关乎能否在合成式互联网中维持训练数据的健康，是开放且紧迫的问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读清单（详见 <code>references.md</code>）：Shumailov 2024（model collapse，Nature）、Alemohammad 2023（self-consuming / MAD）、Gerstgrasser 2024（累积 vs 替换）、Zelikman 2022（STaR）、Wang 2023（Self-Instruct）。下一模块把「保真 vs 多样」做成可计算的指标——生成媒体评测：FID、IS、precision-recall。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_data_pipeline/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 数据流水线</div></a>
+    <a class="next" href="../05_generative_media_eval/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 生成媒体评测</div></a>
+  </div>
+
+</div>
+</body>
+</html>

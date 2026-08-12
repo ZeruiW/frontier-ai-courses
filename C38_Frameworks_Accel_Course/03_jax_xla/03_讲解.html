@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · JAX/XLA 函数式与变换</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · JAX/XLA 函数式与变换</h1>
+  <p class="subtitle">纯函数、可组合的 grad/vmap/jit 变换、pytree、XLA 融合 —— 用模块 01 的 autograd 实现 numpy 版 grad+vmap 并自由组合，从零写 pytree 展平，对照 JAX 的函数式心智模型</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（autograd）、模块 02（tracing/IR/编译）、numpy 广播</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_jax_xla.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">JAX 文档 / Autodidax、Bradbury 等 JAX、Frostig 2018（high-level tracing）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#routes">两条路线：操作张量 vs 变换函数</a></li>
+      <li><a href="#pure">纯函数：一切的前提</a></li>
+      <li><a href="#grad">grad：把求导变成函数变换</a></li>
+      <li><a href="#vmap">vmap：自动向量化</a></li>
+      <li><a href="#jit">jit 与 pytree：编译与嵌套结构</a></li>
+      <li><a href="#compose">组合：函数式训练循环</a></li>
+      <li><a href="#reality">工程现实与陷阱</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="routes"><span class="num">1</span>两条路线：操作张量 vs 变换函数</h2>
+  <p>模块 01、02 走的是 PyTorch 的路线：<strong>命令式 + 动态图</strong>——张量带着梯度状态（<code>.grad</code>），<code>loss.backward()</code> 改写这些状态，再 <code>torch.compile</code> 事后捕获优化。本模块换一条根本不同的路线：<strong>JAX 的函数式 + 可组合变换</strong>。它的世界观和 PyTorch 截然不同，理解这个不同，你对「框架」的认识会立刻立体起来。</p>  <p>一句话点出分野：在 PyTorch 里你<strong>操作张量</strong>（<code>x.backward()</code>、<code>opt.step()</code>）；在 JAX 里你<strong>变换函数</strong>。求梯度不是「让张量反向传播」，而是 <code>grad(f)</code>——<strong>接受一个函数 f，返回一个新函数</strong>（它算 f 的梯度）。批处理不是「加一维循环」，而是 <code>vmap(f)</code>——返回 f 的批量化版本。编译不是事后捕获，而是 <code>jit(f)</code>——返回 f 的编译版本。全是<strong>函数 → 函数</strong>的高阶操作。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：PyTorch 像在工作台上摆弄零件——你直接拿起张量、给它求导、更新它。JAX 像有一套<strong>能改装函数的工具</strong>：给它一个函数，它还你一个「会求导的版本」「会批处理的版本」「编译过的版本」。而且这些改装工具能<strong>叠着用</strong>——「先批处理、再求导、再编译」就是 <code>jit(grad(vmap(f)))</code>，像乐高一样拼。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：JAX 的核心是一组<span class="term">functional transform</span>（函数变换），每个都是 <code>(函数) → (函数)</code> 的高阶函数：<code>grad</code>（reverse-mode AD）、<code>vmap</code>（自动向量化）、<code>jit</code>（XLA 编译）、<code>pmap</code>（多设备并行）。它们<strong>可任意组合</strong>，因为每个都只是「再 trace 一遍、做某种变换」，输入输出都是纯函数。</p></div>
+  </div>  <p>把两种世界观逐项摆出来，你会看清这不是表面语法差异，而是<strong>两套对「计算」的根本不同的组织方式</strong>：</p>  <table>
+    <thead><tr><th>维度</th><th>PyTorch（命令式）</th><th>JAX（函数式）</th></tr></thead>
+    <tbody>
+      <tr><td>核心动作</td><td>操作有状态的张量（<code>.backward()</code>、<code>.step()</code>）</td><td>变换无状态的纯函数（<code>grad/vmap/jit</code>）</td></tr>
+      <tr><td>梯度</td><td>副作用：写进 <code>x.grad</code></td><td>返回值：<code>g = grad(f)(x)</code></td></tr>
+      <tr><td>状态（参数/RNG）</td><td>藏在 <code>Module</code>/全局 RNG（可变）</td><td>显式传入传出（不可变）</td></tr>
+      <tr><td>批处理</td><td>手写 batch 维 / 循环</td><td><code>vmap</code> 自动向量化</td></tr>
+      <tr><td>编译</td><td><code>torch.compile</code> 事后附加</td><td><code>jit</code> 一等公民、与变换共生</td></tr>
+      <tr><td>控制流</td><td>原生 Python（eager 下自由）</td><td>需 <code>lax.cond/scan</code>（纯函数约束）</td></tr>
+      <tr><td>调试</td><td>直观（随时 print、动态）</td><td>较陡（jaxpr、<code>jax.debug.print</code>）</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>JAX = 纯函数 + 可组合的函数变换</strong>。本模块用模块 01 的 autograd 思想，从零实现 numpy 版的 <code>grad</code> 与 <code>vmap</code>，并验证它们能<strong>自由组合</strong>（如 <code>grad(vmap(f))</code> == 逐样本求导）。你会亲手体会为什么「函数式」是变换可组合的前提——这正是 JAX 与 PyTorch 最深的设计差异。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pure"><span class="num">2</span>纯函数：一切的前提</h2>
+  <h3>纯函数：一切的前提</h3>  <p>JAX 的一切变换都有一个<strong>硬性前提</strong>：被变换的必须是<span class="term">pure function</span>（纯函数）——<strong>输出只由输入决定，没有副作用</strong>（不改全局变量、不做 IO、不依赖隐藏的可变状态、不原地修改输入）。这不是风格建议，而是<em>能不能安全变换</em>的根本要求。</p>  <p>为什么纯函数如此关键？因为 JAX 的变换都要<strong>trace（追踪）</strong>这个函数——用抽象值跑一遍、记录它做了什么（模块 02 讲过 tracing）。如果函数有副作用（比如依赖一个全局计数器、或打印），trace 只会捕获到<em>第一次</em>的行为，副作用本身丢失；如果函数原地改了输入，重排或并行执行就会出错。<strong>只有纯函数，trace 出来的图才忠实、可缓存、可重排、可并行</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>纯函数像数学里的函数：同样的输入永远给同样的输出，不留痕迹、不看外界脸色。这样的函数你可以放心地求导、批处理、编译、并行——因为它的行为完全由输入决定，没有任何「暗箱」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>代价是 JAX 要求你把<strong>状态显式化</strong>。PyTorch 的 <code>nn.Module</code> 把参数藏在对象里（可变状态），JAX 则把参数作为<strong>显式输入</strong>传进纯函数、把更新作为<strong>显式输出</strong>传出来。随机数也一样：JAX 不用全局 RNG（那是隐藏状态），而是把随机 <code>key</code> 显式传递、显式分裂（<code>split</code>）。这套「无隐藏状态」的纪律，正是函数式的精髓。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个直接后果：JAX 里<strong>不能</strong>随手写 <code>for i in range(n): state += ...</code> 去依赖外部可变状态，也不能指望 Python 的 <code>if x &gt; 0</code> 在 trace 后还起作用（模块 02 的「控制流被烤死」）。数据相关的控制流要用 <code>jax.lax.cond</code>/<code>scan</code>/<code>while_loop</code> 这些<strong>结构化原语</strong>显式写——它们能被 trace 进图并保留语义。这是 JAX 换取「全程序可变换」付出的代价：你得用它的方式写控制流。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="grad"><span class="num">3</span>grad：把求导变成函数变换</h2>
+  <h3>grad：把求导变成函数变换</h3>  <p>JAX 求梯度的接口是 <code>grad</code>：给定纯函数 <code>f: 参数 → 标量</code>，<code>grad(f)</code> 返回一个新函数，输入同样的参数、输出梯度。底层仍是模块 01 的<strong>反向模式 AD</strong>，但暴露方式完全不同：</p>  <table>
+    <thead><tr><th></th><th>PyTorch（命令式）</th><th>JAX（函数式）</th></tr></thead>
+    <tbody>
+      <tr><td>求梯度</td><td><code>loss = f(x); loss.backward()</code>；读 <code>x.grad</code></td><td><code>g = grad(f)(x)</code></td></tr>
+      <tr><td>状态</td><td>梯度作为张量的副作用属性 <code>.grad</code></td><td>梯度作为<strong>返回值</strong>，无副作用</td></tr>
+      <tr><td>二阶导</td><td><code>create_graph=True</code> 再 backward</td><td><code>grad(grad(f))</code>（直接再变换一次！）</td></tr>
+      <tr><td>对谁求导</td><td>对 <code>requires_grad=True</code> 的张量</td><td>对第几个参数（<code>argnums</code>）</td></tr>
+    </tbody>
+  </table>  <p>这个差异看似只是语法，实则深刻。因为 <code>grad(f)</code> 返回的还是一个<strong>纯函数</strong>，你可以<em>再对它做任何变换</em>：<code>grad(grad(f))</code> 就是二阶导（对求导函数再求导，自然得很），<code>vmap(grad(f))</code> 就是「对一批输入分别求梯度」，<code>jit(grad(f))</code> 就是「编译过的梯度函数」。在 PyTorch 里这些都要特殊处理（<code>create_graph</code>、手动批处理、<code>compile</code>），在 JAX 里只是<strong>把变换叠起来</strong>。</p>  <div class="math-block">\[\texttt{grad}:\ (f:\mathbb{R}^n\!\to\!\mathbb{R})\ \longmapsto\ (\nabla f:\mathbb{R}^n\!\to\!\mathbb{R}^n)\qquad\text{——一个把函数映成函数的算子}\]</div>  <p>这个「返回值 vs 副作用」的差别，决定了<strong>组合是否可能</strong>。PyTorch 的 <code>x.grad</code> 是张量的一个属性（副作用）——你没法对「一个副作用」再求一次导、再批处理一次，因为它不是函数。而 <code>grad(f)</code> 是个<em>函数</em>，函数天生可以再被任何接受函数的高阶操作处理。<strong>把梯度做成返回值、把求导做成函数变换，是 JAX 一切组合能力的源头</strong>——这不是 API 品味问题，而是数学结构问题：只有「函数 → 函数」的东西才能像函数复合一样自由叠加。</p>  <p>本模块 notebook 会用模块 01 的 autograd 思想，实现一个 numpy 版 <code>grad(f)</code>：它内部 trace <code>f</code>、建图、反向传播，但对外暴露成「函数 → 函数」。你会验证 <code>grad(f)(x)</code> 与数值梯度一致，并体会到「梯度是返回值而非副作用」带来的组合性——这是理解 JAX 的钥匙。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="vmap"><span class="num">4</span>vmap：自动向量化</h2>
+  <h3>vmap：自动向量化</h3>  <p>第二个核心变换 <code>vmap</code>（向量化映射）解决一个极常见的痛点：你写了一个处理<strong>单个样本</strong>的函数，却要把它高效地应用到一<strong>批</strong>样本上。传统做法要么写 Python 循环（慢），要么手动给每个运算加 batch 维、处理广播（易错、改写量大）。<code>vmap(f)</code> 让你<strong>只写单样本逻辑</strong>，它自动把函数提升为批量版本。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：你写好了「怎么处理一张图片」，<code>vmap</code> 自动帮你变成「怎么处理一批图片」——而且不是套个 for 循环，而是把每个运算<strong>整体向量化</strong>（一次算完整批），高效得多。你不用在代码里到处操心 batch 维，逻辑保持单样本的清爽。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：<code>vmap</code> 沿一个新增的<strong>批轴</strong>把函数里的每个原语提升——标量运算变成逐元素、matmul 变成批量 matmul。它在 trace 时就把批维「推」过整个计算图，等价于<em>自动插入正确的广播/批处理</em>，但比手写更不易错、且能被 XLA 进一步融合。<code>in_axes</code>/<code>out_axes</code> 控制哪些参数沿哪个轴批处理。</p></div>
+  </div>  <div class="ascii">你写的（单样本）:  f(x)         x: (d,)        -&gt; 标量
+vmap 后（一批）  :  vmap(f)(X)   X: (B, d)      -&gt; (B,)
+
+vmap 不是 for 循环，而是把每个算子整体向量化：
+  单样本里的  w·x   (点积)  --vmap--&gt;  X @ w   (一次算完 B 个点积)</div>  <p>机制再说细一点，破除「vmap 是不是偷偷套了循环」的疑惑。<code>vmap</code> 在 trace 时给每个中间值附带一个<strong>批维标记</strong>（这维是批轴、还是没有批轴），然后逐 primitive 改写规则：<code>x*y</code> 两个操作数都带批 → 仍是逐元素（批维对齐）；<code>w·x</code> 里 <code>w</code> 无批维、<code>x</code> 有 → 升成 <code>X @ w</code>（批量矩阵-向量积）；遇到 <code>sum</code> 这类规约则只沿非批轴规约。整条链改写完，得到的是一个<strong>一次处理整批、没有任何 Python 循环</strong>的新计算图——这就是它比手写 for 快的根因：批并行被表达进了算子本身，交给 BLAS/XLA 一次算完。</p>  <p>最妙的是 <code>vmap</code> 与 <code>grad</code> 的<strong>组合</strong>。<code>vmap(grad(f))</code> 给出「每个样本各自的梯度」（per-sample gradients，差分隐私、影响函数都要它，PyTorch 里很麻烦）；<code>grad(vmap(f_sum))</code> 则是「批损失对参数的梯度」（普通训练）。同样两个变换，叠的顺序不同，语义不同——而你只写了一遍单样本的 <code>f</code>。本模块 notebook 会实现一个 numpy 版 <code>vmap</code>（最简版用沿批轴映射 + 结果堆叠表达语义），并验证 <code>vmap(f)(X)</code> 与逐样本 for 循环逐位一致、且能与 <code>grad</code> 组合。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="jit"><span class="num">5</span>jit 与 pytree：编译与嵌套结构</h2>
+  <h3>jit 与 pytree：编译与嵌套结构</h3>  <h4>jit：把 XLA 接上</h4>  <p><code>jit(f)</code> 返回 <code>f</code> 的编译版本：首次调用时 trace 出 <span class="term">jaxpr</span>（JAX 的 IR，模块 02 讲过 IR），交给 <span class="term">XLA</span> 编译器<strong>融合、优化、生成内核</strong>，缓存编译产物；之后同形状调用直接复用。这和 <code>torch.compile</code> 殊途同归（都是 trace + 编译 + 缓存），区别在 JAX<strong>从设计之初就是函数式</strong>，jit 是一等公民、与其他变换天然可组合，而非事后附加。</p>  <p>和模块 02 一样，jit 也受 tracing 的约束：控制流被烤死（要用 <code>lax</code> 原语）、形状变化触发重编译（有 <strong>guard</strong>/缓存机制）。一个 JAX 特有的坑是 <code>jit</code> 里<strong>不能</strong>用普通 Python <code>if x&gt;0</code>（<code>x</code> 是抽象 tracer，没有具体值），必须 <code>lax.cond</code>——这正是「纯函数 + 结构化控制流」纪律的体现。</p>  <h4>pytree：穿过嵌套容器</h4>  <p>真实模型的参数不是单个张量，而是<strong>嵌套的字典/列表</strong>（每层一组 W/b）。JAX 用 <span class="term">pytree</span> 统一处理这种嵌套：变换会自动「穿过」pytree、作用到每个<strong>叶子</strong>（张量）上。核心操作是 <code>tree_flatten</code>（把嵌套结构拆成「扁平的叶子列表 + 结构定义 treedef」）和 <code>tree_unflatten</code>（用 treedef 把叶子装回原结构）。</p>  <pre><code># pytree：一个模型参数的嵌套结构
+params = {'layer1': {'W': W1, 'b': b1},
+          'layer2': {'W': W2, 'b': b2}}
+leaves, treedef = tree_flatten(params)   # leaves=[W1,b1,W2,b2], treedef 记住嵌套形状
+# grad(loss)(params) 自动对每个叶子求梯度，返回【同样结构】的梯度 pytree
+# 优化器更新：new = tree_map(lambda p,g: p - lr*g, params, grads)  &lt;- 逐叶子
+</code></pre>  <p>pytree 解决的核心矛盾是：<strong>变换想作用在「一堆张量」上，而模型参数是「有结构的一堆张量」</strong>。<code>tree_flatten</code> 把结构（treedef）与内容（叶子列表）<em>分离</em>——于是变换只管对扁平的叶子列表做事（求导、更新、分片），完全不用懂结构有多复杂；做完再用 treedef 把结果<strong>装回同样的结构</strong>。这就是为什么 <code>grad(loss)(params)</code> 能对任意嵌套的 <code>params</code> 工作、还返回同构的梯度：它内部就是 flatten → 对叶子求导 → unflatten。<strong>结构与内容分离</strong>，是 pytree 让函数式范式能驾驭真实模型的关键抽象。</p>  <p>pytree 是 JAX 处理复杂模型的<strong>黏合剂</strong>：<code>grad(loss)(params)</code> 返回与 <code>params</code><em>同构</em>的梯度 pytree；<code>tree_map</code> 让你对所有叶子做同一操作（如梯度下降更新）。本模块 notebook 会从零实现 <code>tree_flatten</code>/<code>tree_unflatten</code>/<code>tree_map</code>，并验证「展平再装回 == 原结构」、用它对一个嵌套参数做梯度更新——你会看到为什么函数式范式下，处理任意复杂的模型参数也只是「对叶子列表操作」这么简单。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="compose"><span class="num">6</span>组合：函数式训练循环</h2>
+  <h3>把它们组合：函数式训练循环</h3>  <p>把上面四件事拼起来，JAX 的训练循环呈现出一种独特的<strong>函数式美感</strong>——没有可变状态，每步是「旧状态 → 新状态」的纯函数：</p>  <div class="ascii"># JAX 风格训练步（纯函数，可被 jit）
+@jit
+def train_step(params, batch):
+    loss, grads = value_and_grad(loss_fn)(params, batch)  # 一次拿 loss + 梯度 pytree
+    new_params = tree_map(lambda p, g: p - lr * g, params, grads)
+    return new_params, loss          # 显式返回新状态，无副作用
+
+for batch in data:
+    params, loss = train_step(params, batch)   # 旧 params -&gt; 新 params</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>对比 PyTorch 的 <code>opt.zero_grad(); loss.backward(); opt.step()</code>（三步都在<em>改</em>状态），JAX 的一步是 <code>params, loss = train_step(params, batch)</code>——参数进、参数出，整个 step 是个纯函数，可以整体 <code>jit</code> 编译、可以 <code>vmap</code> 到多组超参、可以 <code>pmap</code> 到多设备。状态显式化的回报，是<strong>整个训练步都能被变换</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这里 <code>value_and_grad</code> 是 <code>grad</code> 的变体，一次同时返回函数值和梯度（避免重复前向）。整个循环里<strong>没有一处原地修改</strong>：<code>params</code> 每步被一个新的 pytree 替换。这正是纯函数范式——也是为什么 JAX 在需要<em>对训练过程本身求导/并行</em>的研究场景（元学习、大规模并行）特别受欢迎。</p></div>
+  </div>  <p>为什么纯函数对<strong>并行</strong>如此关键，值得再点一句。要把计算切到上千个芯片上跑，编译器必须能<strong>自由地重排、复制、分片</strong>你的运算——而这只有在<em>没有隐藏状态、没有副作用</em>时才安全（否则重排会改变结果、复制会让副作用发生多次）。纯函数恰好给了这个保证，所以 JAX 能把 <code>pmap</code>/<code>shard_map</code> 也做成一个变换：你写单设备的纯函数，它自动切分到多设备、插入通信。这就是「函数式」在大规模训练上的隐藏红利——<strong>可变换性 = 可并行性</strong>，两者同源于纯函数。这也是为什么前沿大模型（尤其 TPU 上的）大量用 JAX。</p>  <p>退一步看两条路线的取舍：PyTorch 的命令式让<strong>调试直观、上手快</strong>（随时 print 张量、动态控制流自由），代价是变换（编译、批处理）要事后附加、有缝；JAX 的函数式让<strong>变换天然可组合、极适合并行与高阶导</strong>，代价是要遵守纯函数纪律、控制流得用原语、调试曲线更陡。没有谁绝对更好——理解了这个取舍，你就能按任务选框架，也能在两者间迁移思想（PyTorch 的 <code>functorch</code>/<code>torch.func</code> 正是把 JAX 的 <code>vmap</code>/<code>grad</code> 函数式变换搬进 PyTorch）。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="reality"><span class="num">7</span>工程现实与陷阱</h2>
+  <h3>工程现实与陷阱</h3>  <p>先把本模块的「numpy 玩具复刻」与「真实 JAX」逐项对上号——你会看到我们复刻的是<strong>机制与心智模型</strong>，真版多的是<em>编译与并行的工程</em>：</p>  <table>
+    <thead><tr><th>维度</th><th>本模块 numpy 玩具复刻</th><th>真实 JAX/XLA</th></tr></thead>
+    <tbody>
+      <tr><td><code>grad</code></td><td>trace 计算图 + 反向传播，对外是「函数→函数」</td><td>同样语义，底层 XLA 编译的 VJP，支持 <code>jacfwd</code>/<code>hessian</code></td></tr>
+      <tr><td><code>vmap</code></td><td>沿批轴 map + 结果堆叠（讲清语义）</td><td>在 trace 期把批维推过每个 primitive，零循环、可被 XLA 融合</td></tr>
+      <tr><td><code>jit</code></td><td>（不实现）只讲 trace+缓存的道理</td><td>trace 成 jaxpr → XLA 融合/优化/生成内核 → 按形状缓存</td></tr>
+      <tr><td>IR</td><td>无（直接在 numpy 上跑）</td><td><code>jaxpr</code>（可 <code>make_jaxpr</code> 打印），再降到 HLO</td></tr>
+      <tr><td>设备</td><td>只有 CPU/numpy</td><td><code>pmap</code>/<code>shard_map</code> 自动切到多 TPU/GPU</td></tr>
+    </tbody>
+  </table>  <p>看这张表的要点：玩具版<strong>不追求快</strong>（甚至 vmap 用 for 循环表达语义），它的价值是让你<em>在没有 JAX 的环境里把「函数式 + 可组合变换」练成肌肉记忆</em>；真版的全部额外复杂度，都是为了把同一套语义<strong>编译并行到上千芯片上高效执行</strong>。下面这些坑，正是真版为换取「全程序可变换」而要求你遵守的纪律：</p>  <ul>
+    <li><strong>控制流必须用原语</strong>：<code>jit</code> 下 Python 的 <code>if x&gt;0</code>/<code>for</code> 依赖具体值的部分会报错或被烤死。要用 <code>lax.cond</code>/<code>lax.scan</code>/<code>lax.while_loop</code>。<code>scan</code> 还能避免循环展开导致的编译爆炸。</li>
+    <li><strong>随机数显式化</strong>：没有全局 RNG。每次要随机就得有一个 <code>key</code>，用 <code>jax.random.split(key)</code> 分裂出新 key——忘了 split 会得到<em>相同</em>的随机数。这是纯函数对「随机」的必然要求。</li>
+    <li><strong>重编译陷阱</strong>：传入 Python int/bool 作为参数会被当成<strong>静态</strong>值，每变一次就重编译。要么标 <code>static_argnums</code>（确实想按它特化），要么转成数组（按值不重编译）。</li>
+    <li><strong>就地更新语法</strong>：不能 <code>x[i] = v</code>（张量不可变），要用 <code>x.at[i].set(v)</code>（返回新张量）。这是函数式「无副作用」的直接体现。</li>
+    <li><strong>调试更难</strong>：<code>jit</code> 里不能直接 print（trace 时机不对），要用 <code>jax.debug.print</code>；报错栈对应 jaxpr 而非源码。函数式的调试税。</li>
+  </ul>  <p>一个统一的心法：<strong>把所有状态和随机性都显式地穿进穿出，把控制流交给 lax 原语</strong>。一旦接受了「函数进、函数出，没有暗箱」这套纪律，JAX 的所有变换就会像数学一样干净地组合起来。本模块的 numpy 复刻刻意保留这套纪律（纯函数、显式状态、grad/vmap 作为函数变换），让你在没有 JAX 的环境里也能把这套思维练成肌肉记忆。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>可组合变换的边界</strong>：<code>grad</code>/<code>vmap</code>/<code>jit</code> 之外，还能定义哪些有用的函数变换（如 <code>checkpoint</code>、<code>custom_vjp</code>、自动并行）？它们如何与已有变换无缝组合，是 JAX 生态持续探索的。</li>
+    <li><strong>自动并行与分片</strong>：从 <code>pmap</code> 到 <code>shard_map</code>/<code>Mesh</code>/GSPMD——让编译器根据张量的分片标注自动插入通信、切分计算。把单设备程序自动扩展到上千芯片，是 JAX 在大模型训练的核心竞争力（与 C08 交叉）。</li>
+    <li><strong>函数式与命令式的融合</strong>：PyTorch 的 <code>torch.func</code>（前 functorch）把 JAX 式的 <code>vmap</code>/<code>grad</code>/<code>jacrev</code> 搬进 PyTorch。两种范式的边界在模糊，理想是「命令式的易用 + 函数式的可组合」兼得。</li>
+    <li><strong>高阶导与科学计算</strong>：<code>grad(grad(...))</code>、<code>jacfwd</code>/<code>jacrev</code>/<code>hessian</code> 让 JAX 在物理模拟、优化、概率推断等需要高阶导的领域大放异彩。如何让高阶导也高效（而非朴素嵌套）是活跃方向。</li>
+    <li><strong>编译器与 IR 的统一</strong>：jaxpr → HLO → XLA，与 PyTorch 的 FX → Inductor，是否会收敛到统一的 IR（如 StableHLO/MLIR），让模型在框架间无损迁移、共享编译优化？这是整个生态的开放问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：JAX 文档与《Autodidax: JAX core from scratch》（从零搭 trace/grad/vmap/jit，与本模块 numpy 复刻精确对应）、Bradbury 等的 JAX（函数式 + 可组合变换的出处）、Frostig 等 2018《Compiling ML programs via high-level tracing》（tracing 编译方法论）、XLA 文档。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_torch_compile/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · torch.compile 图捕获与编译</div></a>
+    <a class="next" href="../04_mixed_precision_memory/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 混合精度与显存</div></a>
+  </div>
+
+</div>
+</body>
+</html>

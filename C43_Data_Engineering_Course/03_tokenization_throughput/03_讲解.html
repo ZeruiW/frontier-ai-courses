@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · Tokenization 吞吐</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · Tokenization 吞吐</h1>
+  <p class="subtitle">大规模并行分词 · 序列 packing 消灭 padding 浪费 · token 内存账 (uint16/uint32 + mmap) · 并行加速比与 Amdahl 上限 —— 把分词从一个 encode() 调用升级成可规划、可预算、可扩展的工程系统</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、BPE/子词分词的基本概念、大 O 复杂度、一点点装箱/并行常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_tokenization_throughput.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Sennrich 2016（BPE）、Kudo 2018（SentencePiece）、Raffel 2020（T5 packing）、Krell 2021（高效 packing）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">分词在万亿 token 下的三堵墙</a></li>
+      <li><a href="#parallel">为什么能并行，又为什么不免费</a></li>
+      <li><a href="#throughput">吞吐账：万亿 token 要跑多久</a></li>
+      <li><a href="#packing">序列 packing：消灭 padding 浪费</a></li>
+      <li><a href="#memory">内存账：token 用几个字节存</a></li>
+      <li><a href="#pipeline">分词管线的吞吐全景</a></li>
+      <li><a href="#tradeoff">吞吐与正确性的权衡清单</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>分词在万亿 token 下的三堵墙</h2>
+  <p>分词（<span class="term">tokenization</span>）听起来是个解决了的问题：拿现成的 BPE 分词器，对每篇文档调一次 <code>encode()</code> 就行。在小数据上确实如此。但当语料是万亿（<code>1e12</code>）token 时，这件「平凡」的事会突然撞上三堵墙：<strong>吞吐</strong>（单核分完要几个月）、<strong>内存</strong>（token 数组放不进内存）、和一个最隐蔽的浪费——<strong>padding</strong>（把短序列填齐造成的算力空烧）。</p>  <p>先和上游课程划清边界。C21（大规模预训练）讲的是分词的<strong>科学</strong>：词表多大、用 BPE 还是 unigram、分词粒度如何影响下游困惑度与压缩率——这些是「<em>分词器应该长什么样</em>」的问题。本课接手的是分词的<strong>工程</strong>：分词器已经定了，现在要把它<em>高效地、正确地、可规模化地</em>套到万亿 token 上。同一个 BPE 分词器，朴素地用和工程化地用，吞吐可以差几十倍、有效算力利用率可以差一倍。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>分词在工程上有个得天独厚的好处：它是<strong>逐文档独立</strong>的——分 A 文档不需要看 B 文档。这种「<span class="term">embarrassingly parallel</span>（易并行）」结构意味着理论上加机器就能线性提速。但「理论上」三个字藏着魔鬼：分词器的训练（合并规则的学习）是偏串行的，而分词产物的下游消费（packing、写盘）也可能成为新瓶颈。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化本模块的三笔账。<strong>吞吐账</strong>：分完 <code>N</code> 个 token 的时间 ≈ <code>N / (R · P · η)</code>，其中 <code>R</code> 是单核每秒 token 数、<code>P</code> 是核数、<code>η</code> 是并行效率。<strong>浪费账</strong>：padding 浪费率 = 填充 token 数 ÷ 总 token 数，packing 的目标是把它压到接近 0。<strong>内存账</strong>：token 用几字节存（<code>uint16</code> 还是 <code>uint32</code>）由词表大小定，直接决定落盘体量与 mmap 是否必要。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>本模块的一句话主线：<strong>分词的难点不在「怎么切词」，而在「万亿 token 下怎么把核跑满、把浪费压没、把内存放下」</strong>。这三件事分别由<em>并行 + Amdahl 上限</em>、<em>序列 packing</em>、<em>token 数据类型 + 内存映射</em>解决。学完你能为一条真实分词管线算出「要几台机器、跑几天、产出多大、浪费多少」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="parallel"><span class="num">2</span>为什么能并行，又为什么不免费</h2>
+  <h3>分词为什么能并行，又为什么并行不是免费的</h3>  <p>把分词拆成两个阶段看，能力差异立刻清楚。<strong>训练阶段</strong>（学 BPE 合并规则）：统计全语料的字节对频率、反复挑最高频的对合并——这一步本质<strong>串行</strong>（每次合并依赖上一次的结果），且要全局词频，难并行。好在它<em>只做一次</em>、且常在一个采样子集上做，不是吞吐瓶颈。<strong>编码阶段</strong>（把文本切成 token id）：拿训练好的合并规则套到每篇文档——这一步<strong>逐文档独立、完全可并行</strong>，也正是万亿 token 的吞吐主战场。</p>  <p>既然编码可并行，是不是加核就线性提速？不是。真实分词管线里总有<strong>串行或半串行的环节</strong>：从对象存储读原始文本（IO，可重叠但有上限）、把分词结果<strong>汇总写盘</strong>（多进程写同一批 shard 文件需协调）、以及<span class="term">BPE</span> 编码里那点不可向量化的合并循环。这些串行占比，决定了加核的收益上限。</p>  <p>这里要澄清一个常见误解：「易并行」不等于「零通信」。逐文档独立确实意味着 worker 之间在<em>计算阶段</em>不需要互相通信，但它们仍然共享两个有限资源——<strong>输入带宽</strong>（所有 worker 都从同一批对象存储拉数据，总带宽是定值）和<strong>输出汇聚</strong>（所有 worker 的产物最终要落成有组织的 shard 文件）。当 worker 数少时，这两个共享资源绰绰有余、加核近线性提速；当 worker 数多到把输入带宽吃满、或把写盘出口堵住时，再加 worker 只是让它们<em>排队等 IO</em>。这就是为什么真实吞吐曲线总会从近线性逐渐压平——不是分词本身不可并行，而是它依赖的共享资源有上限。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：100 个工人切菜（分词），理论上比 1 个工人快 100 倍。但如果所有切好的菜都得经过<strong>一个出菜口</strong>打包（写盘汇总），出菜口就成了瓶颈——再多工人也快不过出菜口的速度。这个「出菜口」就是串行占比。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这正是 <span class="term">Amdahl's law</span>（阿姆达尔定律）说的：设串行占比为 <code>s</code>、并行核数为 <code>P</code>，加速比上限是</p>  <div class="math-block">\[\text{Speedup}(P) = \frac{1}{s + \frac{1-s}{P}} \xrightarrow{P\to\infty} \frac{1}{s}\]</div>  <p>即便核数 <code>P→∞</code>，加速比也被 <code>1/s</code> 死死封住。<code>s=5%</code> 时，无论多少核，最多快 20 倍。所以分词调优的第一步不是加核，而是<strong>先量化并压低串行占比</strong>（如让每个 worker 各写各的 shard、避免汇总瓶颈）。</p></div>
+  </div>  <div class="callout danger"><span class="label">加核前先算 Amdahl</span>
+    <p>一个真实而昂贵的教训：很多人给分词管线疯狂加核，吞吐却卡在某个值上不去——<strong>瓶颈根本不在分词本身，而在串行的写盘/汇总，或在喂数据的 IO</strong>。Amdahl 定律告诉你：优化前必须先测出串行占比 <code>s</code>。如果 <code>s</code> 已经是 10%，那你的加速天花板就是 10 倍——这时该做的是把那 10% 的串行环节并行化（如分片写盘），而不是把核从 100 加到 1000（收益微乎其微）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="throughput"><span class="num">3</span>吞吐账：万亿 token 要跑多久</h2>
+  <h3>吞吐账：万亿 token 到底要跑多久</h3>  <p>把吞吐账算具体。一个现代 CPU 核心用优化过的分词库（如 <span class="term">SentencePiece</span> / HuggingFace tokenizers 的 Rust 实现）每秒能分大约 <code>1e5 ~ 1e6</code> 个 token（取决于文本与词表）。取保守的 <code>R=1e5</code> tok/s/核，分完 <code>1e12</code> token：单核要 <code>1e7</code> 秒 ≈ <strong>116 天</strong>。这就是为什么分词<em>必须</em>并行——单核根本等不起。</p>  <p>代入并行：<code>P=1024</code> 核、效率 <code>η=0.8</code>，有效吞吐 <code>1e5·1024·0.8 ≈ 8.2e7</code> tok/s，分完 <code>1e12</code> token 约 <code>1.2e4</code> 秒 ≈ <strong>3.4 小时</strong>。从 116 天到 3.4 小时——这就是吞吐账的价值：它把「分词要不要并行、并行到什么程度」从拍脑袋变成可规划的工程决策。</p>  <table>
+    <thead><tr><th>核数 P</th><th>有效吞吐 (tok/s)</th><th>分完 1e12 token</th><th>瓶颈在哪</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><code>1e5</code></td><td>≈ 116 天</td><td>纯计算，等不起</td></tr>
+      <tr><td>64</td><td><code>5.1e6</code></td><td>≈ 2.3 天</td><td>计算为主</td></tr>
+      <tr><td>1024</td><td><code>8.2e7</code></td><td>≈ 3.4 小时</td><td>开始触及 IO/汇总</td></tr>
+      <tr><td>10000</td><td><code>8e8</code></td><td>理论 ≈ 21 分钟</td><td><strong>Amdahl / IO 封顶</strong></td></tr>
+    </tbody>
+  </table>  <p>注意最后一行的告诫：核数堆到上万，理论时间是 21 分钟，但实际几乎达不到——因为此时<strong>读数据的 IO 带宽</strong>和<strong>写产物的汇总</strong>早已成为瓶颈（回到上一节的 Amdahl）。真实的分词吞吐曲线不是一条无限上扬的直线，而是先近线性、再被 IO/串行压平。工程上的「够用就好」是：把核数加到<em>吞吐曲线开始变平</em>的拐点附近，再往上加核是浪费钱。notebook 会让你把这条曲线（含 Amdahl 上限）画/算出来。</p>  <p>吞吐账还有一个常被忽略的维度——<strong>它不是一次性的</strong>。语料每月随新的 CommonCrawl 快照增长，分词可能要<em>反复跑</em>（换了分词器、加了新数据）。所以分词工期不只影响「第一次训练前要等多久」，还影响<strong>迭代速度</strong>：如果每次调整数据配方都要重新分词三天，团队的实验节奏就被锁死在三天一轮。这就是为什么大团队会把分词产物缓存、做增量分词、甚至把它做成一个常驻服务——把「分词工期」从关键路径上挪走。一笔吞吐账，算的不只是机器成本，还有团队的时间成本。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>吞吐账的可迁移智慧：<strong>任何大规模数据操作，先用「总量 ÷ 单位吞吐 ÷ 有效并行度」估个数量级，再决定要不要做、怎么做</strong>。这个数量级估算（back-of-envelope）哪怕只精确到 10 倍以内，也足以避免「上了集群才发现要跑三个月」的灾难。分词如此，去重（模块 01）、过滤（模块 04）皆如此。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="packing"><span class="num">4</span>序列 packing：消灭 padding 浪费</h2>
+  <h3>序列 packing：消灭 padding 这个隐形浪费</h3>  <p>现在讲最隐蔽、也最值钱的一笔账：<strong>padding 浪费</strong>。训练时模型吃的是<strong>定长</strong>序列（如长度 2048）。但真实文档长短不一——有的 50 token，有的 5000 token。朴素做法是把每篇文档单独成一条、<strong>短的用占位符填齐到 2048</strong>。问题来了：一篇 50 token 的文档，要填 1998 个 <span class="term">padding</span> token，这些 token<em>不产生任何有用梯度，却照样占显存、照样过一遍注意力计算</em>——纯粹的算力空烧。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>浪费有多大？如果文档平均长度只有序列长的零头，padding 浪费率可以高达 <strong>80%~90%</strong>——意味着你买的 GPU 算力，大部分花在了计算「无意义的填充符」上。在万亿 token、千卡集群的规模上，这是天文数字的浪费。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>解法是 <span class="term">sequence packing</span>（序列打包）：<strong>把多条短文档拼接进同一条定长序列</strong>，用分隔符隔开，几乎不留空白。一条 2048 的序列可以塞下「50+300+1200+490」四篇文档，浪费率从 90% 砍到接近 0。浪费率定义：</p>  <div class="math-block">\[\text{waste} = \frac{\#\text{padding tokens}}{\#\text{total tokens}} = 1 - \frac{\#\text{real tokens}}{B \cdot L}\]</div>  <p>其中 <code>B</code> 是序列条数、<code>L</code> 是序列长。packing 通过减少序列条数 <code>B</code> 来逼近「真实 token 占满每条序列」。</p></div>
+  </div>  <p>packing 本质是一个 <span class="term">bin packing</span>（装箱）问题：把不同长度的文档（物品）塞进定长的序列（箱子），使箱子数最少（等价于浪费最少）。最优装箱是 NP 难的，但工程上用<strong>贪心近似</strong>就足够好：<em>首次适配（first-fit）</em>——来一篇文档，放进第一个还装得下的箱子，装不下就开新箱子；或更简单的<em>贪心流式拼接</em>——一直往当前序列拼，满了就封箱开新的。这些 O(n) 或 O(n log n) 的近似，打包率通常能到 95%+。</p>  <div class="callout warn"><span class="label">packing 的正确性前提</span>
+    <p>packing 有一个<strong>绝不能忘的正确性陷阱</strong>：一条序列里拼了多篇文档，必须用 <span class="term">document mask</span>（文档掩码 / 块对角注意力掩码）阻止注意力<strong>跨越文档边界</strong>。否则第二篇文档会「看到」拼在它前面的第一篇——这叫<strong>跨文档污染</strong>（cross-contamination），会让模型学到本不该有的跨文档关联，悄悄损害质量。Krell et al. 2021 专门研究了这个问题。记住：<strong>packing 省算力的前提，是掩码挡住了跨文档泄漏</strong>。notebook 会从零实现这个块对角掩码并验证它正确隔离了各文档。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="memory"><span class="num">5</span>内存账：token 用几个字节存</h2>
+  <h3>内存账：token 用几个字节存</h3>  <p>分词的产物是海量的 token id 整数。一个常被忽略、却直接决定落盘体量与加载方式的决策是：<strong>每个 token id 用几个字节存</strong>？答案由<strong>词表大小</strong>决定。</p>  <p>token id 是 <code>[0, vocab_size)</code> 的整数。若 <code>vocab_size &lt; 65536 (2^16)</code>，每个 id 用 <code>uint16</code>（2 字节）就够；若词表更大（如 12.8 万的多语种词表），就得用 <code>uint32</code>（4 字节）。这个看似微小的选择，在万亿 token 上是<strong>2 TB vs 4 TB</strong>的差别——直接关系到存储成本、IO 带宽、和能否 mmap。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么不无脑用 <code>uint32</code> 图省事？因为存储和 IO 都翻倍。万亿 token 用 <code>uint16</code> 是 2 TB，用 <code>uint32</code> 是 4 TB；训练时每个 epoch 都要把这些 token 从磁盘读一遍，IO 量也翻倍。在带宽受限的训练里，<strong>token 存得越紧，喂数据越快</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>真实框架（Megatron-LM、GPT-NeoX）把 tokenized 语料存成 <code>.bin/.idx</code> 两个文件：<code>.bin</code> 是所有 token 拼成的一个大数组（按词表选 <code>uint16/uint32</code>），<code>.idx</code> 记录每篇文档在大数组里的起止偏移。训练时用 <span class="term">memory-mapped (mmap)</span> 把 <code>.bin</code> 当内存数组访问、由 OS 按需分页——于是能<strong>随机读取远大于内存的 token 文件</strong>，无需全部载入。</p></div>
+  </div>  <p>把内存账串起来：<strong>词表大小 → token 数据类型 → 落盘体量 → 是否必须 mmap → 训练时的 IO 带宽</strong>，这是一条环环相扣的工程链。一个 12.8 万词表的多语种模型，光是「<code>uint16</code> 装不下、被迫用 <code>uint32</code>」这一点，就让它的 tokenized 语料比同等 token 数的英文模型大一倍——这是做数据容量规划时必须算清的账，否则会低估存储与 IO 一倍。</p>  <p>为什么 mmap 在这里几乎是必选项，值得多说一句。训练要<strong>随机</strong>地从 token 数组里取序列（打乱顺序喂，见模块 02），而数组有 2~4 TB、远超单机内存。若不用 mmap，要么把整个数组读进内存（放不下），要么每次随机读都重新 <code>seek + read</code> 文件（系统调用开销大）。mmap 的妙处是把文件<em>映射</em>成一个虚拟内存数组，访问哪一页、OS 才从磁盘载入哪一页，并自动缓存热页——于是代码里 <code>arr[i:i+L]</code> 这种朴素切片，背后是 OS 高效的按需分页。这就是 Megatron/GPT-NeoX 的 <code>.bin</code> 必用 mmap 的原因：它让「随机访问一个比内存大千倍的 token 数组」变成一行普通的 numpy 切片。token 存得越紧（<code>uint16</code>），每页能放的 token 越多，分页与缓存也越高效——内存账与 IO 效率在 mmap 这里再次咬合。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>内存账的可迁移智慧：<strong>在大规模下，「一个元素用几个字节」从来不是小事</strong>。token 用 uint16 还是 uint32、MinHash 签名用 int32 还是 int64（模块 01）、shard 元数据存多少——每个「× 总量」之后都是 TB 级的差别。养成「先问数据类型、再乘总量」的习惯，是大规模数据工程师的基本功。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">6</span>分词管线的吞吐全景</h2>
+  <h3>把流水串起来：分词管线的吞吐全景</h3>  <p>现在把本模块的机制拼成一条完整的分词管线，并标出每一环的吞吐特性：</p>  <div class="ascii">原始文本 shard (对象存储)
+   │  ① 读 IO（可预取重叠，带宽有上限）
+   ▼
+并行编码 encode()  ← P 个 worker，逐文档独立（易并行，吞吐主体）
+   │  ② 串行占比 s 在此之外（合并循环不可向量化的部分）
+   ▼
+序列 packing（贪心装箱）+ 文档掩码  ← 消 padding 浪费，O(n)
+   │  ③ 注意正确性：块对角掩码挡住跨文档泄漏
+   ▼
+按 uint16/uint32 写 .bin / .idx  ← 汇总写盘（半串行，易成瓶颈）
+   │  ④ 各 worker 各写各的 shard 可避免汇总瓶颈
+   ▼
+tokenized 语料（mmap 供训练随机读）</div>  <p>读这张图的方式：吞吐由<strong>最慢的一环</strong>决定（流水线的木桶效应）。编码（②）虽是主体，但若读 IO（①）跟不上，worker 会饿着；若写盘汇总（④）是单点，再多 worker 也堵在出菜口。所以分词吞吐优化是个<strong>找瓶颈、消瓶颈</strong>的循环：先测出哪一环最慢（用吞吐账 + Amdahl 定位串行占比），再针对性地预取（治 IO）、加核（治计算）、或分片写盘（治汇总）。</p>  <p>把三笔账合起来，就是一次完整的分词管线规划：<strong>吞吐账</strong>告诉你要几台机器、跑几天；<strong>浪费账</strong>（packing）告诉你产出的 token 有多少是有效的、省了多少训练算力；<strong>内存账</strong>告诉你产物多大、要不要 mmap、IO 压力多大。这三笔账，正是把「分词」从一个 <code>encode()</code> 调用，升级成一个<em>可规划、可预算、可扩展的工程系统</em>所需的全部。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一个值得记住的全局视角：<strong>packing 省下的算力，最终是省在训练（C08）那一侧的</strong>。数据工程师在分词阶段多花一点心思做好 packing（浪费率从 50% 降到 5%），训练侧的有效 token 吞吐就能近乎翻倍——同样的 GPU 时间能多训近一倍的真实 token。数据工程与训练系统在这里紧密咬合：上游的工程质量，直接兑换成下游的算力效率。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">7</span>吞吐与正确性的权衡清单</h2>
+  <h3>吞吐与正确性的权衡清单</h3>  <p>把本模块的工程取舍整理成一张决策表，作为做分词管线规划时的速查：</p>  <table>
+    <thead><tr><th>旋钮</th><th>调大/开启的好处</th><th>代价 / 风险</th><th>经验起点</th></tr></thead>
+    <tbody>
+      <tr><td>并行核数 P</td><td>吞吐近线性提升</td><td>受 Amdahl 串行占比与 IO 封顶</td><td>加到吞吐曲线变平的拐点</td></tr>
+      <tr><td>序列 packing</td><td>浪费率→0，有效算力翻倍</td><td>需文档掩码（否则跨文档污染）</td><td>默认开启 + 块对角掩码</td></tr>
+      <tr><td>序列长 L</td><td>更长上下文、装箱更易满</td><td>padding 难度随文档分布变化</td><td>对齐训练上下文长（2048/8192）</td></tr>
+      <tr><td>token dtype</td><td>uint16 省一半存储与 IO</td><td>词表 ≥65536 时装不下</td><td>vocab<65536 用 uint16，否则 uint32</td></tr>
+      <tr><td>预取深度</td><td>藏住读 IO 延迟</td><td>占额外内存（有界队列）</td><td>够藏住一两个 batch 的读延迟</td></tr>
+    </tbody>
+  </table>  <p>这张表的统一逻辑是本课反复出现的：<strong>先保正确（packing 必须配掩码），再追吞吐（并行 + 预取 + 紧凑存储），且每个旋钮都「够用即可」而非越大越好</strong>。并行核数有 Amdahl 上限，序列长要对齐训练配置，dtype 由词表硬约束——没有一个旋钮是「越大越好」的，每一个都有它的甜点区，靠前面三笔账把甜点区算出来。</p>  <p>最后强调一个容易被忽视的顺序问题：分词在整条数据管线里<strong>通常放在去重、过滤、去污染之后</strong>（先把该删的删掉，再对留下的干净文本分词，避免在垃圾数据上浪费分词算力）。这又是「先便宜后贵、先筛后算」的工程节奏在管线层面的体现——和模块 01 的「先精确去重再近重复」、模块 04 的「先启发式再分类器」同构。整门课的工程智慧，本质上是同一套「把昂贵操作留到数据最少时再做」的复用。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见的新手陷阱：以为 packing 既然这么好，序列长就该开到极大以便装更满。<strong>序列长不是 packing 的自由旋钮，它由训练配置（模型的上下文长度）决定</strong>。你不能为了 packing 把 L 设成 100000——那会改变模型训练的语义。packing 是在<em>给定的 L</em>下尽量装满，而非反过来调 L 去迁就 packing。把这个因果搞反，是工程规划里的低级但致命的错误。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>最优 packing 策略</strong>：first-fit / best-fit / 贪心流式各有打包率与计算开销的权衡，超长文档（超过 L）的截断 vs 切分也影响数据完整性。在变长、多模态序列上做最优装箱仍是活跃的工程研究（Krell 2021 是起点）。</li>
+    <li><strong>无 padding 训练（变长注意力）</strong>：与其 packing 后用掩码，不如让注意力内核原生支持变长序列（如 FlashAttention 的 varlen 接口、PyTorch 的 NestedTensor），彻底消除 padding。这把浪费问题从数据侧推到了内核侧，是 C36（GPU 内核）的延伸话题。</li>
+    <li><strong>流式 / 在线分词</strong>：边训练边分词（而非预先全量分词落盘），省掉 TB 级中间存储，但要求分词吞吐跟得上训练吞吐、且可复现。何时该预分词、何时该在线分词，是吞吐与存储的权衡。</li>
+    <li><strong>分词器本身的吞吐</strong>：BPE 编码的合并循环是分词吞吐的核心，Rust/C++ 实现（HF tokenizers、tiktoken）比纯 Python 快几十倍；如何进一步向量化/GPU 化 BPE 编码是工程前沿。</li>
+    <li><strong>分词与多语言/多模态</strong>：多语种大词表（12.8 万+）逼出 uint32 与更大存储；图像/音频 token、字节级模型（无显式分词）正在改变「token」的定义，分词工程也随之演化。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Sennrich et al. 2016（BPE）、Kudo & Richardson 2018（SentencePiece）、Raffel et al. 2020（T5/C4，序列 packing 的早期大规模实践）、Krell et al. 2021（高效 packing 与跨文档污染）；工程对标 Megatron-LM / GPT-NeoX 的 <code>.bin/.idx</code> 数据格式。下游接 C08（训练系统）的有效 token 吞吐。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../02_streaming_loaders/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 流式加载与分片</div></a>
+    <a class="next" href="../04_quality_filtering/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 大规模质量过滤</div></a>
+  </div>
+
+</div>
+</body>
+</html>

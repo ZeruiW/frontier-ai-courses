@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 可观测与评测（Observability）</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 可观测与评测（Observability）</h1>
+  <p class="subtitle">给一次跨多 agent 的运行拍一张可回看的 X 光片 —— trace / span 树、结构化日志、成本/延迟/token 沿树聚合、看客观结果的评测；从零搭 span 树并聚合一次编排的成本与对错</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–03、编排结构、字典/树的遍历、上下文管理器（with）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_observability.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">OpenTelemetry + GenAI 约定、Dapper、LangSmith/Langfuse、τ-bench</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">给黑箱装上透视镜</a></li>
+      <li><a href="#model">核心模型：span / trace / span 树</a></li>
+      <li><a href="#logging">结构化日志：机器可读的事件流</a></li>
+      <li><a href="#cost">成本/延迟/token：挂数 + 沿树聚合</a></li>
+      <li><a href="#eval">评测：看客观结果而非自述</a></li>
+      <li><a href="#weave">织进编排：给 orchestrator 装 trace</a></li>
+      <li><a href="#pitfalls">工程权衡与陷阱</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>给黑箱装上透视镜</h2>
+  <p>到这里，我们已经能把多个 agent 编排成系统（01–02）、并给它装上权限边界（03）。但这个系统现在是一个<strong>黑箱</strong>：一次运行跑完，给了个结果——如果结果错了，你<strong>根本不知道是哪一步出的问题</strong>。是 orchestrator 分解错了？某个 subagent 跑偏了？合成时丢了信息？还是某个工具返回了垃圾？这门课的第四步，是给这个黑箱装上<strong>透视镜</strong>——<span class="term">observability</span>（可观测性）。</p>  <p>为什么多 agent 系统<strong>尤其</strong>需要可观测？因为它的一次运行是<em>一棵跨多个 agent、多步交互的复杂调用树</em>：orchestrator 分解 → 派 5 个 subagent 并行 → 每个 subagent 内部又调几次工具 → 合成。一个错误答案背后，可能是这几十个节点里<strong>任何一个</strong>出了岔子。没有可观测，调试多 agent 就像在黑暗里找一根针——你只能反复重跑、瞎猜。有了可观测，你能像看一张<em>X 光片</em>一样，一眼定位到那个出问题的节点。</p>  <p>可观测不只是为了调试，它还回答三个生产关键问题：<strong>这次跑花了多少钱？</strong>（多 agent 耗费可能十几倍，不追踪就是无底洞）、<strong>慢在哪？</strong>（哪个 subagent 拖了后腿）、<strong>它做对了吗？</strong>（评测——不能只看「它说做完了」，要看可程序化验证的客观结果）。这正是本模块的四块内容：<strong>trace / span 树</strong>（记录调用结构）、<strong>结构化日志</strong>（记录事件）、<strong>成本 / 延迟 / token 聚合</strong>（算账）、<strong>评测</strong>（判对错）。</p>  <p>本模块的工具叫 <span class="term">trace</span>（追踪）与 <span class="term">span</span>（跨度），它们是分布式系统可观测的事实标准（OpenTelemetry）。我们会从零把这套数据模型搭出来：每个工作单元（一次 LLM 调用、一次工具调用、一个 subagent 的运行）记成一个 span，span 靠父子关系嵌套成一棵 <strong>span 树</strong>，整棵树就是一次运行的完整画像。再在 span 上挂载成本与延迟，沿树聚合出总账；最后用 trace 上<em>可断言的不变量</em>对 agent 行为做评测。这一切<strong>纯标准库、可 assert</strong>——这正是把「我感觉它还行」变成「我能证明这次运行花了多少、慢在哪、对不对」的分界。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话抓住本模块：<strong>可观测 = 给一次跨多 agent 的运行拍一张可回看的 X 光片</strong>。这张片子是一棵 span 树：根是整次任务，枝是 orchestrator 的各步与各 subagent，叶是具体的 LLM / 工具调用。读懂这棵树，你就能<em>定位错误（哪个节点红了）、算清成本（各叶之和）、找出瓶颈（哪个枝最长）、评测对错（树上的不变量满不满足）</em>。本模块教你从零把这棵树搭出来、并从它身上读出这四样东西。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="model"><span class="num">2</span>核心模型：span / trace / span 树</h2>
+  <h3>核心数据模型：span、trace、span 树</h3>  <p>可观测的整个数据模型，可以从三个概念长出来。先把它们的定义钉死。</p>  <ul>
+    <li><span class="term">span</span>（跨度）：一个<strong>工作单元</strong>的记录，有名字、起止时间、属性（attributes）、以及<strong>唯一 id</strong>。一次 LLM 调用是一个 span、一次工具调用是一个 span、一个 subagent 的整个运行也是一个 span。span 是可观测的<em>原子</em>。</li>
+    <li><span class="term">trace</span>（追踪）：一次完整请求 / 任务从开始到结束的<strong>端到端记录</strong>，由许多 span 组成，它们共享同一个 <code>trace_id</code>。一次「研究三家公司」的任务就是一个 trace。</li>
+    <li><span class="term">span 树</span>（span tree / call tree）：span 之间靠 <code>parent_id</code> 形成<strong>父子关系</strong>，嵌套成一棵树。根 span 是整次任务，子 span 是 orchestrator 的各步与各 subagent，叶 span 是最底层的具体调用。</li>
+  </ul>  <p>把分散的 span 关联成一棵树，靠三个 id（这是 OpenTelemetry 的核心）：<strong>trace_id</strong>——同一次任务的所有 span 共享它（标识「属于哪次运行」）；<strong>span_id</strong>——每个 span 的唯一标识；<strong>parent_id</strong>——指向它的父 span（根 span 的 parent_id 为空）。有了这三个 id，哪怕 span 是乱序、分散记录的（真实里来自不同进程 / 机器），也能<em>拼回</em>一棵完整的树——这正是「分布式」追踪能跨进程关联的原理。</p>  <div class="ascii">  一个 trace (trace_id=T) 的 span 树:
+  [root: 研究任务]                 span_id=1, parent=None
+   ├─ [orchestrator: 分解]         span_id=2, parent=1
+   ├─ [subagent: 查A公司]          span_id=3, parent=1
+   │    ├─ [llm_call]              span_id=6, parent=3   ← 叶: 真实开销在这
+   │    └─ [tool: web_search]      span_id=7, parent=3
+   ├─ [subagent: 查B公司]          span_id=4, parent=1
+   │    └─ [llm_call]              span_id=8, parent=4
+   └─ [orchestrator: 合成]         span_id=5, parent=1
+  全部 span 共享 trace_id=T；靠 parent 拼成树</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 trace 想成一次手术的全程录像：span 是录像里的每个动作片段（消毒、麻醉、切口、缝合），每个片段有起止时间、谁做的、做了什么。span 树则把这些片段按「谁套在谁里面」组织——「切口」嵌在「主刀」里、「主刀」嵌在「整台手术」里。回看录像（trace），出了问题能精确定位到是哪个动作片段（span）出的岔。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上，一个 span 是一个字典：<code>{trace_id, span_id, parent_id, name, start, end, attributes}</code>。一次运行产生一组这样的字典。<strong>建树</strong>就是按 parent_id 把它们连起来：<code>children[parent_id].append(span)</code>，根是 parent_id 为 None 的那个。本模块 notebook 从零实现 span 的记录、树的重建、和树上的遍历 / 聚合。</p></div>
+  </div>  <p>一个关键设计：span 要能<strong>嵌套</strong>——记一个 span 时，要知道当前的「父」是谁。实践中用一个<strong>调用栈</strong>或上下文管理器（<code>with span(name):</code>）来追踪「当前在哪个 span 里」：进入一个 with 就把新 span 压栈、它的 parent 是栈顶；退出就出栈、记下 end 时间。这让记录 span 变得几乎透明——你只要在每个工作单元外面包一层 <code>with span(...)</code>，父子关系、起止时间就自动记好了。本模块会实现这个上下文管理器，它是把可观测「无侵入」地织进代码的关键。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="logging"><span class="num">3</span>结构化日志：机器可读的事件流</h2>
+  <h3>结构化日志：可被机器读的事件流</h3>  <p>span 树记录的是<em>调用结构</em>；与之互补的是 <span class="term">structured logging</span>（结构化日志）——记录运行中<em>发生的事件</em>。两者的关键区别：日志该是<strong>结构化的（机器可解析的字段），而非自由文本</strong>。</p>  <p>为什么不用 <code>print('subagent A done')</code> 这样的自由文本？因为自由文本<strong>无法被程序化处理</strong>：你没法按字段过滤（只看错误级别的）、没法聚合（统计某类事件出现几次）、没法关联（把日志挂到对应的 span）。而一条结构化日志是一个带固定字段的记录：<code>{timestamp, level, event, span_id, ...payload}</code>——它能被过滤、聚合、关联，能喂给日志系统检索，能在出事时按字段精确捞出相关记录。</p>  <table>
+    <thead><tr><th></th><th>自由文本日志</th><th>结构化日志</th></tr></thead>
+    <tbody>
+      <tr><td>形态</td><td>print("error: A failed")</td><td>{"level":"error","event":"subagent_failed","id":"A"}</td></tr>
+      <tr><td>能过滤吗</td><td>只能 grep 字符串（脆弱）</td><td>按 level/event 字段精确过滤</td></tr>
+      <tr><td>能聚合吗</td><td>几乎不能</td><td>按字段 count / group（如各类错误数）</td></tr>
+      <tr><td>能关联 span 吗</td><td>不能</td><td>带 span_id，可挂回 span 树</td></tr>
+      <tr><td>机器友好</td><td>差</td><td><strong>好（JSON 可直接喂日志系统）</strong></td></tr>
+    </tbody>
+  </table>  <p>结构化日志和 span 的分工：<strong>span 回答『调用结构与耗时』，日志回答『过程中发生了什么』</strong>。一个 subagent 的运行是一个 span（有起止、有成本）；它运行中「开始检索」「检索到 3 条结果」「命中一次缓存」「遇到一次重试」是若干条结构化日志。好的做法是让日志<strong>带上当前 span_id</strong>——这样日志能挂回 span 树，你看一个 span 时能展开它内部发生的所有事件。两者合起来，才是完整的可观测：<em>结构（span 树）+ 事件（日志）</em>。</p>  <p>一个实用约定：日志要有<strong>级别（level）</strong>（debug / info / warn / error）和<strong>事件名（event）</strong>。级别让你能按严重程度过滤（生产只看 warn 以上）；事件名让你能按类型聚合（这次跑了几次重试、几次越权被拦——后者正接上模块 03 的审计）。本模块 notebook 实现一个最小的结构化 logger，并演示按 level 过滤、按 event 聚合、与 span 关联。<em>把日志当数据来设计，而非当给人看的字符串</em>——这是可观测工程的基本功。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="cost"><span class="num">4</span>成本/延迟/token：挂数 + 沿树聚合</h2>
+  <h3>成本 / 延迟 / token：在 span 上挂数，沿树聚合</h3>  <p>可观测最直接的生产价值是<strong>算账</strong>。多 agent 系统耗费可能是单 agent 的十几倍（模块 01），不追踪就是个无底洞。做法很优雅：<strong>在每个 span 上挂载它的开销（token / 耗时 / 钱），再沿 span 树聚合出一次运行的总账</strong>。</p>  <p>具体挂什么？每个<strong>叶 span</strong>（真实开销发生的地方——LLM 调用、工具调用）记录：</p>  <ul>
+    <li><strong>token</strong>：这次 LLM 调用的输入 + 输出 token 数（真实里来自 <code>resp.usage</code>）。</li>
+    <li><strong>latency</strong>（延迟）：这次调用的耗时（<code>end - start</code>）。</li>
+    <li><strong>cost</strong>（成本）：token 数 × 单价，换算成钱。不同模型单价不同（如 opus 贵、haiku 便宜）。</li>
+  </ul>  <p>聚合则是一次<strong>树的后序遍历</strong>：一个 span 的总成本 = 它自己的成本 + 所有子 span 的总成本（递归）。根 span 聚合出来的，就是整次运行的总 token / 总成本。延迟的聚合略有不同：串行的子 span 延迟<em>相加</em>，并行的子 span（fan-out 的多个 subagent）延迟取<em>最大值</em>（因为它们同时跑）——这呼应模块 01「fan-out 总时间 ≈ max 而非 sum」。所以聚合延迟时要知道子 span 是串行还是并行的。</p>  <div class="math-block">\[\text{cost}(\text{span}) = \text{self\_cost} + \sum_{\text{child}} \text{cost}(\text{child}) \qquad (\text{后序遍历，沿树累加})\]</div>  <p>这种「在叶上挂数、沿树聚合」的模型，让成本归因变得<strong>精确且可下钻</strong>：你不仅知道总共花了多少，还能<em>展开树</em>看到「哪个 subagent 最烧钱」「哪次 LLM 调用 token 最多」「哪个工具最慢」。这正是控成本的前提——你不能优化你看不见的东西。Anthropic 报告多 agent 的 token 主要花在 subagent 的并行检索上；有了 span 树的成本下钻，你能直接看到这一点、并据此调整分解粒度（模块 01 / 02 的派生数）。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>成本聚合的心智模型：<strong>span 树是一张『分项账单』</strong>。根是总额，每往下展开一层就看到更细的分项——这次任务花了 $0.5（根），其中 subagent-查B 花了 $0.2（最贵的枝），它里面那次 llm_call 花了 $0.18（最贵的叶）。和你查信用卡账单一样：先看总额，可疑就逐项下钻找出『哪笔花得离谱』。<em>没有这张分项账单，多 agent 的成本就是一笔糊涂账</em>——可观测把糊涂账变成了可下钻、可优化的明细。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">5</span>评测：看客观结果而非自述</h2>
+  <h3>评测：别问 agent 做没做，去看客观结果</h3>  <p>可观测的最后一块、也是最容易被做错的一块，是<span class="term">agent evaluation</span>（评测）：<strong>这个 agent / 编排，到底做对了吗？</strong>评测 agent 远比评测「一次问答」难，且有一个必须刻进骨子里的原则：<strong>别信 agent 的『嘴上完成』，去看可程序化验证的客观结果</strong>。</p>  <p>为什么不能信 agent 的自述？因为 agent 会<em>声称</em>自己完成了任务（「我已为您汇总好三家公司的对比」），但实际可能某个 subagent 失败了、或合成时丢了一家、或数字算错了。只看它「说」做完，等于把评测交给了被评测者自己——这在生产里是灾难。正确的做法是检查<strong>客观的、可断言的最终状态</strong>：对比报告里<em>真的</em>包含三家公司了吗？数字<em>真的</em>对吗？这呼应单 agent 课里 τ-bench 的核心——「看世界状态变没变、对不对」，而非看 agent 自述。</p>  <p>评测多 agent 编排，可观测的 trace 是天然的素材。三类可断言的评测：</p>  <ul>
+    <li><strong>结果断言</strong>：最终输出满足客观判据吗（包含所有要求的部分、数值正确、格式合规）。</li>
+    <li><strong>过程断言（在 trace 上）</strong>：编排过程合规吗——派了正确数量的 subagent 吗？该并行的并行了吗？没有越权调用吗（接模块 03 审计）？没把污染子结果用进去吗？这些都能在 span 树上断言。</li>
+    <li><strong>可靠性（pass^k）</strong>：同一任务跑 k 次，全部成功吗？<span class="term">pass^k</span> ≈ 单次成功率的 k 次方——多 agent 的连乘链路（每个 subagent 都可能失败）让可靠性尤其脆弱，必须看它而非单次。</li>
+  </ul>  <p>没有客观判据的开放任务（如「写一篇好文案」）怎么评？常用 <span class="term">LLM-as-judge</span>（模型评判）：用一个 LLM 按 rubric 给输出打分。它适合主观质量评估，但要警惕<em>判官本身的偏差和不稳定</em>。本课为保持确定性，用一个<strong>规则模拟的判官</strong>（按可断言的 rubric 打分），让评测逻辑能被 assert——真实里换成 LLM judge，评测的<em>框架</em>（rubric、聚合、报告）一字不改。</p>  <p>一个贯穿的设计：<strong>评测要可复现、可回放</strong>。可观测产出的 trace 不只是给人看的，还能用于 <span class="term">replay</span>（回放）——用记录的输入重跑一次、对比不同版本的 agent 表现、复现某个偶发 bug。所以「记录完整 trace」和「能评测」是一体的：trace 是评测和回放的原料。<em>一个不可观测的 agent 系统，既无法调试，也无法被可信地评测</em>——这就是为什么可观测是把多 agent 系统推向生产的必经之路。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="weave"><span class="num">6</span>织进编排：给 orchestrator 装 trace</h2>
+  <h3>把它织进编排：给 orchestrator-worker 装上 trace</h3>  <p>前面五节是零件，本节把它们组装：给模块 02 的 orchestrator-worker 编排<strong>织上 trace</strong>，让一次「分解 → fan-out → 合成」的运行自动产出一棵完整的 span 树、一份成本账单、一组可断言的评测。这就是可观测的实战形态。</p>  <p>织法是<strong>无侵入</strong>的——用上下文管理器在每个工作单元外包一层。一次研究任务的 trace 长这样：根 span 包整次任务，里面 <code>with span('decompose')</code> 包分解、每个 subagent 一个 <code>with span('subagent-X')</code>、subagent 内部的 LLM 调用又是一层 <code>with span('llm_call')</code>、最后 <code>with span('synthesize')</code> 包合成。每层 with 自动记好父子关系、起止时间；在叶 span 上挂 token / cost。跑完，你就得到一棵能回看的树。</p>  <p>这棵树立刻能回答全部生产问题：<strong>调试</strong>——某个 subagent 的 span 标了 error，一眼定位；<strong>成本</strong>——根 span 聚合出总 token / 总钱，下钻看哪个 subagent 最贵；<strong>瓶颈</strong>——哪个枝的 latency 最长；<strong>评测</strong>——在树上断言「派了 3 个 subagent」「无越权」「结果含三家公司」。一份代码，五种回答——这就是<strong>可观测作为横切关注点</strong>的威力：织一次，处处受益。这与模块 02 的 router、模块 03 的沙箱一样，都是「把横切的事集中到一层」的工程模式。</p>  <p>还有一个跨模块的合流值得点出：模块 03 的<strong>审计日志</strong>和本模块的<strong>trace</strong>其实是一回事的两面——审计是「权限裁决」这类事件的结构化日志，它天然属于 trace 的一部分。一个成熟的可观测系统里，权限拦截、工具调用、LLM 调用、subagent 运行<em>都是 span / 日志</em>，统一在一棵 trace 树上。于是「这次运行有没有越权」（模块 03）和「这次运行花了多少」（本模块）能在<strong>同一张 X 光片</strong>上一起看——安全与成本与正确性，在 trace 上汇成对一次运行的完整画像。</p>  <p>最后回到主线：<strong>可观测是多 agent 系统从『能跑』到『可信、可运维』的分水岭</strong>。一个不可观测的多 agent 系统，错了不知道哪错、贵了不知道哪贵、慢了不知道哪慢、对不对只能靠它自己说——这样的系统不敢放进生产。而一旦它的每次运行都产出可回看的 trace、可下钻的成本、可断言的评测，它就从黑箱变成了<em>透明、可调试、可优化、可信任</em>的系统。下一模块（部署）会看到，这些 trace 和健康指标正是生产运维的眼睛。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="pitfalls"><span class="num">7</span>工程权衡与陷阱</h2>
+  <h3>可观测的工程权衡与陷阱</h3>  <p>把可观测织进系统不是免费的，本节收口几个真实的工程权衡与易踩的坑。</p>  <p>第一是<strong>开销</strong>。记 span、聚合、写日志本身有成本（时间 + 存储）。一个跑了几百步、几十个 subagent 的运行可能产出成千上万个 span。权衡手段是<strong>采样</strong>（只记一部分 trace，如 1%）和<strong>分级</strong>（生产只记 info 以上、调试时才开 debug）。本课为教学记全量、记到底，但真实高流量系统必须在「可观测的完整性」与「开销」间取舍。</p>  <p>第二是<strong>敏感信息</strong>。span 的 attributes 和日志里可能不小心记进用户隐私、密钥、PII。可观测系统要做<strong>脱敏</strong>——记「调用了 send_email」而非记邮件正文、记「token=8400」而非记完整 prompt。这与模块 03 的安全相通：日志本身也是攻击面（泄露的日志能让攻击者了解系统）。<em>记够调试所需，不记多余的敏感数据</em>。</p>  <p>第三是一个常见陷阱：<strong>span 没正确闭合</strong>。如果用手动的 start / end 而非上下文管理器，异常发生时 end 可能没记上——span 永远「开着」，树就建坏了、延迟算错了。用 <code>with</code>（或 <code>try/finally</code>）保证<strong>无论是否异常，end 一定记上、span 一定闭合</strong>。这与模块 01 的失败隔离、模块 05 的状态机是同一种「保证清理一定发生」的纪律。本课的 span 上下文管理器正是这么写的。</p>  <p>第四是<strong>别让可观测代码淹没业务代码</strong>。如果每行业务代码都裹着三行追踪代码，可读性就毁了。好的可观测是<strong>无侵入</strong>的——靠上下文管理器、装饰器、或在框架层统一织入，让业务代码几乎看不见追踪的存在。本课的 <code>with span(name):</code> 就是这个理念的最小体现：业务逻辑该长什么样还长什么样，只是外面包了一层透明的追踪。<em>可观测应该像空气——无处不在，但不碍事</em>。</p>  <p>把这几条放在一起，可观测的工程成熟度可以概括为：<strong>记得全（能定位 / 算账 / 评测）、记得省（采样 / 分级控开销）、记得安全（脱敏）、记得干净（无侵入、span 必闭合）</strong>。做到这四点，可观测就从「调试时临时加的 print」升级成了「生产系统与生俱来的透明度」——而这正是一个多 agent 系统能被长期运维、持续优化、放心信任的基础设施。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>agent 可观测的标准化</strong>：OpenTelemetry 的 GenAI 语义约定（记录模型、token、成本等）仍在演进。一次 LLM / agent 调用到底该记哪些字段、多 agent 的 span 树该怎么标注（哪些是并行、哪个是 orchestrator），缺乏统一成熟的标准。LangSmith / Langfuse / Phoenix 等各做各的。</li>
+    <li><strong>自动归因与根因定位</strong>：一个错误答案，能否让系统<em>自动</em>从 trace 里定位到根因 span（是哪一步错的）？目前还多靠人读 trace。把根因分析自动化（甚至让一个 agent 读 trace 找 bug）是活跃方向。</li>
+    <li><strong>成本-质量的可观测优化</strong>：有了精确的成本树，能否<em>自动</em>找到「在哪砍成本对质量影响最小」（如把某个 subagent 换成更便宜的模型）？把可观测数据接入自动优化回路，是 agent 运维的前沿。</li>
+    <li><strong>开放任务评测的可靠性</strong>：LLM-as-judge 适合主观评测但本身有偏差、不稳定、可被操纵。如何让模型评判更可靠（多判官、校准、对抗鲁棒），是评测的核心难题，直接决定我们能否信任对开放 agent 任务的评测结论。</li>
+    <li><strong>在线评测与回归检测</strong>：生产中 agent 的表现会随模型更新、提示改动、外部环境变化而漂移。如何持续地、自动地评测线上 agent、在质量回归时告警（而非等用户投诉），是把评测从「上线前一次性」变成「持续监控」的工程方向。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：OpenTelemetry 规范 + GenAI 语义约定（trace/span 的数据模型，本模块直接复现）、Dapper（Sigelman 2010，分布式追踪奠基）、LangSmith / Langfuse / Phoenix（LLM 可观测平台，本模块的工业对应）、τ-bench（Yao 2024，看最终状态 + pass^k 评测）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../03_permissions/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 权限与沙箱（Permissions）</div></a>
+    <a class="next" href="../05_deploy/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 部署 Agent（Deployment）</div></a>
+  </div>
+
+</div>
+</body>
+</html>

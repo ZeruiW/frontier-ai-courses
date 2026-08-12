@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 稀疏自编码器 SAE</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 稀疏自编码器 SAE</h1>
+  <p class="subtitle">字典学习把叠加的激活解压成稀疏的单义特征 —— L1 / TopK / JumpReLU 三代 SAE、激活收缩、dead features 与复活、重建-稀疏帕累托前沿，并从零训一个 SAE 在合成数据上恢复植入的真特征</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00、叠加/多义概念、线代（投影/范数）、梯度下降与 Adam、一点点稀疏编码常识</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_sae.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">Bricken 2023、Cunningham 2023、Templeton 2024、Gao 2024(TopK)、Rajamanoharan 2024(Gated/JumpReLU)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">从叠加到字典学习：SAE 的想法</a></li>
+      <li><a href="#arch">SAE 的结构与损失</a></li>
+      <li><a href="#tradeoff">重建 vs 稀疏与帕累托前沿</a></li>
+      <li><a href="#shrinkage">第一代的麻烦：激活收缩</a></li>
+      <li><a href="#topk-jump">第二、三代：TopK 与 JumpReLU</a></li>
+      <li><a href="#dead">Dead features 与复活</a></li>
+      <li><a href="#eval">怎么知道 SAE 拆对了？</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>从叠加到字典学习：SAE 的想法</h2>
+  <p>上一模块立下了本课的核心困境：<strong>叠加（superposition）</strong>——网络要表示的特征数远多于神经元数，于是把多个特征非正交地挤进同一组神经元，结果单个神经元<strong>多义</strong>，读不出意义。本模块给出前沿 interp 对这个困境的主力解法：<strong>稀疏自编码器（sparse autoencoder, SAE）</strong>。</p>  <p>SAE 的想法一句话就能说清：<strong>既然真实特征被压缩进了低维、叠加的激活，那就训一个网络把它「解压」回一个高维、稀疏、每维单义的表示</strong>。具体地，给一层激活 <code>x ∈ ℝ^d</code>，SAE 先用编码器把它映射成一个<strong>更宽（过完备）</strong>的特征向量 <code>f ∈ ℝ^m</code>（<code>m ≫ d</code>，如 8×、32×、256×），并逼迫 <code>f</code> 是<strong>稀疏</strong>的（每个输入只点亮少数特征），再用解码器把 <code>f</code> 线性重建回 <code>x̂</code>。训练目标 = 重建得准 + 激活得稀。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把它想成一台「特征解压器」。叠加是模型为了省地方做的有损压缩——把一堆特征塞进太少的维度。SAE 反过来：把激活摊到一个<strong>足够宽</strong>的层上，并要求每次只用其中<strong>几个</strong>槽位，于是每个槽位被逼着只负责一件事——一个<strong>单义特征</strong>。训完，原本「读不懂的神经元」就被换成了「一个个看得懂的特征开关」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上 SAE 在做<span class="term">dictionary learning</span>（字典学习）：把信号 <code>x</code> 表示成一个过完备字典 <code>D = W_d</code> 中少数原子的稀疏线性组合 <code>x ≈ Σ_i f_i d_i</code>。解码器各列 <code>d_i</code> = 字典原子 = 特征方向；编码器 = 求稀疏系数 <code>f</code> 的（摊销）近似求解器。稀疏性正是把欠定问题 <code>x = D f</code>（<code>m&gt;d</code> 时有无穷多解）变得<em>有意义、可辨识</em>的先验。</p></div>
+  </div>  <p>为什么是<strong>这一层</strong>（residual stream / MLP 激活）而不是别处？因为前沿 interp 关心的「特征」就活在那里被读写。而 residual stream 几乎没有<span class="term">privileged basis</span>（优先基），特征方向不对齐到任何坐标轴、彼此叠加——这正是「读神经元」失败、而「学一组字典方向」才有希望的根本原因。SAE 是目前把<em>整层</em>激活<em>无监督</em>拆成可解释单元的最 scalable 的工具。</p>  <div class="callout paper"><span class="label"></span>
+    <p>SAE 的两篇奠基作同期发表：Anthropic 的 <strong>Bricken et al. 2023《Towards Monosemanticity》</strong> 与 <strong>Cunningham et al. 2023</strong>。随后 <strong>Templeton et al. 2024《Scaling Monosemanticity》</strong> 把它推到 Claude 3 Sonnet，提取出数千万特征（含著名的「金门大桥」特征）。本模块从零复现它们的核心机器。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="arch"><span class="num">2</span>SAE 的结构与损失</h2>
+  <h3>SAE 的结构与损失：完整写清</h3>  <p>一个标准 SAE 由三部分组成。<strong>编码器</strong>把激活映射到稀疏特征：</p>  <div class="math-block">\[f = \sigma\!\big(W_e\,(x - b_d) + b_e\big), \qquad W_e \in \mathbb{R}^{m\times d}\]</div>  <p>注意细节：先减去 <code>b_d</code>（解码器偏置兼作<strong>pre-encoder bias</strong>，把数据近似中心化）再编码；<code>σ</code> 是非负激活（保证特征激活 ≥ 0，符合「激活强度」语义），第一代用 <code>ReLU</code>。<strong>解码器</strong>把稀疏特征线性重建回激活：</p>  <div class="math-block">\[\hat{x} = W_d\, f + b_d, \qquad W_d \in \mathbb{R}^{d\times m}\]</div>  <p><strong>解码器的列 &lt;code&gt;W_d[:,i]&lt;/code&gt; 就是第 &lt;code&gt;i&lt;/code&gt; 个特征的方向（字典原子）</strong>——记住这句话，它是后面所有模块（电路用特征当节点、steering 钳制特征）的接口。解码器列通常约束为<strong>单位范数</strong>，否则 SAE 可以把特征方向放大、把激活值缩小来「作弊」绕过稀疏惩罚。训练损失是重建 + 稀疏两项：</p>  <div class="math-block">\[\mathcal{L} = \underbrace{\lVert x - \hat{x}\rVert_2^2}_{\text{重建}} \;+\; \lambda\, \underbrace{\textstyle\sum_i f_i \,\lVert W_d[:,i]\rVert_2}_{\text{稀疏（按列范数加权的 }L_1\text{）}}\]</div>  <p>第一代（L1）SAE 用 <code>L1</code> 范数作稀疏惩罚。这里有个常被忽略的工程点：<strong>按解码器列范数加权的 L1</strong>——因为 <code>f_i</code> 与 <code>‖d_i‖</code> 的乘积才是该特征对重建的真实贡献，直接惩罚 <code>f_i</code> 会与「放大 d_i、缩小 f_i」的作弊耦合。若把 <code>d_i</code> 硬约束为单位范数（本课 notebook 的做法），这一项就退化成普通 <code>‖f‖_1</code>。超参 <code>λ</code> 调节重建与稀疏的此消彼长，是 L1 SAE 最重要的旋钮。</p>  <p>训练就是对这个损失做梯度下降——但有几个<strong>不调就训不出特征</strong>的实操点：每步之后把解码器列<strong>重新归一化</strong>为单位范数；用 <strong>Adam</strong> 而非朴素 SGD（损失面病态，SGD 收敛极慢、恢复不出干净特征——这点 notebook 会让你亲眼看到）；以及监控<strong>死特征</strong>并定期 resampling（第 6 节）。这些细节是 Bricken 2023、Conerly 2024 等「怎么训 SAE」文章的主要内容。</p>  <p>编码器与解码器的<strong>分工</strong>也值得想清楚：解码器是<em>线性</em>的字典（一组方向），干净、可解释、可直接拿去做 steering（模块 04）和电路（模块 03）；而编码器是个<em>非线性</em>的「特征探测器」，它要在叠加的激活里把每个特征的系数<strong>摊销地</strong>（一次前向、不迭代优化）估计出来——这是个比解码难得多的任务，也是为什么有的工作（如 Gated SAE）专门给编码器加结构。一个常见且有用的初始化技巧是令 <code>W_e ≈ W_d^⊤</code>（编码器是解码器的转置），因为「检测方向 d_i」的最朴素做法就是拿 <code>d_i</code> 去和激活做内积。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把损失读成一句话：<strong>用尽量少的、单位长度的字典原子，尽量准地拼回原激活</strong>。重建项拉着 SAE「别丢信息」，稀疏项拉着它「别乱用特征」，两者的拉锯就是下一节的核心张力——也是评判一个 SAE 好坏的全部。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">3</span>重建 vs 稀疏与帕累托前沿</h2>
+  <h3>核心张力：重建 vs 稀疏，与帕累托前沿</h3>  <p>SAE 的一切都绕着一个<strong>权衡</strong>转：<strong>越稀疏（每输入激活的特征越少，L0 越小）⇒ 越可解释，但重建越差（丢信息越多）</strong>。这不是工程瑕疵，而是<em>本质的</em>——把信息压进更少的活跃特征，必然损失保真。所以「一个 SAE 好不好」从来不是单一数字，而是一条曲线。</p>  <p>度量两端的指标：<strong>稀疏度</strong>用 <span class="term">L0</span>（每输入平均激活的特征数，越小越稀疏）——注意是 L0 不是 L1，因为我们真正在乎的是「点亮几个特征」这一可解释性量；<strong>重建质量</strong>用归一化重建误差（或解释方差比例 FVE），更贴近下游的是 <strong>loss recovered</strong>（把这层激活换成 SAE 重建后，模型整体语言建模 loss 恢复了多少——直接衡量「SAE 丢的信息模型在不在乎」）。</p>  <p>扫一组 <code>λ</code>（或 TopK 的 <code>K</code>），每个配置得到一对 <code>(L0, 重建误差)</code>，画在平面上就是一条<strong>帕累托前沿</strong>（<span class="term">Pareto frontier</span>）：在「重建 vs 稀疏」上不被任何其它配置同时占优的点集。<strong>比较两种 SAE 架构，就是比谁的前沿更靠左下角</strong>（同样稀疏度下重建更好，或同样重建下更稀疏）。</p>  <div class="ascii">重建误差 ↑
+  |  ·                         越往左下越好（更稀疏且重建更准）
+  |    · ·   L1 前沿
+  |       · ·                ← JumpReLU/TopK 前沿通常压在 L1 左下方
+  |          o o
+  |             o o o
+  +-------------------------→  L0（每输入激活特征数）</div>  <p>为什么前沿这么重要？因为单点比较会<strong>骗人</strong>：A 在 L0=20 时重建比 B 好，不代表 A 更好——也许 B 在 L0=20 时被你用了别的 <code>λ</code>。只有把两条完整前沿叠在一起，才能公平地说「在所有稀疏度上谁更优」。这也是为什么三代 SAE 的论文（Gao 2024、Rajamanoharan 2024）和 SAEBench 都以前沿（而非单点）作为主结果。</p>  <p>还有一个<strong>容量</strong>维度常被一并扫：固定稀疏度，更宽的字典（更多原子）几乎总能重建更好——因为有更多插槽分给被叠加压在一起的特征（<span class="term">feature splitting</span>：字典越大，一个粗特征会分裂成多个更细的特征，如「鸟」分裂成各种鸟）。所以「重建-稀疏前沿」严格说是一族曲线，每条对应一个字典宽度。本模块 notebook 的练习 4 会让你扫宽度、亲眼看到「容量换保真」：<code>m</code> 越大，同稀疏度下重建越好。</p>  <div class="callout warn"><span class="label"></span>
+    <p>陷阱：只报一个 <code>λ</code> 下的「重建误差 X、L0 Y」几乎没有信息——换个 <code>λ</code> 两个数都变。评 SAE 必须报<strong>整条前沿</strong>。本模块 notebook 会亲手扫出 L1 与 TopK 的前沿并验证其单调性（稀疏度↑↔重建↓）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="shrinkage"><span class="num">4</span>第一代的麻烦：激活收缩</h2>
+  <h3>第一代的麻烦：激活收缩（shrinkage）</h3>  <p>L1 SAE 简单有效，但有一个<strong>结构性缺陷</strong>：<span class="term">shrinkage</span>（激活收缩）。L1 惩罚的是<strong>所有</strong>非零激活的大小——它当然压制了无关特征（好），但也把<strong>本该激活的特征的幅度一并压小了</strong>（坏）。于是 SAE 系统性地<em>低估</em>特征强度，重建偏小。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个比方：你想让员工「少做无关的事」，但你的考核方式是「谁干活多就扣谁钱」——结果该干的活也被扣得缩手缩脚。L1 就是这样一把<strong>不分青红皂白</strong>的尺子，它想要的是「少激活特征」（L0 小），却用「激活值总和小」（L1 小）来近似，副作用就是把该大的也压小。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>数学上：固定一个特征确实该激活，最优的 <code>f_i</code> 会被 L1 的次梯度推低一个 <code>∝ λ</code> 的量（软阈值 soft-threshold 的收缩效应）。这使 L1 SAE 面对一个两难——<code>λ</code> 大则稀疏但重建因收缩而差，<code>λ</code> 小则重建好但不够稀疏。收缩把它的帕累托前沿整体推向右上（更差）。</p></div>
+  </div>  <p>一个常见的部分补救是<strong>解码器微调（decoder fine-tuning）</strong>：固定编码器选出的稀疏支撑（哪些特征激活），只对这些激活值重解一个最小二乘，把被收缩压小的幅度补回来。但更彻底的解法是换稀疏机制——<strong>把「是否激活」与「激活多大」解耦</strong>，只对前者施加稀疏压力，让后者自由地把重建做准。后续两代 SAE 都是为此而生：</p>  <ul>
+    <li><span class="term">Gated SAE</span>（Rajamanoharan 2024）：一条「门」分支决定哪些特征开（受 L1 约束），另一条决定幅度（不受），用辅助项耦合两者。把收缩从幅度里剥离。</li>
+    <li><span class="term">JumpReLU SAE</span>（Rajamanoharan 2024）：见下节，用可学习阈值 + 直接惩罚 L0。</li>
+    <li><span class="term">TopK SAE</span>（Gao 2024）：见下节，干脆只留最大的 K 个、其余清零，根本不用 L1。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这条因果链：<strong>L1 想要稀疏，却只能罚激活值大小，副作用就是收缩；收缩拖差重建；于是整条前沿变差</strong>。理解了「为什么 L1 不够好」，才理解后两代 SAE 到底在解决什么——它们不是花哨的新结构，而是对症下药。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="topk-jump"><span class="num">5</span>第二、三代：TopK 与 JumpReLU</h2>
+  <h3>第二、三代：TopK 与 JumpReLU</h3>  <h4>TopK SAE（Gao et al. 2024, OpenAI）</h4>  <p>最直接的想法：既然我们想要 L0 = K，那就<strong>直接钉死它</strong>。编码后只保留激活值最大的 <code>K</code> 个特征，其余全部置零：</p>  <div class="math-block">\[f = \mathrm{TopK}\big(\mathrm{ReLU}(W_e(x-b_d)+b_e)\big)\quad(\text{只留最大的 }K\text{ 个，其余}=0)\]</div>  <p>好处立竿见影：<strong>L0 恒等于 K（精确、不用调 λ）、没有 shrinkage</strong>（被保留的特征不受范数惩罚，幅度自由地服务重建）。代价是 <code>K</code> 是个<strong>离散超参</strong>（要扫不同 K 画前沿），且 TopK 的硬选择容易制造 <strong>dead features</strong>——一旦某特征长期挤不进前 K，就再也得不到梯度、彻底死掉。所以通常配一个 <span class="term">auxk</span> 辅助损失：</p>  <div class="math-block">\[\mathcal{L} = \lVert x-\hat x\rVert_2^2 \;+\; \alpha\,\lVert x - \hat x_{\text{aux}}\rVert_2^2,\quad \hat x_{\text{aux}}=\text{用 top-}k_{\text{aux}}\text{ 个}\textbf{死}\text{特征重建残差}\]</div>  <p>即让当前的「最可能复活的死特征」去重建主重建剩下的残差，给死特征一条直接的重建梯度通路。Gao 2024 用它把死特征率从可能的一半压到个位数百分比。</p>  <h4>JumpReLU SAE（Rajamanoharan et al. 2024, DeepMind）</h4>  <p>另一条路：保留连续激活，但给每个特征一个<strong>可学习的阈值</strong> <code>θ_i</code>，低于阈值直接归零（一个「跳变」的 ReLU），并<strong>直接惩罚 L0</strong>：</p>  <div class="math-block">\[\mathrm{JumpReLU}_\theta(z) = z \cdot \mathbb{1}[z > \theta], \qquad \mathcal{L} = \lVert x-\hat x\rVert_2^2 + \lambda\,\lVert f\rVert_0\]</div>  <p>关键是它惩罚 L0（而非 L1），从而<strong>没有收缩</strong>（超过阈值的特征保留原值）。难点是 <code>𝟙[z&gt;θ]</code> 和 L0 都不可导——JumpReLU 用<strong>直通估计（straight-through estimator）</strong>配合一个核密度的伪梯度，把阈值 <code>θ</code> 训起来。它在重建-稀疏前沿上常是当前最优之一。</p>  <table>
+    <thead><tr><th></th><th>L1 SAE</th><th>TopK SAE</th><th>JumpReLU SAE</th></tr></thead>
+    <tbody>
+      <tr><td>稀疏机制</td><td>L1 惩罚（软阈值）</td><td>硬留前 K 个</td><td>可学习阈值 + 罚 L0</td></tr>
+      <tr><td>L0 控制</td><td>间接（调 λ）</td><td><strong>精确 = K</strong></td><td>间接（调 λ）</td></tr>
+      <tr><td>收缩 shrinkage</td><td><strong>有（主要缺陷）</strong></td><td>无</td><td>无</td></tr>
+      <tr><td>主要超参</td><td>λ</td><td>K（离散）</td><td>λ、阈值初始化</td></tr>
+      <tr><td>dead 风险</td><td>中</td><td><strong>较高（需 auxk）</strong></td><td>中</td></tr>
+      <tr><td>前沿位置</td><td>基线</td><td>优于 L1</td><td>常最优</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>三代一句话：<strong>L1 用「罚激活值」近似稀疏（带收缩副作用）；TopK 用「只留前 K」直接定稀疏度（无收缩但易死）；JumpReLU 用「可学阈值 + 罚 L0」直接要稀疏且无收缩</strong>。本模块 notebook 把 L1 与 TopK 都从零实现并在同一份合成数据上比前沿——你会亲眼看到 TopK 的前沿压在 L1 左下方、且 L0 精确等于 K。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dead"><span class="num">6</span>Dead features 与复活</h2>
+  <h3>Dead features：字典的浪费与复活</h3>  <p><strong>dead feature</strong>（死特征）= 训练中几乎从不激活的字典原子。它白白占着容量、永远得不到梯度（既不参与重建也不被惩罚，停在初始化），在大 SAE 里可能<strong>高达一半</strong>——直接腰斩有效字典大小，是 SAE 训练最常见、最该体检的病。</p>  <p>死特征怎么来的？编码器把某原子的激活前值长期压到 0（ReLU/TopK 阈值之下），它就收不到梯度、无法自我修正，陷入<strong>自我维持的死亡</strong>（越不激活越没机会被纠正）。诊断很简单：统计每个特征在一大批数据上的激活频率，频率 ≈ 0 的就是死的。处方有几种，共同点都是<strong>给死特征重新注入梯度信号</strong>：</p>  <ul>
+    <li><strong>特征重采样（resampling）</strong>（Bricken 2023）：周期性地把死特征的权重<strong>重置</strong>到「当前重建得最差的那些样本」的方向上——等于把闲置原子重新分配去啃硬骨头。本模块 notebook 的练习 3 会从零实现它。</li>
+    <li><strong>auxk 辅助损失</strong>（Gao 2024，TopK 专用）：让 top-k_aux 个死特征额外去重建当前残差，给它们直接的重建梯度（上一节）。</li>
+    <li><strong>更好的初始化与归一化</strong>：解码器初始化为单位范数、编码器用解码器转置初始化、对输入做归一化，都能压低初始死亡率。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>死特征像公司里「在编但没活干」的冗员——既不创造价值，又占着名额。resampling 就是 HR 定期把闲人调去救火（去补当前最差的重建），让他们重新上岗。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式上：监控激活频率 <code>freq_i = (1/N)Σ_x 𝟙[f_i(x)&gt;0]</code>；对 <code>freq_i &lt; ε</code> 的特征，用「高重建损失样本」（按损失加权采样）重置其编码/解码权重、并把其优化器动量清零，使它从下一步起重新参与学习。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>dead feature 是<strong>训练健康度的头号体检指标</strong>。报告 SAE 时除了 (L0, 重建)，几乎都要附上<strong>活特征比例</strong>。本模块 notebook 会先用坏初始化<em>制造</em>一批死特征（活比例掉到接近 0），再用 resampling 把它救回来——你会看到活比例几乎回到 100%。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>怎么知道 SAE 拆对了？</h2>
+  <h3>怎么知道 SAE 拆对了？评测与本课的对拍</h3>  <p>真模型上你不知道「真特征」是什么，于是评 SAE 只能用代理指标，主要三类：</p>  <ul>
+    <li><strong>重建-稀疏前沿</strong>（上文）：(L0, 重建误差) 或 (L0, loss recovered)，比架构优劣的标准方式；</li>
+    <li><strong>可解释性</strong>：auto-interp 给特征写解释、再用解释预测激活的<strong>模拟分</strong>（模块 02），或人工评分；活特征是否单义；</li>
+    <li><strong>下游/因果有用性</strong>：SAE 特征能否用于探测（稀疏探针可分性）、做电路（模块 03）、做 steering（模块 04）。SAEBench（Karvonen 2024）把这些打包成多维基准，还专门测 <span class="term">feature absorption</span>。</li>
+  </ul>  <p>但这些都是<strong>间接</strong>的——你没有标准答案，永远在「这个解释听起来合理吗」「这个指标更高就更好吗」里打转，极易自欺（references 里对 SAE 的批评正源于此）。这恰恰是本课<strong>合成数据</strong>的价值：我们<strong>亲手植入了真特征 F</strong>，于是可以做真模型上做不到的<strong>直接对拍</strong>：</p>  <ul>
+    <li><strong>特征恢复率</strong>：把 SAE 学到的字典原子（解码器列）与真特征方向 <code>F</code> 做<strong>二部匹配</strong>（每个真特征找余弦最近的学到特征），统计有多少真特征被以高余弦（如 >0.9）恢复——这是「拆得对不对」的金标准，模块 01 worked 的核心检验。</li>
+    <li><strong>激活恢复</strong>：匹配上的特征，其激活与真激活码 <code>S</code> 的相关有多高（拆出的特征是不是真的对应那个开关）。</li>
+  </ul>  <p>本课的纪律因此是：<strong>先在「已知 F」上把 SAE 校准好</strong>（恢复率可量化、超参可对照），建立对「什么是好 SAE」的可信直觉，<strong>再</strong>去真模型上用那些间接指标。顺序不能反——拿着没在已知真相上验证过的方法去解读真模型，等于用没校准的尺子量未知物。</p>  <div class="callout paper"><span class="label"></span>
+    <p>评测协议见 Gao 2024（loss recovered、探针可分性、scaling laws）、Rajamanoharan 2024（前沿）、Karvonen 2024（SAEBench，含 feature absorption/splitting）。对 SAE 是否真找到「模型在用的」特征的质疑也务必读（references 的批评一节）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+  <h3>研究前沿与开放问题</h3>  <ul>
+    <li><strong>SAE 真的找到「模型在用的」特征吗</strong>：<span class="term">feature absorption</span>、<span class="term">feature splitting</span> 等失效模式说明 SAE 字典依赖容量/稀疏度，学到的特征未必等于模型计算所用的特征。SAE 与下游因果（电路、steering）的脱节是核心质疑（references 里的 SAE 批评）。</li>
+    <li><strong>更好的稀疏化</strong>：JumpReLU、TopK、BatchTopK、Matryoshka SAE、端到端（e2e，按对模型 loss 的影响而非重建训）SAE…… 怎样的稀疏机制能逼近「真特征」而非只优化重建，仍在快速演进。</li>
+    <li><strong>跨层与多模型</strong>：单层 SAE 看不到特征如何跨层流动。<span class="term">crosscoder</span>（Lindsey 2024，模块 05）同时建多层/多模型，是 model diffing 与跨层电路的基础。</li>
+    <li><strong>规模化与成本</strong>：前沿模型一层就要训百万级特征的 SAE，训练/存储/auto-interp 成本巨大（notebook 胶囊会让你算 Sonnet 34M 特征 SAE 的权重有几百 GB）。Scaling laws（Gao 2024）给了指引，但「值不值」仍是开放权衡。</li>
+    <li><strong>评测的根本难题</strong>：没有 ground truth 时，如何判断一个 SAE「更接近真相」而非「更会刷某个代理指标」？这是 interp 可证伪性的命门（Sharkey 2025《Open Problems》）。本课的合成对拍正是为缓解它而设。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Bricken 2023（L1 SAE 圣经）、Gao 2024（TopK + 评测 + scaling）、Rajamanoharan 2024（Gated/JumpReLU + 前沿）、Templeton 2024（规模化到 Claude）、Sharkey 2025（开放问题）。清单见 <code>references.md</code>。</p>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_features/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 单义特征与叠加</div></a>
+  </div>
+
+</div>
+</body>
+</html>

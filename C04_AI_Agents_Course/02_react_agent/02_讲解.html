@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 从零写 ReAct Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 9</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 从零写 ReAct Agent</h1>
+  <p class="subtitle">ReAct from Scratch —— agent 不是框架魔法，只是 while 循环里的 LLM：推理、行动、观察、再推理</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（tool use / function calling）、Python regex</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span><span class="badge gpu">GPU可选</span><span class="badge api">API可选</span> 02_react_from_scratch.ipynb</div></div>
+    <div class="item"><div class="k">核心论文</div><div class="v">ReAct [Yao 2022]、Reflexion [Shinn 2023]、Anthropic <em>Building Effective Agents</em> (2024)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#loop">从单轮工具调用到循环：agent = while 循环里的 LLM</a></li>
+      <li><a href="#grammar">ReAct 提示文法：Thought / Action / Observation</a></li>
+      <li><a href="#parsing">解析的工程学：regex、格式漂移与兜底</a></li>
+      <li><a href="#budget">终止与预算：max_steps、loop 检测、过早作答</a></li>
+      <li><a href="#failures">失败模式分类（评测视角）</a></li>
+      <li><a href="#reflexion">Reflexion：失败后的自我反思重试</a></li>
+      <li><a href="#compare">ReAct vs Plan-and-Execute vs 原生 tool-loop</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="loop"><span class="num">1</span>从单轮工具调用到循环：agent = while 循环里的 LLM</h2>
+
+  <p>模块 01 里的 function calling 是<strong>单轮</strong>的：模型发出一次工具调用，我们执行、回填结果、模型作答，结束。
+  但真实任务往往需要<strong>多步</strong>：先查资料，根据查到的内容决定下一步查什么，再做计算，最后综合作答。
+  把单轮调用放进一个循环，让模型自己决定"下一步干什么、什么时候停"，这就是 <span class="term">agent</span> 的全部本质。</p>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>Agent 没有任何新模型结构，就是一段二十行的 Python：<code>while 没结束: 让 LLM 说下一步 → 解析 → 执行工具 → 把结果贴回对话</code>。
+      所有 agent 框架（LangChain、AutoGen…）的核心都是这个循环，外面包了层抽象。本模块手写这个循环，框架就再也不神秘了。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>形式化地，agent 是一个由 LLM 参数化的策略 $\pi_\theta$，在每步 $t$ 依据完整轨迹上下文产生行动：
+      $a_t \sim \pi_\theta(\cdot \mid q,\, \tau_{&lt;t})$，其中轨迹 $\tau_{&lt;t} = (\hat{z}_1, a_1, o_1, \dots, \hat{z}_{t-1}, a_{t-1}, o_{t-1})$
+      包含此前的推理痕迹 $\hat{z}$、行动 $a$ 与环境观察 $o$。环境执行 $o_t = \mathrm{env}(a_t)$，循环直到 $a_t$ 为终止行动（Final Answer）或耗尽预算。</p>
+    </div>
+  </div>
+
+  <p><strong>ReAct</strong> [Yao 2022] 的核心贡献不是这个循环本身，而是回答了"循环里的每一步，模型该输出什么"：
+  把<span class="term">推理痕迹（Thought）</span>与<span class="term">行动（Action）</span><strong>交错</strong>生成。
+  纯推理（CoT）没有外部信息接地，容易幻觉；纯行动（不写 Thought 直接调工具）缺乏规划，容易盲目试错。交错之后形成双向闭环：</p>
+
+  <div class="ascii">
+              推理引导行动                      观察修正推理
+   ┌─────────┐ reason→act ┌─────────┐  act→obs  ┌─────────┐
+   │ Thought │ ─────────► │ Action  │ ────────► │  环境   │
+   │ (规划/  │            │ +Input  │           │ (工具   │
+   │  分解/  │ ◄───────────────────────────────│  执行)  │
+   │  纠错)  │      Observation (obs→reason)    └─────────┘
+   └─────────┘
+        │ 信息足够时
+        ▼
+   Final Answer ──► 退出循环
+
+   while 循环视角：
+     loop t = 1..max_steps:
+       LLM 生成  Thought_t + Action_t(Input_t)
+       若 Action == Final Answer → return
+       Observation_t = tools[Action_t](Input_t)
+       把 Thought/Action/Observation 追加进 prompt
+</div>
+
+  <div class="callout paper"><span class="label"></span>
+  <strong>ReAct</strong> [Yao 2022, arXiv:2210.03629] 在 HotpotQA / FEVER 上证明：交错的 Thought+Action 显著降低 CoT 的幻觉率（CoT 的错误中约 56% 是幻觉，ReAct 降到 6%），
+  在 ALFWorld / WebShop 上分别比纯行动基线高出绝对 34% / 10% 的成功率。代价是格式更长、对提示格式更敏感——这正是第 3 节"解析工程学"的由来。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  评测视角的预告：一旦任务变成多步循环，<strong>评测对象就从"单个回答"变成"整条轨迹"</strong>。
+  成功率之外，步数、工具调用分布、失败模式归类都成了一等公民指标。本章 notebook 会让你亲手打印并分析轨迹，模块 03 把它系统化为 harness。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="grammar"><span class="num">2</span>ReAct 提示文法：Thought / Action / Observation</h2>
+
+  <p>ReAct 是一种<strong>文本协议</strong>：通过 system prompt 约定一套行格式（grammar），让模型的自由文本变得机器可解析。经典文法如下：</p>
+
+  <div class="ascii">
+  ┌─ system prompt 约定的文法 ──────────────────────────────────┐
+  │ Question: 用户问题                                          │
+  │ Thought: 我现在的推理（下一步该做什么、为什么）              │
+  │ Action: 工具名（必须是 [calculator, wiki_lookup, ...] 之一） │
+  │ Action Input: 工具参数（一行或多行文本）                     │
+  │ Observation: 工具返回结果   ◄── 这一行由 harness 填，       │
+  │                                  不允许模型自己写！          │
+  │ ...（Thought/Action/Action Input/Observation 重复 N 次）     │
+  │ Thought: 我已经知道答案了                                    │
+  │ Final Answer: 最终答案                                       │
+  └─────────────────────────────────────────────────────────────┘
+</div>
+
+  <p>两个关键工程技巧：</p>
+  <ul>
+    <li><strong>stop sequence</strong>：调用 LLM 时设置 <code>stop=["Observation:"]</code>。模型生成到 "Observation:" 就被截断，
+    把"写观察结果"的权力从模型手里收回来，由 harness 执行真实工具后回填。这是防止<strong>幻觉观察</strong>（第 5 节失败模式之一）的第一道防线。</li>
+    <li><strong>few-shot 示例</strong>：在 system prompt 里放 1–2 个完整的 Thought→Action→Observation→Final Answer 轨迹示例。
+    对小模型（如 Qwen2.5-1.5B）这几乎是必需的——格式遵循能力随模型规模急剧变化，few-shot 是最便宜的格式稳定器。</li>
+  </ul>
+
+  <div class="callout warn"><span class="label"></span>
+  Observation 行<strong>永远由 harness 写入，绝不让模型生成</strong>。如果你忘了设 stop sequence，模型会自顾自地编造 "Observation: 巴黎人口 210 万" 并继续推理——
+  整条轨迹看起来流畅完美，结果全是幻觉。这是新手手写 agent 循环时最常见、也最隐蔽的 bug。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="parsing"><span class="num">3</span>解析的工程学：regex、格式漂移与兜底</h2>
+
+  <p>ReAct 把结构化协议建立在自由文本上，于是解析器（parser）成了 agent 可靠性的咽喉。一个最小解析器用 regex 提取三元组：</p>
+
+  <div class="math-block">
+  <pre style="margin:0">Action:\s*(?P&lt;action&gt;[\w\.\- ]+)\s*\n+\s*Action\s+Input:\s*(?P&lt;input&gt;.+)</pre>
+  </div>
+
+  <p>但真实模型输出会发生<span class="term">格式漂移（format drift）</span>，解析器必须分层兜底：</p>
+
+  <table>
+    <thead><tr><th>漂移类型</th><th>样例</th><th>兜底策略</th></tr></thead>
+    <tbody>
+      <tr><td>大小写/空格变体</td><td><code>action: calculator</code>、<code>Action :  wiki</code></td><td>regex 加 <code>re.IGNORECASE</code>、宽松空白匹配</td></tr>
+      <tr><td>多行 Action Input</td><td>Input 跨多行（如一段代码）</td><td><code>re.DOTALL</code> + 以下一个标签行（或文本结尾）为界</td></tr>
+      <tr><td>Markdown 污染</td><td><code>**Action**: `calculator`</code></td><td>解析前剥掉 <code>*</code> 和反引号</td></tr>
+      <tr><td>缺 Action Input</td><td>只有 Action 行</td><td>视为解析失败，触发格式提醒</td></tr>
+      <tr><td>编造工具名</td><td><code>Action: google_search</code>（不在工具表内）</td><td>解析成功但执行层拒绝，Observation 回填"未知工具，可用工具为…"</td></tr>
+      <tr><td>彻底乱格式</td><td>整段散文、没有任何标签</td><td>返回 <code>None</code> → 回喂格式提醒</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>解析失败 ≠ 轨迹失败</strong>。正确的做法是把错误信息当成一次 Observation 回喂给模型，给它自我修复的机会：</p>
+
+  <div class="ascii">
+  parse_step(llm_output)
+      │
+      ├─ Final Answer ─────────────► 退出循环，返回答案
+      ├─ (thought, action, input) ─► 执行工具 → Observation 回填
+      └─ None（解析失败）──────────► Observation: "输出格式无法解析。
+                                      请严格按 Thought/Action/Action Input
+                                      的格式输出。可用工具：[...]"
+                                      （消耗一步预算，防止无限纠错）
+</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  评测视角：<strong>解析失败率本身就是一个能力指标</strong>（instruction following / format robustness），但更多时候它是评测的<em>混淆变量</em>——
+  harness 的解析器写得差，会把"格式偏好不同"误判成"能力不行"。报告 agent 成绩时务必区分 <em>task failure</em> 与 <em>harness/format failure</em>，
+  这也是 [Kapoor 2024] 强调"agent 评测要报告 harness 细节"的原因之一。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="budget"><span class="num">4</span>终止与预算：max_steps、loop 检测、过早作答</h2>
+
+  <p>循环引入了单轮调用没有的新问题：<strong>它可能不停</strong>。生产级 agent 循环至少要有三层终止控制：</p>
+
+  <ul>
+    <li><strong>硬预算 <code>max_steps</code></strong>：最朴素也最必要。超步即强制终止，结果记为 <em>budget exceeded</em>（评测中应与 wrong answer 区分统计）。
+    更精细的预算还包括 token 数、墙钟时间、API 费用——METR 风格的评测通常以"人类完成该任务的时间"为参照设定预算。</li>
+    <li><strong>loop 检测</strong>：模型反复执行同一个 (action, input) 对——典型如反复查同一个查不到的词条。
+    实现上对每步取<span class="term">行动指纹（action fingerprint）</span> $f_t = \mathrm{hash}(a_t, \mathrm{input}_t)$，
+    若最近 $w$ 步指纹全部相同（如 $w=3$）即判定死循环，提前终止或注入干预提示（"你在重复同一操作，请换一种方法"）。</li>
+    <li><strong>过早 Final Answer 的对策</strong>：与"停不下来"相反的失败是"停得太早"——模型一步工具都不调，直接凭参数化知识作答。
+    对需要接地的任务这通常是幻觉的前兆。对策：①prompt 中明确要求"必须先用工具验证再作答"；②harness 检测到零工具调用的 Final Answer 时打上 <em>ungrounded</em> 标记；
+    ③评测中把"作答前的工具调用数"作为辅助指标。注意不能一刀切惩罚早停——简单问题一步作答是<em>效率优势</em>，这正是 [Kapoor 2024] 主张成本-准确率联合报告的场景。</li>
+  </ul>
+
+  <div class="callout danger"><span class="label"></span>
+  不设 max_steps 的 agent 循环 + 按 token 计费的 API = 一张失控账单。即使在本地小模型上做教学实验，也请永远先写预算再写循环。
+  本章 notebook 的 <code>react_agent()</code> 把 <code>max_steps=8</code> 作为签名默认值，这是刻意的教学设计。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="failures"><span class="num">5</span>失败模式分类（评测视角）</h2>
+
+  <p>做 agent 评测，比"成功率多少"更有信息量的是"<strong>失败长什么样</strong>"。下表是 ReAct 类 agent 的五大经典失败模式及其<strong>可自动化的检测信号</strong>——
+  notebook 里你会亲手触发并分类其中几种：</p>
+
+  <table>
+    <thead><tr><th>失败模式</th><th>表现</th><th>检测信号（可写进 harness）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>幻觉观察</strong> hallucinated observation</td><td>模型自己编写 Observation 行并基于它继续推理</td><td>模型原始输出中含 "Observation:" 字样（在 stop sequence 失效/未设时）；轨迹中 Observation 内容与工具真实返回不一致</td></tr>
+      <tr><td><strong>死循环</strong> action loop</td><td>反复执行相同 (action, input)，期待不同结果</td><td>连续 $w$ 步行动指纹相同；步数耗尽且后半段指纹熵接近 0</td></tr>
+      <tr><td><strong>过早作答</strong> premature answer</td><td>未做必要查证就给 Final Answer</td><td>工具调用数为 0（或低于任务最少跳数）即终止；答案中的实体未在任何 Observation 中出现过</td></tr>
+      <tr><td><strong>工具滥用</strong> tool misuse</td><td>调不存在的工具、参数类型错误、用 calculator 查事实</td><td>未知工具名比率；工具执行报错率；工具-子任务类型错配规则</td></tr>
+      <tr><td><strong>目标漂移</strong> goal drift</td><td>中途偏离原问题，去解决路上遇到的别的问题</td><td>后期 Thought/Action 与原 question 的语义相似度下降；Final Answer 答非所问（judge 模型或关键词匹配）</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><span class="label"></span>
+  这些信号都是<strong>启发式</strong>的，有误报：连续三次查同一词条也可能是合理重试（如工具瞬时故障）；零工具调用作答对常识题是最优行为。
+  评测 harness 的失败分类器自身也需要被校准——抽样人工复核失败标签，是 agent 评测工作流的固定环节（模块 06 详述）。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="reflexion"><span class="num">6</span>Reflexion：失败后的自我反思重试</h2>
+
+  <p>失败之后怎么办？最朴素的方案是原样重跑（靠采样随机性），<strong>Reflexion</strong> [Shinn 2023] 给出更聪明的方案：
+  让模型对失败轨迹做<strong>语言化的自我反思</strong>，把反思文本写入情景记忆（episodic memory），下一次尝试时注入上下文：</p>
+
+  <div class="ascii">
+   尝试 k：ReAct 轨迹 τ_k ──► 评估器（任务反馈：失败）
+                                   │
+                                   ▼
+              Reflexion LM：读 τ_k → 生成自我反思文本 r_k
+              （"我失败是因为反复查不存在的词条 X，
+                下次应改查更通用的词条 Y 再推算"）
+                                   │
+                                   ▼
+   尝试 k+1：prompt = 原任务 + [r_1 … r_k] ──► 新的 ReAct 轨迹
+</div>
+
+  <div class="dual">
+    <div class="plain">
+      <h4>直白讲</h4>
+      <p>Reflexion = 不更新一个参数的"强化学习"：把梯度换成一段中文/英文的失败总结。
+      它管用的前提是模型<em>能看出自己哪儿错了</em>——所以反馈信号越明确（单元测试红了、答案被判错），反思就越有效。</p>
+    </div>
+    <div class="formal">
+      <h4>严谨讲</h4>
+      <p>Reflexion 以语言反馈替代标量奖励的策略改进：$\pi_{k+1}(\cdot) = \pi_\theta(\cdot \mid q, m_k)$，
+      其中记忆 $m_k = [r_1, \dots, r_k]$，$r_k = \mathrm{LM}_{\text{reflect}}(q, \tau_k, \text{feedback}_k)$。
+      参数 $\theta$ 冻结，全部"学习"发生在上下文中（in-context），因此提升被限制在反馈可识别、且失败原因可被语言概括的任务上。
+      [Shinn 2023] 报告 HumanEval pass@1 从 GPT-4 基线 80.1% 升至 91.0%。</p>
+    </div>
+  </div>
+
+  <p><strong>何时有效 / 何时无效：</strong></p>
+  <ul>
+    <li>✅ 有效：反馈信号明确（测试通过与否、精确匹配判分）；失败原因可言说（查错了词条、漏了一步换算）；任务允许多次尝试。</li>
+    <li>❌ 无效：反馈稀疏或模糊（"答案不对"但不知道哪不对）；失败源于模型能力上限（反思写得头头是道，下一轮照样做不出）；
+    评测协议只允许单次尝试（此时 Reflexion 属于改变协议——报告成绩时必须注明 attempts 数，对应 τ-bench 的 pass^k 思想 [Yao 2024]）。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="compare"><span class="num">7</span>ReAct vs Plan-and-Execute vs 原生 tool-loop</h2>
+
+  <p>ReAct 不是 agent 循环的唯一写法。三种主流形态对比：</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>ReAct（文本协议）</th><th>Plan-and-Execute [Wang 2023]</th><th>原生 tool-loop（function calling）</th></tr></thead>
+    <tbody>
+      <tr><td>步骤决策</td><td>每步即时决策，边走边想</td><td>先生成完整计划，再逐步执行（可定期 re-plan）</td><td>每步即时决策（同 ReAct，但无显式 Thought 文法）</td></tr>
+      <tr><td>结构化方式</td><td>自由文本 + regex 解析</td><td>计划列表 + 执行器</td><td>API 原生 JSON（<code>tool_calls</code> 字段），无需自写 parser</td></tr>
+      <tr><td>格式鲁棒性</td><td>差——依赖模型格式遵循 + 解析兜底</td><td>中——计划本身也要解析</td><td>好——由 provider 端约束解码保证</td></tr>
+      <tr><td>长程任务</td><td>容易目标漂移（无全局计划）</td><td>全局结构好，但计划赶不上变化时僵化</td><td>同 ReAct；推理模型可在内部隐式规划</td></tr>
+      <tr><td>可解释性/可评测性</td><td>最好——Thought 显式可读、可审计</td><td>计划显式，步内推理不一定</td><td>推理藏在模型内部（或单独的 reasoning 块）</td></tr>
+      <tr><td>适用场景</td><td>教学、研究、无 function-calling 的模型</td><td>步骤多且结构稳定的任务</td><td>生产环境默认选择</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout paper"><span class="label"></span>
+  Anthropic <em>Building Effective Agents</em> (2024) 的核心原则：<strong>简单优先</strong>——"寻找最简单的方案，只在确有必要时增加复杂度"。
+  能用单次 LLM 调用 + 检索解决的就不要上 agent；要上 agent 也先用最朴素的循环，workflow（预定义编排）优于自由 agent，除非任务的开放性确实需要模型自主决策。
+  该文还区分了 <em>workflow</em>（代码编排 LLM）与 <em>agent</em>（LLM 自主导向自己的过程与工具使用）——ReAct 循环属于后者的最小实现。</div>
+
+  <div class="callout intuition"><span class="label"></span>
+  那为什么 2026 年还要学手写 ReAct？因为做<strong>评测研究</strong>时你需要：①一个完全透明、可控的最小 harness 来做消融；
+  ②读懂大量仍以 ReAct 文法组织轨迹的 benchmark（AgentBench、GAIA 早期基线等）；③在不支持原生 function calling 的开源小模型上跑 agent 实验。
+  ReAct 是 agent 评测的"汇编语言"。</div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">8</span>研究前沿与开放问题</h2>
+
+  <ul>
+    <li><strong>推理模型会杀死显式 ReAct 吗？</strong> o 系列 / R1 / 扩展思考把 Thought 内化为隐藏推理链，外部只剩 tool-loop。
+    评测视角的新难题：推理不可见（或仅给摘要）时，轨迹审计、幻觉观察检测怎么做？显式 Thought 的可审计性是否值得为之牺牲性能？</li>
+    <li><strong>格式鲁棒性与能力的解耦</strong>：同一模型换 prompt 文法（ReAct vs JSON vs XML）成绩可差出两位数。benchmark 成绩多大程度在测 harness 而非模型？
+    标准化 harness（模块 03 的 Inspect / Task Standard）是当前的工程答案，但"harness 最优性"本身仍是开放问题。</li>
+    <li><strong>反思的泛化</strong>：Reflexion 的记忆是任务内的。跨任务、跨 episode 的经验积累（skill library、自我演化 memory）如何评测其真实增益、
+    又如何防止它变成对 benchmark 的隐性过拟合（训练-测试污染的 agent 版）？</li>
+    <li><strong>失败归因的自动化</strong>：第 5 节的检测信号都是启发式。用 judge 模型做轨迹级失败归因正在成为标配，但 judge 自身的可靠性、
+    与人工标注的一致率（inter-rater agreement）报告仍然稀缺——这直接是一个可发论文的评测方法学方向。</li>
+    <li><strong>预算公平性</strong>：不同 agent 的"一步"成本天差地别（一次 LLM 调用 vs 一次完整子 agent 运行）。以步数为预算单位是否公平？
+    [Kwa 2025] 的 time-horizon 思路（以人类完成时间为标尺）与 [Kapoor 2024] 的成本-准确率 Pareto 前沿是两条互补出路。</li>
+  </ul>
+
+  <div class="card">
+    <strong>✅ 本章你应该能回答：</strong>
+    <ol style="margin:8px 0 0">
+      <li>ReAct 相比纯 CoT 和纯行动各解决了什么问题？"推理引导行动、观察修正推理"分别对应循环里的哪条边？</li>
+      <li>为什么 Observation 必须由 harness 回填而不能让模型生成？stop sequence 在其中起什么作用？</li>
+      <li>列出至少四种 agent 失败模式，并各给出一个可写进 harness 的自动检测信号。</li>
+      <li>Reflexion 在什么条件下有效？为什么报告 Reflexion 成绩时必须注明尝试次数？</li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="../01_tool_use/01_讲解.html"><div class="dir">← 上一章</div><div class="t">01 · Tool Use 与 function calling</div></a>
+    <a class="next" href="../03_sandbox_harness/03_讲解.html"><div class="dir">下一章 →</div><div class="t">03 · 沙箱、轨迹与 agent harness</div></a>
+  </div>
+
+</div>
+</body>
+</html>
