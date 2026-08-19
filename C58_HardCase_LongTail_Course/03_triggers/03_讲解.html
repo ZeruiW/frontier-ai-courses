@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 主动学习与线上触发策略</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 主动学习与线上触发策略</h1>
+  <p class="subtitle">车队数据是无限的、标注预算是有限的 → 真正的问题不是「挖什么」而是「<strong>回传什么</strong>」 · 检测的不确定性先要解决<em>聚合</em>问题：框级熵 / margin / 最小置信度算完之后，图级用 max 还是 mean？选错会让触发器系统性偏向目标多的图，而 TSR 恰恰是稀疏场景 · <strong>熵高 ≠ 值得标</strong>：熵包含不可约的偶然不确定性（本来就糊的牌），BALD 用互信息只保留<em>认知</em>不确定性 · 一致性触发在 TSR 上最有效：同一块牌前后帧类别跳变<em>几乎必然</em>是难例，而且判定<strong>不需要任何标注</strong> · 规则触发：检测到但跟踪丢失 / 置信度在阈值附近震荡 / 与高精地图不符 / 接管与急刹前后 5 秒 · 影子模式是唯一能拿到「模型自信地错了」样本的通道 · 触发器要做 PR 分析：触发率 1%、命中率 30% 意味着每 1000 帧回传 10 帧、其中 3 帧真有用，带宽预算直接换算成阈值 · <strong>触发器本身有偏</strong>：只回传模型不确定的，就会系统性漏掉最危险的那一类——自信且错</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–02（数据闭环、长尾、难例挖掘）；C55 m04（跟踪与时序融合）会让「多帧一致性」这一节读起来轻松很多</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_active_learning_triggers.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Settles, <em>Active Learning Literature Survey</em>（2009）；Beluch et al., <em>The Power of Ensembles for Active Learning in Image Classification</em>（CVPR 2018）；Kirsch et al., <em>BatchBALD</em>（NeurIPS 2019）；Tesla / Waymo 关于影子模式与数据引擎的公开技术分享</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#budget">问题重述：车队数据无限，标注预算有限</a></li>
+      <li><a href="#uncertainty">不确定性触发：三种度量与它们各自的失效方式</a></li>
+      <li><a href="#aggregate">框级 → 图级：检测里最容易做错的一步聚合</a></li>
+      <li><a href="#consistency">一致性触发：多模型分歧，以及 TSR 的杀手锏「多帧不一致」</a></li>
+      <li><a href="#rules">规则触发：最便宜、最可解释，也最容易被低估</a></li>
+      <li><a href="#bias">触发器本身会引入偏差：「模型自信地错了」这个系统性盲区</a></li>
+      <li><a href="#pr_budget">把触发器当模型来评：PR 分析与带宽预算下的阈值优化</a></li>
+      <li><a href="#shadow">影子模式与线上工程：触发器怎么真的跑在车上</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="budget"><span class="num">1</span>问题重述：车队数据无限，标注预算有限</h2>
+  <p>模块 02 讨论的是「<strong>已经标好的数据里，该多看哪些</strong>」。这一模块的问题完全不同，也更贴近量产：</p>  <p><strong>一支 10 万辆车的车队，每天产生的视频数据以 PB 计。你的标注预算是每天几万个框。回传哪些帧？</strong></p>  <p>这就是 <span class="term">active learning</span>（主动学习）在自动驾驶里的真实形态，而且它比教科书里的主动学习多了三个硬约束：</p>  <table>
+    <thead><tr><th>约束</th><th>教科书主动学习</th><th><strong>车端主动学习</strong></th></tr></thead>
+    <tbody>
+      <tr><td>候选池</td><td>几万个已存储的无标注样本</td><td><strong>近乎无限的流式数据</strong>，且大部分永远不会被存储</td></tr>
+      <tr><td>打分时机</td><td>可以离线跑大模型给全池打分</td><td><strong>必须在车端实时算</strong>（算力只剩几个百分点给触发器）</td></tr>
+      <tr><td>选择方式</td><td>全局排序取 top-k</td><td><strong>只能用阈值做在线判决</strong>（看到这一帧就得决定留不留，没有全局视野）</td></tr>
+      <tr><td>回传成本</td><td>≈ 0</td><td><strong>带宽有钱，且用户流量与隐私都要顾</strong></td></tr>
+      <tr><td>评价指标</td><td>标注 N 个后的模型精度</td><td>「回传的东西里有多少真的是 badcase」+ 「真 badcase 有多少被抓到」</td></tr>
+    </tbody>
+  </table>  <p>换个角度看，<strong>这就是一个「二分类器」的设计问题</strong>：输入是一帧（或一小段），输出是「回传 / 丢弃」。它有 precision（回传的里面有多少真值钱）和 recall（真正的 badcase 抓到了多少），有工作点，有 PR 曲线，也有偏差。<em>把触发器当成一个需要评估的模型来对待，是这一模块最重要的思维转变</em>——而绝大多数人只把它当成「几行 if 语句」。</p>  <div class="ascii">车端触发 → 回传 → 挖掘 → 标注 → 训练 的完整链路
+
+  ┌── 车端（实时，算力预算 &lt; 5%）──────────────────────────────┐
+  │                                                          │
+  │  相机 ─► 感知模型 ─► 检测/分类结果 + 跟踪                    │
+  │                          │                               │
+  │                          ▼                               │
+  │              ┌───────────────────────┐                   │
+  │              │   触发器（三类并联）    │                   │
+  │              │  ① 不确定性            │                   │
+  │              │  ② 一致性（含多帧）     │                   │
+  │              │  ③ 规则/事件           │                   │
+  │              └───────────┬───────────┘                   │
+  │                          │  触发率必须 &lt;= 带宽预算          │
+  │                          ▼                               │
+  │              环形缓冲区（保留触发点前后 ±3s）                │
+  │                          │  脱敏（人脸/车牌模糊）           │
+  └──────────────────────────┼───────────────────────────────┘
+                             ▼
+  ┌── 云端 ────────────────────────────────────────────────┐
+  │  回传队列 ─► **去重**（近重复检测/聚类）─► 多样性采样       │
+  │                    │                                    │
+  │                    ▼                                    │
+  │            大模型/离线模型复检（离线可以跑 10× 大的模型）    │
+  │                    │                                    │
+  │                    ▼                                    │
+  │            标注 ─► 训练 ─► 评测 ─► 门禁 ─► 发布            │
+  │                                       │                 │
+  │                    影子模式验证 ◄──────┘                 │
+  └────────────────────────────────────────────────────────┘
+
+  ⚠️ 整条链路的**瓶颈永远是标注**，所以触发器的 precision
+     （回传的里面有多少值得标）直接决定整个数据飞轮的效率。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>先把最容易被忽略的一点说清楚：<strong>「回传什么」的答案不是「模型不确定的」，而是「能让模型变好的」</strong>。这两者只在一部分情况下重合。<em>模型对某一帧不确定，可能是因为那一帧真的信息不足（远处 8 像素的标志，标了也学不到）；模型对某一帧很确定，也可能是它<strong>自信地错了</strong>（把限速 80 稳稳当当认成 60）</em>。<strong>后一类才是最危险的，而它恰恰是不确定性触发器的系统性盲区</strong>——这是本模块的第 6 节主题。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化一点：主动学习的理想目标是选出使<span class="term">expected model change</span>（期望模型改变量）或期望误差下降最大的样本。但这两个量都需要「知道真标签」才能算，所以实践中只能用<strong>代理量</strong>：不确定性、分歧、规则命中。<em>每一个代理量都有它偏离真实目标的方式，而这些偏离在长期运行的闭环里会被不断放大</em>（因为下一版模型是在这些数据上训的，触发器又跟着模型走）。<strong>所以触发器组合里必须有一条「与模型无关」的通路</strong>——随机基线、规则、外部先验（高精地图），三者缺一不可。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把数字摆出来会更有感觉。假设每辆车每天行驶 1 小时、30 FPS，那就是 <strong>10.8 万帧/天/车</strong>。1 万辆车 = <strong>10.8 亿帧/天</strong>。如果标注预算是 5 万帧/天，<strong>触发率必须控制在 4.6×10⁻⁵</strong>——也就是<em>每两万帧里只能挑出一帧</em>。<strong>在这个量级下，触发器 precision 从 5% 提到 20% 意味着标注效率翻两番</strong>，其价值远超模型上的大部分改动。这也是 JD 里「define mining strategies for long-tail scenarios」这条职责的真实分量。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="uncertainty"><span class="num">2</span>不确定性触发：三种度量与它们各自的失效方式</h2>
+  <p>最基础的一类触发器。给定模型对某个框输出的类别概率分布 <code>p</code>，用一个标量刻画「模型有多不确定」。三种常用度量：</p>  <div class="math-block">\[H(p) = -\sum_{c} p_c \log p_c, \qquad\quad M(p) = p_{(1)} - p_{(2)}, \qquad\quad LC(p) = 1 - p_{(1)}\]</div>  <p>分别是<span class="term">entropy</span>（熵）、<span class="term">margin</span>（最大与次大概率之差）与 <span class="term">least confidence</span>（最小置信度，即 1 减去最大概率）。它们看起来差不多，但在<strong>类别数很多的场景下差别巨大</strong>——而 TSR 恰好是类别数很多的场景（百来个细分类）。</p>  <table>
+    <thead><tr><th>度量</th><th>抓住的是</th><th>在 TSR 上的表现</th><th>失效场景</th></tr></thead>
+    <tbody>
+      <tr><td><strong>熵 H(p)</strong></td><td>整个分布的弥散程度</td><td><strong>会被「长尾小概率」拉高</strong>：100 个类各分到 0.5% 的残余概率，熵就已经不低了，即使 top-1 是 0.5</td><td>类别数多时对「真正的二选一混淆」不敏感；<em>被无关类的噪声概率污染</em></td></tr>
+      <tr><td><strong>margin M(p)</strong></td><td><strong>最像样的两个候选之间的竞争</strong></td><td><strong>TSR 上最好用</strong>：限速 60 vs 80、禁止驶入 vs 禁止通行，都是典型的二选一</td><td>三个及以上类别势均力敌时会低估不确定性</td></tr>
+      <tr><td><strong>least confidence</strong></td><td>只看 top-1 有多高</td><td>最便宜（不需要排序），常用于车端粗筛第一层</td><td>完全忽略「输给谁」；0.5 对 0.49 与 0.5 对 0.05 被视为一样</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>选哪个？在 TSR 这类「细粒度多类别 + 混淆成对出现」的任务上，margin 明显优于熵</strong>。原因很具体：熵是全分布的函数，当类别数 C 很大时，即使模型已经把答案锁定在两个类之间，剩下 C-2 个类上残余的小概率仍会贡献可观的熵值——<em>于是熵在「限速 60 vs 80」和「一片模糊什么都不像」这两种完全不同的情况上给出接近的分数</em>。而 margin 只看前两名，正好对应了 TSR 的错误结构。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但有一个前提条件必须先满足：<strong>这三个度量都建立在「softmax 概率是可信的」这一假设上，而现代神经网络的 softmax 是<em>系统性过自信</em>的</strong>（Guo et al., 2017）。<em>未校准的模型上，0.9 的置信度可能对应 70% 的真实正确率</em>，这会让阈值完全失去意义，而且校准误差在不同类别、不同尺寸桶上还不一样（小目标通常更过自信）。<strong>所以不确定性触发器上线前必须先做校准</strong>（温度缩放最简单），并且<strong>按尺寸/光照分桶分别校准</strong>——否则触发器会系统性偏向某些桶。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>还有一个检测特有的维度常被忘掉：<strong>定位不确定性</strong>。分类概率只刻画「是什么」，不刻画「在哪里」。一个框如果类别很确定但<em>位置抖动很大</em>（多帧之间 IoU 反复跳、或用 MC-dropout / TTA 时框位置方差大），同样是值得回传的 badcase。<em>在 TSR 里这尤其重要——远处小标志的框抖动会直接导致跟踪断裂</em>。<strong>实现上可以用「回归头输出分布的方差」（如 GFL 的 distribution focal loss 天然给出分布）或「多帧框位置的方差」</strong>，成本都很低。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="aggregate"><span class="num">3</span>框级 → 图级：检测里最容易做错的一步聚合</h2>
+  <p>上一节的度量都定义在<strong>单个框</strong>上，但回传决策是<strong>整帧（或整段）</strong>的。<em>这一步聚合看起来是个小细节，实际上它决定了触发器会系统性偏向什么样的场景</em>。</p>  <table>
+    <thead><tr><th>聚合算子</th><th>定义</th><th>偏向什么</th><th>什么时候用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>max</strong></td><td><code>U = max_j u_j</code></td><td><strong>只要有一个可疑框就触发</strong>。对「单个关键错误」最敏感</td><td><strong>默认选择</strong>；TSR 关心的是「有没有一个标志被认错」而不是平均质量</td></tr>
+      <tr><td><strong>mean</strong></td><td><code>U = mean_j u_j</code></td><td><strong>偏向框少的帧</strong>：一帧只有 1 个可疑框时 mean 很高，10 个框里 1 个可疑时 mean 被稀释</td><td>几乎不该单独用——它会系统性漏掉复杂路口</td></tr>
+      <tr><td><strong>top-k mean</strong></td><td>最高的 k 个的均值</td><td>介于两者之间，比 max 抗噪</td><td>k=2~3，对单帧噪声更稳</td></tr>
+      <tr><td><strong>count 超阈</strong></td><td><code>U = #{j : u_j > τ}</code></td><td><strong>偏向框多的帧</strong>（拥挤路口天然计数高）</td><td>要做归一化才能用，否则触发的全是市区路口</td></tr>
+      <tr><td><strong>加权（按尺寸/距离）</strong></td><td><code>U = max_j w_j u_j</code></td><td>可以显式偏向「近处大标志」或「远处小标志」</td><td><strong>与安全代价挂钩时用</strong>：近处的错误后果更严重</td></tr>
+    </tbody>
+  </table>  <p>这里有一个必须点破的偏差机制：</p>  <div class="callout danger"><span class="label">聚合算子是一个隐藏的采样偏差源</span>
+    <p><strong>用 <code>mean</code> 聚合，会让触发器系统性地漏掉「复杂场景」；用 <code>count</code> 聚合，会让触发器几乎只回传市区拥挤路口</strong>。两者都是<em>由聚合算子引入的、与模型无关的采样偏差</em>——而它会在闭环里被固化：回传的数据偏向某类场景 → 模型在那类场景上变好 → 其他场景的问题永远发现不了。<em>这类偏差比模型的问题更难察觉，因为它不体现在任何模型指标上。</em></p>
+  </div>  <p>除了聚合算子，还要处理三个检测特有的细节：</p>  <ol>
+    <li><strong>只对「已检出的框」算不确定性，会漏掉漏检</strong>。模型完全没检出的目标，压根不会产生任何框级分数。<em>解法是同时用低阈值的候选（比如 score &gt; 0.05 的所有 proposal）参与打分</em>，或者依赖规则触发（跟踪丢失、地图先验）来覆盖漏检。<strong>这是不确定性触发器的第二个结构性盲区</strong>（第一个是「自信地错」）。</li>
+    <li><strong>要不要按框数归一化</strong>。如果用 max，不需要；如果用 count 或 sum，必须除以框数或做长度归一化，否则触发率与场景复杂度强相关。</li>
+    <li><strong>时间维度上的去重</strong>。30 FPS 下，一个 badcase 会连续触发几十帧。<em>必须做时间窗内抑制</em>（同一 track、同一场景在 N 秒内只触发一次），否则带宽预算会被少数几个片段吃光。<strong>这是「触发器 NMS」——和模块 02 里 OHEM 的 NMS 去重是同一个道理</strong>：不去重，预算就被少数几件事重复消耗。</li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第三条特别值得展开：<strong>在时序数据上，「触发一次」和「触发一段」是完全不同的成本</strong>。一次触发实际回传的是触发点前后各 3 秒（约 180 帧）的片段。<em>如果不做时间窗抑制，一段 10 秒的困难路段可能产生 200 次触发、回传 200 个高度重叠的片段</em>——占满预算却只贡献一个场景的信息。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>正确做法是<strong>两级抑制</strong>：车端做<em>时间窗抑制</em>（同一 track 在 T 秒内只触发一次，且优先保留分数最高的那一帧）；云端做<em>内容去重</em>（感知哈希 / 嵌入聚类，见模块 04）。<strong>两级都需要，因为车端不知道这个路口昨天已经回传过 50 次了，而云端不知道这 200 帧其实是同一个 3 秒</strong>。<em>把这两级说清楚，就说明你理解了「触发」是一个分布式系统问题而不是一个打分问题。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="consistency"><span class="num">4</span>一致性触发：多模型分歧，以及 TSR 的杀手锏「多帧不一致」</h2>
+  <p>不确定性触发器只能看到<strong>模型自己报告的</strong>不确定性——而它系统性地不报告「自信地错了」那一类。一致性触发器绕开了这个问题：<strong>它不问模型「你有多确定」，而是把同一个东西的多个独立预测放在一起，看它们对不对得上</strong>。</p>  <table>
+    <thead><tr><th>一致性来源</th><th>怎么做</th><th>抓到什么</th><th>车端可行性</th></tr></thead>
+    <tbody>
+      <tr><td><strong>多模型分歧</strong>（query-by-committee）</td><td>K 个独立训练的模型投票，算 vote entropy 或平均 JS 散度</td><td>「模型集体不确定」与「单模型自信但集体分歧」两类</td><td><strong>车端跑不动 K 个模型</strong>；通常只在云端影子复检时用</td></tr>
+      <tr><td><strong>TTA 分歧</strong></td><td>同一帧做翻转/多尺度推理，看结果是否一致</td><td>对增强不鲁棒的样本；标注边界模糊的样本</td><td>延迟翻倍，车端一般只在低负载时抽样开启</td></tr>
+      <tr><td><strong>教师-学生分歧</strong></td><td>车端小模型 vs 云端/离线大模型的预测差异</td><td><strong>蒸馏损失最大的样本</strong>——直接对应「小模型学不会的东西」</td><td>车端只跑学生；分歧在云端影子模式里算</td></tr>
+      <tr><td><strong>多帧不一致</strong>（temporal inconsistency）</td><td>同一个 track 在连续帧上的类别序列是否跳变</td><td><strong>TSR 上极其有效</strong>——见下文</td><td><strong>几乎零成本</strong>（跟踪本来就要跑），车端首选</td></tr>
+    </tbody>
+  </table>  <h3>为什么「多帧不一致」在 TSR 上如此有效</h3>  <p>因为交通标志有一个别的目标没有的强物理性质：<strong>它是静止的刚体，类别在时间上恒定</strong>。一个限速 60 的标志，在车辆接近的整个过程中永远是限速 60。所以——</p>  <div class="callout intuition"><span class="label"></span>
+    <strong>同一个 track 上出现类别跳变，就是一个「无需标注即可确认的错误」</strong>：不管跳变前后哪一帧是对的，<em>至少有一帧一定是错的</em>。这是一个<strong>免费的、零标注成本的自动标签</strong>——你不需要知道正确答案，就能确定「这里出了问题」。<em>行人跟踪、车辆跟踪都没有这个性质（它们的属性会真的变化），这是 TSR 独有的红利。</em>
+  </div>  <div class="ascii">多帧一致性触发：同一个 track 的类别序列
+
+  帧号:      t0    t1    t2    t3    t4    t5    t6    t7
+  距离:     80m   70m   60m   50m   40m   30m   20m   15m
+  像素:      9px  11px  13px  16px  20px  27px  40px  53px
+
+  ✅ 正常 track（无需回传）
+     类别:   SL60  SL60  SL60  SL60  SL60  SL60  SL60  SL60
+     置信:   0.42  0.51  0.63  0.75  0.88  0.94  0.97  0.98
+     → 类别恒定，置信度随距离单调上升 —— 教科书式的正常行为
+
+  ⚠️ 类别跳变 track（**必须回传**）
+     类别:   SL80  SL80  SL80  SL60  SL60  SL60  SL60  SL60
+     置信:   0.91  0.93  0.88  0.72  0.85  0.93  0.96  0.98
+                              ↑
+              **远处「自信地」认成 SL80，近处才纠正过来**
+              · 单帧不确定性完全抓不到（t0-t2 的置信度都 &gt; 0.88）
+              · 多帧一致性一抓一个准，而且**自动告诉你哪几帧错了**
+                （用近处高置信的结果反标远处的低分辨率帧 = **免费的困难样本**）
+
+  ⚠️ 闪烁 track（**必须回传**）
+     类别:   SL60  SL80  SL60  SL80  SL60  SL60  SL60  SL60
+     → 跳变次数 = 4，典型的「决策边界上反复横跳」
+
+  可用的量化指标：
+     flip_count      = 相邻帧类别变化次数
+     mode_fraction   = 众数类别占比（越低越不一致）
+     class_entropy   = track 上类别分布的熵
+     stabilize_frame = 第几帧之后不再变（越晚越糟）</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>「多帧不一致」不只是一个触发器，它还是一台<strong>自动标注机</strong>。因为 TSR 有一个额外的结构：<em>置信度随距离单调上升</em>——近处的预测几乎总是对的。<strong>于是可以用「近处高置信的结果」去反标「远处低分辨率的同一个 track」</strong>，自动产出一批「远距离小目标 + 正确标签」的困难样本，而这正是 TSR 最缺的数据类型。<em>这个技巧的正式名字叫 auto-labeling by temporal propagation / track-level label propagation，在量产系统里价值极高。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要小心两个失效条件。<strong>① 跟踪本身可能错</strong>：如果两个相邻的标志被跟成同一个 track（ID switch），类别「跳变」其实是跟踪的错，不是分类的错。<em>所以反标之前必须先验证 track 的纯度</em>（用几何一致性：静止标志在自车运动下的图像位置是可预测的，偏离预测太多就说明 track 有问题）。<strong>② 可变电子牌的类别是真的会变的</strong>——限速 80 的电子牌可能在你接近的过程中变成 60。<em>这类标志必须从「类别恒定」假设里排除掉，否则你会把真实变化当成模型错误反复回传</em>。<strong>这两条例外是这个技巧能不能真正落地的分水岭。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rules"><span class="num">5</span>规则触发：最便宜、最可解释，也最容易被低估</h2>
+  <p>第三类触发器完全不依赖模型的输出分布，而是依赖<strong>系统级的、可以被外部验证的矛盾</strong>。它们的共同结构是：「<em>如果系统是对的，这件事不该发生；它发生了，所以某处出错了</em>」。</p>  <table>
+    <thead><tr><th>规则触发器</th><th>信号</th><th>抓到什么类型的 badcase</th><th>误触发风险 / 注意事项</th></tr></thead>
+    <tbody>
+      <tr><td><strong>检测到但跟踪丢失</strong></td><td>一个 track 存在 &lt; N 帧就消失，且不是因为出画面</td><td><strong>不稳定检测</strong>：远距离小目标、遮挡边缘、光照突变（隧道出入口）</td><td>真实遮挡（被大车挡住）也会触发 → 要结合几何判断是否出画面</td></tr>
+      <tr><td><strong>阈值附近震荡</strong></td><td>score 在工作点阈值上下反复穿越（如 0.48↔0.52）</td><td><strong>决策边界样本</strong>——这批数据的边际信息量最高</td><td>阈值附近本来就有大量样本 → <strong>触发率容易失控</strong>，必须配时间窗抑制</td></tr>
+      <tr><td><strong>与高精地图不符</strong></td><td>地图记录此处有「限速 60」，模型报「限速 80」或什么都没报</td><td><strong>直击「自信地错了」与漏检两大盲区</strong>（不确定性触发完全抓不到的两类）</td><td><strong>地图本身会过期</strong>（施工改道、限速调整）→ 触发的可能是「地图该更新了」，这同样有价值但要分开处理</td></tr>
+      <tr><td><strong>接管 / 急刹 / 急打方向前后</strong></td><td>驾驶员接管、AEB 触发、纵向加速度 &lt; -3 m/s²</td><td><strong>与安全后果直接相关的场景</strong>，价值密度最高</td><td>多数接管与 TSR 无关 → 需要二次筛选（回传后用离线模型复检）</td></tr>
+      <tr><td><strong>罕见类别命中</strong></td><td>模型报出了一个长尾类（哪怕置信度很高）</td><td>长尾类的真实分布样本 —— <strong>正是模块 01 最缺的</strong></td><td>罕见类的误报也很多 → 精确率天然低，但因为量小，绝对成本可控</td></tr>
+      <tr><td><strong>地理/时间围栏</strong></td><td>进入新城市、新国家、夜间、恶劣天气</td><td><strong>域偏移场景</strong>的主动覆盖</td><td>与模型无关，是纯粹的分布覆盖策略 → <strong>这是对抗触发器偏差的重要一环</strong></td></tr>
+    </tbody>
+  </table>  <p>规则触发器有三个被严重低估的优点：</p>  <ul>
+    <li><strong>它们与模型无关</strong>。不确定性和一致性触发器都是模型的函数，所以它们的盲区会随着模型一起演化（模型在某处系统性地错，触发器也就在那处系统性地沉默）。<em>规则触发器打破了这个耦合</em>。</li>
+    <li><strong>它们可解释、可审计</strong>。「与高精地图不符」这个触发条件，可以直接生成一句人能读懂的说明，标注员和工程师都能立刻理解在看什么。<em>而「熵 &gt; 1.7」不能。</em></li>
+    <li><strong>它们几乎不花算力</strong>。跟踪、地图匹配、车辆信号本来就在跑，触发条件只是几个比较。<em>在车端只剩几个百分点算力的约束下，这是决定性的优势</em>。</li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <p>但规则触发器有一个共同的失效模式：<strong>规则会随着系统演进而悄悄失效</strong>。「跟踪丢失」这条规则的触发率，会因为跟踪器换了一版而整体漂移；「与高精地图不符」会因为地图版本更新而突然爆量。<em>所以每条规则触发器都必须有<strong>触发率监控</strong>与告警</em>——<strong>触发率的异常漂移本身就是一个极有价值的信号</strong>：它意味着模型、跟踪器、地图或真实世界中的某一个变了。<em>在成熟的团队里，触发率看板与模型指标看板是同等重要的两块屏。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bias"><span class="num">6</span>触发器本身会引入偏差：「模型自信地错了」这个系统性盲区</h2>
+  <div class="callout danger"><span class="label">不确定性触发器的结构性盲区</span>
+    <p><strong>本模块最深的一个洞察：只回传「模型不确定的」样本，会系统性地漏掉「模型自信地错了」的样本。</strong> 而在安全关键系统里，<em>后者才是真正会出事的那一类</em>——模型不确定时，下游还能靠迟滞、多帧投票、保守策略兜住；模型自信地错时，整条链路都会相信它。</p>
+  </div>  <div class="ascii">把所有样本按「置信度 × 是否正确」摆成四象限
+
+                        正确                     错误
+              ┌───────────────────────┬───────────────────────┐
+              │                       │                       │
+     高置信度  │   ① 已经学会           │  ② **自信地错了**       │
+              │   （占绝大多数）        │   ⚠️ **最危险**         │
+              │   回传价值 ≈ 0         │   回传价值 **最高**      │
+              │                       │                       │
+              │   不确定性触发：不触发 ✅│  不确定性触发：**不触发** ❌│
+              │                       │   ← **系统性盲区**      │
+              ├───────────────────────┼───────────────────────┤
+              │                       │                       │
+     低置信度  │   ③ 蒙对了 / 边界       │  ④ 不确定且错了         │
+              │   回传价值 中           │   回传价值 高           │
+              │                       │                       │
+              │   不确定性触发：触发 ⚠️  │   不确定性触发：触发 ✅  │
+              │   （**误触发**，占用预算）│                       │
+              └───────────────────────┴───────────────────────┘
+
+  不确定性触发器实际做的是「按行切」（只看下面那一行），
+  而我们真正想要的是「按列切」（只看右边那一列）。
+  **两者的交集只有 ④ 一格。**
+
+  ⇒ 象限 ② 只能靠：**一致性触发（多帧/多模型）** + **规则触发（地图/事件）**
+    + **随机基线采样**（唯一能覆盖「未知的未知」的通路）</div>  <p>这个盲区还有一个更麻烦的性质：<strong>它是自我强化的</strong>。</p>  <ol>
+    <li>触发器只回传模型不确定的样本 →</li>
+    <li>标注 + 训练后，模型在「原本不确定的区域」上变得确定 →</li>
+    <li>下一轮触发器在这些区域沉默，转向新的不确定区域 →</li>
+    <li><strong>而象限 ② 的那些样本，模型从一开始就很确定，所以从头到尾都不会被触发</strong> →</li>
+    <li><strong>这块盲区会一直存在，而且不会体现在任何离线指标上</strong>（因为验证集是从同一个有偏的回传流里抽的）。</li>
+  </ol>  <table>
+    <thead><tr><th>偏差来源</th><th>具体机制</th><th>会漏掉什么</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>不确定性偏差</strong></td><td>只按模型自报的不确定性选样本</td><td><strong>象限 ②：自信地错</strong></td><td>一致性触发 + 规则触发 + 随机基线</td></tr>
+      <tr><td><strong>漏检不可见</strong></td><td>没有检出就没有框，也就没有分数</td><td>模型完全没看到的目标（远处、极端遮挡）</td><td>低阈值候选参与打分；地图先验；跟踪丢失规则</td></tr>
+      <tr><td><strong>聚合偏差</strong></td><td>mean 偏向框少的帧，count 偏向拥挤帧</td><td>整类场景（简单场景 / 复杂路口）</td><td>用 max 或 top-k mean；<strong>按场景桶分别设阈值</strong></td></tr>
+      <tr><td><strong>触发率的地理/时段偏差</strong></td><td>触发率在夜间/雨天天然更高 → 预算被这些时段吃光</td><td>白天晴天下那些「罕见但确实存在」的错误</td><td><strong>按桶分配预算</strong>而不是全局阈值</td></tr>
+      <tr><td><strong>闭环反馈偏差</strong></td><td>触发器是模型的函数，模型是回传数据的函数</td><td><strong>盲区会被固化并随时间加深</strong></td><td><strong>固定比例的随机采样（10–20%）作为无偏基线</strong>，并用它定期审计触发器</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>随机基线采样是这一整套里最容易被砍掉、也最不能砍的一环</strong>。它看起来极其低效——随机回传的帧里 99% 都是模型已经会的东西。但它有一个无可替代的作用：<em>它是唯一一条不经过模型判断的数据通路，因此是唯一能发现「未知的未知」的手段</em>。<strong>而且它同时提供了一个无偏的评测集</strong>——所有触发器的 precision / recall 都必须在这个无偏样本上度量，否则你根本不知道自己漏了多少。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>具体做法：<strong>把总预算的 10%–20% 划给纯随机采样（分层随机更好：按地理/时段/天气分层）</strong>，这批数据有两个用途——① 作为触发器的<strong>评测集</strong>：在这上面标注全部样本，就能算出每个触发器的真实 recall（分母是所有真 badcase，而不是「被触发的 badcase」）；② 作为模型的<strong>无偏验证集</strong>：它的分布才是真实路况分布，而回传流的分布已经被触发器扭曲了。<em>面试里能主动说出「必须留一部分随机采样做无偏审计」，是判断一个人是否真的做过闭环的分水岭</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pr_budget"><span class="num">7</span>把触发器当模型来评：PR 分析与带宽预算下的阈值优化</h2>
+  <p>既然触发器是一个二分类器，就应该用二分类器的方式评估它。定义清楚三个量：</p>  <ul>
+    <li><strong>触发率</strong> <code>rate = P(触发)</code>——这是<em>成本</em>，直接对应带宽与标注预算；</li>
+    <li><strong>精确率</strong> <code>precision = P(是真 badcase | 触发)</code>——回传的东西里有多少值得标；</li>
+    <li><strong>召回率</strong> <code>recall = P(触发 | 是真 badcase)</code>——真 badcase 抓到了多少。<em>注意分母必须来自随机基线采样，否则算不出来。</em></li>
+  </ul>  <p>于是「设阈值」就变成一个标准的<strong>约束优化</strong>问题：在总触发率不超过预算 B 的前提下，最大化召回。多个触发器并联时（OR 关系），目标写成：</p>  <div class="math-block">\[\max_{\tau_1,\dots,\tau_T}\; \Big|\bigcup_{t} S_t(\tau_t) \cap \mathcal{B}\Big| \qquad \text{s.t.} \qquad \Big|\bigcup_{t} S_t(\tau_t)\Big| \;\le\; B\cdot N\]</div>  <p>其中 <code>S_t(τ_t)</code> 是触发器 t 在阈值 τ_t 下选中的帧集合，<code>𝓑</code> 是真 badcase 集合。<strong>因为是「集合并集的覆盖」，这是一个 submodular（次模）最大化问题</strong>——贪心算法有 <code>1-1/e ≈ 63%</code> 的近似保证，而且实现只要十几行。<em>notebook 里会把这个贪心分配器写出来。</em></p>  <table>
+    <thead><tr><th>组合方式</th><th>怎么算</th><th>优点</th><th>问题</th></tr></thead>
+    <tbody>
+      <tr><td><strong>OR（并联）</strong></td><td>任一触发器命中即回传</td><td>召回高；各触发器独立可调、可单独下线</td><td><strong>触发率是并集</strong>，重叠部分白白算了两次预算 → 必须做全局去重</td></tr>
+      <tr><td><strong>AND（串联）</strong></td><td>多个同时命中才回传</td><td>精确率高</td><td>召回极低；容易只留下最平凡的 badcase</td></tr>
+      <tr><td><strong>加权打分</strong></td><td><code>s = Σ w_t·u_t</code>，对 s 设单一阈值</td><td>只有一个阈值要调；天然做了融合</td><td><strong>可解释性差</strong>；某个触发器坏掉时不易发现；权重难标定（量纲不同）</td></tr>
+      <tr><td><strong>级联</strong></td><td>车端便宜触发器粗筛 → 云端贵触发器精筛</td><td><strong>算力与带宽最优</strong></td><td>两级都要维护；粗筛的漏检无法被精筛挽回</td></tr>
+      <tr><td><strong>按桶配额</strong></td><td>每个场景桶（夜间/雨天/城区…）独立预算</td><td><strong>直接消除地理/时段偏差</strong></td><td>桶的划分本身是一个设计决策，需要定期回顾</td></tr>
+    </tbody>
+  </table>  <h3>量产系统里的真实做法：级联 + 按桶配额 + 随机基线</h3>  <p>把上面几条合起来，一个能上车的配置大致是这样：<strong>车端跑最便宜的三个触发器（多帧一致性、跟踪丢失、地图不符）做粗筛，触发率控制在 10⁻³ 量级；回传后在云端用大模型 + 多模型分歧做精筛，把 precision 提到 20–40%；总预算按场景桶分配，每桶有独立配额；额外划 15% 给分层随机采样做无偏审计</strong>。<em>这套结构的每一部分在前面都有对应的理由，没有一条是拍脑袋的。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>调阈值时有一个非常实用的经验：<strong>不要直接调「熵 &gt; 1.7」这种绝对阈值，而是调「触发率」这个百分位</strong>。因为绝对阈值会随模型版本漂移——换一版模型，同样的熵阈值可能让触发率翻十倍，直接打爆带宽。<em>而按分位数设阈（「触发 top-0.1% 最高熵的帧」）天然是自适应的</em>。<strong>实现上需要车端维护一个滑动窗口的分位数估计</strong>（P² 算法或简单的直方图即可），成本很低。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个必须提前设计的东西：<strong>安全阀（circuit breaker）</strong>。触发率一旦异常升高（模型换版、进入新区域、天气突变），必须能自动降级——例如把阈值临时上调、或直接停止回传并告警。<em>没有安全阀的触发器，会在某个雨夜把整个车队的流量打满</em>。<strong>这条在面试里说出来，会立刻显出「上过线」和「只写过 notebook」的区别</strong>：任何在车端持续运行、且消耗共享资源的组件，都必须有自我限流的能力。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="shadow"><span class="num">8</span>影子模式与线上工程：触发器怎么真的跑在车上</h2>
+  <p><span class="term">shadow mode</span>（影子模式）是这套体系的运行载体：<strong>新模型（或新触发器）在车上实时运行，但它的输出不接入控制，只用于与线上模型对比、记录分歧</strong>。它同时解决了三个问题——验证新模型、发现 badcase、收集数据——所以是量产团队的标配。</p>  <table>
+    <thead><tr><th>影子模式的三种用法</th><th>比什么</th><th>产出</th><th>注意</th></tr></thead>
+    <tbody>
+      <tr><td><strong>新模型 vs 线上模型</strong></td><td>两者的检测/分类结果差异</td><td><strong>发布前的真实路况验证</strong>，不用等 A/B</td><td>只知道「不一样」，不知道「谁对」→ 分歧片段仍需标注或大模型复检</td></tr>
+      <tr><td><strong>大模型 vs 车端小模型</strong></td><td>教师-学生分歧</td><td><strong>蒸馏最需要的样本</strong> + 车端模型的能力边界</td><td>大模型跑不动就只能抽样跑，或者回传后在云端跑</td></tr>
+      <tr><td><strong>新触发器 vs 旧触发器</strong></td><td>触发率、重叠度、命中率</td><td>触发器本身的 A/B 验证</td><td><strong>触发器也需要灰度发布</strong>，直接全量上线会打爆带宽</td></tr>
+    </tbody>
+  </table>  <p>车端落地时的五个硬约束，每一条都会实实在在地砍掉一些方案：</p>  <ol>
+    <li><strong>算力预算</strong>：TSR 只是众多感知任务之一，触发器能分到的算力常常不足 1 ms/帧。<em>这直接排除了「车端跑 K 个模型做分歧」，也排除了大部分 TTA 方案</em>。多帧一致性与规则触发之所以是首选，正是因为它们几乎免费。</li>
+    <li><strong>存储与环形缓冲</strong>：触发发生时，你需要的是<em>触发点之前</em>的几秒（问题往往在触发前就开始了）。所以必须常驻一个环形缓冲区，滚动保存最近 N 秒的原始帧。<strong>缓冲区大小 = 回看时长 × 帧率 × 分辨率，是一笔要提前算的账。</strong></li>
+    <li><strong>隐私与合规</strong>：回传前必须对人脸、车牌做模糊/脱敏，且要满足数据出境与用户授权的要求。<em>脱敏本身要花算力，且做得太狠会破坏训练数据的有效性</em>（把整块区域涂黑会制造训练-推理不一致）。</li>
+    <li><strong>触发器的版本与回滚</strong>：触发器配置（阈值、开关、桶配额）必须像模型一样有版本、可灰度、可远程回滚。<em>「改一个阈值要等下次 OTA」是不可接受的</em>。</li>
+    <li><strong>触发率监控与安全阀</strong>：实时上报每个触发器的触发率与带宽占用，异常时自动降级。<strong>触发率漂移本身是最早的系统异常信号</strong>——它比模型指标更早暴露「环境变了」或「上游变了」。</li>
+  </ol>  <div class="ascii">触发器的评估看板（每天该看的几个数）
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │ 触发器            触发率      带宽占比   精确率*   新场景占比  │
+  ├─────────────────────────────────────────────────────────────┤
+  │ 多帧类别跳变      3.2e-4      28%       34%      12%        │
+  │ 跟踪丢失          5.1e-4      44%       18%       9%        │
+  │ 地图不符          0.9e-4       8%       61%      31%   ★    │
+  │ margin 低         1.4e-4      12%       22%       4%        │
+  │ 接管/急刹前后     0.3e-4       3%       47%      22%        │
+  │ **分层随机基线**   0.6e-4       5%        2%      **41%** ★★ │
+  ├─────────────────────────────────────────────────────────────┤
+  │ 合计（去重后）    9.8e-4     100%       29%      —          │
+  │ 预算上限         10.0e-4                                    │
+  └─────────────────────────────────────────────────────────────┘
+   * 精确率的分母是回传量，分子是「经复检确认确实是 badcase」
+   ★  地图不符精确率最高 —— 因为它用了**模型之外的外部真值**
+   ★★ 随机基线精确率最低（2%），但**新场景占比最高（41%）** ——
+      它是唯一能发现「未知的未知」的通路，砍掉它就等于关闭了这条路
+
+  必看的三个趋势：
+    · 触发率是否漂移（模型/跟踪/地图/环境变了）
+    · 触发器之间的**重叠度**（重叠高 = 有一个是冗余的，可以省预算）
+    · 从触发到修复上线的**周期时间**（这才是数据闭环真正的 KPI）</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后一行值得单独强调：<strong>数据闭环的核心 KPI 不是「回传了多少数据」，而是「从发现问题到修复上线的周期时间」</strong>。<em>回传量是投入，修复速度才是产出</em>。一个每天回传 100 万帧但修一个 badcase 要六周的团队，远不如一个每天回传 5 万帧但两周就能闭环的团队。<strong>而周期时间的瓶颈通常不在模型，在标注排期与门禁流程</strong>——这也是模块 05 的主题。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从这个角度反推，触发器设计还有一个常被忽略的目标：<strong>让回传的数据「好标」</strong>。同样是 badcase，一个「远处 9 像素的模糊标志」标注员标不了（也标不准），而一个「近处清晰但被认错的标志」几分钟就能标完且质量高。<em>所以触发时最好带上「可标注性」的信号</em>——比如优先回传那些「同一 track 里既有远处的困难帧、也有近处的清晰帧」的片段，<strong>这样标注员标一次近处，就能通过 track 传播反标出整段的困难样本</strong>。<em>这是把第 4 节的时序反标技巧反过来用于触发器设计，收益极高而几乎无人在意。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>主动学习是一个有 30 年历史的领域，但它在深度学习 + 流式车队数据上的形态，绝大部分问题仍然是开放的。</p>  <ul>
+    <li><strong>批量主动学习的多样性问题</strong>：按不确定性取 top-k 会选出<em>一批互相高度相似</em>的样本（都是同一个失效模式），信息严重冗余。<em>BatchBALD</em>（Kirsch et al., NeurIPS 2019）用互信息显式建模了批内冗余；<em>Core-set</em>（Sener &amp; Savarese, ICLR 2018）从覆盖角度选样本。<strong>但两者在千万级流式数据上都跑不动</strong>——如何在「只能看一遍、只能用阈值」的在线设定下保证批多样性，目前没有好答案。</li>
+    <li><strong>不确定性估计本身的可靠性</strong>：深度集成（deep ensembles）目前仍是最可靠的不确定性来源，但车端跑不起。单模型近似（MC-dropout、evidential deep learning、Laplace 近似、conformal prediction）各有各的问题。<em><span class="term">Conformal prediction</span>（保形预测）因为能给出有覆盖率保证的预测集合，近年在自动驾驶里关注度上升很快</em>——它对触发器的意义是：<strong>可以把「触发率」直接和「真实错误率的上界」挂钩</strong>，而不是靠经验调阈值。</li>
+    <li><strong>「自信地错了」的检测</strong>：这是本模块指出的核心盲区，也是学术上的开放问题。相关方向包括 <span class="term">OOD detection</span>（分布外检测）、<span class="term">failure prediction</span>（失败预测，训练一个专门预测「主模型会不会错」的辅助模型）、以及用外部先验（地图、物理约束、多传感器一致性）做交叉验证。<em>其中「用物理/几何约束做自监督验证」在自动驾驶里最有前途，因为它完全不依赖模型自身的判断。</em></li>
+    <li><strong>主动学习的理论保证在深度模型上基本失效</strong>：经典主动学习的样本复杂度分析依赖凸性与可实现性假设，深度网络两个都不满足。<em>实践中甚至存在「主动学习不如随机采样」的报告</em>（尤其在数据量已经很大、或不确定性估计很差时）——<strong>所以「用随机基线作对照」不只是工程上的谨慎，也是学术上的必需</strong>。</li>
+    <li><strong>用 VLM 做触发器</strong>：直接让视觉-语言模型判断「这一帧有没有异常/罕见场景」，可以表达远比阈值规则丰富的条件（「有临时施工标志」「有被遮挡一半的限速牌」）。<em>目前的瓶颈是车端跑不动，所以只能作为云端二级筛选</em>；蒸馏出一个极小的「场景异常打分器」放到车端，是当前很热的工程方向，也直接对应 JD 里的「automated data mining workflows」。</li>
+    <li><strong>闭环反馈偏差的理论刻画</strong>：触发器 → 数据 → 模型 → 触发器 是一个反馈系统，它会收敛到什么分布？盲区会如何演化？<em>这与推荐系统里的 feedback loop / filter bubble 研究是同构问题</em>，但在感知系统上几乎没有系统性研究。<strong>目前唯一可靠的对策仍然是那条最朴素的：留一条不经过模型的随机通路。</strong></li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Settles, <em>Active Learning Literature Survey</em>（2009）——把不确定性采样、query-by-committee、expected model change 等基本框架讲全了，读第 3 章即可；Beluch et al., <em>The Power of Ensembles for Active Learning in Image Classification</em>（CVPR 2018）——证明集成分歧优于 MC-dropout，是「一致性触发」的实证基础；Kirsch et al., <em>BatchBALD</em>（NeurIPS 2019）——批量选择的冗余问题与互信息解法；Sener &amp; Savarese, <em>Active Learning for CNNs: A Core-Set Approach</em>（ICLR 2018）——覆盖视角，与模块 04 的多样性采样直接相关；Guo et al., <em>On Calibration of Modern Neural Networks</em>（ICML 2017）——不确定性触发器的前提条件；Lakshminarayanan et al., <em>Simple and Scalable Predictive Uncertainty Estimation using Deep Ensembles</em>（NeurIPS 2017）；Angelopoulos &amp; Bates, <em>A Gentle Introduction to Conformal Prediction</em>（2021）——把触发率与错误率上界挂钩的现代工具。相邻模块：C58 m02（难例挖掘）、C58 m04（大规模挖掘基础设施）、C58 m05（闭环验证）、C55 m04（时序融合与跟踪）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_hard_mining/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 难例挖掘：OHEM、难负样本与难例的类型学</div></a>
+    <a class="next" href="../04_mining_infra/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 大规模挖掘基础设施</div></a>
+  </div>
+
+</div>
+</body>
+</html>

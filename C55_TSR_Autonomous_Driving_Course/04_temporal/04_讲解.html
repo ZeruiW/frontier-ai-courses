@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 时序与多帧融合：从单帧检测到稳定输出</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 时序与多帧融合：从单帧检测到稳定输出</h1>
+  <p class="subtitle">TSR 是一个「接近过程」，单帧永远不够 · 标志静止 + 自车运动可预测 → 关联问题比行人跟踪简单一个量级 · ByteTrack 的低分二次关联为什么对远处小标志格外有效 · 贝叶斯 log-odds 累积 vs K-of-N 滑窗投票的响应延迟 · 迟滞双阈值一行不等式消灭闪烁 · 生命周期状态机决定首检距离 · 「越稳越晚」这个根本矛盾必须被量化</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–03；C54 模块 01（匈牙利匹配）会被直接复用；C53 模块 05（延迟预算）有帮助</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_temporal_fusion.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">SORT / DeepSORT / ByteTrack / OC-SORT；BEVFormer 与 StreamPETR 的时序传播；卡尔曼滤波与贝叶斯滤波基础</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#approach">TSR 是一个「接近过程」，不是一次快照</a></li>
+      <li><a href="#tracking">跟踪：把帧间的检测串成同一个物体</a></li>
+      <li><a href="#motion">运动补偿：TSR 相对行人跟踪的巨大优势</a></li>
+      <li><a href="#fusion">证据累积：滑窗投票 vs 贝叶斯更新</a></li>
+      <li><a href="#hysteresis">迟滞：用两个阈值消灭闪烁</a></li>
+      <li><a href="#lifecycle">生命周期状态机：把所有策略收进一张图</a></li>
+      <li><a href="#map_prior">与地图和定位的先验融合</a></li>
+      <li><a href="#tradeoff">延迟与稳定性的根本矛盾：把它算成一笔账</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="approach"><span class="num">1</span>TSR 是一个「接近过程」，不是一次快照</h2>
+  <p>绝大多数检测教程默认的场景是「给一张图，输出框」。<strong>TSR 不是这样的任务</strong>。一块限速牌不会突然出现在你面前——它先在一百多米外变成几个像素的斑点，然后随着自车前进逐帧变大、变清晰，最后在车头掠过时离开视野。<em>同一个物理目标，你会看到它 80–120 次。</em></p>  <p>把这件事量化一遍，你会发现「单帧检测」这个提法在 TSR 里有多浪费。用针孔相机模型，一块边长 <code>S</code> 米的标志在距离 <code>Z</code> 米处的像素边长是：</p>  <div class="math-block">\[w_{px} \;=\; \frac{f_{px}\cdot S}{Z}, \qquad f_{px} \approx \frac{W/2}{\tan(\mathrm{HFOV}/2)}\]</div>  <p>取一组量产常见的参数：1920×1080、水平 FOV 65°（<code>f≈1500 px</code>）、限速牌边长 0.6 m、车速 100 km/h、30 FPS。于是每帧自车前进 <code>27.8/30 = 0.926 m</code>，而标志的像素尺寸是：</p>  <table>
+    <thead><tr><th>距离 Z</th><th>像素边长</th><th>单帧检出概率（典型）</th><th>从这里到 20 m 还剩多少帧</th></tr></thead>
+    <tbody>
+      <tr><td>120 m</td><td><strong>7.5 px</strong></td><td>≈ 0.18（几乎靠猜）</td><td>108 帧</td></tr>
+      <tr><td>80 m</td><td>11.3 px</td><td>≈ 0.42</td><td>65 帧</td></tr>
+      <tr><td>60 m</td><td>15.0 px</td><td>≈ 0.73</td><td>43 帧</td></tr>
+      <tr><td>40 m</td><td>22.5 px</td><td>≈ 0.95</td><td>22 帧</td></tr>
+      <tr><td>20 m</td><td>45.0 px</td><td>≈ 0.99</td><td>0 帧</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>换个角度看这张表：<strong>在标志离开视野之前，系统已经拿到了近百次独立（或准独立）的观测机会</strong>。如果你只用最后一帧、或者每帧独立判断然后直接上报，等于把其中 99 次证据扔掉了。<em>更糟的是，你还把每一次观测的噪声都原样传给了下游</em>——某一帧因为一片树叶挡了半个牌子而漏检，下游就会看到限速值凭空消失一帧。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说，多帧融合把问题从「单样本分类」变成了<span class="term">序贯假设检验</span>（sequential hypothesis testing）：给定一串观测 <code>z_1..z_t</code>，判断假设 <code>H</code>（此处存在类别为 c 的标志）是否成立。序贯检验的经典结论是，<em>在同样的错误率约束下，它需要的样本量显著少于固定样本量检验</em>；反过来说，在同样的样本量下它的错误率显著更低。<strong>这就是多帧融合的理论依据，而不是「多看几眼比较保险」这种朴素直觉。</strong></p></div>
+  </div>  <p>但「多看几眼」不是免费的，因为 TSR 的输出有<strong>时间窗口</strong>。假设从 100 km/h 降到 60 km/h，用舒适减速度 1.5 m/s²，需要 7.4 秒、走过约 165 米。<em>也就是说，理想情况下限速牌应该在一百多米外就被确认</em>——而那时它只有 7–8 个像素。这构成了本模块要反复回到的张力：<strong>越晚上报越稳，越早上报越有用</strong>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>本模块的一句话心法：<strong>单帧检测器输出的是「证据」，不是「结论」。时序模块的职责是把证据累积成结论，并决定何时公布这个结论。</strong> <em>把这两件事分开，是 TSR 系统设计里最重要的一次切分</em>——它让你可以独立地调「检测器多敏感」和「系统多敢报」，而不必每次都重训模型。面试里如果你能主动说出这句话，基本就绕开了「你只会调 mAP」的判断。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tracking"><span class="num">2</span>跟踪：把帧间的检测串成同一个物体</h2>
+  <p>要累积证据，先得知道<strong>哪些帧的哪个框说的是同一块牌子</strong>。这就是<span class="term">multi-object tracking</span>（多目标跟踪）里的<span class="term">data association</span>（数据关联）问题。TSR 用得上的关联信号有三层，代价与收益递增：</p>  <table>
+    <thead><tr><th>关联信号</th><th>怎么算</th><th>代价</th><th>在 TSR 里的表现</th></tr></thead>
+    <tbody>
+      <tr><td><strong>IoU / 框重叠</strong></td><td>上一帧框（或其预测）与本帧框的 IoU</td><td>≈ 0</td><td>近处极好；<strong>远处小框极差</strong>（见下）</td></tr>
+      <tr><td><strong>中心距离 / 归一化距离</strong></td><td>中心点欧氏距离除以框尺寸，或马氏距离</td><td>≈ 0</td><td>对小目标比 IoU 稳健得多，推荐做主信号</td></tr>
+      <tr><td><strong>外观特征</strong></td><td>从 crop 提 embedding，算余弦相似度</td><td>一次额外前向（DeepSORT 路线）</td><td>TSR 里性价比低——<em>同类标志长得一模一样，外观根本不可分</em></td></tr>
+    </tbody>
+  </table>  <p>第三行值得展开：<strong>DeepSORT 那套「外观 re-ID」在 TSR 上基本失效</strong>，因为同一条路上的三块限速 60 牌在外观空间里是同一个点。行人跟踪里外观是最强的区分信号，在 TSR 里它几乎没有信息量。<em>反过来说，TSR 的救星是运动模型——这正是下一节的内容。</em></p>  <h3>IoU 关联在小目标上的失效，要用数字说</h3>  <p>一个 <code>8×8</code> 的框，如果帧间中心位移 2 px（且尺寸不变），重叠区域是 <code>6×6=36</code>，并集是 <code>2×64−36=92</code>，<strong>IoU = 36/92 ≈ 0.39</strong>。位移 3 px 时 IoU = 25/103 ≈ 0.24——已经跌破常用的 0.3 关联阈值。而同样 2 px 的位移放到 <code>64×64</code> 的框上，IoU = (62×64)/(2×4096−3968) = 3968/4224 ≈ <strong>0.94</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以「IoU 阈值 0.3」这条在行人跟踪里工作良好的默认设置，<strong>搬到 TSR 的远距离场景就会直接把轨迹打断</strong>：明明是同一块牌子，因为框小、抖动 2–3 像素，关联失败，于是新建一条轨迹，之前累积的证据全部作废，确认时间被反复重置。<em>症状是「远处的牌子怎么也确认不了」，而根因在关联层不在检测层</em>——这类误诊在实际项目里非常常见。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>正确的做法有两条，通常一起用：① <strong>把 IoU 换成尺度归一化的中心距离</strong>，例如 <code>d = ‖c_t − ĉ_t‖ / max(w, h)</code>，它对框尺寸不敏感；② <strong>把阈值做成尺度的函数</strong>，小框放宽、大框收紧。更彻底的做法是用<span class="term">Mahalanobis distance</span>（马氏距离）——把预测位置的不确定度（卡尔曼滤波的协方差）显式建模进来，<em>远处目标的位置协方差本来就大，马氏距离会自动放宽门限</em>。这是 SORT/DeepSORT 用马氏门控而不是纯 IoU 门控的原因。</p></div>
+  </div>  <h3>贪心 vs 匈牙利：一个两行的反例</h3>  <p>拿到代价矩阵之后，怎么配对？<strong>贪心</strong>（每次取当前最相似的一对，配上就锁定）实现最简单，但它是局部最优。看这个 2×2 的 IoU 矩阵：</p>  <div class="ascii">            det D0      det D1
+track T0     0.60        0.55
+track T1     0.58        0.10
+
+贪心：先挑全局最大 0.60 → (T0,D0) 锁定
+      剩下只能 (T1,D1) = 0.10          总相似度 = 0.70
+
+匈牙利：全局最优 (T0,D1)=0.55 + (T1,D0)=0.58   总相似度 = 1.13
+
+差别的来源：T1 只有 D0 能用（对 D1 几乎没有重叠），
+            而 T0 对两个都行 —— 贪心先把 T0 的位置占了。</div>  <p>这个结构在 TSR 里天天发生：<strong>门架上并排两块牌子</strong>（限速 + 解除、或限速 + 货车专用），框互相靠近；其中一块被短暂遮挡，剩下的检测同时对两条轨迹都有中等 IoU。<em>贪心会把它配给「更像」的那条，而那条其实有更好的备选</em>——结果是一条轨迹丢帧、另一条 ID 跳变。</p>  <p>匈牙利算法（Kuhn–Munkres）在 <code>O(n³)</code> 时间里求出总代价最小的一对一配对，机理与代价矩阵设计在 <strong>C54 模块 01</strong> 里已经完整讲过——<em>那门课里为 DETR 的集合预测写的匈牙利实现，可以原样搬到这里做跟踪关联</em>。这不是巧合：<strong>「一对一分配」是同一个数学问题，只是一边发生在训练时（预测 ↔ GT），一边发生在推理时（轨迹 ↔ 检测）</strong>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>匈牙利算法本身<strong>不认识阈值</strong>——它会把每一行都配掉，哪怕最优的那个配对 IoU 只有 0.01。<em>所以必须先做门控（gating）：把不合格的配对代价设成一个大常数（或 <code>inf</code>），匹配完成后再逐对检查、把超过门限的配对拆掉</em>。漏掉这一步的典型症状是「一辆车驶过后，标志的轨迹莫名其妙跳到了车尾灯上」。</p>
+  </div>  <h3>ByteTrack 的两阶段思路：为什么它特别适合 TSR</h3>  <p><span class="term">ByteTrack</span> 的做法一句话说清：<strong>先用高分检测（&gt; 0.6）做第一轮关联；剩下的低分检测（0.1–0.6）不用来新建轨迹，只用来「续」已有的轨迹</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这个小改动收益巨大？因为<strong>低分框有两种截然不同的来源</strong>：一种是真背景的随机响应（该丢），一种是被遮挡/太远的真目标（该留）。传统做法用一个阈值一刀切，把两种都丢了。ByteTrack 用「有没有一条已经存在的轨迹在预测位置上等着它」来区分这两种——<em>有轨迹接应的低分框，大概率是真目标</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>把它翻译成 TSR 的语言：<strong>一块标志从 120 m 接近到 20 m，它的检测分数是单调上升的</strong>。在最有价值的远距离段，分数恰好都在 0.2–0.5 这个「低分区」。如果按 0.5 一刀切，你在 60 m 之外基本什么都拿不到；而用 ByteTrack 的两阶段策略，只要在 40 m 处高分建轨成功，就可以<em>反向</em>用低分框把轨迹维持住——更进一步，配合下一节的运动模型，甚至可以在轨迹建立后<strong>回溯</strong>确认更远处的低分观测。<strong>「用轨迹的存在性给低分证据加权」，是本节最可迁移的一条。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="motion"><span class="num">3</span>运动补偿：TSR 相对行人跟踪的巨大优势</h2>
+  <p>现在讲本模块最该记住的一条领域知识。<strong>交通标志是静止的刚体，自车的运动是自己测出来的。</strong> 这两句合起来意味着：<em>标志在下一帧图像上的位置和大小，可以被解析地预测出来，误差只来自里程计噪声和相机标定误差。</em></p>  <p>推导很短。取相机坐标系（光心为原点、Z 轴指向前方），标志中心在 <code>(X, Y, Z)</code>，像素坐标是 <code>u = c_x + f X/Z</code>、<code>v = c_y + f Y/Z</code>，像素宽度 <code>w = fS/Z</code>。自车沿光轴前进 <code>d</code> 米后，<code>X, Y</code> 不变而 <code>Z → Z−d</code>，于是：</p>  <div class="math-block">\[s=\frac{Z}{Z-d};\qquad u'=c_x+(u-c_x)\,s,\quad v'=c_y+(v-c_y)\,s,\quad w'=w\,s\]</div>  <p>也就是说，<strong>整幅画面里所有静止物体都以「光心为中心」按同一个尺度因子 s 向外放射性膨胀</strong>——这就是所谓的 <span class="term">focus of expansion</span>（扩张中心）。数字感受一下：</p>  <table>
+    <thead><tr><th>距离 Z</th><th>每帧尺度因子 s（d = 0.926 m）</th><th>20 px 的框中心位移</th><th>不补偿时的帧间 IoU</th></tr></thead>
+    <tbody>
+      <tr><td>100 m</td><td>1.0093</td><td>≈ 2.2 px（若中心离光心 240 px）</td><td>0.80 左右</td></tr>
+      <tr><td>50 m</td><td>1.0189</td><td>≈ 4.5 px</td><td>0.63 左右</td></tr>
+      <tr><td>30 m</td><td>1.0318</td><td>≈ 7.6 px</td><td>0.44 左右</td></tr>
+      <tr><td>20 m</td><td>1.0485</td><td>≈ 11.6 px</td><td><strong>0.28 左右（已跌破门限）</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>不做运动补偿的后果，在<strong>近距离</strong>反而最严重——这一点和直觉相反。很多人以为「近了框大了，关联肯定更容易」，但 <code>s = Z/(Z−d)</code> 随 Z 减小而快速增大，<em>近距离时框在图像上跑得飞快</em>。于是出现一个经典 badcase：一块牌子在中远距离跟得好好的，快到车头时轨迹突然断掉、ID 跳变、状态回到 tentative——刚好发生在最需要它稳定的时刻。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>补偿之后，<strong>预测残差从「几十像素」降到「里程计误差 + 标定误差」的量级</strong>。轮速里程计在 1/30 秒内的误差是毫米级，投影到像素上远小于 1 px；主要残差来自俯仰变化（过减速带、刹车点头）和横向运动（变道、弯道），这两项可以用 IMU 的角速度做一阶补偿。<em>实践中做完补偿，关联门限可以收得很紧（IoU &gt; 0.5 或残差 &lt; 3 px），既不丢真目标又几乎不会错配</em>——而在行人跟踪里你永远不敢把门限收这么紧。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把对比讲透：<strong>行人跟踪难，是因为被跟踪对象是一个有自主意志的 agent——他可以随时停、转、被遮挡后从另一侧出现，运动模型只能给出很宽的先验。TSR 里被跟踪对象是钉在地上的一块铁皮，它的图像运动完全由自车运动决定，而自车运动是你自己的传感器直接测量的。</strong> <em>这是 TSR 工程上最大的一块「免费午餐」，而绝大多数只做过通用检测的候选人不会主动提到它。面试里主动讲这一点，等于告诉面试官你真的想过这个领域的特殊结构。</em></p>
+  </div>  <h3>反过来用：运动一致性是一个免费的误检过滤器</h3>  <p>既然静止物体的图像膨胀率被 <code>s = Z/(Z−d)</code> 严格约束，那么<strong>凡是膨胀率对不上的，就不是静止物体</strong>。这直接干掉 TSR 里最烦人的一类误检：</p>  <ul>
+    <li><strong>前车车身上的贴纸 / 尾门上的限速标识 / 货车尾部的广告</strong>——前车与自车速度接近，相对接近速度只有 2–3 m/s，实际膨胀率远小于「静止假设」的预测。累积十几帧后，观测尺度与预测尺度的对数差会拉开到 0.5 以上，<em>而真标志的这个量是 0.0X 量级</em>，两类完全分开。</li>
+    <li><strong>对向车道上的移动广告车 / 公交车身广告</strong>——相对接近速度反而更快，膨胀率高于预测，同样对不上。</li>
+    <li><strong>路侧固定广告牌</strong>——它是静止的，运动一致性检验<em>拦不住它</em>。这类只能靠外观与上下文（形状/颜色/位置先验）解决。<strong>诚实地说清楚一个方法的边界，比夸大它的作用重要得多。</strong></li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <p>运动补偿的三个隐藏前提，任何一条不成立都会让它变成负收益：<strong>①里程计可用且时间对齐</strong>（图像时间戳与轮速时间戳错开 30 ms，在 100 km/h 下就是 0.8 m 的位置误差）；<strong>②相机内参与俯仰角已标定</strong>（<code>c_x, c_y</code> 用错会让扩张中心偏移，补偿反而制造残差）；<strong>③自车运动近似为沿光轴平移</strong>——转弯、变道、上下坡时必须用完整的 <code>R, t</code> 而不是标量 <code>d</code>。<em>在弯道上用直线模型做补偿，是一个会让你在弯道场景专项掉点、却在整体指标上看不出来的经典坑。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fusion"><span class="num">4</span>证据累积：滑窗投票 vs 贝叶斯更新</h2>
+  <p>轨迹建立起来之后，问题变成：<strong>这条轨迹上一串带分数的观测，该怎么合成一个「有 / 没有 / 是哪一类」的判断？</strong> 工业界的两条主流路线是滑窗投票与贝叶斯累积，它们的差别不是「哪个更准」，而是<em>响应延迟的形状完全不同</em>。</p>  <h3>路线 A：滑窗投票（M-of-K）</h3>  <p>最近 K 帧里有至少 M 帧检出（且类别一致）就上报。实现只要一个环形缓冲区，几十行 C++ 就能写完，<strong>没有任何需要标定的连续量</strong>——这是它在量产系统里长盛不衰的真正原因：<em>可解释、可穷举测试、参数只有两个整数</em>。</p>  <h3>路线 B：贝叶斯累积（log-odds 递推）</h3>  <p>把每帧观测当作独立证据，在对数几率（log-odds）域上做加法：</p>  <div class="math-block">\[\ell_t=\ell_{t-1}+\log\frac{P(z_t\mid H)}{P(z_t\mid \neg H)},\qquad \ell_0=\log\frac{P(H)}{P(\neg H)}\]</div>  <p>如果检测器的分数已经<strong>标定</strong>（模块 02 的 ECE/可靠性图讲过怎么验），那么单帧的证据量就是 <code>logit(s) = log(s/(1−s))</code>，未检出帧则加一个负的常数惩罚。上报条件是 <code>ℓ_t &gt; τ_on</code>。</p>  <table>
+    <thead><tr><th></th><th>滑窗投票 M-of-K</th><th>贝叶斯 log-odds 累积</th></tr></thead>
+    <tbody>
+      <tr><td>用到分数大小吗</td><td><strong>不用</strong>（0.51 与 0.99 同权）</td><td><strong>用</strong>（证据量正比于 logit）</td></tr>
+      <tr><td>确认延迟</td><td>刚性：<strong>至少 M 帧</strong>，与证据强度无关</td><td>自适应：一帧 0.99 就可能够，弱证据要攒很久</td></tr>
+      <tr><td>对「持续中等分」的反应</td><td><em>会确认</em>（0.55 也算一票）</td><td><em>也会确认，但慢得多</em>，且可通过 τ 调节</td></tr>
+      <tr><td>需要标定吗</td><td>不需要</td><td><strong>需要</strong>——分数不准 = 证据量算错</td></tr>
+      <tr><td>参数</td><td>两个整数 M, K</td><td>τ_on / τ_off / miss 惩罚 / clamp / 衰减</td></tr>
+      <tr><td>可测试性</td><td><strong>可穷举</strong>（K 帧只有 2^K 种输入）</td><td>连续状态，只能抽样测</td></tr>
+      <tr><td>典型归属</td><td>安全相关的最终判决层</td><td>证据层 / 融合层</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>两者最有意思的差别在<strong>「弱但持续」的证据</strong>上。一块被树叶挡了一半的牌子，每帧分数稳定在 0.52。投票法（阈值 0.5）会认为它每帧都「检出」，3 帧后就确认——<em>它把 0.52 当成了 0.99</em>。贝叶斯法算出每帧证据只有 <code>log(0.52/0.48) = 0.08</code>，要攒到 τ_on = 3.0 需要 37 帧。<strong>哪个对？取决于分数标定得好不好</strong>：如果 0.52 真的意味着 52% 的后验概率，贝叶斯是对的；如果检测器在遮挡场景上系统性低估（分数被压低但其实很确定），贝叶斯就过于保守。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>反过来在<strong>「强但短暂」的证据</strong>上，结论相反。一块近距离的大牌子第一帧就给出 0.98，贝叶斯当帧证据是 <code>log(0.98/0.02) = 3.9</code>，<em>一帧就越过 τ_on</em>；而 3-of-5 投票<strong>无论如何都要等满 3 帧</strong>（100 km/h 下 = 2.8 m）。<em>在「牌子突然从遮挡后露出、而车已经很近了」这个场景里，那 3 帧的刚性延迟是真实的安全成本。</em> 这就是为什么成熟系统往往<strong>两者串联</strong>：贝叶斯层做连续的证据累积（快、信息利用充分），投票层做最终判决（可穷举验证、给安全评审看）。</p></div>
+  </div>  <div class="callout danger"><span class="label">证据卡死：无界累加是会出人命的 bug</span>
+    <p>贝叶斯累积有一个必须处理的实战故障，我称之为「<strong>证据卡死</strong>」：<code>ℓ</code> 是无界累加的，一块牌子跟了 80 帧、每帧 +3.5，<code>ℓ</code> 会累到 280。此后<strong>即使它已经被车头掠过、连续 30 帧完全检不到</strong>（每帧 −0.4），<code>ℓ</code> 仍有 268，远在 τ_off 之上——<em>系统会一直坚称前方有一块限速牌，直到轨迹因为 max_age 被强制删除</em>。如果轨迹还因为运动补偿被「维持」着，它甚至可以卡死几秒钟。</p><p><strong>解法是三件套，缺一不可</strong>：① <code>clamp</code> 把 <code>ℓ</code> 限制在 <code>[−L, +L]</code>（典型 L = 5–8，对应 99.3%–99.9% 的置信上限）；② 加<strong>时间衰减</strong> <code>ℓ ← λℓ</code>（λ≈0.98），让旧证据自然遗忘；③ 对<strong>观测相关性</strong>降权——相邻帧根本不独立（同一个 ISP、几乎相同的视角、相同的遮挡），把它们当独立证据会指数级地高估置信度。<em>一个粗糙但有效的近似：每 n 帧才计入一次证据，或把每帧的 logit 乘以 1/n。</em></p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>第 ③ 点值得再强调一次，因为它是<strong>面试里区分「读过贝叶斯滤波」和「用过贝叶斯滤波」的分水岭</strong>。相邻帧的检测结果相关系数常常在 0.9 以上（同一片树叶挡着、同一个曝光设置）。若把 10 帧强相关观测当作 10 个独立样本，<em>有效样本量其实只有 1–2 个</em>，累积出来的置信度会虚高一到两个数量级。<strong>面试官想听的是：你知道「独立」这个前提在时序数据上默认不成立，并且知道至少一种补救办法。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hysteresis"><span class="num">5</span>迟滞：用两个阈值消灭闪烁</h2>
+  <p>假设融合层已经输出了一个连续的置信量（log-odds 或滑窗命中率），最后一步是把它变成一个<strong>二值的上报状态</strong>。用单阈值会立刻遇到 TSR 最刺眼的用户可见缺陷：<strong>闪烁</strong>。</p>  <p>原因是纯统计的。设置信量在阈值附近波动，均值 0.50、标准差 0.10。单阈值 0.50 意味着每一帧都在做一次公平抛硬币，<em>相邻两帧状态不同的概率约 50%</em>——300 帧里会发生大约 150 次上报/撤销翻转。仪表盘上的限速数字会以每秒十几次的频率闪，而下游的限速控制逻辑会收到 150 次「有效/失效」事件。</p>  <div class="ascii">单阈值 τ = 0.50                       迟滞 τ_on = 0.70 / τ_off = 0.30
+
+conf                                  conf
+0.7 ┤     ╭╮   ╭╮                     0.7 ┤─────────────────────  τ_on
+0.5 ┼─╮╭─╯╰─╮╭╯╰╮╭─   τ               0.5 ┤ ╮╭─╮╭─╮╭─╮╭─╮╭─╮
+0.3 ┤ ╰╯    ╰╯  ╰╯                    0.3 ┤─────────────────────  τ_off
+    └──────────────── t                   └──────────────── t
+
+state                                 state
+ ON ┤ ▁▄▁▄▁▄▁▄▁▄▁▄▁▄  ← 抖成一片        ON ┤ ▁▁▁▁▁▁▁▁▁▁▁▁▁▁  ← 稳
+OFF ┤                                  OFF ┤
+
+翻转次数 ≈ 150 / 300 帧               翻转次数 ≈ 7 / 300 帧
+用户体验：仪表盘限速数字在闪            用户体验：稳定显示
+
+代价：撤销也变慢了 —— 一旦误报上去，
+      要跌破 τ_off 才撤得掉。</div>  <p><span class="term">Hysteresis</span>（迟滞）的做法就一句话：<strong>上报用高阈值 τ_on，撤销用低阈值 τ_off，且 τ_on &gt; τ_off</strong>。系统进入 ON 状态后，要一直等到置信量跌破 τ_off 才回到 OFF。这样在 <code>[τ_off, τ_on]</code> 这个「死区」内，噪声再怎么抖也不会引起状态变化。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>取 τ_on = 0.70、τ_off = 0.30，噪声 σ = 0.10：从 OFF 翻到 ON 需要一次 +2σ 的偏离（概率 2.3%），反向同理。<strong>翻转率从每帧 50% 掉到每帧 2.3%，降了 20 倍</strong>，而且这个降幅是<em>指数级</em>随死区宽度增长的（死区宽 4σ 时约 0.003%）。这是一个几乎不花钱的巨大改善——代价只有一行代码和两个常数。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但迟滞<strong>不是免费的</strong>，它的代价藏在反方向：<em>一旦误报上去了，撤销也要跨越同样宽的死区</em>。一个瞬时误报如果不幸冲到 τ_on 之上，它至少要维持到置信量掉回 τ_off 才消失——<strong>「误报持续时长」这个指标会因为迟滞而系统性变长</strong>。所以 τ_off 不能设得太低，否则你换来的是「不闪，但错得更久」。<em>这两个阈值的正确设法不是拍脑袋，而是把它们连到模块 05 的两个指标上：τ_on 决定 FP/km 与首报距离，τ_off 决定误报持续时长的 p95。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>面试高频追问：「既然有『连续 N 帧才上报』，为什么还需要阈值迟滞？」</strong> 标准答案是：<em>它们作用在两个正交的维度上</em>。「连续 N 帧」是<strong>时间维</strong>的迟滞——要求证据在时间上持续；「τ_on/τ_off」是<strong>幅度维</strong>的迟滞——要求证据在强度上明确。单靠时间维挡不住「持续了 20 帧的 0.51 分误检」，单靠幅度维挡不住「单帧冲到 0.99 的闪光误检」。<strong>成熟系统两个都用，而且还会加第三个维度：状态机的 max_age（撤销也要求持续）。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="lifecycle"><span class="num">6</span>生命周期状态机：把所有策略收进一张图</h2>
+  <p>把前面几节的机制装配起来，就得到 TSR 时序模块的核心数据结构：<strong>每条轨迹一个状态机</strong>。这套状态划分继承自 SORT，但每个转移条件都被 TSR 的领域约束重新解释过。</p>  <div class="ascii">                    新检测（无轨迹接应）
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │  TENTATIVE    │  已建轨，**不向下游上报**
+                    │  hits &lt; N_init│  作用：吸收单帧闪光误检
+                    └───────┬───────┘
+       连续 miss ≥ 2        │  hits ≥ N_init  且  ℓ ≥ τ_on
+       ──────────────┐      ▼
+                     │  ┌───────────────┐
+                     │  │  CONFIRMED    │ ── 向下游上报 ──▶ 限速约束 / HMI / VLA
+                     │  │  reported=T   │
+                     │  └───┬───────▲───┘
+                     │ miss │       │ 重新关联上（低分框也算，ByteTrack）
+                     │      ▼       │       且 ℓ 仍 ≥ τ_off
+                     │  ┌───────────────┐
+                     │  │  LOST(coast)  │  用运动模型**外推**位置，
+                     │  │  0&lt;miss&lt;max_age│  仍上报（短暂遮挡不该让输出消失）
+                     │  └───────┬───────┘
+                     │          │ miss ≥ max_age  或  ℓ &lt; τ_off
+                     ▼          ▼
+                    ┌───────────────┐
+                    │   DELETED     │  释放 ID
+                    └───────────────┘
+
+关键：TENTATIVE 阶段不上报 —— 这一条挡掉了绝大部分单帧误检，
+      而它的代价就是首报距离往后退 N_init 帧（100 km/h 下每帧 0.93 m）。</div>  <p>每个参数都直接对应一个可测量的指标，这是设计这套状态机时最该建立的映射：</p>  <table>
+    <thead><tr><th>参数</th><th>调大会怎样</th><th>调小会怎样</th><th>对应的评测指标（模块 05）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>N_init</strong>（确认所需命中数）</td><td>误报大幅下降，首报距离后退</td><td>反应快，单帧误检漏出去</td><td>FP / 100 km ↔ 首次检出距离</td></tr>
+      <tr><td><strong>max_age</strong>（丢失后保留帧数）</td><td>扛得住长遮挡，但误报持续更久</td><td>遮挡一断就丢，输出闪断</td><td>遮挡场景 recall ↔ 误报持续时长 p95</td></tr>
+      <tr><td><strong>τ_on</strong></td><td>更保守，只报高置信</td><td>更激进，远处也敢报</td><td>precision ↔ 远距离 recall</td></tr>
+      <tr><td><strong>τ_off</strong></td><td>撤销快，但可能闪</td><td>撤销慢，误报赖着不走</td><td>闪烁次数 ↔ 误报持续时长</td></tr>
+      <tr><td><strong>关联门限</strong></td><td>不易错配，但易断轨</td><td>轨迹连续，但可能串到别的目标</td><td>ID switch 率 ↔ 轨迹连续性</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>LOST 状态（coasting，惯性滑行）在 TSR 里的价值被严重低估。</strong> 一块牌子被前方大货车挡住 4–8 帧是家常便饭。如果没有 coasting，输出会消失再出现，下游看到的是「限速 60 → 无 → 限速 60」，很多下游逻辑会在「无」的那一刻回落到默认限速，然后再跳回来。<em>有了 coasting，加上上一节的运动模型能<strong>准确</strong>外推位置（因为标志静止），遮挡结束后重关联的成功率非常高</em>——这又是一次运动模型带来的红利。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但 coasting 的危险对称地存在：<strong>它同样会让误报活得更久</strong>。一个被确认的误报进入 LOST 后，还会被继续上报 max_age 帧。所以工程上的处理是<em>非对称的</em>：对已确认的<strong>真实类别</strong>用较大的 max_age（扛遮挡），对<strong>低置信或运动一致性存疑</strong>的轨迹用较小的 max_age（快速丢弃）。<strong>「参数按轨迹质量分档，而不是全局一刀切」是这一层最实用的工程手艺。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个容易写错的实现细节：<strong>coasting 期间轨迹的位置必须继续用运动模型推进，而不是冻结在最后一次观测的位置上</strong>。冻结会导致遮挡结束时预测位置已经落后真实位置十几个像素（近距离尤其严重），重关联直接失败——<em>于是你既付出了 coasting 的误报代价，又没拿到它的抗遮挡收益</em>。这个 bug 在代码 review 里很难看出来，但在「近距离被遮挡」的专项集上会暴露成一个显著的召回坑。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="map_prior"><span class="num">7</span>与地图和定位的先验融合</h2>
+  <p>如果车上有高精地图（或者哪怕只是一份众包的标志图层），它天然就是贝叶斯框架里的<strong>先验</strong> <code>ℓ_0</code>。这在数学上零成本地接进上一节的递推里：</p>  <div class="math-block">\[\ell_0=\log\frac{P(H\mid \text{map})}{P(\neg H\mid \text{map})}=\underbrace{\log\frac{P(H)}{P(\neg H)}}_{\text{无图先验}}+\underbrace{\log\frac{P(\text{map}\mid H)}{P(\text{map}\mid \neg H)}}_{\text{地图证据}}\]</div>  <p>直观后果：<strong>地图说这里有一块限速 60 牌，那么感知只需要更少的观测证据就能确认它</strong>（首报距离可以推远十几米）；反过来，地图说这里没有牌子，那么一个孤立的中等置信检测需要更强的证据才能翻盘。</p>  <table>
+    <thead><tr><th>场景</th><th>地图先验</th><th>感知证据</th><th>系统应有的行为</th></tr></thead>
+    <tbody>
+      <tr><td>地图有 + 感知强</td><td>+2.0</td><td>+4.0</td><td><strong>快速确认</strong>，首报距离最远</td></tr>
+      <tr><td>地图有 + 感知弱</td><td>+2.0</td><td>+0.5</td><td>谨慎确认；<em>这是先验最有价值的一档</em></td></tr>
+      <tr><td>地图无 + 感知强</td><td>−1.0</td><td>+5.0</td><td><strong>确认</strong>——感知必须能推翻地图（临时牌/改牌）</td></tr>
+      <tr><td>地图无 + 感知弱</td><td>−1.0</td><td>+0.5</td><td>不报；<em>典型的广告牌误检会落在这一档</em></td></tr>
+      <tr><td>地图有 + 感知持续无</td><td>+2.0</td><td>−3.0（连续未检出）</td><td>不报，并<strong>触发数据回传</strong>（地图可能过期）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后一行才是这一节真正的重点：<strong>地图与感知的分歧本身就是最有价值的数据挖掘触发器</strong>。地图说有、感知连续几十帧说没有，两种可能：地图过期（牌子被拆了/改了）或者感知有系统性漏检（这个位置逆光/被树遮）。<em>无论哪种，这个路段都值得回传</em>——这条正是 C58「主动学习与线上触发」里最高效的规则触发之一，而且它的触发率天然很低（不会撑爆回传带宽）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>而危险在于<strong>先验强度不能无上限</strong>。施工改道、临时限速、可变电子牌，都是「地图错、感知对」的场景，而这些恰恰是安全上最要紧的。<em>如果 ℓ_0 给到 +5，感知需要极强的反向证据才能推翻它，系统就会在临时施工区坚持播报一个已经不存在的限速</em>。工程约束是：<strong>先验只能加速「确认」，不能否决「感知的强证据」</strong>——实现上给 ℓ_0 设一个远小于 clamp 上限的量（如 ±2），并保证单帧强证据（logit ≈ 4）就能翻盘。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>还有一层常被忽略的耦合：<strong>地图先验依赖定位，而定位误差会让先验作用在错误的位置上</strong>。横向定位偏 1.5 m、纵向偏 10 m 在城市峡谷里并不罕见。纵向偏 10 m 意味着「地图上前方 60 m 有牌」这条先验，实际对应的是 50 m 或 70 m 处——<em>如果匹配逻辑用的是硬距离窗口，先验会被加到错误的轨迹上，甚至加到一个误检上</em>。<strong>正确做法是把定位不确定度显式建模进匹配（用概率关联而非硬窗口），并在定位质量下降时自动削弱先验强度</strong>。「先验的强度必须随它所依赖的信息的质量而变」，是所有先验融合的通则。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">8</span>延迟与稳定性的根本矛盾：把它算成一笔账</h2>
+  <p>现在把本模块的所有旋钮收敛到一个问题上：<strong>到底要攒多少帧才上报？</strong> 这是一个真正的取舍，不存在两全的设置。用 M-of-K 投票做载体最容易算清楚。</p>  <p>设单帧检出概率 <code>p</code>（真标志）、单帧误检通过概率 <code>q</code>（背景）。误检那一侧是干净的二项尾和；延迟那一侧则要小心：</p>  <div class="math-block">\[P(\text{误检被确认})=\sum_{i=M}^{K}\binom{K}{i}q^i(1-q)^{K-i},\qquad \mathbb{E}[T_{\text{confirm}}]\;\underset{\text{仅当 }K\gg M}{\approx}\;\frac{M}{p}\]</div>  <p><strong>那个 <code>M/p</code> 是一个会骗人的近似</strong>。它算的是「累计 M 次成功」的期望等待（负二项分布），但 M-of-K 要求这 M 次落在一个<em>长度为 K 的滑窗内</em>——窗口越紧，真实延迟越长。<code>p=0.6</code> 时 3-of-3 的近似值是 5.0 帧，<strong>精确值是 9.07 帧，低估了 45%</strong>。正确做法是把滑窗内容当状态、建一个吸收马尔可夫链解线性方程组（notebook 里会实现，只有十几行）。下表全部用精确值：</p>  <table>
+    <thead><tr><th>策略</th><th>期望确认延迟（帧，精确）</th><th>折算距离</th><th>误检被确认的概率</th><th>相对 1-of-1 的 FP 降幅</th></tr></thead>
+    <tbody>
+      <tr><td>1-of-1</td><td>1.67</td><td>1.5 m</td><td>5.00×10⁻²</td><td>1×</td></tr>
+      <tr><td>2-of-3</td><td>3.65</td><td>3.4 m</td><td>7.25×10⁻³</td><td><strong>7×</strong></td></tr>
+      <tr><td>3-of-5</td><td>5.51</td><td><strong>5.1 m</strong></td><td>1.16×10⁻³</td><td><strong>43×</strong></td></tr>
+      <tr><td>4-of-7</td><td>7.30</td><td>6.8 m</td><td>1.94×10⁻⁴</td><td>258×</td></tr>
+      <tr><td>5-of-9</td><td>9.06</td><td>8.4 m</td><td>3.32×10⁻⁵</td><td>1505×</td></tr>
+      <tr><td><em>3-of-3（对照）</em></td><td><em>9.07</em></td><td><em>8.4 m</em></td><td><em>1.25×10⁻⁴</em></td><td><em>400×</em></td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>看最后一行：<strong>3-of-3（连续三帧）的延迟和 5-of-9 一样，但误检抑制能力却只有它的 1/4</strong>。原因是「连续」这个要求把容错余量全砍掉了——只要中间漏一帧就得从头再来，而真实检出率 0.6 意味着漏帧非常频繁。<em>「连续 N 帧」这种最直觉、最常被写进第一版代码的策略，在 p 不接近 1 的场景下是严格劣于 M-of-K 的</em>。如果用 <code>M/p</code> 近似去做参数搜索，优化器会因为低估了它的延迟而<strong>把你骗到这个劣解上</strong>。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这张表里藏着 TSR 领域最重要的一个工程判断：<strong>延迟的代价用「米」衡量之后，其实非常便宜</strong>。从 1-of-1 换到 3-of-5，误检率降了 43 倍，而首报距离只后退了 5.1 米——相对于 60 米的检出距离，这是 <strong>8.5%</strong> 的损失。<em>换句话说：在 TSR 里，多帧融合的性价比高得离谱，理由是「同一目标可观测上百帧」这个领域特性。</em> 这与行人检测形成鲜明对比：一个突然从车间窜出的行人可能只有 5–10 帧的观测窗口，那里每一帧延迟都是真金白银。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要诚实标注这个结论的<strong>边界条件</strong>，否则它就变成了一句危险的口号。三种情况下延迟的代价会陡增：① <strong>可变电子限速牌切换</strong>——牌面内容在几十毫秒内变化，攒帧会让系统在切换后仍播报旧值；② <strong>临时施工牌</strong>——常常出现在弯道后、被前车遮挡，可观测帧数可能只有十几帧，M 攒不满就已经开过去了；③ <strong>近距离突然露出</strong>（前车变道后牌子才可见）——此时剩余可用距离本来就短。<em>成熟系统的做法是让 M 随「剩余可用观测帧数的估计」而变</em>：远处慢慢攒（帧多，攒得起），近处快速判（帧少，攒不起）。<strong>「把固定参数变成场景自适应的参数」是从「能跑」到「量产」的一个典型跨越。</strong></p></div>
+  </div>  <p>要把这个取舍变成可优化的量，就得写出一个显式的目标函数。最简单可用的形式是加权和，其中权重来自下游的安全代价（模块 05 会讲怎么定这些代价）：</p>  <div class="math-block">\[J(M,K)=w_d\cdot \underbrace{\mathbb{E}[T_{\text{confirm}}]\,v\,\Delta t}_{\text{首报距离损失(m)}}\;+\;w_{fp}\cdot \underbrace{P(\text{FP确认})\cdot \rho_{bg}}_{\text{单位里程误报数}}\]</div>  <div class="callout intuition"><span class="label"></span>
+    <p>这个式子的实用价值不在于算出一个精确最优解（<code>w_d</code> 和 <code>w_fp</code> 本来就是拍出来的），而在于它<strong>强迫你把两个原本不可比的量放到同一个尺度上</strong>。团队里关于「要不要多攒两帧」的争论，十次有九次是因为一方在谈米、另一方在谈误报数，而没人写下这个式子。<em>写下它之后，争论就变成了「w_fp 该取多少」——这是一个可以拿数据和用户反馈来谈的问题。</em> <strong>面试里被问「你怎么定这些参数」，能给出「先写目标函数、再讨论权重来源」这个回答，比给出任何具体数字都强。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>时序这一层长期是「工程比论文强」的领域——量产系统里跑的东西往往比学术 SOTA 简单也更可靠。但有几条线值得跟踪。</p>  <ul>
+    <li><strong>跟踪范式的演进</strong>：SORT（卡尔曼 + 匈牙利）→ DeepSORT（加外观）→ <strong>ByteTrack</strong>（低分框二次关联，几乎零成本的大收益）→ OC-SORT（用观测而非估计做重关联，修正卡尔曼在长遮挡后的漂移）→ BoT-SORT（加相机运动补偿——<em>正是本模块第 3 节的思想被写进通用跟踪器</em>）。这条线的启示是：<strong>近几年最有效的改进都不是更强的模型，而是对「什么时候该相信哪种证据」的更细致处理。</strong></li>
+    <li><strong>端到端的时序检测器</strong>：MOTR / TrackFormer 把 track query 跨帧传播，让关联变成模型内部的注意力；StreamPETR 用 object-centric 的时序传播把历史信息压进 query。<em>它们在公开榜单上很漂亮，但车端落地慢</em>——原因是显存与延迟随历史长度增长、失败模式难以定位、以及最要命的：<strong>没有一个可以给安全评审看的、可穷举的判决逻辑</strong>。这是「可解释性作为部署硬约束」的一个真实例子。</li>
+    <li><strong>BEV 时序融合</strong>：BEVFormer 的 temporal self-attention 把上一帧的 BEV 特征作为额外的 key/value；SOLOFusion 讨论了「长时序低分辨率 vs 短时序高分辨率」的取舍。<em>对 TSR 的启发是把标志从图像空间提升到 3D/BEV 空间后再做时序融合</em>——一旦标志有了稳定的 3D 位置，跨帧关联就退化成一个平凡问题，还能天然支持多相机之间的关联（广角发现、长焦确认）。</li>
+    <li><strong>时序一致性作为自监督信号</strong>：同一条轨迹上的类别跳变（60→80→60）几乎必然意味着至少一帧错了。<em>这可以零标注地生成难例</em>——直接连到 C58 的挖掘触发器，也是「automated data mining workflows」最容易落地的一条规则。开放问题是如何区分「模型错」与「牌面真的变了」（可变电子牌）。</li>
+    <li><strong>标定与不确定度</strong>：贝叶斯累积的正确性完全依赖单帧分数的标定质量，而检测器的分数出了名地过自信。<em>conformal prediction 与检测的结合</em>（给出有覆盖率保证的框集合与类别集合）是近两年的热点，但如何在时序累积中保持这种保证，仍是开放的。</li>
+    <li><strong>时序稳定性缺少公认指标</strong>：mAP 是逐帧算的，闪烁 50 次与稳定输出得分完全相同。学术界目前没有一个被广泛接受的「输出稳定性」指标，各家量产团队都在用自己的一套（首报距离 / 闪烁次数 / 误报持续时长）。<em>模块 05 会把这套指标完整实现一遍</em>。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：<em>Simple Online and Realtime Tracking</em>（SORT, Bewley et al. 2016——先把这 4 页读透，后面所有跟踪器都是它的变体）；<em>Simple Online and Realtime Tracking with a Deep Association Metric</em>（DeepSORT, Wojke et al. 2017，重点看马氏门控与外观度量的融合方式）；★<em>ByteTrack: Multi-Object Tracking by Associating Every Detection Box</em>（Zhang et al. ECCV 2022——本模块第 2 节的核心，对 TSR 远距离低分场景直接适用）；<em>Observation-Centric SORT</em>（Cao et al. CVPR 2023，长遮挡后的重关联）；<em>BoT-SORT</em>（Aharon et al. 2022，相机运动补偿）；<em>BEVFormer</em>（Li et al. ECCV 2022，时序自注意力）与 <em>StreamPETR</em>（Wang et al. ICCV 2023，object-centric 时序传播）。基础读物：Thrun 等 <em>Probabilistic Robotics</em> 第 2 章（贝叶斯滤波与 log-odds 的标准推导）。相邻课程：C54 模块 01（匈牙利匹配的完整实现）、C58 模块 03（一致性触发）、C55 模块 05（时序稳定性指标）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_failure_modes/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 失效模式全景：TSR 到底在哪些地方出错</div></a>
+    <a class="next" href="../05_safety_eval/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 安全导向的评测体系</div></a>
+  </div>
+
+</div>
+</body>
+</html>

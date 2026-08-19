@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · TSR 输出如何进入 VLA：接口设计</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · TSR 输出如何进入 VLA：接口设计</h1>
+  <p class="subtitle"><strong>全课落点，也是 JD 里那条独特职责的直接对应</strong> · 三种融合层次的「信息量 - 可解释性 - token 成本」三角：符号/文本级、特征级（cross-attention 注入）、中间表示级（BEV query / 场景 token，量产主流）· TSR 序列化 schema 的每个字段都要能回答同一个问题——<em>下游少了它会做错什么</em>：类别、坐标系（图像 / 自车 / BEV）、距离、尺寸、置信度、跟踪 ID、首检时间、关联车道 · <strong>不传置信度 = 强迫下游把所有检测当真</strong>，这是感知-决策接口最常见的设计错误；而<strong>未标定的置信度比没有置信度更危险</strong>（0.9 实际只有 0.6 时，下游的保守策略被系统性绕过）· 感知错了 VLA 会「合理化」错误输入并给出自信的解释 —— 接口设计的目标是让低置信输入触发保守，而不是触发幻觉</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–02（VLA 结构与动作头）；C55（TSR 系统与失效模式）；C58 模块 03（不确定性触发）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_perception_interface.ipynb（纯 numpy，含感知错误注入实验）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">DriveVLM · EMMA · OmniDrive · Guo et al. On Calibration of Modern Neural Networks · LLM prompt sensitivity 系列</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 85 分钟 + 跑 70 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#three-levels">三种融合层次：感知的输出可以在三个地方进入 VLA</a></li>
+      <li><a href="#schema">TSR → VLA 的序列化 schema：每一个字段为什么必须有</a></li>
+      <li><a href="#frames">位置传什么：坐标系与距离的不确定度</a></li>
+      <li><a href="#confidence">置信度必须传递：接口设计里最常见、代价最大的错误</a></li>
+      <li><a href="#prompt">prompt 模板与稳定性：把接口当成协议来设计</a></li>
+      <li><a href="#error-prop">错误传播与幻觉：VLA 会「合理化」一切喂给它的东西</a></li>
+      <li><a href="#conservative">如何让 VLA 对低置信输入保持保守</a></li>
+      <li><a href="#interview">面试标准答案骨架（JD 直接对应）</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="three-levels"><span class="num">1</span>三种融合层次：感知的输出可以在三个地方进入 VLA</h2>
+  <p>这是整门课的核心模块，也是 <strong>JD 里「设计感知输出接口以支持 VLA 模型」那条职责的字面对应</strong>。所以先把问题定义清楚：TSR 模块每帧产出一批结构化的检测结果（类别、位置、尺寸、置信度、跟踪 ID……），VLA 需要用到它们。<strong>接口设计要回答的第一个问题不是「传什么字段」，而是「在网络的哪个位置传」</strong>——这个选择决定了后面所有事情。</p>  <div class="ascii">三个可能的接入点
+
+  多相机图像
+      │
+      ▼
+  ┌─ 视觉编码器 ─┐
+  │  patch tokens│───────────────────────┐
+  └──────┬───────┘                       │
+         │                               │  ② **特征级**
+         ▼                               │  TSR 的 ROI 特征 / 检测头特征
+  ┌─ BEV / 场景编码 ─┐                    │  投影成额外 token 或 cross-attn 注入
+  │  BEV query x N   │──────┐             │
+  └──────┬───────────┘      │ ③ **中间表示级**
+         │                  │ 感知与 VLA **共享同一份 BEV query / 场景 token**
+         ▼                  │
+  ┌─ TSR 检测头 ─┐          │             │
+  │ 框+类别+置信 │          │             │
+  └──────┬───────┘          │             │
+         │                  │             │
+         ▼                  │             │
+  ┌─ 跟踪 / 时序融合 ─┐      │             │
+  │ track_id + 状态机 │      │             │
+  └──────┬────────────┘     │             │
+         │ ① **符号/文本级**  │             │
+         ▼ 序列化成结构化文本 │             │
+  ┌─────────────────────────▼─────────────▼──────────────┐
+  │                    LLM 主干                           │
+  │  [系统 prompt][图像 token][**感知 token**][指令]      │
+  └──────────────────────┬────────────────────────────────┘
+                         ▼
+                    动作输出头（模块 02）</div>  <table>
+    <thead><tr><th>维度</th><th>① 符号 / 文本级</th><th>② 特征级</th><th>③ 中间表示级（BEV query）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>传什么</strong></td><td>序列化的结构化文本：<code>cls=speed_limit_60|conf=0.87|dist_m=42.3</code></td><td>ROI 特征向量 / 检测头输出特征，投影成 token</td><td>感知与 VLA <strong>共用同一组 BEV query / 场景 token</strong></td></tr>
+      <tr><td><strong>信息保真度</strong></td><td><strong>低</strong>——只有你显式写进 schema 的字段</td><td>高——特征里的信息几乎全在</td><td><strong>最高</strong>，且是稠密几何信息</td></tr>
+      <tr><td><strong>可解释 / 可调试</strong></td><td><strong>✅ 最好</strong>：prompt 可直接读，能一眼看出模型看到了什么</td><td>❌ 不可读</td><td>❌ 不可读</td></tr>
+      <tr><td><strong>token 成本</strong></td><td><strong>随目标数线性增长</strong>（约 20–30 token/目标）</td><td>1 token/目标，很低</td><td><strong>固定</strong>（如 100 个 BEV query），与目标数无关</td></tr>
+      <tr><td><strong>模块解耦</strong></td><td><strong>✅ 完全解耦</strong>：感知换模型不影响 VLA，只要 schema 不变</td><td>⚠️ 耦合特征维度与语义</td><td><strong>❌ 强耦合</strong>：两边必须一起训练、一起发版</td></tr>
+      <tr><td><strong>置信度可传递</strong></td><td><strong>✅ 天然</strong>（就是一个字段）</td><td>⚠️ 隐含在特征里，下游未必学得到</td><td>⚠️ 同左</td></tr>
+      <tr><td><strong>能否复用预训练</strong></td><td><strong>✅ 直接用文本，零改动</strong></td><td>需训连接器</td><td>需从头联合训练</td></tr>
+      <tr><td><strong>误差归因</strong></td><td><strong>✅ 能明确定位是感知错还是决策错</strong></td><td>⚠️ 困难</td><td><strong>❌ 端到端，很难定位</strong></td></tr>
+      <tr><td><strong>延迟</strong></td><td>增加 prompt 长度 → 预填充变慢</td><td>极小</td><td>无额外开销（本来就要算）</td></tr>
+      <tr><td>典型使用者</td><td>DriveVLM 的场景描述、多数原型与调试链路</td><td>OmniDrive 等的 3D 感知 token</td><td><strong>量产端到端系统的主流</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么<strong>量产系统最终会走向中间表示级</strong>？三个理由叠加：<em>①token 成本与目标数解耦</em>——城市路口 40 个交通元素时，符号级要 800–1200 个 token 光描述场景，而 BEV query 永远是那 100 个；<em>②信息不经过「人写的 schema」这个瓶颈</em>——你永远想不全该传哪些字段，而 BEV 特征里什么都有；<em>③省掉一次序列化-反序列化</em>，延迟与工程复杂度都低。<strong>代价是：感知和 VLA 变成一个不可分割的整体，出了问题很难说清是谁的错。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但<strong>符号级远没有过时，而且在两个场景里不可替代</strong>。<em>第一是<strong>调试与归因</strong></em>：当路测出现一次「该减速没减速」，符号级接口让你能直接打开那一帧的 prompt，看到「感知当时报的是 <code>speed_limit_120, conf=0.31</code>」——五秒钟定位。而 BEV query 是一堆浮点数，你只能重跑整条链路做消融。<em>第二是<strong>安全相关的强语义</strong></em>：限速值、禁令类别这些直接决定合法性的东西，必须以<strong>可审计、可追溯、可写进日志</strong>的形式存在，因为事故调查要的是「系统当时认为限速是多少」这个明确答案，而不是一组特征。<strong>所以真实系统的形态几乎总是混合的</strong>：稠密几何走中间表示级，<em>少量但关键的强语义（限速值、禁行、停车让行）额外走一条符号级通路</em>，两条通路互为交叉校验。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一条可迁移的判据：<strong>「这个信息出了错，事后需要能说清楚吗？」需要 → 走符号级；不需要 → 走特征/中间表示级。</strong><em>可审计性是符号接口存在的根本理由，不是「信息量」或「性能」。</em>面试里能把「为什么明知道有信息损失还要用文本接口」答成这一条，比背三种融合的定义强得多。</p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>别把「符号级」等同于「让 LLM 读一段自然语言描述」。<strong>用自然语言描述场景是 token 成本最高、稳定性最差的做法</strong>（第 5 节会算：同样的信息，紧凑键值 schema 只要自然语言的 1/3 token，而且可以被严格解析与校验）。<em>符号级接口应该是「结构化文本」，不是「文章」。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="schema"><span class="num">2</span>TSR → VLA 的序列化 schema：每一个字段为什么必须有</h2>
+  <p>假设我们走符号/混合路线。现在来设计那份 schema。<strong>下面这张表是本模块最实用的产出——它可以直接当成接口评审的检查单</strong>。设计原则只有一条：<em>每加一个字段，都要能回答「下游拿它干什么，不传会导致什么具体故障」；答不上来的字段就是噪声，占 token 还让模板变脆。</em></p>  <table>
+    <thead><tr><th>字段</th><th>类型 / 单位</th><th>下游用它干什么</th><th><strong>不传会发生什么（具体故障）</strong></th></tr></thead>
+    <tbody>
+      <tr><td><code>schema_version</code></td><td>字符串，如 <code>tsr/1.3</code></td><td>解析器选版本；模型卡记录训练时用的版本</td><td><strong>感知升级加了字段 → VLA 的解析器悄悄错位 → 全线误读</strong>。这是接口演进唯一可靠的抓手</td></tr>
+      <tr><td><code>t_capture</code> / <code>frame_id</code></td><td>毫秒时间戳</td><td>判断数据新鲜度；与自车状态对齐</td><td><strong>无法识别陈旧数据</strong>。感知卡了 300 ms，VLA 会拿 9 米前的世界做决策却毫不知情（模块 02 的 staleness 在这里落地）</td></tr>
+      <tr><td><strong><code>track_id</code></strong></td><td>整数，跨帧稳定</td><td>识别「这是同一块牌子」；做迟滞与状态机；关联历史</td><td><strong>一块牌子的 10 帧被当成 10 块牌子</strong>；无法做「连续 N 帧确认才生效」；无法解释「牌子消失了」是遮挡还是真的过去了</td></tr>
+      <tr><td><code>cls</code> + <code>cls_id</code></td><td>枚举 + 整数</td><td>语义分派</td><td>无从谈起</td></tr>
+      <tr><td><strong><code>value</code></strong></td><td>数值 + 单位（<code>speed_kph=60</code>）</td><td>限速值、重量/高度限制的<strong>具体数字</strong></td><td><strong>「限速牌」和「限速 60」是两回事</strong>。把数值编进类别名（<code>speed_limit_60</code>）会让类别数爆炸且无法表达罕见值</td></tr>
+      <tr><td><strong><code>conf_det</code> / <code>conf_cls</code></strong></td><td>分开的两个 [0,1]</td><td>检测置信 ≠ 分类置信，下游用法不同</td><td><strong>见第 4 节——这是最常见的接口设计错误</strong></td></tr>
+      <tr><td><code>cls_top2</code></td><td>第二候选类别 + 概率</td><td>表达「60 还是 80 说不准」</td><td><strong>下游连「这里有两种可能」都不知道</strong>，只能被迫二选一（呼应模块 02 的多模态）</td></tr>
+      <tr><td><strong><code>pos_ego</code></strong></td><td>$(x_{\text{fwd}}, y_{\text{left}})$ 米，自车坐标系</td><td>算「还有多远到」「在哪条车道」</td><td><strong>见第 3 节：传图像像素等于让 LLM 做相机标定</strong></td></tr>
+      <tr><td><strong><code>sigma_dist</code></strong></td><td>米，距离的 1σ 不确定度</td><td>远处小目标的距离本来就不准，下游要按不确定度决定提前量</td><td>把 83 m 当成精确值，而它的真实误差是 ±7 m（第 3 节推导）</td></tr>
+      <tr><td><code>bbox_wh</code></td><td>像素</td><td>距离估计的输入；<strong>框太小本身就是不可靠信号</strong></td><td>丢掉一个几乎免费的可靠性代理</td></tr>
+      <tr><td><strong><code>lane_assoc</code></strong></td><td>枚举：<code>ego / left / right / opposite / service / unknown</code></td><td>判断这块牌子<strong>管不管我</strong></td><td><strong>把辅路限速 40 当成主路限速 40</strong>；把对向车道的禁令当成自己的。这是 TSR 下游最高频的实际事故</td></tr>
+      <tr><td><code>n_obs</code> / <code>age_ms</code></td><td>整数 / 毫秒</td><td>「跟了 20 帧的稳定目标」vs「刚冒出来的一帧」</td><td><strong>置信度本身不含这个信息</strong>——单帧 0.9 和连续 20 帧 0.9 的可信度差一个量级</td></tr>
+      <tr><td><code>state</code></td><td>枚举：<code>tentative / confirmed / lost</code></td><td>生命周期；lost 后的宽限期</td><td>牌子被树叶遮住一帧就「消失」→ 约束被误撤销</td></tr>
+      <tr><td><code>ttl_ms</code></td><td>毫秒有效期</td><td>看门狗：超期自动降级</td><td>过期数据被当成当前数据</td></tr>
+      <tr><td><code>src</code></td><td>相机 ID / 传感器</td><td>多相机冲突时的仲裁；归因</td><td>同一块牌子被前视与侧视各报一次，下游当成两块</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>表里最容易被漏掉、后果又最严重的两个字段是 <strong><code>track_id</code></strong> 和 <strong><code>lane_assoc</code></strong>。<em>漏 <code>track_id</code></em> 的后果不是「少了个 ID」，而是<strong>下游彻底失去时间维度</strong>——它没法说「这块牌子我已经连续看到 15 帧了」，于是要么每帧都重新做决定（输出抖动），要么自己重新做一遍跟踪（把感知的活干第二遍，还干得更差，因为它只有框没有特征）。<em>漏 <code>lane_assoc</code></em> 则是把一个<strong>感知有能力回答、下游没能力回答</strong>的问题甩给了下游：牌子挂在龙门架的哪一格、对应哪条车道，这需要标志与车道线的几何关联，感知模块有车道线、有 BEV，做起来是自然的；VLA 只拿到一个坐标，只能猜。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更一般的原则是：<strong>接口的边界应该划在「谁有能力回答这个问题」的地方，而不是划在「谁的代码好改」的地方</strong>。<em>感知能算的东西不要留给下游算</em>——因为感知有原始像素、有多帧、有几何标定，下游只有一份摘要。反过来，<em>感知不该做的也不要越界做</em>：比如「这块限速牌该不该生效」涉及导航路径、当前车道、法规优先级，那是决策层的知识，感知强行判断只会在信息不全的情况下猜错，而且把错误锁死在一个下游无法纠正的字段里。<strong>一个好用的检验：把每个字段问一遍「如果这个判断错了，下游有没有信息把它纠正回来？」——没有的话，这个字段就不该由感知来定。</strong></p></div>
+  </div>  <pre><code>{
+  "schema_version": "tsr/1.3",
+  "t_capture_ms": 1723891234567,
+  "ego": {"speed_mps": 27.8, "lane_id": "ego"},
+  "signs": [
+    {
+      "track_id": 4127,
+      "cls": "speed_limit", "cls_id": 12,
+      "value": {"speed_kph": 60},
+      "cls_top2": [["speed_limit:60", 0.71], ["speed_limit:80", 0.22]],
+      "conf_det": 0.93, "conf_cls": 0.71, "conf_calibrated": true,
+      "pos_ego": {"x_fwd_m": 82.4, "y_left_m": -3.1},
+      "sigma_dist_m": 6.9,
+      "bbox_wh_px": [12, 12],
+      "lane_assoc": "ego",
+      "n_obs": 3, "age_ms": 240, "state": "tentative",
+      "src": "front_wide", "ttl_ms": 500
+    }
+  ]
+}</code></pre>  <div class="callout danger"><span class="label">置信度 ≠ 时序一致性，别提前融合掉</span>
+    <p><strong>面试里一个高频且很能区分人的追问：「你的 schema 里为什么要有 <code>state</code> 和 <code>n_obs</code>？置信度不是已经表达可靠性了吗？」</strong>标准答法：<em>置信度是<strong>单帧证据强度</strong>，<code>n_obs</code>/<code>state</code> 是<strong>时间上的一致性</strong>，两者正交</em>。一块牌子可以单帧 conf=0.95 但只出现过一帧（很可能是广告牌上的图案或一次瞬时误检），也可以单帧 conf=0.6 但连续 20 帧稳定跟踪（那几乎肯定是真的）。<strong>下游对这两种情况的处理完全不同：前者应该等，后者应该信。</strong>如果只传一个融合后的标量，你就<em>永远无法在下游区分它们</em>——而融合规则一旦写死在感知里，下游想改都改不了。<em>这也是「置信度不要提前融合」这条更一般原则的一个实例。</em></p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>还有一个务实的建议：<strong>把单位写进字段名</strong>（<code>x_fwd_m</code> 而不是 <code>x</code>，<code>speed_kph</code> 而不是 <code>speed</code>）。<em>看起来啰嗦，但它把「单位错误」这一整类事故变成了不可能</em>——而单位错误（米/厘米、m/s 与 km/h、度/弧度）在跨团队接口里是排第一的低级事故来源，且极难在代码评审里发现。这个约定对 LLM 尤其有价值：<strong>字段名本身就是给模型的提示，<code>dist_m=82.4</code> 比 <code>dist=82.4</code> 更不容易被误解成厘米。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frames"><span class="num">3</span>位置传什么：坐标系与距离的不确定度</h2>
+  <p>schema 里最容易做错的一项是位置。三个候选，取舍很清楚：</p>  <table>
+    <thead><tr><th>坐标系</th><th>内容</th><th>优点</th><th><strong>致命问题</strong></th><th>何时用</th></tr></thead>
+    <tbody>
+      <tr><td>图像像素 $(u,v,w,h)$</td><td>检测框在图上的位置</td><td>感知直接有，零成本</td><td><strong>下游要做反投影才能知道「多远」，而它没有内参外参</strong>；相机一换全部失效</td><td>只在调试可视化时用</td></tr>
+      <tr><td><strong>自车坐标 $(x_{\text{fwd}}, y_{\text{left}})$</strong></td><td>米，原点在后轴中心</td><td><strong>直接可用于「还有多远」「在哪条车道」</strong>；与相机无关</td><td>需要距离估计，而距离估计有误差</td><td><strong>默认选择</strong></td></tr>
+      <tr><td>BEV / 全局坐标</td><td>地图坐标系下的位置</td><td>可与高精地图先验融合、可跨帧累积</td><td>依赖定位精度；定位漂移会污染感知输出</td><td>有高精地图与高精定位时叠加提供</td></tr>
+    </tbody>
+  </table>  <h3>距离怎么来，误差有多大</h3>  <p>单目相机估标志距离用针孔模型：焦距（像素）由分辨率与水平视场角决定，物理尺寸已知（中国的圆形限速牌直径通常 0.6 m 或 0.8 m），于是</p>  <div class="math-block">\[f_{px} = \frac{W_{px}}{2\tan(\mathrm{FOV}_h/2)}, \qquad Z = \frac{f_{px}\cdot S}{w_{px}}, \qquad \frac{\mathrm{d}Z}{Z} = -\frac{\mathrm{d}w}{w}\]</div>  <p>最后那个式子是本节的关键：<strong>距离的<em>相对</em>误差等于框宽的<em>相对</em>误差</strong>。代入 1920×1080、$\mathrm{FOV}_h=60^\circ$ → $f_{px}=1662.8$，$S=0.6$ m：</p>  <table>
+    <thead><tr><th>框宽 $w$</th><th>估计距离 $Z$</th><th>1 px 误差 ⇒ 相对误差</th><th><strong>距离不确定度 $\sigma_Z$</strong></th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>60 px</td><td>16.6 m</td><td>1.67%</td><td>±0.28 m</td><td>近处，几乎精确</td></tr>
+      <tr><td>24 px</td><td>41.6 m</td><td>4.17%</td><td>±1.73 m</td><td>可用</td></tr>
+      <tr><td><strong>12 px</strong></td><td><strong>83.1 m</strong></td><td><strong>8.33%</strong></td><td><strong>±6.9 m</strong></td><td><strong>远处，误差已达 7 米</strong></td></tr>
+      <tr><td>8 px</td><td>124.7 m</td><td>12.5%</td><td>±15.6 m</td><td>只能当「那边有东西」用</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以「82.4 米」这个数字如果<strong>不带 $\sigma$，它就是在撒谎</strong>。下游看到 82.4 会以为精确到分米，实际上它可能是 75 也可能是 90。<em>而这 15 米的差别在 30 m/s 下就是 0.5 秒的决策提前量</em>——足以决定「现在开始平缓减速」还是「必须急刹」。<strong>更糟的是这个误差不是随机噪声，它是尺寸的确定性函数</strong>：越远越大、且是乘性的。下游只要拿到 <code>bbox_wh_px</code> 就能自己算出来——<em>但前提是你把它传了。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，$Z = f S / w$ 在 $w$ 上做一阶传播得到 $\sigma_Z \approx (Z/w)\,\sigma_w = (Z^2/(fS))\,\sigma_w$——<strong>距离误差随距离的<em>平方</em>增长</strong>。$\sigma_w$ 的来源有三：检测框本身的定位误差（远处小框 ±1 px 是乐观估计）、标志物理尺寸 $S$ 的不确定（0.6 还是 0.8 m 的牌子？误判就是 33% 的系统性偏差）、以及相机标定误差。<em>其中第二项常被忽略但影响最大</em>：<strong>如果你不知道这块牌子的物理尺寸，单目就根本无法给出绝对距离</strong>——所以 schema 里的 <code>cls</code> 不只是语义，它同时是距离估计的先验。这也解释了为什么「先粗分类拿到尺寸先验，再精细分类」在 TSR 两级架构里是自然的（C55 模块 02）。</p></div>
+  </div>  <div class="ascii">自车坐标系（右手系，原点在后轴中心）
+
+              y_left (+)
+                 ▲
+                 │        ● 限速牌 (x_fwd=82.4, y_left=-3.1)
+                 │          ╲  σ_dist = 6.9 m  ← **必须传**
+      ───────────┼────────────╲──────────────────────► x_fwd (+)
+                 │  ┌───┐      ╲                        前方
+                 │  │自车│       ╲ 真实位置可能在 75.5 ~ 89.3 m
+                 │  └───┘
+                 ▼
+              y_left (−)  = 右侧
+
+  ★ 为什么不用图像像素：下游要知道「还有多远」就得做反投影，
+    而反投影需要内参、外参、地平面假设 —— **这些 VLA 都没有**。
+    让 LLM 从 (u=1204, v=463, w=12, h=12) 推出 82 米，是让它做相机标定。</div>  <div class="callout danger"><span class="label">坐标系符号错误只在偏侧目标上暴露</span>
+    <p><strong>一个真实且高频的接口事故：坐标系约定不一致。</strong><code>y</code> 到底是「向左为正」还是「向右为正」？<code>x</code> 是「车头方向」还是「图像横轴」？角度是度还是弧度、逆时针还是顺时针？<em>这类问题在同一个团队内靠口头约定还能撑住，跨团队（感知组 vs 规控组 vs 大模型组）必然出事</em>——而且症状极其隐蔽：<strong>系统大部分时候是对的（因为多数标志在正前方，$y\approx 0$，符号错了看不出来），只在牌子明显偏一侧时才错</strong>，于是问题只在特定路段复现，查起来极痛苦。<strong>唯一可靠的做法是：把坐标系定义写进 <code>schema_version</code> 对应的文档，并在接口层加一个断言测试（放一个 $y_{\text{left}}=+5$ 的合成目标，检查下游认为它在左边）。</strong>这个测试写十行，能省掉一次线上事故。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="confidence"><span class="num">4</span>置信度必须传递：接口设计里最常见、代价最大的错误</h2>
+  <p>这一节请当作整门课的重点。<strong>不传置信度，等于强迫下游把每一个检测都当成事实</strong>——而任何检测器的输出里都混着 10%–30% 的错误。接口一旦这样定，下游就<em>永远</em>没有办法把这部分错误挡住，因为信息在接口处就已经被丢掉了。</p>  <h3>四个层次的错误，一层比一层隐蔽</h3>  <ol>
+    <li><strong>不传</strong>：下游被迫全信。这是最粗暴、也最容易被发现的（一测就炸）。</li>
+    <li><strong>传了，但只传一个融合后的标量</strong>：下游区分不了「单帧强证据」和「多帧弱证据」（见第 2 节），也区分不了「框准不准」和「类别对不对」。<em>融合规则被锁死在感知里，下游想改也改不了。</em></li>
+    <li><strong>传了，但没校准</strong>：0.9 实际只有 0.6 的正确率。下游用它做期望代价计算时，算出来的风险系统性偏低。</li>
+    <li><strong>传了、校准了，但下游用固定阈值</strong>：阈值是拍脑袋定的（「0.7 听起来挺自信」），而不是从代价推出来的。<em>这时候校准反而「显得没用」——因为调阈值能掩盖失准（见下面的 DUAL）。</em></li>
+  </ol>  <h3>校准是什么，以及它的度量</h3>  <p><span class="term">Calibration</span>（校准）的定义很朴素：<strong>模型说 0.8 的那一批样本，实际正确率应该就是 80%</strong>。度量它的标准工具是 <span class="term">ECE</span>（Expected Calibration Error，期望校准误差）——把样本按置信度分箱，算每个箱里「平均置信度」与「实际准确率」的差，再按箱内样本数加权平均：</p>  <div class="math-block">\[\mathrm{ECE} = \sum_{m=1}^{M} \frac{|B_m|}{n}\;\Bigl|\;\underbrace{\mathrm{acc}(B_m)}_{\text{实际准确率}} \;-\; \underbrace{\mathrm{conf}(B_m)}_{\text{平均置信度}}\;\Bigr|\]</div>  <p>而下游要用它做的事，是一个<strong>期望代价最小化</strong>的决策。设采纳一个错误检测的代价是 $C_{\text{wrong}}$、拒绝并退到保守方案的代价是 $C_{\text{rej}}$，则「采纳」的贝叶斯最优条件是：</p>  <div class="math-block">\[(1-p)\,C_{\text{wrong}} \;\le\; C_{\text{rej}} \quad\Longleftrightarrow\quad p \;\ge\; p^{\star} = 1 - \frac{C_{\text{rej}}}{C_{\text{wrong}}}\]</div>  <p>$C_{\text{wrong}}=10$、$C_{\text{rej}}=1.5$ 时 $p^\star = 0.85$。<strong>注意这个阈值是从代价<em>算</em>出来的，不是调出来的</strong>——而它成立的前提是 $p$ 真的是概率，也就是<strong>校准过的</strong>。notebook 会验证：在这个决策规则下，期望代价<em>恰好</em>在 ECE 最小（完全校准）时取到最小值，而「不传置信度」的基线代价比它高 97%。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这里有一个必须讲清楚、否则会被面试官问倒的微妙点：<strong>如果失准是<em>单调</em>的（比如温度缩放那种），而你又允许重新调阈值，那么决策完全不变</strong>。因为单调变换不改变排序，ROC 曲线一模一样，最优阈值只是平移了一下。<em>这正是「我们调了调阈值就好了，所以校准没用」这个错误结论的来源</em>——它在那个特定配置下确实「好了」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但这个补偿是<strong>脆弱且不可迁移的</strong>，三种情况下会立刻塌掉。<em>①<strong>阈值是固定或共享的</strong></em>：下游按「0.7 = 挺可信」写死，或者多个消费者共用一个阈值；这时感知模型一升级、失准程度一变，所有下游行为同时漂移，而没人会想到去重调。<em>②<strong>决策要用概率做算术</strong></em>：期望代价 $(1-p)C_{\text{wrong}}$、风险预算分配、代价不对称的门控——这些都直接用 $p$ 这个<em>数值</em>，而不只是它的排序，失准就是系统性的算错。<em>③<strong>多源融合</strong></em>：把相机的 $p_1$ 和地图先验的 $p_2$ 相乘或做贝叶斯更新时，两个失准的概率相乘会把误差放大，而且方向不可预测。<strong>所以正确的说法是：校准不是为了让排序更好（它做不到），而是为了让「概率」这个数在下游可以被<em>当作概率来算</em>。</strong></p></div>
+  </div>  <table>
+    <thead><tr><th>接口设计</th><th>下游能做什么</th><th>本例期望代价</th><th>相对最优</th></tr></thead>
+    <tbody>
+      <tr><td><strong>不传置信度</strong></td><td>只能全部采纳</td><td><strong>2.272</strong></td><td><strong>+97%</strong></td></tr>
+      <tr><td>传原始分数（过自信，$T{=}0.35$）</td><td>能排序，但概率算术会算错</td><td>1.430</td><td>+24%</td></tr>
+      <tr><td>传原始分数（欠自信，$T{=}2$）</td><td>过度保守，白白拒绝大量正确检测</td><td>1.402</td><td>+22%</td></tr>
+      <tr><td><strong>传校准后的概率</strong></td><td><strong>可直接做期望代价决策</strong></td><td><strong>1.152</strong></td><td><strong>最优</strong></td></tr>
+      <tr><td>（参考）全部拒绝，只用地图先验</td><td>不用感知</td><td>1.500</td><td>+30%</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">接口一旦丢掉不确定性，下游永远补不回来</span>
+    <p><strong>这是 JD 那条职责最核心的一句话，值得逐字记住：不传置信度不是「少传一个字段」，而是<em>在接口层面永久删除了下游做风险决策的能力</em>。</strong>下游收到 <code>speed_limit_120</code> 之后，如果没有伴随的概率，它只有两种选择：全信（于是感知的每一个误检都变成一次危险动作）或全不信（那要感知干什么）。<em>而只要传了校准过的概率，下游立刻可以做「代价加权的采纳决策」，把 10 倍代价不对称的场景处理得完全不同</em>——本模块 notebook 里的非对称门控把超速率降了 72%，用的就是这一个字段。<strong>面试里如果只有一句话的时间讲你对感知-决策接口的理解，就讲这一句。</strong></p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>不确定性不只是一个标量。</strong>一份完整的不确定性至少包含四样：<em>①检测置信（这里有没有东西）；②分类分布（是什么，最好给 top-2 及其概率）；③几何不确定度（$\sigma_{\text{dist}}$，第 3 节）；④时序一致性（<code>n_obs</code>/<code>state</code>）</em>。<strong>它们的下游用法完全不同</strong>：①决定要不要理会，②决定要不要表达「有两种可能」（呼应模块 02 的多模态），③决定提前量与安全裕度，④决定要不要再等几帧。<em>把它们压成一个数，就是把四个正交的决策塌成一个。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="prompt"><span class="num">5</span>prompt 模板与稳定性：把接口当成协议来设计</h2>
+  <p>符号级接口的物理形态是一段进入 prompt 的文本。<strong>而 LLM 对格式的敏感程度远超直觉</strong>：字段顺序、数值格式、分隔符、甚至空格数量的变化，都可能让同一份语义得到不同的输出。所以这段文本必须<strong>当成一个有版本、有校验、有兼容策略的协议来设计</strong>，而不是「拼个字符串给模型看看」。</p>  <h3>三条铁律</h3>  <table>
+    <thead><tr><th>铁律</th><th>做法</th><th>反例与它的具体后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 键值，不要位置</strong></td><td><code>track_id=4127|cls=speed_limit|value_kph=60|…</code></td><td>位置式 <code>4127|speed_limit|60|…</code>：<strong>感知那边插入一个新字段，下游解析器会<em>静默错位</em></strong>——把置信度读成距离，还不报错</td></tr>
+      <tr><td><strong>② 字段顺序固定并写进版本</strong></td><td>顺序是 schema 的一部分，改顺序 = 升版本 = 重新评测</td><td>「我只是把 conf 挪到前面，语义没变」：<em>模型在训练时见到的是另一种顺序，注意力模式不同，输出会漂</em></td></tr>
+      <tr><td><strong>③ 缺失值用显式 <code>null</code>，绝不用哨兵数值</strong></td><td><code>lane_assoc=null</code>、<code>dist_m=null</code></td><td><strong>用 <code>-1</code> 表示「距离未知」→ 下游的「忽略车后目标（dist&lt;0）」规则把它<em>静默丢掉</em></strong>。一个有效检测就这样消失了，且没有任何日志</td></tr>
+    </tbody>
+  </table>  <h3>还有四件必须定死的事</h3>  <ul>
+    <li><strong>数值格式</strong>：定点、固定小数位、单位在字段名里。<em><code>60</code> / <code>60.0</code> / <code>6.0e+01</code> 三种写法在 tokenizer 眼里是不同长度的不同 token 序列</em>；训练时是 <code>60.0</code>、推理时变成 <code>60</code>，模型的行为就可能变。<strong>格式漂移属于训练-部署一致性问题（C60 的主题），只是发生在文本层。</strong></li>
+    <li><strong>排序规则</strong>：目标按什么排？<em>必须确定且稳定</em>（如「先按 <code>lane_assoc</code> 分组，组内按距离升序」）。如果用哈希序或多线程完成序，<strong>同一帧跑两次会得到不同 prompt → 输出不可复现 → 任何 badcase 都无法稳定重放</strong>。</li>
+    <li><strong>截断策略</strong>：目标太多超 token 预算时丢谁？<em>丢的规则必须与下游的安全逻辑一致</em>——按距离截断会丢掉远处刚出现的限速牌（而那恰恰是需要提前决策的）；按置信度截断会丢掉低置信但高影响的目标。<strong>务实做法：按「安全相关性 × 距离」排序，并在 prompt 里显式写 <code>truncated=true, n_dropped=7</code>，让模型知道自己看到的不全。</strong></li>
+    <li><strong>空场景的表示</strong>：一个标志都没有时传什么？<em>传空字符串会让模型「看不到这个字段」从而依赖先验；传显式的 <code>signs=[] (n=0)</code> 才是「我确实看了，确实没有」</em>。<strong>「没有证据」和「证据说没有」是两件事，接口必须能区分。</strong></li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这些看起来琐碎的约定值得写进课程？因为<strong>它们造成的故障有一个共同特征：静默</strong>。位置错位不报错、哨兵值被规则吃掉不报错、格式漂移不报错、排序不稳定不报错——<em>它们全都表现为「模型有时候表现变差了」，而不是一个可以定位的异常</em>。而排查这类问题的成本，通常是排查一个崩溃的几十倍。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>对应的工程手段也很清楚，而且都不贵：<em>①<strong>渲染与解析必须成对实现并做 round-trip 测试</strong></em>（渲染出来再解析回去，字段必须逐一相等；这一个测试能挡住 80% 的模板事故）；<em>②<strong>解析失败要 fail loud</strong></em>——宁可抛异常也不要「尽力猜」，因为猜错是静默的；<em>③<strong>schema 版本进 prompt 的第一行</strong></em>，并在模型卡里记录训练时用的版本；<em>④<strong>把一份「金标准 prompt」纳入回归测试</strong></em>，任何渲染改动都要 diff 它。<strong>这套做法与 C60 讲的训练-部署一致性是同一个方法论：把「约定」变成「可执行的检查」。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话概括本节：<strong>prompt 模板不是 UI，是 ABI。</strong><em>它是两个模块之间的二进制接口，只不过恰好长得像人话——而「长得像人话」正是它最危险的地方，因为它诱使人们随手改。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="error-prop"><span class="num">6</span>错误传播与幻觉：VLA 会「合理化」一切喂给它的东西</h2>
+  <p>现在假设接口设计得很好，但感知这一帧就是错了——报了一块根本不存在的「禁止驶入」。<strong>VLA 会怎么反应？答案是：它会生成一个完全自洽、有理有据、听起来无懈可击的绕行方案。</strong></p>  <div class="ascii">错误如何被「合理化」并放大
+
+  感知（错）                    VLA（忠实地条件生成）
+  ┌────────────────────┐       ┌──────────────────────────────────────┐
+  │ cls = no_entry     │──────►│ 「前方检测到禁止驶入标志，本车道不可   │
+  │ conf = 0.62        │       │  通行。右侧车道空闲，建议提前变道并    │
+  │ lane_assoc = ego   │       │  减速至 40 km/h 后并线。」            │
+  │ **实际是广告牌**    │       │  ↑ 语言流畅、逻辑自洽、**完全错误**   │
+  └────────────────────┘       └──────────────────────────────────────┘
+                                              │
+                                              ▼
+                                  高速上一次无理由变道 + 急减速
+                                  （后车追尾风险；用户信任崩塌）
+
+  ★ 关键：**输出里没有任何一处表达「我不确定」**。
+    这是 silent failure ——比崩溃危险得多，因为没有任何信号触发兜底。</div>  <h3>为什么会这样：条件生成没有「质疑输入」的机制</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>VLA 建模的是 $p(\text{动作} \mid \text{观测}, \text{感知输入}, \text{指令})$。<strong>它的训练目标里没有任何一项是「判断输入是否可信」</strong>——训练数据里的感知输入几乎总是对的（因为是离线标注或高质量回放），于是模型学到的是「感知说什么就是什么」。<em>这不是模型的缺陷，是训练分布的必然结果</em>：<strong>你没给它见过「感知错了，正确做法是保守」的样本，它就不会那么做。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>而语言模型的生成特性会把这个问题放大一层：<strong>它不仅接受错误输入，还会为它<em>构造理由</em></strong>。因为流畅、自洽的解释在训练分布里是常态（人写的驾驶决策说明都是有理有据的），模型学到的是「给出决策就要配一段合理的解释」。<em>于是错误被包装成了「有依据的判断」，反而更难被人工审核发现</em>——一段写着「因为前方 60 米处有禁止驶入标志」的输出，比一段没有解释的输出<strong>看起来更可信</strong>。<strong>这是可解释性的一个反直觉的负面效应：解释的流畅度与决策的正确性无关，但人会把前者当作后者的证据。</strong></p></div>
+  </div>  <h3>两个方向的幻觉，要分开度量</h3>  <table>
+    <thead><tr><th>类型</th><th>定义</th><th>怎么发生</th><th><strong>怎么度量与拦截</strong></th></tr></thead>
+    <tbody>
+      <tr><td><strong>输入幻觉</strong>（被骗）</td><td>感知报了不存在的东西，VLA 全盘接受并放大</td><td>误检 + 下游无置信度门控</td><td><strong>度量</strong>：注入合成误检，统计下游动作错误率。<strong>拦截</strong>：置信度门控 + 非对称代价（第 7 节）</td></tr>
+      <tr><td><strong>输出幻觉</strong>（编造）</td><td>VLA 提到了感知输出里<em>根本没有</em>的实体</td><td>语言先验太强（「路口通常有停车让行牌」）</td><td><strong>度量</strong>：解析输出中引用的实体，检查每个是否能对上一个 <code>track_id</code>。<strong>拦截</strong>：<strong>grounding 校验——引用不到就拒绝整条输出</strong></td></tr>
+      <tr><td><strong>沉默错误</strong></td><td>错了，且输出里没有任何不确定信号</td><td>上面两者的共同后果</td><td><strong>度量</strong>：错误样本中「输出未表达不确定」的比例。<strong>这是最该被追踪的单一指标</strong></td></tr>
+    </tbody>
+  </table>  <p><strong>输出幻觉的拦截手段值得展开，因为它便宜且有效</strong>：既然 schema 里每个目标都有 <code>track_id</code>，那就要求 VLA 的输出必须<em>显式引用 track_id</em>（「因为 <code>track#4127</code> 是限速 60，减速至 60」）。<em>然后在输出侧做一次纯字符串校验：引用的每个 ID 是否都在本帧的输入里？</em>不在就说明模型在编造，整条输出作废、走兜底。<strong>这个检查十几行代码、零延迟，却能把「模型凭空造出一块牌子」这类事故完全挡住</strong>——而且它同时给了你一个可日志、可统计的幻觉率指标。</p>  <h3>级联的乘法</h3>  <p>最后回到一个 C55 模块 02 讲过、这里必须重申的算术：<strong>端到端正确率是各环节正确率的<em>乘积</em></strong>。</p>  <div class="math-block">\[P_{\text{e2e}} = P_{\text{det}} \times P_{\text{cls}} \times P_{\text{assoc}} \times P_{\text{decide}}\]</div>  <p>每环 95% 的四环级联只有 81.5%。<strong>这意味着「把感知做到 99%」的边际价值，取决于其他环节现在是多少</strong>——如果车道关联只有 85%，把检测从 95% 提到 99% 带来的端到端提升不到 3.4 个点。<em>而置信度传递之所以价值巨大，正是因为它<strong>打破了这个乘法</strong></em>：下游知道哪些环节这次不可靠时，可以选择不把错误往下传，而是退到一个已知安全的默认值。<strong>不传置信度 = 各环节的错误必然相乘；传了 = 下游有机会截断。</strong></p>  <div class="callout danger"><span class="label">流畅的解释会制造它并不配得的信任</span>
+    <p><strong>一个必须在设计阶段就想清楚的问题：VLA 的解释输出该不该给用户看？</strong>给看的好处是信任与可调试；<em>坏处是「流畅的错误解释」会<strong>制造</strong>信任</em>——用户看到「因为前方有施工标志」会倾向于相信系统真的看到了。<strong>务实的折中是：解释里必须带上它所依赖的感知证据与置信度</strong>（「依据：<code>track#4127</code> 限速牌，置信 0.62，距离 82±7 m」），让人看到的不只是结论，还有结论的脆弱程度。<em>把不确定性一路透传到用户界面，是这条设计原则的终点。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="conservative"><span class="num">7</span>如何让 VLA 对低置信输入保持保守</h2>
+  <p>知道了问题，来看手段。<strong>七种做法，按「在哪一层生效」排列</strong>——注意它们不是可选项列表，而是应该<em>叠加</em>使用的纵深防御。</p>  <table>
+    <thead><tr><th>层</th><th>手段</th><th>怎么做</th><th>代价 / 边界</th></tr></thead>
+    <tbody>
+      <tr><td><strong>输入侧</strong></td><td>① 置信度门控</td><td>低于阈值的检测不进 prompt，或进但标注为 <code>uncertain=true</code></td><td>阈值定低了漏、定高了噪；<strong>阈值必须从代价推导</strong>而不是拍脑袋</td></tr>
+      <tr><td><strong>输入侧</strong></td><td>② <strong>不确定性语言化</strong></td><td>把分布写进文本：<code>cls=speed_limit value_kph=60 p=0.71 alt=80 p=0.22</code></td><td><strong>训练时必须见过这种输入</strong>，否则模型不知道该怎么用（最容易被忽略的一点）</td></tr>
+      <tr><td><strong>决策</strong></td><td>③ <strong>非对称门控</strong></td><td>降低限速：低门槛即采纳；<strong>提高限速：高门槛才采纳</strong></td><td><strong>本模块 notebook 里超速率降 72%</strong>；代价是过度限速率上升</td></tr>
+      <tr><td><strong>训练</strong></td><td>④ 带噪输入 + 保守标签</td><td>训练数据里注入合成感知误差，标注「此时正确动作是保守」</td><td>要构造这类样本；<strong>没有这一步，前三条只是外挂规则</strong></td></tr>
+      <tr><td><strong>输出侧</strong></td><td>⑤ grounding 校验</td><td>输出引用的 <code>track_id</code> 必须存在于本帧输入</td><td>只挡输出幻觉，挡不住输入幻觉；<strong>但零成本</strong></td></tr>
+      <tr><td><strong>兜底</strong></td><td>⑥ 约束/安全层</td><td>VLA 输出经过无神经网络的可行性与合规校验（模块 04）</td><td>只能挡住「不可行」，挡不住「可行但不该做」</td></tr>
+      <tr><td><strong>闭环</strong></td><td>⑦ 触发回传</td><td>低置信 + 高影响 = 难例，回传标注（C58 模块 03）</td><td>带宽预算；<strong>但这是长期唯一的根治手段</strong></td></tr>
+    </tbody>
+  </table>  <h3>非对称门控：把代价不对称直接写进规则</h3>  <p>第 ③ 条最值得展开，因为它是「置信度传递」的直接变现，也是最容易在面试里讲清楚的一个具体设计。<strong>核心观察：限速类约束的两个方向代价完全不同</strong>——</p>  <ul>
+    <li><strong>把限速调低了（过度保守）</strong>：车开慢了。代价是效率与舒适，以及被追尾的<em>间接</em>风险。可恢复。</li>
+    <li><strong>把限速调高了（超速）</strong>：车开快了。代价是<strong>直接的安全与合规风险</strong>，且不可恢复（罚单已经开了，事故已经发生了）。</li>
+  </ul>  <p>既然代价不对称，门槛就该不对称：<strong>「往安全方向走」用低门槛（$p \ge 0.30$ 就采纳），「往风险方向走」用高门槛（$p \ge 0.90$ 才采纳）</strong>。notebook 会把这个规则实现出来并量化：</p>  <table>
+    <thead><tr><th>下游策略</th><th>超速率</th><th>过度限速率</th><th>加权风险（超速 ×10 + 过限 ×3）</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><strong>不传置信度（全采纳）</strong></td><td>11.35%</td><td>11.41%</td><td><strong>1.477</strong></td><td>基线：感知的错误 1:1 变成动作的错误</td></tr>
+      <tr><td>对称阈值 0.70（校准）</td><td>8.14%</td><td>8.07%</td><td>1.056</td><td>−29%：光是「能拒绝」就有很大收益</td></tr>
+      <tr><td><strong>非对称门控（校准）</strong></td><td><strong>3.13%</strong></td><td>16.97%</td><td><strong>0.822</strong></td><td><strong>−44%；超速率降 72%</strong></td></tr>
+      <tr><td>非对称门控（过自信输入）</td><td>6.99%</td><td>11.02%</td><td>1.030</td><td><strong>失准让收益打对折</strong>——门槛形同虚设</td></tr>
+      <tr><td>（参考）完全忽略感知，只用地图</td><td>12.45%</td><td>12.67%</td><td>1.625</td><td>比全采纳还差：感知确实有价值</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这张表里最重要的是<strong>倒数第二行</strong>：同样的非对称门控规则，输入换成未校准的过自信置信度，加权风险从 0.822 涨到 1.030（+25%），超速率从 3.13% 涨到 6.99%（翻倍多）。<em>因为「$p\ge0.90$ 才允许提速」这条规则的全部效力，都建立在「0.90 真的意味着 90%」上</em>。<strong>过自信的模型把一堆实际只有 60% 正确率的检测标成了 0.92，门槛形同虚设。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>同时也要诚实地看到<strong>保守不是免费的</strong>：非对称门控把过度限速率从 11.4% 抬到了 17.0%。<em>如果代价权重换一组（比如用户对「莫名其妙减速」极度反感，$C_{\text{under}}$ 权重加大），最优策略会不同</em>。<strong>所以正确的做法不是「宁可错杀」，而是把 $C_{\text{over}}$ 与 $C_{\text{under}}$ 显式写下来，然后由代价推出门槛</strong>——这样当产品说「用户抱怨减速太频繁」时，你改的是一个有明确含义的代价参数，而不是去凭感觉挪一个阈值。<em>把「拍脑袋的阈值」变成「可讨论的代价」，是这套方法论最实际的价值。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>第 ④ 条（训练时注入带噪输入）是最容易被跳过、也最不能跳过的一条。</strong>前面三条都是外挂在模型之外的规则；如果模型本身从没见过「输入里带着 <code>conf=0.4</code> 的检测」这种情况，它就<em>不知道该怎么用这个数字</em>——你把置信度写进 prompt，它可能干脆忽略。<strong>正确做法是在训练数据构造阶段就注入合成感知误差（误检、漏检、错分、距离偏差），并把对应的专家动作标成保守的</strong>，让「低置信 → 保守」成为一个<em>学到的</em>行为而不是<em>外加的</em>规则。<em>这也是评测时必须专门构造「感知错误」子集的原因——不然你根本不知道模型有没有学到。</em>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把第 4 节与本节连起来的一句话：<strong>置信度传递创造了「拒绝」这个选项，而非对称门控决定了什么时候用它。</strong><em>没有前者，下游只有「全信」；有了前者但没有后者，下游只会对称地拒绝，白白丢掉大量安全方向上本可采纳的信息。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="interview"><span class="num">8</span>面试标准答案骨架（JD 直接对应）</h2>
+  <p><strong>这一节直接对应 JD 里「设计感知输出接口以支持 VLA / 端到端模型」那条职责。</strong>五道题，覆盖了这条职责会被问到的全部角度。骨架的组织原则同前：<em>先给判断，再给机制，然后给数字，最后给代价与边界</em>。</p>  <h3>Q1 · 你会怎么把 TSR 的输出接进 VLA？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>你知道有三个接入层次、各自的取舍，并且能给出一个<strong>混合</strong>方案而不是单选</td></tr>
+      <tr><td><strong>40 秒骨架</strong></td><td>「三个层次。<strong>符号/文本级</strong>——把检测序列化成结构化文本进 prompt，可解释、可审计、与感知模块完全解耦，但有信息损失且 token 随目标数线性增长。<strong>特征级</strong>——ROI 特征投影成 token，信息全、成本低，但不可读。<strong>中间表示级</strong>——感知与 VLA 共享 BEV query，token 数固定、信息最全，是量产端到端的主流，代价是两边强耦合、误差无法归因。<em>我会做混合：稠密几何走中间表示级，少量安全强语义（限速值、禁行、停车让行）额外走一条符号通路</em>。<strong>判据是「这个信息出错以后需不需要事后说清楚」——需要就必须走符号级，因为事故调查要的是『系统当时认为限速是多少』这个明确答案，不是一组特征。</strong>」</td></tr>
+      <tr><td>加分点</td><td>「符号级在<strong>调试与归因</strong>上的价值经常被低估：一次路测异常，打开那一帧的 prompt 五秒钟就能定位；BEV query 只能重跑消融。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>只答「拼成文本塞进 prompt」；把「符号级」做成自然语言描述（token 贵 3 倍且无法严格解析）</td></tr>
+    </tbody>
+  </table>  <h3>Q2 · 你的 schema 里有哪些字段？为什么每一项都必须有？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>你能对每个字段说出「不传会发生什么具体故障」，而不是罗列字段名</td></tr>
+      <tr><td><strong>40 秒骨架</strong></td><td>「除了类别和位置，有五项是最容易漏又最致命的。<strong><code>track_id</code></strong>——没有它，一块牌子的 10 帧会被当成 10 块牌子，也没法做「连续 N 帧确认才生效」。<strong><code>lane_assoc</code></strong>——判断这块牌子管不管我；不传就会把辅路限速 40 当成主路的，这是 TSR 下游最高频的实际事故，而且<em>感知有车道线和 BEV，有能力回答；下游只有一个坐标，只能猜</em>。<strong><code>value</code> 独立成字段</strong>——「限速牌」和「限速 60」是两回事，把数值编进类别名会让类别数爆炸。<strong><code>sigma_dist</code></strong>——82 米这个数如果不带 ±7 米就是在撒谎。<strong><code>n_obs</code>/<code>state</code></strong>——置信度是单帧证据强度，时序一致性是另一个正交维度，单帧 0.95 出现一次 vs 连续 20 帧 0.6，下游处理完全不同。<em>再加一个 <code>schema_version</code>，否则接口演进必然出静默错位。</em>」</td></tr>
+      <tr><td>加分点</td><td>「一条通用原则：<strong>接口边界应该划在『谁有能力回答这个问题』的地方</strong>——感知能算的不要留给下游；但『这块牌子该不该生效』涉及导航与法规优先级，感知不该越界猜。检验方法是问『如果这个判断错了，下游有没有信息纠正它』。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>背字段清单但说不出故障场景；把单位省掉（<code>dist</code> 而不是 <code>dist_m</code>）</td></tr>
+    </tbody>
+  </table>  <h3>Q3 · 为什么置信度必须传？不传会怎样？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td><strong>这是这条 JD 最核心的一题。</strong>你要能说出「接口丢掉的信息永远补不回来」</td></tr>
+      <tr><td><strong>40 秒骨架</strong></td><td>「<strong>不传置信度不是少传一个字段，是在接口层面永久删除了下游做风险决策的能力。</strong>任何检测器都有 10–30% 的错误率，下游拿不到概率就只有两种选择：全信（感知每个误检都变成一次危险动作）或全不信（那要感知干什么）。<strong>传了校准过的概率，下游立刻能做期望代价决策</strong>：采纳错误的代价 $C_w$、拒绝退保守的代价 $C_r$，最优阈值就是 $p^\star = 1-C_r/C_w$，这是<em>算</em>出来的不是调出来的。更进一步可以做<strong>非对称门控</strong>——降低限速低门槛、提高限速高门槛——我做过的实验里超速率降了 72%。<em>而且要传的不止一个标量：检测置信、分类 top-2 分布、几何 σ、时序一致性，这四个是正交的，下游用法完全不同，压成一个数就是把四个决策塌成一个。</em>」</td></tr>
+      <tr><td><strong>加分点（很能加分）</strong></td><td>主动讲清楚那个微妙点：「<strong>单调失准 + 重调阈值 = 决策不变</strong>，这是『调调阈值就好了所以校准没用』的错觉来源。但三种情况会塌：①阈值固定或多消费者共享，模型一升级全线漂移；②决策要用概率做<em>算术</em>（期望代价、风险预算）；③多源融合把两个失准概率相乘。<strong>校准不是为了改善排序，是为了让概率这个数能被当作概率来算。</strong>」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>只说「置信度低就不要用」；说不出阈值该从代价推导；把校准说成能提升 AUC</td></tr>
+    </tbody>
+  </table>  <h3>Q4 · 感知错了，VLA 会怎样？怎么防？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>「合理化」与「沉默错误」两个词，以及可落地的拦截手段</td></tr>
+      <tr><td><strong>40 秒骨架</strong></td><td>「<strong>VLA 会<em>合理化</em>错误输入</strong>——给它一块不存在的『禁止驶入』，它会输出一个完全自洽、有理有据的绕行方案，而且<strong>输出里没有任何一处表达不确定</strong>。这是 silent failure，比崩溃危险得多，因为没有信号触发兜底。根因是训练目标里没有『判断输入是否可信』这一项，训练数据里的感知输入几乎总是对的。<strong>要分开度量两种幻觉</strong>：输入幻觉（被骗）用注入合成误检来测下游动作错误率；输出幻觉（编造）用 grounding 校验——<em>要求 VLA 输出必须显式引用 <code>track_id</code>，然后在输出侧检查每个引用是否存在于本帧输入，不存在就整条作废走兜底</em>。这个检查十几行代码、零延迟。<strong>最该追踪的单一指标是『沉默错误率』：错了且输出未表达不确定的比例。</strong>」</td></tr>
+      <tr><td>加分点</td><td>「还要防一个反直觉的效应：<strong>流畅的解释会制造它并不配得的信任</strong>。所以解释里必须带上依赖的证据与置信度（『依据 track#4127，置信 0.62，距离 82±7 m』），把不确定性一路透传到用户界面。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>只说「加个安全兜底」；说不出输入幻觉与输出幻觉要用不同手段</td></tr>
+    </tbody>
+  </table>  <h3>Q5 · prompt 模板要注意什么？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>你把它当协议而不是字符串拼接；能说出静默故障的具体形态</td></tr>
+      <tr><td><strong>40 秒骨架</strong></td><td>「三条铁律。<strong>①键值不要位置</strong>——位置式解析在感知插入新字段时会<em>静默错位</em>，把置信度读成距离还不报错。<strong>②字段顺序固定并写进 <code>schema_version</code></strong>——改顺序等于改接口，要重新评测，因为模型训练时见到的注意力模式不同。<strong>③缺失值用显式 <code>null</code>，绝不用哨兵数值</strong>——用 <code>-1</code> 表示『距离未知』，下游『忽略车后目标』的规则会把它<em>静默丢掉</em>。再加四件事：数值格式定死（<code>60.0</code> 还是 <code>60</code> 是不同 token 序列，属于文本层的训练-部署一致性问题）、排序规则确定（否则同帧两次渲染出不同 prompt，badcase 无法重放）、截断策略与安全逻辑一致（并显式写 <code>truncated=true, n_dropped=7</code>）、空场景要能表达『我看了，确实没有』而不是什么都不写。<strong>工程上就一条：渲染与解析成对实现 + round-trip 测试，能挡掉八成模板事故。</strong>」</td></tr>
+      <tr><td>加分点</td><td>「一句话总结：<strong>prompt 模板不是 UI，是 ABI</strong>——它恰好长得像人话，而这正是它最危险的地方，因为诱使人随手改。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>答「多试几个 prompt 看哪个效果好」（那是调优，不是接口设计）</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>五题共用一组关键数字与短语，背下来即可：<strong>三个融合层次 · 「出错要不要说清楚」判据 · <code>track_id</code>/<code>lane_assoc</code>/<code>sigma_dist</code> · $p^\star = 1-C_r/C_w$ · 不传置信度 = 永久删除风险决策能力 · 非对称门控降超速 72% · 合理化与沉默错误 · grounding 校验 · prompt 是 ABI 不是 UI</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>符号接口与端到端的最终边界在哪？</strong>产业趋势明显在往中间表示级走（token 成本恒定、信息不过 schema 瓶颈），但<em>可审计性与事故归因的需求不会消失</em>。<strong>一个尚未解决的问题是：能否让端到端系统「事后生成」可审计的符号解释，且这个解释可证明地忠实于实际决策依据</strong>——目前的 post-hoc 解释都无法保证忠实性（模型可以给出一个与实际计算路径无关的合理解释）。这是可解释性研究里最硬的问题之一。</li>
+    <li><strong>不确定性的表示与传播。</strong>本模块讲的还是「每个目标一个标量 + 一个 σ」。<em>真实的不确定性是联合的、结构化的</em>：两块牌子是「二选一」还是「都在」？距离误差与类别误差相关吗？<strong>把完整的联合不确定性传给下游，token 成本会爆炸；只传边缘分布，下游就无法做正确的联合推理。</strong>这个取舍目前没有好的理论指导，工业界普遍只传边缘量。</li>
+    <li><strong>LLM 到底会不会用置信度这个数字？</strong>把 <code>conf=0.62</code> 写进 prompt，模型是真的在做概率推理，还是只把它当成一个「弱化语气」的记号？<em>已有证据表明 LLM 对 prompt 里的数值概率使用得相当粗糙，且对表述方式（数字 vs「可能」「大概」）高度敏感</em>。<strong>「如何让模型正确使用输入的不确定性」目前主要靠在训练数据里构造对应样本，缺少更原理性的方法。</strong>这直接决定了第 7 节手段 ② 的天花板。</li>
+    <li><strong>感知与决策的联合优化 vs 接口稳定性。</strong>联合训练能让感知输出「决策真正需要的东西」而不是「人以为需要的东西」，收益明确；<em>但它会让接口随训练一起漂移，模块化开发、独立评测、供应商分工全部失效</em>。<strong>能否做到「训练时联合、部署时仍有稳定接口」，是量产组织形态与算法效率之间的真实矛盾</strong>，目前没有干净的答案。</li>
+    <li><strong>接口层面的对抗鲁棒性。</strong>如果感知输出是文本，那么一个被精心构造的场景（比如车身贴纸让检测器输出某个特定类别）就等价于一次 <em>prompt injection</em>。<strong>「物理世界的对抗样本 → 感知误检 → 文本注入 → VLA 行为被操纵」这条链路在学术上刚开始被研究，在工程上几乎没有防护</strong>。最低限度的防御是对序列化字段做严格的白名单与范围校验（不允许自由文本进入 prompt），但这只挡住了最粗糙的一类。</li>
+    <li><strong>校准在长尾与分布漂移下的维持。</strong>温度缩放这类后处理校准在同分布上很有效，<em>但夜间、雨雾、新区域上校准会失效，而这些恰恰是最需要正确不确定性的场景</em>。<strong>「分场景校准」（按天气/光照/距离分桶各校一个温度）是务实做法，但桶的划分本身又是一个开放问题</strong>，而且桶太细会导致每桶样本不足、校准本身过拟合。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>★ 必读</strong>：Guo et al., <em>On Calibration of Modern Neural Networks</em>（ICML 2017，arXiv:1706.04599）——ECE、可靠性图、温度缩放的原始出处，本模块第 4 节的全部工具都来自它，<em>务必自己动手复现一次可靠性图</em>。<strong>★</strong> Tian et al., <em>DriveVLM: The Convergence of Autonomous Driving and Large Vision-Language Models</em>（CoRL 2024，arXiv:2402.12289）——看它怎么把场景描述与关键物体分析组织成结构化输入，以及慢-快双系统的分工。<strong>★</strong> Hwang et al., <em>EMMA: End-to-End Multimodal Model for Autonomous Driving</em>（arXiv:2410.23262）——把驾驶任务全部表述为语言任务的极端做法，读它对「文本作为通用接口」的论证与代价分析。</p><p>配套背景：Wang et al., <em>OmniDrive</em>（3D 感知 token 注入 LLM 的特征级方案）；Kendall &amp; Gal, <em>What Uncertainties Do We Need in Bayesian Deep Learning for Computer Vision?</em>（NeurIPS 2017，aleatoric vs epistemic 的区分）；Ovadia et al., <em>Can You Trust Your Model's Uncertainty?</em>（NeurIPS 2019，分布漂移下校准的失效）；Sclar et al., <em>Quantifying Language Models' Sensitivity to Spurious Features in Prompt Design</em>（ICLR 2024，格式敏感性的系统性证据）；Zhao et al., <em>Calibrate Before Use</em>（ICML 2021）。相邻课程：模块 02（动作头与多模态）、模块 04（约束化与安全兜底）、模块 05（评测与上车）、C55 模块 02（级联误差传播）与模块 04（时序与迟滞）、C58 模块 03（不确定性触发与回传）、C60（训练-部署一致性）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_action_repr/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 动作表示与输出头设计</div></a>
+    <a class="next" href="../04_instruction/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 交通规则的指令跟随与约束化</div></a>
+  </div>
+
+</div>
+</body>
+</html>

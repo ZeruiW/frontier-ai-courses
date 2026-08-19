@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 分配与损失层面的解法</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 分配与损失层面的解法</h1>
+  <p class="subtitle">三条<em>正交</em>的路：改分配 / 换度量 / 调损失 · 改分配——center-based 让正样本数不会归零、尺度自适应阈值、ATSS 用「均值+标准差」自适应、SimOTA 动态 k · <strong>换度量——NWD 把框建成 2D 高斯，用 Wasserstein 距离</strong>：对尺度不敏感，且<em>两框完全不相交时仍有平滑梯度</em>（IoU 在这里恒为 0，GIoU 只给方向不给尺度公平）· RFLA 换个对象建高斯——建的是<em>有效感受野</em>而不是框 · 调损失——scale-aware 加权的收益与反噬（正样本为零时，权重乘以零还是零）· GIoU/DIoU/CIoU/SIoU/EIoU 在小框上的实测差异与选择建议</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（IoU 位移敏感性）、模块 02（层级负载与格子数）；C53 m02（标签分配谱系）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_assignment_loss_small.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">NWD (Wang 2021) · RFLA (Xu, ECCV 2022) · ATSS (Zhang 2020) · GIoU/DIoU/CIoU/EIoU/SIoU · Focal Loss</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 65 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#scarcity">先把问题钉死：IoU 这把尺子对小框本身就是坏的</a></li>
+      <li><a href="#nwd">NWD：把框建模成 2D 高斯，用 Wasserstein 距离量相似度</a></li>
+      <li><a href="#nwd_props">NWD 的三个关键性质：为什么它恰好补上了 IoU 的短板</a></li>
+      <li><a href="#center">解法一·A：center-based 分配与尺度自适应阈值</a></li>
+      <li><a href="#adaptive">解法一·B：ATSS 与 SimOTA 的自适应性，以及它们在小目标上的意外表现</a></li>
+      <li><a href="#rfla">RFLA：把「感受野」而不是「anchor」当作先验</a></li>
+      <li><a href="#iou_family">IoU 变体家族：GIoU / DIoU / CIoU / EIoU / SIoU 在小框上的真实差异</a></li>
+      <li><a href="#scale_loss">解法三：scale-aware 损失加权，与「加过头」的两种代价</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="scarcity"><span class="num">1</span>先把问题钉死：IoU 这把尺子对小框本身就是坏的</h2>
+  <p>模块 02 解决了「目标在特征图上有没有格子」，这一节要解决的是下一个问题：<strong>格子有了，但它能不能被判成正样本</strong>。这两件事经常被混为一谈，而它们的解法完全不同。</p>  <p>回到模块 01 的核心事实：<strong>IoU 对绝对位移的敏感度反比于框的边长</strong>。对边长为 w 的方框，沿对角线每轴各位移 δ：</p>  <div class="math-block">\[\mathrm{IoU}(\delta) \;=\; \frac{(w-\delta)^2}{2w^2-(w-\delta)^2}, \qquad \left|\frac{\partial\,\mathrm{IoU}}{\partial \delta}\right|_{\delta=0} \;=\; \frac{4}{w}\]</div>  <table>
+    <thead><tr><th>每轴位移 δ</th><th>IoU（8×8 框）</th><th>IoU（64×64 框）</th><th>NWD（8×8，C=12.8）</th><th>NWD（64×64，C=12.8）</th></tr></thead>
+    <tbody>
+      <tr><td>0 px</td><td>1.000</td><td>1.000</td><td>1.000</td><td>1.000</td></tr>
+      <tr><td>1 px</td><td><strong>0.620</strong></td><td>0.940</td><td>0.895</td><td>0.895</td></tr>
+      <tr><td>2 px</td><td><strong>0.391</strong></td><td>0.884</td><td>0.802</td><td>0.802</td></tr>
+      <tr><td>4 px</td><td><strong>0.143</strong></td><td>0.784</td><td>0.643</td><td>0.643</td></tr>
+      <tr><td>8 px</td><td><strong>0.000（死区）</strong></td><td>0.620</td><td>0.413</td><td>0.413</td></tr>
+      <tr><td>位移灵敏度 |∂/∂δ|</td><td><strong>0.50 /px</strong></td><td>0.031 /px</td><td><strong>0.110 /px</strong></td><td><strong>0.110 /px</strong></td></tr>
+    </tbody>
+  </table>  <p>最后一行是全模块的钥匙：<strong>IoU 的位移灵敏度是 4/w——对 8 px 的框比对 128 px 的框陡 16 倍；而 NWD 的灵敏度恒为 √2/C，与框的尺寸完全无关。</strong></p>  <h3>这个不公平的三个具体后果</h3>  <ol>
+    <li><strong>同一个阈值对不同尺度是完全不同的要求。</strong> 把 IoU ≥ τ 反解成「允许的位移半径」，得 <em>r = w(1−τ)/(1+τ)</em>——<strong>半径正比于框的边长</strong>。τ = 0.5 时，8 px 的框只允许位移 2.67 px，而 128 px 的框允许 42.7 px。</li>
+    <li><strong>而网格量化本身就带来 4 px 的误差。</strong> 在 stride 8 的特征图上，格子中心间隔 8 px，GT 中心到最近格子中心的偏移在每轴上最大 4 px。<em>2.67 px 的容忍半径小于 4 px 的固有误差</em>——这是一个<strong>结构性的不匹配</strong>，不是调参能解决的。notebook 会算出：即使 anchor 尺寸完美匹配，<strong>也只有约 25% 的 8 px 目标能在 stride 8 网格上找到 IoU ≥ 0.5 的 anchor</strong>（16 px 时是 85%，32 px 时是 100%）。</li>
+    <li><strong>不相交时 IoU 恒为 0，梯度也恒为 0。</strong> 对 8 px 的框，只要位移超过 8 px（在 stride 8 上就是一个格子）就进入死区。<em>死区里所有的「错得多远」信息全部丢失</em>——错 9 px 和错 90 px 在 IoU 眼里一模一样。</li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以「小目标正样本少」不是一个统计现象，是<strong>度量本身的性质导致的必然结果</strong>。很多工程实践里的第一反应是「把 IoU 阈值从 0.5 降到 0.3」——这有用，但它只是把不公平从一个点挪到另一个点：<em>τ = 0.3 时 8 px 框的容忍半径是 4.3 px，勉强够；而 128 px 框的容忍半径变成 69 px，等于把一大批明显错的框也收成了正样本</em>。<strong>单一阈值下，无论取什么值，总有一头是错的。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说：<strong>IoU 是一个「相对」度量——它衡量的是位移相对于框尺寸的比例</strong>。这在目标尺寸跨度不大时是优点（尺度不变），在目标尺寸跨越 4–200 px 时就是灾难。而小目标真正需要的是一个<em>「绝对」度量</em>——因为对小目标构成威胁的误差（网格量化 ±4 px、标注抖动 ±2 px、亚像素回归精度）<strong>都是绝对像素量，与目标尺寸无关</strong>。<em>用相对度量去衡量绝对误差，就是整个问题的根源。</em> 这直接指向了解法：换一个位置项是绝对距离的度量——<strong>这就是 NWD。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把三层解法的关系先摆清楚，后面就不会乱：<strong>① 改分配（谁是正样本）→ ② 换度量（用什么尺子判）→ ③ 调损失（正样本怎么加权）</strong>。三者独立且可叠加，但<em>优先级是从上往下的</em>——如果度量本身是坏的，再精巧的损失加权也只是在错误的正样本集合上优化。<strong>面试里如果只答「加大小目标的损失权重」，那是从第三层入手，会被追问到底。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="nwd"><span class="num">2</span>NWD：把框建模成 2D 高斯，用 Wasserstein 距离量相似度</h2>
+  <p><span class="term">NWD（Normalized Wasserstein Distance）</span>的构造分三步，每一步都可以在纸上验算。</p>  <h3>第一步：bbox → 2D 高斯</h3>  <p>一个框 (c_x, c_y, w, h) 里的目标并不是均匀铺满整个矩形的——中心的像素属于目标，四角往往是背景。用一个<strong>内切椭圆</strong>去近似目标的实际占据区域更合理，而椭圆恰好是二维高斯的等密度线：</p>  <div class="math-block">\[\mathcal{N}_b \;=\; \mathcal{N}\!\left(\boldsymbol\mu = \begin{bmatrix} c_x \\ c_y\end{bmatrix},\; \boldsymbol\Sigma = \begin{bmatrix} \frac{w^2}{4} & 0 \\[2pt] 0 & \frac{h^2}{4}\end{bmatrix}\right)\]</div>  <div class="ascii">bbox -&gt; 2D 高斯：把框的内切椭圆当作高斯的 1-sigma 等密度线
+
+     (cx-w/2, cy-h/2)
+        ┌──────────────────────────┐        Sigma^{1/2} = diag(w/2, h/2)
+        │        ╭────────╮        │        &lt;=&gt; 沿 x 轴 sigma_x = w/2
+        │     ╭──╯        ╰──╮     │            沿 y 轴 sigma_y = h/2
+        │    ╱   ●(cx,cy)    ╲     │  h
+        │     ╰──╮        ╭──╯     │        四角是背景 -&gt; 高斯自然衰减
+        │        ╰────────╯        │        中心是目标 -&gt; 高斯密度最高
+        └──────────────────────────┘
+                     w                       **注意 Sigma 是对角阵**：
+                                             轴对齐框没有 xy 相关性。
+                                             旋转框才需要非对角 Sigma。</div>  <h3>第二步：两个高斯之间的 2-Wasserstein 距离</h3>  <p>对两个高斯分布，二阶 Wasserstein 距离有闭式解。把它写出来，代入对角协方差之后<strong>会退化成一个极其简单的形式</strong>：</p>  <div class="math-block">\[W_2^2(\mathcal{N}_a, \mathcal{N}_b) \;=\; \|\boldsymbol\mu_a - \boldsymbol\mu_b\|_2^2 \;+\; \left\|\boldsymbol\Sigma_a^{1/2} - \boldsymbol\Sigma_b^{1/2}\right\|_F^2\]</div>  <div class="math-block">\[=\; (c_{x_a}-c_{x_b})^2 + (c_{y_a}-c_{y_b})^2 + \left(\frac{w_a-w_b}{2}\right)^{\!2} + \left(\frac{h_a-h_b}{2}\right)^{\!2}\]</div>  <p>换句话说，<strong>W₂² 就是把框写成四维向量 [c_x, c_y, w/2, h/2] 之后的欧氏距离平方</strong>。实现只需要一行。但这个简洁形式背后有真正的意义：<em>位置项和尺寸项被放在同一个度量空间里，且都是绝对像素量</em>。</p>  <h3>第三步：归一化成 (0, 1] 的相似度</h3>  <p>W₂ 是一个距离（越小越像），量纲是像素，取值无上界——不能直接当 IoU 用。NWD 用一个指数把它映射到相似度：</p>  <div class="math-block">\[\mathrm{NWD}(\mathcal{N}_a, \mathcal{N}_b) \;=\; \exp\!\left(-\frac{\sqrt{W_2^2(\mathcal{N}_a, \mathcal{N}_b)}}{C}\right) \;\in\; (0, 1]\]</div>  <table>
+    <thead><tr><th>符号</th><th>含义</th><th>取值</th><th>怎么定</th></tr></thead>
+    <tbody>
+      <tr><td><strong>C</strong></td><td><strong>NWD 唯一的超参</strong>：把「像素距离」换算成「相似度」的尺度常数</td><td>AI-TOD 上用 12.8</td><td><strong>取数据集目标的平均绝对尺寸</strong>（√(wh) 的均值）</td></tr>
+      <tr><td><strong>W₂</strong></td><td>两个高斯的 2-Wasserstein 距离，单位是像素</td><td>[0, ∞)</td><td>闭式解，无需迭代</td></tr>
+      <tr><td><strong>NWD</strong></td><td>相似度，可直接替换 IoU 用于分配 / NMS / 损失</td><td>(0, 1]，= 1 当且仅当两框完全相同</td><td>τ 与 C 联动，见下节</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以 NWD 的实现只有三行：<em>把两个框各写成 [c_x, c_y, w/2, h/2]，算欧氏距离，取 exp(−d/C)</em>。它比 IoU 还简单（不需要求交集），也<strong>处处可导</strong>（IoU 在框刚好相切时不可导，在不相交时梯度为 0）。作为一把「尺子」，它可以原样替换掉分配器里的 IoU、NMS 里的 IoU、以及回归损失里的 IoU（用 L = 1 − NWD）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>要注意 NWD 用的是 <strong>W₂ 而不是 KL 散度</strong>，这个选择是有讲究的。<em>KL 散度在两个分布不重叠时会发散到无穷</em>（它衡量的是「用一个分布编码另一个分布的代价」），而 Wasserstein 距离衡量的是「把一堆土从一个分布搬成另一个分布需要多少功」——<strong>即使两个分布完全不重叠，这个功也是有限且连续变化的</strong>。这正是 WGAN 当年选择 Wasserstein 而不是 JS 散度的同一个理由。<em>对小目标检测，「不重叠时仍有有意义的度量」恰恰是最需要的性质。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个必须澄清的常见误读：<strong>NWD 里的高斯不是「不确定性建模」</strong>。它不是在说「这个框的位置有多不确定」，而是<em>纯粹把矩形换成一个更平滑的、有解析距离的等价表示</em>。σ = w/2 是硬性规定的（框的半宽），不是学出来的、也不是估计出来的。<em>把 NWD 和「概率化检测 / 不确定性估计」混为一谈是面试里常见的答错点。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="nwd_props"><span class="num">3</span>NWD 的三个关键性质：为什么它恰好补上了 IoU 的短板</h2>
+  <p>公式写出来只是第一步。真正要说清楚的是<strong>它到底解决了前面列的哪几条</strong>——以下三条都可以在 notebook 里 assert。</p>  <h3>性质一：对「相同绝对位移」给出相同的相似度，与框的大小无关</h3>  <p>如果两个框尺寸相同、只有位置不同，那么 Σ 项完全抵消，W₂ = ‖Δμ‖。于是</p>  <div class="math-block">\[\mathrm{NWD} \;=\; \exp\!\left(-\frac{\|\Delta\boldsymbol\mu\|}{C}\right), \qquad \left|\frac{\partial\,\mathrm{NWD}}{\partial \|\Delta\boldsymbol\mu\|}\right|_{0} = \frac{1}{C} \;\;(\text{与 } w \text{ 无关})\]</div>  <p>对照 IoU 的 4/w：<strong>8 px 的框和 64 px 的框位移 2 px，IoU 分别是 0.391 和 0.884（差 2.3 倍），NWD 都是 0.802（完全相同）</strong>。这是可以精确 assert 的等式，不是近似。</p>  <p>把它翻译成分配阈值下的「正样本容忍半径」，对比更直观：</p>  <div class="math-block">\[r_{\mathrm{IoU}}(\tau, w) \;=\; w\cdot\frac{1-\tau}{1+\tau} \;\;(\propto w), \qquad r_{\mathrm{NWD}}(\tau, C) \;=\; -\,C\ln\tau \;\;(\text{常数})\]</div>  <table>
+    <thead><tr><th>框边长 w</th><th>r（IoU@0.5）</th><th>r（IoU@0.3）</th><th>r（NWD@0.5, C=12.8）</th><th>stride 8 网格的固有量化误差</th></tr></thead>
+    <tbody>
+      <tr><td><strong>4 px</strong></td><td>1.33 px</td><td>2.15 px</td><td><strong>8.87 px</strong></td><td>最大 4 px / 轴</td></tr>
+      <tr><td><strong>8 px</strong></td><td><strong>2.67 px ❌</strong></td><td>4.31 px</td><td><strong>8.87 px ✅</strong></td><td>最大 4 px / 轴</td></tr>
+      <tr><td><strong>16 px</strong></td><td>5.33 px</td><td>8.62 px</td><td><strong>8.87 px</strong></td><td>最大 4 px / 轴</td></tr>
+      <tr><td><strong>64 px</strong></td><td>21.3 px</td><td>34.5 px ⚠️</td><td><strong>8.87 px</strong></td><td>最大 4 px / 轴</td></tr>
+      <tr><td><strong>256 px</strong></td><td>85.3 px</td><td>138 px ⚠️⚠️</td><td><strong>8.87 px</strong></td><td>最大 4 px / 轴</td></tr>
+    </tbody>
+  </table>  <p>这张表把「降低 IoU 阈值」这个常见做法的问题暴露得很清楚：<strong>把 τ 从 0.5 降到 0.3，确实把 8 px 框的容忍半径从 2.67 提到 4.31（够用了），但同时把 256 px 框的容忍半径从 85 提到了 138 px</strong>——那是把中心偏了半个框的预测也收成正样本。<em>NWD 则在所有尺度上给出同一个 8.87 px 的半径，这个半径由 C 和 τ 共同决定，可以按「网格量化误差 + 标注抖动」直接设计。</em></p>  <h3>性质二：不相交时仍有非零梯度，而且惩罚「放大预测框」</h3>  <p>IoU 在不相交时恒为 0，梯度也恒为 0——这是一个<strong>平台（plateau）</strong>，优化完全停滞。GIoU 用「最小外接框的空洞比例」补上梯度，但它有一个著名的病态：<em>在不相交时，让预测框变大可以缩小空洞比例，于是 GIoU 的梯度主要在推动「把框放大」</em>。notebook 里可以算出来：一个 8×8 的 GT，预测框中心偏 30 px 时，<strong>预测框从 8×8 放大到 40×40，GIoU 从 −0.911 涨到 −0.429（「变好了」），而 IoU 全程为 0</strong>。对小目标，这直接产生系统性偏大的框。</p>  <p>NWD 没有这个问题，因为 Σ 项<strong>显式地惩罚尺寸不匹配</strong>：同样的场景下，预测框从 8×8 放大到 40×40，W₂² 从 1800 涨到 2312，NWD 从 0.0363 <strong>降到</strong> 0.0234。<em>GIoU 奖励放大，NWD 惩罚放大——方向相反。</em></p>  <h3>性质三：处处光滑，且等值面是正圆</h3>  <p>NWD 是 exp 复合欧氏距离，<strong>C^∞ 光滑</strong>，没有 IoU 在相切处的折点、也没有死区。此外，因为它只依赖 ‖Δμ‖，<strong>它的等值面是标准圆</strong>；而 IoU 的等值面是各向异性的（沿轴移动和沿对角移动的容忍度不同——对同一个 8 px 框，τ=0.5 时沿轴能容忍 2.67 px，沿对角每轴只能容忍 1.47 px）。<em>各向异性意味着同一个目标落在格子的不同相对位置上，被匹配的概率不同——这是一种没人想要的随机性。</em></p>  <div class="callout danger"><span class="label">纯 NWD 会伤大目标</span>
+    <p><strong>但 NWD 不是免费的，它有一个必须知道的代价：对大目标的区分度不足。</strong></p><p>因为位置项是绝对距离，<em>一个 3 px 的偏移在 10 px 的框上和在 300 px 的框上被同等对待</em>——而后者显然是好得多的定位。结果是：<strong>纯 NWD 训练会让大目标的定位精度下降</strong>（AP@0.75 尤其明显）。</p><p>工程上的标准做法有两种：<strong>① 混合</strong>——<code>metric = (1−α)·IoU + α·NWD</code>，α 按数据集的小目标占比设（TSR 上 α 取 0.5–0.8 合理）；<strong>② 按尺寸切换</strong>——小于某个阈值（如 √(wh) &lt; 32 px）的 GT 用 NWD 分配，其余用 IoU。<em>NWD 原论文在 AI-TOD（几乎全是极小目标）上用纯 NWD，那是因为那个数据集没有大目标。直接照搬到有大目标的场景会掉点</em>——<strong>这正是面试里区分「读过论文」和「用过方法」的地方。</strong></p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>C 的取值不是随便定的，它<strong>决定了 NWD 的有效作用范围</strong>。因为 NWD = exp(−d/C)，当 d ≫ C 时它指数衰减到 0，梯度也随之消失。<em>C 太小 → 稍远一点就没有梯度，退化成 IoU 的死区；C 太大 → 远处的错误框也拿到高分，正样本质量下降。</em> <strong>经验规则：C ≈ 数据集目标 √(wh) 的均值</strong>（AI-TOD 上是 12.8）。在 TSR 上，如果尺寸中位数是 14 px，C 取 12–16 是合理起点，然后配合 τ 用「r = −C ln τ 应当略大于网格量化误差 + 标注抖动」来验算。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="center"><span class="num">4</span>解法一·A：center-based 分配与尺度自适应阈值</h2>
+  <p>换度量之外，另一条独立的路是<strong>改变「谁有资格当正样本」的规则</strong>。这条路更早、更简单，而且和 NWD 完全可以叠加。</p>  <h3>center-based：从「框和框比」到「点在不在框里」</h3>  <p><span class="term">FCOS</span> 式的 anchor-free 分配把问题换了个提法：不再问「这个 anchor 和 GT 的 IoU 够不够」，而是问「<strong>这个特征点的中心落没落在 GT 框里</strong>」。这对小目标有一个直接的好处——<em>它绕开了 IoU 阈值，也绕开了 anchor 尺寸是否匹配的问题</em>。</p>  <p>但它有自己的天花板，而且是模块 02 算过的那个：<strong>对边长 L 的框，每轴上落入至少一个格子中心的概率是 min(1, L/stride)</strong>，二维需要两轴同时满足，于是</p>  <div class="math-block">\[P(\text{一个正样本都没有}) \;=\; 1 - \min\!\left(1, \frac{L}{s}\right)^{\!2}\]</div>  <p>在 stride 8 上：<strong>4 px 的目标有 75% 的概率一个中心点都落不进去，6 px 的目标是 44%</strong>。center-based 不能解决这个，只有更高分辨率（P2）能。<em>这就是为什么模块 02 必须排在前面。</em></p>  <p>实践中还会加两个修正：</p>  <ul>
+    <li><strong>center sampling</strong>：只把「距 GT 中心 &lt; r·stride」的点算正样本（YOLOX / FCOS 改进版用 r = 1.5 或 2.5），避免框边缘的点被当正样本——那些点的特征其实是背景。<em>对小目标要注意：r·stride 可能已经大于目标本身，此时必须再和「点在框内」求交</em>，否则会把背景点收进来。</li>
+    <li><strong>centerness / IoU-aware 分支</strong>：给每个正样本打一个「离中心多近」的软标签，推理时乘到分类分数上，压制边缘点产生的低质量框。<em>对小目标，centerness 的取值范围被压缩（框太小，中心和边缘差不了几个像素），这个分支的作用会减弱。</em></li>
+  </ul>  <h3>尺度自适应阈值：让「容忍半径」在所有尺度上恒定</h3>  <p>如果不想换度量，还有一个更保守的改法：<strong>让 IoU 阈值随目标尺寸变化</strong>。关键是别拍脑袋定阈值表，而是<em>反解出来</em>——要求容忍半径恒为 r₀，直接从 r = w(1−τ)/(1+τ) 解出：</p>  <div class="math-block">\[\tau(w) \;=\; \mathrm{clip}\!\left(\frac{w-r_0}{w+r_0},\; \tau_{\min},\; \tau_{\max}\right)\]</div>  <table>
+    <thead><tr><th>框边长 w</th><th>τ(w)（r₀ = 4 px）</th><th>反算的容忍半径</th><th>对比：固定 τ=0.5 的半径</th></tr></thead>
+    <tbody>
+      <tr><td>8 px</td><td><strong>0.333</strong></td><td>4.0 px ✅</td><td>2.67 px ❌</td></tr>
+      <tr><td>16 px</td><td>0.600</td><td>4.0 px ✅</td><td>5.33 px</td></tr>
+      <tr><td>32 px</td><td>0.778</td><td>4.0 px ✅</td><td>10.7 px</td></tr>
+      <tr><td>64 px</td><td>0.882</td><td>4.0 px ✅</td><td>21.3 px</td></tr>
+      <tr><td>256 px</td><td>0.969 → clip 0.90</td><td>13.5 px</td><td>85.3 px ⚠️</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这个式子的好处是它<strong>不是经验表，而是从一个明确的设计目标反解出来的</strong>：「我希望在所有尺度上，容忍的定位误差都是 r₀ 像素」。r₀ 该取多少也不是猜的——<em>它应该覆盖「网格量化误差（stride/2）+ 标注抖动（±1–2 px）+ 亚像素回归的固有精度」</em>。stride 8 时 r₀ = 4–6 px 是合理区间。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>而一旦这么写出来，就会发现一件事：<strong>「尺度自适应的 IoU 阈值」和「固定阈值的 NWD」在做的是同一件事——让容忍半径与尺度解耦</strong>。NWD 的 r = −C ln τ 天然就是常数，而尺度自适应阈值是用一个补偿函数把 IoU 掰成常数半径。<em>两者的区别在于：NWD 在整个度量上都是绝对的（包括不相交的情形和梯度），而尺度自适应阈值只在「判正负」这一个点上做了补偿，回归损失里的 IoU 该多陡还是多陡。</em> <strong>所以如果只能改一处，改度量比改阈值更彻底。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把这一节浓缩成一句：<strong>所有对小目标友好的分配策略，本质上都在做同一件事——把「相对误差」的判据换成「绝对误差」的判据</strong>。center-based 用「点在不在框里」（绝对），尺度自适应阈值用补偿函数（把相对掰成绝对），NWD 直接用绝对距离。<em>认出这个共同点，就不用记三套方法，只需要记一条原则。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="adaptive"><span class="num">5</span>解法一·B：ATSS 与 SimOTA 的自适应性，以及它们在小目标上的意外表现</h2>
+  <p>动态分配（ATSS / OTA / SimOTA / TaskAligned，详见 C53 m02）常被说成「天然对小目标更公平」。这句话<strong>一半对，一半是错的</strong>，值得逐条拆开。</p>  <h3>ATSS：阈值从数据里长出来，确实更公平</h3>  <p><span class="term">ATSS</span> 的规则是：对每个 GT，在每个金字塔层各选 k=9 个中心最近的候选 anchor，算它们与 GT 的 IoU，然后把<strong>阈值定成这些 IoU 的 均值 + 标准差</strong>，超过阈值且中心在框内的成为正样本。</p>  <p><strong>为什么这对小目标更公平：</strong> 阈值是从候选集里算出来的。小目标的所有候选 IoU 都低（比如 0.02–0.08），阈值也就自动变低（0.05 左右），于是仍能选出正样本——<em>而固定 0.5 的阈值会一个都选不出来</em>。</p>  <div class="callout warn"><span class="label"></span>
+    <strong>但 ATSS 在极小目标上会退化。</strong> 均值+标准差这个设计的原意是：标准差大 = 该 GT 在某一层上明显更合适 → 抬高阈值只留那一层；标准差小 = 各层差不多 → 阈值接近均值。<em>对极小目标，所有候选的 IoU 都挤在 0 附近，标准差趋近于 0</em>，于是阈值 ≈ 均值 ≈ 0.03，<strong>结果是 top-9 候选几乎全部被收成正样本，而它们的 IoU 全都低于 0.1</strong>。<em>正样本数量有了，质量没有</em>——模型被要求从一堆几乎不含目标的 anchor 上回归出准确的框。<strong>解法：把 ATSS 里的 IoU 换成 NWD，两个机制叠加。</strong>
+  </div>  <h3>SimOTA 的 dynamic-k：对小目标的作用方向是反的</h3>  <p><span class="term">SimOTA</span> 的动态 k 规则是：取每个 GT 的 top-q（q=10）个候选的 IoU，<strong>把它们求和再取整，作为该 GT 应分配的正样本个数</strong> k_i = max(1, round(Σ IoU))。这个设计的直觉是「和 GT 匹配得好的候选多，就多给几个正样本」。</p>  <p><strong>但把它套到小目标上，方向恰好是反的。</strong> 小目标的所有候选 IoU 都低，求和自然小，于是 k 被压到 1–2；而大目标的候选 IoU 高，k 可以到 7–10。<em>结果是：本来正样本就稀缺的小目标，被 dynamic-k 又砍了一刀。</em></p>  <table>
+    <thead><tr><th>GT 尺寸</th><th>top-10 候选 IoU 之和</th><th>k（IoU 版）</th><th>top-10 候选 NWD 之和</th><th>k（纯 NWD 版）</th><th>k（混合 α=0.7）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>8 px</strong></td><td>2.06</td><td><strong>2</strong> ❌</td><td>5.53</td><td><strong>6</strong> ✅</td><td><strong>4</strong> ✅</td></tr>
+      <tr><td>32 px</td><td>4.74</td><td>5</td><td>4.92</td><td>5</td><td>5</td></tr>
+      <tr><td><strong>128 px</strong></td><td>4.74</td><td><strong>5</strong> ✅</td><td>0.83</td><td><strong>1</strong> ❌</td><td><strong>2</strong></td></tr>
+    </tbody>
+  </table>  <p>最后一行同样重要，而且它是本课「必须混合」这条建议的直接证据：<strong>纯 NWD 版把 128 px 目标的 k 从 5 砍到了 1</strong>——因为位置项是绝对距离，一个大目标的候选中心偏十几像素就被 NWD 判成「很远」。<em>不公平只是被倒向了另一头。</em> 换成 <code>0.3·IoU + 0.7·NWD</code> 的混合度量后是 <strong>4 / 5 / 2</strong>：小目标的 k 被拉起来（2 → 4），大目标不至于塌到 1。<em>α 越大越偏袒小目标——它是一个可以按数据分布调的旋钮，而不是一个常数。</em></p>  <p><strong>所以修法有三条，可以叠加：</strong> ① 把 dynamic-k 里的 IoU 换成 <strong>IoU 与 NWD 的混合</strong>；② 给 k 设一个下界（如 k ≥ 3）；③ 按尺寸切换度量。<em>第二条最粗暴但最好调试，第一条最一致。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这一节的价值不在于「ATSS/SimOTA 好不好」，而在于一个更一般的判断力：<strong>任何以 IoU 为内部度量的自适应机制，都会把 IoU 的尺度不公平继承下来，而且往往被自适应性放大</strong>。ATSS 的均值+标准差、SimOTA 的 dynamic-k、TaskAligned 的 t = s^α·u^β（u 就是 IoU）——<em>它们都在「自适应」，但适应的是一把对小框有系统性偏见的尺子。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以正确的做法不是「在 ATSS 和 NWD 之间二选一」，而是<strong>把 NWD 装进 ATSS / SimOTA / TaskAligned 的内部</strong>。这是一个几乎零成本的改动（换一个函数调用），却把两条独立的改进叠加了起来：<em>自适应性负责「不同 GT 该拿多少正样本」，NWD 负责「候选好不好这件事怎么量」</em>。<strong>面试里能说出这个组合关系，比背出任何单个方法的公式都有价值——因为它说明你理解了这些方法各自在解决哪一层的问题。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rfla"><span class="num">6</span>RFLA：把「感受野」而不是「anchor」当作先验</h2>
+  <p><span class="term">RFLA（Receptive Field based Label Assignment）</span>是另一条思路，它质疑的是一个更底层的假设：<strong>为什么要拿「anchor 框」或「格子中心点」去和 GT 比？真正接收信息的是那个特征点的感受野。</strong></p>  <h3>三个组成部分</h3>  <ol>
+    <li><strong>把有效感受野建模成高斯。</strong> 理论感受野（TRF）是一个方块，但<span class="term">有效感受野（ERF）</span>——真正对输出有显著贡献的区域——近似一个<em>以特征点为中心的二维高斯</em>，且远小于 TRF（典型只有 TRF 面积的几分之一，见 C53 m03 的数值实验）。RFLA 于是给每个特征点配一个高斯 N(μ_点, σ²_ERF·I)，σ_ERF 由该层的感受野决定。</li>
+    <li><strong>用 KLD 度量「感受野高斯」与「GT 高斯」的匹配度</strong>，代替 IoU。</li>
+    <li><strong>HLA（Hierarchical Label Assignment）分层分配</strong>：先按 KLD 排序取 top-k；对没拿够 k 个的 GT，逐级放宽条件再补；<em>保证每个 GT 至少有 k 个正样本</em>。</li>
+  </ol>  <div class="math-block">\[D_{\mathrm{KL}}(\mathcal{N}_g \,\|\, \mathcal{N}_e) = \frac12\left[\mathrm{tr}(\boldsymbol\Sigma_e^{-1}\boldsymbol\Sigma_g) + (\boldsymbol\mu_e - \boldsymbol\mu_g)^{\!\top}\boldsymbol\Sigma_e^{-1}(\boldsymbol\mu_e - \boldsymbol\mu_g) - 2 + \ln\frac{|\boldsymbol\Sigma_e|}{|\boldsymbol\Sigma_g|}\right]\]</div>  <h3>一个必须搞清楚的细节：KLD 的方向决定了公平性</h3>  <p>KLD 是<strong>非对称</strong>的，而这里的不对称性恰恰是关键。看中间那个位置项——它是<span class="term">马氏距离（Mahalanobis distance）</span>，<strong>用「参考分布」的协方差做归一化</strong>：</p>  <table>
+    <thead><tr><th>方向</th><th>位置项</th><th>对固定 2 px 偏移的行为</th><th>对小目标是否公平</th></tr></thead>
+    <tbody>
+      <tr><td><strong>D_KL(GT ‖ 预测框)</strong></td><td>Δᵀ Σ_pred⁻¹ Δ，用预测框尺寸归一化</td><td>∝ 1/w²：8 px 框的惩罚是 64 px 框的 <strong>64 倍</strong></td><td>❌ <strong>比 IoU 还不公平</strong></td></tr>
+      <tr><td><strong>D_KL(GT ‖ ERF)</strong>（RFLA 用的）</td><td>Δᵀ Σ_ERF⁻¹ Δ，用<strong>感受野</strong>尺寸归一化</td><td>σ_ERF 由层决定、与 GT 尺寸无关 → <strong>惩罚恒定</strong></td><td>✅ 与 NWD 同类</td></tr>
+      <tr><td><strong>W₂（NWD 用的）</strong></td><td>‖Δ‖²，纯绝对距离</td><td>恒定</td><td>✅</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>所以 <strong>RFLA 的公平性不来自 KLD，而来自「拿感受野当参考分布」这个选择</strong>——因为感受野的尺度由<em>网络层</em>决定，与目标大小无关，于是位置项自动变成了「绝对距离除以一个固定尺度」。<em>如果有人告诉你「KLD 比 IoU 对小目标更公平」，那是没说全：方向搞反了会更不公平。</em> <strong>这是一个很好的面试追问点——它检验你是不是真的把公式展开算过。</strong></p>
+  </div>  <p>RFLA 相比 NWD 的取舍：</p>  <table>
+    <thead><tr><th></th><th>NWD</th><th>RFLA</th></tr></thead>
+    <tbody>
+      <tr><td>核心先验</td><td>GT 框本身的高斯化</td><td><strong>特征点的有效感受野</strong></td></tr>
+      <tr><td>度量</td><td>W₂（对称、绝对距离）</td><td>KLD（非对称、按 ERF 归一化）</td></tr>
+      <tr><td>超参</td><td><strong>只有 C</strong></td><td>σ_ERF（需按层估计）+ HLA 的 k + 放宽策略</td></tr>
+      <tr><td>能否直接当损失</td><td>✅ L = 1 − NWD，处处可导</td><td>⚠️ 主要用于分配；当损失需额外归一化</td></tr>
+      <tr><td>「每个 GT 至少 k 个正样本」保证</td><td>❌ 需自己加保底逻辑</td><td><strong>✅ HLA 内建</strong></td></tr>
+      <tr><td>实现复杂度</td><td><strong>三行</strong></td><td>中等（要估 ERF、要写分层逻辑）</td></tr>
+      <tr><td>工程建议</td><td><strong>先上这个</strong>（改动最小、收益确定）</td><td>已有 NWD 后再叠加 HLA 的保底逻辑</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>实践上最划算的组合往往不是「选 NWD 还是选 RFLA」，而是<strong>取 NWD 的度量 + 取 RFLA 的「保底 k」思想</strong>：用 NWD 判正负，同时保证每个 GT 至少拿到 k 个正样本（不够就取 NWD 最大的前 k 个）。这两行代码解决了「某些极端小或极端偏的 GT 完全没有监督」的问题。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>「保底 k」为什么重要，值得算一笔账：在 TSR 的尺寸分布下，即使加了 P2，<em>仍有一小部分 GT（极小 + 恰好落在格子边界）拿不到任何正样本</em>。这些 GT 对损失的贡献是 0——<strong>它们不是「学得差」，而是「完全没被学」</strong>。更隐蔽的是，它们所在的位置会被当成<em>负样本</em>去训练，<strong>模型被主动教育「这里没有目标」</strong>。<em>这比单纯漏掉它们更糟。</em> 保底 k 把这种「负向监督」变成了正向监督。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="iou_family"><span class="num">7</span>IoU 变体家族：GIoU / DIoU / CIoU / EIoU / SIoU 在小框上的真实差异</h2>
+  <p>分配之外，<strong>回归损失</strong>用哪个 IoU 变体也是个真问题。这几个变体的关系经常被讲成一串「后一个比前一个好」的故事，但在小目标上它们的差异是具体且可验算的。</p>  <table>
+    <thead><tr><th>度量</th><th>在 IoU 之上加的惩罚项</th><th>不相交时</th><th>在小框上的具体问题</th><th>TSR 建议</th></tr></thead>
+    <tbody>
+      <tr><td><strong>IoU</strong></td><td>—</td><td><strong>恒为 0，梯度为 0</strong></td><td>8 px 框位移 8 px 就进死区</td><td>❌ 单用不行</td></tr>
+      <tr><td><strong>GIoU</strong></td><td>外接框空洞比 <code>|C\(A∪B)|/|C|</code></td><td>∈ [−1, 0)，有梯度</td><td><strong>梯度主要在推「把预测框放大」</strong> → 小目标框系统性偏大</td><td>⚠️ 有更好的选择</td></tr>
+      <tr><td><strong>DIoU</strong></td><td>中心距离 <code>ρ²/c²</code></td><td>有梯度，且直接拉中心</td><td>对小目标是<strong>正确的方向</strong>（小目标的主要误差就是中心偏）</td><td>✅ 可用</td></tr>
+      <tr><td><strong>CIoU</strong></td><td>DIoU + 长宽比项 <code>αv</code></td><td>同 DIoU</td><td><strong>①</strong> ∂v/∂w ∝ 1/w，小框上梯度大 25×（官方实现把 1/(w²+h²) 直接删掉了）<br><strong>②</strong> 长宽比一致时 v ≡ 0，<em>即使预测框大 5 倍也不惩罚</em></td><td>⚠️ 需用修正版</td></tr>
+      <tr><td><strong>EIoU</strong></td><td>DIoU + 分别惩罚 <code>(w−w_g)²/c_w²</code> 与 <code>(h−h_g)²/c_h²</code></td><td>同 DIoU</td><td>修掉了 CIoU 的两个毛病：不再有 1/(w²+h²)，也不再有「比例对了就不管」的退化</td><td><strong>✅ 推荐</strong></td></tr>
+      <tr><td><strong>SIoU</strong></td><td>角度代价 + 距离代价 + 形状代价</td><td>有梯度</td><td>角度项要求中心偏移有明确方向；<em>亚像素级偏移时角度基本是噪声</em></td><td>⚠️ 收益不稳定，超参多</td></tr>
+    </tbody>
+  </table>  <h3>三个可以验算的具体事实</h3>  <ol>
+    <li><strong>GIoU 奖励放大，NWD 惩罚放大。</strong> 8×8 的 GT，预测框中心偏 30 px：预测框从 8×8 放大到 40×40，<em>GIoU 从 −0.911 涨到 −0.429</em>（优化器会朝这个方向走），而 <em>NWD 从 0.0363 降到 0.0234</em>。前者产生偏大的框，后者不会。</li>
+    <li><strong>CIoU 的长宽比项在小框上梯度大一个量级。</strong> ∂v/∂w = −(8/π²)·(arctan(w_g/h_g) − arctan(w/h))·h/(w²+h²)，对方形框这个因子是 1/(2w)，<em>正比于 1/w</em>。8 px 与 200 px 相差 <strong>25 倍</strong>。而在归一化坐标下（除以图宽 1920），8 px 对应的因子是 120——<strong>这就是 CIoU 原文说「w²+h² 在归一化坐标下很小，容易梯度爆炸，所以我们的实现里直接把这个分母去掉了」的由来</strong>。<em>如果你用的框架没做这个处理，小目标上会出现莫名其妙的训练不稳。</em></li>
+    <li><strong>CIoU 的长宽比项会完全失效。</strong> 预测框 40×40、GT 8×8、中心重合：长宽比相同 ⇒ v = 0，中心距离为 0 ⇒ DIoU 项也为 0，于是 <em>CIoU = IoU = 0.04</em>，惩罚全部来自 IoU 本身。而 EIoU 的宽高项给出 <em>−1.24</em>——<strong>差了一个半量级的信号</strong>。这正是 EIoU 存在的理由。</li>
+  </ol>  <h3>回归损失的组合建议</h3>  <p>单一 IoU 类损失在小目标上都偏弱，需要和 L1 类损失配合。但这里有一个<strong>容易被忽略的陷阱</strong>：</p>  <div class="callout danger"><span class="label">L1 在归一化坐标下对小目标是打折的</span>
+    <p><strong>归一化坐标下的 L1 损失会系统性地低估小目标的误差。</strong> 假设图宽 1920：一个 8 px 的框宽度错了 50%（4 px），归一化 L1 = 4/1920 = <strong>0.00208</strong>；一个 200 px 的框宽度错了 10%（20 px），归一化 L1 = 20/1920 = <strong>0.0104</strong>。<em>客观上明显更差的那个预测，损失只有另一个的五分之一。</em></p><p>这解释了一个常见困惑：「我用了 L1 + GIoU 的标准组合，小目标还是不准」——<strong>因为 L1 项在归一化坐标下把小目标的权重压掉了，而 GIoU 项对小目标本来就陡峭到近乎噪声</strong>。<em>三种修法：① 把 L1 换成按框尺寸归一化的相对误差；② 加 scale-aware 权重（下一节）；③ 直接用 L = 1 − NWD 作为回归损失——它的位置项是绝对像素距离，天然没有这个问题。</em></p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以给 TSR 的一套具体推荐是：<strong>分配用 NWD（或 IoU/NWD 混合），回归损失用 <code>L = 1 − NWD</code> 或 <code>EIoU + 尺度归一化的 L1</code>，避开纯 GIoU 和未修正的 CIoU</strong>。这不是「哪个最新用哪个」，而是逐条对应到上面验算出来的问题。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个常被忽略的地方：<strong>NMS 里的 IoU 同样有这个不公平</strong>。两个 8 px 的框中心相距 5 px，IoU 只有 <strong>0.23</strong>，在任何常用阈值（0.5–0.65）下都会被当成两个不同目标全部保留——<em>于是小目标区域出现大量重复框</em>；而两个 200 px 的框中心同样相距 5 px，IoU 高达 <strong>0.95</strong>，会被正确合并。<em>NWD 对这两种情形给出的都是 0.677——同样的绝对偏移，同样的判断。</em> <strong>把 NMS 的 IoU 也换成 NWD（阈值相应调整）能显著减少小目标的重复框</strong>。<em>这一步在论文里很少提，但在真实系统里很有效——而且改动只有一行。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="scale_loss"><span class="num">8</span>解法三：scale-aware 损失加权，与「加过头」的两种代价</h2>
+  <p>最后一层是损失加权：既然小目标学不好，<strong>就在损失里给它更大的权重</strong>。典型形式是</p>  <div class="math-block">\[w_i \;=\; \left(\frac{s_{\mathrm{ref}}}{s_i}\right)^{\!\gamma}, \qquad s_i = \sqrt{w_i h_i}, \qquad \text{并归一化使 } \frac{1}{N}\sum_i w_i = 1\]</div>  <p>这条路最容易实现（改一行），也最容易做过头。<strong>「加权多少」有一个内点最优解，而不是「越大越好」</strong>——notebook 里用一个可以精确求解的模型把这件事算出来。</p>  <h3>为什么最优 γ 是内点：两股相反的力</h3>  <table>
+    <thead><tr><th>γ 增大时</th><th>机制</th><th>效果方向</th></tr></thead>
+    <tbody>
+      <tr><td><strong>①  修正梯度杠杆不平衡</strong></td><td>归一化坐标下小目标的损失/梯度本来就小（上一节的 5 倍差距）；加权把它补回来</td><td><strong>↑ 变好</strong></td></tr>
+      <tr><td><strong>②  容量冲突</strong></td><td>检测头是共享的，小目标与大目标的最优参数不同。权重全给小目标 ⇒ 大目标退化</td><td><strong>↓ 变差</strong></td></tr>
+      <tr><td><strong>③  噪声放大</strong></td><td>小目标的标注噪声相对量级最大（±2 px 对 8 px 框是 25% 相对误差）。加权同时放大了噪声的方差</td><td><strong>↓ 变差</strong></td></tr>
+      <tr><td><strong>④  与 Focal 的双重加权</strong></td><td>Focal Loss 已按「难度」隐式加权，而小目标本来就难 ⇒ 隐式 × 显式 = 过度</td><td><strong>↓ 变差</strong></td></tr>
+    </tbody>
+  </table>  <p>notebook 的模拟（共享参数 + 两组不同最优值 + 异方差噪声）给出的结论是定量的：<strong>在按尺寸分桶等权的指标下，最优 γ ≈ 1.4，指标从 0.463 降到 0.250；而 γ = 3 时指标回升到 0.476，比不加权还差</strong>。同时估计量的方差从 2.8×10⁻⁵ 涨到 1.07×10⁻²（<strong>380 倍</strong>）——<em>这就是「加了小目标权重后训练开始不稳、多种子方差变大」的机制。</em></p>  <div class="callout warn"><span class="label"></span>
+    <strong>三条实操约束，都直接来自上表：</strong> ① <strong>γ 取 0.25–0.5</strong>（不是 1 更不是 2）；② <strong>必须归一化使权重均值为 1</strong>，否则总梯度尺度改变，等价于偷偷改了学习率——这是「加了加权之后 loss 曲线整体抬高、需要重调 lr」的原因；③ <strong>只对回归损失加权，不对分类损失加权</strong>。分类的不平衡应该由 Focal / 采样策略处理，两边同时加权就是上表的第 ④ 条。
+  </div>  <h3>Focal Loss 的参数在小目标场景要往回调</h3>  <p>Focal Loss 的 <code>(1−p_t)^γ_f</code> 把梯度集中到「难」样本上。<strong>在小目标密集的场景，这个机制有一个特定的失效模式，而且后果很严重。</strong></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>小目标场景里最「难」的负样本，往往<strong>不是真的负样本，而是漏标的真实目标</strong>——标注员看不清 6 px 的牌子，于是没标；模型（尤其在训练后期）却能对它产生响应。<em>在 Focal 眼里，这就是一个「模型很自信、标签说是背景」的极难负样本，会拿到最大的权重</em>。<strong>γ_f = 2 时，模型被最用力地训练去把真实目标压成背景。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以在 TSR 这类「小目标 + 标注必然不完整」的任务上，建议是：<strong>① γ_f 从 2 降到 1.0–1.5</strong>（削弱对极难负样本的聚焦）；<strong>② α 从 0.25 提到 0.4–0.5</strong>（正样本占比只有 0.04%，见模块 02，需要更强的正样本权重）；<strong>③ 更根本的一招——把低于标注下限的区域标成 ignore</strong>，让它们既不算正也不算负，从源头切断这条错误监督；<strong>④ 如果用 Quality Focal / VariFocal 这类以 IoU 为软标签的损失，把软标签换成 NWD</strong>——因为小目标的 IoU 软标签系统性偏低，会把模型训成对小目标永远不自信（这直接影响下游的置信度阈值设定）。</p></div>
+  </div>  <div class="ascii">三层解法的关系与推荐叠加顺序（TSR 场景）
+
+  第 ①层 · 分配「谁是正样本」
+     ├─ center-based（点在框内）……………… 绕开 anchor 尺寸匹配
+     ├─ ATSS（阈值 = 均值+标准差）………… 自适应，但极小目标上会退化
+     ├─ SimOTA dynamic-k ………………………… **对小目标方向是反的**，需设 k 下界
+     └─ HLA / 保底 k ……………………………… 保证每个 GT 至少 k 个正样本
+                     ▲
+                     │  这一层的所有机制内部都在用一把「尺子」
+                     ▼
+  第 ②层 · 度量「用什么尺子判」          ← **优先级最高，改动最小**
+     ├─ IoU ………………………… 相对度量，对小框有系统性偏见
+     ├─ 尺度自适应 IoU 阈值 …… 只在判正负这一点上补偿
+     ├─ **NWD** …………………… 位置项是绝对距离，处处光滑，三行实现
+     └─ KLD(GT‖ERF) (RFLA) …… 用感受野当参考分布
+                     ▲
+                     ▼
+  第 ③层 · 损失「正样本怎么加权」
+     ├─ scale-aware 加权（γ ∈ [0.25, 0.5]，均值归一化，只加回归）
+     ├─ IoU 变体选择（EIoU / 1−NWD；避开纯 GIoU、未修正 CIoU）
+     └─ Focal 参数回调（γ_f 1.0–1.5, α 0.4–0.5, 低于下限的标 ignore）
+
+  推荐顺序：② → ① → ③   （先把尺子换对，再改分配规则，最后微调权重）</div>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么顺序是 ② → ① → ③：<strong>第 ② 层的改动最小、收益最确定、且会自动改善第 ① 层</strong>（因为分配器内部就在用这把尺子）；第 ① 层的保底 k 解决的是「完全没有监督」这种极端情况，收益大但只影响少数 GT；第 ③ 层的加权是<em>在已经正确的正样本集合上做微调</em>，收益最小、副作用最多。<strong>如果面试时被问「你会先做哪个」，这个排序本身就是答案，而给出排序的理由比排序本身更重要。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>小目标的分配与损失是近三年最活跃的方向之一，但也是最容易「刷点」的地方——很多提升在换数据集后不复现。以下是仍然开放、且对 TSR 有直接意义的问题。</p>  <ul>
+    <li><strong>度量的统一理论仍然缺失。</strong> IoU、GIoU、NWD、KLD、GWD（Gaussian Wasserstein Distance，用于旋转框）各自解决一部分问题，但<em>没有一个框架能说明「给定目标尺寸分布与噪声水平，最优的度量是什么」</em>。目前的选择基本靠试。一个有价值的方向是把度量的选择建模成「在标注噪声下的最优判决规则」——<em>如果标注抖动是 ±2 px 的高斯，什么度量能最大化正样本判决的信噪比？</em></li>
+    <li><strong>C 的自适应。</strong> NWD 的 C 是全局常数，但一张图里可能同时有 6 px 和 200 px 的目标。<em>让 C 随目标尺寸或金字塔层变化</em>，理论上更合理，但会破坏「绝对度量」这个核心性质（C 随尺寸变就又回到相对度量了）。这个张力目前没有干净的解法，实践上用「按尺寸切换 IoU/NWD」绕过。</li>
+    <li><strong>分配的稳定性。</strong> 动态分配在训练早期极不稳定（同一个 GT 在相邻 epoch 被不同的 anchor 认领），这个问题在小目标上被放大——<em>因为小目标的候选之间差异本来就小，排序容易翻转</em>。C54 m04 讲的 DN-DETR 式「去噪 query」是 DETR 系的解法，密集检测器这边还缺少对应的机制。</li>
+    <li><strong>标注噪声与难例的纠缠。</strong> 小目标的标注误差相对量级最大（±2 px 对 8 px 框是 25%），于是「难例」和「噪声标签」在损失空间里几乎不可分。<em>Focal Loss 与 OHEM 都会优先学噪声</em>（见 C58 m02）。一个开放问题是：<strong>能否用度量本身的性质做区分</strong>——例如噪声标签在 NWD 下的表现与真难例是否有系统差异（噪声是位置抖动 → W₂ 的位置项主导；真难例是遮挡/模糊 → 分类分数低但位置准）。</li>
+    <li><strong>与端到端检测器的结合。</strong> DETR 系用匈牙利匹配做一对一分配，代价矩阵里的 L1 + GIoU 对小目标同样不友好。<em>把代价矩阵里的 GIoU 换成 NWD</em> 是一个直接的想法，但一对一匹配下正样本本来就只有一个，度量的改变对匹配结果的影响与密集检测器不同——这方面的系统研究还很少。</li>
+    <li><strong>评测的循环论证。</strong> 小目标方法几乎都在 AI-TOD / VisDrone / TinyPerson 上评测，而这些数据集的标注下限、尺寸分布、噪声水平各不相同。<em>一个在 AI-TOD 上 +4 AP 的方法在 TT100K 上可能只有 +0.5</em>。<strong>更根本的是：如果评测集本身就漏标了大量极小目标，那么「学会检出它们」的模型反而会被判为误检更多。</strong> 这是 TSR 上离线指标与路测体验背离的一个直接来源（详见 C55 m05）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：<em>A Normalized Gaussian Wasserstein Distance for Tiny Object Detection</em>（Wang, Xu, Yang, Yu, 2021，arXiv:2110.13389——本模块的核心，重点看第 3 节的推导与图 3 的 IoU/NWD 敏感性对比）；<em>RFLA: Gaussian Receptive Field based Label Assignment for Tiny Object Detection</em>（Xu et al., ECCV 2022，注意 KLD 的方向与 HLA 的三级放宽策略）；<em>Bridging the Gap Between Anchor-based and Anchor-free Detection via ATSS</em>（Zhang et al., CVPR 2020，均值+标准差阈值的动机）；<em>OTA / YOLOX（SimOTA）</em>（Ge et al., 2021，dynamic-k 的出处）；IoU 变体一族：<em>GIoU</em>（Rezatofighi, CVPR 2019）、<em>DIoU/CIoU</em>（Zheng et al., AAAI 2020——第 4 节明确写了去掉 1/(w²+h²) 分母的理由）、<em>Focal-EIoU</em>（Zhang et al., 2021）、<em>SIoU</em>（Gevorgyan, 2022）；<em>Focal Loss</em>（Lin et al., ICCV 2017）。旋转框方向的 <em>GWD</em>（Yang et al., ICML 2021）与 <em>KLD</em>（Yang et al., NeurIPS 2021）是同一套高斯建模思路的延伸，很值得对照阅读。相邻课程：C57 m01（IoU 敏感性推导）、C57 m02（层级与分辨率）、C53 m02（标签分配谱系）、C58 m02（难例与噪声的区分）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_architecture/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 架构层面的解法：分辨率、多尺度与上下文</div></a>
+    <a class="next" href="../04_slicing/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 切片推理与高分辨率策略</div></a>
+  </div>
+
+</div>
+</body>
+</html>

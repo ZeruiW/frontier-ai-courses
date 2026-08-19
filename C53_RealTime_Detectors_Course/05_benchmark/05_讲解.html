@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 延迟-精度权衡与实时检测器选型</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 延迟-精度权衡与实时检测器选型</h1>
+  <p class="subtitle">端到端延迟的六段拆解（预处理 / H2D / 推理 / NMS / 后处理 / D2H），只报「推理」那一段是最常见的自欺 · <strong>论文 FPS 为什么基本不可比</strong>：batch 多大、含不含 NMS、含不含预处理、什么精度、什么卡、什么驱动 · 帕累托前沿与被支配判定 · 目标数从 10 涨到 300 时谁的 p99 先崩 · 为 TSR 场景选型的完整推理链（小目标多、类别长尾、延迟预算紧、要求稳定）· 精度之外的工程指标：p99 延迟、显存峰值、engine 构建时间、多硬件一致性、可维护性</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–04（尤其 04 的 NMS 耗时分析）；C27（量化）与 C60（TensorRT）有帮助但不必需</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_benchmark.ipynb（纯 numpy，延迟模型 + 帕累托 + 选型脚本）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">RT-DETR / RTMDet / YOLOv8-v10 的论文附录测速口径 · TensorRT Developer Guide · trtexec</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#budget">先算清预算：33 ms 是帧周期，不是延迟预算</a></li>
+      <li><a href="#pipeline">端到端延迟的完整拆解：模型推理只是其中一段</a></li>
+      <li><a href="#fps-lies">为什么论文的 FPS 不可信：六个变量</a></li>
+      <li><a href="#measure">怎么正确地测：五条纪律</a></li>
+      <li><a href="#precision">精度档的真实数量级：FP16 几乎白送，INT8 要算总账</a></li>
+      <li><a href="#pareto">帕累托前沿：选型的正确姿势是「同延迟比 AP」</a></li>
+      <li><a href="#stability">延迟稳定性：p99 才是决定能不能上车的那个数</a></li>
+      <li><a href="#tsr-choice">为 TSR 选型的完整推理链（含精度之外的工程指标）</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="budget"><span class="num">1</span>先算清预算：33 ms 是帧周期，不是延迟预算</h2>
+  <p>「车端要 30 FPS」这句话被无数次误读成「检测模型有 33 ms 可用」。<strong>这两件事完全不同，而且差了一个数量级。</strong></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>帧周期</strong>（frame period）说的是<em>吞吐</em>：每 33.3 ms 必须消化掉一帧，否则要么丢帧、要么排队积压。它约束的是「平均每帧能花多少算力」。<strong>反应延迟</strong>（end-to-end latency）说的是<em>从光子打到传感器，到刹车片开始动</em>，中间隔了多久。它约束的是安全。<em>一个流水线系统完全可以做到「吞吐 30 FPS 但延迟 150 ms」——每一级都在同时处理不同的帧</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以两个约束要分别核算：吞吐决定「模型的单帧计算量上限」，延迟决定「整条链路的串行深度上限」。<strong>而检测模型拿到的既不是 33 ms，也不是 145 ms，而是「感知总预算 ÷ 感知任务数」之后剩下的那一小块。</strong>更麻烦的是，感知任务共享同一颗 SoC 的推理单元，多数量产系统里它们是<em>分时串行</em>的（因为要保证每个任务的 WCET 可界定），所以 TSR 拿到的是一个真正意义上的固定时隙。</p></div>
+  </div>  <div class="ascii">一帧图像从「光子」到「刹车片」的时间账（量级示意，单位 ms）
+
+ 曝光+读出   ISP    传输 ┃        感知（所有任务共享 SoC）        ┃ 融合  预测   规划     控制+执行
+ ├───12───┤├──8──┤├─2─┤┃├─────────────45─────────────┤┃├─8─┤├─10─┤├──20──┤├─────40─────┤
+ 0        12    20   22 ┃22                            67┃67   75    85     105        145
+
+ └──────────────────── 端到端反应延迟 ≈ 145 ms ────────────────────────────────────────┘
+                    @120 km/h（= 33.3 m/s）→ 车在这段时间里已经开出 **4.83 米**
+
+ 而「感知」这 45 ms 里，TSR 只是众多任务之一：
+   ┌────────────┬──────────┬────────┬────────┬────────┬──────┐
+   │ BEV 3D 检测 │ 占用栅格  │ 车道线  │ 红绿灯  │ **TSR**│ 其他 │
+   │     18     │    10    │   5    │   4    │  **6** │  2   │
+   └────────────┴──────────┴────────┴────────┴────────┴──────┘
+                                                  ↑
+        「30 FPS = 33.3 ms」→ TSR 的真实预算是 **6 ms**，不是 33 ms</div>  <div class="math-block">\[d_{\text{travel}} \;=\; v \cdot t_{\text{lat}} \;=\; \frac{120}{3.6}\,\text{m/s} \times 0.145\,\text{s} \;=\; 4.83\ \text{m} \qquad\Longrightarrow\qquad \text{每省 10 ms} \;=\; \text{少开 0.33 m}\]</div>  <p>这个换算是你在需求评审里唯一需要的工具：<strong>把毫秒翻译成米</strong>。「把 TSR 从 8 ms 优化到 6 ms」听起来微不足道，翻译成「120 km/h 下决策提前 0.067 米」也确实微不足道——<em>那就说明这个优化不值得做，应该把工程时间花在别处</em>。反过来，「感知总预算从 45 ms 涨到 65 ms」= 多开 0.67 米，在跟车场景里就可能是要不要追尾的差别。</p>  <div class="callout warn"><span class="label">先问架构，再报数字</span>
+    <p><strong>一个必须提前问清楚的问题：你的延迟预算是「分配给你的」还是「你占用的」？</strong>如果 TSR 是和其他任务串行分时的，你超时会直接推迟后面所有任务；如果是独立算力单元，你超时只影响自己。<em>这两种架构下，「p99 超预算 20%」的后果完全不同</em>——前者是全系统级联抖动，后者是本任务偶发丢帧。<strong>在没搞清楚这一点之前，任何「我的模型跑 8 ms」的陈述都是没有意义的。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">2</span>端到端延迟的完整拆解：模型推理只是其中一段</h2>
+  <p>绝大多数人报的「延迟」只有 $T_{\text{infer}}$ 那一项。真实系统里它经常连一半都不到。</p>  <div class="math-block">\[T_{\text{e2e}} \;=\; T_{\text{pre}} \;+\; T_{\text{H2D}} \;+\; T_{\text{infer}} \;+\; T_{\text{decode}} \;+\; \underbrace{T_{\text{NMS}}(N,K)}_{\text{依赖场景}} \;+\; T_{\text{D2H}} \;+\; \underbrace{T_{\text{track}}(K)}_{\text{依赖场景}}\]</div>  <table>
+    <thead><tr><th>阶段</th><th>做什么</th><th>车端典型量级</th><th>随什么增长</th><th>常见的坑</th></tr></thead>
+    <tbody>
+      <tr><td><strong>预处理</strong></td><td>resize / letterbox / BGR→RGB / 归一化 / HWC→CHW</td><td>0.5–5 ms</td><td>输入分辨率（线性于像素数）</td><td><strong>CPU 上做 fp32 归一化是最大浪费</strong>；OpenCV 与训练端 resize 语义不一致（C60 模块 01）</td></tr>
+      <tr><td><strong>H2D 拷贝</strong></td><td>把张量从主机内存搬到设备内存</td><td>0.3–2 ms</td><td>字节数 ÷ PCIe 带宽</td><td><strong>传 fp32 比传 uint8 贵 4 倍</strong>；未用 pinned memory 会再慢一倍</td></tr>
+      <tr><td><strong>模型推理</strong></td><td>卷积 / attention 前向</td><td>2–20 ms</td><td>FLOPs、精度档、算子是否被融合</td><td>算子回退到 CPU 导致「转了 TRT 但没变快」</td></tr>
+      <tr><td><strong>解码</strong></td><td>把输出张量变成候选框（sigmoid、anchor 解码、top-k）</td><td>0.05–1 ms</td><td>候选框数</td><td>在 CPU 上遍历 8400 个 anchor 是真实事故</td></tr>
+      <tr><td><strong>NMS</strong></td><td>去重</td><td><strong>0.2–12 ms</strong></td><td><strong>$O(NK)$，超线性</strong></td><td>见模块 04：这是唯一一个方差大到能毁掉 p99 的项</td></tr>
+      <tr><td><strong>D2H 拷贝</strong></td><td>把结果搬回主机</td><td>0.02–0.3 ms</td><td>输出大小</td><td>同步点设错会把整条流水线串起来</td></tr>
+      <tr><td><strong>跟踪与关联</strong></td><td>IoU/匈牙利关联、状态机、多帧投票</td><td>0.2–3 ms</td><td>目标数</td><td>常被忘记计入「感知延迟」，但它在预算里</td></tr>
+    </tbody>
+  </table>  <h3>拷贝的账：一个能立刻省下 1.2 ms 的决定</h3>  <p>1920×1080×3 的图像，uint8 是 6.22 MB，fp32 是 24.9 MB。按 PCIe 有效带宽 16 GB/s 算：</p>  <pre><code>uint8 上传:  6,220,800 B / 16e9 B/s = 0.389 ms
+fp32  上传: 24,883,200 B / 16e9 B/s = 1.555 ms       ← 贵 4 倍
+
+正确做法: 主机端只传 uint8，**在 GPU 上做 归一化 / HWC→CHW / BGR→RGB**
+          （这些都是访存受限的逐元素算子，GPU 上几乎免费）
+六路相机: 0.389 × 6 = 2.33 ms  vs  1.555 × 6 = 9.33 ms   ← 差 7 ms，比换模型还多</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这个坑这么普遍？因为在 PyTorch 里 <code>transforms.ToTensor()</code> + <code>Normalize()</code> 是默认写法，它们在 CPU 上把图变成 fp32 再 <code>.cuda()</code>。<em>训练时无所谓（DataLoader 有多个 worker 在并行预取，而且 GPU 在算上一个 batch）；推理时是串行的，这 1.2 ms 直接进 p99。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更完整的做法是把整个预处理搬到设备侧：uint8 图像上传 → GPU kernel 完成 resize + letterbox + 归一化 + 通道重排。NVIDIA 的 DALI/CV-CUDA、或直接写一个 CUDA kernel 都行。<strong>但代价是训练-部署一致性的风险上升</strong>——GPU resize 的插值实现与 OpenCV 未必逐像素一致，而这类差异能让 mAP 掉几个点（C60 模块 01 的主题）。<em>所以正确的顺序是：先建立预处理对拍工具，再做设备侧预处理，而不是反过来。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>本节的可迁移结论：<strong>报延迟时永远报「端到端」，并且把分解表一起给出。</strong>只报模型前向时间，在任何一个做过量产的人面前都会被追问到底。<em>而分解表本身就是优化的路线图——你会经常发现最大的一块不是模型。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fps-lies"><span class="num">3</span>为什么论文的 FPS 不可信：六个变量</h2>
+  <p>论文里那个 FPS 是一个<strong>没有单位定义的数</strong>。同一个模型、同一份权重，把下面六个变量各拨一档，报出来的数字可以差 10 倍以上——而且每一档都不算造假，只是口径不同。</p>  <table>
+    <thead><tr><th>变量</th><th>论文常用口径</th><th>车端真实口径</th><th>影响倍数</th><th>怎么识别</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① batch size</strong></td><td>batch=32 报吞吐，FPS = batch ÷ 总时间</td><td><strong>batch=1</strong>（一帧来了就要处理）</td><td><strong>1.3–3×</strong></td><td>论文只给 FPS 不给 ms，多半是吞吐；看附录的 <code>--batch</code></td></tr>
+      <tr><td><strong>② 含不含 NMS</strong></td><td>常常只计网络前向</td><td>必须含</td><td>1.1–1.5×（密集场景更多）</td><td>看是否写 “end-to-end” / “including post-processing”</td></tr>
+      <tr><td><strong>③ 含不含预处理与拷贝</strong></td><td>几乎从不含</td><td>必须含</td><td>1.2–2×</td><td>看是否从「图像文件」还是从「已在显存里的张量」开始计时</td></tr>
+      <tr><td><strong>④ 精度档</strong></td><td>TensorRT <strong>FP16</strong>（有时不写）</td><td>FP16 或 INT8</td><td>FP32→FP16 约 2–3×，FP16→INT8 约 1.3–2×</td><td>没写精度的 FPS 基本可以认为是 FP16</td></tr>
+      <tr><td><strong>⑤ 什么卡</strong></td><td>T4 / V100 / A100 / 3090，各不相同</td><td>车端 SoC（Orin / 自研 NPU）</td><td><strong>2–5×</strong></td><td>跨代际的卡对比毫无意义；同代不同卡也差 2 倍</td></tr>
+      <tr><td><strong>⑥ 输入分辨率</strong></td><td>640×640（COCO 惯例）</td><td><strong>TSR 常需 1280 以上</strong></td><td><strong>3–4×</strong></td><td>看 <code>imgsz</code> / <code>test_size</code></td></tr>
+    </tbody>
+  </table>  <p>再加一个隐形的第七项：<strong>测量方法</strong>（有没有 warmup、有没有同步、报均值还是 p99、GPU 有没有锁频）——下一节专门讲。</p>  <h3>一次完整的折算：108 FPS 变成 14.8 FPS</h3>  <p>以 RT-DETR-R50 的论文口径（T4 + TensorRT FP16 + batch=1 + 640×640，<strong>只计网络前向</strong>，约 108 FPS = 9.26 ms）为起点，逐项折算到一个 TSR 车端场景：</p>  <pre><code>  论文口径                                    9.26 ms   (108.0 FPS)
+  × 1.90  T4 → 车端 SoC（同精度算力约 0.53×）  17.59 ms
+  × 3.40  输入 640 → 1280（TSR 的小目标必需）   59.81 ms
+  + 5.40  预处理（1280 下的 resize/归一化）     65.21 ms
+  + 1.60  H2D + D2H 拷贝                        66.81 ms
+  + 0.80  跟踪与时序关联                        67.61 ms
+  ────────────────────────────────────────────────────────
+  车端端到端                                   67.61 ms   ( 14.8 FPS)   **差 7.3 倍**</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>注意这里<strong>没有任何一步是「论文夸大了」</strong>。论文报的 108 FPS 在它自己的口径下是真的、可复现的。差距全部来自「口径不同」——而口径的差异，是<em>你的系统约束</em>造成的，不是作者的问题。<strong>所以正确的心态不是「论文数字不能信」，而是「论文数字必须先折算到你的口径才能比较」</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这也解释了一个常见的困惑：为什么按论文选了「延迟最低」的模型，上车后反而是另一个模型更快？因为六个变量对不同模型的<strong>敏感度不同</strong>。举例：<em>①分辨率翻倍时，密集预测器的 NMS 代价涨得比推理还快（候选框数正比于像素数），而 RT-DETR 的 query 数固定不变；②INT8 量化时，纯卷积模型几乎不掉点，含 attention 的模型可能掉 1–2 AP 要上混合精度，于是实际能用的精度档不同；③batch=1 时，参数量大但 FLOPs 低的模型（深而窄）比 FLOPs 高但并行度好的模型（浅而宽）吃亏更多，因为 kernel launch 开销占比上升</em>。<strong>结论：排名会随口径改变，所以必须在你自己的口径下重测，不能照抄论文的相对顺序。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">「谁更快」是一个关于口径的问题</span>
+    <p><strong>面试里最容易翻车的一句话：「YOLOv8-L 是 XX FPS，RT-DETR-R50 是 108 FPS，所以后者更快」。</strong>只要面试官问一句「这两个数是同一口径吗」，你就得当场承认不知道。<em>正确的答法是把口径先说出来：「论文里 RT-DETR 报的是 T4 + TRT FP16 + batch=1 + 640 且不含预处理；YOLOv8 那个数如果是含 NMS 的端到端，两者不可直接比。我会把两个模型在同一台机器、同一份预处理代码、同一 batch、同一精度下重测，报 p50 和 p99 两个数。」</em><strong>这句话本身就是答案的主体——面试官考的是「你知不知道要控制变量」，而不是那两个数字。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="measure"><span class="num">4</span>怎么正确地测：五条纪律</h2>
+  <p>测延迟比想象的容易做错。下面五条，每一条都对应一个能让结论反转的真实错误。</p>  <ol>
+    <li><strong>必须 warmup 并丢弃。</strong>前几十次调用包含：kernel autotune、显存分配、cache 冷启动、GPU 从低频升到 boost 频率。<em>不丢弃 warmup，200 次循环测出来的均值能比稳态高 20%。</em></li>
+    <li><strong>必须显式同步。</strong>GPU 调用是异步的。<code>t0=time(); model(x); t1=time()</code> 测的是<em>kernel launch 的时间</em>（约 0.15 ms），不是执行时间。<strong>不同步能测出 60 倍的假加速</strong>——这个错误在博客和 issue 里到处都是。正确做法是每次计时前后都 <code>synchronize()</code>，或用 CUDA event。</li>
+    <li><strong>报分布，不报均值。</strong>延迟分布是右偏长尾的（抢占、DVFS、内存竞争、NMS 的场景依赖）。<em>均值被尾巴拉高但又低于尾巴，两头不靠</em>。车端安全关心的是 <strong>p99</strong>（甚至 p99.9），因为「100 帧里有 1 帧超时」在 30 FPS 下就是<em>每 3 秒一次</em>。</li>
+    <li><strong>测够长，并覆盖热态。</strong>短测试（几秒）跑在 boost 频率上；持续满负载几分钟后 SoC 降频、温度上来，稳态延迟可能高 10–20%。<strong>「实验室 8 ms，车上跑半小时后 10 ms」几乎总是这个原因。</strong></li>
+    <li><strong>用真实的输入分布，不要用同一张图跑 1000 次。</strong>同一张图会让 cache 命中率异常高，而且完全测不出 NMS 的场景依赖。<em>要用一组覆盖「稀疏高速 / 密集路口 / 极端杂波」的真实帧。</em></li>
+  </ol>  <pre><code># ❌ 三个错误同时犯：没 warmup、没同步、只报均值
+t0 = time.time()
+for _ in range(100): out = model(x)
+print(100 / (time.time() - t0), "FPS")        # 这个数基本是编的
+
+# ✅ 正确姿势
+for _ in range(50): model(x)                   # ① warmup（丢弃）
+torch.cuda.synchronize()
+ts = []
+for _ in range(1000):                          # ⑤ 用不同的真实帧，不是同一张
+    x = next(real_frames)
+    torch.cuda.synchronize(); t0 = time.perf_counter()
+    out = model(x)
+    torch.cuda.synchronize()                   # ② 同步
+    ts.append((time.perf_counter() - t0) * 1e3)
+p50, p90, p99, p999 = np.percentile(ts, [50, 90, 99, 99.9])   # ③ 报分布
+print(f"p50={p50:.2f} p90={p90:.2f} p99={p99:.2f} p99.9={p999:.2f} ms")
+
+# 补充：trtexec 已经把这些做对了，优先用它作为交叉验证
+#   trtexec --loadEngine=m.engine --iterations=2000 --avgRuns=1 --percentile=99 \
+#           --useCudaGraph --noDataTransfers=false --dumpProfile</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第 3 条值得再算一次账。假设 p50=8 ms、p99=13 ms、预算 12 ms。<strong>按均值看，你「有 4 ms 余量」；按 p99 看，你已经超预算了。</strong>而 p99 意味着 30 FPS 下每 3.3 秒就有一帧超时——如果 TSR 与其他任务串行共享 SoC，这一帧的超时会推迟后面所有任务，产生级联抖动。<em>「偶尔慢一点」在实时系统里不是「偶尔」，是一个可以按秒数出来的周期性事件。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严格地说，实时系统关心的是 <span class="term">WCET</span>（worst-case execution time）而不是任何分位数——<strong>p99 也不是上界</strong>，它只是一个「99% 的情况下不会超过」的经验统计量。$p_{99}$ 之上还有 $p_{99.9}$ 和真正的 max，而后者可能被一次页错误、一次驱动重试、一次热节流拉到 3 倍。<em>可以做的事有三件：①把数据依赖项（NMS）删掉或封顶，让 WCET 可以被结构性地界定；②给整个任务加超时保护与降级路径（比如模块 04 讲的 decoder 层数动态下调）；③在验收里明确写出 p99 与 max 两个门槛，而不是只写均值。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>还有一个隐形变量：<strong>同一份 engine 在不同驱动 / TensorRT 版本 / GPU 频率策略下的延迟不同</strong>。所以延迟数字必须和「硬件型号 + 驱动版本 + TRT 版本 + 频率模式（是否锁频）」一起记录，否则三个月后没人能复现。<em>这与 C60 讲的「engine 与硬件绑定」是同一件事的两面：绑定意味着结果不可跨环境比较。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="precision"><span class="num">5</span>精度档的真实数量级：FP16 几乎白送，INT8 要算总账</h2>
+  <p>换精度是延迟优化里性价比最高的一步，但它的收益经常被误报，代价也经常被误算。</p>  <table>
+    <thead><tr><th>精度档</th><th>相对 FP32 延迟</th><th>典型 AP 变化</th><th>需要什么</th><th>对检测器的特殊风险</th></tr></thead>
+    <tbody>
+      <tr><td><strong>FP32</strong></td><td>1.00×</td><td>基线</td><td>无</td><td>—</td></tr>
+      <tr><td><strong>FP16</strong></td><td><strong>约 0.35–0.50×</strong></td><td>≈ 0（−0.1 以内）</td><td>Tensor Core 硬件；检查激活是否溢出（fp16 上限 65504）</td><td>极少数归一化中间量溢出 → inf/nan；用极端输入验证</td></tr>
+      <tr><td><strong>INT8 (PTQ)</strong></td><td>约 0.22–0.35×</td><td>−0.5 ~ −2.0 AP</td><td><strong>几百到上千张有代表性的校准集</strong></td><td><strong>回归头比分类头更敏感；小目标掉得更多；attention/softmax 掉得更多</strong></td></tr>
+      <tr><td><strong>INT8 (QAT)</strong></td><td>同 PTQ</td><td>−0.2 ~ −0.6 AP</td><td>重新训练（几个 GPU-天）</td><td>工程成本高，只在 PTQ 掉点无法用混合精度救回时才做</td></tr>
+      <tr><td>混合精度（敏感层保 FP16）</td><td>约 0.28–0.42×</td><td>−0.2 ~ −0.8 AP</td><td>逐层敏感度分析</td><td>分区变多可能反而变慢，要实测</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>FP16 基本是白送的</strong>：在有 Tensor Core 的硬件上延迟降到 40% 左右，AP 几乎不动，不需要任何数据。<em>如果你的部署还在跑 FP32，这是第一件该做的事，而且不需要开会讨论。</em>唯一要做的验证是用极端输入（超大幅值、超长曝光的过曝图）跑一遍看有没有 inf/nan——这个问题在训练时被 loss scaling 掩盖，只在纯 FP16 推理时暴露。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>INT8 要算的是「总账」而不是「掉了多少 AP」。</strong>假设 FP16 下 RT-DETR-R50 是 12.0 ms / 53.1 AP，INT8 PTQ 变成 3.2 ms / 51.9 AP——掉 1.2 AP 看起来不小。但你省下了 8.8 ms，<em>这 8.8 ms 足够把模型从 R50 换成 R101（+1.2 AP），甚至还能把输入分辨率提一档</em>。<strong>所以正确的问法不是「INT8 掉多少点」，而是「在同一延迟预算下，INT8 的大模型 vs FP16 的小模型，谁的 AP 更高」</strong>——这正是下一节帕累托前沿要回答的问题。多数情况下答案是前者，尤其在 TSR 这种「提分辨率就直接见效」的小目标任务上。</p></div>
+  </div>  <div class="callout danger"><span class="label">校准集分布不匹配 = 静默掉点</span>
+    <p><strong>INT8 校准集是最容易毁掉一切的一步。</strong>它的作用是统计每层激活的数值范围。<em>用训练集的前 500 张（很可能全是晴天白天的高速路段）做校准，会得到一组只对晴天白天正确的量化范围</em>——离线评测（同分布）看不出问题，上车遇到夜间隧道口、雨天逆光就大幅掉点。<strong>校准集必须是线上分布的一个有代表性的小样本：覆盖夜间、逆光、雨雾、隧道出入口、以及各类标志的长尾类别，几百到上千张，且预处理必须与线上完全一致。</strong>这是 C60 模块 03 的核心内容，也是「离线 0.82、车上像 0.6」这类故事的常见原因之一。</p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>另一个必须实测而不能推断的点：<strong>「更少的 FLOPs」不等于「更低的延迟」</strong>。depthwise 卷积、极窄的通道数、大量小算子都是访存受限的，FLOPs 很低但延迟不降；相反，宽而浅的结构 FLOPs 高却能把 Tensor Core 喂饱。<em>所以模型选型的排序必须用「实测延迟」，FLOPs 只能用来做粗筛。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pareto"><span class="num">6</span>帕累托前沿：选型的正确姿势是「同延迟比 AP」</h2>
+  <p>有了同口径的实测数据后，选型就变成一个二维问题：<strong>延迟越低越好、AP 越高越好</strong>。一个模型如果存在另一个模型「不更慢<em>且</em>不更差」，它就被<span class="term">支配</span>（dominated），可以直接从候选集里删掉。剩下的构成<span class="term">帕累托前沿</span>（Pareto front）。</p>  <div class="math-block">\[i \ \text{被支配} \iff \exists\, j \neq i:\ t_j \le t_i \ \wedge\ \text{AP}_j \ge \text{AP}_i \ \wedge\ (t_j < t_i \ \vee\ \text{AP}_j > \text{AP}_i)\]</div>  <div class="ascii">AP
+ 55 ┤
+ 54 ┤                        ●             ●               ○
+    │                    D-FINE-L        R-101           v8-X
+ 53 ┤                     ●        ○
+    │                    R-50    v8-L
+ 52 ┤             ●
+    │          D-FINE-M
+ 51 ┤               ○
+    │           RTMDet-L
+ 50 ┤                 ○
+    │              v8-M
+ 49 ┤        ●  ○
+    │  RTMDet-M R-34
+ 48 ┤    ●
+    │ D-FINE-S
+ 47 ┤
+ 46 ┤   ●
+    │  R-18
+ 45 ┤       ○
+    │     v8-S
+ 44 ┤●
+    │RTMDet-S
+    └┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴──►
+     4    5    6    7    8    9   10   11   12   13   14   15  16
+                        端到端延迟 ms（同口径：batch=1 / FP16 / 含 NMS 1.4 ms）
+
+  ● 在帕累托前沿上（8 个）    ○ 被支配（6 个）：存在一个「不更慢且不更差」的替代品</div>  <h3>两条容易搞反的规则</h3>  <ul>
+    <li><strong>同延迟比 AP，而不是同 AP 比延迟。</strong>因为你的延迟预算是系统给的<em>硬约束</em>，AP 是你要最大化的目标。「达到 53 AP 谁最快」是个假问题——你根本不需要恰好 53 AP，你需要「在 9 ms 内 AP 最高」。</li>
+    <li><strong>前沿是口径的函数，不是模型的固有属性。</strong>notebook 会演示：只把 NMS 的计入方式从 1.4 ms 改成 0.5 ms（比如上了 EfficientNMS plugin 并做了 top-k 截断），<em>前沿的成员立刻从 8 个变成 10 个</em>，YOLOv8-S 和 RTMDet-L 重新进入。<strong>所以「谁在前沿上」这个结论必须和口径一起被引用。</strong></li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>被支配 ≠ 没用。一个被支配的模型可能在<em>其他维度</em>上更好：工具链成熟、算子全支持、量化友好、团队熟悉、社区活跃。<strong>帕累托前沿只是筛掉「在这两个维度上都没有理由选它」的候选，它不是最终答案，是候选集的第一道过滤。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>而且这张二维图隐藏了一个致命简化：<strong>AP 是 COCO 的 AP</strong>。TSR 关心的是 8–30 像素目标的 AP，两者的排序可能完全不同。<em>一个在 COCO 上被支配的模型，加上 P2 层与高分辨率输入后，在「小目标 AP vs 延迟」这张图上可能反而在前沿上</em>。<strong>所以正确的流程是：先定义你自己的评测指标（分尺寸桶的 AP、关键类别的召回），在你自己的数据上重测，再画前沿。照抄 COCO 的前沿是最常见的选型错误。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把选型压成三步：<strong>①用硬约束（p99 预算、显存上限、算子支持）过滤掉不可行的；②在可行集里按你自己的指标画帕累托前沿；③在前沿上按工程维度（可维护性、量化友好、多档速度）加权排序。</strong><em>顺序不能反——先加权打分再看约束，会得到一个分数很高但根本上不了车的方案。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="stability"><span class="num">7</span>延迟稳定性：p99 才是决定能不能上车的那个数</h2>
+  <p>这一节把模块 04 的结论落到可操作的层面。</p>  <p>同一个 YOLO 式检测器，在一段真实路测里的延迟分布是<strong>右偏长尾</strong>的，因为 $T_{\text{NMS}}$ 与 $T_{\text{track}}$ 都依赖目标数，而目标数本身是重尾分布（多数帧只有几个标志，少数城市路口帧有几十个）。notebook 会用同一套延迟模型跑出这样一组数（量级示意）：</p>  <table>
+    <thead><tr><th>方案</th><th>p50</th><th>p90</th><th>p99</th><th>p99 − p50</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>YOLO 式（含 NMS）</td><td><strong>7.21 ms</strong></td><td>8.31 ms</td><td>12.28 ms</td><td><strong>5.07 ms</strong></td><td>中位数最快，但尾巴很长</td></tr>
+      <tr><td>RT-DETR 式（无 NMS）</td><td>8.97 ms</td><td>9.33 ms</td><td>10.18 ms</td><td><strong>1.21 ms</strong></td><td>中位数慢 1.8 ms，<strong>p99 反而快 2.1 ms</strong></td></tr>
+      <tr><td>YOLO + top-k 封顶(1000)</td><td>7.21 ms</td><td>7.82 ms</td><td><strong>9.02 ms</strong></td><td>1.81 ms</td><td>两头都好，<strong>但约 35% 的帧被截断</strong></td></tr>
+    </tbody>
+  </table>  <p><strong>三行读出三个不同的结论，取决于你看哪一列。</strong>按 p50 选 → YOLO；按 p99 选 → RT-DETR；按「p99 且愿意承担密集场景召回风险」选 → YOLO + 封顶。<em>而「按均值选」会给出和「按 p50 选」一样的答案，然后上车在城市路口掉帧。</em></p>  <h3>给 NMS 加硬上限：一个实用但有代价的折中</h3>  <p>如果因为其他原因（工具链、小目标、算力）必须用密集预测器，有一个标准手段可以把 WCET 钉死：<strong>在进 NMS 之前，先按 score 取 top-$N_{\max}$</strong>（典型 300–1000）。这样 $T_{\text{NMS}}$ 的最坏值变成一个可计算的常数。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>代价是：<strong>在候选框数超过 $N_{\max}$ 的帧里，被截掉的都是低分候选</strong>——而低分候选恰恰主要是<em>远处的小目标</em>和<em>部分遮挡的目标</em>。也就是说，这个优化在最需要召回的场景里牺牲召回。TSR 场景里这尤其危险：一块 80 米外刚进视野的限速牌，分数天然低，在拥挤路口很可能就是被截掉的那一个。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以封顶必须配三件事：<em>①统计你的数据里「候选框数 > $N_{\max}$」的帧占比（notebook 里是 34.8%，这些帧平均被截掉 33% 的候选、最坏的一帧被截掉 88%），这个数太高说明 $N_{\max}$ 设小了；②在<strong>分场景评测</strong>里专门建一个「密集路口」切片，对比封顶前后的召回；③把截断事件打点上报，作为线上监控指标</em>。<strong>「加了个 top-k 就上线」而不做②，是一个会在几个月后以「某些路口漏检」的形式浮出水面的技术债。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label">无 NMS ≠ 延迟完全恒定</span>
+    <p>还有一个更隐蔽的数据依赖项经常被忽略：<strong>跟踪与关联</strong>。匈牙利关联是 $O(n^3)$，IoU 矩阵是 $O(n^2)$，目标多时同样会涨。<em>notebook 的模型里即使删掉 NMS，p99 − p50 仍有 1.2 ms，全部来自跟踪</em>。<strong>所以「无 NMS = 延迟恒定」是一个近似说法</strong>——严格地说是「删掉了方差最大的那一项，剩下的项方差小一个数量级」。面试里能主动补这一句，说明你是自己测过而不是背的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tsr-choice"><span class="num">8</span>为 TSR 选型的完整推理链（含精度之外的工程指标）</h2>
+  <p>把前面所有东西串起来，走一遍真实的选型推理。<strong>这一节的结构本身就是一个可以在面试里复述的系统设计答案骨架。</strong></p>  <h3>第一步：把场景需求翻译成约束</h3>  <table>
+    <thead><tr><th>TSR 的场景特征</th><th>翻译成什么约束</th><th>对选型的直接影响</th></tr></thead>
+    <tbody>
+      <tr><td>目标极小（80 m 外的限速牌约 10–20 px）</td><td>输入分辨率 ≥ 1280；需要 stride 8 甚至 stride 4 的特征</td><td><strong>计算量按分辨率平方涨</strong> → 挤压模型规模的空间</td></tr>
+      <tr><td>类别多且长尾（含限速 5–120 的变体、组合牌）</td><td>分类头大；或采用两级架构解耦</td><td>端到端多类检测器的类别数上升会抬高 NMS 的 $N$（class-wise NMS）</td></tr>
+      <tr><td>延迟预算紧（共享 SoC，约 6 ms）</td><td>端到端 <strong>p99</strong> ≤ 6 ms（不是 p50）</td><td>直接砍掉一半候选；<strong>逼你必须上 INT8 或降分辨率</strong></td></tr>
+      <tr><td>输出必须稳定（时序融合、迟滞状态机在下游）</td><td>p99 − p50 要小；帧间抖动会污染跟踪</td><td>偏好无 NMS，或必须给 NMS 封顶</td></tr>
+      <tr><td>多硬件平台（高中低三配车型）</td><td>一份权重覆盖多档速度，或接受多次训练</td><td><strong>RT-DETR 系的 decoder 层数可调是实打实的优势</strong></td></tr>
+      <tr><td>功能安全要求</td><td>WCET 可界定；要有优雅降级路径</td><td>数据依赖项必须可封顶；要能动态降精度换延迟</td></tr>
+    </tbody>
+  </table>  <h3>第二步：精度之外的工程指标（这些常常才是决定因素）</h3>  <table>
+    <thead><tr><th>指标</th><th>为什么重要</th><th>怎么量</th><th>典型硬门槛</th></tr></thead>
+    <tbody>
+      <tr><td><strong>p99 延迟</strong></td><td>决定会不会周期性掉帧与级联抖动</td><td>真实帧序列 + 长时间热态测量</td><td>≤ 预算，且 max ≤ 1.5× 预算</td></tr>
+      <tr><td><strong>峰值显存</strong></td><td>SoC 显存由所有感知任务共享，超了直接 OOM</td><td><code>trtexec</code> 报告 + 运行时峰值</td><td>硬上限，无商量余地</td></tr>
+      <tr><td><strong>engine 构建时间 × 硬件种类</strong></td><td>决定 CI 时长与发布节奏</td><td>单次构建时间 × 平台数 × 精度档数</td><td>构建 30 min × 3 平台 × 2 档 = 3 小时/次发布</td></tr>
+      <tr><td><strong>算子支持度 / 是否需要 plugin</strong></td><td>plugin 要跟着 TRT 版本维护，是长期负债</td><td><code>trtexec --verbose</code> 看子图数与 unsupported</td><td>尽量为 0；每个 plugin 都要有 owner</td></tr>
+      <tr><td><strong>量化友好度</strong></td><td>决定能不能用 INT8，进而决定能用多大模型</td><td>逐层敏感度分析 + PTQ 掉点</td><td>PTQ 掉点 > 2 AP 就要重新评估</td></tr>
+      <tr><td><strong>收敛成本与数据需求</strong></td><td>决定迭代速度（一年能试多少次）</td><td>达到目标 AP 所需 epoch × GPU-天</td><td>DETR 系通常更贵</td></tr>
+      <tr><td><strong>可调试性</strong></td><td>出了 badcase 能不能定位到具体环节</td><td>能否逐阶段 dump 中间结果</td><td>端到端模型更难，要提前设计日志</td></tr>
+      <tr><td><strong>多档速度支持</strong></td><td>决定多平台的维护成本</td><td>一份权重能出几档</td><td>RT-DETR 原生支持；YOLO 需训多个尺寸</td></tr>
+    </tbody>
+  </table>  <h3>第三步：过滤 → 打分 → 敏感性分析</h3>  <p>notebook 里实现了完整的决策脚本。它的关键设计是<strong>把「硬约束过滤」和「加权打分」严格分开</strong>，并且强制做敏感性分析。三个场景的结果：</p>  <table>
+    <thead><tr><th>场景</th><th>硬约束</th><th>权重</th><th>胜出</th><th>读法</th></tr></thead>
+    <tbody>
+      <tr><td>S1 保守</td><td>p99 ≤ 12 ms、显存 ≤ 1024 MB、<strong>不允许 plugin</strong></td><td>小目标 AP 0.45 / 余量 0.20 / 多档 0.20 / 工具链 0.15</td><td><strong>RT-DETRv2-S</strong></td><td>4 个候选被硬约束直接淘汰，根本轮不到打分</td></tr>
+      <tr><td>S2 放开 plugin 与显存</td><td>p99 ≤ 12 ms、显存 ≤ 1280 MB、允许 plugin</td><td>同 S1</td><td><strong>RT-DETRv2-S</strong>（不变）</td><td>放开约束没改变结论 → 说明这两条不是瓶颈</td></tr>
+      <tr><td>S3 强调小目标</td><td>同 S2</td><td><strong>小目标 AP 0.70</strong> / 余量 0.10 / 多档 0.10 / 工具链 0.10</td><td><strong>RT-DETR-R50</strong></td><td><strong>权重一改结论就变</strong> → 说明决策对「多看重小目标」高度敏感</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p><strong>选型脚本的价值不是给出答案，而是把假设摆到台面上。</strong>S2 → S3 只改了权重，胜出者就换了——这说明真正需要开会讨论的不是「选哪个模型」，而是「小目标 AP 到底值多少权重」。<em>而这个问题只能用数据回答：统计你的数据集里各尺寸桶的目标占比，以及各桶漏检对应的安全后果。</em></p><p>面试里能把这层意思讲出来，比背出任何一个模型的 AP 都有价值：<strong>「我会先把硬约束列清楚，多数候选在这一步就被淘汰了；剩下的按我自己数据上的分桶指标画帕累托前沿；最后做权重敏感性分析，如果结论对某个权重特别敏感，那说明真正要确定的是那个权重而不是模型。」</strong></p>
+  </div>  <div class="callout danger"><span class="label">COCO AP + 论文 FPS = 双重误导</span>
+    <p>最后一个必须说的坑：<strong>不要在「论文口径的 COCO AP」上做 TSR 的选型决策。</strong>COCO 的 AP 由中大目标主导，而 TSR 的目标绝大多数落在 small 桶里，两者的模型排序可以完全不同。<em>正确的做法是先在自己的数据上按像素尺寸分桶评测（&lt;16 / 16–32 / 32–64 / &gt;64），拿到分桶 AP 之后再画前沿</em>。<strong>「用 COCO AP 排序 + 用论文 FPS 排序」这两个错误叠加起来，得出的选型结论可以和实测完全相反</strong>——而这两个错误都极其常见。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>延迟基准的标准化仍未解决。</strong>目前每篇论文自定口径，导致跨论文的 FPS 不可比。MLPerf Inference 在服务器/边缘场景做了标准化（固定 batch、固定精度、报 p99 而非均值、含端到端后处理），<em>但检测领域的学术论文几乎不用它</em>。「实时检测器论文应该报哪些数字」是一个社区级的开放问题，也是读论文时必须自己补的功课。</li>
+    <li><strong>延迟感知的架构搜索（latency-aware NAS）。</strong>用实测延迟而非 FLOPs 作为搜索目标已经是共识（因为访存受限的算子 FLOPs 低但不快），但<em>延迟查找表与目标硬件强绑定</em>，换一颗 SoC 就要重建。「如何让延迟模型跨硬件泛化」尚无好解。</li>
+    <li><strong>动态推理与自适应计算。</strong>模块 04 讲的 decoder 层数可调是最粗粒度的一种；更细的做法（early exit、token 剪枝、区域自适应分辨率）能省更多，<em>但它们都把延迟重新变成输入的函数</em>——正好抵消了无 NMS 带来的可预测性。<strong>「如何在自适应计算与 WCET 可界定之间取得平衡」是实时感知的一个真问题</strong>，目前的工程答案是「自适应但有硬上界」。</li>
+    <li><strong>量化对检测器各部件的差异化影响。</strong>已知回归头比分类头敏感、小目标比大目标敏感、attention 比卷积敏感，但<em>缺少可预测的先验规则</em>，实践上仍靠逐层敏感度分析穷举。对 DETR 系（含 softmax、LayerNorm、可变形采样）的低比特量化尤其缺少成熟配方。</li>
+    <li><strong>共享 SoC 上的多任务调度。</strong>TSR 只是十几个感知任务之一，它们竞争同一份算力、显存带宽与内存。<em>单任务的 p99 测得再准，多任务并发下的实际 p99 也可能翻倍</em>。「多模型共存时的延迟保证」在学术界基本没人研究，但在量产里是天天要面对的问题。</li>
+    <li><strong>评测指标与下游行为的脱节。</strong>AP 涨了不等于路测体验变好；延迟降了不等于反应更快（可能被时序融合的窗口吃掉）。<em>「什么样的离线指标能预测闭环表现」是自动驾驶感知评测的核心开放问题</em>（C55 模块 05 与 C58 模块 05 会分别从安全评测与数据闭环的角度继续讨论）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>★ 必读</strong>：Zhao et al., <em>DETRs Beat YOLOs on Real-time Object Detection</em>（RT-DETR，CVPR 2024，arXiv:2304.08069）——重点看附录里对测速口径的说明（batch、精度、是否含后处理），这是学习「怎么报延迟」的正面样本。<strong>★</strong> Lyu et al., <em>RTMDet: An Empirical Study of Designing Real-Time Object Detectors</em>（arXiv:2212.07784）——它的延迟对比表明确写了测量条件，值得当模板。<strong>★</strong> NVIDIA, <em>TensorRT Developer Guide</em>——重点读 “Performance Best Practices”（warmup、CUDA graph、锁频、多流）与 “Working with INT8”（校准算法与校准集要求）两章；配合 <code>trtexec</code> 的 <code>--percentile</code>、<code>--dumpProfile</code>、<code>--useCudaGraph</code> 三个参数动手跑一遍。</p><p>配套背景：Reddi et al., <em>MLPerf Inference Benchmark</em>（ISCA 2020，标准化推理基准的设计原则，尤其是「为什么要报 p99 而不是均值」）；Wang et al., <em>YOLOv10: Real-Time End-to-End Object Detection</em>（NeurIPS 2024，无 NMS 的另一条路）；Peng et al., <em>D-FINE</em>（ICLR 2025）；Cai et al., <em>Once-for-All</em>（ICLR 2020，一份权重多档速度的另一种实现思路，可与模块 04 的 decoder 截断对照阅读）。相邻课程：模块 04（RT-DETR 与 NMS 方差）、C57 模块 05（TSR 小目标的物理推导与分桶评测）、C60 模块 02/03/05（TensorRT 构建、INT8 校准、性能剖析与 p99）、C61 模块 01（实验设计与「+0.3 算不算提升」）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_rtdetr/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · RT-DETR 解剖：DETR 如何跑赢 YOLO</div></a>
+  </div>
+
+</div>
+</body>
+</html>

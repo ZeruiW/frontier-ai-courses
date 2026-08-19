@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>00 · 课程总览与环境</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 00 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>00 · 课程总览与环境</h1>
+  <p class="subtitle">实时检测的三个硬约束（延迟预算 / 显存 / 精度）与贯穿全课的三条主线——标签分配、无 NMS、结构重参数化 · 延迟-精度曲线要「同延迟比 AP」而不是「同 AP 比延迟」 · 30 FPS 的 33 ms 里感知只分得到十几毫秒 · 帕累托前沿与「被支配」判定：一个模型该不该进候选池是可以算出来的</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">C18（目标检测基础：anchor / IoU / NMS / mAP / FPN）；numpy 基本操作</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 00_environment_check.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">YOLO 系列原论文、RTMDet、RT-DETR / D-FINE；MMDetection 与 Ultralytics 的 benchmark 说明</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">总览 30 分钟 + 跑 25 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#hard">「实时」到底有多硬：三个不能谈判的约束</a></li>
+      <li><a href="#budget">33 毫秒的账：交通标志检测到底分到多少</a></li>
+      <li><a href="#threads">三条主线：这门课其实只讲三件事</a></li>
+      <li><a href="#curve">怎么读延迟-精度曲线：同延迟比 AP，而不是同 AP 比延迟</a></li>
+      <li><a href="#map">课程地图与相邻课程的分界</a></li>
+      <li><a href="#env">环境、方法论与这门课的用法</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hard"><span class="num">1</span>「实时」到底有多硬：三个不能谈判的约束</h2>
+  <p>这门课讲<strong>实时目标检测器</strong>——YOLO 家族、RTMDet、RT-DETR。它们和 Faster R-CNN、Mask R-CNN 那一支的区别不在「精度」，而在<strong>它们是被一个外部给定的延迟预算逼出来的</strong>。理解这一点，后面每一代的设计选择才有解释。</p>  <p>「实时」不是一个形容词，它是三个可量化、且<strong>同时成立</strong>的约束。缺任何一个，这门课里的绝大多数设计都会失去动机。</p>  <table>
+    <thead><tr><th>约束</th><th>具体是什么</th><th>违反了会怎样</th><th>谁给定的</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 延迟预算</strong></td><td>端到端 <code>p99</code> 必须小于分给你的那几毫秒——注意是 p99 不是均值，也不是 FPS</td><td>帧被丢弃、下游拿到过期的感知结果、控制回路失稳</td><td><strong>外部硬性给定</strong>：相机帧率 × 感知任务排期</td></tr>
+      <tr><td><strong>② 显存与带宽</strong></td><td>车端 SoC 的显存要被十几个任务瓜分；带宽常常比算力更早成为瓶颈</td><td>engine 构建失败、被迫降分辨率、多任务互相抢占</td><td>硬件平台选型（几年前就定死了）</td></tr>
+      <tr><td><strong>③ 精度</strong></td><td>在<em>那个延迟预算下</em>能达到的最高精度，而不是不限时间能达到的精度</td><td>漏检 / 误检直接变成安全事件</td><td>产品与安全团队</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>三者的关系不是「三个目标做权衡」，而是<strong>「两个是硬约束、一个是优化目标」</strong>。延迟预算与显存是外部给你的，<em>你不能通过「模型再准一点」去和它们谈判</em>；精度才是你唯一能争取的东西。所以实时检测器的整个研究史，可以概括成一句话：<strong>在给定的毫秒数里，把 AP 往上抬</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这也解释了为什么实时检测领域的论文长得和通用检测不一样：通用检测比的是「在 COCO 上的 AP」，实时检测比的是<strong>一条曲线</strong>——延迟为横轴、AP 为纵轴的帕累托前沿。<em>一个模型「更好」的严格定义是：它把这条前沿往左上方推了</em>。单点比 AP、或者单点比 FPS，都是没有意义的（第 4 节会把这件事讲透，而它是本课最容易在面试里加分的一个点）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>学完这门课你应当能当场回答：<strong>标签分配为什么比换 backbone 更能涨点？结构重参数化凭什么「训练时多分支、推理时单分支」还数值等价？YOLOv10 的一致双分配到底怎么去掉 NMS 的、和 DETR 的一对一匹配是不是一回事？RT-DETR 为什么敢说自己比 YOLO 快——它省掉的到底是哪一部分时间？给你一个 33 ms 的帧周期和一块被十几个任务瓜分的 SoC，你怎么为交通标志检测选型并给出论证？</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="budget"><span class="num">2</span>33 毫秒的账：交通标志检测到底分到多少</h2>
+  <p>先把「实时」这个词换成数字。车端前视相机常见 30 FPS，于是有一个不可协商的帧周期：</p>  <div class="math-block">\[T_{\text{frame}} = \frac{1000}{30} \approx 33.3\ \text{ms}\]</div>  <p>但这 33.3 ms <strong>不是给检测器的</strong>。它要先被一串固定开销切掉，剩下的才是「全部感知任务」的时间窗，然后这个时间窗还要被十几个感知任务瓜分。交通标志检测（<span class="term">TSR, Traffic Sign Recognition</span>）在这里面只是一个中等优先级的任务。</p>  <div class="ascii">一帧 33.3 ms 的真实去向（量产前视感知的典型量级）
+
+|&lt;--------------------------- 33.3 ms 帧周期 ---------------------------&gt;|
+|  曝光+ISP+MIPI  |        全部感知任务         | 融合/跟踪/规控/执行 | 裕度 |
+|     8.0 ms      |        16.3 ms              |      7.0 ms         | 2.0  |
+                  |                             |
+                  v                             v
+                  +----- 感知的 16.3 ms 再被瓜分 -----+
+                  | BEV 障碍物            45%   7.35 ms |
+                  | 车道线/可行驶区域     20%   3.27 ms |
+                  | **交通标志 TSR**      15%   2.45 ms |  &lt;-- 本课的主角
+                  | 红绿灯                10%   1.63 ms |
+                  | 其他（静态障碍/占位） 10%   1.63 ms |
+                  +-------------------------------------+
+
+                        TSR 的端到端预算 = 2.45 ms
+
+再把这 2.45 ms 拆开（这一层才是你能动的）：
+  预处理 resize+letterbox+归一化 ......... 0.35 ms   14%
+  H2D 拷贝 ............................... 0.15 ms    6%
+  网络前向 backbone+neck+head ............ 1.45 ms   60%   &lt;-- 换模型只能动这一段
+  NMS .................................... 0.30 ms   12%   &lt;-- 唯一随场景波动的一项
+  解码/坐标还原/阈值 ..................... 0.12 ms    5%
+  D2H 拷贝 ............................... 0.05 ms    2%
+  ---------------------------------------------------
+  合计 2.42 ms，余量 0.03 ms</div>  <table>
+    <thead><tr><th>这张账单告诉你什么</th><th>推论</th></tr></thead>
+    <tbody>
+      <tr><td><strong>网络前向只占 60%</strong></td><td>论文里 <code>FPS</code> 那一栏通常只测这 60%。<em>「换个快一倍的 backbone」对端到端最多带来 30% 的收益</em></td></tr>
+      <tr><td><strong>预处理 + 后处理占 39%</strong></td><td>它们在 CPU 上、常常没被优化、且是训练-部署不一致的头号来源（见 C60）</td></tr>
+      <tr><td><strong>NMS 是唯一「不确定」的一项</strong></td><td>耗时随候选框数近似 O(n²) 增长。空旷高速 40 个候选 vs 雨夜误检爆炸 900 个候选，<em>端到端延迟能差 40%</em>——这是 RT-DETR 存在的直接理由（模块 04）</td></tr>
+      <tr><td><strong>余量只有 0.03 ms</strong></td><td>任何「顺手加一个后处理」的想法都要先算账。<em>「反正只多 0.5 ms」在这里等于超预算 20 倍余量</em></td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">预算是硬约束，不是建议值</span>
+    <p>notebook 第 4 节会给你一个反直觉的结果：<strong>本课要讲的所有公开模型，没有一个能塞进 2.45 ms</strong>——最快的 YOLOv5-S 在 T4 上也要 4.5 ms。这不是账算错了，而是真实的量产约束长这样。<em>它逼出了三条工程路线</em>：① 用 tiny/nano 档 + INT8 + 更小输入分辨率把延迟压下去（代价是小目标掉点，见 C57）；② 把 TSR 降频到 10–15 Hz 跑（代价是首次检出距离变远、时序稳定性变差，见 C55 模块 04）；③ 只在 ROI（消失点附近的图像上半部）上跑（代价是漏掉侧向标志）。<strong>面试里被问「你怎么把这个模型放进车里」，说得出这三条并说得出各自的代价，就已经区分度很高了。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="threads"><span class="num">3</span>三条主线：这门课其实只讲三件事</h2>
+  <p>YOLO 从 v1 到 v10、加上 RTMDet 与 RT-DETR，表面上是十几个模型、上百个改动。但<strong>真正影响精度与延迟的机制只有三条，其余都是围绕它们的工程包装</strong>。把这三条抓住，你就能在面试里对任何一个新模型做出判断，而不是背名字。</p>  <table>
+    <thead><tr><th>主线</th><th>它回答的问题</th><th>关键节点</th><th>本课在哪讲</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 标签分配<br>label assignment</strong></td><td>训练时，哪些位置该被当成正样本？<em>这个问题的答案决定了梯度往哪流</em></td><td>IoU 阈值 → ATSS → OTA/SimOTA → TaskAligned → dynamic soft label</td><td>模块 <strong>02</strong>（全模块）；模块 01 的 YOLOX / v8 / v10</td></tr>
+      <tr><td><strong>② 无 NMS<br>NMS-free</strong></td><td>能不能让模型直接吐出不重复的框？<em>NMS 是延迟不确定性的唯一来源</em></td><td>一对多 + NMS → DETR 的一对一匹配 → YOLOv10 一致双分配</td><td>模块 <strong>01</strong>（v10）、<strong>04</strong>（RT-DETR）；C54 全课</td></tr>
+      <tr><td><strong>③ 结构重参数化<br>re-parameterization</strong></td><td>能不能训练时用复杂结构、推理时折叠成简单结构？<em>免费的精度</em></td><td>Conv+BN 融合 → RepVGG 多分支 → YOLOv6/v7 的 RepBlock</td><td>模块 <strong>01</strong>（含 numpy 数值等价证明）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么是这三条？因为它们分别对应了检测器的三个可独立优化的层面：<strong>① 训练信号（分配）、② 输出形式（去重）、③ 计算形式（重参数化）</strong>。<em>三者互不干扰，可以自由组合</em>——这正是 YOLOv6/v7/v8/v10 能一代一代叠加的原因。反过来，一个「新模型」如果在这三条之外只改了 backbone 的连接方式，它的收益通常在 ±0.5 AP 的噪声里。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更有价值的是它们的<strong>共同结构</strong>：三条主线都是「<em>训练期与推理期解耦</em>」。分配只在训练期存在（推理时没有 GT，也就没有分配）；一对一 vs 一对多的区别也只在训练期（推理时只是要不要跑 NMS）；重参数化更是字面意义上的训练一个结构、推理另一个结构。<strong>「凡是只在训练期付出代价的改动，都是免费的午餐」——这是实时检测领域最重要的一条心法</strong>，也是它区别于「加模块涨点」式研究的根本处。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把这条心法反过来用，就得到一个很好用的判据：<strong>看到一个新的检测器改进，先问「它的代价是落在训练期还是推理期」</strong>。落在训练期（更复杂的分配、更多的辅助头、更强的增强、更长的训练）→ 值得试，因为推理零成本。落在推理期（多一个注意力模块、多一个尺度、TTA）→ 必须先算延迟账，因为你只有 2.45 ms。<em>这个判断你在面试现场就能做，不需要跑实验。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="curve"><span class="num">4</span>怎么读延迟-精度曲线：同延迟比 AP，而不是同 AP 比延迟</h2>
+  <p>实时检测的所有论文都会画一张图：横轴延迟、纵轴 AP、一堆点连成几条曲线。<strong>这张图有一种正确读法和两种常见的错误读法</strong>，而分辨它们是这个领域的入门门槛。</p>  <p>先给出严格定义。模型 A <span class="term">支配</span>（dominate）模型 B，当且仅当：</p>  <div class="math-block">\[A \succ B \iff t_A \le t_B \ \wedge\ \mathrm{AP}_A \ge \mathrm{AP}_B \ \wedge\ (t_A < t_B \ \vee\ \mathrm{AP}_A > \mathrm{AP}_B)\]</div>  <p>不被任何模型支配的那些点，构成<span class="term">帕累托前沿</span>（Pareto front）。<strong>被支配的模型可以直接从候选名单里划掉——存在一个又快又准的替代品，没有任何理由选它</strong>。notebook 第 4 节会让你在一组真实量级的数据上把这件事算出来：11 个模型里有 5 个是被支配的。</p>  <table>
+    <thead><tr><th>读法</th><th>长什么样</th><th>为什么对 / 错</th></tr></thead>
+    <tbody>
+      <tr><td><strong>✅ 同延迟比 AP</strong></td><td>「我有 10 ms 预算，这个预算内 AP 最高的是谁？」</td><td><strong>延迟预算是外部硬约束、AP 是可争取量</strong>。这个问法直接对应真实的选型决策</td></tr>
+      <tr><td><strong>❌ 跨延迟点比 AP</strong></td><td>「我们比 YOLOv8-M 高 4.1 AP」（却慢了 65%）</td><td>把两个不在同一预算档的模型放一起比。<em>论文最常见的话术，也是面试里最容易被追问穿的一句</em></td></tr>
+      <tr><td><strong>❌ 同 AP 比延迟</strong></td><td>「达到 53 AP 我们只要 9.3 ms」</td><td>在<em>研究</em>语境下可以，在<strong>工程</strong>语境下是倒过来的：没有人会先定一个 AP 目标再去找延迟。<em>AP 目标本身就是延迟预算的函数</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么「同 AP 比延迟」在工程上是错的？因为<strong>AP 不是一个需求，延迟才是</strong>。产品不会说「我要 53 AP」，产品会说「感知在 33 ms 帧周期里，TSR 只能占 2.45 ms」。<em>于是唯一有意义的问题是：在 2.45 ms 里我能拿到多少 AP</em>。把这个问句反过来，你就会做出「为了达到某个 AP 而超支延迟」的决定——而延迟超支在车端是硬故障，AP 低一点只是性能差一点。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个更隐蔽的错误：<strong>比较不在同一条测量协议下的点</strong>。不同论文的 FPS 可能包含或不包含 NMS、包含或不包含预处理、batch size 是 1 还是 32、精度是 FP32/FP16/INT8、卡是 V100/T4/A100/3090。<em>这些差异合起来能造成 3–5 倍的差距，远大于模型之间的真实差距</em>。所以任何跨论文的曲线对比都只能用来「粗分档」，不能用来做最终选型——<strong>选型必须自己在目标硬件上、用统一协议重测</strong>（模块 05 会给出完整的重测流程与容易踩的坑）。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>notebook 里那张模型表刻意用了各论文自报的量级数字，于是会得到一个「RT-DETR 系几乎占满前沿、RTMDet 全被支配」的结论。<strong>你应该对这个结论保持怀疑，而不是记住它</strong>——因为 RT-DETR 论文的对比表就是在自己的测量协议下做的（例如 YOLO 那一侧是否用了官方最优的 TensorRT 导出、NMS 用什么实现与阈值）。<em>这正是「论文的 FPS 不可信」的活标本</em>。本课教你的不是「哪个模型最好」，而是<strong>怎么自己把这张表算出来</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="map"><span class="num">5</span>课程地图与相邻课程的分界</h2>
+  <div class="ascii">起点：你知道什么是 anchor、IoU、NMS、mAP（C18），但没做过量产实时检测器。
+
+  模块 01  YOLO 家族演进：每一代到底改了什么
+     |      v1 网格回归的根本缺陷 -&gt; anchor+多尺度+FPN -&gt; CSP/PAN/Mosaic -&gt;
+     |      YOLOX 三件套 -&gt; 结构重参数化 -&gt; C2f/TaskAligned -&gt; v10 一致双分配
+     v      「每代改动的收益归因：架构红利还是训练技巧红利」  &lt;- 面试高频
+  模块 02  标签分配：检测器真正的胜负手
+     |      静态 IoU 阈值的三个病 -&gt; ATSS 自适应阈值 -&gt; OTA/SimOTA 最优传输 -&gt;
+     |      TaskAligned -&gt; RTMDet dynamic soft label
+     v      「同一份数据、同一个网络，换分配能差 3-5 AP」
+  模块 03  RTMDet 解剖：大核、共享头与软标签
+     |      CSPNeXt / 5x5 depthwise 大核的有效感受野 / 跨层共享头 /
+     |      软标签代价函数 / 全尺度缩放策略
+     v      「一套框架覆盖 tiny 到 x 的工程哲学」
+  模块 04  RT-DETR 解剖：DETR 如何跑赢 YOLO
+     |      NMS 是延迟方差的来源 -&gt; AIFI 只在 S5 做 self-attn + CCFF 跨尺度融合 -&gt;
+     |      IoU-aware query selection -&gt; **decoder 层数可调 = 一份权重多档速度**
+     v      「端到端无 NMS 在部署上到底买到了什么」
+  模块 05  延迟-精度权衡与实时检测器选型
+            端到端延迟的完整拆解 / 为什么论文 FPS 不可信 / 帕累托选型 /
+            TensorRT fp16-int8 的真实量级 / p99 与显存 / **为 TSR 选型的完整推理**
+
+终点：给定一个硬件平台、一个延迟预算和一个 TSR 任务，你能独立完成选型、
+      给出论证、并说清每个选择的代价。</div>  <table>
+    <thead><tr><th>相邻课程</th><th>它讲什么</th><th>和本课的分界</th></tr></thead>
+    <tbody>
+      <tr><td><strong>C18 目标检测</strong></td><td>anchor、IoU、NMS、FPN、mAP 的<em>定义与原理</em></td><td>本课假设你已经会。<em>本课讲的是「在延迟约束下这些机制该怎么改」</em></td></tr>
+      <tr><td><strong>C54 DETR 家族</strong></td><td>集合预测、匈牙利匹配、object query、收敛难题</td><td>本课模块 04 只讲 <strong>RT-DETR 为了实时做了哪些取舍</strong>；<em>匹配算法本身与 DETR 的收敛机理去 C54</em></td></tr>
+      <tr><td><strong>C57 小目标检测</strong></td><td>IoU 对位移的敏感性、NWD、切片推理、P2 层</td><td>本课在讲分配与架构时会指出「对小目标意味着什么」，<em>但系统解法在 C57</em></td></tr>
+      <tr><td><strong>C60 车端部署</strong></td><td>TensorRT、INT8 校准、预处理一致性、C++ 管线</td><td>本课模块 05 只算<strong>延迟账</strong>；<em>怎么把 engine 真正建出来、怎么排查掉点，去 C60</em></td></tr>
+      <tr><td><strong>C56 检测增强</strong></td><td>Mosaic / copy-paste / 增强流水线</td><td>本课模块 01 会讲 Mosaic 是「训练期红利」的典型，<em>但增强工程本身在 C56</em></td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>一个必须提前说清的边界：<strong>本课不讲「怎么训一个更准的检测器」这件事的全部</strong>。数据（C55/C56/C58）通常比模型更能决定 TSR 的最终指标——在一个 badcase 驱动的项目里，把 RTMDet-S 换成 RT-DETR-R18 可能涨 2 AP，而把夜间数据补齐可能涨 8 AP。<em>本课教的是「模型这一侧能榨出多少」，以及更重要的：怎么用可验证的方式说清它到底榨出了多少</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="env"><span class="num">6</span>环境、方法论与这门课的用法</h2>
+  <p>本课全程 <strong>纯 numpy + 标准库、CPU 可跑、不联网</strong>。不需要 PyTorch、mmdetection、TensorRT 或任何数据集下载。所有 notebook 在 CPU 上实跑验证，<code>assert</code> 零失败。</p>  <pre><code>pip install -r requirements.txt      # numpy / matplotlib / jupyterlab / ipykernel
+jupyter lab                          # 打开 00_setup/00_environment_check.ipynb</code></pre>  <table>
+    <thead><tr><th>真实世界里你需要</th><th>本课怎么处理</th></tr></thead>
+    <tbody>
+      <tr><td>GPU + TensorRT 实测延迟</td><td>用<strong>参数化的延迟模型</strong>（含 NMS 的目标数依赖项）+ 各论文自报数字的量级表；真实测量协议写在模块 05 的胶囊里</td></tr>
+      <tr><td>COCO / TT100K 数据集</td><td>用<strong>按针孔相机模型合成</strong>的交通标志尺寸分布（<code>px = f·S/Z</code>），物理上可解释、可复现</td></tr>
+      <tr><td>mmdetection / ultralytics</td><td>把关键机制<strong>从零用 numpy 实现</strong>：Conv+BN 融合、RepVGG 合并、k-means anchor、ATSS/SimOTA、软标签代价矩阵</td></tr>
+      <tr><td>PyTorch 训练循环</td><td>只在需要「证明数值等价」的地方复现前向；<em>本课不训练模型，本课解剖模型</em></td></tr>
+    </tbody>
+  </table>  <p>三条贯穿全课的纪律：</p>  <ul>
+    <li><strong>凡是说「更好」，必须说清是在哪个延迟点上更好</strong>。孤立的 AP 数字在这门课里没有意义。每次比较都要能写成「在 X ms 预算下，从 A 换到 B，AP 从 p 变到 q」。</li>
+    <li><strong>凡是改动，必须归因到训练期还是推理期</strong>。这决定了它的代价结构，也决定了要不要试。第 3 节的心法要贯穿每一个模块。</li>
+    <li><strong>凡是数值等价的声明，必须用 assert 证明</strong>。「重参数化后精度不变」不是一句话，是 <code>np.allclose(y_multi_branch, y_fused)</code>——模块 01 的 notebook 会让你亲手写出这个 assert。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>这门课的用法建议：<strong>模块 01–02 顺着读（它们是后面所有内容的语言），03–04 可以按需求跳读，05 建议在选型前重读一遍</strong>。<em>如果你现在就要为一个具体项目选模型，可以先读 00 + 05，把账算出来，再回头读 01–04 理解每个候选到底做了什么</em>。全课的 notebook 彼此独立，不依赖前一个的变量。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>研究前沿与开放问题</h2>
+  <p>实时检测在 2023 年之后进入了一个有意思的阶段：<strong>纯 CNN 的 YOLO 系与端到端的 DETR 系在同一条帕累托前沿上正面相遇了</strong>，而且各自都在吸收对方的东西。以下是目前仍然开放的问题。</p>  <ul>
+    <li><strong>无 NMS 的收益到底有多大，仍然没有公认答案。</strong> YOLOv10 与 RT-DETR 都主张「去掉 NMS」，但去掉 NMS 换来的是<em>延迟的确定性</em>（方差变小）而不必然是<em>延迟的均值</em>更低。在候选框不多的场景（高速上的 TSR），NMS 本来就只占 12%。<em>「无 NMS 值不值」是一个和场景强相关的问题，不存在通用答案。</em></li>
+    <li><strong>一对一匹配的训练效率问题没有被真正解决。</strong> 一对一提供的监督信号密度远低于一对多，这是 DETR 系收敛慢的根因之一。目前的主流做法（YOLOv10 的双分配、Co-DETR/Group-DETR 的辅助一对多分支）本质都是「训练时借一对多的密集监督、推理时只用一对一」——<em>这更像是绕过问题而不是解决问题</em>。</li>
+    <li><strong>结构重参数化与量化的冲突。</strong> 多分支合并后的等效卷积，其权重分布往往比原生单分支训练出来的更「长尾」，导致 INT8 量化掉点更严重。<em>「重参数化友好的量化」或「量化感知的重参数化」目前还没有干净的解法</em>——这是 C60 模块 03 会重新遇到的问题。</li>
+    <li><strong>标签分配的理论仍然缺失。</strong> 从 IoU 阈值到 ATSS 到 SimOTA 到 TaskAligned，每一步都被实验证明有效，但<em>「什么是最优的分配」至今没有一个可优化的形式化目标</em>。OTA 的最优传输视角是最接近的一次尝试，但它的代价函数仍然是手工设计的。</li>
+    <li><strong>评测协议的碎片化。</strong> 「同一模型在不同论文里 FPS 差 3 倍」是这个领域的常态。<em>缺少一个像 MLPerf 那样被普遍接受的实时检测端到端 benchmark</em>（含预处理、含 NMS、报 p99、指定硬件与精度），使得跨论文比较基本失效——这是本课模块 05 花整整一个模块讲测量的原因。</li>
+    <li><strong>面向车端多任务共享算力的联合优化。</strong> 现实中 TSR 不是独占 SoC，而是和 BEV、车道线、红绿灯抢时间片。<em>「多个感知任务共享 backbone / 联合排期 / 动态分配算力」在工业界已经是标配，在学术界几乎没有对应的 benchmark</em>——这也是学术实时检测与量产实时检测最大的一条鸿沟。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读（按本课顺序）：<em>You Only Look Once</em>(Redmon 2016) 与 <em>YOLO9000</em>(2017) —— 读它们是为了理解「网格回归」的原始动机与 anchor 被引入的确切原因；<em>YOLOX: Exceeding YOLO Series in 2021</em> —— 解耦头 / anchor-free / SimOTA 三件套的消融表是整个领域最有信息量的一张表；<em>RepVGG: Making VGG-style ConvNets Great Again</em>(2021) —— 结构重参数化的原始论文，公式极简，务必自己推一遍；<em>RTMDet: An Empirical Study of Designing Real-Time Object Detectors</em>(2022) —— 大核与共享头，工程细节写得最实在；<em>DETRs Beat YOLOs on Real-time Object Detection</em>(RT-DETR, 2023) —— 注意读它的 NMS 敏感性分析那一节；<em>YOLOv10: Real-Time End-to-End Object Detection</em>(2024) —— 一致双分配。相邻课程：C18（检测基础）、C54（DETR 家族）、C57（小目标）、C60（车端部署）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="next" href="../01_yolo_evolution/01_讲解.html"><div class="dir">下一模块 →</div><div class="t">01 · YOLO 家族演进：每一代到底改了什么</div></a>
+  </div>
+
+</div>
+</body>
+</html>

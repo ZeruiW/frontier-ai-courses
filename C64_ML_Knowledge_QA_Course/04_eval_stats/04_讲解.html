@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 评估、概率与统计问答</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 评估、概率与统计问答</h1>
+  <p class="subtitle">不平衡数据下 <strong>ROC-AUC 会撒谎</strong>——负样本占 99% 时一个几乎认不出正样本的模型也能刷出 0.9+ 的 ROC-AUC，<strong>PR-AUC</strong> 才是这时候该看的指标，这是本模块最高频的追问点 · <strong>校准（calibration）</strong>与准确率是两件独立的事：一个模型可以精度很高但输出的 0.9 置信度里只有六成真的对——<strong>可靠性图 / ECE / 温度缩放</strong>是诊断和修正这件事的标准工具 · 三种置信区间不是任选其一：<strong>Wilson 区间</strong>在小样本或极端比例下比正态近似稳健得多，正态区间在 p 接近 0 或 1 时甚至会给出负数或超过 1 的荒谬结果 · A/B 测试没有<strong>功效（power）</strong>分析等于没做——「没测出显著差异」到底是真没差异还是样本量不够，只有这个计算能回答 · 辛普森悖论、幸存者偏差、回归到均值、p-hacking——这四个统计陷阱几乎必考，而且往往以「这个结论哪里可能错了」的开放题形式出现，不是选择题</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">会算混淆矩阵、知道什么是 sigmoid 输出的概率；数学推导见 <span class="term">C07</span>（贝叶斯公式、交叉验证的推导），本模块不重复</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_eval_stats_qa.ipynb（ROC-AUC/PR-AUC 分歧演示 · 可靠性图与温度缩放 · 三种置信区间对比 · A/B 功效计算 · 辛普森悖论构造，纯 numpy）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Davis & Goadrich 2006「The Relationship Between PR and ROC」· Guo et al. 2017「On Calibration of Modern Neural Networks」· Efron 1979 bootstrap · Wilson 1927 · 本课程 C58-01（类别不平衡）、C61-01（种子方差与显著性）、C55-05（安全导向评测）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#eval-stats-scope">为什么这一段区分度最高：三段式答法用在统计上</a></li>
+      <li><a href="#metric-family">指标全家：Accuracy / Precision / Recall / F1 / Fβ</a></li>
+      <li><a href="#roc-pr-map">ROC-AUC vs PR-AUC vs mAP：不平衡数据下谁在骗你</a></li>
+      <li><a href="#threshold-cost">阈值、工作点与代价敏感决策</a></li>
+      <li><a href="#calibration">校准：可靠性图、ECE、温度缩放</a></li>
+      <li><a href="#ci-significance">置信区间与显著性检验：正态 / bootstrap / Wilson</a></li>
+      <li><a href="#ab-testing">A/B 测试：样本量、功效、新奇效应与多重比较</a></li>
+      <li><a href="#traps-bayes">统计陷阱四重奏与概率题：从辛普森悖论到基率谬误</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval-stats-scope"><span class="num">1</span>为什么这一段区分度最高：三段式答法用在统计上</h2>
+  <p>前三个模块的三段式答法是「一句话定义 → 为什么需要 → 什么时候失效」。到了评估与统计这一段，<strong>「什么时候失效」不再是加分项，而是整个答案的重心</strong>——因为统计方法的正确性从来不是「公式对不对」，而是「前提假设成不成立」。正态置信区间假设样本够大、比例不极端；ROC-AUC 假设你关心排序而不是绝对错误率；A/B 测试的显著性检验假设你没有中途偷看结果。<em>忘记假设，工具就会给你一个看起来很科学、实际上错误的答案。</em></p>  <p>这也是为什么这一段是全部 <span class="term">C64</span> 里<strong>区分度最高</strong>的一段。背公式人人都会——$F_1 = 2PR/(P+R)$ 三秒钟能查到，$\text{ROC-AUC}$ 的定义随口能说。但能不能在 30 秒内说出「这个指标在什么场景下会撒谎」，才能看出候选人是<em>真的用过、debug 过</em>这些指标，还是只在课堂上背过定义。</p>  <table>
+    <thead><tr><th>面试官的追问</th><th>只背公式的候选人</th><th>懂失效边界的候选人</th></tr></thead>
+    <tbody>
+      <tr><td>「不平衡数据下你会用什么指标？」</td><td>「F1，因为它综合了精确率和召回率」</td><td>「先看不平衡程度：如果负类占 99%，我会看 <strong>PR-AUC</strong> 而不是 ROC-AUC，因为……」</td></tr>
+      <tr><td>「那 ROC-AUC 有什么问题？」</td><td>卡壳，或重复一遍 ROC-AUC 的定义</td><td>「它的分母里有海量真阴性，会稀释假阳性的影响，我可以举个数字例子」</td></tr>
+      <tr><td>「能举一个 ROC-AUC 很高但模型没用的例子吗？」</td><td>说不出来</td><td>秒举：<em>10 万分之一的欺诈检测，ROC-AUC=0.98 但精确率只有 5%</em></td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>统计学面试问的从来不是「这个指标是什么」，是<strong>「这个指标什么时候会说谎，以及你怎么发现它在说谎」</strong>。把这句话当成本模块所有小节的统一读法。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>每一个统计工具都是在一组假设下才成立的近似。正态置信区间假设样本够大、分布不太偏；ROC-AUC 假设你关心的是「谁的分数更高」而不是「绝对错了多少」；A/B 测试的 $p$ 值假设你只看了一次结果。<em>忘记假设，工具不会报错，它只会安静地给你一个错误的自信。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说，每个统计方法都对应一个「如果条件不满足，第一类/第二类错误率会怎样膨胀」的具体机制——小样本下正态近似的覆盖率会低于名义置信度（尤其 $\hat p$ 接近 0 或 1 时）；ROC-AUC 作为一个排序统计量（等价于 Mann-Whitney U 统计量的归一化形式），本身与类别先验<em>无关</em>，这正是它在不平衡场景下「对假阳性数量不敏感」的数学根源——不是它坏了，是它<u>压根没有被设计来衡量这件事</u>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>面对不熟悉的检验，正确姿势是「我会先确认这个检验的假设是否满足——比如样本是否独立、方差是否齐性——再决定能不能用」，而<strong>不是</strong>硬着头皮编一个公式出来。承认「我需要先查一下」比编错一个公式安全得多，见模块 05 的知识边界练习。</p>
+  </div>  <p>数学推导（贝叶斯公式的完整推导、交叉验证的方差分解）见 <span class="term">C07</span>，本模块不重复；这里只训练「60 秒讲清 + 接住追问」。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="metric-family"><span class="num">2</span>指标全家：Accuracy / Precision / Recall / F1 / Fβ</h2>
+  <p>五个最基础的指标都从同一张<strong>混淆矩阵</strong>（TP/FP/FN/TN）里算出来，但它们回答的是<em>五个不同的问题</em>——把「它们都是分类指标」当成一回事，是这一段最常见的踩雷点。</p>  <table>
+    <thead><tr><th>指标</th><th>公式</th><th>一句话回答的问题</th><th>什么时候它会骗你</th></tr></thead>
+    <tbody>
+      <tr><td>Accuracy</td><td>$(TP+TN)/N$</td><td>整体猜对了多少</td><td><strong>类别不平衡时完全失效</strong>：全猜负类在 99:1 数据上也有 99% accuracy</td></tr>
+      <tr><td>Precision</td><td>$TP/(TP+FP)$</td><td>我说是正的，有多少真是正的</td><td>只看它会忽略召回——把阈值调到 1.0，precision 可以刷到 1，但漏检全部</td></tr>
+      <tr><td>Recall</td><td>$TP/(TP+FN)$</td><td>真正的正例，我抓到了多少</td><td>只看它会忽略代价——把阈值调到 0，recall 恒为 1，但全是假阳性</td></tr>
+      <tr><td>F1</td><td>$2PR/(P+R)$</td><td>precision 与 recall 的调和平均</td><td><strong>默认 precision 与 recall 同等重要</strong>——代价不对称时这个假设本身就是错的</td></tr>
+      <tr><td>Fβ</td><td>$(1{+}\beta^2)PR / (\beta^2P+R)$</td><td>让 recall 的重要性是 precision 的 $\beta$ 倍</td><td>$\beta$ 选错等于假设错了代价比——很多人报了 F1 却没意识到自己隐含选了 $\beta{=}1$</td></tr>
+    </tbody>
+  </table>  <div class="math-block">\[F_\beta = \frac{(1+\beta^2)\cdot P \cdot R}{\beta^2 \cdot P + R}, \qquad \beta{>}1 \text{ 更看重召回}, \;\; \beta{<}1 \text{ 更看重精确率}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>调和平均（而不是算术平均）的意义在于<strong>惩罚两者失衡</strong>：precision=1.0、recall=0.01 时，算术平均还有 0.505 看起来不错，调和平均只有 0.0198，一眼就能看出「这个模型基本没用」。F1 就是靠这一点防止你被单边的高分数骗过去。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说 $\beta$ 是「召回相对于精确率的重要性倍数」：$\beta{=}2$（即 F2）意味着面试官告诉你「漏检的代价是误检的 4 倍」（$\beta^2{=}4$）——这在 TSR 里对应<span class="term">停车让行</span>这类标志：漏检一次的安全代价远高于多一次误刹车，此时该报 F2 甚至更极端的 recall 优先指标，而不是默认报 F1。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <strong>「accuracy 高就是模型好」是面试里最容易当场翻车的一句话。</strong>一个 <span class="term">TSR</span> 数据集里「限速 5」这一类可能只占 0.1%，一个永远不预测这个类的模型 accuracy 照样很高——面试官只要追问一句「稀有类的 recall 呢」，这句话就会当场破功。
+  </div>  <h3>典型追问：给你一组 P/R，能不能秒算 F1/F0.5/F2？</h3>  <p>$P{=}0.9, R{=}0.1$ 时：$F_1{=}2{\times}0.9{\times}0.1/1.0{=}0.18$；$F_{0.5}$（更看重精确率）$\approx 0.36$；$F_2$（更看重召回）$\approx 0.12$。记住这个方向就够了：<strong>$\beta$ 越大，Fβ 越贴近 recall 本身；$\beta$ 越小，越贴近 precision 本身</strong>——不需要在白板上心算到小数点后四位，说对趋势 + 给出边界情况（$\beta\to 0$ 退化为 P，$\beta\to\infty$ 退化为 R）就已经拿到分。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="roc-pr-map"><span class="num">3</span>ROC-AUC vs PR-AUC vs mAP：不平衡数据下谁在骗你</h2>
+  <p>这是本模块的<strong>招牌问题</strong>：「不平衡数据下 ROC-AUC 为什么会骗人？」几乎是检测/风控/医疗类岗位的必考题，而且是少数几个「能当场用数字讲清楚」的理论问题。</p>  <div class="ascii">ROC 空间：坐标是 (FPR, TPR)                 PR 空间：坐标是 (Recall, Precision)
+  TPR                                          Precision
+   1 ┤        ╭──────────                       1 ┤╲
+     │     ╭──╯   看起来都贴着左上角           │ ╲___
+     │  ╭──╯      —— 因为 FPR 分母里有         │     ╲___  —— 不平衡时会
+     │╭─╯         海量真阴性 TN 在稀释 FP        │         ╲___ 塌到很低，
+   0 └───────────────────────► FPR            0 └──────────────►Recall
+     0                        1                  0                1
+   两条不同分类器的 ROC 曲线几乎重合            同样两条分类器的 PR 曲线拉开明显差距
+   （因为 FPR = FP/(FP+TN)，TN 巨大时不敏感）  （因为 Precision = TP/(TP+FP)，直接受 FP 绝对数量影响）</div>  <p>拿一组具体数字讲清楚：负类 99000、正类 1000。分类器 A 产生 900 个真阳性、1000 个假阳性——$FPR = 1000/99000 \approx 0.0101$，看起来微不足道，ROC 曲线几乎贴着左上角，$\text{ROC-AUC}$ 可以高达 0.97+。但 $\text{Precision} = 900/(900{+}1000) \approx 0.47$——<strong>你发出的每两个报警里就有一个是错的</strong>，这在下游系统里是完全不同的体验，而 PR 曲线会把这个问题直接暴露出来。</p>  <div class="math-block">\[\text{ROC-AUC} = P\big(s(x^+) > s(x^-)\big) \quad \text{—— 只关心排序，与类别先验无关}\]</div>  <table>
+    <thead><tr><th>指标</th><th>数学本质</th><th>对类别先验</th><th>适用场景</th><th>常见误用</th></tr></thead>
+    <tbody>
+      <tr><td>ROC-AUC</td><td>排序统计量（Mann-Whitney U 的归一化形式）</td><td><strong>不敏感</strong>——这是它「骗人」的根源</td><td>两类样本量相近、你关心排序能力</td><td>在极不平衡数据上报 ROC-AUC 当作唯一指标</td></tr>
+      <tr><td>PR-AUC</td><td>精确率-召回率曲线下面积</td><td>敏感——正类越稀少，同样的 FP 数量对 precision 冲击越大</td><td>正类稀少、你关心「报警的可信度」</td><td>把 PR-AUC 和 ROC-AUC 数值直接比大小（量纲不同，基线不同）</td></tr>
+      <tr><td>mAP</td><td>对每个类别算 PR-AUC 再求平均（检测里还要在多个 IoU 阈值上再平均）</td><td>对<strong>类别间</strong>不平衡不敏感——平均会掩盖表现极差的类</td><td>多类检测的整体排行榜指标</td><td>只看 mAP 不看逐类 AP——见 C61-02 的 TIDE 式误差分解；细节推导见 C18、C53–C61</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白地说：ROC 曲线的横轴（假阳性率）分母里站着<strong>全部</strong>真阴性，负类越多，同样数量的假阳性占比就越小，曲线自然显得好看；PR 曲线的横轴纵轴里根本没有真阴性这一项，假阳性一多，precision 立刻掉下来，<em>藏不住</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说，PR-AUC 的这种敏感性不是「优点」而是<strong>对代价结构的不同建模</strong>：ROC-AUC 隐含假设「阴性样本被误判的相对代价 = 阴性样本的相对数量」，而这在类别本身极不平衡时通常不成立——真正在意的是「每次报警的可信度」而非「负类整体被误判的比例」。<em>选 ROC 还是 PR，本质是在选一个隐含的代价假设</em>，这也是为什么 Davis & Goadrich (2006) 证明「一条曲线在 ROC 空间占优，当且仅当它在 PR 空间也占优」——两者排序一致，但<strong>绝对数值的可读性</strong>天差地别。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <strong>面试当场翻车模板</strong>：面试官给你一份「ROC-AUC=0.95」的报告问「这个模型能上线吗」，你说「AUC 这么高，能上」——这是本节要根除的反应。正确反应是反问一句「正负类比例是多少？能不能看一下 PR 曲线和实际阈值下的 precision？」。
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话记住选择规则：<strong>正类稀少 → 看 PR-AUC；两类均衡 → ROC-AUC 也可信；多类检测的整体排行 → mAP，但永远要配一张逐类 AP 表</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="threshold-cost"><span class="num">4</span>阈值、工作点与代价敏感决策</h2>
+  <p>指标是连续的，但线上系统要做一个<strong>非黑即白的决定</strong>——这中间的桥梁就是<span class="term">阈值</span>（threshold）。「用 0.5 当阈值」是最常见的默认动作，也是最没有依据的一个默认动作。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>0.5 只在一种情况下天然合理：两个类别一样多、犯两种错误的代价完全相等。现实里这两条几乎从不同时成立——类别常常不平衡，犯错的代价也几乎总是不对称的（漏检一个停车让行标志，和多看错一次广告牌，后果完全不是一个量级）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严谨的做法是显式写出<strong>代价矩阵</strong> $C_{FP}, C_{FN}$，选择使<strong>期望代价</strong>$E[\text{cost}] = C_{FP}\cdot FP(\tau) + C_{FN}\cdot FN(\tau)$ 最小的阈值 $\tau$——这把「选阈值」从一个经验动作变成了一个可以在白板上写出目标函数的优化问题。</p></div>
+  </div>  <table>
+    <thead><tr><th>场景</th><th>$C_{FN}$（漏检代价）</th><th>$C_{FP}$（误检代价）</th><th>该往哪个方向调阈值</th></tr></thead>
+    <tbody>
+      <tr><td>TSR 停车让行标志检测</td><td>极高——可能导致未减速通过路口</td><td>低——多一次不必要的减速</td><td><strong>降低阈值</strong>，牺牲精确率换召回</td></tr>
+      <tr><td>广告牌误识别为限速牌</td><td>中——如果误触发限速会造成不必要减速</td><td>中——同上</td><td>阈值需结合下游多帧融合再定（见 C55-04）</td></tr>
+      <tr><td>垃圾邮件过滤</td><td>低——漏判一封垃圾邮件影响小</td><td>高——把重要邮件误判为垃圾邮件代价大</td><td><strong>提高阈值</strong>，牺牲召回换精确率</td></tr>
+      <tr><td>医疗初筛（阳性即转诊复查）</td><td>极高——漏诊致命</td><td>中——多一次复查有成本但可接受</td><td>降低阈值，宁可信其有</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>阈值选择必须建立在<strong>验证集</strong>上，不能用测试集调阈值——这和用测试集调超参数是同一类错误，会让你在测试集上的评估结果虚高。工程上常见做法是在验证集上扫描阈值画出 PR 曲线，锁定阈值后才在测试集上报一次最终指标。</p>
+  </div>  <h3>典型追问：Youden's J 与「与场景无关」的阈值选择</h3>  <p>如果面试官问「没有明确代价矩阵怎么选阈值」，一个安全答案是 <span class="term">Youden's J</span> 统计量：$J = TPR - FPR$ 最大化的点，几何上是 ROC 曲线上离对角线最远的点。<strong>但要补一句「这只是一个无代价假设下的默认解，真实工程里几乎总有代价矩阵，应该优先用它」</strong>——只给出公式而不加这句限定，会显得你没有工作点选择的实战经验。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话总结：<strong>阈值不是从指标里「读」出来的，是从代价矩阵里「算」出来的</strong>；没有代价矩阵时才退而求其次用 Youden's J 或 F1 最大点。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="calibration"><span class="num">5</span>校准：可靠性图、ECE、温度缩放</h2>
+  <p><span class="term">校准</span>（calibration）回答的是一个和「准不准」完全不同的问题：<strong>「模型说我 90% 有把握时，它真的有 90% 的时候是对的吗？」</strong>——这是「高置信不等于高准确」这句话的精确版本。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>现代深度网络有一个广为人知的坏毛病：它们通常<strong>过度自信</strong>。一个 softmax 输出 0.99 的预测，实际正确率可能只有 0.85——网络在「知道自己不知道」这件事上是不诚实的，而这在需要做风险决策的系统里（要不要触发紧急制动、要不要转诊）是致命的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格定义：模型是<strong>完美校准</strong的，如果对所有输出置信度为 $c$ 的预测，其真实正确率恰好等于 $c$。<span class="term">可靠性图</span>（reliability diagram）把预测按置信度分桶，画「桶内平均置信度」vs「桶内实际准确率」，完美校准应该落在对角线上；<span class="term">ECE</span>（Expected Calibration Error）把每个桶的偏差按桶内样本占比加权求和，给出一个标量总结这条曲线偏离对角线的程度。</p></div>
+  </div>  <div class="math-block">\[\text{ECE} = \sum_{b=1}^{B} \frac{n_b}{N}\, \big|\, \text{acc}(b) - \text{conf}(b)\, \big|\]</div>  <div class="ascii">可靠性图（10 个置信度桶）
+准确率
+  1.0┤                              ╱  ← 完美校准（对角线）
+     │                          ●╱
+     │                      ●  ╱
+     │                  ● ╱               ● = 模型的实际桶（常见现象：
+     │              ● ╱                        高置信区间的柱子低于对角线
+     │          ●  ╱                            —— over-confident）
+  0.0└──────────────────────────────► 置信度
+     0.0                            1.0</div>  <table>
+    <thead><tr><th>校准方法</th><th>做什么</th><th>代价</th><th>适用场景</th></tr></thead>
+    <tbody>
+      <tr><td><strong>温度缩放</strong> Temperature Scaling</td><td>把 logits 除以标量 $T{>}1$ 再过 softmax，压平过度自信的分布</td><td>只有 1 个参数，验证集拟合几秒钟</td><td><strong>首选</strong>——不改变预测排序（不影响 accuracy/AUC），只调整置信度的尺度</td></tr>
+      <tr><td>Platt Scaling</td><td>在 logit 上拟合一个逻辑回归 $\sigma(aZ+b)$</td><td>2 个参数，比温度缩放灵活但也更容易过拟合验证集</td><td>二分类、样本量适中</td></tr>
+      <tr><td>Isotonic Regression</td><td>非参数、单调地重映射置信度</td><td>参数量随分桶数增长，小验证集上容易过拟合</td><td>验证集足够大时效果最好，但要小心过拟合</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <strong>「高置信不等于高准确」是这一节唯一要记住的一句话。</strong>在检测/分类的下游决策里（例如 TSR 输出直接喂给 VLA，见 C59-03），如果不传置信度、或置信度本身没有校准过，下游系统会把「模型自信但错了」的输出当真——这是感知-决策接口最常见也最隐蔽的设计错误。
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>温度缩放只能修正<strong>整体</strong>的过度自信，修不了「模型对某个特定类别系统性地过度自信」这种更细粒度的偏差——那需要按类别做校准，而且要小心校准用的验证集本身分布是否和线上一致。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ci-significance"><span class="num">6</span>置信区间与显著性检验：正态 / bootstrap / Wilson</h2>
+  <p>「AP 从 0.42 涨到 0.45」——这句话本身没有意义，除非你能回答「这个 0.03 是噪声还是真实提升」。置信区间和显著性检验就是回答这个问题的两套工具，<strong>选错方法会让你把噪声当成信号</strong>（见 C61-01）。</p>  <table>
+    <thead><tr><th>方法</th><th>假设</th><th>什么时候用</th><th>什么时候失效</th></tr></thead>
+    <tbody>
+      <tr><td>正态近似 CI</td><td>$n$ 足够大，$\hat p$ 不接近 0 或 1（中心极限定理生效）</td><td>样本量大、比例适中的场景，计算最快</td><td><strong>小样本或极端比例下覆盖率显著低于名义值</strong>——比如 $n{=}20, \hat p{=}0.95$ 时区间可能跑到 1 以外</td></tr>
+      <tr><td>Bootstrap</td><td>只需要能重复重采样，几乎不假设分布形状</td><td>任意统计量（中位数、AUC、mAP 这类没有解析方差公式的量）</td><td>计算量大；重采样次数不够时区间本身有噪声；对极小样本仍然不稳</td></tr>
+      <tr><td>Wilson Score</td><td>专为二项比例设计，用「反转正态检验」推导，天然把区间约束在 $[0,1]$</td><td><strong>二分类准确率/召回率这类比例型指标的首选</strong>，尤其小样本</td><td>只适用于二项比例，不能直接套到均值或 AUC 上</td></tr>
+    </tbody>
+  </table>  <div class="math-block">\[\text{Wilson}:\quad \hat p_{center} = \frac{\hat p + \frac{z^2}{2n}}{1+\frac{z^2}{n}}, \qquad \text{margin} = \frac{z}{1+\frac{z^2}{n}}\sqrt{\frac{\hat p(1-\hat p)}{n} + \frac{z^2}{4n^2}}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>正态 CI 的公式人人都写得出（$\hat p \pm z\sqrt{\hat p(1-\hat p)/n}$），但它有一个致命的隐藏假设：$n$ 要足够大。$n{=}20$ 时测出 19 次正确（$\hat p{=}0.95$），正态公式会给出一个可能超过 1 的上界——<em>区间本身就已经荒谬了，这正是「小样本下别无脑用正态近似」的活证据</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>Wilson 区间的推导思路是<strong>反转显著性检验</strong>：先问「对哪些 $p_0$，观测到的 $\hat p$ 不会被拒绝」，把这些 $p_0$ 的集合作为置信区间——这个构造方式天然保证区间落在 $[0,1]$ 内，且小样本下的覆盖率比正态近似更接近名义值。<em>这也是为什么 Wilson 区间是二项比例场景下更稳的默认选择</em>，而不是「更复杂所以更好」。</p></div>
+  </div>  <h3>显著性检验：配对 vs 非配对</h3>  <p>同一批测试样本上，模型 A 与模型 B 的差异要用<strong>配对</strong>检验（paired t-test 或 bootstrap 配对），因为两组分数天然相关（同一张图片难，两个模型大概率都难）；如果是两批<em>不同</em>的测试样本（比如 A/B 测试里两组不同用户），才用非配对检验。<strong>用错会低估显著性——把配对数据当非配对处理，方差会被高估，导致本该显著的结果被判为不显著。</strong></p>  <div class="callout warn"><span class="label"></span>
+    <p>「+0.3 mAP 算不算提升」是检测岗最常见的追问（见 C61-01）。正确答法：先给出多种子的方差范围（比如典型 ±0.2–0.5），再说明用的是配对还是非配对检验，最后给出结论——<em>不给方差范围直接说「涨了」，是这一段最容易失分的地方</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ab-testing"><span class="num">7</span>A/B 测试：样本量、功效、新奇效应与多重比较</h2>
+  <p>A/B 测试是把「显著性检验」搬到真实用户身上的工程实践，多出的坑全部来自<strong>「真实世界」这三个字</strong>——用户会变、实验会被同时运行多个、新功能天然会引来短暂的额外关注。</p>  <div class="math-block">\[n \;\approx\; \frac{(z_{\alpha/2} + z_{\beta})^2 \big(p_1(1-p_1) + p_2(1-p_2)\big)}{(p_1 - p_2)^2}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>样本量公式的直觉是：想检出的效应 $|p_1-p_2|$ 越小，需要的样本量按<strong>平方反比</strong>暴涨——想把「能检出的最小提升」减半，样本量要翻 4 倍。这也是为什么很多团队宁愿多等两周攒够样本，也不愿意在样本不够时强行下结论。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>$z_{\alpha/2}$ 由显著性水平 $\alpha$（第一类错误率，通常 0.05）决定，$z_\beta$ 由<span class="term">功效</span>（power，$1-\beta$，通常要求 0.8）决定——<strong>功效是「真的有效应时，你的实验有多大概率检测出来」</strong>，这是经常被忽略的一半：很多「无显著差异」的实验结论，其实只是样本量不够、功效太低，而不是真的没有效应。</p></div>
+  </div>  <table>
+    <thead><tr><th>陷阱</th><th>机制</th><th>怎么防</th></tr></thead>
+    <tbody>
+      <tr><td><strong>新奇效应</strong> novelty effect</td><td>用户因为「新」而多点击/多停留，效应会随时间衰减</td><td>实验跑够长（覆盖至少一个完整周期），看效应是否随时间递减</td></tr>
+      <tr><td><strong>多重比较</strong> multiple comparisons</td><td>同时看 10 个指标，每个都用 $\alpha{=}0.05$，至少一个假阳性的概率飙到 $1-0.95^{10}\approx 40\%$</td><td>Bonferroni 校正（$\alpha/m$）或控制 FDR（Benjamini-Hochberg），或提前锁定<strong>唯一</strong>的主指标</td></tr>
+      <tr><td><strong>提前偷看（peeking）</strong></td><td>看到显著就提前停止实验，等价于隐式做了多重比较，实际第一类错误率远高于 0.05</td><td>预先固定样本量/时长，或用序贯检验（sequential testing）等专门为「持续监控」设计的方法</td></tr>
+      <tr><td>样本比例失衡 / SRM</td><td>分流本身就有 bug，两组样本比例不是预期的 50/50</td><td>先做<span class="term">样本比例不匹配</span>（Sample Ratio Mismatch）检验，比看指标更优先</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <strong>「每天看一眼 dashboard，一看到显著就下结论」是 A/B 测试里最常见的事故根源</strong>——本质上是把「提前偷看」和「多重比较」揉在了一起：你在多个时间点上反复检验同一个假设，总有一个时间点会因为纯噪声而「显著」。
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这条判断顺序：<strong>先查 SRM → 再查功效是否够 → 再查是不是多个指标/多个时间点在偷看 → 最后才谈论 $p$ 值本身</strong>。大部分「A/B 测试结论不可信」的真实故事，问题都出在前三步，而不是最后一步。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="traps-bayes"><span class="num">8</span>统计陷阱四重奏与概率题：从辛普森悖论到基率谬误</h2>
+  <p>这一节是「快问快答」的预演——面试官爱用一个简短故事考你能不能认出陷阱的名字，然后追问「你怎么在自己的数据里发现它」。</p>  <table>
+    <thead><tr><th>陷阱</th><th>一句话机制</th><th>怎么在数据里发现它</th></tr></thead>
+    <tbody>
+      <tr><td><strong>辛普森悖论</strong> Simpson's Paradox</td><td>分组内的趋势，合并后反转——因为组的权重（样本量）在分组间不同</td><td>任何「整体指标」的结论，都要按关键维度（场景/子群体）切片复核一遍，见 C58-05 的分场景切片评测</td></tr>
+      <tr><td><strong>幸存者偏差</strong> Survivorship Bias</td><td>只观察到「活下来」的样本，看不到被淘汰的那部分，导致结论系统性偏乐观</td><td>检查数据收集流程本身是否存在过滤——线上只收集到「成功上报」的 badcase，漏检的往往不在里面</td></tr>
+      <tr><td><strong>回归到均值</strong> Regression to the Mean</td><td>一次极端表现之后，下一次测量自然会更靠近均值，容易被误认为「干预生效」</td><td>设对照组；只对「上次表现极端」的样本做前后对比是这个陷阱的经典触发条件</td></tr>
+      <tr><td><strong>p-hacking</strong></td><td>试了很多种切分/指标/模型，只报告显著的那个，本质是隐式的多重比较</td><td>实验前<strong>预注册</strong>要检验的假设与指标；多重比较必须做校正（见上一节）</td></tr>
+    </tbody>
+  </table>  <div class="ascii">辛普森悖论的最小可复现构造：
+                组 A（小样本）        组 B（大样本）        合并
+  方案甲     8/10  = 80%          30/90  = 33%        38/100 = 38%
+  方案乙     45/50 = 90%          2/10   = 20%        47/60  = 78%   ← 合并后乙反而遥遥领先！
+  但分组看：组 A 里甲(80%)&lt;乙(90%)，组 B 里甲(33%)&gt;乙(20%) —— 两组内乙都不是简单地"更差"
+  真相：乙把大量样本堆在组 A（乙容易的场景），甲把大量样本堆在组 B（甲难的场景），
+        合并比例被"谁在哪个组测得多"主导，而不是被"哪个方案更好"主导。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>贝叶斯定理直白地说，是「反过来想」：你想知道的是 $P(\text{病}\mid\text{阳性})$，但你手上的数据通常是 $P(\text{阳性}\mid\text{病})$（检测的灵敏度）——贝叶斯公式就是把后者倒过来算前者，而中间那个容易被忽略的分母，才是<span class="term">基率谬误</span>（base rate fallacy）的根源。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>$P(A\mid B) = P(B\mid A)P(A) / P(B)$，其中 $P(B) = P(B\mid A)P(A) + P(B\mid \neg A)P(\neg A)$。基率谬误就是<strong>只盯着灵敏度 $P(B\mid A)$，忘了先验 $P(A)$ 极小时分母会被 $P(\neg A)$ 那一项主导</strong>——这正是「99% 准确率的检测，阳性结果却大概率是假的」这类反直觉结论的完整数学解释。</p></div>
+  </div>  <div class="math-block">\[P(\text{disease}\mid{+}) = \frac{P({+}\mid\text{disease})\,P(\text{disease})}{P({+}\mid\text{disease})P(\text{disease}) + P({+}\mid\neg\text{disease})P(\neg\text{disease})}\]</div>  <p>代入一个经典数字：患病率 $P(\text{disease}){=}0.001$，检测灵敏度与特异度都是 99%。算出来 $P(\text{disease}\mid{+}) \approx 0.09$——<strong>阳性结果里超过 90% 是假阳性</strong>，尽管测试本身「99% 准」。这个数字每次算出来都会让人意外，这正是它作为面试题的价值：<em>它检验的不是你会不会背公式，而是你有没有真正把公式在脑子里跑过一遍</em>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>「期望的线性性」$E[X+Y]=E[X]+E[Y]$<strong>永远成立，不需要 $X,Y$ 独立</strong>——这是概率题里最容易被误用的一条「附加条件」，很多人下意识加上「因为独立」，其实线性性对任意随机变量、任意相关结构都成立，独立只在算方差 $\text{Var}(X{+}Y)$ 时才是必要条件。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>最后放一组更长期的问题——它们不会直接出现在你的一面里，但决定了「评估这件事」本身正在往哪个方向演化。</p>  <ul>
+    <li><strong>校准在分布漂移下会失效吗？</strong>温度缩放假设验证集与部署分布一致；一旦线上出现验证集没见过的天气/光照，温度缩放学到的那个标量 $T$ 不再适用。<em>如何做「分布漂移鲁棒」的校准，仍是一个开放问题——目前的工程折中通常是按场景分桶各自校准（呼应 C58-05 的分场景评测），而不是追求一个全局最优 $T$。</em></li>
+    <li><strong>安全攸关系统里 PR-AUC 也不够用。</strong>它仍然是一个「平均」指标，掩盖了具体在哪个阈值下、哪个子场景下会出问题。TSR、医疗这类领域正在转向<em>分桶 + 场景化</em>的评测体系（按距离/光照/类别切片，见 C55-05），单一标量指标的地位正在下降。</li>
+    <li><strong>持续实验平台上的多重比较问题被低估。</strong>大公司同时跑成百上千个 A/B 实验，传统的 Bonferroni 校正过于保守（会让检出效应变得极难），FDR 控制和贝叶斯层级模型是当前更主流的工业实践，但「怎么在保持高吞吐决策的同时控制长期误报率」仍在演进中。</li>
+    <li><strong>LLM 参与统计推理时会不会引入新的统计错误？</strong>让大模型辅助做数据分析、自动选择检验方法，正在成为新的工作流，但它们和人类一样会犯基率谬误、会被辛普森悖论骗到——<em>而且更危险的是它们输出时的语气通常很自信，这让「高置信不等于高准确」这条规律在人机协作场景里更加重要。</em></li>
+    <li><strong>贝叶斯 A/B 测试与频率派方法之争仍未有定论。</strong>贝叶斯框架允许「持续监控不受多重比较惩罚」这类更符合工程直觉的用法，但它引入了先验选择的主观性；两派方法在工业界的取舍仍是一个活跃的讨论。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>★ 必读</strong>：Davis & Goadrich, <em>The Relationship Between Precision-Recall and ROC Curves</em>（ICML 2006）——ROC 与 PR 空间等价性的正式证明，本节 §3 的理论来源。<strong>★</strong> Guo, Pleiss, Sun, Weinberger, <em>On Calibration of Modern Neural Networks</em>（ICML 2017）——「现代网络普遍过度自信」的经典实证与温度缩放的提出。<strong>★</strong> Wilson, <em>Probable Inference, the Law of Succession, and Statistical Inference</em>（1927）——Wilson score interval 的原始推导。</p><p>Efron, <em>Bootstrap Methods: Another Look at the Jackknife</em>（1979）——bootstrap 的奠基工作；Ioannidis, <em>Why Most Published Research Findings Are False</em>（PLoS Medicine, 2005）——p-hacking 与多重比较在科研中系统性泛滥的经典论证；Kohavi et al., <em>Trustworthy Online Controlled Experiments</em>（2020）——A/B 测试工程实践的权威参考。相邻课程：数学推导见 <strong>C07</strong>；类别不平衡处理谱系见 <strong>C58-01</strong>；安全导向的分桶评测见 <strong>C55-05</strong>；检测专项的 mAP/TIDE 细节见 <strong>C18、C53–C61</strong>；种子方差与显著性的工程实践见 <strong>C61-01</strong>。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_architectures/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 深度学习架构问答</div></a>
+    <a class="next" href="../05_rapid_fire/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 快问快答题库与自测</div></a>
+  </div>
+
+</div>
+</body>
+</html>

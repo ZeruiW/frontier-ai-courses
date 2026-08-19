@@ -128,6 +128,21 @@ jupyter lab
 | C51 | `C51_Data_Augmentation_Course/` | 文本数据增强与合成数据工程（EDA/AEDA · 回译 · Self-Instruct/Evol/Magpie · 质控 · 消融） | 「标注不够时怎么造数据、怎么验证造得有用」 |
 | C52 | `C52_Industrial_Research_Practice_Course/` | 工业研究工程实务（TF/Keras 心智模型 · 跨框架权重迁移 · ONNX 导出与运行时 · 真机 GPU 工作流 · 专利与开源合规） | 一批「没有归属却天天要用」的孤儿技能 |
 
+#### C53–C61 · 自动驾驶感知 / TSR 岗位补缺课（对齐 XPENG TSR 2D Detection JD）
+| 课 | 目录 | 主题 | 补的洞 |
+|----|------|------|--------|
+| C53 | `C53_RealTime_Detectors_Course/` | 实时检测器架构（YOLO 全代演进 · 标签分配 · RTMDet · RT-DETR · 延迟-精度选型） | JD 点名的 RT-DETR / RTMDet |
+| C54 | `C54_DETR_Set_Prediction_Course/` | 端到端集合预测检测（匈牙利匹配 · 集合损失 · object query · 收敛家族 · 工程实践） | 匈牙利匹配与 set prediction loss |
+| C55 | `C55_TSR_Autonomous_Driving_Course/` | 交通标志识别与自动驾驶感知（数据集与法规体系 · 两级 vs 端到端 · 失效模式 · 时序融合 · 安全评测） | TSR 领域知识与自动驾驶感知语境 |
+| C56 | `C56_Detection_Augmentation_Course/` | 检测数据增强工程（几何与标注同步 · 光度与域 · Mosaic/Copy-Paste · 流水线 · 消融验证） | 图像检测增强（C51 是文本增强） |
+| C57 | `C57_Small_Object_Detection_Course/` | 小目标检测（IoU 尺度敏感性量化 · 多尺度架构 · NWD 与分配 · 切片推理 · TSR 物理推导） | 小目标的具体技术手段 |
+| C58 | `C58_HardCase_LongTail_Course/` | 难例挖掘与长尾数据闭环（不平衡谱系 · OHEM · 主动学习触发 · 挖掘基建 · 闭环验证） | 检测语境的 hard-case / 长尾挖掘 |
+| C59 | `C59_VLA_Perception_Interface_Course/` | 视觉-语言-动作模型与感知接口（VLM→VLA · 动作表示 · TSR 输出接口 · 规则约束化 · 评测上车） | JD 独有的 VLA 职责 |
+| C60 | `C60_Edge_Deployment_Consistency_Course/` | 车端部署与训练-部署一致性（预处理对齐 · TensorRT · INT8 校准 · 后处理与 C++ · 延迟剖析） | TensorRT/C++ 实操与一致性调试 |
+| C61 | `C61_Detection_Practice_Interview_Course/` | 检测工程实战与面试实务（实验设计 · TIDE 误差分解 · 调试手册 · 项目叙事 · 面试题库） | production 手感与面试交付能力 |
+
+> 缺口分析与复习路线见根目录 [`INTERVIEW_PREP_XPENG_TSR.md`](INTERVIEW_PREP_XPENG_TSR.md)。
+
 <a name="zh-format"></a>
 ### 每门课的格式
 
@@ -325,6 +340,19 @@ Read a module's `NN_讲解.html` lesson first (or start from `index.html` to pic
 | C50 | `C50_HuggingFace_Ecosystem_Course/` | HuggingFace ecosystem in practice (Auto*/from_pretrained · tokenizers/datasets · Trainer · PEFT/TRL · accelerate/Hub) | Numpy-from-scratch doesn't tell you how the real ecosystem is actually used, or where the pitfalls are |
 | C51 | `C51_Data_Augmentation_Course/` | Text augmentation & synthetic data engineering (EDA/AEDA · back-translation · Self-Instruct/Evol/Magpie · QC · ablation) | How to manufacture data when labels are scarce — and how to prove it actually helped |
 | C52 | `C52_Industrial_Research_Practice_Course/` | Industrial research practice (TF/Keras mental model · cross-framework weight porting · ONNX export & runtimes · real-GPU workflow · patents & OSS compliance) | A batch of "orphan skills" nobody owns but everyone needs |
+
+#### C53–C61 · AD Perception / TSR Gap Courses (aligned to an XPENG TSR 2D Detection JD)
+| # | Directory | Topic | Gap it fills |
+|---|-----------|-------|--------------|
+| C53 | `C53_RealTime_Detectors_Course/` | Real-time detector architectures (YOLO generations · label assignment · RTMDet · RT-DETR · latency–accuracy selection) | RT-DETR / RTMDet named in the JD |
+| C54 | `C54_DETR_Set_Prediction_Course/` | End-to-end set-prediction detection (Hungarian matching · set loss · object queries · convergence family · practice) | Hungarian matching & set prediction loss |
+| C55 | `C55_TSR_Autonomous_Driving_Course/` | Traffic sign recognition & AD perception (datasets & sign codes · two-stage vs end-to-end · failure modes · temporal fusion · safety-oriented eval) | TSR domain knowledge and AD context |
+| C56 | `C56_Detection_Augmentation_Course/` | Detection data augmentation (geometry & label sync · photometric & domain · Mosaic/Copy-Paste · pipeline · ablation) | Image-detection augmentation (C51 is text) |
+| C57 | `C57_Small_Object_Detection_Course/` | Small object detection (IoU scale sensitivity · multi-scale architecture · NWD & assignment · sliced inference · TSR physics) | Concrete small-object techniques |
+| C58 | `C58_HardCase_LongTail_Course/` | Hard-case mining & long-tail data loop (imbalance spectrum · OHEM · active triggers · mining infra · closed-loop validation) | Detection-context hard-case / long-tail mining |
+| C59 | `C59_VLA_Perception_Interface_Course/` | Vision-Language-Action models & perception interface (VLM→VLA · action representation · TSR output schema · rule constraints · eval & deployment) | The JD's distinctive VLA responsibility |
+| C60 | `C60_Edge_Deployment_Consistency_Course/` | Edge deployment & train-deploy consistency (preprocessing parity · TensorRT · INT8 calibration · postprocessing & C++ · latency profiling) | Hands-on TensorRT/C++ and consistency debugging |
+| C61 | `C61_Detection_Practice_Interview_Course/` | Detection engineering practice & interview readiness (experiment design · TIDE error decomposition · debug playbook · project narrative · drills) | Production instincts and interview delivery |
 
 <a name="en-format"></a>
 ### Format of Each Course

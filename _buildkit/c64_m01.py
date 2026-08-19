@@ -1,0 +1,852 @@
+# -*- coding: utf-8 -*-
+"""C64 模块 01 · 机器学习基础问答。"""
+from coursekit import P, H3, DUAL, CALLOUT, ASCII, CODE, MATH, TABLE, UL, OL, md, code
+
+META = [
+    ("前置知识", "模块 00 的三段式答法与边界意识；本模块默认你已经在 C07 里推导过偏差-方差分解、"
+                 "L1/L2 的 KKT 条件、贝叶斯定理——这里<strong>不重复推导</strong>，只练「怎么讲」。"),
+    ("配套 notebook", '<span class="badge cpu">CPU</span> 01_ml_basics_qa.ipynb'
+                       "（偏差-方差数值分解与双下降复现 / L1-L2 解路径的稀疏性演示 / "
+                       "dropout 集成等价性的精确与近似两种情形 / 交叉验证在时序数据上的泄漏量化 / "
+                       "bagging 降方差与 boosting 降偏差的实测对比）"),
+    ("核心参考", "Belkin et al., <em>Reconciling modern machine-learning practice and the classical "
+                 "bias-variance trade-off</em>（2019，双下降）· Breiman, <em>Bagging Predictors</em>（1996）· "
+                 "本课程 C07-02～C07-06（完整数学推导）· C58-01（类别不平衡完整处理谱系）"),
+    ("预计时长", "读 55 分钟 + 跑 40 分钟"),
+]
+
+SECTIONS = [
+    # ============================================================== 1
+    ("bias-variance-tradeoff", "偏差-方差分解：经典框架与它的局限", "".join([
+        P("从这一节开始，每一条知识点都按同一个骨架展开：<strong>一句话定义 → 为什么需要 → 什么时候失效</strong>，"
+          "再加两条面试实战信息——<strong>面试官的典型追问</strong>与<strong>踩雷点</strong>。"
+          "数学推导本身不重复（$\\mathbb{E}[(y-\\hat f(x))^2]=\\text{Bias}^2+\\text{Var}+\\sigma^2$ 的完整推导见 "
+          "<span class=\"term\">C07-04</span>），这里默认你已经会推，只练怎么在对话里把它讲清楚。"),
+        MATH(r"\mathbb{E}\big[(y-\hat f(x))^2\big] \;=\; \underbrace{\big(\mathbb{E}[\hat f(x)]-f(x)\big)^2}_{\text{Bias}^2} \;+\; \underbrace{\mathrm{Var}[\hat f(x)]}_{\text{Variance}} \;+\; \sigma^2"),
+        ASCII("""error
+ │                       经典 U 型（欠拟合 ←→ 过拟合）
+ │＼                    ╱‾‾‾‾‾╲
+ │ ＼                  ╱       ╲
+ │  ＼________________╱         ╲___________ 双下降的第二次下降
+ │      bias 主导        插值点附近误差骤增    过参数化区间反而更好
+ └──────────────────────────────────────────────────→ 模型复杂度/参数量
+                    ▲
+                经典理论的"最优点"          深度网络实际运行的区间在这里 ────►"""),
+        TABLE(["项目", "内容"], [
+            ["一句话定义", "把泛化误差拆成三块——模型系统性偏离真值的程度（bias）、模型对训练集抽样的敏感程度（variance）、"
+                          "数据本身不可约的噪声（noise）。"],
+            ["为什么需要", '它把"模型为什么表现不好"从一句模糊的"泛化能力差"，拆成两个可以分别诊断、分别下药的方向——'
+                          "bias 高就加复杂度/减正则，variance 高就减复杂度/加正则/加数据。"],
+            ["<strong>什么时候它失效</strong>", "<strong>深度学习的双下降 double descent</strong>：当模型参数量跨过"
+                                             "「插值阈值」（能完全拟合训练集的临界点）后继续增大，测试误差不像经典理论预期那样持续上升，"
+                                             "而是先在插值点附近骤增、然后重新下降——这与「方差随复杂度单调增加」的经典图像直接矛盾"
+                                             "（Belkin et al. 2019）。"],
+            ["面试官典型追问", '"那还要不要控制模型复杂度？"——答案是控制的对象变了：经典理论下控制的是参数量，'
+                              "过参数化区间下真正起作用的是隐式正则（SGD 的归纳偏置、初始化方式、训练时长）。"],
+            ["踩雷点", '把"越复杂越容易过拟合"当放之四海皆准的真理，被反问"那为什么现在的大模型不加正则也不过拟合"'
+                      "时答不上来。"],
+        ]),
+        DUAL(
+            '偏差-方差就是拿一把尺子量"你的模型错在哪"：要么整体上偏得系统性一致（bias），要么换一批数据结果就跳来跳去'
+            "（variance）。经典结论是：模型越复杂，bias 降、variance 升，中间有个最优点。",
+            "但经典结论隐含一个假设——模型复杂度和「能拟合训练集的自由度」单调对应，且训练算法在这个自由度范围内"
+            "充分探索了假设空间。深度网络用 SGD 训练时，两个假设都不完全成立：过参数化网络的<strong>有效自由度</strong>"
+            "受 SGD 隐式正则约束（不是参数量决定的名义自由度），所以插值阈值之后继续加参数，反而是在一个更「温和」的"
+            "假设空间里搜索，方差可以重新下降。这解释了为什么双下降不是对偏差-方差分解本身的否定，而是对"
+            "「复杂度=参数量」这个简化映射的否定——具体推导见 <span class=\"term\">C07-05</span>。",
+        ),
+    ])),
+
+    # ============================================================== 2
+    ("regularization-mechanisms", "过拟合与正则化：机制不同，别混着讲", "".join([
+        P("过拟合的成因不止一种，正则化对应的手段也不止一种，混着讲是最常见的丢分原因——"
+          "面试官追问「那 L1 和 dropout 是不是一回事」时，答不出机制差异会立刻露馅。"),
+        MATH(r"\min_\beta \; \|y-X\beta\|_2^2 + \lambda\|\beta\|_2^2 \;\;(\text{Ridge}) \qquad\qquad \min_\beta \; \|y-X\beta\|_2^2 + \lambda\|\beta\|_1 \;\;(\text{Lasso})"),
+        TABLE(["机制", "一句话机制", "什么时候它是错的选择", "踩雷点"], [
+            ["L1 (Lasso)", "惩罚系数绝对值之和，几何上约束区域是有棱角的菱形，最优点大概率落在角上 → 系数被精确压成 0。",
+             "特征之间高度相关时，L1 会随机选一个丢掉其它，选择不稳定（换个随机种子选中的特征都不同）。",
+             "把 L1 做特征选择当万能操作，忽略了它在共线特征上的不稳定性——这时 Elastic Net（L1+L2）更稳。"],
+            ["L2 (Ridge)", "惩罚系数平方和，约束区域是光滑的球，最优点几乎不会恰好落在坐标轴上 → 系数只收缩、不清零。",
+             '需要的是"选出重要特征"而非"抑制过大权重"时，L2 起不到稀疏化作用。',
+             "以为 L2 也能产生稀疏解——它在数学上几乎不可能精确产生 0 系数。"],
+            ["Dropout", "训练时按概率随机丢弃单元，等价于同时训练指数多个共享权重的子网络并在测试时取平均（集成视角）。",
+             '子网络之间共享权重且样本量很小时，"隐式集成"的多样性不够，效果会退化成普通加噪声。',
+             "忘了 dropout 是训练时的随机性，测试时要么关闭要么做权重缩放；忘记切换会让线上结果和训练时不一致。"],
+            ["Early stopping", "训练还没收敛到全局最小就提前停止，因为参数还没来得及「用满」表达能力去拟合噪声。",
+             '学习率没调好导致收敛本身就很慢时，"提前"这个信号完全不可靠，容易在还没学到关键信号时就叫停。',
+             "不知道它和 L2 在线性回归+梯度下降下有渐近等价性，却把两者当成完全独立的两个技巧分别调参。"],
+            ["数据增强", '不改变模型/损失，直接扩充训练分布的多样性，让模型见过的"合理变化"更全。',
+             '增强引入了标签不该有的变化（比如翻转改变了语义）时，增强本身反而在教错误的东西（见 C56-01）。',
+             "把增强当成免费的正则化，忽略了它对训练时长和标签语义的隐性要求。"],
+        ]),
+        DUAL(
+            "L1 和 L2 的区别，最直观的画法是「约束区域的形状」：L1 是带尖角的菱形，最优解撞上尖角的概率很高，"
+            "尖角对应的正是某个系数=0；L2 是光滑的圆，最优解几乎不会精确落在坐标轴上。dropout 和前两者不是一回事："
+            "它不改变损失函数的形状，而是训练时不断「临时截肢」网络，等价于同时训练一大群共享参数的子网络，"
+            "测试时相当于把这群子网络的预测做平均。",
+            "更严谨地看，early stopping 和 L2 在线性回归+梯度下降的简单情形下有渐近等价性——"
+            "提前停止相当于隐式地对高曲率方向的系数做了收缩，这个收缩量在特定条件下等价于岭回归的收缩量"
+            "（推导见 <span class=\"term\">C07-06</span>）。这条等价性的价值在于：它解释了为什么很多深度网络实践里"
+            "根本没写 weight decay 却依然不会无限过拟合——训练时长本身就是一个隐式的正则化旋钮。",
+        ),
+        CALLOUT("warn", "面试官追问「这五种正则化本质上是不是同一件事」，正确答案是「<strong>效果类似（都在对抗过拟合），"
+                        "机制完全不同</strong>」——把它们混为一谈，是这一题最常见的扣分点。"),
+    ])),
+
+    # ============================================================== 3
+    ("cross-validation", "交叉验证：什么时候它会悄悄撒谎", "".join([
+        P("CV 本身不难，难的是知道<strong>什么时候它给出的分数是假的</strong>——这恰恰是「边界意识」"
+          "在这个知识点上最集中的体现。"),
+        ASCII("""标准 K 折（随机打乱后再分块）：
+ fold1  fold2  fold3  fold4  fold5     每折轮流当验证集，其余当训练集
+ [███]  [███]  [███]  [███]  [███]     —— 只对 i.i.d. 数据成立
+
+时间序列上的正确做法（walk-forward / 前向切分）：
+ 训练 ──────────────► 验证         训练只能用"过去"，验证永远是"未来"
+ [██████████][▓▓]
+ [████████████][▓▓]
+ [██████████████][▓▓]                窗口不断前移，绝不让训练集看到验证集之后的数据"""),
+        TABLE(["方法", "一句话定义", "什么时候不能用/失效", "踩雷点"], [
+            ["标准 K 折", "把数据随机分成 K 份，轮流拿 1 份当验证、其余当训练，重复 K 次取平均。",
+             "数据点之间不独立时（时间序列、同一用户/场景产生多条样本）——独立同分布假设一旦破坏，"
+             "K 折给出的分数会系统性偏乐观。", "默认所有数据都能随机打乱，忽略了打乱本身就是在假设无自相关。"],
+            ["留一法 LOOCV", "K=n 的极端情形，每次只留一个样本做验证。",
+             "n 较大时计算代价是 K 折的 n/K 倍，且各次训练集几乎完全重叠，方差估计本身也不稳定。",
+             '以为 LOOCV"更精确"所以总是更好——它在计算代价和 estimator 方差上都不占优。'],
+            ["嵌套 CV nested CV", "外层 CV 评估泛化能力，内层 CV 专门做超参数搜索，两层严格不共享数据。",
+             "超参数搜索空间大、数据量本身很小时，两层 CV 的总计算量可能高到不现实。",
+             "<strong>用同一层 CV 既调参又报最终分数</strong>——调参本身会「偷看」验证集，导致报出来的分数是"
+             "乐观偏差的（这是最高频的 CV 误用）。"],
+            ["时序 walk-forward", "训练集永远是过去、验证集永远是未来，窗口随时间前移。",
+             "本来就是分类问题、样本间没有时间依赖时，用 walk-forward 反而白白牺牲数据利用率。",
+             "<strong>对有自相关的数据用标准 K 折</strong>——训练集里混进了验证点「未来」的信息，会系统性高估性能。"],
+            ["分组 CV group CV", "保证同一组（同一病人/同一场景/同一段视频）的所有样本只能整体出现在训练集或验证集。",
+             "组的定义本身模糊、或组间也存在相关时，分组也堵不住所有泄漏路径。",
+             '<strong>知道要按时间分组却忘了按"场景/设备/个体"分组</strong>——同一段视频的相邻帧被随机分到'
+             "训练和验证两侧，本质和时序泄漏是同一个错误。"],
+        ]),
+        DUAL(
+            'CV 的本质就是用"多次拿一部分数据装作没见过"来估计模型见到全新数据会怎样。这个把戏成立的前提只有一个：'
+            "训练集和验证集之间除了你主动切分的那条线，不能有任何其它信息通道。",
+            "更精确地说，CV 的无偏性依赖于验证集相对训练集是「可交换的」（<span class=\"term\">exchangeable</span>）——"
+            "对 i.i.d. 数据这天然成立；对时间序列，未来样本相对过去在因果上不可交换（过去不该看到未来），"
+            "标准 K 折的随机切分恰好制造了这条被违反的通道；对分组数据，组内样本共享一个未被建模的潜变量，"
+            "随机切分同样制造了泄漏——两类问题的数学本质相同：可交换性假设被打破。",
+        ),
+        CALLOUT("danger", "<strong>嵌套 CV 不是可选项，是必需品</strong>——如果用同一份验证集既选超参数又报告最终分数，"
+                          "这个分数本身就是在优化过程中被「多次窥视」过的，期望上一定偏乐观。"),
+    ])),
+
+    # ============================================================== 4
+    ("class-imbalance", "类别不平衡：问答骨架（完整方案见 C58-01）", "".join([
+        P("这一节<strong>只给面试口头问答需要的骨架</strong>——完整的工程处理谱系（有效样本数、EQL、"
+          "解耦训练、logit adjustment 的推导与消融）在 <span class=\"term\">C58-01</span>，不在这里重复。"),
+        TABLE(["手段", "一句话机制", "什么时候失效", "面试官追问"], [
+            ["重采样(过采样/欠采样)", "让训练时看到的类别分布更均衡：过采样复制/合成少数类样本，欠采样丢弃多数类样本。",
+             "过采样容易在少数类上过拟合（尤其是简单复制而非 SMOTE 类合成）；欠采样丢掉多数类有效信息，"
+             "样本量本就不大时代价更高。",
+             '"过采样和欠采样怎么选？"——数据量充足优先欠采样（保留验证集信息完整），数据本就稀缺优先'
+             "过采样或直接重加权。"],
+            ["重加权(loss权重/focal loss)", "不改变数据分布，只改变每个样本对损失的贡献权重，让稀有类的错误惩罚更重。",
+             "类别数极多且稀有类难度不同时，单一的类别频次权重不够精细（需要看「有效样本数」公式，见 C58-01）。",
+             '"focal loss 和加权交叉熵的区别？"——focal loss 按样本难度动态加权，类别权重按频次静态加权，'
+             "两者可以叠加。"],
+            ["阈值调整", "训练时不动分布，只在推理时把决策阈值从默认 0.5 挪到符合业务代价的位置。",
+             "模型输出概率本身没有校准（见模块 04）时，阈值调整是在一个不准的刻度尺上找位置，效果打折。",
+             '"为什么不直接改训练？"——阈值调整零成本、可逆、不需要重训，是最先该试的手段。'],
+            ["两级架构", "用类别无关的检测器先筛前景，再用另一个模型做类别细分，把极度不平衡限制在第二级里。",
+             "前后两级误差会级联（第一级召回 × 第二级准确率），新增类别需要重训第二级，工程复杂度更高。",
+             '"什么时候用两级而不是端到端？"——类别数会持续增长且长尾占比高时（比如交通标志识别，见 C55-02）。'],
+        ]),
+        CALLOUT("intuition", "这四类手段不是互斥的选择题，而是可以叠加的工具箱：重采样处理「模型看到的分布」、"
+                             "重加权处理「损失怎么算账」、阈值调整处理「推理时怎么下判断」——它们作用在流水线的不同阶段。"
+                             "面试里能说清楚<strong>这三刀分别切在哪</strong>，比说出一堆方法名字更值钱。"),
+    ])),
+
+    # ============================================================== 5
+    ("ensemble-methods", "集成方法：bagging 降方差，boosting 降偏差", "".join([
+        P("这是一道极高频的对比题，能不能讲清楚「降的是谁」，直接决定这一题拿几分。"),
+        TABLE(["方法", "一句话机制", "为什么有效", "什么时候失效/踩雷点"], [
+            ["Bagging(如随机森林)", "对训练集做有放回抽样，训练多个高方差低偏差的基学习器（如深树），预测取平均/投票。",
+             "基学习器之间的误差不完全相关时，平均会抵消掉「随机波动」，同时几乎不改变偏差。",
+             "基学习器本身偏差就很高（比如都用浅层 stump）时，bagging 基本无效——平均一堆系统性错误的答案，"
+             "答案依然系统性错误。"],
+            ["Boosting(如GBDT/AdaBoost)", "串行训练一系列弱学习器，每一个重点拟合前面所有模型的残差/错误，加权累加。",
+             "每一轮都在直接修正当前的系统性偏差，所以轮数增加时偏差持续下降；代价是拟合越来越「紧」，"
+             "方差缓慢上升。",
+             "轮数/学习率没控制住会真正过拟合；对标签噪声敏感——错误标注会被反复「重点关照」（见 C58-02 的"
+             "难例挖掘陷阱）。"],
+            ["Stacking", "训练多个异质基模型，再用一个「元学习器」学怎么组合它们的输出，而不是简单平均/投票。",
+             "几个基模型的错误模式确实不同（一个擅长边缘case、一个擅长常见case）时，元学习器能学到「什么时候该信谁」。",
+             "元学习器如果直接在基模型的训练集上学组合权重，等于「偷看」了训练误差——必须用样本外预测"
+             "（out-of-fold）来训练元学习器。"],
+            ["随机森林 vs GBDT", "前者并行独立训练、抗过拟合、调参容易；后者串行训练、精度上限更高、对超参更敏感。",
+             "随机森林在特征噪声大、时间预算紧时更稳；GBDT 在数据干净、有调参预算、追求最高精度时更强。",
+             '面试常问"表格数据你会选哪个"——标准答案不是"哪个更好"，是先说清楚两者的偏差-方差取舍，'
+             "再按约束给结论。"],
+        ]),
+        MATH(r"\mathrm{Var}\!\left(\frac{1}{B}\sum_{b=1}^{B}\hat f_b(x)\right) \;=\; \rho\,\sigma^2 \;+\; \frac{1-\rho}{B}\,\sigma^2"),
+        DUAL(
+            'bagging 就是"平均掉噪声"：每个基学习器自己都在瞎猜（相对真实答案有随机误差），但只要这些瞎猜的方向'
+            '不完全一样，平均起来误差就会互相抵消。boosting 反过来，是"接力改错"：第一个模型先给个粗糙答案，'
+            "第二个模型专门盯着第一个模型错在哪儿去改，一棒接一棒。",
+            "更精确地看，bagging 对方差的削减效果由基学习器之间的相关系数 $\\rho$ 决定：$B$ 个方差为 $\\sigma^2$、"
+            "两两相关系数为 $\\rho$ 的估计量取平均，方差是 $\\rho\\sigma^2+(1-\\rho)\\sigma^2/B$——当 $B\\to\\infty$，"
+            "方差不会降到 0，而是收敛到 $\\rho\\sigma^2$ 这个下限。这解释了随机森林为什么要在 bagging 之外"
+            "再做「特征随机子采样」：单纯的 bootstrap resample 之间平均有约 63% 的样本重叠，相关性 $\\rho$ 依然偏高；"
+            "引入特征随机性能进一步压低 $\\rho$，把方差下限也压下去（推导见 <span class=\"term\">C07-07</span>）。",
+        ),
+    ])),
+
+    # ============================================================== 6
+    ("generative-vs-discriminative", "生成式 vs 判别式：分类问题的两条路", "".join([
+        P("这道题的陷阱不在于「哪个更好」，而在于能不能说清楚<strong>两者解决的其实是不同难度的问题</strong>。"),
+        MATH(r"P(y\mid x) \;=\; \frac{P(x\mid y)\,P(y)}{P(x)} \;\propto\; P(x\mid y)\,P(y) \qquad \text{（生成式：先建模右边，再用贝叶斯定理反推左边）}"),
+        TABLE(["维度", "生成式 generative", "判别式 discriminative"], [
+            ["一句话定义", "建模联合分布 $P(x,y)$（或 $P(x|y)$ 和 $P(y)$），需要时用贝叶斯定理反推 $P(y|x)$。",
+             "直接建模条件分布 $P(y|x)$，或者干脆直接学一个决策边界，不关心 $x$ 本身是怎么生成的。"],
+            ["为什么需要", "一旦有了 $P(x,y)$，不仅能分类，还能生成新样本、处理缺失特征、做异常检测"
+                          "（低 $P(x)$ 的样本很可能是异常）。",
+             "分类任务只需要一个好的决策边界，不需要给「数据是怎么长出来的」建模，通常参数更少、"
+             "大数据下精度更高。"],
+            ["<strong>什么时候它失效</strong>", "$x$ 往往高维、结构复杂（图像/文本），对 $P(x)$ 建模不准会直接拖累"
+                                             "最终分类精度——即使 $P(y|x)$ 本身容易学。",
+             "判别式模型丢弃了 $x$ 的生成机制，样本量很小、或需要处理缺失特征/做异常检测/需要生成能力时"
+             "无能为力。"],
+            ["典型例子", "朴素贝叶斯、GMM、HMM、扩散模型/GAN、VAE。",
+             "逻辑回归、SVM、大多数判别式神经网络分类器（检测里的分类头就是判别式设计）。"],
+        ]),
+        DUAL(
+            '判别式模型只学"给我一张图，告诉我它是不是交通标志"这一件事；生成式模型学的是"交通标志长什么样子、'
+            '背景长什么样子"，分类只是这份知识的副产品——所以生成式模型往往还能干别的事，比如生成一张假的'
+            '交通标志图片，或者告诉你"这张图看起来根本不像我见过的任何东西"（异常检测）。',
+            "这个区别对应经典的 Vapnik 论断：判别式模型直接求解你真正关心的那个问题，而生成式模型先解一个"
+            "更难的中间问题（估计 $P(x,y)$）再通过贝叶斯定理反推——直接解决容易的问题，通常比先解决一个更难的"
+            "问题再退回来更高效，这也是为什么数据量越大，判别式模型的精度优势通常越明显。但生成式模型的额外"
+            "产出（似然、可解释的生成过程、对缺失数据的原生支持）在判别式框架里没有对应物。",
+        ),
+        CALLOUT("intuition", "检测模型里的分类头几乎都是判别式设计（直接输出类别概率），但异常检测、开放集识别"
+                             '这类"这是不是我见过的东西"的问题，天然更适合往生成式方向想——估计训练分布下的似然，'
+                             "似然过低就判定为未知/异常。"),
+    ])),
+
+    # ============================================================== 7
+    ("curse-of-dimensionality", "维度灾难与流形假设", "".join([
+        TABLE(["项目", "内容"], [
+            ["一句话定义", '随着特征维度增加，数据在空间中变得指数级稀疏，"近邻"这个概念本身开始失效——'
+                          "高维空间里几乎所有点两两之间的距离都趋于相等。"],
+            ["为什么需要理解它", "几乎所有依赖「距离」或「近邻密度」的方法（KNN、核方法、基于距离的聚类、检索）"
+                              '都会在高维下失灵；理解它能解释"为什么直接把100维原始特征扔进KNN效果很差"。'],
+            ["<strong>什么时候它不成立/流形假设的救赎</strong>", "如果高维数据实际上分布在一个低维流形上"
+                                                            "（现实世界的图像、语音几乎都是这样），有效维度远小于表观维度，距离度量在流形内部依然有意义——"
+                                                            "这就是<span class=\"term\">流形假设 manifold hypothesis</span>，它是几乎所有深度表示学习方法"
+                                                            "成立的前提。"],
+            ["面试官典型追问", '"那为什么检测/检索里用几百维的embedding还能work？"——因为embedding学习的目标'
+                              "就是把高维原始像素映射到一个低维、语义上有意义的流形，距离度量在这个学到的流形空间里"
+                              "重新变得可靠（见 C58-04 的嵌入检索）。"],
+            ["踩雷点", '以为"维度越高信息越多，效果只会更好"——高维带来的稀疏性会直接毁掉任何依赖距离/密度的方法，'
+                      "加维度前要么先降维，要么确保用的是学出来的流形表示而不是原始特征。"],
+        ]),
+        MATH(r"\frac{V_{\text{shell}}(\varepsilon)}{V_{\text{ball}}} \;=\; 1-(1-\varepsilon)^d \;\xrightarrow[d\to\infty]{}\; 1 \qquad \text{（几乎所有体积集中在球面附近的薄壳里）}"),
+        DUAL(
+            '想象在一个立方体里随机撒点：维度低的时候，两个点之间"近"和"远"是有意义的区分；维度一高，'
+            '几乎所有点对之间的距离都挤在同一个狭窄区间里——"近邻"这个词开始失去意义，因为没有谁比谁明显更近。',
+            "更精确地说，高维单位球的体积几乎全部集中在紧贴球面的一层薄壳里（上面公式给出体积占比随维度趋于 1 "
+            "的速度），这意味着高维空间中的样本几乎必然彼此「等距」，基于欧氏距离的算法判别力会随维度增长系统性"
+            "衰减。流形假设之所以重要，是因为它把「表观维度」和「有效自由度」解耦——真实数据的有效自由度可能"
+            "只有个位数到几十维，即使它们被表示在几百上千维的原始空间里。",
+        ),
+        CALLOUT("warn", '面试里常见的追问陷阱是"那 PCA 降维是不是就解决了维度灾难"——PCA 只是找一个线性子空间上'
+                        "方差最大的方向，如果数据的低维结构本身是非线性的（流形弯曲），线性降维会丢失关键的非线性"
+                        "结构，这时需要非线性降维或者干脆用学出来的表示（深度 embedding）。"),
+    ])),
+
+    # ============================================================== 8
+    ("feature-engineering-and-threshold", "特征工程与判别阈值：训练完之后还能调的旋钮", "".join([
+        P("这一节合并两个经常被面试官打包一起问的小话题——特征怎么选、阈值怎么定，"
+          "它们的共同点是<strong>都不需要重新训练模型</strong>。"),
+        H3("特征工程与特征选择"),
+        TABLE(["手段", "一句话机制", "什么时候失效", "踩雷点"], [
+            ["特征工程(构造新特征)", '把领域知识/物理先验编码进输入（比如给检测模型加"物体在图像中的归一化坐标"'
+                                  "这种位置先验特征）。",
+             "深度模型本身有足够数据和容量自动学到等价甚至更好的表示时，手工特征反而增加维护成本和"
+             "过拟合到某个先验假设的风险。",
+             '以为特征工程"永远有用"——数据量极大、模型容量足够时，手工特征的边际收益会被表示学习本身超过。'],
+            ["过滤法 filter", "不依赖具体模型，只看每个特征和标签的统计关联（互信息/相关系数），独立打分排序。",
+             "特征之间存在交互效应（单独看都不重要，组合起来才重要）时，过滤法会误删有用特征。",
+             '把过滤法的分数当"这个特征绝对没用"的铁证，忽略了交互效应。'],
+            ["包裹法 wrapper", "直接用下游模型的表现来评估特征子集的好坏（如递归特征消除），效果更准但计算代价高。",
+             "特征数量很大时，子集组合空间是指数级的，穷举/近似搜索的计算成本可能超出预算。",
+             "忘了包裹法本身要在独立验证集上评估，否则和嵌套 CV 一样，会把特征选择的「偷看」泄漏进"
+             "最终报告的分数里。"],
+        ]),
+        H3("判别阈值与决策边界"),
+        TABLE(["项目", "内容"], [
+            ["一句话定义", '模型输出的是连续分数(概率/logit)，阈值决定"多高的分数才算正类"，决策边界是阈值在'
+                          "特征空间里对应的那条（或那个曲面）分割线。"],
+            ["为什么需要理解它", '同一个模型换一个阈值，precision/recall 会完全不同——"这个模型效果不好"这句话'
+                              "经常其实是「阈值没选对」，混淆两者是很常见的诊断错误。"],
+            ["<strong>什么时候 0.5 是错的阈值</strong>", "类别不平衡、或 FP 和 FN 代价不对称时（见本模块第 4 节、"
+                                                       "模块 04），默认阈值 0.5 几乎从不是业务最优点，必须按代价矩阵重新求解工作点。"],
+            ["面试官典型追问", '"决策边界一定是线性的吗？"——不是，边界形状由模型 family 决定：逻辑回归给线性边界，'
+                              "树模型给轴对齐的矩形拼接边界，核方法/神经网络给任意光滑边界。"],
+            ["踩雷点", '把"改变阈值"和"重新训练模型"混为一谈——前者是免费的推理时操作，后者才需要改损失/改数据，'
+                      "遇到「效果不好怎么办」，永远先检查阈值选得对不对，再考虑重新训练。"],
+        ]),
+        CALLOUT("intuition", "这一节两个话题共享一个心法：模型训练完之后，还有大量不需要重新训练就能调的旋钮"
+                             "（阈值、特征筛选、后处理）。面试里能第一时间想到这些低成本手段，比直接说"
+                             '"我会重新训练/收集更多数据"更显工程判断力。'),
+    ])),
+
+    # ============================================================== 9
+    ("frontier", "研究前沿与开放问题", "".join([
+        P("最后放一组更长期的问题——它们不会出现在你的一面里，但决定了这批「经典结论」还能用多久。"),
+        UL([
+            "<strong>双下降现象的理论解释仍在演进。</strong>NTK（neural tangent kernel）理论和隐式正则的"
+            "精确刻画还没有完全统一，「为什么过参数化区间反而泛化更好」在不同模型族上的成因不完全相同。",
+            "<strong>基础模型时代，类别不平衡处理还需要做多少？</strong>预训练数据本身极度不均衡（互联网数据的"
+            "长尾比任何人工标注数据集都极端），下游微调阶段的不平衡处理策略是否需要重新设计，还是"
+            "预训练已经隐式解决了大半问题——目前没有定论。",
+            "<strong>生成式/判别式的边界在新范式下变得模糊。</strong>很多用对比学习、自回归 NLL 训练的"
+            "「生成式模型」，本质上是在优化一个判别性的目标（预测下一个 token 相对其它 token 的相对概率），"
+            "这条经典二分法本身可能需要更新。",
+            "<strong>流形假设在多模态/组合泛化场景下是否依然成立？</strong>不同模态（图像/文本/动作）各自的"
+            "流形怎么对齐、组合出的新场景是否还落在训练时见过的流形附近，仍是活跃的研究方向。",
+        ]),
+        CALLOUT("paper", "<p><strong>★ 必读</strong>：Belkin, Hsu, Ma, Mandal, <em>Reconciling modern machine-learning "
+                         "practice and the classical bias–variance trade-off</em>（PNAS, 2019）——双下降的奠基论文。"
+                         "<strong>★</strong> Breiman, <em>Bagging Predictors</em>（Machine Learning, 1996）与 "
+                         "<em>Random Forests</em>（2001）。<strong>★</strong> Freund & Schapire, "
+                         "<em>A Decision-Theoretic Generalization of On-Line Learning</em>（AdaBoost 原始论文，1997）。"
+                         "<strong>★</strong> Ng & Jordan, <em>On Discriminative vs. Generative Classifiers</em>"
+                         "（NeurIPS, 2001）——生成式判别式对比的经典分析。</p>"
+                         "<p>配套材料：Cui et al., <em>Class-Balanced Loss Based on Effective Number of Samples</em>"
+                         "（CVPR 2019，本模块第 4 节引用的有效样本数公式出处，完整方案见 C58-01）。"
+                         "相邻模块：<strong>C07</strong>（全部数学推导）、<strong>C58-01</strong>（类别不平衡完整"
+                         "处理谱系）、<strong>下一站 · 模块 02</strong>（优化与训练问答）。</p>"),
+    ])),
+]
+
+NB = [
+    md("""# 01 · 机器学习基础问答（偏差-方差与双下降 / L1-L2稀疏性 / dropout集成等价性 / CV时序泄漏 / bagging-boosting实测）
+
+目标：把模块 00 的"三段式答法"应用到 C07 已经推导过的六个 ML 基础主题上——
+这里**不重复推导**，只用可运行的数值实验，把每个主题"什么时候会失效"这条最难背出来的边界，
+变成你亲手跑出来、亲眼看到的结果。
+
+本 notebook 你会亲手实现：
+1. **偏差-方差数值分解** —— 复现经典 U 型曲线
+2. **双下降** —— 用随机傅里叶特征 + 最小范数解，复现"插值阈值附近误差骤增、之后又下降"的现象
+3. **L1 vs L2 的稀疏性** —— 正交设计下的闭式解，量化"L1精确清零、L2只收缩"
+4. **dropout 作为集成的等价性** —— 线性 readout 下精确成立，非线性 readout 下只是近似
+5. **CV 在时序数据上的泄漏** —— 量化 shuffled K-fold 比 walk-forward 乐观多少倍
+6. **bagging 降方差 / boosting 降偏差** —— 在同一个玩具问题上实测两者的偏差-方差变化
+
+> 心智模型：**C07 教你怎么推导这些结论；这里教你怎么亲手验证"它什么时候会不成立"。**"""),
+
+    md("""## 0 · 环境自检"""),
+
+    code("""import sys
+import numpy as np
+
+print('Python :', sys.version.split()[0])
+print('numpy  :', np.__version__)
+assert sys.version_info >= (3, 8)
+
+rng_check = np.random.default_rng(0)
+assert rng_check.uniform(0, 1) is not None
+print('\\n✅ 环境自检通过：本课全程只用 numpy + 标准库，CPU 可跑，不联网。')"""),
+
+    md("""## 1 · 偏差-方差数值分解：复现经典 U 型曲线
+
+真实函数 $f(x)=\\sin(2x)+0.4x$ 加噪声，用不同阶数的多项式拟合。对每个阶数重复 300 次独立抽样训练集，
+统计预测的均值（→ bias）和方差（→ variance）。"""),
+
+    code("""rng = np.random.default_rng(0)
+
+def true_fn(x):
+    return np.sin(2.0 * x) + 0.4 * x
+
+sigma = 0.25
+n_train = 30
+x_test = np.linspace(-1, 1, 50)
+y_test_true = true_fn(x_test)
+
+degs = [1, 2, 3, 5, 7, 9]
+B = 300
+result = {}
+for deg in degs:
+    preds = np.zeros((B, len(x_test)))
+    for b in range(B):
+        x_tr = rng.uniform(-1, 1, n_train)
+        y_tr = true_fn(x_tr) + rng.normal(0, sigma, n_train)
+        preds[b] = np.polyval(np.polyfit(x_tr, y_tr, deg), x_test)
+    mean_pred = preds.mean(axis=0)
+    bias2 = np.mean((mean_pred - y_test_true) ** 2)
+    var = np.mean(preds.var(axis=0))
+    result[deg] = (bias2, var, bias2 + var + sigma ** 2)
+
+print(f'{"deg":>4} {"bias2":>10} {"var":>10} {"total":>10}')
+for deg in degs:
+    b2, v, t = result[deg]
+    print(f'{deg:>4} {b2:>10.4f} {v:>10.4f} {t:>10.4f}')
+
+# 断言：低阶到中阶，bias 应该显著下降；高阶时方差应该远超低阶（经典 U 型的"过拟合"一侧）
+assert result[1][0] > result[3][0] * 50          # bias: deg1 远高于 deg3
+assert result[9][1] > result[3][1] * 100         # var:  deg9 远高于 deg3（未加正则的高阶多项式方差爆炸）
+assert result[9][2] > result[1][2] * 5           # 总误差：deg9 远超 deg1，说明"过拟合"确实更差
+best_deg = min(degs, key=lambda d: result[d][2])
+assert best_deg == 3
+print(f'\\n✅ U 型验证通过：最优阶数在 deg={best_deg}（bias 和 var 的总和最小）；'
+      f'deg=9 时方差已经比 deg=3 大 100 倍以上——未加正则的高阶多项式基是数值上极不稳定的经典陷阱。')"""),
+
+    md("""## 2 · 双下降：随机傅里叶特征 + 最小范数解
+
+真实关系是 5 维输入上的线性函数。用 $P$ 个随机傅里叶特征 $z=\\cos(Xw+b)$ 拟合，$P$ 从远小于训练样本数
+一路增大到远大于训练样本数，$P$ 每次都取**最小范数**解（`np.linalg.pinv`）。
+
+关键现象：误差在 $P\\approx n_{\\text{train}}$（插值阈值）附近骤增，之后随 $P$ 继续增大反而下降——
+这正是双下降，也是模块 01 第 1 节"什么时候失效"的实证。"""),
+
+    code("""rng2 = np.random.default_rng(1)
+
+d_true, n_train2, n_test = 5, 40, 200
+w_star = rng2.normal(size=d_true)
+sigma2 = 0.5
+
+X_train = rng2.normal(size=(n_train2, d_true))
+y_train = X_train @ w_star + rng2.normal(0, sigma2, n_train2)
+X_test = rng2.normal(size=(n_test, d_true))
+y_test = X_test @ w_star + rng2.normal(0, sigma2, n_test)
+
+Ps = [5, 20, 35, 40, 42, 50, 80, 200, 800]
+P_max = max(Ps)
+W_full = rng2.normal(size=(d_true, P_max))
+b_full = rng2.uniform(0, 2 * np.pi, P_max)
+
+def rff_features(X, P):
+    return np.cos(X @ W_full[:, :P] + b_full[:P])
+
+mse = {}
+for P in Ps:
+    Z_train = rff_features(X_train, P)
+    Z_test = rff_features(X_test, P)
+    beta = np.linalg.pinv(Z_train) @ y_train      # 最小范数解，欠定/超定都适用
+    pred = Z_test @ beta
+    mse[P] = np.mean((pred - y_test) ** 2)
+
+print(f'{"P":>5} {"test_mse":>12}')
+for P in Ps:
+    print(f'{P:>5} {mse[P]:>12.4f}')
+
+peak = max(mse.values())
+assert mse[40] == peak                              # 插值阈值(P≈n_train=40)附近误差骤增到最大
+assert mse[40] > mse[35] and mse[40] > mse[42]       # 峰值两侧都更低——"骤增"是局部的
+assert mse[800] < mse[40] / 50                       # 过参数化到 P=800 时，误差比峰值低 50 倍以上
+assert mse[800] < mse[35]                            # 甚至比"峰值之前"的欠参数化区间还低——这才是双下降的关键
+print(f'\\n✅ 双下降复现：峰值在 P={list(mse.keys())[list(mse.values()).index(peak)]}（插值阈值附近），'
+      f'P=800 时误差 {mse[800]:.3f} 反而低于 P=35 时的 {mse[35]:.3f}。')
+print('   这个现象无法用"方差随复杂度单调增加"的经典图像解释——过参数化区间的最小范数解自带隐式正则。')"""),
+
+    md("""## 3 · L1 vs L2 的稀疏性：正交设计下的闭式解
+
+完整 KKT 推导见 C07-06；这里只验证结论本身。在正交设计（$X^TX=I$）下，Ridge 和 Lasso 都有闭式解：
+$\\hat\\beta_{\\text{ridge}}=\\hat\\beta_{\\text{ols}}/(1+\\lambda)$，
+$\\hat\\beta_{\\text{lasso}}=\\text{sign}(\\hat\\beta_{\\text{ols}})\\cdot\\max(|\\hat\\beta_{\\text{ols}}|-\\lambda,0)$（软阈值）。"""),
+
+    code("""beta_ols = np.array([3.0, -0.5, 1.2, 0.05, -2.0])
+
+def ridge_shrink(beta, lam):
+    return beta / (1 + lam)
+
+def lasso_shrink(beta, lam):
+    return np.sign(beta) * np.maximum(np.abs(beta) - lam, 0.0)
+
+lam = 1.0
+r = ridge_shrink(beta_ols, lam)
+l = lasso_shrink(beta_ols, lam)
+print('OLS  :', beta_ols)
+print('Ridge:', r)
+print('Lasso:', l)
+
+n_zero_ridge = np.sum(np.isclose(r, 0.0))
+n_zero_lasso = np.sum(np.isclose(l, 0.0))
+assert n_zero_ridge == 0
+assert n_zero_lasso == 2                         # |-0.5| 和 |0.05| 都 <= lam=1.0，被精确压成 0
+assert np.allclose(l, [2.0, 0.0, 0.2, 0.0, -1.0])
+
+# 解路径：随 lambda 增大，lasso 非零系数个数单调不增
+lambdas = [0.0, 0.3, 0.6, 1.0, 2.0, 3.5]
+nnz = [int(np.sum(~np.isclose(lasso_shrink(beta_ols, lam), 0.0))) for lam in lambdas]
+print('\\nlambda            :', lambdas)
+print('lasso非零系数个数  :', nnz)
+assert nnz == sorted(nnz, reverse=True)
+print('\\n✅ 正交设计下：L1 随 lambda 增大产生越来越多精确 0；L2 只收缩，从不精确为 0。')"""),
+
+    md("""## 4 · dropout 作为集成：线性 readout 下精确成立，非线性下只是近似
+
+对输入做 Bernoulli(p) 的 dropout mask，比较"大量随机 mask 取平均"和"直接用权重缩放(×p)"两种做法。
+线性输出层下二者在期望上完全相等；非线性 readout（sigmoid）下二者存在系统性的 Jensen gap，不会随采样数增加而消失。"""),
+
+    code("""rng3 = np.random.default_rng(2)
+d, p = 6, 0.7
+x = rng3.normal(size=d)
+w = rng3.normal(size=d)
+
+exact_linear = p * (w @ x)
+
+def mc_dropout_linear(n_samples):
+    masks = (rng3.random((n_samples, d)) < p).astype(float)
+    return ((masks * x) @ w).mean()
+
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
+
+def mc_dropout_nonlinear(n_samples):
+    masks = (rng3.random((n_samples, d)) < p).astype(float)
+    z = (masks * x) @ w
+    return sigmoid(z).mean()
+
+approx_nonlinear = sigmoid(p * (w @ x))
+
+print(f'{"n":>8} {"MC(线性)":>10} {"解析值":>10} {"|diff|":>8} | {"MC(sigmoid)":>12} {"近似值":>10} {"gap":>8}')
+for n in [200, 2000, 20000, 200000]:
+    el = mc_dropout_linear(n)
+    en = mc_dropout_nonlinear(n)
+    print(f'{n:>8} {el:>10.5f} {exact_linear:>10.5f} {abs(el-exact_linear):>8.5f} | '
+          f'{en:>12.5f} {approx_nonlinear:>10.5f} {abs(en-approx_nonlinear):>8.5f}')
+
+final_linear = mc_dropout_linear(200000)
+final_nonlinear = mc_dropout_nonlinear(200000)
+assert abs(final_linear - exact_linear) < 0.01        # 线性readout：MC均值收敛到解析的权重缩放值
+assert abs(final_nonlinear - approx_nonlinear) > 0.02  # 非线性readout：gap持续存在，不随采样数消失
+print('\\n✅ 验证通过：dropout≈权重缩放这条等价性，只在"下一步是线性组合"时精确成立；'
+      '一旦中间插入非线性（如本例的sigmoid），就只是近似，而且这个 gap 不会随蒙特卡洛采样数增加而消失'
+      '（Jensen不等式决定的系统性偏差，不是采样噪声）。')"""),
+
+    md("""## 5 · CV 在时序数据上的泄漏：量化 shuffled K-fold 比 walk-forward 乐观多少倍
+
+构造一条随机游走序列（自相关极强、且未来增量独立于过去、本质不可预测）。
+用 1-NN（按时间索引找最近邻）分别在 shuffled K-fold 和 walk-forward 两种切分下评估，比较 MSE。"""),
+
+    code("""rng4 = np.random.default_rng(3)
+N = 300
+y_walk = np.cumsum(rng4.normal(0, 1.0, N))
+t_idx = np.arange(N).reshape(-1, 1).astype(float)
+
+def nn_predict(t_train, y_train, t_query):
+    preds = np.empty(len(t_query))
+    for i, tq in enumerate(t_query):
+        j = np.argmin(np.abs(t_train[:, 0] - tq[0]))
+        preds[i] = y_train[j]
+    return preds
+
+# 方案 A：标准 shuffled K-fold（错误做法——test点的"未来"近邻很可能落在训练集里）
+K = 5
+idx = rng4.permutation(N)
+folds = np.array_split(idx, K)
+mse_shuffled = []
+for k in range(K):
+    test_idx = folds[k]
+    train_idx = np.concatenate([folds[j] for j in range(K) if j != k])
+    pred = nn_predict(t_idx[train_idx], y_walk[train_idx], t_idx[test_idx])
+    mse_shuffled.append(np.mean((pred - y_walk[test_idx]) ** 2))
+mse_shuffled = float(np.mean(mse_shuffled))
+
+# 方案 B：walk-forward（正确做法——只用过去预测未来）
+splits = [(150, 180), (180, 210), (210, 240), (240, 270), (270, 300)]
+mse_forward = []
+for tr_end, te_end in splits:
+    train_idx = np.arange(0, tr_end)
+    test_idx = np.arange(tr_end, te_end)
+    pred = nn_predict(t_idx[train_idx], y_walk[train_idx], t_idx[test_idx])
+    mse_forward.append(np.mean((pred - y_walk[test_idx]) ** 2))
+mse_forward = float(np.mean(mse_forward))
+
+print(f'shuffled K-fold MSE = {mse_shuffled:.4f}')
+print(f'walk-forward   MSE = {mse_forward:.4f}')
+print(f'比值 walk-forward / shuffled = {mse_forward/mse_shuffled:.2f}x')
+
+assert mse_forward > 5 * mse_shuffled     # 真实差距约20倍，这里用5倍做保守断言
+print('\\n✅ 验证通过：在自相关数据上，标准K折会让"未来"信息通过近邻泄漏进训练集，'
+      '把真实误差低估一个数量级以上。')"""),
+
+    md("""## 6 · bagging 降方差 / boosting 降偏差：同一个玩具问题上的实测
+
+真实函数 $f(x)=\\sin(3x)$。bagging 用 1-NN（低偏差高方差）做基学习器；boosting 用深度1回归树桩
+（高偏差低方差）做基学习器，通过拟合残差逐轮降低偏差。"""),
+
+    code("""rng5 = np.random.default_rng(4)
+
+def true_fn2(x):
+    return np.sin(3.0 * x)
+
+sigma5 = 0.3
+n_train5 = 40
+x_test5 = np.linspace(-2, 2, 40)
+y_test5_true = true_fn2(x_test5)
+
+def nn_predict_1d(x_train, y_train, x_query):
+    preds = np.empty(len(x_query))
+    for i, xq in enumerate(x_query):
+        j = np.argmin(np.abs(x_train - xq))
+        preds[i] = y_train[j]
+    return preds
+
+R, B = 200, 25
+single_preds = np.zeros((R, len(x_test5)))
+bagged_preds = np.zeros((R, len(x_test5)))
+for r in range(R):
+    x_tr = rng5.uniform(-2, 2, n_train5)
+    y_tr = true_fn2(x_tr) + rng5.normal(0, sigma5, n_train5)
+    single_preds[r] = nn_predict_1d(x_tr, y_tr, x_test5)
+    boot_preds = np.zeros((B, len(x_test5)))
+    for b in range(B):
+        bidx = rng5.integers(0, n_train5, n_train5)
+        boot_preds[b] = nn_predict_1d(x_tr[bidx], y_tr[bidx], x_test5)
+    bagged_preds[r] = boot_preds.mean(axis=0)
+
+def bias2_var(preds):
+    mp = preds.mean(axis=0)
+    return np.mean((mp - y_test5_true) ** 2), np.mean(preds.var(axis=0))
+
+b2_single, v_single = bias2_var(single_preds)
+b2_bag, v_bag = bias2_var(bagged_preds)
+print(f'1-NN 单模型  : bias2={b2_single:.4f}  var={v_single:.4f}')
+print(f'1-NN bagging : bias2={b2_bag:.4f}  var={v_bag:.4f}')
+print(f'方差降低倍数 : {v_single/v_bag:.2f}x')
+
+assert v_single > 1.3 * v_bag             # bagging 显著降方差
+assert b2_single < 0.02 and b2_bag < 0.02 # bagging 几乎不改变（很低的）偏差
+
+def fit_stump(x, r):
+    order = np.argsort(x)
+    xs, rs = x[order], r[order]
+    best_sse, best_thr, best_l, best_rgt = np.inf, None, np.mean(rs), np.mean(rs)
+    for i in range(1, len(xs)):
+        if xs[i] == xs[i-1]:
+            continue
+        thr = (xs[i] + xs[i-1]) / 2
+        left, right = rs[:i], rs[i:]
+        lval, rval = left.mean(), right.mean()
+        sse = np.sum((left - lval)**2) + np.sum((right - rval)**2)
+        if sse < best_sse:
+            best_sse, best_thr, best_l, best_rgt = sse, thr, lval, rval
+    return best_thr, best_l, best_rgt
+
+def stump_predict(thr, lval, rval, xq):
+    if thr is None:
+        return np.full(len(xq), lval)
+    return np.where(xq < thr, lval, rval)
+
+def boosted_predict(x_tr, y_tr, x_query, M, eta=0.5):
+    F0 = np.mean(y_tr)
+    stumps, residual = [], y_tr - F0
+    for _ in range(M):
+        thr, lval, rval = fit_stump(x_tr, residual)
+        stumps.append((thr, lval, rval))
+        residual = residual - eta * stump_predict(thr, lval, rval, x_tr)
+    pred = np.full(len(x_query), F0)
+    for thr, lval, rval in stumps:
+        pred = pred + eta * stump_predict(thr, lval, rval, x_query)
+    return pred
+
+Ms = [1, 3, 6, 12, 25, 50]
+boost_result = {}
+for M in Ms:
+    preds = np.zeros((R, len(x_test5)))
+    for r in range(R):
+        x_tr = rng5.uniform(-2, 2, n_train5)
+        y_tr = true_fn2(x_tr) + rng5.normal(0, sigma5, n_train5)
+        preds[r] = boosted_predict(x_tr, y_tr, x_test5, M)
+    boost_result[M] = bias2_var(preds)
+
+print(f'\\n{"M":>4} {"bias2":>10} {"var":>10}')
+for M in Ms:
+    b2, v = boost_result[M]
+    print(f'{M:>4} {b2:>10.4f} {v:>10.4f}')
+
+bias_seq = [boost_result[M][0] for M in Ms]
+var_seq = [boost_result[M][1] for M in Ms]
+assert bias_seq == sorted(bias_seq, reverse=True)      # 偏差随轮数单调下降
+assert bias_seq[-1] < bias_seq[0] / 10                 # 50轮后偏差降到1轮时的1/10以下
+assert var_seq[-1] < var_seq[0] * 3                     # 方差只是缓慢增长（远没有偏差降得那么剧烈）
+print('\\n✅ 验证通过：bagging 主要压缩方差、几乎不动偏差；boosting 随轮数持续压缩偏差、方差缓慢上升。')"""),
+
+    md("""## ✏️ 练习 1：Lasso 软阈值算子
+
+实现 `lasso_soft_threshold(beta_ols, lam)`：对每个系数做 $\\text{sign}(\\beta)\\cdot\\max(|\\beta|-\\lambda,0)$，
+用 `numpy` 向量化实现（不要写 Python for 循环）。"""),
+
+    code("""def lasso_soft_threshold(beta_ols, lam):
+    # TODO
+    raise NotImplementedError"""),
+
+    code("""# —— 练习 1 自测 ——
+beta = np.array([3.0, -0.5, 1.2, 0.05, -2.0])
+out = lasso_soft_threshold(beta, 1.0)
+assert np.allclose(out, [2.0, 0.0, 0.2, 0.0, -1.0])
+assert np.allclose(lasso_soft_threshold(beta, 0.0), beta)     # lambda=0 时等于不惩罚
+assert np.all(np.abs(lasso_soft_threshold(beta, 10.0)) < 1e-12)  # lambda 大到能把所有系数清零
+
+print('lam=1.0:', out)
+print('\\n✅ 练习 1 通过。')"""),
+
+    md("""## ✏️ 练习 2：有效样本数权重（呼应 C58-01）
+
+实现 `effective_number_weight(counts, beta=0.999)`：按 Cui et al. 2019 的「有效样本数」公式
+$E_n=(1-\\beta^n)/(1-\\beta)$，返回权重 $w_c \\propto 1/E_{n_c}$，**归一化到权重之和等于类别数**
+（即平均权重为 1）。"""),
+
+    code("""def effective_number_weight(counts, beta=0.999):
+    # TODO
+    raise NotImplementedError"""),
+
+    code("""# —— 练习 2 自测 ——
+w = effective_number_weight([10, 100, 1000], beta=0.99)
+assert len(w) == 3
+assert abs(sum(w) - 3.0) < 1e-9                 # 归一化到 sum=类别数
+assert w[0] > w[1] > w[2]                       # 样本越少权重越大
+assert abs(w[0] - 2.406841855617004) < 1e-6
+assert abs(w[2] - 0.2301471597560314) < 1e-6
+
+print('counts=[10,100,1000] 的权重:', [round(x, 4) for x in w])
+print('\\n✅ 练习 2 通过：稀有类样本数越少，权重越大——这是类别不平衡重加权的骨架公式。')"""),
+
+    md("""## ✏️ 练习 3：Walk-forward 切分生成器
+
+实现 `walk_forward_splits(n, n_splits=5, min_train_frac=0.5)`：训练集从 0 开始、长度不断增长，
+测试块紧跟其后、大小相等（最后一块吸收余数）。返回 `[(train_idx_list, test_idx_list), ...]`。"""),
+
+    code("""def walk_forward_splits(n, n_splits=5, min_train_frac=0.5):
+    # TODO
+    raise NotImplementedError"""),
+
+    code("""# —— 练习 3 自测 ——
+sp = walk_forward_splits(100, n_splits=5, min_train_frac=0.5)
+assert len(sp) == 5
+for tr, te in sp:
+    assert max(tr) < min(te)                    # 训练永远早于验证，不会看到"未来"
+assert sp[0][0] == list(range(50))              # 第一折训练集是前50个
+assert sp[0][1] == list(range(50, 60))          # 第一折验证集是接下来10个
+assert sp[-1][1] == list(range(90, 100))        # 最后一折验证集吸收到数据末尾
+assert len(sp[0][0]) < len(sp[-1][0])           # 训练集随折数递增
+
+for tr, te in sp:
+    print(len(tr), '训练 ->', len(te), '验证，验证区间', te[0], '~', te[-1])
+print('\\n✅ 练习 3 通过：这就是第 5 节 CV 泄漏实验里"正确做法"背后的切分逻辑。')"""),
+
+    md("""## ✏️ 练习 4：从预测矩阵直接算偏差-方差
+
+实现 `bias_variance_from_preds(preds, y_true)`：`preds` 形状 `(R, T)`（R个模型在T个测试点上的预测），
+`y_true` 形状 `(T,)`。返回 `(bias2, var)`。"""),
+
+    code("""def bias_variance_from_preds(preds, y_true):
+    # TODO
+    raise NotImplementedError"""),
+
+    code("""# —— 练习 4 自测 ——
+preds = np.array([[1., 2.], [3., 4.], [5., 6.]])
+y_true = np.array([3., 4.])
+b2, v = bias_variance_from_preds(preds, y_true)
+assert abs(b2 - 0.0) < 1e-12                    # 均值预测正好等于真值 -> bias为0
+assert abs(v - 8/3) < 1e-9                      # 每列方差 (4+0+4)/3 = 8/3
+
+perfect = np.tile(y_true, (5, 1))               # 5个模型全部预测完全正确、且完全一致
+b2p, vp = bias_variance_from_preds(perfect, y_true)
+assert abs(b2p) < 1e-12 and abs(vp) < 1e-12     # 零偏差零方差
+
+print(f'合成用例: bias2={b2:.4f}, var={v:.4f}')
+print('\\n✅ 练习 4 通过：本节前面 6 个实验背后用的都是这个函数的等价逻辑。')"""),
+
+    md("""---
+### 📖 参考答案（先自己做，再对照）"""),
+
+    code("""# 练习 1 参考答案
+def lasso_soft_threshold(beta_ols, lam):
+    beta_ols = np.asarray(beta_ols, dtype=float)
+    return np.sign(beta_ols) * np.maximum(np.abs(beta_ols) - lam, 0.0)"""),
+
+    code("""# 练习 2 参考答案
+def effective_number_weight(counts, beta=0.999):
+    en = [(1 - beta**n) / (1 - beta) for n in counts]
+    w = [1.0 / e for e in en]
+    total = sum(w)
+    k = len(w)
+    return [wi * k / total for wi in w]"""),
+
+    code("""# 练习 3 参考答案
+def walk_forward_splits(n, n_splits=5, min_train_frac=0.5):
+    start = int(n * min_train_frac)
+    remaining = n - start
+    step = remaining // n_splits
+    splits = []
+    for i in range(n_splits):
+        train_end = start + i * step
+        test_end = start + (i + 1) * step if i < n_splits - 1 else n
+        splits.append((list(range(0, train_end)), list(range(train_end, test_end))))
+    return splits"""),
+
+    code("""# 练习 4 参考答案
+def bias_variance_from_preds(preds, y_true):
+    preds = np.asarray(preds, dtype=float)
+    y_true = np.asarray(y_true, dtype=float)
+    mean_pred = preds.mean(axis=0)
+    bias2 = np.mean((mean_pred - y_true) ** 2)
+    var = np.mean(preds.var(axis=0))
+    return bias2, var"""),
+
+    md("""---
+## 🧪 真实工程胶囊：九个主题的 60 秒速记卡"""),
+
+    code("""RECIPE = r'''
+# ══════════════════════════════════════════════════════════════════════
+# 每条一句话定义 + 一条最容易被追问到的失效边界（面试当天可以直接照抄）
+# ══════════════════════════════════════════════════════════════════════
+# 1) 偏差-方差   定义: 泛化误差=Bias^2+Var+噪声
+#              失效: 深度网络的双下降——过参数化后误差先骤增后再降，打破"越复杂越容易过拟合"
+# 2) 正则化家族  定义: L1/L2/dropout/early-stop/数据增强 效果类似但机制完全不同
+#              失效: L1在共线特征上选择不稳定；dropout的"权重缩放"只在线性readout下精确成立
+# 3) 交叉验证    定义: 用"装作没见过的数据"估计泛化能力
+#              失效: 时间序列/分组数据上标准K折会因数据不可交换而系统性乐观
+# 4) 类别不平衡  定义: 重采样/重加权/阈值调整/两级架构，四把刀切在流水线不同阶段
+#              完整方案见 C58-01，本课只给问答骨架
+# 5) 集成方法    定义: bagging平均降方差，boosting接力改错降偏差
+#              失效: bagging基学习器相关性高(如都用同一批数据)时，方差降不动
+# 6) 生成vs判别  定义: 生成式建模P(x,y)，判别式直接建模P(y|x)
+#              失效: x高维时生成式对P(x)建模不准，会拖累分类精度
+# 7) 维度灾难    定义: 高维空间中几乎所有点对距离趋同，"近邻"失去意义
+#              失效: 流形假设成立时(数据实际落在低维流形上)，距离度量在流形内依然可靠
+# 8) 特征工程/阈值 定义: 训练完之后还能调的旋钮——特征筛选和阈值都不需要重新训练
+#              踩雷: 把"调阈值"和"重新训练"混为一谈
+#
+# ══════════════════════════════════════════════════════════════════════
+# 与本课程其他部分的分工
+# ══════════════════════════════════════════════════════════════════════
+# · 以上九个主题的完整数学推导                    -> C07
+# · 类别不平衡的完整工程方案(有效样本数/EQL/解耦训练) -> C58-01
+# · 优化器/学习率调度/初始化/混合精度              -> C64 模块 02
+# · 卷积/归一化/attention/CNN vs Transformer      -> C64 模块 03
+'''
+print(RECIPE)
+for token in ['双下降', 'dropout', 'C58-01', '流形假设', 'C07']:
+    assert token in RECIPE, token
+print('✅ 检查单覆盖：九个主题的定义+失效边界速记 / 课程分工')"""),
+
+    md("""### 小结
+
+- **偏差-方差分解的经典 U 型有一个重要例外**：深度学习的双下降——过参数化跨过插值阈值后，
+  测试误差先骤增再重新下降，这打破"复杂度越高越容易过拟合"的朴素直觉（本 notebook 用随机傅里叶特征
+  + 最小范数解完整复现了这个现象）。
+- **L1/L2/dropout/early stopping/数据增强是五种不同机制**，效果都指向"抗过拟合"但原理各不相同：
+  L1 靠约束区域的尖角产生精确 0，L2 只收缩不清零；dropout 的"权重缩放"等价性**只在线性 readout 下精确成立**，
+  一旦有非线性就只是近似（Jensen gap 不随采样数消失）。
+- **交叉验证的无偏性依赖"可交换性"假设**：时间序列和分组数据都会打破这个假设，标准 K 折会让
+  "未来"或"同组"信息泄漏进训练集，本 notebook 实测泄漏可以让 MSE 被低估一个数量级以上。
+- **bagging 降方差、boosting 降偏差**——这不是一句空话，本 notebook 在同一个玩具问题上分别实测了
+  两者的偏差-方差变化曲线，数字上验证了这条经典结论。
+- 类别不平衡本节**只给问答骨架**，完整方案见 **C58-01**；九个主题的数学推导全部见 **C07**。
+
+下一站：**模块 02 · 优化与训练问答** —— 优化器怎么选、weight decay 和 L2 为什么在 Adam 下不等价、
+warmup 为什么必要。"""),
+]

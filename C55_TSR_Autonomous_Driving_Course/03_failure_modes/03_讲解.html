@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 失效模式全景：TSR 到底在哪些地方出错</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 失效模式全景：TSR 到底在哪些地方出错</h1>
+  <p class="subtitle">四象限（漏检 / 误检 / 错分 / 定位不准）与各自的下游后果完全不同 · 远距离小目标、遮挡、逆光与隧道出入口、夜间眩光、雨雾雪、运动模糊与卷帘快门、褪色涂鸦 · 广告牌与车身贴纸的误检是后果最重的一类 · 对向车道与辅路标志的错误关联（检测再准也解决不了）· 优先级 = 发生频率 × 安全后果 × 修复成本</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–02（TSR 任务定义、数据集、两级 vs 端到端）；C18/C53 的检测基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_failure_modes.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">TT100K / Mapillary 的失效分析、TIDE 误差分解、FMEA 风险优先数、大气散射与卷帘快门模型</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#quadrant">四象限框架：先把「错了」拆成四种不同的错</a></li>
+      <li><a href="#distance">失效源 1：远距离小目标——先算出物理下界，再谈模型</a></li>
+      <li><a href="#occlusion">失效源 2：遮挡与截断</a></li>
+      <li><a href="#light">失效源 3：光照——逆光、隧道口、夜间与眩光</a></li>
+      <li><a href="#weather_motion">失效源 4：天气与运动——雨雾雪、运动模糊、卷帘快门</a></li>
+      <li><a href="#appearance_fp">失效源 5：外观退化与误检源</a></li>
+      <li><a href="#association">失效源 6：关联与歧义——「这块牌管不管我」</a></li>
+      <li><a href="#priority">把失效模式排成一张可执行的清单：频率 × 安全后果 × 修复成本</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="quadrant"><span class="num">1</span>四象限框架：先把「错了」拆成四种不同的错</h2>
+  <p>「模型识别得不准」是一句没有信息量的话。<strong>做失效分析的第一步，是把「错」拆成互不重叠、下游后果不同、修复手段也不同的几类。</strong>检测任务天然有四种错法——它们的成因、代价、对策几乎没有交集，混在一起谈必然得不出行动项。</p>  <div class="ascii">                        真实世界有这块牌吗？
+                          有                 没有
+                    ┌──────────────────┬──────────────────┐
+   模型报了吗？ 报了 │  ✅ 正确检出      │  ② 误检 FP       │
+                    │  （但可能错分/     │  「凭空多出一块牌」│
+                    │    定位不准）      │                  │
+                    ├──────────────────┼──────────────────┤
+              没报  │  ① 漏检 FN        │  ✅ 正确忽略      │
+                    │ 「牌在那，没看见」 │                  │
+                    └──────────────────┴──────────────────┘
+
+   在「✅ 正确检出」这一格里，还藏着两种错：
+     ③ 错分 (misclassification)：框对了，类别错了（限速 60 判成 80）
+     ④ 定位不准 (poor localization)：类别对了，框偏了 / 尺度错了
+        → 直接影响距离估计 → 影响「什么时候开始生效」
+
+   注意：**这四类的下游后果完全不同**，所以不能用一个 mAP 概括。</div>  <table>
+    <thead><tr><th>象限</th><th>定义</th><th>下游后果（规控 / VLA 视角）</th><th>典型量级</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 漏检 FN</strong></td><td>真实标志存在，模型未输出（或分数低于阈值被滤掉）</td><td><strong>最危险</strong>。限速牌漏检 → 超速；停车让行漏检 → 冲入路口。<em>而且是「静默失败」——系统不知道自己漏了</em></td><td>远距离段（&gt;60 m）漏检率可达 30–60%；近距离通常 &lt; 2%</td></tr>
+      <tr><td><strong>② 误检 FP</strong></td><td>无标志处输出了标志（广告牌、车身贴纸、路面反光）</td><td>急减速、幽灵刹车（phantom braking）；用户信任崩塌；<em>但至少是「可观测」的失败——用户会投诉</em></td><td>工程指标要看 <strong>FP/km</strong> 而不是 precision。量产要求常在 0.05–0.5 次/km</td></tr>
+      <tr><td><strong>③ 错分</strong></td><td>框正确但类别错误</td><td>取决于错成什么。限速 60→80 是安全事故；限速 60→40 是体验问题；禁令→指示是行为错误</td><td>混淆高度集中在少数「相似对」上（数字类、同形状同色类）</td></tr>
+      <tr><td><strong>④ 定位不准</strong></td><td>IoU 偏低、尺度估计错、中心偏移</td><td><strong>距离估计错</strong>（尺寸→距离的反演对框宽极敏感）→ 生效时机错；跟踪关联失败 → 时序确认变慢</td><td>小目标上 2 px 偏移就能让 IoU 从 1.0 掉到 0.39</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>四象限最重要的价值不是分类本身，而是<strong>它强迫你回答「这次改动修的是哪一类」</strong>。提高检测阈值会减少 ②、增加 ①；加更多小目标增强会减少 ①、可能增加 ②；改分类器只动 ③。<em>如果一个改动同时声称「减少漏检又减少误检」，它要么是真的架构改进，要么是评测有问题——多数情况下是后者。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严格的做法是做<span class="term">error decomposition</span>（误差分解）：把 mAP 的损失按 <em>Cls / Loc / Both / Dupe / Bkg / Miss</em> 六类归因，并算出「修好每一类能涨多少 mAP」——这是 TIDE 的做法（C61 模块 02 会完整实现）。<strong>它把「我该做什么」从争论变成计算。</strong>在 TSR 上做 TIDE 分解，通常会看到一个高度不均衡的结果：<em>Miss（漏检）在远距离桶里占绝对主导，而 Cls（错分）集中在少数几对相似类上</em>——这两条结论直接决定了后面几节的重点。</p></div>
+  </div>  <div class="callout danger"><span class="label">漏检是静默失败</span>
+    <p>四象限里最容易被忽视的是 <strong>①「静默失败」这个性质</strong>。误检会被用户投诉、会在日志里留下高分记录；<em>漏检什么都不会留下</em>——没有框、没有分数、没有日志条目。你只有拿到带标注的回归集，才知道自己漏了。</p><p><strong>工程含义：漏检必须靠「主动构造的场景化回归集」来监控，不能靠线上指标。</strong>而误检可以靠线上 FP/km 直接监控。这两类失效的<em>可观测性</em>完全不同，因此监控体系也必须不同——这是模块 05 评测体系的核心动机之一。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="distance"><span class="num">2</span>失效源 1：远距离小目标——先算出物理下界，再谈模型</h2>
+  <p>TSR 最大的单一失效源。而它有一个必须先算清楚的前提：<strong>有些距离上的失败不是模型的错，是像素不够。</strong>不先把这条物理下界画出来，你会把大量精力浪费在「优化一个信息论上不可能的任务」上。</p>  <div class="math-block">\[p \;=\; f_{px} \cdot \frac{S}{Z}, \qquad f_{px} \;=\; \frac{W_{px}}{2\tan(\mathrm{FOV}/2)}\]</div>  <p>其中 <code>p</code> 是标志在图像上的像素边长，<code>S</code> 是标志物理尺寸（米），<code>Z</code> 是距离（米），<code>f_px</code> 是以像素为单位的焦距。代入一组真实参数（1920×1080、水平 FOV 60°、限速牌直径 0.6 m）：</p>  <table>
+    <thead><tr><th>距离 Z</th><th>像素边长 p</th><th>能做什么</th><th>主要失效</th></tr></thead>
+    <tbody>
+      <tr><td>20 m</td><td>约 50 px</td><td>轻松检出 + 可靠分类</td><td>几乎无失效（除非遮挡）</td></tr>
+      <tr><td>40 m</td><td>约 25 px</td><td>可检出，分类开始吃力</td><td>相似数字混淆开始出现</td></tr>
+      <tr><td><strong>60 m</strong></td><td><strong>约 17 px</strong></td><td>检出勉强，分类需要高分辨率 crop</td><td><strong>漏检率明显抬头</strong></td></tr>
+      <tr><td>80 m</td><td>约 12 px</td><td>检出困难；限速数字几乎不可读</td><td>漏检 + 错分同时恶化</td></tr>
+      <tr><td>100 m</td><td>约 10 px</td><td><strong>接近信息论下界</strong></td><td>此距离的失败多数不可修</td></tr>
+    </tbody>
+  </table>  <p>再补一个关键的时间账：车速 120 km/h ≈ 33 m/s。<strong>如果 60 m 才检出，你只有 1.8 秒</strong>去完成「多帧确认 → 决策 → 执行」。而多帧确认本身要花 5–8 帧（0.17–0.27 s），留给规控的时间就更少了。<em>这就是为什么「首次检出距离」是 TSR 最重要的工程指标之一（模块 05 会把它做成正式指标）。</em></p>  <table>
+    <thead><tr><th>成因层次</th><th>具体机制</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>传感器</strong></td><td>焦距不足、分辨率不足、ISP 在弱纹理小目标上做了过度降噪</td><td><strong>加长焦相机</strong>（广角负责近距离与大 FOV，长焦负责远距离）；调 ISP 的降噪强度；用 RAW 而非 ISP 后的图训练</td></tr>
+      <tr><td><strong>模型</strong></td><td>stride 太大（stride 32 上 16 px 的牌只占 0.5 格）；正样本分配用固定 IoU 阈值 → 小目标几乎分不到正样本</td><td><strong>加 P2 层（stride 4）</strong>；ATSS/SimOTA 等自适应分配；<strong>NWD</strong> 等对尺度不敏感的度量（详见 C57）</td></tr>
+      <tr><td><strong>数据</strong></td><td>训练集中小目标实例少；标注在小尺寸上本身就带噪（±2 px 对 16 px 框是 12% 的相对误差）</td><td>小尺度采样 + Mosaic 制造更多小目标；<strong>copy-paste 稀有小目标</strong>；对极小框做标注复核</td></tr>
+      <tr><td><strong>推理策略</strong></td><td>整图一次前向，小目标的相对尺寸太小</td><td><strong>ROI 裁剪</strong>（只精检消失点附近 / 图像上半部分）；两级级联（低分辨率找 ROI → 高分辨率精检）；SAHI 式切片（车端代价偏高）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>ROI 裁剪是量产系统里性价比最高的一招，而且几乎没人在论文里写。</strong>交通标志几乎总是出现在图像的特定区域：地平线上方一带、道路两侧、龙门架上。<em>只在这个 ROI 上跑一个高分辨率分支，算力开销可能只有全图的 1/6，却把该区域的有效分辨率翻倍。</em>先验来自车道线、消失点估计，或高精地图。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要清楚它的失效条件：<strong>ROI 先验错了就是系统性漏检，而且是最难发现的那种</strong>——上坡、下坡、急弯、颠簸时地平线位置会大幅偏移；施工期的临时牌可能放在地面上；匝道汇入处的牌位置不规则。<em>正确做法是 ROI 只用来「分配更多算力」，而不是「排除区域」</em>：全图仍然跑一个低分辨率检测作为兜底，ROI 内额外跑高分辨率。<strong>这个「先验只做加法不做减法」的原则，可以迁移到所有基于先验的加速方案。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个必须提前建立的判断：<strong>把「不可修的失败」与「可修的失败」分开统计</strong>。100 m 外 10 px 的牌漏检，是物理下界问题，写进 backlog 只会浪费评审时间；而 40 m 处 25 px 的牌漏检，是实实在在的模型问题。<em>做失效分析时，第一件事就是按像素尺寸分桶，把物理下界那一段单独圈出来</em>——否则你的「漏检率 18%」这个数字里，可能有一半是不可修的，导致所有优先级排序都失真。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="occlusion"><span class="num">3</span>失效源 2：遮挡与截断</h2>
+  <p>遮挡是第二大失效源，且它有一个让人不舒服的性质：<strong>它无法通过「更好的模型」根本解决</strong>——被树叶盖住一半的限速牌，信息真的少了一半。能做的是让模型在部分信息下仍给出正确判断，并让时序去补齐。</p>  <table>
+    <thead><tr><th>遮挡类型</th><th>典型场景</th><th>特点</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>植被遮挡</strong></td><td>行道树枝叶在夏季长到牌前</td><td><strong>季节性</strong>、局部、纹理高频；同一位置的牌在冬天正常、夏天被挡</td><td>训练时合成随机高频遮挡块；<strong>时序累积</strong>（车在移动，遮挡角度变化，总有一帧能看清）；地图先验（这个位置本来就有牌）</td></tr>
+      <tr><td><strong>车辆遮挡</strong></td><td>前方大车（卡车/公交）挡住路侧牌</td><td><strong>大面积、连续多帧</strong>——这是最难的一类，时序也救不了</td><td>换道后重新观测；<strong>依赖地图与车道级先验</strong>；接受「在跟车时降级」并让下游知道（置信度传递）</td></tr>
+      <tr><td><strong>杆件/结构遮挡</strong></td><td>龙门架、路灯杆、另一块牌挡住部分</td><td>位置固定、遮挡形状规则</td><td>训练中加入这类样本；<strong>标注规范必须明确「遮挡多少还算有效目标」</strong></td></tr>
+      <tr><td><strong>截断</strong></td><td>牌在图像边缘只露出一部分</td><td>常见于近距离大牌、急弯</td><td>边缘样本单独建桶评测；<strong>不要在训练时无脑丢弃截断样本</strong>——推理时它们真实存在</td></tr>
+      <tr><td><strong>自遮挡 / 视角</strong></td><td>牌面与视线夹角大（路口侧向牌、匝道牌）</td><td>透视畸变严重，牌变成窄条</td><td>透视增强（小角度）；<strong>但不要过度</strong>——极端斜视角的牌本来就不该管我方车道（见第 7 节）</td></tr>
+    </tbody>
+  </table>  <h3>标注规范：遮挡处的隐形分歧</h3>  <p><strong>遮挡最大的坑不在模型，在标注规范。</strong>「牌被挡住 60% 还标不标」这个问题，如果规范没写死，会产生两个后果：</p>  <ul>
+    <li><strong>训练标签自相矛盾</strong>：同一种情况一半标了一半没标 → 模型收到互相冲突的监督 → 学出一个「随机决定要不要报」的行为，表现为<em>置信度在阈值附近震荡、时序上闪烁</em>。</li>
+    <li><strong>评测口径漂移</strong>：新一批标注的规范略有变化，模型指标就变了，但你以为是模型变了。<em>这是「指标涨了但路测没感觉」的常见成因。</em></li>
+  </ul>  <p>正确做法是把遮挡度做成<strong>显式属性</strong>（如 0–25% / 25–50% / 50–75% / &gt;75% 四档）而不是二元的「标/不标」，评测时按遮挡度分桶。<em>这样规范争议变成了一个可以在评测阶段调整的参数，而不是一个污染训练数据的隐形分歧。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>遮挡场景里最值得讲的一条工程直觉是：<strong>TSR 的遮挡有一个行人跟踪没有的巨大优势——标志是静止的，自车在动</strong>。这意味着遮挡关系随时间必然变化（除非被前车持续遮挡）。<em>所以「单帧被挡住」不等于「这块牌检不到」，只要时序模块设计得当，一次穿越过程中总有若干帧能看清。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>把它形式化：设某帧能看清的概率为 <code>q</code>，且各帧近似独立，则 <code>K</code> 帧内至少看清一次的概率是 <code>1 − (1−q)^K</code>。<em>q = 0.3、K = 10 时已经是 97%。</em><strong>这就是为什么 TSR 的时序融合收益远大于通用检测</strong>（模块 04 的主题）。但要注意独立性假设在<strong>车辆遮挡</strong>下严重失效——前车会连续挡几十帧，此时 K 帧之间高度相关，公式给出的乐观估计是错的。<em>识别「哪些失效模式是时序可救的、哪些不是」，本身就是一个重要的分类维度。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把遮挡的对策排个序，可迁移到很多任务：<strong>① 让单帧更鲁棒（合成遮挡增强）→ ② 让时序补齐（多帧融合）→ ③ 让先验兜底（地图/位置先验）→ ④ 让下游知道（降低置信度并传递）</strong>。<em>注意第 ④ 条常被跳过，但它是安全系统的底线</em>——当感知确实看不清时，正确的行为不是硬猜，而是<strong>诚实地报告不确定</strong>，让下游选择保守策略。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="light"><span class="num">4</span>失效源 3：光照——逆光、隧道口、夜间与眩光</h2>
+  <p>光照类失效有一个共同的根因，而且它<strong>不在模型里，在相机与 ISP 里</strong>：车载相机的动态范围有限，而真实道路场景的动态范围经常超出它一到两个数量级。<em>当传感器已经把信息丢掉（过曝为纯白 / 欠曝为纯黑），任何模型都救不回来。</em></p>  <div class="ascii">场景动态范围 vs 传感器动态范围（示意，单位：EV 档）
+
+  隧道出口正午:   洞内 |■■■■|                          洞外 |■■■■■■|
+                       ← ~14 EV 跨度 ───────────────────────→
+  传感器(单次曝光):        |■■■■■■■■■■|  ~10 EV
+                              ↑ 曝光锁在这里 → 洞外全白（过曝）
+                              ↓ 曝光锁在那里 → 洞内全黑（欠曝）
+
+  夜间对向远光:   路面 |■|                  灯头 |■■■■■■■■|
+                        ← ~16 EV，且**灯就在牌旁边** →
+                        自动曝光被灯拉低 → 标志沉入噪声
+
+  对策链：
+    HDR 多帧合成 ─▶ 局部色调映射 ─▶ 训练数据必须含这些工况的**真实**样本
+         ↑                              ↑
+      硬件/ISP 层                    数据层（合成只能补一部分）</div>  <table>
+    <thead><tr><th>工况</th><th>物理机制</th><th>在图上表现为</th><th>成因归属</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>逆光 / 迎着太阳</strong></td><td>太阳在牌后方；标志正面处于阴影，背景极亮</td><td>牌变成剪影，颜色信息几乎全丢（红/蓝分不出）</td><td><strong>传感器 + ISP</strong>为主</td><td>HDR / 多曝光；训练加入逆光真实样本；<strong>降低对颜色的依赖</strong>（形状 + 内容也要能判）</td></tr>
+      <tr><td><strong>隧道出入口</strong></td><td>10+ EV 的瞬间跨度；且自动曝光有 0.3–1 s 的收敛延迟</td><td><strong>进洞瞬间全黑、出洞瞬间全白，持续若干帧</strong></td><td><strong>ISP 曝光控制</strong>（不是模型）</td><td>曝光预测（用地图/前视预判即将进洞）；这段时间<strong>主动降级并告知下游</strong>；靠时序在过渡前后的帧上补</td></tr>
+      <tr><td><strong>夜间</strong></td><td>照度低 → 高 ISO → 噪声大；标志靠反光膜回光，亮度依赖车灯照射角</td><td>低信噪比；远处标志几乎不可见；反光膜近距离可能<strong>过曝成一团白</strong></td><td><strong>传感器 + 数据</strong></td><td>低光合成增强（gamma + 泊松噪声 + 量化）；<strong>夜间数据必须真采</strong>，合成补不全；近距离过曝要单独建样本</td></tr>
+      <tr><td><strong>眩光 / 光晕</strong></td><td>对向远光、路灯、镜头内反射（lens flare）、雨夜路面反射</td><td>大面积光晕覆盖标志；<strong>光斑本身可能被误检成圆形标志</strong></td><td><strong>传感器 + 模型</strong></td><td>合成 flare 增强；把光斑作为 hard negative 加入 background 类；镜头镀膜/遮光罩（硬件）</td></tr>
+      <tr><td><strong>斑驳树影</strong></td><td>阳光透过树冠在牌面形成高对比条纹</td><td>牌面被切成明暗块，破坏颜色与内容的一致性</td><td><strong>数据 + 模型</strong></td><td>合成条纹阴影增强；局部对比度归一化</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>光照类失效最重要的判断是「这一类到底该谁修」。</strong>如果隧道口的问题是自动曝光收敛慢，那么再多的训练数据也只能缓解症状；正确的修法是<em>让 ISP 团队做曝光预判</em>（甚至用感知输出反过来指导曝光——这在量产系统里叫 perception-in-the-loop AE）。<em>把一个 ISP 问题当成模型问题去解，是感知团队最常见的资源浪费。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>而判断归属的方法是可操作的：<strong>看输入图像里信息还在不在。</strong>把失败帧调出来，如果标志区域已经是纯白（像素值饱和到 255）或纯黑（接近 0、方差极小），那就是传感器/ISP 丢了信息，模型不可能恢复；如果人眼在原图上能认出来而模型认不出来，那才是模型或数据的问题。<em>这个「人眼可读性检查」应该成为失效分析的标准第一步</em>——它能在几分钟内把一批 badcase 分成「不可修」「ISP 修」「模型修」三堆。<strong>面试里被问「你怎么分析 badcase」，先讲这个分诊步骤，比直接跳到「加数据」高明得多。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>夜间有一个反直觉的失效：<strong>近距离的反光标志会过曝成一团白</strong>。反光膜（retroreflective sheeting）会把车灯几乎原路反射回来，在近距离形成极高亮度。<em>结果是「远处太暗看不见、近处太亮糊成白块」，中间只有一小段窗口可用。</em>训练数据里如果只有白天样本，模型对这两种极端都毫无准备。<strong>这也是「夜间数据必须真采，不能只靠 gamma 变换合成」的直接理由</strong>——合成的低光图像不会产生反光膜过曝。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="weather_motion"><span class="num">5</span>失效源 4：天气与运动——雨雾雪、运动模糊、卷帘快门</h2>
+  <p>这一组的共同点是：<strong>它们都在图像形成的物理过程里引入了确定性的退化，因此都可以被相当准确地合成</strong>——这使它们成为「合成增强性价比最高」的一类失效模式。</p>  <h3>① 雨雾雪：大气散射模型</h3>  <p>雾的成像可以用经典的大气散射模型（atmospheric scattering model）描述：</p>  <div class="math-block">\[I(x) \;=\; J(x)\,t(x) \;+\; A\bigl(1 - t(x)\bigr), \qquad t(x) = e^{-\beta d(x)}\]</div>  <p>其中 <code>I</code> 是观测图像、<code>J</code> 是无雾的真实场景、<code>A</code> 是大气光（通常接近白色）、<code>t</code> 是透射率、<code>β</code> 是散射系数、<code>d</code> 是深度。<strong>关键结论直接从公式读出来：对比度随距离指数衰减。</strong></p>  <table>
+    <thead><tr><th>现象</th><th>对 TSR 的具体影响</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>雾/霾</strong></td><td><code>t = e^(−βd)</code> ⇒ 远处标志的对比度指数衰减；<strong>颜色向大气光 A 偏移</strong>（红牌变粉、蓝牌变灰）——而颜色是 TSR 的一级语义</td><td>按物理模型合成雾（需要深度先验，可用「y 坐标越靠近地平线越远」的粗估）；<strong>去雾预处理的收益有限且会放大噪声</strong>，通常不如直接用含雾数据训练</td></tr>
+      <tr><td><strong>雨</strong></td><td>雨条纹（rain streaks）叠加高频噪声；<strong>雨滴附着在镜头上会形成持续多帧的局部模糊斑</strong>——这一类比雨本身更致命，因为它不随时间变化</td><td>合成雨条纹（有向运动模糊的亮线）；镜头水珠要单独合成（局部径向模糊 + 折射位移）；硬件上靠加热/疏水镀膜</td></tr>
+      <tr><td><strong>雪</strong></td><td>雪片遮挡（类似动态遮挡）；<strong>积雪覆盖牌面</strong>——这是真正的信息丢失；地面积雪造成整体高亮，自动曝光被拉低</td><td>雪片合成（随机白斑 + 运动拖尾）；积雪牌需要真实数据；接受在此工况下降级</td></tr>
+      <tr><td><strong>路面湿滑反射</strong></td><td>夜雨时路面像镜子，反射的灯光与标志形成<strong>虚像</strong> → 误检</td><td>把反射虚像作为 hard negative；用位置先验（地平线以下的「标志」高度可疑）</td></tr>
+    </tbody>
+  </table>  <h3>② 运动模糊与卷帘快门</h3>  <p>这两个常被混为一谈，但成因与表现完全不同，<strong>面试里能分清是加分项</strong>：</p>  <table>
+    <thead><tr><th></th><th>运动模糊 (motion blur)</th><th>卷帘快门 (rolling shutter)</th></tr></thead>
+    <tbody>
+      <tr><td>成因</td><td>曝光时间内目标在成像面上移动 → 能量被涂抹</td><td>CMOS 逐行读出，行与行之间有时间差 → 不同行看到的是不同时刻的场景</td></tr>
+      <tr><td>数学</td><td>与一个有向线段核卷积：<code>I_blur = I ⊛ k(θ, L)</code>，<code>L = v·t_exp</code>（像素/曝光）</td><td>第 <code>r</code> 行的时刻是 <code>t₀ + r·Δt</code> → 目标位置随行号线性偏移 → <strong>几何形变（斜切）</strong></td></tr>
+      <tr><td>表现</td><td>标志边缘拖尾、数字糊成一团；<strong>低照度下更严重</strong>（曝光时间被拉长）</td><td>垂直杆件变斜、圆牌变椭圆；<strong>快速横向运动或强振动时明显</strong></td></tr>
+      <tr><td>对 TSR</td><td>细节丢失 → 错分（尤其数字）；边缘模糊 → 定位不准</td><td><strong>框的形状被扭曲 → 定位不准 + 尺寸估计错 → 距离估计错</strong></td></tr>
+      <tr><td>对策</td><td>合成有向模糊核增强；<strong>缩短曝光</strong>（代价是更多噪声——这是一个真实的 ISP 取舍）</td><td>合成行相关的位移；<strong>用全局快门传感器</strong>（成本高）；标定 <code>Δt</code> 后做几何校正</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>运动模糊有一个容易被忽略的量级问题：<strong>相对运动速度决定模糊长度，而 TSR 的相对速度极高。</strong>120 km/h 时自车 33 m/s，但标志在图像上的移动主要来自「越来越近」造成的尺度变化与横向掠过。<em>正对前方的标志在图像上移动很慢（这是好消息），而路侧近距离掠过的标志移动极快</em>——所以模糊主要伤害「近距离侧向牌」，而近距离本该是最容易的场景。<strong>这解释了一个反直觉的观测：某些系统的错分率在最近的距离桶里反而回升。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>卷帘快门的量级值得亲手算一遍，因为<strong>直觉会严重高估它</strong>。全帧读出确实要 10–30 ms，但<em>一块只占 16 行的小牌，其首末行的时间差只有 <code>T·h/H = 20 ms × 16/1080 ≈ 0.3 ms</code></em>——横向像速 200 px/s 时形变仅 0.06 px，完全可以忽略。<strong>真正让卷帘快门变危险的是另外三种情况</strong>：① <strong>颠簸与俯仰</strong>——角速度 ω 时形变约 <code>f·ω·T·h/H</code>，<em>ω = 2 rad/s（过减速带）时对 16 px 的牌就是约 1 px ≈ 6% 的尺度误差</em>，而 <code>Z = f·S/p</code> 是反比关系 ⇒ <strong>直接变成 6% 的距离误差</strong>；② 近距离大牌跨越大量行；③ <strong>LED 电子牌与逐行读出的相位干扰</strong>（下一节展开）。<em>「先算出量级再决定要不要管」这个习惯，比记住「卷帘快门有害」有用得多。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>这一整节可以浓缩成一条判断：<strong>凡是能写出物理模型的退化，都应该用合成增强去覆盖；凡是写不出物理模型的（积雪覆盖、涂鸦、褪色），都必须真采数据。</strong><em>雾、运动模糊、卷帘快门、低光噪声都属于前者——它们的合成成本极低而覆盖收益极高；而后者只能靠数据闭环去挖。</em>这条判据可以直接用来分配你的数据预算。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="appearance_fp"><span class="num">6</span>失效源 5：外观退化与误检源</h2>
+  <p>前面几节讲的是「外部条件让牌看不清」，这一节讲两类更麻烦的问题：<strong>牌本身不标准</strong>，以及<strong>不是牌的东西长得像牌</strong>。</p>  <h3>① 褪色、破损、涂鸦、非标准牌</h3>  <table>
+    <thead><tr><th>现象</th><th>为什么难</th><th>成因归属</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>褪色</strong></td><td>红色禁令牌褪成橙粉色 → <strong>颜色这个一级判据失效</strong>；而模型往往过度依赖颜色（因为训练集里颜色是最强的捷径特征）</td><td><strong>数据</strong>（训练集里全是新牌）</td><td>颜色抖动增强（<em>但幅度要保守，过强会破坏语义</em>）；<strong>刻意采集老旧路段数据</strong>；评测时单独建「褪色」桶</td></tr>
+      <tr><td><strong>破损 / 弯折 / 被撞歪</strong></td><td>形状先验失效；圆牌变椭圆、三角牌缺角</td><td><strong>数据</strong></td><td>少量真实样本 + 几何形变增强；这类频率低，优先级通常不高</td></tr>
+      <tr><td><strong>涂鸦 / 贴纸覆盖</strong></td><td>牌面内容被局部改变，<strong>可能被改成另一个类别的样子</strong>（恶意场景下这是安全问题）</td><td><strong>数据 + 模型</strong></td><td>局部遮挡增强；<strong>依赖多帧一致性发现异常</strong>；极端情况应拒识而非硬猜</td></tr>
+      <tr><td><strong>非标准 / 地方性变体</strong></td><td>同一语义在不同省份/年代有不同版式；小尺寸牌、临时打印牌</td><td><strong>数据分布</strong></td><td>层次标签（先判粗类再判细类，粗类更鲁棒）；<strong>拒识 + 回传</strong></td></tr>
+    </tbody>
+  </table>  <h3>② 误检源：长得像牌的东西</h3>  <p><strong>误检不是随机的，它高度集中在少数几类「结构性诱因」上。</strong>把它们枚举出来，就能有针对性地构造 hard negative——这比泛泛地「加负样本」有效得多。</p>  <table>
+    <thead><tr><th>误检源</th><th>为什么像</th><th>为什么难以简单过滤</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>广告牌 / 店招</strong></td><td>矩形、高饱和度、常含数字与箭头；<strong>有些故意模仿交通标志的视觉语言</strong></td><td>尺寸与位置分布和真牌重叠；单帧上下文不足</td><td><strong>最有价值的 hard negative 来源</strong>——用当前检测器在路测视频上挖；加入 background 类；位置先验（广告牌通常更大更高或在建筑立面上）</td></tr>
+      <tr><td><strong>车身贴纸 / 车尾标识</strong></td><td>限速贴纸（如货车尾部「限速 80」）、危化品标志牌尺寸与真牌接近</td><td><strong>它们真的是标志，只是不该被遵守</strong>——这是语义问题不是识别问题</td><td><strong>需要「附着于车辆」这个判据</strong>：与动态目标检测结果做关联，若框落在车辆框内则抑制；这是多任务融合的典型价值</td></tr>
+      <tr><td><strong>路面标线 / 地面限速数字</strong></td><td>同样的数字与颜色</td><td>语义上它们确实是限速信息，但位置与生效规则不同</td><td>位置先验（地平线以下）；单独建类而非归为标志</td></tr>
+      <tr><td><strong>光斑 / 交通灯 / 圆形物体</strong></td><td>圆形 + 高亮 + 红色</td><td>夜间尤其严重</td><td>作为 hard negative；<strong>用时序稳定性过滤</strong>（光斑随视角剧变，真牌稳定）</td></tr>
+      <tr><td><strong>反射虚像</strong></td><td>湿路面、玻璃幕墙上的标志倒影</td><td>外观几乎与真牌相同</td><td>位置先验 + <strong>几何一致性</strong>（虚像的运动模式与真实静止物不符）</td></tr>
+    </tbody>
+  </table>  <h3>③ 电子可变限速牌（VMS / 可变情报板）</h3>  <p>这是一个<strong>独立的、常被漏掉的失效类别</strong>，值得单独讲，因为它同时触碰了四象限里的多个格子：</p>  <ul>
+    <li><strong>成像问题</strong>：LED 屏是自发光的，与相机曝光/快门存在<em>频闪（flicker）与相位干扰</em>——某些帧可能拍到熄灭状态或部分扫描，表现为「数字缺笔画」甚至整块变暗。<em>这是纯粹的传感器-显示器同步问题，模型层面几乎无解，需要调整曝光时间使其为 LED 刷新周期的整数倍。</em></li>
+    <li><strong>语义问题</strong>：同一块物理牌在不同时刻显示不同数值 ⇒ <strong>「牌的身份」与「牌的内容」必须分开跟踪</strong>。跟踪 ID 保持不变，但类别属性会变——如果时序模块用「多帧投票决定类别」，遇到真实的变化就会反应迟钝甚至一直投旧值。</li>
+    <li><strong>优先级问题</strong>：电子牌通常<em>覆盖</em>固定牌与地图限速（因为它反映实时管控）。这条规则必须显式实现在下游（C59 模块 04 会展开），而 TSR 侧必须<strong>把「这是电子牌」作为一个属性输出</strong>，否则下游无从判断优先级。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 ② 和 ③ 放在一起会看到一个共同结论：<strong>很多「TSR 失效」根本不是识别错误，而是语义与关联错误。</strong>货车尾部的「限速 80」贴纸，模型「认对了」——它确实是一块写着 80 的限速标志；错的是把它当成了适用于本车的路侧标志。<em>同理，电子牌被正确识别为「限速 60」也可能是错的，如果系统不知道它是电子牌因而没有正确处理优先级。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这引出 TSR 输出契约的一条硬性要求：<strong>除了类别，必须输出属性（是否电子牌、是否附着于车辆、是否临时牌）与关联信息（适用车道/方向）</strong>。<em>只输出「类别 + 框 + 分数」的 TSR 模块，在量产系统里是不合格的</em>——它把大量语义判断的责任推给了没有像素信息的下游。<strong>这也是模块 02 里「TSR 不是一个检测器，是一条链路」那个论断的具体兑现。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">跟车时被货车贴纸限速</span>
+    <p>车身贴纸这一类值得单独警惕，因为它的失效有<strong>系统性偏差</strong>：跟在货车后面时持续存在、且高度可复现。一旦模型学会了「货车尾部的限速数字也算数」，用户会在每次跟车时被莫名限速。</p><p><strong>对策是跨任务关联而非更多数据</strong>：把 TSR 的框与动态目标检测（车辆）的框求 IoU，落在车辆框内的标志一律抑制或降级。<em>这是「感知模块之间应该互相利用」的最典型例子</em>——单靠 TSR 自己的像素信息，几乎无法可靠区分「贴在卡车上的牌」与「路侧的牌」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="association"><span class="num">7</span>失效源 6：关联与歧义——「这块牌管不管我」</h2>
+  <p>这是<strong>整个模块最容易被低估的一类失效</strong>，因为它在传统检测指标上完全不可见：框对了、类别对了、mAP 满分，系统行为却是错的。<em>它的本质是「检测正确 ≠ 应当采纳」。</em></p>  <div class="ascii">俯视图：一个典型的匝道/辅路场景
+
+        对向车道                      本车道                辅路
+      ┌────────────┬─────────────────┬──────────────┐
+      │  ←         │        ↑        │      ↑       │
+      │  [限速40]  │     [限速80]    │   [限速30]   │
+      │   ▲ 对向牌 │      ▲ 我的牌   │    ▲ 辅路牌  │
+      └────────────┴─────────────────┴──────────────┘
+                          🚗 我在这
+
+  单帧图像里这三块牌可能同时出现，而且**对向牌与辅路牌常常更靠近图像中心**
+  （因为道路曲率、相机安装角）——**「离图像中心近」不是「适用于我」的证据**。
+
+  正确的关联需要：车道级定位 + 牌的横向位置 + 朝向 + 高精地图先验</div>  <table>
+    <thead><tr><th>歧义类型</th><th>错误行为</th><th>为什么单帧解决不了</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>对向车道标志</strong></td><td>采纳了对向的限速/禁令</td><td>对向牌的<em>背面</em>常常也能看到；分隔带窄时正面也可见。单帧只有一个 2D 框，没有朝向信息</td><td><strong>牌面朝向估计</strong>（背面 = 无内容的灰/白面，应作为独立类别检出并显式忽略）；横向位置 + 车道关联；<strong>时序上对向牌的相对运动速度约为本侧的两倍</strong>——这是一个可用的判据</td></tr>
+      <tr><td><strong>辅路 / 匝道标志</strong></td><td>主路上采纳了辅路的低限速</td><td>几何上非常接近，透视下难以区分</td><td><strong>高精地图 + 车道级定位</strong>是主力；纯视觉需要判断牌所属的道路分支（依赖车道线/路沿的拓扑）</td></tr>
+      <tr><td><strong>出口/分岔前的方向性标志</strong></td><td>把「出口限速」当成主路限速</td><td>标志本身语义正确，错的是适用范围</td><td>识别附加的方向箭头/文字附加牌；<strong>与导航路径规划耦合</strong>（我要不要下这个出口）</td></tr>
+      <tr><td><strong>临时施工牌</strong></td><td>忽略（认为是非标准牌）或位置关联错误</td><td>版式非标准、位置不规则（可能放在车道内、地面上、护栏上）；<strong>地图先验此时是错的</strong></td><td><strong>临时牌必须优先于地图</strong>；专门采集施工场景；把「临时/移动式」作为属性输出</td></tr>
+      <tr><td><strong>区域性标志歧义</strong></td><td>同一形状在不同国家/地区含义不同</td><td>训练集若混合多地区数据而无地区标签，模型会学出一个平均的、两边都不对的解</td><td><strong>把地区作为条件输入</strong>（或按地区训练不同的分类头）；用定位确定当前地区；层次标签让粗类跨地区共享</td></tr>
+    </tbody>
+  </table>  <h3>为什么 mAP 完全看不见这一类</h3>  <p>因为标准检测评测只问「框和类别对不对」，不问「该不该采纳」。<strong>一个把对向车道限速 40 完美检出并上报的系统，在 mAP 上得满分，在路上会莫名其妙地减速。</strong></p>  <ul>
+    <li>这直接推出模块 05 的一个核心主张：<strong>必须有「采纳正确率」这一层指标</strong>——即最终上报给规控的约束里，有多少比例是真正适用于本车的。</li>
+    <li>也推出一条标注要求：<strong>标注时必须记录「该牌适用于哪条车道/哪个方向」</strong>，否则这个指标根本无法计算。<em>而这项标注成本高、争议大，常常在项目早期被砍掉，然后在量产前被迫补回来。</em></li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把关联问题讲透的一个好角度是：<strong>TSR 的输出是「对世界的观测」，而下游需要的是「对我的约束」——这两者之间隔着一次推理，而这次推理需要的信息（车道拓扑、朝向、地图）不在图像的那个小 crop 里。</strong><em>所以试图让检测器自己学会「这块牌管不管我」，通常是走错了方向</em>：它缺少必要的输入。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>正确的架构是<strong>把关联做成一个显式的、可测试的模块</strong>，输入是 TSR 的观测（框、类别、属性、朝向、横向位置）+ 车道线/路沿拓扑 + 定位与地图 + 导航路径，输出是「适用范围」。<em>这样它的错误可以被单独度量、单独回归、单独修复</em>，而不是混在检测指标里看不见。<strong>这与模块 02 的分解哲学是同一条：把统计性质不同的子问题拆开，你才获得分别优化它们的自由。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>区域性歧义有一个特别隐蔽的形式：<strong>数据集混合导致的「平均化」</strong>。若训练数据同时包含中国 GB 5768 与欧洲 Vienna 体系的样本，而没有地区标签，模型面对一个圆形红边白底的牌时，会在「禁止驶入」与「限速」之间学出一个折中的表示——<em>结果是在两个地区都不够可靠，而整体指标看起来还行</em>。<strong>面试里如果被问「跨国部署 TSR 要注意什么」，先讲这个「无条件混合导致平均化」的坑，再讲条件化（地区作为输入）与层次标签，答案就完整了。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="priority"><span class="num">8</span>把失效模式排成一张可执行的清单：频率 × 安全后果 × 修复成本</h2>
+  <p>到这里我们列了十几类失效模式。<strong>但列清单不是目的，排序才是。</strong>一个团队一个季度只能真正解决 2–3 个问题，剩下的都是噪声。所以必须有一个能把「工程师的直觉」变成「可以在评审会上被质疑与修正的数字」的方法。</p>  <h3>风险优先数（借用 FMEA 的思路）</h3>  <div class="math-block">\[\mathrm{Priority} \;=\; \frac{F \times S \times D}{C}\]</div>  <p>其中 <code>F</code> = 发生频率（每千公里出现次数，或占里程的比例）、<code>S</code> = 安全后果严重度（1–10）、<code>D</code> = 可检出性的<em>倒数</em>（越难被系统自己发现越高——静默失败要加权）、<code>C</code> = 修复成本（人月，或含硬件改动的折算）。<strong>把除以成本这一步做出来，是这个公式和「拍脑袋排序」的关键区别。</strong></p>  <table>
+    <thead><tr><th>失效模式</th><th>F 频率</th><th>S 安全后果</th><th>D 静默性</th><th>C 成本</th><th>优先级</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td><strong>远距漏检（40–70 m）</strong></td><td>高</td><td><strong>高</strong>（超速）</td><td>高（静默）</td><td>中</td><td><strong>★★★★★</strong></td><td>可修区间，收益最大</td></tr>
+      <tr><td><strong>货车贴纸误检</strong></td><td>中</td><td>中（幽灵刹车）</td><td>低（用户投诉）</td><td><strong>低</strong>（跨模块关联即可）</td><td><strong>★★★★★</strong></td><td><em>低成本高收益，先做</em></td></tr>
+      <tr><td><strong>限速数字混淆 60/80</strong></td><td>中</td><td><strong>高</strong></td><td>高</td><td>低（补数据+改采样）</td><td><strong>★★★★☆</strong></td><td>集中在少数相似对上</td></tr>
+      <tr><td><strong>隧道口过渡帧</strong></td><td>低-中</td><td>中</td><td>中</td><td><strong>高</strong>（要 ISP 配合）</td><td>★★★☆☆</td><td>跨团队，周期长</td></tr>
+      <tr><td><strong>对向车道误采纳</strong></td><td>中</td><td>中-高</td><td><strong>高</strong>（mAP 看不见）</td><td>高（需地图+朝向）</td><td>★★★★☆</td><td>架构性问题，要立项</td></tr>
+      <tr><td><strong>积雪覆盖牌面</strong></td><td><strong>极低</strong>（地域性）</td><td>中</td><td>中</td><td>高（只能真采）</td><td>★☆☆☆☆</td><td><em>接受降级，写进 ODD</em></td></tr>
+      <tr><td><strong>100 m 外漏检</strong></td><td>高</td><td>低（还很远）</td><td>高</td><td><strong>不可修</strong>（物理下界）</td><td>—</td><td><em>不该进 backlog</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这张表里最值得学的是<strong>最后两行</strong>。「积雪覆盖」的正确处理不是修，而是<strong>写进 ODD（Operational Design Domain，运行设计域）——明确声明系统在此工况下降级</strong>，并确保降级行为是安全的（提示接管而非硬猜）。<em>「承认做不到」是安全系统设计的一部分，不是失败。</em>而「100 m 外漏检」是物理下界，把它放进 backlog 只会消耗评审带宽。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第二个要点是 <code>D</code>（静默性）这一列，它常被遗漏。<strong>能被用户投诉或线上指标捕获的失效，其实是「便宜」的</strong>——你会知道它、会持续监控它。而漏检、错误关联这类静默失败，只有你主动去构造回归集才能看见，<em>因此在优先级里必须给它们额外的权重</em>。<strong>这也是为什么 D 出现在分子上：越难被发现的失效，越应该优先投入，因为它的真实代价被系统性低估了。</strong></p></div>
+  </div>  <h3>从优先级到行动：每一类失效对应一条闭环</h3>  <div class="ascii">失效模式          → 触发器（怎么在车队里找到它）      → 数据动作          → 验证方式
+─────────────────────────────────────────────────────────────────────────────
+远距漏检          跟踪回溯：近处确认的牌，回放前 N 帧     定向采集+小目标增强   按像素尺寸分桶的召回
+                  看它最早在哪一帧才被检出                 copy-paste 小牌      「首次检出距离」中位数
+
+货车贴纸误检      检测框与车辆框 IoU &gt; 0.5 的标志         加入 background 类    FP/km（跟车场景切片）
+                                                          + 跨模块抑制规则
+
+限速数字混淆      多帧类别跳变（60↔80）                   相似对定向标注        逐对混淆矩阵
+                  + top1−top2 margin 小                    + 难例挖掘
+
+对向车道误采纳    上报的约束与地图/导航不一致              标注「适用车道」      采纳正确率（新指标）
+
+隧道口            场景标签=tunnel 的帧上分数骤降          真采隧道数据          分场景切片指标
+                                                          + ISP 曝光预判        + 过渡帧数统计</div>  <p><strong>这张图是本模块的最终产物</strong>：它把「失效模式」从一个描述性的清单，变成了一套「触发器 → 数据动作 → 验证指标」的可执行流程。<em>每一行都可以直接变成一个季度的工作项，并且完成时有明确的验收标准。</em></p>  <div class="callout intuition"><span class="label"></span>
+    <p>面试里遇到「<strong>你怎么分析 TSR 的 failure case</strong>」这个问题（JD 里那条职责的直接考法），一个能立刻拉开差距的答案结构是：</p><p><strong>① 先分诊</strong>——四象限 + 人眼可读性检查，把 badcase 分成「不可修 / 传感器修 / 数据修 / 模型修 / 关联修」；<strong>② 再分桶</strong>——按距离、光照、天气、遮挡度切片，找出集中的那一两个桶；<strong>③ 再归因</strong>——用误差分解算出「修好每一类能涨多少」；<strong>④ 再排序</strong>——频率 × 后果 × 静默性 ÷ 成本；<strong>⑤ 最后给闭环</strong>——每一类配一个触发器、一个数据动作、一个验证指标。</p><p><em>大多数候选人会直接跳到「加数据」，而这五步里「加数据」只是第四步之后的一个可能动作。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>失效分析这件事本身正在从「人工看 badcase」变成「自动化的挖掘与归因」。下面几个方向值得跟踪。</p>  <ul>
+    <li><strong>用 VLM 做失效模式的自动标注与聚类</strong>。给定一批 badcase，让视觉-语言模型描述「这张图为什么难」（逆光/遮挡/模糊/褪色），再对描述做聚类，就能自动得到失效模式的分布。<em>这是 JD 里「automated data mining workflows」最现实的落点</em>，也是目前工业界推进最快的方向（C58 模块 04 会实现一个简化版）。开放问题是：VLM 的描述本身有偏差与幻觉，如何验证它的归因是对的。</li>
+    <li><strong>失效预测（failure prediction / introspection）</strong>：让模型输出「我现在可能不可靠」而不是等到错了再发现。与不确定性估计相关，但目标不同——它要预测的是<em>系统级</em>失败而不是单个预测的置信度。对静默失败（漏检）尤其重要，因为漏检没有任何输出可供打分。</li>
+    <li><strong>对抗性与物理攻击</strong>：在标志上贴特定图案就能让识别翻转（Eykholt et al. 的 <em>Robust Physical Perturbations</em> 是经典工作）。<em>与「涂鸦」失效的边界是模糊的</em>——一个足够像涂鸦的攻击很难与自然退化区分。目前的现实防御主要靠时序一致性与多传感器/地图交叉验证，而非模型本身的鲁棒性。</li>
+    <li><strong>合成数据与仿真的域差</strong>：雾、雨、低光可以物理建模，但 ISP 处理链（去噪、锐化、色调映射、局部对比度增强）会把物理上正确的合成图变成与真实相机输出不同的东西。<em>「在 ISP 之前还是之后做增强」是一个尚无定论但影响很大的工程问题。</em></li>
+    <li><strong>失效模式的因果归因</strong>：目前的分桶分析只能给出相关性（「夜间桶指标低」），但夜间同时意味着低照度、眩光、车流少、路段类型不同。<em>如何把这些混杂因素解开，从而知道「到底是哪一个因素导致了下降」，是失效分析里最缺方法论的一环。</em>反事实/干预式的评测设计（在同一段路上只改变一个因素）是一个方向。</li>
+    <li><strong>长尾失效的评测统计学</strong>：某个失效模式一年只出现十几次，如何在统计上判断一次改动是否真的修好了它？<em>小样本 + 高代价场景的显著性判定，目前普遍靠「构造放大该场景比例的回归集」这一权宜之计</em>，其偏差如何校正尚无标准做法。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：<em>Bolya et al., TIDE: A General Toolbox for Identifying Object Detection Errors</em>（ECCV 2020，误差分解的标准工具，本模块四象限的定量化版本，必读）；<em>Hoiem et al., Diagnosing Error in Object Detectors</em>（ECCV 2012，误差分析方法论的开山之作）；<em>Zhu et al., Traffic-Sign Detection and Classification in the Wild</em>（CVPR 2016，TT100K，含小目标与长尾的失效讨论）；<em>Eykholt et al., Robust Physical-World Attacks on Deep Learning Visual Classification</em>（CVPR 2018，标志上贴纸即可翻转识别）；<em>He et al., Single Image Haze Removal Using Dark Channel Prior</em>（CVPR 2009，大气散射模型的经典应用）；卷帘快门可读 <em>Meingast et al., Geometric Models of Rolling-Shutter Cameras</em>。相邻课程：C56（增强，含天气与模糊合成）、C57（小目标）、C58（难例挖掘与触发器）、C61（误差分析工程）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_pipeline/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · TSR 系统设计：两级 vs 端到端</div></a>
+    <a class="next" href="../04_temporal/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 时序与多帧融合：从单帧检测到稳定输出</div></a>
+  </div>
+
+</div>
+</body>
+</html>

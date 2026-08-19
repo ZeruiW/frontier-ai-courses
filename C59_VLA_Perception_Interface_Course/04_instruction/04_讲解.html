@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 交通规则的指令跟随与约束化</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 交通规则的指令跟随与约束化</h1>
+  <p class="subtitle">把标志语义翻译成可执行约束：限速牌 → 速度上限；禁左 → 轨迹候选屏蔽；停车让行 → 「速度必须过零」的时空约束 · <strong>约束的作用域与生命周期（从哪里开始生效、到哪里失效、被什么解除）是 TSR 下游最容易出错的地方</strong>——漏掉一块「解除限速」标志，车会一路按 40 km/h 开上高速；而错误地提前解除，则是直接的超速违规 · 规则冲突的优先级链：临时施工牌 &gt; 可变电子牌 &gt; 固定标志 &gt; 地图限速 &gt; 默认路网限速，并且<em>时效性可以反超优先级</em> · 思维链越长越准也越慢 → 快慢双系统的分工与切换条件 · <strong>VLA 的输出必须经过一层规则与安全兜底（可行性、动力学、法规硬约束），这是量产红线</strong>，不是「等模型更强了就能去掉」的临时补丁</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 03（TSR→VLA 接口与序列化 schema）；C55 模块 04（跟踪与迟滞状态机）；不需要控制理论基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_traffic_rule_following.ipynb（纯 numpy + 标准库，约束状态机 / 冲突消解 / 安全兜底层）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">RSS (Shalev-Shwartz et al.) · Signal Temporal Logic 规划 · DriveVLM · EMMA · Vienna 公约与 GB 5768</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 80 分钟 + 跑 70 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why-constraint">从「认出标志」到「能执行」：为什么必须显式约束化</a></li>
+      <li><a href="#taxonomy">约束的类型学：四类约束与「可投影性」</a></li>
+      <li><a href="#lifecycle">作用域与生命周期：本节是全课最容易出事故的地方</a></li>
+      <li><a href="#conflict">冲突与优先级：三个维度，外加一条兜底规则</a></li>
+      <li><a href="#explain">可解释输出：解释必须来自约束层，不能来自语言模型</a></li>
+      <li><a href="#fast-slow">思维链与延迟的矛盾：快慢双系统与「时空提前量」</a></li>
+      <li><a href="#safety">安全兜底：VLA 输出必须过校验——这是量产红线</a></li>
+      <li><a href="#interview">面试标准答案骨架</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why-constraint"><span class="num">1</span>从「认出标志」到「能执行」：为什么必须显式约束化</h2>
+  <p>先把这一节在整门课里的位置钉死。模块 03 解决的是「TSR 的输出<em>怎么进</em> VLA」。这一节解决的是紧接着的下一个问题：<strong>VLA 读到「前方限速 60」之后，车到底该做什么，以及这件事由谁负责、怎么验证。</strong></p>  <p>这是 JD 里 <em>traffic-sign-aware instruction following</em> 那条职责的正面战场。而它的第一个反直觉结论是：<strong>量产系统里，绝大多数「标志相关」的线上问题，根因都不是把标志认错了。</strong></p>  <table>
+    <thead><tr><th>线上问题现象</th><th>常见的第一反应</th><th>真实根因分布（工业系统的典型经验）</th><th>归属</th></tr></thead>
+    <tbody>
+      <tr><td>高速上车速被压在 60</td><td>「检测把 120 认成 60 了」</td><td>更常见的是：<strong>进匝道时读到的 60 限速牌，出匝道后没有被解除</strong></td><td><strong>约束生命周期</strong></td></tr>
+      <tr><td>路口后突然减速</td><td>「误检了一块限速牌」</td><td>更常见的是：<strong>对向车道 / 辅路的标志被关联到了本车道</strong></td><td><strong>约束作用域</strong></td></tr>
+      <tr><td>施工区不减速</td><td>「施工牌漏检」</td><td>也可能是：<strong>施工临时牌与固定限速牌冲突时优先级判反了</strong></td><td><strong>冲突消解</strong></td></tr>
+      <tr><td>停车让行牌前只减速不停</td><td>「模型没懂 STOP」</td><td>更常见的是：<strong>把「完全停止」实现成了「速度低于阈值」</strong></td><td><strong>约束语义</strong></td></tr>
+      <tr><td>认错限速数值</td><td>「模型不行」</td><td>确实是感知问题，但在总量里往往<strong>不是最大的一块</strong></td><td>感知</td></tr>
+    </tbody>
+  </table>  <p>这张表要传达一件事：<strong>「标志 → 动作」这条链路上，感知只占前三分之一，中间那段「语义 → 可执行约束」的翻译工作才是 bug 的高发区，而且它几乎从不被当成一个独立模块认真设计。</strong>本节要做的就是把它变成一个有类型、有状态、可单测、可回归的一等公民。</p>  <h3>三级翻译：感知语义 → 规范语义 → 可执行约束</h3>  <div class="ascii">① 感知语义（TSR 输出，模块 03 的 schema）
+   {class: "speed_limit_60", conf: 0.93, track_id: 47,
+    bbox_px: [...], range_m: 82.4, lane_assoc: "ego", first_seen_t: 12.4}
+   ← 这是「我看见了什么」。它**不是**指令，也**不是**约束。
+
+② 规范语义（法规解释层：把标志放进法律与地理上下文）
+   {rule: "MAX_SPEED", value_kmh: 60,
+    applies_to: [ego_lane, left_lane], vehicle_class: all,
+    time_window: always,
+    begins_at_s: 1240.0,             ← 牌所在里程
+    ends_when: [END_SIGN, NEXT_JUNCTION, ROAD_CLASS_CHANGE]}
+   ← 这一层需要**国家/地区法规知识**，同一块牌在不同国家的失效规则不同。
+
+③ 可执行约束（规控/VLA 真正消费的对象）
+   Constraint(id=c17, kind=SPEED_MAX, value=16.67 m/s,
+              scope_s=[1240.0, +inf), lanes={ego,left},
+              source=FIXED_SIGN, authority=2, t_obs=12.4,
+              state=ACTIVE, evidence=[track_47])
+   ← 有**类型 / 值 / 作用域 / 来源 / 权威度 / 状态 / 证据链**，缺一不可。</div>  <p>形式上，规控在每一时刻求解的是一个受约束的优化问题，而这一节讲的全部内容都是在回答「<strong>那个约束集合 $\mathcal{C}(t)$ 到底怎么来的</strong>」：</p>  <div class="math-block">\[\mathcal{A}_{\text{feas}}(t) \;=\; \mathcal{A}_{\text{dyn}}(t) \;\cap\; \bigcap_{c \,\in\, \mathcal{C}(t)} F_c \,, \qquad a^\star(t) \;=\; \arg\min_{a \,\in\, \mathcal{A}_{\text{feas}}(t)} J(a)\]</div>  <p>$\mathcal{A}_{\text{dyn}}$ 是车辆动力学能做到的动作集合，$F_c$ 是第 $c$ 条约束划出的可行子集，$J$ 是舒适度/效率代价。<strong>VLA 的角色是提供 $J$ 的一个好的候选解，不是提供 $\mathcal{C}$，更不是取代那个交集运算。</strong>这句话是本节的骨架，第 7 节会把它变成一条量产红线。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么不能让 VLA 直接输出轨迹、把规则理解全交给它？<strong>因为「它理解了」和「它这次做对了」是两件事，而你只能观测到后者。</strong>一个语言模型可以在 99% 的帧里正确遵守限速，然后在某一帧因为 prompt 里多了一句无关的话而输出超速轨迹——它没有任何内部机制保证「速度不超过 16.67」这个不等式恒成立。<em>而一个显式的约束对象有：它是一个数，你可以在输出上直接检查。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严谨的说法：VLA 提供的是<span class="term">soft compliance</span>（统计意义上的遵守，由训练分布保证，无最坏情况界），约束层提供的是 <span class="term">hard compliance</span>（每一帧都能被验证的不变式，invariant）。功能安全的论证要求后者：你必须能对着一条具体的输出说「它满足约束 $c$，因为 $v_{\max}=16.67$ 而输出的 $\max_t v(t)=15.2$」。<strong>把这个不变式的维护责任交给一个 $10^{10}$ 参数的黑盒，等于放弃了论证的可能性。</strong>这不是对 VLA 能力的怀疑——即使它的遵守率是 99.999%，你也无法<em>证明</em>它是，而约束层的检查是可证的。</p></div>
+  </div>  <div class="callout danger"><span class="label">「模型自己会理解」= 没上过车</span>
+    <p><strong>面试高频翻车点。</strong>被问「VLA 怎么处理交通标志」时，回答「模型看到标志会自己理解并做出正确反应」会立刻暴露没做过量产。<strong>正确的答法要有三段</strong>：<em>①感知给的是<u>观测</u>（类别+置信度+关联车道+距离），不是指令；②中间必须有一个<u>显式的约束层</u>，把标志语义翻译成有作用域、有生命周期、有优先级的可执行约束对象；③VLA 的输出必须过这个约束层的校验，不满足就<u>投影或拒绝</u>，这是量产红线</em>。<strong>面试官想听的是你把「语义理解」和「安全保证」当成两件必须分开的事。</strong></p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话心法：<strong>感知回答「有什么」，约束层回答「因此不能做什么」，VLA 回答「在能做的里面选哪个」。三件事混在一个网络里，出问题时你连该修哪一段都不知道。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="taxonomy"><span class="num">2</span>约束的类型学：四类约束与「可投影性」</h2>
+  <p>把标志翻译成约束，第一步是承认<strong>约束不是一种东西</strong>。不同类型的约束在数学形式、违反检测方式、以及<em>被违反时能不能修</em>这三件事上完全不同——而最后一点是整个安全层设计的地基。</p>  <table>
+    <thead><tr><th>类型</th><th>典型标志</th><th>数学形式</th><th>违反检测</th><th><strong>能否投影修复</strong></th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 标量上下界</strong></td><td>限速 60 / 最低限速 60 / 限高 4.5m / 限重</td><td>$v(t) \le v_{\max}$</td><td>逐时刻比较，$O(T)$</td><td><strong>能</strong>：直接 clip 到边界，最小修改</td></tr>
+      <tr><td><strong>② 离散动作屏蔽</strong></td><td>禁止左转 / 禁止掉头 / 单行道 / 禁止超车</td><td>$m \notin \mathcal{B}$（$m$ 是机动类型）</td><td>枚举比对，$O(1)$</td><td><strong>不能</strong>：只能整条拒绝、换一条候选</td></tr>
+      <tr><td><strong>③ 时空硬约束</strong></td><td>停车让行（STOP）/ 让行（YIELD）</td><td>$\exists t^\star:\ v(t^\star)=0 \wedge s(t^\star)\in[s_0-\delta,\,s_0]$</td><td>需要看整条轨迹的时序性质</td><td><strong>不能</strong>：必须重新规划整段</td></tr>
+      <tr><td><strong>④ 撤销算子</strong></td><td>解除限速 / 解除禁止超车 / 区域结束</td><td>$\mathcal{C} \leftarrow \mathcal{C} \setminus \{c : \text{match}(c)\}$</td><td>作用于约束集合本身</td><td>N/A（它改的是约束集，不是轨迹）</td></tr>
+      <tr><td><strong>⑤ 软约束 / 保守化</strong></td><td>注意儿童 / 事故多发 / 建议速度 / 前方施工</td><td>改 $J$ 的权重与安全裕度，不改 $F_c$</td><td>无法「违反」，只能度量保守度</td><td>N/A</td></tr>
+    </tbody>
+  </table>  <p><strong>「可投影性」这一栏是整张表的重点</strong>，它直接决定了第 7 节安全层的三态输出：</p>  <div class="math-block">\[\Pi_{F_c}(a) \;=\; \arg\min_{a' \in F_c} \lVert a' - a \rVert \qquad \text{只有当 } F_c \text{ 是凸的（区间/半空间）时，投影才既存在、又唯一、又「最小改动」}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直白地说：<strong>限速违反是可以「削平」的</strong>——VLA 输出了一条 70 km/h 的轨迹，限速是 60，把速度曲线压到 60 就行，轨迹的形状、变道意图、跟车逻辑全都保留。而<strong>禁左违反是削不平的</strong>：一条左转轨迹削掉一点还是左转轨迹，你没法「稍微不左转一点」。停车让行更糟——「必须在某一刻速度恰好为 0」是一个关于整条轨迹的<em>时序</em>性质，你不能靠局部修改凑出来，只能推倒重规划。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>用集合的语言说：类型①的 $F_c$ 是 $\mathbb{R}^T$ 里的一个凸盒（box），投影是逐坐标 clip，$O(T)$ 且保证是欧氏意义下的最小修改；类型②的 $F_c$ 是若干不连通分支的并集，投影问题变成组合搜索，且「最近的可行点」可能在语义上是完全不同的行为（离一条左转轨迹最近的非左转轨迹，可能是一条会撞上路缘的直行轨迹）；类型③的 $F_c$ 由一个存在量词定义，<strong>它甚至不是闭集意义上「可投影」的对象</strong>——满足与不满足之间没有连续过渡。<em>因此安全层必须区分「clip 型违反」与「reject 型违反」，对后者准备一条独立的规则型 fallback 轨迹，而不是指望修好 VLA 的输出。</em></p></div>
+  </div>  <h3>辅助牌：约束的限定符</h3>  <p>中国 GB 5768、欧洲 Vienna 公约、美国 MUTCD 都有一套<span class="term">辅助标志</span>（supplementary plate）系统，它们本身不是约束，而是<strong>给主标志的约束加限定条件</strong>——这是 TSR 里最容易被工程实现遗漏的一类：</p>  <ul>
+    <li><strong>时间限定</strong>：「7:00–19:00」→ 约束带 <code>time_window</code>，超出时间窗自动不激活。<em>忘了实现的后果：凌晨也在执行工作日限行。</em></li>
+    <li><strong>车型限定</strong>：「货车」「限载 &gt; 3.5t」→ 约束带 <code>vehicle_class</code>。乘用车 ADAS 里这类牌<strong>必须被识别出来然后忽略</strong>——识别不出来会误执行，识别成主标志更糟。</li>
+    <li><strong>车道限定</strong>：「左侧车道」「HOV」→ 约束带 <code>lanes</code>，与车道级定位耦合。<em>这是横向作用域的来源。</em></li>
+    <li><strong>距离/范围限定</strong>：「前方 500m」「区间 2km」→ 直接给出 <code>scope_s</code> 的终点，是最干净的一种失效方式。</li>
+    <li><strong>天气限定</strong>：「雨雪天」→ 约束的激活条件依赖另一个感知模块的输出，形成<strong>跨模块依赖</strong>，是接口设计上的一个坑。</li>
+  </ul>  <div class="callout warn"><span class="label">限速是上界，不是目标</span>
+    <p><strong>「限速牌 → v ≤ 60 km/h」这个翻译本身就是错的。</strong>法定限速是<em>上限</em>，但实际执行速度还要受三个东西压制：<em>①雨雪/能见度的降级限速（很多国家写进法规，例如雨天高速降 20 km/h）；②道路曲率与舒适度约束 $v \le \sqrt{a_{\text{lat,max}} / \kappa}$；③前车与跟车距离</em>。所以约束层输出的从来不是「目标速度」，而是<strong>一条上界</strong>，最终速度是所有上界取 min 再交给规控。<em>把限速牌的值直接当成巡航设定速度是一个真实发生过的产品事故类型</em>——弯道上按 60 巡航会侧滑。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="lifecycle"><span class="num">3</span>作用域与生命周期：本节是全课最容易出事故的地方</h2>
+  <p>如果这一模块只能记住一件事，记住这一节。<strong>约束不是一个瞬时事实，是一个有出生、有生效范围、有死亡方式的对象。</strong>而下游几乎所有「莫名其妙的减速/超速」都源于这三件事里的某一件被实现错了。</p>  <h3>作用域的三个正交维度</h3>  <table>
+    <thead><tr><th>维度</th><th>含义</th><th>数据来源</th><th><strong>做错的典型后果</strong></th></tr></thead>
+    <tbody>
+      <tr><td><strong>纵向 scope_s</strong></td><td>从哪个里程开始生效、到哪个里程失效</td><td>标志所在里程（由测距 + 定位得到）+ 失效规则</td><td>提前生效 = 无谓减速；<strong>延后失效 = 长期压速（用户投诉第一名）</strong></td></tr>
+      <tr><td><strong>横向 lanes</strong></td><td>作用于哪些车道（本车道？全部车道？仅左侧？）</td><td>标志的车道关联（模块 03 的 <code>lane_assoc</code>）+ 辅助牌</td><td><strong>对向车道 / 辅路标志被关联到本车道 = 错误约束</strong>（安全与体感双输）</td></tr>
+      <tr><td><strong>对象/时间</strong></td><td>适用于哪类车、哪个时间段</td><td>辅助牌 + 车辆自身属性 + 时钟</td><td>非工作日执行工作日限行；乘用车执行货车限速</td></tr>
+    </tbody>
+  </table>  <h3>生命周期状态机</h3>  <div class="ascii">                         首次检出（conf &gt;= θ_lo）
+                                  │
+                                  ▼
+                          ┌───────────────┐   连续 N 帧未再观测
+                          │   TENTATIVE   │──────────────────────► DROPPED
+                          │  （试探，不生效）│
+                          └───────┬───────┘
+              累计证据达标（hits &gt;= K 且 conf &gt;= θ_hi）
+                                  │        ← 迟滞：**上报阈值 &gt; 撤销阈值**（C55 m04）
+                                  ▼
+                          ┌───────────────┐
+                          │   CONFIRMED   │  已确认存在，但**还没到生效里程**
+                          └───────┬───────┘
+                       ego_s &gt;= begins_at_s（车开过了牌）
+                                  │
+                                  ▼
+     ┌────────────────────►┌───────────────┐
+     │  同类新约束生效       │    ACTIVE     │────► EXPIRED   ego_s &gt; ends_at_s（里程/时间过期）
+     │  且权威度 &gt;=         │  （正在约束规控）│────► REVOKED   匹配的「解除牌」被 CONFIRM
+     └──SUPERSEDED◄────────└───────┬───────┘────► SATISFIED  一次性约束已履行（STOP 已停）
+                                   │
+                                   └──────────► INVALIDATED  证据链失效
+                                                （关联车道被修正 / 上游 track 被判为误检）
+
+  * 所有终态统一进 ARCHIVED，**保留 60 秒**用于事后归因与日志回放（第 5 节）。
+  * 关键不变式：**同一 (kind, arg, lanes, source) 槽位上最多一条 ACTIVE 约束**——
+    跨来源并存是正常的（那交给第 4 节消解），同来源并存一定是 bug。
+    这条不变式可以直接写成运行时 assert，是最便宜的一道防线。</div>  <p>注意 <code>CONFIRMED</code> 和 <code>ACTIVE</code> 必须分开。<strong>「我确认前方 80 米有一块限速 60 的牌子」和「我现在应该以 60 行驶」是两个完全不同的事实</strong>，中间隔着 80 米。把它们合并成一个状态，车就会在看见牌子的那一瞬间开始减速——这是一个非常典型的、会被用户直接感知为「这车反应很奇怪」的实现错误。</p>  <h3>失效方式：五条路，少实现一条就是一个 bug 类</h3>  <table>
+    <thead><tr><th>失效方式</th><th>触发条件</th><th>为什么容易漏</th><th>对应的失效现象</th></tr></thead>
+    <tbody>
+      <tr><td><strong>显式解除</strong></td><td>检测到匹配的「解除限速」「解除禁止超车」牌</td><td>解除牌本身是小目标、样式朴素、样本少 → <strong>检测召回明显低于主标志</strong></td><td>长期压速</td></tr>
+      <tr><td><strong>路口隐式失效</strong></td><td>通过一个有信号/无信号交叉口（多数法规规定限速在路口后失效）</td><td>需要地图或路口检测，<strong>纯视觉 TSR 拿不到这个信号</strong></td><td>路口后仍执行旧限速</td></tr>
+      <tr><td><strong>道路等级变化</strong></td><td>驶出匝道进入主路 / 城市道路进入高速</td><td>同上，依赖地图与定位</td><td><strong>匝道限速带上高速</strong>（最经典的一例）</td></tr>
+      <tr><td><strong>范围耗尽</strong></td><td>辅助牌给出的「前方 2km」走完；临时约束超时</td><td>范围的起点应是<em>牌所在里程</em>而不是<em>检出时的里程</em>——差了 80 米</td><td>提前解除（更危险）</td></tr>
+      <tr><td><strong>被取代</strong></td><td>同类型、同车道的新约束以不低于当前权威度生效</td><td>「取代」与「并存」的判定规则要写清楚，否则 min 运算会把旧值一直拖着</td><td>新限速 80 但仍按旧的 60 跑</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么「延后失效」比「提前失效」在投诉量上高一个数量级，而「提前失效」在安全上更严重？<strong>因为这两类错误的可观测性完全相反。</strong>延后失效（该 120 却跑 60）每一秒都在被用户感知，会立刻产生投诉；提前失效（该 60 却跑 80）用户毫无感觉——甚至觉得挺好——直到某一次它恰好发生在施工区。<em>所以只看用户反馈来排优先级，会系统性地把安全问题排到体验问题后面。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>工程上的应对是：<strong>把两类错误分别度量，并给「提前失效」设独立的门禁</strong>。定义 $\text{over-hold}$ = 约束在应失效点之后仍 ACTIVE 的里程（米），$\text{early-release}$ = 约束在应失效点之前就退出的里程。前者是体验指标，允许 p95 有几十米；后者是安全指标，<strong>任何一次 &gt; 0 都要进 badcase 池</strong>。实现上有一条不对称的保守规则：<em>当「是否失效」不确定时（例如路口检测置信度低），限速类约束倾向于<strong>保持</strong>（宁可慢），而禁行类约束（禁左/禁超）也倾向于<strong>保持</strong>——两者都指向「保持更保守」</em>。但注意第 4 节会讲，「保守」并不总是安全，最低限速牌就是一个反例。</p></div>
+  </div>  <div class="callout danger"><span class="label">对向车道标志：一个不能靠模型解决的问题</span>
+    <p><strong>作用域最凶险的一条：对向车道与辅路的标志。</strong>一块 40 米外对向车道的「限速 40」，在图像上和本车道的牌几乎没有区别——都是圆的、红边、白底、写着 40。<em>把它当成本车道约束，车会在高速上莫名其妙减速到 40；忽略它，本车道真正的 40 牌就可能被漏</em>。<strong>解决方案不在检测模型里</strong>，而在：①标志的横向偏移 + 距离 → 反投影到 BEV 判断落在哪条车道的延长线上；②标志的朝向（背面/侧面的牌一定不是给你的——正面朝向本车的牌才生效，这是一个极强的几何先验）；③高精地图的标志图层做交叉验证；④跟踪后的多帧几何一致性。<strong>面试里能主动说出「朝向判定」这一条的人很少，它是很好的加分点</strong>——因为它把一个看似的分类问题变成了一个几何问题。</p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把本节压成一句话：<strong>约束的正确性 = 值对 × 从哪开始对 × 到哪结束对 × 对谁生效对。四项里错任何一项，前面 TSR 做到 99.9% mAP 都白搭。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="conflict"><span class="num">4</span>冲突与优先级：三个维度，外加一条兜底规则</h2>
+  <p>现实道路上，同一时刻对「本车该多快」给出说法的东西至少有五个：地图限速、道路等级默认限速、固定标志、可变电子牌、临时施工牌，偶尔还有交警手势。<strong>它们经常不一致，而且不一致本身是正常状态而不是异常</strong>（施工期间就是这样）。约束层必须有一个确定性的、可写进文档的消解规则。</p>  <h3>维度一：权威度（authority）</h3>  <table>
+    <thead><tr><th>来源</th><th>权威度</th><th>为什么在这个位置</th><th>实现上的坑</th></tr></thead>
+    <tbody>
+      <tr><td><strong>现场人员指挥 / 交警手势</strong></td><td>5（最高）</td><td>各国法规几乎都规定人工指挥优先于一切标志与信号</td><td>视觉上极难可靠识别 → 多数量产系统<strong>不自动执行，而是请求接管</strong></td></tr>
+      <tr><td><strong>临时施工标志</strong></td><td>4</td><td>临时设施反映的是<em>此刻</em>的实际路况，固定牌反映的是设计时的路况</td><td>如何判定「临时」？—— 锥桶/水马/黄色底色/可移动支架，是<strong>视觉上下文</strong>问题而非标志分类问题</td></tr>
+      <tr><td><strong>可变电子标志（VMS / 龙门架）</strong></td><td>3</td><td>由交管中心实时下发，比固定牌新</td><td><strong>LED 屏的成像问题</strong>：与相机快门不同步会拍到黑屏或残缺数字；夜间过曝；这类误识别的后果是直接的</td></tr>
+      <tr><td><strong>固定实体标志</strong></td><td>2</td><td>法定效力强，但可能已过时</td><td>本节的主角</td></tr>
+      <tr><td><strong>高精地图限速图层</strong></td><td>1</td><td>覆盖广、稳定、看不见也知道，但<strong>有更新延迟</strong>（周级到月级）</td><td>地图与实牌冲突时，实牌赢——但要防「实牌其实是误检」</td></tr>
+      <tr><td><strong>道路等级默认值</strong></td><td>0</td><td>法定兜底（例如城市道路默认 50、高速默认 120）</td><td>只在什么都没有时使用；<strong>它是保证约束集永不为空的那条</strong></td></tr>
+    </tbody>
+  </table>  <h3>维度二与三：空间特异性、时效性</h3>  <p>光有权威度不够。两块同为「固定实体标志」的限速牌都在生效范围内怎么办？再加两个维度，按<strong>字典序</strong>比较：</p>  <div class="math-block">\[\text{key}(c) \;=\; \bigl(\, \underbrace{\text{authority}(c)}_{\text{谁说的}} ,\; \underbrace{\text{specificity}(c)}_{\text{管得多具体}} ,\; \underbrace{t_{\text{obs}}(c)}_{\text{什么时候说的}} \,\bigr) \,, \qquad c^\star = \arg\max_{c \in \mathcal{C}_{\text{kind}}(t)} \text{key}(c)\]</div>  <ul>
+    <li><strong>specificity（特异性）</strong>：作用范围越窄越优先。「本车道 + 货车 + 7-19 时」的牌比「全路段全车型」的牌更具体，说明它是为更精确的情况设的。这是法律解释里 <em>lex specialis</em>（特别法优于一般法）原则的直接搬运。</li>
+    <li><strong>recency（时效）</strong>：同权威、同特异性时，<strong>后遇到的赢</strong>。这符合驾驶直觉——你开过一块 80 的牌又开过一块 60 的牌，当然按 60。<em>注意这里比的是「牌所在里程」而不是「检出时刻」</em>：远处的 60 牌可能比近处的 80 牌先被检出。这个细节写错会导致约束乱跳。</li>
+  </ul>  <div class="callout warn"><span class="label">平票必须计数，不能只是兜底</span>
+    <p><strong>字典序比较有一个必须显式处理的退化情况：三元组完全相同。</strong>这在现实中并不罕见——龙门架上并排两块牌分别写着不同车道的限速，如果车道关联失败，两条约束的 (authority, specificity, t_obs) 会一模一样。<em>此时唯一安全的规则是：取最保守的那个</em>（限速取 min、禁行取并集）。<strong>但一定要打日志并计数</strong>：平票的发生率本身就是一个健康度指标，它突然上升说明车道关联出了问题。<em>「用兜底规则悄悄掩盖上游故障」是感知-决策接口最常见的技术债形态。</em></p>
+  </div>  <h3>那条兜底规则，以及它为什么不总对</h3>  <p>默认的安全兜底是「<strong>无法消解时取最保守</strong>」：速度取所有上界的 min，禁行动作取并集。这个规则在 90% 的情况下是对的，但<strong>把它当成普适真理会在三个地方翻车</strong>：</p>  <table>
+    <thead><tr><th>反例</th><th>「最保守」会怎么做</th><th>为什么错</th><th>正确做法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>最低限速牌</strong>（高速左侧车道 min 90）</td><td>取 min → 把 90 的下界也往低压</td><td>「保守」在下界约束上方向是<strong>相反</strong>的：更保守 = 更高的下界</td><td>按约束语义分别定义「保守方向」，不能一律 min</td></tr>
+      <tr><td><strong>施工区结束后</strong></td><td>解除牌漏检 → 一直保持 40</td><td>在车流 100 km/h 的路段以 40 行驶，<strong>被追尾的风险远高于超速风险</strong></td><td>给临时约束设<strong>硬性里程/时间上限</strong>（例如超过 3km 未见解除牌则自动降级到地图限速）</td></tr>
+      <tr><td><strong>误检产生的幽灵约束</strong></td><td>取 min → 一次误检就能压住整段路</td><td>保守规则让<strong>单点误检的影响被放大成持续状态</strong></td><td>约束生效前要求多帧证据；ACTIVE 约束要有证据心跳，证据消失即降级</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以「安全 = 保守」是个漂亮但危险的等式。<strong>真正的安全是「与周围交通流一致」加上「不违反硬性法规」，而不是「速度尽可能低」。</strong>一辆在高速上突然减速到 40 的车，制造的风险比它规避的风险大得多。这在自动驾驶里有个专门的说法：<em>过度保守本身是一种失效模式</em>，它甚至有自己的指标（不必要制动次数 / 100km）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地讲，约束层的目标不是最小化「违规概率」这一个量，而是最小化<strong>期望风险</strong> $\mathbb{E}[R] = \sum_i p_i \cdot L_i$，其中不同失效模式的损失 $L_i$ 差着数量级，且<em>互相竞争</em>：把限速压低会降低超速风险 $L_{\text{speeding}}$，同时抬高追尾与被追尾风险 $L_{\text{flow-mismatch}}$。<strong>这意味着「保守方向」必须逐约束定义，而且需要一个显式的、可调的保守度参数，而不是散落在代码里的若干 min()</strong>。工程上的做法是给每条约束附一个 <code>conservatism_policy</code> 字段（<code>MIN</code> / <code>MAX</code> / <code>UNION</code> / <code>REQUEST_TAKEOVER</code>），让消解逻辑读它而不是硬编码。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="explain"><span class="num">5</span>可解释输出：解释必须来自约束层，不能来自语言模型</h2>
+  <p>VLA 的一个宣传点是「它能解释自己」。这一节要说的是：<strong>这个能力是真的，但它的可信度被严重高估了，而且量产系统需要的那种解释根本不该由语言模型生成。</strong></p>  <h3>三种「解释」，用途完全不同</h3>  <table>
+    <thead><tr><th>层次</th><th>形态</th><th>消费者</th><th>可信度</th><th>延迟代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 决策日志</strong></td><td>结构化记录：<code>{decel: -1.2, cause: c17, sign_track: 47, conf: 0.93, rule: MAX_SPEED_60}</code></td><td>工程师（归因）、回归测试、事故取证</td><td><strong>高——它就是决策本身，不是对决策的描述</strong></td><td>≈0（只是写日志）</td></tr>
+      <tr><td><strong>② 自然语言解释</strong></td><td>「前方 80 米有限速 60 标志，正在减速」</td><td>用户（信任）、客服（沟通）</td><td><strong>低——见下方陷阱</strong></td><td>生成 token 的代价</td></tr>
+      <tr><td><strong>③ 证据溯源</strong></td><td>注意力图 / 关联的 token / 触发的规则链</td><td>调试、可解释性研究</td><td>中（注意力≠因果，但有参考价值）</td><td>中（要额外导出）</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">别把 VLA 的自述当作因果证据</span>
+    <p><strong>最重要的一个陷阱：post-hoc rationalization（事后合理化）。</strong>语言模型生成的解释，与它内部真正导致该输出的计算路径之间<em>没有任何机制保证一致</em>。它生成的是「一个听起来能解释这个动作的说法」，而不是「这个动作真实的原因」。<strong>大量研究显示模型可以因为原因 A 做出决策、然后自信地报告原因 B</strong>，而且报告得非常流畅。<em>后果是：如果你的 badcase 归因流程依赖 VLA 的自述，你会被系统性地误导到错误的修复方向上——而且完全不自知，因为每一条解释读起来都很合理。</em></p><p><strong>正确的做法是把「解释」的生成职责从模型移到约束层</strong>：「减速的原因是约束 c17（MAX_SPEED=60，来源 FIXED_SIGN，证据 track#47，置信度 0.93，首检于 t=12.4s，作用域里程 [1240, ∞)）」。<em>这条解释是可核对的</em>——你能去查 track#47 那几帧的图像，能查 c17 的状态机转移记录。语言模型的角色只是<strong>把这条结构化解释翻译成人话</strong>，而不是产生它。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>换个角度理解：<strong>可解释性不是一个「模型属性」，是一个「系统设计属性」。</strong>你不是通过挑一个更可解释的模型得到它，而是通过在架构里留出「决策必须经过一个显式的、有名字的对象」这个环节得到它。约束层就是那个对象。<em>一旦决策必须写成「因为约束 c17」，可解释性就是免费的副产品；如果决策是一个 6 层 decoder 的隐向量，事后再怎么努力也补不回来。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这和模块 03 的接口设计是同一条原则的两个方向。模块 03 说「感知的置信度必须传递给下游，否则下游被迫把所有检测当真」；这一节说「决策的因果依据必须显式落成对象，否则上游无法归因」。<strong>两者合起来是一条完整的主张：端到端系统的可测试性不来自事后的可解释性工具，而来自<em>提前规划的中间表示</em></strong>。这正是模块 05「VLA 的可测试性问题」要展开的核心论点——<em>中间表示与日志设计必须在架构阶段就定下来，等到路测出问题再补是补不回来的</em>。</p></div>
+  </div>  <h3>决策日志的最小必要字段</h3>  <p>这是一份可以直接抄的 schema。<strong>判据是：事故发生 3 个月后，只看日志能不能重建当时的决策链。</strong></p>  <pre><code>DecisionRecord:
+  t_ego            : float          # 自车时间戳（与感知时间戳分开记，两者的差就是端到端延迟）
+  ego_s, ego_v     : float          # 里程与速度
+  active_constraints:               # 当帧全部 ACTIVE 约束（不只是起作用的那条）
+    - {id, kind, value, source, authority, specificity,
+       scope_s, lanes, state, t_obs, evidence_track_ids, conf}
+  binding_constraint : id           # **实际起作用的那条**（谁赢了消解）
+  resolution_trace   : [ (id, key_tuple, verdict) ]   # 消解过程，含平票标记
+  vla_raw_action     : [...]        # VLA 原始输出（未经安全层）
+  safety_verdict     : ACCEPT | CLIP | REJECT
+  safety_reasons     : [ ... ]      # 每条违反的约束 id 与违反量
+  final_action       : [...]        # 真正下发给控制的
+  latency_ms         : {perceive, reason, constrain, safety, total}</code></pre>  <p>三个字段值得特别说明。<strong><code>active_constraints</code> 必须记全部而不只是获胜的那条</strong>——否则你永远查不出「为什么那块施工牌没赢」。<strong><code>vla_raw_action</code> 与 <code>final_action</code> 必须都记</strong>——两者的差就是安全层的干预量，它是 VLA 质量最直接的代理指标（模块 05 会把它变成一个正式指标）。<strong><code>resolution_trace</code> 里的平票标记</strong>是第 4 节说的那个健康度信号。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一条可迁移的心法：<strong>如果一个决策没有名字，它就不可能被归因、被回归、被审计。给约束编 id、给消解过程留 trace，成本几乎为零，收益是把「看视频猜」变成「查日志」。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fast-slow"><span class="num">6</span>思维链与延迟的矛盾：快慢双系统与「时空提前量」</h2>
+  <p><span class="term">chain-of-thought</span>（思维链）让 VLA 在复杂语义场景上明显更准——「前方施工，左侧两车道封闭，请并入右道」这种需要多步推理的场景，让模型先把标志内容、车道拓扑、自车位置写出来再决策，正确率会有可观提升。<strong>问题是它同时把延迟从几百毫秒推到秒级，而车是在动的。</strong></p>  <h3>先把账算清楚：留给推理的时间到底有多少</h3>  <p>从「必须在标志所在位置前完成动作」倒推，可用推理时间是：</p>  <div class="math-block">\[T_{\text{reason}}^{\max} \;=\; \frac{d_{\text{detect}} \;-\; \overbrace{v^{2}/(2a_{\text{comf}})}^{\text{舒适制动距离}}}{v} \;-\; \underbrace{T_{\text{perceive}}}_{\approx 0.15\,\text{s}} \;-\; \underbrace{T_{\text{act}}}_{\approx 0.10\,\text{s}}\]</div>  <p>代入真实数字（$a_{\text{comf}} = 3\ \text{m/s}^2$，这是一个乘客不会觉得难受的减速度）：</p>  <table>
+    <thead><tr><th>场景</th><th>车速</th><th>检出距离</th><th>制动距离</th><th><strong>可用推理时间</strong></th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>城区限速牌</td><td>60 km/h = 16.7 m/s</td><td>80 m</td><td>46.3 m</td><td><strong>1.77 s</strong></td><td>慢系统勉强够用（可跑约 60 个推理 token）</td></tr>
+      <tr><td>城区，检出晚</td><td>60 km/h</td><td>50 m</td><td>46.3 m</td><td><strong>−0.03 s</strong></td><td><strong>已经来不及舒适制动，只能快系统直接反应</strong></td></tr>
+      <tr><td>高速限速牌</td><td>120 km/h = 33.3 m/s</td><td>150 m</td><td>185.2 m</td><td><strong>负数（−1.31 s）</strong></td><td><strong>纯视觉根本来不及 → 必须靠地图先验</strong></td></tr>
+      <tr><td>高速，长焦相机</td><td>120 km/h</td><td>250 m</td><td>185.2 m</td><td><strong>1.69 s</strong></td><td>长焦是高速场景的必需品，不是奢侈品</td></tr>
+      <tr><td>临时施工牌</td><td>80 km/h = 22.2 m/s</td><td>60 m</td><td>82.3 m</td><td><strong>负数</strong></td><td><strong>必须靠 V2X / 众包地图提前告知</strong></td></tr>
+    </tbody>
+  </table>  <p>这张表里藏着一个把 C57（小目标）和本课接起来的关键结论。要在 250 米外检出一块 60 cm 的限速牌，用针孔模型算：1920 像素宽、60° 水平 FOV 的相机焦距 $f = 960/\tan 30° \approx 1663$ 像素，则该标志的像素尺寸是 $1663 \times 0.6 / 250 \approx \mathbf{4.0}$ <strong>像素</strong>。<strong>4 像素是任何检测器都做不到的。</strong>所以「高速场景的 VLA 推理时间」这个看似的软件问题，答案其实在硬件上——<em>要么上长焦相机（把 $f$ 提到 4000+ 像素），要么承认高速限速必须由地图提供、视觉只做校验</em>。</p>  <h3>双系统的分工：慢系统输出约束，不输出控制量</h3>  <div class="ascii">  ┌──────────────── 慢系统 / System 2（0.2 – 2 Hz）──────────────────┐
+  │  VLA + 思维链：长时程语义推理                                     │
+  │    · 「前方施工，左二车道封闭」→ 生成变道意图 + 时间窗            │
+  │    · 「限速 60，本车道，从这块牌开始」→ 生成**约束对象**          │
+  │  输出：意图（intent）+ 约束（constraint）+ 解释                   │
+  │  **绝不输出方向盘转角与油门开度**                                 │
+  └───────────────────────────┬──────────────────────────────────────┘
+                              │  意图与约束（带时间戳与有效期）
+                              ▼
+  ┌──────────────── 快系统 / System 1（10 – 100 Hz）────────────────┐
+  │  规则 + 小模型 + 传统规控                                        │
+  │    · 在慢系统给的约束集内做高频轨迹优化与跟踪                    │
+  │    · 独立处理必须立刻反应的事件：AEB、切入、车道保持              │
+  │  **慢系统失联 / 超时时，快系统必须能独立维持安全行驶**            │
+  └───────────────────────────┬──────────────────────────────────────┘
+                              ▼
+                         安全层（第 7 节）→ 执行器
+
+  关键不变式：慢系统的延迟被「约束的时空提前量」吸收。
+  标志在 80 m 外看到，2 s 的推理延迟只消耗掉 33 m —— 还剩 47 m 余量。
+  一旦提前量 &lt; 延迟（上表的负数行），**这个架构就失效**，必须换信息源。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么慢系统输出「约束」而不是「轨迹」是关键？<strong>因为约束的有效期比轨迹长得多。</strong>一条 VLA 在 $t$ 时刻算出的轨迹，到 $t+0.6$ s 送达时，车已经开出去 10 米，那条轨迹的起点已经错了。<em>而「限速 60，作用于 [1240m, ∞)」这条约束在 $t+0.6$ s、$t+6$ s、$t+60$ s 都同样有效</em>——它是一个关于世界的陈述，不是一个关于此刻的指令。所以约束天然抗延迟，轨迹天然不抗延迟。这就是模块 02 讲的动作分块（action chunking）之外，另一个对抗低推理频率的思路，而且它更根本。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从控制理论的角度：慢系统扮演的是<span class="term">reference governor</span>（参考调节器）/ 约束管理器的角色，而不是控制器。它在低频上重塑可行域 $\mathcal{A}_{\text{feas}}$，高频控制器在这个可行域内做实时优化——这是<strong>分层 MPC</strong> 的标准结构，也是它能给出稳定性论证的原因：只要慢层输出的约束集是「递归可行的」（recursively feasible，即存在一条满足约束的可行轨迹），快层就能保证不违反。<em>反过来，如果慢层直接输出控制量，整个闭环的稳定性就取决于一个延迟不确定、且延迟随输入长度变化的模块，这在控制上是无法分析的。</em><strong>「慢系统给约束、快系统给控制」不是工程妥协，是唯一能做出安全论证的结构。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label">CoT 的延迟是数据依赖的</span>
+    <p><strong>思维链的延迟不是常数，这一点比「延迟大」更麻烦。</strong>推理 token 数取决于场景复杂度：空旷高速可能 20 个 token，复杂施工路口可能 200 个。<em>于是延迟又变成了「这一帧有多难」的函数</em>——这正是 C53 模块 04 里 NMS 那个问题的重演，只是量级从毫秒变成了秒。<strong>对策有三条</strong>：①<strong>硬性 token 上限 + 超时降级</strong>（超时就用快系统的结果，并记一次 timeout 事件）；②<strong>推理预算随速度自适应</strong>（速度越高，允许的推理 token 越少——直接由本节的公式算出来）；③<strong>投机执行</strong>：先用快系统输出一个保守动作立即下发，慢系统结果到达后再修正。<em>「延迟依赖输入」这个模式一旦出现在实时系统里，处理套路是通用的：设硬上限 + 准备降级路径。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="safety"><span class="num">7</span>安全兜底：VLA 输出必须过校验——这是量产红线</h2>
+  <p>这一节是整个模块的落点，也是 JD 那条职责在量产语境下的真正含义。<strong>一句话：VLA 的输出没有任何一条可以直接下发给执行器。</strong></p>  <h3>三层架构与它们的独立性要求</h3>  <div class="ascii">┌─ L1 · VLA（语义与意图层）───────────────────────────────────────┐
+│  输入：图像 / TSR 结构化输出 / 导航指令 / 历史                  │
+│  输出：候选轨迹或动作序列 + 意图 + 解释                         │
+│  性质：能力上限高、覆盖长尾好、**无最坏情况保证、会幻觉**       │
+└───────────────────────────┬────────────────────────────────────┘
+                            ▼
+┌─ L2 · 规则 / 约束层（本模块前 6 节）────────────────────────────┐
+│  维护 C(t)：标志→约束的翻译、作用域、生命周期、冲突消解         │
+│  输出：当前时刻的硬约束集合 + 每条约束的证据链                  │
+│  性质：**确定性、可单测、可回归、可审计**                       │
+└───────────────────────────┬────────────────────────────────────┘
+                            ▼
+┌─ L3 · 安全层（独立实现，不依赖 L1）─────────────────────────────┐
+│  五项校验：有效性 / 动力学 / 碰撞与安全距离 / 硬约束 / 连续性    │
+│  三态输出：ACCEPT ─┐                                            │
+│             CLIP ──┼─► 执行器                                   │
+│             REJECT ─► **规则型 fallback 轨迹**（保持车道+减速）  │
+│  性质：代码量小、可形式化、**必须与 L1 共模失效解耦**           │
+└─────────────────────────────────────────────────────────────────┘
+
+独立性的四条硬要求（缺一条，安全论证就不成立）：
+  ① 不同代码库、不同语言/框架，L3 不引用 L1 的任何库
+  ② **不同输入路径** —— L3 不能只吃 L1 用过的那份感知结果
+     （否则感知错了两层一起错，这就是 common-mode failure）
+  ③ 独立的算力与时间预算，L1 超时不能拖垮 L3
+  ④ 不同团队开发与评审；L3 的变更走更严格的流程</div>  <h3>五项校验，以及每一项失败时怎么处置</h3>  <table>
+    <thead><tr><th>#</th><th>校验项</th><th>判据（示例）</th><th>违反时的处置</th><th>为什么是这个处置</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><strong>有效性</strong></td><td>无 NaN/Inf、维度正确、时间戳新鲜（&lt; 200 ms）、单调时间轴</td><td><strong>REJECT</strong></td><td>无法解释的输出说明上游已经处于未知状态，不能试图修复</td></tr>
+      <tr><td>2</td><td><strong>动力学可行性</strong></td><td>$|a| \le 4$、$|j| \le 4$ m/s³、$\kappa \le a_{\text{lat}}/v^2$</td><td><strong>CLIP</strong>（凸区间约束）</td><td>可投影，且投影后语义不变（还是同一个动作，只是更柔和）</td></tr>
+      <tr><td>3</td><td><strong>碰撞与安全距离</strong></td><td>RSS 式最小纵向距离 $d_{\min}$、横向安全走廊</td><td><strong>CLIP 或 REJECT</strong></td><td>纵向可通过减速修复；横向侵占他车走廊必须整条拒绝</td></tr>
+      <tr><td>4</td><td><strong>硬约束满足</strong></td><td>$v \le v_{\max}$（CLIP）；机动 $\notin$ 禁行集（REJECT）；STOP 已履行（REJECT）</td><td><strong>按第 2 节的可投影性分类</strong></td><td>这正是第 2 节那张表的用途所在</td></tr>
+      <tr><td>5</td><td><strong>时序连续性</strong></td><td>与上一帧输出的差异 &lt; 阈值；意图不得高频翻转</td><td><strong>CLIP + 计数</strong></td><td>抖动本身是危险的；同时翻转率是 VLA 不稳定的早期信号</td></tr>
+    </tbody>
+  </table>  <div class="math-block">\[d_{\min} \;=\; v_{\text{ego}}\,\rho \;+\; \tfrac{1}{2} a_{\max,\text{accel}}\,\rho^{2} \;+\; \frac{\bigl(v_{\text{ego}} + \rho\, a_{\max,\text{accel}}\bigr)^{2}}{2\,a_{\min,\text{brake}}} \;-\; \frac{v_{\text{lead}}^{2}}{2\,a_{\max,\text{brake}}}\]</div>  <p>这是 <span class="term">RSS</span>（Responsibility-Sensitive Safety，责任敏感安全）的纵向最小安全距离公式，$\rho$ 是反应时间。<strong>它的价值不在于数值本身，而在于它是<em>可计算的、可写进需求文档的、能被形式化验证的</em></strong>——这正是安全层需要而 VLA 提供不了的东西。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>安全层最容易被误解成「一个额外的保险」。<strong>它不是保险，它是唯一在数学上说得清的那部分。</strong>整个系统的安全论证结构是：「无论 L1 输出什么（包括最坏情况的胡言乱语），L3 保证下发的动作满足性质 P」。<em>注意这句话里 L1 的行为完全没有出现</em>——这就是为什么 L3 必须独立：一旦 L3 的判断依赖 L1 的中间结果，「无论 L1 输出什么」这个前件就不成立了，整个论证塌掉。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但独立性有代价，而且这个代价常被低估：<strong>L3 看不到 L1 看到的语义，所以它必然更保守</strong>。L1 知道「那个横穿的是塑料袋」，L3 只知道「前方 8 米有一个未分类障碍物」，于是 L3 会要求刹车。<em>系统的实际能力上界因此被 L3 而不是 L1 决定</em>。这就产生了一个真实的工程张力：把 L3 做严，能力受限、用户体验差、且频繁干预；把 L3 做松，安全论证的强度下降。<strong>唯一的出路是把「L3 干预率」当成一等指标持续度量并驱动 L1 改进</strong>——干预率高说明 L1 在系统性地输出不安全动作，那些帧就是最有价值的训练数据（这正好接上 C58 的难例挖掘：<em>安全层的每一次 REJECT 都是一个自动标注好的 hard case</em>）。</p></div>
+  </div>  <div class="callout danger"><span class="label">「把规则写进 prompt」是最经典的错误答案</span>
+    <p><strong>面试里最能区分「读过论文」和「做过量产」的一个问题：「安全规则直接写进 prompt 不行吗？」</strong>不行，而且理由要说得出三条：<em>①<u>prompt 里的规则是软的</u>——它改变输出分布，不提供任何保证；同一条规则在 99% 的输入上被遵守，在对抗性或分布外输入上会失效，而你无法枚举那些输入。②<u>无法验证</u>——你没法对着一个 prompt 说「因此速度一定不超过 16.67」，而对着一行 `v = min(v, v_max)` 你可以，这个差别在功能安全审查里是决定性的。③<u>共模失效</u>——prompt 规则和 VLA 决策共用同一次前向传播、同一份感知输入、同一套权重，任何一个环节出问题两者一起错，等于没有冗余。</em><strong>加分回答</strong>：「prompt 里的规则仍然有价值——它让 VLA 的输出<em>大部分时候</em>就在可行域内，从而降低安全层的干预率、提升体验。但它是<u>优化项</u>，不是<u>保证项</u>。」<em>能把「让它更常做对」和「保证它不会做错」这两件事分开说，就答到点上了。</em></p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>红线记法：VLA 负责让车「开得好」，约束层与安全层负责让车「不出事」。这两件事的责任主体必须不同，否则你无法在任何一个出问题的时候修另一个。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="interview"><span class="num">8</span>面试标准答案骨架</h2>
+  <p>组织原则同 C53：<strong>先给判断，再给机制，然后给数字，最后给代价</strong>。缺「数字」显得没做过，缺「代价」显得没上线过。</p>  <h3>Q1 · 你怎么把一块交通标志变成车能执行的东西？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>你有没有「中间必须有一个显式约束层」这个概念，而不是「模型看到了就会做」</td></tr>
+      <tr><td><strong>30 秒骨架</strong></td><td>「三级翻译。<strong>①感知语义</strong>：TSR 给的是观测——类别、置信度、距离、关联车道、跟踪 ID，这不是指令。<strong>②规范语义</strong>：结合法规与地理上下文，得到『MAX_SPEED=60，作用于本车道，从牌所在里程开始，遇解除牌/路口/道路等级变化失效』——这一层需要国家法规知识。<strong>③可执行约束</strong>：生成一个带类型、值、作用域、来源、权威度、状态、证据链的对象，规控在它划出的可行域里做优化。<em>规控每一帧解的是 $\mathcal{A}_{\text{feas}} = \mathcal{A}_{\text{dyn}} \cap \bigcap_c F_c$，VLA 提供的是这个可行域里的一个好候选，不是提供可行域本身。</em>」</td></tr>
+      <tr><td>加分点</td><td>「而且量产系统里，标志相关的线上问题多数根因不在识别，而在这层翻译——作用域、生命周期、优先级。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>说「模型端到端学会了限速」；把限速值当成目标速度而不是上界</td></tr>
+    </tbody>
+  </table>  <h3>Q2 · 约束的生命周期最容易在哪里出错？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>你知道「什么时候不再生效」比「什么时候生效」难得多，并且能说出多条失效路径</td></tr>
+      <tr><td><strong>30 秒骨架</strong></td><td>「失效比生效难。生效只有一个条件——车开过牌；<strong>失效有五条路</strong>：显式解除牌、路口隐式失效、道路等级变化、辅助牌给的范围耗尽、被更高权威的新约束取代。<em>少实现任何一条就是一整类 bug</em>。最经典的是匝道限速带上高速——因为『驶出匝道』这个信号纯视觉拿不到，必须靠地图。而且状态机里 <strong>CONFIRMED 和 ACTIVE 必须分开</strong>：『确认前方 80 米有 60 的牌』和『现在该以 60 行驶』隔着 80 米，合并了车就会一看见牌就减速。」</td></tr>
+      <tr><td>加分点</td><td>「两类错误要分别度量：延后失效（over-hold）是体验指标，允许 p95 有几十米；<strong>提前失效（early-release）是安全指标，任何一次都要进 badcase 池</strong>。只看用户投诉会系统性地把安全问题排在体验问题后面，因为超速用户没感觉。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>只说「要有解除牌」；说不出路口/道路等级这类<em>隐式</em>失效</td></tr>
+    </tbody>
+  </table>  <h3>Q3 · 临时施工牌写 40，固定牌写 80，地图说 100，怎么办？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td><strong>30 秒骨架</strong></td><td>「按<strong>字典序三元组</strong>消解：(权威度, 空间特异性, 时效)。权威度从高到低是——现场人员指挥 &gt; 临时施工牌 &gt; 可变电子牌 &gt; 固定标志 &gt; 高精地图 &gt; 道路等级默认值；理由是越临时的信息越反映<em>此刻</em>的实际路况。所以这题的答案是 40。特异性用的是<em>特别法优于一般法</em>：『本车道+货车+7-19 时』比『全路段』更具体。时效比的是<strong>牌所在里程</strong>而不是检出时刻——远处的牌可能先被检出。」</td></tr>
+      <tr><td>加分点（很重要）</td><td>「三元组完全相同的平票必须显式处理：取最保守 + <strong>打日志计数</strong>，因为平票率上升通常意味着车道关联坏了。而且<strong>『取最保守』不是普适规则</strong>——最低限速牌的保守方向是相反的；施工区解除牌漏检导致一直保持 40，在车流 100 的路上被追尾风险更大。所以每条约束要带一个 <code>conservatism_policy</code> 字段，而不是到处硬编码 min()。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>答「取最小值最安全」就停了——这是把「保守」等同于「安全」，是本模块最想纠正的直觉</td></tr>
+    </tbody>
+  </table>  <h3>Q4 · 思维链能提升准确率，为什么量产不直接开？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td><strong>30 秒骨架</strong></td><td>「因为车在动，可用推理时间是算得出来的。$T_{\text{reason}}^{\max} = (d_{\text{detect}} - v^2/2a)/v - T_{\text{perceive}} - T_{\text{act}}$。代入 60 km/h、检出距离 80 米、舒适减速度 3 m/s²，只有 <strong>1.77 秒</strong>；同样车速下检出距离掉到 50 米就只剩 0.03 秒。120 km/h 下检出 150 米算出来是<strong>负数</strong>——纯视觉根本来不及，必须靠地图先验。所以架构是<strong>快慢双系统</strong>：慢系统跑 CoT，但它<strong>输出约束与意图，不输出控制量</strong>；快系统在约束集内做 10–100 Hz 的实时优化，并独立处理必须立刻反应的事件。<em>约束天然抗延迟——『限速 60 从这里开始』这条陈述在 0.6 秒后依然正确，而一条轨迹在 0.6 秒后起点就错了。</em>」</td></tr>
+      <tr><td>加分点</td><td>「而且 CoT 的延迟是<strong>数据依赖</strong>的——复杂场景 token 更多——这就把 C53 里 NMS 那个问题在秒级重演了一遍。处理套路一样：硬性 token 上限 + 超时降级 + 推理预算随车速自适应。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>只说「太慢了」，给不出量级和倒推公式；说「用更快的芯片解决」（数量级差太远）</td></tr>
+    </tbody>
+  </table>  <h3>Q5 · 为什么必须在 VLA 外面套安全层？规则写进 prompt 不行吗？</h3>  <p><strong>骨架</strong>：「不行，三条理由。<em>①prompt 里的规则是软的</em>——它改变输出分布，不提供保证；在分布外输入上会失效而你无法枚举。<em>②无法验证</em>——你没法对着 prompt 论证『速度一定不超过 16.67』，对着一行 <code>v = min(v, v_max)</code> 可以，这在功能安全审查里是决定性的。<em>③共模失效</em>——prompt 规则与决策共用同一次前向、同一份感知输入、同一套权重，一起错就等于没有冗余。所以安全层要满足四条独立性：不同代码库、<strong>不同输入路径</strong>、独立算力预算、不同团队评审。它做五项校验（有效性/动力学/碰撞与安全距离/硬约束/连续性），三态输出 ACCEPT / CLIP / REJECT——<strong>其中 CLIP 还是 REJECT 取决于约束是否可投影</strong>：限速是凸区间可以 clip，禁左是不连通集只能整条拒绝，停车让行是个时序存在量词、必须重规划。」<br><strong>加分点</strong>：「但 prompt 规则仍然有价值——它降低安全层的干预率、提升体验，是<em>优化项</em>不是<em>保证项</em>。而且干预率本身要当一等指标度量：<strong>安全层每一次 REJECT 都是一个自动标注好的 hard case</strong>，直接进数据闭环。」</p>  <h3>Q6 · 你怎么验证约束层是对的？</h3>  <p><strong>骨架</strong>：「四层。<em>①单元测试</em>——状态机的每一条转移边都要有用例，特别是五条失效路径各一条；有一条不变式可以直接写成运行时 assert：<strong>同一 (kind, arg, lanes, source) 槽位上最多一条 ACTIVE 约束</strong>（跨来源并存正常，同来源并存一定是 bug）。<em>②场景回放</em>——把真实路段的 TSR 输出序列录下来，回放进约束层，逐帧比对期望约束集；这类回归集按失效模式组织，每个 bug 修复都补一条。<em>③指标化</em>——over-hold 里程 p95、early-release 次数（硬门禁 = 0）、平票率、安全层干预率、不必要制动次数/100km。<em>④影子模式</em>——线上不执行，只记录约束层输出与人类驾驶员实际行为的差异，用差异分布找系统性偏差。<strong>关键是这四层里没有一层依赖『看视频判断模型懂不懂』——约束层的正确性是可以完全客观化的，这正是把它从 VLA 里拆出来的最大收益。</strong>」</p>  <div class="callout intuition"><span class="label"></span>
+    <p>六道题共享一条主线：<strong>把「语义理解」和「安全保证」拆成两个责任主体。</strong>所有加分点都是这条主线的推论，所有踩雷点都是把两者混在一起的后果。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>法规的机器可读化。</strong>目前约束层里的失效规则、优先级、辅助牌语义，全是人工按各国法规手写的规则表——中国 GB 5768、欧洲 Vienna 公约、美国 MUTCD 三套体系的差异使得系统难以跨区域移植。<em>能否把交通法规半自动地编译成形式化的约束库（一个「法规 DSL」），并对它做一致性与完备性检查？这是一个学术界刚起步、工业界极需要的方向。</em></li>
+    <li><strong>神经-符号：让 LLM 生成约束程序而不是动作。</strong>与其让 VLA 直接输出轨迹，不如让它输出一段可执行的约束代码 / 时序逻辑公式（<span class="term">Signal Temporal Logic</span>），再交给一个确定性求解器。<em>这样语言模型的长尾理解能力被保留，而输出变成可验证的对象</em>。难点是生成的程序本身可能是错的——但至少它<strong>可以被检查</strong>，而一条轨迹不能。</li>
+    <li><strong>「最小必要保守」的度量。</strong>第 4 节指出保守本身是一种失效模式，但目前几乎没有公认的方法来量化「保守到什么程度是最优的」。<em>需要一个把超速风险、追尾风险、被追尾风险、乘客体感放在同一个期望风险框架里比较的模型，而不同风险的损失函数在不同法域下还不一样。</em></li>
+    <li><strong>安全层与能力上界的张力。</strong>安全层因为看不到语义而必然更保守，系统能力被 L3 而非 L1 决定。<em>能否设计一种「分级独立性」——让 L3 使用一份独立的、轻量的、但仍有一定语义能力的感知（例如一个专门的小模型），在不破坏共模失效解耦的前提下提升 L3 的判断力？</em>这是当前量产架构里最实际的张力之一。</li>
+    <li><strong>约束层的自动验证与合规测试生成。</strong>状态机 + 优先级规则是一个有限状态系统，原则上可以用模型检验（model checking）穷举所有转移路径，验证「不存在导致 early-release 的路径」这类性质。<em>但一旦引入感知置信度、连续里程、时间窗，状态空间就变成混合系统，验证难度陡增。</em>如何在可验证性与表达力之间取得平衡，是形式化方法与自动驾驶交叉处最有价值的问题。</li>
+    <li><strong>指令跟随的形式化评测。</strong>「VLA 有多好地遵守交通规则」目前几乎都靠场景集里的违规计数，而场景集是人写的、覆盖不全的。<em>能否像软件测试里的覆盖率一样，定义「规则覆盖率」与「约束状态机的转移覆盖率」，并自动生成能触达未覆盖转移的仿真场景？</em>模块 05 会讲评测体系，但这条自动化生成的路仍然是开放的。</li>
+    <li><strong>解释的忠实性（faithfulness）度量。</strong>第 5 节指出 VLA 的自述可能与真实计算路径无关。学术界已有一些忠实性测试方法（扰动输入看解释是否随之变化、反事实一致性检查），但<em>在自动驾驶这种高维连续输入 + 安全关键的场景下，还没有可用的标准做法</em>。在此之前，工程上的答案只有一个：解释由约束层产生，语言模型只负责翻译成人话。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>★ 必读</strong>：Shalev-Shwartz, Shammah, Shashua, <em>On a Formal Model of Safe and Scalable Self-driving Cars</em>（RSS，arXiv:1708.06374）——第 7 节那条最小安全距离公式的出处，重点看它<em>如何把「安全」变成一个可计算、可验证的定义</em>，这正是安全层存在的理论依据。<strong>★</strong> Tian et al., <em>DriveVLM: The Convergence of Autonomous Driving and Large Vision-Language Models</em>（CoRL 2024，arXiv:2402.12289）——重点看它的双系统设计（DriveVLM-Dual：大模型做慢推理、传统 3D 检测与规划做快通路），这是本模块第 6 节的工业界原型。<strong>★</strong> Hwang et al., <em>EMMA: End-to-End Multimodal Model for Autonomous Driving</em>（Waymo，arXiv:2410.23262）——重点看它对「用自然语言作为中间表示」的论证与它坦诚列出的局限。</p><p>配套背景：Raman et al., <em>Sorry Dave, I'm Afraid I Can't Do That: Explaining Unachievable Robot Tasks Using Natural Language</em>（RSS 2013，约束不可满足时如何解释——可解释性的形式化源头）；Sadigh et al. 关于 <em>Signal Temporal Logic</em> 在规划中的应用（把「必须在停止线前完全停止」这类时序性质写成可求解的约束）；Turpin et al., <em>Language Models Don't Always Say What They Think</em>（NeurIPS 2023，思维链的不忠实性——第 5 节 danger 框的直接依据）；Gilpin et al. 关于自动驾驶可解释性的综述。相邻课程：模块 03（TSR→VLA 接口与置信度传递）、模块 05（评测与上车，本模块的指标在那里被正式化）、C55 模块 04（跟踪与迟滞状态机，本模块状态机的上游）、C55 模块 05（安全导向评测）、C58（安全层 REJECT 作为难例来源）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_perception_interface/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · TSR 输出如何进入 VLA：接口设计</div></a>
+    <a class="next" href="../05_eval_deploy/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · VLA 的评测与上车</div></a>
+  </div>
+
+</div>
+</body>
+</html>

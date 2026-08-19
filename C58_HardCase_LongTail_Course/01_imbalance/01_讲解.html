@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 类别不平衡的处理谱系</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 类别不平衡的处理谱系</h1>
+  <p class="subtitle">两种不平衡必须<em>分开</em>治：前景-背景（单张图 1:1000 量级，靠 Focal / OHEM）与类别间长尾（靠采样 / 重加权 / 解耦），混着治是「加了一堆技巧但尾部纹丝不动」的头号原因 · repeat factor <code>r_c = max(1, √(t/f_c))</code>：t = 0.001、f_c = 1e-4 时该类被重复 <strong>3.16</strong> 倍，而不是按 1/f 的 10 倍——平方根就是「怕过拟合」的那个刹车 · Class-Balanced Loss 用<em>有效样本数</em> (1−β^n)/(1−β) 而非 1/n：β = 0.999 时 n = 1000 与 n = 10000 的权重只差 <strong>1.58</strong> 倍 · LDAM 让 margin Δ_j ∝ n_j^(−1/4) · EQL 的洞察是检测独有的：稀有类每步被上千个<em>负梯度</em>淹没，EQLv2 直接把正负梯度比拉回 1 · <strong>logit adjustment 只在推理时减去 τ·log π_y，零训练成本、可回滚</strong> · 解耦训练（cRT / LWS）证明了长尾伤的主要是<em>分类器</em>而不是表示 · 决策树的第一问是「你能不能改推理」</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00；C18（检测基础）与 C55 m01（标志分类体系）有帮助；懂 softmax/sigmoid 交叉熵即可</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_class_imbalance.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">LVIS (CVPR 2019)、Class-Balanced Loss (CVPR 2019)、LDAM-DRW (NeurIPS 2019)、EQL/EQLv2 (CVPR 2020/2021)、Logit Adjustment (ICLR 2021)、Decoupling (ICLR 2020)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#two_kinds">先分清：检测里有两种完全不同的不平衡</a></li>
+      <li><a href="#resample">重采样：让稀有类多出现几次</a></li>
+      <li><a href="#reweight">重加权：不改采样，改损失的权重</a></li>
+      <li><a href="#eql">EQL / EQLv2：稀有类是被负梯度淹死的</a></li>
+      <li><a href="#logit_adj">Logit adjustment：零训练成本的一行修正</a></li>
+      <li><a href="#decouple">解耦训练：表示是好的，坏掉的是分类器</a></li>
+      <li><a href="#arch">架构与数据侧：两级方案、层次标签与 copy-paste</a></li>
+      <li><a href="#tree">方法选择决策树：面试里能分层作答的人极少</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="two_kinds"><span class="num">1</span>先分清：检测里有两种完全不同的不平衡</h2>
+  <p>「长尾怎么办」这个问题之所以能筛掉大多数候选人，第一关就卡在这里：<strong>检测任务里同时存在两种性质完全不同的不平衡，它们的成因、症状、解法都不一样，而且互不替代。</strong>混为一谈，后面所有方法的选择都会错。</p>  <table>
+    <thead><tr><th></th><th><strong>前景-背景不平衡</strong></th><th><strong>类别间（长尾）不平衡</strong></th></tr></thead>
+    <tbody>
+      <tr><td>层级</td><td><strong>位置级</strong>（anchor / grid cell / query）</td><td><strong>数据集级</strong>（跨图统计实例数）</td></tr>
+      <tr><td>典型比例</td><td>1 : 300 ~ 1 : 10000（每张图都是）</td><td>1 : 100 ~ 1 : 10000（头部类 vs 尾部类）</td></tr>
+      <tr><td>是否与类别有关</td><td><strong>无关</strong>——只有两类：是目标 / 不是目标</td><td><strong>核心就是类别</strong></td></tr>
+      <tr><td>每张图都存在吗</td><td>是。哪怕数据集完全平衡也存在</td><td>否。它是数据集统计属性，单张图看不出来</td></tr>
+      <tr><td>主要症状</td><td>训练早期被背景主导，loss 被背景吃掉；分类头输出全是背景</td><td>尾部类 AP 接近 0；macro 与 micro 指标严重背离</td></tr>
+      <tr><td>主流解法</td><td>采样（RPN 1:3、OHEM）、<strong>Focal Loss</strong>、标签分配（一对一天然正样本少但比例可控）</td><td>重采样（RFS）、重加权（CB Loss/LDAM）、<strong>EQL/EQLv2</strong>、<strong>logit adjustment</strong>、<strong>解耦训练</strong></td></tr>
+    </tbody>
+  </table>  <p>把数字落实一下。一张 640×640 的图，anchor-free 检测器在 P3–P5 三层上一共约 <strong>8400 个预测位置</strong>；一张典型的 TSR 图像里有 1–5 个交通标志，标签分配给出 3–30 个正样本。<strong>正负比大约 1:280 到 1:2800</strong>。这就是前景-背景不平衡，与「限速 40 有 12 万实例、注意落石只有 30 个」没有任何关系。</p>  <div class="ascii">① 前景-背景不平衡（**位置级**，每张图都有）
+   一张 640×640 图 → 8400 个预测位置
+   ┌────────────────────────────────────────────────┐
+   │ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ │  ■ = 背景位置 ≈ 8380
+   │ ■ ■ ■ ■ ● ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ● ■ ■ ■ ■ ■ ■ ■ │  ● = 正样本   ≈ 20
+   │ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ ■ │
+   └────────────────────────────────────────────────┘
+   → Focal Loss / OHEM / 采样比例。**与类别无关。**
+
+② 类别间不平衡（**数据集级**，跨图统计）
+   实例数
+   80000 ┤██  限速40
+         │██
+   20000 ┤██ ██  禁止停车
+         │██ ██ ██
+     500 ┤██ ██ ██ ██ ██ ▁▁ ▁▁ ▁▁ ▁▁ ▁▁ ▁▁ ▁▁ ▁▁ ▁▁ ▁▁
+      30 ┤                                        ▁ 注意落石 / 注意牲畜 / 事故易发
+         └──────────────────────────────────────────────→ 类别（按频次排序）
+   → RFS / CB Loss / LDAM / EQLv2 / logit adjustment / 解耦。**与位置无关。**</div>  <div class="callout danger"><span class="label">Focal Loss 不是长尾解法</span>
+    <p><strong>面试高频陷阱：问「长尾怎么办」，答「用 Focal Loss」——这是把两个问题混为一谈，会被当场追问到崩。</strong></p><p>Focal Loss 的权重是 <code>(1−p_t)^γ</code>，它按<em>样本难度</em>加权，<strong>完全不看类别频率</strong>。头部类里也有难样本（被遮挡的限速 40），尾部类里也有易样本（画面正中的大号警告牌）。所以 Focal Loss 解决的是「大量简单背景淹没损失」，对「限速 40 有 12 万个而注意落石只有 30 个」这件事几乎无能为力。原论文的实验也是在 COCO（类别相对平衡）上做的。<em>能主动指出这一点，比会背 Focal Loss 公式有价值得多。</em></p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>两种不平衡还有一个关键的<strong>耦合点</strong>：在 sigmoid 多标签检测头里，「背景位置对某个类别的负梯度」与「其他类别的正样本对这个类别的负梯度」是<em>同一种东西</em>——都是 <code>y=0</code> 的 BCE 项。于是前景-背景不平衡的量级（1:2800）会<strong>乘上</strong>类别间不平衡的量级，稀有类的正负梯度比可以低到 <code>1 : 10^5</code>。这正是第 4 节 EQL 要解决的问题，也是<strong>检测的长尾比分类的长尾更难</strong>的技术原因。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有第三种常被忽略的不平衡：<strong>尺度/难度不平衡</strong>（小目标的正样本天然更稀缺，因为 IoU 阈值对小框极不友好——8×8 的框位移 2 px，IoU 就从 1.0 掉到 0.39）。它属于 C57 的范畴，但在 TSR 里与类别长尾<em>高度纠缠</em>：稀有标志往往也是远处的小标志（稀有 → 采集机会少 → 只在远景里偶然拍到过几次）。<strong>做误差分析时必须按「类别频率 × 像素尺寸」双向分桶</strong>，否则你会把小目标问题误诊成长尾问题，然后用重采样去治，白忙一场。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="resample"><span class="num">2</span>重采样：让稀有类多出现几次</h2>
+  <p>最直接的想法：稀有类样本少，那就让它在每个 epoch 里多出现几次。但在<strong>检测</strong>里这件事比分类难，难在一个结构性事实上——<strong>采样的单位是图像，而一张图里可能同时含有头部类和尾部类</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>分类任务里，「按类别平衡采样」是干净的：每个样本恰好一个标签，想让每类等频率就按 <code>1/f_c</code> 采。检测里做不到——你为了多看一次「注意落石」而重复了那张图，图里的三块「限速 40」也跟着被重复了。<em>所以检测的重采样只能是「图像级的近似」，永远无法做到类别精确平衡。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更麻烦的是，朴素的 <code>1/f_c</code> 采样会把只有 8 张图的类别重复几百次。模型看到的不是「更多的注意落石」，而是<strong>同样 8 张图的第 300 遍</strong>——它会把这 8 张图的<em>背景</em>、光照、拍摄角度一起背下来。这就是重采样的过拟合风险：<strong>重采样增加的是「看到的次数」，不是「信息量」</strong>。30 张图重复 100 次 ≠ 3000 张图。</p></div>
+  </div>  <h3>Repeat Factor Sampling（RFS）：LVIS 的做法</h3>  <p>LVIS 提出的 <span class="term">repeat factor sampling</span> 是目前检测长尾里<strong>最常用、最先该试的重采样方法</strong>（mmdet 里就是 <code>ClassBalancedDataset</code>）。它分三步：</p>  <div class="math-block">\[r_c \;=\; \max\!\left(1,\ \sqrt{\frac{t}{f_c}}\right) \qquad\quad r_i \;=\; \max_{c \,\in\, i} r_c \qquad\quad \hat r_i \;=\; \lfloor r_i \rfloor + \mathbb{1}\!\left[u < r_i - \lfloor r_i \rfloor\right],\ \ u \sim U(0,1)\]</div>  <ol>
+    <li><strong>类别级 repeat factor</strong> <code>r_c = max(1, √(t/f_c))</code>。<strong><code>f_c</code> 是「包含类别 c 的图像数 ÷ 数据集总图像数」，即<em>图像频率</em>，不是实例数占比</strong>——这个细节面试会问，因为采样的单位是图像。<code>t</code> 是阈值超参（LVIS 用 <code>t = 0.001</code>）：<em>频率高于 t 的类完全不重复</em>。</li>
+    <li><strong>图像级 repeat factor</strong> <code>r_i = max_{c ∈ i} r_c</code>——<strong>取最大值而不是平均</strong>。理由：一张图里只要含有任何一个稀有类，这张图就值得被重复；取平均会被图里的常见类稀释掉。</li>
+    <li><strong>随机取整</strong>：每个 epoch 开始时，整数部分确定重复，小数部分用伯努利采样决定要不要多来一次。<em>这样期望重复次数正好是 <code>r_i</code>，而且每个 epoch 的重复集合都不同，缓解了固定重复带来的过拟合。</em></li>
+  </ol>  <p><strong>为什么是平方根，而不是 <code>t/f_c</code>？</strong>这是 RFS 最值得讲的一个设计。<code>1/f_c</code> 会把分布<em>完全拉平</em>到均匀，尾部类的重复倍数直接爆炸（<code>f_c = 1e-5</code> 时重复 10 万次）。平方根相当于在「原始分布」和「均匀分布」之间做<strong>几何插值（指数 0.5）</strong>：既显著抬高尾部，又不至于把 8 张图重复到模型背下来。<em>换句话说，√ 是「过采样强度」这个连续旋钮上一个经验上很好的取值</em>——你完全可以把它换成 <code>(t/f_c)^p</code> 并把 <code>p</code> 当超参调（p=0 不重采样，p=1 完全拉平）。</p>  <table>
+    <thead><tr><th>方案</th><th>尾部重复倍数（f_c=1e-4, t=1e-3）</th><th>过拟合风险</th><th>评价</th></tr></thead>
+    <tbody>
+      <tr><td>不重采样</td><td>1×</td><td>无</td><td>尾部类一个 epoch 出现不到一次，学不到</td></tr>
+      <tr><td><code>1/f_c</code> 完全拉平</td><td><strong>10 倍于 √ 的量级</strong>（此例 10×→ 但对更稀有的类会到 10³×）</td><td><strong>极高</strong></td><td>模型背下尾部类那几张图的背景</td></tr>
+      <tr><td><strong>RFS <code>√(t/f_c)</code></strong></td><td><strong>3.2×</strong></td><td>中</td><td><strong>检测长尾的默认起点</strong></td></tr>
+      <tr><td>RFS + 上界裁剪</td><td>min(3.2×, cap)</td><td>低</td><td>工程上常见的加固：给 r 设上界（如 6）防极端类</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>RFS 有两个必须知道的副作用。<strong>① 共现污染</strong>：因为 <code>r_i</code> 取图内最大值，与稀有类经常共现的常见类会被顺带过采样。在 TSR 里这很典型——「注意落石」几乎总和「限速」牌一起出现在山区路段，于是山区的限速牌被过采了一大堆，而城市的限速牌相对被稀释了。<strong>② epoch 长度变化</strong>：重采样后一个 epoch 的迭代数变多（LVIS 上典型 1.5–2×），<em>如果你不同步调整学习率调度和总 iteration，就等于偷偷给重采样组多训了一倍——这是消融实验里最常见的不公平对比</em>。</p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话记住 RFS：<strong>它只回答「每张图该被看几遍」，用的是图像频率、开方、取图内最大、每 epoch 随机取整。</strong>能把这四个设计点逐个说出理由，就说明你读过原文而不是只用过 config。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="reweight"><span class="num">3</span>重加权：不改采样，改损失的权重</h2>
+  <p>重采样改的是「数据出现的频率」，重加权改的是「同一份数据在损失里的分量」。两者在理论上有相似的效果，但工程性质差别很大：<strong>重加权不改变 epoch 长度、不制造重复样本、也不会有共现污染</strong>，代价是它对<em>极端</em>不平衡更容易训崩。</p>  <h3>① 朴素反频率加权：为什么不能直接用</h3>  <p>最朴素的做法是 <code>w_c ∝ 1/n_c</code>。它在 <code>n_c = 8</code> 的类上给出比头部类大 <strong>一万倍</strong>的权重，于是一个 batch 里只要出现一个尾部样本，梯度就被它主导，<em>梯度方差爆炸、训练震荡甚至发散</em>。实践中要么加温度 <code>w_c ∝ n_c^{-p}</code>（p=0.5 常用），要么用下面两个更有原则的方案。</p>  <h3>② Class-Balanced Loss：有效样本数</h3>  <p><span class="term">Class-Balanced Loss</span>（Cui et al., CVPR 2019）的洞察是：<strong>同一类的样本之间存在信息重叠，第 n 个样本带来的边际信息量随 n 递减</strong>。作者用一个简单的覆盖模型形式化它——假设每个新样本有 <code>β</code> 的概率落进已经被覆盖的区域，则 n 个样本的「有效样本数」满足递推 <code>E_n = 1 + β·E_{n−1}</code>，<code>E_1 = 1</code>，解得：</p>  <div class="math-block">\[E_n \;=\; \frac{1-\beta^{\,n}}{1-\beta}, \qquad w_c \;\propto\; \frac{1}{E_{n_c}} \;=\; \frac{1-\beta}{1-\beta^{\,n_c}}, \qquad \beta \in [0,1)\]</div>  <p>这个公式的价值在于它的<strong>两个极限</strong>：</p>  <ul>
+    <li><code>β → 0</code>：<code>E_n → 1</code>，所有类权重相同——<strong>等价于不加权</strong>（假设样本完全冗余）。</li>
+    <li><code>β → 1</code>：<code>E_n → n</code>，<code>w_c ∝ 1/n_c</code>——<strong>等价于朴素反频率</strong>（假设样本完全不重叠）。</li>
+  </ul>  <p><strong>所以 β 是一个把「不加权」与「反频率」连成一条连续曲线的旋钮</strong>，而不是二选一。典型取值 <code>β ∈ {0.99, 0.999, 0.9999}</code>；直觉上 <code>1/(1−β)</code> 就是「一个类大约需要多少样本才饱和」——β=0.999 意味着假定约 1000 个样本后边际信息趋零，这与前一模块的边际收益曲线是同一个思想的两种写法。<em>β 该怎么选？看你的头部类样本数：如果头部类有 10 万个而 1/(1−β)=1000，那么头部类被视为「早已饱和」，权重被压得很低。</em></p>  <h3>③ LDAM：不改权重，改间隔</h3>  <p><span class="term">LDAM</span>（Label-Distribution-Aware Margin, Cao et al., NeurIPS 2019）走的是另一条路：<strong>稀有类的问题是决策边界离它太近，泛化间隔不够</strong>，所以给稀有类一个更大的分类间隔：</p>  <div class="math-block">\[\mathcal{L}_{\mathrm{LDAM}} = -\log \frac{e^{\,z_y - \Delta_y}}{e^{\,z_y - \Delta_y} + \sum_{j \neq y} e^{\,z_j}}, \qquad \Delta_c = \frac{C}{n_c^{1/4}}\]</div>  <p><code>Δ_c ∝ n_c^{−1/4}</code> 这个指数不是拍脑袋的——它来自泛化误差界的优化：在「间隔之和固定」的约束下最小化各类泛化界，最优解就是 <code>n_c^{−1/4}</code>。<strong>LDAM 的实际效果高度依赖它的搭档 DRW（deferred re-weighting）</strong>：前若干 epoch 完全不加权地训练，到学习率第一次衰减时才开启重加权。<em>这个「先按原分布学、后期再平衡」的两段式，已经是下一节要讲的「解耦训练」的雏形</em>——作者当时给的解释是「先学好表示，再调决策边界」，而这正是 Kang 等人后来系统验证的结论。</p>  <table>
+    <thead><tr><th>方法</th><th>改什么</th><th>关键超参</th><th>适用</th><th>失效场景</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Focal Loss</strong></td><td>按样本难度 <code>(1−p_t)^γ</code> 加权</td><td>γ=2, α=0.25</td><td><strong>前景-背景不平衡</strong></td><td><strong>对类别间长尾几乎无效</strong>；标注有噪时会放大噪声（噪声样本永远是「难例」）</td></tr>
+      <tr><td><strong>反频率</strong></td><td><code>w_c ∝ 1/n_c</code></td><td>无</td><td>轻度不平衡（<20×）</td><td>极端不平衡下梯度爆炸、训练发散</td></tr>
+      <tr><td><strong>CB Loss</strong></td><td><code>w_c ∝ (1−β)/(1−β^{n_c})</code></td><td><strong>β</strong>（0.99~0.9999）</td><td>分类；检测里也常用</td><td>β 选错等于回退到「不加权」或「反频率」两个极端</td></tr>
+      <tr><td><strong>LDAM(+DRW)</strong></td><td>给稀有类更大 margin <code>Δ_c ∝ n_c^{−1/4}</code></td><td>C（max margin）、DRW 起点</td><td>softmax 多分类</td><td><strong>sigmoid 多标签检测头上不直接适用</strong>；单独用不加 DRW 收益有限</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>一个真实的坑：<strong>Focal Loss 与标注噪声是反向作用的</strong>。Focal 给「模型觉得难」的样本更大权重，而<em>标注错误的样本对模型来说永远是最难的</em>——它会被持续放大。所以在标注质量不高的数据上（比如众包标的小目标 TSR 数据），γ 调大反而掉点。<em>这是模块 02「挖掘过头会把噪声当难例」那条主线的第一次出现。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eql"><span class="num">4</span>EQL / EQLv2：稀有类是被负梯度淹死的</h2>
+  <p>这一节是本模块最该讲透的地方，因为它是<strong>检测特有</strong>的机制，也是「长尾在检测里为什么比在分类里更难」的直接答案。<strong>面试里能说清这一段的人极少。</strong></p>  <h3>机制：负梯度的量级差</h3>  <p>现代检测器的分类头几乎都用 <strong>sigmoid 多标签</strong>（每个类一个独立的二分类），而不是 softmax。对某一个类别 <code>j</code> 而言，一个 batch 里的样本被分成两拨：</p>  <ul>
+    <li><strong>正梯度</strong>：来自真实标签是 <code>j</code> 的候选框。BCE 的梯度是 <code>σ(z_j) − 1 < 0</code>，把 <code>z_j</code> <em>推高</em>。</li>
+    <li><strong>负梯度</strong>：来自所有<em>其他</em>候选框——包括背景位置，<strong>也包括所有其他前景类的正样本</strong>。梯度是 <code>σ(z_j) > 0</code>，把 <code>z_j</code> <em>压低</em>。</li>
+  </ul>  <p>现在算账。一张图 8400 个位置，其中约 20 个正样本。对头部类「限速 40」，一个 batch 里可能有 15 个它的正样本、8385 个负样本，正负梯度比约 <strong>1 : 560</strong>——不好，但还能训。对尾部类「注意落石」，它<em>在 500 个 batch 里才出现一次</em>，而每个 batch 的 8400 个位置都在对它施加负梯度。累积下来正负梯度比可以低到 <strong>1 : 10⁵ 甚至 1 : 10⁶</strong>。</p>  <div class="ascii">对类别 j 的梯度流（sigmoid 多标签头，累积一个训练周期）
+
+  头部类「限速40」                          尾部类「注意落石」
+  ┌──────────────────────────┐             ┌──────────────────────────┐
+  │ 正梯度 ↑↑↑↑↑↑↑↑ (推高)   │             │ 正梯度 ↑    (推高)       │
+  │ 负梯度 ↓↓↓↓↓↓↓↓↓↓↓↓↓↓    │             │ 负梯度 ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ │
+  │        ~1 : 560          │             │        **~1 : 10^5**     │
+  └──────────────────────────┘             └──────────────────────────┘
+            │                                          │
+            ▼                                          ▼
+     z_j 稳定在合理区间                    **z_j 被持续压向 -∞**
+     σ(z_j) 峰值 0.85                       σ(z_j) 峰值 0.03
+            │                                          │
+            ▼                                          ▼
+     score 0.85 &gt; 阈值 0.3 ✅          score 0.03 &lt; 阈值 0.3 ❌ 被过滤掉
+                                       → **框定位得很准，但根本输不出来**
+
+  诊断指纹：把各类分类器权重范数 ||w_c|| 画出来 → 与 log(n_c) 强正相关。
+            尾部类的 ||w_c|| 只有头部类的几分之一。</div>  <div class="callout intuition"><span class="label"></span>
+    <strong>把这句话背下来：稀有类的问题往往不是「特征学不好」，而是「分类器的 logit 被海量负梯度压死了」。</strong>证据是：把同一个模型的特征拿出来做最近类均值（NCM）分类，尾部类的准确率会显著高于模型自己的分类头给出的结果——<em>说明表示是好的，坏掉的是最后那一层</em>。这一句能同时串起 EQL、logit adjustment 和解耦训练三节内容，是本模块的枢纽。
+  </div>  <h3>EQL v1：屏蔽来自更常见类的负梯度</h3>  <p><span class="term">Equalization Loss</span>（Tan et al., CVPR 2020）的做法很直接：<strong>当一个候选框属于某个比 j 更常见的前景类时，屏蔽掉它对 j 的负梯度</strong>。形式上给 BCE 的负样本项乘一个权重：</p>  <div class="math-block">\[w_j \;=\; 1 - \beta\,T_\lambda(f_j)\,(1-y_j), \qquad T_\lambda(f_j)=\mathbb{1}[f_j<\lambda], \qquad \beta \sim \mathrm{Bernoulli}(p)\]</div>  <p>解读：<code>T_λ(f_j)=1</code> 表示 j 是稀有类（图像频率低于 λ）；<code>(1−y_j)</code> 表示这是个负样本项；<code>β</code> 是一个伯努利随机量，作用是<strong>只屏蔽一部分负梯度</strong>——因为完全屏蔽会让稀有类的 logit 无节制上涨、误检暴增。<em>此外 EQL 只屏蔽来自「其他前景类正样本」的负梯度，保留来自背景的负梯度</em>，否则模型会把背景也当成稀有类。</p>  <p>EQL 的问题是<strong>它把类别硬切成「稀有/不稀有」两档</strong>，λ 是个敏感超参，而且要求你事先知道类别频率——在数据持续增长的量产系统里，频率是天天在变的。</p>  <h3>EQLv2：把梯度比当作反馈信号在线均衡</h3>  <p><span class="term">EQLv2</span>（Tan et al., CVPR 2021）把思路从「屏蔽」升级为「<strong>梯度引导的重加权，目标是把每个类的累积正负梯度比拉到 1:1</strong>」。它在训练中<em>在线</em>维护每个类的累积梯度统计：</p>  <div class="math-block">\[g_j = \frac{\sum |\nabla^{+}_j|}{\sum |\nabla^{-}_j|}, \qquad q_j = 1 + \alpha\bigl(1 - f(g_j)\bigr), \qquad r_j = f(g_j), \qquad f(x)=\frac{1}{1+e^{-\gamma(x-\mu)}}\]</div>  <p><code>q_j</code> 放大正梯度、<code>r_j</code> 衰减负梯度（论文默认 <code>α=4, γ=12, μ=0.8</code>）。<code>g_j</code> 越小（说明该类被负梯度压得越狠），<code>f(g_j)</code> 越接近 0，于是正梯度被放大到接近 <code>1+α</code> 倍、负梯度被压到接近 0。<strong>这是一个负反馈控制器</strong>：类别一旦被均衡回来，<code>g_j</code> 上升，加权自动退回中性。</p>  <table>
+    <thead><tr><th></th><th>EQL v1</th><th>EQLv2</th></tr></thead>
+    <tbody>
+      <tr><td>核心操作</td><td>对稀有类<strong>屏蔽</strong>来自常见前景类的负梯度</td><td>按累积梯度比<strong>连续重加权</strong>正/负梯度</td></tr>
+      <tr><td>是否需要类别频率先验</td><td><strong>需要</strong>（λ 阈值基于 f_c）</td><td><strong>不需要</strong>——统计量在线累积</td></tr>
+      <tr><td>类别粒度</td><td>二值（稀有 / 不稀有）</td><td><strong>每类连续</strong>，且随训练自适应</td></tr>
+      <tr><td>超参</td><td>λ、β 的概率 p（敏感）</td><td>α, γ, μ（论文默认值鲁棒，基本不用调）</td></tr>
+      <tr><td>对新增类别</td><td>要重新统计频率、重设 λ</td><td><strong>天然友好</strong>：新类 g_j 低 → 自动被扶持</td></tr>
+      <tr><td>典型收益（LVIS AP_r）</td><td>+4~6</td><td><strong>再 +2~3</strong>，且训练更稳</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>什么时候<strong>不</strong>该用 EQL 系？<em>如果你的检测头是 softmax 多分类（老式两阶段 R-CNN 的 RoI head），负梯度淹没的机制并不成立</em>——softmax 里各类 logit 是竞争关系，稀有类不会被独立地压到 −∞，问题表现为「被判成头部类」而不是「分数极低」。这时该用的是 BAGS（balanced group softmax）或 logit adjustment，而不是 EQL。<strong>能说出「EQL 是为 sigmoid 头设计的」这个前提，是读懂了机制而不是记住了名字。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>EQLv2 在 TSR 上的价值特别高，原因是<strong>类别数多且持续增长</strong>：一个量产 TSR 系统的类别表通常有 200–500 项（限速 5–120 的每一档、组合牌、区域性标志），且随着法规更新和城市扩展不断加类。<em>每加一批类就重新统计频率、重调 λ 是不现实的</em>；EQLv2 的在线梯度统计恰好绕开了这个运维负担。而且新类刚加进来时样本极少、<code>g_j</code> 极低，正是它被自动扶持得最狠的时候——<strong>这与数据闭环「持续加新类、持续补数据」的节奏天然契合</strong>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="logit_adj"><span class="num">5</span>Logit adjustment：零训练成本的一行修正</h2>
+  <p>前面几节都要改训练。这一节的方法<strong>完全不改训练</strong>，只改推理时的一行代码，却有干净的贝叶斯推导。<strong>它应该是你遇到长尾问题时第一个试的东西</strong>——因为它半小时就能告诉你「先验修正能救回多少」，从而判断值不值得投入去改训练。</p>  <h3>推导</h3>  <p>设训练集的类别先验是 <code>π_c = n_c / N</code>，而你真正关心的评测分布是<strong>类别平衡</strong>的（macro 指标、或者每类同等重要的安全场景）。模型在训练分布上拟合的是</p>  <div class="math-block">\[p_{\mathrm{train}}(y=c \mid x) \;\propto\; p(x \mid y=c)\,\pi_c \qquad\Longrightarrow\qquad p_{\mathrm{bal}}(y=c \mid x) \;\propto\; \frac{p_{\mathrm{train}}(y=c\mid x)}{\pi_c}\]</div>  <p>在 logit 空间上，除以 <code>π_c</code> 就是<strong>减去 <code>log π_c</code></strong>。于是平衡分布下的最优决策是：</p>  <div class="math-block">\[\hat y \;=\; \arg\max_c \ \bigl[\, z_c(x) \;-\; \tau \log \pi_c \,\bigr], \qquad \tau = 1 \ \text{为理论最优}\]</div>  <p><code>τ</code> 是一个实践中放松出来的温度：<code>τ=0</code> 退回原始预测，<code>τ=1</code> 是完全的先验校正，<code>τ∈(0,1)</code> 是折中。<em>理论最优 τ=1 的前提是模型完美拟合了 <code>p_train(y|x)</code>；实际模型有拟合误差，所以最优 τ 往往落在 0.5–1.0 之间，需要在验证集上扫一遍。</em></p>  <p>还有一个<strong>训练时版本</strong>（logit-adjusted loss）：把修正项<em>加</em>进训练的 softmax 里，推理时什么都不做——</p>  <div class="math-block">\[\mathcal{L} = -\log \frac{e^{\,z_y + \tau\log\pi_y}}{\sum_j e^{\,z_j + \tau\log\pi_j}}\]</div>  <p>两者在理想情况下等价，但训练时版本通常更稳（模型有机会自己适应这个偏置），代价是要重训。<strong>工程上的正确顺序是：先用推理时版本白嫖一次，看天花板在哪，再决定要不要花一次训练去做训练时版本。</strong></p>  <table>
+    <thead><tr><th></th><th>推理时 logit adjustment</th><th>训练时 logit-adjusted loss</th><th>τ-normalized（下一节）</th></tr></thead>
+    <tbody>
+      <tr><td>成本</td><td><strong>零</strong>——改一行 argmax</td><td>一次完整重训</td><td><strong>零</strong>——只归一化权重</td></tr>
+      <tr><td>需要什么</td><td>训练集类别先验 <code>π_c</code></td><td>同左</td><td>训练好的分类器权重</td></tr>
+      <tr><td>能调吗</td><td><strong>能</strong>，τ 可在验证集上扫</td><td>要重训才能换 τ</td><td>能，τ 可扫</td></tr>
+      <tr><td>典型增益（长尾分类）</td><td>尾部 +5~15 个点</td><td>略优于推理时版</td><td>与推理时版相当</td></tr>
+      <tr><td>主要风险</td><td><strong>稀有类误检暴增</strong>，score 阈值失效</td><td>同左，但更可控</td><td>同左</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">调 logit = 移动工作点，必须重新标定</span>
+    <p><strong>在检测里用 logit adjustment 有三个必须处理的细节，忽略任何一个都会翻车：</strong></p><p>① <strong>π_c 用什么统计？</strong>检测的 <code>π_c</code> 可以是实例数占比，也可以是图像频率，还可以是「被标签分配判为该类正样本的位置数」占比。<em>严格对应推导的是最后一个</em>（因为分类头是在候选位置上做决策的），但实践中实例数占比就够用。写清楚你用的是哪个，否则复现不出来。</p><p>② <strong>sigmoid 头上推导不严格成立。</strong>公式是从 softmax 的贝叶斯规则来的；sigmoid 多标签头里各类独立，减去 <code>log π_c</code> 只是一个启发式（虽然实践中有效）。此时 τ 必须调。</p><p>③ <strong>调完 logit，原来的 score 阈值与 NMS 全部失效。</strong>所有类的分数分布被整体平移，<em>你必须重新标定工作点</em>。在 TSR 里这一步尤其危险：把稀有类的分数抬上去，意味着「注意落石」「事故易发」这类牌的误检率上升——而误报一个「停车让行」会触发不必要的急刹。<strong>正确做法是按类别分别标定阈值，并在安全关键类上用更保守的 τ。</strong></p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>面试里的加分说法：<strong>「我会先做 logit adjustment 和 τ-normalize，因为它们零训练成本，半小时就能知道『先验校正』这条路的天花板在哪；如果尾部 AP 因此涨了很多，说明瓶颈在分类器先验而不是表示，那我接下来做 cRT；如果几乎没涨，说明表示本身就分不开，得去补数据或者上层次标签。」</strong>——这段话展示的是「用便宜的实验做诊断，再决定贵的投入」的工程判断，比列举十个方法名有说服力得多。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="decouple"><span class="num">6</span>解耦训练：表示是好的，坏掉的是分类器</h2>
+  <p>2020 年 Kang 等人的 <em>Decoupling Representation and Classifier for Long-Tailed Recognition</em>（ICLR 2020）做了一个把整个领域重新定向的实验。<strong>结论反直觉但极其实用</strong>，而且它给上一节那句「坏掉的是最后一层」提供了系统性证据。</p>  <h3>那个关键实验</h3>  <ol>
+    <li>用<strong>原始长尾分布</strong>（instance-balanced sampling，就是什么都不做）训练一个模型。</li>
+    <li>把 backbone 冻住，只把最后的线性分类器<strong>丢掉重训</strong>，重训时用类别平衡采样。</li>
+    <li>结果：尾部类准确率大幅提升，<strong>而且整体表现优于「从头就用平衡采样训练」的模型</strong>。</li>
+  </ol>  <p>再补一个更强的证据：<strong>用长尾训练出来的特征做最近类均值（NCM）分类</strong>——不训练任何分类器，只算每类特征均值然后按余弦相似度分类——尾部类的准确率也显著高于模型自己的分类头。<em>这说明重采样带来的收益几乎全部作用在分类器上，而重采样对表示学习是<strong>有害</strong>的</em>（因为它让 backbone 反复看同样那几十张尾部图片，多样性下降）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把两件事拆开就清楚了：<strong>backbone 需要的是「多样性」，分类器需要的是「平衡」</strong>。instance-balanced 采样给 backbone 提供了最大的数据多样性（每张图看一遍），而分类器则应该在平衡的分布上决定决策边界。<em>过去所有「从头重采样」的方法都在用一个手段同时干预两个需求，于是在其中一个上做了错事。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这个结论也解释了 LDAM-DRW 里 DRW（延迟重加权）为什么有效：前期不加权 = 让表示在原分布上充分学；后期加权 = 只在末段调整决策边界。<strong>DRW 本质上是解耦的「软」版本</strong>——不冻结 backbone，但通过时间顺序近似达到同样效果。<em>把「解耦」「DRW」「两阶段微调分类头」看成同一个思想的三种实现，是理解这一整块的正确方式。</em></p></div>
+  </div>  <table>
+    <thead><tr><th>阶段二方法</th><th>做什么</th><th>训练成本</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td><strong>cRT</strong>（classifier re-training）</td><td>冻结 backbone，用类别平衡采样重训最后一层 fc</td><td><strong>极低</strong>（只有一层，可离线在缓存特征上跑）</td><td><strong>最实用的一招</strong>；工程上通常几分钟</td></tr>
+      <tr><td><strong>τ-normalized</strong></td><td><code>w_c ← w_c / ‖w_c‖^τ</code>，直接把权重范数拉平</td><td><strong>零</strong>（不训练）</td><td>τ 在验证集上扫；与 logit adjustment 效果相当</td></tr>
+      <tr><td><strong>LWS</strong>（learnable weight scaling）</td><td>冻结方向，只学每类一个标量缩放 <code>f_c</code></td><td>极低（C 个参数）</td><td>介于 cRT 与 τ-norm 之间</td></tr>
+      <tr><td><strong>NCM</strong>（nearest class mean）</td><td>用每类特征均值 + 余弦相似度分类，完全不用 fc</td><td>零</td><td>主要用作<strong>诊断</strong>：NCM 明显优于 fc ⇒ 问题在分类器</td></tr>
+    </tbody>
+  </table>  <h3>检测里怎么落地</h3>  <ul>
+    <li><strong>两阶段检测器（Faster R-CNN 系）最容易</strong>：RoI head 的分类分支就是一个独立的小网络，可以单独重训。把训练集过一遍、缓存 RoI 特征，然后用平衡采样重训分类分支——成本是全量训练的 <strong>1/50 量级</strong>。</li>
+    <li><strong>BAGS（Balanced Group Softmax, CVPR 2020）</strong>：把类别按频率分组，组内做 softmax，组间不竞争。这样头部类的 logit 不会直接压制尾部类，是「分组解耦」的思路。</li>
+    <li><strong>一阶段 sigmoid 头</strong>：分类分支与回归分支共享卷积，冻结更麻烦；实践中常用「只解冻分类分支的最后 1×1 conv + 用平衡采样微调少量 iteration」，或直接用 τ-normalize 这种零成本方案。</li>
+    <li><strong>诊断优先</strong>：先算 <code>‖w_c‖ vs log n_c</code> 的相关系数。<em>相关系数高（>0.8）就说明你正处在「分类器被频率带偏」的典型状态，解耦一定有效；相关系数低则说明问题在别处</em>——这个五分钟就能做的检查，能省掉一次白跑的训练。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>本节的可迁移心法：<strong>遇到长尾，先问「是表示的问题还是分类器的问题」，再选药。</strong>诊断工具有两个，都很便宜：① 分类器权重范数 vs log(样本数) 的相关性；② NCM 准确率 vs 模型自身分类头准确率的差。<em>这两个数一算，你就知道该去补数据（表示问题）还是该去重训分类头（分类器问题）——这正是下一节决策树的第一个分叉。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="arch"><span class="num">7</span>架构与数据侧：两级方案、层次标签与 copy-paste</h2>
+  <p>前面五节都在「同一份数据、同一个模型」的框架内做文章。但长尾最有效的两类解法其实在框架之外：<strong>换架构</strong>和<strong>真的补数据</strong>。TSR 恰好是这两类解法都特别适用的场景。</p>  <h3>两级方案：把长尾从检测器里搬出去</h3>  <p>C55 m02 讲过 TSR 的两级方案——<strong>第一级做类别无关（或粗类）的标志检测，第二级把 crop 送进一个专门的分类器</strong>。从长尾的角度看，它带来四个结构性好处：</p>  <ol>
+    <li><strong>第一级完全没有类别间不平衡</strong>。它只做「是标志 / 不是标志」的二分类，剩下的只有前景-背景不平衡，用 Focal Loss 就够了。<em>把两种不平衡在架构层面分离开——这是本模块第一节那个区分的最优雅的兑现方式。</em></li>
+    <li><strong>第二级是纯分类任务，长尾方法的全部弹药都能用</strong>。而且分类的重采样成本极低（crop 可以缓存成小图，一个 epoch 秒级），CB Loss / LDAM / cRT / logit adjustment 全部直接适用，调参迭代快一两个数量级。</li>
+    <li><strong>新增类别不需要重训检测器</strong>。法规更新加了 5 个新标志？只重训第二级分类器，几分钟的事，检测器一行不动。<em>在类别表持续增长的量产系统里，这个性质的价值极高。</em></li>
+    <li><strong>第二级可以用更高分辨率</strong>。把 24×24 的 crop 放大到 64×64 再分类，比在检测特征图上直接分类的信息量大得多——这同时缓解了长尾与小目标两个问题。</li>
+  </ol>  <div class="callout warn"><span class="label"></span>
+    <p>两级方案的代价必须一起讲，否则面试官会追问：<strong>① 误差级联</strong>——端到端召回 = 检测召回 × 分类准确率，两个 0.95 相乘就只剩 0.90，<em>第一级漏掉的第二级永远救不回来</em>；<strong>② 延迟叠加</strong>——车端 33ms 的预算里要塞下两次前向；<strong>③ 置信度合成</strong>——两级各有一个分数，怎么合成、怎么标定是个真问题（C55 m02 展开）。<em>能主动说出「级联召回是乘法」这一句，说明你真的算过账。</em></p>
+  </div>  <h3>层次标签：让粗类的梯度帮到细类</h3>  <p>交通标志天然有层次：<strong>禁令 / 警告 / 指示 / 指路</strong>（粗类，由形状和颜色决定）→ 具体标志（细类）→ 属性（限速值等）。关键观察是：<strong>粗类永远不稀有</strong>——「警告类」加起来有几万个实例，哪怕其中「注意落石」只有 30 个。于是用层次损失（粗类头 + 细类头，或树结构 softmax），<em>稀有细类可以从它所属粗类的海量样本里借到梯度</em>，学会「三角形 + 黄底 + 黑边 = 警告类」这个共享结构，只需要用自己那 30 个样本去学「里面画的是石头」。</p>  <h3>copy-paste：真正增加实例数与背景多样性</h3>  <p>重采样只是把同样 30 张图看更多遍；<strong>copy-paste 是真的在造新样本</strong>——把稀有标志从原图抠出来，贴到大量新背景上（C56 m03 展开）。它同时提升了「实例数」和「背景多样性」两个维度，这是重采样做不到的。合理性约束也要一起记：<em>尺度要符合透视（贴在远处的标志要小）、位置要合法（不能贴到天上或路面上）、边缘要羽化、光照要匹配</em>。</p>  <table>
+    <thead><tr><th>手段</th><th>实例数</th><th>背景多样性</th><th>表示质量</th><th>成本</th><th>一句话</th></tr></thead>
+    <tbody>
+      <tr><td>重采样（RFS）</td><td>不变</td><td><strong>不变</strong></td><td>略降（过拟合）</td><td>零</td><td>把同样的图多看几遍</td></tr>
+      <tr><td>重加权（CB/LDAM）</td><td>不变</td><td>不变</td><td>中性</td><td>零</td><td>改损失分量，不改数据</td></tr>
+      <tr><td>EQLv2</td><td>不变</td><td>不变</td><td>中性</td><td>零</td><td>修正梯度失衡，检测专用</td></tr>
+      <tr><td>logit adj / τ-norm</td><td>不变</td><td>不变</td><td><strong>不变</strong></td><td>零</td><td>只改决策边界，表示一点不碰</td></tr>
+      <tr><td>解耦（cRT）</td><td>不变</td><td>不变</td><td><strong>保住</strong>（用原分布学表示）</td><td>极低</td><td>表示与分类器分开对待</td></tr>
+      <tr><td><strong>copy-paste</strong></td><td><strong>↑↑</strong></td><td><strong>↑↑</strong></td><td><strong>↑</strong></td><td>低（需实例库）</td><td>真的造新样本</td></tr>
+      <tr><td><strong>定向挖掘补数据</strong></td><td><strong>↑↑↑</strong></td><td><strong>↑↑↑</strong></td><td><strong>↑↑</strong></td><td><strong>高</strong>（标注钱）</td><td>唯一能提高信息量上限的手段</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>把这张表读成一句话：<strong>前五行都在「重新分配已有信息」，只有最后两行在「增加信息」。</strong>所以它们不是互斥的选项而是<em>叠加的层次</em>——先用零成本的手段把现有数据榨干（这是本模块），再用挖掘与标注去提高信息量上限（这是模块 03–05）。<em>顺序反过来做，你会花很多标注钱去买本来靠一行 logit adjustment 就能拿到的收益。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tree"><span class="num">8</span>方法选择决策树：面试里能分层作答的人极少</h2>
+  <p>到这里方法已经很多了。<strong>真正的区分度不在「知道多少个方法」，而在「能不能先诊断再开药」。</strong>面试官问「长尾怎么办」，绝大多数人会开始背方法名；能先说「我要先看三个数，再决定用哪一类方法」的人，立刻就分出来了。</p>  <h3>第一步：先看这三个数（十分钟）</h3>  <ol>
+    <li><strong>逐类 AP 按频率分桶</strong>（frequent / common / rare）。确认问题真的是长尾——<em>如果 rare 桶 AP 不低，你面对的根本不是长尾问题</em>。</li>
+    <li><strong>尾部类的 recall 与 score 分布</strong>。recall 也是 0（框根本没出来）还是 recall 尚可但分数低被阈值滤掉？<strong>这两种情况的解法完全相反。</strong></li>
+    <li><strong>分类器权重范数 ‖w_c‖ 与 log(n_c) 的相关系数</strong>，以及 <strong>NCM 准确率 vs 模型分类头准确率</strong>。这两个数直接告诉你「坏的是表示还是分类器」。</li>
+  </ol>  <div class="ascii">                        ┌──────────────────────────────┐
+                        │  尾部类指标差 —— 先诊断       │
+                        └──────────────┬───────────────┘
+                                       │
+        ┌──────────────────────────────┼──────────────────────────────┐
+        │                              │                              │
+   ① recall ≈ 0                  ② recall 尚可                  ③ 被错分成
+   （框根本没出来）                 但 score 极低                 相似的头部类
+        │                              │                              │
+   不是分类问题！                 **典型的负梯度淹没**            特征不可分，
+   是**检出**问题                 ‖w_c‖ ~ log n_c 强相关          不是先验问题
+        │                              │                              │
+        ▼                              ▼                              ▼
+   · 查标签分配（尾部框是否        零成本先试:                    · 层次标签（借粗类梯度）
+     根本分不到正样本）            · **logit adjustment**          · 更高分辨率 crop / 两级
+   · 查 anchor / 尺度              · **τ-normalize**               · 难例挖掘（C58 m02）
+   · 尾部是否同时是小目标(C57)          ↓ 还不够                    · 混淆矩阵找出具体混淆对
+   · 检查这些类是否漏标严重        低成本:                              │
+        │                          · **cRT**（只重训分类头）           │
+        │                              ↓ 还不够                        │
+        │                          改训练:                             │
+        │                          · **RFS**（检测默认起点）           │
+        │                          · **EQLv2**（sigmoid 头必选）       │
+        │                          · CB Loss / LDAM+DRW                │
+        └──────────────┬───────────────┴──────────────────────────────┘
+                       │            ④ 尾部类训练集只有 10 张图
+                       ▼               → 任何重加权都在压榨同样 10 张图
+        ┌────────────────────────────────────────────────────┐
+        │  数据侧（唯一能提高信息量上限的手段）               │
+        │  · **copy-paste** 合成（C56 m03）                   │
+        │  · **定向挖掘 + 标注**（C58 m03–m05）               │
+        │  · 架构：两级方案把长尾搬出检测器                   │
+        └────────────────────────────────────────────────────┘</div>  <table>
+    <thead><tr><th>症状</th><th>诊断</th><th>首选方法</th><th>为什么不用别的</th></tr></thead>
+    <tbody>
+      <tr><td>rare 类 AP=0 且 <strong>recall≈0</strong></td><td>框都没出来 → 检出问题</td><td>改标签分配 / 查漏标 / 按小目标处理</td><td><strong>重加权只影响分类分数，框都没出来时它什么也改变不了</strong></td></tr>
+      <tr><td>rare 类 recall 尚可、<strong>score 极低</strong></td><td>负梯度淹没 / 分类器先验偏置</td><td><strong>logit adj → τ-norm → cRT → EQLv2</strong>（按成本递增试）</td><td>先用零成本方案探天花板，别一上来就重训</td></tr>
+      <tr><td>rare 类被<strong>错分成相似头部类</strong></td><td>特征不可分</td><td>层次标签 / 高分辨率 crop / 两级 / 难例挖掘</td><td>先验校正只会把误分方向反转，不会让特征变得可分</td></tr>
+      <tr><td>rare 类<strong>只有 10 张图</strong></td><td>信息量根本不够</td><td><strong>copy-paste + 定向挖掘</strong></td><td>所有重采样/重加权都在压榨同样 10 张图，天花板锁死</td></tr>
+      <tr><td>整体 mAP 尚可但 <strong>macro 很低</strong></td><td>指标口径问题</td><td>先改评测：分桶报告 + macro，再谈优化</td><td>优化没有度量的东西 = 白干</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>决策树的骨架可以压成一句面试答案：<strong>「先分桶诊断（是不是长尾、是 recall 问题还是 score 问题、是表示问题还是分类器问题），再按成本递增依次试：零成本的 logit adjustment / τ-normalize → 低成本的 cRT → 改训练的 RFS 与 EQLv2 → 最贵但唯一提高上限的 copy-paste 与定向挖掘。每一步都用分桶指标验证，并守住『头部类不许掉』的回归门禁。」</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>补一句能显出实战经验的话：<strong>这些方法的收益不是可加的</strong>。RFS + CB Loss + logit adjustment 三个叠起来，往往只比单用最好的那个多一点，甚至更差——因为它们本质上都在做同一件事（把有效类别先验拉平），叠加就是<em>过度校正</em>：尾部类误检暴涨，头部类被压。<em>正确做法是把它们视为同一个旋钮的不同实现，选一个、把它的强度参数（p / β / τ）调好，而不是全都开上。</em>这个认识在消融实验里能省掉一半的无效组合。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>长尾方法在强预训练下还剩多少价值。</strong>越来越多的证据表明，用大规模预训练（或自监督）得到的表示已经把尾部类的<em>特征</em>学得足够好，于是长尾专用方法的增益大幅缩水，剩下的几乎全是「分类器先验校正」那一部分。<em>如果这个趋势成立，本模块的重心会进一步向 logit adjustment / 解耦这条线收敛，而重采样与复杂重加权会逐渐退场。</em>这是当前最值得关注的一个方向性问题。</li>
+    <li><strong>AP_r 的统计不可靠性。</strong>LVIS 的 rare 类往往只有个位数实例，其 AP 的估计方差极大——<em>不同随机种子之间 AP_r 波动 1–2 个点是常态</em>。于是「某方法 AP_r +1.5」这类结论在统计上常常站不住。领域内缺少公认的、方差可控的长尾评测协议，这直接影响所有方法对比的可信度。</li>
+    <li><strong>开放词表检测（open-vocabulary detection）</strong>把长尾推到极限：稀有类干脆不在训练集里，用 CLIP 等视觉-语言模型的文本嵌入做零样本识别。对 TSR 这种<em>类别体系随法规演化、新标志不断出现</em>的任务，吸引力显而易见；但零样本精度距离量产安全阈值仍有明显差距，目前更现实的用法是<strong>用 VLM 做挖掘与打标（模块 04），而不是直接做识别</strong>。</li>
+    <li><strong>生成式合成能替代多少真实尾部数据。</strong>扩散模型合成稀有类样本在分类基准上已有可观收益，但在检测上要同时保证「实例真实」与「上下文合理」（一个贴在人行道正中的限速牌会教坏模型）。<em>「合成数据涨的点在真实路测上兑现多少」目前缺少可信的度量</em>——现有共识是合成能救「实例数不足」，救不了「场景多样性不足」。</li>
+    <li><strong>梯度均衡与优化器的交互。</strong>EQLv2 这类在线重加权本质上在动态改变每个类的有效学习率，它与 AdamW 的二阶矩估计、与学习率调度、与 EMA 的交互几乎没有被系统研究过。<em>实践中「EQLv2 + 某些优化器配置不稳定」的报告一直存在，但缺少理论解释。</em></li>
+    <li><strong>长尾与安全代价的耦合。</strong>所有现有长尾方法都在优化「每类同等重要」的 macro 指标，但在自动驾驶里<strong>漏检「停车让行」和漏检「景点指示」的代价差几个数量级</strong>。<em>把代价矩阵直接写进重加权/先验校正（而不是事后调阈值），在理论上是自然的（贝叶斯决策），在工程上却几乎没人做</em>——这是一个对 TSR 特别有价值、且相对空白的方向（评测侧见 C55 m05）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>本模块必读（★ 为优先，读的顺序就是这个）：★ <em>LVIS: A Dataset for Large Vocabulary Instance Segmentation</em>（Gupta et al., CVPR 2019）——repeat factor sampling 的原始出处，公式与三个设计选择都在里面；★ <em>Class-Balanced Loss Based on Effective Number of Samples</em>（Cui et al., CVPR 2019）——有效样本数 <code>(1−β^n)/(1−β)</code> 的推导；<em>Learning Imbalanced Datasets with Label-Distribution-Aware Margin Loss</em>（Cao et al., NeurIPS 2019）——LDAM 与 DRW；★ <em>Equalization Loss for Long-Tailed Object Recognition</em>（Tan et al., CVPR 2020）与 ★ <em>Equalization Loss v2: A New Gradient Balance Approach</em>（Tan et al., CVPR 2021）——<strong>检测长尾最该精读的两篇</strong>，负梯度淹没机制与在线梯度均衡；★ <em>Long-tail learning via logit adjustment</em>（Menon et al., ICLR 2021）——推理时先验校正的理论；★ <em>Decoupling Representation and Classifier for Long-Tailed Recognition</em>（Kang et al., ICLR 2020）——cRT / τ-normalize / LWS / NCM 四种阶段二方案；<em>Overcoming Classifier Imbalance for Long-tail Object Detection with Balanced Group Softmax</em>（Li et al., CVPR 2020）——softmax 头的对应解法；<em>Focal Loss for Dense Object Detection</em>（Lin et al., ICCV 2017）——注意它解决的是<strong>前景-背景</strong>不平衡；<em>Simple Copy-Paste is a Strong Data Augmentation Method</em>（Ghiasi et al., CVPR 2021）与 <em>Deep Long-Tailed Learning: A Survey</em>（Zhang et al., TPAMI 2023）。相邻课程：C55（TSR 两级方案与安全评测）、C56（copy-paste）、C57（小目标与长尾的纠缠）、C58 m02（难例挖掘）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_hard_mining/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 难例挖掘：OHEM、难负样本与难例的类型学</div></a>
+  </div>
+
+</div>
+</body>
+</html>

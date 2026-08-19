@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 集合预测损失：匹配之后怎么算账</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 集合预测损失：匹配之后怎么算账</h1>
+  <p class="subtitle">只有匹配上的 query 才算框损失，这个不对称是集合损失的骨架 · eos_coef=0.1 是因为背景 query 占 90%+，不降权模型会塌到「全预测 ∅」· L1 对尺度敏感、IoU 在不相交时零梯度，两者必须组合 · DIoU/CIoU 各补了什么 · 每层 decoder 都算辅助损失，去掉掉 ~2 AP</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（二分匹配与匈牙利算法）；C18（检测基础：IoU/NMS/mAP）有帮助</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_set_prediction_loss.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">DETR (Carion et al. 2020) §3.1–3.2；GIoU (Rezatofighi 2019)；DIoU/CIoU (Zheng 2020)；Deformable DETR / DINO 的 focal 版集合损失</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 70 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#cost-vs-loss">匹配代价与训练损失：两个长得像、职责完全不同的东西</a></li>
+      <li><a href="#formula">Hungarian loss 的完整公式：逐项拆开</a></li>
+      <li><a href="#noobject">no-object 权重：背景 query 占 97%，不降权就废了</a></li>
+      <li><a href="#l1-giou">为什么必须 L1 + GIoU 组合：两个互补的洞</a></li>
+      <li><a href="#iou-family">IoU 家族：GIoU / DIoU / CIoU 的定义与各自补的洞</a></li>
+      <li><a href="#gradients">解析梯度：手推 IoU / GIoU 对四个坐标的导数</a></li>
+      <li><a href="#aux-loss">辅助损失：为什么「每层 decoder 都算一遍」能把收敛砍掉一大半</a></li>
+      <li><a href="#weights-focal">损失权重配比，以及从 CE 到 focal 的演进</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost-vs-loss"><span class="num">1</span>匹配代价与训练损失：两个长得像、职责完全不同的东西</h2>
+  <p>模块 01 解决了「哪个预测对哪个 GT」。本模块解决「对上了之后，梯度怎么写」。这两步之间横着一个<strong>初学者几乎必然踩、面试官几乎必然追问</strong>的区分：<span class="term">matching cost</span>（匹配代价）和 <span class="term">Hungarian loss</span>（集合损失）<em>不是同一个函数</em>，虽然它们的三个组成项名字一模一样。</p>  <p>原因很朴素：匹配代价只用来<strong>排序</strong>（选出总代价最小的那个一一对应），它在 <code>torch.no_grad()</code> 里算完就扔；而损失要<strong>反向传播</strong>。一个只需要「谁比谁小」，另一个需要「梯度指向哪」。这两个需求会推出不同的函数形式。</p>  <table>
+    <thead><tr><th></th><th>匹配代价 C(i, σ(i))</th><th>训练损失 L</th></tr></thead>
+    <tbody>
+      <tr><td>用途</td><td>给匈牙利算法排序，决定一一对应</td><td><strong>产生梯度</strong>，更新参数</td></tr>
+      <tr><td>是否需要可导</td><td><strong>不需要</strong>（在 <code>no_grad</code> 下计算）</td><td>必须可导</td></tr>
+      <tr><td>分类项形式</td><td><strong><code>-p̂<sub>σ(i)</sub>(c<sub>i</sub>)</code>（概率，负号取最大）</strong></td><td><strong><code>-log p̂<sub>σ(i)</sub>(c<sub>i</sub>)</code>（交叉熵）</strong></td></tr>
+      <tr><td>背景 query 参与吗</td><td>不参与（匹配只在 M 个真实 GT 上做）</td><td><strong>参与</strong>，且是绝大多数</td></tr>
+      <tr><td>框损失作用范围</td><td>只对候选配对算</td><td><strong>只对匹配上的 query 算</strong>（背景 query 没有框可比）</td></tr>
+      <tr><td>权重</td><td>λ<sub>cls</sub>=1, λ<sub>L1</sub>=5, λ<sub>giou</sub>=2（DETR 默认）</td><td>同上（<em>可以不同，但通常取同值</em>）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么匹配时用<strong>概率 p 而不是 log p</strong>？因为要和 L1、GIoU 放在同一个代价矩阵里相加。<code>-log p</code> 是<em>无界</em>的：一个 p=1e-8 的预测会贡献 18.4 的代价，而 L1 项（归一化坐标下）通常只有 0.05 量级，GIoU 项最多 2。结果就是<strong>分类项会完全淹没定位项，匹配退化成「只看分类」</strong>——而分类分数高但框歪到天上的 query 就会抢走 GT。用概率则把分类项压在 [-1, 0]，三项量纲可比。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说，匈牙利算法要求的只是代价矩阵的<em>序结构</em>，任何单调变换都不改变最优匹配——<strong>但那只在单项时成立</strong>。一旦三项相加，单调变换会改变各项的<em>相对贡献</em>，从而改变最优匹配。所以「用 p 还是 log p」在这里不是数值技巧而是<strong>设计决策</strong>：DETR 论文明确写了这一点（§3.1 脚注）。而损失端必须用 log，因为 <code>-p</code> 的梯度在 p→0 时不消失也不放大，收敛远慢于交叉熵。<em>同一件事，排序要有界，优化要陡峭。</em></p></div>
+  </div>  <div class="callout warn"><span class="label">别把代价和损失混为一谈</span>
+    <strong>面试高频陷阱</strong>：被问「DETR 的匹配代价是什么」时，如果直接背出 <code>CE + L1 + GIoU</code>，面试官会追问「那你说的 CE 是 <code>-log p</code> 吗？为什么」。<strong>面试官想听的是：匹配阶段不需要梯度，所以可以（也应该）用无量纲、有界的 <code>-p</code>，让三项可比；损失阶段需要梯度，所以用 <code>-log p</code>。</strong>这一句话能立刻把「读过论文」和「看过博客摘要」区分开。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="formula"><span class="num">2</span>Hungarian loss 的完整公式：逐项拆开</h2>
+  <p>先把整个式子摆出来，再逐项解释每一项为什么长这样。设网络输出 N 个预测 <code>{(p̂<sub>i</sub>, b̂<sub>i</sub>)}</code>，GT 集合用 ∅ 补齐到 N 个 <code>{(c<sub>i</sub>, b<sub>i</sub>)}</code>，σ* 是模块 01 求出的最优排列：</p>  <div class="math-block">\[\mathcal{L}_{\mathrm{Hungarian}}(y,\hat{y}) \;=\; \sum_{i=1}^{N}\Big[\, -\lambda_{\mathrm{cls}}\,w_{c_i}\log \hat{p}_{\sigma^*(i)}(c_i) \;+\; \mathbb{1}_{\{c_i \neq \varnothing\}}\;\mathcal{L}_{\mathrm{box}}\big(b_i,\hat{b}_{\sigma^*(i)}\big)\,\Big]\]</div>  <div class="math-block">\[\mathcal{L}_{\mathrm{box}}(b,\hat{b}) \;=\; \lambda_{\mathrm{L1}}\,\lVert b-\hat{b}\rVert_1 \;+\; \lambda_{\mathrm{giou}}\,\big(1-\mathrm{GIoU}(b,\hat{b})\big)\]</div>  <div class="ascii">预测 N=100 个 (p̂, b̂)          GT M=3 个 (c, b)
+       │                              │
+       └──────────┬───────────────────┘
+                  ▼
+        [1] 代价矩阵 C  (3 x 100)      ← no_grad，分类项用 -p̂ 而非 -log p̂
+                  ▼
+        [2] 匈牙利算法 → σ*            ← 一一对应，O(N^3)
+                  ▼
+        ┌─────────┴──────────────┐
+        ▼                        ▼
+  匹配上的 3 个 query        其余 97 个 query
+  · 分类损失 -log p̂(c)       · 分类损失 -w_∅ · log p̂(∅)   ← eos_coef 降权
+  · L1 框损失                 · **没有框损失**（无框可比）
+  · GIoU 框损失               ·
+        └─────────┬──────────────┘
+                  ▼
+        [3] 求和 → 反传（每层 decoder 各来一遍 = 辅助损失）</div>  <table>
+    <thead><tr><th>项</th><th>作用</th><th>去掉它会怎样</th></tr></thead>
+    <tbody>
+      <tr><td>分类 CE（前景）</td><td>让被认领的 query 说对类别</td><td>框对了但不知道是什么；分类分数全靠背景项挤出来</td></tr>
+      <tr><td><strong>分类 CE（∅ 背景）</strong></td><td><strong>压制没认领到目标的 query</strong></td><td><strong>所有 query 都会输出高分前景 → 满屏误检</strong>。这一项是 DETR「不需要 NMS」的另一半原因</td></tr>
+      <tr><td>L1 框损失</td><td>提供<em>处处存在</em>的、方向明确的坐标梯度</td><td>框不相交时 GIoU 梯度很弱，收敛极慢</td></tr>
+      <tr><td>GIoU 框损失</td><td>提供<strong>尺度无关</strong>的重叠度监督</td><td>大框主导梯度，小目标（TSR 的主体）几乎学不动</td></tr>
+      <tr><td><code>1</code><sub>{c≠∅}</sub> 指示函数</td><td>背景 query 不算框损失</td><td>背景 query 的框会被拉向某个无意义目标，浪费容量还污染梯度</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>把式子读成一句话：<strong>「每个 query 都要回答『我是什么』；只有被认领的 query 还要回答『在哪、多大』」</strong>。整个 DETR 的损失就这两句。<em>后面所有 DETR 变体的损失改动，都只是在这两句话里换零件：把 CE 换成 focal、把 L1 换成分布回归、把 GIoU 换成别的 IoU 变体、或者给「我是什么」的目标加上定位质量。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="noobject"><span class="num">3</span>no-object 权重：背景 query 占 97%，不降权就废了</h2>
+  <p>先算一笔具体的账。DETR 默认 <code>N=100</code>。COCO 一张图平均 7.7 个实例，所以典型情况下 <strong>92 个 query 被匹配到 ∅</strong>。而在<strong>交通标志检测（TSR）场景里这个比例更极端</strong>：一张高速公路前视图像上通常只有 1–3 块标志，意味着 <strong>97–99 个 query 的监督信号全是「你是背景」</strong>。</p>  <div class="math-block">\[\underbrace{\frac{97}{100}}_{\text{背景 query 占比}} \;\times\; \underbrace{1.0}_{w_\varnothing=1 \text{ 时的权重}} \;=\; 0.97 \quad \text{vs} \quad \underbrace{\frac{3}{100}}_{\text{前景}} \times 1.0 = 0.03\]</div>  <p>如果不降权，分类损失里 <strong>97% 的信号在说「输出背景」</strong>。梯度下降的第一件事就是找到那个能立刻把 97% 的损失干掉的解——<em>所有 query 一律预测背景</em>。这不是理论担忧，是真实的训练崩溃模式：loss 快速下降、mAP 恒为 0。</p>  <p>DETR 的做法是给 ∅ 类一个固定权重 <code>eos_coef = 0.1</code>：</p>  <table>
+    <thead><tr><th><code>eos_coef</code></th><th>有效背景/前景权重比（N=100, M=3）</th><th>症状</th><th>适用场景</th></tr></thead>
+    <tbody>
+      <tr><td><strong>1.0</strong>（不降权）</td><td>97 : 3 ≈ 32:1</td><td><strong>全部预测背景，mAP≈0</strong></td><td>❌ 从不</td></tr>
+      <tr><td><strong>0.1</strong>（DETR 默认）</td><td>9.7 : 3 ≈ 3.2:1</td><td>平衡；标准配置</td><td>✅ softmax CE 版 DETR</td></tr>
+      <tr><td>0.02</td><td>1.94 : 3 ≈ 0.65:1</td><td>误检明显增多，score 普遍偏高</td><td>召回优先、下游有强过滤时</td></tr>
+      <tr><td>0（完全不管背景）</td><td>0 : 3</td><td><strong>每个 query 都成前景 → 退化回需要 NMS</strong></td><td>❌ 从不</td></tr>
+      <tr><td><em>改用 focal loss</em></td><td>由 γ 自动调节</td><td>无需手调；<strong>后续工作的主流</strong></td><td>✅ Deformable DETR / DINO</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><code>eos_coef</code> 的调法有个反直觉之处：<strong>它不该按「前景背景比例」精确配平</strong>。如果真的配成 1:1，模型会变得极其激进——因为「误报一个前景」的代价被压到和「漏掉一个前景」一样低。<em>实际上 0.1 得到的 9.7:3 仍然是背景占优，这是刻意的</em>：在检测里，<strong>让 query 默认沉默、只在有足够证据时才发声</strong>，才能得到干净的输出集合。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更本质地看，<code>eos_coef</code> 调的是模型输出的<strong>工作点（operating point）</strong>，而不是「是否学得会」。它和推理时的 score 阈值高度耦合：<em>降低 eos_coef 等价于整体抬高 score，然后你必须相应提高推理阈值，最终 PR 曲线可能几乎不动</em>。所以调它之前先问：你要的是 PR 曲线整体外扩（那要改数据/架构），还是只是换工作点（那调阈值更直接、且不用重训）。<strong>「调 eos_coef」和「调 score 阈值」的区别，是一个很好的深度探针问题。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>在 <strong>TSR 这类误检代价高度不对称</strong>的场景里，把 <code>eos_coef</code> 调小来「提高召回」是危险的：<em>误检一块限速牌，下游可能真的去执行一个错误的限速约束</em>。正确做法是<strong>把召回问题留给数据与架构（小目标增强、多尺度、copy-paste），把工作点留给标定后的置信度阈值</strong>——而不是用损失权重去偷换工作点。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="l1-giou"><span class="num">4</span>为什么必须 L1 + GIoU 组合：两个互补的洞</h2>
+  <p>这是本模块最重要的一节，也是白板题的高频出处。结论先行：<strong>L1 提供尺度敏感但处处存在的梯度，GIoU 提供尺度无关但在远离时衰减的梯度；它们各自都有一个致命的洞，恰好被对方补上。</strong></p>  <h3>洞一：L1 对尺度敏感 —— 同样的绝对误差，对小框是灾难，对大框无所谓</h3>  <p>DETR 预测的是归一化坐标 <code>(cx, cy, w, h) ∈ [0,1]<sup>4</sup></code>。在 640×640 的输入上，一个 <strong>8×8 像素的交通标志</strong>归一化宽高是 0.0125；一辆 <strong>64×64 像素的车</strong>是 0.1。现在两个框都<strong>对角偏移 2 像素</strong>：</p>  <table>
+    <thead><tr><th>目标</th><th>像素尺寸</th><th>对角偏移</th><th>L1 误差（归一化）</th><th>IoU</th><th>1 − IoU</th></tr></thead>
+    <tbody>
+      <tr><td><strong>远处限速牌</strong></td><td>8 × 8</td><td>2 px</td><td>0.00625（cx+cy 各 0.003125）</td><td><strong>36/92 = 0.391</strong></td><td><strong>0.609</strong></td></tr>
+      <tr><td>近处车辆</td><td>64 × 64</td><td>2 px</td><td>0.00625（完全相同）</td><td>3844/4348 = 0.884</td><td>0.116</td></tr>
+      <tr><td>大型广告牌</td><td>256 × 256</td><td>2 px</td><td>0.00625（完全相同）</td><td>0.969</td><td>0.031</td></tr>
+    </tbody>
+  </table>  <p><strong>三个目标的 L1 损失完全相同，但实际定位质量（1−IoU）差了 20 倍。</strong>如果只用 L1，网络会认为「把大车的框修准 2 像素」和「把远处限速牌的框修准 2 像素」同样重要——<em>而后者决定了这块牌子能不能被判定为检出</em>。反过来，只用 L1 时大目标的绝对误差天然更大（一个 0.5×0.5 的大框偏 10% 就是 0.05 的 L1），<strong>大目标会主导梯度，小目标被淹没</strong>。这对 TSR 是致命的。</p>  <div class="math-block">\[\text{1D 情形的解析解：宽 } w \text{ 的框沿 } x \text{ 平移 } d\;(0\le d< w) \;\Longrightarrow\; \mathrm{IoU}(d) = \frac{w-d}{w+d}, \qquad \left|\frac{\partial \mathrm{IoU}}{\partial d}\right|_{d=0} = \frac{2}{w}\]</div>  <p>最后那个导数是全节的关键：<strong>IoU 对位移的敏感度与框宽成反比</strong>。8 像素的框，敏感度是 64 像素框的 8 倍。<em>这正是 IoU 系损失「尺度无关」的数学含义——它自动帮你把小目标的误差放大回来。</em></p>  <h3>洞二：IoU 在两框不相交时梯度恒为零</h3>  <p>如果两个框完全不重叠，<code>I = 0</code>，于是 <code>IoU = 0</code>，而且<strong>无论预测框往哪个方向挪、挪多远，IoU 都还是 0</strong>——梯度精确为零，不是「很小」，是<strong>数学上的零</strong>。这是一整片<span class="term">plateau</span>（平台区），优化器在上面完全收不到方向信号。</p>  <p>这在 DETR 里不是边缘情形而是<strong>常态</strong>：训练初期 100 个 query 的框是随机初始化的，<em>绝大多数预测框和它被匹配到的 GT 根本不相交</em>。如果只用 IoU 损失，训练根本启动不了。</p>  <div class="ascii">       梯度存在吗？
+                 不相交              相交但不完美          完美重合
+                ┌────────┐         ┌────┬───┐          ┌────────┐
+  pred          │        │         │    │▓▓▓│          │▓▓▓▓▓▓▓▓│
+  gt                       ┌────┐  └────┼───┤          └────────┘
+                           │    │       └───┘
+                           └────┘
+  IoU          ❌ 梯度 = 0          ✅ 有梯度            ✅ 梯度 = 0（已最优）
+  GIoU         ✅ 有梯度（推近）    ✅ 有梯度            ✅ 梯度 = 0
+  L1           ✅ 有梯度            ✅ 有梯度            ✅ 梯度 = 0
+                 ↑
+        **只有这一列出问题，而它恰好是训练初期的常态**</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>GIoU 补的就是这个洞</strong>：它在 IoU 之外减去一项「最小外接框中的空白比例」。两框离得越远，最小外接框 C 越大，空白 <code>(|C| − |U|)/|C|</code> 越接近 1，<code>GIoU → −1</code>。<em>于是「把两个不相交的框推近」这个动作，会稳定地降低损失</em>——梯度回来了。GIoU 的值域是 <code>[−1, 1]</code>，而 IoU 只有 <code>[0, 1]</code>，多出来的负半轴正是用来编码「有多不相交」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但 GIoU 也有它自己的退化：<strong>当一个框完全包含另一个框时，最小外接框 C 就等于大框，<code>|C| = |U|</code>，惩罚项归零，GIoU 退化成 IoU</strong>。此时 GIoU 无法区分「小框在大框中心」和「小框贴在大框边缘」——两者 GIoU 相同。<em>这正是 DIoU 引入中心点距离项要解决的问题</em>。另外 GIoU 在框远离时的梯度会随距离衰减（因为 |C| 变大，惩罚项对位移的导数变小），收敛速度不如 L1 直接——<strong>所以 L1 也不能去掉。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话记住分工：<strong>L1 负责「把框拽到大致位置」（快、方向明确、但对尺度不公平），GIoU 负责「把框调到形状贴合」（尺度公平、但远处梯度弱）</strong>。DETR 的权重 <code>λ<sub>L1</sub>=5, λ<sub>giou</sub>=2</code> 也印证了这个分工：<em>归一化坐标下 L1 的数值只有 1e-2 量级，不乘 5 根本发不出声音；而 (1−GIoU) 本身就有 0.1–2 的量级，乘 2 即可。</em><strong>面试被问「为什么是 5 和 2」，答「量纲配平」比答「实验调出来的」高一个层次。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="iou-family"><span class="num">5</span>IoU 家族：GIoU / DIoU / CIoU 的定义与各自补的洞</h2>
+  <p>四个损失是一条清晰的递进链，<strong>每一个都精确地补上前一个的一个失效场景</strong>。记住这条链，比记住四个公式有用得多。</p>  <div class="math-block">\[\mathrm{IoU} = \frac{|A\cap B|}{|A\cup B|} \qquad\qquad \mathrm{GIoU} = \mathrm{IoU} - \frac{|C \setminus (A\cup B)|}{|C|} = \mathrm{IoU} - 1 + \frac{|A\cup B|}{|C|}\]</div>  <div class="math-block">\[\mathrm{DIoU} = \mathrm{IoU} - \frac{\rho^2(\mathbf{c}_A,\mathbf{c}_B)}{d_C^2} \qquad\qquad \mathrm{CIoU} = \mathrm{DIoU} - \alpha v\]</div>  <div class="math-block">\[v = \frac{4}{\pi^2}\left(\arctan\frac{w_B}{h_B} - \arctan\frac{w_A}{h_A}\right)^2, \qquad \alpha = \frac{v}{(1-\mathrm{IoU}) + v}\]</div>  <p>其中 <code>C</code> 是两框的<strong>最小外接矩形</strong>，<code>ρ</code> 是两框<strong>中心点欧氏距离</strong>，<code>d<sub>C</sub></code> 是 <code>C</code> 的<strong>对角线长度</strong>，<code>v</code> 度量<strong>宽高比不一致度</strong>，<code>α</code> 是自适应权重（重叠度越高，宽高比项越重要）。</p>  <table>
+    <thead><tr><th>损失</th><th>补的洞</th><th>新增惩罚项</th><th>退化/失效场景</th><th>典型用途</th></tr></thead>
+    <tbody>
+      <tr><td><strong>IoU</strong></td><td>—（基准）</td><td>—</td><td><strong>不相交时梯度恒为 0</strong></td><td>评测指标；一般不直接当损失</td></tr>
+      <tr><td><strong>GIoU</strong></td><td>不相交无梯度</td><td>外接框中的空白面积占比</td><td><strong>包含关系时退化回 IoU</strong>；远距离时梯度衰减、收敛慢</td><td><strong>DETR 系默认</strong></td></tr>
+      <tr><td><strong>DIoU</strong></td><td>包含关系无区分度</td><td>中心点距离 / 外接框对角线</td><td><strong>中心重合但宽高比不同时无区分</strong></td><td>NMS 的距离感知版（DIoU-NMS）</td></tr>
+      <tr><td><strong>CIoU</strong></td><td>宽高比未被约束</td><td>宽高比一致性 <code>αv</code></td><td><code>α</code> 通常被 detach，梯度非严格；宽高极端时 <code>v</code> 数值不稳</td><td>YOLO 系常用（v5/v8 默认）</td></tr>
+      <tr><td><em>（后续）</em> SIoU / EIoU / MPDIoU</td><td>角度、宽高绝对差、顶点距离</td><td>各自不同</td><td>增益边际、依赖数据分布</td><td>调参空间；小目标可考虑 NWD（见 C57）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>为什么 DETR 选 GIoU 而不是更「先进」的 CIoU？</strong>两个原因。① DETR 的框损失里已经有 L1 项，而 L1 对 <code>(cx, cy)</code> 和 <code>(w, h)</code> <em>都</em>直接施加约束——DIoU 的中心项和 CIoU 的宽高比项在很大程度上被 L1 覆盖了，收益重叠。② GIoU 值域对称、数值最稳，而 CIoU 的 <code>α</code> 在实现里是 detach 的，<em>意味着 CIoU 的「梯度」不是它自身的真实梯度</em>——这在需要严格数值验证的场合是个负担。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>反过来，<strong>YOLO 系用 CIoU 是因为它们没有 L1 项</strong>（anchor-free 的框回归直接用 IoU 系损失），所以中心距离与宽高比必须由 IoU 损失自己承担。<em>这是一个很好的例子：损失函数的选择依赖于整个损失组合，脱离上下文比较「哪个 IoU 变体更好」是无意义的。</em><strong>面试里如果对方问「GIoU 和 CIoU 哪个好」，最好的回答是先反问「在什么损失组合里」</strong>——这比直接站队更能显示你真的用过。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>实现上的三个必查点：① <strong>并集要减掉交集</strong>（<code>U = A + B − I</code>，写成 <code>A + B</code> 是最常见的低级 bug，会让 IoU 恒小于真值）；② <strong>交集的宽高必须 clamp 到 ≥0</strong>（不 clamp 时两个负数相乘会得到<em>正的假交集</em>——这个 bug 极其隐蔽，因为只在完全不相交时触发，单元测试如果只测相交情形就查不出来）；③ <strong>除零保护</strong>（退化框 <code>w=0</code> 或 <code>h=0</code> 会让 U=0）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="gradients"><span class="num">6</span>解析梯度：手推 IoU / GIoU 对四个坐标的导数</h2>
+  <p><strong>「在白板上写出 IoU 的解析梯度」是检测岗最高频的手写题之一</strong>，因为它同时考察：链式法则、<code>max/min</code> 的次梯度处理、以及你是否真的知道「不相交时梯度为零」这句话在代码里长什么样。本节把它推完，notebook 里用数值梯度逐项校验。</p>  <p>记预测框 <code>a = (x₁, y₁, x₂, y₂)</code>（视为变量），GT 框 <code>b</code>（常量）。定义交集边界与面积：</p>  <div class="ascii">ix1 = max(a.x1, b.x1)      ix2 = min(a.x2, b.x2)
+iy1 = max(a.y1, b.y1)      iy2 = min(a.y2, b.y2)
+iw  = max(0, ix2 - ix1)    ih  = max(0, iy2 - iy1)
+I   = iw * ih
+Aa  = (a.x2-a.x1)(a.y2-a.y1)      Ab = (b.x2-b.x1)(b.y2-b.y1)
+U   = Aa + Ab - I
+IoU = I / U
+
+外接框：cx1 = min(a.x1,b.x1)  cx2 = max(a.x2,b.x2)   （y 同理）
+Ac  = (cx2-cx1)(cy2-cy1)
+GIoU = IoU - (Ac - U)/Ac = IoU - 1 + U/Ac</div>  <h3>第一步：交集面积 I 对 a 的导数（关键在指示函数）</h3>  <div class="math-block">\[\frac{\partial I}{\partial a_{x_1}} = -\,ih \cdot \mathbb{1}[a_{x_1} > b_{x_1}] \cdot \mathbb{1}[iw>0]\mathbb{1}[ih>0], \qquad \frac{\partial I}{\partial a_{x_2}} = +\,ih \cdot \mathbb{1}[a_{x_2} < b_{x_2}] \cdot \mathbb{1}[iw>0]\mathbb{1}[ih>0]\]</div>  <p>解释：<code>ix1 = max(a.x1, b.x1)</code>，只有当 <code>a.x1</code> 是那个较大者时，动它才会改变 <code>ix1</code>——这就是指示函数 <code>1[a.x1 > b.x1]</code> 的来源。而 <code>iw = ix2 − ix1</code>，所以 <code>∂iw/∂a.x1 = −1[a.x1 > b.x1]</code>，再乘上 <code>ih</code> 得到面积导数。<strong>最外层的 <code>1[iw>0]1[ih>0]</code> 就是「不相交时梯度为零」在代码里的样子</strong>——也是白板题最容易漏的一项。</p>  <h3>第二步：并集与 IoU</h3>  <div class="math-block">\[\frac{\partial A_a}{\partial a} = (-h_a,\; -w_a,\; +h_a,\; +w_a), \qquad \frac{\partial U}{\partial a} = \frac{\partial A_a}{\partial a} - \frac{\partial I}{\partial a}\]</div>  <div class="math-block">\[\frac{\partial\, \mathrm{IoU}}{\partial a} = \frac{\frac{\partial I}{\partial a}\,U - I\,\frac{\partial U}{\partial a}}{U^2}\]</div>  <h3>第三步：GIoU 的额外一项</h3>  <div class="math-block">\[\frac{\partial\, \mathrm{GIoU}}{\partial a} = \frac{\partial\, \mathrm{IoU}}{\partial a} + \frac{\frac{\partial U}{\partial a}A_c - U\,\frac{\partial A_c}{\partial a}}{A_c^2}, \qquad \frac{\partial A_c}{\partial a_{x_1}} = -\,c_h\cdot\mathbb{1}[a_{x_1} < b_{x_1}]\]</div>  <p>注意外接框的指示函数<strong>方向和交集相反</strong>：<code>cx1 = min(...)</code>，所以只有 <code>a.x1</code> 更<em>小</em>时它才起作用。<em>这个「一个取 max 一个取 min，指示函数方向相反」的对称性，是手推时最容易写反的地方。</em></p>  <div class="callout danger"><span class="label">白板题：IoU 的解析梯度</span>
+    <strong>白板题评分要点（面试官在心里的 checklist）</strong>：① 有没有写出 <code>U = Aa + Ab − I</code> 而不是 <code>Aa + Ab</code>；② 有没有对 <code>iw, ih</code> 做 clamp，并且<strong>在梯度里体现出 clamp 的截断</strong>；③ 有没有意识到 <code>max/min</code> 会产生指示函数（而不是当成常数）；④ 能否说出「不相交 ⇒ 梯度恒 0 ⇒ 所以要 GIoU」；⑤ 加分项：主动说「实际训练中预测的是 <code>(cx,cy,w,h)</code>，还要再套一层从 <code>(x1,y1,x2,y2)</code> 到 <code>(cx,cy,w,h)</code> 的链式法则」——<em>notebook 的练习 4 就是这一步。</em>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么要手推而不是「反正 autograd 会算」？三个实际理由。① <strong>调试</strong>：训练中出现 NaN 时，你需要知道 <code>U=0</code>（退化框）和 <code>Ac=0</code> 是唯二的除零来源，才能定位。② <strong>部署</strong>：车端 C++ 侧如果要做在线的框精修或跟踪滤波，autograd 不在了。③ <strong>理解</strong>：只有把 <code>1[iw>0]</code> 这一项写出来，「IoU 不相交无梯度」才从一句口号变成一个你亲眼见过的乘子。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>数值上还有一处必须注意：<code>max/min</code> 在<strong>相等点不可导</strong>（<code>a.x1 == b.x1</code>），此时任何一侧的次梯度都合法。PyTorch 的 <code>torch.max</code> 在 tie 时把梯度全给第一个参数，<em>这个约定与你手写的实现可能不一致，从而导致极小概率的对拍失败</em>。所以<strong>数值梯度校验时要避开退化配置</strong>（用随机连续坐标即可，tie 是零测集）；反过来，如果你的对拍在随机输入上就有 1% 的失败率，那多半不是 tie 而是真 bug。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="aux-loss"><span class="num">7</span>辅助损失：为什么「每层 decoder 都算一遍」能把收敛砍掉一大半</h2>
+  <p>DETR 的 decoder 有 6 层。默认配置下，<strong>每一层的输出都接同一套（共享权重的）分类头与框头，各自独立做一次匈牙利匹配、各自算一份完整的 Hungarian loss，最后全部相加</strong>。这叫 <span class="term">auxiliary decoding losses</span>（辅助损失），是 DETR 里性价比最高的一个设计——论文的消融显示去掉它 AP 掉约 2 点，且收敛显著变慢。</p>  <div class="ascii">            ┌──── decoder L1 ──→ head ──→ 匹配 σ1 ──→ loss1  ┐
+ queries ──→ ├──── decoder L2 ──→ head ──→ 匹配 σ2 ──→ loss2  │
+             ├──── decoder L3 ──→ head ──→ 匹配 σ3 ──→ loss3  │  Σ → 反传
+             │        ...                                     │
+             └──── decoder L6 ──→ head ──→ 匹配 σ6 ──→ loss6  ┘
+                                    ↑              ↑
+                          **权重共享的同一个头**   **每层独立匹配**
+                          （所以中间层的输出       （所以 σ 可能层间不同，
+                            与最终输出可比）         这本身就是个诊断信号）</div>  <table>
+    <thead><tr><th>收益</th><th>机制</th><th>证据/数字</th></tr></thead>
+    <tbody>
+      <tr><td><strong>梯度直达浅层</strong></td><td>第 1 层 decoder 不必等梯度穿过 5 层才收到信号</td><td>深度监督（deep supervision）的标准论证；ResNet/GoogLeNet 时代就验证过</td></tr>
+      <tr><td><strong>逼出「逐层精修」的归纳偏置</strong></td><td>每层都被要求输出一个<em>可用的</em>框 → 后层只需在前层基础上改进</td><td>这直接催生了 DAB-DETR / DINO 的 <em>iterative box refinement</em>（见模块 03/04）</td></tr>
+      <tr><td><strong>正则化</strong></td><td>6 份损失相当于 6 个「早停点」，抑制最后一层过拟合</td><td>论文消融：AP +2.0 左右</td></tr>
+      <tr><td><strong>免费的诊断信号</strong></td><td>对比各层的匹配 σ，可算<em>层间匹配翻转率</em></td><td>翻转率高 ⇒ 各层「认领」的目标不一致 ⇒ 优化目标在抖（连到模块 04）</td></tr>
+    </tbody>
+  </table>  <p>代价也要说清楚：<strong>匈牙利匹配是在 CPU 上做的 O(N³) 运算</strong>，6 层就是 6 次。当 <code>N=900</code>（DINO）时这已经不可忽略，是 DETR 系训练吞吐的一个真实瓶颈。显存方面，需要保留 6 层的中间输出用于反传——<em>这也是 DETR 系显存占用偏高的原因之一</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>推理时辅助头全部丢掉，只用最后一层</strong>。这带来一个非常实用的部署性质：<em>既然每一层的输出都是「可用的」，那就可以在推理时只跑前 k 层</em>。RT-DETR 正是靠这一点做到<strong>「同一份权重支持多档速度-精度，无需重训」</strong>——车端算力紧张时跑 3 层，空闲时跑 6 层。<em>辅助损失从一个训练技巧变成了部署能力。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更细的一点：DINO 等两阶段变体还会给 <strong>encoder 输出</strong>加一份损失（把 encoder 的 top-k 提议当作「第 0 层」的预测来监督）。此时损失项变成 <code>6 × decoder + 1 × encoder + DN 分支</code>，<em>总共可能有十几份 Hungarian loss 在同时反传</em>。这时候<strong>各份损失的权重就不再能靠直觉，必须做敏感性分析</strong>——而一个常被忽略的事实是：辅助层的权重通常直接取 1.0（与最后一层同权），这是个从未被认真消融过的默认值。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把辅助损失理解成<strong>「把一个 6 步的推理过程，改造成 6 个各自可评分的 1 步」</strong>。这个模式在 Transformer 之外也到处出现（扩散模型的每步去噪损失、级联检测器 Cascade R-CNN 的每级损失）。<em>共同的心法是：当你有一个深的、串行的精修过程，而每个中间状态本身也有明确语义时，就应该给每个中间状态配一份监督。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="weights-focal"><span class="num">8</span>损失权重配比，以及从 CE 到 focal 的演进</h2>
+  <h3>DETR 的默认配比与它的量纲逻辑</h3>  <table>
+    <thead><tr><th>项</th><th>权重</th><th>典型数值量级（训练中期）</th><th>加权后贡献</th><th>为什么是这个权重</th></tr></thead>
+    <tbody>
+      <tr><td>分类 CE</td><td>λ<sub>cls</sub> = 1</td><td>0.2 – 1.5</td><td>0.2 – 1.5</td><td>基准，其余项向它对齐</td></tr>
+      <tr><td><strong>L1 框损失</strong></td><td><strong>λ<sub>L1</sub> = 5</strong></td><td><strong>0.02 – 0.15</strong>（归一化坐标）</td><td>0.1 – 0.75</td><td><strong>不放大 5 倍就淹没在分类项里</strong></td></tr>
+      <tr><td><strong>GIoU 框损失</strong></td><td><strong>λ<sub>giou</sub> = 2</strong></td><td>0.1 – 1.0</td><td>0.2 – 2.0</td><td>本身量级已可比，2 倍是为了让它略压过 L1（尺度公平性优先）</td></tr>
+      <tr><td>no-object 权重</td><td><code>eos_coef</code> = 0.1</td><td>—</td><td>—</td><td>见第 3 节</td></tr>
+    </tbody>
+  </table>  <p><strong>记住这个「量纲配平」的思路，比记住 1/5/2 这三个数字重要得多。</strong>如果你把坐标从 <code>[0,1]</code> 归一化改成像素坐标（0–640），L1 的量级会放大 640 倍，<code>λ<sub>L1</sub>=5</code> 立刻变成灾难。<em>损失权重从来不是绝对的，它是相对于「你的表示」的。</em></p>  <h3>为什么后续工作把 CE 换成了 focal loss</h3>  <div class="math-block">\[\mathrm{FL}(p_t) = -\alpha_t\,(1-p_t)^{\gamma}\log(p_t), \qquad \alpha = 0.25,\; \gamma = 2 \;(\text{Deformable DETR / DINO 默认})\]</div>  <table>
+    <thead><tr><th></th><th>DETR（softmax CE）</th><th>Deformable DETR / DINO（sigmoid focal）</th></tr></thead>
+    <tbody>
+      <tr><td>输出层</td><td>softmax over <code>K+1</code> 类（含显式 ∅ 类）</td><td><strong>K 个独立 sigmoid，无 ∅ 类</strong>（全部低 = 背景）</td></tr>
+      <tr><td>类间关系</td><td>互斥竞争</td><td><strong>互相独立</strong></td></tr>
+      <tr><td>背景抑制</td><td>靠手调 <code>eos_coef=0.1</code></td><td><strong>靠 <code>(1−p)<sup>γ</sup></code> 自动降权易分样本</strong></td></tr>
+      <tr><td>典型 query 数</td><td>100</td><td><strong>300 / 900</strong></td></tr>
+      <tr><td>匹配代价的分类项</td><td><code>−p̂(c)</code></td><td><strong>focal 形式的代价</strong>（正负项之差）</td></tr>
+      <tr><td>推理取框</td><td>argmax 后按 score 排序</td><td><strong>所有 (query, 类) 对里取 top-k</strong>（一个 query 可出多类）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>换 focal 的<strong>根本理由是 softmax 与一对一匹配的哲学不兼容</strong>。softmax 强迫 <code>K+1</code> 个类互相抢概率质量，但集合预测里每个 query 是<em>独立地</em>在回答「我认领的这个东西是什么」——它和别的 query 认领什么无关，也不该和「我是不是背景」做零和竞争。<em>sigmoid + focal 把「是不是前景」和「是哪一类」解耦，正好匹配这个语义。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>实践收益也很直接：① <strong>省掉 <code>eos_coef</code> 这个超参</strong>（focal 的 <code>(1−p)<sup>γ</sup></code> 自动把大量「已经预测得很低的背景 query」的梯度压下去）；② <strong>支持把 N 从 100 提到 900</strong>——softmax 版在 N 增大时背景项会失控，而 focal 版几乎不受影响；③ 推理时在 <code>N×K</code> 个 (query, 类) 对里取 top-100，<em>允许同一个 query 在两个易混类上都出框</em>，这对 <strong>TSR 里「限速 60 / 限速 80」这类极易混淆的标志对是有实际价值的</strong>——下游可以拿到第二候选做时序投票，而 softmax 版的第二候选被压得几乎没有分数。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>换成 focal 后有一个必须同步改的地方：<strong>推理阈值的语义变了</strong>。softmax 版的 score 是「在所有类里的相对份额」，天然归一化；sigmoid 版的 score 是「这一类的独立置信度」，<em>多个类可以同时是 0.9，也可以全部是 0.1</em>。把 softmax 时代的阈值（如 0.7）原样搬到 sigmoid 版上，召回会莫名其妙地掉一大截。<strong>对 TSR 这种需要把置信度传给下游做时序融合的系统，换损失之后必须重新做置信度标定（calibration），否则下游的贝叶斯累积会全盘失准。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>集合损失看起来只是「三项加权和」，但它其实是 DETR 系近五年改动最密集的地方。下面几条是<strong>目前仍未收敛的问题</strong>，也是读论文时值得盯的方向。</p>  <ul>
+    <li><strong>匹配代价与损失不一致的理论缺口</strong>：匹配用 <code>−p</code>、损失用 <code>−log p</code>，这意味着<em>「谁被选中」和「选中后往哪优化」用的不是同一个目标</em>。Stable-DINO / position-supervised loss 一类工作指出这会导致训练不稳定，并提出把<strong>定位质量直接写进分类目标</strong>（分类标签不再是 0/1 而是 IoU）来弥合。这条线与 Varifocal Loss、Quality Focal Loss（GFL）是同一个思想的不同分支。</li>
+    <li><strong>一对多辅助分支的回归</strong>：Group DETR / H-DETR / Co-DETR 在训练时额外挂一条一对多监督的分支（推理时丢弃），显著加速收敛并提点。<em>这在理论上很值得玩味：它说明「一对一」是<strong>推理端的需求</strong>（去 NMS），而不是<strong>训练端的最优</strong>（监督太稀疏）。</em>把训练目标和推理约束解耦，可能是这条线最重要的启示。</li>
+    <li><strong>框回归的表示之争</strong>：L1 直接回归四个数是最朴素的做法。GFL / D-FINE 改为<strong>预测每条边的概率分布</strong>（把回归变成分类），既能表达定位不确定性，又能提供更丰富的梯度。<em>对 TSR 这种需要把定位不确定性传给时序融合的系统，分布式表示的价值可能被低估了。</em></li>
+    <li><strong>IoU 变体的长尾</strong>：SIoU（角度感知）、EIoU（宽高绝对差）、WIoU（动态聚焦）、α-IoU（幂次调节）、MPDIoU（顶点距离）……<em>大多数只在特定数据集上有零点几个点的增益，缺少跨数据集的一致结论</em>。更值得注意的是<strong>为小目标专门设计的度量</strong>——NWD（把框建模成 2D 高斯，用 Wasserstein 距离）在不相交时仍有平滑梯度、且对尺度不敏感，<strong>这正是 TSR 远距离小标志最需要的性质</strong>（详见 C57 模块 03）。</li>
+    <li><strong>匹配的可微化</strong>：匈牙利匹配是离散的、不可导的。有工作尝试用 Sinkhorn 迭代做<em>软匹配</em>（可微的最优传输），或用 top-k 软选择替代硬匹配。<em>目前尚未证明比硬匹配更好</em>，但它触及一个根本问题：<strong>「先匹配再算损失」这个两阶段结构本身是不是必要的？</strong></li>
+    <li><strong>开放问题：什么才是「正确」的集合损失？</strong>现有损失都是「先建立对应，再逐对算距离」。而集合之间本来有更自然的距离（Chamfer、Wasserstein、最优传输）。<em>为什么检测里几乎没人用这些？主要障碍是：它们不强制一一对应，于是无法在训练期压制重复框——而这恰恰是 DETR 去掉 NMS 的全部依据。</em></li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>必读（按顺序）</strong>：</p><ul><li>★ <em>End-to-End Object Detection with Transformers</em>（DETR, Carion et al. ECCV 2020）——读 §3.1「Object detection set prediction loss」全节 + 附录 A.1 的损失权重表。<strong>解决什么问题：把检测变成集合预测，并给出第一个可用的集合损失。</strong></li><li>★ <em>Generalized Intersection over Union</em>（Rezatofighi et al. CVPR 2019）——读 §3 与算法 1（GIoU 的解析形式）。<strong>解决什么问题：IoU 在不相交时梯度为零。</strong></li><li>★ <em>Distance-IoU Loss</em>（Zheng et al. AAAI 2020）——DIoU 与 CIoU 同一篇。<strong>解决什么问题：GIoU 在包含关系下退化、收敛慢。</strong></li><li><em>Focal Loss for Dense Object Detection</em>（Lin et al. ICCV 2017）——理解 Deformable DETR / DINO 为何弃用 <code>eos_coef</code>。</li><li><em>DINO: DETR with Improved DeNoising Anchor Boxes</em>（Zhang et al. ICLR 2023）——看它的完整损失组合（decoder 辅助 + encoder + DN 分支）。</li><li><em>Detection Transformer with Stable Matching</em>（Stable-DINO, ICCV 2023）——匹配-损失不一致问题的代表作。</li></ul><p>相邻课程：模块 01（匈牙利匹配）、模块 04（收敛与 DETR 家族）、C53 模块 02（标签分配）、C57 模块 03（小目标的 NWD 度量）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_hungarian/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 二分图匹配与匈牙利算法</div></a>
+    <a class="next" href="../03_queries/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · Object query 与交叉注意力：模型如何「认领」目标</div></a>
+  </div>
+
+</div>
+</body>
+</html>

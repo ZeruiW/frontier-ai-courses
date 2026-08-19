@@ -7,7 +7,20 @@
 
 ---
 
-## 总览：53 门课（C00–C52）
+## 总览：66 门课（C00–C65）
+
+### 🆕 一面三板块补缺课 · C62–C65（HR 明确的面试形式）
+> 触发：HR 补充「First Round Interview Format: **Technical Knowledge Assessment,
+> Problem-Solving, and Practical (Coding) Exercise**」并提到 coding / system design / ML knowledge。
+> JD 全文见 `JD_XPENG_TSR.md`。
+
+| 课 | 文件夹 | 主题 | 补的洞 | 状态 |
+|----|--------|------|--------|------|
+| C62 | `C62_Coding_Interview_Course/` | 编程面试实战：算法与数据结构（六步答题协议 · 双指针/滑窗/前缀和 · 哈希排序二分 · 树图与搜索 · DP 与贪心 · 模拟面试） | 全库最大缺口：62 门课里「链表」「双指针」零命中 | ✅ 已完成 |
+| C63 | `C63_ML_System_Design_Course/` | ML 系统设计面试（七步框架 · 需求与指标 · 数据系统 · 建模评测 · 容量估算 · 六案例库） | C07 仅一节 system design 框架，无方法论与案例库 | ✅ 已完成 |
+| C64 | `C64_ML_Knowledge_QA_Course/` | ML/DL 技术知识问答（三段式答法 · ML 基础 · 优化训练 · 架构 · 评估统计 · 快问快答题库） | C07 教推导，缺「60 秒讲清 + 接住追问」的广度题库 | ✅ 已完成 |
+| C65 | `C65_ProblemSolving_Communication_Course/` | 结构化问题求解与面试沟通（估算 · 诊断归因 · 权衡决策 · 模糊需求澄清 · 白板与英文表达） | 估算/诊断/权衡/澄清/沟通均无系统覆盖 | ✅ 已完成 |
+
 
 图例 — 深度：🟢 极深（对标 C06/C00） · 🟡 待深化（本轮目标）· 🆕 新建（本轮）。
 
@@ -91,6 +104,22 @@
 | C51 | `C51_Data_Augmentation_Course/` | 文本数据增强与合成数据工程（EDA/AEDA · 回译 · Self-Instruct/Evol/Magpie · 质控 · 消融） | C21/C43 讲预训练语料，缺「有标注任务训练集不够时怎么造与怎么验」 |
 | C52 | `C52_Industrial_Research_Practice_Course/` | 工业研究工程实务（TF/Keras 心智模型 · 跨框架权重迁移 · ONNX 导出与运行时 · 真机 GPU 工作流 · 专利与开源合规） | 一批「没有归属却天天要用」的孤儿技能；JD 里的 TensorFlow、CUDA 诊断、patents 三项 |
 
+### 🆕 自动驾驶感知 / TSR 岗位补缺课 · C53–C61
+> 触发：比对 XPENG「Machine Learning Engineer / Computer Vision Engineer — Traffic Sign Recognition (TSR) 2D Detection」JD
+> 后识别出的 9 个缺口（见根目录 `INTERVIEW_PREP_XPENG_TSR.md`）。**不改动既有课程，追加在末尾。**
+
+| 课 | 文件夹 | 主题 | 补的洞 |
+|----|--------|------|--------|
+| C53 | `C53_RealTime_Detectors_Course/` | 实时检测器架构（YOLO 全代演进 · 标签分配 · RTMDet · RT-DETR · 延迟-精度选型） | JD 点名的 RT-DETR / RTMDet 全库零覆盖 |
+| C54 | `C54_DETR_Set_Prediction_Course/` | 端到端集合预测检测（匈牙利匹配 · 集合损失 · object query · 收敛家族 · 工程实践） | 匈牙利匹配 / set prediction loss 全库零覆盖 |
+| C55 | `C55_TSR_Autonomous_Driving_Course/` | 交通标志识别与自动驾驶感知（数据集与法规体系 · 两级 vs 端到端 · 失效模式 · 时序融合 · 安全评测） | TSR 领域知识与自动驾驶感知语境完全缺失 |
+| C56 | `C56_Detection_Augmentation_Course/` | 检测数据增强工程（几何与标注同步 · 光度与域 · Mosaic/Copy-Paste · 流水线 · 消融验证） | C51 是文本增强；图像检测增强零覆盖 |
+| C57 | `C57_Small_Object_Detection_Course/` | 小目标检测（IoU 尺度敏感性量化 · 多尺度架构 · NWD 与分配 · 切片推理 · TSR 物理推导） | C18 只提「小目标弱仍待解」，无技术手段 |
+| C58 | `C58_HardCase_LongTail_Course/` | 难例挖掘与长尾数据闭环（不平衡谱系 · OHEM · 主动学习触发 · 挖掘基建 · 闭环验证） | 检测语境的 hard-case / 长尾挖掘缺失 |
+| C59 | `C59_VLA_Perception_Interface_Course/` | 视觉-语言-动作模型与感知接口（VLM→VLA · 动作表示 · TSR 输出接口 · 规则约束化 · 评测上车） | JD 独有的 VLA 职责，全库零覆盖 |
+| C60 | `C60_Edge_Deployment_Consistency_Course/` | 车端部署与训练-部署一致性（预处理对齐 · TensorRT · INT8 校准 · 后处理与 C++ · 延迟剖析） | C52 只到概念层，缺实操与一致性调试 |
+| C61 | `C61_Detection_Practice_Interview_Course/` | 检测工程实战与面试实务（实验设计 · TIDE 误差分解 · 调试手册 · 项目叙事 · 面试题库） | production 手感与面试交付能力 |
+
 ---
 
 ## 「极深」标准（本轮全谱对齐，对标 C06）
@@ -132,3 +161,12 @@
   - **验证**：五门课全部 30 个 notebook 用 `_buildkit/runnb.py` 顺序实跑，assert 0 失败；并额外做了一轮「参考答案就地替换 stub」复验，确保每道 ✏️ 练习的 📖 参考答案真的能通过它自己的自测（该轮复验同时修好了 C49 模块 01/04 与 C51 模块 05 的 3 处答案-自测不一致）。
   - 生成器重建于 `_buildkit/coursekit.py`（原 scratchpad 版本已丢失，按 C43 的产物逆向复原）；各课 `build_c4x.py` / `build_c5x.py` 与内容模块 `c4x_mNN.py` / `c5x_mNN.py` 均在 `_buildkit/`。
   - **全谱：53 门课 · 346 讲解 HTML · 346 notebook。**
+
+- 2026-08-17：**按 XPENG「TSR 2D Detection」JD 做覆盖度比对，新增 C53–C61 九门课**（不改动既有 53 门，纯追加）。
+  - 缺口来源：比对 JD 后识别出 9 个零覆盖项，逐项建课——RT-DETR/RTMDet、匈牙利匹配与 set prediction、TSR 领域知识、检测专用图像增强、小目标技术、难例与长尾挖掘、VLA 感知接口、TensorRT/INT8/一致性调试、production 实战与面试实务。缺口分析见根目录 `INTERVIEW_PREP_XPENG_TSR.md`。
+  - 规格与 C48–C52 一致且更厚：每门 6 模块，**54 个讲解页可见字符中位数 14669**（既有课程标准 8000+，最厚 23923），**2220 个 notebook cell**，每门 glossary 27.9–51.0KB、references 14.9–26.5KB，纯 numpy/CPU、无 GPU/联网/API 依赖。
+  - **验证**：九门课 54 个 notebook 全部实跑，`_buildkit/runnb2.py`（新增的**两遍执行**验证器）确认 1348 个 code cell 与 **207 个 ✏️ 练习自测 assert 真实通过**。
+    - 新增 `runnb2.py` 的原因：原 `runnb.py` 遇到练习骨架的 `NotImplementedError` 会整格跳过，导致练习自测 cell 从未被真正执行（假通过）。两遍执行先让 📖 参考答案生效，再重跑被跳过的自测 cell。
+  - 构建过程中修复的真实缺陷：C56 的 `np.clip(b[:,[0,2]], ..., out=b[:,[0,2]])`（花式索引返回副本导致裁剪从未生效）、C58 的校准演示方向与正文相反、C60 的 IoU 敏感性工作点选错、C55 的小目标框 IoU 达不到匹配阈值等。
+  - 生成规范 `_buildkit/GAPKIT_SPEC.md`；各课 `build_c5x.py` / `build_c6x.py` 与内容模块 `c5x_mNN.py` / `c6x_mNN.py` 均在 `_buildkit/`。
+  - **全谱：62 门课 · 400 讲解 HTML · 400 notebook。**

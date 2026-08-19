@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 大规模挖掘基础设施</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 大规模挖掘基础设施</h1>
+  <p class="subtitle">嵌入检索是长尾挖掘的主力工具：给一个 badcase，从千万级帧里捞出「长得像的」——但<em>没有评估的检索等于抽奖</em>，recall@k 与人工抽检必须先做 · ANN 索引（HNSW / IVF-PQ）的召回-延迟-内存三角，以及索引过期（模型换了、嵌入分布漂了）这个最常见的静默失效 · <strong>场景标签体系</strong>（天气 / 光照 / 道路类型 / 标志类别 / 遮挡度）的三条自动打标路：元数据、规则、<strong>VLM 打标</strong>——后者正是 JD 里 automated data mining workflows 的指向，但必须先量它的准确率，否则是在用一个未评估的模型给另一个模型选数据 · 去重是挖掘的第一道闸：<em>回传 1000 张同一路口的连续帧，标注预算就白烧了</em>，感知哈希抓像素级近重复、嵌入聚类抓语义级重复 · core-set 的 k-center 贪心是 2-近似，目标是<strong>最小化最大覆盖半径</strong>而不是找最难的 · 标注预算按「类别缺口 × 难度 × 单价」分配 · 数据血缘要能在十分钟内回答「这批数据进了哪个模型」</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–03（不平衡 / 难例挖掘 / 触发策略）；C43（数据工程）与 C11（向量检索）有帮助但不必需</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_mining_infrastructure.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">FAISS / HNSW 论文、Core-set active learning (Sener & Savarese)、感知哈希、VLM 自动标注相关工作</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#scale">从 PB 到 500 张：挖掘基础设施要解决的问题</a></li>
+      <li><a href="#embedding">嵌入检索：以图搜图是长尾挖掘的主力工具</a></li>
+      <li><a href="#ann">向量索引：从暴力扫描到 IVF / HNSW / PQ</a></li>
+      <li><a href="#tagging">场景标签体系：让数据变得可查询</a></li>
+      <li><a href="#vlm_tag">用 VLM 自动打标：现在的主流做法</a></li>
+      <li><a href="#dedup">去重与多样性采样：别回传 1000 张同一路口</a></li>
+      <li><a href="#budget">标注预算分配：把钱花在最缺的格子上</a></li>
+      <li><a href="#lineage">数据版本与血缘：出了问题能回溯到帧</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="scale"><span class="num">1</span>从 PB 到 500 张：挖掘基础设施要解决的问题</h2>
+  <p>模块 03 解决的是「<strong>该不该回传这一帧</strong>」——那是车端的、逐帧的、在线的决策。本模块解决的是它的下游：<strong>几千万帧候选已经躺在云上了，怎么从里面挑出这一轮真正要标的那 500 张</strong>。这两件事经常被混为一谈，但它们的约束完全不同。</p>  <table>
+    <thead><tr><th></th><th>车端触发（模块 03）</th><th>云端挖掘（本模块）</th></tr></thead>
+    <tbody>
+      <tr><td>决策对象</td><td>单帧 / 单个片段</td><td><strong>整个候选池的一个子集</strong></td></tr>
+      <tr><td>能看到的信息</td><td>只有当前帧与短时序</td><td><strong>全池的分布、标签、嵌入、历史</strong></td></tr>
+      <tr><td>主要约束</td><td>算力与回传带宽</td><td><strong>标注预算与工程师时间</strong></td></tr>
+      <tr><td>优化目标</td><td>命中率（触发的确实是难例）</td><td><strong>子集的边际价值</strong>（标完模型能涨多少）</td></tr>
+      <tr><td>典型规模</td><td>每车每天几百帧</td><td>池子 10⁷–10⁹ 帧，选出 10³–10⁴</td></tr>
+      <tr><td>失败形态</td><td>触发率爆炸打爆带宽</td><td><strong>选出 1000 张同一个路口</strong></td></tr>
+    </tbody>
+  </table>  <p>最后一行是本模块的灵魂。<strong>触发器是逐帧独立工作的，它没有「已经回传过很多类似的了」这个概念</strong>——同一个隧道口的同一种逆光失效，一辆车经过一次就触发 200 帧，一个车队一天就是几万帧几乎一模一样的数据。它们全都是「真难例」，触发器没做错任何事，但把它们全标了，模型学到的东西约等于标 5 张。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以挖掘基础设施的核心命题只有一句：<strong>把「和这个 badcase 相似」和「彼此之间不相似」这两个要求同时满足</strong>。前者靠<span class="term">embedding retrieval</span>（嵌入检索）与<span class="term">scenario tagging</span>（场景标签）实现——它们负责<em>找得到</em>；后者靠去重与多样性采样实现——它们负责<em>不重复</em>。缺任一半，挖掘系统就退化成一个昂贵的随机采样器。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，这是一个带约束的子集选择问题：给定候选池 <code>P</code>、预算 <code>B</code>、以及一个（未知的）「标注后模型收益」函数 <code>V(S)</code>，求 <code>argmax_{S⊆P, cost(S)≤B} V(S)</code>。<em><code>V</code> 的真实形式要训完模型才知道，所以工程上永远是在优化它的代理（proxy）</em>：相似度、不确定性、覆盖度、类别缺口。<strong>本模块讲的每个组件，本质都是在给 <code>V</code> 造一个便宜且可计算的代理，并知道这个代理在什么时候会骗你。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个能立刻用在面试里的说法：<strong>「数据挖掘系统的产出不是『找到了多少难例』，而是『每一块标注预算换来了多少模型提升』」</strong>。前者是虚荣指标——难例要多少有多少；后者才是这套基础设施存在的理由。<em>候选池是免费的，标注是贵的，所以整套系统的所有设计压力都集中在「筛选」这一步。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="embedding"><span class="num">2</span>嵌入检索：以图搜图是长尾挖掘的主力工具</h2>
+  <p>挖掘的最常见入口是这样一句话：<strong>「昨天路测在西二环隧道口漏了一块施工牌，帮我从池子里找 300 张类似的」</strong>。这句话里的「类似」没法用 SQL 表达——它不是「天气=雾」，而是「和<em>这一帧</em>长得像」。<span class="term">embedding retrieval</span>（嵌入检索）就是把这句话变成可执行操作的方法。</p>  <div class="ascii">挖掘流水线的标准形态
+
+  车队回传        ┌──────────────┐
+  ──────────────► │  原始帧存储   │  (对象存储, 10^8 帧)
+                  └──────┬───────┘
+                         │  离线批处理：一次性算好、增量更新
+                         ▼
+       ┌─────────────────────────────────────────┐
+       │  ① 嵌入 (embedding)   ② 场景标签 (tags)  │  ← 本模块的两个"索引面"
+       │     backbone 特征         天气/光照/道路  │
+       │     全局 pooling          遮挡/标志类别   │
+       └────────┬──────────────────────┬─────────┘
+                │                      │
+        向量索引 (ANN)            结构化索引 (列存/数仓)
+        "和这张像的"              "夜间+雨+隧道 的所有帧"
+                │                      │
+                └──────────┬───────────┘
+                           ▼
+                   候选集 (10^4 ~ 10^5)
+                           │
+                  ③ 去重 + 多样性采样      ← "别给我 1000 张同一路口"
+                           │
+                   待标集 (10^3)
+                           │
+                  ④ 预算分配 → 送标 → 质检
+                           │
+                  ⑤ 入库 + **版本与血缘**   ← 出问题能回溯到帧
+                           ▼
+                     训练集 v1.7.3</div>  <p>这里的嵌入通常<strong>不是</strong>专门训的。最省事也最常用的做法是<strong>直接复用检测器 backbone 的中间特征</strong>：取 FPN 某一层做全局平均池化，得到 256–2048 维向量。它免费、和你的任务分布天然对齐（模型觉得像的，往往就是模型会犯同类错误的）。代价是：<em>它只反映模型「看到了什么」，模型看不见的东西（比如夜里那块本来就没检出的牌子）在嵌入里也不会体现</em>——这是嵌入检索的第一个系统性盲区。</p>  <table>
+    <thead><tr><th>嵌入来源</th><th>怎么拿</th><th>优点</th><th>盲区 / 代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>检测 backbone 特征</strong></td><td>FPN 层 GAP，免费顺手</td><td>与任务分布对齐；零额外成本</td><td><strong>模型漏检的东西在嵌入里也是「空的」</strong></td></tr>
+      <tr><td><strong>自监督 / CLIP 类通用嵌入</strong></td><td>跑一遍通用视觉模型</td><td>语义丰富，跨任务可复用；支持<em>文本查图</em></td><td>与检测任务不完全对齐；要额外算力</td></tr>
+      <tr><td><strong>ROI 级嵌入</strong>（只对检测框抠图）</td><td>对每个框单独编码</td><td><strong>精确到「这块牌子」</strong>，不被背景稀释</td><td>只能找已检出的目标——<em>对漏检无效</em></td></tr>
+      <tr><td><strong>场景级手工特征</strong></td><td>亮度直方图 / 边缘密度 / GPS</td><td>极便宜、可解释</td><td>表达力弱，只能做粗筛</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>「<strong>ROI 级 vs 全图级</strong>」是实践中要先想清楚的分叉。要挖「限速 60 和 80 被互相错分」的样本，用 ROI 级嵌入——因为你要找的是<em>牌子本身</em>长得像的；要挖「隧道口逆光整体失效」的场景，用全图级——因为你要找的是<em>环境</em>像的。<strong>用错粒度，检索出来的东西看着都对，但对模型没用。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更根本的问题是<strong>嵌入检索对「漏检」这一类失效天生偏弱</strong>。ROI 嵌入需要先有框，漏检的样本压根没有框；全图嵌入虽然能用，但一整帧的全局特征被道路、天空、车辆主导，那块 12×12 像素的牌子对向量的贡献接近噪声。<em>实践中的对策是「用别的模态定位再检索」</em>：用高精地图里标注的标志位置反查该处的图像、用后帧检出的目标反向追溯前帧（<strong>目标从近处倒推回远处，正是 TSR 挖远距离漏检样本的标准姿势</strong>）。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>嵌入检索的<strong>质量必须被度量，而不是靠肉眼看几张图觉得「挺像」</strong>。最小可用的度量是：拿一批已知标签的帧做查询，看 top-k 里有多少条与查询帧属于同一场景/同类别（<code>precision@k</code>），并和「随机抽 k 张」的基线比。<em>如果 precision@10 只有随机基线的 2–3 倍，这个嵌入不值得建索引</em>——它省不下多少标注钱。notebook 里会实测这个比值。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ann"><span class="num">3</span>向量索引：从暴力扫描到 IVF / HNSW / PQ</h2>
+  <p>池子小的时候（&lt; 10⁶）暴力矩阵乘法就够了：<code>E @ q</code> 一次几十毫秒。<strong>但候选池是按车队规模线性增长的</strong>，到 10⁸ 量级时，暴力扫描一次查询要几十秒、内存放不下（10⁸ × 512 维 × 4 字节 = 200 GB）。<span class="term">ANN</span>（approximate nearest neighbor，近似最近邻）索引就是用「牺牲一点召回换几十上百倍速度」来解这个问题。</p>  <div class="ascii">IVF（倒排文件）                        HNSW（分层可导航小世界）
+
+  1. 先聚 nlist 个粗中心               上层：稀疏长边，快速跳转
+     ●   ●   ●   ●                       ○────────────○
+     │   │   │   │                       │            │
+  2. 每个向量归到最近中心              中层：中等密度
+     ┌─┴─┬─┴─┬─┴─┬─┴─┐                  ○──○────○────○
+     │ ▪ │ ▪ │ ▪ │ ▪ │  倒排列表         │  │    │    │
+     │ ▪ │ ▪ │ ▪ │   │                 底层：全部向量，短边
+     └───┴───┴───┴───┘                  ○─○─○─○─○─○─○─○
+  3. 查询时只扫 nprobe 个最近的列表
+     nprobe=1  → 快、召回低              查询 = 从上往下贪心下降
+     nprobe=全 → 退化成暴力扫描          每层走到局部最优再下一层
+
+  代价模型：距离计算次数 ≈ nlist + nprobe/nlist · N
+  → nlist=√N 时总代价约 2√N，比 N 小两三个数量级</div>  <table>
+    <thead><tr><th>索引</th><th>构建成本</th><th>查询</th><th>内存</th><th>什么时候用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Flat（暴力）</strong></td><td>0</td><td>O(N·D)</td><td>全量</td><td><strong>N &lt; 10⁶，或作为 recall 的 ground truth</strong></td></tr>
+      <tr><td><strong>IVF</strong></td><td>一次 k-means</td><td>只扫 nprobe 个桶</td><td>全量</td><td>中等规模；<em>nprobe 给了一个可调的召回-延迟旋钮</em></td></tr>
+      <tr><td><strong>HNSW</strong></td><td>较贵（建图）</td><td>极快，召回高</td><td><strong>比 flat 还多</strong>（要存图）</td><td>对延迟敏感、内存管够</td></tr>
+      <tr><td><strong>IVF-PQ</strong></td><td>k-means + 码本训练</td><td>快</td><td><strong>压缩 8–64×</strong></td><td>10⁸ 级别，内存是硬约束时</td></tr>
+      <tr><td><strong>分片 + 粗筛</strong></td><td>按场景标签分区</td><td>先标签过滤再向量检索</td><td>按需加载</td><td><strong>工程上最实用</strong>：标签先砍掉 99%</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后一行值得单独说：<strong>真实系统里很少「对全池做向量检索」，而是先用结构化标签把范围砍到 1%，再在里面做向量检索</strong>。因为挖掘请求几乎总是带条件的——「夜间的、隧道里的、和这张像的」。<em>先过滤再检索，既省算力，检索质量也更高</em>（候选里没有大量无关场景来抢名额）。这也是下一节「场景标签」为什么值得单独建设的原因之一。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要注意<strong>「先过滤再检索」的召回陷阱</strong>：ANN 索引的 <code>nprobe</code> 是在<em>整个索引</em>上生效的，如果你的过滤条件命中的向量恰好分散在很多个 IVF 桶里，扫 nprobe 个桶可能一条都命中不到，返回空结果——而系统不会报错，只会「什么也没找到」。<em>正确做法是把高频过滤维度<strong>物化成分区</strong>（按天气/光照分别建索引），而不是建一个大索引再后置过滤</em>。<strong>「后置过滤导致召回塌陷」是向量检索系统最经典的静默故障。</strong></p></div>
+  </div>  <div class="math-block">\[\text{cost}(\text{IVF}) \approx \underbrace{n_{list}}_{\text{粗量化}} + \underbrace{\frac{n_{probe}}{n_{list}}\cdot N}_{\text{扫倒排}}, \qquad \frac{\partial \text{cost}}{\partial n_{list}} = 0 \Rightarrow n_{list}^{\star} = \sqrt{n_{probe}\cdot N}\]</div>  <div class="callout intuition"><span class="label"></span>
+    <p>选索引其实没什么可纠结的，<strong>决策只有两个输入：池子多大、内存多少</strong>。10⁶ 以下别建索引（暴力最省心且是精确的）；10⁶–10⁸ 且内存够 → HNSW 或 IVF；超过 10⁸ 或内存不够 → 上 PQ 压缩。<em>真正要花心思的是「怎么把标签过滤和向量检索组合起来」，以及「怎么持续验证召回没有塌陷」</em>——这两件事没有现成方案，得自己建监控。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tagging"><span class="num">4</span>场景标签体系：让数据变得可查询</h2>
+  <p>嵌入检索回答「和这张像的」，<span class="term">scenario tagging</span>（场景标签）回答另一半问题：<strong>「我们池子里到底有多少雪天+夜间+隧道口的数据？」「哪些场景我们几乎是空白？」</strong>。没有标签体系，数据池就是一个黑箱——你只能碰到问题了去捞，永远没法主动发现「这个场景我们从来没覆盖过」。<em>这条能力就是 JD 里 <strong>scenario tagging</strong> 那个词的实际含义。</em></p>  <h3>标签体系怎么设计：正交轴 + 受控词表</h3>  <p>好的标签体系有三个特征，缺一个用起来都别扭：</p>  <ol>
+    <li><strong>轴是正交的</strong>：天气 / 光照 / 道路类型 / 遮挡程度 / 标志类别 / 自车行为，各成一维。<em>「雨夜高速」这种复合标签不能当基本单位</em>——一旦复合，组合数爆炸且没法做交叉统计。</li>
+    <li><strong>每个轴是受控词表（controlled vocabulary）</strong>，取值封闭且互斥。自由文本标签在半年内一定会长出 <code>night</code> / <code>Night</code> / <code>夜间</code> / <code>low_light</code> 四种写法。</li>
+    <li><strong>标签自带来源与置信度</strong>：这条 <code>weather=fog</code> 是雨刷信号推的、规则推的、VLM 打的、还是人工标的？<em>不同来源的可信度差一个量级，做统计时必须能区分</em>。</li>
+  </ol>  <table>
+    <thead><tr><th>轴</th><th>受控词表（示例）</th><th>主要来源</th><th>为什么这一轴必须有</th></tr></thead>
+    <tbody>
+      <tr><td>weather</td><td>clear / rain / fog / snow</td><td>雨刷信号 + VLM</td><td>决定图像退化的类型；<strong>雾天是 TSR 的经典失效场景</strong></td></tr>
+      <tr><td>lighting</td><td>day / dusk / night / tunnel</td><td>时间 + 大灯 + VLM</td><td><strong>隧道进出口的逆光是最难的一类</strong>，且时间戳推不出来</td></tr>
+      <tr><td>road_type</td><td>highway / urban / ramp / rural</td><td>高精地图 / GPS</td><td>决定标志的种类分布与出现频率</td></tr>
+      <tr><td>occlusion</td><td>none / partial / heavy</td><td>标注或 VLM</td><td>分桶评测的必需维度（模块 05 会用）</td></tr>
+      <tr><td>sign_class</td><td>GB 5768 类目</td><td>检测器输出 + 人工</td><td><strong>长尾统计与预算分配的主键</strong></td></tr>
+      <tr><td>ego_event</td><td>cruise / brake / takeover</td><td>车端 CAN 信号</td><td>关联到「接管前 10 秒」这类高价值片段</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>标签体系最大的价值不是「能查」，而是<strong>能算出「缺口矩阵」</strong>：把 <code>(场景, 标志类别)</code> 摆成一张二维表，每格填「训练集里有多少张 / 评测集里表现如何」，<em>空的和红的格子就是下一轮该挖的目标</em>。这张表是数据团队和感知团队之间最有效的沟通界面——它把「模型不太行」变成「<code>(night, tunnel) × construction</code> 只有 31 张，AP 0.34」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>而它最大的工程风险是<strong>标签本身的漂移与不一致</strong>。同一个 <code>rain</code> 标签，去年是雨刷信号推的（覆盖全、精度低），今年换成 VLM 打的（精度高、语义变了：毛毛雨不再算 rain）。<em>于是「今年雨天数据变少了」这个结论完全是标签口径变化造成的假象</em>。<strong>所以标签必须版本化，且每次口径变更要么重刷全量、要么保留旧标签共存</strong>——这与本模块最后一节的数据血缘是同一件事。</p></div>
+  </div>  <div class="callout danger"><span class="label">模型的盲区会传染给数据系统</span>
+    <p>一个真实会翻车的做法：<strong>用当前模型的输出当标签，再用这些标签去挖数据训下一版模型</strong>。比如用检测器输出的 <code>sign_class</code> 统计类别缺口——但检测器恰恰在稀有类上召回最差，于是稀有类的统计数字被系统性低估，<em>你会得出「这个类数据够了」的错误结论，然后再也不挖它</em>。<strong>这是数据闭环里最隐蔽的正反馈陷阱：模型的盲区会传染给数据系统，让盲区自我延续。</strong></p><p>对策：<em>关键统计维度上必须有一条不依赖当前模型的信息通路</em>——人工抽检、高精地图先验、或者独立的更大的教师模型。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="vlm_tag"><span class="num">5</span>用 VLM 自动打标：现在的主流做法</h2>
+  <p>标签体系设计完，问题就变成「<strong>10⁸ 帧，谁来打这些标签</strong>」。历史上有三条路，今天是三条路混用，但重心已经明显移动了。</p>  <table>
+    <thead><tr><th>路线</th><th>怎么做</th><th>覆盖 / 精度</th><th>成本</th><th>适合的轴</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 元数据推断</strong></td><td>从 CAN 信号、时间戳、GPS、地图直接推</td><td>覆盖 100%，精度参差</td><td><strong>≈ 0</strong></td><td>road_type、ego_event、粗粒度 lighting</td></tr>
+      <tr><td><strong>② 规则 / 小模型</strong></td><td>亮度直方图、雨滴检测器、专用分类头</td><td>覆盖高，精度中</td><td>低（一次推理）</td><td>day/night、模糊度、曝光异常</td></tr>
+      <tr><td><strong>③ VLM 打标</strong></td><td>把帧喂给视觉语言模型，让它按受控词表输出结构化标签</td><td><strong>覆盖高、精度接近人工</strong></td><td>中（每帧几厘–几分钱）</td><td><strong>weather、occlusion、异常场景描述</strong></td></tr>
+      <tr><td><strong>④ 人工标注</strong></td><td>标注员按规范打标</td><td>精度最高</td><td><strong>高 100–1000×</strong></td><td>只用于<em>审计集</em>与仲裁</td></tr>
+    </tbody>
+  </table>  <p><strong>VLM 打标之所以在最近两年成为主流，是因为它把「加一个新标签轴」的成本从「训一个分类器」降到了「改一段 prompt」</strong>。以前想统计「画面里有没有施工锥桶」，要标几千张、训个模型、部署、维护；现在写一句 <code>是否存在施工锥桶？只答 yes/no</code> 就能刷全库。<em>这个成本结构的变化，才是「automated data mining workflow」这个词在今天的真实含义。</em></p>  <pre><code># VLM 打标的工程形态：**强制结构化输出 + 受控词表 + 拒答选项**
+PROMPT = '''你是自动驾驶数据标注器。只输出 JSON，不要解释。
+字段与允许取值（必须严格从中选择）：
+  weather:   ["clear","rain","fog","snow"]
+  lighting:  ["day","dusk","night","tunnel"]
+  occlusion: ["none","partial","heavy"]        # 指画面中交通标志被遮挡的最严重程度
+  sign_present: true | false
+  confidence: 0.0-1.0                          # 你对以上判断的整体把握
+无法判断的字段填 "unknown"，不要猜。'''
+
+# 三条必须做的工程约束：
+#   1) 输出用 JSON schema 约束（不是靠 prompt 求它听话）
+#   2) **保留 confidence 与 "unknown"** —— 强迫模型二选一会制造大量静默错误
+#   3) 每批抽 200–500 帧送人工做**审计集**，算 agreement / Cohen's kappa
+#      kappa &lt; 0.6 就不要用这批标签做任何统计决策</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>VLM 打标最容易被忽视的一点：<strong>它的错误不是随机的，是成片的（systematic）</strong>。人工标注员会零星标错，VLM 会「把所有薄雾一致地判成 clear」。<em>随机错误在统计聚合时会被平均掉，系统性错误不会——它会把整个缺口矩阵的某一行整体挪位</em>。所以审计集不能只算总体准确率，必须<strong>按每个取值分别算召回</strong>，专门盯稀有取值（fog、tunnel、heavy）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第二点是<strong>成本必须做级联</strong>。10⁸ 帧全过 VLM，即使每帧 0.001 美元也是 10 万美元。标准做法是三级：<em>元数据能定的先定（免费，砍掉 60–80%）→ 规则/小模型再定一层 → 只有剩下的「不确定」样本送 VLM</em>。notebook 里会把这个级联的成本-精度账算出来：<strong>级联能把 VLM 调用量降到 30–40%，而总体准确率只比全量 VLM 低 1 个点左右</strong>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>别用 VLM 标签直接当训练监督（伪标签），除非你非常清楚在做什么。<strong>VLM 打的是「场景标签」（用来<em>组织</em>数据），不是「任务标签」（用来<em>训练</em>模型）</strong>。前者错了只是挖数据挖偏一点，后者错了是直接往训练集里注入噪声——而模块 02 已经讲过，<em>噪声标签混进难例池会毁掉模型</em>。这条界线在工程上要用不同的字段、不同的表、不同的权限来物理隔离。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dedup"><span class="num">6</span>去重与多样性采样：别回传 1000 张同一路口</h2>
+  <p>现在候选集有了：嵌入检索给了 20000 张「和 badcase 像的」。但这 20000 张里，可能 15000 张来自同 60 段行车片段——<strong>因为触发器在一段路上会连续触发几百帧，而这几百帧几乎是同一张图</strong>。直接送标，等于花 20000 张的钱买 60 张的信息量。</p>  <h3>第一层：近重复检测（near-duplicate detection）</h3>  <p>最便宜的手段是<span class="term">perceptual hash</span>（感知哈希）。它把图像压成一个 64 位指纹，<strong>视觉上几乎一样的图会得到汉明距离很小的指纹</strong>，而且指纹是整数、可以建倒排、可以在几十亿量级上做。</p>  <table>
+    <thead><tr><th>哈希</th><th>怎么算</th><th>对什么鲁棒</th><th>对什么敏感</th></tr></thead>
+    <tbody>
+      <tr><td><strong>aHash</strong>（average）</td><td>缩到 8×8 灰度，与均值比较取 0/1</td><td>亮度整体缩放、轻微压缩</td><td><strong>对结构变化不够敏感</strong>，误合并多</td></tr>
+      <tr><td><strong>dHash</strong>（difference）</td><td>缩到 9×8，比较相邻像素大小</td><td>亮度与对比度变化</td><td>轻微平移会翻转较多位</td></tr>
+      <tr><td><strong>pHash</strong>（DCT）</td><td>取 DCT 低频系数与中位数比较</td><td><strong>最鲁棒</strong>：缩放、压缩、小幅变换</td><td>计算稍贵</td></tr>
+      <tr><td><strong>嵌入聚类</strong></td><td>在向量空间上做半径聚类</td><td>语义级近重复（同路口不同天）</td><td>贵；阈值难定</td></tr>
+    </tbody>
+  </table>  <p><strong>工程上一般两层都用</strong>：先用感知哈希砍掉「像素级几乎相同」的帧（便宜，能砍掉大头），再用嵌入距离砍掉「语义上重复」的帧（比如同一个路口不同时间拍的 20 次）。<em>注意第二层要小心：同一路口的雨天和晴天不是重复，它们恰恰是你要的对比样本</em>——所以嵌入聚类去重必须在场景标签内部做，跨场景不去重。</p>  <h3>第二层：多样性采样（core-set）</h3>  <p>去完重还剩 5000 张，预算只有 500 张，选哪 500 张？<strong>随机抽是有效的基线，但它会按池子的分布抽——池子里 70% 是晴天城区，抽出来也是 70% 晴天城区</strong>，而那恰恰是模型已经会的。<span class="term">core-set selection</span>（核心集选择）换一个目标：<em>让选出的子集在特征空间里「覆盖」整个池子</em>。</p>  <div class="math-block">\[S^{\star} = \arg\min_{S \subseteq P,\, |S|=k} \ \max_{x \in P} \ \min_{s \in S} d(x, s)\]</div>  <p>这就是 <span class="term">k-center</span> 问题：最小化「池子里任意一点到最近的被选点」的最大距离，也叫<strong>覆盖半径</strong>。它是 NP-hard，但有一个漂亮的贪心近似——<strong>每次选「离已选集合最远的那个点」</strong>，可以证明结果不超过最优解的 2 倍。实现只有 5 行，且天然把稀有场景选进来（<em>稀有场景在特征空间里就是「离大家都远」的点</em>）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>贪心 k-center 的直觉非常好用：<strong>第一步选任意点，之后每一步都问「现在覆盖得最差的是哪块区域」，然后往那块区域插一根钉子</strong>。它的行为和随机采样恰好相反——随机采样按密度分配名额，k-center 按<em>空白</em>分配名额。所以在长尾数据上，k-center 选出的子集里稀有场景的比例会远高于池子的自然比例。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但它有一个致命弱点必须知道：<strong>k-center 对离群点（outlier）极度敏感</strong>。一帧因为相机故障产生的全绿图像，在特征空间里离所有点都很远，于是它一定会被选中——而且它旁边的每个噪声帧都会被接着选中。<em>结果是预算被一批坏数据吃掉</em>。<strong>对策是先做离群剔除（按 k 近邻密度过滤掉密度极低的点），或者改用「聚类均衡采样」</strong>：先聚类，再从每个簇里按 <code>√簇大小</code> 配额抽——它没有 k-center 那么激进，但对噪声稳健得多，是工业上更常见的选择。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把这一节压成一句可迁移的话：<strong>相似度决定「找什么」，多样性决定「买什么」</strong>。检索环节要的是高相似（越像 badcase 越好），采样环节要的是低相似（彼此越不像越好）。<em>把这两个阶段的目标搞混——比如直接把检索的 top-500 送标——就是「回传 1000 张同一路口」的根本原因。</em>notebook 里会量化这个差别：同样 500 张预算，core-set 覆盖的场景组合数比 top-k 检索高一倍以上。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="budget"><span class="num">7</span>标注预算分配：把钱花在最缺的格子上</h2>
+  <p>最后一步是分钱。假设这一轮有 8 万元标注预算，缺口矩阵上有 40 个格子——<code>(场景, 标志类别)</code>——每个格子的现状、难度、单价都不同。<strong>「平均分」和「哪个 AP 最低给哪个」都是错的</strong>，前者浪费在已经饱和的格子上，后者会把钱全砸进一个可能根本救不回来的格子。</p>  <table>
+    <thead><tr><th>格子的属性</th><th>含义</th><th>怎么获得</th><th>在分配里的作用</th></tr></thead>
+    <tbody>
+      <tr><td><code>n_have</code></td><td>训练集里该格已有多少样本</td><td>查数据仓库</td><td>决定<strong>边际收益</strong>（已经很多 → 再加没用）</td></tr>
+      <tr><td><code>ap_now</code></td><td>评测集上该格当前 AP</td><td>分桶评测（模块 05）</td><td>低 AP 才有提升空间</td></tr>
+      <tr><td><code>w</code>（重要度）</td><td>该格的安全权重 × 出现频率</td><td>产品/安全团队给</td><td><strong>漏检「停车让行」和漏检「景点指示」不是一回事</strong></td></tr>
+      <tr><td><code>cost</code></td><td>该格每张的标注单价</td><td>标注供应商报价</td><td>夜间/遮挡样本标注更慢更贵，<em>可差 3–5 倍</em></td></tr>
+      <tr><td><code>n_avail</code></td><td>候选池里该格最多能挖出多少</td><td>查候选池</td><td><strong>硬上限</strong>——池子里没有就是没有</td></tr>
+    </tbody>
+  </table>  <p>把「标注 n 张后该格的收益」建模成一条<strong>饱和曲线</strong>（这正是模块 05 边际收益曲线的离线版本）：</p>  <div class="math-block">\[V_c(n) = w_c\left(1 - e^{-n/\tau_c}\right), \qquad \text{边际收益率} = \frac{\partial V_c/\partial n}{\text{cost}_c} = \frac{w_c}{\tau_c\,\text{cost}_c}e^{-n/\tau_c}\]</div>  <p>于是分配算法就是一句话：<strong>反复把下一块钱投给「当前边际收益率最高」的格子，直到预算用完</strong>。因为 <code>V_c</code> 是凹函数，这个贪心是最优的（这是经典的水位填充 / water-filling 结构）。它自动产生了三个符合直觉的行为：<em>样本已经很多的格子边际收益率低，自动不给钱；重要度高的格子多给；标注单价贵的格子会被折价</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这个模型的价值不在于它的数学，而在于<strong>它逼着你把「拍脑袋」变成三个可以被质疑的数字</strong>：这个格子多重要（<code>w</code>）、它离饱和还有多远（<code>τ</code>）、标一张多少钱（<code>cost</code>）。<em>面试里如果你能说出「我们把标注预算分配写成了一个带成本的贪心，w 由安全等级决定，τ 用历史边际收益曲线拟合」，这比任何算法细节都更能体现工程成熟度。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要诚实地承认它的两个漏洞。第一，<code>τ_c</code> 是拟合出来的，<strong>新场景没有历史数据就没有 τ</strong>——冷启动只能先给一个探索性的小配额（比如 200 张）跑一轮，拿到真实的边际收益点再进入优化。第二，<strong>格子之间不独立</strong>：给「夜间限速牌」加数据，「夜间禁令牌」也会受益（共享的是夜间的低光特征）。<em>独立性假设会让贪心高估分散投资的价值</em>。实践中的粗暴修正是按场景轴（而不是场景×类别）分配，把相关性最强的格子先合并。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>别忘了给「保持集」留预算</strong>。所有钱都投给当前最缺的格子，会导致评测集与训练集的分布一起漂移——<em>半年后你发现所有场景的 AP 都在涨，但路测体验没变好，因为评测集也被这套逻辑喂成了「当前最缺场景」的集合</em>。规范做法：每轮预算里固定切出 10–15%，按<strong>部署真实分布</strong>随机采样去标，专门用来维护一个不随挖掘策略漂移的基准评测集。这条与模块 05 的「回归门禁」是一套的。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="lineage"><span class="num">8</span>数据版本与血缘：出了问题能回溯到帧</h2>
+  <p>挖掘系统跑起来之后，最先出事的往往不是算法，是<strong>「这个模型到底是用哪些数据训的」没人说得清</strong>。当线上出现一类新的误检、怀疑是某批标注有问题时，你需要在几小时内回答三个问题——而没有血缘系统的话，这三个问题都答不了。</p>  <div class="ascii">数据血缘图（lineage）：每条边都必须可查
+
+  mine_job#412 ──produces──► candidate_set/2026-07-03/tunnel_fp
+       │  查询: emb_knn(seed=frame_88e1a, k=20000) &amp; tags.lighting=tunnel
+       │  索引版本: ivf_v3   嵌入模型: det_backbone@f19c2
+       ▼
+  dedup+coreset ──produces──► label_task#889  (1,204 帧)
+       │  phash_thresh=6, coreset_k=1200, seed=7
+       ▼
+  标注供应商 A ──produces──► **batch_2026w27_tunnel**  (1,204 帧, 质检通过率 0.94)
+       │                          │
+       │                          ├──used_by──► dataset_v1.7.2  (+ v1.7.1 全量)
+       │                          │                  │
+       │                          │                  └──trains──► model_r38  ──► **已上车**
+       │                          └──used_by──► dataset_v1.7.3 ──► model_r41 (灰度中)
+       ▼
+  反向查询："batch_2026w27_tunnel 标错了" → 受影响: dataset v1.7.2/v1.7.3
+                                          → 受影响模型: model_r38(**线上**), r41
+                                          → 决策: r38 回滚 or 热修?</div>  <table>
+    <thead><tr><th>要回答的问题</th><th>需要记录什么</th><th>不记录的后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>这个模型用了哪些数据？</strong></td><td>model → dataset 版本 → batch 列表（含父数据集的递归展开）</td><td>改了数据却不知道，指标变化无法归因</td></tr>
+      <tr><td><strong>这批数据是怎么挖来的？</strong></td><td>挖掘任务的查询、种子帧、索引版本、<strong>嵌入模型版本</strong>、去重与采样参数与随机种子</td><td>复现不了；也说不清挖掘策略是否引入了偏差</td></tr>
+      <tr><td><strong>这批数据出问题了，谁受影响？</strong></td><td>batch → dataset → model 的<strong>反向索引</strong>，且要能递归传播</td><td>只能全量重训「以防万一」，代价极高</td></tr>
+      <tr><td><strong>评测集和训练集有没有重叠？</strong></td><td>帧级唯一 ID + <strong>clip 级</strong>归属</td><td><strong>同一段路的相邻帧分别进训练和评测 → 指标虚高</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后一行是数据闭环里最常见、也最贵的事故：<strong>数据泄漏（leakage）</strong>。按帧随机划分训练/验证集，会让同一个 clip 的第 100 帧进训练、第 101 帧进验证——<em>它们几乎是同一张图</em>。于是验证 AP 虚高 5–15 个点，而且是<strong>系统性的、稳定的、看不出来的</strong>虚高。<strong>划分必须按 clip（更严格是按「路段 + 日期」）而不是按帧</strong>，这条在 TSR 上尤其致命，因为一块标志会在几十帧里连续出现。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>实现上不需要上重型工具。<strong>最小可用血缘 = 三张表加一条纪律</strong>：<code>batch</code> 表（一批标注的元数据 + 产出它的挖掘任务参数）、<code>dataset</code> 表（版本 → 包含哪些 batch，含父版本）、<code>run</code> 表（训练任务 → 用了哪个 dataset 版本 + 代码 commit）。纪律是：<em>训练脚本不接受「数据目录路径」，只接受「数据集版本号」</em>。<strong>把不可追溯的用法在接口层面禁掉，比要求所有人记得填表可靠得多</strong>——这与 C52 讲的「用产物的存在性编码验证已通过」是同一个模式。</p></div>
+  </div>  <div class="callout danger"><span class="label">换 backbone = 全量重建索引</span>
+    <p>一个必须提前设计的字段：<strong>嵌入模型的版本</strong>。挖掘用的嵌入来自某个 backbone；半年后 backbone 换了，新算的嵌入和索引里的旧嵌入<em>不在同一个空间</em>。此时检索会返回语义上毫无关系的结果，<strong>而且不会报错</strong>——相似度分数看起来一切正常（0.8、0.7……），只是含义全变了。</p><p>症状是「最近挖出来的数据质量突然变差，但说不上哪里不对」。<em>对策：索引必须绑定嵌入模型版本，版本不匹配直接拒绝查询；换 backbone 就重建全量索引（这是一笔要提前排期的算力预算）。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>挖掘基础设施是工程味最重的一环，但它有几个真问题至今没有好答案，值得在面试里作为「我知道边界在哪」的信号讲出来。</p>  <ul>
+    <li><strong>子集选择的目标函数依然是代理</strong>。core-set 优化的是特征空间覆盖，不确定性优化的是模型分歧，但真正想优化的是「标完之后模型涨多少」。<em>影响函数（influence function）、数据 Shapley、datamodels 这条线试图直接估计单条数据对最终指标的贡献</em>，但计算代价在检测任务与千万级数据上仍然不现实。目前工业界的共识是：<strong>用多个便宜代理的组合（相似 + 不确定 + 多样 + 类别缺口），而不是追求一个精确代理</strong>。</li>
+    <li><strong>批量主动学习的组合效应</strong>。逐条选择的最优性，在「一次选 1000 条」时完全不成立——单看每条都很有价值的 1000 条，可能高度冗余。<em>批量场景下的次模优化（submodularity）、行列式点过程（DPP）提供了理论工具</em>，但在高维嵌入与巨大候选池上的可扩展实现仍是开放问题。</li>
+    <li><strong>VLM 标注的可靠性度量</strong>。VLM 打标已经是主流，但「什么时候可以信它、信到什么程度」缺少标准方法。<em>自一致性（多次采样投票）、多模型交叉、置信度校准</em>都在被试，但 VLM 的置信度本身就是出了名的不可靠，且错误是成片而非随机的——这让传统的抽样审计效率大打折扣。</li>
+    <li><strong>合成数据在闭环里的位置</strong>。生成模型可以「造」出雪夜隧道口的施工牌，成本远低于去挖真实数据。<em>但合成数据的域差会不会把模型带偏、合成数据该占多大比例、怎么评估合成数据的「有效性」</em>，目前都只有经验答案。<strong>一个被反复验证的结论是：合成数据擅长补「几何/布局」的稀缺，不擅长补「传感器与光学退化」的稀缺</strong>——而 TSR 的难点恰恰大量属于后者。</li>
+    <li><strong>挖掘策略引入的分布偏移</strong>。挖掘系统按「模型现在的弱点」选数据，训练集就会持续偏离部署真实分布。<em>长期迭代后，训练分布是「历次弱点的并集」，与真实路况分布相去甚远</em>，这会以什么方式伤害模型（校准变差？对常见场景过拟合？）目前缺少系统研究，工程上只能靠「固定比例的随机采样」来对冲。</li>
+    <li><strong>跨车队/跨区域的数据可迁移性</strong>。欧洲车队挖到的雨夜数据能多大程度上帮到中国路况？<em>标志体系不同、道路结构不同、相机与 ISP 不同</em>——「数据可迁移性的度量」还没有比「拿去训一遍看结果」更好的方法，而这恰恰是最贵的方法。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Sener &amp; Savarese, <em>Active Learning for Convolutional Neural Networks: A Core-Set Approach</em>（ICLR 2018，k-center 贪心的理论与实证，本模块 core-set 一节的来源）；Johnson et al., <em>Billion-scale similarity search with GPUs</em>（FAISS，IVF/PQ 的工程细节）；Malkov &amp; Yashunin, <em>Efficient and robust approximate nearest neighbor search using HNSW graphs</em>；Koh &amp; Liang, <em>Understanding Black-box Predictions via Influence Functions</em>（数据价值估计这条线的起点）；Ghorbani &amp; Zou, <em>Data Shapley</em>；Ilyas et al., <em>Datamodels</em>；Kirsch et al., <em>BatchBALD</em>（批量主动学习的冗余问题）。工程侧建议读 Tesla 与 Waymo 公开分享里关于 data engine / scenario mining 的部分，以及 DVC / LakeFS / Delta Lake 的数据版本模型。相邻课程：C43（数据工程与血缘）、C11（向量检索）、C00（VLM）、C58 模块 03（触发）与 05（闭环验证）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_triggers/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 主动学习与线上触发策略</div></a>
+    <a class="next" href="../05_close_loop/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 闭环验证：证明数据真的有用</div></a>
+  </div>
+
+</div>
+</body>
+</html>

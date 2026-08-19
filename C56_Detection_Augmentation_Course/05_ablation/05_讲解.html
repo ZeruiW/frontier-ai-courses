@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 增强的消融与验证：怎么证明它真的有用</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 增强的消融与验证：怎么证明它真的有用</h1>
+  <p class="subtitle"><strong>整体 mAP +0.3 完全可能是「雨天 +3、晴天 −1」</strong>——不切片就看不见 · 检测的种子方差本身就有 ±0.2–0.5，单次跑赢不算赢，要多种子 + 配对检验 · 强增强需要更长训练，<strong>短 schedule 下比较增强是结构性不公平</strong> · 增强过强的指纹：验证优于训练、收敛变慢、小模型掉点 · 按失效模式反推配方：夜间弱→低光合成，远处小目标弱→Mosaic + 小尺度采样，稀有类少→copy-paste</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–04（几何 / 光度 / 混合 / 流水线）；C61 模块 01（实验方法论）与 C55 模块 05（安全导向评测）是本模块的两个邻居</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_aug_ablation.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Bouthillier et al. 的方差研究、Dodge et al. 的报告规范、Bootstrap 方法、YOLO 系的增强消融表</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#masking">整体 mAP 会掩盖什么：+0.3 背后可能是「雨天 +3、晴天 −1」</a></li>
+      <li><a href="#variance">种子方差：多少提升才不是噪声</a></li>
+      <li><a href="#paired">配对设计：让方差自己抵消掉</a></li>
+      <li><a href="#power">功效分析：动手之前先算需要多少种子</a></li>
+      <li><a href="#overaug">增强过强的症状学</a></li>
+      <li><a href="#budget">增强强度与训练时长的交互：短训练下的比较是不公平的</a></li>
+      <li><a href="#design">消融的正确设计：一张检查表</a></li>
+      <li><a href="#tsr_recipe">为 TSR 定制一套增强配方：按失效模式反推</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="masking"><span class="num">1</span>整体 mAP 会掩盖什么：+0.3 背后可能是「雨天 +3、晴天 −1」</h2>
+  <p>前四个模块教你怎么做增强。这一模块回答一个更难也更重要的问题：<strong>你怎么知道它真的有用？</strong>答案不是「跑一遍看 mAP 涨没涨」——那是这个领域里最常见、也最昂贵的错误。</p>  <p>先看一组具体数字。某个新增强上线前的分场景评测：</p>  <table>
+    <thead><tr><th>场景</th><th>里程占比</th><th>baseline AP</th><th>加增强后 AP</th><th>变化</th></tr></thead>
+    <tbody>
+      <tr><td>晴天白天</td><td>60%</td><td>0.7200</td><td>0.7050</td><td><strong style="color:#c33">−1.50 pt</strong></td></tr>
+      <tr><td>夜间</td><td>20%</td><td>0.4800</td><td>0.5100</td><td>+3.00 pt</td></tr>
+      <tr><td>雨天</td><td>15%</td><td>0.4100</td><td>0.4400</td><td>+3.00 pt</td></tr>
+      <tr><td>隧道</td><td>5%</td><td>0.3900</td><td>0.4200</td><td>+3.00 pt</td></tr>
+      <tr><td><strong>里程加权整体</strong></td><td>100%</td><td><strong>0.6090</strong></td><td><strong>0.6120</strong></td><td><strong>+0.30 pt</strong></td></tr>
+    </tbody>
+  </table>  <p><strong>只看最后一行，你会说「涨了 0.3，微弱正收益，上吧」。</strong>而真相是：这个增强在占 60% 里程的主力场景上掉了 1.5 个点，只是被三个小场景的 +3 抬了回来。<em>这两个结论会导向完全不同的决策</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>整体 mAP 是一个<strong>加权平均</strong>，而平均的天职就是抹掉分布信息。检测任务的评测集通常由多个异质子群组成（天气、光照、距离、类别、遮挡度），<em>它们的样本量和难度都差好几倍</em>。当你在这样的集合上算一个标量，<strong>任何「一部分涨、一部分掉」的模式都会被压成一个数</strong>，而增强恰恰是最容易产生这种模式的干预——它按定义就是在改变数据分布，<em>而分布的改变很难对所有子群同向</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说，问题在于<strong>评测集的权重不等于业务的权重</strong>。上表用的是里程占比；但如果按<em>安全风险</em>加权（夜间和雨天的事故率是晴天的 2–3 倍），同一份实验数据算出来是 <strong>+1.26 pt</strong>——是里程加权结果的 4 倍多。<em>同一个实验，两套权重，结论差 4 倍</em>。<strong>所以「增强有没有用」这个问题在没有定义权重之前是不完整的</strong>，而权重必须来自业务而不是来自评测集的天然构成（评测集的构成往往只反映了「哪些数据好收集」）。</p></div>
+  </div>  <div class="callout danger"><span class="label">面试高频：你怎么验收一个增强/一个改动</span>
+    <p>这个坑在 TSR 上尤其致命，因为<strong>误检与漏检的代价高度不对称且随场景变化</strong>。晴天白天掉 1.5 个点意味着在最常见的路况下多漏了标志——<em>如果漏的是「停车让行」，后果是安全事件；如果漏的是「景点指示」，后果是零</em>。而整体 mAP 对这两者一视同仁。<strong>规则：任何增强的验收都必须同时给出「分场景切片表」与「关键类别表」，只报整体 mAP 的实验报告应当被直接打回。</strong></p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把这一节压成一条可执行的规矩：<strong>先定义切片，再跑实验</strong>。切片的定义（哪些维度、每个维度怎么分桶、每桶的最小样本量）应当在实验开始<em>之前</em>写死并进版本库。<em>事后才去切片，你会不自觉地挑那些让结论好看的切法</em>——这是一种极难自我察觉的 p-hacking。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="variance"><span class="num">2</span>种子方差：多少提升才不是噪声</h2>
+  <p>第二个问题比第一个更基础：<strong>你观测到的那个差值，有多少是真实效应，有多少是随机噪声？</strong>深度学习的训练是随机过程——初始化、数据顺序、增强采样、cuDNN 的非确定算法，每一样都会让同一份配置跑出不同结果。</p>  <p>检测任务上，<strong>单次训练的 mAP 种子标准差典型在 0.3–0.6 个点</strong>（数据量越小、训练越短、类别越长尾，方差越大）。取 σ = 0.5 pt 做一笔账：</p>  <div class="math-block">\[\Delta_{\text{obs}} = \mu + (\varepsilon_A - \varepsilon_B), \qquad \varepsilon \sim \mathcal{N}(0, \sigma^2) \ \Longrightarrow\ \mathrm{sd}(\Delta_{\text{obs}}) = \sqrt{2}\,\sigma \approx 0.71\ \text{pt}\]</div>  <table>
+    <thead><tr><th>问题</th><th>计算</th><th>答案</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>零效应下，观测到 |Δ| &gt; 0.3 的概率</td><td>2(1−Φ(0.3/0.71))</td><td><strong>67.1%</strong></td><td><strong>「+0.3」这个数字几乎不含信息</strong></td></tr>
+      <tr><td>真实效应 +0.4，单种子比较得出<em>反</em>号的概率</td><td>Φ(−0.4/0.71)</td><td><strong>28.6%</strong></td><td>三分之一的概率你会把好改动毙掉</td></tr>
+      <tr><td>跑 3 个种子只报最好的，凭空得到多少</td><td>E[max of 3]·σ</td><td>+0.42 pt</td><td>「挑种子」的作弊幅度</td></tr>
+      <tr><td>跑 10 个种子只报最好的</td><td>E[max of 10]·σ</td><td><strong>+0.77 pt</strong></td><td>比绝大多数真实增强的效应还大</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第一行是这一节的核心事实：<strong>在 σ=0.5 的噪声下，两次纯粹相同的训练有 67% 的概率给出 |Δ| &gt; 0.3 的差值</strong>。所以当一篇论文、一个同事、或者你自己说「这个增强带来 +0.3 mAP」，<em>而只跑了一个种子</em>，那句话在统计上等价于「我掷了一次骰子」。<strong>面试里被问「+0.3 算提升吗」，正确答案是先反问「跑了几个种子、种子方差多大」</strong>，而不是直接判断大小。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第三、四行揭示了一个更隐蔽的问题：<strong>「挑最好的种子」在方法上等价于把噪声的最大值当成信号</strong>。它甚至不需要你有意作弊——<em>「这次跑崩了，重跑一遍」本身就是一种选择性报告</em>，因为你只会对结果差的实验说「跑崩了」。<strong>防线是把种子数与报告方式在实验开始前固定下来</strong>：跑 N 个种子，报均值 ± 标准差，N 由功效分析决定而不是由结果决定。<em>「跑到显著为止」和「跑到不显著就停」是同一种错误的两个方向。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>种子方差还有一个被普遍忽视的来源：<strong>评测本身的方差</strong>。如果验证流水线里残留任何随机性（模块 04 讲过），同一个 checkpoint 评两次就会给出不同的 mAP，<em>这部分方差会叠加到训练方差上，而且无法通过多种子平均消除</em>。所以做显著性分析之前，第一件事是断言「同权重评两次逐位相同」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="paired"><span class="num">3</span>配对设计：让方差自己抵消掉</h2>
+  <p>上一节的数字让人绝望：σ=0.5 意味着要检出 +0.3 需要几十次训练。<strong>但那是「非配对」设计的代价。换成配对设计，同样的检出能力只需要几个种子。</strong></p>  <p>关键的观察是：<strong>训练结果的方差可以分解成「种子效应」与「残差」两部分</strong>。同一个种子下，初始化、数据顺序、shuffle 序列都是相同的——这部分波动对 baseline 和 treatment <em>是共同的</em>，做差就抵消了。</p>  <div class="math-block">\[y_{s,a} = \mu_a + \underbrace{b_s}_{\text{种子效应}} + \underbrace{\epsilon_{s,a}}_{\text{残差}}, \qquad d_s = y_{s,A} - y_{s,B} = (\mu_A - \mu_B) + (\epsilon_{s,A} - \epsilon_{s,B})\]</div>  <table>
+    <thead><tr><th>设计</th><th>差值的标准差</th><th>数值（b=0.45, ε=0.15）</th><th>检出 +0.4 需要的种子数</th></tr></thead>
+    <tbody>
+      <tr><td><strong>非配对</strong>（各自随机种子）</td><td>√(2(σ_b²+σ_ε²))</td><td><strong>0.67 pt</strong></td><td><strong>每组 ~25 个</strong></td></tr>
+      <tr><td><strong>配对</strong>（共用同一批种子）</td><td>√(2σ_ε²)</td><td><strong>0.21 pt</strong></td><td><strong>3 个</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>配对设计的做法极其朴素：<strong>用同一组种子 <code>[0,1,2,3,4]</code> 分别跑 baseline 和 treatment，逐种子做差，然后对这 5 个差值做统计</strong>。它把「同一个初始化下这个改动带来了什么」这个问题隔离了出来，<em>而不是问「这个改动的平均效果 vs 那个改动的平均效果」</em>。在上面的数字下，标准差从 0.67 降到 0.21——<strong>方差降了 10 倍，需要的算力降了 8 倍</strong>。这是这个模块里性价比最高的一条建议。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>配对要成立有两个前提，都必须显式检查：① <strong>种子必须真的控制住了所有共享随机性</strong>——包括 DataLoader 的 shuffle 序列、增强的 RNG（模块 04）、以及权重初始化；如果 treatment 改变了增强算子的数量，RNG 消耗的次数就变了，<em>后续的随机序列会错开，配对效果部分失效</em>。② <strong>两个 arm 的其他一切必须完全相同</strong>：同 epoch 数、同 LR schedule、同 close-mosaic 时点、同评测代码。<em>只要有一项不同，你测的就不是那个增强。</em></p></div>
+  </div>  <h3>配对 t 检验与 bootstrap：两个都要看</h3>  <p>拿到 n 个配对差值 <code>d₁…dₙ</code> 之后，有两件事要做：</p>  <ol>
+    <li><strong>配对 t 检验</strong>：<code>t = d̄ / (s_d/√n)</code>，与自由度 <code>n−1</code> 的临界值比较。<em>它假设差值近似正态——小样本下这个假设未必成立，所以不能只看它。</em></li>
+    <li><strong>Bootstrap 置信区间</strong>：对差值有放回重采样 B 次，取均值分布的 2.5%/97.5% 分位数。<em>不依赖分布假设</em>，而且它给出的是<strong>效应量的区间</strong>而不是一个 yes/no。</li>
+    <li><strong>工程容差判定</strong>：区间下界是否超过你愿意为之付出代价的阈值。<em>统计显著 ≠ 值得做</em>——一个统计上确凿的 +0.05 pt，若代价是 3 倍的数据管线复杂度，答案仍然是不做。</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>这三步的顺序很重要，它对应三个不同的问题：<strong>「有没有效应」（t 检验）→「效应有多大、多确定」（bootstrap 区间）→「这么大的效应值不值得」（工程容差）</strong>。<em>绝大多数实验报告只做了第一步，而第三步才是真正的决策依据</em>。面试里能把这三步分清楚，是资深度的直接信号。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="power"><span class="num">4</span>功效分析：动手之前先算需要多少种子</h2>
+  <p>配对设计之后还剩一个问题：<strong>到底要跑几个种子？</strong>这个问题必须在实验开始<em>之前</em>回答，否则你会陷入「跑到显著为止」的陷阱。</p>  <div class="math-block">\[n \ \geq\ \frac{(z_{1-\alpha/2} + z_{1-\beta})^2 \, \sigma_d^2}{\Delta^2}, \qquad \text{MDE}(n) = (z_{1-\alpha/2} + z_{1-\beta}) \cdot \frac{\sigma_d}{\sqrt{n}}\]</div>  <p>其中 <code>Δ</code> 是你希望检出的最小效应，<code>σ_d</code> 是配对差值的标准差。取 α=0.05、power=0.80，则 <code>(1.96+0.84)² = 7.85</code>。</p>  <table>
+    <thead><tr><th>设计</th><th>σ_d</th><th>想检出 +0.4</th><th>想检出 +0.2</th><th>想检出 +0.1</th></tr></thead>
+    <tbody>
+      <tr><td><strong>配对</strong></td><td>0.21 pt</td><td><strong>3 个种子</strong></td><td>9 个种子</td><td><strong>35 个种子</strong></td></tr>
+      <tr><td><strong>非配对</strong></td><td>0.67 pt</td><td>25 个种子</td><td>88 个种子</td><td><strong>353 个种子</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把这张表反过来读更有用——<strong>用 MDE（最小可检出效应）代替 n</strong>：「我只能跑 5 个配对种子，那我能检出多小的提升？」答案是 <code>2.80 × 0.21/√5 = 0.26 pt</code>。<em>这意味着任何小于 0.26 pt 的观测差值，无论正负，都不该被当成结论</em>。<strong>MDE 应该写在实验报告的最上面</strong>，它一句话就界定了这次实验能说什么、不能说什么。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>最后一列是残酷的现实：<strong>要可靠地检出 +0.1 pt，配对设计要 35 次训练，非配对要 353 次</strong>。对一次要跑 12 小时的检测训练，后者是 176 天。<em>结论不是「想办法跑 353 次」，而是「+0.1 这个量级的改动在当前方差水平下不可验证，所以不要基于它做决策」</em>。<strong>正确的应对有三条</strong>：① 降低 σ_d（配对、固定评测、更长训练）；② 提高 Δ（做更有力的改动，而不是堆小 trick）；③ 换一个方差更小的指标（分场景 AP 往往比整体 mAP 的信噪比更高，因为效应更集中）。</p></div>
+  </div>  <div class="callout danger"><span class="label">面试高频：怎么避免自欺</span>
+    <p><strong>多重比较</strong>是这一节的隐藏杀手。你一次消融 10 个增强算子，每个都做 α=0.05 的检验，<em>那么「至少一个假阳性」的概率是 1−0.95¹⁰ = 40%</em>。如果还按 8 个场景切片各看一遍，就是 80 次检验——<strong>纯噪声也会给你四个「显著」的发现</strong>。规则：<strong>要么预先声明一个主指标（primary endpoint）、其余全部标为探索性；要么做 Bonferroni / FDR 校正</strong>。<em>「我在 8 个切片里发现雨天显著提升」这句话，若切片是事后挑的，几乎没有证据价值。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="overaug"><span class="num">5</span>增强过强的症状学</h2>
+  <p>增强不是越多越好。<strong>过强的增强会让训练分布偏离真实分布，模型把容量花在拟合不存在的变化上</strong>。问题是它的症状容易被误读成别的东西。</p>  <table>
+    <thead><tr><th>症状</th><th>观察到什么</th><th>为什么</th><th>是不是病</th></tr></thead>
+    <tbody>
+      <tr><td><strong>验证指标高于训练指标</strong></td><td>val mAP &gt; train mAP</td><td>训练集带增强（更难），验证集不带</td><td><strong>不是病</strong>——强增强下这是正常现象，误诊率极高</td></tr>
+      <tr><td><strong>训练 loss 居高不下</strong></td><td>loss 平台期比预期高</td><td>同上，任务变难了</td><td>不是病（单独看）</td></tr>
+      <tr><td><strong>验证指标低于无增强 baseline</strong></td><td>val AP 掉了</td><td><strong>分布偏移超过了正则化收益</strong></td><td><strong>是病</strong>——这才是判据</td></tr>
+      <tr><td><strong>收敛显著变慢</strong></td><td>到达同一 val AP 需要 2–3 倍 epoch</td><td>有效任务难度上升</td><td>视预算而定（见下一节）</td></tr>
+      <tr><td><strong>小模型掉点、大模型涨点</strong></td><td>同一配置在 tiny 上 −1.6、在 large 上 +1.7</td><td><strong>容量-强度错配</strong>：小模型欠拟合</td><td><strong>是病</strong>——按模型规模分档配增强</td></tr>
+      <tr><td><strong>某个切片崩塌</strong></td><td>整体持平但某场景掉 5+</td><td>该增强破坏了这个场景的关键线索</td><td><strong>是病</strong>——第 1 节的切片表能抓到</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第一行值得展开，因为它是<strong>最常被误诊的一条</strong>。「验证优于训练」在没有增强的年代确实是数据泄漏的指纹，但在强增强的检测训练里它是<em>预期行为</em>——训练时模型看到的是被 Mosaic 拼过、被透视扭过、被压暗加噪的图，验证时看到的是干净的原图，<strong>后者当然更容易</strong>。<em>把它当成 bug 去查，会浪费大量时间</em>。真正的判据永远是<strong>「验证指标 vs 无增强 baseline」</strong>，而不是「验证 vs 训练」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第五行「容量-强度错配」是实践中最有用的一条。增强的作用机制是<strong>用「更难的任务」换「更好的泛化」</strong>——这笔交易只有在模型有余量的时候才划算。<em>小模型的容量本来就不够拟合原始任务，再把任务变难，它连原始分布都学不好了</em>。所以 <strong>YOLO 系为 n/s/m/l/x 各档配了不同强度的增强</strong>（小模型关掉 MixUp、降低 Mosaic 比例、缩小尺度抖动范围），这不是调参玄学而是这条原理的直接推论。<em>把大模型的增强配置照搬到 tiny 模型上，是很常见也很昂贵的错误。</em></p></div>
+  </div>  <div class="ascii">增强过强的诊断树（从症状走到处方，不要在第一步就停）
+
+  观察到：val 指标不如预期
+        │
+        ├─ val &gt; train ？ ──────► 是 ──► **不是病**：训练集带增强本来就更难。
+        │                              继续往下走，别在这里停下来查数据泄漏。
+        │
+        └─► 唯一判据：val vs **无增强 baseline**
+              │
+              ├─ val ≥ baseline ──► 增强有效。再看分场景切片是否有局部崩塌。
+              │
+              └─ val &lt; baseline ──► 增强过强，分三种成因：
+                    │
+                    ├─ 小模型掉/大模型涨 ──► **容量-强度错配**
+                    │      处方：按模型档位分配强度（tiny 关 MixUp、降 Mosaic 比例）
+                    │
+                    ├─ 曲线末段仍在上升 ──► **预算不足**，不是增强的锅
+                    │      处方：延长训练，或按比例缩放强度后重比（第 6 节）
+                    │
+                    └─ 某个切片单独崩塌 ──► **该增强破坏了这个场景的关键线索**
+                           处方：查混淆矩阵。TSR 里最常见的是色相抖动
+                           导致「禁令牌→指示牌」这类跨颜色族错分 ——
+                           整体 mAP 只掉 0.2，安全上却是灾难。</div>  <div class="callout warn"><span class="label"></span>
+    <p>还有一个 TSR 特有的过强症状：<strong>色相抖动破坏语义</strong>（模块 02 量化过）。它的表现不是整体掉点，而是<em>混淆矩阵里出现「禁令牌被判成指示牌」这类跨颜色族的错分</em>——整体 mAP 可能只掉 0.2，但这类错分在安全上是灾难。<strong>所以 TSR 的增强验收表里必须有一列「跨颜色族错分率」</strong>，它比 mAP 敏感得多。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="budget"><span class="num">6</span>增强强度与训练时长的交互：短训练下的比较是不公平的</h2>
+  <p>这是消融设计里最容易犯、后果最严重的一个错误：<strong>用短训练预算去比较不同强度的增强</strong>。</p>  <p>原理很直接：<strong>增强提高了有效任务难度，因此收敛更慢</strong>。在训练还没收敛的时候比较，你测到的主要是「谁收敛得快」，而不是「谁的终点更高」。下面是一个能算出来的例子（模型容量固定，只变增强强度与 epoch 数）：</p>  <table>
+    <thead><tr><th>训练预算</th><th>aug=0.0</th><th>aug=0.3</th><th>aug=0.6</th><th>aug=1.0</th><th>最优强度</th></tr></thead>
+    <tbody>
+      <tr><td>12 epoch</td><td><strong>0.545</strong></td><td>0.494</td><td>0.431</td><td>0.329</td><td><strong>0.0</strong></td></tr>
+      <tr><td>36 epoch</td><td>0.759</td><td><strong>0.770</strong></td><td>0.728</td><td>0.627</td><td><strong>0.3</strong></td></tr>
+      <tr><td>100 epoch</td><td>0.780</td><td>0.834</td><td><strong>0.842</strong></td><td>0.797</td><td><strong>0.6</strong></td></tr>
+      <tr><td>300 epoch</td><td>0.780</td><td>0.835</td><td><strong>0.846</strong></td><td>0.811</td><td><strong>0.6</strong></td></tr>
+    </tbody>
+  </table>  <p>看第三列与第一列的对比：<strong>在 12 epoch 的预算下，aug=0.6 比 aug=0.0 低 11.4 个点；在 300 epoch 下，同样的比较是高 6.6 个点。同一个实验，符号相反。</strong></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这解释了一个常见的组织性失败：<strong>团队为了「快速迭代」把消融的训练预算砍到 1/10，然后系统性地淘汰掉所有强增强的方案</strong>。<em>短预算下的排序与全预算下的排序不一致，而且不是随机不一致——它有明确的方向：短预算永远偏袒弱增强</em>。于是这个团队会一路收敛到一个「训练很快、天花板很低」的配置，并且永远不知道自己错过了什么。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>正确的做法有三种，成本递增：① <strong>用足够长的预算做消融</strong>（最可靠，最贵）；② <strong>在缩短预算的同时按比例缩放增强强度</strong>（把「强度 × 时长」当成一个联合超参，而不是独立变量）；③ <strong>看曲线而不是看终点</strong>——如果强增强的验证曲线在预算末尾仍在明显上升而弱增强已经平了，<em>这本身就是「预算不够、排序不可信」的证据</em>。<strong>第 ③ 条几乎不花额外成本，应当成为默认动作。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">消融的第一原则：单变量 + 同预算 + 同调参机会</span>
+    <p>同一个逻辑还有一个变体：<strong>「同 budget」必须包含调参预算</strong>。你为 baseline 调了三个月的学习率与 schedule，然后把新增强直接插进去用同一套超参跑一次——<em>新方案没有得到同等的调参机会</em>。强增强通常需要更大的学习率或更长的 warmup，不调就会低估它。<strong>这类不公平比较在论文和内部实验里都极其普遍，而且总是偏向「现状」。</strong>面试里能主动指出这一点，是很强的加分项。</p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把这一节和上一节合起来看：<strong>增强强度、模型容量、训练时长三者构成一个三角，任意固定两个去调第三个，得到的结论都不能外推</strong>。<em>这也是为什么「某某论文说 Mosaic 有用/没用」这类断言几乎没有信息量</em>——不说清楚模型多大、训多久，那句话是不完整的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="design"><span class="num">7</span>消融的正确设计：一张检查表</h2>
+  <p>把前面几节的规则合成一张可执行的检查表。<strong>每一条都对应一种已经导致过错误结论的真实做法。</strong></p>  <table>
+    <thead><tr><th>检查项</th><th>为什么</th><th>怎么验</th></tr></thead>
+    <tbody>
+      <tr><td><strong>单变量</strong></td><td>同时改两处，收益无法归因</td><td>diff 只应包含增强配置；<strong>配置指纹（模块 04）</strong>能自动查出「顺手改了别的」</td></tr>
+      <tr><td><strong>同训练预算</strong></td><td>强增强收敛慢，短训练系统性偏袒弱增强</td><td>epoch/iter 数、LR schedule、close-mosaic 时点全部一致</td></tr>
+      <tr><td><strong>同调参预算</strong></td><td>现状被调过、新方案没有</td><td>两个 arm 各做同等规模的 LR 搜索，或都用默认</td></tr>
+      <tr><td><strong>配对种子</strong></td><td>方差降 10 倍，算力降 8 倍</td><td>两个 arm 用同一组 seed 列表；检查 RNG 消耗未错位</td></tr>
+      <tr><td><strong>预先声明种子数</strong></td><td>「跑到显著为止」= 自欺</td><td>由功效分析定 n，写进实验计划，<strong>不许中途加</strong></td></tr>
+      <tr><td><strong>预先声明切片</strong></td><td>事后挑切片 = p-hacking</td><td>切片定义进版本库；每桶最小样本量也要定</td></tr>
+      <tr><td><strong>预先声明主指标</strong></td><td>多重比较下纯噪声也能给出「显著」</td><td>一个 primary endpoint，其余标探索性；或做 FDR 校正</td></tr>
+      <tr><td><strong>确定性评测</strong></td><td>评测有随机性 → 所有结论作废</td><td>同权重评两次必须逐位相同（模块 04 的断言）</td></tr>
+      <tr><td><strong>报告代价</strong></td><td>只报收益会被追问到崩</td><td>训练时长、CPU 需求、显存、部署复杂度都要写</td></tr>
+    </tbody>
+  </table>  <div class="ascii">一次合格的增强消融，报告长什么样
+
+  ┌─ 实验计划（跑之前写死）────────────────────────────
+  │  假设      : 低光合成能提升夜间 AP，不损害晴天 AP
+  │  主指标    : 夜间切片 AP           ← 只有一个
+  │  次要指标  : 晴天切片 AP（不劣于 −0.5 pt 为门禁）
+  │  设计      : 配对，seeds=[0,1,2,3,4]，其余全同
+  │  MDE       : 2.80 × 0.21/√5 = **0.26 pt**  ← 小于它的差值不下结论
+  │  切片定义  : 天气×4 / 距离桶×4 / 类别族×5（版本 v3，已入库）
+  └────────────────────────────────────────────────────
+  ┌─ 结果 ─────────────────────────────────────────────
+  │  夜间  d̄ = +2.9 pt, 95% CI [+2.1, +3.6], t=8.2 (df=4, crit=2.78) ✅
+  │  晴天  d̄ = −0.2 pt, 95% CI [−0.7, +0.3]  → 门禁通过（下界 &gt; −0.5）
+  │  整体  d̄ = +0.3 pt  ← **单独看它什么都说明不了**
+  │  代价  : t_aug 12.0 → 13.8 ms（+15%），min_workers 7 → 8
+  └────────────────────────────────────────────────────
+  ┌─ 结论 ─────────────────────────────────────────────
+  │  采纳。理由：主指标显著且效应量 (+2.9) 远超 MDE (0.26)，
+  │  门禁指标未劣化，代价可接受（还有 1 个核的余量）。
+  └────────────────────────────────────────────────────</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>注意报告里那句<strong>「整体 +0.3 单独看什么都说明不了」</strong>——它出现在结果里，但不是结论的依据。<em>这正是第 1 节和第 2 节合起来的结果：+0.3 既可能被切片掩盖，又落在噪声量级内</em>。而夜间的 +2.9 pt 有两重支撑：效应量远超 MDE，且置信区间下界（+2.1）也远超。<strong>「效应量 vs MDE」这个对比比 p 值有用得多</strong>，因为它同时回答了「有没有」和「有多大」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还要注意<strong>「门禁指标」的写法</strong>：晴天的判据不是「有没有显著下降」，而是<strong>「置信区间下界是否高于 −0.5 pt」</strong>。<em>这是非劣性检验（non-inferiority）的思路，而不是显著性检验</em>——因为「没测出显著下降」和「确实没下降」是两回事，前者可能只是样本不够。<strong>凡是「不劣化」类的要求，都必须用区间下界来判，不能用 p 值。</strong>这是回归门禁设计里最常见的方法学错误。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>整张表可以压成一句话：<strong>把所有的决策自由度都挪到实验开始之前</strong>。跑之前定死种子数、切片、主指标、门禁阈值，跑完就只剩「照表读数」。<em>这不是形式主义——它消灭的是「事后选择」这个人类无法自我察觉的偏差源</em>，而这个偏差源的量级（第 2 节算过：挑 10 个种子的最大值 = +0.77 pt）比绝大多数真实增强的效应还大。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tsr_recipe"><span class="num">8</span>为 TSR 定制一套增强配方：按失效模式反推</h2>
+  <p>最后把整门课收拢：<strong>不要从「有哪些增强算子」出发去挑，要从「模型在哪里失效」出发去反推</strong>。这个方向差别决定了你是在堆 trick 还是在解决问题。</p>  <h3>① 从失效模式到算子的映射</h3>  <table>
+    <thead><tr><th>失效模式</th><th>当前 AP → 目标</th><th>里程占比</th><th>安全权重</th><th>反推出的增强</th><th>验证切片</th></tr></thead>
+    <tbody>
+      <tr><td><strong>远距离小目标（&lt;16px）</strong></td><td>0.31 → 0.50</td><td>35%</td><td>3.0</td><td><strong>Mosaic + 小尺度采样</strong>（制造更多小目标）+ 轻度运动模糊</td><td>按像素尺寸分桶 [&lt;16, 16–32, 32–64, &gt;64]</td></tr>
+      <tr><td><strong>夜间 / 弱光</strong></td><td>0.48 → 0.62</td><td>18%</td><td>2.5</td><td><strong>低光合成</strong>（gamma + 噪声 + 量化）+ 保守 HSV 的 value 通道</td><td>光照标签 = night / dusk</td></tr>
+      <tr><td><strong>雨雾</strong></td><td>0.41 → 0.58</td><td>10%</td><td>2.0</td><td>大气散射雾化 <code>I = J·t + A(1−t)</code> + 雨条纹</td><td>天气标签 = rain / fog</td></tr>
+      <tr><td><strong>稀有类（施工牌/让行）</strong></td><td>0.36 → 0.60</td><td>4%</td><td>3.5</td><td><strong>copy-paste</strong>（透视合理的尺度与位置）</td><td>按类别族，尾部类单列</td></tr>
+      <tr><td><strong>逆光 / 隧道出入口</strong></td><td>0.44 → 0.60</td><td>6%</td><td>2.5</td><td>局部过曝 + 眩光合成 + 强对比抖动</td><td>场景标签 = tunnel_in / tunnel_out</td></tr>
+      <tr><td><strong>运动模糊</strong></td><td>0.52 → 0.65</td><td>12%</td><td>1.5</td><td>方向性运动模糊核（长度按车速采样）</td><td>车速分桶</td></tr>
+      <tr><td><strong>广告牌误检</strong></td><td>P 0.90 → 0.96</td><td>25%</td><td>1.2</td><td><strong>难背景 copy-paste</strong>（把广告牌抠出来贴成负样本）</td><td>FP/km，按 FP 来源分类</td></tr>
+    </tbody>
+  </table>  <p>优先级用 <code>(目标−当前) × 里程占比 × 安全权重</code> 排序，结果是 <strong>远距离小目标（0.200）≫ 夜间（0.063）&gt; 雨雾（0.034）≈ 稀有类（0.034）&gt; 逆光（0.024）≈ 运动模糊（0.023）&gt; 广告牌（0.018）</strong>。<em>这个排序和「哪个算子最流行」几乎没关系，这正是它的价值。</em></p>  <h3>② 配方本身（含每条的约束来源）</h3>  <pre><code># TSR 增强配方 v1（按失效模式反推，含约束注释）
+stage_A_mixing:
+  mosaic:            p=1.0   scale=(0.4,1.2)   close_at_epoch=-15   # ★ 最后 15 epoch 必关
+  mixup:             p=0.08                                          # 小模型档位置 0
+stage_B_geometric:                     # ★ 合成一个仿射矩阵，只重采样一次
+  affine:            p=0.9   scale=(0.5,1.5) translate=0.1 rotate=(-8,8) shear=(-4,4)
+  small_scale_bias:  p=0.5   extra_downscale=(0.5,0.8)  # ← 主动制造小目标
+  hflip:             p=0.5   whitelist=SYMMETRIC_CLASSES  # ★ 左转/右转/文字牌禁翻
+stage_C_cleanup:
+  clip + min_area=16px^2 + min_visibility=0.3            # ★ 紧跟几何段
+stage_D_photometric:                   # ★ 必须在几何之后
+  lowlight_synth:    p=0.30  gamma=(1.6,2.6) iso_noise=(8,30) quant_bits=7
+  atmos_fog:         p=0.15  beta=(0.4,1.2)  A=(0.7,0.95)
+  glare:             p=0.10  radius=(20,80)
+  hsv:               p=0.70  hue=±8   sat=±25  val=±25  # ★ hue&lt;=10：颜色是语义
+  motion_blur:       p=0.20  length=(5,15) angle=按车速与转向采样
+  jpeg/isp_artifact: p=0.25  quality=(45,90)
+stage_E_instance:
+  copy_paste_rare:   p=0.30  classes=TAIL_20  scale_by_perspective=True
+  copy_paste_hardbg: p=0.20  source=广告牌/车身贴纸实例库  as_negative=True
+stage_F_normalize:                     # ★ 与 val / 部署共用同一份代码
+  letterbox(pad=114, stride=32) -&gt; RGB -&gt; /255 -&gt; mean/std</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>配方里有<strong>四条星标约束</strong>，每一条都能追溯到前面的模块：<code>close_at_epoch=-15</code> 来自模块 03（close-mosaic）；<code>hflip whitelist</code> 来自模块 01（<em>水平翻转会把「左转」变「右转」</em>，这是 TSR 面试可以主动提的点）；<code>hue≤10</code> 来自模块 02（<em>红=禁令、蓝=指示、黄=警告，色相是语义</em>）；<code>stage_C 紧跟几何</code> 与 <code>stage_F 共用代码</code> 来自模块 04。<strong>一份没有这些约束注释的配方，下一个人一定会把它们改坏。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一条隐性约束是<strong>算力</strong>：把上面所有算子的 CPU 成本加起来约 38.7 ms/样本，再加解码约 8 ms ≈ 46.7 ms。按模块 04 的公式，喂饱一张卡需要 <code>⌈533 × 0.0467⌉ = 25</code> 个 worker——<em>16 核的机器做不到</em>。<strong>所以配方必须连带给出算力方案</strong>：预解码成未压缩格式（省掉 8 ms）、Mosaic 移到 GPU 侧、或者把 <code>p</code> 调低换吞吐。<em>不带算力账的增强配方是不可执行的</em>，这是训练平台上最常见的返工原因。</p></div>
+  </div>  <h3>③ 验证方案</h3>  <ol>
+    <li><strong>逐条上、不要一次全上</strong>：按优先级顺序，每次只加一组算子，配对 5 种子，主指标 = 该失效模式对应的切片 AP，门禁 = 其余切片下界不低于 −0.5 pt。<em>一次全上的话，涨了不知道是谁的功劳，掉了不知道是谁的锅。</em></li>
+    <li><strong>每条都要过 MDE 检查</strong>：σ_d 用该切片的历史方差（<em>小切片的方差更大</em>，MDE 也更大——夜间切片只有 18% 的样本，σ_d 可能是整体的 2 倍）。</li>
+    <li><strong>跨颜色族错分率</strong>作为 HSV 类算子的专项门禁（模块 02 的量化方法），mAP 对它不敏感。</li>
+    <li><strong>FP/km</strong> 作为 hard-background copy-paste 的主指标——<em>precision 会被 TP 数量稀释，FP/km 不会</em>（C55 模块 05）。</li>
+    <li><strong>最后做一次全配方 vs baseline 的联合验证</strong>，并检查是否出现「单条都涨、合起来不涨」——那说明算子之间在争夺同一份模型容量，需要重新分配 p。</li>
+    <li><strong>报告代价</strong>：t_aug、min_workers、训练时长、以及 close-mosaic 后的收敛曲线是否已平（否则第 6 节的预算陷阱又回来了）。</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>这套方法的可迁移之处不在于具体算子，而在于<strong>「先量化失效模式、再反推干预、再逐条验证」这个闭环</strong>。<em>它和 C58 讲的数据闭环是同构的</em>：失效模式清单 ↔ 触发器，增强算子 ↔ 挖掘策略，切片门禁 ↔ 回归门禁。<strong>面试里能把「增强配方」讲成这样一个闭环而不是一串算子名，是最有效的区分度。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>消融与验证看起来是「方法学」，但它连着几个仍然开放的问题——而且这些问题正在变得更重要，因为模型改动的边际收益越来越小，噪声相对越来越大。</p>  <ul>
+    <li><strong>深度学习实验的方差来源分解</strong>：Bouthillier 等人的工作系统地测量了初始化、数据顺序、增强、非确定 kernel、数据划分各自贡献了多少方差，结论之一是<em>「数据划分」的方差常常大于「随机种子」的方差</em>——这意味着很多论文的 ±std 严重低估了真实不确定性。<strong>检测任务上的同类测量仍然稀缺。</strong></li>
+    <li><strong>报告规范与可复现性</strong>：Dodge 等人提出「报告计算预算与超参搜索规模」（因为「最好模型的性能」是搜索预算的函数），以及用 <em>expected max performance vs budget</em> 曲线代替单点数字。<em>这个规范在检测领域几乎没有被采纳</em>，而它恰恰能解决第 6 节讲的「同调参预算」问题。</li>
+    <li><strong>增强效果的理论刻画</strong>：现有理论主要把增强解释为「群等变性的近似」或「隐式正则化」，能定性解释但不能定量预测「这个增强在这个数据集上能涨多少」。<strong>「给定数据分布与模型容量，预测某个增强的收益」目前完全做不到</strong>——这也是为什么一切只能靠实验。</li>
+    <li><strong>分场景/分组的鲁棒评测</strong>：Group DRO、最差组精度（worst-group accuracy）这一支工作把「不能只看平均」形式化成了优化目标而不只是评测口径。<em>把它用到检测的分场景 AP 上（直接优化最差场景而不是平均）是一个自然但尚未成熟的方向</em>，难点在于场景标签本身的噪声与不完备。</li>
+    <li><strong>自动化的切片发现</strong>：人工定义切片必然漏掉「你没想到的失效模式」。Slice Discovery / Domino 这类方法尝试<em>用嵌入聚类自动找出模型表现异常差的样本子群</em>，再交给人命名。<strong>它与 C58 的难例挖掘是同一件事的两个入口</strong>，但在检测任务上（框级而非图级）的适配仍然开放。</li>
+    <li><strong>用 LLM/VLM 辅助实验分析</strong>：自动读实验日志、生成切片对比、指出不公平比较、起草消融报告——这是当前工业界正在快速落地的方向，也是 JD 里「automated workflows」的一部分。<em>开放问题是可靠性</em>：一个会「合理化」错误结论的分析助手，比没有更危险。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：<em>Accounting for Variance in Machine Learning Benchmarks</em>（Bouthillier et al., MLSys 2021）——方差来源分解与「多少次运行才够」的一手证据，本模块第 2/4 节的方法论基础；<em>Show Your Work: Improved Reporting of Experimental Results</em>（Dodge et al., EMNLP 2019）——报告规范与「性能是搜索预算的函数」；<em>Distributionally Robust Neural Networks (Group DRO)</em>（Sagawa et al., ICLR 2020）——把「最差组」变成优化目标；<em>Domino: Discovering Systematic Errors with Cross-Modal Embeddings</em>（Eyuboglu et al., ICLR 2022）——自动切片发现；<em>Bag of Freebies for Training Object Detection Neural Networks</em>（Zhang et al., 2019）与 YOLOv4/v7 论文的消融表——检测增强消融的实操范本（<em>注意用本模块的检查表去读它们，你会发现不少条目是不可比的</em>）。相邻课程：C61 模块 01（实验方法论）、C55 模块 05（安全导向评测）、C58 模块 05（闭环验证）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_pipeline/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 增强流水线工程</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 哈希、排序与二分</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 哈希、排序与二分</h1>
+  <p class="subtitle">Python <code>dict</code>/<code>set</code> 是<strong>均摊 O(1) 而不是保证 O(1)</strong>：最坏退化到 O(n)，而且浮点做 key（<code>0.1+0.2</code>）、可变对象做 key、<code>True == 1</code> 撞键各有坑 · 稳定排序在检测里是<strong>正确性问题而非风格问题</strong>——NMS 遇到同分框时，不稳定排序会让同一份输入两次运行给出不同结果 · 二分的三套模板（精确值 / 左边界 / 右边界）与开闭区间不一致导致的死循环，用循环不变量把它钉死 · <strong>「在答案上二分」是中高频题型的统一解法</strong>：把「求最优值」翻译成「判定某个值可行吗」 · Top-K 三解法的选择依据：全排序 O(n log n) / 堆 O(n log k) / quickselect 期望 O(n) 但最坏 O(n²)</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00（六步答题协议）、模块 01（数组与字符串 / 双指针）；不需要 C61 的检测背景</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_hash_sort_search.ipynb（纯 Python + numpy，三套二分与 bisect 对拍、Top-K 三解法计时）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">CLRS 第 8/9/11 章 · Bentley & McIlroy 快排工程 · Peters 的 Timsort listsort.txt · Kraska et al. 学习型索引</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 80 分钟 + 跑 90 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#hash">哈希表：均摊 O(1) 的代价，与 Python 的三个坑</a></li>
+      <li><a href="#sort">排序：自定义键、稳定性，以及 NMS 为什么需要它</a></li>
+      <li><a href="#binsearch">二分的三套模板与循环不变量</a></li>
+      <li><a href="#deadloop">死循环的四种成因：开闭区间不一致</a></li>
+      <li><a href="#answer-space">在答案上二分：最小化最大值 / 最大化最小值</a></li>
+      <li><a href="#topk">Top-K 的三种解法与选择依据</a></li>
+      <li><a href="#dedup">去重、计数与分桶：四种惯用法和它们的差别</a></li>
+      <li><a href="#interview">面试标准答案骨架</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hash"><span class="num">1</span>哈希表：均摊 O(1) 的代价，与 Python 的三个坑</h2>
+  <p>哈希表是面试里出现频率最高的数据结构，也是最容易被<strong>误报复杂度</strong>的一个。「用个 dict 就是 O(1)」这句话在 90% 的面试题里是对的，但你必须知道它在什么条件下成立——<strong>面试官问「dict 的查找真的是 O(1) 吗」时，他要的就是那 10%</strong>。</p>  <p>哈希表 = 一个定长数组 + 一个把 key 映射到下标的哈希函数 + 一套冲突解决策略。三样东西各自贡献一种失效模式：</p>  <div class="ascii">链地址法（教学模型；CPython 实际用开放寻址）
+
+  桶数组 (capacity = 8)              装载因子 α = n / capacity
+  ┌───┬───┬───┬───┬───┬───┬───┬───┐
+  │ 0 │ 1 │ 2 │ 3 │ 4 │ 5 │ 6 │ 7 │
+  └─┬─┴───┴─┬─┴───┴─┬─┴───┴───┴───┘
+    │       │       │
+    ▼       ▼       ▼
+   [k8]    [k1]    [k2]              ← 理想：每桶 O(1) 个元素
+    │
+    ▼
+   [k16]                             ← 冲突：同一桶挂成链
+    │
+    ▼
+   [k24]        ← 退化：若所有 key 都映射到同一桶，查找变成 O(n) 的链表扫描
+
+  两种"变慢"要分清：
+    ① 一次 rehash（扩容重建）= O(n)，但均摊到 n 次插入是 O(1)  ← 可接受
+    ② 哈希函数烂 / 被攻击 → 每次查找都是 O(n)                  ← 不可接受</div>  <h3>均摊分析：为什么扩容不破坏 O(1)</h3>  <p>CPython 的 dict 在装载因子超过 2/3 时把容量翻倍并重建全部条目。单次扩容是 $O(n)$，但从空表插到 $n$ 个元素，一共只会在容量为 $1,2,4,\dots$ 时各触发一次重建，总代价是等比级数：</p>  <div class="math-block">\[\sum_{i=0}^{\lceil\log_2 n\rceil} 2^{i} \;<\; 2n \quad\Longrightarrow\quad \frac{\text{总重建代价}}{n\ \text{次插入}} \;=\; O(1)\ \text{（均摊）}\]</div>  <p><strong>「均摊 O(1)」和「每次 O(1)」不是一回事</strong>。对延迟敏感的系统（比如车端每帧要跑的后处理），均摊 O(1) 意味着<em>某一帧会突然多花几毫秒</em>——这正是模块 00 里说的「延迟均值 vs 延迟分布」。工程上的对策是<strong>预分配</strong>：如果知道最多有 4000 个候选框，就一次性开好，别让它在关键路径上扩容。</p>  <table>
+    <thead><tr><th>操作</th><th>平均</th><th>最坏</th><th>触发最坏的条件</th><th>面试怎么说</th></tr></thead>
+    <tbody>
+      <tr><td><code>d[k]</code> 查找</td><td>$O(1)$</td><td><strong>$O(n)$</strong></td><td>所有 key 哈希到同一桶（自定义 <code>__hash__</code> 返回常数、或被构造的碰撞攻击）</td><td>「期望 O(1)，最坏 O(n)，前提是哈希函数把 key 均匀散开」</td></tr>
+      <tr><td><code>d[k] = v</code> 插入</td><td>$O(1)$ 均摊</td><td>$O(n)$</td><td>触发 rehash 的那一次</td><td>「均摊 O(1)，但单次可能 O(n)——扩容重建」</td></tr>
+      <tr><td><code>del d[k]</code></td><td>$O(1)$</td><td>$O(n)$</td><td>同上</td><td>CPython 删除只打墓碑，不缩容</td></tr>
+      <tr><td>遍历 <code>for k in d</code></td><td>$O(\text{capacity})$</td><td>$O(\text{capacity})$</td><td>大量删除后表很稀疏</td><td><strong>不是 $O(n)$！</strong>删了 99% 的元素后遍历仍要扫全表</td></tr>
+      <tr><td><code>k in set</code></td><td>$O(1)$</td><td>$O(n)$</td><td>同查找</td><td>set 与 dict 是同一套机制</td></tr>
+    </tbody>
+  </table>  <h3>Python 面试里真正会踩的三个坑</h3>  <ol>
+    <li><strong><code>hash(1) == hash(1.0) == hash(True)</code></strong>。所以 <code>{1: 'x', 1.0: 'y', True: 'z'}</code> 的长度是 <strong>1</strong>，值是 <code>'z'</code>。用「类别 id」做 key 时，如果一条路径传的是 <code>int</code>、另一条传的是 <code>np.float32</code>，它们会静默合并成同一个 key——<em>这类 bug 不报错，只是统计数字对不上</em>。</li>
+    <li><strong>浮点数做 key</strong>。<code>0.1 + 0.2 != 0.3</code>，所以 <code>d[0.1+0.2]</code> 会 KeyError。更隐蔽的是 <code>float('nan')</code>：<code>nan != nan</code>，但 dict 查找有一条 <em>identity 短路</em>（先比 <code>is</code> 再比 <code>==</code>），于是<strong>同一个 nan 对象能查到，另一个 nan 对象查不到</strong>。</li>
+    <li><strong>可哈希性</strong>。<code>list</code> 不可哈希，<code>tuple</code> 可以，但<em>含 list 的 tuple 又不可以</em>（哈希是递归计算的）。自定义类如果重写了 <code>__eq__</code> 而没重写 <code>__hash__</code>，Python 会把 <code>__hash__</code> 设为 <code>None</code>，实例直接变成不可哈希——<em>这是「我的对象放进 set 就报错」的标准答案</em>。</li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>面试里对内置函数的态度要分场合。<strong>如果考点不是哈希</strong>（比如题目是滑动窗口、二分、DP），直接用 <code>collections.Counter</code>、<code>defaultdict</code>、<code>set</code> 是加分的——它说明你熟悉标准库、代码短、不容易写错。<strong>如果考点就是哈希本身</strong>（「实现一个 LRU Cache」「设计一个支持 O(1) 随机删除的集合」），上来就 <code>Counter</code> 会被判「绕过考点」。<em>安全做法：先问一句「我可以用 collections 吗？还是你希望我手写？」——这一问本身就是分数</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确的判据是看<strong>题目要求的复杂度里，哈希是不是那个决定性的一步</strong>。「两数之和」的 $O(n)$ 解法唯一的技术内容就是「用哈希表把查找从 $O(n)$ 降到 $O(1)$」——此时用 <code>dict</code> 不是绕过考点，<em>用 <code>dict</code> 就是考点</em>。而「设计一个 <code>insert/delete/getRandom</code> 都 $O(1)$ 的结构」的考点是「哈希表存值到下标的映射 + 动态数组存值，删除时用『和末尾交换』避免空洞」——这里 <code>dict</code> 只是零件，不能替代设计。<strong>一句话：内置容器可以当零件，不能当答案。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">浮点数不能当哈希 key</span>
+    <p><strong>会导致线上事故的写法：用浮点数当 key 做分桶。</strong>评测代码里经常要按 IoU 或框面积分桶统计（呼应 C55-05 的分桶评测、C57-05 的按像素尺寸分桶），有人会写 <code>buckets[round(iou, 2)] += 1</code>。问题是 <code>round(0.145, 2)</code> 在 IEEE-754 下等于 <code>0.14</code> 而不是 <code>0.15</code>（因为 0.145 的二进制表示略小于 0.145），而 <code>round(0.155, 2)</code> 等于 <code>0.16</code>——<em>舍入方向随数值不规则地翻转</em>。同一份预测在两台机器上算出的 IoU 差 $10^{-16}$，就可能落进不同的桶，于是「训练机上的评测报告」和「CI 机上的评测报告」对不上。<strong>正确做法：桶边界用显式的有序数组 + <code>bisect</code> 定位，不要用浮点当 key。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sort"><span class="num">2</span>排序：自定义键、稳定性，以及 NMS 为什么需要它</h2>
+  <p>Python 的 <code>sorted</code> / <code>list.sort</code> 用的是 <span class="term">Timsort</span>（Tim Peters, 2002），一个「归并排序 + 自适应 run 检测」的混合算法。三条性质要能脱口而出：</p>  <table>
+    <thead><tr><th>性质</th><th>含义</th><th>为什么面试里重要</th></tr></thead>
+    <tbody>
+      <tr><td><strong>稳定</strong></td><td>比较相等的元素保持原相对顺序</td><td><strong>这是本节的主角</strong>——多关键字排序与输出确定性都靠它</td></tr>
+      <tr><td><strong>自适应</strong></td><td>对已经部分有序的输入接近 $O(n)$；最坏 $O(n\log n)$</td><td>「数据基本有序」是可以说出来的优化理由，比空谈复杂度有说服力</td></tr>
+      <tr><td><strong>key 只调用 n 次</strong></td><td>先算好所有 key（decorate-sort-undecorate），再排序</td><td>所以 <code>key=</code> 比 <code>cmp_to_key</code> 快得多；<code>key</code> 里做重活（比如算 IoU）只付 $n$ 次而不是 $n\log n$ 次</td></tr>
+    </tbody>
+  </table>  <h3>多关键字排序的两种写法，以及为什么第二种必须靠稳定性</h3>  <pre><code># 写法 A：元组 key —— 首选，一次排序搞定
+recs.sort(key=lambda r: (r.cls, -r.score))     # 类别升序、分数降序
+
+# 问题：字符串没法「取负」。下面这句是错的
+recs.sort(key=lambda r: (-r.score, -r.name))   # ✗ TypeError
+
+# 写法 B：分次排序 —— 从次关键字排到主关键字，靠稳定性把结果叠起来
+recs.sort(key=lambda r: r.name)                 # ② 次关键字：名字升序
+recs.sort(key=lambda r: r.score, reverse=True)  # ① 主关键字：分数降序
+# 稳定性保证：分数相同的记录，仍保持上一步排好的名字顺序</code></pre>  <p><strong>写法 B 的顺序是反的</strong>（先排次要的、后排主要的），这是稳定排序最经典的应用，也是面试里「稳定性有什么用」的标准答案之一。<em>如果排序不稳定，写法 B 直接失效。</em></p>  <h3>真正的重点：NMS 的确定性依赖排序稳定性</h3>  <p><span class="term">NMS</span>（non-maximum suppression）的第一步是按分数降序排序，然后贪心地「保留最高分、抑制与它 IoU 超阈值的框」。问题来了：<strong>如果两个重叠的框分数完全相同，保留哪一个？</strong></p>  <div class="ascii">两个 IoU = 0.72 的框，分数都是 0.90
+
+  排序结果 [A, B]  →  保留 A，抑制 B  →  输出框在 (100,200,140,240)
+  排序结果 [B, A]  →  保留 B，抑制 A  →  输出框在 (103,204,143,244)
+                                            ↑ 差了 3 像素，下游的距离估计就差了
+
+  "分数完全相同"有多罕见？一点也不罕见：
+    · INT8 量化后，分类头的输出只有 256 个可能取值 → 大量并列   （见 C60）
+    · 分数被 round 到 3 位小数后再排序                          （常见的日志/导出代码）
+    · 同一个目标的多个候选框，特征几乎一样 → 浮点结果逐位相同</div>  <p>而排序实现的 tie-break 行为在各处<strong>不一致</strong>：</p>  <table>
+    <thead><tr><th>实现</th><th>是否稳定</th><th>并列时的顺序</th><th>风险</th></tr></thead>
+    <tbody>
+      <tr><td>Python <code>sorted</code> / <code>list.sort</code></td><td><strong>稳定</strong></td><td>保持输入顺序</td><td>安全，但依赖「输入顺序本身是确定的」</td></tr>
+      <tr><td><code>np.argsort(x)</code>（默认 quicksort）</td><td><strong>不稳定</strong></td><td>由 introsort 的划分决定，随数组长度和内容变化</td><td><strong>同一批框换个顺序输入，结果就变</strong></td></tr>
+      <tr><td><code>np.argsort(x, kind='stable')</code></td><td>稳定</td><td>保持输入顺序</td><td>推荐</td></tr>
+      <tr><td><code>torch.sort</code></td><td>默认不保证；需 <code>stable=True</code></td><td>CUDA 上与 CPU 上可能不同</td><td>训练端与部署端 tie-break 不一致</td></tr>
+      <tr><td>TensorRT <code>TopK</code> / EfficientNMS</td><td>未文档化保证</td><td>由 kernel 的归约顺序决定</td><td><strong>车端与离线复现不一致的经典来源</strong>（见 C60）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这类 bug 的表现极具迷惑性：一致性对拍时，1000 帧里有 3 帧出现「1 个框不一致」，位置差几个像素，分数完全相同。你会先去怀疑预处理、怀疑量化、怀疑算子精度——<strong>而真正的原因只是两个并列分数的排序顺序不同</strong>。<em>修法只有一行：把排序键从 <code>-score</code> 换成一个保证唯一的元组。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨的表述：NMS 的输出是排序结果的函数，而排序在存在并列键时是<strong>一个关系而不是一个函数</strong>——它把一个输入映射到一组合法输出。要让整条流水线成为确定性函数，必须给排序键补上一个<span class="term">total order</span>（全序）：把键扩展成 <code>(-score, class_id, x1, y1, box_index)</code> 之类，使任意两个不同元素的键都不相等。<strong>这样一来，是否稳定就不再重要了——因为根本不会出现并列。</strong><em>这个技巧的通用形式叫「tiebreaker 消歧」，在任何「结果依赖排序顺序」的贪心算法里都适用</em>（模块 04 的区间调度、模块 03 的并查集聚类都会再遇到）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一条可迁移的心法：<strong>凡是贪心算法，输出就依赖于排序顺序；凡是依赖排序顺序，就必须保证排序键是全序的。</strong><em>面试里被问「你的代码是确定性的吗」，能主动指出这一点比写出正确解法更显水平。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="binsearch"><span class="num">3</span>二分的三套模板与循环不变量</h2>
+  <p>二分是「看起来会、写起来错」的头号题型。工程上的统计口径是：<strong>相当一部分工程师无法在不调试的情况下一次写对二分</strong>（Bentley 在《Programming Pearls》里做过课堂实验，Bloch 在 2006 年发现 JDK 里的二分查找有溢出 bug 且存在了九年）。面试里写错二分的代价特别高，因为<em>它是「基础题」，写错等于基础不牢</em>。</p>  <p>解决办法不是「多做题找感觉」，是<strong>把循环不变量写下来，然后让每一行代码都为不变量服务</strong>。</p>  <h3>先把前提说清楚：二分的条件不是「有序」</h3>  <p>很多人以为二分的前提是「数组有序」。<strong>更本质的前提是：存在一个把搜索空间切成两段的单调谓词</strong> $\text{check}(x)$，使得它在前一段恒假、后一段恒真（或反过来）。数组有序只是让 <code>a[mid] &lt; t</code> 这个谓词单调的一个<em>充分条件</em>。</p>  <div class="math-block">\[\exists\, x^\ast \in [L, R]:\quad \text{check}(x)=\text{False}\ \ \forall x < x^\ast, \qquad \text{check}(x)=\text{True}\ \ \forall x \ge x^\ast\]</div>  <p><strong>写二分之前，先把 <code>check</code> 写出来并确认它单调。</strong>做到这一步，第 5 节的「在答案上二分」就是同一套模板的直接应用。</p>  <h3>模板 A · 找精确值（闭区间 $[lo, hi]$）</h3>  <pre><code>def bs_exact(a, t):
+    """不变量 I_A：若 t 存在于 a 中，则它的下标一定在闭区间 [lo, hi] 内。
+       循环条件 lo &lt;= hi 正是「闭区间非空」。"""
+    lo, hi = 0, len(a) - 1              # 初始区间 = 全数组，I_A 显然成立
+    while lo &lt;= hi:
+        mid = lo + (hi - lo) // 2       # 写成这样而不是 (lo+hi)//2：防止大整数溢出（Python 无此问题，C++/Java 有）
+        if a[mid] == t:
+            return mid
+        if a[mid] &lt; t:
+            lo = mid + 1                # a[mid] 及其左边全 &lt; t，t 不可能在那里 → I_A 保持
+        else:
+            hi = mid - 1                # a[mid] 及其右边全 &gt; t → I_A 保持
+    return -1                           # 区间空 ⇒ 由 I_A，t 不存在</code></pre>  <h3>模板 B · 找左边界（半开区间 $[lo, hi)$）= <code>bisect_left</code></h3>  <pre><code>def bs_left(a, t):
+    """返回第一个 &gt;= t 的下标（不存在则返回 len(a)）。
+       不变量 I_B：a[0:lo] 全部 &lt; t   且   a[hi:n] 全部 &gt;= t
+       循环结束时 lo == hi，于是「&lt; t」和「&gt;= t」的分界点就是 lo。"""
+    lo, hi = 0, len(a)                  # a[0:0] 与 a[n:n] 都是空集，I_B 平凡成立
+    while lo &lt; hi:
+        mid = lo + (hi - lo) // 2       # lo &lt;= mid &lt; hi（下取整保证 mid != hi）
+        if a[mid] &lt; t:
+            lo = mid + 1                # a[0:mid+1] 全 &lt; t（因为有序）→ I_B 保持
+        else:
+            hi = mid                    # a[mid:n] 全 &gt;= t → I_B 保持；注意是 mid 不是 mid-1
+    return lo</code></pre>  <h3>模板 C · 找右边界（半开区间 $[lo, hi)$）= <code>bisect_right</code></h3>  <pre><code>def bs_right(a, t):
+    """返回第一个 &gt; t 的下标。
+       不变量 I_C：a[0:lo] 全部 &lt;= t   且   a[hi:n] 全部 &gt; t
+       与模板 B 只差一个符号：a[mid] &lt; t  →  a[mid] &lt;= t"""
+    lo, hi = 0, len(a)
+    while lo &lt; hi:
+        mid = lo + (hi - lo) // 2
+        if a[mid] &lt;= t:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo</code></pre>  <div class="ascii">三套模板的区间语义（数组 a = [1, 3, 3, 3, 7]，t = 3）
+
+  下标:      0    1    2    3    4         5
+  值:        1    3    3    3    7        (末尾哨兵位)
+             │    │              │         │
+             │    └─ bs_left  = 1          │
+             │       第一个 &gt;= 3            │
+             │                  └─ bs_right = 4
+             │                     第一个 &gt; 3
+             └─ bs_exact 返回 1/2/3 中的某一个（不保证是哪个！）
+
+  由 B 和 C 派生出的一切（**只背 B 和 C，其余现推**）：
+    出现次数         = bs_right(a,t) - bs_left(a,t)          = 4 - 1 = 3
+    最后一个 &lt;= t    = bs_right(a,t) - 1                     = 3
+    最后一个 &lt;  t    = bs_left(a,t) - 1                      = 0
+    第一个   &gt;  t    = bs_right(a,t)                         = 4
+    精确查找         = i = bs_left(a,t);  a[i] == t ?  i : -1
+  ⇒ 面试里不要背三套模板，背 bs_left 一套 + 上面这张换算表。</div>  <h3>终止性：为什么这两套模板一定不死循环</h3>  <p>记第 $k$ 轮的区间长度 $\ell_k = hi_k - lo_k$。模板 B/C 里 $mid = lo + \lfloor \ell_k/2 \rfloor$，于是：</p>  <div class="math-block">\[\ell_{k+1} \;=\; \begin{cases} hi_k - (mid+1) \;=\; \lceil \ell_k/2\rceil - 1 & \text{（走 } lo=mid+1\text{）}\\[2pt] mid - lo_k \;=\; \lfloor \ell_k/2 \rfloor & \text{（走 } hi=mid\text{）}\end{cases} \qquad \Longrightarrow\qquad \ell_{k+1} < \ell_k \ \ (\forall\, \ell_k \ge 1)\]</div>  <p><strong>两个分支都严格缩小区间</strong>，而 $\ell$ 是非负整数，所以循环至多执行 $\lceil \log_2 n\rceil$ 轮后 $\ell = 0$，退出。<em>这就是「不会死循环」的完整证明——面试里说得出这句话，比说「我一般写 <code>hi = mid</code>」有份量得多。</em>注意关键点：当 $\ell_k = 1$ 时 $mid = lo_k$，<strong>走 <code>hi = mid</code> 分支得到 $\ell_{k+1} = 0$——正因为用了下取整，这个分支才没有卡死</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>记不住哪个模板对应哪种边界？给一个不用背的办法：<strong>写完循环体，用「区间只剩两个元素」的情形手推一遍</strong>。$lo, hi$ 相邻时 $mid$ 落在哪、两个分支各把区间变成什么——推 30 秒就能确定它会不会卡住。<em>这个手推动作在面试里应该<strong>说出来</strong>：「我验一下 lo 和 hi 相邻的情况……」——这是测试意识的直接展示。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更系统的方法是<span class="term">循环不变量</span>三段式验证，这也是 Hoare 逻辑在实践中最常用的形式：<em>①初始化</em>——进入循环前不变量成立（空区间上平凡成立）；<em>②保持</em>——若进入某轮时成立，则该轮结束时仍成立（这一步逼你说清「为什么 <code>lo = mid + 1</code> 是安全的」）；<em>③终止</em>——退出条件 + 不变量 ⇒ 目标结论（<code>lo == hi</code> 且 <code>a[:lo] &lt; t &lt;= a[hi:]</code> ⇒ <code>lo</code> 就是左边界）。<strong>再加上一个严格递减的整数度量（这里是 $\ell$）就得到终止性。</strong>四件事写完，二分的正确性就是被证明的而不是被测试的。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <code>mid = (lo + hi) // 2</code> 在 Python 里永远安全（大整数），但在 C++/Java/CUDA kernel 里当 <code>lo + hi</code> 超过 <code>INT_MAX</code> 会溢出成负数——<strong>这就是 Bloch 2006 年在 JDK 里找到的那个 bug</strong>。面试写 Python 时用 <code>lo + (hi - lo) // 2</code> 并顺口提一句「这样写是为了在 C++ 里也不溢出」，是一个成本极低、辨识度很高的加分动作。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="deadloop"><span class="num">4</span>死循环的四种成因：开闭区间不一致</h2>
+  <p>二分的所有 bug 几乎都能归到同一个根因：<strong>区间的开闭约定和更新语句不匹配</strong>。「$hi$ 是最后一个候选下标」（闭）和「$hi$ 是第一个被排除的下标」（半开）是两套不能混用的约定，而它们的初始化、循环条件、更新语句<em>各有一套配套写法</em>，混搭必出事。</p>  <table>
+    <thead><tr><th>约定</th><th>初始化</th><th>循环条件</th><th>排除 mid 的写法</th><th>保留 mid 的写法</th></tr></thead>
+    <tbody>
+      <tr><td>闭区间 $[lo, hi]$</td><td><code>hi = n - 1</code></td><td><code>lo &lt;= hi</code></td><td><code>lo = mid+1</code> / <code>hi = mid-1</code></td><td><code>lo = mid</code> / <code>hi = mid</code>（<strong>危险</strong>，需配上取整）</td></tr>
+      <tr><td>半开区间 $[lo, hi)$</td><td><code>hi = n</code></td><td><code>lo &lt; hi</code></td><td><code>lo = mid+1</code></td><td><code>hi = mid</code>（安全）</td></tr>
+    </tbody>
+  </table>  <h3>四种典型翻车</h3>  <table>
+    <thead><tr><th>#</th><th>错误写法</th><th>后果</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td>①</td><td><code>hi = len(a)</code> 配 <code>while lo &lt;= hi</code></td><td><strong>IndexError</strong></td><td>当 <code>lo == hi == n</code> 时 <code>mid == n</code>，<code>a[n]</code> 越界</td></tr>
+      <tr><td>②</td><td>半开区间里写 <code>lo = mid</code>（忘了 <code>+1</code>）</td><td><strong>死循环</strong></td><td><code>hi = lo+1</code> 时 <code>mid = lo</code>，走这支后 <code>lo</code> 不变、<code>hi</code> 不变 → 区间永不缩小</td></tr>
+      <tr><td>③</td><td>求右边界时用 <code>lo = mid</code> 配 <strong>下取整</strong> mid</td><td><strong>死循环</strong></td><td>同 ②。求右边界必须用 <code>mid = lo + (hi - lo + 1) // 2</code>（<strong>上取整</strong>）把 mid 顶到右边</td></tr>
+      <tr><td>④</td><td>半开区间里写 <code>hi = mid - 1</code></td><td><strong>漏解</strong>（返回值偏小或 -1）</td><td>半开区间里 <code>a[hi]</code> 本来就不在候选内，再减 1 等于多排除一个合法候选</td></tr>
+    </tbody>
+  </table>  <div class="ascii">成因 ② 的执行轨迹（a = [1, 3, 5]，找第一个 &gt;= 5，错写成 lo = mid）
+
+   轮次   lo   hi   mid   a[mid]   判断        更新           区间长度
+   ─────────────────────────────────────────────────────────────────
+     1     0    3    1      3      3 &lt; 5      lo = mid = 1        3 → 2
+     2     1    3    2      5      5 &gt;= 5     hi = mid = 2        2 → 1
+     3     1    2    1      3      3 &lt; 5      lo = mid = 1        1 → 1   ← 不变！
+     4     1    2    1      3      3 &lt; 5      lo = mid = 1        1 → 1   ← 不变！
+     ...                                                          ∞
+
+   根因：区间长度为 1 时，下取整让 mid == lo；
+        而 `lo = mid` 这条更新**没有跨过 mid**，于是度量函数不再递减。
+
+   通用判据（背这一条就够）：
+     ┌───────────────────────────────────────────────────────────┐
+     │  mid 落在区间的哪一半，那一半的更新语句就必须「跨过 mid」  │
+     │  下取整 mid 偏左  ⇒  左侧更新必须写 lo = mid + 1           │
+     │  上取整 mid 偏右  ⇒  右侧更新必须写 hi = mid - 1           │
+     └───────────────────────────────────────────────────────────┘</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>考场上的自保流程只有三步，30 秒能做完：<em>①写下你用的是闭区间还是半开区间，并把这句话<strong>说出来</strong>（「我用半开区间 [lo, hi)，hi 是第一个被排除的位置」）；②按上表抄配套写法；③用「区间只剩 1–2 个元素」手推一遍</em>。<strong>第①步的价值不只是防错——它让面试官知道你脑子里有明确的约定，而不是在试。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>如果你已经陷进去了（跑不出来 / 结果偏 1），<strong>不要盲改 <code>+1 -1</code></strong>——这是面试里最糟糕的画面，改一次跑一次，五分钟就没了。正确的补救是回到不变量：<em>把「循环退出时 lo 应该满足什么」写在纸上（或注释里），再倒推每个分支是否维持了它</em>。一个实用的兜底手段是<strong>加一个步数上界</strong>：<code>for _ in range(len(a).bit_length() + 2)</code> 替代 <code>while</code>，这样即使写错也只是结果错而不是挂死——<em>在压力下把「死循环」降级成「答案错」，是能救命的工程习惯</em>。</p></div>
+  </div>  <div class="callout danger"><span class="label">死循环 = 双重扣分</span>
+    <p><strong>面试当场翻车的场景：二分死循环。</strong>共享屏幕的编辑器卡住、进程没响应、你开始慌——这几乎是 coding 环节最难看的失败模式，因为它同时暴露了「不会写二分」和「没有测试意识」两件事。<strong>预防成本极低：所有二分统一用半开区间 + <code>bisect_left</code> 模板，其余边界一律用第 3 节的换算表现推。</strong><em>如果真的卡住了，标准话术是：「我先加一个循环次数上界，把死循环变成可观察的错误，再看不变量哪里破了。」——面试官要的是这句话，不是你立刻改对。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="answer-space"><span class="num">5</span>在答案上二分：最小化最大值 / 最大化最小值</h2>
+  <p>这是<strong>中高频、且区分度最高</strong>的一类二分题。它的特征是：题面里出现「最小化最大的 X」「最大化最小的 X」「至少需要多少 Y」，而且<em>直接求最优解很难，但给定一个候选答案去验证可行性却很容易</em>。</p>  <p>识别信号（三个都满足就基本可以断定）：</p>  <ol>
+    <li><strong>答案是一个数，且取值范围有明确上下界</strong>（$L$ = 最松/一定可行，$R$ = 最紧/一定不可行，或反过来）。</li>
+    <li><strong>存在一个单调的可行性谓词</strong>：若容量 $x$ 可行，则 $x+1$ 也一定可行（放宽约束不会让问题变难）。</li>
+    <li><strong><code>check(x)</code> 好写</strong>——通常是一遍 $O(n)$ 的贪心扫描。</li>
+  </ol>  <p>满足这三条，答案就是那个「谓词第一次为真的位置」，直接套模板 B：</p>  <div class="math-block">\[x^\ast \;=\; \min\,\{\, x \in [L, R] \;:\; \text{check}(x) = \text{True} \,\} \qquad \text{总复杂度} \;=\; O\bigl(\,\text{cost}(\text{check}) \cdot \log (R-L)\,\bigr)\]</div>  <h3>样板题：分割数组的最大值（LeetCode 410）</h3>  <p>把非负数组 <code>a</code> 分成 <code>m</code> 个连续子数组，使得<strong>各子数组和的最大值最小</strong>。直接做是区间 DP，$O(n^2 m)$；在答案上二分只要 $O(n\log(\sum a))$。</p>  <pre><code>def split_array(a, m):
+    # check(cap): 每段和都不超过 cap 的前提下，贪心地尽量多塞，最少需要几段？
+    # 单调性：cap 越大 → 需要的段数单调不增 → parts(cap) &lt;= m 是单调谓词  ✔
+    def parts(cap):
+        cnt, cur = 1, 0
+        for x in a:
+            if cur + x &lt;= cap:
+                cur += x
+            else:
+                cnt += 1; cur = x       # 开新的一段（贪心：能塞就塞是最优的）
+        return cnt
+
+    lo, hi = max(a), sum(a)             # lo：一段都装不下单个元素就不可能可行；hi：全放一段一定可行
+    while lo &lt; hi:                      # 半开区间 [lo, hi]，不变量：答案 ∈ [lo, hi]
+        mid = lo + (hi - lo) // 2
+        if parts(mid) &lt;= m:
+            hi = mid                    # mid 可行 → 答案 &lt;= mid，保留 mid
+        else:
+            lo = mid + 1                # mid 不可行 → 答案 &gt; mid
+    return lo</code></pre>  <p><strong>两个边界的选取是这类题最容易错的地方</strong>：$lo$ 必须取「显然不可行的下界」或「可行性刚好可能开始的位置」——这里 $\max(a)$ 是硬下界（任何一段至少要装得下最大的那个元素）；$hi$ 必须取「一定可行的上界」——全放一段即 $\sum a$。<em>把边界的物理含义说出来，比写对代码更能证明你理解了</em>。</p>  <h3>同一个模板下的题族</h3>  <table>
+    <thead><tr><th>题</th><th>答案空间 $x$</th><th>check(x)</th><th>单调方向</th><th>频率 / 层级</th></tr></thead>
+    <tbody>
+      <tr><td>分割数组的最大值 (LC410)</td><td>每段和的上限</td><td>贪心分段，段数 $\le m$</td><td>$x\uparrow$ ⇒ 更容易可行</td><td><strong>高频 / 必会</strong></td></tr>
+      <tr><td>在 D 天内送达包裹 (LC1011)</td><td>船的载重</td><td>贪心装船，天数 $\le D$</td><td>同上</td><td><strong>高频 / 必会</strong></td></tr>
+      <tr><td>爱吃香蕉的珂珂 (LC875)</td><td>每小时吃的速度</td><td>$\sum \lceil p_i/x\rceil \le H$</td><td>同上</td><td>中频 / 必会</td></tr>
+      <tr><td>制作 m 束花所需最少天数 (LC1482)</td><td>天数</td><td>扫一遍数连续可用段</td><td>同上</td><td>中频 / 加分</td></tr>
+      <tr><td>第 K 小的数对距离 (LC719)</td><td>距离阈值</td><td>双指针数「距离 $\le x$ 的对数」$\ge K$</td><td>同上</td><td>低频 / 加分</td></tr>
+      <tr><td>最大化最小间距（放置 m 个物体）</td><td>最小间距</td><td>贪心放置，能放下 $\ge m$ 个</td><td>$x\uparrow$ ⇒ <strong>更难</strong>可行（方向相反，找最后一个真）</td><td>中频 / 加分</td></tr>
+    </tbody>
+  </table>  <h3>CV / 感知工程里的同构问题（这才是本课的锚点）</h3>  <ul>
+    <li><strong>「给定 30 ms 的延迟预算，输入分辨率最大能开到多少？」</strong> $\text{check}(r) = \text{latency}(r) \le 30$，分辨率越大延迟越大 ⇒ 谓词单调递减 ⇒ 二分找<em>最后一个</em>可行的 $r$。<em>这就是 C53-05 的选型问题的一维版本。</em></li>
+    <li><strong>「要让召回率不低于 0.95，score 阈值最高能设到多少？」</strong> $\text{check}(\tau) = \text{recall}(\tau) \ge 0.95$。$\tau$ 越大召回越低 ⇒ 单调 ⇒ 二分。<em>这正是 C55-05 的工作点选择——而它在代码上就是一次答案空间二分。</em></li>
+    <li><strong>「切片推理时重叠率最小取多少能保证不漏检？」</strong> $\text{check}(\rho) = $「任意目标至少完整落在一个切片内」，重叠越大越安全 ⇒ 单调 ⇒ 二分求下界（呼应 C57-04）。</li>
+    <li><strong>「标注预算固定，采样阈值取多少能覆盖长尾类的目标数量？」</strong> $\text{check}(\theta)$ = 触发量 $\le$ 带宽预算（呼应 C58-03 的触发器阈值优化）。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这类题在 ML/CV 岗特别常见？因为<strong>工程里大量的决策就长这个样子</strong>：一个连续的旋钮（阈值、分辨率、批大小、重叠率），一个单调的约束（延迟、召回、带宽、显存），要找旋钮的极限位置。<em>你在工作里做的「二分调参」和面试里的 LC410，是同一个算法</em>——面试里能主动把这层联系说出来，是把「刷题」变成「工程直觉」的最直接证据。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>两个必须警惕的失效条件。<em>①单调性不成立</em>：延迟对分辨率<strong>不是</strong>严格单调的（TensorRT 会在特定尺寸上选到更优的 kernel，出现「更大反而更快」的反常点），此时二分会收敛到一个局部错误的答案——<strong>正确做法是先扫一遍粗网格确认单调，再在单调段内二分</strong>。<em>②浮点答案空间</em>：不能用 <code>while lo &lt; hi</code>（浮点相等几乎永不成立，会死循环），要用<strong>固定迭代次数</strong>——<code>for _ in range(100): mid = (lo+hi)/2; ...</code>，100 次把区间缩小 $2^{-100}$，远超 double 的精度，绝对够用且绝不死循环。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>面试里必须主动验证单调性。</strong>直接写「这题二分答案」而不说明 <code>check</code> 为什么单调，是典型的「背题痕迹」。正确的一句话是：「<em>我先确认单调性——如果容量 x 能装下，那 x+1 显然也能装下，所以 check 是单调的，可以二分。</em>」<strong>说这一句大约花 8 秒，但它把「我做过这题」变成了「我知道为什么可以这么做」。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="topk"><span class="num">6</span>Top-K 的三种解法与选择依据</h2>
+  <p>「从 $n$ 个数里取最大的 $k$ 个」是 ML/CV 岗的超高频题型，因为它在真实系统里到处都是：NMS 前的候选框截断、难例挖掘的回传排序（C58-03）、检索的近邻返回（C58-04）、长尾类别的重采样。三种解法要能<strong>同时说出复杂度、空间、副作用和适用场景</strong>。</p>  <div class="ascii">          ┌──────────────────────────────────────────────────┐
+  n 个数  │  ① 全排序      sorted(a)[-k:]                     │  O(n log n)  空间 O(n)
+  ───────►│  ② 大小为 k 的最小堆                              │  O(n log k)  空间 O(k)   ← 流式可用
+          │     for x in a: heappushpop(h, x)                 │
+          │  ③ quickselect  随机主元三路划分，只递归一侧      │  O(n) 期望   空间 O(1)   ← 破坏原数组
+          └──────────────────────────────────────────────────┘
+
+  ② 的关键性质：**只需要一次遍历，且内存只占 k**。
+     数据是一条流（车队每天几 TB 的回传候选）时，①③ 都要求全量落地，② 不用。
+
+  ③ 的关键性质：**期望 O(n)，最坏 O(n²)**。
+     最坏发生在「每次主元都选到极值」——有序输入 + 固定取首元素做主元 = 必然退化。
+     修法：随机主元（工程标配）或 median-of-medians（理论 O(n) 最坏，常数太大，实践不用）。</div>  <table>
+    <thead><tr><th>方法</th><th>时间</th><th>额外空间</th><th>输出是否有序</th><th>改动原数组</th><th>什么时候选它</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 全排序</strong></td><td>$O(n\log n)$</td><td>$O(n)$</td><td><strong>是</strong></td><td>否（<code>sorted</code>）</td><td>$k$ 接近 $n$；需要有序输出；<strong>$n$ 不大时它实际最快</strong>（见下）</td></tr>
+      <tr><td><strong>② 堆</strong></td><td>$O(n\log k)$</td><td><strong>$O(k)$</strong></td><td>否（需再排 $k\log k$）</td><td>否</td><td><strong>$k \ll n$；数据是流；内存受限</strong></td></tr>
+      <tr><td><strong>③ quickselect</strong></td><td>$O(n)$ 期望 / $O(n^2)$ 最坏</td><td>$O(1)$</td><td>否</td><td><strong>是</strong></td><td>$n$ 极大且能一次性放进内存；只要「哪 $k$ 个」不要顺序</td></tr>
+    </tbody>
+  </table>  <div class="math-block">\[\frac{T_{\text{sort}}}{T_{\text{heap}}} \;=\; \frac{n\log_2 n}{n\log_2 k} \;=\; \frac{\log_2 n}{\log_2 k} \;=\; \frac{1}{\alpha} \quad\text{（记 } k = n^{\alpha}\text{）} \qquad\Longrightarrow\qquad k=\sqrt{n}\ \text{时堆只快 2 倍}\]</div>  <p><strong>这个公式值得记住，因为它解释了一个反直觉的现实：堆的渐进优势远没有想象中大。</strong>$n = 10^6$、$k = 100$ 时，$\log_2 n / \log_2 k \approx 20/6.6 \approx 3$ 倍——而 Python 的 <code>sorted</code> 是 C 实现的 Timsort，常数比纯 Python 的堆循环小一到两个数量级。<em>notebook 会实测给你看：在 Python 里，$n = 10^5$ 量级时 <code>sorted(a)[-k:]</code> 往往比手写 quickselect 还快。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以面试里被问「用哪个」，最好的答案不是报一个方法名，而是<strong>先反问约束</strong>：「$k$ 和 $n$ 的量级是多少？数据能一次放进内存吗？需要有序输出吗？可以改原数组吗？」<em>四个问题问完，选哪个是自明的</em>——而且你已经展示了「按约束做决策」的思维方式，这正是模块 00 说的评分维度。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更进一步，能主动区分<strong>渐进复杂度</strong>与<strong>实际耗时</strong>是一个很强的信号。标准说法：「<em>渐进上 quickselect 是 $O(n)$ 最优，但在 CPython 里 <code>sorted</code> 走的是 C 层 Timsort，常数小两个数量级；如果 $n$ 只有 $10^5$，我会先写 <code>sorted</code>，只有在 profile 证明这里是瓶颈、或者数据规模到 $10^7$ 以上时才换 quickselect。</em>」<strong>「先测量再优化」和「知道复杂度只是常数未知的上界」是两个独立的加分点，这句话同时拿到。</strong><em>反过来，如果你张口就说「必须用 quickselect 因为它是 O(n)」，成熟度会被打折。</em></p></div>
+  </div>  <h3>回到检测：NMS 前的 top-K 截断</h3>  <p>生产级检测后处理（TensorRT 的 <code>EfficientNMS</code>、MMDetection 的 <code>nms_pre</code>）几乎都会在 NMS 之前先做一次 <strong>top-1000 by score</strong>。这不是为了精度，是为了<strong>把最坏耗时钉死</strong>：NMS 的代价是 $O(NK)$，$N$ 是过阈候选数；不截断时 $N$ 随场景无上界，截断后 $N \le 1000$ 是常数（呼应 C53-04 的 WCET 讨论）。<em>代价是：极端密集的场景（一整排限速牌 + 龙门架）可能有目标被截掉，所以评测里必须专门覆盖这类切片。</em></p>  <div class="callout intuition"><span class="label"></span>
+    <p>把三种解法压成一句：<strong>全排序买「有序」，堆买「小内存 + 流式」，quickselect 买「渐进最优」。你付的钱分别是 $\log n$ 因子、$\log k$ 因子、和最坏情况的保证。</strong><em>面试里说清「买了什么、付了什么」，比背三段代码有用。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dedup"><span class="num">7</span>去重、计数与分桶：四种惯用法和它们的差别</h2>
+  <p>去重和计数看起来是最简单的操作，但四种写法在<strong>是否保序、复杂度、额外空间</strong>上各不相同，面试里被追问「还有别的写法吗」时能一次说全四种，是很轻松的加分。</p>  <table>
+    <thead><tr><th>写法</th><th>时间</th><th>额外空间</th><th>保持原顺序</th><th>要求输入有序</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td><code>set(a)</code></td><td>$O(n)$</td><td>$O(n)$</td><td><strong>否</strong></td><td>否</td><td>最快，但顺序不确定 ⇒ <strong>不要用于需要确定性输出的场合</strong></td></tr>
+      <tr><td><code>list(dict.fromkeys(a))</code></td><td>$O(n)$</td><td>$O(n)$</td><td><strong>是</strong></td><td>否</td><td>CPython 3.7+ 起 dict 保持插入序是<em>语言规范</em>，可以放心用</td></tr>
+      <tr><td>排序后相邻比较</td><td>$O(n\log n)$</td><td>$O(1)$（原地排序）</td><td>否</td><td>否</td><td>元素<strong>不可哈希</strong>但可比较时唯一的选择</td></tr>
+      <tr><td>双指针原地去重</td><td>$O(n)$</td><td><strong>$O(1)$</strong></td><td>是</td><td><strong>是</strong></td><td>模块 01 的快慢指针；面试题「删除有序数组中的重复项」</td></tr>
+    </tbody>
+  </table>  <h3>计数的确定性陷阱</h3>  <p><code>Counter(a).most_common(k)</code> 在<strong>频次并列时按插入顺序</strong>返回，不是按字典序。这意味着「同一份数据、不同的读取顺序 → 不同的 top-k 输出」——又是一个 tie-break 不确定性（和第 2 节的 NMS 是同一个病）。要确定性就必须显式给出全序键：</p>  <pre><code>from collections import Counter
+
+c = Counter(a)
+# ✗ 并列时的顺序依赖插入序，不可复现
+top = c.most_common(k)
+
+# ✓ 显式全序：先按频次降序，再按元素本身升序
+top = sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))[:k]
+
+# ✓ 桶排序版本：频次是 [0, n] 的整数 ⇒ 可以 O(n) 完成（不需要 O(n log n)）
+buckets = [[] for _ in range(len(a) + 1)]
+for val, cnt in c.items():
+    buckets[cnt].append(val)
+out = []
+for cnt in range(len(a), 0, -1):
+    for val in sorted(buckets[cnt]):          # 桶内排序保证确定性
+        out.append(val)
+        if len(out) == k:
+            break</code></pre>  <p><strong>「前 K 个高频元素」的桶排序解法（$O(n)$）是这道高频题的加分答案</strong>：频次的取值范围被 $n$ 界住了，所以可以用计数排序思想直接把 $\log$ 因子消掉。<em>面试里先给堆解法 $O(n\log k)$，再补一句「如果要严格 $O(n)$，可以用桶排序，因为频次上界是 n」——这是标准的「先给可行解、再给优化」节奏。</em></p>  <h3>分桶：把连续值离散化成整数 key</h3>  <p>按尺寸 / 距离 / IoU 分桶做切片评测（C55-05、C57-05）是感知工程里最常做的统计。第 1 节已经说过<strong>不能用浮点当 key</strong>，正确姿势是显式桶边界 + <code>bisect</code>：</p>  <pre><code>import bisect
+
+EDGES = [0, 16, 32, 64, 128, 256]     # 像素面积开方后的分桶边界（COCO 风格）
+LABELS = ['&lt;16', '16-32', '32-64', '64-128', '128-256', '&gt;=256']
+
+def bucket_of(v):
+    # bisect_right 返回「第一个 &gt; v 的边界下标」，减 1 就是 v 落在哪个区间
+    # 不变量：EDGES[i] &lt;= v &lt; EDGES[i+1]  ⇔  返回 i
+    i = bisect.bisect_right(EDGES, v) - 1
+    return min(max(i, 0), len(LABELS) - 1)
+
+# bucket_of(31.999999999) -&gt; 1  ('16-32')；bucket_of(32.0) -&gt; 2  ('32-64')
+# 边界归属是**明确的**（左闭右开），不依赖浮点相等</code></pre>  <h3>本模块的高频题单（按优先级排）</h3>  <table>
+    <thead><tr><th>题</th><th>考点</th><th>频率</th><th>层级</th><th>一句话解法</th></tr></thead>
+    <tbody>
+      <tr><td>两数之和</td><td>哈希</td><td><strong>高频</strong></td><td><strong>必会</strong></td><td>边扫边把 <code>值→下标</code> 存进 dict，查 <code>t - a[j]</code></td></tr>
+      <tr><td>在排序数组中查找元素的首末位置</td><td>二分左右边界</td><td><strong>高频</strong></td><td><strong>必会</strong></td><td><code>bs_left</code> 与 <code>bs_right - 1</code></td></tr>
+      <tr><td>搜索旋转排序数组</td><td>二分 + 判断哪半有序</td><td><strong>高频</strong></td><td><strong>必会</strong></td><td>比较 <code>a[lo]</code> 与 <code>a[mid]</code> 定位有序半区，再判 t 是否落在其中</td></tr>
+      <tr><td>前 K 个高频元素</td><td>哈希 + 堆 / 桶排序</td><td><strong>高频</strong></td><td><strong>必会</strong></td><td>Counter + 大小 k 的堆；加分答案是桶排序 $O(n)$</td></tr>
+      <tr><td>分割数组的最大值 / D 天送达</td><td>答案空间二分</td><td><strong>高频</strong></td><td><strong>必会</strong></td><td>贪心 <code>check(cap)</code> + 模板 B</td></tr>
+      <tr><td>数组中的第 K 个最大元素</td><td>quickselect / 堆</td><td><strong>高频</strong></td><td><strong>必会</strong></td><td>随机主元三路划分；要能说出最坏 $O(n^2)$</td></tr>
+      <tr><td>最长连续序列</td><td>哈希集合</td><td>中频</td><td><strong>必会</strong></td><td>只从「$x-1$ 不在集合里」的 $x$ 起步向右数，总代价 $O(n)$</td></tr>
+      <tr><td>有效的字母异位词 / 字母异位词分组</td><td>哈希计数</td><td>中频</td><td>必会</td><td>排序后的字符串或 26 维计数元组做 key</td></tr>
+      <tr><td>颜色分类（荷兰国旗）</td><td>三路划分</td><td>中频</td><td>加分</td><td>三指针一次扫描；和 quickselect 的划分是同一段代码</td></tr>
+      <tr><td>H 指数</td><td>排序 / 计数排序</td><td>中频</td><td>加分</td><td>降序排后找最大的 $i$ 使 $c[i-1] \ge i$</td></tr>
+      <tr><td>寻找峰值 / 山脉数组的峰顶</td><td>二分（谓词不是有序性）</td><td>中频</td><td>加分</td><td><code>a[mid] &lt; a[mid+1]</code> 即峰在右——<strong>无序数组也能二分</strong></td></tr>
+      <tr><td>第 K 小的数对距离</td><td>答案二分 + 双指针计数</td><td>低频</td><td>加分</td><td>二分距离阈值，双指针数对数</td></tr>
+      <tr><td>两个有序数组的中位数</td><td>分割点二分</td><td>低频</td><td>加分</td><td>在短数组上二分分割点，$O(\log \min(m,n))$</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <strong>「寻找峰值」这道题是理解二分的试金石。</strong>数组完全无序，但「<code>a[mid] &lt; a[mid+1]</code> ⇒ 右侧必有峰」这个谓词是单调可用的——<em>它证明了第 3 节那句话：二分的前提是「存在可切分的单调判据」，而不是「数组有序」。</em>面试里能拿这道题反过来解释二分的本质，说明你不是在背模板。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="interview"><span class="num">8</span>面试标准答案骨架</h2>
+  <p>这一节请当作可背诵材料。组织原则和模块 00 一致：<strong>先给判断，再给机制，最后给数字和代价</strong>。</p>  <h3>Q1 · <code>dict</code> 的查找真的是 $O(1)$ 吗？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>你分得清<strong>期望 / 均摊 / 最坏</strong>三种复杂度口径，而不是背一个符号</td></tr>
+      <tr><td><strong>30 秒骨架</strong></td><td>「<em>期望</em> $O(1)$，<em>最坏</em> $O(n)$。最坏发生在所有 key 冲突到同一个桶——现实里两种触发方式：自定义 <code>__hash__</code> 写成常数，或者被构造的碰撞攻击（CPython 从 3.3 起默认开启哈希随机化 <code>PYTHONHASHSEED</code> 就是为了这个）。插入还有第三个口径：<em>均摊</em> $O(1)$——装载因子超过 2/3 会翻倍扩容并重建，单次是 $O(n)$，但等比级数求和后均摊是 $O(1)$。<strong>对延迟敏感的系统这个区别是实的</strong>：均摊 $O(1)$ 意味着某一帧会突然多花几毫秒，所以关键路径上要预分配。」</td></tr>
+      <tr><td>加分点</td><td>补一句「还有个容易忽略的：<strong>遍历 dict 是 $O(\text{capacity})$ 不是 $O(n)$</strong>，大量删除后表很稀疏，遍历仍要扫全表——CPython 删除只打墓碑不缩容」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>只说「$O(1)$」；或者说「最坏 $O(\log n)$」（那是 Java 8+ 的 HashMap 树化，Python 没有）</td></tr>
+    </tbody>
+  </table>  <h3>Q2 · 你怎么保证你的二分不会死循环？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>你有<strong>可陈述的方法</strong>，而不是「我一般都对」</td></tr>
+      <tr><td><strong>30 秒骨架</strong></td><td>「三件事。<strong>①约定</strong>：我统一用半开区间 <code>[lo, hi)</code>，<code>hi</code> 是第一个被排除的位置，所以初始化 <code>hi = n</code>、循环条件 <code>lo &lt; hi</code>、更新只用 <code>lo = mid+1</code> 或 <code>hi = mid</code>。<strong>②不变量</strong>：<code>a[:lo]</code> 全 $&lt; t$、<code>a[hi:]</code> 全 $\ge t$，退出时 <code>lo == hi</code> 就是分界点。<strong>③终止性</strong>：下取整让 <code>lo &lt;= mid &lt; hi</code>，两个分支都严格缩小区间长度，而区间长度是非负整数，所以至多 $\lceil\log_2 n\rceil$ 轮必然退出。写完我会用『区间只剩 1–2 个元素』手推一遍。」</td></tr>
+      <tr><td>加分点</td><td>「另外我只背 <code>bisect_left</code> 一套模板，右边界、计数、精确查找全部由它推——<em>少一套模板就少一类 bug</em>。」再顺口提 <code>lo + (hi-lo)//2</code> 防溢出（JDK 的经典 bug）</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>答「多写几遍就熟了」；或者当场靠改 <code>+1/-1</code> 试出来</td></tr>
+    </tbody>
+  </table>  <h3>Q3 · Top-K 用哪种解法？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>你<strong>先问约束</strong>再选方法，并且知道渐进复杂度不等于实际耗时</td></tr>
+      <tr><td><strong>30 秒骨架</strong></td><td>「先问四个问题：$k$ 与 $n$ 的量级、数据能否一次进内存、要不要有序输出、能不能改原数组。<strong>$k \ll n$ 且是流式 → 大小 $k$ 的最小堆</strong>，$O(n\log k)$、空间只要 $O(k)$；<strong>$n$ 极大且能全放内存、不要顺序 → quickselect</strong>，期望 $O(n)$，但要随机主元，否则有序输入会退化成 $O(n^2)$；<strong>$k$ 接近 $n$ 或需要有序 → 直接全排序</strong>。补一个实测事实：$\log_2 n/\log_2 k$ 在 $n=10^6,k=100$ 时只有 3 倍，而 CPython 的 <code>sorted</code> 是 C 层 Timsort，常数小两个数量级，所以 $n$ 在 $10^5$ 量级时全排序往往<em>实际更快</em>。」</td></tr>
+      <tr><td>加分点</td><td>主动连到工程：「检测后处理里 NMS 前的 <code>top-1000</code> 截断就是这个——不是为了精度，是为了把 NMS 的最坏耗时钉死，代价是极密集场景可能截掉真目标。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>张口就「必须 quickselect 因为 $O(n)$」；说不出 quickselect 的最坏情况与随机主元</td></tr>
+    </tbody>
+  </table>  <h3>Q4 · 排序的稳定性有什么用？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>你能给出<strong>两个层次</strong>的答案：语法层（多关键字）和系统层（确定性）</td></tr>
+      <tr><td><strong>30 秒骨架</strong></td><td>「两个用途。<strong>①多关键字排序</strong>：主关键字要降序而次关键字是字符串时没法用元组取负，只能『先按次关键字排、再按主关键字排』，这一步完全依赖稳定性。<strong>②输出确定性</strong>——这个更重要：任何贪心算法的输出都依赖排序顺序，NMS 就是典型。两个 IoU 超阈值的框如果分数完全相同，先排到的那个会被保留、另一个被抑制，输出的框位置就不一样。而<em>分数并列一点都不罕见</em>：INT8 量化后分类头只有 256 个可能取值。更糟的是 <code>np.argsort</code> 默认不稳定、<code>torch.sort</code> 默认不保证、TensorRT 的 TopK 没有文档化保证——<strong>训练端和部署端的 tie-break 不一致，表现为『1000 帧里有 3 帧差一个框』，极难定位</strong>。」</td></tr>
+      <tr><td>加分点</td><td>给出根治方案：「与其依赖稳定性，不如让排序键成为<strong>全序</strong>——用 <code>(-score, class_id, x1, y1, index)</code>，任意两个元素的键都不相等，就不存在并列，是否稳定也就无所谓了。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>只答「保持相等元素的相对顺序」——这是定义不是用途</td></tr>
+    </tbody>
+  </table>  <h3>Q5 · 你怎么识别一道题该「在答案上二分」？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>你有<strong>可复用的识别信号</strong>，而不是「见过这题」</td></tr>
+      <tr><td><strong>30 秒骨架</strong></td><td>「三个信号同时出现就基本可以断定：<strong>①题面是『最小化最大值』『最大化最小值』或『至少需要多少』</strong>；<strong>②直接求最优难，但给定候选答案验证可行性容易</strong>（通常一遍 $O(n)$ 贪心）；<strong>③可行性单调</strong>——放宽约束不会让问题变难。满足了就把答案空间当成有序数组，套 <code>bisect_left</code> 模板，复杂度是 $O(\text{check} \cdot \log(R-L))$。写之前我会先说清 $L$ 和 $R$ 的物理含义，比如 LC410 里 $L=\max(a)$ 是硬下界、$R=\sum a$ 是一定可行的上界。」</td></tr>
+      <tr><td>加分点</td><td>「而且这个模式在工程里到处都是：给定延迟预算求最大分辨率、给定召回下限求最高 score 阈值、给定带宽预算求触发阈值——<strong>都是同一个算法</strong>。」<em>把刷题模式映射到工程决策，是这道题最高分的答法。</em></td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>不验证单调性直接二分；浮点答案空间用 <code>while lo &lt; hi</code>（会死循环，要用固定 100 次迭代）</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>五道题的共同结构：<strong>先分清口径（期望/均摊/最坏、渐进/实际），再给机制，最后给一个具体数字或一个工程后果。</strong><em>数字和后果是把「背过」和「用过」区分开的东西——把 2/3 装载因子、$\log_2 n/\log_2 k$、INT8 的 256 档、$\lceil\log_2 n\rceil$ 轮这几个记住即可。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>学习型索引（learned index）。</strong> Kraska 等人 2018 年提出：既然 B 树本质是「把 key 映射到位置」的函数，那就用一个小模型直接拟合累积分布函数 CDF，预测位置后在局部做小范围二分。在只读、分布平滑的数据上比 B 树快数倍且省内存。<em>开放问题：更新（插入会破坏已学的 CDF）、对抗分布下的最坏保证、以及如何给出可证明的误差界——这正是「机器学习替代经典数据结构」这条线的核心难点。</em></li>
+    <li><strong>最坏 $O(1)$ 的哈希。</strong> Cuckoo hashing 用两个哈希函数保证查找最坏 $O(1)$（代价是插入可能失败并重建）；Robin Hood hashing 通过均衡探测距离压低方差。<em>它们在数据库和 GPU 上被广泛使用，但在通用语言的默认 dict 里几乎没有——因为通用场景更在意平均性能与内存布局，这是「理论最优」和「工程默认」分道扬镳的典型案例。</em></li>
+    <li><strong>GPU 上的排序与 select 是另一套算法学。</strong> CPU 上的 quickselect 依赖分支和随机访问，在 GPU 上都是反模式；GPU 的 top-K 用的是 <span class="term">radix select</span>（按位分桶，无数据依赖分支）或 bitonic 网络。<em>这解释了为什么 TensorRT 的 <code>EfficientNMS</code> 不是「把 CPU NMS 搬到 GPU」而是重新设计的算法——以及为什么它的 tie-break 行为和 CPU 不一致（呼应第 2 节与 C60 的一致性对拍）。</em></li>
+    <li><strong>浮点归约的不确定性。</strong> 浮点加法不满足结合律，所以并行归约的分块方式一变，结果的最后几位就变；cuDNN 的算法自动选择（<code>benchmark=True</code>）会让同一份权重两次前向的分数差 $10^{-7}$。<em>这个 $10^{-7}$ 本身无害，但它会让「并列分数」在两次运行中翻转顺序，从而让 NMS 输出不同的框——「确定性训练/推理」（deterministic mode）为此付出的性能代价是否值得，在量产系统里仍是有争议的工程决策。</em></li>
+    <li><strong>亚线性算法与 sketch。</strong> 当数据大到连一遍都扫不完时，Count-Min Sketch、HyperLogLog、蓄水池采样这类算法用固定内存给出有界误差的近似统计。<em>大规模数据挖掘（C58-04）里统计「某个稀有类在几十 PB 回传里出现了多少次」用的就是这类工具；开放问题是如何给检测这种「结构化输出」设计合适的 sketch。</em></li>
+    <li><strong>近似最近邻（ANN）是高维版的 Top-K。</strong> HNSW、IVF-PQ、ScaNN 把精确 top-K 的 $O(n)$ 换成亚线性，代价是召回不再是 100%。<em>嵌入检索式的难例挖掘（C58-04）完全建立在这个取舍上——「召回 95% 的近邻但快 100 倍」在挖掘场景里是划算的，但在评测场景里就不一定；如何为不同下游任务选择 recall-latency 工作点，仍然主要靠经验。</em></li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>★ 必读</strong>：Cormen et al., <em>Introduction to Algorithms</em>（CLRS）第 9 章（Medians and Order Statistics：quickselect 的期望线性证明与 median-of-medians）与第 11 章（Hash Tables：全域哈希与完美哈希的严格分析）——<em>这两章是本模块所有复杂度陈述的出处，面试里要报「期望 / 均摊 / 最坏」的口径就必须读它</em>。<strong>★</strong> Tim Peters, <em>listsort.txt</em>（CPython 源码 <code>Objects/listsort.txt</code>）——Timsort 的设计说明，讲清了「自适应」与「稳定」是怎么同时做到的，一小时能读完，性价比极高。</p><p>延伸：Bentley &amp; McIlroy, <em>Engineering a Sort Function</em>（1993）——工业级快排的主元选择与三路划分，quickselect 的工程细节都来自这里；Bloch, <em>Extra, Extra – Read All About It: Nearly All Binary Searches and Mergesorts are Broken</em>（2006，JDK 二分溢出 bug 的著名博文）；Kraska et al., <em>The Case for Learned Index Structures</em>（SIGMOD 2018）；Pagh &amp; Rodler, <em>Cuckoo Hashing</em>（2004）；Cormode &amp; Muthukrishnan, <em>Count-Min Sketch</em>（2005）；Malkov &amp; Yashunin, <em>HNSW</em>（TPAMI 2020，ANN 检索的事实标准）。相邻课程：模块 01（双指针与滑动窗口）、模块 03（树与图，并查集的复杂度分析）、模块 04（DP 与贪心，区间调度）、C53-04（NMS 的 WCET 与 top-K 截断）、C58-04（嵌入检索与去重）、C60（训练-部署一致性与浮点确定性）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_arrays_strings/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 数组与字符串：双指针、滑动窗口、前缀和</div></a>
+    <a class="next" href="../03_trees_graphs/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 树、图与搜索</div></a>
+  </div>
+
+</div>
+</body>
+</html>

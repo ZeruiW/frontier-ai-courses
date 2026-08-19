@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · RTMDet 解剖：大核、共享头与软标签</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · RTMDet 解剖：大核、共享头与软标签</h1>
+  <p class="subtitle">用同一套框架做 tiny→x 全尺度，而不是每个尺度重新设计 · CSPNeXt 与 5×5 depthwise 大核：有效感受野远小于理论感受野，而 depthwise 扩核的参数代价小到几乎免费 · 检测头跨尺度共享权重、每层独立 BN（共享的是「怎么判断」，不共享的是「统计量」）· dynamic soft label 的代价函数与中心先验 · 深度 / 宽度 / 分辨率三者的缩放分配 · RTMDet-Ins 的实例分割扩展与它对 TSR 的启发</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（YOLO 演进、重参数化）与模块 02（标签分配、dynamic-k、软中心先验）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_rtmdet.ipynb（梯度回传法数值测 ERF / 软标签代价矩阵 / 缩放计算器）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">RTMDet (arXiv 2212.07784) · ConvNeXt · RepLKNet · CSPNet · Effective Receptive Field (NeurIPS 2016)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 70 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#philosophy">设计哲学：用一套框架吃下 tiny → x 全尺度</a></li>
+      <li><a href="#cspnext">CSPNeXt：backbone 到底改了什么</a></li>
+      <li><a href="#erf">5×5 depthwise 大核：有效感受野才是真的感受野</a></li>
+      <li><a href="#cost">成本账：为什么 5×5 几乎免费，又为什么不是 11×11</a></li>
+      <li><a href="#head">颈部与检测头：共享权重 + 每层独立 BN</a></li>
+      <li><a href="#dsla">Dynamic Soft Label Assignment：代价函数逐项拆解</a></li>
+      <li><a href="#scaling">模型缩放与任务扩展：tiny→x 的预算怎么分</a></li>
+      <li><a href="#tradeoff">与 YOLO 系的工程取舍：给 TSR 选哪个</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="philosophy"><span class="num">1</span>设计哲学：用一套框架吃下 tiny → x 全尺度</h2>
+  <p>RTMDet（Real-Time Models for object Detection，MMDetection 团队，2022）的副标题是 <em>An Empirical Study of Designing Real-Time Object Detectors</em>——<strong>它是一篇「实证研究」而不是一篇「新模块」论文</strong>。这个定位本身就是它最值得学的地方：它没有发明惊天动地的新算子，而是把 backbone / neck / head / 标签分配 / 数据增强 / 优化器<em>逐项换掉再逐项验证</em>，最后给出一套在 tiny 到 x 五档尺度上<strong>同构</strong>的配置。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>「同构」是什么意思、为什么重要？<strong>YOLO 系的各档模型经常不是同一个东西</strong>：v5 的 nano 和 x 用的是同一套结构但宽深不同，而 v7 的 tiny 与 v7-E6E 在结构上差别很大（辅助头、重参数化分支的用法都不同）。<em>结果是：你在 large 上调好的一个技巧，换到 tiny 上可能根本不成立</em>。RTMDet 坚持五档共用同一套 block、同一个 head、同一个分配器，<strong>只有 depth/width 两个标量在变</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>对工程团队来说，这个性质的价值是<strong>「一次调参，五档复用」</strong>：车端可能同时需要一个跑在主 SoC 上的 m 档模型、一个跑在备份芯片上的 tiny 档模型，还需要一个 x 档模型在云端做自动标注（伪标签教师）。<em>如果三个模型结构不同构，就要维护三套训练配方、三套导出脚本、三套精度基线</em>。RTMDet 让这三件事塌缩成一件。<strong>面试里被问「为什么选 RTMDet 而不是 YOLOv8」，「全尺度同构带来的工程收益」是一个比「AP 高 0.5」有力得多的答案。</strong></p></div>
+  </div>  <div class="ascii">RTMDet 的整体结构（本模块会逐块拆开）
+
+  输入 640x640
+     │
+  ┌──▼───────────────────────────────────────────────┐
+  │ CSPNeXt backbone                                 │  ← 第 2 节
+  │   stem(3x 3x3 conv) → 4 x [下采样 + CSPLayer]     │
+  │   CSPNeXtBlock = 3x3 conv + **5x5 depthwise** + 1x1  ← 第 3/4 节
+  └──┬────────────┬────────────┬─────────────────────┘
+     │ C3(s=8)    │ C4(s=16)   │ C5(s=32)
+  ┌──▼────────────▼────────────▼─────────────────────┐
+  │ CSPNeXtPAFPN（neck）：与 backbone **同一种 block**  │
+  │   自顶向下 + 自底向上，全部统一到 256 通道          │
+  └──┬────────────┬────────────┬─────────────────────┘
+     │ P3         │ P4         │ P5
+  ┌──▼────────────▼────────────▼─────────────────────┐
+  │ RTMDetSepBNHead：**卷积权重跨层共享 + 每层独立 BN** │  ← 第 5 节
+  │   cls 支 2x(3x3) ─┐         reg 支 2x(3x3) ─┐      │
+  │   每层各自的 1x1 输出头 ←┘                  ←┘      │
+  └──────────────────────────────────────────────────┘
+     │
+  DynamicSoftLabelAssigner（训练期）                     ← 第 6 节
+  软标签分类代价 + IoU 代价 + **软中心先验 10^(d/s-3)**</div>  <div class="callout intuition"><span class="label"></span>
+    <p>读 RTMDet 论文的正确姿势：<strong>把它当成一份「消融表汇编」</strong>。它的每个设计点都配了一行 AP/延迟对照——backbone 换成 CSPNeXt、block 里加 5×5 depthwise、neck 与 backbone 用同一种 block、head 共享权重、分配器换 DSLA、训练用 AdamW + cosine + 后期关 Mosaic。<em>面试里能按「改了什么 → 收益多少 → 代价是什么」讲三到四个点，比背整个结构图有用得多。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cspnext"><span class="num">2</span>CSPNeXt：backbone 到底改了什么</h2>
+  <p><span class="term">CSPNeXt</span> 这个名字直接说明了它的血统：<strong>CSP</strong>（Cross Stage Partial，来自 CSPNet / YOLOv4）+ <strong>NeXt</strong>（来自 ConvNeXt 的现代化配方）。它不是从零设计的，而是在 CSPDarknet（YOLOv5 的 backbone）上做了几处替换。</p>  <table>
+    <thead><tr><th>部件</th><th>CSPDarknet（YOLOv5）</th><th>CSPNeXt（RTMDet）</th><th>为什么换</th></tr></thead>
+    <tbody>
+      <tr><td>基本 block</td><td>两个 3×3 dense conv 的残差块</td><td><strong>3×3 conv + 5×5 depthwise + 1×1</strong></td><td>用几乎零成本的 depthwise 大核换<strong>更大的有效感受野</strong>（第 3 节详解）</td></tr>
+      <tr><td>跨阶段结构</td><td>CSP：特征分两半，一半过 block、一半直连，最后 concat</td><td><strong>保留 CSP</strong></td><td>CSP 减少约一半的 block 计算量、缓解梯度重复，是被反复验证过的结构</td></tr>
+      <tr><td>neck 的 block</td><td>与 backbone 不同（YOLOv5 的 neck 用普通 C3）</td><td><strong>与 backbone 完全相同</strong></td><td>同构 → 结构简单、缩放规则统一、部署时算子种类更少</td></tr>
+      <tr><td>通道注意力</td><td>无</td><td><strong>CSPLayer 末尾加 channel attention</strong></td><td>小模型上收益明显（弥补容量不足），大模型上收益递减</td></tr>
+      <tr><td>激活</td><td>SiLU</td><td>SiLU</td><td>未变——RTMDet 的消融显示激活函数不是瓶颈</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>「neck 与 backbone 用同一种 block」</strong>这条看起来只是省事，其实有实打实的工程收益。YOLO 系的 neck 通常是另一套结构（PAN + C3/C2f），<em>于是缩放时要为 neck 单独定一套规则、导出时要多支持一类算子、写 TensorRT plugin 时要多调一次</em>。RTMDet 直接复用 CSPNeXtBlock，<strong>整个网络只有三种基本算子：3×3 conv、5×5 depthwise conv、1×1 conv</strong>——这对车端量化与算子覆盖检查是很友好的性质（C60 会展开）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更深一层的观察：RTMDet 的论文明确指出 <strong>backbone 与 neck 的计算量分配也是一个可调的设计变量</strong>。他们发现把一部分预算从 backbone 挪到 neck（提高 neck 的通道数与 block 数），在同等延迟下 AP 更高。<em>直觉是：检测任务真正吃紧的是多尺度融合而不是语义抽取</em>——ImageNet 预训练已经把语义抽取做得不错了，而多尺度融合是检测特有的、必须从检测数据里学的部分。<strong>这个「backbone/neck 预算分配」的视角在面试里很少有人提，提出来会显得你真的读过论文而不只是看过结构图。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个容易被忽略的实现细节：<strong>CSPNeXtBlock 里的 depthwise 是「5×5 depthwise + 1×1 pointwise」的可分离结构，不是单独一个 5×5 depthwise</strong>。少了后面那个 1×1，通道之间就完全不通信了——depthwise 卷积<em>只在空间维度混合，不在通道维度混合</em>。<strong>「depthwise 必须配 pointwise」是一条硬规则</strong>，而下一节会看到：<em>成本几乎全在那个 1×1 上，5×5 那部分只占零头</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="erf"><span class="num">3</span>5×5 depthwise 大核：有效感受野才是真的感受野</h2>
+  <p>这是本模块最值得花时间的一节。<strong>「大核为什么有效」的标准答案不是「感受野更大」——那是理论感受野，而理论感受野几乎不影响精度</strong>。真正起作用的是 <span class="term">effective receptive field</span>（ERF，有效感受野）。</p>  <h3>① 理论感受野（TRF）：一个纯几何量</h3>  <p>理论感受野是「输出的一个单元，在输入上<em>可能</em>依赖的像素范围」。它由一个递推式完全决定，与权重无关：</p>  <div class="math-block">\[r_{\ell} \;=\; r_{\ell-1} + (k_{\ell}-1)\cdot d_{\ell} \cdot j_{\ell-1}, \qquad j_{\ell} = j_{\ell-1}\cdot s_{\ell}, \qquad r_0=1,\; j_0=1\]</div>  <p>$k$ 是核尺寸、$s$ 是 stride、$d$ 是空洞率、$j$ 是累计 stride（jump）。<strong>堆 $N$ 层 3×3（stride 1）的 TRF 半径是 $N$；堆 $N$ 层 5×5 的 TRF 半径是 $2N$。</strong> 简单、干净、也<em>基本没用</em>——因为它假设了「范围内的每个像素都同等重要」，而这个假设是错的。</p>  <h3>② 有效感受野（ERF）：一个统计量</h3>  <p>Luo et al. (NeurIPS 2016) 的关键观察：<strong>把中心输出单元对输入的梯度画出来，得到的不是一个均匀的方块，而是一个近似高斯的钟形</strong>。中心像素的贡献远大于边缘像素，边缘的贡献几乎为零。这个梯度图的「有效宽度」才是模型真正看得见的范围。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么会是高斯？<strong>因为卷积的堆叠就是概率分布的卷积</strong>。把每层卷积核归一化后看成一个概率分布（每个位置的权重 = 「信息从这里来」的概率），堆 $N$ 层就是这个分布自己卷自己 $N$ 次。<em>中心极限定理直接给出结论：$N$ 大时结果趋于高斯，方差是单层方差的 $N$ 倍</em>。于是 ERF 的<strong>标准差</strong>按 $\sqrt{N}$ 增长，而 TRF 的半径按 $N$ 增长。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这就得到了本节最重要的一个式子：对宽度为 $k$ 的均匀核，单层的空间方差是 $(k^2-1)/12$（离散均匀分布的方差），堆 $N$ 层后 $\sigma_{ERF} = \sqrt{N(k^2-1)/12}$。<strong>而 TRF 半径 $= N(k-1)/2$。两者之比按 $1/\sqrt{N}$ 衰减</strong>：<em>网络越深，模型「名义上看得见」和「实际上用得上」的差距就越大</em>。notebook 里会用梯度回传法把这个式子逐项数值验证到小数点后六位——<strong>这不是近似关系，在均匀核线性网络下它是精确成立的等式。</strong></p></div>
+  </div>  <div class="math-block">\[\sigma_{ERF} \;=\; \sqrt{\;\sum_{\ell=1}^{N} \frac{d_{\ell}^2\,(k_{\ell}^2-1)}{12}\;} \;\;\xrightarrow[\;\text{同核}\;]{}\;\; \sqrt{\frac{N(k^2-1)}{12}}, \qquad \frac{\sigma_{ERF}}{r_{TRF}} = \frac{2}{k-1}\sqrt{\frac{k^2-1}{12N}}\]</div>  <table>
+    <thead><tr><th>配置</th><th>TRF 半径</th><th>ERF 标准差（实测＝理论）</th><th>ERF/TRF</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>3×3 × 10 层</td><td>10</td><td>2.582</td><td><strong>0.258</strong></td><td>名义看 21×21，实际只用得上中间 ~5×5</td></tr>
+      <tr><td>5×5 × 10 层</td><td>20</td><td>4.472</td><td>0.224</td><td>TRF 翻倍，ERF 只涨 √3 ≈ 1.73 倍</td></tr>
+      <tr><td>7×7 × 10 层</td><td>30</td><td>6.325</td><td>0.211</td><td>继续加大核，ERF/TRF 继续下降</td></tr>
+      <tr><td>3×3 × 64 层</td><td>64</td><td>6.532</td><td><strong>0.102</strong></td><td><em>深网络的 TRF 早就覆盖全图，但 ERF 只有十几个像素</em></td></tr>
+    </tbody>
+  </table>  <h3>③ 于是 5×5 depthwise 的价值就清楚了</h3>  <p>两个 3×3 与一个 5×5 的 <strong>TRF 完全相同</strong>（半径都是 2），但 ERF 不同：$\sigma_{2\times3\times3} = \sqrt{2\cdot 8/12} = 1.155$，$\sigma_{1\times5\times5} = \sqrt{24/12} = 1.414$，<strong>比值 $\sqrt{1.5} = 1.2247$</strong>。也就是说——<em>用一层 5×5 换掉两层 3×3，TRF 不变、深度减半、ERF 反而大了 22.5%</em>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把「大核为什么有效」压缩成一句面试可用的话：<strong>「堆小核只能让理论感受野线性增长，而有效感受野按 $\sqrt{N}$ 增长——增大单层核尺寸是<em>直接</em>把每一步的方差做大，这比多堆几层划算得多，而且不增加深度（不增加串行延迟、不加重梯度传播负担）。」</strong> <em>能同时说出「TRF 线性、ERF 根号」和「深度是串行延迟」这两点，就已经比绝大多数候选人讲得深了。</em></p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>ERF 还有两个必须知道的修正：<strong>① ReLU 让 ERF 进一步缩小</strong>——门控会随机切断梯度路径，notebook 里会看到激活门控（保留概率 0.3）把「有效面积」从 205 压到 52（缩小 4 倍），而梯度总质量掉了 4 个数量级；<strong>② ERF 是训练出来的，不是固定的</strong>——Luo 的论文指出训练后的 ERF 会显著大于随机初始化时的 ERF。<em>所以「ERF 不够大」有时是训练不充分的症状，不一定是结构问题。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost"><span class="num">4</span>成本账：为什么 5×5 几乎免费，又为什么不是 11×11</h2>
+  <p>如果大核这么好，为什么不直接上 11×11？答案分两层：<strong>参数量的账说「上」，硬件的账说「停」</strong>。</p>  <h3>① 参数量：depthwise 让核尺寸变成零头</h3>  <div class="math-block">\[\text{params}_{\text{dense }k\times k} = k^2 C^2, \qquad \text{params}_{\text{DW }k\times k + \text{PW}} = k^2 C + C^2 = C^2\left(1 + \frac{k^2}{C}\right)\]</div>  <table>
+    <thead><tr><th>通道数 C</th><th>5×5 depthwise</th><th>两层 3×3 dense</th><th>倍数</th><th>5×5 DW 占「DW+PW」总量的比例</th></tr></thead>
+    <tbody>
+      <tr><td>64</td><td>1,600</td><td>73,728</td><td>46×</td><td>1600 / (1600+4096) = <strong>28%</strong></td></tr>
+      <tr><td>128</td><td>3,200</td><td>294,912</td><td>92×</td><td>3200 / (3200+16384) = <strong>16%</strong></td></tr>
+      <tr><td>256</td><td>6,400</td><td>1,179,648</td><td><strong>184×</strong></td><td>6400 / (6400+65536) = <strong>8.9%</strong></td></tr>
+      <tr><td>512</td><td>12,800</td><td>4,718,592</td><td>369×</td><td>12800 / (12800+262144) = <strong>4.7%</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后一列是关键：<strong>在可分离结构里，成本几乎全在 1×1 pointwise 上，空间核只占零头</strong>。C=256 时把 block 里的 3×3 depthwise 换成 5×5 depthwise，整个 block 的参数只涨 <code>(6400-2304)/67840 ≈ 6.0%</code>。<em>这就是「5×5 depthwise 几乎免费」的准确含义——不是绝对免费，而是相对于同一个 block 里那个 1×1，它便宜到可以忽略。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>notebook 里会做一个更有意思的实验：<strong>固定参数预算，问「买哪个核尺寸能得到最大的 ERF」</strong>。C=256、预算 200 万参数时，答案是 <em>核越大越好</em>——k=3 能堆 29 层得到 $\sigma=4.40$，k=11 只能堆 20 层但 $\sigma=14.14$，<strong>相差 3.2 倍</strong>。纯参数量视角下，大核是压倒性的。<em>所以「为什么 RTMDet 停在 5×5」这个问题，答案一定不在参数量里。</em></p></div>
+  </div>  <h3>② 硬件：depthwise 卷积是访存受限的</h3>  <p>算一笔 <span class="term">arithmetic intensity</span>（算术强度，MAC 数 ÷ 访存元素数）：</p>  <ul>
+    <li><strong>Dense 3×3</strong>（C=256）：MACs $= 9C^2HW$，访存 $\approx 2CHW$，强度 $\approx 9C/2 = 1152$ —— 妥妥的<em>计算受限</em>，GPU 跑得飞快。</li>
+    <li><strong>Depthwise $k\times k$</strong>：MACs $= k^2CHW$，访存 $\approx 2CHW$，强度 $\approx k^2/2$。$k=3$ 时是 4.5，$k=5$ 时是 12.5 —— <strong>比 dense 低两个数量级，是彻底的<em>访存受限</em></strong>。</li>
+    <li><strong>推论</strong>：depthwise 层的墙钟时间主要由「读一遍输入、写一遍输出」决定，<em>而这部分与 $k$ 无关</em>。所以 3×3→5×5 的延迟增量非常小；但 $k$ 继续增大到 9/11 时，权重驻留、寄存器压力、以及 cuDNN/TensorRT 对大 depthwise 核的 kernel 优化不足开始显现，<strong>延迟会非线性地跳上去</strong>。</li>
+  </ul>  <div class="callout danger"><span class="label"></span>
+    <p>这是一个<strong>「FLOPs 骗人」的经典案例</strong>，面试里出现频率很高：<em>depthwise 卷积的 FLOPs 极低，但实测延迟远高于 FLOPs 预测</em>。MobileNet 系在 GPU 上「FLOPs 只有 ResNet 的 1/10，实测只快 2 倍」就是这个原因。<strong>正确的说法是：FLOPs 是计算受限算子的良好代理，对访存受限算子完全失效。</strong> 讲 RTMDet 的大核时如果只说「参数几乎不涨」而不提访存，会被追问到；<em>主动说出「所以 RTMDet 停在 5×5 是硬件约束而不是精度约束」，是很强的加分项。</em></p>
+  </div>  <p>RTMDet 论文的消融给出的结论与这个分析一致：<strong>3×3 → 5×5 带来明确的 AP 提升且延迟几乎不变，而 5×5 → 7×7 精度收益消失、延迟开始上升</strong>。<em>5×5 是精度-延迟曲线的拐点，不是一个拍脑袋的数字。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="head"><span class="num">5</span>颈部与检测头：共享权重 + 每层独立 BN</h2>
+  <p><span class="term">RTMDetSepBNHead</span> 的名字里 <code>SepBN</code> 就是它的全部设计：<strong>卷积权重在 FPN 各层之间共享，但 BatchNorm 的统计量每层各自独立</strong>。这个组合看起来是个小 trick，实际上解决了一个真问题。</p>  <div class="ascii">三种检测头设计的对比（feat=256, stacked_convs=2, 3 层 FPN, 80 类）
+
+  ① 每层独立头（RetinaNet 早期 / 部分 YOLO 实现）
+     P3 ──► [conv3x3, conv3x3] ──► 1x1 out      各层参数完全独立
+     P4 ──► [conv3x3, conv3x3] ──► 1x1 out      主体 = 3 x 2 x 2 x 590K
+     P5 ──► [conv3x3, conv3x3] ──► 1x1 out      含输出头共 ≈ **7.15 M**
+
+  ② 全共享头（RetinaNet 原版：conv 与 BN 全共享）
+     P3 ─┐                                      共 ≈ **2.43 M**（省 2.95 倍）
+     P4 ─┼► [同一套 conv3x3, conv3x3] ──► 1x1    但 **BN 统计量被三层的特征混着算**
+     P5 ─┘                                      而三层的特征尺度差异极大 ✗
+
+  ③ 共享 conv + 每层独立 BN（RTMDet）
+     P3 ─┐                             ┌─ BN_P3 ─┐
+     P4 ─┼► [同一套 conv3x3 权重] ──────┼─ BN_P4 ─┼──► 每层各自的 1x1 out
+     P5 ─┘                             └─ BN_P5 ─┘
+     共 ≈ **2.43 M**  ← 只比全共享多 4,096 个参数（BN 从 2,048 变成 6,144）
+     既拿到共享的正则化收益，又不让三层的统计量互相污染 ✅
+
+  （以上按 feat=256 / stacked_convs=2 / 3 层 FPN / 80 类，含每层的 1x1 输出头）</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么 BN 不能共享？<strong>因为 FPN 三层的特征分布根本不是一个量级</strong>。P3（stride 8）是高分辨率、低语义、激活幅值小；P5（stride 32）是低分辨率、高语义、激活幅值大。<em>用一套 BN 统计量去归一化它们，等价于用同一个均值方差去标准化三组分布差很远的数据</em>——结果是三层都没被正确归一化，且推理时 running stats 会偏向格点数最多的那一层（P3 的格点数是 P5 的 16 倍）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>而卷积权重<strong>应该</strong>共享，原因也很清楚：<em>「什么样的局部纹理是交通标志」这件事在三个尺度上是同一个函数</em>，只是输入的尺度不同。共享权重让三层的梯度汇到同一套参数上，<strong>等价于把训练样本量乘了 3</strong>——这对小目标层（P3 的正样本本来就少）是实打实的收益。notebook 里会用合成特征验证：共享 BN 下某一层归一化后的均值可以偏离 0 达到 1 个标准差以上，而每层独立 BN 下三层都精确落在 (0, 1)。</p></div>
+  </div>  <table>
+    <thead><tr><th>方案</th><th>参数量</th><th>正则化效果</th><th>多尺度统计</th><th>部署影响</th></tr></thead>
+    <tbody>
+      <tr><td>每层独立头</td><td>7.15 M</td><td>弱（各层各学各的）</td><td>各层正确</td><td>权重多，engine 更大</td></tr>
+      <tr><td>全共享（含 BN）</td><td>2.43 M</td><td><strong>强</strong></td><td><strong>✗ 被污染</strong>（P5 归一化后均值偏离 +1.63）</td><td>最省</td></tr>
+      <tr><td><strong>共享 conv + 独立 BN</strong></td><td><strong>2.43 M</strong>（只多 4,096 个参数）</td><td><strong>强</strong></td><td><strong>✓ 各层精确落在 (0, 1)</strong></td><td>省；且 BN 可与 conv 折叠</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>有一个很漂亮的部署副产品：<strong>推理时 BN 会被折叠进卷积（Conv+BN fusion），于是「共享 conv + 每层独立 BN」在导出后就变成了「每层一套独立的 conv 权重」</strong>——<em>训练时享受共享带来的正则化与样本量放大，推理时又不承担任何额外开销</em>。这与模块 01 讲的结构重参数化是同一类思想：<strong>训练态与推理态可以是两个不同的结构，只要数值等价。</strong></p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>落到 TSR 上有个直接后果：<strong>共享头意味着「远处 12px 的标志」和「近处 96px 的标志」用的是同一套分类权重</strong>。好处是稀有类别在任何尺度上出现都能贡献梯度（长尾友好）；<em>坏处是如果某一类只在特定尺度出现（比如高速龙门架上的可变限速牌几乎只在 P5 上出现），共享权重会让它与其他尺度的类别互相干扰</em>。<strong>这也是「两级方案（类别无关检测 + 高分辨率 crop 分类）」在 TSR 里长期有生命力的原因之一</strong>——C55 模块 02 会完整展开。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dsla"><span class="num">6</span>Dynamic Soft Label Assignment：代价函数逐项拆解</h2>
+  <p>模块 02 已经铺垫过它的三项，这里把完整实现讲透。RTMDet 的 <span class="term">DynamicSoftLabelAssigner</span> 是目前工业实时检测器里综合最稳的一个分配器，也是 MMDetection 里 RTMDet / RTMDet-Ins / RTMDet-R 的默认选择。</p>  <div class="math-block">\[C_{ig} \;=\; \underbrace{\sum_{c}\mathrm{BCE}\big(p_{ic},\, y_{igc}\big)\cdot\big|y_{igc}-p_{ic}\big|^{2}}_{\text{软标签分类代价}} \;+\; \underbrace{\lambda\big(-\log u_{ig}\big)}_{\lambda=3}\;+\; \underbrace{10^{\,d_{ig}/s_i-R}}_{R=3,\ \text{软中心先验}}\]</div>  <p>其中 $y_{igc} = u_{ig}\cdot\mathbf{1}[c = c_g]$ 是<strong>软标签</strong>——分类目标不是 1，而是该格点预测框与 GT 的 IoU。三项分别在做三件事：</p>  <table>
+    <thead><tr><th>项</th><th>形式</th><th>解决什么问题</th><th>去掉它会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><strong>软标签分类代价</strong></td><td>BCE 乘以 $|y-p|^2$ 调制因子</td><td>把「框准不准」写进分类目标，让分数可用于 NMS 排序</td><td>退化成 SimOTA 的硬标签；分数与定位质量脱钩，NMS 排错</td></tr>
+      <tr><td><strong>调制因子 $|y-p|^2$</strong></td><td>focal 式的平方权重</td><td>已对齐的格点代价 → 0，<strong>不再参与争抢</strong>；差得远的被放大</td><td>所有格点的分类代价量级相近，代价矩阵区分度下降</td></tr>
+      <tr><td><strong>IoU 代价</strong></td><td>$-\log u$，$u\to 0$ 时发散</td><td>天然排除框离得远的格点；权重 3 与 YOLOX 一致</td><td>分配变成纯分类驱动，回归监督质量下降</td></tr>
+      <tr><td><strong>软中心先验</strong></td><td>$10^{d/s-3}$，连续单调增</td><td>把 SimOTA 的 0/100000 悬崖换成斜坡</td><td>候选不足时 dynamic-k 顶穿硬先验、选到框外格点（模块 02 实测）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>$|y-p|^2$ 这个调制因子值得单独强调，因为它有一个可以直接 assert 的性质：<strong>当预测 $p$ 恰好等于软标签 $y$ 时，分类代价严格为 0</strong>。含义是——<em>「你已经报了一个与你的定位质量完全相称的分数，我不再需要动你」</em>。这让代价矩阵天然把「已经对齐好的格点」排在最前面，<strong>分配结果因此比 SimOTA 稳定得多</strong>（相邻 epoch 之间正样本集合的翻转更少）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>软中心先验的三个刻度值得背下来：$d=0$ 时代价 $10^{-3}$（几乎不惩罚）；$d=3s$ 时代价 $1$（与一个中等 IoU 代价相当，$-\log 0.37 \approx 1$）；$d=5s$ 时代价 $100$（实质排除）。<strong>把 <code>soft_center_radius</code> 从 3.0 调到 2.5，等价于把整条衰减曲线左移半个 stride——远处格点的代价整体乘以 $10^{0.5}\approx 3.2$</strong>。<em>在 TSR 这类「小 + 密」的场景里，调小它能有效减少两个紧邻标志的候选池重叠</em>；代价是极小目标可用的候选进一步减少。</p></div>
+  </div>  <p>剩下的两步与 SimOTA 相同：<strong>dynamic-k</strong>（RTMDet 用 top-13 的 IoU 求和取整，SimOTA 用 top-10）与<strong>去冲突</strong>（代价最小者胜）。<em>所以 DSLA 可以准确地概括成一句话：「把 SimOTA 的硬标签换成 IoU 软标签，把 0/100000 硬先验换成 $10^{d/s-3}$ 软先验，其余不变。」</em></p>  <div class="callout danger"><span class="label"></span>
+    <p>换成软标签后<strong>必须</strong>同步换分类损失：普通 <code>FocalLoss</code> 只接受 0/1 标签，喂给它一个连续目标值会静默出错（不报错、AP 掉几个点）。正确搭配是 <span class="term">Quality Focal Loss</span>：$\mathrm{QFL}(p,y) = |y-p|^{\beta}\cdot\mathrm{BCE}(p,y)$，它把 focal 的调制项从「离散的难易」推广到「连续的偏离量」。<em>notebook 的练习 4 会让你实现它并验证 $\mathrm{QFL}(y,y)=0$ 这个性质。</em> <strong>「软标签必须配 QFL」是一个非常具体、面试官一听就知道你真调过的细节。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="scaling"><span class="num">7</span>模型缩放与任务扩展：tiny→x 的预算怎么分</h2>
+  <p>RTMDet 用两个标量控制全部五档：<strong>deepen_factor</strong>（每个 stage 的 block 数乘子）与 <strong>widen_factor</strong>（通道数乘子）。这是 EfficientNet 复合缩放的简化版——<em>去掉了分辨率维度（检测端分辨率通常由部署约束定死），只保留深度与宽度</em>。</p>  <table>
+    <thead><tr><th>档位</th><th>deepen</th><th>widen</th><th>参数量</th><th>FLOPs@640</th><th>COCO AP</th><th>典型定位</th></tr></thead>
+    <tbody>
+      <tr><td><strong>tiny</strong></td><td>0.167</td><td>0.375</td><td>4.8 M</td><td>8.1 G</td><td>41.1</td><td>边缘芯片 / 备份链路</td></tr>
+      <tr><td><strong>s</strong></td><td>0.33</td><td>0.5</td><td>8.89 M</td><td>14.8 G</td><td>44.6</td><td>中低算力车端</td></tr>
+      <tr><td><strong>m</strong></td><td>0.67</td><td>0.75</td><td>24.7 M</td><td>39.3 G</td><td>49.4</td><td><strong>主流量产档位</strong></td></tr>
+      <tr><td><strong>l</strong></td><td>1.0</td><td>1.0</td><td>52.3 M</td><td>80.2 G</td><td>51.5</td><td>高算力车端 / 车队回传预筛</td></tr>
+      <tr><td><strong>x</strong></td><td>1.33</td><td>1.25</td><td>94.9 M</td><td>141.7 G</td><td>52.8</td><td><strong>云端教师模型 / 自动标注</strong></td></tr>
+    </tbody>
+  </table>  <div class="math-block">\[\text{params} \;\propto\; w^2 \cdot f(d), \qquad \text{FLOPs} \;\propto\; w^2 \cdot f(d) \cdot r^2\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>三条缩放规律必须分清楚：<strong>参数量对宽度是<em>平方</em>关系</strong>（每个 conv 的输入输出通道都乘以 $w$）；<strong>对深度是<em>近似线性</em></strong>（多堆几个 block）；<strong>而分辨率完全不影响参数量，只按平方影响 FLOPs</strong>。notebook 的计算器会把这三条各自 assert 一遍：宽度翻倍 → 参数 ×3.98，分辨率翻倍 → FLOPs ×4.00。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么 RTMDet 的宽深比这么保守（x 档只有 widen=1.25）？<strong>因为宽度带来的是并行度，深度带来的是串行延迟</strong>。在 GPU/NPU 上，加宽通常能被并行度吃掉、延迟增长远小于 FLOPs 增长；<em>而加深每一层都要等前一层算完，延迟是硬加上去的</em>。所以<strong>面向延迟优化的模型族倾向于「宽而浅」，面向 FLOPs 优化的倾向于「窄而深」</strong>——这也解释了为什么直接照搬 ImageNet 上的缩放系数到检测器上往往效果不好。<em>面试里能说出「宽度换并行、深度换串行延迟」这一句，就把缩放这题答透了。</em></p></div>
+  </div>  <h3>同一套结构还能长出别的任务</h3>  <ul>
+    <li><strong>RTMDet-Ins（实例分割）</strong>：在检测头旁加一个 mask 分支，用 <em>kernel + mask feature 的动态卷积</em>（CondInst / SOLOv2 路线）——检测头预测一组卷积核参数，与一张共享的 mask feature 做卷积得到实例掩码。<em>好处是掩码分辨率不受 ROI 尺寸限制，对小目标友好</em>。</li>
+    <li><strong>RTMDet-R（旋转框）</strong>：把回归目标从 4 维改成 5 维（加角度），并处理角度的周期性与边界不连续问题。<strong>这一条对 TSR 有直接价值</strong>——<em>侧向安装、倾斜的标志牌，以及路侧广告牌与标志的区分，用旋转框能显著减少背景像素占比</em>。</li>
+    <li><strong>RTMPose / RTMO</strong>：同一套 CSPNeXt backbone 被复用到姿态估计。<em>这反过来验证了「同构」的价值：一个 backbone 训一次，多个任务复用。</em></li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>选档位的实用法则：<strong>先定延迟预算，再在帕累托前沿上取点，而不是先选模型再测延迟</strong>。TSR 在车端通常只分到整个感知预算的一小块（33 ms 里可能只有 3–5 ms），<em>这基本上把选择框定在 tiny/s 两档，或者 m 档 + INT8</em>。而 x 档的正确用法不是上车，是<strong>当云端教师</strong>——跑在回传数据上做自动标注与难例挖掘（C58 的核心工具）。<em>「同一个模型族里，大档位模型的价值在离线而不在线上」是一个很成熟的工程观点。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">8</span>与 YOLO 系的工程取舍：给 TSR 选哪个</h2>
+  <p>把 RTMDet 与同期的 YOLO 系放在一起，逐项对比工程属性——<strong>注意这里刻意不比 AP</strong>，因为在同延迟下它们的 AP 差距通常在 1 点以内，而工程属性的差距可以是数量级的。</p>  <table>
+    <thead><tr><th>维度</th><th>RTMDet</th><th>YOLOv8</th><th>YOLOv10</th><th>对 TSR 的含义</th></tr></thead>
+    <tbody>
+      <tr><td><strong>全尺度同构</strong></td><td><strong>✓ 五档同一套 block/head/分配器</strong></td><td>✓ 基本同构</td><td>✓</td><td>一次调参五档复用；车端+云端共用配方</td></tr>
+      <tr><td><strong>算子种类</strong></td><td><strong>只有 3×3 / 5×5 DW / 1×1</strong></td><td>C2f 结构分支较多</td><td>含 PSA 等注意力块</td><td>算子越少，<strong>TensorRT 覆盖越好、量化越稳</strong></td></tr>
+      <tr><td><strong>标签分配</strong></td><td>DSLA（软标签 + 软先验）</td><td>TaskAligned</td><td>一致双分配</td><td>DSLA 对<strong>密集小目标更稳</strong>；v10 无 NMS 延迟更可控</td></tr>
+      <tr><td><strong>需要 NMS</strong></td><td>✓ 需要</td><td>✓ 需要</td><td><strong>✗ 不需要</strong></td><td>NMS 让 p99 延迟随目标数波动 —— 车端最忌讳</td></tr>
+      <tr><td><strong>许可证</strong></td><td><strong>Apache 2.0</strong></td><td>AGPL-3.0</td><td>AGPL-3.0</td><td><strong>量产项目的硬约束，别忽略</strong></td></tr>
+      <tr><td><strong>生态</strong></td><td>MMDetection（配置化、可复现）</td><td>ultralytics（开箱即用）</td><td>同 v8</td><td>团队协作与实验管理 vs 快速原型</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>许可证那一行是真实会卡住量产的</strong>：ultralytics 的 YOLOv8/v10 是 AGPL-3.0，商用需要购买商业授权，否则整个调用它的系统都可能被要求开源。<em>很多团队在 POC 阶段用 YOLOv8 跑得很爽，到量产评审时才发现这个问题</em>。RTMDet 的 Apache 2.0 没有这个负担。<strong>面试里主动提许可证，会让人觉得你有产品化经验而不只是刷榜经验。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>如果只能给一个 TSR 场景的选型结论，我会这样论证：<strong>① 小目标多 → 需要密集且高质量的正样本 → DSLA 的软先验 + dynamic-k 优于固定 top-k；② 类别多且长尾 → 共享头对稀有类友好，且两级方案可平滑接入；③ 车端延迟预算紧且要 p99 稳定 → 算子种类少、易量化，但 NMS 的目标数依赖是个减分项；④ 量产合规 → Apache 2.0。</strong> <em>综合下来 RTMDet-s/m 是一个很稳的起点；如果 p99 延迟是硬指标，则应该同时评估 RT-DETR（模块 04）或 YOLOv10 这类无 NMS 方案</em>。<strong>注意这个论证的结构：先列场景约束，再逐条映射到技术属性，最后给结论——这就是系统设计题的标准答法。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见的比较错误：<strong>拿 RTMDet 论文里的 FPS 与 YOLOv8 官方的 FPS 直接比</strong>。两者的测量口径几乎肯定不同——是否含 NMS、是否含预处理、batch size、精度（fp16/int8）、显卡型号都可能不一样。<em>模块 05 会专门讲怎么读延迟-精度曲线；这里只记住一条：<strong>跨论文的 FPS 数字不可比，唯一可信的是你自己在目标硬件上、用同一套 harness 测出来的数</strong>。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>大核的上限在哪里</strong>：RepLKNet 用 31×31、SLaK 用 51×51（稀疏分解）在分类上有效，但<em>检测器上普遍停在 5×5–7×7</em>。是精度真的饱和，还是被硬件 kernel 的实现质量卡住？<strong>如果 depthwise 大核的算子实现被优化到接近访存上限，检测器的最优核尺寸会不会上移？</strong>这是一个「结论依赖硬件代际」的开放问题。</li>
+    <li><strong>ERF 的可控设计</strong>：目前 ERF 是结构的<em>副产品</em>——选好核尺寸和深度，ERF 就定了。<strong>能不能把 ERF 作为显式的设计目标</strong>（例如给定目标 $\sigma_{ERF}$ 反解结构，或加一个正则项直接塑形 ERF）？本模块 notebook 里的解析公式 $\sigma=\sqrt{\sum d_\ell^2(k_\ell^2-1)/12}$ 已经把「反解」这一步变得可行，<em>但训练后的真实 ERF 与解析值的偏差如何建模，仍然没有好答案</em>。</li>
+    <li><strong>分配的稳定性度量</strong>：DSLA 的 $|y-p|^2$ 调制被认为让分配更稳，但<em>「更稳」缺少标准指标</em>。定义一个「跨 epoch 正样本翻转率」并系统比较 SimOTA / TaskAligned / DSLA，是一个门槛低、价值高的实验（模块 02 的诊断报告是现成的起点）。</li>
+    <li><strong>共享头的尺度干扰</strong>：共享权重对长尾友好，但<em>尺度特化的类别会被互相干扰</em>。有没有介于「全共享」与「全独立」之间的方案（例如低秩的 per-level adapter，或按尺度分组共享）？这在 TSR 这类「类别多 + 尺度跨度大」的任务上收益可能很直接。</li>
+    <li><strong>缩放系数的自动搜索</strong>：RTMDet 的 deepen/widen 组合是人工给定的。<em>在给定硬件延迟约束下自动搜索宽深比</em>（延迟感知 NAS）在学术上做过很多，但工业上很少真用——因为搜索成本高、且结果换个硬件就失效。<strong>「延迟模型足够准 → 搜索可以离线做」是一条尚未被充分利用的路径</strong>（模块 05 会建这样的延迟模型）。</li>
+    <li><strong>无 NMS 与软标签的结合</strong>：YOLOv10 的一致双分配去掉了 NMS，而 DSLA 的软标签让分数携带定位质量。<em>两者原则上互补</em>（无 NMS 需要更可靠的排序，而软标签正是为排序设计的），但把 DSLA 直接接到一对一分支上会遇到监督过稀的问题。<strong>这是一个明确、具体、可做的方向。</strong></li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读（按阅读顺序）：<em>RTMDet: An Empirical Study of Designing Real-Time Object Detectors</em>（★ 主线；重点读消融表而不是结构图）；<em>Understanding the Effective Receptive Field in Deep Convolutional Neural Networks</em>（Luo et al., NeurIPS 2016，★ 本模块第 3 节的理论来源，高斯形状与 $\sqrt{N}$ 增长的原始推导）；<em>A ConvNet for the 2020s</em>（ConvNeXt，7×7 depthwise 与现代化配方的来源）；<em>Scaling Up Your Kernels to 31×31: Revisiting Large Kernel Design in CNNs</em>（RepLKNet，大核的上限探索与「大核需要重参数化辅助」的观察）；<em>CSPNet: A New Backbone that can Enhance Learning Capability of CNN</em>（CSP 结构）；<em>Generalized Focal Loss</em>（★ Quality Focal Loss 与软标签的理论支撑）；<em>Conditional Convolutions for Instance Segmentation</em>（CondInst，RTMDet-Ins 的 mask 分支路线）。相邻课程：C53 模块 02（标签分配）、模块 04（RT-DETR）、模块 05（延迟-精度权衡）；C57（小目标）、C60（量化与部署）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_label_assignment/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 标签分配：检测器真正的胜负手</div></a>
+    <a class="next" href="../04_rtdetr/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · RT-DETR 解剖：DETR 如何跑赢 YOLO</div></a>
+  </div>
+
+</div>
+</body>
+</html>

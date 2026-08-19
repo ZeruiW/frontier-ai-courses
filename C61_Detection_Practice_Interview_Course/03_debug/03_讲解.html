@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 训练与部署调试手册</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 训练与部署调试手册</h1>
+  <p class="subtitle"><strong>mAP 恒为 0 的三大原因</strong>：类别 ID 差 1、坐标格式弄反（xyxy ↔ cxcywh、归一化 ↔ 像素）、评测集与训练集类别表不一致——三者占了绝大多数，而且都<em>不会报错</em> · 「先把一个 batch 过拟合」是万能诊断法：过不去 = 代码或标签有 bug，过得去 = 数据量/超参问题，半小时就能砍掉半个搜索空间 · loss 变 NaN 的四条支路（学习率 / 数值溢出 / 坏标注 / 除零）· 三类数据管线 bug 各有可识别的<strong>指纹</strong>：类别偏移 → 逐类 AP 整体位移；通道顺序弄反 → 分数普降但框位置基本还对；坐标格式弄反 → 框在图上镜像或聚成一团 · 分布式训练的隐性不一致（BN 未同步、各 worker 种子相同导致增强完全一样、数据分片重叠）· 梯度与激活的健康检查器（NaN / 爆炸 / 死亡神经元 / 各层梯度范数量级）</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">本课模块 01（实验设计）、模块 02（误差分析）；C18 模块 03（检测评测）。C60 是本模块在部署侧的延伸</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class='badge cpu'>CPU</span> 03_debug_playbook.ipynb（纯 numpy：可训练的迷你检测头 + 单 batch 过拟合诊断 + 三类管线 bug 的指纹检测）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Karpathy《A Recipe for Training Neural Networks》· PyTorch autograd anomaly detection · MMDetection / Detectron2 的 FAQ 与 issue 库</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 80 分钟 + 跑 75 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#first-principles">调试的第一性原理：把「不 work」变成可证伪的假设</a></li>
+      <li><a href="#nan">症状一：loss 变成 NaN</a></li>
+      <li><a href="#flat-loss">症状二：loss 不降（或降一点就躺平）</a></li>
+      <li><a href="#map-zero">症状三：mAP 恒为 0（三大元凶占绝大多数）</a></li>
+      <li><a href="#fingerprints">数据管线 bug 的特征指纹</a></li>
+      <li><a href="#train-val-gap">症状四：训练正常但验证极差；过拟合与欠拟合的区分</a></li>
+      <li><a href="#overfit-one-batch">万能诊断法：先把一个 batch 过拟合</a></li>
+      <li><a href="#distributed-repro">分布式不一致与复现失败的排查顺序</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="first-principles"><span class="num">1</span>调试的第一性原理：把「不 work」变成可证伪的假设</h2>
+  <p>模块 02 的决策树在第一步就把你送到这里：<strong>mAP ≈ 0，或者 PR 曲线的左端就崩了。</strong>这一节先讲方法，后面八节是具体的病历。</p>  <h3>三条铁律</h3>  <ol>
+    <li><strong>先证伪最便宜的假设。</strong>「查一次类别映射」10 分钟，「训一次模型」10 小时。任何时候都应该先做那个 10 分钟的检查——即使你「觉得」不太可能是它。<em>「觉得不可能」正是这类 bug 能存活三个月的原因。</em></li>
+    <li><strong>每个假设都要能被一个具体的观察证伪。</strong>「我觉得是学习率问题」不是假设，「如果是学习率过大，那么第 1 个 iteration 的梯度范数应该 &gt; 100，且权重更新后 loss 会上升」才是假设。<em>写不出「如果……那么应该观察到……」的句子，说明你还没想清楚。</em></li>
+    <li><strong>二分定位，而不是逐个尝试。</strong>训练链路是 数据 → 增强 → 编码 → 前向 → 损失 → 反传 → 更新 → 评测 八段。八段里定位一段，二分只要 3 次；逐个试平均要 4 次，最坏 8 次。<em>更重要的是二分给了你「已排除」的确定性，而逐个试只给你「试过了没用」的焦虑。</em></li>
+  </ol>  <div class="ascii">训练链路的八段与「二分定位」的切点
+
+  ①原始数据 → ②增强 → ③标签编码 → ④前向 → ⑤损失 → ⑥反传 → ⑦优化器 → ⑧评测
+       │         │         │         │        │        │        │        │
+       │         │         │         │        │        │        │        └─ 反解：把预测
+       │         │         │         │        │        │        │           喂成 GT，mAP
+       │         │         │         │        │        │        │           必须 = 1.0
+       │         │         │         │        │        │        └─ 冻结全部权重，
+       │         │         │         │        │        │           loss 必须完全不变
+       │         │         │         │        │        └─ 数值梯度对拍解析梯度
+       │         │         │         │        └─ 把 GT 当成完美预测喂进 loss，
+       │         │         │         │           loss 必须 ≈ 0
+       │         │         │         └─ **单 batch 过拟合**：loss 必须 → 0
+       │         │         └─ 把编码后的目标**解码回框**，与原 GT 逐元素对拍
+       │         └─ 关掉全部增强，看指标是否恢复
+       └─ 直接可视化 dataloader 吐出来的张量 + 框，画在图上肉眼看
+
+  **每一段都有一个「必须成立的等式」**——这就是可证伪性的具体形态。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么「反解检查」这么有效？因为它把一个开放问题（模型为什么不好）变成了一个封闭问题（这个变换是不是可逆的）。<strong>标签编码 → 解码 → 与原 GT 对拍</strong>，如果对不上，bug 就一定在编码里，不可能在别处；如果对得上，编码这一段就被<em>彻底排除</em>了，你再也不用回头怀疑它。<em>调试的进展不是「试了很多东西」，而是「排除了很多可能」。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严格地说，这是把系统的每一段都包上一个<span class='term'>不变量</span>（invariant）：编码段的不变量是 $\text{decode}(\text{encode}(b)) \approx b$；损失段的不变量是 $\mathcal{L}(\text{GT}, \text{GT}) \approx 0$；反传段的不变量是解析梯度与数值梯度在 $10^{-5}$ 量级一致；评测段的不变量是「把 GT 当预测送进去 mAP = 1.0」。<strong>这些不变量应当写成单元测试常驻仓库，而不是每次出事再手写一遍。</strong>在 TSR 这种「数据格式多、供应商多、坐标系多」的项目里，这套断言的价值会随着团队规模超线性增长——<em>因为大多数管线 bug 是在别人改了上游之后引入的，而单元测试是唯一会替你盯着上游的东西。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把本节压成一句话：<strong>不要问「是什么坏了」，要问「哪一段可以被彻底排除」。</strong><em>每一次成功的调试，都是把搜索空间对半砍掉若干次的结果。</em></p>
+  </div>  <div class="callout danger"><span class="label">列清单 vs 给流程</span>
+    <p><strong>面试里这一节是「资深度探针」。</strong>被问「模型不收敛你怎么查」时，列举一堆可能原因（学习率、初始化、数据……）只能拿及格分——<em>因为那是背下来的清单，不是流程</em>。拿高分的回答是给出<strong>顺序与判据</strong>：「我会先跑单 batch 过拟合，因为它一步就能把『数据+模型+损失+优化器』整体判定为可用或不可用；如果过拟合不了，说明是前四段；如果能过拟合但真实训练不降，说明是数据规模/增强/学习率调度的问题。」<strong>面试官要听的是你能把搜索空间切开，而不是你知道很多可能性。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="nan"><span class="num">2</span>症状一：loss 变成 NaN</h2>
+  <p>NaN 的特点是<strong>会传染</strong>：一旦某个张量里出现一个 NaN，它会在下一次前向-反传中污染所有与之相连的权重，两三个 iteration 之内整个网络就全是 NaN 了。<em>所以「什么时候出现的」比「现在哪里有」重要得多——你必须抓第一现场。</em></p>  <h3>四条通路</h3>  <table>
+    <thead><tr><th>通路</th><th>机制</th><th>典型触发条件</th><th>10 分钟内的判据</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 数值溢出</strong></td><td>学习率过大 → 权重爆炸 → 激活爆炸 → <code>exp</code>/<code>softmax</code>/<code>log</code> 溢出</td><td>lr 比正常大 10–100×；warmup 没生效；混合精度下 fp16 的最大值只有 65504</td><td>看 <strong>grad norm 曲线</strong>：NaN 之前一定有一段指数上升。若 grad norm 正常则不是这条</td></tr>
+      <tr><td><strong>② $\log 0$ / 除零</strong></td><td>$-\log p$ 在 $p$ 被 saturate 成 0 或 1 时；IoU 的分母为 0；标准差为 0 的归一化</td><td>自己手写的 BCE/focal 没加 $\epsilon$；<strong>标注里存在 $x_1 = x_2$ 的退化框</strong></td><td>NaN 在<strong>第一个 iteration 就出现</strong>，且与 lr 无关 → 几乎必然是这条</td></tr>
+      <tr><td><strong>③ 坏标注</strong></td><td>$\log(w/w_a)$ 在 $w \le 0$ 时；坐标为 <code>inf</code>/<code>nan</code>；类别 id 越界导致索引到未初始化内存</td><td>标注 json 里有负宽高、超界坐标、空框；数据增强裁剪后产生零面积框</td><td><strong>固定 seed 后 NaN 出现在同一个 iteration</strong> → 一定是某个特定样本</td></tr>
+      <tr><td><strong>④ 反传中的除零</strong></td><td>$\sqrt{x}$ 在 $x=0$ 处梯度为 $\infty$；$\lVert v\rVert$ 归一化时 $v = 0$；GIoU 的闭包面积为 0</td><td>前向不报错、反传才 NaN；常见于自写的 IoU-family 损失</td><td>前向的所有中间张量都正常，<strong>只有 <code>.grad</code> 里有 NaN</strong></td></tr>
+    </tbody>
+  </table>  <h3>为什么手写 BCE 一定要用 log-sum-exp 稳定版</h3>  <p>这是最常见的 ② 号病例，值得写清楚。朴素实现是：</p>  <div class="math-block">\[\mathcal{L} \;=\; -y\log\sigma(z) \;-\; (1-y)\log\bigl(1-\sigma(z)\bigr), \qquad \sigma(z) = \frac{1}{1+e^{-z}}\]</div>  <p>当 $e^{-z}$ 相对 1 小于机器精度时，$1+e^{-z}$ 被舍入成 $1$，于是 $\sigma(z)$ 被<strong>精确地</strong>舍入成 <code>1.0</code>——<strong>float32 的临界点约 $z = 17$，float64 约 $z = 37$</strong>（notebook 会把这两个断点逐点打出来）。此时 $\log(1-\sigma(z)) = \log 0 = -\infty$；如果这个样本的标签恰好是 $y=0$，loss 就是 $+\infty$，反传立刻产出 NaN。<strong>注意这不是「数值不准」，是「结果完全错误」——而且它只在某些样本上触发，所以看平均 loss 是发现不了的。</strong>稳定形式是：</p>  <div class="math-block">\[\mathcal{L} \;=\; \max(z,0) \;-\; z\,y \;+\; \log\bigl(1 + e^{-|z|}\bigr)\]</div>  <p>这个式子对任意 $z$ 都不会溢出（$e^{-|z|} \le 1$），且与朴素式在数学上完全等价。<em>notebook 里会把两者在 $z$ 从 10 到 100 的范围内逐点对比，看着朴素版在 $z = 37$ 附近断掉。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>定位 NaN 的标准姿势是<strong>「前向逐层挂哨兵」</strong>：在每一层输出后记录 <code>(有无 NaN, min, max)</code>，找到<em>第一个</em>出现 NaN 的位置。PyTorch 里可以用 <code>torch.autograd.set_detect_anomaly(True)</code>（会慢很多，只在复现时开）或者给每个模块挂 forward hook。<strong>关键是不要在 NaN 已经扩散之后才去看——那时候到处都是 NaN，信息量为零。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>工程上更彻底的做法是把哨兵做成<strong>常驻的、低成本的</strong>：每 $N$ 个 iteration 记录一次全局 grad norm、各层激活的 <code>max(|x|)</code>、以及 loss 的各个分项（cls / box / obj 分开记）。<em>这样 NaN 出现时你不需要复现——历史曲线里已经写着答案。</em>特别地，<strong>把 loss 的各分项分开记录能一眼区分通路 ①③</strong>：只有 box 分项炸而 cls 正常，几乎必然是坏标注（$\log(w/w_a)$ 那条）；所有分项同时炸，才是学习率导致的整体发散。<em>这个「分项记录」的成本接近 0，但省下的排查时间以小时计。</em></p></div>
+  </div>  <div class="callout warn"><span class="label">坏标注不是小概率事件</span>
+    <p><strong>TSR 项目里 ③ 号通路格外高发</strong>，因为交通标志的标注常常来自多个供应商、多个年份、多种工具。真实见过的坏数据：宽或高为 0 的框（标注员点了一下就保存）、坐标是归一化值但字段名写着 <code>pixel</code>、被遮挡标志的框被标成负坐标、以及<strong>一张图里同一块牌子被标了两次且其中一次类别不同</strong>。<em>防御手段只有一个：在 Dataset 的 <code>__getitem__</code> 里加断言</em>——<code>assert (w &gt; 1) and (h &gt; 1) and 0 &lt;= x1 &lt; x2 &lt;= W</code>，并且<strong>在断言里打印文件名</strong>，否则你只知道「有坏数据」，不知道是哪张。</p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>NaN 的第一个问题永远是「它是第几个 iteration 出现的」。</strong><em>第 0–1 个 iteration 出现 ⇒ 数据或损失的实现问题；训练几百步后才出现 ⇒ 学习率/发散；固定 seed 后总在同一步出现 ⇒ 某个特定样本。</em>这一个问题就能砍掉三分之二的可能性。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="flat-loss"><span class="num">3</span>症状二：loss 不降（或降一点就躺平）</h2>
+  <p>比 NaN 更折磨人，因为它不报错。<strong>四个嫌疑人，按「查起来由便宜到贵」排序。</strong></p>  <table>
+    <thead><tr><th>嫌疑人</th><th>特征</th><th>验证方法（都在 10 分钟内）</th><th>修法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>学习率</strong></td><td>太小：loss 缓慢线性下降，怎么都到不了低位。<br>太大：loss 剧烈震荡或先降后升</td><td><strong>lr range test</strong>：从 $10^{-7}$ 指数增长到 $10$，画 loss-lr 曲线，取「下降最陡」处的 1/10</td><td>改 lr；检查 warmup 是否真的生效（打印前 100 步的实际 lr）</td></tr>
+      <tr><td><strong>标签映射错</strong></td><td>loss 会降一点点然后卡在「预测先验分布」的水平，<strong>mAP ≈ 0</strong></td><td>把一个 batch 的编码后目标<strong>解码回框与类别名</strong>，画到图上肉眼看</td><td>见第 4 节</td></tr>
+      <tr><td><strong>数据没打乱</strong></td><td>loss 曲线呈<strong>周期性锯齿</strong>（周期 = 一个 epoch 或一个数据分片）</td><td>打印前 200 个样本的类别序列；<code>shuffle=True</code> 是否被 <code>sampler</code> 覆盖了</td><td>开 shuffle；分布式下确认 <code>DistributedSampler.set_epoch(epoch)</code> 被调用</td></tr>
+      <tr><td><strong>冻错了层</strong></td><td>loss 完全水平，或只在小范围抖动；<strong>参数量统计里可训练参数远小于预期</strong></td><td><code>sum(p.numel() for p in model.parameters() if p.requires_grad)</code> 打出来对一遍；<br>再看 optimizer 的 <code>param_groups</code> 里到底有几个张量</td><td>解冻；注意 <code>requires_grad=False</code> 与「不在 optimizer 里」是两回事</td></tr>
+    </tbody>
+  </table>  <h3>「数据没打乱」为什么会让 loss 躺平</h3>  <p>如果一个 batch 里全是同一类（比如连续 64 帧同一段路的限速 60），那么<strong>这个 batch 的最优解就是「无论看到什么都输出限速 60」</strong>。下一个 batch 全是指路牌，最优解又变成「都输出指路牌」。于是模型在两个互相矛盾的解之间来回跳，<em>梯度互相抵消，平均下来什么也没学到</em>。<strong>TSR 的数据天然是按行车序列采集的，相邻帧极度相关——这使得「忘记打乱」在 TSR 项目里的后果比在 ImageNet 上严重得多。</strong></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>「冻错了层」有一个非常隐蔽的变体：<strong>你设了 <code>requires_grad=False</code>，但 optimizer 是在设之前构造的</strong>。此时参数确实不产生梯度，但如果 optimizer 带 weight decay，它<em>仍然会每步把这些权重乘以 $(1-\lambda\eta)$ 往零缩</em>——结果是「冻结」的 backbone 被慢慢地衰减成零。<em>症状是训练前几百步正常，然后指标开始不可逆地下滑。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>反过来的坑同样常见：<strong>BatchNorm 的统计量不受 <code>requires_grad</code> 控制</strong>。把 backbone 「冻住」但忘了 <code>model.eval()</code> 或忘了把 BN 换成 <code>FrozenBatchNorm</code>，BN 的 <code>running_mean/var</code> 会继续被新数据更新，于是「冻结的 backbone」的输出分布在训练中一直在变。<em>这在 TSR 的微调场景里很致命</em>：你在 COCO 预训练权重上微调，本意是保住通用特征，结果 BN 统计被几千张全是路面和天空的图带偏，<strong>通用特征反而被破坏得比不冻还厉害</strong>。<strong>检查方法很简单：训练前后把 backbone 某个 BN 层的 <code>running_mean</code> 打出来对比，变了就说明没真冻住。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>lr range test 有一个容易忽略的前提：<strong>它必须在「已经确认数据管线正确」之后做</strong>。如果标签是错的，任何学习率下 loss 都降不下去，你会得出「所有 lr 都不行」的结论，然后浪费一天在调 lr 上。<em>这就是为什么第 7 节的「单 batch 过拟合」应该排在 lr range test 之前——它能一次性判定「数据+模型+损失」这一整块是否可用。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="map-zero"><span class="num">4</span>症状三：mAP 恒为 0（三大元凶占绝大多数）</h2>
+  <p>这是检测任务独有的、最经典的症状：<strong>loss 在正常下降、可视化的框看起来也在目标附近，但评测出来 mAP 就是 0.00x。</strong>工业界的经验分布是：<strong>类别 ID 偏移、坐标格式弄反、评测集与训练集类别表不一致——这三个加起来占了绝大多数。</strong><em>它们的共同点是：都不会报错，都不会让 loss 异常，只在最终指标上表现为「一切归零」。</em></p>  <div class="ascii">mAP ≈ 0 的三分钟分诊
+
+  ┌────────────────────────────────────────────────────────────────┐
+  │ 检查 A：把预测类别整体 +1 / -1，重算 mAP                        │
+  │   mAP 突然正常  ==&gt;  【类别 ID 偏移】                            │
+  │   常见根因：COCO 的 category_id 从 1 开始，模型输出从 0 开始；   │
+  │             有的框架把 background 放在 index 0，有的不放        │
+  └────────────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────────┐
+  │ 检查 B：把预测框按 cxcywh-&gt;xyxy（或 xywh-&gt;xyxy、yxyx-&gt;xyxy）    │
+  │         转换后重算「与最近 GT 的 IoU」分布                      │
+  │   平均 IoU 从 0.0x 跳到 0.8+  ==&gt;  【坐标格式弄反】              │
+  │   指纹：转换前的框**面积中位数与 GT 差一个数量级**，            │
+  │         且框中心系统性偏向左上（xywh 被当成 xyxy 时）           │
+  └────────────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────────┐
+  │ 检查 C：diff 训练与评测两侧的类别表（顺序！不只是集合）          │
+  │   两边 sorted() 的结果不同  ==&gt;  【类别表不一致】                │
+  │   指纹：**混淆矩阵是一个置换矩阵**——每一行的质量都集中在        │
+  │         某一个非对角格子上，且这个映射是一一对应的              │
+  └────────────────────────────────────────────────────────────────┘
+
+  三条都过了才允许怀疑模型。**顺序不要换：A/B/C 各 3 分钟，训一次模型 10 小时。**</div>  <h3>为什么类别表不一致这么隐蔽</h3>  <p>因为它经常是<strong>由「正确的代码」产生的</strong>。典型场景：训练侧用 <code>sorted(os.listdir(ann_dir))</code> 得到类别顺序，评测侧用 <code>json.load()</code> 里 <code>categories</code> 数组的原始顺序。两边都没错，但顺序不同。<em>更隐蔽的是：某个类在训练集里出现过、在评测集里一个样本都没有，于是评测侧的类别表少了一项，后面所有 index 全部左移一位。</em></p>  <table>
+    <thead><tr><th>元凶</th><th>为什么发生</th><th>它<strong>不会</strong>表现为什么</th><th>根治手段</th></tr></thead>
+    <tbody>
+      <tr><td><strong>类别 ID 偏移</strong></td><td>COCO 的 <code>category_id</code> 从 1 开始；Pascal VOC 把 background 当 0 类；<br>不同框架对「有没有 background 类」约定不同</td><td>不会让 loss 异常（模型照样能学，只是学到了偏移一位的映射）</td><td>把 <strong>id ↔ name 的映射表</strong>随权重一起序列化，评测时从权重里读，不从配置文件读</td></tr>
+      <tr><td><strong>坐标格式</strong></td><td><code>xyxy</code> / <code>xywh</code>（左上+宽高） / <code>cxcywh</code>（中心+宽高） / 归一化 vs 像素 / <code>yxyx</code>（TF 系）</td><td>不会报错——四个数就是四个数，任何格式都能塞进去</td><td>在数据结构里<strong>带上格式标签</strong>（<code>Boxes(fmt='xyxy')</code>），转换必须显式调用</td></tr>
+      <tr><td><strong>类别表不一致</strong></td><td>两侧从不同来源、用不同顺序构造类别列表；某类在某个 split 里样本数为 0</td><td>不会让训练侧有任何异常，训练指标一路正常</td><td><strong>类别表只允许有一个来源</strong>（单一 <code>classes.json</code>），并把它的 md5 写进模型卡</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么「类别 ID 偏移」会让 mAP 精确地掉到 0 而不是掉一半？因为 AP 是<strong>逐类算的</strong>。偏移一位之后，类 $c$ 的预测全部落进类 $c{+}1$ 的评测里；而类 $c{+}1$ 的 GT 与类 $c$ 的目标在图像上完全不重叠，所以 IoU 全是 0，<em>每一类的 AP 都是 0，平均下来还是 0</em>。<strong>这也解释了一个反直觉的现象：偏移 1 位和偏移 5 位的后果完全一样，都是 0。</strong>所以「mAP 是 0 而不是 0.3」本身就是强烈的信号——<em>模型能力问题不会让指标精确归零，只有映射问题会。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>坐标格式的情况稍有不同，值得单独想清楚。把 <code>cxcywh</code> 直接当 <code>xyxy</code> 用会得到 $(c_x, c_y, w, h)$ 这样一个「框」：当 $w &lt; c_x$ 或 $h &lt; c_y$ 时它的宽高为负，面积按 <code>clip(x2-x1,0)</code> 算出来是 0，<strong>于是 IoU 恒为 0，mAP 精确为 0</strong>；而当目标靠近图像左上角时 $w &gt; c_x$，会得到一个「从中心点延伸到 $(w,h)$」的怪框，IoU 是个很小的正数。<em>所以「坐标格式弄反」的指纹不只是 IoU 低，更关键的是<strong>「IoU 恰好等于 0 的比例接近 100%」</strong></em>——<strong>而模型定位不准时这个比例几乎是 0</strong>（框再歪也总有些许重叠，IoU 是连续分布）。<strong>notebook 里会把「正常 / cxcywh 当 xyxy / xywh 当 xyxy / yxyx 当 xyxy」四种情况的指纹并排打出来，一眼就能分辨。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">背清单 vs 给判据</span>
+    <p><strong>这是 TSR / 检测岗位的高频面试题：「mAP 一直是 0，你怎么查？」</strong></p><p><em>不合格的回答</em>：「我会检查数据、检查代码、打印一下看看。」</p><p><em>拿分的回答</em>：「我会按三个 3 分钟的检查走。<strong>第一，把预测类别整体 ±1 重算 mAP</strong>——如果突然正常就是类别 ID 偏移，COCO 的 category_id 从 1 开始是最常见的来源。<strong>第二，把预测框按 cxcywh→xyxy 转换后重算 IoU 分布</strong>——如果平均 IoU 从 0.03 跳到 0.85 就是坐标格式。而且格式错的指纹很特别：IoU 分布是『大量精确的 0 + 少量小正值』的双峰，不是模型定位不准的单峰。<strong>第三，diff 训练与评测两侧类别表的<u>顺序</u></strong>——如果混淆矩阵是个置换矩阵，就是这个。这三条覆盖绝大多数情况，都不用重训；三条都过了我才会去怀疑模型。」</p><p><strong>加分句</strong>：「而且 mAP 恰好是 0 而不是 0.3 本身就是线索——模型能力问题不会让指标精确归零。」</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fingerprints"><span class="num">5</span>数据管线 bug 的特征指纹</h2>
+  <p>上一节的三大元凶都是「让 mAP 归零」的重症。还有一类更麻烦：<strong>指标掉了但没归零</strong>——模型照样能跑，指标从 0.72 掉到 0.58，你会以为是「这次训练没调好」，于是开始调超参，然后在一个有 bug 的管线上做三个月的架构消融。</p>  <p><strong>对抗这类 bug 的唯一有效手段是「指纹」：每种 bug 都有一组它<em>独有的</em>可观测特征。</strong>认识指纹，你就能从症状直接反推病因，而不是逐个试。</p>  <table>
+    <thead><tr><th>bug</th><th>指标表现</th><th><strong>独有指纹</strong></th><th>一行验证</th></tr></thead>
+    <tbody>
+      <tr><td><strong>类别 ID 偏移</strong></td><td>mAP ≈ 0</td><td>混淆矩阵的质量集中在<strong>偏离对角线 $k$ 格的次对角线</strong>上；<br>把预测类别 $-k$ 后指标完全恢复</td><td><code>argmax_k Σ_i cm[i, i+k]</code>，若 $k \ne 0$ 则中招</td></tr>
+      <tr><td><strong>坐标格式弄反</strong></td><td>mAP ≈ 0</td><td><strong>IoU 恰好为 0 的比例 ≈ 100%</strong>（定位不准时该比例 ≈ 0）；<br>预测框的有效面积中位数塌成 0（宽或高为负被 clip）</td><td>对候选格式各试一遍，取 <code>mean IoU</code> 最大的</td></tr>
+      <tr><td><strong>x/y 互换（yxyx）</strong></td><td>mAP ≈ 0（非方形图更明显）</td><td><strong><code>corr(pred_cx, gt_cy)</code> 很高而 <code>corr(pred_cx, gt_cx)</code> 很低</strong>——散点图是转置的</td><td>算两个相关系数比大小</td></tr>
+      <tr><td><strong>通道顺序 BGR/RGB</strong></td><td>mAP 掉 5–15 点，<strong>但不归零</strong></td><td><strong>颜色语义类别掉点远大于中性色类别</strong>：红色禁令牌与蓝色指示牌互相错分，白底黑字的指路牌几乎不掉；<br>输入张量的 R/B 通道均值与训练集统计互换</td><td>把输入 <code>[..., ::-1]</code> 后重测，指标恢复即确诊</td></tr>
+      <tr><td><strong>归一化 mean/std 不一致</strong></td><td>掉 3–20 点不等</td><td><strong>所有类别均匀掉点</strong>（没有颜色语义的偏向）；<br>第一层卷积输出的激活分布整体平移或缩放</td><td>dump 一个 batch，比对 <code>x.mean(axis=(0,1,2))</code> 与训练端</td></tr>
+      <tr><td><strong>resize 插值/对齐不一致</strong></td><td>掉 1–5 点，<strong>小目标掉得多</strong></td><td><strong>按像素尺寸分桶后，&lt;16 px 桶掉 10+ 点、&gt;64 px 桶几乎不掉</strong></td><td>同一张图两边 resize 后逐元素 diff，看 max abs error</td></tr>
+    </tbody>
+  </table>  <h3>为什么「通道顺序」的指纹是类别相关的</h3>  <p>这是本节最有价值的一条，也是 TSR 特有的洞察。<strong>交通标志的颜色是语义</strong>：红色 = 禁令、蓝色 = 指示、黄色 = 警告、绿色 = 高速指路。R 与 B 互换会把红色变成蓝色、蓝色变成红色——<em>一个禁令标志在模型眼里变成了指示标志</em>。而白底黑字的指路牌 R≈G≈B，交换前后几乎不变。</p>  <div class="ascii">BGR/RGB 弄反的类别指纹（notebook 会实测这张表）
+
+  类别组              颜色特征          交换 R/B 后          准确率变化
+  ─────────────────────────────────────────────────────────────────────
+  红色禁令（限速/禁止）  R 高 B 低    -&gt;   R 低 B 高  变蓝     ▼▼▼ 崩到接近 0
+  蓝色指示（直行/环岛）  B 高 R 低    -&gt;   B 低 R 高  变红     ▼▼▼ 崩到接近 0
+  黄色警告（注意行人）   R 高 G 高 B 低 -&gt; R 低 G 高 B 高 变青   ▼▼  大幅下降
+  白底黑字（指路牌）    R≈G≈B       -&gt;   R≈G≈B     几乎不变  ▬   基本不掉
+  ─────────────────────────────────────────────────────────────────────
+  **这个「掉点的类别选择性」就是指纹。**
+
+  对照：如果是 mean/std 归一化写错，所有类别会**均匀**掉点，
+        因为它不改变通道之间的相对关系，只是整体平移/缩放。
+
+  =&gt; 看到「颜色类崩、中性色类不掉」就直接去查通道顺序，不要调超参。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>指纹思维的价值在于它把调试从<strong>「顺序搜索」变成「哈希查表」</strong>。没有指纹时，你面对 6 种可能的 bug 要平均试 3.5 次，每次可能要重训或重跑评测；有指纹时，你看一眼「掉点的类别选择性」就能定位。<em>而且指纹是可以自动化的——把这几条检查写成一个脚本，每次评测完自动跑一遍，它会主动告诉你「疑似通道顺序问题」。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更深一层：<strong>好的指纹必须是「充分区分」的，而不只是「相关」的。</strong>「mAP 掉了」和通道顺序相关，但它和另外五种 bug 也相关，所以它不是指纹。「颜色语义类崩而中性色类不掉」只和通道顺序相关，所以它是指纹。<em>设计指纹的方法是问：这个 bug 的机制会在哪个维度上产生<strong>不对称</strong>的影响？</em>通道顺序 → 颜色维度不对称；resize 不一致 → 尺寸维度不对称；类别表错位 → 类别维度上呈置换结构；坐标格式 → IoU 分布形态不对称。<strong>「找不对称」是构造指纹的通用方法，也是本节最可迁移的东西。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label">组合 bug 会污染指纹</span>
+    <p><strong>一个真实的、极难查的组合 bug</strong>：训练用 PIL 读图（RGB）+ <code>cv2.resize</code>（默认 INTER_LINEAR），推理用 <code>cv2.imread</code>（BGR）+ PIL 的 <code>resize</code>（默认 BICUBIC）。<em>两个 bug 叠加时，指纹会互相干扰</em>——通道错导致颜色类崩、插值错导致小目标崩，你看到的是「颜色类的小目标崩得特别厉害」，很容易被误判成「小目标问题」而去加 P2 层。<strong>所以指纹检查必须是「逐项独立」的：一次只改一个变量重测</strong>，而不是看着最终指标猜。<em>这正好呼应模块 01 的单变量原则。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="train-val-gap"><span class="num">6</span>症状四：训练正常但验证极差；过拟合与欠拟合的区分</h2>
+  <p>「训练 loss 一路下降到 0.05，验证 mAP 只有 0.11」——这个症状有两个完全不同的病因，而<strong>把它们搞混是初级工程师最典型的失误</strong>：一个需要更多数据/更强正则，另一个需要修 bug。</p>  <table>
+    <thead><tr><th></th><th>真·过拟合</th><th><strong>验证管线不一致</strong>（伪过拟合）</th></tr></thead>
+    <tbody>
+      <tr><td>训练指标</td><td>很好</td><td>很好</td></tr>
+      <tr><td>验证指标</td><td>差，但<strong>不至于崩</strong>（比如 0.72 → 0.55）</td><td><strong>崩到接近随机</strong>（0.72 → 0.11）</td></tr>
+      <tr><td><strong>关键判据</strong></td><td>把<strong>训练集</strong>当验证集跑评测流程 → 指标仍然很好</td><td>把<strong>训练集</strong>当验证集跑评测流程 → <strong>指标同样崩</strong></td></tr>
+      <tr><td>曲线形态</td><td>验证 loss 先降后升，有明确拐点</td><td>验证 loss <strong>从第一个 epoch 就是坏的</strong>，没有拐点</td></tr>
+      <tr><td>随数据量</td><td>加数据会改善</td><td>加数据完全无效</td></tr>
+      <tr><td>常见根因</td><td>数据太少、模型太大、增强太弱、训太久</td><td>验证侧的 resize/归一化/通道/letterbox 与训练侧不同；<br>评测时忘了 <code>model.eval()</code>（BN 用了 batch 统计）；<br>验证集类别表不一致（见第 4 节）</td></tr>
+    </tbody>
+  </table>  <p><strong>那个关键判据值得单独强调</strong>：把训练集喂进<em>验证的那条代码路径</em>去评测。如果指标同样崩，那就与「泛化」毫无关系——数据模型都是同一批，唯一的变量就是那条代码路径。<em>这是一个能在 20 分钟内做完、并且结论是二值的实验，收益极高。</em></p>  <h3>过拟合与欠拟合的信号</h3>  <table>
+    <thead><tr><th>信号</th><th>欠拟合</th><th>过拟合</th></tr></thead>
+    <tbody>
+      <tr><td>训练 loss</td><td>高，且还在下降（没到平台）</td><td>很低，接近 0</td></tr>
+      <tr><td>训练-验证 gap</td><td>小</td><td><strong>大且持续扩大</strong></td></tr>
+      <tr><td>加强增强</td><td>指标<strong>变差</strong></td><td>指标变好</td></tr>
+      <tr><td>加大模型</td><td>指标变好</td><td>指标变差或不变</td></tr>
+      <tr><td>加数据</td><td>帮助有限</td><td><strong>帮助最大</strong></td></tr>
+      <tr><td><strong>单 batch 过拟合</strong></td><td><strong>做不到</strong>（说明容量/优化/实现有问题）</td><td>轻松做到</td></tr>
+      <tr><td>检测任务特有</td><td>框普遍偏大偏中心（回归退化到均值）；分类分数普遍偏低</td><td>训练集上框极准，验证集上小目标与罕见类崩得特别厉害</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>检测任务的欠拟合有一个很有辨识度的表现：<strong>回归分支退化到「输出训练集框的平均值」</strong>。表现为所有预测框尺寸差不多、位置都靠近图像中心。<em>因为在没学到有效特征时，最小化 L1/GIoU 损失的最优常数解就是训练集框分布的中位数。</em><strong>看到「所有框长得一样」，先别怀疑标签分配，先怀疑模型压根没在学。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>TSR 场景里还有一类介于两者之间的情况值得警惕：<span class='term'>虚假过拟合</span>——模型不是记住了训练样本，而是<strong>记住了训练集里的一个捷径特征</strong>。<em>例如某个采集批次的图像都有相同的相机 ISP 风格，模型学会了「这种色调下出现的圆形物体就是限速牌」；换到另一个批次（另一台车、另一个国家），这个捷径失效，指标崩塌。</em><strong>它的判据是：验证集按「采集批次」分桶后，同批次内的验证指标好、跨批次的差。</strong>这不是加数据能解决的（加同批次的数据没用），也不是正则化能解决的——<strong>唯一的解法是让训练数据在那个捷径维度上具有多样性</strong>（多车型、多时段、多地域），或者用增强主动破坏那个捷径（色彩抖动、ISP 模拟）。<em>这直接连到 C56 的增强设计与 C58 的数据闭环。</em></p></div>
+  </div>  <div class="callout danger"><span class="label">别把管线问题说成泛化问题</span>
+    <p><strong>最容易在面试里丢分的一句话：「验证集上差就是过拟合」。</strong>面试官会立刻追问「你怎么排除是验证管线的问题」。<em>准备好那个判据</em>：<strong>「我会先把训练集喂进验证的代码路径跑一遍——如果指标同样崩，那和泛化没关系，是管线；如果指标依然很好，才是真的泛化问题。这个实验 20 分钟能做完，结论是二值的。」</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="overfit-one-batch"><span class="num">7</span>万能诊断法：先把一个 batch 过拟合</h2>
+  <p>如果这门课你只能记住一个技巧，就记这个。<strong>拿 8–32 个样本，关掉所有增强、关掉正则、关掉 dropout、关掉学习率衰减，反复在这一个 batch 上训练几百到几千步。训练 loss 必须掉到接近 0，mAP 必须接近 1.0。</strong></p>  <h3>它为什么这么强</h3>  <p>因为它<strong>一次性判定了「数据 → 增强 → 编码 → 前向 → 损失 → 反传 → 优化器」这一整块是否可用</strong>，而且把「泛化」这个最难的变量彻底移出了方程。</p>  <div class="math-block">\[\text{一个足够容量的模型在 } n \text{ 个样本上，最优训练损失应当} \to 0 \quad (n \ll \text{参数量})\]</div>  <p>这句话是<strong>无条件成立的</strong>——它不依赖数据质量、不依赖任务难度、不依赖超参调得好不好。所以<strong>如果做不到，就一定有 bug</strong>，而不是「这个任务比较难」。这个「无条件」是它作为判据的全部价值所在。</p>  <div class="ascii">单 batch 过拟合的结果 -&gt; 结论
+
+  loss -&gt; ~0，mAP -&gt; ~1.0
+      ==&gt; 数据/编码/前向/损失/反传/优化器 **全部可用**
+          问题一定在：数据规模、增强、学习率调度、正则、验证管线
+          （搜索空间瞬间砍掉一半以上）
+
+  loss 完全水平（一动不动）
+      ==&gt; 梯度没有流到权重
+          查：requires_grad / optimizer.param_groups / 是否忘了 loss.backward()
+              / 是否 detach 了 / lr 是否为 0 / 是否有 torch.no_grad() 包住了
+
+  loss 下降但停在某个正数（例如二分类停在 0.693 = ln 2）
+      ==&gt; 模型只能输出常数
+          查：特征全被 ReLU 杀死（死亡神经元）/ 输入全零 / 归一化把方差归零了
+              / 只有 bias 可训练
+
+  loss 下降到 0 但 mAP 仍然是 0
+      ==&gt; **训练侧对、评测侧错** —— 直接跳到第 4 节的三大元凶
+          （这是最有价值的一种结果：它把 bug 精确锁在评测代码里）
+
+  loss 剧烈震荡 / 变 NaN
+      ==&gt; 学习率过大或数值实现有问题（第 2 节）</div>  <table>
+    <thead><tr><th>检查项</th><th>为什么必须关掉</th><th>忘了关的后果</th></tr></thead>
+    <tbody>
+      <tr><td>数据增强</td><td>随机增强让「同一个 batch」每步都不同，等于换了任务</td><td>loss 降不到 0，你会误判为有 bug</td></tr>
+      <tr><td>Dropout / DropPath</td><td>注入随机性，同上</td><td>loss 在某个正数附近抖动</td></tr>
+      <tr><td>Weight decay</td><td>把权重往零拉，与「记住这几个样本」相冲突</td><td>loss 停在一个非零平台</td></tr>
+      <tr><td><strong>学习率 warmup/衰减</strong></td><td>几百步的实验里 warmup 可能还没结束，lr 还接近 0</td><td><strong>loss 几乎不动，被误判成「梯度不流」</strong></td></tr>
+      <tr><td>EMA / 模型平均</td><td>评测用的是 EMA 权重，而 EMA 需要很多步才追上</td><td>训练 loss 到 0 但评测指标很差</td></tr>
+      <tr><td>shuffle</td><td>只有一个 batch，无所谓，但要确保每步用的是<strong>同一批</strong>数据</td><td>实际上在遍历数据集，等于普通训练</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>还有一个进阶用法：<strong>用「能过拟合多少个样本」来估计模型容量与实现质量</strong>。先过拟合 1 个样本，再 8 个、64 个、512 个。<em>如果 8 个能过拟合而 64 个不能，说明有一个与 batch 大小相关的 bug</em>（比如损失里错误地对 batch 维度求了 max 而不是 mean，或者标签分配在多目标时出错）。<strong>这个「阶梯式过拟合」能定位到很多单样本测不出来的问题。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>在检测任务里还要额外注意一点：<strong>「过拟合一个 batch」在有标签分配（label assignment）的检测器里不是平凡的</strong>。如果分配策略有 bug——比如所有 anchor 都被判成负样本、或者正样本阈值设得过高——<em>那么无论训多久，分类分支都只会学到「全是背景」，loss 会降到「全预测背景」对应的值然后不动</em>。<strong>所以检测的单 batch 过拟合必须同时打印「每步分到的正样本数」</strong>：如果正样本数是 0 或者远小于 GT 数，问题就在分配，而不在网络。<em>这一条在 TSR 上尤其重要，因为小目标（8–20 px）在 IoU 阈值 0.5 的静态分配下天然极难匹配到正样本</em>（C57 模块 03 展开），<strong>「正样本数 = 0」在 TSR 项目里是常态而不是异常</strong>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>单 batch 过拟合是检测调试里唯一的「无条件必须成立」的实验。</strong><em>它成立时你排除了半个系统；它不成立时你知道 bug 一定在前半段。没有任何其他实验有这么高的信息量/成本比。</em>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>常见的自欺欺人：<strong>「我的 loss 降到 0.02 了，应该没问题」</strong>。在检测里 loss 是多项之和（cls + box + obj/dfl），<em>某一项塌成 0 而另一项没动，总和看起来也会很小</em>。<strong>必须分项打印，并且必须同时看 mAP</strong>——mAP 在单 batch 上应该达到 0.95 以上，达不到就说明「loss 低」和「预测对」之间断了链，那个断点通常就在后处理或评测里。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="distributed-repro"><span class="num">8</span>分布式不一致与复现失败的排查顺序</h2>
+  <p>单卡跑通之后，多卡上出现「指标比单卡低 2 个点」「每次跑结果都不一样」「某张卡 hang 住」——<strong>这类问题的特点是：它们几乎从不报错，只是让结果慢慢变得不可信。</strong></p>  <table>
+    <thead><tr><th>问题</th><th>机制</th><th>症状</th><th>检查/修法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>BN 不同步</strong></td><td>每张卡用自己的 mini-batch 算 BN 统计。8 卡 × batch 2 = 每张卡只有 2 个样本的统计量</td><td>多卡指标低于单卡；<strong>per-GPU batch 越小差距越大</strong></td><td>换 <code>SyncBatchNorm</code>；或增大 per-GPU batch；或换 GN/LN。<em>per-GPU batch ≥ 16 时通常不必同步</em></td></tr>
+      <tr><td><strong>随机种子相同</strong></td><td>所有 rank 用同一个 seed → <strong>数据增强在所有卡上完全一样</strong></td><td>等效 batch 的多样性只有名义值的 $1/N$；训练比预期慢、指标偏低</td><td><code>seed = base_seed + rank</code>；<strong>DataLoader worker 还要再叠一层 worker_id</strong></td></tr>
+      <tr><td><strong>数据分片重叠</strong></td><td>sampler 配置错误导致同一样本被多张卡拿到；或 <code>drop_last=False</code> 时补齐样本重复</td><td>一个 epoch 的实际样本数 ≠ 数据集大小；<strong>指标虚高</strong>（重复样本相当于变相过采样）</td><td>打印 <code>len(sampler) * world_size</code> 与数据集大小对比；评测时用 <strong>去重后的</strong> 结果</td></tr>
+      <tr><td><strong>忘了 <code>set_epoch</code></strong></td><td><code>DistributedSampler</code> 的打乱种子固定 → 每个 epoch 的划分完全相同</td><td>每个 epoch 每张卡看到的都是同一批数据；<strong>loss 曲线呈现强周期性</strong></td><td>每个 epoch 开头调 <code>sampler.set_epoch(epoch)</code>——这是最常忘的一行</td></tr>
+      <tr><td><strong>梯度累积与 loss 缩放</strong></td><td>累积 $k$ 步时 loss 没除以 $k$，等效学习率变成 $k$ 倍</td><td>换了累积步数之后训练发散或指标变化很大</td><td>确认 loss 归一化口径；<strong>换累积步数时等效 lr 要跟着变</strong></td></tr>
+      <tr><td><strong>评测只在 rank 0 做</strong></td><td>各 rank 的结果没有 gather 完全，或 gather 时顺序不定</td><td>多卡评测结果与单卡不一致，且每次略有不同</td><td>评测结果按样本 id 排序后再算指标；<strong>指标计算只在一个 rank 上做</strong></td></tr>
+    </tbody>
+  </table>  <h3>复现失败的排查顺序</h3>  <p>「同一份代码、同一份配置，昨天 0.72、今天 0.68」——按下面的顺序查，<strong>每一步都比下一步便宜</strong>：</p>  <ol>
+    <li><strong>先确认这不是种子方差。</strong>检测任务同配置不同种子的 mAP 波动典型是 ±0.2–0.5 个点（模块 01）。<em>0.72 vs 0.68 完全可能就是噪声。先跑 3–5 个种子看分布，再决定要不要查。</em><strong>这一步排除掉的「bug」占了所有「复现失败」报告的一大半。</strong></li>
+    <li><strong>代码版本。</strong><code>git status</code> 是否干净？有没有未提交的本地修改？依赖库版本有没有变（<code>pip freeze</code> diff）？<em>「我只改了个打印」是经典的最后遗言。</em></li>
+    <li><strong>数据版本。</strong>数据集有没有被人补标/修标？标注文件的 md5 对得上吗？<em>在 TSR 项目里数据是持续回流的，「同一个数据集」这个说法本身就需要版本号才有意义。</em></li>
+    <li><strong>随机性来源。</strong>seed 设了几处（python / numpy / 框架 / cudnn / DataLoader worker）？<code>cudnn.benchmark=True</code> 会让算法选择依赖硬件状态；某些 GPU 算子本身<strong>非确定性</strong>（atomicAdd 的浮点加法不满足结合律）。<em>完全确定性通常要付 10–30% 的速度代价，所以多数团队选择「不追求逐位复现，只追求指标分布可复现」。</em></li>
+    <li><strong>环境。</strong>驱动 / CUDA / 框架版本 / 硬件型号。<em>换卡会改变 kernel 选择，也会改变浮点累加顺序。</em></li>
+    <li><strong>最后才是「代码里有 bug」。</strong></li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第 1 步值得再强调一次：<strong>大多数「复现失败」根本不是失败，是没有理解方差。</strong>一个只跑了单种子的实验，它的 mAP 是一个随机变量的<em>一次抽样</em>，而你在拿两次抽样比大小。<em>「昨天 0.72 今天 0.68」这句话在统计上是没有信息的，除非你知道 $\sigma$。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>反过来，真正需要「逐位复现」的场景也是存在的，而且在车企里很重要：<strong>安全相关的模型证据链</strong>。当一个模型要进入量产、要过功能安全评审时，「这份权重是由这份代码 + 这份数据 + 这个环境产生的」必须是可验证的，否则出了事故无法归因。<em>此时可复现性不再是调试便利，而是合规要求。</em><strong>工程上的做法是分层：日常迭代允许非确定性（换速度），发布候选版本必须在确定性模式下重跑一遍并归档</strong>（固定 seed、<code>cudnn.deterministic=True</code>、固定镜像、固定数据快照）。<em>这套东西在 C37 的 MLOps 课里叫「实验记录的最小必要字段」，在这里叫「出事之后你还能不能说清楚」。</em></p></div>
+  </div>  <div class="callout warn"><span class="label">所有 worker 生成同样的增强</span>
+    <p><strong>DataLoader worker 的种子是一个经典事故</strong>，值得单独记住：多个 worker 进程会各自继承主进程的 numpy 随机状态，如果不显式给每个 worker 设不同的种子，<strong>所有 worker 会生成完全相同的随机增强</strong>。<em>症状是：增强的有效多样性只有名义值的 $1/N_{\text{workers}}$，指标莫名其妙比预期低，而且怎么调增强参数都没用。</em>修法是给 DataLoader 传 <code>worker_init_fn</code>，用 <code>base_seed + rank * n_workers + worker_id</code> 初始化。<strong>这个 bug 在 C56 模块 04 有完整的实验复现。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>调试看起来是最「工程」的一节，但它背后有一批还没被解决好的问题。</p>  <ul>
+    <li><strong>训练故障的自动诊断。</strong>目前 grad norm、激活分布、loss 分项这些信号都要人看。<em>能否用一组规则或一个小模型，从训练日志里自动判定「这是学习率过大 / 这是标签分配失效 / 这是数据管线错」？</em>工业界已有雏形（如自动 NaN 归因、自动 lr 推荐），但覆盖率与误报率都还很差，<strong>而这恰恰是「训练一次要几千 GPU 小时」的场景下最值钱的能力</strong>。</li>
+    <li><strong>标签噪声与「难例」的可分离性。</strong>模块 02 提到 10–20% 的 badcase 是标注错。<em>置信学习、损失轨迹（一个样本的 loss 随训练的演化形态）、多模型一致性都能部分识别，</em>但在检测任务上（框与类别两个维度、还有漏标）仍无成熟方法。<strong>漏标（missing annotation）尤其难</strong>：模型检出了一个真实存在但没被标注的目标，训练时它被当成难负样本，<em>等于主动教模型「不要检出这类目标」</em>——这是长尾类别持续变差的隐藏机制。</li>
+    <li><strong>确定性与性能的取舍。</strong>GPU 上的浮点归约天然非确定，完全确定性要付显著的速度代价。<em>能否设计出「统计可复现」的训练——不要求逐位相同，但保证指标分布的可复现性有理论界？</em>这对需要通过安全评审的车载模型是实际需求，目前只能靠「多跑几次取分布」这种经验做法。</li>
+    <li><strong>训练-部署一致性的形式化验证。</strong>现在的做法是逐层对拍 + 容差判定，<em>但容差该设多少、逐层对齐能否推出端到端对齐、量化误差如何在层间传播——这些都没有可用的理论</em>。C60 模块 01/04 给了工程做法，但「证明两条管线等价」仍然是开放问题。</li>
+    <li><strong>分布式训练的可观测性。</strong>多卡训练里「哪张卡拖慢了」「哪次通信超时了」「BN 统计在各卡上差多少」目前都缺乏低开销的标准工具。<em>随着模型与集群规模增长，这类「系统层的误差」正在变成精度损失的重要来源，而它们在单卡上完全不可见。</em></li>
+    <li><strong>把调试知识沉淀成可执行资产。</strong>本模块的每条诊断都可以写成一个自动检查器（notebook 里做了几个）。<em>更进一步的问题是：如何让这些检查器随着代码演化而不腐化？</em><strong>「不变量测试」（decode∘encode = id、$\mathcal{L}(\text{GT},\text{GT})=0$、GT-as-prediction 的 mAP = 1）应当像单元测试一样常驻 CI</strong>，但业界这么做的团队仍是少数——这是一个「知道该做但没做」的巨大缺口。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>★ 必读</strong>：Andrej Karpathy, <em>A Recipe for Training Neural Networks</em>（2019 博文）——「先和数据融为一体 / 搭端到端骨架并接上 dumb baseline / 过拟合 / 正则化 / 调参 / 榨干」这套顺序，以及「<strong>neural net training fails silently</strong>」这个论断，是本模块全部方法论的源头。<em>建议逐段精读并对照自己的流程。</em></p><p><strong>★</strong> Bolya et al., <em>TIDE</em>（ECCV 2020）——与模块 02 配套；当你需要判断「是模型能力问题还是管线问题」时，TIDE 的分解形态本身就是一个强指纹。</p><p><strong>★</strong> Northcutt, Jiang &amp; Chuang, <em>Confident Learning: Estimating Uncertainty in Dataset Labels</em>（JAIR 2021）——标注噪声的系统性识别；把它的思路迁移到检测（框 + 类别 + 漏标）是很好的自研课题。</p><p>延伸：Ioffe &amp; Szegedy, <em>Batch Normalization</em>（ICML 2015，理解 BN 在冻结/分布式下的行为）；Goyal et al., <em>Accurate, Large Minibatch SGD</em>（2017，warmup 与线性缩放规则，也解释了梯度累积的 loss 归一化口径）；Peng et al., <em>MegDet</em>（CVPR 2018，检测里 SyncBN 的实证）；PyTorch 官方的 <em>Reproducibility</em> 与 <em>Autograd anomaly detection</em> 文档（工程细节最权威）。相邻课程：本课模块 01（种子方差与显著性）、模块 02（误差分析与决策树）、C56 模块 04（worker RNG 事故的完整复现）、C57 模块 03（小目标的正样本稀缺）、C60 模块 01/04（预处理与后处理的逐层对拍）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_error_analysis/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 误差分析工程：从指标到根因</div></a>
+    <a class="next" href="../04_narrative/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 项目叙事：把工作讲成让人信服的故事</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 定量分析：小目标到底难在哪</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 定量分析：小目标到底难在哪</h1>
+  <p class="subtitle">8×8 的框对角位移 2 px，IoU 从 1.00 掉到 <strong>0.39</strong>；同样位移下 64×64 的框还有 0.88 —— 所以同一个 0.5 阈值对不同尺度是<em>极不公平</em>的 · 临界位移 d ≈ 0.184w：8 px 目标只有 1.5 px 的余量 · 由此推出正样本稀缺（不是「学不好」而是「没有梯度」）· stride 32 上 8 px 的目标只占 0.25 个格子 · 有效感受野随深度只按 √n 增长，远小于理论值 · ±2 px 标注误差对 8 px 框是 25% 的相对噪声，标签本身就带噪</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00；C18 的检测基础（IoU / anchor / FPN / stride）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_why_small_is_hard.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Luo et al. 有效感受野（NeurIPS 2016）；Lin et al. FPN / RetinaNet；Xu et al. NWD / RFLA；COCO 评测协议</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#iou_shift">IoU 对位移的敏感性：一个可以手推的闭式解</a></li>
+      <li><a href="#unfair">同一个 IoU 阈值，对不同尺度极不公平</a></li>
+      <li><a href="#positive">正样本稀缺：从「阈值不公平」到「一个正样本都没有」</a></li>
+      <li><a href="#stride">stride 与特征预算：8 像素在 stride 32 上只有 0.25 个格子</a></li>
+      <li><a href="#erf">有效感受野：理论感受野是一张空头支票</a></li>
+      <li><a href="#noise">标注噪声：小目标的标签本身就带噪</a></li>
+      <li><a href="#alias">特征混叠与上下文依赖：信息不够时，模型在看什么</a></li>
+      <li><a href="#synthesis">归因表：五个原因，五张不同的药方</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="iou_shift"><span class="num">1</span>IoU 对位移的敏感性：一个可以手推的闭式解</h2>
+  <p>先把最重要的一件事算清楚。设两个轴对齐的正方形框，边长都是 <code>s</code>，预测框相对真值框在 x、y 两个方向各偏移 <code>d</code> 像素（<code>0 ≤ d &lt; s</code>）。交集是一个边长 <code>s-d</code> 的正方形，并集是两个面积减去交集：</p>  <div class="math-block">\[\mathrm{IoU}(s,d)=\frac{(s-d)^2}{2s^2-(s-d)^2}\]</div>  <p>若只在一个方向上偏移（1D 情形，另一轴完全对齐），交集为 <code>(s-d)·s</code>，并集为 <code>s(s+d)</code>：</p>  <div class="math-block">\[\mathrm{IoU}_{1D}(s,d)=\frac{s-d}{s+d}\]</div>  <p>两个式子都是初等代数，<strong>面试白板上三十秒能推完</strong>。代进去看数字：</p>  <table>
+    <thead><tr><th>边长 s</th><th>d=1 px</th><th><strong>d=2 px</strong></th><th>d=3 px</th><th>d=4 px</th><th>d=0 处的斜率 dIoU/dd</th></tr></thead>
+    <tbody>
+      <tr><td><strong>8 px</strong></td><td>0.6203</td><td><strong>0.3913</strong></td><td>0.2427</td><td>0.1429</td><td><strong>−0.500 /px</strong></td></tr>
+      <tr><td>16 px</td><td>0.7840</td><td>0.6203</td><td>0.4927</td><td>0.3913</td><td>−0.250 /px</td></tr>
+      <tr><td>32 px</td><td>0.8841</td><td>0.7840</td><td>0.6968</td><td>0.6203</td><td>−0.125 /px</td></tr>
+      <tr><td><strong>64 px</strong></td><td>0.9399</td><td><strong>0.8841</strong></td><td>0.8323</td><td>0.7840</td><td><strong>−0.0625 /px</strong></td></tr>
+      <tr><td>128 px</td><td>0.9693</td><td>0.9399</td><td>0.9115</td><td>0.8841</td><td>−0.03125 /px</td></tr>
+    </tbody>
+  </table>  <p><strong>同样偏 2 个像素，8×8 的框 IoU 掉到 0.3913（低于 0.5，会被判成负样本），而 64×64 的框还有 0.8841（毫发无伤）——相差 2.26 倍。</strong>把 IoU 对 <code>d</code> 求导并令 <code>d→0</code>，可以得到一个极其干净的结论：</p>  <div class="math-block">\[\left.\frac{\partial \mathrm{IoU}}{\partial d}\right|_{d=0}=-\frac{4}{s}\quad(\text{2D 对角})\ ,\qquad -\frac{2}{s}\quad(\text{1D})\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>推导只需两步：记 <code>u=(s-d)²</code>，则 <code>IoU = u/(2s²-u)</code>，<code>dIoU/du = 2s²/(2s²-u)²</code>；在 <code>d=0</code> 处 <code>u=s²</code>，所以 <code>dIoU/du = 2/s²</code>，而 <code>du/dd = -2(s-d) = -2s</code>，两者相乘得 <code>-4/s</code>。<em>结论一句话：<strong>IoU 对绝对位移的敏感度与目标边长成反比</strong></em>——8px 的框每偏 1 个像素就丢掉半个 IoU，64px 的框只丢 6.25%。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但必须补上一个精确的边界条件，否则会得出错误结论：<strong>IoU 本身是尺度不变的</strong>。若把位移写成相对量 <code>d = α·s</code>，则 <code>IoU = (1-α)²/(2-(1-α)²)</code>，与 <code>s</code> 完全无关。<em>也就是说，IoU 惩罚的是「相对误差」，它对尺度是绝对公平的</em>。真正的不公平来自另一侧：<strong>现实中的定位误差绝大部分是<em>绝对像素量级</em>的</strong>——标注员的手抖是 ±1–2 px、特征网格的量化误差是 stride/2、相机抖动与运动模糊是固定的几个像素。<em>把「绝对误差」喂给一把「按相对误差计分」的尺子，尺度不公平就此产生。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>这是全课的第一块基石，也是最值得背下来的一句话：<strong>IoU 是尺度不变的度量，但检测系统的误差来源是尺度不变<em>不了</em>的</strong>。所以问题不在 IoU 这个公式本身，而在「用一个相对尺子去量一堆绝对误差」这个组合。<em>后面模块 03 的 NWD 之所以有效，恰恰是因为它换了一把在绝对误差下更平滑的尺子。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="unfair"><span class="num">2</span>同一个 IoU 阈值，对不同尺度极不公平</h2>
+  <p>把上式反解，就得到<span class="term">临界位移</span>（critical displacement）：让 IoU 恰好等于阈值 <code>τ</code> 的最大允许偏移。令 <code>(s-d)² = u</code>，由 <code>u/(2s²-u)=τ</code> 得 <code>u = 2τs²/(1+τ)</code>，于是：</p>  <div class="math-block">\[d^{*}(s,\tau)=s\left(1-\sqrt{\tfrac{2\tau}{1+\tau}}\right)\]</div>  <p>这个式子里 <code>s</code> 是一个纯粹的比例因子——<strong>临界位移与目标边长严格成正比</strong>。代入 <code>τ=0.5</code> 得系数 <code>1-√(1/1.5) = 0.18350</code>，即 <strong><code>d* ≈ 0.1835·s</code></strong>；代入 <code>τ=0.75</code> 得 <code>0.07418·s</code>。</p>  <table>
+    <thead><tr><th>目标边长</th><th>τ=0.5 允许偏移</th><th>τ=0.75 允许偏移</th><th>τ=0.9 允许偏移</th><th>翻译成人话</th></tr></thead>
+    <tbody>
+      <tr><td><strong>8 px</strong>（100 m 外的限速牌）</td><td><strong>1.47 px</strong></td><td><strong>0.59 px</strong></td><td>0.21 px</td><td><strong>AP@0.75 要求亚像素级定位</strong>——比标注精度还高</td></tr>
+      <tr><td>16 px（60 m）</td><td>2.94 px</td><td>1.19 px</td><td>0.43 px</td><td>刚好卡在人工标注误差的量级上</td></tr>
+      <tr><td>32 px（30 m）</td><td>5.87 px</td><td>2.37 px</td><td>0.85 px</td><td>开始有余量</td></tr>
+      <tr><td><strong>64 px</strong>（15 m）</td><td><strong>11.74 px</strong></td><td>4.75 px</td><td>1.71 px</td><td>随便偏，怎么都过</td></tr>
+      <tr><td>128 px</td><td>23.49 px</td><td>9.50 px</td><td>3.41 px</td><td>定位早已不是瓶颈</td></tr>
+    </tbody>
+  </table>  <p>再把真实世界里的误差量级并排放上去，不公平就一目了然：</p>  <div class="ascii">误差来源                                典型量级（绝对像素）  对 8px 目标  对 64px 目标
+─────────────────────────────────────────────────────────────────────────
+人工标注抖动（每条边）                  ±1 ~ ±2 px            **致命**     可忽略
+特征网格量化（stride 8 的中心量化）      ±4 px                 **致命**     可忽略
+回归头的固有噪声（≈ 0.3~1 个特征格）     ±2 ~ ±8 px            **致命**     轻微
+运动模糊 / 卷帘快门（车速 120km/h）      1 ~ 3 px              **致命**     可忽略
+相机标定与时间戳对齐误差                 0.5 ~ 2 px            严重         可忽略
+─────────────────────────────────────────────────────────────────────────
+IoU@0.5 的容忍度                        1.47 px              11.74 px
+IoU@0.75 的容忍度                       0.59 px               4.75 px
+
+结论：**同一条 "IoU &gt;= 0.5" 的判定线，对 8px 目标要求「1.5 像素以内」，
+      对 64px 目标要求「12 像素以内」——后者的容忍度是前者的 8 倍。**
+      而误差源的量级对两者是一样的。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这解释了一个长期被误读的现象：<strong>COCO 的 AP@[.5:.95] 对小目标格外苛刻</strong>。这个指标在 0.5 到 0.95 之间取十个阈值再平均。对 64px 目标，即使 τ=0.95 也还允许约 0.83 px 的偏移——高阈值段仍然可达；<em>而对 8px 目标，τ 一过 0.7 允许的偏移就跌破 1 个像素，后面几个阈值段的 AP 直接归零</em>。于是 AP_S 天然被压低了近一半，<strong>这一半与模型好坏无关，纯粹是指标定义带来的</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以在小目标场景，「用哪个阈值报指标」不是一个可以随便糊弄的细节。<strong>工程上的正确做法有三条</strong>：① 小目标桶只报 AP@0.5 与召回，不报 AP@[.5:.95]（并在文档里写清原因）；② 若必须用统一口径，则把它当成「同一把尺子下的相对比较」，绝不做跨尺寸桶的横向比较；③ 训练阶段用尺度自适应的分配阈值或干脆换度量（模块 03 的 NWD/RFLA）。<em>关键是<strong>把「指标口径造成的差距」与「模型能力造成的差距」分开记账</strong></em>——这两笔账混在一起，后续所有优化决策都会跑偏。</p></div>
+  </div>  <div class="callout danger"><span class="label">别把指标的账算到模型头上</span>
+    <p><strong>面试高频问题：「为什么小目标的 AP 低？」</strong>——如果只回答「因为特征少」，是及格线以下的答案。面试官想听的是分层归因：<em>「其中一部分不是模型的问题，是指标的问题。IoU 阈值按相对误差计分，而真实误差是绝对像素量级的；对 8px 目标 IoU@0.5 只允许 1.47 px 偏移、IoU@0.75 只允许 0.59 px——已经低于标注精度。所以 AP_S 里有一块是天然的、跟模型无关的损失。剩下的才是模型的账：正样本稀缺、特征分辨率不足、标签带噪。」</em></p><p><strong>能把「指标的账」和「模型的账」拆开，是这道题的分水岭。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="positive"><span class="num">3</span>正样本稀缺：从「阈值不公平」到「一个正样本都没有」</h2>
+  <p>阈值不公平的下一步后果是致命的：<strong>小目标不是「正样本少」，而是在某些配置下「在数学上不可能有正样本」</strong>。</p>  <p>看一个最干净的上界。设 anchor 是边长 <code>A</code> 的正方形，目标是边长 <code>s</code> 的正方形，且 <code>s &lt; A</code>。<strong>即使中心完美重合、形状完美匹配</strong>，目标也完全落在 anchor 内部，此时交集就是目标本身，并集就是 anchor：</p>  <div class="math-block">\[\mathrm{IoU}_{\max}(s,A)=\frac{s^2}{A^2}\qquad (s\le A)\]</div>  <p>这是一个<strong>上界</strong>——中心还没偏、宽高比还没错，就已经封顶了。RetinaNet 的标准 anchor 集合是 base <code>{32,64,128,256,512}</code> 乘以三档 scale <code>{2⁰, 2^(1/3), 2^(2/3)}</code>，<strong>最小的 anchor 边长是 32 px</strong>。代进去：</p>  <table>
+    <thead><tr><th>目标边长</th><th>最好可能 IoU（vs 32px anchor）</th><th>0.5 阈值下能否成为正样本</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>4 px</td><td>0.0156</td><td><strong>否</strong></td><td>差 32 倍</td></tr>
+      <tr><td><strong>8 px</strong></td><td><strong>0.0625</strong></td><td><strong>否 —— 数学上不可能</strong></td><td>= (8/32)²，连 0.1 都到不了</td></tr>
+      <tr><td>12 px</td><td>0.1406</td><td><strong>否</strong></td><td>—</td></tr>
+      <tr><td>16 px</td><td>0.2500</td><td><strong>否</strong></td><td>—</td></tr>
+      <tr><td>20 px</td><td>0.3906</td><td><strong>否</strong></td><td>已经很接近但仍然不够</td></tr>
+      <tr><td><strong>22.63 px</strong></td><td><strong>0.5000</strong></td><td><strong>临界线</strong> = 32/√2</td><td><strong>低于此线的目标全军覆没</strong></td></tr>
+      <tr><td>24 px</td><td>0.5625</td><td>是（但余量极小）</td><td>中心稍偏就掉出去</td></tr>
+      <tr><td>32 px</td><td>1.0000</td><td>是</td><td>完美匹配档位</td></tr>
+    </tbody>
+  </table>  <p>把中心量化也算进去（目标中心均匀落在特征格内，取全图 anchor 里的最大 IoU），蒙特卡洛的结果是：</p>  <table>
+    <thead><tr><th>配置</th><th>8 px 目标</th><th>16 px</th><th>24 px</th><th>32 px</th><th>64 px</th></tr></thead>
+    <tbody>
+      <tr><td>RetinaNet P3–P7（最小 anchor 32）<br>P(max IoU ≥ 0.5)</td><td><strong>0.000</strong></td><td><strong>0.000</strong></td><td>1.000</td><td>1.000</td><td>1.000</td></tr>
+      <tr><td>同上，平均 max IoU</td><td>0.063</td><td>0.250</td><td>0.563</td><td>0.787</td><td>0.787</td></tr>
+      <tr><td>加 P2（stride 4）+ anchor 基准缩到 8<br>P(max IoU ≥ 0.5)</td><td><strong>0.922</strong></td><td>1.000</td><td>1.000</td><td>1.000</td><td>1.000</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这张表把「正样本稀缺」从一句抱怨变成了一个可执行的检查：<strong>拿你自己的 anchor 配置，对最小的目标尺寸算一次 <code>(s/A_min)²</code>，如果它小于分配阈值，那么这一类目标在整个训练过程中<em>一次监督信号都收不到</em></strong>。模型不是学不好，是<em>从来没被教过</em>。<em>而这个检查只需要一行除法，却是我见过最常被跳过的一步。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>解法分三层，成本递增：<strong>① 最便宜——重新聚类 anchor</strong>（YOLOv5 起用 k-means 在自己数据的 wh 上聚类，最小 anchor 常常落在 10 px 附近，同时把匹配判据从 IoU 换成宽高比 <code>max(w/w_a, w_a/w) &lt; 4</code>，天然对尺度公平）；<strong>② 换分配策略</strong>——ATSS 用「每个 GT 的候选 anchor IoU 的均值+标准差」做自适应阈值，小目标的阈值会被自动压低；SimOTA/TaskAligned 用代价矩阵 + dynamic-k，正样本数由数据决定而不是阈值决定；<strong>③ 彻底放弃 IoU 分配</strong>——FCOS 这类 center-based 方法只问「特征点是否落在 GT 框内且在合适的尺度区间」，与框大小无关；RFLA 用感受野高斯与 GT 高斯的 KL 散度分配。<em>三层解法都在模块 03 展开。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见的错误修法：<strong>把分配阈值从 0.5 一刀切降到 0.3</strong>。这确实能让小目标拿到正样本，但同时也让<em>大目标</em>吸纳一批质量很差的正样本——大目标本来余量充足，降阈值对它们纯粹是噪声。<em>结果往往是 AP_S 涨一点、AP_M/AP_L 掉更多</em>。<strong>正确的做法是「按尺度自适应」而不是「全局放宽」</strong>：小目标降、大目标不动。这一点在面试里主动提出来，能显著区别于「我把阈值调低了」这种回答。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="stride"><span class="num">4</span>stride 与特征预算：8 像素在 stride 32 上只有 0.25 个格子</h2>
+  <p>第三笔账是纯粹的除法，但结论比想象中狠。特征图上一个格子对应输入图像上 <code>stride × stride</code> 的区域，所以边长 <code>s</code> 的目标在 stride 为 <code>r</code> 的特征层上占 <code>s/r</code> 个格子（线性），面积上是 <code>(s/r)²</code> 个格子。</p>  <table>
+    <thead><tr><th>特征层</th><th>stride</th><th>8 px 目标（线性 / 面积）</th><th>64 px 目标（线性 / 面积）</th><th>两者的格子数之比</th></tr></thead>
+    <tbody>
+      <tr><td>P2</td><td>4</td><td>2.00 格 / 4.00 格</td><td>16.0 格 / 256 格</td><td>64×</td></tr>
+      <tr><td>P3</td><td>8</td><td>1.00 格 / 1.00 格</td><td>8.0 格 / 64 格</td><td>64×</td></tr>
+      <tr><td>P4</td><td>16</td><td>0.50 格 / 0.25 格</td><td>4.0 格 / 16 格</td><td>64×</td></tr>
+      <tr><td><strong>P5</strong></td><td><strong>32</strong></td><td><strong>0.25 格 / 0.0625 格</strong></td><td>2.0 格 / 4 格</td><td>64×</td></tr>
+      <tr><td>P6</td><td>64</td><td>0.125 格 / 0.0156 格</td><td>1.0 格 / 1 格</td><td>64×</td></tr>
+    </tbody>
+  </table>  <p><strong>stride 32 的特征图上，8 像素的目标只占 0.25 个格子——它连一个格子都填不满，必须和周围 16 倍面积的背景共享同一个特征向量。</strong>而输入侧的账同样悬殊：8×8×3 = 192 个数，64×64×3 = 12288 个数，差 <strong>64 倍</strong>。</p>  <div class="ascii">同一块 8×8 像素的限速牌，在不同 stride 的特征图上「长什么样」：
+
+  输入图像 (8×8 px)        stride 4 (P2)      stride 8 (P3)     stride 32 (P5)
+  ┌────────┐              ┌──┬──┐            ┌──┐              ┌────────────┐
+  │▓▓▓▓▓▓▓▓│              │▓▓│▓▓│            │▓▓│              │            │
+  │▓░░░░░░▓│    ───►      ├──┼──┤    ───►    └──┘     ───►     │    ·       │ ← 目标只占
+  │▓░6░0░░▓│              │▓▓│▓▓│                              │            │   这个格子的
+  │▓▓▓▓▓▓▓▓│              └──┴──┘                              └────────────┘   1/16 面积
+  └────────┘
+   192 个数              2×2 = 4 个格子      1×1 = 1 个格子     0.25×0.25 = 0.0625 格
+
+  同一层上的 64×64 目标：
+                         16×16 = 256 格     8×8 = 64 格        2×2 = 4 格
+                         ↑ 每一档都是 8px 目标的 **64 倍**
+
+代价的另一面：加一层 P2（stride 4），neck + head 的空间格子总数
+  P3..P7 = 1/8² + 1/16² + 1/32² + 1/64² + 1/128²  = 0.01665·HW
+  P2..P7 = 上式 + 1/4²                             = 0.06665·HW
+  ==&gt; **约 4.00 倍**。这就是「加 P2」这个最直接解法的价目表。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以 <strong>stride 不是一个「架构超参」，而是「你打算给小目标留几个格子」的直接声明</strong>。工程上有一条粗糙但极好用的经验：<em>目标在最细特征层上至少要有 2×2 个格子，检测头才有可能同时表达「有没有」和「在哪、多大」这两件事</em>。反解一下：最细 stride 为 8 时，可靠工作的最小目标约 16 px；要处理 8 px 目标，最细 stride 必须到 4。<strong>这条经验反过来就是模块 00 里「网络相对定义」的由来。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但 P2 的代价必须诚实地摆出来：<strong>空间格子数 ×4，而 neck 与 head 的计算量、显存、以及后处理（NMS 前的候选框数）都近似正比于格子数</strong>。更麻烦的是它<em>只帮到小目标</em>——P2 上几乎不会分配到中大目标，所以这 4 倍开销的收益完全集中在最小的那个尺寸桶。<em>在车端延迟预算里，这往往是不可接受的</em>。所以量产系统更常见的是<strong>「不加 P2，改用 ROI 裁剪 / 两级级联 / 切片推理」</strong>——它们同样提高了目标的<em>相对</em>尺寸，但只在需要的区域付出代价（模块 04）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把 stride 这笔账翻译回 TSR：车端模型为了延迟通常最细只到 <strong>stride 8</strong>。按「2×2 格子」的经验，可靠工作的下限是 16 px；查模块 00 的像素预算表，1920p/60° 相机下 16 px 对应 <strong>62 米</strong>。<em>也就是说，架构一旦定死在 stride 8，「62 米外读不准限速值」就已经被写进系统里了</em>——这不是训练能补回来的。<strong>想突破 62 米，只有三条路：加 P2（贵）、上长焦相机（改硬件）、或对上半幅图做 ROI 高分辨率精检（模块 04/05 的主推方案）。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="erf"><span class="num">5</span>有效感受野：理论感受野是一张空头支票</h2>
+  <p>很多人对小目标的直觉是「感受野不够大」。<strong>这个直觉恰好是反的</strong>，而且原因可以精确算出来。</p>  <p>先算理论感受野（<span class="term">theoretical receptive field, TRF</span>）：<code>n</code> 层 stride-1 的 3×3 卷积堆叠，TRF 的半径就是 <code>n</code>（每层向外扩 1）。但 <span class="term">Luo et al. (2016)</span> 证明了：<strong>感受野内各位置对输出的贡献<em>不是均匀的</em>，而是呈近似高斯分布</strong>——中心权重极大、边缘几乎为零。这就是<span class="term">有效感受野</span>（effective receptive field, ERF）。</p>  <p>用最简模型可以把它算到底：把 3×3 卷积近似成一个 3 抽头的均匀核，单层在 1D 上的方差是 <code>((-1)²+0²+1²)/3 = 2/3</code>；<code>n</code> 层堆叠等价于 <code>n</code> 次独立卷积，方差可加（中心极限定理）：</p>  <div class="math-block">\[\sigma_{\mathrm{ERF}}=\sqrt{\tfrac{2n}{3}}\ ,\qquad R_{\mathrm{TRF}}=n\ ,\qquad \frac{\sigma_{\mathrm{ERF}}}{R_{\mathrm{TRF}}}=\sqrt{\tfrac{2}{3n}}\xrightarrow[n\to\infty]{}0\]</div>  <table>
+    <thead><tr><th>3×3 卷积层数 n</th><th>理论感受野半径</th><th>ERF 标准差 σ</th><th>含 95% 权重的半径</th><th>占理论感受野的比例</th></tr></thead>
+    <tbody>
+      <tr><td>5</td><td>5</td><td>1.83</td><td>3.58</td><td>71.6%</td></tr>
+      <tr><td>10</td><td>10</td><td>2.58</td><td>5.06</td><td>50.6%</td></tr>
+      <tr><td><strong>20</strong></td><td><strong>20</strong></td><td><strong>3.65</strong></td><td><strong>7.16</strong></td><td><strong>35.8%</strong></td></tr>
+      <tr><td>40</td><td>40</td><td>5.16</td><td>10.12</td><td>25.3%</td></tr>
+      <tr><td>80</td><td>80</td><td>7.30</td><td>14.31</td><td>17.9%</td></tr>
+    </tbody>
+  </table>  <p><strong>理论感受野按 O(n) 增长，有效感受野只按 O(√n) 增长——网络越深，这张支票就越空。</strong>再把它和目标尺寸联系起来：设某个特征位置的 ERF 在输入图像上的标准差是 30 px（一个典型主干中层的量级），那么一个边长 <code>s</code> 的目标能占据这个神经元<em>有效输入</em>的比例是 <code>erf(s/(2σ√2))</code>（1D）与其平方（2D）：</p>  <table>
+    <thead><tr><th>目标边长</th><th>占 ERF 的 1D 比例</th><th>占 ERF 的 2D 比例</th><th>解读</th></tr></thead>
+    <tbody>
+      <tr><td><strong>8 px</strong></td><td><strong>10.6%</strong></td><td><strong>1.1%</strong></td><td><strong>该神经元 99% 的有效输入是背景</strong></td></tr>
+      <tr><td>16 px</td><td>21.0%</td><td>4.4%</td><td>仍被上下文淹没</td></tr>
+      <tr><td>32 px</td><td>40.6%</td><td>16.5%</td><td>开始成为主要信号源</td></tr>
+      <tr><td><strong>64 px</strong></td><td><strong>71.4%</strong></td><td><strong>51.0%</strong></td><td><strong>目标本身占了一半以上</strong></td></tr>
+      <tr><td>128 px</td><td>96.7%</td><td>93.5%</td><td>几乎纯信号</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这解释了为什么「小目标需要更大感受野」是个错误的直觉：<strong>问题不是感受野太小，而是感受野相对目标太大</strong>。同一个神经元，看 64px 目标时一半以上的有效输入来自目标本身，看 8px 目标时只有 1%——<em>信号被上下文按 45 倍的比例稀释了</em>。继续加深网络、继续堆大核，只会让 ERF 更大、稀释更严重。<strong>小目标需要的是「与目标尺寸<em>匹配</em>的感受野」，而不是更大的。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这也给出了多尺度设计的第一性原理：<strong>FPN 的价值不只是「保留高分辨率」，更是「让每个尺度的目标去找一个 ERF 与自己匹配的特征层」</strong>。FPN 的层级分配公式 <code>k = k₀ + log₂(√(wh)/224)</code> 本质上就是在做这件匹配。<em>反过来，RTMDet 用 5×5 depthwise 大核、DETR 系用全局 attention，是在主动<strong>放大</strong> ERF——那是为大目标与长程上下文服务的设计，对小目标是中性甚至负面的</em>。<strong>「大核对小目标好」是一个必须警惕的误传。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>ERF 还有一个工程上的坑：<strong>它是随训练变化的</strong>。Luo et al. 观察到训练后的 ERF 通常会比随机初始化时更大（网络学会利用更远的上下文）。<em>所以「用初始化模型测出来的 ERF」会低估真实值</em>。测量的正确姿势是：在<strong>训练好的</strong>模型上，对某个特征位置的输出取梯度回传到输入，看输入端梯度的幅值分布——notebook 里会用一个纯 numpy 的可微堆叠把这个方法完整实现一遍。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="noise"><span class="num">6</span>标注噪声：小目标的标签本身就带噪</h2>
+  <p>前四个原因都在讲模型侧。第五个原因在<strong>数据侧</strong>，而且它设定的是<strong>指标的上限</strong>——无论模型多强都突破不了。</p>  <p>做一个最保守的假设：标注员画框时，每条边独立地有 <code>U(-2, +2)</code> 像素的误差（这是很温和的估计；真实标注在小目标上通常更差）。<strong>对 8 px 的框，±2 px 就是 25% 的相对误差；对 64 px 的框只有 3.1%。</strong>蒙特卡洛跑十万次：</p>  <table>
+    <thead><tr><th>目标边长</th><th>标注 vs 真值的平均 IoU</th><th>P(IoU ≥ 0.5)</th><th><strong>P(IoU ≥ 0.75)</strong></th><th>IoU 的 5% 分位</th></tr></thead>
+    <tbody>
+      <tr><td><strong>8 px</strong></td><td><strong>0.621</strong></td><td>0.917</td><td><strong>0.083</strong></td><td>0.478</td></tr>
+      <tr><td>16 px</td><td>0.785</td><td>1.000</td><td>0.727</td><td>0.697</td></tr>
+      <tr><td>32 px</td><td>0.885</td><td>1.000</td><td>1.000</td><td>0.834</td></tr>
+      <tr><td><strong>64 px</strong></td><td><strong>0.940</strong></td><td>1.000</td><td><strong>1.000</strong></td><td>0.913</td></tr>
+      <tr><td>128 px</td><td>0.969</td><td>1.000</td><td>1.000</td><td>0.955</td></tr>
+    </tbody>
+  </table>  <p>这张表要读出三个结论：</p>  <ol>
+    <li><strong>AP@0.75 在 8 px 桶上测的是标注员，不是模型。</strong>一个「完美模型」——它输出的框恰好等于物理真值——在这个桶上的 AP@0.75 上限只有 <strong>8.3%</strong>。<em>你在这个指标上做的任何优化，绝大部分是在拟合标注噪声。</em></li>
+    <li><strong>训练信号本身带噪。</strong>回归头学的是「真值框」，而它拿到的监督是「带 25% 相对误差的框」。<em>小目标的回归分支在很大程度上是在学习噪声</em>——这也解释了为什么小目标的框普遍抖、为什么时序平滑（模块 C55）对 TSR 收益特别大。</li>
+    <li><strong>它与前四个原因完全正交。</strong>加 P2、换 NWD、提分辨率——没有任何一个能改善标注质量。<em>唯一的解法在数据侧：收紧标注规范（放大到固定倍数再画框、双人复核、亚像素标注工具）、用软标签降低对边界的确定性假设、以及把评测口径改掉。</em></li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>工程上最有价值的一个动作，是<strong>定期测量自己数据集的「标注一致性天花板」</strong>：抽 200 个小目标让第二位标注员盲标一遍，算两份标注之间的 IoU 分布。<em>这个分布就是你在该尺寸桶上的指标上限</em>。如果一致性 IoU 的均值只有 0.65，那么「把小目标 AP@0.75 从 12 提到 15」这个 OKR 本身就是不合理的。<strong>我见过团队为一个根本不可能达成的指标烧掉一个季度——只因为没人花两天做这个测量。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精细的处理是<strong>把标注不确定性显式建模进损失</strong>：既然小目标的边界本来就不确定，就不该用一个 delta 分布去监督它。<em>把框回归成分布</em>（GFL 的 General Distribution、D-FINE 的细粒度分布优化）或用高斯建模（NWD/KLD），都能让损失对边界的小幅偏差不那么敏感。<strong>这条思路在模块 03 会与 NWD 一起讲——它同时缓解了原因 ②（度量）和原因 ⑤（标签噪声），是少见的「一药医两病」。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">别让难例挖掘吃进标注噪声</span>
+    <p>还有一个更隐蔽的版本：<strong>标注噪声会污染「难例挖掘」</strong>。按 loss 排序挑难例时，小目标因为标签带噪天然 loss 高，于是<em>难例池被小目标的噪声标签塞满</em>；模型反复在这些噪声上加权训练，越训越歪。<em>症状是「加了 OHEM 之后小目标反而掉点」</em>。</p><p><strong>解法：难例挖掘必须与噪声识别配套</strong>（多模型一致性、损失轨迹、重标注抽检）——这是 C58 模块 02 的核心内容。<em>在这里先埋一个钩子：凡是「按 loss 选样本」的机制，在小目标上都要额外小心。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="alias"><span class="num">7</span>特征混叠与上下文依赖：信息不够时，模型在看什么</h2>
+  <p>最后补两个不独立成因、但会显著放大前五条的机制。</p>  <h3>① 特征混叠：两个小目标共用一个格子</h3>  <p>在 stride 为 <code>r</code> 的特征图上，两个中心相距 <code>g</code> 像素的目标落进同一个格子的概率（1D，中心均匀分布）是 <code>max(0, 1 - g/r)</code>。对 TSR 这是个真问题——<strong>门架上并排的指路牌、限速牌下面挂的辅助牌、施工区连续摆放的锥形牌，中心间距常常只有 15–30 px</strong>。</p>  <table>
+    <thead><tr><th>中心间距 g</th><th>stride 8 同格概率</th><th>stride 16</th><th>stride 32</th><th>TSR 里的典型场景</th></tr></thead>
+    <tbody>
+      <tr><td>10 px</td><td>0.00</td><td>0.375</td><td>0.688</td><td>远处的组合标志（主牌 + 辅助牌）</td></tr>
+      <tr><td>20 px</td><td>0.00</td><td>0.000</td><td>0.375</td><td>门架上并排的两块指路牌</td></tr>
+      <tr><td>30 px</td><td>0.00</td><td>0.000</td><td>0.063</td><td>中距离的两块牌</td></tr>
+      <tr><td>50 px</td><td>0.00</td><td>0.000</td><td>0.000</td><td>已经安全</td></tr>
+    </tbody>
+  </table>  <p>同格意味着<strong>一个特征向量必须同时表达两个目标</strong>。anchor-based 方法靠不同 anchor 分担（但小目标本来就匹配不到 anchor）；<span class="term">center-based</span> 方法（FCOS/CenterNet）则会直接冲突——FCOS 用「取面积最小的那个 GT」来消歧，CenterNet 的高斯热图会把两个峰糊成一个。<em>后果是稳定的漏检，而且在指标上表现为「召回天花板」而不是「置信度低」——调阈值救不回来。</em></p>  <h3>② 上下文依赖：先验开始主导后验</h3>  <p>信息量少的直接后果是<strong>外观证据的似然比变弱，判断被先验主导</strong>。用对数几率写出来最清楚：</p>  <div class="math-block">\[\log\frac{P(y\mid x_{\text{app}},c)}{P(\bar y\mid x_{\text{app}},c)}=\underbrace{\log\frac{P(x_{\text{app}}\mid y)}{P(x_{\text{app}}\mid \bar y)}}_{\text{外观证据}}+\underbrace{\log\frac{P(y\mid c)}{P(\bar y\mid c)}}_{\text{上下文先验}}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>目标越小，第一项越接近 0，于是<strong>第二项（上下文）在决策中的权重相对越大</strong>。这不是模型「作弊」，而是贝叶斯最优的行为——<em>在证据不足时，理性的做法就是更依赖先验</em>。实际上小目标检测能工作到今天，很大程度上就是靠上下文：杆件、龙门架、天空-道路交界线、消失点附近的位置先验、以及「限速牌总是成对出现在车道两侧」这类共现规律。<strong>TSR 尤其吃这套——标志的安装位置受法规约束，先验极强。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>危险也正在这里：<strong>上下文先验是与域强绑定的</strong>。换一个城市（杆件样式变了）、换一种路型（高速 → 城区）、换一个国家（安装规范不同）、甚至只是换到夜间（天空-道路交界不可见），先验就失效了。<em>而模型对小目标的判断有很大一块建立在这个先验上，于是<strong>小目标的跨域掉点显著大于大目标</strong></em>。<em>这是一个在面试里很有区分度的观察</em>：「为什么我们的模型换城市后小目标掉得特别多？」——因为小目标的决策里先验占比高，而先验是最不可迁移的那部分。<strong>对策是把上下文先验显式化（用地图/车道/消失点作为独立输入），而不是让它隐式地长在特征里。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>这两个机制的共同点是：<strong>它们不改变前五个原因的存在，但会放大它们的后果，并且让问题在评测上「换一副面孔」出现</strong>。特征混叠表现为召回天花板，上下文依赖表现为跨域崩塌——两者都不像「小目标难」，所以很容易被归错因。<em>诊断口诀：调阈值救不回来的漏检，先怀疑混叠；换域后小目标掉得比大目标多，先怀疑先验依赖。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="synthesis"><span class="num">8</span>归因表：五个原因，五张不同的药方</h2>
+  <p>把全部账目合到一张表上。<strong>这张表就是本课的产出，也是面试里「小目标怎么做」这道题的完整答案骨架。</strong></p>  <table>
+    <thead><tr><th>原因</th><th>病灶</th><th>本模块给出的量化</th><th>解法</th><th>代价</th><th>副作用 / 边界</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 信息量少</strong></td><td>物理层</td><td>8×8×3=192 vs 64×64×3=12288（<strong>64×</strong>）；固定 0.8 px 模糊下「60 vs 80」的可分性 d′ 从 32px 的约 90 掉到 8px 的约 6（局部指数 ≈ D<sup>1.95</sup>）</td><td>提分辨率 / 长焦相机 / 切片推理 / ROI 精检</td><td>算力按分辨率<strong>平方</strong>增长；多相机增加硬件与标定成本</td><td>切片推理延迟不可控；长焦牺牲视野覆盖</td></tr>
+      <tr><td><strong>② IoU 对位移敏感</strong></td><td>度量层</td><td>偏 2 px：<strong>0.3913 vs 0.8841</strong>；斜率 −4/s；τ=0.5 的临界位移 <strong>0.1835·s</strong></td><td>换度量：NWD / KLD / 尺度自适应阈值；框回归成分布</td><td>与主流评测指标（IoU）脱钩；多一个超参</td><td>训练用 NWD、评测用 IoU，最优解不一定重合</td></tr>
+      <tr><td><strong>③ 正样本稀缺</strong></td><td>分配层</td><td>8 px 对 32 px anchor 的<strong>上界只有 0.0625</strong>；22.63 px 是死线；P(match)=0.000</td><td>缩小/聚类 anchor、ATSS、SimOTA、RFLA、center-based 分配</td><td>几乎零算力代价，<strong>性价比最高</strong></td><td>全局降阈值会伤大目标；动态分配增加训练不稳定性</td></tr>
+      <tr><td><strong>④ 下采样丢失</strong></td><td>架构层</td><td>stride 32 上 8 px 只占 <strong>0.25 格</strong>；ERF 里目标只占 <strong>1.1%</strong></td><td>FPN/PAN/BiFPN、加 P2、可变形注意力、匹配 ERF</td><td>加 P2 → neck+head 空间代价 <strong>×4.0</strong></td><td>收益只集中在最小尺寸桶；显存与 NMS 候选数同步上升</td></tr>
+      <tr><td><strong>⑤ 标注误差相对大</strong></td><td>数据层</td><td>±2 px 下 8 px 框平均 IoU <strong>0.621</strong>，<strong>只有 8.3%</strong> 能达 0.75</td><td>标注规范、双人复核、软标签/分布回归、<strong>改评测口径</strong></td><td>标注成本上升；评测口径变更需要跨团队对齐</td><td>改口径会破坏与公开 benchmark 的可比性</td></tr>
+    </tbody>
+  </table>  <p>为什么必须拆成五条？因为总损失是<strong>乘性</strong>的。把每个原因对小目标造成的效率折损记作 <code>rᵢ ∈ (0,1]</code>，粗略地：</p>  <div class="math-block">\[\frac{\mathrm{AP}_S}{\mathrm{AP}_L}\ \approx\ \prod_{i=1}^{5} r_i\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>乘性结构解释了两个反复出现的工程现象：<strong>① 单点改进的收益总是低于预期</strong>——把 <code>r₄</code> 从 0.5 修到 0.9，总账只涨 1.8 倍，而其余四项还在乘；<strong>② 修到某一项之后，下一项会立刻成为新瓶颈</strong>，看起来像「怎么改都不涨」。<em>正确的心态是：小目标不存在银弹，只存在「按性价比排序的组合拳」。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以本课给出的<strong>诊断顺序是有严格依据的</strong>：先查 ③（分配）——因为它几乎零算力代价、且折损常常是最狠的（<code>r₃</code> 可能直接是 0）；再查 ⑤（标注）——因为它决定指标上限，不查清楚后面所有实验都读不懂；再查 ④（架构）——代价约 4 倍，但可预期；最后才是 ①（算力/硬件）——最贵，且往往受产品约束。<em>② 贯穿其中，它既是分配问题也是损失问题，所以和 ③ 一起解决最省事。</em></p></div>
+  </div>  <h3>回到 TSR：一次完整的诊断</h3>  <p>目标：<strong>1920×1080 / 60° FOV 主视相机，要在 60 米外读准 0.6 m 的限速牌</strong>。逐条过账：</p>  <ul>
+    <li><strong>① 像素预算</strong>：<code>1662.8 × 0.6 / 60 = 16.6 px</code>。分类下限约 16 px（笔画 ≥ 2 px），<em>刚好卡线，没有余量</em> → <strong>r₁ 已经很低，这是硬约束</strong>。</li>
+    <li><strong>② 度量</strong>：16.6 px 目标在 τ=0.5 下只容忍 <code>3.05 px</code> 偏移；而回归头的固有噪声就是这个量级 → <strong>必须换尺度自适应阈值或 NWD</strong>。</li>
+    <li><strong>③ 分配</strong>：若沿用最小 32 px 的 anchor，<code>(16.6/32)² = 0.269 &lt; 0.5</code>，<strong>这个尺寸的目标一个正样本都拿不到</strong> → <strong>最优先修，且几乎免费</strong>。</li>
+    <li><strong>④ 架构</strong>：最细 stride 8 时只有 <code>2.08 × 2.08</code> 个格子，刚好卡在「2×2」经验线上 → <em>勉强可用，但没有余量；加 P2 代价 ×4，车端难以承受</em> → <strong>转而用 ROI 精检（只处理图像上半部分/消失点附近）</strong>。</li>
+    <li><strong>⑤ 标注</strong>：16.6 px 框上 ±2 px 是 12% 相对误差，平均一致性 IoU 约 0.79 → <strong>评测必须用 AP@0.5 + 召回，AP@0.75 不可信</strong>。</li>
+  </ul>  <div class="callout danger"><span class="label">诊断顺序错了，算力就白烧了</span>
+    <p>这次诊断给出的行动顺序是：<strong>改 anchor/分配（免费，收益最大）→ 改评测口径（免费，让后续实验可读）→ ROI 精检（中等代价）→ 才考虑加 P2 或换相机（最贵）</strong>。</p><p><em>而工程上最常见的错误顺序恰好是反的</em>：先换更大的 backbone、再提分辨率、再加 P2——三个动作都在修 ①④，而真正为零的 <code>r₃</code> 一直没人查。<strong>「先算 (s/A_min)² 再动手」这一行除法，能省下的时间以人月计。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>本模块把「小目标难」拆成了五笔可计算的账。每一笔账的边缘都还有真实的开放问题：</p>  <ul>
+    <li><strong>度量该不该整体换掉</strong>：NWD/KLD 在训练侧的收益已被反复验证，但<em>评测侧仍然是 IoU 的天下</em>。于是出现「训练目标与评测目标不一致」的结构性矛盾。有工作提出把评测也换成尺度自适应阈值，但这会破坏与既有 benchmark 的可比性——<strong>这是一个社区协调问题而不是技术问题</strong>，短期内看不到解。</li>
+    <li><strong>标注噪声下的可达上限</strong>：既然 8 px 目标的标注一致性 IoU 只有 0.62，「小目标 AP 的理论上限是多少」应当是一个可以严格计算的量，但目前几乎没有论文报告自己数据集的标注一致性分布。<em>「报告指标时同时报告标注噪声水平」应该成为规范</em>，就像报告置信区间一样。</li>
+    <li><strong>有效感受野的主动控制</strong>：ERF 目前基本是架构的<em>副产物</em>（由深度、核大小、stride 被动决定）。<em>能否让 ERF 成为可学习/可调度的量</em>——按目标尺度动态选择采样范围（可变形注意力是这个方向的雏形）、或用尺度专属的分支——仍是开放的。RFLA 把感受野建模成高斯并用于分配，是把 ERF 从「隐含假设」变成「显式先验」的一次尝试。</li>
+    <li><strong>亚采样极限的信息恢复</strong>：单帧一旦低于奈奎斯特极限，信息就是真的没了。<em>但多帧不是</em>——自车运动带来的亚像素位移在原理上可以支撑超分。TSR 场景对此格外有利（标志静止、自车运动可测），然而<strong>「多帧超分 + 检测」端到端联合优化的公开工作很少，量产落地报道更少</strong>。这可能是本方向最有价值的未开垦地。</li>
+    <li><strong>合成小目标的域差</strong>：copy-paste 与渲染可以廉价制造小目标，但合成的「小」与真实的「远」在模糊核、噪声谱、ISP 响应上系统性不同。<em>缺少标准工具去度量这个域差</em>，于是「合成数据加了多少才开始有害」全靠试。</li>
+    <li><strong>评测与下游脱节</strong>：AP 不区分「漏掉一块 8 px 的限速牌」与「漏掉一块 8 px 的景点指示牌」，但两者的安全后果差着数量级。<em>代价敏感的、按距离分桶的、与下游动作挂钩的评测体系</em>（C55 模块 05）在学术上讨论很少，却是量产系统真正在用的口径。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读（按本模块的推导顺序）：<em>Understanding the Effective Receptive Field in Deep Convolutional Neural Networks</em>（Luo et al., NeurIPS 2016 —— ERF 呈高斯、半径按 √n 增长的原始论证，本模块第 5 节的数值实验即复现其核心结论）；<em>Feature Pyramid Networks for Object Detection</em>（Lin et al., CVPR 2017 —— 层级分配与 ERF 匹配的第一性来源）；<em>Focal Loss for Dense Object Detection</em>（Lin et al., ICCV 2017 —— RetinaNet 的 anchor 设置，本模块「最小 anchor 32 px」的出处）；<em>A Normalized Gaussian Wasserstein Distance for Tiny Object Detection</em>（Xu et al., 2021 —— 直接针对本模块原因 ②，模块 03 展开）；<em>RFLA: Gaussian Receptive Field based Label Assignment for Tiny Object Detection</em>（Xu et al., ECCV 2022 —— 把 ERF 显式用于分配，同时针对原因 ③④）；<em>Generalized Focal Loss</em>（Li et al., NeurIPS 2020 —— 把框回归成分布，对应原因 ⑤ 的「软化边界」思路）。数据集侧：<em>TT100K</em>（Zhu et al., CVPR 2016）、<em>AI-TOD</em>（Wang et al., ICPR 2020，平均目标只有 12.8 px 的专门基准）。相邻课程：C18（检测基础）、C53（标签分配全谱）、C55（TSR 系统与安全评测）、C58（难例挖掘与标注噪声）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_architecture/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 架构层面的解法：分辨率、多尺度与上下文</div></a>
+  </div>
+
+</div>
+</body>
+</html>

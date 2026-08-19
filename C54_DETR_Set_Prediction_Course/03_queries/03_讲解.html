@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · Object query 与交叉注意力：模型如何「认领」目标</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · Object query 与交叉注意力：模型如何「认领」目标</h1>
+  <p class="subtitle">query 是可学习的位置查询而不是图像特征 · self-attention 负责 query 之间去重协商、cross-attention 负责从图像取证据——这个分工是理解 DETR 的关键 · 训练后 query 出现空间与尺度特化，事实上学成了数据驱动的 anchor · N 必须 > 单图最大目标数 · DAB-DETR 把 query 显式解释成 4D anchor box 并用 w/h 调制注意力范围</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（二分匹配）、模块 02（集合损失）；C08/C09（Transformer 与注意力）有帮助</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_object_queries.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">DETR (Carion 2020) §3.2 与附录 A.3/图 7；Conditional DETR (ICCV 2021)；Anchor-DETR (AAAI 2022)；DAB-DETR (ICLR 2022)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 70 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what-is-query">Object query 到底是什么：一个可学习的「提问」，不是特征</a></li>
+      <li><a href="#division">职责分工：self-attention 谈判去重，cross-attention 取证据</a></li>
+      <li><a href="#cross-mechanics">Cross-attention 的机制细节：Q/K/V 从哪来，位置编码加在哪</a></li>
+      <li><a href="#dedup">Self-attention 如何实现「训练期的 NMS」</a></li>
+      <li><a href="#specialization">Query 的空间特化：训练完之后，它们各自变成了什么</a></li>
+      <li><a href="#num-queries">Query 数量 N 怎么选：一笔必须算清的账</a></li>
+      <li><a href="#spatial-prior">给 query 装上空间先验：Conditional / Anchor / DAB-DETR</a></li>
+      <li><a href="#query-vs-anchor">Query 与 anchor 的本质异同（面试爱问）</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what-is-query"><span class="num">1</span>Object query 到底是什么：一个可学习的「提问」，不是特征</h2>
+  <p>先把最常见的误解正面击碎：<strong>object query 不是「目标的特征」，也不是「候选框」，更不是从图像里提取出来的东西</strong>。它是 <code>nn.Embedding(num_queries, d_model)</code> —— 一张 <code>100 × 256</code> 的<strong>可学习参数表</strong>，在整个数据集上是<em>同一份</em>，与输入图像完全无关。</p>  <div class="ascii">DETR decoder 的真实输入（PyTorch 官方代码的形状）
+
+  tgt        = torch.zeros(100, B, 256)        ← **内容，初始化为全 0**
+  query_pos  = self.query_embed.weight          ← (100, 256) **可学习参数**
+  memory     = encoder 输出 (H*W/32^2, B, 256)  ← 图像证据
+  mem_pos    = 2D sine positional encoding      ← 图像的位置编码
+
+  每一层 decoder：
+    q = k = tgt + query_pos ; v = tgt           ← self-attn：**pos 加在 Q/K，不加在 V**
+    tgt = LN(tgt + SelfAttn(q, k, v))
+    tgt = LN(tgt + CrossAttn(q = tgt + query_pos,
+                             k = memory + mem_pos,
+                             v = memory))       ← cross-attn：**V 不加位置编码**
+    tgt = LN(tgt + FFN(tgt))
+
+  最终 tgt (100, B, 256) --&gt; 分类头 / 框头</div>  <p>三个必须读懂的细节：</p>  <ol>
+    <li><strong><code>tgt</code> 初始化为全 0</strong>。第一层 self-attention 之前，100 个 query 的「内容」<em>完全相同（都是 0 向量）</em>，区分它们的<strong>只有 <code>query_pos</code></strong>。所以「query 是什么」这个问题的答案就是 <code>query_pos</code>——一个位置嵌入。</li>
+    <li><strong>位置嵌入只加到 Q 和 K，从不加到 V</strong>。这是一条贯穿整个 DETR 的设计约定：<em>位置只决定「往哪看 / 谁跟谁配对」，不决定「取回什么内容」</em>。如果把 pos 加进 V，取回来的向量里就混进了位置信息，后面的 FFN 无法区分「这是物体的外观」还是「这是我站的位置」。</li>
+    <li><strong><code>query_pos</code> 是参数，不是激活值</strong>。它在所有图像上共享，因此<em>一个 query 不可能编码「本图第 3 个物体」</em>——它没有这个信息。它能编码的只有一件事：<strong>一种搜索策略</strong>（「我负责去图像右上方找中等大小的东西」）。</li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以最准确的直觉是：<strong>query 是一个「提问模板」，decoder 是「带着问题去图上找答案」的过程</strong>。<code>tgt</code>（内容）从 0 开始，每过一层 cross-attention 就往里灌一点图像证据，每过一层 self-attention 就和别的 query 对一次账。<em>六层之后，<code>tgt</code> 里装的才是「我认领的那个物体长什么样、在哪」。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说，<code>query_pos</code> 学到的是一个<span class="term">learned positional prior</span>（可学习的位置先验）与一个<span class="term">content template</span>（内容模板）的混合体——原始 DETR 并不区分这两者，这正是它收敛慢的原因之一。<strong>Conditional DETR 与 DAB-DETR 的核心改动，就是把这两者显式拆开</strong>（见第 7 节）：spatial query 只管「看哪里」，content query 只管「找什么」。<em>拆开之后，「query 是位置嵌入」这句话才真正名副其实。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>面试常见翻车点</strong>：被问「object query 是什么」时说「是 100 个候选目标的特征向量」——这句话在初始状态下是<em>错的</em>（初始内容是 0 向量），在训练后也只是<em>近似对</em>（decoder 输出才是特征，query 本身仍是那份不变的参数表）。<strong>面试官想听的是：query 是与图像无关的可学习位置嵌入，它编码的是「搜索策略」；真正的目标特征是 decoder 逐层从 memory 里取回来累积在 <code>tgt</code> 上的。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="division"><span class="num">2</span>职责分工：self-attention 谈判去重，cross-attention 取证据</h2>
+  <p>这一节是<strong>理解 DETR 的钥匙</strong>。decoder 每层有两个注意力，它们不是「都在做注意力」，而是<strong>两条完全不同的信息通道，各自承担一个不可替代的职责</strong>。</p>  <div class="ascii">                     ┌───────────────────────────────┐
+   query 0 ────┐      │                               │
+   query 1 ────┤      │        SELF-ATTENTION         │  ← **唯一的 query↔query 通道**
+   query 2 ────┼──────┤   「你认领哪个？那我换一个」    │     职责：协商、去重、分工
+     ...       │      │   信息只在 100 个 query 之间流  │     不看图像
+   query 99 ───┘      └───────────────┬───────────────┘
+                                      │
+                                      ▼
+                      ┌───────────────────────────────┐
+   encoder memory ───→│        CROSS-ATTENTION        │  ← **唯一的 image→query 通道**
+   (H*W/1024 个 token)│   「图上哪块区域支持我的假设？」 │     职责：取证据
+                      │   信息从图像单向流入 query      │     query 之间**不通信**
+                      └───────────────┬───────────────┘
+                                      ▼
+                                     FFN
+                              （逐 query 独立）
+
+关键不对称：cross-attn 与 FFN 都是**逐 query 独立**的（pointwise），
+            所以**如果拿掉 self-attention，整个 decoder 就是 100 条互不相干的流水线**。</div>  <table>
+    <thead><tr><th></th><th><strong>self-attention</strong></th><th><strong>cross-attention</strong></th></tr></thead>
+    <tbody>
+      <tr><td>Q 来自</td><td>query（<code>tgt + query_pos</code>）</td><td>query（<code>tgt + query_pos</code>）</td></tr>
+      <tr><td>K / V 来自</td><td><strong>query 自己</strong></td><td><strong>encoder memory（图像）</strong></td></tr>
+      <tr><td>序列长度</td><td>N = 100（很短）</td><td>H·W/1024 ≈ 850–1000（很长）</td></tr>
+      <tr><td>职责</td><td><strong>协商：谁认领谁、去掉重复</strong></td><td><strong>取证：这个假设有没有像素支持</strong></td></tr>
+      <tr><td>拿掉它会怎样</td><td><strong>出现大量重复框</strong>（退化回需要 NMS）</td><td>query 拿不到任何图像信息，输出与输入无关</td></tr>
+      <tr><td>计算量</td><td>O(N²·d) = 100²·256，可忽略</td><td><strong>O(N·HW·d)</strong>，是 decoder 的主要开销</td></tr>
+      <tr><td>第一层是否必要</td><td><strong>几乎不必要</strong>（此时 tgt 全 0，没什么可谈判）</td><td>必要</td></tr>
+    </tbody>
+  </table>  <p>表格最后一行是 DETR 论文附录里一个很有说服力的消融：<strong>去掉<em>第一层</em>的 self-attention，AP 几乎不掉</strong>——因为那时 <code>tgt</code> 还是 0，所有 query 的内容一模一样，「谈判」没有任何信息可谈。<strong>但去掉后面几层的 self-attention，AP 掉约 <em>3 个点</em>，并且失效模式非常特征化：同一个物体上冒出多个高分框。</strong><em>这个「哪一层可以去掉、哪一层不能」的差异，正好证明了 self-attention 的职责是去重而不是别的。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么<strong>只有</strong> self-attention 能做去重？因为 cross-attention 和 FFN 都是<span class="term">pointwise</span>（逐 query 独立）的运算：query <em>i</em> 的输出<strong>只依赖 query <em>i</em> 自己的输入</strong>，和 query <em>j</em> 在干什么<em>数学上无关</em>。<em>notebook 第 3 节会用一个扰动实验精确验证这一点：改动 query 5，在无 self-attention 的 decoder 里其余 query 的输出<strong>逐比特不变</strong>；加上 self-attention 后立刻改变。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>把这件事和模块 02 的一对一匹配连起来，DETR 的去重机制就完整了：<strong>一对一匹配提供了「压力」（一个 GT 只有一个 query 能拿到正标签，其余全被推向 ∅），self-attention 提供了「执行这个压力的通道」</strong>。<em>两者缺一不可</em>：只有匹配没有通道，query 之间无法协调，只能各自靠静态先验碰运气；只有通道没有匹配（一对多监督），则根本没有「你退我进」的训练信号。<strong>面试里能把「压力」和「通道」拆开讲，是很强的信号。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">面试必答：一对一匹配是「压力」，self-attention 是「通道」</span>
+    <strong>高频面试题：「DETR 为什么不需要 NMS？」</strong>只答「因为一对一匹配」<em>只答对了一半</em>，而且是容易被追问穿的一半。追问会是：「一对一匹配只是损失函数，推理时又不算损失，凭什么推理时不出重复框？」<strong>完整答案：一对一匹配在<em>训练期</em>制造了「重复必被惩罚」的压力，而 decoder 的 self-attention 提供了 query 之间互相观察、互相抑制的<em>通道</em>，使模型能把这种抑制学进权重里；推理时抑制行为已经内化在注意力权重中，所以不需要外挂 NMS。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cross-mechanics"><span class="num">3</span>Cross-attention 的机制细节：Q/K/V 从哪来，位置编码加在哪</h2>
+  <div class="math-block">\[\mathrm{CrossAttn}(\mathbf{q}_i) = \sum_{k=1}^{HW} \underbrace{\mathrm{softmax}_k\!\left(\frac{(\mathbf{t}_i + \mathbf{p}^{q}_i)^\top W_Q^\top W_K (\mathbf{m}_k + \mathbf{p}^{m}_k)}{\sqrt{d_h}}\right)}_{\text{注意力权重 } a_{ik}} \; W_V\,\mathbf{m}_k\]</div>  <p>把这个式子逐块读一遍，每一块都有一个「为什么」：</p>  <table>
+    <thead><tr><th>符号</th><th>是什么</th><th>为什么这样设计</th></tr></thead>
+    <tbody>
+      <tr><td><code>t<sub>i</sub></code></td><td>query <em>i</em> 的当前内容（初始 0，逐层累积）</td><td>承载「我目前认为我认领的是什么」</td></tr>
+      <tr><td><code>p<sup>q</sup><sub>i</sub></code></td><td>query <em>i</em> 的可学习位置嵌入</td><td><strong>提供空间先验：「我大概往哪块区域看」</strong></td></tr>
+      <tr><td><code>m<sub>k</sub></code></td><td>encoder 输出的第 <em>k</em> 个空间位置特征</td><td>图像证据</td></tr>
+      <tr><td><code>p<sup>m</sup><sub>k</sub></code></td><td>图像的 2D sine 位置编码</td><td>让 attention 能表达「左上角 / 右下角」这类空间关系</td></tr>
+      <tr><td><strong>V 里没有 <code>p<sup>m</sup></code></strong></td><td>value 用的是纯 <code>m<sub>k</sub></code></td><td><strong>位置只决定「看哪里」，不该混进「取回什么」</strong></td></tr>
+      <tr><td><code>HW</code></td><td>≈ 850–1000（800×1066 输入 / stride 32）</td><td><strong>key 的数量决定了初始注意力有多「稀」</strong></td></tr>
+    </tbody>
+  </table>  <h3>初始注意力近似均匀 —— 这是 DETR 收敛慢的第一个根因</h3>  <p>训练开始时，<code>t<sub>i</sub> = 0</code>，<code>p<sup>q</sup></code> 随机初始化，于是 attention logits 的方差很小，<strong>softmax 之后近似均匀分布在 ~1000 个 key 上</strong>。用<span class="term">effective span</span>（有效关注范围，定义为 <code>exp(H(a))</code>，<code>H</code> 为注意力分布的熵）来量化：</p>  <div class="math-block">\[\text{effective span} = \exp\big(H(a_i)\big) = \exp\Big(-\sum_k a_{ik}\log a_{ik}\Big) \;\;\xrightarrow[\;\text{均匀}\;]{}\;\; HW \approx 1000, \qquad \xrightarrow[\;\text{收敛后}\;]{}\;\; O(10)\]</div>  <p><strong>初始 span 动辄好几百（notebook 实测约占全部 key 的 60%），意味着每个 key 只分到几百分之一的梯度</strong>。模型必须先花掉大量 epoch 把注意力「收窄」到目标区域，才谈得上学定位。<em>这正是 DETR 需要 500 epoch 的核心机理之一</em>，也是 Deformable DETR 用「每个 query 只采样 K=4 个点」来根治它的原因（模块 04）。notebook 的练习 4 会实测这个数字。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>多头的作用在 cross-attention 里特别直观。DETR 论文的可视化显示：<strong>不同的 head 会去关注同一物体的<em>不同极值点</em></strong>（左边缘、右边缘、上沿、下沿）。这非常合理——<em>要预测一个框的四条边，最自然的分工就是让几个 head 各负责一条边</em>。所以 cross-attention 的注意力图在收敛后往往<strong>不是一个团，而是几个点</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这个观察有个直接的工程推论：<strong>cross-attention 的注意力图是 DETR 最好用的调试工具</strong>。把 <code>a<sub>ik</sub></code> reshape 回 <code>H×W</code> 画出来，可以一眼看出：① query 有没有找到目标（注意力是否聚焦在目标上）；② 是不是几个 query 聚焦到了同一个目标（重复框的前兆）；③ 注意力是否还是弥散的（收敛不足）。<em>在 <strong>TSR</strong> 里这尤其有用：远处 8–16 px 的标志在 stride-32 特征图上只占不到半个格子，如果注意力图显示 query 关注的是杆件而不是牌面，就说明特征分辨率不够，该加 P2 层或用多尺度可变形注意力，而不是继续调超参。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这条位置编码的规则，它在所有 DETR 变体里都成立：<strong>位置编码进 Q 和 K，永远不进 V</strong>。推论：<em>凡是看到某个实现把 pos 加进了 V，基本可以判定是 bug</em>。同样的规则也解释了为什么 encoder 的位置编码要<strong>每一层都重新加一次</strong>（而不是像 ViT 那样只在输入加一次）——因为它只影响配对，不进入残差流。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dedup"><span class="num">4</span>Self-attention 如何实现「训练期的 NMS」</h2>
+  <p>上一节说了 self-attention 是去重的<em>通道</em>。这一节把「它到底怎么去的重」讲透，并说明<strong>它比 NMS 强在哪、弱在哪</strong>。</p>  <h3>机制：一对一匹配把「重复」变成了可导的损失</h3>  <p>假设 query 3 和 query 7 都锁定了同一块限速牌。匹配阶段只有一个能拿到这个 GT（比如 query 3），<strong>query 7 被匹配到 ∅，它的分类目标变成「背景」</strong>。于是梯度会同时做两件事：① 压低 query 7 的前景分数；② 通过 self-attention 的连接，让 query 7 <strong>学会「当我看到 query 3 已经在认领这块牌子时，我就该退让」</strong>。</p>  <p>第 ② 点才是关键——它把「退让」变成了一个<strong>输入条件（input-conditional）的函数</strong>：query 7 不是永远沉默，而是<em>在检测到冲突时</em>沉默。<strong>这正是 self-attention 相比「静态先验」的根本优势</strong>：如果 query 只有静态的位置先验、没有互相通信的能力，那么当一张图里两个目标恰好都落进 query 7 的偏好区域时，它无法动态调整。</p>  <table>
+    <thead><tr><th></th><th>NMS（推理期、手工规则）</th><th><strong>self-attention 去重（训练期学到）</strong></th></tr></thead>
+    <tbody>
+      <tr><td>何时生效</td><td>推理后处理</td><td><strong>内化在权重里，推理时零额外开销</strong></td></tr>
+      <tr><td>判据</td><td><strong>只看 IoU 阈值</strong></td><td><strong>可用外观、语义、上下文、相对位置</strong></td></tr>
+      <tr><td>超参</td><td>IoU 阈值（0.5/0.6/0.7，需按数据集调）</td><td><strong>无</strong></td></tr>
+      <tr><td>延迟</td><td><strong>随目标数波动</strong>（O(n²)，是 p99 延迟的不确定来源）</td><td>固定（已在 O(N²) 的 self-attn 里）</td></tr>
+      <tr><td>密集/重叠场景</td><td><strong>两难</strong>：阈值高则重复多，阈值低则误删真目标</td><td>可学会「这是两个物体」而不是「重复」</td></tr>
+      <tr><td>失败模式</td><td>同类相邻目标被误删</td><td><strong>训练不足时重复框仍会出现</strong>（去重没学会）</td></tr>
+      <tr><td>可解释性</td><td>高（规则明确）</td><td>低（藏在注意力权重里）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>「判据可以不只是 IoU」这一条在 <strong>TSR 里有非常具体的价值</strong>。中国高速上很常见的一种排布是<em>同一根立杆上下挂两块牌</em>（上面「限速 100」，下面「解除限速」的辅助牌），或者<em>组合标志牌</em>（一个大蓝底牌里嵌着几个小图标）。<strong>这些框的 IoU 天然很高</strong>——NMS 阈值设 0.5 会把下面那块牌当重复删掉，设 0.7 又会在别处放出重复框。<em>而 self-attention 可以学到「这两个框虽然重叠，但颜色/形状/语义不同，是两个物体」</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>反过来也要诚实说清 self-attention 去重的<strong>代价与失效场景</strong>：① 它是<em>学出来的</em>，所以在训练不足、数据分布外的场景上会失效——<strong>DETR 训练早期最典型的现象就是满屏重复框</strong>；② 它<em>不可调</em>：NMS 的阈值可以在部署时按场景改，而学到的抑制行为要改就得重训；③ 它<em>不可解释</em>：出了重复框，你没有一个「把阈值调一下」的旋钮。<strong>所以量产系统里常见的做法是「主要靠模型去重，但仍保留一个非常宽松的 NMS 兜底」</strong>（IoU 阈值 0.9 左右，只删几乎完全重合的框），<em>用极小的延迟代价买一个保险</em>——这是模块 05 会展开的工程取舍。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>训练诊断技巧：<strong>统计「同一个 GT 附近出现 ≥2 个高分预测」的比例</strong>，把它作为一个训练期指标画出来。<em>如果这个「重复率」随 epoch 稳定下降，说明 self-attention 的去重正在学到；如果它长期不降，通常意味着 ① query 数量太少（query 之间竞争过于激烈）、② 匹配不稳定（模块 04 的 DN-DETR 就是治这个的）、或 ③ self-attention 被错误地加了 mask。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="specialization"><span class="num">5</span>Query 的空间特化：训练完之后，它们各自变成了什么</h2>
+  <p>DETR 论文图 7 是这门课里最值得反复看的一张图：作者把 100 个 query 中的 20 个挑出来，<strong>把它们在 COCO val 上预测出的所有框的中心点画在同一张图上</strong>。结果是：<em>每个 query 都形成了一个清晰的、与其他 query 不同的分布</em>。</p>  <div class="ascii">query #12 的框中心分布            query #47 的框中心分布
+  ┌─────────────────────┐          ┌─────────────────────┐
+  │  · ·                │          │              ·  ··· │
+  │ ····                │          │             ······  │
+  │ ·····               │          │              ····   │
+  │  ···                │          │                     │
+  │                     │          │                     │
+  │ ══════════════════  │ ← 几乎每个 │ ══════════════════  │ ← 这条横线是
+  └─────────────────────┘   query 都 └─────────────────────┘   「大的、横跨全图的框」
+   偏好：左上、中小目标      有的模式    偏好：右上、小目标        （COCO 的分布偏差）
+
+结论：query = **一种「区域 + 尺度」的操作模式（operating mode）**
+      而不是一个固定的框，也不是一个固定的类别。</div>  <ul>
+    <li><strong>空间特化是自发涌现的</strong>，没有任何损失项要求 query 分工。它是一对一匹配的必然结果：<em>如果两个 query 的偏好完全一样，它们会永远争夺同一批 GT，其中一个总是拿到 ∅ 标签、被压成背景——于是「分开」才是损失更低的解。</em></li>
+    <li><strong>特化的维度是「位置 + 尺度」，不是「类别」</strong>。论文里没有观察到「某个 query 专门检测人」这类语义特化。<em>原因很直接：query 的先验是通过 cross-attention 的空间项起作用的，而空间项天然只能表达「看哪里、看多大」。</em></li>
+    <li><strong>几乎每个 query 都保留了一个「大横框」模式</strong>（图里那条横线）。这是 COCO 数据集的偏差（大量图像有一个占满画面的主体）被 query 学了进去。<em>这直接说明：query 的特化是<strong>数据分布的镜像</strong>。</em></li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>「query 特化是数据分布的镜像」这句话在 <strong>TSR 上有非常实际的后果</strong>。中国高速的交通标志分布是极度有结构的：<em>竖直方向集中在地平线上方一条窄带里，水平方向偏向道路右侧（右行 + 立杆在右），龙门架标志则集中在画面正上方</em>。在这样的数据上训练，<strong>query 会强烈特化到「右上 + 正上」这两块区域</strong>——notebook 第 5 节会用一个真训练的合成实验把这个现象复现出来。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>而这就带来一个<strong>容易在实车上炸、离线却看不出的失效模式</strong>：一旦分布变了——<em>换到左行国家、换到城市道路（标志更低更近）、换到匝道或环岛（标志出现在画面左侧）</em>——<strong>那些从没被训练到过的区域没有任何 query 负责，召回会成片掉下去</strong>，而整体 mAP 可能只掉一两个点（因为主分布还在）。<em>对策：① 评测必须按「标志在画面中的位置」分桶（C55 模块 05）；② 数据要覆盖各类道路几何；③ 慎用水平翻转增强——它能补左侧分布，但会把「左转」翻成「右转」、把文字镜像（C56 模块 01 的禁区）。</em><strong>「用翻转增强补 query 的空间偏置」是个陷阱，能主动指出来是加分项。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个可迁移的心法：<strong>凡是「一组并行的、可学习的槽位（slot）」配上「一对一分配」的结构，都会自发产生特化</strong>。这个模式在 Slot Attention（无监督物体发现）、MoE 的专家路由、Perceiver 的 latent array 里反复出现。<em>反过来，如果你观察到槽位<strong>没有</strong>特化（都长得差不多），通常意味着分配机制失效了——比如 MoE 的路由崩塌、或者 DETR 的匹配极不稳定。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="num-queries"><span class="num">6</span>Query 数量 N 怎么选：一笔必须算清的账</h2>
+  <p><code>N</code> 是 DETR 系最显眼的超参之一，而关于它的直觉<strong>有一半是错的</strong>。先立三条硬约束：</p>  <ol>
+    <li><strong><code>N</code> 必须严格大于单图最大目标数</strong>——否则那张图上必然有 GT 匹配不到 query，形成<em>结构性漏检</em>（无论怎么训练都救不回来）。COCO 单图最多 63 个实例，DETR 取 100。</li>
+    <li><strong>但 <code>N</code> 大于最大目标数还不够</strong>。DETR 论文做过一个尖锐的实验：合成一张有 100 个小目标的图，<em>模型在检出约 50 个之后开始饱和</em>。说明 query 之间并非完全对称、可互换——<strong>「N=100 就能检 100 个」是错的，实际可用容量大约只有一半</strong>。</li>
+    <li><strong><code>N</code> 越大，正样本比例越低</strong>：<code>M/N</code> 直接决定了分类损失里前景与背景的比例（模块 02 的 <code>eos_coef</code> 问题）。<em>这也是为什么把 N 从 100 提到 900 的工作（DINO）必须同时把 CE 换成 focal loss</em>——softmax + <code>eos_coef</code> 那套在 N=900 时会失控。</li>
+  </ol>  <div class="math-block">\[\text{正样本比例} = \frac{\mathbb{E}[M]}{N}: \quad \underbrace{\frac{7.7}{100} = 7.7\%}_{\text{COCO, DETR}} \quad \underbrace{\frac{7.7}{900} = 0.86\%}_{\text{COCO, DINO}} \quad \underbrace{\frac{1.8}{100} = 1.8\%}_{\textbf{TSR, N=100}} \quad \underbrace{\frac{1.8}{900} = 0.2\%}_{\textbf{TSR, N=900}}\]</div>  <table>
+    <thead><tr><th>N</th><th>代表模型</th><th>正样本比例（COCO）</th><th>self-attn 计算</th><th>匈牙利匹配</th><th>分类损失</th></tr></thead>
+    <tbody>
+      <tr><td><strong>100</strong></td><td>DETR / Conditional DETR</td><td>7.7%</td><td>10<sup>4</sup>（可忽略）</td><td>O(M²N)，很快</td><td>softmax CE + <code>eos_coef</code>=0.1</td></tr>
+      <tr><td><strong>300</strong></td><td>Deformable DETR / DAB-DETR</td><td>2.6%</td><td>9×10<sup>4</sup></td><td>3× 于 N=100</td><td><strong>sigmoid focal</strong></td></tr>
+      <tr><td><strong>900</strong></td><td>DINO / Co-DETR</td><td>0.86%</td><td>8×10<sup>5</sup></td><td><strong>9× 于 N=100，CPU 上开始可见</strong></td><td><strong>sigmoid focal（必须）</strong></td></tr>
+      <tr><td><em>N &lt; max objects</em></td><td>—</td><td>—</td><td>—</td><td>—</td><td><strong>❌ 结构性漏检，任何训练都救不回</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一个<strong>极常见的误解</strong>：「DINO 用 900 个 query 是因为它要检更多目标」。<em>不是。</em> COCO 单图最多 63 个实例，100 早就够了。<strong>把 N 提到 300/900 的真实动机是「增加监督密度、加快收敛」</strong>：query 越多，encoder 提议（two-stage 里 query 由 encoder 的 top-k 初始化）覆盖越密，每张图能产生的有效梯度路径越多。<em>这与「一对多辅助分支」（Group DETR / Co-DETR）是同一个动机的两种做法——都在解决「一对一监督太稀疏」。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>对 <strong>TSR</strong> 来说，这个账要重新算。一张高速前视图像通常只有 <strong>1–5 块标志</strong>，极端情况（复杂互通、多杆并列）也就十几块。<em><code>N=100</code> 已经远远超过需求，继续加到 900 不会提升召回，只会让正样本比例从 1.8% 掉到 0.2%、并增加匹配与 self-attn 开销</em>。<strong>但也不该激进地把 N 砍到 20</strong>——① query 的实际可用容量只有名义值的一半左右；② N 太小会让 query 之间竞争过于激烈，加剧匹配不稳定；③ 车端的 self-attn 开销在 N=100 时本来就可忽略（10<sup>4</sup> 量级）。<strong>结论：TSR 场景 <code>N</code> 取 50–100 是合理区间，这个「按目标数分布反推 N」的推理过程本身就是很好的面试素材</strong>——notebook 练习 3 会把它写成一个决策脚本。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>改 <code>N</code> 时有两个必须同步改的地方，忘了就会「换个数字模型就废」：① <strong>分类损失的配置</strong>（N 大幅增加时 softmax + <code>eos_coef</code> 必须换成 focal）；② <strong>推理端的 top-k</strong>（DETR 取所有 query 的 argmax；focal 版在 <code>N×K</code> 个 (query, 类) 对里取 top-100——<em>N 变了而 top-k 没变，会直接改变召回上限</em>）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="spatial-prior"><span class="num">7</span>给 query 装上空间先验：Conditional / Anchor / DAB-DETR</h2>
+  <p>原始 DETR 的 query 是一个「什么都混在一起」的 256 维向量：既要编码「看哪里」，又要编码「找什么」，还要参与去重协商。<strong>这一系列工作的共同思路，就是把「看哪里」这件事从向量里<em>拆出来、显式化</em></strong>，让它有明确的空间语义。</p>  <table>
+    <thead><tr><th>工作</th><th>query 变成什么</th><th>关键机制</th><th>收敛加速</th></tr></thead>
+    <tbody>
+      <tr><td><strong>DETR</strong></td><td>一个 256-d 可学习向量</td><td>什么都混在一起</td><td>基准（500 epoch）</td></tr>
+      <tr><td><strong>Conditional DETR</strong></td><td><strong>content query + spatial query 分开</strong></td><td>cross-attn logits 拆成 <code>c<sub>q</sub>·c<sub>k</sub> + p<sub>q</sub>·p<sub>k</sub></code>；<code>p<sub>q</sub></code> 由参考点生成</td><td><strong>6.7×</strong>（→ 50–75 epoch）</td></tr>
+      <tr><td><strong>Anchor-DETR</strong></td><td><strong>2D 锚点 (x, y)</strong></td><td>query 直接由锚点的位置编码生成，完全可解释</td><td>~10×</td></tr>
+      <tr><td><strong>DAB-DETR</strong></td><td><strong>4D anchor box (x, y, w, h)</strong></td><td><strong>用 w, h 调制位置注意力的宽窄</strong> + <strong>逐层精修 anchor</strong></td><td>~10×（50 epoch）</td></tr>
+      <tr><td><strong>DINO</strong></td><td>4D anchor + 混合初始化</td><td>encoder top-k 提议初始化位置部分，content 部分仍可学</td><td>12 epoch 即 SOTA</td></tr>
+    </tbody>
+  </table>  <h3>Conditional DETR：把 attention logits 拆成内容项 + 空间项</h3>  <div class="math-block">\[(\mathbf{c}_q + \mathbf{p}_q)^\top(\mathbf{c}_k + \mathbf{p}_k) \;\;\longrightarrow\;\; \underbrace{\mathbf{c}_q^\top \mathbf{c}_k}_{\text{内容：找什么}} \;+\; \underbrace{\mathbf{p}_q^\top \mathbf{p}_k}_{\text{空间：看哪里}}\]</div>  <p>原始 DETR 把 pos 直接<em>加</em>进 Q/K，展开后会多出两个交叉项 <code>c<sub>q</sub>·p<sub>k</sub></code> 和 <code>p<sub>q</sub>·c<sub>k</sub></code>——<strong>这两项让「内容」和「位置」互相污染，谁也说不清 attention 到底在响应什么</strong>。Conditional DETR 把它们去掉（等价于把 content 与 spatial 拼接后做单次点积，notebook 练习 1 会验证这个等价性），<em>于是空间项可以独立地把注意力「拉」到参考点附近，内容项独立地负责匹配外观</em>。</p>  <h3>DAB-DETR：用 w, h 调制位置注意力的「窗口宽度」</h3>  <p>Conditional DETR 的空间项是<strong>各向同性</strong>的：注意力窗口是个固定大小的圆斑。但目标有大有小、有宽有扁——<em>一块 8×8 的远处限速牌和一块跨越整个画面的龙门架指路牌，需要的注意力窗口差了两个数量级</em>。DAB-DETR 的做法非常漂亮：</p>  <div class="math-block">\[\mathrm{PosAttn}(x_q, x_k) = \mathrm{PE}\!\left(\frac{x_q}{w_q}\right)^{\!\top} \mathrm{PE}\!\left(\frac{x_k}{w_q}\right), \qquad \mathrm{PE}(x)^\top \mathrm{PE}(x') = \sum_{j} \cos\big(\omega_j (x - x')\big)\]</div>  <p>右边那个恒等式是关键：<strong>正弦位置编码的点积只依赖于两点的<em>距离</em>，并且是一个以 0 为峰的钟形核</strong>。所以把坐标除以 <code>w<sub>q</sub></code>，<strong>就等于把这个核在空间上<em>拉宽</em> <code>w<sub>q</sub></code> 倍</strong>——宽目标得到宽窗口，小目标得到窄窗口。<em>notebook 第 6 节会把这个核画出来并实测半宽，验证它精确地正比于 w。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>DAB-DETR 还带来第二个红利：<strong>既然 query 就是一个框 <code>(x,y,w,h)</code>，那它就可以被<em>逐层精修</em></strong>——第 <em>l</em> 层预测一个增量 <code>Δ</code>，在 inverse-sigmoid 空间累加后得到第 <em>l+1</em> 层的 anchor。<em>这与模块 02 讲的辅助损失是天生一对</em>：辅助损失要求每层都输出可用的框，逐层精修则提供了「在前一层基础上改进」的结构。<strong>DINO 的 look-forward-twice 正是在这条链上的进一步优化</strong>（模块 04）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从更高的视角看，这一整条线做的事情可以概括成一句话：<strong>把「隐式的、纠缠的」query 逐步改造成「显式的、可解释的、可精修的」空间假设</strong>。<em>而它的终点非常有意思：当 query 变成一个 4D 框、并且逐层精修时，它已经在结构上极其接近一个「可学习的、动态的 anchor」了</em>——这正好把我们带到下一节那个高频面试题。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>这条演进线还有一个可迁移的启发：<strong>当一个模块「什么都能表示」但收敛很慢时，往往是因为它需要先<em>学会</em>一个本可以直接<em>写死</em>的结构</strong>。<em>DETR 的 query 要从随机向量里学出「空间局部性」这个先验，而 CNN 的卷积核天生就有。给 query 装上 <code>(x,y,w,h)</code> 的显式语义，本质上是把这个先验直接送给它。</em>这与「加归纳偏置 vs 让模型自己学」的经典权衡是同一件事——<strong>数据量不够时，送先验；数据量足够时，先验反而是天花板。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="query-vs-anchor"><span class="num">8</span>Query 与 anchor 的本质异同（面试爱问）</h2>
+  <p>这是 DETR 相关面试里<strong>区分度最高的问题之一</strong>，因为它同时考察你对两代检测器的理解深度。很多人会给出一个非黑即白的答案（「query 是学出来的，anchor 是设计的」），<em>而好答案应该指出：它们在「提供空间先验」这个功能上是同构的，真正的差别在<strong>监督方式</strong>和<strong>是否可动</strong></em>。</p>  <table>
+    <thead><tr><th>维度</th><th>Anchor（Faster R-CNN / YOLO / RetinaNet）</th><th><strong>Object query（DETR 系）</strong></th></tr></thead>
+    <tbody>
+      <tr><td>本质</td><td>预设的参考框（尺度 × 长宽比 × 位置）</td><td>可学习的 <code>d</code> 维嵌入（DAB 后：4D 框）</td></tr>
+      <tr><td>来源</td><td><strong>人工设计</strong>（或对训练集 wh 做 k-means 聚类）</td><td><strong>随机初始化 + 反向传播学出来</strong></td></tr>
+      <tr><td>数量</td><td><strong>密集</strong>：每个特征图格点 ×A 个，总量 10<sup>4</sup>–10<sup>5</sup></td><td><strong>稀疏</strong>：100–900 个</td></tr>
+      <tr><td>与位置的绑定</td><td><strong>硬绑定到特征图格点</strong>（anchor 不能离开自己的格子）</td><td><strong>不绑定</strong>：一个 query 可以在任意位置出框（有偏好但无硬约束）</td></tr>
+      <tr><td>跨图共享</td><td>是（同一套 anchor 用于所有图）</td><td>是（同一份参数表用于所有图）</td></tr>
+      <tr><td><strong>监督方式</strong></td><td><strong>一对多</strong>（一个 GT 匹配多个 anchor）</td><td><strong>一对一</strong>（一个 GT 只匹配一个 query）</td></tr>
+      <tr><td><strong>是否需要 NMS</strong></td><td><strong>需要</strong></td><td><strong>不需要</strong>（模块 02 + 本模块第 4 节）</td></tr>
+      <tr><td>能否逐层精修</td><td>两阶段可以（RPN→RCNN），单阶段一般不</td><td><strong>可以</strong>（DAB/DINO 的 iterative refinement）</td></tr>
+      <tr><td>query 之间是否通信</td><td><strong>否</strong>（anchor 之间完全独立）</td><td><strong>是</strong>（self-attention）</td></tr>
+      <tr><td>需要调的先验超参</td><td>尺度、长宽比、每格 anchor 数、匹配 IoU 阈值</td><td><strong>只有 N</strong></td></tr>
+    </tbody>
+  </table>  <h3>三句话的标准答案骨架</h3>  <ol>
+    <li><strong>相同点</strong>：两者在功能上都是<em>「空间假设的载体」</em>——先摆出一批候选位置，再让网络去修正它们。<em>DAB-DETR 把 query 显式写成 <code>(x,y,w,h)</code> 之后，这个同构关系已经变成字面意义上的相同了。</em></li>
+    <li><strong>关键差别一：监督方式</strong>。anchor 是一对多（所以必须 NMS 去重），query 是一对一（所以训练期就压制了重复）。<em>这是「需不需要 NMS」的根本原因，也是两者最本质的分野。</em></li>
+    <li><strong>关键差别二：query 之间能通信，anchor 不能</strong>。self-attention 让 query 可以互相观察、动态分工；anchor 各自独立，只能靠推理后的 NMS 收拾残局。<em>加一句：正因为 query 是稀疏的（100 vs 10<sup>5</sup>），两两通信的 O(N²) 才付得起。</em></li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>如果面试官继续追问「那 query 到底比 anchor 好在哪」，<strong>不要说「更好」，要说「换了一组取舍」</strong>：<em>query 换来了「无 NMS、端到端、延迟稳定、少调超参」，代价是「收敛慢、需要更多数据、小目标弱、失效不可解释」</em>。<strong>能主动说出代价，比只背优点更能体现工程判断力。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个更深的观察值得放在结尾：<strong>「一对一」是<em>推理端</em>的需求（要输出一个不含重复的集合），而不是<em>训练端</em>的最优（一对一提供的监督信号太稀疏）</strong>。<em>Group DETR / H-DETR / Co-DETR 的做法正是承认了这一点：训练时额外挂一条一对多的分支来加密监督，推理时把它丢掉。</em>换句话说，检测器的演进不是「从 anchor 走向 query」，而是<strong>「把训练目标和推理约束解耦」</strong>——这个视角能把 C53（YOLO/RTMDet 的标签分配）和 C54（DETR 的集合预测）串成一条线。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <strong>面试陷阱</strong>：「DETR 是 anchor-free 的吗？」答「是」会被追问 DAB-DETR，答「不是」又和大众说法冲突。<strong>正确答法：原始 DETR 没有显式 anchor，但它的 query 起了同样的空间先验作用；而 DAB-DETR 把 query 显式参数化成 4D anchor box 之后，DETR 系实际上重新引入了 anchor——只不过是<em>可学习的、稀疏的、逐层精修的、一对一监督的</em> anchor。</strong><em>「anchor-free vs anchor-based」这个二分法本身在 2022 年后已经不再是好的分类维度，更有信息量的分类维度是「一对一 vs 一对多」。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>Query 的设计是 DETR 系目前<strong>仍在快速变化</strong>的部分。下面几条是值得持续关注的方向与尚未解决的问题。</p>  <ul>
+    <li><strong>query 的初始化：静态参数 vs 内容感知</strong>。DINO 的 <em>mixed query selection</em> 用 encoder 的 top-k 提议初始化 query 的<em>位置</em>部分，但保留 content 部分为可学习参数——<em>因为实验发现用 encoder 特征初始化 content 反而更差</em>（提议特征还不够精炼，会误导 decoder）。<strong>「位置该由数据给、内容该由参数给」这个不对称结论目前只有经验解释，缺少理论。</strong></li>
+    <li><strong>query 数量的自适应</strong>。现在 N 是固定超参，而实际场景的目标数分布方差极大（<em>TSR 里空旷高速 0 块标志，复杂互通 15 块</em>）。<em>能否让 N 随图像内容动态调整（早退、稀疏化、级联扩展）？</em>这既是精度问题也是<strong>延迟问题</strong>——固定 N 意味着为最坏情况付费。</li>
+    <li><strong>query 与多尺度的关系</strong>。Deformable DETR 让每个 query 在多个尺度上采样，但<em>「哪个 query 该负责哪个尺度」仍然是隐式学出来的</em>，不像 FPN 有明确的层级分配规则（<code>k = k₀ + log₂(√(wh)/224)</code>）。<strong>对小目标为主的 TSR，显式的尺度分配可能仍有价值</strong>（详见 C57 模块 02）。</li>
+    <li><strong>self-attention 去重的可解释性与可控性</strong>。去重行为藏在注意力权重里，<em>既无法在部署时调整，也无法在出问题时定位</em>。有工作尝试从注意力图里读出「抑制关系图」，但尚无成熟工具。<strong>这对安全攸关的量产系统是个真实的痛点</strong>——「为什么这一帧多出一个框」目前没有可审计的答案。</li>
+    <li><strong>query 作为跨任务的通用接口</strong>。Mask2Former 用同一套 query 统一了语义/实例/全景分割，MOTR / TrackFormer 把 query 延续到下一帧做<em>跟踪</em>（track query 与 detect query 分工）。<em>对 TSR 而言这条线特别有吸引力：标志是静止的、自车运动可预测，「用 query 携带跟踪状态跨帧传播」在理论上比「检测完再关联」更自然</em>（对照 C55 模块 04）。</li>
+    <li><strong>开放问题：query 的容量瓶颈</strong>。DETR 论文的合成实验显示 100 个 query 实际只能稳定检出约 50 个目标。<em>这个「一半」是从哪来的？是 self-attention 的竞争？是匹配的不稳定？还是位置嵌入的表达能力？</em> 目前没有令人满意的解释，而它直接限制了 DETR 系在密集场景（人群、货架、密集车流）的上限。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>必读（按顺序）</strong>：</p><ul><li>★ <em>End-to-End Object Detection with Transformers</em>（DETR, ECCV 2020）——重点读 §3.2（decoder 结构）、附录 A.3（消融：去掉 self-attention 会出重复框）、<strong>图 7（query 的空间特化）与图 6（cross-attention 关注物体极值点）</strong>。<strong>解决什么问题：把检测变成集合预测，并给出 query + 匈牙利匹配这套骨架。</strong></li><li>★ <em>Conditional DETR for Fast Training Convergence</em>（ICCV 2021）——读 §3 的 attention 分解。<strong>解决什么问题：content 与 spatial 纠缠导致收敛慢。</strong></li><li>★ <em>DAB-DETR: Dynamic Anchor Boxes are Better Queries for DETR</em>（ICLR 2022）——读 §3.2 的 modulated positional attention 与 §3.3 的逐层精修。<strong>解决什么问题：query 缺少尺度先验；顺带把「query 就是 anchor」讲透。</strong></li><li><em>Anchor DETR: Query Design for Transformer-Based Detector</em>（AAAI 2022）——最简洁的「query = 锚点」实现，适合先读它建立直觉。</li><li><em>DINO</em>（ICLR 2023）——看 mixed query selection 为何只用位置不用内容。</li><li><em>Masked-attention Mask Transformer</em>（Mask2Former, CVPR 2022）——看 query 如何被推广成通用的分割接口。</li></ul><p>相邻课程：模块 02（集合损失提供去重的「压力」）、模块 04（收敛难题与 Deformable/DN/DINO）、模块 05（工程实践与选型）、C55 模块 04（时序关联，可与 track query 对照）、C57 模块 02（小目标的多尺度架构）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_set_loss/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 集合预测损失：匹配之后怎么算账</div></a>
+    <a class="next" href="../04_convergence/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 收敛难题与 DETR 家族演进</div></a>
+  </div>
+
+</div>
+</body>
+</html>

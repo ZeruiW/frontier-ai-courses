@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · INT8 校准与精度恢复</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · INT8 校准与精度恢复</h1>
+  <p class="subtitle">scale / zero-point 与「对称 vs 非对称 × per-tensor vs per-channel」四种组合各自省什么、赔什么 · <strong>MinMax 被一个离群值就毁掉</strong>（一个 100 倍的异常激活能让其余 99.99% 的值全部落进同一个 bin）· Entropy/KL（TensorRT 默认）到底在最小化什么、直方图与候选阈值怎么搜 · Percentile 截断 99.9% 的收益与代价 · <strong>校准集用训练集头 500 张（很可能全是晴天白天）是经典错误</strong>，它让夜间与逆光整段失真 · 逐层敏感度分析 + 混合精度：通常 5% 的层贡献 80% 的掉点 · PTQ 掉点 &gt; 1–2 mAP 且混合精度救不回来，才轮到 QAT · 一棵可以照着走的量化掉点排查决策树</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（预处理一致性）、模块 02（builder config 与精度标志）；C27（量化原理）有帮助但不必需</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_int8_calibration.ipynb（纯 numpy：完整实现 TensorRT 的 KL 熵校准）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Migacz «8-bit Inference with TensorRT» (GTC 2017) · Nagel et al. «A White Paper on Neural Network Quantization» · NVIDIA «Integer Quantization for DL Inference»</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 90 分钟 + 跑 75 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#basics">INT8 回顾：scale、对称性，以及为什么权重能 per-channel 而激活不能</a></li>
+      <li><a href="#calibration">校准：静态的权重不需要它，动态的激活离不开它</a></li>
+      <li><a href="#algorithms">三种校准算法：它们最小化的根本不是同一个东西</a></li>
+      <li><a href="#kl">TensorRT 的熵校准：完整算法</a></li>
+      <li><a href="#calibset">校准集的构造：整条链路上最容易做错的一步</a></li>
+      <li><a href="#sensitivity">敏感层分析与混合精度：把掉点还回来</a></li>
+      <li><a href="#detection">量化对检测的特殊影响：分类头、回归头、小目标</a></li>
+      <li><a href="#qat-tree">QAT 何时值得，与量化掉点排查决策树</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="basics"><span class="num">1</span>INT8 回顾：scale、对称性，以及为什么权重能 per-channel 而激活不能</h2>
+  <p>先把地基打牢。<strong>量化就是用一个仿射映射把浮点张量塞进 8 位整数</strong>，推理时在整数域做乘加、在需要的地方再映射回浮点：</p>  <div class="math-block">\[r \;\approx\; S\,(q - Z), \qquad q \;=\; \mathrm{clip}\Bigl(\mathrm{round}\bigl(\tfrac{r}{S}\bigr) + Z,\; q_{\min},\; q_{\max}\Bigr)\]</div>  <p>$S$ 是 <span class="term">scale</span>（步长），$Z$ 是 <span class="term">zero-point</span>（零点偏移）。<strong>TensorRT 只用对称量化</strong>：$Z=0$，$q\in[-127,127]$（<em>不用 $-128$，为的是让正负范围严格对称</em>），于是 $S = T/127$，其中 $T$ 就是我们要通过校准确定的<strong>阈值（threshold）</strong>。</p>  <h3>对称量化的代价，以及 TensorRT 为什么还是选了它</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>对称量化有一个显而易见的浪费：<strong>ReLU 之后的激活全是非负的，而 $[-127,-1]$ 这半边永远用不到</strong>——8 位里白白丢掉 1 位，有效精度只剩 7 位。非对称量化（带 zero-point）可以把整个 $[0,T]$ 映射到 $[-128,127]$，分辨率直接翻倍。<em>那为什么不用？</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>因为 zero-point 会在矩阵乘里制造<strong>交叉项</strong>。展开 $y=\sum_c w_c x_c$，若 $x_c = S_x(q^x_c - Z_x)$、$w_c = S_w q^w_c$，则$y = S_wS_x\bigl(\sum_c q^w_c q^x_c - Z_x\sum_c q^w_c\bigr)$。多出来的 $Z_x\sum_c q^w_c$ 虽然可以预计算（因为权重是常数），<em>但一旦两边都非对称，就会出现 $Z_wZ_x$ 与 $Z_w\sum q^x$ 两项，后者依赖运行时输入、必须现算</em>。<strong>在 INT8 张量核上，这些额外的规约会打断最紧的 GEMM 内循环</strong>。TensorRT 的取舍是：宁可丢掉 ReLU 后的那 1 位，也要保住 GEMM 的峰值吞吐。<em>这也解释了为什么很多网络在 TRT 上更喜欢用 ReLU6 / Clip 这类<u>有界</u>激活，或者干脆用带负半轴的激活（LeakyReLU、SiLU）——对称量化在它们身上不浪费。</em></p></div>
+  </div>  <h3>per-tensor 与 per-channel：一个可以严格推导的边界</h3>  <p><strong>这是本节最值得背下来的一段，面试里能立刻显出水平。</strong>把量化后的卷积/GEMM 完整展开，看 scale 能不能提到求和号外面：</p>  <div class="math-block">\[y_o \;=\; \sum_{c,k} w_{o,c,k}\, x_{c,k} \;\approx\; \sum_{c,k} \bigl(S_w^{(o)} q^w_{o,c,k}\bigr)\bigl(S_x\, q^x_{c,k}\bigr) \;=\; \underbrace{S_w^{(o)}\,S_x}_{\text{每个输出通道一个标量}} \cdot \underbrace{\sum_{c,k} q^w_{o,c,k}\,q^x_{c,k}}_{\text{纯 INT32 累加}}\]</div>  <p><strong>权重的 scale 带下标 $o$（输出通道）却仍然能提出来</strong>，因为对固定的 $o$，$S_w^{(o)}$ 是一个常数，和求和变量 $c,k$ 无关——所以 <span class="term">per-channel</span> 权重量化是<em>免费</em>的：INT32 累加照常做，最后每个输出通道乘一个标量即可。</p>  <p>但如果激活也想 per-channel，$S_x$ 就变成 $S_x^{(c)}$，它<strong>在求和号里面</strong>：</p>  <div class="math-block">\[y_o \;\approx\; S_w^{(o)} \sum_{c} S_x^{(c)} \sum_{k} q^w_{o,c,k}\,q^x_{c,k} \quad\Longrightarrow\quad \text{每个 } c \text{ 都要单独乘一次再累加，INT32 累加器废了}\]</div>  <table>
+    <thead><tr><th>张量</th><th>粒度</th><th>为什么</th><th>不这么做的后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>权重</strong></td><td><strong>per-channel（输出通道）</strong></td><td>scale 与求和变量无关，可提到累加之外；且权重是静态的，离线算好即可</td><td>per-tensor 权重在 depthwise 卷积上是灾难——各通道的动态范围可以差 10× 以上</td></tr>
+      <tr><td><strong>激活</strong></td><td><strong>per-tensor</strong></td><td>per-channel scale 落在求和号内，破坏 INT32 累加；且激活在运行时才存在</td><td>—（做不到，不是不想做）</td></tr>
+      <tr><td>偏置</td><td>跟随 $S_w^{(o)}S_x$，用 INT32</td><td>偏置直接加在累加器上，尺度必须匹配</td><td>偏置尺度错 = 系统性偏移</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label">从 per-channel 的边界推出 SmoothQuant</span>
+    <p>这条推导还顺手解释了一整个研究方向。既然<strong>激活不能 per-channel、而权重可以</strong>，那面对「某些激活通道天生比别的大 10 倍」（Transformer 里普遍存在的 outlier channel）这个问题，自然的解法就是：<em>用一个对角矩阵把激活的通道差异「搬」到权重上去</em>——$y = (x\,\mathrm{diag}(s)^{-1})\,(\mathrm{diag}(s)\,W)$，数学上完全等价，但搬完之后激活变平了（好量化），权重变陡了（无所谓，因为它可以 per-channel）。<strong>这就是 SmoothQuant 的全部思想</strong>，AWQ 是它的加权变体。<em>能把「per-channel 的可行性边界」和「SmoothQuant 为什么有效」串起来讲，是很强的信号。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="calibration"><span class="num">2</span>校准：静态的权重不需要它，动态的激活离不开它</h2>
+  <p><strong>校准（calibration）要解决的问题只有一个：每个激活张量的阈值 $T$ 该取多少。</strong>权重不需要校准——它是常数，直接取 $\max|w|$（还能 per-channel 取）就完事了。<em>激活是输入数据的函数，你不跑数据就永远不知道它的范围</em>。这就是全部的动机。</p>  <div class="ascii">PTQ（训练后量化）的完整流程
+
+  ① 拿到 FP32/FP16 模型              ② 准备**校准集**（本模块第 5 节的重点）
+        │                                  │  几百到上千张，覆盖部署分布
+        │                                  │  **预处理必须与线上完全一致**
+        ▼                                  ▼
+  ③ 在每个待量化张量上挂 observer，前向 N 个 batch
+        │      收集：直方图 / running max / 分位数
+        ▼
+  ④ 按校准算法算出每个张量的阈值 T      ← MinMax / Percentile / **Entropy(KL)**
+        │
+        ▼
+  ⑤ 写 calibration cache（层名 -&gt; scale 的十六进制文本）
+        │      · **可以跨硬件复用**（scale 与 GPU 型号无关）
+        │      · **不能跨预处理复用**（预处理一改，激活分布就变了）
+        ▼
+  ⑥ builder 用这些 scale 构建 INT8 engine
+        │      TRT 会决定哪些层真的用 INT8（隐式量化模式下你控制不了）
+        ▼
+  ⑦ **按尺寸/场景分桶评测** ← 只看整体 mAP 会漏掉小目标的塌方</div>  <h3>隐式量化 vs 显式量化：TRT 8.x 之后请优先用后者</h3>  <table>
+    <thead><tr><th></th><th><strong>隐式量化</strong>（<code>IInt8Calibrator</code>）</th><th><strong>显式量化</strong>（图里带 Q/DQ 节点）</th></tr></thead>
+    <tbody>
+      <tr><td>scale 从哪来</td><td>TRT 在构建期跑校准算出来</td><td>ONNX 图里就带着（来自 PTQ 工具或 QAT）</td></tr>
+      <tr><td><strong>哪些层被量化</strong></td><td><strong>TRT 自己决定</strong>（按它认为划算）</td><td><strong>你决定</strong>——Q/DQ 放哪儿就量化到哪儿</td></tr>
+      <tr><td>跨 TRT 版本稳定性</td><td><strong>差</strong>：版本一升，量化的层集合可能变，精度跟着变</td><td>好：图不变，行为不变</td></tr>
+      <tr><td>混合精度控制</td><td>只能靠 <code>setPrecision</code> 事后覆盖</td><td>自然支持：某层不插 Q/DQ 就是不量化</td></tr>
+      <tr><td>与 QAT 的关系</td><td>无关</td><td><strong>统一</strong>：QAT 产出的就是 Q/DQ 图</td></tr>
+      <tr><td>上手成本</td><td>低</td><td>中（要懂 Q/DQ 放置规则）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>两者的差别用一句话说清：<strong>隐式量化是「我把数据给你，你看着办」，显式量化是「我把每个量化点都写在图里，你照做」</strong>。前者省事，但你无法回答「为什么这次升级 TRT 之后 mAP 掉了 0.4」——因为量化的层集合悄悄变了。<em>量产链路上这种不可复现性是不可接受的。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>显式量化的核心纪律是 <strong>Q/DQ 的放置规则</strong>：TensorRT 会把 <code>DQ → op → Q</code> 这个模式整体折叠成一个 INT8 算子（所谓 <em>Q/DQ propagation</em>），所以 Q/DQ 必须成对地夹住你希望跑 INT8 的算子；<strong>放错位置的后果不是「不量化」，而是「量化了但插满了 reformat」——延迟不降反升</strong>（见模块 02 第 5 节）。此外还有几条容易踩的：<em>①残差 Add 的两个输入应共用同一个 scale，否则要额外 requantize；②concat 的所有分支应共用 scale，否则 TRT 会插入转换层；③MaxPool、Relu 这类保序算子的前后可以只放一处 Q/DQ</em>。<strong>这些规则不是学术细节，它们直接决定你的 INT8 engine 到底快不快。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label">cache 能跨硬件，不能跨预处理</span>
+    <p><strong>calibration cache 的复用边界，是个很实际的问题。</strong>cache 里存的是「层名 → scale」，<em>scale 是数据的性质，不是硬件的性质</em>，所以<strong>同一份 cache 可以在 Orin-X / Orin-N / Thor 上分别重建 engine 而不用重跑校准</strong>——这在模块 02 的 engine 矩阵里能省下大量时间。</p><p>但它<strong>与三件事强绑定</strong>，任一改变都必须重新校准：<em>①预处理管线</em>（resize 插值、letterbox padding 值、归一化、通道序——改一个数值分布就变了）；<em>②模型结构与权重</em>（层名对不上就静默失效，TRT 只会 warn）；<em>③校准集本身</em>。<strong>所以 cache 必须和「预处理版本号 + 权重哈希 + 校准集版本」一起签名存档</strong>，否则半年后没人知道这份 scale 是怎么来的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="algorithms"><span class="num">3</span>三种校准算法：它们最小化的根本不是同一个东西</h2>
+  <p>给定一个激活张量的样本分布，怎么定阈值 $T$？三种主流做法，<strong>关键在于理解它们各自在最小化什么——而且没有一个是在最小化 mAP</strong>。</p>  <table>
+    <thead><tr><th>算法</th><th>阈值怎么定</th><th>隐含的目标函数</th><th>对离群值</th><th>成本</th><th>典型适用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>MinMax</strong></td><td>$T=\max|x|$</td><td>最小化<strong>最大</strong>误差（$\ell_\infty$），保证不裁剪</td><td><strong>被毁灭</strong></td><td>极低</td><td>权重；有界且无长尾的张量（sigmoid/softmax 输出）；<strong>BERT 类模型的激活</strong></td></tr>
+      <tr><td><strong>Percentile</strong></td><td>$T=$ 第 $p$ 分位（99.9 / 99.99）</td><td>在「裁掉 $1-p$ 的质量」这个约束下最小化步长</td><td>鲁棒，<strong>但分位点必须和离群比例匹配</strong></td><td>低</td><td>快速 baseline；离群比例已知时</td></tr>
+      <tr><td><strong>Entropy / KL</strong></td><td>扫描候选阈值，最小化量化前后<strong>分布</strong>的 KL 散度</td><td>最小化<strong>信息损失</strong>（而不是数值误差）</td><td>鲁棒且自适应</td><td>中（要建 2048-bin 直方图 + 扫 1920 个候选）</td><td><strong>TensorRT 的默认（CNN 检测/分类）</strong></td></tr>
+      <tr><td>MSE / MinMSE</td><td>网格搜索 $T$ 最小化 $\lVert x-\hat x\rVert^2$</td><td>最小化 $\ell_2$ 误差</td><td>较鲁棒</td><td>中</td><td><code>pytorch-quantization</code> 的可选项；对权重很好用</td></tr>
+    </tbody>
+  </table>  <h3>一个具体到刺眼的数值例子</h3>  <p>取一个典型的 ReLU 后激活：主体是半正态分布（99% 的值 &lt; 2.6），另有 <strong>0.02% 的离群值落在 30–60</strong>（现实中它们来自过曝像素、某个特殊通道、或数值不稳定的 normalization）。notebook 会算出这张表：</p>  <table>
+    <thead><tr><th>算法</th><th>阈值 $T$</th><th>步长 $S=T/127$</th><th><strong>主体占多少个电平</strong></th><th>主体 SQNR</th><th>有效位数 ENOB</th><th>裁剪率</th></tr></thead>
+    <tbody>
+      <tr><td>MinMax</td><td>59.95</td><td>0.472</td><td><strong>5.5</strong> 个（127 个里）</td><td>17.0 dB</td><td><strong>2.5 bit</strong></td><td>0</td></tr>
+      <tr><td>Percentile 99.9%</td><td>3.34</td><td>0.026</td><td>98 个</td><td>42.1 dB</td><td>6.7 bit</td><td>0.10%</td></tr>
+      <tr><td><strong>Percentile 99.99%</strong></td><td><strong>46.3</strong></td><td>0.365</td><td>7.1 个</td><td>19.2 dB</td><td>2.9 bit</td><td>0.01%</td></tr>
+      <tr><td><strong>Entropy (KL)</strong></td><td><strong>4.76</strong></td><td>0.037</td><td><strong>69</strong> 个</td><td><strong>39.0 dB</strong></td><td><strong>6.2 bit</strong></td><td>0.02%</td></tr>
+    </tbody>
+  </table>  <p><strong>MinMax 把一个 8 位量化器变成了 2.5 位。</strong>这不是修辞——SQNR 与有效位数的换算是$\mathrm{ENOB} = (\mathrm{SQNR}_{\text{dB}} - 1.76)/6.02$，17.0 dB 对应的就是 2.5 位。<em>你以为你在做 INT8，实际上主体信息只剩 2–3 位。</em></p>  <div class="callout danger"><span class="label">Percentile 选错分位点比 MinMax 还糟</span>
+    <p><strong>注意表里的第三行——这是 Percentile 最阴险的坑。</strong>这个分布的离群比例是 0.02%，而 99.99% 分位切掉的是 0.01%，<em>于是分位点直接落在了离群值的population 里面</em>，算出 46.3 的阈值，结果比 99.9% 差了整整一个数量级。<strong>「分位点越高越保守」是错的——分位点必须跟你的离群比例匹配</strong>，而离群比例是逐层不同的、也是随数据变化的。<em>这正是 KL 校准的价值：它不需要你事先知道离群比例，它是从数据的形状里把截断点找出来的。</em></p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以选哪个？<strong>先跑三个都跑一遍</strong>——这不是偷懒，是最省时间的做法。MinMax 和 Percentile 各只要几行代码，KL 是 TRT 默认，三个 engine 建出来在你的分桶评测集上各跑一遍，半天就能有结论，比任何先验推理都可靠。<em>然后再决定要不要往混合精度和 QAT 走。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但有一个 <strong>必须知道的反直觉事实</strong>，notebook 会把它算出来：如果你用<strong>整个张量的 MSE / SQNR</strong> 作为评判标准，<em>MinMax 往往赢</em>（在上面的例子里 MinMax 全张量 SQNR 18.9 dB，KL 只有 6.1 dB）——因为 KL 把那 0.02% 的离群值裁掉了，而离群值的平方误差极大，直接主导了 MSE。<strong>这说明「哪个校准算法好」这个问题本身依赖于「你认为张量的哪部分信息重要」</strong>。KL 校准的立场是：<em>那 0.02% 的极值多半是噪声或饱和，把 99.98% 的主体分辨率提高十倍更划算</em>。<strong>而这个立场对不对，只能由下游任务指标回答，不能由张量级指标回答。</strong><em>——这也是为什么本模块反复强调：校准算法的选择必须落到分桶评测上。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="kl"><span class="num">4</span>TensorRT 的熵校准：完整算法</h2>
+  <p>这是本模块技术密度最高的一节，也是面试里区分「用过」和「懂」的地方。<strong>熵校准（<code>IInt8EntropyCalibrator2</code>）的问题设定是：把 2048 个 bin 的浮点分布压成 128 个量化级，选哪个截断点能让「信息损失」最小。</strong>信息损失用 KL 散度度量：</p>  <div class="math-block">\[D_{\mathrm{KL}}(P \,\Vert\, Q) \;=\; \sum_{j} P(j)\,\log\frac{P(j)}{Q(j)}\]</div>  <p>其中 $P$ 是<strong>参考分布</strong>（截断后的真实分布），$Q$ 是<strong>候选分布</strong>（经过「量化再反量化」之后的分布）。整个算法就是在候选截断点上扫描这个量。</p>  <div class="ascii">① 一次全量前向，收集 |x| 的直方图：2048 个 bin，范围 [0, max|x|]
+       hist[0..2047]
+
+② for i = 128, 129, ..., 2048:                      ← 候选截断点（至少要 128 个 bin）
+
+     (a) 构造参考分布 P（长度 i）
+         P = hist[0:i]
+         P[i-1] += sum(hist[i:])       ← **所有离群值并进最后一个 bin**
+                                          这就是「clip 到阈值」的分布语义
+
+     (b) 构造候选分布 Q（长度 i）—— 模拟「量化再反量化」
+         · 把 [0, i) 均分成 128 组（每组 nm = i // 128 个 bin，余数并入最后一组）
+         · 每组求和  -&gt;  quantized[j]          ← 这一步是「量化」：128 个电平
+         · 摊回原 bin：quantized[j] 在组内**按非零 bin 的个数均分**
+                       原本是 0 的 bin 保持 0   ← 这一步是「反量化」
+                       （为什么保持 0：那里本来就没数据，
+                         把质量分给它们会虚假地降低 KL）
+         · Q[P == 0] = 0
+
+     (c) 归一化 P、Q（并做平滑，避免 Q 出现 0 导致 KL 发散）
+     (d) divergence[i] = KL(P || Q)
+
+③ i* = argmin divergence
+④ **threshold = (i* + 0.5) * (max|x| / 2048)**,   scale = threshold / 127</div>  <h3>三个容易讲错的细节</h3>  <ol>
+    <li><strong>为什么离群值要并进最后一个 bin，而不是丢掉。</strong>因为参考分布 $P$ 要表达的是「如果我在这里截断，真实数据会变成什么样」——被截断的值不会消失，它们会被 clip 成阈值本身。<em>丢掉它们等于假装它们不存在，那 KL 就衡量不到裁剪的代价了</em>，算法会一路往小的阈值跑。</li>
+    <li><strong>为什么反量化时零 bin 要保持零。</strong>如果把组内的质量平均摊给组内<em>所有</em> bin（包括空的），$Q$ 会在原本没有数据的地方凭空长出概率质量，<em>这会让 $Q$ 的支撑集与 $P$ 不一致，KL 被人为抬高，而抬高的量与「这一组里有多少空 bin」有关</em>——那是直方图分辨率的伪影，不是量化的真实损失。</li>
+    <li><strong>为什么从 128 开始扫。</strong>候选分布只有 128 个电平，如果 $i &lt; 128$，「把 $i$ 个 bin 压成 128 个级」就不是压缩而是插值，问题失去意义。</li>
+  </ol>  <table>
+    <thead><tr><th>TensorRT calibrator</th><th>算法</th><th>推荐场景</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong><code>IInt8EntropyCalibrator2</code></strong></td><td>上面这套 KL 扫描</td><td><strong>CNN 分类 / 检测（默认首选）</strong></td><td>卷积激活的离群多半是噪声，裁掉换主体分辨率是划算的</td></tr>
+      <tr><td><strong><code>IInt8MinMaxCalibrator</code></strong></td><td>$T=\max|x|$</td><td><strong>BERT / Transformer 类</strong>（NVIDIA 官方就是这么推荐的）</td><td><em>attention 的 softmax 输出与 LayerNorm 前后的激活，尾部携带真实信息；而且 Transformer 有结构性的 outlier channel，KL 会把它们当噪声切掉，掉点很惨</em></td></tr>
+      <tr><td><code>IInt8LegacyCalibrator</code></td><td>早期版本的 KL 变体（可调 cutoff/regression）</td><td>兼容旧流程</td><td>一般不用</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把整个算法压成一句能在面试里说的话：<strong>「TensorRT 默认用熵校准。它把激活的绝对值打成 2048 个 bin 的直方图，然后从第 128 个 bin 开始逐个试截断点：每个候选截断点下，把被截掉的质量并到最后一个 bin 得到参考分布 P，再把前 i 个 bin 压成 128 个级、按非零 bin 摊回去得到候选分布 Q，算 KL(P‖Q)；取 KL 最小的那个截断点，阈值就是 (i+0.5)×bin 宽，scale = 阈值/127。」</strong><em>加分点：主动说明它为什么对 CNN 好而对 Transformer 不好。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从统计的角度看，这个算法在做的是<strong>在「量化器」这个受限的信道上最小化信息损失</strong>——$D_{\mathrm{KL}}(P\Vert Q)$ 恰好是「用 $Q$ 来编码服从 $P$ 的数据所付出的额外比特数」。<em>所以熵校准的立场不是「让数值误差小」，而是「让量化后的分布尽可能像量化前的分布」。</em>两者在有重尾时给出截然不同的答案：数值误差准则会保留极值（因为它们的平方误差大），信息准则会牺牲极值（因为它们的概率质量小）。<strong>值得注意的是，这个算法有几个从未被严格论证的选择：2048 这个 bin 数、128 这个起点、以及「按非零 bin 均摊」这个反量化模型，都是工程经验值。</strong><em>后续研究（AdaRound、BRECQ 等）干脆放弃了「先定阈值再量化」这个两段式框架，改成直接以「逐块输出重建误差」为目标做优化——见最后一节。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="calibset"><span class="num">5</span>校准集的构造：整条链路上最容易做错的一步</h2>
+  <p><strong>如果 INT8 掉点了，八成问题在这一节，而不在算法。</strong>校准算法只有三四种、每种几十行代码；校准集却有无数种做错的方式，而且做错了不报错。</p>  <h3>五条铁律</h3>  <ol>
+    <li><strong>预处理必须与线上完全一致，一个字节都不能差。</strong>校准时用 PIL 的 <code>BILINEAR</code>、线上用 OpenCV 的 <code>INTER_LINEAR</code>，两边的像素值就已经不同（见模块 01）；letterbox 的 padding 值取 114 还是 0、归一化是先除 255 还是先减均值——<em>每一处差异都会平移激活分布，进而平移阈值</em>。<strong>正确做法：校准脚本直接调用线上推理用的同一个预处理函数，不许重写一份。</strong></li>
+    <li><strong>绝对不能开训练增强。</strong>Mosaic 会把四张图拼在一起、强色彩抖动会把红色禁令牌变成粉色、RandomErasing 会造出训练里才有的纯色块。<em>校准集要代表的是<u>部署分布</u>，不是训练分布。</em>开了增强的直接后果是激活范围被人为拉大 → 阈值偏大 → 有效电平被浪费。<strong>这是最常见、也最容易被忽视的一条，因为大多数人是直接复用训练 dataloader 的。</strong></li>
+    <li><strong>必须覆盖长尾与极端场景。</strong>夜间、逆光、隧道出入口、雨雪雾、迎面车灯眩光、强反光——<em>这些场景的激活范围最大</em>。校准集里没有它们，阈值就按晴天白天定；上线遇到时激活整片超出阈值被 clip 成饱和值，特征被压平。<strong>于是最难的场景掉点最多——这个「反相关」正是它危险的原因。</strong></li>
+    <li><strong>但也不能只放极端。</strong>全放夜间，阈值被夜间的大动态范围决定，白天正常场景的分辨率反而被稀释。<em>正确做法是<u>分层采样</u>：按部署分布的比例配额，同时给每个关键场景设一个下限（比如「隧道出口至少 30 张」），两者取较大值。</em></li>
+    <li><strong>去重。</strong>视频数据里相邻帧几乎相同。1000 张连续帧的信息量可能还不如 50 张跨场景采样。<em>按序列采样：每个片段取 1–2 帧，而不是取一整段。</em></li>
+  </ol>  <div class="callout danger"><span class="label">三个错误叠在一行代码里</span>
+    <p><strong>「用训练集头 500 张」——这个经典错误值得单独说清楚为什么它这么容易发生。</strong>写校准脚本时最自然的一行就是 <code>for i, batch in enumerate(train_loader): if i &gt;= 500: break</code>。问题在于：<em>①数据集通常按采集时间/序列排序，头 500 张很可能来自同一次采集、同一段路、同一个天气；②它们还可能是连续帧，实际独立样本数只有十几个；③train_loader 带着完整的训练增强</em>。<strong>三个错误叠加，你得到的阈值几乎必然是「晴天白天、被 Mosaic 拉宽过」的。</strong></p><p>notebook 里会把这个实验做出来：一个只用白天数据校准的 INT8 模型，在夜间场景上的<strong>激活裁剪率高达 49%</strong>，下游分类准确率从 0.90 掉到 <strong>0.67</strong>（掉 23 个点）；而按部署分布分层采样（白天 90% + 夜间 10%）的校准集，夜间准确率保持在 0.90。<em>——同样的模型、同样的算法、同样的 512 张图，只是选图的方式不同。</em></p>
+  </div>  <h3>TSR 场景：极值到底来自哪里</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>交通标志有一个别的目标没有的物理特性：<strong>它们贴着反光膜（retroreflective sheeting）</strong>，设计目的就是把车灯的光原路反射回驾驶员眼睛。<em>白天它只是个普通的彩色牌子，夜间被近光灯一照，它在图像里就是一块接近饱和的高亮区域</em>。再加上夜间相机会自动提高增益和曝光时间，整张图的激活幅度都会被抬上去。<strong>所以「TSR 的激活极值主要来自夜间的反光标志本身」——恰恰是你最关心的那个目标。</strong>校准集里没有夜间数据，等于专门把你最在乎的信号裁掉。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更完整的极值来源清单，可以直接当作校准集的场景配额表来用：<em>①夜间反光膜 + 近光/远光灯（高亮饱和）；②隧道出入口（&gt;100 dB 的场景动态范围，ISP 的 HDR 融合会在这里产生非典型的像素统计）；③迎面车灯直射与湿路面镜面反射；④逆光（太阳低角度时标志成为剪影，激活反而异常低）；⑤雨雪造成的大面积高频噪声；⑥曝光切换的瞬间帧（自动曝光还没收敛）</em>。<strong>还有一条工程手段值得强烈推荐：在车端记录关键层的<u>裁剪率</u>（激活超过阈值的比例）并按场景标签统计。</strong><em>如果某类场景的裁剪率显著高于校准时的水平，说明校准集缺这个场景——这是一个可以在线上直接观测、不需要标注、也不需要重新评测的早期告警信号。</em></p></div>
+  </div>  <table>
+    <thead><tr><th>常见错误</th><th>症状</th><th>怎么发现</th><th>修法</th></tr></thead>
+    <tbody>
+      <tr><td>复用训练 dataloader（带增强）</td><td>阈值系统性偏大，整体掉点但说不清哪儿</td><td>对比开/关增强算出的阈值差异</td><td>校准专用 loader，只做部署侧预处理</td></tr>
+      <tr><td><strong>预处理与线上不一致</strong></td><td>掉点，且 FP16 版本也可能有小差异</td><td><strong>逐张 dump 预处理后的张量做 diff（模块 01）</strong></td><td>共用同一个预处理函数</td></tr>
+      <tr><td>只用晴天白天</td><td><strong>夜间/隧道场景塌方，整体 mAP 只掉一点</strong></td><td><strong>按场景分桶评测</strong> + 车端裁剪率监控</td><td>分层采样 + 每场景配额</td></tr>
+      <tr><td>连续帧</td><td>校准结果方差大，换一段视频就变</td><td>统计独立序列数而不是帧数</td><td>每序列取 1–2 帧</td></tr>
+      <tr><td>校准集太小（&lt;100）</td><td>阈值不稳，重跑一次就变</td><td>跑 3 个不同随机种子看阈值离散度</td><td>加到 500–1000</td></tr>
+      <tr><td>校准集太大（&gt;5000）</td><td>校准很慢，收益早已饱和</td><td>画「张数 vs 指标」曲线</td><td>取饱和点</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="sensitivity"><span class="num">6</span>敏感层分析与混合精度：把掉点还回来</h2>
+  <p>校准集和算法都做对了，还是掉点，怎么办？<strong>下一步是找出「是哪几层在掉点」，把它们放回 FP16。</strong>这就是敏感层分析（sensitivity analysis）+ 混合精度（mixed precision）。</p>  <h3>两种扫描方向，而且它们不等价</h3>  <table>
+    <thead><tr><th>方向</th><th>做法</th><th>回答的问题</th><th>评测次数</th><th>何时用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>孤立量化</strong>（isolate）</td><td>只把第 $i$ 层量化成 INT8，其余保持 FP16</td><td>「量化这一层要付多少代价」</td><td>$L$ 次</td><td>快速定位问题层</td></tr>
+      <tr><td><strong>恢复到 FP16</strong>（restore）</td><td>全 INT8，只把第 $i$ 层放回 FP16</td><td>「救这一层能拿回多少」</td><td>$L$ 次</td><td><strong>更贴近最终配置，做混合精度方案时用这个</strong></td></tr>
+    </tbody>
+  </table>  <p><strong>两者给出的排序常常不同</strong>，因为量化误差在层间是<em>相互作用</em>的：第 3 层的误差可能被第 4 层放大，也可能被后面的 ReLU 或归一化吸收掉。notebook 里会构造一个 6 层的玩具网络复现这个现象——<strong>甚至会出现「把某一层从 INT8 恢复成 FP16，整体精度反而略降」的情况</strong>（误差之间部分抵消，一方消失反而暴露了另一方）。<em>这不是 bug，这是量化误差非线性传播的正常表现，也是「混合精度方案必须整体验证、不能逐层加总」的原因。</em></p>  <h3>便宜的代理指标：SQNR</h3>  <p>逐层扫描要跑 $2L$ 次评测。如果 $L=200$、每次评测半小时，那就是一周。实践里的做法是<strong>先用张量级代理指标粗筛，再对候选层做真评测</strong>。最常用的代理是逐层输出的 SQNR：</p>  <div class="math-block">\[\mathrm{SQNR}_{\text{dB}} \;=\; 10\log_{10}\frac{\sum_i x_i^2}{\sum_i (x_i - \hat x_i)^2}, \qquad \mathrm{ENOB} \;=\; \frac{\mathrm{SQNR}_{\text{dB}} - 1.76}{6.02}\]</div>  <p>同一批输入下，跑 FP32 和 INT8 两条路径，逐层比对该层输出的 SQNR（或余弦相似度）。<strong>经验阈值：SQNR &lt; 20 dB（约 3 位有效）的层值得进候选名单。</strong>代理指标与最终指标的相关性不完美（它衡量的是张量误差，不是任务误差），<em>但它便宜 $N$ 倍，用来把 200 层筛成 10 层再做真评测，是标准做法</em>。</p>  <h3>典型的敏感层清单</h3>  <table>
+    <thead><tr><th>层类型</th><th>为什么敏感</th><th>处理</th></tr></thead>
+    <tbody>
+      <tr><td><strong>第一层卷积</strong></td><td>输入是原图，动态范围大且分布特殊（尤其归一化之后）；且它的误差会被整个网络放大</td><td>常规做法就是<strong>保 FP16</strong>，代价很小（第一层通道少）</td></tr>
+      <tr><td><strong>检测头，尤其回归分支</strong></td><td>输出直接是坐标，误差直接变成像素偏移（见下一节）</td><td>回归分支保 FP16，分类分支可以量化</td></tr>
+      <tr><td><strong>多尺度特征 concat 的前后</strong></td><td><strong>P3/P4/P5 的激活范围可以差 5–10 倍，共用一个 per-tensor scale 时小的那个被压死</strong></td><td>分支各自量化后再 concat；或对齐各分支 scale（Q/DQ 显式量化下可控）</td></tr>
+      <tr><td>depthwise 卷积</td><td>各通道的动态范围差异极大</td><td><strong>权重必须 per-channel 量化</strong>（这条是硬要求，不是优化）</td></tr>
+      <tr><td>element-wise Add（残差）</td><td>两路输入的 scale 不同，需要 requantize；scale 差得多时小的那路被淹没</td><td>让两路共用 scale</td></tr>
+      <tr><td>attention 的 softmax / LayerNorm</td><td>输出分布极不均匀，且尾部含信息</td><td>保 FP16；或改用 MinMax 校准</td></tr>
+      <tr><td>网络最后的分类/回归线性层</td><td>误差无处可被后续层吸收</td><td>视情况保 FP16</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label">散点式混合精度 = 两头不讨好</span>
+    <p><strong>混合精度不是「越多层放回 FP16 越好」。</strong>每一处精度切换点，TensorRT 都要插入一个 <code>Reformat</code> 层做 INT8↔FP16 转换，而 reformat 是纯访存操作。<em>把 200 层里散落的 30 层挑出来放 FP16，可能要插 50 个 reformat，最终比全 INT8 慢、比全 FP16 也快不了多少——两头不讨好。</em></p><p><strong>正确的做法是按「连续块」划分而不是按「散点」：</strong>比如「整个 backbone 的 stem + 整个检测头」保 FP16，中间全 INT8。notebook 会把 reformat 代价放进搜索的目标函数里，你会看到<em>同样是 3 层 FP16，连续的方案比散落的方案更快</em>。<strong>这也是为什么敏感层分析的输出不应该是「一个层的列表」，而应该是「若干个连续区间」。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="detection"><span class="num">7</span>量化对检测的特殊影响：分类头、回归头、小目标</h2>
+  <p>通用的量化文献几乎都以分类任务为背景。<strong>检测有三个额外的敏感点，而它们恰好都指向 TSR 最在乎的东西。</strong></p>  <h3>① 分类头 vs 回归头：容错能力差一个数量级</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>分类头的输出只要<strong>排序</strong>不变、阈值附近不翻转，量化误差就基本无害。而且检测器的分类 logit 分布很宽（focal loss 训出来的，绝大多数位置是强负），<em>量化噪声相对于 top-1 与 top-2 的间距通常小得多</em>。回归头就完全不同：<strong>它的输出直接是坐标，误差直接变成像素偏移</strong>，没有任何「排序容错」可言。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>把它量化一下就很清楚。设量化在框的每条边上引入标准差 $\sigma$ 像素的独立误差，一个边长 $s$ 的正方形框沿对角线整体位移 $d$ 时，$\mathrm{IoU} = (s-d)^2 / \bigl(2s^2 - (s-d)^2\bigr)$。代入数字：<strong>$s=8$、$d=1$ 时 IoU $=49/79=0.62$；$d=2$ 时 IoU $=36/92=0.39$，直接低于 0.5 阈值判为漏检。而 $s=64$、$d=2$ 时 IoU 仍有 $0.884$。</strong><em>同样 2 像素的量化误差，对 8×8 的目标是致命的，对 64×64 的目标几乎无感——差了 40 倍的容错度。</em>这直接推出实践结论：<strong>回归分支优先保 FP16，分类分支可以量化</strong>；如果回归用的是 DFL 这类分布式表示（输出经 softmax 后取期望），容错会好一些，因为期望值对分箱噪声不敏感。</p></div>
+  </div>  <h3>② 小目标为什么更敏感——三个独立原因</h3>  <ol>
+    <li><strong>IoU 对位移的敏感性</strong>（上面那笔账）：同样的坐标误差，小框的 IoU 惩罚是大框的几十倍。</li>
+    <li><strong>小目标的特征来自高分辨率浅层（P2/P3），而浅层激活的动态范围更大、离群更多</strong>（浅层还没被多层归一化「驯服」）。同一个 per-tensor scale 下，浅层被量化得更粗。</li>
+    <li><strong>小目标本身的信噪比就低</strong>（8×8 像素只有 64 个像素点的信息），量化噪声占信号的比例天然更高。</li>
+  </ol>  <div class="callout danger"><span class="label">整体 mAP 会掩盖小目标塌方</span>
+    <p><strong>由此得到本节最重要的工程结论：INT8 之后<u>必须</u>按目标尺寸分桶评测。</strong>一个非常典型的数字组合是：<em>整体 mAP 掉 0.6，看起来完全可以接受；但拆开看是「小目标（&lt;32²）掉 3.2、中目标掉 0.5、大目标掉 0.1」</em>。<strong>整体指标把最要命的退化平均掉了。</strong></p><p>对 TSR 这尤其致命，因为<em>TSR 几乎全是小目标</em>——一块 60 cm 的限速牌在 60 米外、1920×1080 / 60° FOV 的相机上只有约 20 像素，缩放到 640 输入后剩 7 像素。<strong>「远处标志的首次检出距离」是 TSR 最核心的产品指标之一，而它恰好是量化最先破坏的东西。</strong><em>所以 TSR 的量化验收标准不该是「mAP 掉 &lt; 1」，而应该是「按像素尺寸分桶后，最小的那一桶掉 &lt; X」+「首次检出距离退化 &lt; Y 米」。</em></p>
+  </div>  <h3>③ 两个容易被忽略的二阶效应</h3>  <ul>
+    <li><strong>分数量化导致 NMS 排序不稳定。</strong>INT8 之后大量候选框的分数会落在同一个量化电平上，变成并列。<em>NMS 的贪心顺序依赖排序，并列时的顺序取决于实现（<code>argsort</code> 是否稳定）</em>，于是同一份输入在 Python 与 C++ 两边可能输出不同顺序的框。<strong>这通常不掉点，但会让端到端对拍失败</strong>——排查时容易被误导成「后处理写错了」（见模块 04）。</li>
+    <li><strong>多尺度 concat 的 scale 共享灾难。</strong>P3 的激活最大值可能是 2，P5 是 20。如果它们 concat 之后用一个 per-tensor scale（$T=20$），<em>P3 的全部信息被压进 127 个电平里的前 16 个，等于只剩 4 位</em>。notebook 会把这个实验做出来。<strong>解法是各分支独立量化后再 concat</strong>，这在显式 Q/DQ 图里是可控的，在隐式校准里则要靠 TRT 自己判断——这也是推荐显式量化的一个具体理由。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="qat-tree"><span class="num">8</span>QAT 何时值得，与量化掉点排查决策树</h2>
+  <p>先说结论：<strong>QAT 是最后一招，不是第一招。</strong>在我见过的 INT8 掉点里，绝大多数最终定位到校准集或预处理，<em>而这两类问题 QAT 一个都解决不了</em>——你只会得到一个「在错误分布上训练过的量化模型」。</p>  <h3>量化掉点排查决策树</h3>  <div class="ascii">INT8 掉点了
+│
+├─【第 0 步】先确认这真的是量化问题       ← **跳过这步是最常见的时间浪费**
+│    · FP16 engine 的指标 == PyTorch 的指标吗？
+│    · 不等 -&gt; 这不是量化问题，是导出/预处理/后处理一致性问题（回模块 01 / 04）
+│    · 评测集够大吗？同一 engine 跑两次结果一致吗？（mAP 本身有 ±0.2 的抖动）
+│
+├─【第 1 步】校准集         ← **命中率最高，先查这里**
+│    ├ 预处理与线上完全一致？（逐张 dump 张量对拍，不要靠读代码确认）
+│    ├ 关掉训练增强了吗？（Mosaic / 色彩抖动 / RandomErasing）
+│    ├ 覆盖度：场景标签分布 vs 部署分布；夜间/隧道/逆光/雨雪各有多少张？
+│    ├ 独立序列数是多少？（不是帧数）
+│    └ 大小扫描：128 / 512 / 1024 / 2048 各跑一遍，看指标是否饱和
+│
+├─【第 2 步】校准算法       ← 便宜，三个都跑
+│    Entropy / Percentile(99.9, 99.99, 99.999) / MinMax
+│    每个建一个 engine，在**分桶评测集**上比较
+│
+├─【第 3 步】找到底是哪几层
+│    ├ 逐层 SQNR（FP32 vs INT8 同层输出），标出 &lt; 20 dB 的层
+│    ├ 逐层扫描（恢复方向）确认 top-k 敏感层
+│    └ 检查结构性问题：
+│        · depthwise 是否用了 per-channel 权重量化
+│        · 多尺度 concat 是否共用了一个 per-tensor scale
+│        · 残差 Add 两路 scale 差多少
+│        · Q/DQ 位置是否制造了大量 Reformat（看 layer info）
+│
+├─【第 4 步】混合精度
+│    按敏感度把 top-k 层放回 FP16，**按连续块划分而不是散点**
+│    画出「FP16 层数 - 精度 - 延迟」三维曲线，在延迟预算内取最优点
+│
+├─【第 5 步】还不行 -&gt; QAT
+│    前提：① PTQ 掉点 &gt; 1~2 mAP  ② 混合精度救不回来或延迟代价太大
+│          ③ **你有完整的训练数据与训练管线**（这常常才是真正的门槛）
+│
+└─【贯穿全程】每一步都按尺寸/场景分桶评测
+     否则你不知道自己到底修好了什么，也不知道有没有按下葫芦浮起瓢</div>  <table>
+    <thead><tr><th>步骤</th><th>耗时</th><th>命中率（经验）</th><th>为什么值这个顺序</th></tr></thead>
+    <tbody>
+      <tr><td>0 · 确认是量化问题</td><td>1 小时</td><td>—（门禁）</td><td>跳过它，后面所有工作都可能白做</td></tr>
+      <tr><td><strong>1 · 校准集</strong></td><td>半天</td><td><strong>最高</strong></td><td>错误最多、修复最便宜、且修好之后其他步骤的结论才可信</td></tr>
+      <tr><td>2 · 换校准算法</td><td>半天</td><td>中</td><td>三个 engine 而已，几乎零成本</td></tr>
+      <tr><td>3 · 敏感层定位</td><td>1–2 天</td><td>中</td><td>SQNR 粗筛 + 真评测细筛</td></tr>
+      <tr><td>4 · 混合精度</td><td>1–2 天</td><td>中高</td><td>多数情况到这一步就够了</td></tr>
+      <tr><td><strong>5 · QAT</strong></td><td><strong>1–3 周</strong></td><td>高但昂贵</td><td>需要训练数据、训练管线、以及导出成 TRT 认得的 Q/DQ 图</td></tr>
+    </tbody>
+  </table>  <h3>QAT 到底做了什么，以及它的三个隐性要求</h3>  <p><span class="term">QAT</span>（Quantization-Aware Training，量化感知训练）在训练图里插入<strong>伪量化（fake quantization）</strong>节点：前向做「量化再反量化」让网络<em>感受到</em>量化误差，反向用 <span class="term">STE</span>（Straight-Through Estimator，直通估计器）把 round 的零梯度替换成恒等梯度。典型配方是：<em>用 PTQ 的 scale 做初始化 → 用原学习率的 1%–10% → fine-tune 原训练轮数的 5%–10%</em>。</p>  <ul>
+    <li><strong>要求一：BN 必须先折叠再插伪量化。</strong>部署时 BN 会被融进卷积（模块 02 第 4 节），所以 QAT 里量化的必须是<em>折叠后的权重</em>。<em>如果你在未折叠的权重上做伪量化，训练时看到的量化误差和部署时的根本不是一回事——这是 QAT 最经典的实现错误，症状是「QAT 训得好好的，导出后掉点」。</em></li>
+    <li><strong>要求二：产物必须是 TensorRT 认得的 Q/DQ 布局。</strong>QAT 的输出是一张带 <code>QuantizeLinear</code>/<code>DequantizeLinear</code> 的 ONNX 图，<em>Q/DQ 放错位置，TRT 要么不量化、要么插满 reformat</em>。<code>pytorch-quantization</code> / TensorRT Model Optimizer 这类工具存在的意义就是保证这一点。</li>
+    <li><strong>要求三：你得有训练数据和训练管线。</strong>听起来废话，但在很多真实项目里（用了供应商模型、数据在别的团队、训练环境已经不可复现）<em>这一条直接把 QAT 判了死刑</em>。<strong>这也是 AdaRound / BRECQ 这类「只要几百张无标注数据、逐块重建」的方法价值所在</strong>——它们介于 PTQ 与 QAT 之间。</li>
+  </ul>  <div class="callout danger"><span class="label">顺序比方法更重要</span>
+    <p><strong>面试高频题：「INT8 掉了 3 个点，你怎么排查？」</strong>这题的评分点<em>不在你能列出多少方法，而在你的顺序对不对</em>。<strong>直接回答「上 QAT」是明确的减分项</strong>——它说明你没做过，因为做过的人知道 QAT 要一到三周，而 80% 的掉点在校准集上半天就能解决。</p><p>满分骨架：<em>「先确认 FP16 engine 和 PyTorch 对得上，否则这不是量化问题；然后查校准集——预处理是否与线上一致、有没有误开训练增强、场景覆盖够不够、独立序列数多少；接着把三种校准算法各跑一遍；再用逐层 SQNR 粗筛出敏感层、用恢复方向的扫描确认；然后做连续块式的混合精度并画出精度-延迟曲线；只有在混合精度也救不回来、且我有训练数据和管线的前提下才上 QAT。全程按尺寸和场景分桶评测，因为整体 mAP 会把小目标的塌方平均掉。」</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>离群值是结构性的，不是偶然的。</strong>LLM.int8() 与 SmoothQuant 发现 Transformer 的激活离群集中在<em>少数固定通道</em>上，且随模型规模增大而加剧。CNN 检测器里也有类似现象（某些通道长期承担「亮度/对比度」这类全局量）。<em>开放问题：能否在训练期就抑制这种通道级离群（正则化、归一化设计），而不是事后补救？</em></li>
+    <li><strong>更低比特与新的数值格式。</strong>FP8（E4M3 / E5M2，Hopper / Ada / Thor 原生支持）的动态范围远大于 INT8，<em>对离群值天然鲁棒，校准也简单得多（很多情况下 per-tensor MinMax 就够）</em>；代价是同等位宽下的精度密度略低。INT4 在检测任务上目前仍不成熟。<strong>「车端下一代 SoC 上是选 INT8 还是 FP8」会是未来两三年的实际选型问题。</strong></li>
+    <li><strong>学习式舍入（learned rounding）：PTQ 的新范式。</strong>AdaRound 指出「四舍五入」并非最优——<em>逐权重地学习「向上还是向下取整」，能在不改动网络结构、只用几百张无标注数据的情况下显著缩小 PTQ 与 QAT 的差距</em>。BRECQ 把它扩展成逐块重建，QDrop 引入随机丢弃量化以提升泛化。<strong>这条线的实用价值极高，因为它绕开了 QAT 的「必须有训练管线」这个门槛。</strong></li>
+    <li><strong>敏感度的理论化。</strong>目前的逐层扫描本质是暴力搜索。HAWQ 系列用 Hessian 的迹或最大特征值作为层敏感度的理论代理，把混合精度分配变成一个可求解的优化问题。<em>但它在检测任务上的有效性（尤其考虑到 reformat 代价与硬件约束）仍缺少系统验证。</em></li>
+    <li><strong>校准集选择本身是一个主动学习问题。</strong>「哪 500 张图能让量化误差最小」和 C58 讲的「哪 500 张图值得标注」在形式上是同一类问题（子集选择 + 覆盖度目标），<em>但目前几乎所有实践都停留在手工分层采样。用 core-set / 嵌入聚类来选校准集，是一个成本很低、收益可能不小的方向。</em></li>
+    <li><strong>量化模型的安全论证。</strong>如何向功能安全审查证明「INT8 模型的行为边界是已知的」？<em>目前的做法完全是统计性的（大样本上指标不降），而形式化的误差上界（给定输入范围，输出偏差不超过多少）在检测网络上做不到。</em><strong>这是部署工程里最缺理论、也最需要理论的地方。</strong></li>
+    <li><strong>量化-架构协同设计。</strong>与其事后救量化不友好的结构（大量 depthwise、带极端离群的 attention），不如在架构搜索阶段就把「INT8 友好度」作为目标之一。<em>这在车端尤其合理，因为部署精度是先验已知的约束，不是事后才发现的。</em></li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>★ 必读</strong>：Migacz, <em>8-bit Inference with TensorRT</em>（NVIDIA GTC 2017）——熵校准算法的原始出处，本模块第 4 节的算法就来自这份 slides，<u>建议对着 notebook 的实现读一遍</u>。<strong>★</strong> Jacob et al., <em>Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference</em>（CVPR 2018）——定点推理的完整代数（zero-point 交叉项就出自这里）。<strong>★</strong> Nagel et al., <em>A White Paper on Neural Network Quantization</em>（Qualcomm, 2021）——目前最好的量化综述，PTQ/QAT 的决策流程写得极清楚。<strong>★</strong> Wu et al., <em>Integer Quantization for Deep Learning Inference: Principles and Empirical Evaluation</em>（NVIDIA, 2020）——per-channel、校准算法、敏感层的大规模实证对比。</p><p>进阶：Nagel et al., <em>Up or Down? Adaptive Rounding for Post-Training Quantization</em>（AdaRound, ICML 2020）；Li et al., <em>BRECQ</em>（ICLR 2021）；Wei et al., <em>QDrop</em>（ICLR 2022）；Xiao et al., <em>SmoothQuant</em>（ICML 2023）与 Dettmers et al., <em>LLM.int8()</em>（NeurIPS 2022）——结构性离群通道；Lin et al., <em>AWQ</em>（MLSys 2024）；Dong et al., <em>HAWQ / HAWQ-V2</em>——Hessian 驱动的混合精度；Micikevicius et al., <em>FP8 Formats for Deep Learning</em>（2022）；Krishnamoorthi, <em>Quantizing deep convolutional networks: A whitepaper</em>（2018）。相邻课程：本课模块 01（预处理一致性——校准集的第一条铁律）、模块 02（builder config 与融合）、模块 04（后处理与 NMS 排序稳定性）、模块 05（延迟与 p99）；C57（小目标为什么对位移敏感）、C58（数据挖掘与分层采样）、C55 模块 05（分桶评测体系）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_tensorrt/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · TensorRT 构建与优化</div></a>
+    <a class="next" href="../04_postprocess/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 后处理对齐与 C++ 推理管线</div></a>
+  </div>
+
+</div>
+</body>
+</html>

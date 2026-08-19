@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 收敛难题与 DETR 家族演进</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 收敛难题与 DETR 家族演进</h1>
+  <p class="subtitle">500 epoch 的两个独立根因：cross-attention 初期近似均匀 + 匹配不稳定，且解法完全不同 · Deformable 每个 query 只采 K 个可学采样点、权重不走点积，50 epoch 打平 · DN 把带噪 GT 当 query 绕过匹配、attention mask 防泄漏 · DINO = 对比去噪 + mixed query selection + look forward twice · 一对多匹配的回归说明「一对一」是推理需求而非训练最优</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–03（匈牙利匹配 / 集合损失 / object query）；C53 模块 04（RT-DETR）可后置</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_convergence_family.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Deformable DETR (ICLR&#39;21)、DN-DETR (CVPR&#39;22)、DINO (ICLR&#39;23)、Group DETR / H-DETR / Co-DETR (ICCV&#39;23)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#roots">500 epoch 从哪来：把「慢」拆成两个可以分别修的根因</a></li>
+      <li><a href="#deform">Deformable Attention：把 O(HW) 的全局搜索换成 K 个可学采样点</a></li>
+      <li><a href="#deform2">Deformable DETR 的另外两件事：多尺度与两阶段</a></li>
+      <li><a href="#dn">DN-DETR：与其修匹配，不如绕开匹配</a></li>
+      <li><a href="#dino">DINO：三件小事，各修一个具体短板</a></li>
+      <li><a href="#one2many">一对多匹配的回归：训练要密集，推理才要唯一</a></li>
+      <li><a href="#thread">一条主线：每一步都在解决「监督信号太稀疏」</a></li>
+      <li><a href="#tsr">回到 TSR：这条演进线对交通标志检测意味着什么</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="roots"><span class="num">1</span>500 epoch 从哪来：把「慢」拆成两个可以分别修的根因</h2>
+  <p>原版 DETR 在 COCO 上要训 <strong>500 epoch</strong> 才追平 Faster R-CNN 的 1× 配方（12 epoch）。这是 40 倍的训练成本差距，也是 2020–2022 年整个 DETR 家族演进的唯一驱动力。</p>  <p>但「慢」不是一个可以直接修的东西。<strong>面试里能立刻拉开差距的答法，是把「慢」拆成两个彼此独立的根因</strong>——它们发生在模型的不同部位、用不同的指标度量、由不同的后续工作解决。只会说「DETR 收敛慢」的人和能说出这两条的人，水平差一个档次。</p>  <h3>根因 ①：cross-attention 在初期近似均匀，梯度被摊薄到全图</h3>  <p>decoder 的 <span class="term">cross-attention</span>（交叉注意力）要做的事是：让每个 object query 在 HW 个空间位置里找到自己该负责的那个目标。但在训练刚开始时，Q/K 投影是随机初始化的小权重，点积结果接近 0，softmax 之后<strong>注意力权重近似均匀分布</strong>——每个空间位置分到大约 1/HW 的权重。</p>  <p>这意味着什么？<strong>反向传播时，落在目标区域上的梯度只占总梯度的一个极小比例，其余全部打在背景上。</strong>而且这个比例随目标变小而急剧恶化。</p>  <div class="math-block">\[\alpha_0 \;=\; \frac{\text{目标在特征图上占的格子数}}{H \cdot W} \;=\; \frac{(w/s)\cdot(h/s)}{H \cdot W}\]</div>  <table>
+    <thead><tr><th>场景（1333×800 输入，C5 stride 32）</th><th>目标像素尺寸</th><th>占特征图格子</th><th>初始注意力质量 α₀</th></tr></thead>
+    <tbody>
+      <tr><td>大目标（近处车辆）</td><td>256×256</td><td>8×8 = 64</td><td><strong>6.2%</strong></td></tr>
+      <tr><td>中目标（行人）</td><td>64×128</td><td>2×4 = 8</td><td>0.78%</td></tr>
+      <tr><td>COCO 平均目标</td><td>≈100×100</td><td>≈9.8</td><td>0.95%</td></tr>
+      <tr><td><strong>TSR：30 m 外的限速牌</strong></td><td><strong>32×32</strong></td><td>1×1 = 1</td><td><strong>0.098%</strong></td></tr>
+      <tr><td><strong>TSR：60 m 外的限速牌</strong></td><td><strong>16×16</strong></td><td>0.5×0.5 = 0.25</td><td><strong>0.024%</strong></td></tr>
+    </tbody>
+  </table>  <p>最后两行就是这门课要反复回到的地方：<strong>在交通标志检测里，原版 DETR 的 cross-attention 初期把 99.98% 的梯度打在了背景上。</strong>模型必须靠这 0.02% 的信号慢慢把注意力「拧」到标志上——这就是 500 epoch 的第一半。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这不是「学一会儿就好了」？因为注意力要变尖锐，靠的是 Q/K 投影学到「这个 query 的内容和那个位置的特征相似」。可是<em>在注意力还没变尖锐之前，query 拿到的是全图平均特征，根本形不成有区分度的内容</em>——这是一个鸡生蛋的循环。Deformable DETR 论文里画的注意力图显示，要训到约 <strong>10 万次迭代</strong>注意力才明显稀疏化。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说：<strong>这是一个「初始化处于高熵鞍区」的优化问题</strong>。softmax 注意力的对数几率需要从 0 增长到 ln((HW−n)/n) 才能让目标区域占到一半的注意力质量。目标越小，n 越小，需要的对数几率增量越大——<em>而增长速率由梯度决定，梯度又正比于当前的注意力质量</em>。于是小目标陷入「信号弱→学得慢→信号仍弱」的自锁。notebook 里会用一个玩具模型把这个 epoch 数算出来，并复现「小目标需要的 epoch 数显著多于大目标」。</p></div>
+  </div>  <h3>根因 ②：二分匹配不稳定，优化目标每个 epoch 都在抖</h3>  <p>模块 01 已经指出了这个问题，这里给它一个精确的说法：<strong>同一张图的同一个 GT，在相邻两个 epoch 里可能被不同的 query 认领。</strong>一旦认领关系翻转，上个 epoch 被训练着去拟合「停车让行标志」的那个 query，这个 epoch 的目标变成了「背景」；而另一个一直在学背景的 query 突然被要求回归出一个精确的框。</p>  <p><strong>梯度方向不是变小，而是掉头。</strong>这与「学习率太大」的症状完全不同——损失曲线看起来在降，但每个 query 学到的东西被反复覆盖。</p>  <table>
+    <thead><tr><th></th><th>根因 ① 注意力弥散</th><th>根因 ② 匹配不稳定</th></tr></thead>
+    <tbody>
+      <tr><td>发生在哪</td><td>decoder 的 cross-attention</td><td>损失函数的匹配步骤</td></tr>
+      <tr><td>本质是什么</td><td><strong>梯度打在了错误的空间位置</strong></td><td><strong>梯度指向了错误的目标</strong></td></tr>
+      <tr><td>怎么度量</td><td>注意力落在 GT 框内的质量 α</td><td>相邻 epoch 的匹配翻转率 φ</td></tr>
+      <tr><td>谁修的</td><td><strong>Deformable DETR</strong>（可变形采样 + 多尺度）</td><td><strong>DN-DETR / DINO</strong>（去噪 query 绕开匹配）</td></tr>
+      <tr><td>收益</td><td>500 → 50 epoch</td><td>50 → 12 epoch</td></tr>
+      <tr><td>修完另一个还在吗</td><td><strong>在</strong>（Deformable DETR 的匹配依然会翻转）</td><td><strong>在</strong>（DN 不改注意力机制）</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>最后一行是这一节的核心：<strong>两个根因彼此正交，所以两次收益可以相乘而不是相加</strong>。这解释了为什么 DINO = Deformable 的多尺度采样 + DN 的稳定监督，能在 12 epoch 拿到 49.0 AP——它同时修好了「往哪看」和「学什么」。<em>面试里如果只答出一个根因，追问「那 DN-DETR 又解决了什么」时就会卡住。</em></p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>有一个常见的错误归因：把 DETR 收敛慢归结为「Transformer 需要大数据 / 缺少归纳偏置」。<strong>这个说法太笼统，而且被后续工作证伪了</strong>——DINO 用的还是 Transformer、还是从 ImageNet 预训练的 ResNet-50、还是 COCO 那 118k 张图，12 epoch 就到了 49 AP。<em>真正被修好的是注意力的空间稀疏性和监督信号的稳定性，不是「归纳偏置」这种不可操作的东西。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="deform"><span class="num">2</span>Deformable Attention：把 O(HW) 的全局搜索换成 K 个可学采样点</h2>
+  <p><span class="term">Deformable attention</span>（可变形注意力）的想法一句话就能说完：<strong>与其让 query 和全图 HW 个 key 做点积再 softmax，不如让 query 直接预测「我要看哪 K 个点」，只在这 K 个点上采样加权。</strong></p>  <div class="math-block">\[\text{MSDeformAttn}(z_q, \hat{p}_q, \{x^l\}) = \sum_{m=1}^{M} W_m \Bigg[ \sum_{l=1}^{L} \sum_{k=1}^{K} A_{mlqk} \cdot W'_m\, x^l\big(\phi_l(\hat{p}_q) + \Delta p_{mlqk}\big) \Bigg]\]</div>  <p>符号逐个解释，每一个都对应一个设计决策：</p>  <table>
+    <thead><tr><th>符号</th><th>含义</th><th>为什么这么设计</th></tr></thead>
+    <tbody>
+      <tr><td><code>z_q</code></td><td>query 的内容向量</td><td>偏移与权重<strong>只由它产生</strong></td></tr>
+      <tr><td><code>p̂_q</code></td><td><strong>reference point</strong>（参考点，归一化 [0,1]²）</td><td>给 query 一个空间先验；两阶段版本里它来自 encoder 提案</td></tr>
+      <tr><td><code>Δp_mlqk</code></td><td>第 m 头、第 l 层、第 k 个采样点的偏移</td><td><strong>由 z_q 线性预测</strong>，可学；双线性插值让它可微</td></tr>
+      <tr><td><code>A_mlqk</code></td><td>采样点的注意力权重，对 L·K 做 softmax</td><td><strong>也由 z_q 线性预测</strong>——不做 Q·K 点积</td></tr>
+      <tr><td><code>x^l</code></td><td>第 l 层特征图</td><td>L=4 个尺度共享同一套 query</td></tr>
+      <tr><td><code>φ_l</code></td><td>把归一化坐标映射到第 l 层的像素坐标</td><td>让同一个参考点能跨尺度采样</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <strong>表里最容易被忽略、也最容易在面试里拿分的一行是 <code>A_mlqk</code>：可变形注意力的权重不是 query 和 key 的相似度，而是 query 自己「凭空」输出的一组数。</strong>换句话说它<em>放弃了内容匹配</em>，只保留了「加权求和一小撮位置」这个骨架。这就是它便宜的根本原因（不需要算 HW 个点积），也是它的代价（权重与被采样位置的内容无关，靠采样位置本身来编码「看什么」）。<em>被问到「Deformable attention 还算不算注意力」时，这是标准答案。</em>
+  </div>  <div class="ascii">DETR cross-attention（每个 query 看全图）
+  query ──┬─► key(0,0)   w≈1/1025
+          ├─► key(0,1)   w≈1/1025        HW = 25×41 = 1025 个 key
+          ├─► ...                        权重来自 Q·K 点积，初期近似均匀
+          └─► key(24,40) w≈1/1025        **梯度被摊薄 1025 份**
+
+Deformable attention（每个 query 只看 L×K 个点）
+  query z_q ──► 参考点 p̂_q ──► 线性层预测 Δp_1..Δp_K 与 A_1..A_K
+                    │
+                    ├─► 双线性采样 x(p̂_q + Δp_1)  × A_1
+                    ├─► 双线性采样 x(p̂_q + Δp_2)  × A_2     L×K = 16 个点
+                    ├─► ...                                 **权重不经过 Q·K**
+                    └─► 双线性采样 x(p̂_q + Δp_K)  × A_K
+  梯度同时流向两处：
+    ① 被采样格点的特征值（4 个格点/采样点，由双线性权重分配）
+    ② **采样位置 Δp 自己**（dv/dx, dv/dy 来自双线性插值的解析导数）
+       ← 这是「学会往哪看」的直接通道，全局 attention 没有这条路</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第 ② 条是整个机制的灵魂。<strong>全局注意力只能间接地学「往哪看」</strong>——它得先把某个位置的特征学得和 query 相似，权重才会上去。<em>而可变形注意力有一条直达的梯度：如果往右挪 3 个像素能让损失变小，<code>dL/dΔp</code> 就直接告诉你往右挪。</em>这就是 500 epoch 变 50 epoch 的机制层解释。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说，这条梯度来自双线性插值的可微性。设采样点落在格点 <code>(x0,y0)</code> 的单元内，<code>dx = x−x0</code>，则 <code>∂v/∂x = (1−dy)(f₁₀−f₀₀) + dy(f₁₁−f₀₁)</code>——<strong>它正比于特征图在该处的局部差分，也就是特征的空间梯度</strong>。<em>推论：在特征平坦的区域（比如纯色天空），<code>∂v/∂Δp ≈ 0</code>，采样点收不到位置梯度，会停在原地不动。</em>notebook 里会把这个解析梯度写出来并用中心差分校验到 1e-7。</p></div>
+  </div>  <h3>计算量账：为什么 DETR 做不了多尺度而 Deformable 可以</h3>  <p>把与 query 数相乘的那部分算清楚（C=256，N_q=300，1333×800 输入）：</p>  <table>
+    <thead><tr><th>方案</th><th>每个 query 的乘加量</th><th>总量（×300 query）</th><th>相对</th></tr></thead>
+    <tbody>
+      <tr><td>DETR，单尺度 C5（HW=1025）</td><td>2·1025·256 ≈ 5.2×10⁵</td><td>1.6×10⁸</td><td>1×</td></tr>
+      <tr><td>DETR，若做 4 尺度（HW≈22148）</td><td>2·22148·256 ≈ 1.1×10⁷</td><td><strong>3.4×10⁹</strong></td><td><strong>21.6×</strong></td></tr>
+      <tr><td>Deformable，4 尺度 K=4</td><td>L·K·C + C·(3·L·K) ≈ 1.6×10⁴</td><td>4.9×10⁶</td><td><strong>0.03×</strong></td></tr>
+    </tbody>
+  </table>  <p>最后两行放在一起看就明白了：<strong>原版 DETR 不是「忘了」做多尺度，而是全局注意力在多尺度上的复杂度直接不可承受</strong>（encoder 的 self-attention 更是 O((HW)²)，4 尺度下会爆炸）。<em>可变形注意力把复杂度从「与特征图面积成正比」改成「与采样点数成正比」，多尺度才第一次变得免费。</em>这是一个「先有机制，才有能力」的经典例子。</p>  <div class="callout warn"><span class="label"></span>
+    <p>别把可变形注意力和 <span class="term">deformable convolution</span>（可变形卷积，DCN）混为一谈。<strong>DCN 是每个输出位置学一组偏移去采样输入，偏移由局部特征产生，本质仍是卷积；可变形注意力是每个 query（不绑定在特征图格点上）学一组偏移，并且带 softmax 权重与多尺度聚合。</strong><em>共同点只有「用双线性插值实现可学采样」这一条实现技巧。</em>面试里被追问区别时，答「query 不绑定空间位置 + 跨尺度 + 带注意力权重」这三点即可。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="deform2"><span class="num">3</span>Deformable DETR 的另外两件事：多尺度与两阶段</h2>
+  <p>很多人把 Deformable DETR 的收益全部归给「可变形注意力」，这在面试里会被追问穿。<strong>论文的消融清楚地把收益拆成了四块，而且可变形注意力本身只是打开大门的那一块。</strong></p>  <table>
+    <thead><tr><th>组件</th><th>做什么</th><th>解决什么</th><th>COCO AP（R50, 50 epoch）</th></tr></thead>
+    <tbody>
+      <tr><td>DETR-DC5 基线（500 epoch）</td><td>单尺度全局注意力</td><td>—</td><td>43.3</td></tr>
+      <tr><td><strong>+ 可变形注意力</strong></td><td>K 点采样替代全局</td><td>梯度弥散；让多尺度成为可能</td><td>—</td></tr>
+      <tr><td><strong>+ 多尺度（L=4）</strong></td><td>stride 8/16/32/64 共享 query</td><td><strong>小目标</strong>：AP_S 20.5 → 26.4</td><td>43.8（<strong>50 epoch</strong>）</td></tr>
+      <tr><td><strong>+ 迭代框细化</strong></td><td>每层 decoder 在上一层框上出增量</td><td>让参考点逐层逼近，采样越来越准</td><td>45.4</td></tr>
+      <tr><td><strong>+ 两阶段</strong></td><td>encoder 出提案，top-K 作为参考点</td><td>query 不再从零猜位置</td><td>46.2</td></tr>
+    </tbody>
+  </table>  <h3>多尺度：为什么它对 TSR 是生死问题而不是加分项</h3>  <p>原版 DETR 只用 C5（stride 32）。回到上一节的表：<strong>一个 60 米外、16×16 像素的限速牌，在 stride 32 的特征图上只占 0.25 个格子——它在数值上根本没有独立的特征向量</strong>，被邻域的路面、树木、天空混叠在同一个格子里。任何注意力机制都救不了「信息已经在下采样时被抹掉」这件事。</p>  <table>
+    <thead><tr><th>特征层</th><th>stride</th><th>16×16 标志占几个格子</th><th>32×32 标志占几个格子</th><th>能不能被采样到</th></tr></thead>
+    <tbody>
+      <tr><td><strong>P3</strong></td><td>8</td><td><strong>2×2 = 4</strong></td><td>4×4 = 16</td><td><strong>能</strong></td></tr>
+      <tr><td>P4</td><td>16</td><td>1×1 = 1</td><td>2×2 = 4</td><td>勉强</td></tr>
+      <tr><td>P5（DETR 唯一用的层）</td><td>32</td><td><strong>0.5×0.5 = 0.25</strong></td><td>1×1 = 1</td><td><strong>不能</strong></td></tr>
+      <tr><td>P6</td><td>64</td><td>0.0625</td><td>0.25</td><td>不能</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">多尺度不是选项，是准入条件</span>
+    <p>这张表推出一条对 TSR 项目非常硬的结论：<strong>如果你要用 DETR 系做交通标志检测，多尺度（至少到 stride 8，理想是加 stride 4 的 P2）不是调参选项，是准入条件。</strong><em>「我们用了 DINO，但为了省显存只保留了 P4–P6」这种配置，在远距离小标志上的召回会直接崩掉，而整体 mAP 可能只掉两三个点——因为小标志在数量上并不占多数，平均值把它掩盖了。</em>这也是 C55 会反复强调「必须按像素尺寸分桶评测」的原因。</p>
+  </div>  <h3>两阶段与迭代细化：让参考点从「猜」变成「有依据」</h3>  <p>原版 Deformable DETR 的 query 仍然是可学嵌入，参考点由 query 线性预测——<strong>它对具体这张图一无所知</strong>。两阶段版本改成：让 encoder 输出的每个特征点都当作一个提案，预测 objectness 与初始框，取 top-K（K = query 数）作为 decoder 的参考点。</p>  <div class="ascii">单阶段（原始 Deformable DETR）
+  可学 query 嵌入 ──► Linear ──► 参考点 p̂_q （与图像无关，只是学到的统计先验）
+
+两阶段（Deformable DETR two-stage / DINO 沿用）
+  encoder 特征（所有尺度所有位置，约 2.2 万个）
+        │
+        ├─► 每个位置预测 (objectness, box)         ← 这一步就是一个密集检测器
+        │
+        └─► top-K 挑选（K = 300/900）──► 参考点 p̂_q 与初始框
+                                             │
+                                        decoder 只需要**细化**，不需要**发现**
+
+迭代框细化（look forward once, Deformable DETR）
+  layer1: b1 = b0 + Δ1        loss1 ── 梯度 ──► Δ1 的参数
+             └─ detach ──► layer2: b2 = b1 + Δ2   loss2 ── 梯度 ──► Δ2 的参数
+                              └─ detach ──► layer3: ...
+  **detach 切断了 loss2 对第 1 层参数的梯度** ← DINO 的 look forward twice 就是去掉它</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>两阶段的价值可以用一句话概括：<strong>它把「在整张图里找出目标大概在哪」这件本来要 decoder 从零学的事，交给了一个密集预测头</strong>——而密集预测头本来就擅长这个（它每个位置都有监督）。decoder 于是从「发现 + 细化」的双重任务降级为「细化」的单一任务。<em>这也解释了为什么两阶段对小目标的收益更明显：小目标最难的是「发现」。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>代价有三个，都要能说出来：<strong>①</strong> encoder 侧多了一个检测头，训练时要为它单独算一份密集损失（Deformable DETR 复用了同一套 Hungarian 损失做提案监督）；<strong>②</strong> top-K 选择在推理时引入了一次排序，虽然便宜但让计算图多一个数据依赖的算子（C60 会讲这对导出与 TensorRT 的影响）；<strong>③</strong> <em>提案的质量成了新的瓶颈——如果 encoder 的 objectness 对某类目标系统性偏低，那类目标连进入 decoder 的资格都没有</em>。第 ③ 点在长尾场景（TSR 的稀有标志）里是真实风险。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dn"><span class="num">4</span>DN-DETR：与其修匹配，不如绕开匹配</h2>
+  <p>Deformable DETR 把 epoch 从 500 压到 50，但根因 ② 原封不动：<strong>匹配依然在翻转</strong>。DN-DETR 的做法极其漂亮——它没有去改进匈牙利算法，也没有加匹配的稳定性正则，而是<strong>额外塞进一批「不需要匹配」的 query</strong>。</p>  <h3>去噪任务：把最后一公里单独拎出来训练</h3>  <ol>
+    <li>取这张图的 GT 框，加一点噪声（中心平移 + 尺寸缩放），得到一个「差不多但不准」的框；</li>
+    <li>取这张图的 GT 类别，以概率 γ 翻转成另一个类别；</li>
+    <li>把 <code>(带噪框, 带噪标签)</code> 编码成额外的 query，和正常的 matching query 一起送进 decoder；</li>
+    <li><strong>这些 query 的监督目标是已知的</strong>——把框还原成 GT 框、把标签还原成 GT 标签。<em>完全不经过匈牙利匹配。</em></li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这管用？因为<strong>去噪任务恰好就是匹配分支最终要学会的那件事的「最后一公里」</strong>：给你一个大致对的框，把它修准。原来 query 要同时学「找到目标」和「修准框」，而且这两件事的监督还在抖；现在「修准框」这件事有了一份<em>从第一个 iteration 就完全稳定</em>的监督。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说，DN 把一个不稳定的联合任务分解成了两个子任务的和：<strong>匹配分支继续学「发现 + 认领」，去噪分支专门学「条件重建」</strong>。二者共享同一套 decoder 参数与 cross-attention，所以去噪分支学到的定位能力会<em>直接迁移</em>到匹配分支。<strong>关键是去噪分支的监督密度：每个 GT 在每次迭代都被 G 组去噪 query 各学一遍（G 常取 5~100），而匹配分支每个 GT 只有 1 个 query。</strong>监督信号密度提升了一到两个数量级，而且完全无噪。</p></div>
+  </div>  <h3>attention mask：这个机制的成败全在这里</h3>  <p>去噪 query 携带了 GT 的信息（框的位置、类别）。<strong>如果匹配 query 能通过 self-attention 读到它们，就是把答案抄给了模型</strong>——训练损失会掉得非常漂亮，验证 AP 一塌糊涂。所以必须用 attention mask 做隔离：</p>  <table>
+    <thead><tr><th>谁看谁</th><th>允许？</th><th>理由</th></tr></thead>
+    <tbody>
+      <tr><td>匹配 query → 去噪 query</td><td><strong>❌ 禁止</strong></td><td><strong>否则 GT 泄漏</strong>，这是最致命的一条</td></tr>
+      <tr><td>去噪组 g → 去噪组 g&#39;（g≠g&#39;）</td><td>❌ 禁止</td><td>每组是同一批 GT 的不同噪声版本，互看等于抄答案</td></tr>
+      <tr><td>去噪组 g → 同组内部</td><td>✅ 允许</td><td>同组内每个 query 对应不同 GT，互相去重是有意义的</td></tr>
+      <tr><td>去噪 query → 匹配 query</td><td><strong>✅ 允许</strong></td><td>匹配 query 不含 GT 信息，看它无害；<em>官方实现确实是不屏蔽的</em></td></tr>
+      <tr><td>匹配 query → 匹配 query</td><td>✅ 允许</td><td>这就是原本的去重协商</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">mask 写错 = 训练时抄答案</span>
+    <p>第四行是个高频考点：<strong>attention mask 不是对称的</strong>。很多人默认「互相看不见」就写成对称矩阵，那样会削弱去噪分支从匹配分支获得的上下文。<em>官方 DINO 实现里，去噪 query 的行只屏蔽其他去噪组的列，匹配 query 的列是开放的。</em></p><p>而忘记加 mask 的症状极具欺骗性：<strong>训练 loss 迅速降到很低、去噪分支的重建误差趋近 0、验证 AP 却比不加 DN 还差</strong>。<em>排查方法：把去噪分支关掉重训一次，如果验证 AP 反而涨了，八成是 mask 写错了。</em></p>
+  </div>  <h3>噪声强度：一个必须调但很少有人讲清楚的超参</h3>  <p>噪声太小，去噪任务退化成恒等映射，学不到东西；噪声太大，带噪框和 GT 已经不是同一个目标，去噪变成了「无中生有」，反而制造错误监督。DN-DETR 用两个参数控制：</p>  <table>
+    <thead><tr><th>参数</th><th>典型值</th><th>含义</th><th>太大会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><code>box_noise_scale</code> λ</td><td>0.4</td><td>中心平移 ≤ λ/2·w，尺寸缩放 ∈ [1−λ, 1+λ]</td><td>带噪框与 GT 的 IoU 掉到 0.3 以下，重建目标不合理</td></tr>
+      <tr><td><code>label_noise_ratio</code> γ</td><td>0.2 ~ 0.5</td><td>以 γ 的概率把标签换成另一个类</td><td>分类分支学到「输入标签无所谓」，去噪退化</td></tr>
+      <tr><td><code>dn_number</code> G</td><td>100（DINO）</td><td>去噪组数</td><td>显存与训练时间线性上升；单图 GT 多时要动态截断</td></tr>
+    </tbody>
+  </table>  <p><strong>标签翻转这一项对 TSR 特别有价值</strong>：它训练的正是「给我一个大致对的框和一个<em>可能是错的</em>类别，请你从图像证据里纠正它」。交通标志里限速 60 / 80 / 100 这类形状完全相同、只有数字不同的类，恰恰最需要这种纠错能力。<em>把 γ 调大一点、并且让翻转优先发生在易混类之间（而不是全类均匀采样），是一个有依据的定制方向。</em></p>  <div class="callout intuition"><span class="label"></span>
+    <p>记住 DN 最漂亮的一点：<strong>它不改任何网络结构、不加任何推理开销。</strong>去噪 query 只在训练时存在，推理时整块拿掉，模型的参数量、FLOPs、延迟完全不变。<em>「零推理成本换 4 倍收敛速度」——这类改动在工业界的采纳率总是最高的，因为它不需要重新做部署验证。</em>面试里主动点出这一点，说明你在用工程视角读论文。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dino"><span class="num">5</span>DINO：三件小事，各修一个具体短板</h2>
+  <p><span class="term">DINO</span>（DETR with Improved deNoising anchOr boxes，注意与自监督的 DINO 同名不同物）是 DETR 家族第一个在 COCO 榜首击败所有密集检测器的模型（Swin-L 63.3 AP test-dev）。它在 DAB-Deformable-DETR + DN 的基础上只加了三件事，<strong>每件都小到可以在一段话里讲完，但每件都精确地对准了一个具体缺陷</strong>。</p>  <h3>① 对比去噪 CDN：教模型说「不」</h3>  <p>原版 DN 只有正样本：所有去噪 query 的目标都是「还原成这个 GT」。<strong>问题是模型从来没被教过「这个框离得太远，应该判为背景」</strong>——于是它倾向于把任何接近的框都拉向最近的 GT，结果就是重复框与过度自信的低质量预测。</p>  <div class="ascii">对比去噪 CDN：每个 GT 生成一对 query
+                     λ1              λ2
+   GT ●───────────────┼───────────────┼──────────────►  离 GT 的噪声尺度
+      │   正样本区     │   负样本区     │   （不生成）
+      │  noise &lt; λ1   │ λ1&lt;noise&lt;λ2  │
+      └─► 目标 = 还原成 GT 的框与类别
+                      └─► 目标 = **no-object**（背景）
+
+  λ1 = 1.0, λ2 = 2.0（DINO 默认，单位是框宽高的倍数）
+  作用：在 GT 周围划出一圈「近但不够近」的硬负样本，
+        直接教模型「什么距离算认领成功」——**这正是 NMS 在推理期做的事，
+        被搬到了训练期**，所以 DINO 的重复框显著少于 DN-DETR。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>CDN 的作用可以类比成给模型加了一条<strong>决策边界的直接监督</strong>。没有负样本时，模型只知道「往 GT 靠」这个方向，不知道边界在哪；有了负样本，正负两组 query 的噪声尺度之差就明确定义了边界的位置。<em>论文里 CDN 对小目标 AP_S 的提升最明显——因为小目标的「近但不够近」区域相对框尺寸更大，最容易产生重复。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格看，CDN 是把 <span class="term">hard negative mining</span>（难负样本挖掘）以一种<em>可控且无需搜索</em>的方式引入了 DETR：负样本不是从模型预测里挑出来的（那样会有课程学习的不稳定性），而是<strong>由 GT 按固定噪声尺度构造出来的</strong>。<em>代价是这些负样本的分布由 λ1/λ2 人为决定，不一定匹配模型真实的困难区域</em>——这是 C58「难例挖掘」里会展开讨论的取舍：构造式负样本 vs 挖掘式负样本。</p></div>
+  </div>  <h3>② Mixed query selection：只借位置，不借内容</h3>  <p>两阶段 Deformable DETR 从 encoder 的 top-K 特征里同时取出了<strong>位置</strong>（初始框）和<strong>内容</strong>（作为 decoder query 的初始特征）。DINO 发现后者是错的：</p>  <table>
+    <thead><tr><th>方案</th><th>位置（reference box）</th><th>内容（decoder embedding）</th><th>问题 / 收益</th></tr></thead>
+    <tbody>
+      <tr><td>静态（原始 DETR / DAB）</td><td>可学嵌入</td><td>可学嵌入</td><td>与图像无关，decoder 要从零发现</td></tr>
+      <tr><td>纯查询选择（two-stage Deformable）</td><td>encoder top-K 的框</td><td><strong>encoder top-K 的特征</strong></td><td><strong>encoder 特征是「初步的」，可能歧义或含多个目标，用作内容会误导 decoder</strong></td></tr>
+      <tr><td><strong>Mixed（DINO）</strong></td><td><strong>encoder top-K 的框</strong></td><td><strong>仍用可学的静态嵌入</strong></td><td>位置有图像依据，内容保持中性 → 更稳</td></tr>
+    </tbody>
+  </table>  <p><strong>这个设计的逻辑值得记住：位置先验是安全的（错了后面还能细化），内容先验是危险的（错了会一直误导 cross-attention 去看错地方）。</strong><em>面试里被问「为什么不把 encoder 特征直接当 query」，这就是答案。</em></p>  <h3>③ Look forward twice：让每一层的框预测也为下一层负责</h3>  <p>Deformable DETR 在层间对参考框做了 <code>detach()</code>（论文里叫 <span class="term">look forward once</span>）：第 i 层预测出的框传给第 i+1 层时切断梯度，所以第 i 层的参数只被第 i 层的辅助损失监督。DINO 去掉这个 detach（<span class="term">look forward twice</span>）——<strong>第 i 层的参数同时被第 i 层和第 i+1 层的损失监督</strong>。</p>  <div class="math-block">\[\text{LFO}:\; \frac{\partial \mathcal{L}}{\partial \theta_i} = \frac{\partial \mathcal{L}_i}{\partial \theta_i} \qquad\qquad \text{LFT}:\; \frac{\partial \mathcal{L}}{\partial \theta_i} = \frac{\partial \mathcal{L}_i}{\partial \theta_i} + \frac{\partial \mathcal{L}_{i+1}}{\partial b_{i+1}}\cdot\frac{\partial b_{i+1}}{\partial b_i}\cdot\frac{\partial b_i}{\partial \theta_i}\]</div>  <p>为什么原来要 detach？因为担心早期层的框预测不准，梯度会互相干扰。<strong>DINO 的论证是：既然有了 DN 提供的稳定监督，早期层的框已经足够好，此时打通梯度带来的「早期层为最终结果负责」收益大于干扰。</strong><em>这是一个典型的「前一个改进让后一个改进变得可行」的例子——顺序不能颠倒。</em></p>  <table>
+    <thead><tr><th>改动</th><th>修的是哪个具体缺陷</th><th>论文消融量级（R50, 12 epoch）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>CDN 对比去噪</strong></td><td>重复框多、置信度不校准、小目标误检</td><td>约 +0.7 AP，AP_S 提升最明显</td></tr>
+      <tr><td><strong>Mixed query selection</strong></td><td>encoder 特征作内容会误导 cross-attention</td><td>约 +0.2 AP</td></tr>
+      <tr><td><strong>Look forward twice</strong></td><td>早期层的框预测缺少下游监督</td><td>约 +0.2 AP</td></tr>
+      <tr><td>三者叠加 + DN + Deformable</td><td>—</td><td><strong>49.0 AP @ 12 epoch</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>看到「+0.2 AP」不要轻视，也不要迷信。<strong>检测任务里同一配置换随机种子的波动就有 ±0.2~0.5 AP</strong>（C61 模块 01 会详细讲），所以单看一个 +0.2 的消融数字是没有统计意义的。<em>DINO 这三项之所以被普遍接受，是因为它们在多个骨干、多个 epoch 配置、多个后续工作里都稳定复现——而不是因为那张表上的数字。</em>面试里如果对方拿一个 +0.3 的结果问你「这算改进吗」，正确答案是「要看几个种子、方差多大」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="one2many"><span class="num">6</span>一对多匹配的回归：训练要密集，推理才要唯一</h2>
+  <p>2022 年底开始出现一批看似「开倒车」的工作：<strong>Group DETR、H-DETR、Co-DETR 又把一对多匹配加回了训练</strong>。理解它们，等于理解了 DETR 范式最深的一层。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话点破：<strong>「一对一匹配」是<em>推理端</em>的需求（输出不能有重复框，才能扔掉 NMS），不是<em>训练端</em>的最优（每个 GT 只有 1 个正样本，监督密度比密集检测器低两个数量级）。</strong>既然如此，正确的做法就是——<em>训练时用一对多拿密集监督，推理时只留一对一分支拿无重复输出</em>。这个「训练与推理不对称」的设计，是近三年检测领域最重要的观念转变之一。</p>
+  </div>  <p>先把监督密度的账算清楚。COCO 平均每图 7.3 个标注框：</p>  <table>
+    <thead><tr><th>检测器</th><th>每图每次迭代的正样本数</th><th>相对 DETR</th><th>推理端有重复框吗</th></tr></thead>
+    <tbody>
+      <tr><td>Faster R-CNN（RPN + head）</td><td>≈ 256（采样后）</td><td>35×</td><td>有 → 需要 NMS</td></tr>
+      <tr><td>RetinaNet / FCOS（密集）</td><td>≈ 数百~上千</td><td>50~150×</td><td>有 → 需要 NMS</td></tr>
+      <tr><td><strong>DETR（一对一）</strong></td><td><strong>7.3</strong></td><td><strong>1×</strong></td><td><strong>基本没有 → 无需 NMS</strong></td></tr>
+      <tr><td>Group DETR（G=11 组 query）</td><td>≈ 80</td><td>11×</td><td>推理只用 1 组 → 没有</td></tr>
+      <tr><td>H-DETR（一对多分支 K=6）</td><td>≈ 51</td><td>7×</td><td>推理丢掉一对多分支 → 没有</td></tr>
+      <tr><td>Co-DETR（+ ATSS/RCNN 辅助头）</td><td>≈ 数百</td><td>数十×</td><td>推理丢掉辅助头 → 没有</td></tr>
+    </tbody>
+  </table>  <p>这张表把「DETR 为什么慢」的第三个角度也讲清楚了：<strong>密集检测器每个 iteration 从一张图里榨出几百条监督，DETR 只榨出 7 条。</strong>要拿到同样多的梯度更新次数，DETR 自然需要几十倍的 epoch。<em>notebook 里会用这个账反推出「500 epoch ÷ 11 组 ≈ 45 epoch」——和 Group DETR 论文报告的收敛加速惊人地一致。</em></p>  <div class="ascii">训练期（要密集监督）                    推理期（要唯一输出）
+┌─────────────────────────────┐        ┌─────────────────────────────┐
+│ one-to-one 分支   N=300      │───────►│ one-to-one 分支   N=300      │
+│   每图 7.3 个正样本           │        │   直接 top-k 输出，无 NMS    │
+├─────────────────────────────┤        └─────────────────────────────┘
+│ one-to-many 分支  N=1500     │                 ▲
+│   GT 复制 K=6 份再匹配        │──── 整块丢弃 ───┘
+│   每图 44 个正样本            │
+├─────────────────────────────┤        推理开销：**完全为 0**
+│ 去噪分支（DN/CDN） G×2M      │        参数量/FLOPs/延迟：**完全不变**
+│   每图 100×2×7.3 个稳定样本   │        训练开销：显存 +30%~100%，
+└─────────────────────────────┘                  单步时间 +20%~60%</div>  <table>
+    <thead><tr><th>方法</th><th>怎么加密集监督</th><th>参数是否共享</th><th>关键实现细节</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Group DETR</strong></td><td>G 组独立 query，每组各自做一次一对一匹配</td><td>decoder 全共享</td><td><strong>组间 self-attention 必须隔离</strong>（否则组间会互相去重，退化成一对一）</td></tr>
+      <tr><td><strong>H-DETR</strong></td><td>额外一批 query 与「GT 复制 K 份」做一对多匹配</td><td>decoder 共享，query 分开</td><td>两分支的 self-attention 分开跑；损失加权求和</td></tr>
+      <tr><td><strong>Co-DETR</strong></td><td>在 encoder 输出上挂 ATSS / Faster-RCNN 等成熟密集头</td><td>backbone+encoder 共享</td><td>还会把密集头的正样本反过来变成 decoder 的「定制正 query」</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>三者的差别在于「密集监督加在哪一层」：<strong>Group DETR 加在 query 层（复制 query）</strong>，<strong>H-DETR 加在匹配层（复制 GT）</strong>，<strong>Co-DETR 加在 encoder 层（直接挂密集头）</strong>。<em>越靠近底层，对 backbone/encoder 表征的监督越直接，收益越大，但工程侵入性也越强</em>——Co-DETR 相当于把一个完整的密集检测器缝在了 DETR 上，训练代码复杂度显著上升。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>有一个共同的隐性约束必须说清楚：<strong>一对多分支绝不能与一对一分支共享同一次 self-attention</strong>。self-attention 的作用是让 query 互相协商去重；如果一对多的 query 和一对一的 query 在同一次 attention 里，一对多那些「本来就该重复」的 query 会把去重信号搅乱，<em>结果是一对一分支也开始输出重复框，NMS-free 的性质丢失</em>。<strong>Group DETR 用分组 mask、H-DETR 用两次独立前向来保证这一点——这与 DN 的 attention mask 是同一类设计约束。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>这一节还有一个反向的工程结论：<strong>如果你在推理端仍然要加 NMS，那你就没必要坚持一对一匹配。</strong><em>「训练慢了几倍、部署还是要 NMS」是最糟糕的组合。</em>选 DETR 系的唯一硬理由是「无 NMS 带来的延迟确定性」（C53 模块 04 / 本课模块 05 会算这笔账）；如果这个理由对你的系统不成立，密集检测器在同等算力下几乎总是更省心。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="thread"><span class="num">7</span>一条主线：每一步都在解决「监督信号太稀疏」</h2>
+  <p>这一节是本模块的核心，也是<strong>面试里能一击命中的总结</strong>。前面五节看起来是五个互不相干的技巧，其实它们全部在回答同一个问题：<strong>怎么让每一次前向传播产生更多、更准、更稳的监督信号？</strong></p>  <div class="math-block">\[\rho \;\propto\; \underbrace{N_{\text{pos}}}_{\text{每次迭代被监督的 query 数}} \;\times\; \underbrace{\alpha}_{\text{注意力落在目标上的质量}} \;\times\; \underbrace{(1-\phi)}_{\text{匹配未翻转的比例}}\]</div>  <p>这不是论文里的公式，是一个<strong>用来组织记忆的粗糙模型</strong>：三个因子分别对应「监督有多少」「监督打在哪」「监督稳不稳」。<em>DETR 家族的每一步演进，都可以定位到它抬高了哪个因子。</em></p>  <table>
+    <thead><tr><th>工作</th><th>抬高哪个因子</th><th>怎么抬的</th><th>epoch</th></tr></thead>
+    <tbody>
+      <tr><td><strong>DETR</strong> (2020)</td><td>—</td><td>基线：N_pos=7.3, α≈0.001, 1−φ≈0.5</td><td><strong>500</strong></td></tr>
+      <tr><td><strong>Deformable DETR</strong> (2021)</td><td><strong>α</strong> ↑↑↑</td><td>K 点采样让注意力从一开始就集中；多尺度让小目标有独立特征</td><td><strong>50</strong></td></tr>
+      <tr><td>Conditional / DAB-DETR (2022)</td><td>α ↑</td><td>把 query 显式解释为空间锚点/4D 框，给 cross-attention 空间先验</td><td>50</td></tr>
+      <tr><td><strong>DN-DETR</strong> (2022)</td><td><strong>N_pos ↑↑, (1−φ) → 1</strong></td><td>去噪 query 绕开匹配，提供 G 倍且完全无噪的监督</td><td><strong>12</strong></td></tr>
+      <tr><td><strong>DINO</strong> (2023)</td><td>N_pos ↑, α ↑</td><td>CDN 加负样本教决策边界；mixed query selection 让参考点有图像依据；LFT 让梯度多走一层</td><td><strong>12（49.0 AP）</strong></td></tr>
+      <tr><td><strong>Group / H- / Co-DETR</strong> (2023)</td><td><strong>N_pos ↑↑↑</strong></td><td>训练期恢复一对多，直接把正样本数提高一到两个数量级</td><td>12（+1~2 AP）</td></tr>
+    </tbody>
+  </table>  <div class="ascii">                     监督信号太稀疏
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+   打在哪（α）          有多少（N_pos）      稳不稳（1−φ）
+        │                   │                   │
+  Deformable Attn      Group DETR           DN-DETR
+  多尺度 P3~P6         H-DETR                （去噪绕开匹配）
+  两阶段/查询选择       Co-DETR               CDN 负样本
+  DAB 4D anchor        DN 的 G 组去噪         （稳定决策边界）
+        │                   │                   │
+        └───────────────────┴───────────────────┘
+                            │
+                    DINO = 三条线的合流
+                    12 epoch / 49.0 AP / 长期 SOTA 骨架</div>  <h3>面试答法骨架</h3>  <ol>
+    <li><strong>先给结论</strong>：DETR 收敛慢有两个正交根因——注意力初期弥散、匹配不稳定；后续工作按这两条线分头解决。</li>
+    <li><strong>再讲第一条线</strong>：Deformable DETR 用 K 点可学采样把注意力从一开始就集中，顺带让多尺度在算力上变得可行，小目标 AP_S 从 20.5 到 26.4，500→50 epoch。</li>
+    <li><strong>再讲第二条线</strong>：DN-DETR 加一批带噪 GT 作为额外 query，监督目标已知、不经匹配，从第一步就稳定；关键实现是 attention mask 防泄漏；50→12 epoch，且<strong>推理零开销</strong>。</li>
+    <li><strong>再讲合流</strong>：DINO = Deformable + DAB + CDN（正负噪声对，教决策边界）+ mixed query selection（只借位置不借内容）+ look forward twice，12 epoch 到 49.0 AP，成为之后三年的默认骨架。</li>
+    <li><strong>最后给洞察</strong>：Group/H-/Co-DETR 又把一对多加回训练，说明「一对一是推理需求而非训练最优」——<em>这一句能显著抬高对方对你的评价，因为它说明你理解的是范式而不是模型列表</em>。</li>
+    <li><strong>如果对方追问「那你会怎么用」</strong>：接模块 05 的选型论证（数据量、迭代周期、部署工具链、延迟稳定性）。</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>把整条线压缩成一句可迁移的心法：<strong>当一个模型「收敛慢」时，不要先去调学习率，先去数「每次前向产生了多少条有效监督」，再去看「这些监督打在了正确的位置吗」「它们在相邻 iteration 之间稳定吗」。</strong><em>这个三问在任何用了匹配 / 采样 / 稀疏监督的系统上都成立</em>——分割的 mask2former、跟踪的 MOTR、姿态的 PETR，走的是完全一样的演进路径。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tsr"><span class="num">8</span>回到 TSR：这条演进线对交通标志检测意味着什么</h2>
+  <p>这一节把前面所有结论翻译成 TSR 项目里的具体决定。<strong>四条，每条都有可执行的动作。</strong></p>  <h3>① 多尺度是准入条件，而且要往下加而不是往上加</h3>  <p>交通标志的像素尺寸分布与 COCO 完全不同：<strong>绝大多数有效检出发生在 12~48 像素区间</strong>（因为要在 40~80 米外就报出来，留给下游决策的时间才够）。按前面的 stride 表，这意味着 <strong>P3（stride 8）是主力层，P2（stride 4）值得认真评估</strong>，而 P6/P7 几乎没有负载。<em>直接照抄 COCO 配置（P3–P7 均匀分配）会把大量算力浪费在没有目标的高层上。</em></p>  <ul>
+    <li>动作：统计自己数据集的标志像素尺寸直方图，按 FPN 层级分配规则算出各层负载，据此裁剪层数（C57 模块 02 会给完整方法）。</li>
+    <li>动作：可变形注意力的采样点数 K 可以按层设置——<strong>低层（小目标）给更多采样点</strong>，高层减少。</li>
+  </ul>  <h3>② 去噪的标签翻转应该按混淆结构定制，而不是全类均匀</h3>  <p>默认实现里，标签翻转是在全部类别中均匀采样。<strong>但 TSR 的错分是高度结构化的</strong>：限速 60/80/100 互相错分的概率远高于「限速 60 错成禁止掉头」。把翻转分布改成按混淆矩阵采样，相当于让去噪分支专门练易混类。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>这是一个「读懂机制之后才能想到」的定制点，<strong>在面试里作为「你会怎么改进」的回答非常有力</strong>：它不是换个 backbone 那种谁都能说的答案，而是说明你理解 DN 的监督到底在训练什么。<em>配套的验证方式也要说出来：看易混类对的混淆矩阵非对角元是否下降，而不是只看总 mAP。</em></p>
+  </div>  <h3>③ 收敛速度的真实价值不是省 GPU，是缩短数据闭环周期</h3>  <p>量产 TSR 的工作方式是<strong>每周甚至每天都有新挖掘的难例进来</strong>（C58 讲的数据闭环）。在这种节奏下，「一次训练要 500 epoch」意味着数据改进和模型验证之间隔了一两周——<strong>闭环转不动，数据飞轮就不存在</strong>。</p>  <table>
+    <thead><tr><th>方案</th><th>COCO 规模的一次训练</th><th>TSR 数据（约 15 万图）估算</th><th>一周能迭代几次</th></tr></thead>
+    <tbody>
+      <tr><td>DETR（500 ep, 8×V100）</td><td>≈ 6 天</td><td>≈ 8 天</td><td><strong>&lt; 1</strong></td></tr>
+      <tr><td>Deformable DETR（50 ep）</td><td>≈ 1.5 天</td><td>≈ 2 天</td><td>3</td></tr>
+      <tr><td><strong>DINO（12 ep）</strong></td><td><strong>≈ 10 小时</strong></td><td><strong>≈ 14 小时</strong></td><td><strong>7+</strong></td></tr>
+      <tr><td>YOLO 系（300 ep 但单步极快）</td><td>≈ 1 天</td><td>≈ 1.5 天</td><td>4</td></tr>
+    </tbody>
+  </table>  <p><strong>「12 epoch」才是让 DETR 系真正进入量产候选名单的门票。</strong><em>在此之前，无论 AP 多高，工程团队都不会选一个改一次数据要等一周的模型。</em></p>  <h3>④ 密集同类场景要特别小心一对一匹配</h3>  <p>高速龙门架上一排 5 个方向指示牌、施工区连续摆放的同款锥形警示牌——<strong>这类「多个同类目标紧邻」的场景是一对一匹配的天然弱区</strong>：query 之间的去重协商可能把相邻的真目标误判为重复而抑制掉。</p>  <div class="callout danger"><span class="label">密集同类目标：一对一匹配的天然弱区</span>
+    <p>症状是<strong>「密集排列时少检一两个，而且总是少中间那几个」</strong>。这不是分类问题也不是定位问题，是 self-attention 的去重把真目标当成了重复。<em>排查方法：把 decoder self-attention 关掉重新推理一次（或者看该场景下 query 之间的注意力矩阵），如果漏检消失，就确认是去重过度。</em></p><p>对策：<strong>①</strong> 训练期加一对多分支（Group/H-DETR），让模型见过「相邻的多个同类目标都是正样本」；<strong>②</strong> 增大 query 数并检查前景 query 占比（模块 05 的诊断指标）；<strong>③</strong> 数据侧用 copy-paste 合成密集同类场景（C56 模块 03）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>DETR 家族在 2023 年之后进入了「细化与统一」阶段。下面这些是仍然开放、且与 TSR 直接相关的方向。</p>  <ul>
+    <li><strong>匹配稳定性的理论仍不完整</strong>：Stable-DINO 指出问题的根源是<em>分类分数与定位质量不对齐</em>——匹配代价里分类项用的是与位置无关的分数，导致「分类高但框差」的 query 赢得匹配。它用位置监督（position-supervised loss）修正，在 12 epoch 上再涨约 +1.5 AP。<em>但「什么样的匹配代价能保证稳定」尚无理论刻画。</em></li>
+    <li><strong>去噪超参缺少原则</strong>：λ1/λ2/G/γ 四个超参都靠经验，且与数据集的目标尺寸分布强耦合。<em>小目标数据集上「噪声尺度按框宽高的倍数」这个定义本身就可疑——16 像素的框加 0.4 倍噪声只有 6 像素，可能小于标注误差本身。</em>这在 TSR 上是真实问题，值得做消融。</li>
+    <li><strong>一对一与一对多的统一</strong>：DEIM（2025）提出 Dense O2O——用 mosaic/mixup 提高单图目标密度，从而在保持一对一匹配的前提下提高正样本数，再配合 Matchability-Aware Loss。<em>这条路线试图不引入额外分支就拿到密集监督</em>，方向很干净，但对增强策略的依赖使它与「贴近部署分布」的增强原则（C56）存在张力。</li>
+    <li><strong>极小目标仍是 DETR 系的短板</strong>：即使 DINO + P2，在 8~16 像素区间的 AP 依然明显低于专门设计的密集检测器 + 切片推理（C57 模块 04）。<em>核心矛盾是采样点数固定：K=4 个点对一个只占 2×2 格子的目标已经饱和，加点无益；而全局注意力又太贵。</em>「稀疏采样如何在极小目标上不丢信息」没有好答案。</li>
+    <li><strong>NMS-free 在边缘部署的实证仍少</strong>：论文报告的是 GPU 上的端到端延迟，而车端 SoC 上 top-k、多尺度采样（grid_sample 类算子）的支持度与效率都不同。<em>「去掉 NMS 换来的延迟确定性，是否足以抵消可变形采样算子在边缘芯片上的低效」是一个需要在具体硬件上测的问题</em>，C60 会给方法。</li>
+    <li><strong>query 数与场景密度的耦合</strong>：N 是超参且固定。密集场景需要大 N，稀疏场景大 N 浪费且降低正样本比例。<em>自适应 query 数（按图像内容动态决定）会破坏静态图导出</em>——这是一个算法与部署直接冲突的开放问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读（按阅读顺序）：★ <em>Deformable DETR: Deformable Transformers for End-to-End Object Detection</em>（Zhu et al., ICLR 2021）——重点看 Fig.2 的注意力可视化与 Table 关于多尺度/两阶段的消融；★ <em>DN-DETR: Accelerate DETR Training by Introducing Query DeNoising</em>（Li et al., CVPR 2022）——重点看 attention mask 的构造与不稳定性度量的定义；★ <em>DINO: DETR with Improved DeNoising Anchor Boxes</em>（Zhang et al., ICLR 2023）——重点看 CDN 与 mixed query selection 两节；<em>DAB-DETR</em>（Liu et al., ICLR 2022，4D anchor query）与 <em>Conditional DETR</em>（Meng et al., ICCV 2021）补足第一条线的中间环节；<em>Group DETR</em>（Chen et al., ICCV 2023）、<em>DETRs with Hybrid Matching</em>（Jia et al., CVPR 2023）、<em>DETRs with Collaborative Hybrid Assignments</em>（Zong et al., ICCV 2023）看一对多的回归；<em>Detection Transformer with Stable Matching</em>（Liu et al., ICCV 2023）看匹配稳定性的最新解释。相邻课程：本课模块 01（匈牙利匹配）、模块 03（object query）、C53 模块 04（RT-DETR 如何把这条线做到实时）、C57（小目标）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_queries/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · Object query 与交叉注意力：模型如何「认领」目标</div></a>
+    <a class="next" href="../05_practice/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · DETR 工程实践：调参、诊断与选型</div></a>
+  </div>
+
+</div>
+</body>
+</html>

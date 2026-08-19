@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 增强流水线工程</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 增强流水线工程</h1>
+  <p class="subtitle">几何在前光度在后不是习惯而是有理由 · <strong>概率是相乘的</strong>：三个 p=0.5 的算子串起来，全命中只有 12.5%，你以为的强增强其实很弱 · DataLoader 的每个 worker 不重播种 = 所有 worker 生成同一批增强（真实事故，且指标只掉一点点所以极难发现）· 增强常常才是训练吞吐的真正瓶颈 · TTA 融合要用 WBF 而不是 NMS，但它的延迟代价让车端几乎不可用</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–03（几何 / 光度 / 混合类增强）；C43（数据工程）与 C52（训练-部署一致性）有帮助但不必需</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_aug_pipeline.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Albumentations 论文与文档、PyTorch DataLoader 的 worker 语义、WBF（Weighted Boxes Fusion）论文、NVIDIA DALI / FFCV 文档</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#order">顺序：为什么几何在前、光度在后</a></li>
+      <li><a href="#prob">概率相乘：你配置的强度和实际强度差一个数量级</a></li>
+      <li><a href="#throughput">CPU 才是训练吞吐的真正瓶颈</a></li>
+      <li><a href="#optimize">吞吐优化的六个杠杆（按性价比排序）</a></li>
+      <li><a href="#rng">可复现性：DataLoader worker 的 RNG 陷阱</a></li>
+      <li><a href="#split">训练 / 验证 / 测试 / 部署：四条路径的增强一致性</a></li>
+      <li><a href="#tta">TTA 与 WBF：融合多个视角的正确方式</a></li>
+      <li><a href="#config">增强配置的版本管理：它是模型的一部分</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="order"><span class="num">1</span>顺序：为什么几何在前、光度在后</h2>
+  <p>前三个模块讲的是<strong>单个算子</strong>；这一模块讲的是<strong>把它们串成一条流水线</strong>。这不是把算子随便排一排的小事——顺序、概率、进程模型这三件事，每一件搞错都会让「你以为的增强」和「实际发生的增强」相差一个数量级，<em>而且都不报错</em>。</p>  <div class="ascii">一条真实的检测增强流水线（YOLO 系的典型形态）
+
+  原始样本 (img, boxes, labels)
+      │
+      ├─[A] 混合类（读多张图）   Mosaic(p=1.0) → MixUp(p=0.1)
+      │        ↑ 必须最先：它改变"什么是一个样本"
+      ├─[B] 几何类（改坐标）     RandomAffine → RandomPerspective → HFlip
+      │        ↑ 全部合成一个 3×3 矩阵，**只重采样一次**
+      ├─[C] 越界处理            裁剪到画布 → 面积/可见比阈值筛掉残框
+      │        ↑ 必须紧跟几何：此时坐标才是最终的
+      ├─[D] 光度类（不改坐标）   HSV → 亮度/对比度 → 噪声 → 运动模糊 → JPEG
+      │        ↑ 放在几何之后，否则高频扰动被重采样抹平
+      ├─[E] 尺寸归一            Letterbox / Resize（与推理端**逐行相同的代码**）
+      └─[F] 张量化              HWC→CHW, uint8→float, mean/std 归一化
+               ↑ 这一段在 val/test/部署三处必须完全一致</div>  <p>这个顺序不是约定俗成，每一步都有可以量化的理由。</p>  <table>
+    <thead><tr><th>阶段</th><th>是否改标注</th><th>是否重采样像素</th><th>放错位置的后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>A 混合类</strong></td><td>是（合并多图的框）</td><td>是（缩放拼接）</td><td>放在几何之后 → 每张子图各自做过几何，拼接后尺度分布失控</td></tr>
+      <tr><td><strong>B 几何类</strong></td><td><strong>是</strong></td><td><strong>是</strong></td><td>拆开分多次做 → 多次插值，细节被反复抹平（下面有数值）</td></tr>
+      <tr><td><strong>C 越界处理</strong></td><td>是（裁剪/丢弃）</td><td>否</td><td>放在几何之前 → 裁剪的是旧坐标，等于没裁</td></tr>
+      <tr><td><strong>D 光度类</strong></td><td>否</td><td>否</td><td>放在几何之前 → <strong>注入的噪声被后续插值平滑掉 50%–69%</strong></td></tr>
+      <tr><td><strong>E 尺寸归一</strong></td><td>是（等比缩放）</td><td>是</td><td>与推理端实现不同 → 训练-部署鸿沟（C60 的头号杀手）</td></tr>
+      <tr><td><strong>F 张量化</strong></td><td>否</td><td>否</td><td>顺序错（先减均值再除 255）→ 数值全错但模型仍能训</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>「光度放在几何之后」的理由最容易被忽略，而它是可以精确算出来的：<strong>任何亚像素的几何变换都是一次低通滤波</strong>。双线性插值把一个像素写成相邻两点的凸组合，等价于一个 [1−f, f] 的卷积核。你先往图上加了 σ=0.1 的高斯噪声，再做一次 0.5 像素的平移，噪声方差就被乘上 <code>0.5²+0.5²=0.5</code>——<em>实际的 σ 只剩 0.071</em>。如果几何段是三个算子串着做，方差只剩 31%，σ 只剩 0.056。<strong>你在配置文件里写的强度和模型真正见到的强度，差了将近一倍。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说：设几何变换的重采样核为 <span class="term">h</span>，对独立同分布的加性噪声，输出方差为 <code>σ² · ‖h‖²₂</code>。半像素双线性平移 <code>h=[0.5,0.5]</code>，<code>‖h‖²₂=0.5</code>；三次串联的等效核是它的三重卷积 <code>[1,3,3,1]/8</code>，<code>‖h‖²₂=20/64=0.3125</code>。<em>这同时给出了第二条规则</em>：几何算子应当<strong>先把所有变换合成一个仿射/透视矩阵，再做一次 <code>warpAffine</code></strong>，而不是逐个算子各调一次。串联三次不仅慢三倍，还额外损失了 <code>0.5−0.3125=37.5%</code> 的高频能量——<em>而高频正是小目标赖以被检出的信息</em>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>「越界处理必须紧跟几何段」</strong>是另一个高频实现 bug。常见写法是在最后统一裁剪框，但此时若中间插入了 Mosaic 的二次拼接，坐标系已经换过了，裁剪就作用在错误的画布上。<em>症状是训练集里凭空出现大量贴边的窄条框</em>——它们是残缺目标，模型会学到「标志可以只有 2 像素宽」，直接污染小目标的尺度先验。<strong>规则：坐标系一变，立刻做一次合法性清洗。</strong>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把顺序规则压成一句可背的话：<strong>先决定「一个样本是什么」（混合），再决定「它长在哪」（几何 + 清洗），最后决定「它看起来怎样」（光度），末尾是与推理端字节对齐的归一化</strong>。<em>越靠前的阶段影响越结构性、越不可逆；越靠后的阶段越是纯像素级的微调。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="prob"><span class="num">2</span>概率相乘：你配置的强度和实际强度差一个数量级</h2>
+  <p>流水线里每个算子都带一个触发概率 <code>p</code>。绝大多数人凭直觉理解它——「p=0.5 就是一半样本会被增强」——这句话对<strong>单个算子</strong>是对的，对<strong>整条流水线</strong>是灾难性的错。</p>  <div class="math-block">\[P(\text{全部触发}) = \prod_{i=1}^{k} p_i, \qquad P(\text{一个都不触发}) = \prod_{i=1}^{k} (1-p_i), \qquad \mathbb{E}[\#\text{触发}] = \sum_{i=1}^{k} p_i\]</div>  <p>代入最常见的配置：<strong>5 个算子各 p=0.5</strong>。</p>  <table>
+    <thead><tr><th>量</th><th>公式</th><th>数值</th><th>直觉预期</th></tr></thead>
+    <tbody>
+      <tr><td>全部触发</td><td>0.5⁵</td><td><strong>3.1%</strong></td><td>很多人以为是「一半」</td></tr>
+      <tr><td>一个都不触发</td><td>0.5⁵</td><td><strong>3.1%</strong></td><td>——</td></tr>
+      <tr><td>平均触发个数</td><td>5×0.5</td><td>2.5 个</td><td>——</td></tr>
+      <tr><td>至少触发 3 个</td><td>(10+5+1)/32</td><td>50.0%</td><td>——</td></tr>
+      <tr><td>至少触发 1 个</td><td>1−0.5⁵</td><td>96.9%</td><td>看起来很安全，掩盖了强度分布</td></tr>
+    </tbody>
+  </table>  <p>换成 8 个算子（真实流水线的常见规模）各 p=0.5：全部触发的概率是 <code>0.5⁸ = 0.39%</code>。<strong>你写在配置里的「最强增强组合」，在整个训练过程中只会出现在四百分之一的样本上</strong>——它几乎从未参与训练，而你却在 review 时按它来判断增强强度。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>反过来算更有用：<strong>如果你希望「全套增强都上」的样本占 30%，5 个算子每个的 p 该设多少？</strong>答案是 <code>0.30^(1/5) = 0.786</code>——每个算子都要接近 0.8，而不是直觉的 0.5 或 0.6。<em>这个反解在调参时极其实用：你先定「联合强度」这个业务上真正关心的量，再反推每个算子的 p，而不是逐个算子拍脑袋。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>另一个必须知道的实现陷阱是<strong>嵌套概率的折叠</strong>。Albumentations 的 <code>OneOf([...], p=0.5)</code> 语义是：以 0.5 的概率进入这个组，进入后按<em>归一化权重</em>从组内选一个。所以组内某算子的实际触发率是 <code>0.5 × w_i/Σw</code>，而不是它自己写的那个 p。<em>三层嵌套（Compose 里套 OneOf 里套 Compose）之后，叶子算子的实际触发率常常低到 2%–3%</em>。<strong>唯一可靠的做法是给流水线打点，把每个算子的实际触发率和联合分布统计出来，而不是读配置文件推理。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">面试常问：你怎么判断一个增强算子有没有用</span>
+    <p>这个坑在<strong>消融实验</strong>里会直接导致错误结论。你加了一个新算子、设 p=0.3，跑完发现 mAP 只涨了 0.1，于是判定「这个增强没用」。但如果它嵌在一个 <code>OneOf(p=0.5)</code> 的三选一里，实际触发率是 <code>0.5×1/3=16.7%</code>，再乘上它只对 12% 的夜间样本有意义——<em>真正受影响的样本占比 2%</em>。<strong>+0.1 的整体 mAP 对应的是那 2% 样本上的巨大提升</strong>。这也是模块 05 要讲的「分场景验证」的动机之一。</p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>落到 TSR 上：交通标志的关键失效场景（夜间、雨雾、逆光）在数据里本来就只占 10%–20%，<strong>针对它们的增强算子一旦再乘上一个 0.2 的触发概率，实际覆盖的样本就只剩 2%–4%</strong>。<em>所以场景专用增强的 p 应当显著高于通用增强的 p</em>，甚至应该按样本的场景标签做<strong>条件触发</strong>（只在夜间样本上加眩光、只在高速样本上加运动模糊），而不是全局均匀掷骰子。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="throughput"><span class="num">3</span>CPU 才是训练吞吐的真正瓶颈</h2>
+  <p>检测训练的直觉是「GPU 在算」。真实情况常常相反：<strong>数据增强跑在 CPU 上，而检测增强（尤其是 Mosaic、copy-paste、透视变换）比分类增强重一个数量级</strong>。一旦 CPU 供不上，昂贵的 GPU 就在空转，而你从 loss 曲线上完全看不出来。</p>  <div class="math-block">\[\text{throughput} = \min\!\left(\underbrace{\frac{W}{t_{\text{aug}}}}_{\text{CPU 侧}},\ \underbrace{\frac{B}{t_{\text{step}}}}_{\text{GPU 侧}}\right), \qquad \text{GPU 利用率} = \min\!\left(1,\ \frac{W \cdot t_{\text{step}}}{B \cdot t_{\text{aug}}}\right)\]</div>  <p>其中 <code>W</code> = worker 数，<code>t_aug</code> = 单样本增强耗时，<code>B</code> = batch size，<code>t_step</code> = 一步前反向的耗时。代入一组真实数字：<code>t_aug=12 ms</code>、<code>B=32</code>、<code>t_step=60 ms</code>。</p>  <table>
+    <thead><tr><th>配置</th><th>CPU 供给 (img/s)</th><th>GPU 需求 (img/s)</th><th>瓶颈</th><th>GPU 利用率</th></tr></thead>
+    <tbody>
+      <tr><td>W=4</td><td>333</td><td>533</td><td><strong>CPU（数据增强）</strong></td><td><strong>62.5%</strong></td></tr>
+      <tr><td>W=7</td><td>583</td><td>533</td><td>GPU（前反向）</td><td>100%</td></tr>
+      <tr><td>W=8</td><td>667</td><td>533</td><td>GPU（前反向）</td><td>100%</td></tr>
+      <tr><td>W=8, 开 Mosaic（t_aug≈38 ms）</td><td>208</td><td>533</td><td><strong>CPU，严重</strong></td><td><strong>39%</strong></td></tr>
+      <tr><td>要喂饱 GPU 所需最少 worker</td><td>—</td><td>—</td><td>—</td><td><code>⌈533×0.012⌉=7</code>；开 Mosaic 后 <strong>21</strong></td></tr>
+    </tbody>
+  </table>  <p>最后一行是这一节的重点：<strong>Mosaic 要读 4 张图、解码 4 次、拼接后再做一次几何变换，单样本成本大约是普通增强的 3 倍</strong>。于是「喂饱一张卡」需要的 CPU 核数从 7 跳到 21——<em>在一台 8 卡机上就是 168 核，绝大多数机器给不出来</em>。这就是为什么开了 Mosaic 之后训练明显变慢却查不出原因。</p>  <div class="ascii">GPU 利用率随时间（W 不足时的锯齿波形 —— 这就是诊断指纹）
+
+100% ┤ ████        ████        ████        ████
+     │ ████        ████        ████        ████
+ 50% ┤ ████        ████        ████        ████
+     │ ████        ████        ████        ████
+  0% ┴─████████────████████────████████────████████──→ t
+       ↑    ↑
+       │    └─ 空转 38%：worker 还在解码 JPEG + 拼 Mosaic
+       └─ 计算：前向 + 反向
+
+对照组（W 充足）：利用率贴着 95%–100% 平直，没有周期性谷底。
+诊断口诀：**看 GPU 利用率的时间序列，不要看平均值。**
+平均 62% 可能是「一直 62%」（算子本身低效），
+也可能是「100% 和 0% 交替」（数据饿死）—— 两者的处方完全不同。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>怎么<strong>确认</strong>是数据瓶颈而不是模型瓶颈？有一个五秒钟的判定法：<strong>把 DataLoader 换成一个返回固定张量的假数据源，再跑一遍</strong>。如果吞吐显著上升，瓶颈就在数据侧；如果几乎不变，瓶颈在 GPU 侧。<em>这个「短路实验」比任何 profiler 都快</em>，而且不会被采样误差和工具开销骗到。它和 C52 讲的「逐层二分定位」是同一个方法论：<strong>把整体慢分解成可以单独短路的环节。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第二个必须区分的量是<strong>吞吐的均值瓶颈 vs 方差瓶颈</strong>。<code>prefetch_factor</code> 和队列只能<em>削峰</em>——它们把「某一批特别慢」的抖动吸收掉，让 GPU 不因为偶发慢批而空转。<strong>但队列无法提高长期平均吞吐</strong>：只要 <code>W/t_aug &lt; B/t_step</code>，无论队列多深，稳态吞吐都等于 CPU 侧的供给速率。<em>把 prefetch 从 2 调到 16 却没变快，说明你面对的是均值问题而不是方差问题</em>——此时唯一的出路是降低 <code>t_aug</code> 或提高 <code>W</code>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>worker 数<strong>不是越多越好</strong>：① 每个 worker 是一个独立进程，要复制一份数据集索引与 Python 解释器，内存按 W 线性增长（大 <code>annotations</code> 字典能吃掉几 GB×W）；② 超过物理核数后线程争抢反而降低单 worker 吞吐；③ 与 <code>OMP_NUM_THREADS</code> 冲突——OpenCV/numpy 默认多线程，W 个 worker 各开 N 个线程会产生 W×N 的线程风暴。<em>标准做法是 <code>cv2.setNumThreads(0)</code> + <code>W ≈ 物理核数 − 2</code></em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="optimize"><span class="num">4</span>吞吐优化的六个杠杆（按性价比排序）</h2>
+  <p>确认是 CPU 瓶颈之后，有六个杠杆可用。它们的收益、代价和适用条件差别很大，<strong>按性价比排序而不是按流行度排序</strong>。</p>  <table>
+    <thead><tr><th>杠杆</th><th>做什么</th><th>典型收益</th><th>代价 / 风险</th><th>什么时候用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 关掉库内多线程</strong></td><td><code>cv2.setNumThreads(0)</code>、<code>OMP_NUM_THREADS=1</code></td><td>1.3–2×</td><td>几乎无</td><td><strong>永远先做这一条</strong>，五秒钟见效</td></tr>
+      <tr><td><strong>② 合并几何算子</strong></td><td>多个仿射合成一个矩阵，只 warp 一次</td><td>1.5–3×（几何段）</td><td>要自己写矩阵合成</td><td>几何算子 ≥3 个时必做，<em>顺带提升画质</em></td></tr>
+      <tr><td><strong>③ 换解码格式</strong></td><td>JPEG 预解码成 raw/npy/webdataset/LMDB</td><td><strong>2–4×</strong></td><td>磁盘占用涨 5–10×</td><td>JPEG 解码常占 t_aug 的 40%–60%</td></tr>
+      <tr><td><strong>④ 加 worker + 持久化</strong></td><td><code>num_workers</code>↑、<code>persistent_workers=True</code></td><td>线性到核数上限</td><td>内存 ×W；启动慢</td><td>核数还有余量时</td></tr>
+      <tr><td><strong>⑤ GPU 侧增强</strong></td><td>DALI / Kornia / torchvision.transforms.v2 放到 GPU</td><td>3–10×</td><td><strong>抢 GPU 显存与算力</strong>；算子集受限；<em>数值与 CPU 版不完全一致</em></td><td>CPU 核数不够且增强以张量运算为主</td></tr>
+      <tr><td><strong>⑥ 降低增强分辨率</strong></td><td>先 resize 到目标尺寸再做重算子</td><td>1.5–2.5×</td><td><strong>小目标细节提前丢失</strong></td><td><em>TSR 场景慎用</em>——见下方警告</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>杠杆 ③ 常常是最大的一块，却最少被想到。一张 1920×1080 的 JPEG 解码大约 6–10 ms，而整条增强流水线可能才 12 ms——<strong>意味着一半以上的 CPU 时间花在「把图片变成数组」而不是「增强」上</strong>。<em>预解码成未压缩格式后，读取变成纯 IO，t_aug 直接腰斩</em>。代价是磁盘：10 万张 1080p 图从 20 GB 涨到 300 GB。对车队数据这个代价通常可以接受，因为训练机本来就挂着大容量盘。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>杠杆 ⑤ 有一个必须提前知道的副作用：<strong>GPU 侧增强的数值与 CPU 侧不完全一致</strong>。插值实现、边界处理、浮点累加顺序都可能不同，导致「换了数据管线之后 mAP 变了 0.3」这类无法归因的现象。<em>更麻烦的是它抢占 GPU 资源</em>——增强占了 15% 的显存和算力后，你能开的 batch size 变小，反而可能整体更慢。<strong>正确做法是：先把 ①②③ 做完，确认 CPU 侧真的榨不出来了，再考虑 ⑤，并且切换前后必须做一次完整的对拍</strong>（这正是 C60 讲的训练-部署一致性方法论在训练侧的应用）。</p></div>
+  </div>  <div class="callout danger"><span class="label">省 CPU 省掉了小目标</span>
+    <p>杠杆 ⑥ 在 <strong>TSR 场景下是陷阱</strong>。「先把 1920×1080 缩到 640×640 再做增强」能省一大半 CPU，但 60 米外的限速牌在原图上只有 18 像素，缩放后只剩 6 像素——<em>它在增强流水线的第一步就被抹掉了</em>，后面所有的几何/光度增强都作用在一坨模糊上。<strong>症状是小目标 AP 莫名其妙掉 3–5 个点，而所有增强参数看起来都正常</strong>。规则：<strong>凡是会降低有效分辨率的优化，都必须按目标尺寸分桶验证</strong>，不能只看整体 mAP。</p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个能省很多事的工程约定：<strong>把 <code>t_aug</code> 做成训练日志里的一等公民</strong>——每个 epoch 打印一次「单样本增强耗时的 p50/p99、各算子耗时占比、GPU 利用率」。<em>这三个数一旦上了看板，「训练怎么变慢了」这个问题就从「玄学」变成了「看一眼日志」</em>。它的成本是十几行代码，收益是整个团队不再靠猜。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rng"><span class="num">5</span>可复现性：DataLoader worker 的 RNG 陷阱</h2>
+  <p>这一节讲的是<strong>一起真实事故</strong>，而且是那种「跑通了、指标也不算离谱、但你的增强多样性被静默砍掉了 3/4」的事故。它不会报错，不会 warning，只会让你的模型比应有的水平差几个点。</p>  <div class="ascii">PyTorch DataLoader 的 worker 是 **fork** 出来的子进程
+
+  主进程   numpy 全局 RNG state = S0
+     │     random 模块  state = R0
+     │
+     ├── fork ──&gt; worker 0 :  numpy state = S0, random state = R0   ← 完全相同
+     ├── fork ──&gt; worker 1 :  numpy state = S0, random state = R0   ← 完全相同
+     ├── fork ──&gt; worker 2 :  numpy state = S0, random state = R0   ← 完全相同
+     └── fork ──&gt; worker 3 :  numpy state = S0, random state = R0   ← 完全相同
+
+后果：4 个 worker 抽出的随机数序列**逐个相同**。
+样本 0,4,8,...  由 worker0 处理，用 stream[0],stream[1],stream[2],...
+样本 1,5,9,...  由 worker1 处理，用 **同一个** stream[0],stream[1],...
+=&gt; 样本 0/1/2/3 拿到**完全一样**的增强参数。
+=&gt; 一个 epoch 里不同的增强参数只有 N/W 组，**多样性打了 1/W 的折扣**。
+
+注意：PyTorch 会为 **torch 自己的 RNG** 做 base_seed+worker_id 的处理，
+所以 torch.rand 是安全的；**numpy 与 python random 不在此列**。
+而绝大多数检测增强库（Albumentations、imgaug、自写算子）用的正是 numpy。</div>  <p>这个 bug 有三个变体，症状与修法各不相同。</p>  <table>
+    <thead><tr><th>变体</th><th>写法</th><th>症状</th><th>怎么检测</th><th>修法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 全 worker 同 seed</strong></td><td>worker 里直接用全局 <code>np.random</code></td><td><strong>增强多样性 ÷ W</strong>，且完全静默</td><td>统计一个 epoch 内不同增强参数的<strong>去重个数</strong>，应等于样本数</td><td><code>worker_init_fn</code> 里用 <code>base_seed+worker_id</code> 重新播种</td></tr>
+      <tr><td><strong>② 只按 worker_id 播种</strong></td><td><code>seed(1234+worker_id)</code></td><td><strong>每个 epoch 重复同一串增强</strong>；训练 300 epoch 只见过 1 个 epoch 的增强多样性</td><td>对比 epoch 0 与 epoch 1 的参数序列，应完全不同</td><td>seed 里必须含 <strong>epoch</strong>（或用 <code>torch.initial_seed()</code>，它每 epoch 变）</td></tr>
+      <tr><td><strong>③ 复现不了实验</strong></td><td>只固定 <code>torch.manual_seed</code></td><td>同样的命令跑两次结果不同</td><td>跑两次对比 loss 曲线前 10 步</td><td>固定 torch/numpy/random 三家 + <code>generator=</code> + 记录 <code>num_workers</code></td></tr>
+    </tbody>
+  </table>  <pre><code># ✅ 正确写法：seed 必须同时含 base_seed / epoch / worker_id
+import numpy as np, random, torch
+
+def worker_init_fn(worker_id):
+    # torch.initial_seed() = base_seed + worker_id，且**每个 epoch 由 sampler 重新生成**
+    seed = torch.initial_seed() % (2 ** 31)
+    np.random.seed(seed)          # ← numpy 全局（兼容老代码）
+    random.seed(seed)             # ← python random
+    cv2.setNumThreads(0)          # ← 顺手把线程风暴关掉
+
+# 更干净的做法：不用全局 RNG，每个 worker 持有自己的 Generator
+class AugDataset(torch.utils.data.Dataset):
+    def _rng(self):
+        info = torch.utils.data.get_worker_info()
+        wid = 0 if info is None else info.id
+        ss = np.random.SeedSequence(entropy=self.base_seed,
+                                    spawn_key=(self.epoch, wid))   # ← epoch 必须在里面
+        return np.random.default_rng(ss)
+
+loader = torch.utils.data.DataLoader(
+    ds, batch_size=32, num_workers=8,
+    worker_init_fn=worker_init_fn,
+    generator=torch.Generator().manual_seed(1234),   # ← 控制 shuffle 的随机性
+    persistent_workers=True, prefetch_factor=4,
+)</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把损害量化一下就知道为什么这值得单开一节：<strong>N=64 个样本、W=4 个 worker，变体 ① 下一个 epoch 里只有 16 组不同的增强参数</strong>。更糟的是，因为 seed 与 epoch 无关，<em>这 16 组参数在全部 300 个 epoch 里一模一样</em>——整个训练过程中模型只见过 16 种增强变体。而正确实现下是 <code>64×300 = 19200</code> 种。<strong>差了三个数量级，而 loss 曲线看起来完全正常。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么它这么难被发现？因为<strong>增强的作用是统计性的</strong>：少了多样性不会让某个样本出错，只会让泛化差一点。你看到的是「mAP 比论文低 2 个点」，而这个差距会被归因到超参、数据量、backbone——<em>几乎不会有人怀疑到 RNG</em>。<strong>唯一可靠的防线是把「一个 epoch 内增强参数的去重个数」做成一条断言</strong>：它应该等于样本数，不等就直接抛异常。<em>这是那种写一次、终身受益的十行代码。</em></p></div>
+  </div>  <div class="callout danger"><span class="label">评测有随机性 = 所有消融结论作废</span>
+    <p>还有一个更隐蔽的近亲：<strong>验证集 / 评测集的随机性</strong>。如果评测流水线里残留了任何随机算子（哪怕只是随机 letterbox 的填充位置），<em>同一个 checkpoint 评两次会得到不同的 mAP</em>。此时你在模块 05 要做的所有显著性检验都建立在流沙上——<strong>因为你无法区分「模型的差异」和「评测的噪声」</strong>。规则：<strong>评测路径必须是纯确定性的，并且用「同一权重评两次结果必须逐位相同」作为 CI 断言。</strong></p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>「可复现」<strong>不等于</strong>「固定了 seed」。同一个 seed 在不同的 <code>num_workers</code> 下会产生不同的增强序列（因为样本到 worker 的分配变了）；不同版本的 OpenCV/Pillow 的插值实现也会给出不同像素。<em>所以实验记录里必须同时写下：seed、num_workers、增强配置哈希、以及关键库的版本号</em>。这四项少任何一项，半年后都复现不出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="split"><span class="num">6</span>训练 / 验证 / 测试 / 部署：四条路径的增强一致性</h2>
+  <p>增强只属于训练。这句话人人都会说，但真实代码里违反它的方式有很多种，而且每一种都会让离线指标失去意义。</p>  <table>
+    <thead><tr><th>路径</th><th>允许的操作</th><th>禁止的操作</th><th>违反后的症状</th></tr></thead>
+    <tbody>
+      <tr><td><strong>train</strong></td><td>全部随机增强</td><td>——</td><td>——</td></tr>
+      <tr><td><strong>val</strong></td><td><strong>只允许确定性变换</strong>：resize/letterbox/归一化</td><td>任何随机性（含随机裁剪、随机 letterbox 填充位置）</td><td><strong>同一权重评两次结果不同</strong> → 消融结论全部作废</td></tr>
+      <tr><td><strong>test</strong></td><td>同 val，且必须与 val <strong>共用同一份代码</strong></td><td>为了刷分单独调预处理</td><td>test 高于 val 是<em>数据泄漏或预处理不一致</em>的指纹</td></tr>
+      <tr><td><strong>deploy</strong></td><td>必须与 val <strong>逐位一致</strong></td><td>换库（cv2↔PIL）、换插值、换 padding 值</td><td><strong>离线 mAP 0.82，车上像 0.6</strong>（C60 模块 01 的经典故事）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最常见的违规不是「验证集做了增强」这种低级错误，而是<strong>「训练和验证的确定性部分走了两条代码路径」</strong>。训练里 letterbox 用 114 填充、缩放比例向下取整到 32 的倍数；验证里图省事直接 <code>cv2.resize(img,(640,640))</code>——<em>纵横比被拉伸了</em>。模型在训练时从未见过被拉伸的标志，验证 mAP 于是无故低几个点，而你会以为是模型过拟合。<strong>规则：train/val/deploy 的确定性段必须是同一个函数，通过参数开关随机段，而不是三份实现。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>另一个高频错误是<strong>「验证集做了 TTA、线上没做」</strong>。TTA 能让离线 mAP 涨 1–2 个点，如果只在验证路径上打开，你得到的是一个<em>系统性虚高的指标</em>：所有基于它的选型、门禁、消融都偏了，而且偏的量随模型不同而不同（弱模型从 TTA 受益更多），<strong>导致模型间的排序都可能反转</strong>。<em>原则：离线评测的配置必须是线上配置的一个精确镜像；任何线上不会做的事，评测路径也不许做。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>落到 TSR 上，这条原则有一个额外的维度：<strong>车端相机的 ISP 输出才是真正的部署分布</strong>。训练数据如果是从压缩视频里抽的帧，它带着 H.264 的块效应；而车端拿到的是 ISP 直出的 YUV。<em>这两者的高频特性差别很大，对 8–16 像素的小标志尤其致命</em>。所以「增强要贴近部署分布」在这里意味着：<strong>训练侧要么补上 JPEG/视频压缩伪影的增强，要么把训练数据换成 ISP 直出</strong>——而验证集必须用后者，否则你测的是「模型在压缩视频上的表现」，与车上无关。</p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一条容易被忽略的推论：<strong>close-mosaic 这类「阶段性增强」让训练分布在中途发生跳变</strong>。关掉 Mosaic 的那一刻，训练分布突然向验证分布靠拢，<em>验证 mAP 会出现一个明显的台阶</em>。如果你在切换点附近做模型选择或早停，就会选到一个「刚好赶上台阶」的 checkpoint，<strong>而这个提升与你正在消融的那个变量毫无关系</strong>。规则：<strong>所有对比实验必须在完全相同的 epoch 数与相同的 close-mosaic 时点下进行。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tta"><span class="num">7</span>TTA 与 WBF：融合多个视角的正确方式</h2>
+  <p><span class="term">TTA</span>（Test-Time Augmentation，测试时增强）是把同一张图用多种确定性变换各推一遍，再把结果融合。它是离线场景的免费午餐，也是车端几乎用不起的奢侈品。</p>  <h3>① TTA 的构成与逆变换</h3>  <p>典型配置：<strong>3 个尺度 × 2 种翻转 = 6 个分支</strong>。关键的实现细节是<strong>每个分支的框必须逆变换回原图坐标系</strong>：缩放分支要除以缩放比，翻转分支要做 <code>x → W − x</code> 并<strong>交换 x1/x2</strong>（忘记交换会得到 x1&gt;x2 的非法框，NMS 里 IoU 全算成 0，症状是「TTA 之后反而掉点」）。</p>  <h3>② 为什么融合不能用 NMS</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>NMS 的语义是<strong>「选一个、删掉其他」</strong>。这在单模型输出上是对的——重复框是冗余，删掉即可。但在 TTA 场景下，<strong>6 个分支给出的 6 个框是同一个目标的 6 次独立观测</strong>，每一次都带独立的定位噪声。此时删掉 5 个只留最高分的那个，<em>等于扔掉了 5 份可以用来降噪的信息</em>。正确的做法是<strong>平均</strong>——多次独立观测的加权平均，其方差是单次观测的 1/n。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><span class="term">WBF</span>（Weighted Boxes Fusion，加权框融合）正是这么做的：按分数降序遍历所有框，与已有簇的融合框 IoU 超过阈值就并入该簇，并<strong>用分数作权重重算融合坐标</strong>；否则新建一个簇。最后还有关键的一步——<strong>按支持该簇的分支数重标定分数</strong>：只被 1 个分支检出的框，其分数要乘上 <code>1/T</code>（T 为分支总数）。<em>这一步是 WBF 相对 NMS 的第二个优势：它天然抑制了「只有某个尺度才看到」的偶发误检</em>，而 NMS 对这类框无能为力（它没有重复框可以比较）。</p></div>
+  </div>  <div class="math-block">\[b_{\text{fused}} = \frac{\sum_{i=1}^{n} s_i \cdot b_i}{\sum_{i=1}^{n} s_i}, \qquad s_{\text{fused}} = \left(\frac{1}{n}\sum_{i=1}^{n} s_i\right) \cdot \frac{\min(n, T)}{T}\]</div>  <table>
+    <thead><tr><th>融合方式</th><th>坐标怎么定</th><th>分数怎么定</th><th>对 TTA 的适配性</th></tr></thead>
+    <tbody>
+      <tr><td><strong>NMS</strong></td><td>取最高分那一个</td><td>最高分</td><td><strong>差</strong>：丢弃其余观测，定位方差不降</td></tr>
+      <tr><td><strong>Soft-NMS</strong></td><td>取最高分那一个</td><td>重叠者降权而非删除</td><td>中：保住了召回，但坐标仍来自单个分支</td></tr>
+      <tr><td><strong>NMW</strong></td><td>加权平均</td><td><strong>取最大值</strong></td><td>中：坐标对了，但单分支误检不被抑制</td></tr>
+      <tr><td><strong>WBF</strong></td><td><strong>分数加权平均</strong></td><td><strong>均值 × min(n,T)/T</strong></td><td><strong>好</strong>：定位降噪 + 单分支误检降分</td></tr>
+    </tbody>
+  </table>  <h3>③ 延迟账：为什么车端用不起</h3>  <p>6 个分支意味着 6 次前向。按尺度的计算量正比于面积，<code>[0.83, 1.0, 1.25]</code> 三个尺度的相对代价是 <code>0.69 + 1.00 + 1.56 = 3.25</code>，再乘 2（翻转）= <strong>6.5 倍单次推理</strong>。若单次推理 8 ms，TTA 就是 52 ms，加融合约 <strong>53.5 ms</strong>。</p>  <div class="callout danger"><span class="label">面试高频：TTA 上车吗</span>
+    <p>而 TSR 在车端的<strong>整体预算</strong>是这样的：30 FPS → 每帧 33 ms，这 33 ms 要装下多路相机的感知、融合、跟踪、规控——<strong>TSR 分到的通常只有 8–12 ms</strong>。53.5 ms 超出预算 5 倍以上。<em>更致命的是 TTA 的延迟随目标数波动（融合是 O(n²) 的），破坏了 p99 延迟的确定性</em>——而车端要的恰恰是确定性。<strong>结论：TTA 在量产感知里基本不可用。面试里被问「你会用 TTA 吗」，正确答案是「离线会，车端不会，因为……」并给出这笔账。</strong></p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>但 TTA 在离线仍有三个高价值用途，<strong>这才是它该出现的地方</strong>：① <strong>打伪标签</strong>——半监督/自训练里用 TTA 提高教师模型的标注质量；② <strong>难例挖掘的一致性信号</strong>——<em>不同 TTA 分支给出的结果分歧越大，这张图越可能是难例</em>（这正是 C58 讲的一致性触发器）；③ <strong>评估精度上限</strong>——TTA 后的 mAP 可以视作「这个模型在这份数据上的能力天花板」，与单次推理的差距衡量了模型对视角/尺度的鲁棒性缺口。<em>换句话说：TTA 涨得越多，说明你的增强训练做得越差。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="config"><span class="num">8</span>增强配置的版本管理：它是模型的一部分</h2>
+  <p>增强配置不是「训练脚本的一个参数」，而是<strong>模型定义的一部分</strong>——同样的架构、同样的数据、不同的增强配置，产出的是两个能力完全不同的模型。它必须被当作代码一样版本化。</p>  <table>
+    <thead><tr><th>必须记录的字段</th><th>为什么</th><th>漏了会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><strong>算子列表与顺序</strong></td><td>顺序影响数值（见第 1 节）</td><td>复现时把光度放到几何前，噪声强度差一倍</td></tr>
+      <tr><td><strong>每个算子的参数与 p</strong></td><td>强度的直接定义</td><td>——</td></tr>
+      <tr><td><strong>实测的联合触发分布</strong></td><td>配置里的 p 与实际触发率常常不同（嵌套 OneOf）</td><td><strong>消融结论错误归因</strong></td></tr>
+      <tr><td><strong>seed 策略 + num_workers</strong></td><td>两者共同决定实际的随机序列</td><td>复现不出来（第 5 节）</td></tr>
+      <tr><td><strong>库版本</strong>（cv2 / PIL / albumentations）</td><td>插值与边界实现随版本变化</td><td>换机器后 mAP 漂移 0.2–0.5，查不出原因</td></tr>
+      <tr><td><strong>阶段性切换点</strong>（close-mosaic epoch）</td><td>训练分布在此跳变</td><td>对比实验的切换点不一致 → 结论不可比</td></tr>
+      <tr><td><strong>配置哈希</strong></td><td>一个字符串就能判断两次实验是否可比</td><td>只能靠人肉 diff YAML</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>配置哈希</strong>是这里最有杠杆的一条：把规范化后的增强配置（含库版本）序列化，取一个短哈希，写进 checkpoint 的元数据和每一行训练日志。<em>此后「这两次实验的增强一样吗」就从一次考古变成了一次字符串比较</em>。它同时解决了另一个问题——<strong>当有人在 review 里说「我只改了学习率」时，哈希会告诉你他顺手动过增强</strong>。这与 C52 讲的「给不可读的二进制产物附一份可读的来源说明」是同一个模式。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更进一步：<strong>把「实测触发率」也纳入产物</strong>。训练开始时跑 2000 个样本过一遍流水线，统计每个算子的实际触发率与联合分布，写进日志。<em>这一步把「配置」变成了「事实」</em>：你不再需要在脑子里折叠嵌套概率，也能立刻发现「这个算子的实际触发率是 2%，难怪消融看不出差别」。<strong>成本是训练开始时多花 3 秒，收益是消除了整整一类的错误归因。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个真实的组织性陷阱：<strong>增强配置常常被复制粘贴，然后各自演化</strong>。检测组从分类组抄了一份 HSV 参数，其中 <code>hue_shift=±20°</code> 对分类无害，但对 TSR 是灾难——<em>红色禁令牌的色相偏 20° 就滑向橙/品红，语义被破坏</em>（模块 02 已经量化过这一点）。<strong>规则：领域敏感的参数必须在配置里带注释说明约束来源，并写进 CI 断言</strong>（例如「hue 幅度不得超过 10°」），而不是指望下一个人记得。</p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块浓缩成一句可迁移的心法：<strong>增强流水线是一个「你写的配置」与「模型实际见到的分布」之间存在系统性偏差的地方——顺序偏差、概率偏差、RNG 偏差、库实现偏差，四种都静默</strong>。<em>因此工程上唯一可靠的姿态是：不推理，去测量</em>。触发率要打点、多样性要断言、耗时要上看板、配置要哈希。<strong>这四件事加起来不到一百行代码，却消除了这个领域绝大多数的「查不出原因」。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>增强流水线工程看起来很「工程」，但它连着几个仍然开放的研究问题。</p>  <ul>
+    <li><strong>自动增强搜索</strong>：AutoAugment 用 RL 搜策略、成本极高（几千 GPU 小时）；Fast AutoAugment 用密度匹配把成本降两个数量级；<strong>RandAugment 把搜索空间压成两个超参（N 个算子、强度 M）</strong>，几乎不损失精度——<em>这个「简化反而更好」的结果本身是个重要教训</em>；TrivialAugment 更进一步，连强度都随机采样。但<strong>检测任务上的自动搜索仍不成熟</strong>：搜索目标是 mAP（评估贵）、搜索空间要包含框变换的合法性约束、而且最优策略与数据集强相关。</li>
+    <li><strong>在线自适应增强</strong>：Population Based Augmentation、Adversarial AutoAugment 让增强强度<em>随训练进程变化</em>（早期弱、后期强），这与本课模块 05 要讲的「增强强度与训练时长的交互」是同一个现象的两面。开放问题是：<strong>能否用模型自身的不确定性来在线决定每个样本该被增强多强</strong>——即「样本级自适应增强」。</li>
+    <li><strong>数据管线的系统化</strong>：NVIDIA DALI、FFCV、WebDataset 把增强搬到 GPU 或做成流式格式。它们的共同难题是<strong>算子覆盖与数值一致性</strong>——GPU 实现与 CPU 实现的插值差异会造成不可归因的指标漂移。<em>「跨后端的位级一致增强」目前没有标准方案。</em></li>
+    <li><strong>生成式增强</strong>：用扩散模型合成罕见场景（夜间的施工牌、雨雾中的限速牌）。收益诱人，但有两个硬问题：① <strong>标注一致性</strong>——生成的图里目标框在哪、语义对不对，需要可控生成而非自由生成；② <strong>分布真实性</strong>——生成数据的伪影会成为模型学到的捷径特征，<em>在真实数据上反而掉点</em>。这是当前 TSR 长尾问题最被寄予厚望也最不确定的方向。</li>
+    <li><strong>增强与半监督的统一</strong>：FixMatch / Unbiased Teacher 系列把「弱增强出伪标签、强增强做一致性约束」变成了半监督的核心机制。<em>这意味着增强不再只是正则化，而成了监督信号的来源</em>。开放问题是：<strong>强弱增强的「强度差」该多大</strong>——太小没有约束力，太大伪标签失效，目前仍靠手调。</li>
+    <li><strong>TTA 的低成本化</strong>：能否用一次前向获得多视角的效果（如让网络内部显式建模尺度/翻转等变性），从而在车端也享受 TTA 的降噪收益？等变网络（equivariant CNN）与 test-time 自适应是两条正在探索的路径，<em>目前都还没有达到「延迟可接受 + 收益可观」的组合</em>。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：<em>AutoAugment</em>（Cubuk et al., 2019）与 <em>RandAugment</em>（Cubuk et al., 2020）——对照读，理解「搜索空间简化为何不损失精度」；<em>Weighted Boxes Fusion</em>（Solovyev et al., 2021）——WBF 的原始定义与 vs NMS/NMW 的对比实验，本模块 notebook 实现的就是它；<em>Albumentations: Fast and Flexible Image Augmentations</em>（Buslaev et al., 2020）——检测增强库的设计取舍与 <code>OneOf</code> 的概率语义；NVIDIA <em>DALI</em> 与 <em>FFCV</em> 的文档（数据管线瓶颈的系统性解法）；PyTorch 官方文档的 <em>Randomness in multi-process data loading</em> 一节（worker RNG 陷阱的一手说明）。相邻课程：C43（数据工程）、C58（难例挖掘与一致性触发）、C60（训练-部署一致性）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_mixing/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 混合类增强：Mosaic / MixUp / CutMix / Copy-Paste</div></a>
+    <a class="next" href="../05_ablation/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 增强的消融与验证：怎么证明它真的有用</div></a>
+  </div>
+
+</div>
+</body>
+</html>

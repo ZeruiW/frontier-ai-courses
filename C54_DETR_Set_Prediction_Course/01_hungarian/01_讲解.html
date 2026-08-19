@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 二分图匹配与匈牙利算法</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 二分图匹配与匈牙利算法</h1>
+  <p class="subtitle">预测无序、GT 无序，所以损失必须先对齐 · 匈牙利/KM = 对偶顶标 + 增广路径，O(n³) 且不是瓶颈 · 匹配代价的分类项用概率而非 log（否则量纲压垮 L1/GIoU）· 一对一在训练期就压制重复，而不是推理期删重复 · 匹配翻转率是 DN-DETR 的动机</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00；C18（IoU / NMS）；线性代数与基础组合优化。不需要图论背景</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_hungarian_matching.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Kuhn 1955（匈牙利算法原始论文）；DETR §3；DN-DETR §3.1（匹配不稳定性）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 75 分钟 + 跑 70 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">为什么必须先匹配：两个无序集合之间没有天然的对应关系</a></li>
+      <li><a href="#formal">形式化：线性指派问题（Linear Assignment Problem）</a></li>
+      <li><a href="#augment">机理之一：增广路径——先解「有没有」，再解「多好」</a></li>
+      <li><a href="#km">机理之二：对偶变量与 Kuhn–Munkres，为什么是 O(n³) 而不是 O(n!)</a></li>
+      <li><a href="#cost">DETR 的匹配代价：三项设计，以及为什么分类项用概率而不是 log</a></li>
+      <li><a href="#padding">N 个 query、M 个 GT：矩形代价矩阵与 no-object</a></li>
+      <li><a href="#nonms">为什么一对一匹配能替代 NMS：训练期压制 vs 推理期删除</a></li>
+      <li><a href="#instability">匹配不稳定性：DETR 收敛慢的第二个根因</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>为什么必须先匹配：两个无序集合之间没有天然的对应关系</h2>
+  <p>检测的输出是一个<strong>集合</strong>：{（限速60, 框A）,（禁止超车, 框B）}。GT 也是一个集合。两个集合<em>都没有顺序</em>——你把 GT 列表里的两个元素交换位置，标注的含义一点都没变。</p>  <p>但损失函数是逐元素算的。<code>loss(pred[0], gt[0]) + loss(pred[1], gt[1])</code> 这种写法<strong>隐含地假设了「第 0 个预测负责第 0 个 GT」</strong>——而这个假设毫无根据。同一份标注，把 GT 的存储顺序换一下，损失值就变了，梯度方向就变了，训练结果就变了。<em>一个依赖数据存储顺序的损失函数在数学上是没有定义的。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>传统检测器是怎么绕开这个问题的？<strong>它们用「空间位置」当成了天然的对应关系</strong>：Faster R-CNN 说「和这个 anchor 的 IoU 最大的那个 GT 归你负责」，FCOS 说「落在这个 GT 框内部的所有位置都归它负责」，YOLO 说「GT 中心点所在的那个格子负责它」。<em>这些规则把「谁对应谁」这个问题用手工先验回答掉了</em>——代价是这些规则本身变成了一堆要调的超参（IoU 阈值、中心采样半径、层级分配公式），也就是 C53 模块 02 讲的<span class="term">label assignment</span>（标签分配）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>集合预测拿掉了 anchor，也就同时拿掉了这个天然对应关系。<strong>N 个 object query 在几何上没有任何先验位置</strong>（原版 DETR 的 query 就是 N 个可学习向量，编号本身没有含义），所以「第 3 个 query 该对哪个 GT 负责」必须<em>在每次前向之后现算</em>。这就是匹配（matching）：<strong>给定这一次前向的预测结果，找出一个使总代价最小的一一对应</strong>。它每个 iteration 都会重算一次，而且结果可能和上一个 iteration 不同——这个「可能不同」正是本模块第 8 节的主题。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>换个角度看，<strong>匹配就是「动态的标签分配」</strong>：传统检测器用固定规则做分配（静态），DETR 用一个最优化问题做分配（动态，依赖当前预测）。<em>面试里如果被问「DETR 的标签分配是什么」，标准答案就是「基于匈牙利算法的一对一动态分配」</em>——而不是「DETR 没有标签分配」。这两者的差别决定了后面所有的性质：一对一带来无 NMS，动态带来不稳定。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="formal"><span class="num">2</span>形式化：线性指派问题（Linear Assignment Problem）</h2>
+  <p>把它写成数学。设预测集合有 N 个元素 <code>ŷ_1..ŷ_N</code>（N = query 数，固定），GT 集合有 M 个元素 <code>y_1..y_M</code>（M 随图像变化，通常 M ≪ N）。定义一个<strong>代价矩阵</strong> <code>C ∈ ℝ^{N×M}</code>，其中 <code>C_ij</code> 表示「让第 i 个预测去认领第 j 个 GT」的代价。我们要找的是一个单射 σ: {1..M} → {1..N}，使总代价最小：</p>  <div class="math-block">\[\hat{\sigma} \;=\; \arg\min_{\sigma}\; \sum_{j=1}^{M} C\big(\hat{y}_{\sigma(j)},\, y_j\big) \qquad \text{s.t.}\quad \sigma(j_1) \neq \sigma(j_2)\ \ \forall\, j_1 \neq j_2\]</div>  <p>这就是运筹学里的<strong>线性指派问题</strong>（linear assignment problem, LAP），也叫二分图最小权完美匹配。三个要素缺一不可：</p>  <table>
+    <thead><tr><th>要素</th><th>含义</th><th>去掉它会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><strong>代价矩阵</strong> <code>C_ij</code></td><td>「预测 i 认领 GT j」有多贵。它把「像不像」量化成一个数</td><td>无法比较不同配对的优劣，问题不成立</td></tr>
+      <tr><td><strong>一对一约束</strong></td><td>每个 GT 恰好一个预测，每个预测至多一个 GT（<code>σ</code> 是单射）</td><td><strong>退化成逐 GT 独立取 argmin</strong>——多个 GT 会抢同一个 query，重复框就回来了</td></tr>
+      <tr><td><strong>总代价最小</strong></td><td>优化的是<em>总和</em>，不是逐个最优</td><td>变成贪心匹配，会得到次优解（notebook 里实测约 37% 的随机矩阵上贪心次优）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第二行是这门课的地基。<strong>「一对一」这三个字承载了 DETR 的全部特殊性</strong>：如果允许多个预测认领同一个 GT（一对多），那就是传统检测器的标签分配，输出必然重复，必须 NMS；只有强制一对一，模型才被迫学会「一个目标只输出一个框」。<em>而一对一约束恰恰是让这个问题从「N 次独立 argmin」变成「一个组合优化问题」的原因</em>——也是它需要匈牙利算法而不是一行 <code>argmin</code> 的原因。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第三行则常被低估。<strong>「总代价最小」与「每个 GT 各自选最便宜的」是两回事</strong>。考虑一个 2×2 的代价矩阵 <code>[[1, 2], [2, 100]]</code>：贪心先拿走全局最小的 <code>C[0,0]=1</code>，剩下只能吃 <code>C[1,1]=100</code>，总代价 101；而最优解是交叉配对 <code>C[0,1]+C[1,0] = 2+2 = 4</code>。<em>差了 25 倍</em>。<strong>贪心的错误不是「选贵了」，而是「它的选择锁死了别人的选择」</strong>——这正是组合优化与逐点优化的分界线。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个实现上的坑：<strong>M 可能是 0</strong>（这一帧没有任何交通标志，在 TSR 数据里非常常见——高速空旷路段整段都是空帧）。此时代价矩阵是 <code>N×0</code>，匹配为空集，所有 N 个 query 都算 no-object 损失。<em>没有对空矩阵做保护是 DETR 复现里最常见的 crash 来源之一</em>，而且它只在遇到空帧的那个 batch 才炸，可能训练几个小时后才暴露。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="augment"><span class="num">3</span>机理之一：增广路径——先解「有没有」，再解「多好」</h2>
+  <p>匈牙利算法的名字来自 König 与 Egerváry 两位匈牙利数学家的定理，Kuhn 在 1955 年把它整理成算法。理解它要分两步走：<strong>先理解无权版本（最大二分匹配），再把权重加进去</strong>。无权版本的核心概念只有一个——<span class="term">augmenting path</span>（增广路径）。</p>  <div class="ascii">左边是 query，右边是 GT，一条边表示「这对可以配」。粗线 ═ 表示已在当前匹配里。
+
+  当前匹配 M = { q0═g0, q1═g1 }，匹配数 2。现在轮到 q2：
+
+     q0 ═══════ g0          q2 只连着 g1，而 g1 已被 q1 占用。
+                             直接放弃？不行 —— 也许 q1 可以让位。
+     q1 ═══════ g1
+                ╱            走一条**交替路径**（非匹配边、匹配边交替出现）：
+     q2 ───────╱
+                              q2 ──→ g1     (非匹配边)
+     q1 ─────── g2             g1 ══→ q1     (匹配边，反向走)
+                               q1 ──→ g2     (非匹配边)
+                               g2 是**未匹配**的右点 → 路径终止
+
+  这条路径就是**增广路径**：起点是未匹配左点，终点是未匹配右点，边交替。
+
+  增广 = 把路径上所有边的「匹配/非匹配」状态取反：
+       非匹配边 3 条 → 变匹配 (+3)      匹配边 1 条 → 变非匹配 (−1)
+       净增 1 条匹配边。
+
+     增广前: q0═g0, q1═g1              (2 条)
+     增广后: q0═g0, q2═g1, q1═g2       (3 条)   ← q1 让位给 q2，自己去了 g2
+
+  Berge 定理：一个匹配是最大匹配  ⟺  图中不存在增广路径。
+  所以算法就是：**对每个左点找一次增广路径，找到就增广。** 复杂度 O(V·E)。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>增广路径的直觉是<strong>「链式让位」</strong>：新来的 query 想要一个已被占用的 GT，那就问占用者能不能换个别的；占用者去问下一个……只要这条链最终走到一个空位，整条链就能集体挪一格，多容纳一个人。<em>如果走不到空位（所有可达的右点都已被占且它们的占用者也无处可去），说明当前匹配在这一块已经饱和，这个新 query 就只能落空。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这个「落空」的情形在 DETR 里有直接对应：<strong>当 M &gt; N（GT 数超过 query 数）时，必然有 GT 无法被匹配，它们的监督信号直接丢失</strong>。这就是「N 必须大于单图最大目标数」这条工程铁律的来源。<em>TSR 场景要特别小心：绝大多数帧只有 0–3 块标志，但复杂路口一次能出现十几块（龙门架 + 路侧杆 + 地面附着牌）</em>。按平均数设 N 会在最需要它的那些帧上漏检——而这些帧恰恰是安全最关键的。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>这里有个可迁移的心法：<strong>「先解可行性，再解最优性」</strong>。无权最大匹配回答的是「最多能配几对」，带权最优匹配回答的是「在配满的前提下总代价最小是多少」。<em>KM 算法的整个设计就是把第二个问题化归成第一个问题反复求解</em>——用对偶变量筛出一个「只保留最划算的边」的子图，然后在这个子图上跑最大匹配。下一节就是这件事。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="km"><span class="num">4</span>机理之二：对偶变量与 Kuhn–Munkres，为什么是 O(n³) 而不是 O(n!)</h2>
+  <p>带权版本的核心技巧是<strong>对偶</strong>。给每一行（query）配一个数 <code>u_i</code>，每一列（GT）配一个数 <code>v_j</code>，要求它们满足：</p>  <div class="math-block">\[u_i + v_j \;\le\; C_{ij} \qquad \forall\, i, j\]</div>  <p>在这个约束下，<strong>对任意一个合法的一对一匹配，其总代价都 ≥ Σu + Σv</strong>（把匹配上的每一对的不等式加起来即可）。所以 <code>Σu + Σv</code> 是最优总代价的一个<strong>下界</strong>。线性规划对偶告诉我们：把这个下界推到最大，它就等于最优值。</p>  <div class="math-block">\[\max_{u,v}\ \Big(\sum_i u_i + \sum_j v_j\Big) \quad = \quad \min_{\sigma}\ \sum_j C_{\sigma(j)\, j}\]</div>  <p>取等的条件是<strong>互补松弛</strong>：被匹配上的那些格子必须满足 <code>u_i + v_j = C_{ij}</code>（称为<span class="term">tight edge</span>，紧边）。于是算法的形态就出来了：</p>  <ol>
+    <li>维护一组满足 <code>u_i + v_j ≤ C_ij</code> 的对偶变量（初始可全取 0，若代价有负数则先做行减最小值）。</li>
+    <li>只看<strong>紧边</strong>组成的子图（<span class="term">equality subgraph</span>，相等子图），在上面用<strong>增广路径</strong>找匹配。</li>
+    <li>如果找不到增广路径，说明紧边不够用——计算一个最小的松弛量 <code>δ</code>，调整 <code>u/v</code> 让至少一条新的边变紧，然后回到第 2 步。</li>
+    <li>每次调整至少让一条边变紧，每个左点最多做 O(n) 次调整，每次调整扫描 O(n) 列 → <strong>总复杂度 O(n³)</strong>。</li>
+  </ol>  <table>
+    <thead><tr><th>方法</th><th>复杂度</th><th>N=100, M=7 时的规模</th><th>能不能用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>暴力枚举全排列</strong></td><td>O(n!) / P(N,M)</td><td><strong>8.07 × 10¹³ 种指派</strong></td><td>❌ 只能用来做正确性对拍（n ≤ 7）</td></tr>
+      <tr><td><strong>贪心（每次取全局最小）</strong></td><td>O(n² log n)</td><td>≈ 10⁴</td><td>❌ 快但<strong>不是最优</strong>，约 37% 的随机矩阵上会次优</td></tr>
+      <tr><td><strong>匈牙利 / KM（本课手写）</strong></td><td><strong>O(n³)</strong></td><td>≈ 10⁶ 次操作，CPU 上 &lt; 10 ms</td><td>✅ 最优且够快</td></tr>
+      <tr><td>Jonker–Volgenant（scipy 用的）</td><td>O(n³)，常数更小</td><td>同上，快 3–10×</td><td>✅ 生产用它，但<strong>面试要能手写</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这个复杂度可以接受？<strong>因为匹配是在 CPU 上、对每张图单独做的，而且矩阵极小</strong>：N=100（或 DINO 的 900），M 通常个位数。<em>DETR 的官方实现直接调 <code>scipy.optimize.linear_sum_assignment</code>，在整个训练里占比不到 1%</em>。真正的代价不在时间，而在它是一个<strong>不可微的离散步骤</strong>——它决定了梯度流向谁，但它自己没有梯度。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>「不可微」这一点值得说透。<strong>匹配 <code>σ̂</code> 是一个 <code>argmin</code>，在反向传播里被当作常量</strong>（DETR 实现里外面套了 <code>torch.no_grad()</code>）。所以匹配代价 <code>C</code> 里那些项（分类概率、L1、GIoU）在<em>匹配阶段</em>只起「选择」作用，它们的梯度来自后面的<em>损失</em>阶段。<em>这也是为什么匹配代价和损失函数可以用不同的形式</em>——比如匹配用 <code>−p</code>，损失用 <code>−log p</code>（下一节详述）。<strong>面试里能主动区分「匹配代价」和「损失函数」是加分项，很多人以为它们是同一个东西。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">O(n³) 的来源要能说清</span>
+    <p><strong>不要在面试里说「匈牙利算法是 O(n!)」或者「它就是暴力枚举的优化」</strong>。它和暴力枚举没有任何关系——它是一个基于线性规划对偶的原始-对偶算法，每一步都在<em>可证明地</em>提升下界。<em>被追问「为什么是 O(n³)」时，标准答案骨架是：n 个左点，每个点最多 n 次对偶调整，每次调整扫描 n 列</em>。如果还能补一句「它的对偶变量 u/v 满足互补松弛，所以算法终止时自带一个最优性证书」，这题就满分了。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost"><span class="num">5</span>DETR 的匹配代价：三项设计，以及为什么分类项用概率而不是 log</h2>
+  <p>代价矩阵怎么填，决定了「谁认领谁」，进而决定了每个 query 收到什么梯度。<strong>代价函数的设计比匹配算法本身更影响最终精度</strong>。DETR 用的是三项之和：</p>  <div class="math-block">\[C_{ij} \;=\; -\,\lambda_{cls}\,\hat p_i(c_j) \;+\; \lambda_{L1}\,\lVert \hat b_i - b_j \rVert_1 \;-\; \lambda_{giou}\,\mathrm{GIoU}(\hat b_i,\, b_j)\]</div>  <table>
+    <thead><tr><th>项</th><th>形式</th><th>默认权重</th><th>它负责什么</th><th>单独用会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><strong>分类项</strong></td><td><code>−p̂_i(c_j)</code>，直接用 softmax <strong>概率</strong></td><td>1</td><td>让「已经觉得自己是这一类」的 query 优先认领</td><td>只按分数匹配 → <strong>选到框很差的 query</strong>（C53 模块 04 讲的 query selection 同一个病）</td></tr>
+      <tr><td><strong>L1 项</strong></td><td><code>‖b̂ − b‖₁</code>，归一化 cxcywh 四维之和</td><td>5</td><td>中心与尺寸的绝对偏差，对<em>小框</em>友好（不随尺度衰减）</td><td><strong>对尺度极其敏感</strong>：同样 0.01 的偏差，对小框是致命的，对大框无所谓</td></tr>
+      <tr><td><strong>GIoU 项</strong></td><td><code>−GIoU(b̂, b)</code> ∈ [−1, 1]</td><td>2</td><td>尺度不变的重叠度量；<strong>不相交时仍有梯度</strong>（IoU 没有）</td><td>尺度不变意味着它<em>无法区分</em>「小框差一点」和「大框差很多」</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>L1 与 GIoU 必须同时用，因为它们的失效模式正好互补</strong>。L1 在归一化坐标下对小目标不友好：一块 24×24 像素的限速牌在 1920 宽的图上，宽度归一化后只有 0.0125，你的框宽错一倍（0.025）L1 才 0.0125，几乎不产生代价；而对一块占半张图的指路牌，同样 0.0125 的误差可以忽略不计。<em>GIoU 反过来：它只看重叠比例，24 像素的框错 2 像素 IoU 就掉到 0.39，代价立刻拉满。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>而 <strong>GIoU 相对 IoU 的关键改进是「不相交时仍有梯度」</strong>：两个完全不相交的框，IoU 恒为 0，无论它们相距 10 像素还是 500 像素——<em>作为代价它无法区分「差一点」和「差得离谱」</em>。GIoU 减去了「最小外接框中的空白占比」，所以框越远 GIoU 越负，一直到 −1。<strong>这一点对匹配尤其重要</strong>：训练早期所有预测框都是乱的，几乎没有一个和 GT 相交，如果只用 IoU，代价矩阵会退化成一片 0，匹配就完全由分类项决定，等于随机分配。<em>模块 02 会把 GIoU/DIoU/CIoU 的梯度性质完整推一遍。</em></p></div>
+  </div>  <h3>为什么分类项是 <code>−p</code> 而不是 <code>−log p</code></h3>  <p>这是本节最值得记住的一个细节，也是高频面试题。DETR 论文明确写了：<strong>匹配代价里的分类项用概率而非对数概率，「这样它就与框的代价项在同一量级上，我们观察到这带来了更好的表现」</strong>。原因有两层：</p>  <ul>
+    <li><strong>有界性</strong>：<code>−p ∈ [−1, 0]</code>，和 GIoU 项的 <code>[−1, 1]</code> 量级相当；而 <code>−log p</code> 在 <code>p→0</code> 时趋于 +∞。DETR 有 91 个类，训练初期每类概率约 0.01，<code>−log p ≈ 4.6</code>，而 L1 项通常在 0.1–1 之间——<strong>分类项会以数量级优势主导整个代价矩阵，匹配几乎完全由分类分数决定，框的质量被忽略</strong>。</li>
+    <li><strong>饱和性</strong>：<code>−p</code> 在 <code>p</code> 已经很高时增益递减（0.9→0.99 只多赚 0.09），所以「非常自信」的 query 不会因为多一点自信就压倒「框更准」的 query。<code>−log p</code> 则在低概率区极度陡峭，会把一个框很好但分类还没学会的 query 直接判死刑——<em>而训练早期所有 query 的分类都还没学会</em>。</li>
+  </ul>  <p>notebook 里有一个三选一的最小反例：q0 分类很自信但框偏了 0.4，q1 框几乎完美（GIoU 0.95）但分类概率只有 0.02，q2 两头都平庸。<strong>用 <code>−p</code> 匹配选中 q1（框好的那个，正确）；换成 <code>−log p</code> 就选中了 q2</strong>——一个两头平庸的 query 拿走了这个 GT，而框最准的 q1 被判成背景。</p>  <div class="callout warn"><span class="label"></span>
+    <p>但要注意<strong>损失函数里仍然用 <code>−log p</code>（交叉熵）</strong>，只有匹配代价用 <code>−p</code>。<em>把这两处搞混（匹配也用 log，或者损失也用概率）是复现 DETR 时的经典 bug</em>：前者会让训练早期匹配退化成按分数排序，后者会让分类梯度在 <code>p</code> 很小时消失。<strong>记法：匹配要「公平比较」所以要有界；损失要「强力纠错」所以要无界。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="padding"><span class="num">6</span>N 个 query、M 个 GT：矩形代价矩阵与 no-object</h2>
+  <p>实际的代价矩阵几乎从不是方阵。DETR 用 N=100（DINO 用 900），而一张图里的 GT 通常只有几个。<strong>TSR 场景更极端</strong>：一段高速上大量帧的 M=0，市区普通路段 M=1–3，复杂路口偶尔 M=12。所以代价矩阵是 <code>100×M</code> 的瘦长矩形。</p>  <div class="ascii">            GT (M=3)                          padding 到方阵 (N=6)
+        g0     g1     g2                    g0     g1     g2    ∅    ∅    ∅
+   q0 [ 0.3    2.1    1.8 ]            q0 [ 0.3    2.1    1.8   c    c    c ]
+   q1 [ 1.9    0.4    2.2 ]            q1 [ 1.9    0.4    2.2   c    c    c ]
+   q2 [ 2.4    1.7    0.5 ]     ==&gt;    q2 [ 2.4    1.7    0.5   c    c    c ]
+   q3 [ 1.1    1.3    1.6 ]            q3 [ 1.1    1.3    1.6   c    c    c ]
+   q4 [ 2.0    2.2    1.4 ]            q4 [ 2.0    2.2    1.4   c    c    c ]
+   q5 [ 1.5    1.9    2.1 ]            q5 [ 1.5    1.9    2.1   c    c    c ]
+
+   要点：padding 列的代价是**同一个常数 c**。
+         每种指派方案里恰好有 (N−M)=3 行落到 padding 列，贡献 3c —— **对所有方案都一样**。
+         =&gt; c 取什么值都不改变 argmin。**所以直接解矩形问题即可，不需要真的 padding。**
+
+   落到 padding 列的那 3 个 query 的实际待遇：**在损失里被判为 no-object (∅)**。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>很多人第一次看 DETR 的公式会卡在「GT 集合要 pad 到大小 N」这句话上，以为要真的构造一个 N×N 矩阵。<strong>数学上 padding 是为了让 <code>σ</code> 成为一个排列（permutation），叙述更干净；工程上完全不需要</strong>——因为 padding 列的代价是常数，它对所有指派方案的贡献相同，argmin 不受影响。<em>DETR 官方实现里就是直接把 N×M 的矩形矩阵扔给 <code>linear_sum_assignment</code>。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但「no-object 在匹配里代价为常数」这个设计本身是有后果的，值得想清楚：<strong>它意味着「一个 query 该不该被判为背景」这件事完全不由匹配决定，只由「有没有轮到它」决定</strong>。哪怕某个 query 的框和某个 GT 极度吻合，只要有另一个 query 更吻合，它就被打成背景，承受完整的 no-object 损失。<em>这就是「训练期压制重复」的机械原理，也是匹配不稳定性伤害如此之大的原因</em>——身份翻转会让同一个 query 在相邻 epoch 收到方向完全相反的分类监督。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>顺带回答一个常见困惑：<strong>为什么 N 不能设得太大？</strong> 三个理由。① <strong>正样本比例</strong>：N=100、M=3 时前景 query 只占 3%，no-object 损失即使降权也会主导训练（模块 02 量化这一点）；② <strong>计算量</strong>：decoder 的 self-attention 是 O(N²)，N 从 100 到 900 是 81 倍；③ <strong>重复风险</strong>：query 越多，「两个 query 都学到差不多的行为」的机会越大。<em>反过来 N 也不能太小——N &lt; 单图最大目标数会直接漏检</em>。<strong>实务经验：N 取「数据集里单图目标数的 99.9 分位数」的 3–5 倍。</strong>TSR 数据上这通常意味着 N=100 足够，但要先真的去统计那个分位数，而不是照抄 COCO 的配置。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="nonms"><span class="num">7</span>为什么一对一匹配能替代 NMS：训练期压制 vs 推理期删除</h2>
+  <p>这是本模块、也是整门课最核心的一个问题，几乎每场 DETR 相关的面试都会问。答案的骨架是三句话：<strong>① 重复框的根源是「多个预测同时被判为同一目标的正样本」；② 一对一匹配从训练目标上禁止了这件事；③ 被禁止的那些 query 收到 no-object 梯度，于是学会主动把自己压低。</strong></p>  <table>
+    <thead><tr><th></th><th>一对多分配（传统检测器）</th><th>一对一匹配（DETR 系）</th></tr></thead>
+    <tbody>
+      <tr><td>训练时一个 GT 对应几个正样本</td><td>几个到几十个（IoU 阈值 / center sampling / SimOTA 的 dynamic-k）</td><td><strong>恰好 1 个</strong></td></tr>
+      <tr><td>训练信号密度</td><td><strong>稠密</strong>——收敛快（12–36 epoch）</td><td>稀疏——收敛慢（原版 500 epoch）</td></tr>
+      <tr><td>推理时同一目标的高分预测数</td><td>多个（因为训练时它们都被教成正样本）</td><td><strong>≈ 1 个</strong></td></tr>
+      <tr><td>去重发生在</td><td><strong>推理期</strong>：NMS 按 IoU 阈值删（不可微、O(n²)、阈值全局）</td><td><strong>训练期</strong>：no-object 损失把落选者压低（可微、无额外开销）</td></tr>
+      <tr><td>误删真目标的风险</td><td>存在（模块 00 算过：TSR 组合牌场景阈值窗口为空集）</td><td><strong>不存在</strong>（没有抑制步骤）</td></tr>
+      <tr><td>延迟随目标数</td><td>增长，p99 不可控</td><td><strong>常数</strong></td></tr>
+    </tbody>
+  </table>  <p>notebook 里有一个可以完整跑起来的最小实验：8 个 query、2 个 GT、纯 numpy 手写梯度下降 600 步，只改「分配方式」这一个变量。</p>  <div class="ascii">同一份数据、同一个模型、同一套梯度，只改分配方式：
+
+  一对多（半径 0.15 内全算正样本）      一对一（匈牙利匹配，每 GT 只 1 个正样本）
+  ────────────────────────────────      ──────────────────────────────────────
+  正样本: q1 q2 q3 | q4 q5 q6            正样本: q2 | q5
+  负样本: q0, q7                          负样本: q0 q1 q3 q4 q6 q7
+
+  训练 600 步后 sigmoid(score)：          训练 600 步后 sigmoid(score)：
+    q0 0.01                                q0 0.01
+    q1 0.99  ┐                             q1 0.01
+    q2 0.99  ├ 3 个框挤在 GT0 上           q2 0.99  ← 只有它认领 GT0
+    q3 0.99  ┘                             q3 0.01
+    q4 0.99  ┐                             q4 0.01
+    q5 0.99  ├ 3 个框挤在 GT1 上           q5 0.99  ← 只有它认领 GT1
+    q6 0.99  ┘                             q6 0.01
+    q7 0.01                                q7 0.01
+
+  触发数 = 6  →  **必须 NMS 才能回到 2**    触发数 = 2  →  **不需要任何后处理**</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这个实验里有一个自我强化的动力学值得注意：<strong>匹配代价里包含 <code>−p</code>，所以分数被压低的 query 代价更高、更不容易被匹配上，下一步又被压得更低</strong>。这个正反馈让「谁认领这个 GT」很快就锁定下来。<em>它既是一对一匹配能稳定收敛的原因，也是「一旦早期锁错了 query 就很难纠正」的原因</em>——后者是 DETR 训练里 query 利用率不均衡问题的一个来源（模块 05 会给诊断指标）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>必须诚实地补上另一半：<strong>一对一匹配换来无 NMS，代价是监督信号密度掉了一个数量级</strong>。一对多分配下一张图有几百个正样本，一对一只有 M 个（TSR 场景常常就 1–3 个）。<em>这是 DETR 需要 500 epoch 的第一个根因</em>。所以 2022 年之后出现了一批「训练时加一对多分支、推理时丢掉」的工作（Group DETR、H-DETR、Co-DETR），都能稳定涨点 1–2 AP。<strong>它们证明了一件重要的事：一对一是「推理端的需求」，不是「训练端的最优」。</strong>面试里能说出这一层，说明你不只是背了 DETR 的结论。</p></div>
+  </div>  <div class="callout danger"><span class="label">动机（匹配）与能力（self-attention）缺一不可</span>
+    <p>面试高频陷阱题：<strong>「一对一匹配就够了吗？把 decoder 的 self-attention 去掉，还能不出重复框吗？」</strong> 正确答案是<strong>不能</strong>。<em>一对一匹配提供的是「不要重复」的<strong>动机</strong>，decoder self-attention 提供的是「知道别人已经认领了」的<strong>能力</strong></em>——query 之间必须能互相看到，才能协商谁让谁。去掉 self-attention 后，多个 query 面对同一个目标时无法区分彼此，训练会在几个近似解之间震荡，重复框显著回升。<strong>把「动机 vs 能力」这组词说出来，这题就答满分了。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="instability"><span class="num">8</span>匹配不稳定性：DETR 收敛慢的第二个根因</h2>
+  <p>现在讲这个模块最有价值、也最少被讲清楚的一件事。<strong>匹配是一个离散的 <code>argmin</code>，代价矩阵的微小扰动可以让整个指派翻转。</strong>而代价矩阵在训练中每个 iteration 都会变（模型在更新、数据在换、增强在随机）。后果是：<strong>同一个 GT 在相邻 epoch 可能被不同的 query 认领。</strong></p>  <div class="ascii">同一块 40x40 的「禁止超车」牌，在相邻 epoch 被谁认领：
+
+  epoch    120   121   122   123   124   125   126   127   128
+  认领者   q17   q17   q42   q17   q42   q42   q17   q42   q17
+                   └翻转┘ └翻转┘ └翻转┘     └翻转┘ └翻转┘ └翻转┘   翻转率 6/8 = 75%
+
+  q17 这一路收到的监督信号：
+  epoch    120   121   122   123   124   125   126   127   128
+  身份     前景  前景  背景  前景  背景  背景  前景  背景  前景
+  分类梯度  ↑     ↑     ↓     ↑     ↓     ↓     ↑     ↓     ↑
+  框梯度   拉向GT 拉向GT  无   拉向GT   无    无   拉向GT   无  拉向GT
+
+  净效果：分类梯度方向来回抵消 —— 累计 9 步只净得 (5−4)/9 ≈ 11% 的有效信号，
+          而一个**稳定被认领**的 query 净得 100%。
+          等价于：**有歧义的那批 query 的有效学习率只有别人的 1/9。**</div>  <p>notebook 里把这件事做成了可量化的实验：构造一个 8 query × 4 GT 的代价矩阵，其中 GT0 和 GT2 各有两个「势均力敌」的候选 query（代价差 0.01 / 0.02），GT1 和 GT3 的候选则拉开明显差距（代价差 0.70）。给代价矩阵叠加高斯噪声模拟训练抖动，跑 2000 个「epoch」统计翻转率：</p>  <table>
+    <thead><tr><th>噪声 σ</th><th>GT0（代价差 0.01）</th><th>GT1（代价差 0.70）</th><th>GT2（代价差 0.02）</th><th>GT3（代价差 0.70）</th><th>平均</th></tr></thead>
+    <tbody>
+      <tr><td>0.002</td><td>0.000</td><td>0.000</td><td>0.000</td><td>0.000</td><td><strong>0.000</strong></td></tr>
+      <tr><td>0.01</td><td>0.358</td><td>0.000</td><td>0.136</td><td>0.000</td><td><strong>0.124</strong></td></tr>
+      <tr><td>0.05</td><td>0.482</td><td>0.000</td><td>0.474</td><td>0.000</td><td><strong>0.239</strong></td></tr>
+      <tr><td>0.20</td><td>0.488</td><td>0.014</td><td>0.493</td><td>0.013</td><td><strong>0.252</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>三个必须读出来的结论。<strong>① 不稳定性是局部的，不是全局的</strong>：代价差 0.70 的那两个 GT 在任何噪声下都几乎不翻转，而代价差 0.01 的那两个一翻就是 48%。<em>所以「匹配不稳定」真正的意思是「一小撮势均力敌的候选之间反复易主」，而不是整个指派随机乱跳</em>。② <strong>翻转率会饱和在 0.5</strong>：两个候选完全势均力敌时，每个 epoch 各 50% 概率，相邻两 epoch 不同的概率就是 0.5。σ 从 0.05 加到 0.20 平均翻转率只从 0.239 涨到 0.252，就是因为已经饱和了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>③ <strong>「势均力敌」在真实训练里是常态而不是例外</strong>。想想 TSR 场景：一块 24 像素的远处限速牌周围，好几个 query 的预测框只差一两个像素，它们的 L1 项与 GIoU 项几乎相同，分类概率也在同一个量级——<em>代价差恰恰就在 0.01 这个量级上</em>。而每个 iteration 里数据增强的随机裁剪、颜色抖动、乃至 dropout，都会给代价矩阵注入远超 0.01 的扰动。<strong>小目标 + 密集目标的场景，匹配不稳定性最严重</strong>——这正好是 TSR 的画像。</p></div>
+  </div>  <p>这个观察直接催生了后面两代工作，模块 04 会展开：</p>  <table>
+    <thead><tr><th>工作</th><th>对付不稳定性的思路</th><th>效果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>DN-DETR</strong>（CVPR 2022）</td><td>把「加了噪声的 GT 框」作为额外的 query 送进 decoder，它们的标签<strong>已知且固定，完全绕过匹配</strong>，只做去噪重建</td><td>50 epoch 达到原版 500 epoch 的精度；论文里直接画了「不稳定性指标随 epoch 下降」的曲线</td></tr>
+      <tr><td><strong>DINO</strong>（ICLR 2023）</td><td>在 DN 基础上加<strong>对比去噪</strong>（同一个 GT 给一组小噪声正样本 + 一组大噪声负样本），教模型「多远算同一个目标」</td><td>长期 SOTA 骨架；对重复框的抑制也更强</td></tr>
+      <tr><td><strong>Stable-DINO</strong>（ICCV 2023）</td><td>用<strong>定位质量给分类分数加权</strong>再进匹配代价，让「框准」这件事在匹配里更有决定性，减少势均力敌</td><td>直接针对匹配不稳定，在多个 backbone 上稳定涨点</td></tr>
+      <tr><td><strong>Group / H / Co-DETR</strong></td><td>训练时并行多组一对多分配，<strong>用监督密度对冲不稳定的伤害</strong></td><td>涨 1–2 AP，推理零开销</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>把这一节压成一句可迁移的话：<strong>凡是「用一个离散 argmin 决定谁接受监督」的系统，都会有优化目标抖动的问题</strong>。这不是 DETR 独有的——MoE 的专家路由、稀疏检索的 top-k 选择、乃至 SimOTA 的 dynamic-k，都是同一个病。<em>通用解法只有两类：让选择更确定（Stable-DINO 的加权、MoE 的负载均衡损失），或者绕过选择（DN-DETR 的去噪 query、MoE 的 soft routing）</em>。<strong>能把 DETR 的匹配不稳定和 MoE 的路由不稳定联系起来，是很强的信号。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>匹配这件事看起来已经被解决了（算法是 1955 年的，代价函数是 2020 年定下来的），但它仍然是 DETR 系里最活跃的改进入口之一。</p>  <ul>
+    <li><strong>匹配稳定性的理论刻画仍然缺失</strong>。目前所有工作都是「观察到不稳定 → 提出一个启发式 → 实验证明有效」，没有人回答「给定代价矩阵的分布，翻转率的期望是多少」「翻转率降到多少才不影响收敛」。<em>本模块 notebook 里的那个 2000 次模拟，本质上就是在做这件事的最小版本</em>——把它扩展到真实代价矩阵上是一个现成的研究点。</li>
+    <li><strong>一对一与一对多的最优配比</strong>。Group DETR 用 11 组，H-DETR 用一对多分支 + 一对一分支，Co-DETR 挂三个辅助头——<em>组数、噪声强度、损失权重全是调出来的</em>。「训练时该给多稠密的监督」目前没有理论指导，也没有随训练进程自适应的方案。</li>
+    <li><strong>可微匹配 / 软匹配</strong>。用 Sinkhorn 迭代做熵正则化的最优传输（OTA、SimOTA 的思想来源）可以得到一个可微的软指派，理论上能让梯度流过匹配步骤。<em>但在 DETR 上至今没有稳定超过硬匹配的方案</em>——软指派会让多个 query 都收到部分前景梯度，重复抑制的效果被削弱，绕回了一对多的老问题。</li>
+    <li><strong>代价函数的自动设计</strong>。三项权重 (1, 5, 2) 是 DETR 论文里试出来的，此后几乎所有工作都沿用。<em>但它对数据集分布是敏感的</em>：小目标为主的数据集（TSR、航拍）理论上应该提高 GIoU 权重或改用 NWD 这类尺度不变度量（C57 模块 03）。目前没有系统的调参方法论，也没有「按数据集自动搜代价权重」的工作。</li>
+    <li><strong>匹配与时序的结合</strong>。视频/多帧场景里，同一个目标在相邻帧应当被同一个 query 认领（这样 query 就自带跟踪 ID）。TrackFormer / MOTR 这类工作把 query 沿时间传播，<em>但「跨帧匹配一致性」与「单帧最优匹配」之间的冲突还没有好的解法</em>。<strong>对 TSR 尤其有价值</strong>：交通标志是静止的、自车运动可预测，跨帧一致的 query 认领能直接给出稳定的跟踪 ID（见 C55 模块 04）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读（按重要性）：<strong>★ Carion et al., <em>End-to-End Object Detection with Transformers</em>（DETR, ECCV 2020）§3.1</strong>——匹配代价的定义，以及「分类项用概率而非 log」那句关键说明；<strong>★ Li et al., <em>DN-DETR: Accelerate DETR Training by Introducing Query DeNoising</em>（CVPR 2022）§3.1</strong>——匹配不稳定性的定义与量化指标（本节表格的直接来源）；<strong>★ Kuhn, <em>The Hungarian Method for the Assignment Problem</em>（Naval Research Logistics Quarterly, 1955）</strong>——只有 12 页，读原文能真正理解对偶变量的来历；<strong>★ Zhang et al., <em>DINO</em>（ICLR 2023）</strong>——对比去噪；Liu et al., <em>Detection Transformer with Stable Matching</em>（Stable-DINO, ICCV 2023）——直接针对匹配稳定性；Chen et al., <em>Group DETR</em> / Jia et al., <em>DETRs with Hybrid Matching</em>（H-DETR, CVPR 2023）/ Zong et al., <em>Co-DETR</em>——一对多的回归；Ge et al., <em>OTA: Optimal Transport Assignment</em>（CVPR 2021）——把标签分配看成最优传输。相邻课程：C53 模块 02（一对多标签分配的完整谱系）、C54 模块 02（集合损失）、C57 模块 03（小目标的尺度不变度量 NWD）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_set_loss/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 集合预测损失：匹配之后怎么算账</div></a>
+  </div>
+
+</div>
+</body>
+</html>

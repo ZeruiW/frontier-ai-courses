@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 光度增强与域鲁棒性</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 光度增强与域鲁棒性</h1>
+  <p class="subtitle"><strong>交通标志的颜色就是语义</strong>——红=禁令、蓝=指示、黄=警告，色相抖动过强等于在改标签 · 大气散射 I = J·t + A(1−t) 是雨雾霾合成的物理底座 · 运动模糊核 = 方向 + 长度，卷帘快门让高速通过的立杆倾斜 · 合成便宜但有域差、真实贵但准 · 域随机化有效但有边界：它换来的是不变性，赔出去的是精度</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–01（bbox 变换框架、几何增强与标注同步）；C55 模块 03（TSR 失效模式）会让本模块的每个算子都有对应的现实故障</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_photometric_aug.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Koschmieder 能见度关系与大气散射模型；He et al. <em>Dark Channel Prior</em>；Sakaridis et al. <em>Foggy Cityscapes</em>；YOLOv5 <code>hyp.scratch</code> 与 albumentations 的 <code>HueSaturationValue</code></div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">光度增强在管什么：不动一个标注，却可能改掉标签</a></li>
+      <li><a href="#ops">成像链路与光度算子谱系：每个算子对应现实里的哪一环</a></li>
+      <li><a href="#hue">交通标志的颜色就是语义：色相抖动的红线在哪</a></li>
+      <li><a href="#sensor">传感器与编码链路上的退化：噪声、量化、压缩</a></li>
+      <li><a href="#weather">天气与光照合成：用物理模型，不要用滤镜</a></li>
+      <li><a href="#motion">运动模糊与卷帘快门：车载相机独有的两种畸变</a></li>
+      <li><a href="#domain">域随机化与合成-真实的取舍</a></li>
+      <li><a href="#recipe">给 TSR 配一套光度增强：从失效模式反推</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>光度增强在管什么：不动一个标注，却可能改掉标签</h2>
+  <p>几何增强管的是<strong>「物体在图像里的位置与形状」</strong>，所以每做一次变换都必须同步改标注——模块 01 花了整整一节讲四角法与外接框。光度增强管的是另一件事：<strong>「同一个物体，在不同的光照、天气、传感器、编码条件下，长什么样」</strong>。它一个像素都不移动，框的四个数字原封不动。</p>  <p>正因为「不用改标注」，光度增强被广泛当成<em>免费且安全</em>的一类增强，默认配置抄一遍就上。<strong>这恰恰是交通标志识别里最危险的误解</strong>：标注文件没变，不等于标签语义没变。</p>  <table>
+    <thead><tr><th></th><th>几何增强</th><th>光度增强</th></tr></thead>
+    <tbody>
+      <tr><td>改什么</td><td>像素的<strong>位置</strong></td><td>像素的<strong>数值</strong></td></tr>
+      <tr><td>标注要不要同步</td><td><strong>必须</strong>（四角变换 + 外接框）</td><td>完全不用动</td></tr>
+      <tr><td>典型失效</td><td>框膨胀、越界裁剪、小目标被丢弃</td><td><strong>语义被悄悄改掉</strong>、训练-部署分布错位</td></tr>
+      <tr><td>失效是否可见</td><td>可见（画出来就知道框歪了）</td><td><strong>基本不可见</strong>（图看起来还挺正常）</td></tr>
+      <tr><td>TSR 特有禁区</td><td>水平翻转（左转变右转、文字镜像）</td><td><strong>色相抖动（红=禁令、蓝=指示、黄=警告）</strong></td></tr>
+      <tr><td>调过头的症状</td><td>小目标召回崩、框系统性偏移</td><td>混淆矩阵里出现「跨颜色族」的错分</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>光度增强的正当性只有一句话：<strong>你要教模型的是「这些变化不改变它是什么」</strong>。所以判断一个算子该不该用、幅度该多大，只需要问一个问题——<em>真实世界里有什么东西会产生这个变化？变化能有多大？</em>。相机自动曝光会让整幅图明暗浮动 ±1 EV，所以亮度抖动 ±30% 合理；但<em>没有任何物理过程会把一块红牌变成黄牌</em>，所以色相抖动 ±40° 不是增强，是<span class="term">label noise</span>（标签噪声）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说：一个变换 <code>T</code> 是 <span class="term">label-preserving</span>（保标签）的，当且仅当对任务的真实条件分布有 <code>p(y | T(x)) = p(y | x)</code>。<strong>光度增强的所有争议都在这一个等式上</strong>。对通用检测（COCO 里的「人/车/椅子」），颜色几乎不进入 <code>p(y|x)</code>，所以色相抖动无害甚至有益；<em>对 TSR，颜色是分类边界本身的一部分</em>，同一个变换直接把等式打破。<strong>这是「增强配方不可跨任务复制」最干净的一个反例</strong>——面试时能举出这个例子，比背十条增强列表更有说服力。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见的错误推理是「加了强增强、验证集 mAP 没掉，所以是安全的」。<strong>验证集通常与训练集同分布、同标注体系，掉点会被平均掉</strong>：整体 mAP -0.1 可能对应「稀有黄色警告牌 AP -8」。<em>光度增强的验证必须按颜色族与光照条件分桶看</em>，这一点在模块 05 会展开。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ops"><span class="num">2</span>成像链路与光度算子谱系：每个算子对应现实里的哪一环</h2>
+  <p>与其记一张「常用增强清单」，不如把<strong>成像链路</strong>画出来——每个光度算子都应该能挂到链路上的某一环。挂不上去的算子，就是没有物理对应的算子，用它等于在制造训练-部署鸿沟。</p>  <div class="ascii">场景辐射 J   →   大气      →   镜头     →   传感器        →   ISP              →   编码/传输
+(真实反射率)     散射/吸收       失焦/像差      光电转换/噪声      去马赛克/白平衡      JPEG/H.264
+                 雨雪遮挡        运动模糊       读出噪声/量化      降噪/锐化/色调映射    码率自适应
+                 眩光散射        暗角           卷帘快门          自动曝光/自动增益     GOP 内质量波动
+     │               │              │               │                    │                  │
+     ▼               ▼              ▼               ▼                    ▼                  ▼
+  （不可增强）   大气散射合成    运动模糊核     高斯/泊松噪声        亮度/对比度/gamma    JPEG 伪影
+                 雨雪条纹叠加    失焦模糊核     ISO 噪声模型        饱和度/白平衡漂移    块效应/振铃
+
+规则：**任何一个光度增强算子，都必须能在这条链路上指出它模拟的是哪一环。**
+      指不出来（例如 channel shuffle、RGB→BGR 交换、随机反色），就不要用。</div>  <table>
+    <thead><tr><th>算子</th><th>数学形式</th><th>模拟链路上的哪一环</th><th>TSR 建议幅度</th><th>陷阱</th></tr></thead>
+    <tbody>
+      <tr><td><strong>亮度（乘性）</strong></td><td><code>I' = k·I</code></td><td>自动曝光 / 快门时间变化</td><td><code>k ∈ [0.7, 1.4]</code></td><td><strong>纯缩放，色相与饱和度完全不变</strong>——最安全的算子</td></tr>
+      <tr><td><strong>亮度（加性）</strong></td><td><code>I' = I + b</code></td><td>杂散光 / 雾的环境光项</td><td><code>b ∈ [-0.08, 0.12]</code></td><td><strong>是一个饱和度衰减器</strong>：色相不变但 S 下降</td></tr>
+      <tr><td><strong>对比度</strong></td><td><code>I' = c·(I-μ) + μ</code></td><td>ISP 色调映射 / 逆光</td><td><code>c ∈ [0.7, 1.3]</code></td><td>本质是仿射 <code>aI+b</code>，同上</td></tr>
+      <tr><td><strong>gamma</strong></td><td><code>I' = I^γ</code></td><td>编码非线性 / 低光提亮</td><td><code>γ ∈ [0.7, 1.5]</code></td><td><em>非线性</em>：会轻微移动色相（红牌约 1.5°），可接受</td></tr>
+      <tr><td><strong>饱和度</strong></td><td><code>S' = s·S</code></td><td>白平衡偏差 / 褪色老化 / 雾</td><td><code>s ∈ [0.6, 1.4]</code></td><td>褪色标志是真实失效模式，<em>值得刻意训</em></td></tr>
+      <tr><td><strong>色相</strong></td><td><code>H' = H + Δh</code></td><td>白平衡漂移（真实幅度很小）</td><td><strong><code>|Δh| ≤ 12°</code></strong></td><td><strong>超过约 25° 就把红牌推进黄牌的色相区间</strong></td></tr>
+      <tr><td>通道 shuffle / 灰度化</td><td>打乱或合并通道</td><td><strong>链路上没有对应</strong></td><td><strong>禁用</strong></td><td>对 TSR 等价于随机改标签</td></tr>
+      <tr><td><strong>噪声</strong></td><td>泊松（光子）+ 高斯（读出）</td><td>传感器 + 高 ISO</td><td>按曝光比例合成</td><td><em>先 resize 再加噪 ≠ 先加噪再 resize</em></td></tr>
+      <tr><td><strong>模糊</strong></td><td>线核（运动）/ 盘核（失焦）</td><td>相对运动 / 对焦误差</td><td>长度按物理算</td><td>对小目标是毁灭性的（见模块 04 与 C57）</td></tr>
+      <tr><td><strong>JPEG 伪影</strong></td><td>8×8 DCT 量化</td><td>编码 / 回传压缩</td><td>quality ∈ [55, 95]</td><td><strong>训练数据是解码图、车上是 ISP 直出</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把上表压成一句可操作的判据：<strong>先问「相机或环境里有什么会产生这个变化」，再问「它最大能有多大」</strong>。第一问筛掉没有物理对应的算子（channel shuffle 之流），第二问定幅度。<em>幅度不该从别人的 config 里抄，而该从设备与场景里推</em>——车载相机的自动曝光范围、白平衡算法的最大偏差、回传码率对应的 JPEG quality，这些都是可以问到具体数字的工程参数。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>有一个数学结构值得单独记：<strong>亮度、对比度、以及后面要讲的大气散射雾化，全都是逐通道仿射变换 <code>I' = a·I + b</code></strong>。对这一族变换可以精确说清它对颜色做了什么：<em>通道差被同乘 <code>a</code>，于是 <code>(g-b)/Δ</code> 这类比值完全不变 → <strong>色相严格不变</strong>（前提是 <code>b</code> 三通道相同）；而 <code>S = Δ/max</code> 的分子乘 <code>a</code>、分母是 <code>a·max + b</code>，于是 <code>b &gt; 0</code> 时饱和度必然下降</em>。<strong>所以「雾会不会破坏颜色语义」有一个精确答案：雾主要杀饱和度，色相的偏移完全来自环境光 <code>A</code> 的非中性（天空偏蓝）</strong>——notebook 里会把这两个数都量出来。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这个分类比记算子列表有用得多：<strong>仿射类算子（亮度/对比度/雾）安全，非线性类（gamma）轻微移色，显式色相/通道操作危险</strong>。<em>凡是你说不清它对色相做了什么的算子，就不要用在 TSR 上。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hue"><span class="num">3</span>交通标志的颜色就是语义：色相抖动的红线在哪</h2>
+  <p>这一节是本模块的核心，也是 TSR 相比通用检测最特殊的一条约束。<strong>在 GB 5768（中国）、维也纳公约（欧洲）、MUTCD（美国）三套体系里，颜色都不是装饰，而是类别层级的一部分</strong>：红=禁令、黄（欧洲白底红边、中国黄底黑边）=警告、蓝=指示、绿=指路、棕=旅游区。<em>模型看到一块红色圆牌，「这是禁令类」这个判断有一大半来自颜色</em>——这是数据本身的统计事实，不是模型的偏见。</p>  <p>于是问题变得可以精确回答：<strong>色相偏移多少度，会让一块红色禁令牌落进另一个类别的颜色区间？</strong></p>  <div class="math-block">\[d_H(h_1,h_2)=\min\bigl(|h_1-h_2|,\;360^\circ-|h_1-h_2|\bigr),\qquad \hat{c}(h)=\arg\min_{c}\;d_H\bigl(h,\;h_c\bigr)\]</div>  <p>把每个类别的代表色算出色相 <code>h_c</code>，用最近色相作为一个「颜色族分类器」。<strong>某一类的安全余量，就是它到相邻类色相的一半</strong>（越过中点就翻类）。取本课用的一组代表色，结果是：</p>  <table>
+    <thead><tr><th>颜色族</th><th>代表 RGB</th><th>色相 h<sub>c</sub></th><th>负向余量</th><th>正向余量</th><th>最先翻成谁</th></tr></thead>
+    <tbody>
+      <tr><td><strong>禁令（红）</strong></td><td>(0.80, 0.10, 0.12)</td><td>358.3°</td><td>69.1°</td><td><strong>25.2°</strong></td><td><strong>→ 警告（黄）</strong></td></tr>
+      <tr><td>警告（黄）</td><td>(0.95, 0.78, 0.05)</td><td>48.7°</td><td>25.2°</td><td>48.4°</td><td>← 禁令（红）</td></tr>
+      <tr><td>指路（绿）</td><td>(0.05, 0.45, 0.22)</td><td>145.5°</td><td>48.4°</td><td>37.3°</td><td>→ 指示（蓝）</td></tr>
+      <tr><td>指示（蓝）</td><td>(0.05, 0.25, 0.65)</td><td>220.0°</td><td>37.3°</td><td>69.1°</td><td>← 指路（绿）</td></tr>
+    </tbody>
+  </table>  <p><strong>最小余量是 25.2°，出现在「红↔黄」这一对上</strong>——而这恰恰是 TSR 里后果最严重的一对：把「禁止驶入」认成「注意危险」，或者把「限速」认成「解除限速」，下游动作完全不同。现在把常用库的默认值放进同一把尺子：</p>  <table>
+    <thead><tr><th>配置</th><th>实际最大色相偏移</th><th>相对最小余量 25.2°</th><th>判定</th></tr></thead>
+    <tbody>
+      <tr><td><code>YOLOv5/v8 hyp: hsv_h=0.015</code>（乘性）</td><td>约 <strong>±5.4°</strong></td><td>0.21×</td><td><strong>✅ 安全</strong>（默认值其实很克制）</td></tr>
+      <tr><td><code>torchvision ColorJitter(hue=0.1)</code></td><td>±36°</td><td>1.43×</td><td><strong>❌ 已越界</strong></td></tr>
+      <tr><td><code>albumentations HueSaturationValue(hue_shift_limit=20)</code></td><td>±40°<sup>*</sup></td><td>1.59×</td><td><strong>❌ 严重越界</strong></td></tr>
+      <tr><td><code>RandAugment / AutoAugment 的 Color 系算子</code></td><td>随 magnitude 到 ±60°+</td><td>&gt;2×</td><td><strong>❌ 不能直接搬到 TSR</strong></td></tr>
+      <tr><td><strong>本课建议：0.5 × 最小余量</strong></td><td><strong>±12.6°</strong></td><td>0.50×</td><td>✅ 留一半余量给传感器自身的白平衡偏差</td></tr>
+    </tbody>
+  </table>  <p><sup>*</sup> OpenCV 的 HSV 色相通道是 0–179（用 1 个单位表示 2°），所以 <code>hue_shift_limit=20</code> 等于 <strong>±40°</strong>——<em>这个单位换算是最常被漏掉的一步，很多人以为自己只抖了 20°</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么 YOLOv5 的默认值反而安全？因为它做的是<strong>乘性</strong>色相变换（<code>H' = H · r</code>，<code>r ∈ [0.985, 1.015]</code>），偏移量正比于色相值本身。<em>而纯红在 OpenCV 里的色相值接近 0 或 179，乘性变换对色相值 0 附近的像素几乎没有影响</em>——<strong>红色恰好是这个实现下最被保护的颜色</strong>。这纯属幸运，不是设计。<em>换成 albumentations 的加性实现，同样的「20」就直接把红推进黄的地盘。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严谨地讲，判据不该只看色相中心，还要看<strong>类内色相分布的宽度</strong>。真实数据里「红」不是一个点：褪色的红、逆光下的红、夜间路灯下的红，色相能散布 ±15°。<em>所以有效余量 = 半间隔 − 类内散布</em>，25.2° 的一半余量里已经有相当一部分被真实变异吃掉了。<strong>正确做法是：从训练集里实际统计每个颜色族的色相直方图，取分位数算出真实的类间间隔，再据此定抖动上限</strong>——而不是用我们这里的四个代表色。notebook 的练习 1 会把这个流程实现出来。</p></div>
+  </div>  <div class="callout danger"><span class="label">主动说出来能加分的一段话</span>
+    <p><strong>面试高频点，而且是主动提能加分的那一类。</strong>当面试官问「你会怎么给交通标志做数据增强」时，绝大多数候选人会背一遍 flip / scale / mosaic / HSV。<em>能立刻区分出「跑过 baseline」和「想过这个任务」的，是下面这句话</em>：</p><p>「<strong>交通标志有两个别的检测任务没有的增强禁区：一个是水平翻转（左转会变右转、文字会镜像），另一个是色相抖动——因为颜色本身就是类别语义的一部分。我算过，用常见的一组代表色，红色禁令牌只要色相正向偏移约 25 度就会落进黄色警告牌的色相区间，而 albumentations 的默认 <code>hue_shift_limit=20</code> 在 OpenCV 单位下等于 ±40 度，直接越界。所以我会把色相抖动限死在 ±12 度以内，而把幅度让给亮度、对比度和天气合成。</strong>」</p><p>这段话里有<em>禁区、机理、具体数字、具体库的默认值、以及替代方案</em>——五个要素齐全，追问也接得住。</p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>反过来也要警惕<strong>过度保守</strong>。完全不做色相/饱和度抖动，模型会把「精确的那个红」当成必要条件，遇到褪色牌、夜间色偏、不同厂家的油漆批次就掉点。<em>正确姿势不是「不抖」，而是「小幅抖 + 大幅抖饱和度与亮度」</em>——饱和度和亮度的变化在真实世界里幅度大得多，而它们不跨越类别边界。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sensor"><span class="num">4</span>传感器与编码链路上的退化：噪声、量化、压缩</h2>
+  <p>光度增强里最容易被做成「假的」的一类，就是噪声。<code>img + N(0, σ)</code> 这一行代码在物理上是错的：<strong>真实的图像噪声不是加性高斯，而是「信号相关的泊松（光子散粒噪声）+ 信号无关的高斯（读出噪声）」，再经过数字增益放大</strong>。</p>  <div class="math-block">\[\mathrm{SNR}=\frac{N}{\sqrt{N+\sigma_r^2}}\;\xrightarrow[\;N\gg\sigma_r^2\;]{}\;\sqrt{N},\qquad N \propto t_{exp}\cdot L\]</div>  <p>这个式子给出一个可以直接背的结论：<strong>在散粒噪声主导的区间，曝光量降到 1/16，信噪比只降到 1/4</strong>（<code>√16 = 4</code>）。换句话说，<em>夜间画质差不是线性地差，而是按平方根变差</em>——这解释了为什么「稍微暗一点」看起来还行，而「暗到某个点之后」画面突然崩掉：一旦 <code>N</code> 掉到与 <code>σ_r²</code> 同量级，读出噪声接管，SNR 开始线性下降。</p>  <table>
+    <thead><tr><th>退化</th><th>物理来源</th><th>正确的合成方式</th><th>对小目标的相对危害</th><th>常见的错误做法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>散粒噪声</strong></td><td>光子到达的泊松统计</td><td><code>Poisson(L·t·Q)</code>，亮处噪声绝对值更大</td><td>中</td><td>全图同 σ 的高斯噪声（暗处噪声被低估）</td></tr>
+      <tr><td><strong>读出噪声</strong></td><td>读出电路</td><td><code>N(0, σ_r)</code>，与信号无关</td><td><strong>高</strong>（暗处主导）</td><td>忽略它 → 低光合成不真实</td></tr>
+      <tr><td><strong>数字增益（ISO）</strong></td><td>ADC 后放大</td><td>信号与噪声<strong>同时</strong>放大</td><td>高</td><td>只放大信号不放大噪声</td></tr>
+      <tr><td><strong>量化</strong></td><td>8-bit ADC / 编码</td><td><code>round(x·255)/255</code></td><td>低（除非极暗）</td><td>全程 float，忽略量化台阶</td></tr>
+      <tr><td><strong>JPEG 块效应</strong></td><td>8×8 DCT 系数量化</td><td>分块 DCT + 量化表 + 反变换</td><td><strong>极高</strong></td><td>用高斯模糊冒充压缩伪影</td></tr>
+      <tr><td><strong>失焦模糊</strong></td><td>对焦误差 / 景深</td><td>盘状核卷积</td><td>极高</td><td>用高斯核冒充（缺少边缘振铃）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>JPEG 伪影对 TSR 的危害被严重低估</strong>。JPEG 的量化是在 8×8 的块上做的：<em>一块 24×24 像素的限速牌，整个牌面只占 9 个块</em>——牌上的「60」这两个数字所依赖的高频 DCT 系数，正是被量化表压得最狠的那一批。<strong>结果是：框还在、检测还检得出，但「限速 60 / 限速 80」这一对细粒度分类直接崩掉</strong>。这在两级架构（C55 模块 02）里表现为「检测召回正常、分类准确率异常低」，是一个非常有指纹特征的故障。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更工程化的一点是<strong>训练数据与车端数据的编码链路不同</strong>。训练集通常是「相机 → JPEG 存盘 → 解码 → 训练」，车端是「相机 → ISP → 直接送模型」，中间没有 JPEG。<em>于是模型在训练时见惯了块效应，上车后反而遇到了「太干净」的图</em>——这是一种反向的域差，症状是离线指标好、路测更好或更差都可能，很难归因。<strong>正确做法是让训练与部署的编码链路对齐</strong>：要么训练时也用 ISP 直出的无损帧，要么在部署前把车端帧过一遍同样的编码。这与 C60 模块 01 讲的预处理一致性是同一个方法论。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>顺序陷阱：<strong><code>resize(noise(img)) ≠ noise(resize(img))</code></strong>。缩小图像会对噪声做平均，把 σ 降低约 <code>1/缩放比</code>；所以「先在原分辨率加噪、再 letterbox 到 640」得到的噪声，比「先 letterbox、再加噪」弱得多。<em>真实链路是先成像（带噪）再缩放，所以正确顺序是「先加噪再 resize」</em>——但绝大多数增强流水线因为性能原因把 resize 放在最前面。<strong>这是一个「为了速度而牺牲物理正确性」的真实取舍，知道它存在比强行修正更重要。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="weather"><span class="num">5</span>天气与光照合成：用物理模型，不要用滤镜</h2>
+  <p>「加个雾」在图像处理里可以是一行 <code>cv2.addWeighted</code>，但那样合成出来的雾<strong>与距离无关</strong>——近处的车和 80 米外的标志被雾化了同样的程度。真实的雾不是这样，它有一个非常干净的物理模型，这也是本节要求手写实现的原因。</p>  <h3>大气散射模型（Koschmieder）</h3>  <div class="math-block">\[I(x)=\underbrace{J(x)\,t(x)}_{\text{直接透射}}+\underbrace{A\,\bigl(1-t(x)\bigr)}_{\text{环境光}},\qquad t(x)=e^{-\beta\, d(x)},\qquad \beta=\frac{-\ln 0.05}{V}\approx\frac{3.0}{V}\]</div>  <p>其中 <code>J</code> 是无雾的真实场景辐射、<code>A</code> 是大气光（通常取天空的颜色）、<code>d(x)</code> 是每个像素的深度、<code>β</code> 是散射系数、<code>V</code> 是<span class="term">meteorological visibility</span>（气象能见度，定义为对比度衰减到 5% 的距离）。<strong>关键点是 <code>t</code> 依赖深度</strong>——所以合成雾必须有一张深度图，哪怕是很粗糙的（地平线以下按行线性递减，就已经比全局叠加真实得多）。</p>  <div class="ascii">雾对图像的作用，可以精确拆成三件事：
+
+  ① 对比度  ——  I_sign - I_bg = t · ( J_sign - J_bg )     **对比度被严格乘以 t**
+  ② 饱和度  ——  S' = t·Δ / (t·max + (1-t)·A)              **A 越亮，S 掉得越狠**
+  ③ 色相    ——  若 A 是中性灰，色相 **严格不变**；
+                 色相的偏移**全部来自 A 的非中性**（天空偏蓝 → 红牌色相被拉向 350°）
+
+           能见度 V     β=3/V     30 m 处 t     60 m 处 t     保住 20% 对比度的最远距离
+           ────────────────────────────────────────────────────────────────────────
+             500 m      0.006       0.835         0.698               268 m
+             200 m      0.015       0.638         0.407               107 m
+             100 m      0.030       0.407         0.165                54 m
+              50 m      0.060       0.165         0.027                27 m   ← 只剩 27 m！
+              20 m      0.150       0.011         0.0001               11 m</div>  <p>最后一列是这张表里最该记住的数字。<strong>能见度 50 米时，一块交通标志要保住 20% 的原始对比度，最远只能在 27 米处</strong>。以 25 m/s（90 km/h）巡航计算，从检出到经过只剩 <strong>1.1 秒</strong>——留给多帧确认（C55 模块 04）与决策的时间几乎为零。<em>这就是为什么雾天的 TSR 不是「精度掉一点」的问题，而是「系统性地来不及」的问题</em>，对应的工程解法是降速、降级、或依赖高精地图先验，而不是指望模型再强一点。</p>  <table>
+    <thead><tr><th>天气</th><th>物理性质</th><th>合成方法</th><th>为什么不能用滤镜糊弄</th></tr></thead>
+    <tbody>
+      <tr><td><strong>雾/霾</strong></td><td>均匀介质中的<strong>多次散射</strong></td><td><code>I = J·t + A(1-t)</code>，<code>t = e^(-βd)</code></td><td>必须依赖深度；全局叠加会把近景也糊掉</td></tr>
+      <tr><td><strong>雨</strong></td><td><strong>局部遮挡 + 条纹</strong>，非均匀</td><td>运动模糊过的稀疏条纹层 + 轻度雾化</td><td>雨不是全局衰减；<em>雨滴还会在挡风玻璃上形成折射斑</em></td></tr>
+      <tr><td><strong>雪</strong></td><td>大颗粒近距离遮挡</td><td>多尺度光斑（近大远小）+ 雾化</td><td>雪片会<strong>整块遮住</strong>小标志，是遮挡不是衰减</td></tr>
+      <tr><td><strong>夜间</strong></td><td>低光子数 + 点光源</td><td>曝光缩放 + 泊松/读出噪声 + 数字增益</td><td>简单调暗不产生噪声，模型学不到低 SNR</td></tr>
+      <tr><td><strong>眩光</strong></td><td>强光源经镜头散射（PSF）</td><td>点光源 + 大半径 PSF 卷积 + 局部饱和截断</td><td>关键是<strong>截断（clipping）</strong>造成的信息永久丢失</td></tr>
+      <tr><td><strong>隧道出入口</strong></td><td>自动曝光<strong>来不及跟上</strong></td><td>先做曝光失配（过曝/欠曝）再截断</td><td>这是 ISP 的动态行为，不是静态光照</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>合成天气最常见的坑不是模型写错，而是<strong>只合成了退化，没有合成相机对退化的反应</strong>。真实的雾天，车载相机的自动曝光会拉高增益（画面更亮更噪）、ISP 的对比度增强会试图「去雾」（把已经压缩的动态范围再拉开，放大噪声与量化台阶）、自动白平衡会被灰白的大气光带偏。<em>只叠加一层 <code>I = Jt + A(1-t)</code>，得到的是「一台完全不做自动调节的相机拍的雾」——那台相机不存在</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以工程上更靠谱的顺序是：<strong>合成退化 → 模拟 ISP 的响应（自动曝光把均值拉回目标亮度、自动增益放大噪声、色调映射压对比度）→ 再量化到 8 bit</strong>。这样合成出来的图，其亮度直方图与真实雾天数据的直方图才对得上。<em>验证方法也很朴素：拿一批真实雾天帧，与合成雾天帧比较亮度直方图、局部对比度分布、噪声功率谱三个统计量</em>——<strong>三个都对得上，合成数据才值得进训练集</strong>。这比「看起来像雾」可靠得多。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>合成数据进训练集之前必须回答一个问题：<strong>它会不会引入「合成指纹」</strong>。如果所有合成雾图的大气光 <code>A</code> 都是同一个常数、深度图都来自同一个线性假设，模型完全可能学到「见到这种特定的灰白渐变就是雾天场景」这个捷径，而不是学到「在低对比度下也要能找到标志」。<em>症状是：合成雾上指标飞涨，真实雾上纹丝不动</em>。<strong>对策是把 <code>A</code>、<code>β</code>、深度图的形态都随机化，并且始终保留一小份真实恶劣天气数据作为「不可被合成数据污染」的评测集。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="motion"><span class="num">6</span>运动模糊与卷帘快门：车载相机独有的两种畸变</h2>
+  <p>这两个退化在通用检测的增强库里几乎不出现，但在车上它们是天天发生的物理事实。而且它们都能被算清楚——<strong>不需要经验参数，只要相机内参和车速</strong>。</p>  <h3>运动模糊：一个与焦距无关的比值</h3>  <p>设相机焦距 <code>f</code>（像素）、标志物理尺寸 <code>S</code>、距离 <code>Z</code>、横向偏移 <code>X</code>（标志离相机光轴的横向距离，路侧牌典型 2–4 m）、自车速度 <code>v</code>、曝光时间 <code>t_exp</code>。标志在图像上的横坐标 <code>u = fX/Z</code>，对时间求导（<code>dZ/dt = -v</code>）得到像移速度 <code>|du/dt| = fXv/Z²</code>。于是：</p>  <div class="math-block">\[L_{blur}=\frac{f X v}{Z^{2}}\,t_{exp},\qquad s_{px}=\frac{fS}{Z}\quad\Longrightarrow\quad \boxed{\;\frac{L_{blur}}{s_{px}}=\frac{X\,v\,t_{exp}}{S\,Z}\;}\]</div>  <p><strong>模糊长度与目标像素尺寸的比值和焦距无关</strong>——换长焦镜头，模糊和目标一起放大，比值不变。<em>这意味着「用长焦看远处标志」这个方案不会让运动模糊问题变好</em>，这是一个很多人第一反应会想错的结论，也是面试里可以直接抛出的一个小推导。</p>  <table>
+    <thead><tr><th>场景</th><th>v</th><th>Z</th><th>t<sub>exp</sub></th><th>L<sub>blur</sub>/s<sub>px</sub></th><th>后果</th></tr></thead>
+    <tbody>
+      <tr><td>高速白天巡航</td><td>25 m/s</td><td>30 m</td><td>10 ms</td><td><strong>4.2%</strong></td><td>可忽略</td></tr>
+      <tr><td>高速白天近距</td><td>25 m/s</td><td>10 m</td><td>10 ms</td><td><strong>12.5%</strong></td><td>边缘变软，细粒度分类开始掉</td></tr>
+      <tr><td>夜间城区</td><td>14 m/s</td><td>10 m</td><td>30 ms</td><td><strong>21.0%</strong></td><td>牌面数字糊成一团</td></tr>
+      <tr><td><strong>夜间高速近距</strong></td><td>25 m/s</td><td>10 m</td><td>30 ms</td><td><strong>37.5%</strong></td><td><strong>牌面高频基本被抹掉</strong></td></tr>
+      <tr><td>雨夜（曝光更长）</td><td>20 m/s</td><td>8 m</td><td>40 ms</td><td><strong>50.0%</strong></td><td>只剩颜色与轮廓可用</td></tr>
+    </tbody>
+  </table>  <p>（表中固定 <code>X = 3 m</code>、<code>S = 0.6 m</code>。）这张表把「<strong>为什么 TSR 夜间掉点特别多</strong>」拆成了一条可以完整讲出来的因果链——面试里被问到这个问题，下面这条链比「因为夜间光照差」有力得多：</p>  <ol>
+    <li>光子少 → 要么<strong>拉长曝光</strong>，要么<strong>拉高增益</strong>，二选一（没有第三条路）；</li>
+    <li>拉长曝光 → <strong>运动模糊按 <code>t_exp</code> 线性增长</strong>（上表最后两行）；</li>
+    <li>拉高增益 → <strong>SNR 按 <code>√N</code> 下降</strong>，噪声吃掉牌面的高频细节；</li>
+    <li>两条路都在削同一样东西：<strong>牌面上区分「限速 60」和「限速 80」的那点高频</strong>；</li>
+    <li>于是夜间的典型故障不是「检不出」，而是<strong>「检得出但认错」</strong>——混淆矩阵上是同族内的细粒度错分，不是跨族乱窜；</li>
+    <li>对应的解法也就明确了：<strong>低光合成 + 运动模糊必须成对进增强配方</strong>（只加噪不加模糊，等于只模拟了高增益那条路），评测必须按夜间/白天分桶，且要单独看细粒度分类准确率而不只看 mAP。</li>
+  </ol>  <h3>卷帘快门：真正的危害不在畸变，在时间戳</h3>  <div class="ascii">全局快门 (global shutter)              卷帘快门 (rolling shutter)
+  所有行同时曝光                        逐行曝光，行间隔 Δt = T_ro / H
+
+  row 0    ├────────┤                    row 0    ├────────┤
+  row 1    ├────────┤                    row 1      ├────────┤
+  row 2    ├────────┤                    row 2        ├────────┤
+   ...     ├────────┤                     ...           ├────────┤
+  row H-1  ├────────┤                    row H-1              ├────────┤
+           └── 一个时刻 ──┘                        └──── T_ro（整帧读出时间）────┘
+
+  典型 T_ro = 15–33 ms。以 30 m/s 巡航：
+    · 帧内首尾行的时间差 = T_ro = 20 ms  →  **自车位移 0.60 m**
+    · 自车横摆 ω = 0.5 rad/s 时，整帧横向错切 = f·ω·T_ro = 1000×0.5×0.02 = **10 px**
+    · 但一块 24 行高的标志，其内部错切只有 10 × 24/1080 ≈ **0.22 px**（可忽略）
+
+  结论：**对单个小标志，卷帘畸变可以忽略；真正致命的是「同一帧里不同行的时间戳不同」。**</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>很多人第一次听到卷帘快门，想到的是手机拍螺旋桨那种夸张的弯曲。<strong>在 TSR 里这个直觉是错的</strong>：交通标志在图像上只占几十行，行与行的时间差是零点几毫秒，物体内部的畸变小于 1 个像素，完全淹没在标注误差里。<em>所以「要不要给增强加卷帘畸变」的答案通常是「不需要」</em>——把算力花在运动模糊和低光合成上收益大得多。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但卷帘快门有一个真正会出事的地方：<strong>时序融合与运动补偿必须用「行时间戳」而不是「帧时间戳」</strong>。C55 模块 04 讲的多帧融合依赖「自车运动已知 + 标志静止 → 可以预测下一帧位置」，而这个预测用的是自车位姿在<em>某个时刻</em>的值。如果整帧用一个时间戳，30 m/s 下就引入了最多 0.6 m 的位姿误差；投影到 30 m 外的标志上，横向偏差可达数像素——<strong>对一个 20 px 的目标，这足以让 IoU 关联失败、跟踪断裂</strong>。<em>症状是「跟踪 ID 频繁切换、迟滞状态机反复重置」，而根因在传感器时间模型上，不在跟踪算法里</em>。这是一个非常典型的「在错误的层里 debug」的例子。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把这一节压成两句：<strong>运动模糊要算、要合成、要进配方；卷帘畸变不用合成，但一定要在时间戳上处理对</strong>。<em>判断一个退化该不该做成增强，标准是「它是否改变了模型输入的像素分布」——卷帘畸变对小目标几乎不改变像素，所以它不是增强问题，是系统时间同步问题。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="domain"><span class="num">7</span>域随机化与合成-真实的取舍</h2>
+  <p>把上面这些合成手段串起来，就得到了<span class="term">domain randomization</span>（域随机化）的朴素形式：<strong>与其猜测部署域长什么样，不如把训练域撑得足够宽，让部署域落在里面</strong>。这个思路在机器人仿真到实机迁移上非常成功，但直接搬到 TSR 上有明确的边界。</p>  <table>
+    <thead><tr><th></th><th>真实采集</th><th>物理模型合成（本模块）</th><th>渲染引擎 / 生成模型合成</th></tr></thead>
+    <tbody>
+      <tr><td>单位成本</td><td><strong>高</strong>（采集车 + 标注）</td><td><strong>近乎为零</strong></td><td>中（要建场景/训模型）</td></tr>
+      <tr><td>长尾覆盖</td><td>差（罕见天气可能几个月遇不到）</td><td><strong>好</strong>（参数直接扫）</td><td>好</td></tr>
+      <tr><td>保真度</td><td><strong>满分</strong></td><td>中（缺 ISP 动态响应）</td><td>中-高（但有生成指纹）</td></tr>
+      <tr><td>标注成本</td><td>高</td><td><strong>零</strong>（原标注直接复用）</td><td>零（渲染）/ <strong>高风险</strong>（生成可能改变内容）</td></tr>
+      <tr><td>可控性</td><td>无</td><td><strong>完全可控</strong>（β、A、t_exp 都是旋钮）</td><td>部分可控</td></tr>
+      <tr><td>主要风险</td><td>分布偏斜（只采到常见场景）</td><td><strong>合成指纹 → 学到捷径</strong></td><td><strong>内容漂移 → 标注失效</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>域随机化的适用边界可以用一句话划清：<strong>它对「有物理模型的变化」有效，对「没有物理模型的变化」无效</strong>。曝光、噪声、雾、模糊都有干净的物理模型，随机化它们能真实地扩大覆盖；<em>而「这个国家的标志底色偏暖」「这批标志的反光膜老化了」「这个路口的广告牌长得像禁令牌」这类变化没有模型可随机化</em>——只能靠采集与挖掘（C58 整门课在讲这件事）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个反直觉的边界：<strong>随机化过头会伤害精度</strong>。域随机化的代价是让模型学一个更宽的不变性，而模型容量与训练预算是固定的。<em>把训练分布撑到「什么都可能」，模型在真实分布上就会欠拟合</em>——这与模块 03 要讲的「小模型 + 强增强 = 欠拟合」是同一个现象的不同表述。<strong>正确的做法不是「尽量宽」，而是「宽到刚好覆盖部署分布的尾部」</strong>：先用真实数据估计部署分布的参数范围（能见度分布、曝光时间分布、车速分布），再让随机化范围略微超出这个范围，而不是无限撑开。<em>这也让「增强幅度」从一个玄学超参变成了一个可以从数据估出来的量。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>合成数据混入训练集时，<strong>配比是一个需要单独调的超参</strong>，而且它与「合成数据的保真度」强相关：保真度越低，能容忍的比例越小。<em>一个稳妥的起点是「合成数据占该场景真实数据的 1–3 倍，且总占比不超过训练集的 15%」</em>，然后用模块 05 的分场景消融验证。<strong>绝对不要把合成数据也放进验证集</strong>——那会让指标彻底失去意义。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="recipe"><span class="num">8</span>给 TSR 配一套光度增强：从失效模式反推</h2>
+  <p>把前面所有结论收成一张可以直接抄进配置文件的表。<strong>注意每一行的「理由」列都指向一个具体的失效模式</strong>——这是本课程一贯的主张：<em>增强配方应该从失效模式反推，而不是从别人的 config 抄</em>。</p>  <table>
+    <thead><tr><th>算子</th><th>概率 p</th><th>幅度</th><th>反推自哪个失效模式</th><th>验证方式</th></tr></thead>
+    <tbody>
+      <tr><td><strong>亮度（乘性）</strong></td><td>0.8</td><td><code>k ∈ [0.7, 1.4]</code></td><td>隧道出入口、逆光、阴影</td><td>按亮度分位数分桶看 AP</td></tr>
+      <tr><td><strong>对比度</strong></td><td>0.5</td><td><code>c ∈ [0.75, 1.25]</code></td><td>雾霾、低对比度背景</td><td>按局部对比度分桶</td></tr>
+      <tr><td><strong>gamma</strong></td><td>0.4</td><td><code>γ ∈ [0.75, 1.4]</code></td><td>不同 ISP 的色调映射曲线</td><td>跨车型/跨相机验证集</td></tr>
+      <tr><td><strong>饱和度</strong></td><td>0.6</td><td><code>s ∈ [0.6, 1.35]</code></td><td><strong>褪色标志、雾天去饱和</strong></td><td>褪色牌专项切片</td></tr>
+      <tr><td><strong>色相</strong></td><td>0.3</td><td><strong><code>Δh ∈ [-12°, +12°]</code></strong></td><td>白平衡漂移（真实幅度就这么小）</td><td><strong>跨颜色族混淆矩阵</strong></td></tr>
+      <tr><td><strong>低光合成</strong></td><td>0.25</td><td>曝光比 <code>∈ [1/16, 1/2]</code> + 泊松/读出噪声 + 增益</td><td><strong>夜间 SNR 塌陷</strong></td><td>夜间切片 + 细粒度分类准确率</td></tr>
+      <tr><td><strong>运动模糊</strong></td><td>0.25</td><td>长度按 <code>Xvt/(SZ)</code> 采样，方向近水平</td><td><strong>夜间长曝光、近距高速</strong></td><td>按 <code>L/s</code> 比值分桶</td></tr>
+      <tr><td><strong>雾化（带深度）</strong></td><td>0.15</td><td><code>V ∈ [40, 400] m</code>，<code>A</code> 随机化</td><td>雨雾雪天召回塌陷</td><td>真实恶劣天气集（不含合成）</td></tr>
+      <tr><td><strong>JPEG 伪影</strong></td><td>0.2</td><td><code>quality ∈ [55, 95]</code></td><td>回传链路压缩、细粒度分类崩</td><td>限速数字对（60/80）专项</td></tr>
+      <tr><td>失焦模糊</td><td>0.1</td><td>半径 <code>∈ [0.5, 2] px</code></td><td>对焦误差、雨滴附着</td><td>小目标切片</td></tr>
+      <tr><td><s>通道 shuffle / 灰度化 / 反色</s></td><td><strong>0</strong></td><td>—</td><td><strong>无物理对应，等价于改标签</strong></td><td>—</td></tr>
+    </tbody>
+  </table>  <p>配这套表时有三条纪律：</p>  <ol>
+    <li><strong>概率会相乘</strong>。上表列了 10 个算子，看起来「每张图都被大改」，实际上「同时触发亮度+色相+雾+模糊」的概率是 <code>0.8×0.3×0.15×0.25 ≈ 0.9%</code>。<em>直觉严重高估了实际强度</em>——模块 04 会做这个统计。所以<strong>不要因为「算子多」就把每个概率都调低</strong>，那会让强增强根本不发生。</li>
+    <li><strong>顺序要遵循成像链路</strong>：几何 → 雾化（依赖深度，必须在几何之后、否则深度图对不上）→ 曝光/亮度/对比度 → 运动模糊 → 噪声 → 量化 → JPEG。<em>把 JPEG 放在噪声之前，等于假设「先压缩后加噪」，物理上不成立。</em></li>
+    <li><strong>验证集只做确定性变换</strong>（resize + normalize），一个随机算子都不能有。这是铁律，模块 04 会讲为什么它常被无意破坏。</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>整套配方的设计原则可以浓缩成一句：<strong>把幅度让给「颜色语义之外」的维度</strong>。亮度、对比度、饱和度、噪声、模糊、天气——这些在真实世界里的变异幅度大得多，而且都不跨越类别边界，<em>放开手抖</em>；<strong>色相是唯一一个必须捏死的旋钮</strong>。<em>这一条能推广到所有「某个视觉属性直接编码类别」的任务</em>——医学影像里的染色颜色、工业质检里的缺陷颜色、遥感里的地物光谱，都是同一个模式。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>光度增强看起来是最「工程」的一块，但它有几个真正未解的问题，而且都直接卡在 TSR 这类安全相关任务上。</p>  <ul>
+    <li><strong>增强策略的自动搜索，在检测上仍未收敛</strong>。AutoAugment / RandAugment / TrivialAugment 在分类上给出了「几乎不用调」的方案，但检测的搜索空间要同时考虑框变换与多目标交互，搜索代价高一个数量级；<em>而且搜出来的策略往往包含对 TSR 有害的色彩算子</em>（搜索目标是整体 mAP，看不见「红→黄」这种颜色族错分）。<strong>「带语义约束的增强搜索」——即把「色相不得跨越类间边界」写成硬约束再搜——目前几乎没有现成工作</strong>。</li>
+    <li><strong>合成天气与真实天气的差距仍然可测且显著</strong>。Foggy Cityscapes 这类基于深度的合成集把「有雾数据」从零变成了有，但在真实雾天上的迁移增益远低于同等数量的真实数据。<em>核心缺口是 ISP 的动态响应没有被建模</em>——自动曝光、自动白平衡、去雾算法都会对退化做出反应，而这些反应本身就是域差的一部分。<strong>「把 ISP 放进训练回路」（ISP-in-the-loop，甚至直接在 RAW 域训练）是一条正在被认真探索的路线</strong>，代价是数据管线要重做。</li>
+    <li><strong>扩散模型生成恶劣天气数据的标注一致性问题</strong>。用图生图把晴天帧改成雨夜帧，视觉保真度已经很高，但<em>生成过程可能悄悄改变标志的颜色、形状甚至内容</em>——把一块限速 60 改成限速 80，标注却没变。<strong>这类「内容漂移」比合成指纹危险得多，因为它直接制造错误标签</strong>；目前的对策（用检测器/分类器回检生成结果）本身又依赖被训练的模型，存在循环论证。</li>
+    <li><strong>「增强幅度应该多大」缺少理论</strong>。现状是网格搜索 + 经验值。有一条有希望的思路是把幅度与<em>部署分布的参数分布</em>直接对齐：从路测数据估出能见度、曝光时间、车速的真实分布，让增强参数按这个分布采样（而不是均匀采样）。<strong>这把「增强调参」变成了「分布估计」，可验证性强得多</strong>，但需要车队回传足够的元数据，属于 C58 数据闭环的范畴。</li>
+    <li><strong>测试时适应（test-time adaptation）与增强的关系</strong>。既然域差不可能被增强完全覆盖，另一条路是在部署时用无标签数据在线适应（TENT、BN 统计更新等）。<em>对车端来说这非常诱人（隧道进出、天气突变都是渐变域移）</em>，但在线更新的模型难以验证、难以回滚，<strong>与量产系统「可复现、可追溯」的要求直接冲突</strong>——这是一个技术上有效、工程上暂时用不了的典型例子。</li>
+    <li><strong>颜色恒常性（color constancy）能否替代色相增强</strong>。与其教模型对色相不变，不如在预处理里做白平衡校正，把颜色归一化到标准光源下。<em>理论上更优雅，实践中受限于校正算法本身的失败模式</em>（大面积单色物体会让灰世界假设失效——而一块占据画面的蓝色指示牌正是这种情况）。<strong>「校正 vs 增强」的取舍在 TSR 上还没有定论。</strong></li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Sakaridis, Dai &amp; Van Gool, <em>Semantic Foggy Scene Understanding with Synthetic Data</em>（IJCV 2018，基于深度的合成雾与它对真实雾的迁移分析，本模块雾化模型的工程参考）；He, Sun &amp; Tang, <em>Single Image Haze Removal Using Dark Channel Prior</em>（CVPR 2009，大气散射模型在视觉里的经典化，反过来也是最好的合成参考）；Cubuk et al., <em>AutoAugment</em>（CVPR 2019）与 <em>RandAugment</em>（NeurIPS 2020）——注意它们的搜索目标里没有语义颜色约束；Zoph et al., <em>Learning Data Augmentation Strategies for Object Detection</em>（ECCV 2020，检测专用增强搜索）；Brooks et al., <em>Unprocessing Images for Learned Raw Denoising</em>（CVPR 2019，把 sRGB 反推回 RAW 再合成噪声，本模块低光噪声模型的正确做法）；Tobin et al., <em>Domain Randomization</em>（IROS 2017，域随机化的原始论述与它的边界）。相邻课程：C55 模块 03（失效模式全景）、C56 模块 04（流水线与顺序）、C56 模块 05（消融验证）、C60 模块 01（预处理一致性）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_geometric/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 几何增强与标注同步</div></a>
+    <a class="next" href="../03_mixing/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 混合类增强：Mosaic / MixUp / CutMix / Copy-Paste</div></a>
+  </div>
+
+</div>
+</body>
+</html>

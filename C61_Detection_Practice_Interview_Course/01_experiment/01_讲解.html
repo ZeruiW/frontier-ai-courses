@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 实验设计与归因</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 实验设计与归因</h1>
+  <p class="subtitle">检测任务同一份配置只换随机种子，mAP 的典型波动就有 <strong>±0.2–0.5</strong>——所以「我这个改动涨了 0.3」在统计上约等于什么都没说 · 功效分析把这件事变成硬答案：要以 80% 的把握检出 +0.3 的真实提升，配对设计下大概需要几个种子，是可以算出来的 · 配对检验 + bootstrap 置信区间 + BH 校正：一次跑 12 组消融却不做多重比较校正，「至少一个显著」几乎必然发生 · 加法式消融（baseline + X）与减法式消融（full − X）会给出<em>不同的结论</em>，因为组件之间有交互——报哪个要说清楚 · 公平对比的五个「同」（同 epoch、同增强、同分辨率、同调参预算、同评测集），少一个结论就不成立 · 实验记录的最小必要字段（commit / 数据版本 / 配置 / 环境 / 种子 / 完整指标）与自动校验</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00；对检测训练流程有基本了解（C18/C53）；不需要统计学背景，公式都从零推</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_experiment_design.ipynb（种子方差 / 配对 t / bootstrap / 功效分析 / Shapley 消融）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Bouthillier et al. 2021（benchmark 方差分解）· Dodge et al. 2019（Show Your Work）· Henderson et al. 2018（RL that Matters）· Benjamini–Hochberg 1995</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 80 分钟 + 跑 70 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#single-var">单变量原则：唯一的目的，和它总被破坏的四种方式</a></li>
+      <li><a href="#seed-variance">种子方差：为什么 +0.3 很可能什么都不是</a></li>
+      <li><a href="#significance">多种子 + 配对检验：把「看起来涨了」变成「有多大把握」</a></li>
+      <li><a href="#power">功效分析：需要多少个种子才能检出 +0.3</a></li>
+      <li><a href="#fair">公平对比的五个条件：让「谁更好」这个问题有意义</a></li>
+      <li><a href="#ablation">消融设计：加法式与减法式为什么会给出相反的结论</a></li>
+      <li><a href="#hpo">超参搜索预算与「调参不公平」陷阱</a></li>
+      <li><a href="#record">实验记录与可复现：最小必要字段和一份实操清单</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="single-var"><span class="num">1</span>单变量原则：唯一的目的，和它总被破坏的四种方式</h2>
+  <p><strong>单变量原则</strong>（one factor at a time）不是什么学术洁癖，它只服务一个目的：<em>让观测到的指标变化可以被归因到你做的那个改动上</em>。一旦同时改了两个东西，「涨了 0.8」这个观测就同时兼容至少四种解释（A 有用 / B 有用 / 两者都有用 / 一个 +1.3 另一个 −0.5），而你无法用这次实验区分它们。</p>  <p>但真实项目里几乎没有人能严格做到。原因不是懒，是<strong>这个原则在四个地方会被结构性地破坏</strong>——理解这四个机制，比背诵原则有用得多。</p>  <h3>破坏方式一：改动自带隐藏耦合</h3>  <p>你以为改了一个变量，实际上改了五个。这是最隐蔽也最常见的一类：</p>  <div class="ascii">你写在实验记录里的：  "backbone: ResNet50 -&gt; ResNet101"
+
+实际同时发生的变化：
+  ├── 参数量 25.6M -&gt; 44.5M              （模型容量 ↑）
+  ├── 预训练权重换了一份                 （**预训练数据/配方可能完全不同**）
+  ├── 显存占用 ↑ -&gt; batch size 32 -&gt; 16   （**有效学习率、BN 统计量全变了**）
+  ├── 单步耗时 ↑ -&gt; 同样 wall-clock 下 epoch 数 ↓（**训练预算变了**）
+  └── 最优学习率区间右移                 （沿用旧 lr 等于给新模型一个次优配置）
+
+  ▶ 于是"R101 涨了 1.2"这个观测，兼容的解释至少有五个。
+  ▶ **正确做法不是硬拆**（有些耦合物理上不可分离），
+    而是：① 显式声明耦合组；② 在耦合组内做补偿（如按 batch 线性缩放 lr）；
+          ③ 报告时把耦合写出来，而不是假装它不存在。</div>  <table>
+    <thead><tr><th>表面上的一个变量</th><th>被它牵动的隐藏变量</th><th>不控制时的偏差方向</th><th>怎么控</th></tr></thead>
+    <tbody>
+      <tr><td><strong>提高输入分辨率</strong> 640→1280</td><td>正样本数、anchor/GT 的尺度匹配分布、单步耗时、显存→batch、增强参数（crop 尺寸）</td><td>偏向高分辨率（同时得到了更多正样本与更长的有效训练）</td><td>固定 iteration 而非 epoch；重新校准 anchor/分配阈值；报告延迟</td></tr>
+      <tr><td><strong>加入 Mosaic</strong></td><td>有效 batch 内目标数、小目标比例、训练难度→需要的 epoch 数</td><td>短训练下<em>低估</em> Mosaic（强增强需要更长训练才收敛）</td><td>两边都延长到收敛；或同时报告 12/36 epoch 两组</td></tr>
+      <tr><td><strong>换标签分配</strong> MaxIoU→SimOTA</td><td>正样本数量与分布、分类/回归损失的相对量级、最优 loss 权重</td><td>偏向新分配（顺带换了更合适的损失配比）</td><td>分配与损失权重分开消融；或对两者各自做小规模调参</td></tr>
+      <tr><td><strong>换优化器</strong> SGD→AdamW</td><td>最优 lr 相差 1–2 个数量级、weight decay 语义不同、warmup 需求</td><td>严重偏向被调过的那一个</td><td>各自做等预算的 lr 搜索，比较各自的最优</td></tr>
+      <tr><td><strong>换数据版本</strong> v7.1→v7.2</td><td>训练集分布、<em>可能连评测集也一起变了</em>、类别表</td><td>无法解释（这时任何模型对比都失效）</td><td>数据版本必须与模型改动分开做实验，评测集永远冻结</td></tr>
+    </tbody>
+  </table>  <h3>破坏方式二至四：漂移与打包</h3>  <ul>
+    <li><strong>基线漂移</strong>：baseline 的数字是三周前跑的，期间代码库合并了 7 个 PR（包括一次数据加载器的修复）。<em>你在和一个已经不存在的系统比较</em>。→ 规则：<strong>baseline 与实验必须在同一个 commit 上重跑</strong>，「用历史数字当 baseline」是最常见的隐性作弊。</li>
+    <li><strong>环境漂移</strong>：换了卡（A100→H100）、升了 CUDA、换了 cuDNN 版本、评测脚本改过一次。这些都能在 0.1–0.5 点的量级上移动结果，正好覆盖你要检测的效应量。→ 规则：环境写进 manifest，跨环境的对比要标注。</li>
+    <li><strong>打包改动</strong>：为了赶版本，一次改了 5 项，整体涨了 1.5，于是全部保留。<em>问题不是「不知道哪个有用」，而是「不知道其中哪个是负的」</em>——完全可能是 4 项各 +0.5、1 项 −0.5，你带着一个负收益的改动上线并永远不会发现。→ 规则：打包上线可以，但<strong>打包之后必须补做减法式消融</strong>（第 6 节）。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>有一个常见的误解需要澄清：单变量原则<strong>不等于「一次只改一行代码」</strong>。有些变量在物理上就是绑定的——batch size 与有效学习率、模型容量与最优训练时长、分辨率与 anchor 尺度。<em>硬拆它们只会得到「在次优配置下的公平对比」，那同样没有意义</em>。正确的做法是把它们当成一个<strong>耦合组</strong>整体替换，并在组内做标准补偿（如线性缩放规则），然后在实验记录里明确写出「本次改动的耦合组包含哪些变量」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严谨地说，实验设计要控制的不是「变量个数」，而是<span class="term">混杂因子</span>（confounder）——即那些同时影响「你的改动」和「你的指标」的第三个变量。<em>训练预算是检测实验里最大的混杂因子</em>：几乎所有「更强的方法」同时也更慢、更吃显存、需要更长的训练，于是在固定 wall-clock 或固定 epoch 的对比里，它们得到的实际训练量是不同的。<strong>面试里能主动说出「我把训练预算按 iteration 而不是 epoch 对齐，因为 Mosaic 会改变有效 epoch 的含义」这类话，是很强的信号</strong>——它说明你知道要控的是什么，而不只是知道有个原则叫单变量。</p></div>
+  </div>  <div class="callout danger"><span class="label">「涨了 1.2」——条件不说，数字就作废</span>
+    <p><strong>面试高频追问，且极容易当场翻车。</strong>你说「我加了 Mosaic，mAP 涨了 1.2」，面试官会问：<em>「两边训练了多少 epoch？」「baseline 是重跑的还是用的历史数字？」「有没有 close-mosaic？」「跑了几个种子？」</em>——只要有一个答不上来，这个 1.2 就作废了，而且比不说更糟（因为暴露了你不知道要控什么）。<strong>安全的说法是把条件先说出来</strong>：「同一 commit、同 36 epoch、同分辨率、最后 10 epoch 关闭 Mosaic、3 个种子配对，均值 +1.2、配对差的标准差 0.18，配对 t 检验 p&lt;0.01。」<em>把条件说在前面，追问就没有落点了。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="seed-variance"><span class="num">2</span>种子方差：为什么 +0.3 很可能什么都不是</h2>
+  <p>这是本模块、也可能是整门课里<strong>面试性价比最高的一节</strong>。它的结论只有一句话：<strong>同一份配置、同一份数据、只换随机种子，检测任务的 mAP 波动典型在 ±0.2–0.5 之间。所以一个 +0.3 的「提升」，在单次对比里有约 20% 的概率纯粹是噪声。</strong></p>  <h3>方差从哪里来</h3>  <table>
+    <thead><tr><th>方差来源</th><th>机制</th><th>能否关掉</th><th>相对量级</th></tr></thead>
+    <tbody>
+      <tr><td><strong>权重初始化</strong></td><td>检测头/颈部是随机初始化的（backbone 通常预训练）</td><td>能（固定种子）</td><td>中</td></tr>
+      <tr><td><strong>数据顺序与 shuffle</strong></td><td>样本进入网络的顺序改变优化轨迹；小批量梯度是随机的</td><td>能</td><td><strong>大</strong></td></tr>
+      <tr><td><strong>增强的随机采样</strong></td><td>每个样本被 Mosaic/翻转/色彩抖动到什么程度是随机的</td><td>能</td><td><strong>大</strong>（增强越强越大）</td></tr>
+      <tr><td><strong>Dropout / stochastic depth</strong></td><td>训练期随机丢弃</td><td>能</td><td>小-中</td></tr>
+      <tr><td><strong>cuDNN 非确定性算法</strong></td><td>某些卷积反向的原子加法顺序不定 → 浮点结果不可重复</td><td>能但慢 20–40%（<code>deterministic=True</code>）</td><td>小（但足以让两次「同种子」run 不完全相同）</td></tr>
+      <tr><td><strong>多卡梯度规约顺序</strong></td><td>AllReduce 的求和顺序随通信调度变化</td><td>很难</td><td>小</td></tr>
+      <tr><td><strong>评测集本身的抽样</strong></td><td>评测集只是真实分布的一个有限样本；AP 是它的非线性泛函</td><td>不能（除非换更大的评测集）</td><td><strong>大，且不随种子平均消失</strong></td></tr>
+    </tbody>
+  </table>  <p>最后一行值得单独强调：<strong>多跑种子只能消除「训练随机性」，消不掉「评测集抽样随机性」</strong>。前者可以靠平均压下去，后者是你这个评测集固有的，只有加数据或换更大的集合才能减小。<em>这也是为什么「在自己的评测集上涨了 1 点」与「在另一批数据上也涨」是两个强度完全不同的证据。</em></p>  <h3>把它写成一个可计算的模型</h3>  <p>把第 $i$ 个配置、第 $j$ 个种子的结果写成：</p>  <div class="math-block">\[\mathrm{mAP}_{ij} \;=\; \mu_i \;+\; s_j \;+\; \varepsilon_{ij}\,, \qquad s_j \sim \mathcal N(0,\sigma_s^2)\ \ (\text{种子共享}),\quad \varepsilon_{ij} \sim \mathcal N(0,\sigma_e^2)\ \ (\text{配置内独立})\]</div>  <p>$s_j$ 是「这个种子本身好不好」（初始化、数据顺序对两个配置的影响是相关的），$\varepsilon_{ij}$ 是配置特有的噪声。于是两个配置比较时，差值的方差取决于你怎么设计实验：</p>  <div class="math-block">\[\operatorname{Var}(\Delta)_{\text{非配对}} = 2(\sigma_s^2+\sigma_e^2)\,, \qquad \operatorname{Var}(\Delta)_{\text{配对}} = 2\sigma_e^2 \;\;\ll\;\; \operatorname{Var}(\Delta)_{\text{非配对}}\]</div>  <p>代入一组贴近检测实践的数字（$\sigma_s=0.22$、$\sigma_e=0.12$，于是单次 run 的标准差 $\sigma=0.25$）：</p>  <table>
+    <thead><tr><th>量</th><th>数值</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>单次 run 的 mAP 标准差 $\sigma$</td><td><strong>0.25</strong></td><td>跑 5 个种子，最大值与最小值的<strong>期望极差约 0.58</strong>（$2.33\sigma$）</td></tr>
+      <tr><td>非配对单次比较的 $\sigma_\Delta$</td><td><strong>0.354</strong></td><td>$\sqrt2 \cdot 0.25$</td></tr>
+      <tr><td>$P(\Delta \ge +0.3 \mid \text{真实差异}=0)$</td><td><strong>19.9%</strong></td><td><strong>五次纯噪声对比里就有一次能看到「+0.3 的提升」</strong></td></tr>
+      <tr><td>$P(\Delta \ge +0.5 \mid \text{真实差异}=0)$</td><td>7.9%</td><td>连 +0.5 都有 1/13 的概率是假的</td></tr>
+      <tr><td>配对单次比较的 $\sigma_\Delta$</td><td>0.170</td><td>$\sqrt2\cdot\sigma_e$——配对把噪声砍掉了一半以上</td></tr>
+      <tr><td>配对下 $P(\Delta\ge+0.3\mid 0)$</td><td>3.9%</td><td>同样一次实验，配对设计把假阳性率从 20% 降到 4%</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以「+0.3 算不算提升」这个问题的正确回答不是「算」或「不算」，而是<strong>「取决于你的 σ 是多少、跑了几个种子、是不是配对的」</strong>。同样一个 +0.3：单种子非配对 → 五分之一的概率是噪声，不能采信；3 个种子配对且配对差的标准差 0.18 → $t = 0.3/(0.18/\sqrt3) = 2.89$，$p\approx0.10$，仍然不够但已经值得再跑两个种子；5 个种子配对 → 大概率能定下来。<em>关键是你要能报出这些数，而不是报一个孤零零的 0.3。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个更精细的点：<strong>分桶指标的方差比整体 mAP 大得多</strong>。整体 mAP 在数千个实例上平均，而「夜间 + 小目标」桶可能只有几百个实例。AP 的抽样标准差大致随 $1/\sqrt{n}$ 增长，所以一个只有 800 个实例的桶，其种子标准差可以到 <strong>0.8–1.5 点</strong>——是整体 mAP 的 3–6 倍。<em>这直接决定了回归门禁的阈值该怎么设</em>：如果你对每个桶都用「掉 0.5 就阻塞」的统一规则，小桶会天天误报警，团队三周内就会把门禁关掉。<strong>正确做法是每个桶用自己的 $2\sigma_{\text{bucket}}$ 作为阈值，而 $\sigma_{\text{bucket}}$ 必须先用多种子 baseline 测出来</strong>——这就是模块 00 第一周检查单里第 ③ 项的意义。<em>在 TSR 里这一点尤其致命：「停车让行」「注意儿童」这类关键类在一个评测集里可能只有几十到几百个实例，它们的 AP 种子标准差可以到 1–3 点</em>。<strong>所以关键类的门禁不能写成「掉一点就阻塞」（那会天天误报），而应该同时用两个判据：AP 掉幅超过 $2\sigma_{\text{class}}$，或者<u>绝对漏检实例数</u>增加——后者是整数计数，方差小得多，而且直接对应安全后果。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">面试标志题：+0.3 算提升吗</span>
+    <p><strong>「+0.3 算提升吗」是这个岗位的标志性面试题</strong>，因为它一句话就能把「跑过实验的人」和「负责过指标的人」分开。<em>不及格答法</em>：「算啊，0.3 也是涨。」／「不算吧，太小了。」——两者都没有依据。<strong>满分答法的骨架：①先反问口径</strong>（「整体 mAP 还是某个桶？几个种子？配对了吗？」）；<strong>②给出判据</strong>（「检测任务单次 run 的 mAP 标准差典型在 0.2–0.5，非配对单次比较的差值标准差是它的 √2 倍，所以真实差异为 0 时看到 +0.3 的概率约 20%——这个量级不能单独采信」）；<strong>③给出该怎么做</strong>（「同种子配对跑 3–5 组，做配对 t 或 bootstrap；同时看分桶是否一致——如果 +0.3 全部来自它理应影响的那个桶，证据强度会高很多」）；<strong>④给出退路</strong>（「如果算力做不起多种子，就退而求其次找多个弱证据的一致性：分桶方向一致、跨数据集一致、与机制预期一致」）。</p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个能直接用的经验法则：<strong>把你项目的 baseline 跑 3–5 个种子，把每个桶的标准差 $\sigma_{\text{bucket}}$ 记在墙上。从此所有「提升」都以 $\sigma$ 为单位报告</strong>（「+1.6σ」而不是「+0.4」）。<em>这一个动作能消灭团队里 80% 的伪提升，成本是一次性的 3–5 次训练。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="significance"><span class="num">3</span>多种子 + 配对检验：把「看起来涨了」变成「有多大把握」</h2>
+  <p>知道有方差之后，下一步是用统计工具把「把握有多大」量出来。检测工程里真正需要的只有三件工具，且都能用几十行 numpy 写出来（notebook 里会全部实现）。</p>  <h3>① 配对设计：先做设计，再谈检验</h3>  <p>配对的做法极简单：<strong>用同一组种子跑两个配置</strong>，比较每一对的差值 $d_j = \mathrm{mAP}_{Bj} - \mathrm{mAP}_{Aj}$。因为同一个种子下的 $s_j$ 在两边相同，它在做差时被完全抵消——这就是上一节公式里 $\sigma_s$ 消失的来源。</p>  <div class="math-block">\[t \;=\; \frac{\bar d}{s_d/\sqrt{n}}\,, \qquad \bar d = \frac1n\sum_j d_j\,, \quad s_d^2 = \frac{1}{n-1}\sum_j (d_j-\bar d)^2\,, \quad \text{自由度 } \nu = n-1\]</div>  <p><strong>配对不需要额外的算力预算</strong>——同样跑 $2n$ 次训练，只是把种子对齐了。这是本节里性价比最高的一条建议：<em>它是免费的方差削减</em>。</p>  <h3>② Bootstrap：当分布不好假设时</h3>  <p>mAP 是一个高度非线性的汇总量（排序 → 累积 → 单调包络 → 面积），它的抽样分布没有好的解析形式。<span class="term">bootstrap</span> 绕开这个问题：从已有样本有放回重采样，直接把统计量的分布模拟出来。<strong>但要分清两种 bootstrap，它们回答的是不同的问题</strong>：</p>  <table>
+    <thead><tr><th>bootstrap 的对象</th><th>回答的问题</th><th>适用场景</th><th>陷阱</th></tr></thead>
+    <tbody>
+      <tr><td><strong>对种子重采样</strong></td><td>「如果我再跑一次训练，差值会落在哪」</td><td>多种子实验的差值置信区间</td><td>$n$ 只有 3–5 时 bootstrap 的分位数很粗糙，宁可用配对 t</td></tr>
+      <tr><td><strong>对评测图像重采样</strong></td><td>「如果换一批同分布的评测数据，mAP 会落在哪」</td><td>评测集大小是否足够、绝对指标的不确定度</td><td><strong>必须按图像整体重采样</strong>，不能按框重采样（同图的框不独立）</td></tr>
+      <tr><td><strong>两者都做（分层）</strong></td><td>总不确定度</td><td>写论文/写模型卡时的完整报告</td><td>两个来源不能简单相加，要么嵌套模拟要么分开报告</td></tr>
+    </tbody>
+  </table>  <h3>③ 多重比较：试得越多，越容易「发现」不存在的东西</h3>  <p>这是被忽略得最彻底的一条。假设你这个季度试了 20 个改动，每个都用 $\alpha=0.05$ 判定：</p>  <div class="math-block">\[P(\text{至少一个假阳性}) \;=\; 1-(1-\alpha)^m \;=\; 1-0.95^{20} \;=\; \mathbf{64.2\%}\]</div>  <p><strong>也就是说，一个什么都没做对的季度，有近三分之二的概率会「发现」至少一个显著提升。</strong>两种校正各有适用场景：</p>  <table>
+    <thead><tr><th>方法</th><th>控制什么</th><th>怎么做</th><th>什么时候用</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Bonferroni</strong></td><td><span class="term">FWER</span>（一个假阳性都不要）</td><td>把阈值改成 $\alpha/m$</td><td>上线门禁、安全相关判定——<em>宁可漏掉真提升，不能放进假提升</em></td><td>非常保守，$m$ 大时几乎什么都通不过</td></tr>
+      <tr><td><strong>Benjamini–Hochberg</strong></td><td><span class="term">FDR</span>（被判显著的里面假的比例 ≤ q）</td><td>$p$ 值升序排，找最大的 $k$ 使 $p_{(k)}\le \frac{k}{m}q$，拒绝前 $k$ 个</td><td>探索阶段——<em>要的是「值得跟进的候选清单」</em></td><td>允许清单里混入 q 比例的假阳性</td></tr>
+      <tr><td><strong>预注册 + 分阶段</strong></td><td>实践上最有效</td><td>探索阶段随便试，但候选必须在<strong>新的、没用过的评测切片</strong>上复现才算数</td><td>团队日常流程</td><td>需要预留一个「验证集的验证集」</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第三行的「预注册 + 分阶段」在工程上比任何统计校正都好用，因为它不需要你算 $p$ 值。做法是把评测集切成 <strong>dev</strong>（随便看、随便试、随便调）和 <strong>holdout</strong>（每个改动只准跑一次，跑完就记账）。<em>探索在 dev 上做，确认在 holdout 上做</em>。这样多重比较的问题被隔离在 dev 上，而 holdout 上的数字保持诚实。<strong>代价是 holdout 会随着使用次数逐渐「变脏」，所以要有定期换血的机制。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个必须知道的边界条件：<strong>配对不是万能的，它的方差削减效果取决于两个配置的结果相关性</strong>。如果改动很小（加一个增强、调一个损失权重），同种子下 A 和 B 高度相关，配对能砍掉大部分方差；<em>但如果改动改变了随机性本身的作用（换优化器、换整个增强流水线、换 backbone），相关性会显著下降，配对的收益就没那么大了</em>。实践上应该<strong>实测这个相关系数</strong>：把配对差的标准差 $s_d$ 与单边标准差 $s$ 比较——若 $s_d \approx \sqrt2 s$，说明配对没起作用（相关性接近 0），此时就得老老实实加种子。notebook 里会把这个诊断实现出来。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>统计检验的一个常见误用：<strong>把 $p$ 值当成「提升有多大」的度量</strong>。$p$ 只回答「这个观测在零假设下有多罕见」，它随样本量增大而必然变小——跑 50 个种子，一个 +0.05 的差异也能做到 $p<0.001$，但那个 +0.05 在工程上毫无意义。<em>要同时报<strong>效应量</strong>（差了多少点、相当于几个 $\sigma$）和<strong>置信区间</strong>（差值的 95% CI），$p$ 值只是附带信息</em>。面试里能说出「我更关心效应量和置信区间而不是 p 值」，是一个明显高于平均水平的回答。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="power"><span class="num">4</span>功效分析：需要多少个种子才能检出 +0.3</h2>
+  <p>上一节回答的是「已有数据，把握有多大」。这一节回答一个更早、更有用的问题：<strong>在开跑之前，先算出「要检出我期待的这个提升，我需要跑多少次训练」</strong>。这一步叫<span class="term">功效分析</span>（power analysis），做了它，你就不会浪费两周跑一个注定说明不了任何问题的实验。</p>  <h3>公式</h3>  <p>设显著性水平 $\alpha$（通常 0.05，双侧）、检验功效 $1-\beta$（通常 0.8，即真有效应时有 80% 的概率检出）、想检出的效应量 $\delta$、差值的标准差 $\sigma_\Delta$，则所需的重复数为：</p>  <div class="math-block">\[n \;\ge\; \frac{\bigl(z_{1-\alpha/2}+z_{1-\beta}\bigr)^2\,\sigma_\Delta^2}{\delta^2} \;=\; \frac{(1.96+0.8416)^2\,\sigma_\Delta^2}{\delta^2} \;=\; \frac{7.849\,\sigma_\Delta^2}{\delta^2}\]</div>  <p>代入上一节的数字（$\sigma=0.25$，配对差 $\sigma_\Delta^{\text{配对}}=0.170$，非配对差 $\sigma_\Delta^{\text{非配对}}=0.354$）：</p>  <table>
+    <thead><tr><th>要检出的效应 $\delta$</th><th>非配对（每组 $n$ / 总训练次数）</th><th>配对（$n$ 对 / 总训练次数）</th><th>现实评价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>+0.3</strong></td><td><strong>11 / 22 次</strong></td><td><strong>3 / 6 次</strong>（模拟修正后 ≈5 / 10 次）</td><td>配对把成本降到 1/4 左右</td></tr>
+      <tr><td>+0.5</td><td>4 / 8 次</td><td>2 / 4 次（修正后 3 / 6）</td><td>可承受</td></tr>
+      <tr><td>+1.0</td><td>1 / 2 次</td><td>1 / 2 次</td><td>单次对比就够——<em>所以大改动不需要统计学</em></td></tr>
+      <tr><td>+0.1</td><td>99 / 198 次</td><td>23 / 46 次</td><td><strong>做不起。这个量级的效应在检测里基本无法证实</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label">闭式公式在小样本下会低估</span>
+    <p>上表里的「模拟修正后」不是笔误。<strong>那个闭式公式用的是正态分位数 $z$，而小样本下检验统计量服从 $t$ 分布，尾巴更厚</strong>——$n=3$ 时自由度只有 2，双侧 0.05 的临界值是 <strong>4.303</strong> 而不是 1.96。于是闭式给出的 $n=3$ 实际功效远低于 80%。<em>notebook 里会用蒙特卡洛把真实所需的 $n$ 搜出来，结论是配对约需 5–6 对</em>。<strong>可迁移的教训：小样本下所有基于正态近似的公式都会低估所需样本量，务必用模拟校验。</strong></p>
+  </div>  <h3>反过来用：给定预算，你能检出多大的提升</h3>  <p>更常见的情形是预算先定死了（「这个实验最多跑 6 次训练」）。这时把公式反解，得到<span class="term">最小可检效应</span>（minimum detectable effect, MDE）：</p>  <div class="math-block">\[\delta_{\min} \;=\; \bigl(z_{1-\alpha/2}+z_{1-\beta}\bigr)\,\frac{\sigma_\Delta}{\sqrt n} \;\approx\; 2.80\,\frac{\sigma_\Delta}{\sqrt n}\]</div>  <p>预算 3 对配对实验 → $\delta_{\min}\approx 2.80\times0.170/\sqrt3 = 0.27$（正态近似；<strong>notebook 里的蒙特卡洛给出真实值约 0.56，是闭式的两倍</strong>）。<strong>这句话的工程含义是：「我这次实验只能看见 0.5 以上的效应，0.5 以下的一律报『无结论』而不是『无效果』」</strong>——<em>「没有证据说明它有用」和「有证据说明它没用」是两个完全不同的结论，混淆这两者是实验解读里最常见的错误。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>现实是残酷的：<strong>一次 COCO 规模的检测训练要几十 GPU-小时，绝大多数团队跑不起 10 次重复</strong>。所以真实工程里的做法不是「严格做显著性检验」，而是<em>用多个独立的弱证据凑出强证据</em>：①<strong>分桶一致性</strong>——如果这个改动只该影响小目标，那 mAP_small 涨、其他桶不动，比整体涨 0.3 有说服力得多；②<strong>跨数据集/跨规模一致性</strong>——在 tiny 和 small 两个模型尺寸上都涨，或在两个不同来源的评测集上都涨；③<strong>机制可解释性 + 事前预测</strong>——你能在实验前写下「我预期它会涨在哪个桶、大约多少」，然后观测吻合。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第 ③ 条是最被低估的。<strong>事前写下预测，是把「事后找解释」这个最强的自欺来源堵死的唯一办法</strong>。人类在事后为任何数据模式编出合理解释的能力是无限的：涨了就是「有效」，没涨就是「数据不够」，掉了就是「需要调参」——三种结果都能被解释成支持你的假设。<em>而如果你在跑之前就写下「我预期 mAP_small +1.5~3.0、mAP_large 不动、延迟 +30%」，那么观测与预测的吻合度本身就是一个强证据，且它无法被事后改写</em>。<strong>这在面试里也是一个极强的信号——它对应临床试验里的「预注册」，说明你理解证据强度的来源。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把本节压成一句可执行的规则：<strong>开跑之前先算 MDE。如果 MDE 比你期待的效应还大，这个实验不值得跑</strong>——要么加预算，要么改设计（配对、共享评测集、降低方差），要么换一个效应更大的改动去做。<em>「跑完才发现说明不了任何问题」是研究工程里最贵的浪费。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fair"><span class="num">5</span>公平对比的五个条件：让「谁更好」这个问题有意义</h2>
+  <p>统计学解决的是「差异是不是噪声」。公平性解决的是<strong>「差异是不是来自你说的那个原因」</strong>。后者出问题时，统计再严谨也没用——你只是精确地测量了一个错误的量。</p>  <table>
+    <thead><tr><th>条件</th><th>违反的典型形式</th><th>偏差方向</th><th>典型量级</th><th>怎么控</th></tr></thead>
+    <tbody>
+      <tr><td><strong>同训练预算</strong></td><td>新方法训 300 epoch，baseline 用论文里的 12 epoch 数字</td><td>严重偏向新方法</td><td>1–4 点</td><td>两边都训到收敛；或按 iteration 对齐并报告曲线</td></tr>
+      <tr><td><strong>同增强</strong></td><td>新方法带 Mosaic + MixUp，baseline 只有翻转</td><td>偏向新方法</td><td>1–2 点</td><td>增强作为独立变量单独消融</td></tr>
+      <tr><td><strong>同分辨率</strong></td><td>新方法 1280，baseline 640；或测试时分辨率与训练不一致</td><td>偏向高分辨率（尤其小目标桶）</td><td><strong>3–6 点（mAP_small）</strong></td><td>分辨率写进对比表的每一行</td></tr>
+      <tr><td><strong>同调参预算</strong></td><td>新方法搜了 200 组超参，baseline 用默认值</td><td><strong>偏向被调的一方，且难以察觉</strong></td><td>0.5–2 点</td><td>见第 7 节：等预算搜索，或报告 budget 曲线</td></tr>
+      <tr><td><strong>同评测集与评测代码</strong></td><td>评测集加过数据；IoU 口径不同（VOC vs COCO）；score 阈值不同</td><td>任意方向</td><td><strong>任意大</strong></td><td>评测集冻结 + 哈希；评测代码进 CI</td></tr>
+    </tbody>
+  </table>  <p>再加两条容易被忘掉的隐性条件：</p>  <ul>
+    <li><strong>同数值精度与硬件</strong>：fp16 与 fp32 训练的结果可以差 0.1–0.3；不同 GPU 上 cuDNN 选择的算法不同。<em>跨硬件的对比要标注，不要混在一张表里。</em></li>
+    <li><strong>同后处理工作点</strong>：score 阈值、NMS IoU 阈值、max_det 上限。<em>一个模型在 score=0.05、另一个在 score=0.25 下评测，比的是两个不同的东西</em>；正确做法是要么统一，要么各自扫一遍取最优（并说明是各自最优）。</li>
+  </ul>  <div class="ascii">公平对比自查表（贴在实验记录模板里，每次对比逐项打勾）
+
+  [ ] 同一个 commit（**baseline 是重跑的，不是历史数字**）
+  [ ] 同 iteration / epoch，且两边都训到收敛（画 loss 与 val 曲线确认）
+  [ ] 同增强配方（差异项就是被测变量本身时，明确写出来）
+  [ ] 同输入分辨率 + 同 letterbox 实现
+  [ ] 同 batch size 与等效学习率（若不同，说明用了什么缩放规则）
+  [ ] 同调参预算（各搜 N 组，或都用默认；**不能一边搜一边默认**）
+  [ ] 同评测集版本 + 同评测代码版本（记哈希）
+  [ ] 同后处理工作点（score / NMS IoU / max_det）
+  [ ] 同精度（fp16/fp32）与同硬件；不同则标注
+  [ ] **同一组随机种子（配对），且 n &gt;= 3**
+  [ ] 报告：均值 ± 标准差、配对差的 CI、分桶表、延迟与显存
+
+  ▶ 打不满勾不是不能做实验，而是**必须把没打勾的那几项写进结论的限定条件**。
+  ▶ 「在同 epoch、同增强下，A 比 B 高 1.2±0.3」是结论；
+    「A 比 B 好」不是结论，是口号。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>五条里<strong>「同调参预算」是最难做到也最容易被忽略的</strong>。原因很简单：你花在自己方法上的时间必然比花在 baseline 上的多——你会为它调学习率、调损失权重、调增强强度，而 baseline 你只是「跑一下」。<em>这个不对称不需要任何主观恶意就会自然发生</em>，它是研究工作的默认状态。<strong>所以公平对比需要主动对抗这个默认状态</strong>：要么给 baseline 同样的搜索预算，要么把「新方法只调了它自己引入的那一个超参」写清楚。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>在 TSR 这类<strong>两级 vs 端到端</strong>的架构对比里，公平性还有额外的层次。两级方案（类别无关检测 + crop 分类）与端到端多类检测的对比必须统一：<em>①端到端的延迟口径要包含 NMS，两级的要包含所有 crop 的分类耗时（且这个耗时随检出个数变化，要报 p99 而不是均值）；②两级的检测器只需分辨「是不是标志」，它的 mAP 与端到端的多类 mAP 根本不是同一个量，必须换算到<strong>端到端的最终类别级指标</strong>再比；③两级方案的 crop 分辨率是一个额外的自由度，不能一边用 128×128 一边把端到端限制在 640 输入</em>。<strong>面试里如果被问「你会选两级还是端到端」，先说清楚「在什么口径下比」，比直接给答案更能体现水平。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">「你怎么保证对比公平」——要背得出自查表</span>
+    <p><strong>「你怎么保证这个对比是公平的」是一道高区分度的面试题</strong>，而且它经常在你讲完一个项目后作为追问出现。<em>不及格答法</em>：「我们两边用的是同一套代码。」——这只覆盖了十条里的一条。<strong>满分答法是直接背出自查表的核心项并说明为什么</strong>：「同 commit 重跑 baseline（防基线漂移）、同 iteration 对齐（因为 Mosaic 会改变有效 epoch 的含义）、同调参预算（这是最容易出问题的一条，我给 baseline 也跑了同样规模的 lr 搜索）、评测集冻结并记哈希、同一组种子配对跑 3 组。最后报的是均值 ± 标准差和配对差的 95% 置信区间，不是一个孤立数字。」<em>面试官不需要你全对，他需要看到你有一张自查表，而不是靠感觉。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ablation"><span class="num">6</span>消融设计：加法式与减法式为什么会给出相反的结论</h2>
+  <p>消融（ablation）的目的是回答「这几个组件里，哪个才是真正起作用的」。它有两种做法，而<strong>大多数人不知道它们会给出不同的答案，也不知道该报哪个</strong>。</p>  <table>
+    <thead><tr><th>设计</th><th>做法</th><th>度量的是什么</th><th>偏差</th></tr></thead>
+    <tbody>
+      <tr><td><strong>加法式</strong>（additive / bottom-up）</td><td>从 baseline 出发，每次<em>加一个</em>组件</td><td>该组件的<strong>主效应</strong>（在没有其他组件时的贡献）</td><td><strong>高估冗余组件</strong>——两个做同一件事的组件，各自单独加都涨</td></tr>
+      <tr><td><strong>减法式</strong>（subtractive / leave-one-out）</td><td>从完整系统出发，每次<em>去掉一个</em>组件</td><td>该组件的<strong>边际贡献</strong>（在其他组件都在时还剩多少）</td><td><strong>低估冗余组件、高估协同组件</strong></td></tr>
+      <tr><td><strong>全子集 + Shapley</strong></td><td>跑遍 $2^k$ 个子集，按 Shapley 值分摊</td><td>公理化的<strong>公平分摊</strong>（效率 / 对称 / 虚拟 / 可加）</td><td>无偏，但代价 $2^k$</td></tr>
+    </tbody>
+  </table>  <h3>一个具体的数字例子（notebook 会完整跑出来）</h3>  <p>设有三个组件 A（Mosaic）、B（copy-paste）、C（更长训练），baseline 40.0。真实的响应函数含交互项：A 与 B 有<strong>冗余</strong>（都在制造更多小目标，交互 −0.8），B 与 C 有<strong>协同</strong>（更多合成数据需要更长训练才吃得下，交互 +0.5），A 与 C 轻微冲突（−0.3），三者同时有 +0.2 的高阶项。完整系统 42.2，总增益 <strong>+2.2</strong>。三种归因给出的「A 的贡献」是：</p>  <table>
+    <thead><tr><th>组件</th><th>加法式（单独加）</th><th>减法式（从 full 去掉）</th><th>Shapley 值</th><th>结论差异</th></tr></thead>
+    <tbody>
+      <tr><td><strong>A（Mosaic）</strong></td><td><strong>+1.00</strong></td><td><strong>+0.10</strong></td><td>+0.52</td><td><strong>相差 10 倍</strong>——同一组实验，两种读法</td></tr>
+      <tr><td>B（copy-paste）</td><td>+1.00</td><td>+0.90</td><td>+0.92</td><td>一致（它与别人的交互相互抵消了）</td></tr>
+      <tr><td>C（更长训练）</td><td>+0.60</td><td>+1.00</td><td>+0.77</td><td>减法式高估（它与 B 的协同都被算给了它）</td></tr>
+      <tr><td><strong>合计</strong></td><td>2.60 ≠ 2.20</td><td>2.00 ≠ 2.20</td><td><strong>2.20 = 2.20</strong> ✅</td><td>只有 Shapley 满足「加总等于总增益」</td></tr>
+    </tbody>
+  </table>  <p><strong>关键在于：加法式和减法式都没有算错，它们只是在回答不同的问题。</strong>加法式回答「如果我只能加一个，加哪个」；减法式回答「如果我要砍掉一个省成本，砍哪个代价最小」。<em>把其中任何一个说成「A 的贡献」这个唯一数字，都是错的。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>工程上该怎么办？<strong>三条实用规则</strong>：①<em>当你要决定「上不上线」时用减法式</em>——因为部署形态就是完整系统，你关心的是「去掉它会掉多少」；②<em>当你要决定「下一步做什么」时用加法式</em>——因为你的起点是当前系统，你关心的是「单独加一个新东西能涨多少」；③<em>当组件数 $k\le4$ 时直接跑全子集</em>（$2^4=16$ 组实验，配合多种子仍在可承受范围），因为它顺带把交互作用也测出来了，而交互作用往往比主效应更有信息量。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>关于 <span class="term">Shapley value</span>：它是合作博弈论里对「联盟总收益如何公平分摊给成员」的唯一满足四条公理（效率、对称性、虚拟成员、可加性）的解。公式是对所有加入顺序求平均：$\phi_i = \sum_{S\subseteq N\setminus\{i\}} \frac{|S|!\,(n-|S|-1)!}{n!}\bigl[f(S\cup\{i\})-f(S)\bigr]$。<em>它在 ML 里更常见的化身是 SHAP（特征归因），但用在消融上同样自然</em>：把「组件」当成玩家、把「mAP」当成联盟收益。<strong>它的唯一问题是 $2^k$ 的代价</strong>——$k=6$ 时 64 组实验、配合 3 个种子就是 192 次训练，已经不现实。<em>此时的实用退路是「报告加法式与减法式两端，并把两端差距大的组件标记为『存在显著交互，需要单独研究』」</em>——这个做法几乎零成本，却能避免绝大多数错误结论。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住这个判据：<strong>如果加法式和减法式给出的贡献差得很远，那不是数据有问题，那正是「存在交互作用」的信号，而且这个信号本身就是有价值的发现</strong>。在上面的例子里，A 的两个数字差 10 倍，直接告诉你「Mosaic 和 copy-paste 在做同一件事」——<em>这个结论比「Mosaic 涨 1.0 点」有用得多，因为它意味着你可以砍掉一个来省训练时间</em>。</p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>消融的另一个高频错误：<strong>消融时没有重新调参</strong>。去掉 Mosaic 之后，原来为强增强配置的 300 epoch 变成了过拟合，于是「去掉 Mosaic 掉 3 点」——但其中至少一半是「训练时长不再匹配」造成的。<em>严格的消融要求每个子集各自调到最优，而这会让代价再乘一个系数</em>。实践中的折中是：<strong>至少对训练时长这一个最敏感的耦合变量做补偿</strong>，并在报告里注明其余超参沿用完整系统的配置。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hpo"><span class="num">7</span>超参搜索预算与「调参不公平」陷阱</h2>
+  <p>这是「公平对比」里最隐蔽的一条，值得单独一节。它的形态是：<strong>新方法被调了 200 组超参，baseline 用了论文里的默认值——然后你报告说新方法涨了 1.5 点。</strong>问题是：这 1.5 点里，有多少是方法带来的，有多少只是「被调过」带来的？</p>  <h3>为什么「调过」本身就能涨点</h3>  <p>把超参搜索看成一个抽样过程：每次抽一组超参，得到一个结果。<strong>报告最优的那一次，等于报告 $n$ 次抽样的最大值——而最大值随 $n$ 单调增长，与方法好坏无关。</strong>设单次抽样超过 baseline 的概率为 $p$，则：</p>  <div class="math-block">\[P(\text{至少一次超过 baseline}) \;=\; 1-(1-p)^n \quad\Longrightarrow\quad p=0.10,\ n=20 \;\Rightarrow\; \mathbf{87.8\%}\]</div>  <p><strong>也就是说，即使你的方法完全不比 baseline 好，只要允许你随机调 20 组超参，你有 88% 的概率能找到一组「涨了」的配置。</strong>这不是作弊，这是搜索的数学性质——但如果你只报最优那一组而不报预算，读者（和面试官）会把它误读成方法的效果。</p>  <table>
+    <thead><tr><th>报告方式</th><th>内容</th><th>读者能判断什么</th><th>评价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>只报最优</strong></td><td>「我们的方法达到 53.1 AP」</td><td>什么都判断不了</td><td>❌ 最常见，也最没有信息量</td></tr>
+      <tr><td>报最优 + 预算</td><td>「搜索 50 组，最优 53.1」</td><td>至少知道搜索规模</td><td>🟡 及格线</td></tr>
+      <tr><td><strong>报预算-期望最优曲线</strong></td><td>「预算 1/5/10/50 组时的期望最优分别是 51.2 / 52.3 / 52.7 / 53.1」</td><td><strong>在相同预算下比较两个方法</strong>；还能看出方法对超参的敏感度</td><td>✅ Dodge et al. 推荐；曲线越平说明方法越鲁棒</td></tr>
+      <tr><td><strong>等预算对照</strong></td><td>「两个方法各搜 50 组，各自的最优是 53.1 vs 52.4」</td><td>直接可比</td><td>✅ 工程上最实用</td></tr>
+    </tbody>
+  </table>  <p><strong>预算-期望最优曲线</strong>的计算不需要额外实验：把你已经跑过的 $N$ 组结果保存下来，用有放回重采样估计「如果只有预算 $n$，期望能拿到的最优值是多少」。notebook 里会实现这个估计器——<em>它是把「已经跑过的所有实验」变成可发表证据的最便宜手段。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这条陷阱有一个很反直觉的推论：<strong>「对超参不敏感」本身是方法的一个重要优点，而只报最优值的做法会把这个优点完全抹掉</strong>。两个方法都能调到 53.1，但一个在预算 5 组时就到 52.9、另一个要 50 组才到 52.7——前者在工程上远优于后者（换数据集、换分辨率时不用重调）。<em>预算-期望最优曲线正好把这个差别显示出来：曲线越早变平，方法越鲁棒。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>在量产场景里这个问题会以另一种形式出现：<strong>你的超参是在当前数据版本上调的，而数据每周都在增长</strong>。一个高度依赖超参的方法，会在数据更新后悄悄退化——因为原来的最优点已经漂走了，而没有人会为每次数据更新重跑一次搜索。<em>所以「在多个数据版本上都用同一组超参也能工作」是量产系统的硬需求</em>，它比「在某个版本上调到极致」重要得多。<strong>面试里主动提这一点，等于告诉对方你考虑过「上线之后」的事。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">「你的 baseline 调过参吗」</span>
+    <p><strong>面试追问预案：「你的 baseline 调过参吗？」</strong>这是一个陷阱题，因为两个方向的诚实回答都可能扣分——说「调过」要能说出调了什么、多大预算；说「没调」等于承认对比不公平。<em>安全且真实的答法</em>：<strong>「baseline 我用的是官方配方（它本身就是被社区调过的），我的改动只引入了一个新超参，我对这一个超参做了 5 组扫描并报告了全部 5 组，不是只报最优。另外我在两个模型尺寸上都验证了同一个结论——如果提升只来自调参，它不会在两个尺寸上都成立。」</strong><em>后半句是关键：跨配置的一致性是对抗「调参幻觉」的最强证据，而且几乎免费。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="record"><span class="num">8</span>实验记录与可复现：最小必要字段和一份实操清单</h2>
+  <p>前面七节讲的所有东西，只有在实验能被记录、被检索、被重现时才有累积价值。否则每一次实验都是一次性的消耗品，团队的知识永远停留在「大家印象中好像是……」。</p>  <h3>先分清三层可复现</h3>  <table>
+    <thead><tr><th>层级</th><th>定义</th><th>达成条件</th><th>什么时候需要</th></tr></thead>
+    <tbody>
+      <tr><td><strong>逐位可复现</strong>（bit-wise）</td><td>两次运行的权重逐位相同</td><td>固定全部种子 + <code>cudnn.deterministic</code> + 单卡 + 固定库版本</td><td>调试数值 bug、验证重构没改变行为；<em>代价是慢 20–40%，日常不必开</em></td></tr>
+      <tr><td><strong>统计可复现</strong>（statistical）</td><td>重跑落在多种子分布内</td><td>manifest 完整 + 数据与代码版本固定</td><td><strong>日常标准。这一层做不到，一切实验结论都不可信</strong></td></tr>
+      <tr><td><strong>概念可复现</strong>（conceptual）</td><td>别人按你的描述独立实现，能得到同向结论</td><td>方法描述完整 + 关键超参公开 + 报告了方差</td><td>论文/技术分享；也是<strong>交接的真正标准</strong></td></tr>
+    </tbody>
+  </table>  <h3>实验记录的最小必要字段</h3>  <p>模块 00 给了 manifest 的完整结构，这里补充<strong>为什么每一项都是必需的</strong>——每一项都对应一类「三个月后无法回答的问题」：</p>  <table>
+    <thead><tr><th>字段</th><th>缺了它，哪个问题回答不了</th><th>常见的偷懒形式</th></tr></thead>
+    <tbody>
+      <tr><td><strong>代码 commit + dirty 标记</strong></td><td>「这次实验用的到底是哪版代码」</td><td>只记分支名（分支会移动）</td></tr>
+      <tr><td><strong>数据版本（含哈希）</strong></td><td>「训练集是加数据之前还是之后的」</td><td>只记路径（路径下的内容会变）</td></tr>
+      <tr><td><strong>完整配置（展开，非 diff）</strong></td><td>「当时那个 lr 是多少」——base config 后来改过了</td><td>只存与 base 的 diff</td></tr>
+      <tr><td><strong>环境</strong>（python/库/驱动/GPU）</td><td>「为什么现在重跑差了 0.4」</td><td>完全不记</td></tr>
+      <tr><td><strong>随机种子</strong></td><td>「这个差异是改动还是噪声」——<em>本模块全部内容的前提</em></td><td>记了但训练脚本里其实没真正固定住</td></tr>
+      <tr><td><strong>完整指标（含全部分桶）</strong></td><td>「当时夜间桶是多少」——评测代码已经改过</td><td>只存整体 mAP</td></tr>
+      <tr><td><strong>评测集版本 + 评测代码版本</strong></td><td>「这两个数字可比吗」</td><td>假设评测集永远不变</td></tr>
+      <tr><td><strong>训练时长与硬件</strong></td><td>「这个方法的实际成本是多少」</td><td>不记，于是无法算 ROI</td></tr>
+      <tr><td><strong>对照 run 的 id</strong></td><td>「这次实验的 baseline 是哪一次」</td><td>写「和之前那个比」</td></tr>
+    </tbody>
+  </table>  <div class="ascii">可复现实操清单（按顺序做，每项都有可验证的通过条件）
+
+  1. 训练脚本启动时**第一件事**：写 manifest（而不是结束时写）
+     └ 崩溃的 run 也要有记录，否则"跑了但没结果"的实验会被重复做
+
+  2. 种子要固定**四处**，少一处就前功尽弃：
+       random.seed(s) / np.random.seed(s) / torch.manual_seed(s)
+       + DataLoader 的 worker_init_fn（**每个 worker 有独立 RNG**）
+     └ 验证：跑两次前 100 步，loss 序列必须逐值相同
+
+  3. 数据版本 = 内容哈希，不是路径也不是日期
+     └ 验证：sha256 清单进 manifest；数据目录设为只读
+
+  4. 评测集**冻结**，评测代码进 CI
+     └ 验证：拿一个固定 ckpt，每天 CI 跑一次，mAP 必须完全不变
+
+  5. baseline 与实验**同 commit 重跑**，且用同一组种子
+     └ 验证：manifest 里的 baseline_run_id 指向本周的 run，不是上个月的
+
+  6. 结果落库时同时存：全量指标 + 分桶 + 延迟 + 显存 + wall-clock
+     └ 验证：能直接查询"某个桶在过去 20 次 run 里的走势"
+
+  7. 每月做一次**复现演练**：随机抽一个 30 天前的 run 重跑
+     └ 通过条件：落在多种子分布的 2σ 内；不落则说明有未记录的漂移</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第 2 条里的 <code>worker_init_fn</code> 值得单独说，因为它是一个<strong>真实事故</strong>而不是理论风险：PyTorch 的 DataLoader 多进程 worker 会各自继承主进程的 numpy 随机状态，<em>如果不在 <code>worker_init_fn</code> 里给每个 worker 设不同的种子，所有 worker 会生成完全相同的增强随机数</em>。症状是训练看起来正常、loss 也降，但你的增强多样性实际上只有 <code>1/num_workers</code>——mAP 会莫名其妙低 0.5–1.5 点，而且极难发现。<strong>C56 模块 04 有完整的复现实验。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第 7 条的「复现演练」是整个清单里最容易被跳过、也最能暴露问题的一条。<em>它检验的不是某一次 run，而是你的记录系统本身是否完整</em>——只要有任何一个未被记录的变量在漂移（库版本、驱动、数据软链接指向、某个没进 git 的本地脚本），演练就会失败。<strong>而这类漂移在平时是完全隐形的：它不会报错，只会让你的历史数字慢慢变得不可比</strong>。定期演练相当于给可复现性加了一个<span class="term">金丝雀测试</span>。<em>在 TSR 这种「模型要在车上跑三年、期间不断迭代」的场景里，「三年前那版为什么比现在这版在隧道口好」是一个真实会被问到的问题——能不能回答它，取决于你今天有没有做第 7 条。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>记录系统的一个常见失败模式是<strong>「记了但没人用」</strong>：字段很全、写进了实验追踪平台，但没有人在做决策时去查。<em>判断记录系统是否真的在工作，看一个指标：「上一次有人查询三个月前的 run 是什么时候」</em>。如果答案是「没有过」，那这套记录就只是仪式。<strong>让它活起来的最有效办法是把它接进门禁</strong>——回归门禁必须去查历史 run 的分桶数字来算阈值，于是记录系统就有了不可替代的读取方。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>实验方法学这个领域正在从「大家心照不宣的手艺」变成「有明确规范的工程学科」，但仍有几个真正未解的问题。它们既是研究机会，也是很好的面试谈资。</p>  <ul>
+    <li><strong>大模型时代的方差报告困境。</strong>训练成本越高，重复实验越不可行，而效应量却在变小（成熟领域的改进普遍在 0.1–0.5 点）。<em>「成本上升 × 效应量下降」这个剪刀差意味着：越是前沿的工作，越难被统计学证实</em>。目前的替代路径（跨规模一致性、scaling law 外推、机制解释）都还没有形成公认的证据强度标准。这可能是当前 ML 实证方法学最重要的开放问题。</li>
+    <li><strong>方差的来源分解仍不完整。</strong>Bouthillier 等人把 benchmark 方差拆成了数据划分、初始化、数据顺序、超参搜索等来源，但检测任务特有的来源——<em>标注噪声、评测集的类别分布抽样、NMS 与 score 阈值的交互——还没有系统的量化工作</em>。「一个 TSR 评测集需要多少实例，才能让夜间桶的 AP 标准差降到 0.3 以下」这类问题目前只能靠经验。</li>
+    <li><strong>交互作用的高效估计。</strong>Shapley 需要 $2^k$ 次实验，而部分因子设计（fractional factorial design）、响应面方法这些统计学里成熟了几十年的工具，在 ML 消融里几乎没有被使用。<em>「用 $O(k^2)$ 次实验估计出所有二阶交互」在原理上是可行的，但缺少现成的工具与共识</em>。</li>
+    <li><strong>自动化实验与统计严谨性的冲突。</strong>当 agent 能自动改配置、跑训练、读指标时，「试到显著为止」这种坏实践的速度会被放大几个数量级——<em>一个能自主跑 1000 次实验的 agent，几乎必然能找到「显著」的伪结果</em>。多重比较校正、预注册、以及「自动化实验的审计日志」正在成为新的系统设计需求，但还没有成熟方案。</li>
+    <li><strong>评测集老化与隐性过拟合。</strong>同一个评测集被反复使用后，社区在其上报告的提升有多少来自真实进步、多少来自对该集合的适应？Recht 等人的重采样实验给出了部分答案（绝对值下降但排序基本保持），<em>但对自动驾驶这类「评测集与训练集来自同一批采集」的场景，这个问题更严重且缺少研究</em>。</li>
+    <li><strong>离线指标与下游价值的对齐。</strong>mAP 涨了、路测体验没变，是自动驾驶感知的常态。<em>「什么样的离线指标能预测下游安全收益」目前没有公认答案</em>；代价敏感 mAP、场景加权、规则违反率代理各有缺陷（C55 模块 05 展开）。这既是评测问题，也是实验设计问题——<strong>因为如果你的目标指标本身与价值不对齐，再严谨的实验设计也只是在精确地优化一个错误的东西。</strong></li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>★ 必读</strong>：Bouthillier, Delaunay, Bronzi et al., <em>Accounting for Variance in Machine Learning Benchmarks</em>（MLSys 2021）——本节全部方差论述的理论基础；重点看它对「多个方差源的相对贡献」的分解，以及「固定种子反而会低估真实方差」这个反直觉结论。<strong>★</strong> Dodge, Gururangan, Card et al., <em>Show Your Work: Improved Reporting of Experimental Results</em>（EMNLP 2019）——预算-期望最优曲线的出处，第 7 节的直接来源。<strong>★</strong> Henderson, Islam, Bachman et al., <em>Deep Reinforcement Learning that Matters</em>（AAAI 2018）——多种子与报告规范的经典警世文，图 1（同一算法不同种子的学习曲线）值得记住。</p><p>统计工具：Benjamini &amp; Hochberg, <em>Controlling the False Discovery Rate</em>（JRSS-B 1995，BH 校正原文）；Efron &amp; Tibshirani, <em>An Introduction to the Bootstrap</em>（1993）；Demšar, <em>Statistical Comparisons of Classifiers over Multiple Data Sets</em>（JMLR 2006，多数据集比较的规范）；Shapley, <em>A Value for n-Person Games</em>（1953，消融归因的公理基础）。方法学批评：Lipton &amp; Steinhardt, <em>Troubling Trends in Machine Learning Scholarship</em>（2018）；Musgrave, Belongie &amp; Lim, <em>A Metric Learning Reality Check</em>（ECCV 2020，公平对比后大部分提升消失的实证）；Melis, Dyer &amp; Blunsom, <em>On the State of the Art of Evaluation in Neural Language Models</em>（ICLR 2018，等预算调参后老模型反超）；Recht et al., <em>Do ImageNet Classifiers Generalize to ImageNet?</em>（ICML 2019）；Pineau et al., <em>Improving Reproducibility in Machine Learning Research</em>（JMLR 2021）。相邻课程：模块 00（三个核心能力）、模块 02（误差分析：实验之后往哪走）、模块 03（调试手册）、C37（实验追踪与 MLOps）、C40（研究方法论）、C56 模块 05（增强的消融与验证）、C58 模块 05（闭环验证与回归门禁）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_error_analysis/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 误差分析工程：从指标到根因</div></a>
+  </div>
+
+</div>
+</body>
+</html>

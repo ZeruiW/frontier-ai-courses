@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · DETR 工程实践：调参、诊断与选型</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · DETR 工程实践：调参、诊断与选型</h1>
+  <p class="subtitle">backbone 用 0.1× 学习率不是惯例而是必须项 · DETR 弱在小目标有三个独立根因，要分别用多尺度/增大 N/换尺度不敏感度量来解 · 训练失败诊断树（全背景 / 框聚中心 / 重复框 / loss 尖刺）· 无 NMS 真正买到的是 p99 延迟的确定性 · DETR 系 vs YOLO 系工程取舍表与 TSR 选型的完整论证</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–04（匈牙利匹配 / 集合损失 / object query / 家族演进）；C53（实时检测器）会让选型一节更有感觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_detr_practice.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">DETR / Deformable DETR / DINO 官方仓库的训练配置；detrex 与 mmdetection 的 DETR 系配置；RT-DETR 论文</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#recipe">训练配方：为什么 backbone 的学习率是 0.1×</a></li>
+      <li><a href="#small">DETR 对小目标弱：三个根因与它们各自的解法</a></li>
+      <li><a href="#diag">训练失败模式诊断树：四种症状，各自的成因与检查步骤</a></li>
+      <li><a href="#metrics">训练期该盯的四个诊断指标（而不是只盯 loss）</a></li>
+      <li><a href="#infer">推理端：top-k、阈值，以及要不要留一个 NMS 兜底</a></li>
+      <li><a href="#deploy">部署侧的真实差异：算子、动态形状与延迟稳定性</a></li>
+      <li><a href="#compare">DETR 系 vs YOLO 系：完整工程取舍表</a></li>
+      <li><a href="#tsr">给 TSR 选哪个：一次完整的论证</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="recipe"><span class="num">1</span>训练配方：为什么 backbone 的学习率是 0.1×</h2>
+  <p>先把 DETR 官方配置摊开。<strong>这些数字里有一半是「不能动」的，另一半是「必须按数据集调」的，能分清楚这两半就是工程能力。</strong></p>  <table>
+    <thead><tr><th>项</th><th>DETR 官方值</th><th>属于哪一半</th><th>改错了会怎样</th></tr></thead>
+    <tbody>
+      <tr><td>优化器</td><td>AdamW</td><td><strong>不能动</strong></td><td>换 SGD 基本训不动（Transformer 对自适应步长强依赖）</td></tr>
+      <tr><td><code>lr</code>（transformer）</td><td>1e-4</td><td>按 batch 调</td><td>线性缩放规则；太大早期 loss 尖峰</td></tr>
+      <tr><td><strong><code>lr_backbone</code></strong></td><td><strong>1e-5（= 0.1×）</strong></td><td><strong>不能动</strong></td><td><strong>用 1×：预训练特征被冲毁，AP 掉几个点</strong></td></tr>
+      <tr><td><code>weight_decay</code></td><td>1e-4</td><td>按数据量调</td><td>小数据集要加大；<strong>但不能作用于 norm/bias/query embedding</strong></td></tr>
+      <tr><td><code>clip_max_norm</code></td><td><strong>0.1</strong></td><td>不能动</td><td>去掉后早期梯度尖峰会让 loss 炸；<em>0.1 是异常小的值，是刻意的</em></td></tr>
+      <tr><td>BN</td><td><strong>FrozenBatchNorm2d</strong></td><td>不能动</td><td>用普通 BN：单卡 batch=2 的统计量噪声极大，训练不稳</td></tr>
+      <tr><td><code>epochs / lr_drop</code></td><td>300 / 200（或 500/400）</td><td>按方法调</td><td>DINO 系用 12 或 24，配 MultiStep 在 11 步降</td></tr>
+      <tr><td>dropout</td><td>0.1（DETR）→ <strong>0.0</strong>（Deformable/DINO）</td><td>按方法调</td><td><em>后续工作普遍关掉 dropout，因为收敛已不是瓶颈</em></td></tr>
+    </tbody>
+  </table>  <h3>0.1× 的第一个理由：预训练权重已经接近好解，最优步长本来就更小</h3>  <p>这不是玄学，可以算出来。把「一个参数块的训练」建模成带噪声的一阶迭代（噪声来自 mini-batch 采样）：</p>  <div class="math-block">\[\mathbb{E}\big[\|\theta_T - \theta^\star\|^2\big] \;=\; \underbrace{(1-\eta)^{2T} d_0^2}_{\text{初始偏差的衰减}} \;+\; \underbrace{\frac{\eta\,\sigma^2}{2-\eta}}_{\text{梯度噪声的稳态项}}\]</div>  <p>第一项要求 <strong>η 大</strong>（衰减快），第二项要求 <strong>η 小</strong>（噪声地板低）。最优 η 由二者平衡决定，<strong>而 d₀（离最优点的距离）越小，最优 η 就越小</strong>——因为没有多少偏差需要衰减，剩下的全是噪声。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>翻译成人话：<strong>ImageNet 预训练的 backbone 已经站在一个相当好的位置（d₀ 小），而随机初始化的 transformer 与检测头离最优解还很远（d₀ 大）</strong>。同一个学习率对前者是「用噪声把好东西震坏」，对后者是「步子还不够大」。<em>notebook 里会扫描 d₀，画出「最优步长比随预训练质量下降」的曲线。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格说这个模型省略了曲率（Hessian）的差异，而真实情况里 backbone 与 transformer 的曲率尺度也不同。<strong>但结论方向是稳健的，而且它给了一条可操作的推论：预训练越好，backbone 的相对学习率就该越小。</strong><em>推论一：用 COCO 预训练的检测器去微调 TSR 时，backbone 的比例可以比 0.1 更小甚至冻结；推论二：如果 backbone 是随机初始化的（罕见但存在），0.1× 就是错的。</em>面试里能说出「0.1 不是常数，是 d₀ 的函数」，比背下这个数字强得多。</p></div>
+  </div>  <h3>第二、第三个理由</h3>  <ol>
+    <li><strong>早期梯度对 backbone 是纯噪声。</strong>训练开始时 decoder 的匹配在剧烈翻转（模块 04 的 φ 接近随机），传回 backbone 的梯度方向本身就是错的。<em>此时 backbone 走得越快，破坏越彻底。</em></li>
+    <li><strong>检测数据集比预训练数据小两个数量级。</strong>COCO 118k 对 ImageNet 1.28M；TSR 自建数据集可能只有十几万张且高度相关（同一段路的连续帧）。<em>大步长 + 小数据 = 灾难性遗忘，症状是训练集 AP 正常、跨域/跨城市泛化崩掉。</em></li>
+  </ol>  <div class="callout warn"><span class="label"></span>
+    <strong>weight decay 的分组是另一个容易漏的点</strong>：AdamW 的权重衰减不应该作用于 <code>bias</code>、<code>LayerNorm/BatchNorm</code> 的仿射参数、以及 <strong>object query 的可学嵌入与 reference point 参数</strong>。<em>对 query embedding 施加 weight decay 等于持续把它往原点拉，而它编码的是空间先验——会直接削弱 query 的空间特化（模块 03 讲的现象）。</em>这类 bug 不会报错，只会让 AP 低 0.5~1 点，而且极难归因。notebook 里会实现一个正确的 param group 构造器。
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把学习率分组的心法提炼一句：<strong>「离最优解越近、被噪声破坏的风险越大的参数块，步长越小」</strong>。<em>这条规则在任何「预训练 + 新头」的迁移场景都成立</em>——VLM 的视觉塔、LLM 的 LoRA 基座、语音模型的前端，全部是同一个道理。面试时把它讲成一条通用原则而不是 DETR 的特例，效果完全不同。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="small"><span class="num">2</span>DETR 对小目标弱：三个根因与它们各自的解法</h2>
+  <p>原版 DETR 的 AP_S 只有 20.5，而同期的 Faster R-CNN 是 22.9、Deformable DETR 是 26.4。<strong>这不是一个原因造成的，是三个——而且它们的解法完全不同。面试里能拆成三条，是这一节的全部价值。</strong></p>  <table>
+    <thead><tr><th>根因</th><th>机制</th><th>怎么验证是它</th><th>解法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 单尺度特征</strong></td><td>只用 C5（stride 32），16×16 的目标占 0.25 个格子，信息在下采样时已被抹掉</td><td>把 GT 按像素尺寸分桶看 AP，&lt;32px 桶塌陷</td><td><strong>多尺度</strong>（P3–P6，TSR 还要评估 P2）</td></tr>
+      <tr><td><strong>② query 数量固定且偏少</strong></td><td>N=100 对密集小目标不够；且 N 固定时，小目标多的图会被挤掉</td><td>统计单图 GT 数分布与前景 query 占比</td><td><strong>加大 N</strong>（Deformable 300 / DINO 900）</td></tr>
+      <tr><td><strong>③ 匹配代价对小框近似平局</strong></td><td>小 GT 与绝大多数 query 的 IoU=0，GIoU 在不相交区几乎不变化 → 代价由噪声的分类项决定 → 匹配随机翻转</td><td><strong>按 GT 尺寸分别统计匹配翻转率 φ</strong></td><td>两阶段/查询选择给参考点；DN 绕开匹配</td></tr>
+    </tbody>
+  </table>  <h3>根因 ③ 值得展开，因为它最反直觉</h3>  <p>很多人以为「小目标的匹配代价变化更剧烈（IoU 掉得快），所以匹配应该更稳」。<strong>恰恰相反。</strong></p>  <div class="math-block">\[\mathcal{C}(\hat{y}_i, y_j) = -\lambda_{\text{cls}}\,\hat{p}_i(c_j) \;+\; \lambda_{L1}\,\|\hat{b}_i - b_j\|_1 \;+\; \lambda_{\text{giou}}\,\big(1 - \text{GIoU}(\hat{b}_i, b_j)\big)\]</div>  <ul>
+    <li><strong>IoU 对绝对位移的敏感性与框尺寸成反比。</strong>同样沿对角线平移 2 像素：<strong>8×8 的框 IoU 从 1.0 掉到 0.39，64×64 的框还有 0.88，160×160 的框还有 0.95</strong>。而模型的预测误差与人工标注的抖动都是<em>绝对像素</em>量级的（标注 ±2 px 是常态）。</li>
+    <li>于是对一个 8~16 px 的 GT，<strong>「谁该认领它」这个决策运行在标签噪声之下</strong>——GT 框本身就有 ±12%~25% 的相对不确定性，代价矩阵的最小值位置随之抖动。</li>
+    <li>notebook 里把候选框按<em>相对尺度</em>生成（即各尺寸的几何构型完全相同），唯一变化的只有「2 px 占框尺寸的比例」，测得的匹配翻转率是：<strong>8 px → 95%，16 px → 86%，32 px → 57%，64 px → 17%，160 px → 0%</strong>。<em>一条干净的单调曲线，说明这不是玄学而是几何。</em></li>
+    <li>此外 GIoU 在<strong>不相交区间</strong>只由外接框面积决定，<em>提供的排序信息远弱于相交区间</em>——而小 GT 与绝大多数 query 恰好都不相交。两个效应叠加。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以「<strong>小目标的匹配不稳定</strong>」和「<strong>小目标的注意力质量低</strong>」是两个独立的伤害，且互相强化：注意力质量低 → 分类分数没有信息 → 匹配靠噪声决定 → 梯度指向错误目标 → 注意力更学不到东西。<em>这就是为什么单靠「加多尺度」还不够，DINO 必须同时上 DN。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>有一个可操作的诊断：<strong>把匹配翻转率 φ 按 GT 的像素尺寸分桶统计</strong>。健康的训练里 φ 随 epoch 单调下降；如果小尺寸桶的 φ 长期居高不下（比如 30 epoch 后仍 &gt; 0.3），说明代价矩阵在小目标上没有区分度。<em>对策不是调学习率，而是①检查有没有接上低层特征 ②调整代价权重（在小目标数据集上适当提高 λ_L1、降低 λ_giou，因为归一化 L1 至少还随位置单调变化）③上 DN。</em>notebook 里会把这个分桶 φ 实现出来。</p></div>
+  </div>  <div class="callout danger"><span class="label">小目标塌陷在总 mAP 上几乎看不见</span>
+    <p><strong>TSR 场景的直接后果</strong>：交通标志的有效检出距离决定了系统能提前多久告知下游。要在 60 米外报出限速牌，目标就是 16 像素级别——<em>恰好落在上述三个根因全部生效的区间</em>。</p><p>更危险的是它在指标上「看不见」：如果测试集里小标志只占 15%，把它们的 AP 从 0.45 打到 0.20 也只让总 mAP 掉 3.7 点——<strong>而路测体验是「远处的牌子要开到很近才报」，这是一个能被用户直接感知的严重缺陷</strong>。<em>所以 TSR 的评测必须按像素尺寸分桶（C55 模块 05 / C57 模块 05 会给完整方法）。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="diag"><span class="num">3</span>训练失败模式诊断树：四种症状，各自的成因与检查步骤</h2>
+  <p>DETR 系的失败模式和密集检测器很不一样，<strong>因为它多了「匹配」这一层，很多症状的根因藏在匹配里而不是在模型里</strong>。下面四种覆盖了绝大多数情况。</p>  <div class="ascii">症状：训练不收敛 / 结果异常
+   │
+   ├─ ① loss 完全不降（几个 epoch 后仍在初始值附近）
+   │     检查顺序：
+   │      1. **类别 id 是否 0-based**？很多标注是 1-based，导致所有目标被判成别的类
+   │      2. 框格式是不是 **归一化的 cxcywh**？给成 xyxy 或像素坐标 -&gt; 代价矩阵全错
+   │      3. 匹配代价的三个权重是否被误设为 0（尤其 cls 项用的是**概率**不是 log 概率）
+   │      4. backbone 是否被整体冻结（含最后一个 stage）
+   │      5. **先把一个 batch 过拟合**：单张图训 500 步，loss 必须接近 0
+   │
+   ├─ ② 全部预测背景（前景 query 占比 -&gt; 0，AP=0 但 loss 在降）
+   │     成因：**no-object 的类别权重没降**（eos_coef）。N=100 个 query 里
+   │           93 个是背景，不降权时背景项主导梯度 -&gt; 最优策略就是全判背景
+   │     检查：打印前景 query 占比；看 cls loss 中前景/背景的贡献比
+   │     修复：eos_coef=0.1（DETR）；或换 focal loss（Deformable/DINO 的做法）
+   │
+   ├─ ③ 框全都聚在图像中心（中心分布熵极低）
+   │     成因：query 还没完成空间特化 —— 这是**早期的正常现象**，
+   │           但如果 30 epoch 后仍如此，说明 cross-attention 没学起来
+   │     检查：中心分布熵随 epoch 的曲线；cross-attention 的注意力质量 alpha
+   │     修复：接多尺度；上两阶段/查询选择给参考点；检查位置编码是否真的生效
+   │
+   └─ ④ 重复框大量出现（同一目标 2~3 个高分框）
+         成因 a：**decoder 的 self-attention 被误关**（或 mask 写错）-&gt; query 无法协商去重
+         成因 b：一对多分支与一对一分支**共用了同一次 self-attention**（模块 04）
+         成因 c：训练不足，模型还没学会一对一
+         检查：统计重复框率；关掉 self-attn 对比；看 DN 的 attention mask 是否非对称
+         修复：按成因治；**在收敛前不要用「加 NMS」来掩盖它**</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第 ② 种最值得记住，因为它的表现极具迷惑性：<strong>loss 在稳稳下降，曲线好看得不得了，AP 却是 0</strong>。原因是模型找到了一个「局部最优」——既然 93% 的 query 目标都是背景，那全判背景就能把分类损失压得很低。<em>这不是 bug，是损失函数设计不当时的理性行为。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以 <span class="term">eos_coef</span>（no-object 的分类损失权重）是 DETR 里少数几个「必须按 N 与目标密度调」的超参：<strong>N 越大、单图目标越少，背景占比越高，就越需要降权</strong>。<em>DETR 用 N=100、eos_coef=0.1；Deformable/DINO 换成 focal loss 后不再需要它，因为 focal 的 (1−p)^γ 会自动压制已经学会的简单背景样本</em>——<strong>这是模块 02 讲的「集合损失与 focal loss 的关系」在工程上的落点。</strong>面试里能把 eos_coef 和 focal loss 联系起来，说明你理解的是机制而不是配置项。</p></div>
+  </div>  <h3>最有用的一条：先把一个 batch 过拟合</h3>  <p><strong>这是排查一切训练问题的万能第一步</strong>：拿单张图（或 2 张）反复训 300–1000 步，关掉所有增强，看损失能不能压到接近 0、预测框能不能贴合 GT。</p>  <ul>
+    <li><strong>压不下去</strong> → 问题在数据管线或损失定义（类别 id、坐标格式、匹配代价、归一化），<em>与超参无关</em>；</li>
+    <li><strong>能压下去但正常训练不行</strong> → 问题在数据规模/增强/学习率/正则，<em>模型和损失本身是对的</em>；</li>
+    <li><strong>压下去了但预测框位置系统性偏移</strong> → 坐标变换的逆变换写错（letterbox / resize 的还原，C60 模块 04 的经典坑）。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>这个方法的价值在于<strong>它把「无穷多个可能原因」一刀切成两半</strong>。<em>不做这一步就去调学习率，是新手和熟手最明显的分界线。</em>面试里被问「训练不收敛你怎么查」，第一句话就说这个，后面再展开诊断树。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="metrics"><span class="num">4</span>训练期该盯的四个诊断指标（而不是只盯 loss）</h2>
+  <p>DETR 系的 loss 曲线信息量很低——<strong>它是分类损失、L1、GIoU 在匹配之后的加权和，任何一项出问题都会被其他项掩盖</strong>。下面四个指标各自对应一个具体故障，而且都便宜到可以每个 epoch 算一次。</p>  <table>
+    <thead><tr><th>指标</th><th>怎么算</th><th>健康值</th><th>异常说明什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 匹配翻转率 φ</strong></td><td>相邻两次评估同一批图，统计「GT 换了认领 query」的比例</td><td>随 epoch 单调下降，后期 &lt; 0.1</td><td><strong>居高不下 = 代价矩阵没区分度</strong>（按尺寸分桶看）</td></tr>
+      <tr><td><strong>② 前景 query 占比</strong></td><td>score &gt; 阈值且 argmax ≠ no-object 的 query 数 / N</td><td>接近 (单图平均 GT 数)/N</td><td><strong>→0 = 塌陷到全背景</strong>（查 eos_coef）；过高 = 重复框</td></tr>
+      <tr><td><strong>③ 框中心分布熵</strong></td><td>预测中心打进 G×G 网格，算归一化熵</td><td>接近 GT 中心分布的熵</td><td><strong>极低 = 框全聚在中心</strong>，query 没完成空间特化</td></tr>
+      <tr><td><strong>④ 逐层 AP 单调性</strong></td><td>每层 decoder 的辅助输出各算一次 AP</td><td><strong>随层数单调上升</strong></td><td>非单调 = 迭代细化或 look-forward 配置有问题</td></tr>
+    </tbody>
+  </table>  <p>第 ④ 个尤其被低估。<strong>DETR 系每层 decoder 都有辅助头，等于免费提供了 6 个「中途快照」</strong>——正常训练下 AP 应该逐层上升且增量递减。<em>如果第 3 层比第 5 层还高，说明后面的层在「破坏」而不是「细化」，通常是参考框的传递（detach / 坐标空间 / sigmoid-logit 转换）写错了。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这四个指标的共同点：<strong>它们都在回答「机制有没有按预期工作」，而不是「效果好不好」</strong>。loss 和 AP 告诉你结果，这四个告诉你原因。<em>建议把它们做成训练期的固定日志项，成本是每 epoch 在一个固定的小验证子集（200~500 张）上多跑一次前向。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>有一个实现细节要注意：<strong>φ 必须在「同一批图、同一个匹配代价函数」下测量</strong>，否则数据增强的随机性会污染结果。<em>正确做法是固定一小批图、关掉增强、只用模型当前权重重新算一次匹配。</em>另外 <strong>③ 的熵要与 GT 中心分布的熵比较，而不是与均匀分布比</strong>——真实数据里目标本来就不是均匀分布的（TSR 的标志集中在图像上半部分与两侧），拿均匀分布当基准会给出误导性的「熵太低」结论。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>别把这四个指标当成 KPI 去优化。<strong>它们是诊断工具，不是目标函数</strong>——比如「前景 query 占比」可以通过降低阈值人为拉高，但那毫无意义。<em>它们的正确用法是：出问题时看哪个偏离了健康区间，从而把搜索范围从「所有超参」缩小到「一个具体机制」。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="infer"><span class="num">5</span>推理端：top-k、阈值，以及要不要留一个 NMS 兜底</h2>
+  <p>DETR 的推理看起来简单（没有 NMS），但有三个决定会显著影响最终指标，而且<strong>论文里往往一笔带过</strong>。</p>  <h3>① argmax 还是 top-k：一个白拿的召回</h3>  <table>
+    <thead><tr><th>做法</th><th>怎么出框</th><th>输出框数</th><th>适用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>argmax（原版 DETR）</strong></td><td>每个 query 取概率最大的非背景类</td><td>≤ N</td><td>softmax + no-object 类的设定</td></tr>
+      <tr><td><strong>flatten top-k</strong>（Deformable/DINO/RT-DETR）</td><td>把 <code>N × C</code> 个 (query, 类别) 分数拉平取 top-k</td><td>k（100 或 300）</td><td><strong>sigmoid/focal 的设定</strong></td></tr>
+    </tbody>
+  </table>  <p>差别在于：<strong>flatten top-k 允许同一个 query 输出多个类别的框</strong>。当一个 query 的 top-1 类别错了但 top-2 对了（TSR 里限速 60/80 互相错分是家常便饭），argmax 直接丢掉这个目标，top-k 还能把它救回来。<em>代价是输出里会有更多低分框——但那正是 AP 计算所需要的（低分框只影响 PR 曲线尾部）。</em></p>  <div class="callout intuition"><span class="label"></span>
+    <p>这条在面试里是个漂亮的细节：<strong>「DETR 换成 sigmoid + flatten top-k 之后，AP 会涨，但这不是模型变强了，是解码方式不再丢信息」</strong>。<em>它同时解释了为什么后续工作全部从 softmax+no-object 转向了 focal+sigmoid</em>——no-object 类在 softmax 里会和所有前景类竞争同一份概率质量，而 sigmoid 下每个类独立判定，天然适合 top-k 解码。</p>
+  </div>  <h3>② score 阈值：离线评测与在线部署要用两套</h3>  <p><strong>离线算 mAP 时不该设阈值</strong>（或设得极低，如 0.001）——mAP 是在整条 PR 曲线上积分的，砍掉低分框只会让 AP 变低。<strong>而在线部署必须设阈值</strong>，因为下游只能处理有限数量的候选，而且误检有代价。</p>  <ul>
+    <li><strong>阈值应该按「工作点」选，不是按经验数字选</strong>：给定可接受的 FP/km（C55 模块 05 的指标），在验证集上反查出对应的分数阈值。</li>
+    <li><strong>DETR 系的分数分布与 YOLO 系不同</strong>：一对一训练让高分框数量接近真实目标数，分数分布是双峰的（高分的少数 + 低分的一大堆），<em>所以阈值的敏感区间很窄，0.3 和 0.5 的差别可能很小</em>。</li>
+    <li><strong>置信度标定（calibration）不能省</strong>：模型输出的 0.8 不等于 80% 正确率。TSR 的下游（跟踪、地图匹配、VLA）要用置信度做贝叶斯融合，未标定的分数会让整条链路的决策偏移（C55 模块 02、C59 模块 03）。</li>
+  </ul>  <h3>③ 要不要仍然加一个 NMS 兜底</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>正确答案是：可以加，但必须知道你加的是什么。</strong>一个训练充分的 DETR，输出里的重复框率极低（notebook 里会量化），此时加 NMS <em>几乎删不掉任何东西</em>——它是一道保险，不是一个后处理步骤。<strong>而它的代价是把「延迟确定性」这个选 DETR 的核心理由部分退还回去</strong>（NMS 的耗时随目标数波动）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以决策取决于你选 DETR 的动机：<strong>①</strong> 如果动机是「无 NMS 的延迟确定性」（车端最常见），那就<em>不要加</em>，而是把重复框率做成上线门禁指标；<strong>②</strong> 如果动机是「精度」（离线自动标注、教师模型），那加一个 class-wise NMS（IoU=0.8 这种很宽松的阈值）作为保险<em>没有坏处</em>；<strong>③</strong> <strong>绝对不要用 NMS 来掩盖训练不充分</strong>——如果 NMS 能删掉大量框，说明模型还没学会一对一，此时你既付了 DETR 的训练成本，又没拿到 DETR 的部署好处。</p></div>
+  </div>  <div class="callout danger"><span class="label">新增后处理 = 新增一条训练-部署鸿沟</span>
+    <p>一个真实的部署陷阱：<strong>训练时不用 NMS、部署时加了 NMS，而两边的框格式/坐标系/类别处理方式不一致</strong>。<em>典型症状是「离线 mAP 正常，上车后框整体偏移或成片消失」</em>。C60 模块 04 会讲完整的对拍方法，这里只记一条：<strong>任何在推理端新增的后处理，都必须有一份 Python↔C++ 的逐阶段 diff 报告，否则不许上线。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="deploy"><span class="num">6</span>部署侧的真实差异：算子、动态形状与延迟稳定性</h2>
+  <p>选型讨论里最容易被忽略的一半是<strong>部署</strong>。DETR 系和 YOLO 系在这一侧的差别，比在 AP 上的差别大得多。</p>  <table>
+    <thead><tr><th>部署维度</th><th>YOLO / RTMDet 系</th><th>DETR 系（Deformable/DINO/RT-DETR）</th></tr></thead>
+    <tbody>
+      <tr><td>核心算子</td><td>Conv / BN / SiLU —— <strong>所有推理框架的一等公民</strong></td><td>MHA、<strong>grid_sample（可变形采样）</strong>、top-k、cumsum</td></tr>
+      <tr><td>TensorRT 支持</td><td>全部原生融合</td><td><strong>可变形注意力常需自定义 plugin</strong>；不写就静默回退到低效实现</td></tr>
+      <tr><td>车端 SoC（NPU）支持</td><td>成熟，量化工具链完备</td><td><strong>attention 与 grid_sample 的 NPU 支持参差不齐</strong>，可能整块落到 DSP/CPU</td></tr>
+      <tr><td>INT8 量化</td><td>工程实践极多，掉点可控</td><td><strong>attention 的 softmax 与 LayerNorm 对量化敏感</strong>，常需混合精度</td></tr>
+      <tr><td>动态形状</td><td>只有输入分辨率一个维度</td><td>多尺度展平后的序列长度随分辨率变，<strong>optimization profile 更复杂</strong></td></tr>
+      <tr><td><strong>后处理</strong></td><td><strong>NMS：耗时随目标数与阈值波动</strong></td><td><strong>无 NMS：耗时恒定</strong> ← 这是选 DETR 的核心理由</td></tr>
+      <tr><td>端到端延迟方差</td><td>p99 明显高于 p50（拥堵场景目标多）</td><td><strong>p99 ≈ p50</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>把这张表读成一句话：DETR 系用「更难的算子」换来了「更确定的延迟」。</strong><em>这个交换在数据中心 GPU 上几乎白赚（算子都支持，延迟确定性是纯收益），在车端 SoC 上则要具体测——如果可变形采样在你的芯片上跑得极慢，那省下来的 NMS 时间可能远远不够补。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个常被忽略的 DETR 系部署优势：<strong>decoder 层数可以在推理时裁剪，而无需重训</strong>。因为每层都有辅助头，第 3 层的输出本身就是一个可用的检测结果。<em>这意味着同一份权重可以支持多档速度-精度（RT-DETR 明确把它作为卖点）</em>——在多硬件平台的量产项目里，这个性质的工程价值极高：<strong>低算力车型跑 3 层，高配车型跑 6 层，模型管理只有一份。</strong>YOLO 系要做到这一点必须训多个模型。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>「无 NMS」这个卖点要算清楚才能用。</strong>NMS 在目标少时只要零点几毫秒，在密集场景（几百个候选）才会涨到几毫秒。<em>如果你的场景目标数稳定且不多（TSR 单帧标志数通常 &lt; 10），NMS 的绝对耗时和波动都很小，「无 NMS」带来的实际收益可能不到 1 ms</em>——<strong>此时它不足以成为选型的决定性理由</strong>。C53 模块 05 会给出实测方法。面试里能主动说出「这个收益要看目标数分布」，比背诵卖点有说服力得多。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="compare"><span class="num">7</span>DETR 系 vs YOLO 系：完整工程取舍表</h2>
+  <p>这是本模块最该背下来的一张表。<strong>注意每一行都要能说出「为什么」，只念结论会被追问穿。</strong></p>  <table>
+    <thead><tr><th>维度</th><th>YOLO / RTMDet 系</th><th>DETR 系（DINO / RT-DETR）</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>数据量需求</strong></td><td><strong>低</strong>：几千张就能出可用模型</td><td><strong>高</strong>：一对一监督稀疏，小数据下方差大</td><td>监督密度差一到两个数量级（模块 04）</td></tr>
+      <tr><td><strong>收敛成本</strong></td><td>300 ep 但单步极快</td><td><strong>12–36 ep</strong>（DINO 后）</td><td>DN + 一对多把 ρ 抬上来了</td></tr>
+      <tr><td><strong>调参难度</strong></td><td>标签分配的超参多但社区配方成熟</td><td><strong>匹配代价权重、eos_coef、DN 超参</strong>，配方少</td><td>DETR 的失败模式更隐蔽（全背景/中心塌陷）</td></tr>
+      <tr><td><strong>密集小目标</strong></td><td><strong>强</strong>：密集分配 + 多尺度 + 切片推理生态成熟</td><td>中：多尺度后可用，极小目标仍弱</td><td>K 点采样对 2×2 格子的目标已饱和</td></tr>
+      <tr><td><strong>密集同类目标</strong></td><td>强（NMS 按 IoU 去重，行为可预测）</td><td><strong>弱</strong>：self-attention 可能把真目标当重复抑制</td><td>一对一去重是学出来的，没有硬保证</td></tr>
+      <tr><td><strong>部署复杂度</strong></td><td><strong>低</strong>：算子全支持，量化成熟</td><td><strong>中–高</strong>：可变形采样/attention 需 plugin</td><td>见上一节</td></tr>
+      <tr><td><strong>延迟稳定性 (p99)</strong></td><td>中：NMS 随目标数波动</td><td><strong>高：无 NMS，恒定</strong></td><td>这是选 DETR 的核心理由</td></tr>
+      <tr><td><strong>一份权重多档速度</strong></td><td>❌ 要训多个模型</td><td><strong>✅ 裁 decoder 层数即可</strong></td><td>每层都有辅助头</td></tr>
+      <tr><td><strong>精度上限</strong></td><td>高</td><td><strong>更高</strong>（大骨干下差距明显）</td><td>全局建模 + 密集监督的组合</td></tr>
+      <tr><td><strong>迭代速度（数据闭环）</strong></td><td>高</td><td><strong>DINO 后可比</strong></td><td>12 epoch 才是入场券（模块 04）</td></tr>
+    </tbody>
+  </table>  <h3>三条容易记混的更正</h3>  <ul>
+    <li><strong>「DETR 收敛慢」已经过时。</strong>那是 2020 年的 DETR。DINO 是 12 epoch，比 YOLO 的 300 epoch 在墙钟时间上未必更慢。<em>面试里说「DETR 系收敛慢所以不选」会被直接判为知识停留在三年前。</em></li>
+    <li><strong>「DETR 不需要 NMS 所以更快」是错的。</strong>无 NMS 带来的是<em>延迟确定性</em>而不是绝对速度；DETR 的 decoder 本身有成本。RT-DETR 之所以能比 YOLO 快，靠的是 hybrid encoder 的设计（C53 模块 04），不是「省了 NMS」。</li>
+    <li><strong>「DETR 对小目标弱」要加时间戳。</strong>原版 DETR 弱是真的；Deformable 之后主要弱在<em>极小目标（&lt;16px）</em>，中等小目标已经不弱。<em>说这句话时要能给出尺寸区间，否则显得没实测过。</em></li>
+  </ul>  <div class="ascii">选型决策流（**硬约束在前，指标在后**）
+                        开始
+                          │
+          ┌───────────────▼───────────────┐
+          │ Q0: 目标 SoC 支持可变形采样 /   │  ── 否 ──► **DETR 系直接出局**
+          │     attention 吗？（1 天验证）  │           走 YOLO / RTMDet
+          └───────────────┬───────────────┘
+                       是 │
+          ┌───────────────▼───────────────┐
+          │ Q1: p99 延迟是硬安全指标吗？    │  ── 是 ──► **RT-DETR**（无 NMS，
+          └───────────────┬───────────────┘            延迟恒定；且一份权重多档）
+                       否 │
+          ┌───────────────▼───────────────┐
+          │ Q2: 数据量 &lt; 10 万张有效样本？  │  ── 是 ──► **YOLO / RTMDet**
+          │     或稀有类实例数 &lt; 500？      │           （监督密度高，数据效率好）
+          └───────────────┬───────────────┘
+                       否 │
+          ┌───────────────▼───────────────┐
+          │ Q3: 主力目标 &lt; 16 px？          │  ── 是 ──► **YOLO/RTMDet + 切片推理**
+          └───────────────┬───────────────┘           （C57 模块 04）
+                       否 │
+                          ▼
+                  两条路线都可行 -&gt; 用 AP / 延迟做 A/B
+
+  ※ **离线环节（自动标注 / 难例召回 / 蒸馏教师）不走这棵树**：
+    没有延迟与算子约束，直接选精度上限最高的 DINO / Co-DETR。</div>  <div class="callout intuition"><span class="label"></span>
+    <p>把选型逻辑压缩成一条决策规则：<strong>「先看约束，再看指标」</strong>。<em>约束包括：车端芯片支持什么算子、数据量有多少、迭代节奏多快、延迟预算的 p99 要求是多少、团队有没有 DETR 系的调试经验。</em>这些约束往往能直接排除一半选项，剩下的才轮到比 AP。<strong>面试里被问「你会选哪个」，先反问约束是加分项，直接报模型名是减分项。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tsr"><span class="num">8</span>给 TSR 选哪个：一次完整的论证</h2>
+  <p>现在把上面所有东西串成一个真实的选型决定。<strong>场景设定：量产乘用车的交通标志识别，车端 SoC，与其他感知任务共享算力，数据闭环每周迭代。</strong></p>  <h3>第一步：把约束列全，并给出量级</h3>  <table>
+    <thead><tr><th>约束</th><th>TSR 的具体值</th><th>对选型的含义</th></tr></thead>
+    <tbody>
+      <tr><td>延迟预算</td><td>整个感知 33 ms（30 FPS），TSR 分到 <strong>3–6 ms</strong></td><td>排除大骨干；p99 必须可控</td></tr>
+      <tr><td>目标像素尺寸</td><td>主力 12–48 px，长尾到 8 px</td><td><strong>多尺度必需；极小目标是 DETR 系的弱区</strong></td></tr>
+      <tr><td>单帧目标数</td><td>通常 &lt; 10，龙门架场景 10–20</td><td><strong>NMS 的绝对耗时很小 → 无 NMS 的收益有限</strong></td></tr>
+      <tr><td>类别数</td><td>含变体 40–200+，长尾极重</td><td>两级架构有吸引力（C55 模块 02）</td></tr>
+      <tr><td>数据量</td><td>十几万到百万张，但高度相关（连续帧）</td><td>有效样本数远小于名义数量 → <strong>偏向数据效率高的方案</strong></td></tr>
+      <tr><td>迭代节奏</td><td>每周更新数据并重训</td><td>训练时长必须在 1 天内</td></tr>
+      <tr><td>部署工具链</td><td>车规 SoC + 厂商 NPU 编译器，INT8 为主</td><td><strong>非标准算子风险高</strong></td></tr>
+    </tbody>
+  </table>  <h3>第二步：逐条比对，给出结论</h3>  <ol>
+    <li><strong>延迟稳定性的收益在 TSR 上被削弱</strong>：单帧目标数 &lt; 10，NMS 耗时零点几毫秒且波动很小。<em>选 DETR 的第一理由在这个场景里不成立。</em></li>
+    <li><strong>部署风险的代价在车端被放大</strong>：可变形采样在 NPU 上没有原生支持时，可能整块回退，延迟直接超预算。<em>这是一个「要么能跑要么不能跑」的硬约束，不是 0.5 AP 的取舍。</em></li>
+    <li><strong>极小目标是 TSR 的核心场景，恰好是 DETR 系的弱区</strong>：而 YOLO/RTMDet 系有成熟的小目标工程生态（P2、切片推理、NWD 等，见 C57）。</li>
+    <li><strong>数据效率有利于密集检测器</strong>：TSR 数据虽多但高度相关，稀有标志类可能只有几百个实例，一对一的稀疏监督在长尾类上更吃亏。</li>
+    <li><strong>但 DETR 系不是没有位置</strong>：<em>DINO/Co-DETR 这类大模型在离线环节的价值极高</em>——作为自动标注的教师模型、作为难例挖掘的高召回筛选器、作为蒸馏的教师（C58）。这些环节没有延迟约束，正好发挥 DETR 系的精度上限优势。</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p><strong>结论（可以原样在面试里说）：</strong></p><p><strong>车端量产模型选 YOLO/RTMDet 系（或 RT-DETR，视 SoC 对 attention 与 grid_sample 的支持而定），离线环节用 DINO/Co-DETR 系。</strong></p><p>理由三句话：<strong>①</strong> TSR 单帧目标少，无 NMS 的延迟收益不足以抵消车端算子支持的风险；<strong>②</strong> 极小目标与长尾稀有类是 TSR 的核心场景，密集检测器在数据效率和小目标工程生态上更有优势；<strong>③</strong> 但 DETR 系的精度上限在<em>没有延迟约束的离线环节</em>（自动标注、难例召回、蒸馏教师）价值极高，所以正确答案不是二选一，而是<strong>分工</strong>。</p>
+  </div>  <h3>第三步：把结论变成可验证的方案</h3>  <p><strong>只给结论不给验证方案，是面试里最常见的失分点。</strong>下面这套动作要能说出来：</p>  <ul>
+    <li><strong>先做算子可行性验证，再做精度实验</strong>：拿目标 SoC 的编译器把 RT-DETR 的可变形采样跑一遍，看是否回退、延迟多少。<em>这一步一天就能做完，而且能直接砍掉一整条路线。</em></li>
+    <li><strong>评测必须按像素尺寸分桶</strong>：至少分 &lt;16 / 16–32 / 32–64 / &gt;64 四桶，外加按距离、光照、天气分桶（C55 模块 05）。<em>总 mAP 在 TSR 上是一个几乎没有信息量的指标。</em></li>
+    <li><strong>用 p99 而不是均值报延迟</strong>，并在「密集场景（龙门架 + 拥堵）」这个最坏切片上单独测。</li>
+    <li><strong>把 DETR 系作为离线教师的收益也要量化</strong>：伪标注的精度、难例召回率、蒸馏后学生模型的增益——<em>否则「离线用 DINO」只是一句好听的话。</em></li>
+  </ul>  <div class="callout danger"><span class="label">先进 ≠ 适合量产</span>
+    <p>最后一个必须避开的坑：<strong>不要因为「DETR 是端到端的、更先进」就选它。</strong><em>「端到端」在论文里是优点，在量产系统里是可测试性的敌人</em>——出了问题无法定位到具体模块。TSR 是一个安全相关功能，<strong>可解释性与可回滚性的权重远高于架构的先进性</strong>。C59 模块 05 会展开讲这一点。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>这一节列的是「今天还没有好答案、但直接影响 TSR 工程决策」的问题。</p>  <ul>
+    <li><strong>DETR 系在小数据集上的行为缺乏系统研究</strong>：几乎所有对比都在 COCO（118k 图）上做。<em>在几千到几万张的自建数据集上，一对一匹配的方差有多大、需要多少 DN 组、query 数该怎么定——没有可靠的经验规律。</em>而这恰恰是绝大多数工业项目的真实规模。</li>
+    <li><strong>NMS-free 的「确定性」缺少形式化保证</strong>：一对一是训练出来的性质，不是结构保证的。<em>在分布外输入（罕见的密集同类场景）上，模型可能重新输出重复框，而系统没有任何兜底</em>。「如何给 NMS-free 一个可验证的上界」是开放问题，对安全相关系统尤其重要。</li>
+    <li><strong>可变形采样的边缘部署效率</strong>：<code>grid_sample</code> 类算子在各家 NPU 上的支持与效率差异巨大，且缺少公开的横向评测。<em>「用固定采样点模式（可离线展开成 gather）近似可变形采样」是一个有前景但研究不足的方向</em>，它能把动态采样变成静态图友好的操作。</li>
+    <li><strong>置信度标定</strong>：DETR 系的分数分布与密集检测器差别很大，而下游（跟踪、地图融合、VLA）都假设分数是概率。<em>一对一训练下的标定方法（温度缩放是否适用、分尺寸标定是否必要）研究很少</em>，但对 TSR 的多帧融合（C55 模块 04）是硬需求。</li>
+    <li><strong>decoder 层数可裁剪的精度-延迟曲线</strong>：RT-DETR 把它当卖点，但「裁到几层开始崩」「不同场景的最优层数是否不同」缺少系统刻画。<em>如果层数能按场景动态决定（简单场景 2 层、复杂场景 6 层），车端的平均算力占用可以大幅下降</em>——但动态深度会破坏静态图导出，这是算法与部署的又一处直接冲突。</li>
+    <li><strong>DETR 系与时序的结合</strong>：TSR 本质是「接近过程」，单帧检测只是输入。MOTR / TransTrack 把 query 跨帧传递的思路很自然，<em>但训练稳定性问题（跨帧的匹配翻转）比单帧更严重</em>，目前尚无量产级方案。这是 C55 模块 04 与本课的交叉地带。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：★ <em>End-to-End Object Detection with Transformers</em>（Carion et al., ECCV 2020）——附录里的训练细节与超参消融，是本模块第 1 节的一手来源；★ <em>DINO</em>（Zhang et al., ICLR 2023）与 detrex / mmdetection 里 DINO 的完整配置文件，逐项对照本模块的配方表；★ <em>RT-DETR: DETRs Beat YOLOs on Real-time Object Detection</em>（Zhao et al., CVPR 2024）——重点看 hybrid encoder 的动机与 decoder 层数可调的实验，以及它对「无 NMS 到底值多少」的量化；<em>Deformable DETR</em>（Zhu et al., ICLR 2021）的实现细节部分（多尺度参考点与 offset 的归一化方式，是复现时最容易写错的地方）；<em>Detection Transformer with Stable Matching</em>（Liu et al., ICCV 2023）对匹配不稳定的最新解释；YOLO 侧对照读 <em>YOLOv10</em>（一致双分配，把 NMS-free 带进 YOLO）与 <em>RTMDet</em>。相邻课程：C53 模块 04/05（RT-DETR 与实时检测器选型）、C55（TSR 系统设计与安全导向评测）、C57（小目标）、C60（车端部署与一致性）、C61 模块 05（面试题库）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_convergence/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 收敛难题与 DETR 家族演进</div></a>
+  </div>
+
+</div>
+</body>
+</html>

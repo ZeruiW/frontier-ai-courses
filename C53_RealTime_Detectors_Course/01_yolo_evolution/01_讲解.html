@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · YOLO 家族演进：每一代到底改了什么</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · YOLO 家族演进：每一代到底改了什么</h1>
+  <p class="subtitle">v1 网格回归的根本缺陷（每格只认一个目标）· v2/v3 用 anchor + 多尺度 + FPN 补上召回 · v4/v5 的工程集大成（CSPNet / PAN / Mosaic / 自适应 anchor）· YOLOX 三件套：解耦头 + anchor-free + SimOTA · v6/v7 的结构重参数化——训练多分支、推理单分支，而且数值完全等价（可 assert）· v8 的 C2f 与 TaskAligned · v10 的一致双分配让「无 NMS」第一次真的成立 · <strong>每代改动的收益归因：哪些是架构红利、哪些是训练技巧红利</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00；C18（anchor / IoU / NMS / FPN / mAP）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_yolo_evolution.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">YOLOv1–v4 原论文、YOLOX、RepVGG、YOLOv6/v7、Ultralytics YOLOv8 文档、YOLOv9、YOLOv10</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 75 分钟 + 跑 70 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#v1">YOLOv1：把检测变成一次回归，以及它的结构性上限</a></li>
+      <li><a href="#anchor">v2/v3：anchor 先验、维度聚类与多尺度</a></li>
+      <li><a href="#engineering">v4/v5：工程集大成，以及「训练期红利」这个概念的成型</a></li>
+      <li><a href="#yolox">YOLOX 三件套：解耦头 / anchor-free / SimOTA</a></li>
+      <li><a href="#reparam">v6/v7：结构重参数化——训练时多分支，推理时单分支</a></li>
+      <li><a href="#v8v9">v8/v9：C2f、TaskAligned 分配与可编程梯度信息</a></li>
+      <li><a href="#v10">v10：一致双分配，NMS 真的被去掉了</a></li>
+      <li><a href="#attribution">收益归因：架构红利还是训练技巧红利</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="v1"><span class="num">1</span>YOLOv1：把检测变成一次回归，以及它的结构性上限</h2>
+  <p>YOLOv1 的贡献是一句到今天仍然成立的话：<strong>检测可以是一次前向，不需要 proposal 阶段</strong>。它把图像切成 <code>S×S</code>（原文 7×7）个格子，每个格子直接回归 <code>B</code>（原文 2）个框加一个置信度，再加一份类别概率向量。</p>  <div class="ascii">YOLOv1 的输出张量：7 x 7 x 30
+
+  每个格子 30 维 = B x 5 + C = 2 x 5 + 20
+     |             |          |
+     |             |          +-- 20 个类别的**条件概率** P(class | object)
+     |             +------------- 每个框 5 维: x, y, w, h, confidence
+     +--------------------------- 7x7 = 49 个格子，每格 448/7 = 64 px
+
+  关键限制（全部是结构性的，不是训练不够）：
+    (1) 一个格子最多输出 B=2 个框     -&gt; 一格里 3 个目标必丢 1 个
+    (2) 一个格子只有**一份**类别向量  -&gt; 一格里两个不同类别的目标，只能保住一个
+    (3) 类别与框是分开的两件事        -&gt; 两个框被迫共享同一个类别判断
+    (4) 全连接层把空间尺寸写死        -&gt; 换输入分辨率就要重训
+
+  对 TSR 意味着什么：一个施工区门架上 5 块牌子挤在 100 px 内 ——
+  它们全部落进 2 个格子，v1 结构上最多输出 4 个框、且只能给出 2 个类别。</div>  <p>notebook 第 1 节会把这笔账算出来：一个合成的 TSR 场景里 9 个标志，YOLOv1 的结构<strong>最多只能表达 6 个</strong>——1 个死于「每格 B=2」，2 个死于「每格一份类别向量」。同一批目标交给一个 stride 8 的现代 dense head，<strong>9 个全部可表达</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这三条限制的共同根源是<strong>「格子」既是空间单元又是语义单元</strong>。v1 让一个格子同时承担「这里有几个东西」和「这里是什么」两个职责，于是密集场景下两个职责互相挤压。<em>后面所有的演进，本质上都是在把这两个职责解耦</em>——anchor 把「有几个」变成「每个 anchor 一个」，解耦头把「是什么」和「在哪里」拆成两条支路，anchor-free 又把 anchor 换成更细的格点。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一条不那么显眼但影响巨大的限制：<strong>v1 的框是从格子直接回归绝对坐标的</strong>，模型要从零学出「宽度大概是多少像素」。这个回归目标的<em>尺度跨度极大且分布高度非高斯</em>（小目标密集、大目标稀疏），训练极不稳定——原论文用 <code>√w, √h</code> 作为回归目标就是在硬压这个问题。<strong>v2 引入 anchor 的第一动机其实是「把回归变成对一个先验框的相对偏移」，让回归目标分布集中在 1 附近</strong>，而不是教科书上常说的「支持多尺度」。这是面试里能显出你读过原文的一个细节。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>别把 v1 的失败归因于「网络不够深」。<strong>上面四条限制在参数量增加时一条都不会消失</strong>——它们是输出张量的形状决定的。<em>这是一个可迁移的判断方法：看到一个模型在某类样本上系统性失败，先问「这是容量问题还是表达能力问题」</em>。容量问题加参数能解决，表达能力问题必须改输出结构。密集小目标场景下 v1 的失败属于后者。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="anchor"><span class="num">2</span>v2/v3：anchor 先验、维度聚类与多尺度</h2>
+  <p>YOLOv2（YOLO9000）与 YOLOv3 用三个改动把 v1 的结构性上限拆掉。它们至今仍是理解检测器的基本语言。</p>  <table>
+    <thead><tr><th>改动</th><th>解决 v1 的哪条限制</th><th>机制</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>anchor（先验框）</strong></td><td>每格 B=2 且类别共享</td><td>每个格点配 k 个先验框，<strong>每个 anchor 独立预测类别与偏移</strong></td><td>引入超参：anchor 的数量与尺寸；<em>它们必须和数据分布匹配</em></td></tr>
+      <tr><td><strong>维度聚类<br>dimension cluster</strong></td><td>anchor 尺寸靠手工设</td><td>在训练集的 <code>(w,h)</code> 上跑 k-means，<strong>距离用 1−IoU 而不是欧氏距离</strong></td><td>需要提前统计数据；换数据集要重聚类</td></tr>
+      <tr><td><strong>多尺度 + FPN</strong></td><td>单一 stride 覆盖不了尺度跨度</td><td>在 stride 8/16/32 三层各出一套预测，高层语义经上采样与低层融合</td><td>显存与计算量上升；<em>层级分配规则成了新的调参点</em></td></tr>
+      <tr><td><strong>相对偏移 + logistic</strong></td><td>回归目标尺度跨度大</td><td><code>b<sub>x</sub>=σ(t<sub>x</sub>)+c<sub>x</sub></code>，中心被约束在本格内</td><td>无（纯收益）</td></tr>
+      <tr><td><strong>多标签分类</strong></td><td>softmax 假设类别互斥</td><td>每类独立 sigmoid</td><td>无（对含层次标签的 TSR 尤其重要）</td></tr>
+    </tbody>
+  </table>  <p><strong>为什么 k-means 的距离必须用 1−IoU？</strong> 因为欧氏距离会被大框主导：一个 300×300 的框和一个 320×320 的框，欧氏距离是 28；而一个 8×8 和一个 10×10 的框欧氏距离只有 2.8——<em>但后者的 IoU 只有 0.64，前者高达 0.88</em>。用欧氏距离聚类，聚类中心会全部被大框拽走，小目标分不到 anchor。</p>  <div class="math-block">\[d(b, a) = 1 - \mathrm{IoU}(b, a), \qquad \mathrm{IoU}(b,a) = \frac{\min(w_b,w_a)\cdot\min(h_b,h_a)}{w_b h_b + w_a h_a - \min(w_b,w_a)\cdot\min(h_b,h_a)}\]</div>  <p>notebook 第 2 节会在一个<strong>按针孔模型合成的交通标志尺寸分布</strong>上把这件事跑出来（<code>px = f·S/Z</code>，标志物理尺寸 0.6/0.8/1.2 m、距离 10–120 m）。三个结果值得记住：</p>  <ul>
+    <li><strong>IoU 距离显著优于欧氏距离</strong>：k=9 时平均最佳 IoU 0.847 vs 0.809，k=3 时 0.648 vs 0.588。</li>
+    <li><strong>COCO 的默认 anchor 用在 TSR 上是灾难</strong>：平均最佳 IoU 只有 0.589（重新聚类可达 0.847），且 <strong>60.4% 的标志的最佳 anchor 是最小的那一个 <code>[10,13]</code></strong>。<em>「大量样本挤在最小 anchor 上」是一个明确的工程信号：你的 anchor 尺寸下界不够，要么加更小的 anchor，要么加更细的 stride（P2）</em>。</li>
+    <li><strong>TSR 的 anchor 长宽比几乎全是 1</strong>（聚类出来是 6.2×6.0、8.2×8.2、11.1×11.1…）。这意味着 9 个 anchor 全部花在<em>尺度</em>上而不是<em>长宽比</em>上——<strong>而这正是 anchor-free 在 TSR 上代价极小的原因：anchor 本来就没在表达长宽比先验</strong>。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>多尺度这一步的收益同样要落到数字上。notebook 会统计这份 TSR 分布在三层 FPN 上的负载：<strong>84.9% 的标志落在 P3（stride 8），11.8% 在 P4，只有 3.4% 在 P5</strong>。<em>也就是说 P5 那一层的算力几乎白花了</em>——这直接解释了为什么 TSR 系统常常砍掉 P5、加上 P2。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更刺眼的一个数字：<strong>22.2% 的标志边长小于 8 px，在 stride 8 的特征图上连一个格子都占不满</strong>。对这批样本，无论标签分配怎么改、损失怎么调，信息在下采样时就已经丢了。<em>这是架构层面的天花板，只能靠更细的 stride、更高的输入分辨率或切片推理来解决</em>（C57 模块 02/04）。<strong>能把「这个问题在哪一层，改哪一层才有用」说清楚，是检测工程师和调参工程师的分界线。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>anchor 聚类还有一个常被忽略的用法：<strong>它是数据分布的体检报告，而不只是一个超参生成器</strong>。跑一次 k-means，看「平均最佳 IoU」「BPR（best possible recall）」「多少比例的样本挤在最小/最大 anchor 上」，你就知道了：数据的尺度跨度有多大、现有 stride 够不够细、要不要加 P2。<em>即使你用的是 anchor-free 检测器，这个体检也值得做</em>——notebook 的练习 3 就是把它做成一个可复用的报告函数。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="engineering"><span class="num">3</span>v4/v5：工程集大成，以及「训练期红利」这个概念的成型</h2>
+  <p>YOLOv4 与 YOLOv5 几乎没有提出新的检测范式，但它们做了一件更重要的事：<strong>把「有用的技巧」系统地筛了一遍，并按「是否增加推理成本」把它们分成两类</strong>。v4 论文的 <span class="term">Bag of Freebies</span>（BoF，免费赠品）与 <span class="term">Bag of Specials</span>（BoS，特价品）这两个词，是这门课模块 00 那条心法的原始出处。</p>  <table>
+    <thead><tr><th>类别</th><th>定义</th><th>典型成员</th><th>决策规则</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Bag of Freebies</strong></td><td><strong>只在训练期付出代价，推理零成本</strong></td><td>Mosaic、MixUp、CIoU loss、label smoothing、余弦退火、EMA、自适应 anchor</td><td><strong>默认全开</strong>。唯一成本是训练时间与调参</td></tr>
+      <tr><td><strong>Bag of Specials</strong></td><td>增加少量推理成本，换较大精度</td><td>SPP/SPPF、PAN、Mish/SiLU、注意力模块（SE/CBAM）、DIoU-NMS</td><td><strong>必须逐个算延迟账</strong>。在 2.45 ms 预算下大多数进不来</td></tr>
+    </tbody>
+  </table>  <h3>四个真正留下来的结构改动</h3>  <ul>
+    <li><strong>CSPNet（Cross Stage Partial）</strong>：把特征图按通道劈成两半，只让一半过密集的残差块，另一半直接短接到末端再拼接。<em>动机不是精度而是「减少重复的梯度信息」</em>——它把计算量降了约 20% 而精度不掉，是纯粹的效率改进。<strong>它是 v4 之后所有 YOLO backbone 的基本积木</strong>（v5 的 C3、v8 的 C2f、RTMDet 的 CSPNeXt 都是它的变体）。</li>
+    <li><strong>PAN（Path Aggregation Network）</strong>：在 FPN 的自顶向下之后再加一条自底向上的通路。<em>FPN 把语义从高层送到低层，PAN 把定位信息从低层送回高层</em>。对小目标的收益尤其明显，因为高层的框回归可以拿到低层的精确边缘。</li>
+    <li><strong>SPPF（Spatial Pyramid Pooling - Fast）</strong>：用三次串联的 5×5 max-pool 等价替代并联的 5/9/13 池化，输出完全一致但快得多。<em>这是「等价变换换速度」的又一个例子，和第 5 节的重参数化是同一类思想</em>。</li>
+    <li><strong>Mosaic 增强</strong>：把 4 张图拼成 1 张训练。三个作用：变相增大 batch 内的场景多样性、<strong>把大目标缩小成小目标（等于免费的小目标数据）</strong>、丰富上下文。<em>代价是训练分布与真实分布不一致，所以最后 10–15 个 epoch 必须关掉（close-mosaic）</em>——这个细节在 v8 里变成了默认配置项（C56 模块 03 展开）。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>v5 还有一个工程上影响深远的贡献：<strong>自适应 anchor</strong>。它在训练启动时自动对数据集跑一次 k-means 与遗传算法优化，并给出 BPR（best possible recall）；<em>BPR 低于 0.98 就自动重新聚类</em>。这把「anchor 没配好」这个最常见也最隐蔽的坑变成了自动化流程的一部分。<strong>对 TSR 尤其关键——第 2 节的数字说明，直接用 COCO 默认 anchor 会让 4.1% 的标志在任何 IoU 阈值下都匹配不上</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>另一个容易被忽略的是 <strong>letterbox 与 stride 对齐</strong>：v5 把图像按长边缩放后 padding 到 stride 的整数倍（默认填 114），而不是简单 resize 到正方形。<em>这保住了长宽比，避免标志被拉伸变形</em>——对 TSR 是有语义意义的，因为圆形禁令牌被拉成椭圆会削弱形状先验。<strong>但 letterbox 也是训练-部署不一致的头号来源</strong>：padding 值、是否居中、缩放比例是否取整，任何一处两边不一致，框就会整体偏移（C60 模块 01 会把这些差异逐个量化）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>面试里被问「YOLOv5 相比 v4 有什么创新」，正确的回答不是列结构，而是指出「v5 本质上不是一篇论文而是一套工程基线」</strong>：自适应 anchor、自动超参进化、完整的导出链路（ONNX/TensorRT/CoreML）、统一的训练-验证-导出接口。<em>它的价值在于把「复现一个检测器」的成本从数周降到数小时</em>。面试官想听的是你能区分「学术贡献」与「工程贡献」，并且知道后者在工业界往往更值钱。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="yolox"><span class="num">4</span>YOLOX 三件套：解耦头 / anchor-free / SimOTA</h2>
+  <p>YOLOX 是这条演进线上信息量最大的一篇——因为它的消融表把三个改动的收益<strong>分别</strong>列了出来，这在这个领域很罕见。三件套彼此独立，可以单独采纳。</p>  <table>
+    <thead><tr><th>改动</th><th>解决什么问题</th><th>机制要点</th><th>推理成本</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 解耦头<br>decoupled head</strong></td><td>分类与定位<strong>需要的特征不同</strong>，共享一个卷积会互相拖累（分类要语义不变性，定位要空间敏感性）</td><td>1×1 降维后分出两条支路，各自 2 个 3×3；末端三个 1×1 分别出 cls / reg / obj</td><td><strong>不低</strong>，见下方账</td></tr>
+      <tr><td><strong>② anchor-free</strong></td><td>anchor 是超参、要聚类、还会让预测数翻 k 倍</td><td>每个格点直接回归到四条边的距离；正样本由中心先验 + 分配器决定</td><td><strong>负</strong>（预测数减少 2/3）</td></tr>
+      <tr><td><strong>③ SimOTA</strong></td><td>静态 IoU 阈值分配对小目标与密集场景极不公平</td><td>构造代价矩阵，按 <strong>dynamic-k</strong>（k 由该 GT 的候选 IoU 之和决定）动态选正样本</td><td><strong>零</strong>（纯训练期）</td></tr>
+    </tbody>
+  </table>  <p><strong>解耦头的代价必须自己会算</strong>，因为它是这三件套里唯一有推理成本的。notebook 第 5 节实现了这个计算器，结果值得记住（256 通道、三层 FPN、80 类、输入 640）：</p>  <table>
+    <thead><tr><th>检测头</th><th>参数量</th><th>MACs（三层合计）</th><th>相对耦合头</th></tr></thead>
+    <tbody>
+      <tr><td>耦合头（1×1，3 anchor × 85）</td><td>65,535</td><td>0.55 G</td><td>1×</td></tr>
+      <tr><td><strong>解耦头 c_mid=256</strong>（YOLOX 式）</td><td>2,447,957</td><td><strong>20.55 G</strong></td><td><strong>37.5×</strong></td></tr>
+      <tr><td>解耦头 c_mid=64（轻量化）</td><td>169,685</td><td>1.42 G</td><td>2.6×</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>37.5 倍这个数字第一次看到会觉得离谱，但它的构成很简单：<strong>代价的主项是两条支路各 2 个 3×3 卷积，即 <code>4 · c_mid² · 9</code> 每像素</strong>。而耦合头只有 <code>c_in · 255</code>。<em>于是 c_mid 从 256 降到 64，代价降到 1/14.5</em>（3×3 项按 c_mid² 走，降 4 倍就是 16 倍）。<strong>这解释了所有后续工作对解耦头的处理：不是不用，而是把 c_mid 压到很小</strong>——YOLOv8 用 <code>max(c_in/4, 16, reg_max·4)</code>，RTMDet 则用跨层共享权重把参数量摊薄。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>面试高频追问：「解耦头为什么有用？」</strong> 想听的不是「因为解耦了」，而是<em>任务冲突的具体表现</em>：分类要的是平移不变性（标志挪 5 px 还是同一类），定位要的是平移敏感性（挪 5 px 边界就变了）。共享卷积时，这两个梯度方向在同一组权重上打架。YOLOX 的消融显示解耦头不只涨 AP，还<strong>显著加快收敛</strong>——因为梯度冲突消失了。<em>更强的回答会补一句：这也是为什么 IoU 分支/obj 分支要不要独立、放哪条支路上，是个真实的设计选择</em>。</p></div>
+  </div>  <p><strong>anchor-free 的本质</strong>常被讲错。它不是「不用先验」，而是<strong>把「哪些位置是正样本」这个决定，从「与 anchor 的 IoU」交给了「分配器」</strong>。第 2 节的数据已经暗示了这一点：TSR 的 anchor 长宽比几乎全是 1，anchor 实际上只在编码尺度先验；<em>而尺度先验完全可以由 FPN 的层级分配来提供</em>。所以对 TSR 这种长宽比单一的任务，anchor-free 几乎是纯收益。</p>  <div class="callout danger"><span class="label">别打包归因</span>
+    <p>一个真实的踩坑：<strong>把 YOLOX 的三件套「打包」采纳，然后归因说「YOLOX 涨了 3 AP」</strong>。三件套的收益量级完全不同——<em>SimOTA（纯训练期、零推理成本）通常贡献最大，anchor-free 收益中等且省算力，解耦头收益最小却最贵</em>。在 2.45 ms 的 TSR 预算下，正确的采纳顺序是：<strong>先上 SimOTA（免费）→ 再上 anchor-free（省钱）→ 最后才考虑解耦头，且必须把 c_mid 压到 1/4</strong>。<em>面试里能说出这个排序与理由，比说得出三件套的名字有价值得多。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="reparam"><span class="num">5</span>v6/v7：结构重参数化——训练时多分支，推理时单分支</h2>
+  <p>这是这门课里最漂亮的一个机制，也是唯一一个可以<strong>用 <code>assert</code> 严格证明</strong>的机制。它的主张听起来像作弊：训练时用一个复杂的多分支结构（更好优化），推理时把它<strong>数值等价地</strong>折叠成一个单一卷积（更快）。</p>  <p>基础是 <span class="term">Conv-BN 融合</span>。推理期的 BatchNorm 是一个逐通道的仿射变换，可以被吸进前面卷积的权重与偏置：</p>  <div class="math-block">\[W' = \frac{\gamma}{\sqrt{\sigma^2+\epsilon}} \odot W, \qquad b' = \frac{\gamma\,(b-\mu)}{\sqrt{\sigma^2+\epsilon}} + \beta\]</div>  <p><strong>RepVGG 把这一招推到了极致</strong>：训练时每个块是三条并行分支（3×3 conv+BN、1×1 conv+BN、identity+BN），推理时合并成一个 3×3 卷积。合并的三步是：</p>  <div class="ascii">训练期（三分支，好优化）                推理期（单个 3x3，好部署）
+
+        x                                        x
+        |                                         |
+   +----+----+----+                               |
+   |         |    |                          +---------+
+ 3x3+BN   1x1+BN  BN(identity)      ===&gt;     |  3x3    |   数值完全等价
+   |         |    |                          +---------+
+   +----+----+----+                               |
+        (+)                                       y
+         |
+         y
+
+合并三步：
+  (1) 每条分支各自做 Conv-BN 融合  -&gt;  (W_i, b_i)
+  (2) 把 1x1 核零填充到 3x3 的**中心**；identity 写成中心为 1 的 3x3 对角核
+      (零填充为什么成立：填进去的 0 乘任何值都是 0，包括图像的 padding 区)
+  (3) 三个同形状的 3x3 核直接**相加**，偏置也相加   -&gt;  W = W3+W1+Wid, b = b3+b1+bid
+
+收益（C=256, 40x40 特征图）：
+  算子数   3 conv + 3 BN + 2 add = 8 个 kernel  -&gt;  1 个
+  中间张量 3 份 (每份 0.78 MB fp16)             -&gt;  0 份
+  MACs     1.049 G                              -&gt;  0.944 G  (-10%)
+  真正的大头不是 FLOPs，而是**访存与 kernel 启动** —— 小模型上这是主要瓶颈</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么多分支训练更好、单分支推理更快，这两件事同时成立？<strong>因为它们是两个不同的评价函数</strong>。训练期在意的是<em>优化景观</em>——多分支提供了多条梯度通路（identity 分支尤其像残差连接，缓解退化），使深层 plain 网络也能训起来。推理期在意的是<em>访存与并行度</em>——单条 3×3 是 GPU/NPU 上被优化得最好的算子，没有分支就没有中间张量、没有 kernel 启动开销、也不阻碍算子融合。<strong>「训练看优化、推理看访存」是理解这一族方法的钥匙。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>面试高频：「重参数化会掉点吗？」</strong> 想听的是分层回答：<em>① 数学上不掉，合并是严格等价的（notebook 里 <code>np.allclose</code> 误差 2.7e-15）；② 但 INT8 量化后会掉，而且掉得比原生单分支训练更多</em>。原因是三个分支的权重相加之后，等效核的数值分布往往更长尾（几条分支的极值叠加），per-tensor 量化的 scale 被撑大，其余权重被挤到很少的量化格子里。<strong>解法是 per-channel 量化、或对 rep 块做 QAT</strong>——这正是 C60 模块 03 会重新遇到的问题。能主动提这一点，说明你不是只读了论文摘要。</p></div>
+  </div>  <p><strong>YOLOv7 的另一条线是辅助头（auxiliary head）与 coarse-to-fine 标签分配</strong>：在网络中部接一个只在训练时存在的辅助检测头，用比主头更宽松的分配（coarse）给它监督，主头用严格的分配（fine）。<em>这又是一个典型的「训练期红利」</em>——推理时辅助头直接丢弃，零成本。它解决的是深层网络中浅层监督不足的问题，与 v9 的 PGI 是同一个动机的两种解法。</p>  <div class="callout warn"><span class="label"></span>
+    <p>重参数化有两个前提条件容易被忽略：<strong>① identity 分支要求输入输出通道数相同且 stride=1</strong>（否则恒等映射不存在，只能用 3×3 + 1×1 两条分支）；<strong>② 合并必须在 BN 进入 eval 模式、使用 running statistics 之后做</strong>。<em>用训练期的 batch 统计量去合并，得到的权重是错的，而且不会报错——只会表现为「导出后精度莫名下降」</em>。这属于 C60 讲的训练-部署一致性问题：<strong>凡是「训练时一套、推理时另一套」的机制，都必须配一个数值对拍的 assert</strong>，而不是相信它。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="v8v9"><span class="num">6</span>v8/v9：C2f、TaskAligned 分配与可编程梯度信息</h2>
+  <p>YOLOv8 没有论文，只有代码与文档，但它是目前工业界事实上的默认基线。它的改动清单短而准，每一条都能对应到前面讲过的某条主线。</p>  <table>
+    <thead><tr><th>v8 的改动</th><th>属于哪条主线</th><th>具体做了什么</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>C2f 模块</strong></td><td>架构（BoS）</td><td>把 v5 的 C3 改成保留更多分支输出的结构，所有中间 bottleneck 的输出都被 concat</td><td><strong>更丰富的梯度流</strong>，在同等参数量下更好训；思想上和 CSPNet / ELAN 一脉</td></tr>
+      <tr><td><strong>anchor-free + 解耦头</strong></td><td>架构</td><td>沿用 YOLOX 路线，但 <strong>去掉了 obj 分支</strong>，c_mid 压到 <code>max(c_in/4, 16, reg_max·4)</code></td><td>obj 与 cls 的信息高度冗余；压 c_mid 是为了把第 4 节算的 37.5× 降下来</td></tr>
+      <tr><td><strong>TaskAlignedAssigner</strong></td><td><strong>标签分配</strong></td><td>用 <code>t = s<sup>α</sup>·u<sup>β</sup></code> 联合排序，取 top-k</td><td>让被选中的正样本<strong>同时</strong>分类好、定位好，直接对齐推理时的排序准则</td></tr>
+      <tr><td><strong>DFL（Distribution Focal Loss）</strong></td><td>损失</td><td>把每条边的回归变成对 <code>reg_max+1</code> 个离散位置的分布预测，取期望作为最终值</td><td>边界本身是模糊的（遮挡/褪色标志尤其如此），<strong>分布式表示比单点回归更能表达这种不确定性</strong></td></tr>
+      <tr><td><strong>close-mosaic</strong></td><td>训练（BoF）</td><td>最后 10 个 epoch 关闭 Mosaic</td><td>消除训练-推理的分布鸿沟</td></tr>
+    </tbody>
+  </table>  <p><strong>TaskAligned 的公式值得单独看</strong>，因为它是「分配」这条主线的一个分水岭：</p>  <div class="math-block">\[t = s^{\alpha} \cdot u^{\beta}, \qquad s = \text{分类分数},\ u = \text{预测框与 GT 的 IoU},\ (\alpha,\beta) = (0.5, 6)\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>在此之前，分配只看几何（IoU 阈值、中心距离），<strong>而推理时的排序只看分数</strong>——这两者不一致，就产生了经典的 <span class="term">cls-loc misalignment</span>（分类-定位失配）：分数最高的框定位不准、定位最准的框分数不高。<em>NMS 按分数排序，于是它保留的往往不是定位最好的那个框</em>。TaskAligned 的做法是让分配也用「分数 × IoU」来选，<strong>训练期就把两者绑在一起</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>β=6 这个指数值得注意：<strong>它让 IoU 的权重远大于分类分数</strong>。0.88<sup>6</sup>=0.464 而 0.70<sup>6</sup>=0.118——IoU 从 0.70 涨到 0.88，t 就翻了近 4 倍。<em>这是刻意的：分类分数在训练早期几乎没有信息，如果 α 太大，早期会选出一堆定位很差的正样本，形成自我强化的错误</em>。notebook 第 6 节会用这组指数复现一个真实现象：<strong>用「纯分类分数」选 top-1，和用「对齐度量」选 top-1，只有 22% 的情况会选中同一个位置</strong>。</p></div>
+  </div>  <p><strong>YOLOv9 的 PGI（Programmable Gradient Information）与 GELAN</strong> 走的是另一条路：它主张深层网络中<em>信息在前向传播中不断丢失（information bottleneck），导致梯度不可靠</em>。PGI 的做法是加一条只在训练期存在的<strong>可逆辅助分支</strong>，为主干提供「未被压缩」的梯度信息，推理时整条分支移除。<em>又是一次训练期红利</em>——和 v7 的辅助头动机一致，但实现更系统。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把 v8 的清单重新排一下，你会看到一个清晰的模式：<strong>五条改动里有三条（TaskAligned、DFL 的训练侧、close-mosaic）是零推理成本的，剩下两条（C2f、解耦头）都被刻意做了成本控制</strong>。<em>这就是模块 00 那条心法在一个成熟工程产品上的完整体现</em>：不是不用贵的东西，而是<strong>先把免费的全部吃干净，再为每一个收费项单独算账</strong>。你在自己的项目里做技术选型时，这个顺序同样适用。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="v10"><span class="num">7</span>v10：一致双分配，NMS 真的被去掉了</h2>
+  <p>YOLOv10 解决的是模块 00 第 3 节那本账里最刺眼的一项：<strong>NMS 是端到端延迟中唯一随场景波动的部分</strong>（notebook 里 p99/p50 = 1.40）。而它的解法既不是 DETR 的 query，也不是简单地「训练时用一对一」。</p>  <div class="ascii">YOLOv10 的一致双分配 (consistent dual assignments)
+
+  训练期：一个 backbone/neck，**两个头**
+     +-------------------+
+     |  one-to-many head |  每个 GT 分配 top-k 个正样本  -&gt; 监督信号密集，收敛快
+     |   (o2m, 主监督)   |
+     +-------------------+
+              |  两个头用**同一个**匹配度量  m = s^alpha * u^beta   &lt;-- 关键
+     +-------------------+
+     |  one-to-one head  |  每个 GT 只分配 1 个正样本    -&gt; 训练模型自己去重
+     |   (o2o)           |
+     +-------------------+
+
+  推理期：**只保留 o2o 头，o2m 头整个丢弃，不跑 NMS**
+
+  为什么必须「一致」：
+    若两个头用不同度量，o2o 选中的位置常常不在 o2m 的 top-k 里
+    -&gt; 同一个位置被一个头当正样本、被另一个头当负样本
+    -&gt; 梯度互相抵消，o2o 头学不出干净的单峰响应，推理时仍有重复框
+
+  notebook 实测（12 个标志 x 20 组随机种子）：
+    两头同用对齐度量        o2o 的 top-1 落在 o2m 的 top-10 内 = 100%
+    o2o 改用纯分类分数      落在 top-10 内 = 73.8%，top-1 完全相同仅 22.1%</div>  <p>notebook 第 6 节会把「不去重会怎样」也跑出来：同一批 12 个交通标志，一对多分支产生 <strong>120 个候选框</strong>（每 GT 10 个），必须靠 NMS 压回 12 个；一对一分支直接输出 <strong>12 个</strong>。而更有意思的是 NMS 阈值的敏感性：</p>  <table>
+    <thead><tr><th>NMS IoU 阈值</th><th>一对多输出（120 框）</th><th>一对一输出（12 框）</th></tr></thead>
+    <tbody>
+      <tr><td>0.30 / 0.40 / 0.45</td><td>12 ✅</td><td>12 ✅</td></tr>
+      <tr><td>0.50</td><td>13（漏删 1）</td><td>12 ✅</td></tr>
+      <tr><td>0.60（常用默认值）</td><td><strong>15（漏删 3）</strong></td><td>12 ✅</td></tr>
+      <tr><td>0.70</td><td><strong>18（漏删 6）</strong></td><td>12 ✅</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这张表说明了无 NMS 的第二个收益，而且它常被低估：<strong>去掉 NMS 就去掉了一个必须逐场景调、且调不好会同时产生漏检和重复的超参</strong>。阈值调高留重复框，调低会把<em>真正相邻的两个目标</em>合并成一个——而 TSR 恰好充满相邻目标：门架上并排的三块限速牌、主辅牌组合、限速牌加解除牌。<em>「NMS 把两块并排的标志删成一块」是一类真实且很难查的漏检</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要诚实地说清收益的边界。<strong>无 NMS 买到的主要是延迟的<em>确定性</em>，不必然是延迟的<em>均值</em></strong>。在模块 00 的账里 NMS 只占 12%（0.30 / 2.42 ms）——如果你的场景候选框本来就不多（高速上的 TSR 就是这样），去掉它省下的绝对时间有限。<em>真正的收益在 p99：雨夜误检爆炸时 NMS 从 0.05 ms 涨到 0.94 ms，而无 NMS 的管线延迟是常数</em>。<strong>面试里被问「无 NMS 值不值」，标准答案是「取决于你的场景候选框分布，先测 p99 再决定」，而不是「值/不值」。</strong></p></div>
+  </div>  <p><strong>和 DETR 的一对一匹配是不是一回事？</strong> 这是本节最高频的面试题。相同点：都用「一个 GT 只对应一个预测」来在<em>训练期</em>压制重复，而不是在推理期删重复。不同点有三个，缺一个答案就不完整：</p>  <ul>
+    <li><strong>匹配范围</strong>：DETR 是全局二分图匹配（匈牙利算法，O(n³)，所有 query 与所有 GT 一起求最优解）；v10 是<strong>逐 GT 独立取 top-1</strong>，没有全局最优性保证，但快得多且实现简单。</li>
+    <li><strong>监督密度</strong>：DETR 只有一对一这一路监督，是它需要 500 epoch 的根因之一；v10 用 o2m 头<strong>额外提供密集监督</strong>，且两头共享 backbone/neck，等于免费拿到 DETR 拿不到的东西。（C54 模块 04 会讲这正是 Co-DETR / Group-DETR 反过来向 YOLO 学的东西。）</li>
+    <li><strong>预测的载体</strong>：DETR 的 query 是可学习的、与位置解耦的向量；v10 的 o2o 头仍然是<strong>密集预测</strong>，每个格点一个预测。<em>所以 v10 保留了 CNN 检测器对小目标的所有优势，也保留了「预测数固定为格点数」这个部署上的确定性</em>。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>把这三代放在一起看，会得到一个很干净的结论：<strong>「一对一」是推理端的需求（要输出一个不含重复的集合），不是训练端的最优（一对一的监督太稀疏）</strong>。<em>所以最终的赢家形态是「训练时一对多 + 一对一双路，推理时只留一对一」</em>——YOLOv10 从 CNN 侧到达这个形态，Co-DETR / Group-DETR 从 Transformer 侧到达同一个形态。<strong>两条路殊途同归，本身就是这个结论正确的最好证据。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="attribution"><span class="num">8</span>收益归因：架构红利还是训练技巧红利</h2>
+  <p>这是本模块最有面试价值的一节。<strong>被问「YOLO 从 v5 到 v8 涨的这几个点是怎么来的」，能做归因的人和只会背清单的人差距立刻显现</strong>。核心事实是：<em>这条演进线上的大部分收益来自训练侧，而不是架构侧</em>。</p>  <table>
+    <thead><tr><th>改动</th><th>红利类型</th><th>推理成本</th><th>在 2.45 ms 预算下的采纳优先级</th></tr></thead>
+    <tbody>
+      <tr><td><strong>标签分配</strong>（ATSS/SimOTA/TaskAligned）</td><td><strong>训练期</strong></td><td>零</td><td><strong>P0 · 必须上</strong>。同网络同数据换分配可差 3–5 AP（模块 02）</td></tr>
+      <tr><td><strong>Mosaic / close-mosaic / 强增强</strong></td><td><strong>训练期</strong></td><td>零</td><td><strong>P0</strong>。对小目标与长尾尤其有效（C56）</td></tr>
+      <tr><td><strong>结构重参数化</strong></td><td>训练期（推理更快）</td><td><strong>负</strong></td><td><strong>P0</strong>，但要配 INT8 精度验证</td></tr>
+      <tr><td><strong>辅助头 / PGI</strong></td><td><strong>训练期</strong></td><td>零</td><td>P1。训练变慢、显存变大，收益在深模型上更明显</td></tr>
+      <tr><td><strong>anchor-free</strong></td><td>架构</td><td><strong>负</strong>（预测数减 2/3）</td><td><strong>P0</strong>（对 TSR：长宽比单一，几乎纯收益）</td></tr>
+      <tr><td><strong>更好的 loss</strong>（CIoU/DFL）</td><td>训练期</td><td>DFL 有极小的解码成本</td><td>P1</td></tr>
+      <tr><td><strong>backbone/neck 改造</strong>（CSP/C2f/ELAN）</td><td>架构</td><td>看具体设计，通常持平或略降</td><td>P1，必须实测</td></tr>
+      <tr><td><strong>解耦头</strong></td><td>架构</td><td><strong>正，且大</strong>（c_mid=256 时 37.5×）</td><td>P2，且必须压 c_mid</td></tr>
+      <tr><td><strong>注意力模块</strong>（SE/CBAM/Transformer block）</td><td>架构</td><td><strong>正</strong>，且常常破坏算子融合</td><td><strong>P3</strong>，绝大多数进不了预算</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么训练期红利这么大？<strong>因为检测器的瓶颈长期不在「表达能力」而在「优化」</strong>。一个 stride 8 的特征图有 6400 个格点，其中只有几十个该是正样本；<em>「哪几十个」这个选择直接决定了绝大部分梯度的方向</em>。选错了，再强的 backbone 也在学错的东西。这就是模块 02 整整一个模块讲标签分配的原因，也是那句「<strong>标签分配是检测器真正的胜负手</strong>」的含义。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>做归因时最常见的错误是「不公平比较」。</strong> 新模型往往同时换了架构、分配、增强、训练轮数、输入分辨率与后处理阈值，然后把总收益记在架构头上。<em>正确的消融必须单变量、同 epoch、同增强、同分辨率、同调参预算</em>——而这在论文里几乎从不成立。<strong>更要命的是种子方差：检测任务同配置不同种子的 mAP 波动典型在 ±0.2–0.5，所以「+0.3 的提升」很可能是噪声</strong>（C61 模块 01 会给出功效分析：要多少种子才能可靠检出 +0.3）。面试里主动提这一点，通常是全场最加分的一句话。</p></div>
+  </div>  <h3>回到 TSR：这张表怎么用</h3>  <p>假设你接手一个交通标志检测项目，baseline 是 YOLOv5-S，指标不达标。<strong>按上表的优先级，你的动作顺序应该是</strong>：</p>  <ul>
+    <li><strong>① 先把免费的吃干净</strong>：换 TaskAligned 或 SimOTA 分配、开 Mosaic + close-mosaic、按自己的数据重新聚类 anchor（第 2 节的数字：COCO 默认 anchor 让 4.1% 的标志匹配不上）。<em>这一步不增加任何推理延迟</em>。</li>
+    <li><strong>② 再动架构里「负成本」的部分</strong>：anchor-free（TSR 长宽比单一，先验损失极小）、rep 块（推理更快）。</li>
+    <li><strong>③ 然后才是花钱的</strong>：加 P2 层（对 22.2% 边长 &lt; 8 px 的标志是唯一有效的手段，但显存与计算按分辨率平方涨）、解耦头（压 c_mid）。<em>每一项都要在目标硬件上实测 p99 再决定</em>。</li>
+    <li><strong>④ 最后重新算账</strong>：改完之后端到端 p99 是否仍在 2.45 ms 内？如果不在，回到模块 00 的三条出路（tiny 档 + INT8 / 降频 / ROI）。</li>
+  </ul>  <div class="callout danger"><span class="label">归因不清 = 全场失分</span>
+    <p><strong>面试里最危险的一个回答是「我们换成了 YOLOv8，涨了 2 个点」。</strong> 追问必然是「那 2 个点是从哪来的？」——如果你答不上来，前面所有的技术细节都会打折扣。<em>正确的叙事结构永远是：baseline 是什么 → 改了哪一项 → 单独测得多少 → 代价是什么 → 怎么验证它不是噪声</em>。<strong>而这门课教你的每一个机制，都应该被组织成这个结构存进你的项目叙事里</strong>（C61 模块 04 会把这件事做成模板）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>YOLO 这条线走到 v10/v11/v12 之后，边际收益已经明显递减——COCO 上的 AP 提升越来越依赖训练配方而非结构。真正开放的问题在别处。</p>  <ul>
+    <li><strong>「YOLO 版本号」已经不再是技术谱系。</strong> v6（美团）、v7（原作者线）、v8/v11（Ultralytics）、v9、v10（清华）来自完全不同的团队，编号只是命名权的结果。<em>把它们理解成「同一条演进线的连续迭代」是错的</em>——它们更像是在同一组公开技巧上做不同排列组合。这也是为什么归因（第 8 节）比背版本号重要得多。</li>
+    <li><strong>结构重参数化与量化的冲突尚无干净解法。</strong> 合并后的等效核数值分布更长尾，INT8 per-tensor 量化掉点显著大于原生单分支。目前只能靠 per-channel、混合精度或 QAT 缓解。<em>「量化友好的重参数化」是一个明确存在但还没被解决的问题</em>（C60 模块 03）。</li>
+    <li><strong>一对一分配的训练效率仍是瓶颈。</strong> v10 的双分配是一个务实的绕道：用 o2m 提供密集监督、用 o2o 提供无重复输出。<em>但「为什么一对一的监督必然稀疏、能否设计出既一对一又密集的监督」目前没有理论答案</em>。这与 C54 模块 04 讲的 DETR 收敛难题是同一个问题的两面。</li>
+    <li><strong>标签分配缺少可优化的形式化目标。</strong> 从 IoU 阈值到 ATSS 到 OTA 到 TaskAligned，每一步都由实验驱动。OTA 的最优传输视角最接近形式化，但代价矩阵仍是手工设计的。<em>「什么是最优分配」至今是开放问题</em>（模块 02 会把这条线完整走一遍）。</li>
+    <li><strong>NAS 与手工设计的边界。</strong> 大量工作用神经架构搜索找 backbone/neck，但搜索出的结构在<em>目标硬件</em>上未必快（FLOPs 与实测延迟的相关性在小模型上很弱）。<strong>硬件感知的 NAS（latency-aware NAS）是正确方向，但需要在每种芯片上重建延迟查找表</strong>——对车端多硬件平台是一个组合爆炸问题。</li>
+    <li><strong>面向长尾细粒度的检测器设计几乎是空白。</strong> YOLO 全线都在 COCO 的 80 类均衡设定下演进，而 TSR 是 200+ 类、极度长尾、且类间差异极细（限速 60 vs 限速 80 只差一个字符）。<em>「检测器结构该为细粒度长尾做什么改变」在学术界几乎没有对应工作</em>——这也是 C55/C58 存在的理由，以及两级方案（检测 + 分类）在量产中仍占主流的原因。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读（按本模块顺序）：<em>You Only Look Once: Unified, Real-Time Object Detection</em>(Redmon et al., CVPR 2016) —— 读第 2 节的输出张量定义与第 4.4 节的失败分析；<em>YOLO9000: Better, Faster, Stronger</em>(CVPR 2017) —— <strong>dimension cluster 那一小节必须读原文</strong>，它给出了 1−IoU 距离的动机；<em>YOLOv4: Optimal Speed and Accuracy of Object Detection</em>(2020) —— Bag of Freebies / Bag of Specials 的划分是本课「训练期红利」心法的出处；<em>YOLOX: Exceeding YOLO Series in 2021</em> —— <strong>Table 2 的逐项消融是整个领域信息量最大的一张表</strong>；<em>RepVGG: Making VGG-style ConvNets Great Again</em>(CVPR 2021) —— 公式极简，务必自己推一遍再看 notebook 的 assert；<em>TOOD: Task-aligned One-stage Object Detection</em>(ICCV 2021) —— TaskAligned 度量的出处；<em>YOLOv7</em>(CVPR 2023) 的辅助头与 <em>YOLOv9</em>(2024) 的 PGI；<em>YOLOv10: Real-Time End-to-End Object Detection</em>(NeurIPS 2024) —— 一致双分配，注意读它对「为什么必须一致」的消融。相邻课程：模块 02（标签分配全展开）、模块 03（RTMDet）、C54（DETR 的一对一匹配）、C57（小目标）、C60（重参数化与量化的冲突）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_label_assignment/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 标签分配：检测器真正的胜负手</div></a>
+  </div>
+
+</div>
+</body>
+</html>

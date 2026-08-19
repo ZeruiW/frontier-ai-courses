@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 难例挖掘：OHEM、难负样本与难例的类型学</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 难例挖掘：OHEM、难负样本与难例的类型学</h1>
+  <p class="subtitle">OHEM 按 loss 排序取 top-k 反传，但<strong>必须先做 NMS 去重</strong>——一个难区域的 20 个重叠 RoI 会把整个 batch 的名额吃光，这是原论文里最容易被忽略却最致命的实现细节 · <em>Focal Loss 是 OHEM 的连续化</em>：(1−p)^γ 是软权重，OHEM 是 0/1 硬截断，前者不丢样本、后者省算力——两者的关系是高频面试题 · hard negative 不是「低分负样本」，而是<strong>模型自信地错了</strong>的那些（高分假正例）· 难例类型学四类：相似类混淆（限速 60 vs 80）/ 背景误检（广告牌、车身贴纸、后车尾灯）/ 边界样本（半遮挡、极小、逆光）/ <strong>标注错误</strong> · 第四类是陷阱：噪声标签的 loss 同样很高，<em>挖掘过头等于把错标当教材反复讲</em> · 区分难例与噪声的三把尺：多模型一致性、损失轨迹（难例会慢慢降、噪声要靠记忆突然降）、重标注抽检</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–01（长尾与类别不平衡）；C18 检测基础（anchor / proposal / NMS）；交叉熵与梯度的基本直觉</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_hard_example_mining.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Shrivastava et al. <em>Training Region-based Object Detectors with Online Hard Example Mining</em>（CVPR 2016）；Lin et al. <em>Focal Loss for Dense Object Detection</em>（ICCV 2017）；Pleiss et al. <em>Identifying Mislabeled Data using the Area Under the Margin Ranking</em>（NeurIPS 2020）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#budget">梯度预算是稀缺资源：难例挖掘要解决的到底是什么</a></li>
+      <li><a href="#ohem">OHEM 的机制与四个实现细节（第一个决定成败）</a></li>
+      <li><a href="#focal">Focal Loss 是软性 OHEM：连续加权 vs 硬性截断</a></li>
+      <li><a href="#hardneg">难负样本：不是「负样本」，是「模型自信地错了」</a></li>
+      <li><a href="#taxonomy">难例的类型学：四类难例，四种完全不同的解法</a></li>
+      <li><a href="#noise_trap">挖掘过头：噪声标签会被当成最有价值的难例</a></li>
+      <li><a href="#separate">怎么把「难例」和「噪声标签」分开</a></li>
+      <li><a href="#pool">难例池、采样比例与课程学习</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="budget"><span class="num">1</span>梯度预算是稀缺资源：难例挖掘要解决的到底是什么</h2>
+  <p>先把问题摆正。训练一个检测器时，<strong>真正稀缺的不是数据量，而是「有效梯度」</strong>——那些能真的改变模型参数的信号。一张 1920×1080 的图，密集检测器会铺出 <span class="term">anchor</span>（锚框）或候选点 <strong>2 万到 20 万个</strong>；两阶段检测器的 RPN 也会给出 1000–2000 个 <span class="term">proposal</span>（候选框）。其中真正是前景的可能只有 <strong>3 到 30 个</strong>。前景背景比轻松到 <strong>1:1000</strong> 甚至 1:10000。</p>  <p>这个比例本身还不是最糟的。最糟的是<strong>绝大多数背景样本是「一眼假」</strong>：天空、路面、纯色墙面。模型训练两个 epoch 之后就能给它们打出 0.999 的背景分。对交叉熵而言，这类样本的梯度是</p>  <div class="math-block">\[\frac{\partial \mathcal{L}_{\text{CE}}}{\partial z} = p - y \quad\Longrightarrow\quad p=0.999,\ y=0 \;\Rightarrow\; |g| = 10^{-3}\]</div>  <p>而一个模型判成 0.4 的难背景（比如广告牌上的红色圆形），梯度是 0.4——<strong>相当于 400 个简单背景</strong>。但在均匀采样的 batch 里，那 400 个简单背景确实会出现，而这个难背景可能一整个 epoch 才出现一次。<em>于是梯度预算的绝大部分被浪费在「模型已经会了的事情」上</em>。</p>  <div class="ascii">一张图上 anchor 的 loss 分布（典型密集检测器，训练中期）
+
+  数量
+   ^
+   |  ████████████████████████████  ← 约 98% 的 anchor：简单背景
+   |  ████████████████████████████     单个梯度 ~1e-3，加起来却主导了总损失
+   |  ████████████████████████████
+   |  ███
+   |  ██                                 ← 难负样本（高分 FP）：0.5%，梯度 ~0.4
+   |  █           ▂  ▁                   ← 前景正样本：0.1%
+   +--+-----------+---+-------------&gt; loss
+     0.001       0.5  3.0
+
+  总损失 = 98% × 0.001 × N  +  0.5% × 0.4 × N  ≈  简单样本贡献仍然更大
+                                              （数量优势压过质量劣势）
+  → **不做任何处理，模型会被简单背景「淹死」**：
+    它学会的是「什么都判背景」这个 99.9% 正确的退化解。</div>  <p>对这个问题，检测界给出过三代答案，而且这三代<strong>不是替代关系，是同一个思想的三种实现</strong>：</p>  <table>
+    <thead><tr><th>代</th><th>方法</th><th>怎么做</th><th>什么时候用它</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td>第一代</td><td><strong>Hard negative bootstrapping</strong>（离线自举）</td><td>训一版 → 在大量负样本上推理 → 把判错的高分负样本收集起来 → 加入训练集 → 重训。反复几轮</td><td>负样本集大到装不下内存（HOG+SVM / DPM 时代的标准做法）；<em>今天在「难负样本库」建设里仍然用</em></td><td>要多轮训练；离线，反馈慢</td></tr>
+      <tr><td>第二代</td><td><strong>OHEM</strong>（在线难例挖掘）</td><td>一个 batch 内 forward 全部候选 → 按 loss 排序 → 只对 top-k 反传</td><td>两阶段检测器（Fast/Faster R-CNN）；候选数中等（~2000）</td><td>要跑全量 forward；<strong>丢弃了绝大部分样本的梯度</strong>；对标签噪声敏感</td></tr>
+      <tr><td>第三代</td><td><strong>Focal Loss</strong>（重加权）</td><td>不采样，全部样本都算，但按 <code>(1-p_t)^γ</code> 连续降权</td><td>单阶段密集检测器（RetinaNet 及其后所有 YOLO 变体）</td><td>多两个超参 γ、α；<em>在两阶段检测器上收益很小</em>（下一节讲原因）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>三代方法的共同点是一句话：<strong>把梯度预算从「模型已经会的样本」重新分配到「模型还不会的样本」上</strong>。区别只在「重新分配」这个动作发生在哪一层——第一代在数据集层面（改训练集），第二代在采样层面（改 batch 内谁参与反传），第三代在损失层面（改每个样本的权重）。<em>越往后，粒度越细、反馈越快、工程侵入性越小。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要注意，三代方法解决的<strong>不完全是同一个不平衡</strong>。第一代针对的是「负样本空间太大无法穷举」；第二代针对的是「batch 内难易混杂，梯度被稀释」；第三代针对的是「前景-背景比极端失衡下损失函数本身的病态」。<em>模块 01 讲的重采样/重加权针对的则是第三种不平衡——类别之间的长尾</em>。<strong>四种不平衡（前景-背景 / 难-易 / 类别间 / 域间）必须分开诊断</strong>，用错工具是最常见的浪费。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个能一直用下去的判断标准：<strong>看这个样本的梯度还有多大</strong>。梯度接近 0 的样本，无论它是不是「重要类别」，此刻对模型都没有信息量。<em>难例挖掘的全部技巧，都是在用不同的代理量（loss、置信度、模型分歧、不确定性）去逼近「这个样本还剩多少信息量」这一个问题</em>。而它们各自在什么时候会失效——正是本模块要讲的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ohem"><span class="num">2</span>OHEM 的机制与四个实现细节（第一个决定成败）</h2>
+  <p><span class="term">OHEM</span>（Online Hard Example Mining，在线难例挖掘）的机制一句话说完：<strong>一个 batch 内先把所有候选样本都 forward 一遍算出 loss，按 loss 从大到小排序，只让 top-k 参与反向传播</strong>。原论文（Shrivastava et al., CVPR 2016）是在 Fast R-CNN 上做的，把 VOC 上的 mAP 提了 4 个点左右。</p>  <div class="ascii">OHEM 的一轮（原论文的双头实现）
+
+  图像 ──► backbone ──► 特征图
+                          │
+              ┌───────────┴───────────┐
+              ▼                       ▼
+       RoI Pooling (全部 ~2000 个候选)
+              │
+        ┌─────┴──────┐
+        ▼            ▼
+  [read-only head]  [regular head]   ← 两份**共享权重**的检测头
+   只做 forward       做 forward+backward
+        │                  ▲
+        ▼                  │
+   每个 RoI 的 loss         │
+        │                  │
+        ▼                  │
+  ① **按 loss 排序**         │
+  ② **NMS 去重（IoU 0.7，用 loss 当分数）** ◄── 本节的重点，跳过它 OHEM 会失效
+  ③ 取 top-k（如 k=128）    │
+        └──────────────────┘
+             只把这 k 个送进 regular head 反传
+
+  为什么要两份头？ 因为 2000 个 RoI 一起做 backward 显存放不下。
+  今天更简单的等价实现：**一份头，把未选中样本的 loss 直接置 0**
+  （loss 为 0 ⇒ 梯度为 0 ⇒ 完全等价，只是省不了显存）。</div>  <h3>细节 ①：必须先 NMS 去重，否则同一个区域被重复计入</h3>  <p>这是 OHEM 实现里<strong>最容易漏、漏了之后最难查</strong>的一条。原因很直白：候选框在空间上是<strong>高度重叠</strong>的。一个真正难的区域（比如一块被树叶遮住一半的限速牌）周围，会有<strong>几十个 IoU &gt; 0.8 的 proposal</strong>，它们的 loss 几乎一样高。按 loss 排序取 top-128，结果就是——</p>  <table>
+    <thead><tr><th></th><th>不做 NMS 去重</th><th>做 NMS 去重（IoU 0.7）</th></tr></thead>
+    <tbody>
+      <tr><td>top-128 覆盖的<strong>不同区域数</strong></td><td><strong>2–4 个</strong>（被一两个热点吃光）</td><td><strong>60–120 个</strong></td></tr>
+      <tr><td>实际有效 batch</td><td><strong>≈ 3</strong>（128 个样本其实是同一件事的 128 份拷贝）</td><td>≈ 100</td></tr>
+      <tr><td>梯度方向</td><td>被单个区域<strong>完全支配</strong>，方差极大</td><td>多样，稳定</td></tr>
+      <tr><td>症状</td><td>loss 剧烈震荡；模型在几个特定区域上过拟合；换一批数据表现骤降</td><td>正常收敛</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">OHEM 的头号实现坑</span>
+    <p><strong>不做去重的 OHEM 比不做 OHEM 更差</strong>——这是一个反直觉但确实会发生的结果。因为它把整个 batch 的梯度预算交给了两三个区域，等于用 <code>batch_size≈3</code> 在训练，而且这三个区域可能恰好是标注错误。<em>面试里如果你能主动说出「OHEM 要先用 loss 作为分数做一遍 NMS」，面试官基本可以确认你真的实现过它</em>，因为这条在论文里只是一句话，但在代码里是决定成败的一行。</p>
+  </div>  <h3>细节 ②：正负样本要分开挖，否则正样本会被挤没</h3>  <p>如果不分开挖，在 1:1000 的失衡下，top-k 里<strong>可能一个正样本都没有</strong>（因为难负样本的 loss 完全可以比一般正样本高）。结果是回归分支拿不到梯度，框越训越差。<em>标准做法是正负各自排序、各取各的配额</em>，维持 1:3 的正负比——这一步和 Fast R-CNN 原本的采样策略是一致的，OHEM 只是把「随机取」换成了「取最难的」。</p>  <h3>细节 ③：loss 除以 k 还是除以 N</h3>  <p>选出 k 个后，总损失是 <code>Σℓ/k</code> 还是 <code>Σℓ/N</code>？这不是风格问题：<strong>除以 N 相当于把学习率悄悄乘上了 k/N</strong>（比如 128/2000 = 0.064，学习率被打了 1/16 的折）。<em>正确做法是除以实际参与反传的样本数 k</em>，这样梯度幅值不随 k 变化，k 才是一个可独立调的超参。</p>  <h3>细节 ④：warmup 期不要开 OHEM</h3>  <p>模型刚随机初始化时，所有样本的 loss 都是 <code>log(C)</code> 附近的随机噪声，<strong>按 loss 排序等价于随机排序</strong>——但它比随机采样更糟，因为它系统性地偏向那些「初始化恰好不利」的样本。<em>标准做法是前 1–2 个 epoch（或前若干 iteration）用均匀采样，等 loss 分布真正分化了再开挖掘</em>。这一条同样适用于 focal loss 之外的所有基于 loss 的采样策略。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把这四条细节合起来看，会发现它们指向同一个问题：<strong>「loss 高」是「难」的一个<em>有偏</em>代理</strong>。loss 高可能因为：真的难（好）、空间重复（细节①）、类别失衡（细节②）、模型还没学（细节④）、<strong>或者标签是错的</strong>（本模块后半部分的主题）。<em>每一条实现细节，本质上都是在剥掉这个代理量里的一层噪声。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从优化的角度还有一个更根本的解释：OHEM 把损失函数从「样本上的均值」换成了「top-k 的均值」，也就是从 <span class="term">ERM</span>（经验风险最小化）换成了 <span class="term">CVaR</span>（条件风险价值 / 尾部风险）目标。<strong>这个目标是非光滑且非凸的</strong>（top-k 集合会随参数跳变），所以它天然带来优化的不稳定性——loss 曲线锯齿、对学习率敏感、对 batch 组成敏感。<em>而 focal loss 用连续权重把这个跳变抹平了</em>，这正是下一节的内容。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="focal"><span class="num">3</span>Focal Loss 是软性 OHEM：连续加权 vs 硬性截断</h2>
+  <p>这是本模块<strong>最值得背下来的一个类比</strong>，也是面试里区分「读过论文」和「想明白了」的分水岭。先把两者写成同一个形式——它们都是<strong>对样本损失的加权和</strong>，区别只在权重函数的形状：</p>  <div class="math-block">\[\mathcal{L}=\sum_{i} w_i\,\ell_i,\qquad\quad w_i^{\text{OHEM}}=\frac{1}{k}\mathbb{1}\!\left[\ell_i\ge \ell_{(k)}\right],\qquad\quad w_i^{\text{focal}}=\frac{(1-p_i)^{\gamma}}{Z}\]</div>  <p>其中 <code>ℓ_(k)</code> 是 batch 内第 k 大的 loss，<code>p_i</code> 是模型给<em>正确类别</em>的概率（即 <code>p_t</code>），<code>Z</code> 是归一化项。<strong>关键观察：这两个权重都是「模型越错、权重越大」的单调函数</strong>——OHEM 是一个阶跃函数，focal 是一条光滑曲线。</p>  <div class="ascii">权重 w 随样本难度（loss ℓ）的变化
+
+  w
+  ^
+1/k|                    ┌────────────────────  OHEM: **硬性截断**
+   |                    │                      ℓ &lt; ℓ_(k) 的样本权重恰好为 0
+   |                    │                      （梯度被完全丢弃）
+   |                    │
+   |         ...........│....................  Focal (γ=2): **连续加权**
+   |    .....           │                      简单样本权重很小但**永不为 0**
+   |....                │
+  0+--------------------+--------------------&gt; ℓ
+                    ℓ_(k)  ← 这条线的位置由 batch 组成决定，**每步都在跳**
+
+关键推论：
+  · 因为 CE loss ℓ = -log p_t 与 focal 权重 (1-p_t)^γ **都是 p_t 的单调减函数**，
+    所以 **「按 focal 权重排序」和「按 loss 排序」得到的顺序完全一致**。
+    ⇒ focal 的「最重要的 k 个样本」就是 OHEM 会选中的那 k 个。
+  · 唯一的差别是：**被排除的那些样本，权重是 0 还是 ε。**</div>  <table>
+    <thead><tr><th>维度</th><th>OHEM（硬）</th><th>Focal Loss（软）</th><th>工程含义</th></tr></thead>
+    <tbody>
+      <tr><td>权重函数</td><td>阶跃：<code>1[rank ≤ k]</code></td><td>幂律：<code>(1-p_t)^γ</code></td><td>focal 无跳变，优化更稳</td></tr>
+      <tr><td>简单样本的梯度</td><td><strong>完全丢弃（=0）</strong></td><td>保留但缩小 <code>(1-p)^γ</code> 倍</td><td>OHEM 会「忘掉」已学会的东西，需要靠随机采样补</td></tr>
+      <tr><td>超参</td><td>k（或比例 r）</td><td>γ（+ α 平衡正负）</td><td>γ=2、α=0.25 是几乎万能的默认值；k 要随 batch 调</td></tr>
+      <tr><td>是否需要排序</td><td>需要（O(N log N)）+ NMS 去重</td><td><strong>不需要，逐元素向量化</strong></td><td>focal 在密集检测器（10⁵ anchor）上是唯一可行的</td></tr>
+      <tr><td>对<strong>标签噪声</strong></td><td><strong>很脆弱</strong>：把 100% 权重给最高 loss 那批，而噪声样本恰好永远在那批里</td><td>较稳：权重上界是 1，且大量简单样本仍在分母里稀释</td><td><strong>数据脏的时候优先选 focal 或降低 k</strong></td></tr>
+      <tr><td>两阶段检测器上的收益</td><td>明显（+3~4 mAP）</td><td><strong>很小</strong></td><td>见下方解释——这条是面试高分点</td></tr>
+    </tbody>
+  </table>  <h3>为什么 Focal Loss 在两阶段检测器上几乎没有收益</h3>  <p>因为 <strong>RPN 已经把前景背景比从 1:10000 粗筛到了 1:3 左右</strong>，focal loss 想解决的「极端失衡下简单负样本淹没损失」这个病根，在第二阶段已经不存在了。<em>反过来，OHEM 在第二阶段仍然有用，因为它解决的是「剩下的 2000 个候选里难易仍然混杂」</em>。<strong>能说清这一条，说明你理解的不是「focal 好」而是「focal 解决什么」</strong>——面试官想听的正是这个。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>面试标准答案骨架（建议按这个顺序讲）：<strong>① 二者是同一个思想的硬/软两种实现</strong>，都可以写成 <code>Σ w(ℓ)·ℓ</code>；<strong>② 排序完全一致</strong>，因为 focal 权重与 CE loss 都是 p_t 的单调减函数；<strong>③ 差别在被排除样本的权重是 0 还是 ε</strong>——focal 保留全部样本的梯度，OHEM 直接丢；<strong>④ focal 无需排序、无需去重、可完全向量化</strong>，所以密集检测器只能用 focal；<strong>⑤ 对标签噪声，OHEM 明显更脆弱</strong>；<strong>⑥ 两阶段检测器上 focal 收益小，因为 RPN 已经粗筛过了。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个把两者定量连起来的工具：<strong>有效样本数</strong> <code>n_eff = (Σw)² / Σw²</code>（这就是加权平均的「等效样本量」，与统计里的 <span class="term">effective sample size</span> 同源）。给定一个 γ，算出 focal 的 <code>n_eff</code>，就得到了「这个 γ 相当于 OHEM 的 k 取多少」。<em>notebook 里会把这张换算表算出来</em>：在一个典型的 <code>p_t</code> 分布上，<strong>γ=2 大致相当于只有 20%–25% 的样本在真正贡献梯度</strong>，而 <strong>γ=5 会把这个比例压到 2% 量级</strong>。<strong>这个数字也解释了为什么 γ 从 2 调到 5 常常直接训崩</strong>——等效样本量掉一个数量级，梯度方差爆炸。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>两个常见的实现错误。<strong>①「focal loss 用在了已经做过难例采样的样本上」</strong>——两个机制叠加，等效样本量被平方级压缩，训练必然不稳。<em>要么 OHEM 要么 focal，不要同时开</em>。<strong>② focal loss 的 <code>α</code> 被当成了类别平衡权重去调</strong>：α 只平衡前景-背景（二分类意义上的正负），它<em>不解决类别间长尾</em>——那是模块 01 的 EQL / Class-Balanced Loss 的活。混用会让两个机制互相打架。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hardneg"><span class="num">4</span>难负样本：不是「负样本」，是「模型自信地错了」</h2>
+  <p>术语要先掐死。<span class="term">hard negative</span>（难负样本）<strong>不是「随便一个负样本」</strong>，而是<strong>模型给了高分的假正例（high-scoring false positive）</strong>——模型不但错了，还很自信。这个定义里的「自信」是全部价值所在：它意味着这个样本<strong>落在当前决策边界的错误一侧且离边界很远</strong>，修正它会带来最大的边界移动。</p>  <div class="ascii">难负样本挖掘的离线循环（今天仍是「难负样本库」的标准建法）
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │                                                              │
+  │   训练集 v_n  ──►  训练模型 M_n                                │
+  │       ▲                 │                                    │
+  │       │                 ▼                                    │
+  │       │       在**大量未标注/纯背景**素材上推理                  │
+  │       │       （车队回传的路测视频、无标志路段）                  │
+  │       │                 │                                    │
+  │       │                 ▼                                    │
+  │       │       收集 score &gt; τ 的检出                            │
+  │       │                 │                                    │
+  │       │                 ▼                                    │
+  │       │       ┌─────────────────────┐                        │
+  │       │       │ 人工确认这是不是 FP  │ ◄── **这一步不能省**      │
+  │       │       └─────────┬───────────┘                        │
+  │       │                 │                                    │
+  │       │        ┌────────┴────────┐                           │
+  │       │        ▼                 ▼                           │
+  │       │   确实是 FP        **其实是漏标的真目标**               │
+  │       │   → 加为难负样本    → 补标为正样本                      │
+  │       │        │                 │                           │
+  │       └────────┴─────────────────┘                           │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
+
+  ⚠️ 跳过人工确认、把所有高分检出直接当负样本喂回去 =
+     **主动教模型漏检**。这是 TSR 里最容易犯的致命错误。</div>  <p>为什么 TSR 场景里这个陷阱特别致命？因为交通标志的标注天然不全：<strong>远处只有 12×12 像素的标志、被树叶遮住 60% 的标志、对向车道的标志、辅路上的标志</strong>——不同标注员对「这个要不要标」的判断经常不一致。模型在这些地方给出高分检出，从 GT 看是 FP，从物理世界看是<strong>正确的</strong>。把它当难负样本反复加权训练，等于在训练「看到远处的小标志要压住分数」。</p>  <table>
+    <thead><tr><th>TSR 里难负样本的典型来源</th><th>为什么模型会上当</th><th>正确对策</th><th>错误对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>广告牌 / 商店招牌</strong>上的红圈、蓝底白字</td><td>颜色+形状先验与真标志几乎一致，只有内容和语境不同</td><td>定向采集这类场景补为负样本；提高分类头的分辨率让它看清内容</td><td>只调低全局阈值（会同时压掉真标志的召回）</td></tr>
+      <tr><td><strong>车尾/卡车车厢上印的标志图案</strong></td><td>就是标志的图像，只是不在杆上</td><td>把「是否有杆件 / 是否在合理高度」作为上下文特征；补这类负样本</td><td>把所有车辆区域屏蔽（会漏掉车旁边的真标志）</td></tr>
+      <tr><td><strong>后视镜、挡风玻璃反光</strong>里的标志</td><td>确实是标志的像，但语义上不对自车生效</td><td>作为负样本；下游用几何/关联规则过滤</td><td>在检测端硬删（几何信息在检测端不可靠）</td></tr>
+      <tr><td><strong>对向车道 / 辅路</strong>的标志</td><td>是真标志，但不该对本车生效</td><td><strong>不该在检测端解决</strong>——检测出来，交给下游做车道关联</td><td>标成负样本（会破坏检测器对该类的表征）</td></tr>
+      <tr><td><strong>施工牌背面 / 折叠收起的可变牌</strong></td><td>轮廓与正面相似</td><td>补为负样本，并加「背面」这个属性类</td><td>忽略（会周期性地在施工路段爆 FP）</td></tr>
+      <tr><td><strong>漏标的真标志</strong>（伪装成 FP）</td><td>GT 不全</td><td><strong>回流去补标</strong>，并统计漏标率</td><td><strong>当难负样本训练 → 主动制造漏检</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>上表的最后两行揭示了一个原则：<strong>「这个检出该不该被抑制」是一个语境问题，而语境常常不在检测器的视野里</strong>。对向车道的标志、反光里的标志，检测器看到的像素与真标志完全一样——<em>要求检测器区分它们，等于要求它做本该由下游（车道关联、几何一致性、跟踪）做的事</em>。硬塞给检测器的结果是：它会用某些脆弱的伪特征（比如位置偏左）去区分，一换场景就崩。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以难负样本入库前要过一道<strong>「可分性检查」</strong>：<em>把这个负样本的 crop 单独拿给人看，人能不能仅凭这块图像判断它不是标志？</em> 如果人也需要看全图语境才能判断，那它就<strong>不该作为检测端的难负样本</strong>，而应该作为下游过滤规则的测试用例。<strong>这个检查在面试里说出来分量很重</strong>，因为它体现了「知道每个模块该负责什么」——而这正是量产系统与刷榜的分水岭。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>难负样本的价值可以定量估计：如果模型给它的分数是 <code>s</code>，那么修正它带来的梯度大约是 <code>s</code>（对 sigmoid 输出的 CE 而言就是 <code>p-y=s-0=s</code>）。<strong>一个 s=0.8 的难负样本 ≈ 800 个 s=0.001 的简单负样本</strong>。<em>这就是为什么「挖 1000 张难负样本」常常比「多标 10 万张普通图」更有效</em>——但前提是这 1000 张确实是 FP，而不是漏标。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="taxonomy"><span class="num">5</span>难例的类型学：四类难例，四种完全不同的解法</h2>
+  <p>到这里必须做一个关键切分。<strong>「loss 高」把四类性质完全不同的样本混在了一起</strong>，而它们的正确处理方式互相矛盾——把第四类当第一类处理，模型会被毁掉。</p>  <table>
+    <thead><tr><th>类型</th><th>典型表现（TSR 语境）</th><th>根因</th><th><strong>正确解法</strong></th><th>错误解法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 相似类混淆</strong></td><td>限速 60 vs 80（数字形状近）；限速 vs 解除限速（多一道斜杠）；禁止驶入 vs 禁止通行；直行 vs 直行+右转</td><td>细粒度特征不足：分辨率不够 / 感受野不当 / 分类头容量不足</td><td><strong>提高 crop 分辨率</strong>（两级架构的最大理由）；针对混淆对做 metric learning 或加权 CE；补该对的数据</td><td>笼统地「多加数据」——加的多半还是易分的那些</td></tr>
+      <tr><td><strong>② 背景误检（难负）</strong></td><td>广告牌红圈、车身贴纸、反光</td><td>负样本空间没被覆盖到；上下文信息缺失</td><td>定向挖掘并补入难负样本库；引入上下文（杆件、高度、场景标签）</td><td>只降阈值 / 只加 NMS——治标且损召回</td></tr>
+      <tr><td><strong>③ 边界样本</strong></td><td>遮挡 50%、运动模糊、逆光过曝、12 像素的远处标志、褪色破损</td><td><strong>信息真的不足</strong>——有时人也判不了</td><td>增强（模糊/低光/遮挡合成）；时序累积（等它变近）；<strong>接受一个可检测下界</strong>并在评测里按尺寸分桶</td><td>无限加权硬啃——会牺牲正常样本</td></tr>
+      <tr><td><strong>④ 标注错误</strong></td><td>类别标错、框位置错、漏标、类别体系变更后的旧标签</td><td>标注流程问题</td><td><strong>识别并剔除 / 降权 / 回流重标</strong></td><td><strong>当难例反复挖掘 —— 这会直接毁掉模型</strong></td></tr>
+    </tbody>
+  </table>  <p>把这四类放到一张图上，就能看清难例挖掘的真实困难所在：</p>  <div class="ascii">按 loss 排序时，四类样本在 top-k 里的分布（典型的真实检测数据集）
+
+  loss 从高到低 ───────────────────────────────────────────────►
+
+  ┌────────────┬────────────┬───────────────┬───────────────────┐
+  │ ④ 标注错误  │ ③ 边界样本  │ ① 相似类混淆   │ ② 难负样本        │
+  │ **loss 最高** │ 次之        │ 中等           │ 分布很广           │
+  │ 因为标签与   │ 因为信息    │ 因为特征相近   │ 因为「多难」取决于  │
+  │ **任何**可学 │ 客观不足    │ 但可区分       │ 背景本身           │
+  │ 规律都矛盾   │            │               │                   │
+  └────────────┴────────────┴───────────────┴───────────────────┘
+        ▲
+        │
+   **挖掘越激进（k 越小 / γ 越大），选中的样本里 ④ 的占比越高。**
+   这就是「挖掘过头反而毁掉模型」的机制。
+
+   数量对比（假设噪声率 5%）：
+     全体样本中 ④ 占 5%
+     top-1% 高 loss 样本中 ④ 可能占 **40–70%**
+     ⇒ 噪声放大系数 A = 0.5/0.05 = **10×**</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>上面这张图给出了一个非常锋利的推论：<strong>「loss 高」和「有价值」在数据干净时高度相关，在数据脏时几乎反相关</strong>。而真实的量产标注数据，类别标注错误率在 <strong>2%–10%</strong> 是常态（细粒度类别越多越高，TSR 的百来个类正好是高发区）。<em>这意味着难例挖掘的收益曲线不是单调的，而是一条倒 U</em>：挖一点有用，挖过头有害。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说：设噪声率 <code>q</code>，挖掘选中样本中噪声的富集倍数为 <code>A</code>，混合批中难例占比为 <code>r</code>，则 batch 的<strong>有效噪声率</strong> <code>q_eff = (1-r)q + r·q·A</code>。要求 <code>q_eff ≤ q_max</code> 就给出了 <strong>难例比例的安全上界</strong>（下一节展开）。<em>这个式子的实用价值在于：它把「挖多少」从一个凭感觉的超参，变成了一个由「标注质量」决定的可计算量</em>。<strong>换句话说：你的数据有多脏，决定了你能挖多狠。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>还有一类容易被忽略的「假难例」：<strong>类别定义本身模糊的样本</strong>。比如「限速 60 的主牌 + 下方『雨雾天』辅助牌」到底算一个目标还是两个？「电子可变限速牌显示 80」算限速 80 还是算电子牌类？<em>这类样本的 loss 会一直高，但它不是标注员的错，是<strong>标注规范没定义清楚</strong></em>。挖它、加权它、重标它都没用——<strong>唯一的解法是回去改规范，然后全量重刷</strong>。所以难例分析的产出之一，永远应该包括「规范需要补的条目」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="noise_trap"><span class="num">6</span>挖掘过头：噪声标签会被当成最有价值的难例</h2>
+  <div class="callout danger"><span class="label">难例挖掘的头号事故</span>
+    <p><strong>本模块最重要的一句话：难例挖掘是一个噪声放大器。</strong> 它按「模型拟合得最差」来选样本，而<em>标签错误的样本，正是模型永远拟合不好的那一批</em>——因为它的标签与图像中任何可学的规律都矛盾。于是每一轮它都被选中，权重被放大数倍，模型被迫去记住它。<strong>结果是：挖掘越努力，模型越差，而且离线指标可能看不出来</strong>（因为验证集来自同一个标注流程，含有同样的噪声）。</p>
+  </div>  <p>把这个机制拆成三层，每一层都有独立的危害：</p>  <ol>
+    <li><strong>权重放大</strong>：噪声样本的 loss 长期位于分布顶端 → 每个 epoch 都进入 top-k → 有效采样权重被放大 <code>A</code> 倍（合成实验里 <code>A</code> 常在 4–10）。<em>这是最直接的一层</em>。</li>
+    <li><strong>记忆化（memorization）</strong>：深网络容量足够时可以拟合任意随机标签（Zhang et al., ICLR 2017）。正常训练下，模型会<em>先学规律、后记噪声</em>（这就是「记忆化效应」，也是后面 AUM 方法的基础）。而 OHEM 把梯度预算全部导向噪声样本，<strong>大幅加速了记忆过程</strong>——本来 60 个 epoch 才会开始记的东西，20 个 epoch 就记住了。记住噪声 = 破坏了那一片特征空间的泛化。</li>
+    <li><strong>评测污染</strong>：如果验证集与训练集来自同一标注流程，它们的噪声率相同。<em>模型记住训练集噪声，在验证集上并不会变差多少</em>（因为验证集的噪声是另一批），但<strong>在真实路测上会明显变差</strong>。这就是「离线指标没掉、路测体验变糟」的一个真实来源。</li>
+  </ol>  <div class="math-block">\[A \;=\; \frac{P(\text{noisy}\mid \text{selected})}{P(\text{noisy})},\qquad q_{\text{eff}} = (1-r)\,q + r\,q\,A \;\le\; q_{\max} \;\Longleftrightarrow\; r \;\le\; \frac{q_{\max}-q}{q\,(A-1)}\]</div>  <p>代一组真实的数字：标注噪声率 <code>q = 8%</code>，挖掘的噪声富集倍数 <code>A = 6</code>，能容忍的有效噪声率 <code>q_max = 15%</code>。得到 <code>r ≤ (0.15-0.08)/(0.08×5) = 0.175</code>——<strong>难例最多只能占 batch 的 17.5%</strong>。<em>而很多实现里 OHEM 的比例是 100%（整个 batch 都是挖出来的），这在 8% 噪声率下必然出事。</em></p>  <h3>TSR 场景里标注噪声从哪来</h3>  <table>
+    <thead><tr><th>噪声来源</th><th>典型噪声率量级</th><th>为什么难避免</th></tr></thead>
+    <tbody>
+      <tr><td><strong>细粒度类别标错</strong>（限速 60↔80、禁令类内部）</td><td>2–8%</td><td>百来个类，很多类只差一个数字或一道斜杠；标注员疲劳时凭第一印象点</td></tr>
+      <tr><td><strong>小目标漏标</strong>（&lt; 16 像素）</td><td>10–30%（在小尺寸桶内）</td><td>标注员看不清 / 规范说「太小可以不标」但边界模糊</td></tr>
+      <tr><td><strong>框位置不准</strong></td><td>小框上 ±2px 就是 25% 相对误差</td><td>标注工具的最小拖动精度与图像缩放级别</td></tr>
+      <tr><td><strong>类别体系变更后的旧数据</strong></td><td>整批系统性错误</td><td>新增细分类后，旧数据仍是粗类标签；版本混用时静默出错</td></tr>
+      <tr><td><strong>自动预标注（pre-labeling）被直接采纳</strong></td><td>取决于预标模型质量，5–15%</td><td>为省成本用旧模型预标 + 人工快审，<strong>人工倾向于「看着差不多就过」</strong>——这会把旧模型的偏差固化进新数据</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后一行值得特别警惕，因为它制造了<strong>一个自我强化的闭环</strong>：旧模型预标 → 人工快审通过 → 新数据带着旧模型的偏差 → 训出的新模型继承这个偏差 → 下一轮预标偏差更强。<em>症状是「模型在某类上的错误怎么加数据都改不掉」</em>，因为你加的数据本身就是模型自己的错误产物。<strong>破解方法：预标注的样本必须有一定比例走「盲标」（不给预标结果，从零标注），并对比两者的差异率作为监控指标。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从统计角度看，这是一个<span class="term">confirmation bias</span>（确认偏差）在数据管线里的具体化：人类审核者面对一个已有答案时，<em>接受阈值远低于从零判断时</em>。相关研究给出的数字是，预标注会让标注员的「同意率」提高 10–20 个百分点，其中相当一部分是错误的同意。<strong>所以「预标注 + 快审」的真实质量必须用盲标子集去校准，而不能假设它等同于全人工标注。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="separate"><span class="num">7</span>怎么把「难例」和「噪声标签」分开</h2>
+  <p>既然 loss 本身分不开这两者，就需要引入<strong>额外的信息维度</strong>。有四种方法，成本递增、可靠性也递增。<em>实践中它们是组合使用的：前两种做自动初筛，第三种做校准与验收。</em></p>  <h3>方法一：损失轨迹 / AUM（最便宜，应该默认开）</h3>  <p>原理是<strong>记忆化效应的时间不对称性</strong>：干净样本被「学会」（依靠可泛化的规律，早期就快速下降），噪声样本被「记住」（依靠模型容量硬背，发生得<strong>晚得多、也突然得多</strong>）。所以——</p>  <ul>
+    <li><strong>只看最终 loss 分不开</strong>：训练足够久后，难例和噪声样本的最终 loss 可能都在 0.8 左右。</li>
+    <li><strong>看整条轨迹就分得开</strong>：难例的 loss 是「持续缓慢下降」；噪声的 loss 是「长期高位不动 + 晚期突降」。</li>
+    <li><span class="term">AUM</span>（Area Under the Margin，Pleiss et al. 2020）把这件事做成一个标量：<code>AUM_i = mean_t [ z_i,y_i(t) − max_{c≠y_i} z_i,c(t) ]</code>，即<strong>全程「被指派标签的 logit」与「最大其他 logit」之差的均值</strong>。噪声样本的 AUM 显著更低甚至为负；难例的 AUM 低但为正。</li>
+    <li><strong>工程成本极低</strong>：只需在训练时每个 epoch 记录每个样本的 margin，存 <code>N×E</code> 个 float32。100 万样本 × 50 epoch = 200 MB。<em>没有理由不开。</em></li>
+  </ul>  <h3>方法二：多模型一致性（最锋利的二维判据）</h3>  <p>训 K 个种子不同（或结构不同）的模型，看它们在这个样本上的预测。<strong>这给出一个非常干净的二维判据</strong>：</p>  <div class="ascii">            模型间一致性 (consensus)
+                    高
+                     │
+   ┌─────────────────┼─────────────────┐
+   │  ④ **标注错误**  │   ✅ 简单样本     │
+   │  K 个模型高度一致 │  模型一致，       │
+   │  地预测了另一个类 │  且与标签一致      │
+   │  → **强烈怀疑标错**│                 │
+与 ├─────────────────┼─────────────────┤ 与
+标 │  ③ 边界样本      │   ① 相似类混淆    │ 标
+签 │  模型互相不一致，│  模型摇摆但       │ 签
+不 │  也不同意标签    │  多数同意标签     │ 一
+一 │  → **真难例**    │  → **真难例**     │ 致
+致 └─────────────────┼─────────────────┘
+                     │
+                    低
+
+判据（可直接写成代码）：
+  is_mislabeled = (多数票类别 ≠ 标签) AND (多数票占比 ≥ 0.8)
+  is_hard       = (多数票占比 &lt; 0.6)          ← 模型自己都吵起来了
+
+  ⚠️ 注意 K 个模型必须**独立**：不同种子 + 不同数据顺序，
+     最好还有不同架构。**同一个模型的不同 checkpoint 不算独立。**</div>  <h3>方法三：重标注抽检（唯一能给出真值的方法）</h3>  <p>前两种方法只能给出<em>怀疑</em>，要知道真实噪声率、要给前两种方法定阈值，只能<strong>抽样重标</strong>。关键是样本量：要把噪声率 <code>p≈10%</code> 估计到 <strong>±2%（95% 置信）</strong>，需要</p>  <div class="math-block">\[n \;\ge\; \frac{z_{0.975}^{2}\,p(1-p)}{\varepsilon^{2}} \;=\; \frac{1.96^{2}\times 0.1\times 0.9}{0.02^{2}} \;\approx\; 865\]</div>  <p>也就是<strong>大约 900 个样本</strong>——这是一个完全负担得起的数字，而且它换来的是整条挖掘链路的可信度。<em>实操上要做双人独立标注 + 第三方仲裁，并汇报 <span class="term">Cohen's κ</span>（标注一致性系数）</em>：κ &lt; 0.6 说明规范本身有问题，此时讨论噪声率没有意义。</p>  <h3>方法四：可疑样本降权而非删除</h3>  <p>识别出可疑样本后，<strong>默认动作应该是降权（比如权重 ×0.2），而不是删除</strong>。因为：① 前两种方法都有误判，删掉的可能是真难例——而真难例恰恰最宝贵；② 降权是可逆的、可调的；③ 删除会改变数据分布（被删的往往集中在特定类别/场景，等于悄悄做了一次有偏采样）。<em>只有经过重标注确认的错误标签才应该被真正删除或修正。</em></p>  <table>
+    <thead><tr><th>方法</th><th>需要什么</th><th>成本</th><th>能给出什么</th><th>什么时候用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>损失轨迹 / AUM</strong></td><td>训练时记录每 epoch 的 per-sample margin</td><td><strong>几乎为零</strong>（N×E 个 float）</td><td>一个可排序的可疑度分数</td><td><strong>默认全程开启</strong></td></tr>
+      <tr><td><strong>多模型一致性</strong></td><td>K≥3 个独立训练的模型</td><td>K 倍训练成本（可用已有的消融模型复用）</td><td>二维判据：可疑标注 vs 真难例</td><td>有多个模型时（几乎总是有）</td></tr>
+      <tr><td><strong>重标注抽检</strong></td><td>标注人力 + 仲裁流程</td><td>~900 样本 × 单价</td><td><strong>真值</strong>：噪声率、κ、前两种方法的 PR</td><td>每个数据版本发布前一次</td></tr>
+      <tr><td><strong>降权而非删除</strong></td><td>训练管线支持 per-sample weight</td><td>接近零</td><td>风险可控的缓解</td><td>永远（作为默认策略）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把四种方法串成一条可执行的流程：<strong>① 训练时记 margin → ② 算 AUM，取最低的 2–5% 作为「可疑池」→ ③ 用 K 模型一致性把可疑池分成「疑似标错」和「真难例」→ ④ 从「疑似标错」里抽 900 个去重标，得到这套判据的精确率 → ⑤ 按精确率决定是全量重标、还是降权处理</strong>。<em>整条流程只在第 ④ 步花人力钱，其余全自动。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>有一个反直觉但重要的细节：<strong>「真难例」的判定应该比「疑似标错」更保守</strong>。误把标错当难例（假阴性）的代价是模型被污染；误把难例当标错（假阳性）的代价只是少用了一个宝贵样本——<em>但如果你选择的是「降权」而不是「删除」，后一种代价会小得多</em>。<strong>这就是为什么「降权优先」不只是谨慎，而是让整套判据可以调得更激进的前提条件。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pool"><span class="num">8</span>难例池、采样比例与课程学习</h2>
+  <p>最后把机制变成可以上线的工程形态。真实系统里没有人每步重新扫全量数据算 loss——那太贵。标准做法是维护一个<strong>难例池（hard example pool）</strong>。</p>  <div class="ascii">难例池的结构与生命周期
+
+  pool[sample_id] = {
+      'loss_ema':   0.83,      # 指数滑动平均，避免单次波动
+      'last_seen':  epoch 12,  # 上次被评估的时间
+      'n_sampled':  7,         # **被采样次数（用于封顶）**
+      'aum':        -0.4,      # 可疑度（来自损失轨迹）
+      'bucket':     'night',   # **失效模式分桶**：夜间/遮挡/相似类/小目标
+  }
+
+  每个 batch：
+    ┌──────────────────────────────────────────────┐
+    │  batch = (1-r) × 随机采样   +   r × 池采样     │
+    │                                              │
+    │  池采样时：                                   │
+    │    · 按 loss_ema 加权，但 **每桶有独立配额**   │
+    │      （防止「夜间」桶吃掉全部预算）             │
+    │    · 跳过 n_sampled &gt; cap 的样本（过采样封顶）  │
+    │    · 跳过 aum &lt; τ 的样本（疑似标注错误）        │
+    └──────────────────────────────────────────────┘
+
+  老化（aging）：模型在变，三个 epoch 前的难例现在可能已经会了
+    · loss_ema 每 epoch 乘衰减因子，强制样本重新证明自己「还难」
+    · last_seen 超过 E_max 的样本被踢出池，回到随机采样池
+    ⚠️ 不做老化的池会变成一个「化石集合」——
+       里面全是模型早期不会、现在早已学会的样本，白白浪费预算。</div>  <table>
+    <thead><tr><th>超参</th><th>典型取值</th><th>调它的依据</th><th>调错的症状</th></tr></thead>
+    <tbody>
+      <tr><td><strong>难例比例 r</strong></td><td>0.1 – 0.3</td><td><strong>由噪声率决定</strong>（第 6 节的公式）</td><td>过大：训练不稳、验证集掉点；过小：与不挖掘无差别</td></tr>
+      <tr><td><strong>过采样封顶 cap</strong></td><td>单样本 ≤ 5–10 次/epoch</td><td>防止个别样本被采上百次</td><td>不设：某几个样本变成事实上的「验证集」，模型对它们过拟合</td></tr>
+      <tr><td><strong>loss EMA 衰减</strong></td><td>0.9 – 0.95</td><td>模型变化速度（lr 大则衰减快）</td><td>太慢：池变化石；太快：等于每步重扫，噪声大</td></tr>
+      <tr><td><strong>桶配额</strong></td><td>每桶 ≤ 30% 池预算</td><td>失效模式的优先级（C55 m03 的打分）</td><td>不设：单一失效模式吃光预算，其他模式永远修不了</td></tr>
+      <tr><td><strong>AUM 剔除阈值 τ</strong></td><td>最低 2–5%</td><td>重标注抽检得到的精确率</td><td>太松：噪声进池；太紧：真难例被误剔</td></tr>
+    </tbody>
+  </table>  <h3>Curriculum vs anti-curriculum：一个被噪声率决定的选择</h3>  <p><span class="term">Curriculum learning</span>（课程学习，Bengio et al. 2009）主张<strong>先易后难</strong>；OHEM 本质上是 <strong>anti-curriculum</strong>（先难后易，甚至永远只学难的）。两派各有大量实验支持，看起来矛盾——但把噪声率放进来，矛盾就消失了：</p>  <ul>
+    <li><strong>数据干净（q &lt; 2%）</strong>：难样本几乎都是真难例，anti-curriculum（OHEM / 大 γ）收益最大。</li>
+    <li><strong>数据脏（q &gt; 5%）</strong>：难样本里混着大量噪声，<strong>先易后难更安全</strong>——先用干净易学的规律把模型建立起来，再逐步引入难样本，且此时模型已有能力把噪声识别出来（<span class="term">small-loss trick</span> 与 co-teaching 的基础）。</li>
+    <li><strong>实操折中</strong>：<em>warmup 阶段均匀采样 → 中期逐渐把 r 从 0 升到目标值 → 后期把 AUM 最低的样本剔除</em>。这条曲线同时满足了两派的诉求。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>还要注意难例挖掘与<strong>模块 01 的类别重采样会互相放大</strong>。稀有类样本天然 loss 更高（见得少、学得差），所以难例挖掘<em>本身就在过采样稀有类</em>。如果同时开着 repeat factor sampling（<code>r_c = max(1, √(t/f_c))</code>），一个稀有类样本的总放大倍数可能是 <code>r_c × A</code>——轻松到 20–50 倍。<strong>症状是稀有类训练 loss 极低但验证召回不涨（纯粹过拟合了那几十个样本）。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>正确做法是<strong>把「总放大倍数」当成一个需要显式预算的量</strong>：对每个类别，统计它在实际训练流中出现的期望次数与其原始频率之比，<em>把这个比值封顶</em>（比如 ≤ 10×）。这需要重采样与难例挖掘在同一个采样器里协调，而不是两个独立模块各干各的。<strong>面试里如果被问「长尾和难例挖掘怎么一起用」，这个「总放大倍数封顶」就是标准答案</strong>——它说明你想过两个机制的交互，而不是只会分别背它们。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把整节浓缩成一条可迁移的原则：<strong>难例挖掘不是「找最难的」，而是「在给定的标注质量下，找信息量最大且可信的那批」</strong>。「可信」这个约束是绝大多数教程会漏掉的一半，而它在真实数据上决定了成败。<em>所以任何难例挖掘方案的设计文档里，都应该有一节叫「我们如何确认挖到的不是噪声」——没有这一节，方案就是不完整的。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>难例挖掘看起来是个 2016 年就解决了的老问题，但它的三个核心假设——「loss 高 = 有价值」「标签是对的」「样本价值可独立评估」——每一条都在被重新审视。</p>  <ul>
+    <li><strong>噪声鲁棒学习（learning with noisy labels）</strong>：<em>Co-teaching</em>（两个网络互相筛选小损失样本喂给对方，利用「两个网络的记忆化偏差不同」）、<em>DivideMix</em>（用 GMM 拟合 loss 分布把数据分成干净/噪声两半，噪声半当无标签做半监督）、噪声鲁棒损失（GCE、SCE、对称交叉熵）。<em>这一支的共同思想是：不要试图区分难例和噪声，而是设计一个对两者都不敏感的训练过程。</em></li>
+    <li><strong>样本价值的理论化</strong>：<em>influence function</em>（去掉这个样本，测试损失会怎么变）、<em>TracIn</em>（沿训练轨迹累计该样本对测试样本损失的影响）、<em>Data Shapley</em>（合作博弈论视角的样本贡献分配）。<strong>它们比 loss 排序本质得多——直接度量「对测试指标的贡献」而不是「模型拟合得多差」</strong>，但计算成本目前还上不了千万级数据集。<em>这是「难例挖掘」这个领域真正的开放问题。</em></li>
+    <li><strong>数据剪枝与 scaling law</strong>：Sorscher et al.（NeurIPS 2022）给出一个反直觉但重要的结论——<strong>数据充足时应保留难样本，数据稀缺时应保留简单样本</strong>；而好的剪枝策略可以把误差-数据量的幂律关系打破成指数关系。<em>这直接反驳了「永远挖难例」的朴素做法：挖难例的正确性取决于你处在数据量的哪一段。</em></li>
+    <li><strong>检测特有的开放问题：难例的粒度</strong>。loss 定义在框/anchor 级，但「这张图值不值得回传/标注」是图级决策。<strong>框级难度如何正确聚合到图级</strong>（max？top-k 均值？考虑框数量的归一化？）目前没有公认答案——这正是下一模块（主动学习触发器）要处理的核心技术点。</li>
+    <li><strong>用 VLM 做难例分类</strong>：不再只按 loss 排序，而是用视觉-语言模型直接判断「这个 badcase 属于哪类失效模式」（遮挡？逆光？相似类？标注错？）。<em>这把难例挖掘从一个标量排序问题变成了结构化归因问题</em>，也正是当前「automated data mining workflow」的主流形态（模块 04 展开）。</li>
+    <li><strong>标注质量的在线监控</strong>：与其事后检测噪声，不如把 AUM / 模型-标注分歧率做成<strong>标注流水线的实时质控指标</strong>，直接反馈给标注团队。这条工程路线目前缺少公开的最佳实践，但在头部自动驾驶团队里已是标配。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Shrivastava, Gupta, Girshick, <em>Training Region-based Object Detectors with Online Hard Example Mining</em>（CVPR 2016）——OHEM 原文，重点看 3.2 节里关于「用 loss 作为分数做 NMS 去重」的那一段；Lin et al., <em>Focal Loss for Dense Object Detection</em>（ICCV 2017）——重点读第 3 节对 OHEM 的对比实验（表 1(d)），论文自己就把「focal 是 OHEM 的软化」讲清楚了；Pleiss et al., <em>Identifying Mislabeled Data using the Area Under the Margin Ranking</em>（NeurIPS 2020）——AUM 方法与「插入阈值样本」的巧妙定阈技巧；Han et al., <em>Co-teaching</em>（NeurIPS 2018）与 Li et al., <em>DivideMix</em>（ICLR 2020）——噪声鲁棒训练的两条主线；Zhang et al., <em>Understanding Deep Learning Requires Rethinking Generalization</em>（ICLR 2017）——记忆化效应的源头；Sorscher et al., <em>Beyond Neural Scaling Laws: Beating Power Law Scaling via Data Pruning</em>（NeurIPS 2022）——数据剪枝与「什么时候该保留简单样本」。相邻模块：C58 m01（类别不平衡）、C58 m03（主动学习触发器）、C61 m02（误差分析）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_imbalance/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 类别不平衡的处理谱系</div></a>
+    <a class="next" href="../03_triggers/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 主动学习与线上触发策略</div></a>
+  </div>
+
+</div>
+</body>
+</html>

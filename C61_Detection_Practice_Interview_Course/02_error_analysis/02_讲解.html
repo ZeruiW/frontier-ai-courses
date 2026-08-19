@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 误差分析工程：从指标到根因</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 误差分析工程：从指标到根因</h1>
+  <p class="subtitle">「mAP 掉了 2 个点」是结论，<strong>TIDE 六类分解</strong>（Cls / Loc / Both / Dupe / Bkg / Miss）才是「下一步做什么」· 每一类误差的<strong>修复收益</strong>——把这一类全改对 mAP 能涨多少——是排优先级唯一站得住的依据，而不是「感觉漏检更严重」· PR 曲线的诊断读法：高召回段崩塌 = 有一批样本模型根本没学到；低召回段就不高 = 最自信的预测都是错的，八成是数据 bug · 工作点 ≠ 评测阈值：评测要用 0.001 才能画出完整曲线，车端要的是「FP/km 不超过 X 时的召回是多少」· badcase 必须<em>分层抽样</em>看——随便翻 50 张只会反复看到最常见的那一类，最贵的长尾一张都不会出现 · 逐类 AP + 混淆矩阵定位最易互错的标志对（限速 60 / 80 是教科书级例子）</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">C18 模块 03（IoU / NMS / AP 从零实现）、本课模块 01（实验设计与归因）；C55 模块 05（安全导向评测）可后看</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class='badge cpu'>CPU</span> 02_error_analysis.ipynb（纯 numpy：完整 TIDE 分解 + 修复收益 + PR 诊断器 + 分层抽样）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">TIDE (ECCV 2020) · Hoiem et al. Diagnosing Error in Object Detectors (ECCV 2012) · COCO detection analysis toolkit · Detectron2 error analysis</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 80 分钟 + 跑 75 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#metric-gap">指标不是结论：mAP 只说「有多差」，不说「差在哪」</a></li>
+      <li><a href="#tide-six">TIDE 式误差分解：把 FP/FN 拆成六类</a></li>
+      <li><a href="#fix-gain">修复收益：算出「修好每一类能涨多少 mAP」</a></li>
+      <li><a href="#per-class">逐类 AP 与混淆矩阵：找出最容易互相错分的标志对</a></li>
+      <li><a href="#pr-diagnosis">PR 曲线的诊断读法：形状本身就是证据</a></li>
+      <li><a href="#operating-point">score 阈值与工作点：车端要的是「特定 FP 率下的召回」</a></li>
+      <li><a href="#badcase-sampling">badcase 可视化：为什么必须分层抽样</a></li>
+      <li><a href="#decision-tree">从指标到根因：一棵可执行的决策树</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="metric-gap"><span class="num">1</span>指标不是结论：mAP 只说「有多差」，不说「差在哪」</h2>
+  <p>先摆一个具体处境。你刚训完一版 TSR 检测器，评测集上 <code>mAP@0.5 = 0.721</code>，上一版是 <code>0.706</code>。接下来你要做什么？<strong>加数据？换 backbone？提高输入分辨率？调 NMS 阈值？改标签分配？做 copy-paste？</strong>这些每一条都要花 3 天到 3 周，而 <code>0.721</code> 这个数字对「该做哪一条」<em>没有提供任何信息</em>。</p>  <p>这就是初级和资深检测工程师之间最大的一道分水岭。<strong>指标回答的是「我现在在哪」，误差分析回答的是「往哪走最省力」。</strong>一个只会看 mAP 的人，改进路径本质上是随机搜索；一个会做误差分解的人，每次改动之前就能给出「这条路的收益上界是 +X mAP」。</p>  <table>
+    <thead><tr><th>工程师层级</th><th>拿到 mAP=0.721 之后的第一个动作</th><th>下一步的依据</th><th>典型迭代效率</th></tr></thead>
+    <tbody>
+      <tr><td>入门</td><td>换一个更大的 backbone / 多训 100 epoch</td><td>直觉与论文排行榜</td><td>3 周 1 次有效改进</td></tr>
+      <tr><td>中级</td><td>看几十张 badcase 截图，凭印象总结</td><td><strong>被采样偏差主导</strong>（看到的都是常见场景）</td><td>1 周 1 次，方向常错</td></tr>
+      <tr><td><strong>资深</strong></td><td>跑误差分解，算出<strong>每类错误的修复收益上界</strong></td><td><strong>ΔAP 排序 + 修复成本估计</strong></td><td><strong>每次改动前就知道天花板</strong></td></tr>
+    </tbody>
+  </table>  <h3>mAP 把六件完全不同的事压成了一个数</h3>  <p>回忆 AP 的定义——按置信度排序、逐条判 TP/FP、累积算 P/R、取单调包络下的面积：</p>  <div class="math-block">\[\text{AP} \;=\; \sum_{k}\bigl(r_k - r_{k-1}\bigr)\; p_{\text{interp}}(r_k), \qquad p_{\text{interp}}(r) \;=\; \max_{\tilde r \,\ge\, r} p(\tilde r)\]</div>  <p>这个式子里，<strong>「一个检测被判成 FP」这件事只有一个出口，但入口有五个</strong>：框对了类别错、类别对了框不准、两个都错、这个目标已经被另一个更高分的框认领了（重复）、图里那个位置根本没有目标（背景）。而 recall 没到 1 的原因也不止一个：有些 GT 被上面某类错误「半覆盖」了，有些 GT 是<em>彻底没有任何检测靠近</em>。<strong>mAP 把这六种失败混成一个标量，然后你从这个标量里是解不回去的。</strong></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>举个立刻能感受到差别的例子：同样是 <code>mAP@0.5 = 0.72</code>，可能是 A：每个类都在 0.70–0.74，模型均匀地「差一点」；也可能是 B：限速牌类 0.95、指路牌 0.93、而「停车让行」只有 0.11。<strong>A 需要的是更强的模型或更多数据；B 需要的是查「停车让行」这一类的标注、样本量和是否被别的类吃掉——这是两个完全不同的项目。</strong>而这两种情况在 mAP 这个数字上是<em>一模一样</em>的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严格地说，mAP 是一个<span class='term'>聚合统计量</span>（aggregate statistic），它对底层错误分布的<strong>可辨识性（identifiability）为零</strong>：给定一个 mAP 值，能产生它的 (TP, FP 分类, FN 分布) 组合有无穷多个。误差分析要做的事，就是把这个不可逆的聚合过程<em>部分地反演</em>回去——办法不是从数字反推，而是<strong>回到原始的检测-GT 匹配结果，按错误的成因重新分桶，再针对每一桶做「反事实」计算</strong>。第 3 节的修复收益（oracle ΔAP）正是这个反事实：<em>如果这一类错误全部消失，mAP 会变成多少？</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把本节压成一句话：<strong>误差分析的目的不是「知道自己错了」，而是「知道修哪一个最划算」。</strong>任何一次改进动作，都应该能回答「它对应哪一类错误、这类错误的收益上界是多少、修它的成本是多少」——<em>这三个问题答不上来，那次改动就是赌博。</em></p>
+  </div>  <div class="callout danger"><span class="label">「先看 badcase」= 没有流程</span>
+    <p><strong>面试高频开场题：「线上某类交通标志漏检了，你的排查流程是什么？」</strong>如果你的回答从「我会先看看 badcase」开始，面试官基本就给你定档了。<em>正确的开场是：「先确认这是召回问题还是分类问题——因为『漏检』这个词在工程上至少有四种不同的病：真·无检出、检出但被判成别的类、检出但框不准被判 FP、检出但分数低于上线阈值。这四种的修法完全不同，而误差分解能在 10 分钟内区分它们。」</em><strong>面试官想听的是你有一套可复用的分解流程，而不是你很勤奋地看图。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tide-six"><span class="num">2</span>TIDE 式误差分解：把 FP/FN 拆成六类</h2>
+  <p><span class='term'>TIDE</span>（A General Toolbox for Identifying Object Detection Errors，Bolya et al., ECCV 2020）给出的六类划分，已经是检测误差分析事实上的标准词汇。它的价值不在分类本身，而在于<strong>这六类各自对应一条不同的、可执行的修复路径</strong>——分完类你就知道该动数据、动标签分配、动 NMS、还是动分辨率。</p>  <h3>判定只需要两个阈值</h3>  <p>TIDE 用两个 IoU 阈值：<strong>前景阈值 $t_f = 0.5$</strong>（判 TP 的那条线）和 <strong>背景阈值 $t_b = 0.1$</strong>（「离目标近到值得归因」的那条线）。对每一个被判为 FP 的检测，先算它与<em>同类</em> GT 的最大 IoU（记 $u_{\text{same}}$）和与<em>异类</em> GT 的最大 IoU（记 $u_{\text{other}}$），然后走下面这棵判定树：</p>  <div class="ascii">一个被判 FP 的检测 d（类别 c，分数 s）
+   │
+   ├─ u_same &gt;= 0.5 ?  ── 是 ──►  它本来能匹配上，但那个 GT 已被更高分的框认领
+   │                              =&gt; 【Dupe】重复检测      修法：NMS / 一对一分配
+   │  否
+   ├─ 0.1 &lt;= u_same &lt; 0.5 ?  ─ 是 ─►  类别对了，框不够准
+   │                              =&gt; 【Loc】定位误差        修法：回归损失 / 分配策略 / 分辨率
+   │  否（同类 GT 都离得很远）
+   ├─ u_other &gt;= 0.5 ?  ── 是 ──►  框框得很准，但类别判错了
+   │                              =&gt; 【Cls】分类误差        修法：细粒度分类 / 两级架构 / 难例
+   │  否
+   ├─ 0.1 &lt;= u_other &lt; 0.5 ? ─ 是 ─►  框也不准、类也不对
+   │                              =&gt; 【Both】双错          修法：通常和 Loc 一起治
+   │  否
+   └────────────────────────────►  周围什么都没有
+                                  =&gt; 【Bkg】背景误检        修法：难负样本挖掘 / 阈值 / 上下文
+
+所有 GT 里，**没有任何检测以 IoU &gt;= 0.1 靠近过**的那些
+                                  =&gt; 【Miss】漏检          修法：召回侧（分辨率/分配/采样/数据）</div>  <table>
+    <thead><tr><th>错误类型</th><th>一句话定义</th><th>TSR 里的典型成因</th><th>第一顺位的修法</th><th>通常动哪一层</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Cls</strong></td><td>框对、类错</td><td>限速 60 ↔ 80、禁止左转 ↔ 禁止掉头、区域变体</td><td>细粒度分类头 / 两级架构 / 高分辨率 crop</td><td>分类分支、数据</td></tr>
+      <tr><td><strong>Loc</strong></td><td>类对、框不准</td><td>极小目标（8–20 px）位移 2 px 就跌破 0.5、遮挡导致边界不清</td><td>回归损失（GIoU/DIoU）、标签分配、提分辨率</td><td>回归分支、neck</td></tr>
+      <tr><td><strong>Both</strong></td><td>框不准且类错</td><td>远处小目标的连锁失败</td><td>先治 Loc，Both 常跟着降</td><td>同上</td></tr>
+      <tr><td><strong>Dupe</strong></td><td>同一 GT 被检出两次以上</td><td>NMS 阈值过高、多尺度重复触发、密集龙门架</td><td>NMS / soft-NMS / 一对一分配</td><td>后处理</td></tr>
+      <tr><td><strong>Bkg</strong></td><td>无中生有</td><td>广告牌、车身贴纸、路侧圆形物体、树叶光斑</td><td>难负样本挖掘、Focal Loss、上下文、提阈值</td><td>训练采样、阈值</td></tr>
+      <tr><td><strong>Miss</strong></td><td>完全没看见</td><td>太小（&lt;12 px）、被树叶遮挡、夜间低对比、长尾类样本太少</td><td>分辨率 / P2 层 / copy-paste / 定向挖数据</td><td>架构、数据</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么一定要按<strong>顺序</strong>判、而不是「哪个像就归哪个」？因为这六类不是互斥的自然分类，是<em>人为定义的归因规则</em>。一个框可能同时和同类 GT 有 0.3 的 IoU、和异类 GT 有 0.6 的 IoU——它到底算 Loc 还是算 Cls？TIDE 的答案是「优先归给同类」，理由是<strong>「类别对了只是框歪」比「框对了类别错」更容易修</strong>，归因应当偏向更可行动的那一侧。<em>你可以不同意这个优先级，但你必须知道它存在——换了顺序，同一个模型的分解结果会不一样。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更本质地说，误差归因是一个<span class='term'>反事实赋值</span>（counterfactual attribution）问题，而反事实在多因共存时天然不唯一。TIDE 的处理方式是把「归因规则」显式写死成一棵判定树，用<strong>可复现性换取唯一性</strong>——只要所有人用同一棵树，跨模型、跨版本的分解结果就可比。<em>这和统计里的 Type I/Type III sum of squares 之争是同一类问题：不存在「正确」的分解，只存在「说清楚了的」分解。</em>因此在团队里做误差分析，<strong>第一件事是把 $t_f$、$t_b$ 和判定顺序写进评测配置并版本化</strong>，否则两个人算出来的 Cls 占比不同，谁也说服不了谁。</p></div>
+  </div>  <div class="callout warn"><span class="label">分解写错比不写更糟</span>
+    <p><strong>三个几乎人人踩过的实现坑：</strong></p><p>① <strong>Dupe 必须在匹配之后判</strong>。匹配是按分数降序贪心做的，「这个 GT 已被认领」这个状态依赖顺序；先分类再匹配会把大量 Dupe 错记成 Loc。</p><p>② <strong>$u_{\text{same}}$ 要对「所有同类 GT」算，不只对「未匹配的同类 GT」算</strong>，否则 Dupe 这一类会永远是 0。</p><p>③ <strong>Miss 的定义必须和 Cls/Loc 不重复计</strong>。一个被判成 Cls 错误的检测，其实已经「看见」了那个 GT；如果 Miss 里再把这个 GT 数一遍，你会同时高估 Cls 和 Miss，两边都想修，最后修了个寂寞。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fix-gain"><span class="num">3</span>修复收益：算出「修好每一类能涨多少 mAP」</h2>
+  <p>上一节只是<strong>数数</strong>。数数会骗人——而且骗得很凶。「背景误检有 4200 个、分类错只有 310 个」这句话听起来结论很明显：去治背景误检。<strong>但这个结论在多数情况下是错的。</strong></p>  <h3>oracle：一次反事实实验</h3>  <p>TIDE 的核心工具叫 <span class='term'>oracle</span>（先知）：假装有一个神仙，帮你<em>只</em>修好某一类错误，其他一切不变，然后重新算一遍 mAP。差值就是这类错误的<strong>修复收益上界</strong>：</p>  <div class="math-block">\[\Delta\text{AP}_i \;=\; \text{mAP}\bigl(\mathcal{O}_i(D),\; G\bigr) \;-\; \text{mAP}(D,\; G)\]</div>  <p>其中 $D$ 是检测结果集合，$G$ 是标注集合，$\mathcal{O}_i$ 是第 $i$ 类错误的 oracle 算子。六个 oracle 的定义都非常朴素：</p>  <table>
+    <thead><tr><th>oracle</th><th>它做什么</th><th>为什么这样定义</th></tr></thead>
+    <tbody>
+      <tr><td><code>O_Loc</code></td><td>把 Loc 错误的框<strong>吸附到它最接近的同类 GT 上</strong>（IoU 变成 1）</td><td>模拟「回归分支变完美」，但不改变分数与排序</td></tr>
+      <tr><td><code>O_Cls</code></td><td>把 Cls 错误的<strong>预测类别改成它框住的那个 GT 的类别</strong></td><td>模拟「分类分支变完美」，框保持原样</td></tr>
+      <tr><td><code>O_Both</code></td><td>同时修类别与框</td><td>Both 的定义就是两者皆错</td></tr>
+      <tr><td><code>O_Dupe</code></td><td><strong>删掉</strong>重复检测</td><td>模拟「去重完美」</td></tr>
+      <tr><td><code>O_Bkg</code></td><td><strong>删掉</strong>背景误检</td><td>模拟「不再无中生有」</td></tr>
+      <tr><td><code>O_Miss</code></td><td>把彻底没被覆盖的 GT <strong>从评测中移除</strong></td><td>模拟「这些目标本来就检得到」——注意是改 $G$ 不是改 $D$</td></tr>
+    </tbody>
+  </table>  <h3>为什么数量最多的错误往往最不值钱</h3>  <p>答案藏在 AP 的定义里：<strong>AP 是按分数排序后累积算的，所以一个 FP 的杀伤力完全取决于它排在第几名。</strong>背景误检的分数通常很低（模型自己也不确信），它们排在 PR 曲线的<em>最尾巴</em>，那一段的 recall 增量本来就接近 0，删掉它们对面积的贡献微乎其微。而一个 Cls 错误是<strong>双重伤害</strong>：它在<em>错的那个类</em>里是一个高分 FP（狠狠压低那条 PR 曲线的头部），同时在<em>对的那个类</em>里造成一个 FN（recall 上不去）。</p>  <div class="ascii">notebook 在合成 TSR 评测集上实测出的分解（baseline mAP = 0.602）
+
+  错误类型   数量       占比     ΔmAP(pp)   每 100 个错误的 ΔmAP(pp)
+  ────────────────────────────────────────────────────────────────────
+  Bkg      1397  ███████ 87%    +3.05     ▏0.218   &lt;- 数量之王、性价比之末
+  Loc        65  ▍        4%    +9.98     ████████████ 15.35
+  Miss       47  ▎        3%    +6.17     ██████████ 13.12
+  Cls        43  ▎        3%    +8.75     ████████████████ 20.34  &lt;- 最值钱
+  Dupe       37  ▎        2%    +0.32     ▏0.863
+  Both       18  ▏        1%    +1.44     ██████ 7.99
+  ────────────────────────────────────────────────────────────────────
+  六项之和 = 29.7 pp        离满分的总差距 = 39.8 pp   &lt;- **ΔAP 不可加**
+
+  按「数量」排序   -&gt; 先修 Bkg   （错误的决策：占 87% 的数量，只值 3 个点）
+  按「ΔmAP」排序   -&gt; 先修 Loc   （对，但没考虑成本）
+  按「ΔmAP / 成本」-&gt; 先修 Cls   （真实世界的决策：分类头改动便宜得多）</div>  <p>注意最后一行。<strong>ΔAP 只是收益上界，真正的决策变量是「收益 ÷ 成本」。</strong>Miss 的 +6.3% 可能需要「把输入分辨率从 640 提到 1280 + 加 P2 层 + 延迟涨 40%」才能兑现一半；Cls 的 +7.8% 可能只需要「把限速类的 crop 送进一个 64×64 的二级分类器」，代价是 0.3 ms。<em>两者的性价比差一个数量级。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>还有一个必须记住的性质：<strong>这些 ΔAP 不可以相加</strong>。修好 Cls 之后再修 Loc，得到的总收益一般小于 $\Delta\text{AP}_{\text{Cls}} + \Delta\text{AP}_{\text{Loc}}$。原因很直观——两类错误经常打在同一批 GT 上，第一个 oracle 已经把那部分 recall 救回来了，第二个 oracle 再救就没得救了。<em>所以看到「六项加起来 20%，但把所有错误全修好只涨 28% 到 100%」不要慌，这不是 bug。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从数学上看，AP 是匹配结果的<strong>非线性、非可加泛函</strong>：它经过了「排序 → 累积 → 单调包络 → 求面积」四步，其中排序和取 max 都是非线性的。因此 $\mathcal{O}_i$ 的效应不满足叠加原理，$\Delta\text{AP}$ 更接近博弈论里的<span class='term'>边际贡献</span>而非独立分量。<em>如果你真的需要一组「可加」的归因值，正确的工具是对六个 oracle 求 Shapley 值（$2^6 = 64$ 次评测，完全跑得动）</em>——但实践中几乎没人这么做，因为<strong>决策只需要排序，不需要精确的份额</strong>。知道 Cls 最值钱就够了，不必知道它「精确占 34.7%」。</p></div>
+  </div>  <div class="callout danger"><span class="label">跑过的人和背过的人，一句话就分得出</span>
+    <p><strong>面试里这是一个极高分的加分点，也是一个极容易翻车的点。</strong>被问「你怎么决定下一步做什么」时，说「我会做误差分析」只是及格；<em>说「我会跑 TIDE 分解，拿到六类错误的 ΔAP，然后按 ΔAP 除以我估的工程成本排序，先做性价比最高的那一项；而且我会特别小心『数量多但 ΔAP 小』的背景误检——它排在 PR 曲线尾部，删干净了 mAP 也只涨不到 1 个点」</em>——这才是拿分的回答。</p><p><strong>翻车点</strong>：把 ΔAP 说成「可以相加的贡献占比」。面试官只要追问一句「那六项加起来等于总差距吗」，就能看出你到底跑过没跑过。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="per-class"><span class="num">4</span>逐类 AP 与混淆矩阵：找出最容易互相错分的标志对</h2>
+  <p>六类分解告诉你「错在什么<em>机制</em>」，逐类分析告诉你「错在什么<em>对象</em>」。两者正交，都要做。</p>  <h3>mAP 的那个「平均」是最危险的一步</h3>  <p>mAP 对类别取的是<strong>无权重算术平均</strong>：一个在数据集中只出现 40 次的「注意落石」和一个出现 12000 次的「限速 60」，在 mAP 里权重完全一样。这带来两个方向相反的陷阱：</p>  <ul>
+    <li><strong>陷阱 A（长尾稀释）</strong>：你把主力类别从 0.93 提到 0.95，mAP 只涨 0.02/N；而某个尾部类从 0.05 掉到 0.00，mAP 掉 0.05/N——<em>于是「主力变好、长尾变差」的改动在 mAP 上可能是负的，尽管产品体验是正的（或反过来）。</em></li>
+    <li><strong>陷阱 B（尾部噪声）</strong>：只有 40 个样本的类，它的 AP 方差极大。换个随机种子 AP 可能从 0.31 跳到 0.48。<em>把这种波动当成「我的改动生效了」，是本课模块 01 讲的种子方差问题在类别维度上的变体。</em></li>
+  </ul>  <p>所以逐类表必须<strong>三列一起看</strong>：类别 AP、该类的 GT 数量、该类 AP 的种子间标准差。只看第一列的人会不停地追逐噪声。</p>  <h3>检测的混淆矩阵怎么算（和分类不一样）</h3>  <p>分类任务的混淆矩阵是 $C \times C$，每个样本必进一格。检测不是——检测有「无中生有」和「视而不见」，所以矩阵必须是 <strong>$(C{+}1) \times (C{+}1)$</strong>，多出来的那一行一列就是 background：</p>  <div class="ascii">                    预测类别
+                 限30  限60  限80  停让  禁左  ...   BG(未检出)
+        限30  [  86     2     0     0     1        11   ]  &lt;- 行和 = 该类 GT 数
+        限60  [   1   740   162     0     0        44   ]
+   真   限80  [   0   129   604     0     0        38   ]  &lt;- **这一对是重灾区**
+   实   停让  [   0     0     0    23     0        58   ]  &lt;- 召回只有 28%！
+   类   禁左  [   0     0     0     0   310        27   ]
+   别   ...
+        BG   [  55    91    73     8    40         -   ]  &lt;- 背景误检，按预测类分布
+       (误检)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+              最后一行 = Bkg 错误；最后一列 = Miss + 被判 FP 的 Loc 错误
+
+  读法：
+   · 非对角线的**块状热点** =&gt; 该类别对语义/外观太像 =&gt; 细粒度分类问题
+   · 某一行的 BG 列特别大   =&gt; 该类**召回**有问题（不是分类问题）
+   · 最后一行某列特别大     =&gt; 该类是**误检磁铁**（模型见谁都想判成它）</div>  <p>对 TSR 来说，混淆矩阵几乎总是会暴露出同一批「冤家对」。这些对子的共同特征是：<strong>整体形状与颜色完全一致，差异只在一个很小的局部区域</strong>——而这个局部区域在 20 像素的框里可能只有 3×5 个像素。</p>  <table>
+    <thead><tr><th>典型混淆对</th><th>为什么混</th><th>远距离时的可分辨像素</th><th>对应的修法</th></tr></thead>
+    <tbody>
+      <tr><td>限速 60 ↔ 限速 80</td><td>都是红圈白底黑数字，只有数字中间的一横之差</td><td>数字笔画宽度约占框宽 8%，20 px 框 → <strong>1.6 px</strong></td><td>两级架构 + 高分辨率 crop；数字区域专门增强</td></tr>
+      <tr><td>限速 30 ↔ 限速 80</td><td>圆形轮廓 + 首位数字上半闭合</td><td>同上</td><td>同上；分类器用更大的输入（如 64×64）</td></tr>
+      <tr><td>禁止左转 ↔ 禁止掉头</td><td>红圈 + 斜杠 + 箭头，箭头尾部形状不同</td><td>箭头尾部约占 12%</td><td><strong>禁止水平翻转增强</strong>（会把左转变右转）</td></tr>
+      <tr><td>限速 X ↔ 解除限速 X</td><td>解除牌是灰底斜杠，颜色差异明显但夜间失色</td><td>颜色特征在低光下衰减</td><td>低光增强 + 夜间切片单独评测</td></tr>
+      <tr><td>警告牌 ↔ 施工临时牌</td><td>都是三角/菱形黄底</td><td>整体差异大，但临时牌样本极少</td><td>长尾采样 + copy-paste（C58）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>混淆矩阵最容易被忽略、信息量却最大的地方是<strong>最后一行和最后一列</strong>。很多人把混淆矩阵画成 $C \times C$（因为工具默认这么画），于是「停车让行召回只有 28%」这个致命信息被完全隐藏了——在 $C \times C$ 的矩阵里，这一行的对角线值 23 看起来还行，因为你不知道分母是 81。<em>而对 TSR 来说，「停车让行」漏检和「指路牌」漏检的安全后果差着好几个数量级。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>工程上还要区分「未检出」与「检出但被判 FP」这两种落进最后一列的情况。前者是<span class='term'>召回问题</span>（模型压根没在那个位置输出任何框），后者是<span class='term'>定位/阈值问题</span>（有框，但 IoU 没到 0.5，或者分数低于评测的最低分数线）。<strong>这两者的修法完全相反</strong>：召回问题要动分辨率、标签分配、数据；定位问题要动回归损失与 IoU 阈值口径。所以成熟的评测脚本会把最后一列<em>再拆成两列</em>：<code>miss_no_box</code> 与 <code>miss_low_iou</code>，这正好对应第 2 节里的 Miss 与 Loc。<strong>混淆矩阵与 TIDE 分解在这里合流。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>混淆矩阵的构造有一个陷阱：<strong>你得先决定「拿哪些检测来填矩阵」</strong>。用全部检测（含分数 0.01 的）会让最后一行爆炸；用 <code>score &gt; 0.5</code> 的会让矩阵依赖于阈值选择。<em>推荐做法：用「与评测工作点一致的阈值」（见第 6 节）填矩阵，并把阈值写在图标题里。</em>同一个模型在阈值 0.3 和 0.5 下的混淆矩阵可以讲出完全不同的故事——<strong>不写阈值的混淆矩阵是不可复现的。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pr-diagnosis"><span class="num">5</span>PR 曲线的诊断读法：形状本身就是证据</h2>
+  <p>大多数人看 PR 曲线只看一个东西：曲线下面积（就是 AP）。<strong>但曲线的<em>形状</em>携带的诊断信息，比它的面积多得多。</strong>AP 是把形状积掉之后剩下的一个数；形状里写着「病在哪一段」。</p>  <div class="ascii">P                                    P
+1 ┤███████████▄                       1 ┤▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+  │           ██▄                       │
+  │             ██▄                     │      (A) 健康
+  │               ███▄▄                 │  平滑单调下滑，尾部缓慢衰减
+  │                    ▀▀▀▀▄▄▄          │  =&gt; 没有结构性 bug，
+0 └──────────────────────────► R      0 └──────────────────────────► R
+  0                          1          0                          1
+
+P                                    P
+1 ┤████████████████████                1 ┤
+  │                   █                  │  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+  │                   █                  │
+  │      (B) 高召回段崩塌               │      (C) 低召回段就不高
+  │                   █                  │  最自信的预测就已经在错
+0 ┤                   ▀▀▀▀▀▀▀▀        0 ┤  =&gt; **优先怀疑数据管线 bug**
+  └──────────────────────────► R        └──────────────────────────► R
+  0                 0.7      1          0                          1
+  高分部分全对，某个点后突然全错
+  =&gt; 有一整批样本「完全学不到」
+
+P
+1 ┤█████████▌
+  │         ▌            (D) 召回天花板
+  │         ▌      曲线在 R=0.55 处**直接断掉**
+  │         ▌      =&gt; 45% 的 GT 从来没有任何检测靠近过
+0 ┤         ▌      =&gt; Miss 主导；查尺寸分布 / 标注 / 类别表
+  └─────────┴────────────────► R
+  0        0.55              1</div>  <table>
+    <thead><tr><th>曲线形状</th><th>定量判据（可代码化）</th><th>最可能的病因</th><th>第一个该做的检查</th></tr></thead>
+    <tbody>
+      <tr><td><strong>(A) 平滑衰减</strong></td><td>$p(r{=}0.1) &gt; 0.95$ 且 $r_{\max} &gt; 0.9$ 且中段斜率平缓</td><td>没有结构性问题，属于「模型能力不够」</td><td>跑 TIDE 看 Cls/Loc 谁大，走常规优化</td></tr>
+      <tr><td><strong>(B) 高召回段崩塌</strong></td><td>$p(r{=}0.5) &gt; 0.9$ 但 $p(r{=}0.85) &lt; 0.3$，落差集中在 &lt;0.1 的 recall 区间</td><td><strong>有一整批同质样本完全学不到</strong>：某个尺寸段、某个光照条件、某个子类</td><td>按尺寸/场景分桶重画 PR；十有八九某个桶整段趴着</td></tr>
+      <tr><td><strong>(C) 低召回段就不高</strong></td><td><strong>$p(r{=}0.1) &lt; 0.8$</strong>——最高分的那批预测里就有大量 FP</td><td><strong>几乎必然是数据管线 bug</strong>：类别映射、坐标格式、评测集类别表不一致</td><td>立刻转模块 03 的三大元凶检查，不要调参</td></tr>
+      <tr><td><strong>(D) 召回天花板</strong></td><td>$r_{\max} &lt; 0.75$（曲线在中途断掉）</td><td>Miss 主导：目标太小 / 被 NMS 吃掉 / 分数低于评测最低分数线 / GT 有但从没输出</td><td>查 GT 尺寸分布；查评测时的 <code>max_dets</code> 与最低分数线</td></tr>
+    </tbody>
+  </table>  <p>(C) 这一条值得单独强调，因为它是<strong>最省时间的一个信号</strong>。想清楚它为什么成立：</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>PR 曲线的最左端（低 recall）对应的是<strong>模型最自信的那几十个预测</strong>。一个训练正常的检测器，它最自信的预测几乎不可能错——那些是最大、最清晰、最典型的目标。<em>如果连这批都错了一半，说明错的不是「难度」，而是「规则」</em>：模型在按一套规则输出，评测在按另一套规则判分。<strong>类别 ID 差 1、坐标是 xywh 被当成 xyxy、评测集的类别表和训练时的顺序不同——这三个占了绝大多数。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>反过来说，(B) 高召回段崩塌是<strong>「难度」问题而非「规则」问题</strong>：规则是对的（高分预测都对），只是有一批样本模型确实没学会。崩塌点的位置还能反推出这批样本的规模——如果 PR 在 $r = 0.72$ 处崩掉，说明大约 28% 的 GT 属于这个「学不到」的子集。<em>接下来的动作是明确的：按各种维度（像素尺寸、类别、天气、遮挡度、图像区域）分桶重画 PR，找出哪个桶整段贴地。</em><strong>找到那个桶，你就把一个模糊的「模型不行」变成了一个具体的、可以定向挖数据或改架构的工程问题。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一条心法：<strong>PR 曲线的左端诊断「规则」，右端诊断「难度」，中段诊断「能力」。</strong><em>左端有病先别碰模型——去查管线；右端有病先别调参——去分桶。</em></p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>画 PR 曲线时必须注明三件事，否则曲线不可比：<strong>① IoU 阈值</strong>（0.5 还是 0.5:0.95 的哪一档）、<strong>② 是逐类曲线还是所有类混在一起</strong>（后者在长尾数据上几乎无意义，会被头部类完全主导）、<strong>③ 是否用了单调包络</strong>（VOC 风格的包络会把锯齿抹平，掩盖掉小规模的崩塌）。<em>诊断时建议看<strong>不包络的原始曲线</strong>——锯齿本身也是信息，密集的锯齿意味着高分区里 TP/FP 交替出现。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="operating-point"><span class="num">6</span>score 阈值与工作点：车端要的是「特定 FP 率下的召回」</h2>
+  <p>这一节讲的是一个几乎所有做过研究、没做过产品的人都会犯的错：<strong>用 mAP 选模型，然后随便挑个 0.25 的阈值上线。</strong></p>  <h3>mAP 是阈值无关的，产品是阈值有关的</h3>  <p>AP 的定义里对分数只用了「排序」，没用「绝对值」——把所有分数开平方，AP 完全不变。<strong>这意味着 mAP 对「模型的分数标定得好不好」完全不敏感</strong>，而线上系统恰恰是靠分数的绝对值做取舍的。两个 mAP 相同的模型，在 <code>score &gt; 0.4</code> 这个具体工作点上的召回可以差 15 个点。</p>  <p>车端的真实需求长这样：<strong>「在误报不超过每 10 公里 1 次的前提下，尽可能早、尽可能全地检出交通标志」</strong>。写成优化问题就是：</p>  <div class="math-block">\[\tau^\star \;=\; \arg\max_{\tau}\; \text{Recall}(\tau) \quad \text{s.t.} \quad \frac{\text{FP}(\tau)}{N_{\text{frames}}} \;\le\; \beta\]</div>  <p>$\beta$ 是产品定的误报预算（FP per frame，或换算成 FP per km / FP per hour）。<strong>注意这里根本没有出现 precision。</strong>原因是 precision 是个比值，它会随场景里目标的多少而漂移：高速上一公里只有 2 块标志，即使误报率不变，precision 也会比市区低得多。<em>而 FP/frame 是绝对量，它直接对应「司机每天被误报打扰几次」，是产品和安全团队真正能理解的语言。</em></p>  <table>
+    <thead><tr><th>指标</th><th>定义</th><th>随场景目标密度变化吗</th><th>谁在用</th><th>TSR 里的适用性</th></tr></thead>
+    <tbody>
+      <tr><td>Precision</td><td>TP / (TP + FP)</td><td><strong>会</strong>（分母含 TP）</td><td>论文</td><td>❌ 跨场景不可比</td></tr>
+      <tr><td><strong>FP / frame</strong></td><td>FP 总数 / 帧数</td><td>不会</td><td><strong>感知与产品团队</strong></td><td>✅ 主力工作点指标</td></tr>
+      <tr><td><strong>FP / km</strong></td><td>FP 总数 / 里程</td><td>不会</td><td><strong>路测与安全团队</strong></td><td>✅ 与体验直接对应</td></tr>
+      <tr><td>Recall @ 固定 FP</td><td>满足 FP 预算时的最大召回</td><td>不会</td><td><strong>模型选型门禁</strong></td><td>✅ 版本对比的黄金指标</td></tr>
+      <tr><td>mAP</td><td>AP 对类别求平均</td><td>不会（但阈值无关）</td><td>论文、粗筛</td><td>🟡 只能粗筛，不能定工作点</td></tr>
+    </tbody>
+  </table>  <h3>必须逐类设阈值</h3>  <p>TSR 的类别之间<strong>代价极度不对称</strong>：漏掉一个「停车让行」可能导致路口事故；误报一个「景点指示牌」只是让 HMI 上多闪一下。用同一个全局阈值服务这两类，等于是拿最不重要的类别的误报预算，去限制最重要的类别的召回。</p>  <table>
+    <thead><tr><th>标志类别组</th><th>漏检后果</th><th>误检后果</th><th>建议工作点</th><th>典型阈值</th></tr></thead>
+    <tbody>
+      <tr><td><strong>停车让行 / 让行</strong></td><td><strong>可能不减速通过路口</strong></td><td>无谓刹车，体验差但安全</td><td>召回优先</td><td><strong>低（0.15–0.25）</strong> + 时序确认</td></tr>
+      <tr><td>限速类</td><td>超速；但通常有地图限速兜底</td><td>错误限速 → 突兀减速 → 后车风险</td><td><strong>平衡</strong>，且要求高分类准确率</td><td>中（0.35–0.45）</td></tr>
+      <tr><td>禁止类（禁左/禁行）</td><td>违规行驶</td><td>错误封路径 → 绕路</td><td>平衡偏召回</td><td>中（0.30–0.40）</td></tr>
+      <tr><td>指路 / 景点牌</td><td>几乎无后果</td><td>HMI 闪烁，用户投诉</td><td><strong>精度优先</strong></td><td><strong>高（0.55–0.70）</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么阈值不能靠拍脑袋、也不能靠「取 F1 最大点」？因为 F1 隐含地假设了 precision 和 recall<strong>等价重要</strong>，而 TSR 里这个假设对任何一个类别都不成立。<em>正确做法是把产品的误报预算写成硬约束，在约束下最大化召回——这样阈值就成了一个可计算的量，而不是一个可争论的量。</em>notebook 里会实现这个求解器：输入检测结果、GT、帧数、预算 $\beta$，输出每类的 $\tau^\star$ 与对应召回。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一层更工程的考虑：<strong>阈值必须在「送进时序融合之前」还是「之后」定，是两个完全不同的问题。</strong>C55 模块 04 讲的多帧确认会显著改变工作点——单帧允许更低的阈值（更高召回、更多 FP），因为跨帧的一致性检验会把随机 FP 滤掉；而一个只出现一帧的误检根本活不到上报。<em>所以「单帧阈值」应该按「多帧确认后的 FP 预算」反推，而不是按单帧的 FP 预算设。</em><strong>这也解释了一个常见的困惑：为什么离线评测里看起来误报很多的模型，上车之后体验反而更好——因为离线评测的是单帧，产品体验的是融合后的输出。</strong>如果你的评测流水线只评单帧，你就系统性地高估了误报、低估了召回收益，进而会把阈值定得过高。</p></div>
+  </div>  <div class="callout danger"><span class="label">mAP 过门禁 ≠ 产品不坏</span>
+    <p><strong>一个真实且常见的事故模式：用 mAP 做版本门禁，用固定阈值上线。</strong>新版本 mAP 从 0.72 涨到 0.75，顺利过门禁；上车后误报暴增，因为新模型的分数分布整体右移了（比如换了 loss 或加了标签平滑），同样的 0.4 阈值现在放行了更多低质量框。<em>mAP 涨了，产品坏了，而且离线指标完全看不出来。</em></p><p><strong>解法只有一个：门禁指标必须是「工作点上的指标」</strong>——固定 FP/frame 预算下的召回，或固定召回下的 FP/frame。<strong>而且每次换模型都要重新求解阈值，不能沿用上一版的。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="badcase-sampling"><span class="num">7</span>badcase 可视化：为什么必须分层抽样</h2>
+  <p>误差分解给你数字，混淆矩阵给你类别，PR 曲线给你形状——但最终你还是要<strong>用眼睛看图</strong>，因为只有看图才能发现「这些漏检的牌子后面都有一根路灯杆」这种数字里没有的模式。问题是：<strong>怎么选那 100 张要看的图。</strong></p>  <h3>「随便看看」看到的是分布的众数，不是问题的分布</h3>  <p>如果你从 badcase 池里均匀随机抽 100 张，你会得到什么？——<strong>你会得到 100 张限速牌</strong>。因为限速牌占了数据的 60%，即使它的错误率最低，绝对错误数依然最多。于是你花两小时看完，结论是「限速牌有时候会漏」，而真正的问题（那个只有 40 个样本、AP 只有 0.05 的施工临时牌）你一张都没看到。</p>  <p><strong>这是一个采样偏差问题，而不是勤奋程度问题。</strong>看 500 张也救不了——你只会看到 300 张限速牌。</p>  <h3>分层维度：至少四个</h3>  <table>
+    <thead><tr><th>分层维度</th><th>典型分桶</th><th>为什么这个维度必须分</th><th>不分的后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>错误类型</strong></td><td>Cls / Loc / Both / Dupe / Bkg / Miss</td><td>六类的视觉表现完全不同，混在一起看不出模式</td><td>只看到最多的那类（通常是 Bkg）</td></tr>
+      <tr><td><strong>像素尺寸</strong></td><td>&lt;16 / 16–32 / 32–64 / &gt;64 px</td><td>TSR 的错误强烈依赖尺寸，小目标是主战场</td><td>全是大目标的 case，看不出小目标的病</td></tr>
+      <tr><td><strong>类别频次</strong></td><td>head（&gt;5%）/ mid / tail（&lt;0.5%）</td><td>长尾类的绝对错误数少但错误率高</td><td>尾部类一张都抽不到</td></tr>
+      <tr><td><strong>分数区间</strong></td><td>高分 FP / 低分 FP / 高分被漏的 GT</td><td>高分 FP 是「模型自信地错」，最有诊断价值</td><td>只看高分 = 完全看不到召回问题</td></tr>
+      <tr><td>场景（有条件时）</td><td>夜间 / 逆光 / 雨雪 / 隧道口</td><td>域相关的失效模式只在特定场景出现</td><td>把域问题误判成模型能力问题</td></tr>
+    </tbody>
+  </table>  <h3>配额怎么分：不要用比例分配</h3>  <p>按各层大小成比例分配（$n_h \propto N_h$）等于没分层——大层还是吃掉全部名额。按等额分配（每层一样多）又会给一个只有 3 个样本的层塞 20 个名额。实践中最好用的是 <strong>平方根配额（square-root allocation）</strong>：</p>  <div class="math-block">\[n_h \;=\; \max\Bigl(n_{\min},\; \Bigl\lfloor n_{\text{total}} \cdot \frac{\sqrt{N_h}}{\sum_{h'} \sqrt{N_{h'}}} \Bigr\rfloor\Bigr), \qquad n_h \le N_h\]</div>  <p>平方根压缩了层间的规模差异：一个 10000 样本的层和一个 100 样本的层，比例分配下名额差 100 倍，平方根分配下只差 10 倍。再加上「每个非空层至少 $n_{\min}$ 个」的下限，就能保证<strong>尾部类和极小目标层一定会被你看到</strong>。<em>notebook 里会用最大余数法实现它，保证配额之和精确等于 $n_{\text{total}}$。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>分层抽样还有一个副产品好处：<strong>它让 badcase review 变成可复现的流程而不是个人手艺。</strong>同一份检测结果、同一个随机种子，任何人跑出来的 100 张图是同一批；上一版和这一版的对比可以做到「同一个层里，上版错 12 张、这版错 5 张」。<em>不分层就没法做这种版本对比，因为两次抽到的根本不是同一批东西。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更进一步，成熟团队会把这套抽样固化成<span class='term'>回归可视化集</span>：每个分层固定抽 N 张<em>图像 ID</em>（而不是每次重抽），每次训完新模型都在这同一批图上出对比图。<strong>这样人眼看到的差异就是模型的差异，而不是抽样的差异。</strong>代价是这批固定样本会逐渐被「过拟合」——团队会不自觉地针对这 100 张调优。<em>缓解办法是分两份：一份固定的回归集（用于版本对比），一份每次重抽的探索集（用于发现新问题），后者的种子随版本变化。</em>这和 C58 的数据闭环、模块 01 的实验纪律是同一套思路：<strong>任何用于决策的观察，都必须先说清它的采样规则。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label">10–20% 的 badcase 是标注错</span>
+    <p>一个具体的操作细节：<strong>看 badcase 时一定要同时看「模型输出」和「GT」，并且要能看到分数。</strong>至少有 10–20% 的所谓 badcase 其实是<strong>标注错误</strong>——牌子被标漏了、标错类了、框标歪了。<em>如果你不看 GT 就断定「模型漏了」，你会去挖一堆数据来修一个根本不存在的问题。</em>建议在 review 界面上直接放一个「这是标注问题」的按钮，把这类样本回流给标注团队——这条链路本身就是 C58 数据闭环的一部分，而且往往是投入产出比最高的一条。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="decision-tree"><span class="num">8</span>从指标到根因：一棵可执行的决策树</h2>
+  <p>把前七节合成一个流程。<strong>这棵树的设计原则是「先排除便宜的可能性」</strong>——查一次类别映射花 10 分钟，训一次模型花 10 小时，所以任何时候都应该先做那个 10 分钟的检查。</p>  <div class="ascii">【入口】拿到一版模型的评测结果
+   │
+   ├─ Q1: mAP 是不是接近 0（&lt; 0.05）？
+   │      是 ──► **不要做误差分析**，直接去模块 03 查三大元凶：
+   │             ① 类别 ID 偏移 0/1  ② 坐标格式弄反  ③ 评测集类别表不一致
+   │             （这三个占了 mAP≈0 案例的绝大多数）
+   │      否 ↓
+   │
+   ├─ Q2: PR 曲线在 recall=0.1 处 precision &lt; 0.8 ？
+   │      是 ──► 最自信的预测就在错 =&gt; **数据管线 bug**，同样转模块 03
+   │             典型：通道顺序、归一化 mean/std、验证集用了不同的预处理
+   │      否 ↓
+   │
+   ├─ Q3: 跑 TIDE 分解，看六类 ΔAP 的排序
+   │      │
+   │      ├─ **Miss 最大** ──► 召回侧问题
+   │      │     └─ 按像素尺寸分桶重画 PR
+   │      │          ├─ 小目标桶整段趴着 =&gt; 分辨率 / P2 层 / 切片推理（C57）
+   │      │          ├─ 某类别整段趴着   =&gt; 长尾（C58）：采样 / copy-paste / 两级架构
+   │      │          └─ 各桶均匀偏低     =&gt; 模型容量或训练不足
+   │      │
+   │      ├─ **Cls 最大** ──► 分类侧问题
+   │      │     └─ 看混淆矩阵找冤家对
+   │      │          ├─ 集中在 2-3 对   =&gt; 细粒度：两级架构 + 高分辨率 crop
+   │      │          └─ 弥散在整个矩阵 =&gt; 特征不够 / 标注类别定义本身有歧义
+   │      │
+   │      ├─ **Loc 最大** ──► 定位侧问题
+   │      │     └─ 看 Loc 错误的尺寸分布
+   │      │          ├─ 集中在小目标   =&gt; IoU 度量对小框太苛刻（NWD，C57 m03）
+   │      │          └─ 均匀分布       =&gt; 回归损失（换 GIoU/DIoU）/ 标签分配
+   │      │
+   │      ├─ **Bkg 最大且 ΔAP 也大** ──► 难负样本挖掘（C58 m02）/ 提高阈值 / 上下文
+   │      │     （注意：Bkg 数量大但 ΔAP 小是常态，那种情况**不用管**）
+   │      │
+   │      └─ **Dupe 最大** ──► 后处理：NMS 阈值 / class-wise vs agnostic / 一对一分配
+   │
+   └─ Q4: 六类都不突出、且分布均匀？
+          ──► 没有结构性问题，模型处在「能力受限」区间
+              =&gt; 这时候才轮到：更大 backbone / 更长训练 / 更多数据 / 更强增强
+              **注意：这是最后一个选项，不是第一个**</div>  <table>
+    <thead><tr><th>症状</th><th>首查项（10 分钟内可完成）</th><th>判定证据</th><th>确认后的动作</th></tr></thead>
+    <tbody>
+      <tr><td>mAP ≈ 0</td><td>把预测类别整体 ±1 后重算 mAP</td><td><strong>数值突然正常</strong></td><td>修类别映射；检查是否有 background 类占了 index 0</td></tr>
+      <tr><td>mAP ≈ 0</td><td>把预测框按 <code>cxcywh→xyxy</code> 转换后重算 IoU 分布</td><td><strong>平均 IoU 从 0.03 跳到 0.85</strong></td><td>统一坐标格式；在数据加载处加断言</td></tr>
+      <tr><td>低召回段 precision 低</td><td>dump 一个 batch 的输入张量，看通道均值</td><td>R/B 通道均值与训练统计互换</td><td>修 BGR/RGB；对拍训练与评测的预处理</td></tr>
+      <tr><td>某类召回极低</td><td>查该类 GT 数量与像素尺寸分布</td><td>该类 90% 的 GT &lt; 16 px</td><td>转小目标方案（C57），不要盲目加数据</td></tr>
+      <tr><td>某对类别互相混</td><td>看混淆矩阵的非对角块 + 抽样看图</td><td>两类外观差异 &lt; 2 px</td><td>两级架构；给二级分类器更大输入</td></tr>
+      <tr><td>改动后 mAP +0.3</td><td><strong>跑 3–5 个种子做配对检验</strong></td><td>落在种子方差区间内</td><td><strong>判定为噪声，不要采纳</strong>（模块 01）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这棵树最重要的性质是<strong>它把「便宜的检查」排在了「昂贵的实验」前面</strong>。Q1 和 Q2 加起来不超过 30 分钟，却能拦下最常见、也最浪费时间的一整类问题——很多人在这两个问题上耗掉的是「训了三天发现是类别 ID 差 1」。<em>而 Q4 那个「换更大的 backbone」被放在最后，不是因为它没用，而是因为它<strong>掩盖问题的能力太强</strong>：一个有管线 bug 的系统换了更大的模型也会涨点，于是 bug 被永久地留在了代码里。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从方法论上看，这是<span class='term'>期望信息增益除以成本</span>的贪心排序：每一步选「能排除最多可能性 ÷ 花费最少时间」的检查。这个原则可以推广到任何调试场景，也是模块 03 那整本手册的组织依据。<strong>另一个值得内化的原则是：每一步都要求「可证伪的证据」，而不是「看起来像」。</strong>「我觉得是小目标问题」不算证据；「按尺寸分桶后 &lt;16 px 桶的 AP 是 0.04、其余桶都 &gt; 0.7」才算证据。<em>面试里描述排查过程时，每说一个假设就跟一句「我会用 X 来验证它，如果看到 Y 就说明成立」——这个习惯会让你的回答听起来完全不一样。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>整棵树可以压成一句话：先证伪「管线错了」，再证伪「数据不够」，最后才承认「模型不行」。</strong><em>绝大多数人是反着做的——上来就换模型，然后在一个有 bug 的管线上做了三个月的架构消融。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>误差分析看起来是「工程」，但它底下压着一批相当硬的开放问题。下面这些既是研究方向，也是面试里展示深度的材料。</p>  <ul>
+    <li><strong>归因的唯一性。</strong>TIDE 用一棵固定的判定树换取可复现性，但归因本身是不唯一的（第 2 节）。<em>有没有一种「分解结果不依赖判定顺序」的定义？Shapley 值是一条路（对 $2^6$ 个 oracle 子集求边际贡献），但计算量与可解释性的取舍尚无定论，而且 Shapley 的公理是否适合 AP 这种排序型泛函也没被认真论证过。</em></li>
+    <li><strong>误差分解与下游安全后果的脱节。</strong>ΔAP 度量的是「对 mAP 的贡献」，但 TSR 真正关心的是「对驾驶行为的影响」。<em>一个把「限速 80」判成「限速 60」的 Cls 错误，和把「停车让行」漏掉的 Miss 错误，在 ΔAP 上可能一样大，在安全上差着几个数量级。</em>把代价矩阵嵌进误差分解（cost-sensitive TIDE），是一个实用价值极高但公开工作很少的方向（C55 模块 05 给了代价敏感评测的雏形）。</li>
+    <li><strong>时序维度的误差分解完全缺失。</strong>现有工具全部是单帧的。而 TSR 是一个「接近过程」，真正的产品指标是<em>首次检出距离</em>、<em>闪烁次数</em>、<em>误报持续时长</em>。<strong>「把 TIDE 推广到 track 级」——把一条轨迹的失败归因到 ID 切换、过晚检出、中途丢失、类别跳变——目前没有标准工具。</strong></li>
+    <li><strong>自动化的根因归纳。</strong>现在的流程是「分解 → 人看 badcase → 人总结模式」。<em>能否用 VLM 自动给 badcase 打场景标签，再做关联规则挖掘，直接输出「漏检集中在『逆光 + 树影 + 小于 20 px』这个交集」？</em>这正是 C58 模块 04 讲的 scenario tagging 与误差分析的交汇处，也是 JD 里 「automated data mining workflows」最有含金量的一层。</li>
+    <li><strong>标注噪声与模型错误的可分离性。</strong>10–20% 的 badcase 是标注问题（第 7 节）。<em>置信学习（confident learning）、损失轨迹分析、多模型一致性都能部分识别，但在检测任务上（涉及框与类别两个维度）仍缺少成熟方法。</em>在评测集上，一个未被识别的标注错误会同时污染分子和分母，使误差分解系统性偏移。</li>
+    <li><strong>评测集本身的代表性。</strong>所有误差分析的结论都以「评测集能代表线上分布」为前提。<em>当评测集与实际路况分布偏移时，你会自信地修一个线上并不重要的问题。</em>分布偏移的检测、评测集的持续更新与「评测集也要做版本管理」，是把误差分析真正落地的前提（C37 与 C58 模块 05）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>★ 必读</strong>：Bolya et al., <em>TIDE: A General Toolbox for Identifying Object Detection Errors</em>（ECCV 2020，arXiv:2008.08115）——重点读 §3 的六类定义与 oracle 设计、§4 对比不同检测器的分解结果（<em>看 one-stage 与 two-stage 的错误构成差异，这是面试里很好的谈资</em>）。配套代码 <code>tidecv</code> 只有几百行，建议通读。</p><p><strong>★</strong> Hoiem, Chodpathumwan &amp; Dai, <em>Diagnosing Error in Object Detectors</em>（ECCV 2012）——TIDE 的思想源头，第一次系统提出「按错误类型分解检测器性能」；它对目标尺寸、长宽比、遮挡等属性的分层分析至今仍是模板。</p><p><strong>★</strong> Lin et al., <em>Microsoft COCO</em>（ECCV 2014）附带的 detection analysis toolkit——那套 PR 曲线叠加图（C75 / Loc / Sim / Oth / BG / FN 逐层放宽）是 TIDE 的直接前身，理解它有助于理解「为什么需要 oracle」。</p><p>延伸：Everingham et al., <em>The PASCAL VOC Challenge</em>（IJCV 2010，AP 定义与单调包络的来源）；Northcutt et al., <em>Confident Learning</em>（JAIR 2021，标注噪声识别）；Oksuz et al., <em>Localization Recall Precision (LRP) Error</em>（ECCV 2018，一个把定位质量显式写进指标的替代方案）。相邻课程：本课模块 01（种子方差与显著性）、模块 03（管线 bug 的诊断手册）、C55 模块 05（安全导向评测与分桶）、C57 模块 05（按尺寸分桶）、C58 模块 05（闭环验证）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_experiment/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 实验设计与归因</div></a>
+    <a class="next" href="../03_debug/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 训练与部署调试手册</div></a>
+  </div>
+
+</div>
+</body>
+</html>

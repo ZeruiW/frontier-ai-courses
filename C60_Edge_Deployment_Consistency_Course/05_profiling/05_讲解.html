@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 性能剖析与延迟工程</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 性能剖析与延迟工程</h1>
+  <p class="subtitle">没 warmup、没 synchronize 的计时是纯噪声——先学会怎么测，再谈怎么优化 · <strong>车端安全关心的是 p99 而不是均值</strong>：p99 超预算意味着每 100 帧就丢一帧，而丢的那帧往往是最密集的那帧 · roofline 用算术强度判定计算受限还是访存受限，直接决定下一步该减 FLOPs 还是减访存 · H2D/D2H 常占端到端的 20–40%，零拷贝/统一内存能把它拿回来 · <strong>功耗墙与降频让连续跑 30 分钟后的延迟比冷启动漂移 10–30%</strong>，只测前 100 帧会得出错误结论 · 多相机批处理的吞吐收益与延迟代价 · 发布前的六项验收清单（精度 / p99 / 显存峰值 / 长稳 / 多硬件一致 / 回退方案）</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 02（TensorRT 构建 / 层融合 / 算子回退）、模块 03（INT8）、模块 04（后处理放 GPU 还是 CPU）；C53 模块 05 的延迟-精度权衡</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_profiling_latency.ipynb（纯 numpy：延迟分布 / roofline / 热降频模拟 / 验收门禁）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Williams et al., Roofline (CACM 2009) · Dean & Barroso, The Tail at Scale (CACM 2013) · trtexec 与 Nsight Systems 文档 · NVIDIA Orin 平台功耗与热管理指南</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 80 分钟 + 跑 70 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#measure">测延迟的七宗罪</a></li>
+      <li><a href="#tail">为什么是 p99，不是均值</a></li>
+      <li><a href="#decompose">端到端延迟分解：推理往往只占一半</a></li>
+      <li><a href="#roofline">Roofline：算子到底受什么限制</a></li>
+      <li><a href="#fallback">静默回退：「转了 TRT 但没变快」</a></li>
+      <li><a href="#batch-stream">批处理、多流与车端多相机</a></li>
+      <li><a href="#thermal">车端特有约束：功耗墙、降频、抢占</a></li>
+      <li><a href="#checklist">发布前验收清单</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="measure"><span class="num">1</span>测延迟的七宗罪</h2>
+  <p>一个数字比它背后的测量方法可信度更低。<strong>面试里报出「我们的模型 8 ms」而说不清测量口径，是减分的；能主动说出「batch=1、含预处理与拷贝、含后处理、FP16、Orin AGX MAXN 模式、warmup 500 次、报 p50 和 p99」，是加分的。</strong>这一节把七种最常见的测错方式列全。</p>  <table>
+    <thead><tr><th>#</th><th>错误</th><th>会得到什么数</th><th>为什么</th><th>怎么做对</th></tr></thead>
+    <tbody>
+      <tr><td><strong>1</strong></td><td>没有 warmup</td><td>第一帧比稳态慢 <strong>10–100 倍</strong></td><td>CUDA context 创建、kernel 模块懒加载、cuDNN/cuBLAS handle 初始化、首次显存分配、TRT 的 lazy init 全在第一次调用里发生</td><td>丢弃前 200–500 次；<code>trtexec --warmUp=500</code></td></tr>
+      <tr><td><strong>2</strong></td><td><strong>没有同步就计时</strong></td><td>「0.05 ms / 20000 FPS」这种荒谬值</td><td><code>enqueueV3</code> 是异步的，<em>提交完立刻返回</em>——你测的是 CPU 把 kernel 塞进队列的时间</td><td>计时区间末尾加 <code>cudaStreamSynchronize</code>；或用 CUDA event 夹住</td></tr>
+      <tr><td>3</td><td>用 <code>time.time()</code></td><td>分辨率不够，短耗时全测成 0 或跳变</td><td>部分平台上 <code>time.time()</code> 的分辨率是毫秒甚至 16 ms 量级</td><td><code>time.perf_counter()</code> / <code>std::chrono::steady_clock</code></td></tr>
+      <tr><td><strong>4</strong></td><td>只报均值</td><td>看不见尾巴</td><td>延迟是<em>分布</em>，均值对长尾极不敏感</td><td>报 p50 / p99 / p99.9 / max 四个数</td></tr>
+      <tr><td><strong>5</strong></td><td>同一张图跑 1000 次</td><td>方差被人为压成 0</td><td>cache 全热、NMS 输入固定 → <strong>所有数据依赖项都被冻结了</strong></td><td>用真实帧序列跑，且必须包含密集场景帧</td></tr>
+      <tr><td>6</td><td>只测 GPU 推理</td><td>少算一半</td><td>论文与 <code>trtexec</code> 默认口径常常不含预处理、拷贝、后处理</td><td>报「端到端」与「纯推理」两个数并注明</td></tr>
+      <tr><td><strong>7</strong></td><td>开着 profiler 测总延迟</td><td>总延迟被抬高，且逐层耗时之和 ≠ 端到端</td><td>per-layer profiling 要在每层后插同步点，<strong>破坏了层间重叠与融合</strong>（观察者效应）</td><td><code>--separateProfileRun</code>：性能跑一次、profile 跑另一次</td></tr>
+    </tbody>
+  </table>  <h3>CUDA event 与墙钟：两个都要报</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>CUDA event 计时</strong>测的是「GPU 上这段工作花了多久」，不含 CPU 提交开销、不含排队等待。<strong>墙钟计时</strong>（<code>perf_counter</code> 夹住「提交 + 同步」）测的是「用户从发出请求到拿到结果等了多久」。<em>前者是你优化 kernel 时该看的，后者是产品该看的。</em>两者的差就是「提交开销 + 排队 + 同步开销」，如果这个差很大（比如超过 GPU 时间的 20%），说明 CPU 侧成了瓶颈——常见原因是 kernel 太碎、启动开销占比过高。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><code>trtexec</code> 就是这么设计输出的，四个数值必须分清：<em>①<strong>GPU Compute Time</strong></em>——engine 在 GPU 上纯执行的时间；<em>②<strong>Enqueue Time</strong></em>——CPU 把这一次推理提交进 stream 的时间，如果它接近甚至超过 GPU Compute Time，说明 CPU 提交跟不上 GPU 执行，<strong>需要 CUDA Graph 或减少层数</strong>；<em>③<strong>Host Latency</strong></em>——含 H2D/D2H 的端到端；<em>④<strong>Throughput</strong></em>——稳态吞吐，在多流/多 batch 下与延迟的倒数完全不是一回事。<strong>报「FPS」而不说是哪个口径，等于没报。</strong></p></div>
+  </div>  <h3>要多少个样本才能可靠地估出 p99</h3>  <p>这是一个可以精确回答的统计问题。$n$ 个独立样本中，$p$ 分位数落在第 $\lceil pn \rceil$ 个次序统计量上，而「有多少个样本超过真实 $p$ 分位」服从二项分布 $\mathrm{Bin}(n, 1-p)$，秩的标准差是：</p>  <div class="math-block">\[\sigma_{\text{rank}} = \sqrt{n\,p\,(1-p)} \qquad\Longrightarrow\qquad \text{95\% 置信区间对应的分位区间约为}\ \ p \pm \frac{1.96\sqrt{p(1-p)}}{\sqrt{n}}\]</div>  <table>
+    <thead><tr><th>样本数 $n$</th><th>超过 p99 的样本个数</th><th>$\sigma_{\text{rank}}$</th><th>p99 估计的 95% 分位区间</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>100</td><td><strong>1 个</strong></td><td>0.99</td><td>[97.0%, 101.0%]</td><td><strong>完全不可用</strong>——你的「p99」就是最大值</td></tr>
+      <tr><td>1 000</td><td>10 个</td><td>3.15</td><td>[98.4%, 99.6%]</td><td>勉强可用，是<strong>下限</strong></td></tr>
+      <tr><td>10 000</td><td>100 个</td><td>9.95</td><td>[98.8%, 99.2%]</td><td><strong>推荐</strong>（30 FPS 下约 5.5 分钟）</td></tr>
+      <tr><td>100 000</td><td>1 000 个</td><td>31.5</td><td>[99.0%, 99.0%]</td><td>p99.9 也可估（约 55 分钟，正好覆盖热稳态）</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">样本量不够，p99 就是伪科学</span>
+    <p><strong>「我跑了 100 次，p99 是 9.1 ms」——这句话在统计上是空的。</strong>100 个样本里只有 1 个超过 p99，你报的「p99」实际上就是这 100 次里的最大值，而最大值的方差极大（一次系统中断就能污染它）。<em>更糟的是，如果你还是「同一张图跑 100 次」，那么数据依赖的那部分方差压根没进入样本。</em><strong>面试里被问「你们的 p99 是多少」，正确的回答要包含三件事：样本量、样本来源（真实帧序列还是重复单帧）、测量时长（是否覆盖热稳态）。</strong>只报一个数字，等于承认没做过。</p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把七宗罪压成一句检查：<strong>「我丢了 warmup 吗？我同步了吗？我用的是真实帧序列吗？我跑够 10000 次了吗？我报的是端到端还是纯推理？」</strong>五个问题全过，这个数字才配写进报告。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tail"><span class="num">2</span>为什么是 p99，不是均值</h2>
+  <p>数据中心优化吞吐，车端优化<strong>尾延迟</strong>。这不是偏好差异，是任务性质的差异：网页慢 200 ms 用户皱个眉，感知帧晚 20 ms 到达，下游会按时间戳把它<strong>整帧丢弃</strong>——这一帧的算力白花了，而且这一帧本来可能正好包含那块新出现的限速牌。</p>  <h3>超时率的算术：p99 达标 ≠ 安全</h3>  <p>30 FPS 意味着每小时 $30 \times 3600 = 108{,}000$ 帧。把「超过延迟预算」的比例记作 $\epsilon$：</p>  <div class="math-block">\[N_{\text{timeout/h}} \;=\; \epsilon \cdot f \cdot 3600, \qquad \bar{T}_{\text{between}} \;=\; \frac{1}{\epsilon f}\]</div>  <table>
+    <thead><tr><th>达标水平</th><th>$\epsilon$</th><th>每小时超时帧数</th><th>平均多久一次</th><th>工程判断</th></tr></thead>
+    <tbody>
+      <tr><td>p90 ≤ 预算</td><td>10%</td><td>10 800</td><td>0.33 s</td><td>不可用</td></tr>
+      <tr><td><strong>p99 ≤ 预算</strong></td><td>1%</td><td><strong>1 080</strong></td><td><strong>3.3 s</strong></td><td><strong>听起来很好，实际每 3 秒丢一帧</strong></td></tr>
+      <tr><td>p99.9 ≤ 预算</td><td>0.1%</td><td>108</td><td>33 s</td><td>多数量产系统的实际门槛</td></tr>
+      <tr><td>p99.99 ≤ 预算</td><td>0.01%</td><td>10.8</td><td>5.6 min</td><td>安全相关任务的目标</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第二行是本节最该记住的一行。<strong>「我们的 p99 达标」听起来是个很好的结论，翻译成物理事件就是「每 3.3 秒丢一帧」</strong>。对一个 30 FPS 的感知链路，这意味着跟踪器每隔几秒就要处理一次「这一帧没有观测」；如果丢帧还不被上报（模块 04 讲过的静默丢帧），下游的生命周期状态机会误以为目标消失。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严重的是<strong>超时的相关性</strong>。上面那张表隐含假设「每帧是否超时相互独立」，但真实系统里超时几乎从不独立：<em>热节流会让连续几万帧都变慢；一次内存碎片整理会连累几十帧；另一个感知任务的突发负载会压住 TSR 十几帧</em>。<strong>所以除了 $\epsilon$，还必须报「最长连续超时段」</strong>——独立假设下 1% 超时率出现连续 5 帧超时的概率是 $10^{-10}$（几乎不可能），而热节流下连续 5000 帧超时是常态。<em>两者的 p99 可以完全一样，但对系统的伤害差着数量级。</em>notebook 里会把这两种分布并排放出来。</p></div>
+  </div>  <h3>各个统计量分别回答什么问题</h3>  <table>
+    <thead><tr><th>统计量</th><th>回答的问题</th><th>什么时候看它</th><th>陷阱</th></tr></thead>
+    <tbody>
+      <tr><td><strong>均值</strong></td><td>总算力消耗是多少</td><td>做容量规划、算功耗</td><td><strong>对长尾几乎不敏感</strong>；1% 的帧慢 10 倍，均值只涨 9%</td></tr>
+      <tr><td>p50</td><td>典型体验</td><td>对比两个方案的「常规速度」</td><td>两个 p50 相同的系统，p99 可以差 3 倍</td></tr>
+      <tr><td>p90 / p95</td><td>调优时的粗粒度信号</td><td>迭代过程中快速看趋势</td><td>对安全论证不够</td></tr>
+      <tr><td><strong>p99 / p99.9</strong></td><td><strong>会不会超时、多久超一次</strong></td><td><strong>验收、安全论证、调度预留</strong></td><td>样本量不足时不可信（见第 1 节）</td></tr>
+      <tr><td>max</td><td>有没有异常事件</td><td><strong>发现问题</strong>，不是设指标</td><td>单样本，噪声极大；一次中断就能污染</td></tr>
+      <tr><td><strong>最长连续超时段</strong></td><td>会不会「连续失明」</td><td>热/抢占相关的验收</td><td><strong>最常被漏掉的指标</strong></td></tr>
+    </tbody>
+  </table>  <h3>尾延迟从哪来：四个来源要分开治</h3>  <ul>
+    <li><strong>数据依赖</strong>：NMS 的耗时是 $O(NK)$，$N$ 与 $K$ 都随场景复杂度增长（C53 模块 04 实测 log-log 斜率约 1.7）。<em>治法：给 NMS 输入设硬上限，或换无 NMS 架构，或把后处理搬到 GPU（模块 04）。</em></li>
+    <li><strong>系统抖动</strong>：Linux 非实时内核的调度延迟、页错误、中断、锁竞争、内存分配器。<em>治法：关键线程绑核 + <code>SCHED_FIFO</code> + <code>isolcpus</code>；稳态期禁止分配（模块 04 的 C++ 检查单）。</em></li>
+    <li><strong>硬件</strong>：<strong>热节流与功耗墙</strong>（第 7 节）、DRAM refresh、其他任务抢占。<em>治法：长时间测试 + 功耗模式声明 + 时间片预算。</em></li>
+    <li><strong>软件架构</strong>：多余的同步点、动态 shape 触发的 tactic 切换、队列排队。<em>治法：Nsight Systems 看时间线（模块 04）。</em></li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <strong>TSR 场景的反相关是最讨厌的地方：延迟尖峰恰好出现在场景最复杂、最需要及时反应的时候。</strong>高速上视野里 2 块标志，候选框少、NMS 快；开进城市路口，龙门架 + 一排限速牌 + 店铺招牌 + 贴满贴纸的货车，候选框涨十倍、NMS 慢十倍——<em>而这正是最容易出现「新标志突然出现、必须尽快识别」的场景</em>。<strong>「平均够快」在这里没有任何安全意义。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="decompose"><span class="num">3</span>端到端延迟分解：推理往往只占一半</h2>
+  <p>优化的第一步不是「让模型更快」，是<strong>知道时间花在哪里</strong>。下面是一个典型 TSR 检测器在车端 SoC 上的分解（640×640 输入、200 类、三尺度 8400 个位置、FP16 engine；数字是量级真实的示意值）：</p>  <div class="ascii">朴素实现（14.32 ms）
+取帧 ▏0.30
+CPU 预处理 ████████▏3.20         ← resize+letterbox+归一化+HWC→CHW，单核
+H2D fp32 ▊0.31                   ← 640x640x3x4 = 4.91 MB
+推理 FP16 ████████████████████▉8.20
+D2H raw ▌0.21                    ← 8400x204xfp16 = 3.43 MB
+CPU 解码+NMS █████▎2.10
+                                    推理占比 **57.3%**
+
+优化后（9.03 ms，模型一个字节没改）
+取帧(零拷贝) ▏0.05
+GPU 预处理 ▉0.35                  ← 融合成一个 kernel
+H2D uint8 ▎0.08                   ← **1.23 MB，降到 1/4**（归一化搬到 GPU 上做）
+推理 FP16 ████████████████████▉8.20
+GPU 解码+NMS ▉0.35
+D2H 300 框 ▏0.001                 ← **7.2 KB，降到 1/480**
+                                    推理占比 **90.8%**，端到端省 **37%**</div>  <table>
+    <thead><tr><th>阶段</th><th>朴素</th><th>优化后</th><th>怎么优化的</th><th>收益</th></tr></thead>
+    <tbody>
+      <tr><td>取帧</td><td>0.30</td><td>0.05</td><td>相机 dmabuf 直接映射给 CUDA，省掉一次 memcpy</td><td>0.25</td></tr>
+      <tr><td><strong>预处理</strong></td><td><strong>3.20</strong></td><td><strong>0.35</strong></td><td>CPU 单核 → 融合的 GPU kernel（或 VIC 硬件缩放器）</td><td><strong>2.85</strong></td></tr>
+      <tr><td>H2D</td><td>0.31</td><td>0.08</td><td><strong>传 uint8 而不是 float32</strong>，归一化在 GPU 上做</td><td>0.23</td></tr>
+      <tr><td>推理</td><td>8.20</td><td>8.20</td><td>—（本节不碰模型）</td><td>0</td></tr>
+      <tr><td>D2H</td><td>0.21</td><td>0.001</td><td>GPU 侧解码 + NMS，只回传 300 个框</td><td>0.21</td></tr>
+      <tr><td><strong>后处理</strong></td><td><strong>2.10</strong></td><td><strong>0.35</strong></td><td>解码与 NMS 搬到 GPU（模块 04 方案 B/C）</td><td><strong>1.75</strong></td></tr>
+      <tr><td><strong>合计</strong></td><td><strong>14.32</strong></td><td><strong>9.03</strong></td><td></td><td><strong>5.29 ms（37%）</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>整整 5.3 ms，比换一个更小的模型划算得多——而且完全不掉精度。</strong>如果你去优化模型，从 8.2 ms 压到 6.5 ms（掉 1.5 mAP）也只省 1.7 ms。<em>新手一上来就想换 backbone，老手先量拷贝和预处理。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>两条最容易被忽略的收益值得单独拎出来。<em>①<strong>H2D 传 uint8 而不是 float32，拷贝量直接降 4 倍</strong></em>——归一化本来就是逐元素操作，是访存受限的（见下一节），放在 GPU 上做几乎免费，而在 CPU 上做既慢又把数据撑大 4 倍。<em>②<strong>D2H 只传最终框而不是 raw tensor，降 480 倍</strong></em>——8400×204 的 raw 输出有 3.43 MB，而 300 个框只有 7.2 KB。<strong>这两条加起来省的 0.44 ms 看着不多，但它们的真正价值是把 PCIe/内存总线让出来给别的任务</strong>——车端 SoC 上带宽是所有感知任务共享的稀缺资源，你少占 4 MB/帧，就是每秒少占 120 MB/s。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一条可迁移的心法：<strong>先画分解图，再决定优化什么。</strong>没有分解图的性能优化都是猜。而画分解图的成本是一天，猜错的成本是两周。</p>
+  </div>  <div class="callout warn"><span class="label">逐层之和与端到端不该相等</span>
+    <p><strong>分解时要小心「逐层耗时之和 ≠ 端到端」。</strong>打开 per-layer profiling 会在每层后插同步点，破坏层间重叠、抑制某些融合，于是<em>逐层之和通常比端到端<strong>大</strong>（10–30% 不等）</em>。反过来，如果你测出「逐层之和明显<strong>小于</strong>端到端」，那差额就是 CPU 提交开销、排队、同步等待——<strong>这个差额本身是一个非常有价值的诊断量</strong>（对应 <code>trtexec</code> 的 Host Latency 减去 GPU Compute Time）。用 <code>--separateProfileRun</code> 把两件事分开测。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="roofline"><span class="num">4</span>Roofline：算子到底受什么限制</h2>
+  <p>知道「时间花在哪个阶段」之后，下一层问题是「这个阶段为什么慢」。<span class="term">Roofline</span> 模型用两个硬件常数和一个算子属性就能回答它。</p>  <div class="math-block">\[I \;=\; \frac{\text{FLOPs}}{\text{Bytes}} \quad(\text{算术强度}), \qquad P_{\text{attainable}} \;=\; \min\bigl(P_{\text{peak}},\; I \times BW\bigr), \qquad I_{\text{ridge}} \;=\; \frac{P_{\text{peak}}}{BW}\]</div>  <p>取一块车端 SoC 的量级（GPU FP16 峰值约 42 TFLOPS、LPDDR5 带宽约 204.8 GB/s）：</p>  <div class="math-block">\[I_{\text{ridge}} \;=\; \frac{42 \times 10^{12}}{204.8 \times 10^{9}} \;\approx\; \mathbf{205}\ \text{FLOP/Byte}\]</div>  <p><strong>205 是一个高得吓人的脊点。</strong>它意味着：一个算子必须每读 1 个字节就做 205 次浮点运算，才配称为「计算受限」。绝大多数算子达不到。逐个算给你看（FP16，40×40 特征图，256 通道）：</p>  <table>
+    <thead><tr><th>算子</th><th>FLOPs</th><th>访存 Bytes</th><th>$I$</th><th>判定</th><th>预测耗时</th><th><strong>比 FLOPs 预测慢几倍</strong></th></tr></thead>
+    <tbody>
+      <tr><td>3×3 conv 256→256</td><td>1.887 G</td><td>2.82 M</td><td><strong>670</strong></td><td><span class="badge cpu">计算受限</span></td><td>44.9 μs</td><td>1.0×</td></tr>
+      <tr><td>3×3 conv 256→256 <em>@80×80</em></td><td>7.550 G</td><td>7.73 M</td><td>976</td><td>计算受限</td><td>179.8 μs</td><td>1.0×</td></tr>
+      <tr><td>1×1 conv 256→256</td><td>0.210 G</td><td>1.77 M</td><td>119</td><td><strong>访存受限</strong></td><td>8.6 μs</td><td>1.7×</td></tr>
+      <tr><td><strong>5×5 depthwise 256</strong></td><td><strong>0.020 G</strong></td><td>1.65 M</td><td><strong>12.4</strong></td><td><strong>严重访存受限</strong></td><td>8.1 μs</td><td><strong>16.5×</strong></td></tr>
+      <tr><td>逐元素 Add</td><td>0.0004 G</td><td>2.46 M</td><td>0.17</td><td>极端访存受限</td><td>12.0 μs</td><td>1200×</td></tr>
+      <tr><td>SiLU / 激活</td><td>0.0016 G</td><td>1.64 M</td><td>1.0</td><td>极端访存受限</td><td>8.0 μs</td><td>200×</td></tr>
+      <tr><td>Concat / Transpose / Reformat</td><td><strong>0</strong></td><td>≥ 2×数据量</td><td>0</td><td><strong>纯访存</strong></td><td>&gt; 8 μs</td><td>∞</td></tr>
+    </tbody>
+  </table>  <h3>这张表里最重要的一行</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>5×5 depthwise 的 FLOPs 只有 3×3 稠密卷积的 1/92，但延迟只快 5.6 倍。</strong>换句话说，它的实际耗时是「按 FLOPs 推算」的 <strong>16.5 倍</strong>。原因很直白：depthwise 卷积每个输出通道只用自己那一个输入通道，<em>数据复用率极低</em>——搬进来的每个字节只被用了 25 次乘加（$k^2$），而稠密卷积用了 $256 \times 9 = 2304$ 次。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这直接修正了一个常见的误读。C53 模块 03 讲 RTMDet 用 5×5 depthwise 大核时说「参数量代价极小」——<strong>那句话是对的，但它说的是参数量，不是延迟</strong>。$k$ 从 3 涨到 5，depthwise 的 FLOPs 涨 2.78 倍，但访存量几乎不变（权重只占 12.8 KB，可以忽略），于是<em>延迟几乎不涨</em>——从这个角度看大核确实是「便宜」的。<strong>但整个 depthwise 算子本身相对于它的 FLOPs 就是「贵」的</strong>：0.02 GFLOP 的算子花掉 8.1 μs，而 1.887 GFLOP 的稠密卷积才花 44.9 μs。<em>结论是：<strong>FLOPs 不是延迟的好代理，尤其在轻量化架构上</strong>——MobileNet 系、ShuffleNet 系、以及所有大量使用 depthwise 的模型，其「FLOPs 很低」与「延迟很低」之间存在系统性的落差。选型时必须实测，不能查表。</em></p></div>
+  </div>  <h3>融合为什么收益这么大</h3>  <p><code>Conv → BN → SiLU</code> 三个算子串起来，如果不融合：</p>  <table>
+    <thead><tr><th></th><th>FLOPs</th><th>访存</th><th>耗时</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>3×3 Conv</td><td>1.887 G</td><td>2.82 M</td><td><strong>44.9 μs</strong></td><td>计算受限，这是不可省的部分</td></tr>
+      <tr><td>BN（逐元素仿射）</td><td>0.0008 G</td><td>1.64 M</td><td>8.0 μs</td><td><strong>纯搬运</strong>：读一遍写一遍</td></tr>
+      <tr><td>SiLU</td><td>0.0016 G</td><td>1.64 M</td><td>8.0 μs</td><td><strong>纯搬运</strong></td></tr>
+      <tr><td><strong>不融合合计</strong></td><td></td><td></td><td><strong>60.9 μs</strong></td><td></td></tr>
+      <tr><td><strong>融合后</strong></td><td></td><td></td><td><strong>44.9 μs</strong></td><td>BN 折进卷积权重（构建期），SiLU 融进 epilogue（不落盘）</td></tr>
+      <tr><td><strong>收益</strong></td><td></td><td></td><td><strong>−26%</strong></td><td><em>而 FLOPs 只减少了 0.13%</em></td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <strong>融合省的从来不是计算，是「把中间结果写回显存再读回来」这一趟。</strong>这就是为什么模块 02 里「什么阻止了融合」值得追究——一个多余的 <code>Reshape</code>、一个被别处引用的中间张量、一个不支持的激活函数，都会把两个本可以融合的算子拆开，代价是一趟完整的往返访存。
+  </div>  <h3>三种诊断结论与各自的对策</h3>  <table>
+    <thead><tr><th>观察到</th><th>判定</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td>有效算力接近峰值（$I > I_{\text{ridge}}$）</td><td><strong>计算受限</strong></td><td>降精度（FP16→INT8 直接翻倍）、减 FLOPs（剪枝/蒸馏/换结构）、用 Tensor Core 友好的通道数（32 的倍数）</td></tr>
+      <tr><td>有效带宽接近峰值（$I < I_{\text{ridge}}$）</td><td><strong>访存受限</strong></td><td><strong>融合</strong>、降精度（也减字节！）、改 layout（NHWC / NC32HW32）、增大 batch 复用权重</td></tr>
+      <tr><td><strong>两个都远低于峰值</strong></td><td><strong>并行度不足</strong></td><td>增大 batch、多流并发、<strong>CUDA Graph 消除启动开销</strong>、检查是不是 tail effect（最后一个 wave 的 SM 没填满）</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label">小模型上，启动开销可能是最大的一项</span>
+    <p><strong>第三行最容易被忽略，而它在小模型上是常态。</strong>每个 kernel 的启动开销约 <strong>5–10 μs</strong>（含 CPU 侧提交与 GPU 侧调度）。一个融合后仍有 200 层的网络，光启动开销就是 <strong>1.0–2.0 ms</strong>——对一个 8 ms 的模型是 12–25%。<em>症状是「GPU 利用率只有 40%，但换更大的模型延迟几乎不涨」</em>。<strong>治法是 CUDA Graph</strong>：把整张图的 kernel 序列录制一次，之后每帧只提交一次 graph，把 $N$ 次启动摊成 1 次。<em>代价是 shape 必须固定（动态 shape 要每档录一个 graph），且录制期间不能有 CPU 侧的条件分支——这正好和「稳态期不分配、不同步」的纪律吻合（模块 04）。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fallback"><span class="num">5</span>静默回退：「转了 TRT 但没变快」</h2>
+  <p>这是模块 02 埋下的伏笔，在这里给出<strong>可执行的检测方法</strong>。症状永远是同一句话：「我转了 TensorRT / 开了 FP16 / 做了 INT8，但延迟基本没变。」</p>  <h3>四种回退，四种检测</h3>  <table>
+    <thead><tr><th>回退类型</th><th>发生了什么</th><th>检测方法</th><th>红灯判据</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 子图切分</strong></td><td>不支持的算子把图切成多个子图，分别交给不同后端（TRT EP / CUDA EP / 甚至 CPU EP）。<strong>每次子图切换都要一次同步 + 可能的 D2H/H2D</strong></td><td>ONNX Runtime：日志里的 <code>Number of subgraphs</code>；设 <code>ORT_TENSORRT_DUMP_SUBGRAPHS=1</code> 导出子图查看</td><td><strong>子图数 &gt; 1 就要追问原因</strong>；&gt; 3 基本等于没提速</td></tr>
+      <tr><td><strong>② FP16 未生效</strong></td><td><code>kFP16</code> 是「<em>允许</em>」不是「强制」。TRT 的 tactic selection 基于实测，某层若 FP16 kernel 更慢或不存在，会自动选 FP32</td><td><code>IEngineInspector</code> 导出 engine layer 信息（JSON），看每层的 <code>Precision</code> 字段；或 <code>--verbose</code> 日志</td><td><strong>FP32 层的耗时占比 &gt; 10%</strong> 就要逐层查</td></tr>
+      <tr><td><strong>③ INT8 缺 dynamic range</strong></td><td>某层没有校准得到的量化范围 → 退回 FP32/FP16</td><td>同上；构建日志里会有 <code>Missing scale and zero-point</code> 类告警</td><td>任何计算密集层退回 FP32</td></tr>
+      <tr><td><strong>④ 动态 shape 选错 tactic</strong></td><td>实际 shape 落在 profile 的边缘，用的是为 <code>opt</code> 那档挑的 kernel</td><td>对 min/opt/max 三档分别测延迟，看是否有反常的凸起</td><td>非 <code>opt</code> 档的延迟 &gt; <code>opt</code> 档的 1.5 倍</td></tr>
+    </tbody>
+  </table>  <div class="ascii">健康的 engine                        有静默回退的 engine
+─────────────────────────           ─────────────────────────────────
+subgraphs: 1                        subgraphs: **4**   ← 被切碎了
+                                        ├─ TRT   (conv 段)
+layer precision 分布:                   ├─ **CUDA** (某个不支持的算子)
+  FP16  187 层  96.4%                   ├─ TRT   (conv 段)
+  FP32    7 层   3.6%                   └─ **CPU**  (某个 Loop/NMS 变体)
+  (都是 LayerNorm/Softmax 等
+   已知敏感层，且总耗时 &lt; 3%)       layer precision 分布:
+                                      FP16  120 层  61%
+GPU Compute  8.2 ms                   **FP32   74 层  39%**  ← 红灯
+Host Latency 9.0 ms                   (含 3 个 conv 主干层！)
+Enqueue      0.9 ms
+  → 差额 0.8 ms 合理                GPU Compute  8.4 ms
+                                    Host Latency **14.6 ms** ← 差额 6.2 ms
+                                      = 子图之间的同步与来回拷贝</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>右边那一栏是「转了 TRT 但没变快」的完整体检报告。<strong>注意 GPU Compute Time 两边差不多（8.2 vs 8.4），是 Host Latency 差了 5.6 ms</strong>——如果你只看 <code>trtexec</code> 报的 GPU 时间，会得出「engine 没问题」的错误结论。<em>子图切分的代价不在计算里，在同步和拷贝里。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>把这套检查<strong>自动化</strong>是本节的落点：解析 <code>IEngineInspector</code> 输出的 layer JSON（每层有 name / LayerType / Precision / TacticValue / 输入输出格式）与 <code>--dumpProfile</code> 的逐层耗时，合并成一张表，然后跑几条规则：<em>①子图数 == 1；②FP32 层耗时占比 &lt; 10%；③没有计算密集层（Conv/MatMul）落在 FP32；④没有出现 <code>Reformat</code> 层占用超过 5% 的耗时（reformat 是纯访存的格式转换，大量出现说明相邻层的 layout 偏好冲突）；⑤动态 shape 三档的延迟单调且无异常凸起。</em><strong>这五条规则跑一次不到一秒，却能挡住绝大多数「优化了但没优化」的发布。</strong>notebook 里会把这个检查器实现出来。</p></div>
+  </div>  <div class="callout danger"><span class="label">你的 ONNX 里没有的层，可能占掉 10% 的时间</span>
+    <p><strong><code>Reformat</code> 层是最容易被忽略的时间小偷。</strong>TensorRT 在两个 layout 偏好不同的层之间会自动插入 reformat（比如 <code>NCHW</code> ↔ <code>NC32HW32</code>，或 FP32 ↔ FP16 的转换）。这些层<em>不在你的 ONNX 里</em>，是构建器自己加的，所以你在模型结构里看不到它们。<strong>它们的算术强度是 0（纯搬运），却可能占掉 5–15% 的总耗时。</strong><em>治法：让通道数取 32 的倍数、让首尾层的精度与输入输出格式对齐（比如直接用 <code>kHALF</code> 的 NHWC 输入，避免入口处的一次 reformat）、避免在网络中间混用无法融合的精度。</em>面试里能主动提 reformat，说明你真的读过 engine 的 layer 表而不只是跑过 <code>trtexec</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="batch-stream"><span class="num">6</span>批处理、多流与车端多相机</h2>
+  <p>批处理是数据中心提升吞吐的第一手段，在车端却<strong>基本用不上——除非你有多相机</strong>。这一节把账算清楚。</p>  <h3>批处理的收益来自哪里</h3>  <p>把一次推理的时间拆成两部分：<em>与 batch 成正比的激活相关部分</em> $T_{\text{act}}$，和<em>与 batch 无关的权重读取部分</em> $T_w$（权重只需读一次，供整个 batch 复用）：</p>  <div class="math-block">\[T(b) \;=\; b\,T_{\text{act}} + T_w \qquad\Longrightarrow\qquad \frac{T(b)}{b} \;=\; T_{\text{act}} + \frac{T_w}{b} \;\xrightarrow[b\to\infty]{}\; T_{\text{act}}\]</div>  <p>所以<strong>吞吐的提升上限是 $\frac{T_{\text{act}}+T_w}{T_{\text{act}}}$，而且完全由权重读取的占比决定</strong>。取 $T_{\text{act}}=6.0$ ms、$T_w=2.2$ ms（即 batch=1 时 8.2 ms）：</p>  <table>
+    <thead><tr><th>batch</th><th>总耗时</th><th>每帧摊薄</th><th>吞吐提升</th><th><strong>单相机下的端到端延迟</strong></th><th>多相机（硬件同步）</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>8.2 ms</td><td>8.20 ms</td><td>—</td><td><strong>8.2 ms</strong></td><td>8.2 ms</td></tr>
+      <tr><td>2</td><td>14.2 ms</td><td>7.10 ms</td><td>+15%</td><td>33.3 + 14.2 = <strong>47.5 ms</strong>（等 1 帧）</td><td>14.2 ms</td></tr>
+      <tr><td><strong>4</strong></td><td>26.2 ms</td><td>6.55 ms</td><td><strong>+25%</strong></td><td>100 + 26.2 = <strong>126.2 ms</strong>（等 3 帧）</td><td><strong>26.2 ms</strong>（无等待）</td></tr>
+      <tr><td>8</td><td>50.2 ms</td><td>6.28 ms</td><td>+31%</td><td>233 + 50.2 = <strong>283 ms</strong></td><td>50.2 ms</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第五列是车端否决批处理的理由：<strong>单相机做 batch=4，必须先等齐 4 帧，30 FPS 下就是白等 100 ms</strong>。为了把每帧摊薄从 8.2 压到 6.55 ms（省 1.65 ms），付出 100 ms 的等待——这笔账在任何延迟敏感系统里都不成立。<em>吞吐提升 25% 是真的，延迟恶化 15 倍也是真的。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>但最后一列是车端唯一真正合理的批处理场景</strong>：多相机。前视长焦 + 前视广角 + 左右侧视，四路<em>同一时刻</em>曝光的图像天然构成一个 batch，<strong>不需要任何等待</strong>。串行跑是 $4\times8.2=32.8$ ms，batch 跑是 26.2 ms，<em>省 20% 且延迟不增加</em>。<strong>前提有两条，缺一不可</strong>：<em>①四路必须硬件同步曝光</em>（否则「等齐」又回来了，而且时间戳还不一致）；<em>②四路必须用同一个模型与同一个输入分辨率</em>——如果长焦用 640×640 而鱼眼用 960×640，或者长焦跑 TSR 模型而侧视跑另一个模型，就没法组 batch。<em>在 TSR 里这一条经常不成立：远处小标志需要长焦的高分辨率，而侧视相机根本不需要跑 TSR。</em><strong>所以多相机 batching 的适用面比听起来窄得多，要具体看你的相机配置。</strong></p></div>
+  </div>  <h3>多流：填满 SM，但会推高单帧延迟</h3>  <ul>
+    <li><strong>多流的收益来自「一个 kernel 填不满 GPU」</strong>。小模型、小分辨率、小 batch 时，单个 kernel 可能只用掉 30% 的 SM，剩下的算力闲置。开 $N$ 条 stream 并发跑 $N$ 帧（或 $N$ 个任务），可以把利用率推上去。</li>
+    <li><strong>代价是单帧延迟上升</strong>：多个 kernel 竞争 SM、竞争 L2、竞争带宽。<em>吞吐涨了，但每一帧都变慢了</em>——这又是「吞吐 vs 延迟」的对立（模块 04 的线程模型表是同一个道理）。</li>
+    <li><strong>stream priority 不是硬实时保证</strong>。CUDA 的 <code>cudaStreamCreateWithPriority</code> 只影响新 block 的调度倾向，<em>已经在跑的 kernel 不会被抢占</em>。一个长 kernel 可以把高优先级任务堵住几毫秒。<strong>车端要「TSR 优先」，靠的不是 stream priority，而是时间片预算与任务编排（下一节）。</strong></li>
+    <li><strong>MPS / MIG 在车端 SoC 上通常不可用</strong>，别按数据中心的经验做方案。</li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <strong>动态 batch 的隐藏成本：optimization profile。</strong>如果你想「有几路相机就用几路的 batch」，engine 必须建成动态 batch（min=1, opt=4, max=8）。代价有三：<em>①构建时间显著变长（每档都要 tune）；②非 <code>opt</code> 档的 tactic 不是为它挑的，实测常有 10–30% 的额外损耗；③显存必须按 <code>max</code> 档预留</em>。<strong>如果相机数量是固定的（量产车通常是），就用固定 batch 建 engine，别为了「灵活」白付这三笔钱。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="thermal"><span class="num">7</span>车端特有约束：功耗墙、降频、抢占</h2>
+  <p>这一节的内容在数据中心几乎不存在，在车上是决定性的。<strong>桌面 GPU 有 300 W 的风冷预算和 25 °C 的机房；车端 SoC 有 30 W 的被动散热和夏天 60 °C 的舱内环境。</strong></p>  <h3>① 功耗模式：同一个 engine，延迟可以差两倍</h3>  <p>车端 SoC 通常提供若干档功耗预算（例如 15 W / 30 W / 50 W / 无限制），由整车的电源与热设计决定。<strong>同一个 engine 在不同档下的延迟可以差 1.5–2 倍。</strong>因此：</p>  <div class="callout danger"><span class="label">不声明功耗模式的延迟数字是无效数字</span>
+    <p><strong>任何一个延迟数字，不声明功耗模式就是无效的。</strong>论文里报「Orin 上 8 ms」而不说是哪档，等于没说；你自己的报告也一样。<em>更常见的内部事故是：算法团队在开发板上用 MAXN 模式测出 8.2 ms，写进设计文档；集成到量产域控后实际是 30 W 档，跑出 13 ms，整个时序预算作废。</em><strong>纪律：benchmark 脚本第一行就打印当前功耗模式与时钟频率，并把它写进结果文件。</strong></p>
+  </div>  <h3>② 热节流：短 benchmark 全是骗人的</h3>  <p>持续满负载下结温上升，超过阈值后 SoC 主动降频。一个简化的一阶热模型：</p>  <div class="math-block">\[T(t) = T_{\text{amb}} + P R_{\text{th}}\bigl(1 - e^{-t/\tau}\bigr), \qquad \frac{f}{f_{\max}} = \operatorname{clip}\bigl(1 - k\,[T - T_{\text{thr}}]_+,\ \ \tfrac{f_{\min}}{f_{\max}},\ 1\bigr), \qquad T_{\text{lat}} \propto \frac{1}{f}\]</div>  <p>代入一组车规量级的参数（$T_{\text{amb}}=55$ °C 的夏季舱内、$P=40$ W、$R_{\text{th}}=1.1$ °C/W、$\tau=300$ s、节流阈值 85 °C、$k=0.02$/°C、最低频比 0.65）：</p>  <table>
+    <thead><tr><th>运行时长</th><th>结温</th><th>频率比</th><th>p50 延迟</th><th><strong>p99 延迟</strong></th><th>相对第 1 分钟</th></tr></thead>
+    <tbody>
+      <tr><td>第 1 分钟</td><td>59 °C</td><td>1.00</td><td>8.4 ms</td><td><strong>9.2 ms</strong></td><td>—</td></tr>
+      <tr><td>第 5 分钟</td><td>84 °C</td><td>1.00</td><td>8.4 ms</td><td>9.2 ms</td><td>0%</td></tr>
+      <tr><td>第 10 分钟</td><td>94 °C</td><td>0.83</td><td>10.2 ms</td><td><strong>11.1 ms</strong></td><td><strong>+21%</strong></td></tr>
+      <tr><td>第 30 分钟</td><td>99 °C</td><td>0.72</td><td>11.7 ms</td><td><strong>12.7 ms</strong></td><td><strong>+38%</strong></td></tr>
+      <tr><td>稳态（&gt; 45 min）</td><td>99 °C</td><td>0.72</td><td>11.7 ms</td><td><strong>12.8 ms</strong></td><td><strong>+38%</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>跑一分钟测出 p99 = 9.2 ms，跑 30 分钟是 12.7 ms。</strong>如果你的延迟预算是 12 ms，那么开发板上「余量 23%」的方案，在夏天开了半小时的车上<strong>已经超预算了</strong>（余量 −6%，17% 的帧超时）——<em>而这半小时恰恰是长途驾驶最需要 TSR 稳定工作的时候</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>两个必须补充的严谨点。<em>①这个一阶模型是<strong>简化</strong>的</em>：真实系统里降频会同时降低功耗，$P$ 与 $f$ 耦合，达到的是一个自洽的热平衡点，实测曲线通常比模型更早收敛、更平缓。<strong>模型的价值不在预测精确值，而在告诉你「必须测长时间」这件事，以及给你一个外推的形状。</strong><em>②验收要报<strong>分段 p99</strong> 而不是整段 p99</em>——把 30 分钟切成 1 分钟一段，每段各算 p99，看这条曲线是否收敛、收敛到哪。<strong>整段 p99 会把「前 5 分钟很快」和「后 25 分钟很慢」混在一起平均掉，恰好掩盖了你最想看的那个漂移。</strong><em>而且必须在<strong>目标环境温度</strong>下测</em>：实验室 22 °C 空调房里测出的热稳态，和舱内 60 °C 是两个世界。</p></div>
+  </div>  <h3>③ 多任务抢占：TSR 只是众多感知任务之一</h3>  <div class="ascii">一颗共享 SoC 上的感知任务（33 ms 一个周期，30 FPS）
+┌──────────────────────────────────────────────────────────────┐
+│ BEV 3D 检测      ████████████ 12.0 ms                        │
+│ 占用栅格         █████████ 9.0 ms                            │
+│ **TSR**          ████████ 8.2 ms   ← 我们                    │
+│ 车道线           ████ 4.0 ms                                 │
+│ 多目标跟踪(CPU)  ██ 2.0 ms                                   │
+├──────────────────────────────────────────────────────────────┤
+│ 合计             35.2 ms   &gt;  33.3 ms 的周期预算   ← **超了** │
+└──────────────────────────────────────────────────────────────┘
+
+降级策略（按优先级从低到高牺牲）
+  · 车道线      降到 15 Hz（隔帧跑）        省 2.0 ms
+  · 占用栅格    输入分辨率 ×0.8             省 2.6 ms
+  · **TSR**     decoder 6 层 → 3 层         省 0.9 ms（掉约 1 AP，C53 模块 04）
+  · 兜底        丢帧（**最后手段**，且必须上报 frame_id）</div>  <ul>
+    <li><strong>GPU kernel 默认不可抢占</strong>（或抢占粒度很粗）。一个 3 ms 的长 kernel 会把所有其他任务堵住 3 ms，无论它们优先级多高。<em>所以「给 TSR 设高优先级」并不能保证它准时。</em></li>
+    <li><strong>正确的做法是时间片预算（time-slice budgeting）</strong>：给每个任务分配固定的时间窗口，由一个编排层按周期调度；任务超出窗口就触发<strong>降级</strong>而不是抢占。<em>降级路径必须提前设计好并测试过</em>——这正是 C53 模块 04 里「RT-DETR 的 decoder 层数可调」在部署上的真实价值：它提供了一条<strong>精度可降级</strong>的路径，让系统在算力紧张时优雅退化，而不是直接丢帧。</li>
+    <li><strong>DLA 卸载是车端特有的一张牌</strong>。Orin 这类 SoC 带独立的深度学习加速器，可以把部分任务放上去与 GPU 并行。但 DLA 支持的算子有限、精度只有 FP16/INT8、单位算力也低于 GPU，<em>适合放对延迟不那么敏感、结构又规整的任务</em>（比如后处理简单的分割网络），而不是延迟最紧的那个。</li>
+    <li><strong>CPU 侧也要治</strong>：非实时 Linux 内核的调度抖动可以到几毫秒。关键线程绑核（<code>sched_setaffinity</code>）+ <code>SCHED_FIFO</code> + <code>isolcpus</code> 隔离出专用核，能把 CPU 侧的尾延迟压下一个量级。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>车端延迟工程与数据中心的根本差别，一句话：<strong>数据中心问「平均每秒能处理多少」，车端问「最坏情况下这一帧会不会晚」。</strong>前者优化吞吐、可以排队；后者优化尾延迟、不能排队，而且要在功耗、温度、共享算力三重约束下证明它。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="checklist"><span class="num">8</span>发布前验收清单</h2>
+  <p>前面七节的内容，最终要凝结成一张<strong>可以自动化执行的门禁表</strong>。下面这张表是量产 TSR 模型上车前的最小集合——<em>每一项都对应一个真实的事故类型</em>。</p>  <table>
+    <thead><tr><th>#</th><th>维度</th><th>指标</th><th>通过条件（示例）</th><th>怎么测</th><th>不过怎么办</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><strong>精度</strong></td><td>整体 mAP 相对 FP32 baseline 的掉幅</td><td>≤ 1.0 mAP</td><td>全量评测集</td><td>回到模块 03：敏感层分析 + 混合精度</td></tr>
+      <tr><td>2</td><td><strong>精度·分桶</strong></td><td><strong>每一个像素尺寸桶</strong>的 AP 掉幅</td><td><strong>≤ 2.0 mAP（任意一桶）</strong></td><td>按 &lt;16 / 16–32 / 32–64 / &gt;64 px 分桶</td><td><strong>先查坐标变换（模块 04），再怀疑量化</strong></td></tr>
+      <tr><td>3</td><td><strong>精度·关键类</strong></td><td>停车让行 / 限速 等安全关键类的召回</td><td>≥ baseline − 1%</td><td>关键类子集评测</td><td>代价敏感的阈值重标定</td></tr>
+      <tr><td>4</td><td><strong>延迟</strong></td><td>端到端 p50 / <strong>p99</strong> / p99.9</td><td>p99 ≤ 预算；p99.9 ≤ 预算 × 1.1</td><td>≥ 10 000 帧真实序列，含密集场景</td><td>第 3–5 节的分解与 roofline</td></tr>
+      <tr><td>5</td><td><strong>延迟·连续性</strong></td><td><strong>最长连续超时段</strong></td><td>≤ 2 帧</td><td>同上，逐帧标记</td><td>查热节流与抢占（第 7 节）</td></tr>
+      <tr><td>6</td><td><strong>显存</strong></td><td>峰值占用</td><td>≤ 分配预算的 80%</td><td>运行时 query，取 max</td><td>减 batch / 减 workspace / 复用 buffer</td></tr>
+      <tr><td>7</td><td><strong>长时间稳定性</strong></td><td><strong>分段 p99 的漂移</strong>；RSS 斜率</td><td>漂移 ≤ 10%；RSS 斜率 ≈ 0（无泄漏）</td><td><strong>≥ 30 min（推荐 2 h）连续跑，目标环境温度下</strong></td><td>散热设计 / 降低稳态功耗 / 设计降级路径</td></tr>
+      <tr><td>8</td><td><strong>多硬件一致性</strong></td><td>不同 SoC 批次 / 驱动版本上的输出一致性</td><td>框匹配率（IoU ≥ 0.99）≥ 99.9%</td><td>同一批图在 N 个平台上跑，逐帧比对</td><td>查非确定性 kernel 与 engine 重建流程</td></tr>
+      <tr><td>9</td><td><strong>数值一致性</strong></td><td>与 Python 参考实现的逐阶段对拍</td><td><strong>8 个阶段全过</strong></td><td>模块 04 的对拍工具</td><td>按对拍报告定位到具体阶段</td></tr>
+      <tr><td>10</td><td><strong>engine 完整性</strong></td><td>构建环境指纹校验</td><td>GPU 型号 + 驱动 + TRT 版本 + ONNX 哈希全部匹配</td><td>engine 元数据 vs 运行时环境</td><td><strong>拒绝加载</strong>，走重建流程</td></tr>
+      <tr><td>11</td><td><strong>冷启动</strong></td><td>进程启动 → 第一帧可用</td><td>≤ 整车上电预算</td><td>含 engine 反序列化 + warmup</td><td>engine 预加载 / 延迟 warmup / 分级可用</td></tr>
+      <tr><td>12</td><td><strong>回退方案</strong></td><td><strong>降级路径本身被测试过</strong></td><td>注入「加载失败 / 推理超时 / 输出异常」三种故障，系统行为符合预期</td><td><strong>故障注入测试</strong></td><td>补齐降级路径并重测</td></tr>
+      <tr><td>13</td><td><strong>可观测性</strong></td><td>分阶段耗时、候选数、检出数、丢帧数打点</td><td>全部字段可上报且有采样策略</td><td>查日志 schema</td><td>补打点——<em>没有打点的系统在车上无法归因</em></td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">跳过的两项，正好是事故的两大来源</span>
+    <p><strong>清单里最容易被跳过的是第 7 项和第 12 项，而它们恰恰是量产事故的主要来源。</strong>第 7 项被跳过是因为<em>慢</em>——跑 30 分钟意味着一次验证要占掉半小时，迭代节奏里没人愿意等；第 12 项被跳过是因为<em>「应该不会发生」</em>——降级路径写了但从没被触发过，于是它本身就是没测过的代码，真出事时降级路径自己崩了。<strong>正确做法：第 7 项进夜间 CI（反正没人等），第 12 项做成故障注入的自动化用例（三种故障各一条）。</strong><em>面试里被问「你们怎么保证上线质量」，能说出「长时间测试进夜间 CI + 降级路径做故障注入」这两条，比背十个指标名字有说服力。</em></p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这张表看起来很长，但它的执行成本其实很低：<strong>第 1–6、8–11 项都可以脚本化，跑一遍不到一小时；第 7 项进夜间 CI；第 12 项是几条固定的故障注入用例。</strong>真正贵的是「没有这张表」——每次发布靠人回忆该查什么，漏掉的那一项就是下次事故。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更进一步，这张表应该<strong>输出一份结构化的发布报告</strong>而不只是 pass/fail：每一项记录实测值、门限、余量百分比、以及本次相对上次的变化。<em>余量百分比是最有价值的一列</em>——它告诉你哪一项正在悄悄逼近门限。<strong>典型的场景是：连续三个版本 p99 从 9.1 → 9.6 → 10.2 ms，每次都「通过」（门限 12 ms），但趋势明摆着说下一次就要撞墙。</strong><em>门禁只能挡住已经越界的，趋势才能提前告诉你要撞墙了。</em>这也是为什么第 13 项（可观测性）不是可选项——<strong>没有打点的系统，你连趋势都画不出来。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>kernel 启动开销与图执行。</strong>CUDA Graph 把 $N$ 次 kernel 启动摊成一次提交，对小模型能省 10–25%；但它要求 shape 固定、无 CPU 分支。<em>「如何在动态 shape 与控制流下仍然享受图执行」是活跃方向</em>（条件节点、图更新 API、多档预录制），目前仍需要工程上做取舍。</li>
+    <li><strong>编译器路线与手写 kernel 的边界。</strong>TVM / TensorRT / Triton / MLIR 各自在自动搜索融合与 schedule；但在检测这类「主干规整、头部零碎」的模型上，自动编译器往往在<em>头部与后处理</em>上做不过手写。<em>「哪些部分该交给编译器、哪些必须手写」目前没有普适答案，只能实测。</em></li>
+    <li><strong>实时 GPU 调度仍是开放问题。</strong>GPU 的抢占粒度粗、优先级不是硬保证，学术界的 kernel 切分（kernel slicing）、持久线程（persistent threads）、SM 分区等方案都在尝试给 GPU 任务提供可界定的 WCET。<em>在车端多任务共享一颗 SoC 的场景下，这是「能不能证明不超时」的关键，也是功能安全论证最薄弱的一环。</em></li>
+    <li><strong>能耗感知的模型设计。</strong>当前几乎所有架构搜索的目标都是 FLOPs 或延迟，而车端真正的硬约束往往是<strong>能耗</strong>（它决定了热稳态，进而决定了持续延迟）。<em>「以 J/frame 为目标的 NAS」还很少见，但它比以 FLOPs 为目标更贴近车端现实</em>——本模块第 4 节已经说明了 FLOPs 与延迟的脱节，而延迟与能耗之间还有第二层脱节（访存的能耗远高于计算）。</li>
+    <li><strong>Anytime inference / 可中断推理。</strong>让模型在任意时刻被打断时都能给出一个「当前最好的结果」，质量随允许的时间单调提升。<em>DETR 系的逐层辅助头天然接近这个性质（C53 模块 04），但真正的 anytime 需要调度器与模型协同设计</em>，目前在自动驾驶里还停留在「几档固定降级」的粗粒度形态。</li>
+    <li><strong>Roofline 之外的性能模型。</strong>经典 roofline 忽略了 cache 层次、并行度不足、启动开销与 tail effect。ECM（Execution-Cache-Memory）模型、cache-aware roofline 等扩展更贴近真实，<em>但都还没有成为深度学习部署的常规工具</em>——实践中仍然是「先用 roofline 分类，再用 profiler 实测」。</li>
+    <li><strong>车规功能安全对延迟可预测性的要求正在收紧。</strong>ISO 26262 / ASIL 与 AUTOSAR Adaptive 对时序确定性有明确诉求，而「一个包含 GPU、共享内存、非实时内核的 AI 推理栈如何给出可论证的 WCET」目前业界还没有令人满意的答案。<em>这也是为什么「无 NMS」「固定 query 数」「层数可裁」这类<strong>把数据依赖项消掉</strong>的架构性质，在车端的价值被系统性低估了。</em></li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>★ 必读</strong>：Williams, Waterman &amp; Patterson, <em>Roofline: An Insightful Visual Performance Model for Multicore Architectures</em>（CACM 2009）——本模块第 4 节的全部理论基础，篇幅不长，值得完整读一遍并自己画一张你目标硬件的 roofline 图。<strong>★</strong> Dean &amp; Barroso, <em>The Tail at Scale</em>（CACM 2013）——尾延迟这个概念在工程界的奠基文本，虽然写的是数据中心，但「为什么均值没有意义」「尾延迟从哪来」「怎么治」这三条对车端同样成立。</p><p><strong>★</strong> NVIDIA 官方文档三份，都要逐字读参数而不是看教程：<em>TensorRT Developer Guide</em> 的 Performance Best Practices 与 <code>IEngineInspector</code> 章节；<em>trtexec</em> 的完整参数表（尤其 <code>--warmUp</code> / <code>--duration</code> / <code>--avgRuns</code> / <code>--dumpProfile</code> / <code>--separateProfileRun</code> / <code>--useCudaGraph</code>）；<em>Nsight Systems User Guide</em> 的时间线判读部分（如何看 CPU 与 GPU 泳道的重叠）。配套：Jetson/Orin 平台的功耗模式与热管理指南——<strong>它是第 7 节所有数字的来源</strong>。</p><p>相邻课程：模块 01（预处理一致性）、模块 02（engine 构建、层融合与算子回退——第 5 节的伏笔在那里埋下）、模块 03（INT8 与精度门禁）、模块 04（后处理放 GPU、C++ 管线的内存与同步纪律、逐阶段对拍）、C53 模块 04（NMS 的数据依赖与「延迟不确定性」的完整论证）、C53 模块 05（延迟-精度权衡与选型）、C55 模块 05（安全导向的评测体系）、C61 模块 05（部署类面试题的答题骨架）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_postprocess/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 后处理对齐与 C++ 推理管线</div></a>
+  </div>
+
+</div>
+</body>
+</html>

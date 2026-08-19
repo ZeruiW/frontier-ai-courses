@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 架构层面的解法：分辨率、多尺度与上下文</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 架构层面的解法：分辨率、多尺度与上下文</h1>
+  <p class="subtitle">FPN 层级分配公式 k = ⌊4 + log₂(√(wh)/224)⌋ 把几乎所有小目标都 clamp 到最低层，该层严重过载 · PAN 补一条自底向上的定位通路（缩短信息路径），BiFPN 承认「不同来源贡献不等」· <strong>加 P2 是收益最直接也最贵的一招</strong>：P2 一层的像素数就是 P3+P4+P5 之和的 3 倍，检测头计算量 ×4 · 分辨率与计算是<em>平方</em>关系，1.5× 分辨率 = 2.25× 计算 · 可变形注意力对小目标友好的真正原因是稀疏聚焦而非省算力 · 超分补的是合理纹理不是信息 · 小目标必须吃上下文——TSR 里标志有杆件、有位置先验</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–01（小目标的五个根因、IoU 位移敏感性）；C18/C53 的检测器结构基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_architecture_small.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">FPN (Lin 2017) · PANet (Liu 2018) · EfficientDet/BiFPN (Tan 2020) · Deformable DETR (Zhu 2021) · HRNet (Wang 2020)</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#fpn">多尺度不是「多跑几遍」：FPN 解决的到底是什么矛盾</a></li>
+      <li><a href="#assign">层级分配：k = k₀ + ⌊log₂(√(wh)/224)⌋，以及 TSR 分布下的层级负载</a></li>
+      <li><a href="#p2">加 P2 的账：分辨率的平方增长有多贵</a></li>
+      <li><a href="#pan_bifpn">信息该往哪个方向流：PAN、BiFPN 与加权融合</a></li>
+      <li><a href="#resolution">三笔不同的账：提高输入分辨率 vs 加 P2 vs 换更强主干</a></li>
+      <li><a href="#deformable">可变形注意力：稀疏采样为什么对小目标天然友好</a></li>
+      <li><a href="#context">上下文：一个 8 像素的目标必须靠周围</a></li>
+      <li><a href="#superres_light">超分、特征增强，以及轻量化与小目标的根本矛盾</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fpn"><span class="num">1</span>多尺度不是「多跑几遍」：FPN 解决的到底是什么矛盾</h2>
+  <p>卷积主干有一个无法回避的内在矛盾：<strong>语义强度随深度增长，空间分辨率随深度衰减，而它们由同一条链路决定</strong>。ResNet-50 的四个阶段输出 C2/C3/C4/C5，stride 分别是 4/8/16/32，通道 256/512/1024/2048——通道数（语义容量）涨了 8 倍，格子数掉了 64 倍。</p>  <p>把这个矛盾具体到 TSR：一个 60 cm 的限速牌在 50 米外、1920×1080/60°FOV 的相机上是 <strong>20 像素</strong>。它在 C5（stride 32）上占 20/32 = 0.625 个格子——注意，<em>不是「变小了」，是根本没有属于自己的格子</em>。它的响应被摊进一个覆盖 32×32 原图像素的 2048 维向量里，而那 32×32 里还有天空、树叶、灯杆、后面那辆车的车顶。<strong>要在这个向量里把「限速 60」和「限速 80」分开，是在要求网络做一件信息论上就不成立的事。</strong></p>  <table>
+    <thead><tr><th>朴素做法</th><th>怎么做</th><th>计算代价</th><th>小目标语义</th><th>小目标分辨率</th><th>为什么被淘汰</th></tr></thead>
+    <tbody>
+      <tr><td><strong>图像金字塔</strong></td><td>把整张图缩放成 N 档，每档跑一遍网络</td><td><strong>N×（3–5 倍）</strong></td><td>✅ 强</td><td>✅ 高</td><td>延迟无法接受；训练也贵</td></tr>
+      <tr><td><strong>只用最后一层</strong>（Faster R-CNN 原版）</td><td>在 C5 上预测所有尺度</td><td>1×</td><td>✅ 强</td><td>❌ 0.6 个格子</td><td>小目标根本没有表示</td></tr>
+      <tr><td><strong>只用浅层</strong></td><td>在 C2/C3 上预测</td><td>1×（但特征图大，头很贵）</td><td>❌ 弱（只有边缘纹理）</td><td>✅ 高</td><td>分不清标志和广告牌</td></tr>
+      <tr><td><strong>多层各自预测</strong>（SSD）</td><td>C3/C4/C5 各接一个头，互不通信</td><td>1.1×</td><td>❌ 浅层语义弱</td><td>✅ 高</td><td>浅层没有语义，SSD 的小目标 AP 一直很差</td></tr>
+      <tr><td><strong>FPN</strong></td><td>横向连接 + 自顶向下融合</td><td><strong>1.2–1.5×</strong></td><td>✅ 每层都强</td><td>✅ 每层都保留自身分辨率</td><td>——（成为标配）</td></tr>
+    </tbody>
+  </table>  <div class="ascii">FPN：横向连接（1×1 统一到 C=256）+ 自顶向下（2× 最近邻上采样）+ 3×3 消混叠
+
+  backbone                lateral 1x1              top-down            output 3x3
+  ┌────────┐   stride 4   ┌────────┐              ┌────────┐         ┌────────┐
+  │  C2    │──────────────▶│ 256ch  │──── (+) ────▶│  M2    │────────▶│  P2    │ stride 4
+  │ 256ch  │               └────────┘      ▲       └────────┘         └────────┘
+  └───┬────┘                               │ 2x up
+      ▼        stride 8    ┌────────┐      │       ┌────────┐         ┌────────┐
+  │  C3    │──────────────▶│ 256ch  │──── (+) ────▶│  M3    │────────▶│  P3    │ stride 8
+  │ 512ch  │               └────────┘      ▲       └────────┘         └────────┘
+  └───┬────┘                               │ 2x up
+      ▼        stride 16   ┌────────┐      │       ┌────────┐         ┌────────┐
+  │  C4    │──────────────▶│ 256ch  │──── (+) ────▶│  M4    │────────▶│  P4    │ stride 16
+  │1024ch  │               └────────┘      ▲       └────────┘         └────────┘
+  └───┬────┘                               │ 2x up
+      ▼        stride 32   ┌────────┐      │       ┌────────┐         ┌────────┐
+  │  C5    │──────────────▶│ 256ch  │──────┘       │  M5    │────────▶│  P5    │ stride 32
+  │2048ch  │               └────────┘              └────────┘         └────────┘
+
+  信息流：**只有一个方向** —— 语义从深层往浅层广播。
+  浅层的精确定位信息**没有任何通路**能到达深层。这正是 PAN 要补的。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>FPN 的直觉是「让每一层都既看得清、又看得懂」：分辨率由这一层自己提供，语义由上面那层送下来。横向连接的 1×1 卷积做两件事——把通道数统一到 256（否则没法相加），以及给浅层一次线性重组的机会；最后那个 3×3 是为了消除最近邻上采样带来的<em>混叠（aliasing）</em>，不加会在特征图上留下棋盘格。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要精确地说：<strong>FPN 并没有「在 stride 4 上跑一个深网络」，它只是把 stride 32 的语义插值到了 stride 4</strong>。P2 上的语义是<em>借来的</em>，它的空间分辨力上界仍受制于深层的 stride——一个 20 px 的目标在 C5 上被摊在 0.6 个格子里，这个信息损失<em>无法通过上采样恢复</em>。这就是为什么后来出现了两条完全不同的路线：① <span class="term">HRNet</span> 全程保持高分辨率分支（不下采样再上采样，而是并行多分辨率互相交换）；② <span class="term">Deformable DETR</span> 的多尺度稀疏采样（让 query 自己去高分辨率层取证据）。<em>理解「FPN 的语义是借来的」，才能理解这两条路线为什么存在。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句可迁移的判断：<strong>看到「小目标 AP 低」，先问「这个目标在它被分配到的那一层上占几个格子」</strong>。少于 1 个格子 = 网络在猜；1–2 个格子 = 能检出但框不准；4 个格子以上才谈得上正常学习。<em>这个数字是 <code>目标像素边长 / 该层 stride</code>，两秒就能算出来，却能直接决定接下来该改分辨率、改 stride 还是改分配。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="assign"><span class="num">2</span>层级分配：k = k₀ + ⌊log₂(√(wh)/224)⌋，以及 TSR 分布下的层级负载</h2>
+  <p>有了金字塔，下一个问题是：<strong>一个框该由哪一层负责？</strong> FPN 原文（以及 Mask R-CNN 的 RoIAlign）给出的规则是一条闭式公式：</p>  <div class="math-block">\[k \;=\; \left\lfloor k_0 + \log_2\!\left(\frac{\sqrt{wh}}{224}\right) \right\rfloor, \qquad k \leftarrow \mathrm{clip}(k,\; k_{\min},\; k_{\max})\]</div>  <p>三个常数各有来历：<strong>224</strong> 是 ImageNet 预训练的输入边长；<strong>k₀ = 4</strong> 表示「一个 224×224 的框应该由 P4（stride 16）处理」——因为在 ImageNet 预训练里，224 的整图正是被 C4 那一级的感受野覆盖的；<strong>clip 到 [2, 5]</strong> 是因为金字塔只有这几层。公式的含义很朴素：<em>框的边长每减半，就往上（分辨率更高的那一层）挪一级</em>。</p>  <table>
+    <thead><tr><th>√(wh)（像素）</th><th>log₂(√wh/224)</th><th>⌊·⌋ + 4</th><th>clip 到 [2,5]</th><th>该层 stride</th><th>目标占几个格子（每轴）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>448</strong></td><td>+1.00</td><td>5</td><td>P5</td><td>32</td><td>14.0</td></tr>
+      <tr><td><strong>224</strong></td><td>0.00</td><td>4</td><td>P4</td><td>16</td><td>14.0</td></tr>
+      <tr><td><strong>112</strong></td><td>−1.00</td><td>3</td><td>P3</td><td>8</td><td>14.0</td></tr>
+      <tr><td><strong>56</strong></td><td>−2.00</td><td>2</td><td>P2</td><td>4</td><td>14.0</td></tr>
+      <tr><td><strong>32</strong></td><td>−2.81</td><td>1</td><td><strong>P2（被 clip）</strong></td><td>4</td><td>8.0</td></tr>
+      <tr><td><strong>20</strong></td><td>−3.49</td><td>0</td><td><strong>P2（被 clip）</strong></td><td>4</td><td><strong>5.0</strong></td></tr>
+      <tr><td><strong>10</strong></td><td>−4.49</td><td>−1</td><td><strong>P2（被 clip）</strong></td><td>4</td><td><strong>2.5</strong></td></tr>
+      <tr><td><strong>10（没有 P2，clip 到 3）</strong></td><td>−4.49</td><td>−1</td><td><strong>P3</strong></td><td>8</td><td><strong>1.25</strong></td></tr>
+    </tbody>
+  </table>  <p>注意最后两行——这就是整节的要害。<strong>公式在小尺寸上是「饱和」的：所有小于 56 px 的框都被 clip 到同一层</strong>。公式本身没错，它只是在说「我已经没有更高分辨率的层可以给你了」。</p>  <h3>一阶段检测器用的是尺度区间，但结论一样</h3>  <p>YOLO / RetinaNet / FCOS 不用这条公式：YOLO 用 anchor 的 IoU 匹配，FCOS 用<span class="term">回归范围（regression range）</span>——P3 负责 [0, 64)、P4 负责 [64, 128)、P5 负责 [128, 256)、P6 [256, 512)、P7 [512, ∞)。形式不同，<strong>效果完全一样：所有小目标被压在最高分辨率那一层</strong>。FCOS 的 P3 区间下界是 0，上界 64，意味着 6 px 和 63 px 的目标共用同一层同一套回归尺度。</p>  <h3>TSR 尺寸分布：小目标占比不是数据集偏差，是几何必然</h3>  <p>很多人以为「TT100K 里小目标多」是数据集的采集偏好。<strong>不是——它是针孔几何 + 均匀采样的必然结果，可以推导出来。</strong>针孔模型给出像素尺寸</p>  <div class="math-block">\[s \;=\; \frac{f\,S}{Z}, \qquad f \;=\; \frac{W_{\text{px}}/2}{\tan(\mathrm{HFOV}/2)}\]</div>  <p>对 1920×1080、水平 FOV 60° 的前视相机，f ≈ <strong>1662.8 px</strong>；一块 60 cm 的圆形限速牌于是有 s ≈ 997.7 / Z（Z 以米计）。<em>50 米外 20 px，100 米外 10 px，150 米外 6.7 px。</em> 现在关键的一步：车匀速前进、按固定帧率采样，则同一块标志被采到的<strong>距离近似均匀分布</strong>。做变量代换 s = c/Z，得</p>  <div class="math-block">\[p(s) \;=\; p(Z)\left|\frac{\mathrm{d}Z}{\mathrm{d}s}\right| \;=\; \frac{1}{Z_{\max}-Z_{\min}}\cdot\frac{c}{s^{2}} \;\propto\; \frac{1}{s^{2}}\]</div>  <p><strong>尺寸密度以 1/s² 衰减</strong>——这是一个非常陡的幂律。代入 Z ∈ [8, 150] m：<strong>84% 的标志实例小于 32 px（COCO 的「small」定义），62% 小于 16 px，18% 小于 8 px</strong>。notebook 里会把这个解析结果和蒙特卡洛对上。</p>  <table>
+    <thead><tr><th>FPN 配置</th><th>P2 (stride 4)</th><th>P3 (stride 8)</th><th>P4 (stride 16)</th><th>P5 (stride 32)</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td><strong>P2–P5</strong>（含 P2）</td><td><strong>99.4%</strong></td><td>0.6%</td><td>0%</td><td>0%</td><td>P3–P5 三层几乎在空转</td></tr>
+      <tr><td><strong>P3–P5</strong>（无 P2，主流配置）</td><td>—</td><td><strong>100%</strong></td><td>0%</td><td>0%</td><td><strong>付了 3 层的钱，只有 1 层在干活</strong></td></tr>
+      <tr><td><strong>P3–P7</strong>（RetinaNet 配置）</td><td>—</td><td><strong>100%</strong></td><td>0%</td><td>0%</td><td>P6/P7 在 TSR 上是纯浪费</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">层级负载：先算，再改</span>
+    <p>这张表是本模块最重要的一个数字。<strong>在 TSR 的尺寸分布下，一个 P3–P7 的 RetinaNet 等价于一个「单尺度、stride 8」的检测器</strong>——多尺度金字塔的全部收益在这个任务上归零，而它的计算成本你一分不少地付了。<em>更糟的是，这一层的 stride 是 8，对一个 10 px 的标志只有 1.25 个格子。</em></p><p><strong>面试里这是一个能立刻显出水平的点</strong>：被问「小目标怎么办」时，标准答案是「加 P2 / 提分辨率 / 用 NWD」；<em>而能先把「你现在这套配置下各层的负载是多少」算出来再谈方案的人，面试官会立刻知道你真的调过</em>。面试官想听的是<strong>「我先统计了尺寸分布和层级负载，发现 99% 压在 P3，所以先动的是分辨率而不是 backbone」</strong>这种归因过程。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="p2"><span class="num">3</span>加 P2 的账：分辨率的平方增长有多贵</h2>
+  <p>既然所有目标都挤在最高分辨率那层，最直接的解法就是<strong>再加一层更高分辨率的 P2（stride 4）</strong>。它的收益是确定的：10 px 的目标从 1.25 个格子变成 2.5 个格子，正样本候选点数量按面积翻 4 倍。代价也同样确定，而且可以精确算出来。</p>  <h3>成本：为什么恰好是 85/21 ≈ 4.05 倍</h3>  <p>neck 与 head 的计算量正比于<strong>特征图位置数</strong>，而位置数 = HW/s²。以 P3 为 1 归一化，各层的相对成本是 4^(3−l)：</p>  <div class="math-block">\[\frac{\mathcal{C}_{\text{P2--P5}}}{\mathcal{C}_{\text{P3--P5}}} \;=\; \frac{4 + 1 + \tfrac14 + \tfrac1{16}}{1 + \tfrac14 + \tfrac1{16}} \;=\; \frac{85/16}{21/16} \;=\; \frac{85}{21} \;\approx\; 4.05\]</div>  <p><strong>加一层，检测头的计算量变成原来的 4 倍。</strong> 这不是「多了一层的开销」，而是「新加的这一层比原来<em>整个</em>金字塔还贵 3 倍」——因为 P2 一层的位置数就是 P3+P4+P5 之和的 3 倍。</p>  <table>
+    <thead><tr><th>层</th><th>stride</th><th>1536×864 输入下的位置数</th><th>相对 P3 的成本</th><th>head MACs（C=128，4 conv）</th><th>激活显存（fp16，8 个中间张量）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>P2</strong></td><td>4</td><td><strong>82,944</strong></td><td><strong>4.00</strong></td><td><strong>48.92 G</strong></td><td><strong>169.9 MB</strong></td></tr>
+      <tr><td>P3</td><td>8</td><td>20,736</td><td>1.00</td><td>12.23 G</td><td>42.5 MB</td></tr>
+      <tr><td>P4</td><td>16</td><td>5,184</td><td>0.25</td><td>3.06 G</td><td>10.6 MB</td></tr>
+      <tr><td>P5</td><td>32</td><td>1,296</td><td>0.0625</td><td>0.76 G</td><td>2.7 MB</td></tr>
+      <tr><td><strong>合计 P3–P5</strong></td><td>—</td><td>27,216</td><td>1.3125</td><td><strong>16.05 G</strong></td><td>55.7 MB</td></tr>
+      <tr><td><strong>合计 P2–P5</strong></td><td>—</td><td>110,160</td><td>5.3125</td><td><strong>64.98 G（×4.05）</strong></td><td><strong>225.6 MB（×4.05）</strong></td></tr>
+    </tbody>
+  </table>  <h3>四种降本手段，以及组合后的真实倍数</h3>  <p>好消息是，P2 的成本几乎全部来自 head 塔，而 head 的成本对通道数是<strong>平方</strong>依赖、对深度是<strong>线性</strong>依赖。这给了四个独立的旋钮：</p>  <table>
+    <thead><tr><th>手段</th><th>怎么做</th><th>P2 成本变化</th><th>总成本倍数</th><th>副作用</th></tr></thead>
+    <tbody>
+      <tr><td>基线（无 P2）</td><td>P3–P5</td><td>—</td><td><strong>1.00×</strong></td><td>小目标只有 1.25 个格子</td></tr>
+      <tr><td>朴素加 P2</td><td>P2 与其他层同构（C=128, 4 conv）</td><td>48.92 G</td><td><strong>4.05×</strong></td><td>车端基本不可接受</td></tr>
+      <tr><td><strong>P2 通道减半</strong></td><td>P2 用 C=64（成本 ∝ C²，÷4）</td><td>12.23 G</td><td><strong>1.76×</strong></td><td>P2 特征表达力下降，需要更依赖上层语义</td></tr>
+      <tr><td><strong>P2 头变浅</strong></td><td>P2 只用 1 个 conv（其余复用 P3 权重）</td><td>12.23 G</td><td><strong>1.76×</strong></td><td>共享头需要每层独立 BN（见 C53 m03）</td></tr>
+      <tr><td><strong>P2 只算 ROI</strong></td><td>只在图像上半部（标志所在区域）算 P2</td><td>24.46 G</td><td><strong>2.52×</strong></td><td>需要可靠的 ROI 先验；下方近处大标志会漏</td></tr>
+      <tr><td><strong>减半通道 + ROI</strong></td><td>组合上面两条</td><td>6.12 G</td><td><strong>1.38×</strong></td><td>工程复杂度上升，但这是量产里真实的选择</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以「加 P2 太贵」这个结论要打个折扣：<strong>朴素地加确实是 4 倍，但把 P2 当成一个「便宜的、只管小目标的辅助层」来设计，可以压到 1.4 倍左右</strong>。关键的心法是——<em>P2 不需要和 P3–P5 同构</em>。它面对的目标只有 4–30 px，既不需要 128 通道去区分 200 类的精细语义（那部分可以靠上层送下来的语义），也不需要 4 层卷积塔去做大范围回归。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但有一个必须一起算的隐性代价：<strong>加 P2 会让前景-背景比进一步恶化约 4 倍</strong>。以 1536×864、一张图 5 块标志、center-based 分配每个 GT 约 9 个正样本计算：P3–P5 下正样本占比 45/27216 = <strong>0.165%</strong>，加 P2 后总位置数变成 110160，而正样本数几乎不变（中心采样半径按 stride 缩放，落在框内的点数由目标尺寸决定而不是由 stride 决定），占比掉到 <strong>0.041%</strong>。<em>也就是说，你花 4 倍算力买来的分辨率，同时把分类头的正负样本比推到了 1:2400</em>。这不是加 P2 的反对理由，而是说明<strong>架构改动必须和分配 / 损失改动一起做</strong>——这正是下一个模块的内容。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个实现细节的坑：<strong>加了 P2，anchor 的尺度设置也必须跟着改</strong>。RetinaNet 默认每层的基础 anchor 边长是 4×stride（P3 → 32 px）。如果你直接把 P2 挂上去而不改 anchor 配置，P2 的基础 anchor 是 4×4=16 px——听起来合理，但配上 {1, 2^(1/3), 2^(2/3)} 三档尺度后最小 anchor 仍是 16 px，<em>而你要检的目标是 6–10 px</em>。<strong>结果是加了 P2 但 AP_s 几乎没涨，然后得出「加 P2 没用」的错误结论。</strong> 正确做法：先统计尺寸分布，再让最小 anchor 落在分布的 5% 分位上。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pan_bifpn"><span class="num">4</span>信息该往哪个方向流：PAN、BiFPN 与加权融合</h2>
+  <p>FPN 的信息流是<strong>单向</strong>的——语义从深层往浅层广播。反过来的方向呢？浅层拥有最精确的边缘与定位信息，深层却拿不到它。在原始 backbone 里，C2 的信息要到达 C5 需要穿过<strong>一百多层</strong>卷积，经过这么长的路径，精确的空间信息早就被平均掉了。</p>  <p><span class="term">PANet</span>（Path Aggregation Network）的解法直白得近乎粗暴：<strong>在 FPN 之后再接一条自底向上的路径</strong>。这条捷径只有不到 10 层，浅层的定位信息可以近乎无损地送到深层。notebook 里有一个只用 numpy 就能跑的实验来验证这件事：在 P2 上放一个脉冲，跑完 FPN 的 top-down 后 P5 的响应<strong>严格为零</strong>；接上 PAN 的 bottom-up 之后 P5 才有响应。<em>这不是比喻，是可以 assert 的事实。</em></p>  <div class="ascii">三代 neck 的连接拓扑（→ 表示特征流动方向）
+
+  FPN                    PAN (= FPN + bottom-up)        BiFPN（一个 block，可重复 N 次）
+  P5 ●                   P5 ●────────▶● N5              P5 ●──────────────────▶●
+     │↓up                   │↓up      ↑↑down                │↓         ↗ 同层跨接 ↑
+  P4 ●───(+)──▶●         P4 ●──(+)──▶●───▶● N4         P4 ●──(+)──▶●──(+)──▶●
+     │↓up       │            │↓up      │  ↑↑down            │↓        ↗        ↑
+  P3 ●───(+)──▶●         P3 ●──(+)──▶●───▶● N3         P3 ●──(+)──▶●──(+)──▶●
+     │↓up       │            │↓up      │  ↑↑down            │↓        ↗        ↑
+  P2 ●───(+)──▶●         P2 ●──(+)──▶●───▶● N2         P2 ●─────────(+)──────▶●
+
+  单向：语义↓          双向：语义↓ + 定位↑            双向 + 同层跨接 + **可学权重**
+  P2 的信息到不了 P5    捷径 &lt;10 层（原本 &gt;100 层）     删掉只有一个输入的节点（对融合无贡献）</div>  <p><span class="term">BiFPN</span>（EfficientDet）在 PAN 基础上做了三个改动，其中第三个对小目标最关键：</p>  <ol>
+    <li><strong>删掉只有单个输入的节点</strong>——它只做了一次卷积，对「融合」没有贡献，纯粹浪费算力。</li>
+    <li><strong>同层加一条从原始输入到输出的跨接</strong>——保留该层自己的信息不被上下层稀释，成本几乎为零。</li>
+    <li><strong>加权融合（weighted feature fusion）</strong>——不同层的特征分辨率不同，直接相加等于默认它们同等重要，这是错的。BiFPN 给每个输入配一个可学标量权重。</li>
+  </ol>  <div class="math-block">\[O \;=\; \sum_i \frac{w_i}{\varepsilon + \sum_j w_j}\cdot I_i, \qquad w_i = \mathrm{ReLU}(\tilde w_i), \quad \varepsilon = 10^{-4}\]</div>  <p>这个形式叫 <span class="term">fast normalized fusion</span>：用 ReLU 保证非负、用求和归一化保证权重落在 [0,1]，比 softmax 快得多而效果相当。<strong>为什么它对小目标重要？</strong> 因为 P2 的特征是整个金字塔里语义最弱、噪声最大的（它离 backbone 的深层最远，语义全靠上采样借来）。如果 P2 和上采样来的 P3 <em>等权相加</em>，等于强制规定「这一层自己的证据和借来的语义一样可信」。<strong>加权融合让网络自己去学这个比例——而学出来的结果通常是：在小目标密集的层上，自身分辨率的权重更高。</strong></p>  <table>
+    <thead><tr><th>neck</th><th>方向</th><th>融合方式</th><th>参数量增量</th><th>典型 AP 增益</th><th>对小目标的意义</th></tr></thead>
+    <tbody>
+      <tr><td><strong>FPN</strong></td><td>↓ 单向</td><td>逐元素相加</td><td>基线</td><td>基线</td><td>浅层拿到语义，但语义是插值来的</td></tr>
+      <tr><td><strong>PAN</strong></td><td>↓↑ 双向</td><td>逐元素相加</td><td>+~1.5×</td><td>+1–2 AP</td><td>深层拿到定位信息；<em>对小目标的直接收益有限</em></td></tr>
+      <tr><td><strong>BiFPN</strong></td><td>↓↑ 双向 + 跨接</td><td><strong>可学加权</strong></td><td>+~0.6×（比 PAN 更省）</td><td>+1–2 AP，小模型上更明显</td><td><strong>让 P2 的自身证据不被稀释</strong></td></tr>
+      <tr><td><strong>NAS-FPN</strong></td><td>搜索出的任意拓扑</td><td>相加 / 全局池化</td><td>视搜索结果</td><td>+2 AP，但不可解释</td><td>工程上难维护，逐渐被 BiFPN 取代</td></tr>
+      <tr><td><strong>重复 N 次的 BiFPN</strong></td><td>同上，堆叠</td><td>同上</td><td>×N</td><td>边际递减，N=3–7</td><td>小目标受益于更多轮跨层交换</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>两个常见误解。<strong>①「BiFPN 的加权是 attention」——不是。</strong> 它是<em>每个输入一个标量</em>（或每通道一个标量），与输入内容无关，训完就固定了；attention 的权重是逐样本、逐位置动态计算的。这个区别决定了 BiFPN 的加权几乎不增加推理成本，也决定了它的表达力上限。<strong>②「neck 越复杂越好」——在大模型上不成立。</strong> BiFPN 的增益在 EfficientDet-D0/D1 这类小模型上有 1–2 AP，到 D7 就基本被主干的容量淹没了。<em>车端 TSR 恰好在「小模型」那一档，所以 neck 的改动在这里性价比反而更高。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="resolution"><span class="num">5</span>三笔不同的账：提高输入分辨率 vs 加 P2 vs 换更强主干</h2>
+  <p>「小目标检不到」有三个看起来都合理的解法，但它们<strong>解决的根本不是同一件事</strong>。分清楚这一点，是这一节唯一要传达的东西。</p>  <table>
+    <thead><tr><th>方案</th><th>改变了什么</th><th>全模型 FLOPs</th><th>目标的<strong>像素数</strong></th><th>目标占的<strong>格子数</strong></th><th>本质</th></tr></thead>
+    <tbody>
+      <tr><td><strong>加 P2</strong>（stride 8 → 4）</td><td>只改采样网格</td><td>neck+head ×4.05；主干不变</td><td><strong>不变</strong></td><td>×2（每轴）</td><td><strong>把已有信息采得更细</strong></td></tr>
+      <tr><td><strong>输入分辨率 ×2</strong></td><td>改输入信息量</td><td><strong>全模型 ×4</strong></td><td><strong>×4</strong></td><td>×2（每轴）</td><td><strong>恢复被 resize 丢掉的传感器信息</strong></td></tr>
+      <tr><td><strong>换更深/更宽主干</strong></td><td>改表示容量</td><td>主干 ×1.5–3</td><td>不变</td><td>不变</td><td><strong>对小目标几乎无效</strong></td></tr>
+      <tr><td><strong>把 resize 改回原生分辨率</strong></td><td>停止丢信息</td><td>按面积比例</td><td><strong>×(比例)²</strong></td><td>×比例</td><td><strong>免费的、最高 ROI 的一招</strong></td></tr>
+    </tbody>
+  </table>  <h3>为什么这个区分是决定性的：一个 TSR 的具体数字</h3>  <p>典型的工程现状是：相机给 1920×1080，训练脚本 letterbox 到 640×640。<strong>缩放比例是 640/1920 = 0.333。</strong> 于是：</p>  <ul>
+    <li>50 米外的限速牌：原生 <strong>20 px</strong> → 送进网络时 <strong>6.7 px</strong>；在 stride 8 上占 <strong>0.83 个格子</strong>——不到一个格子，<em>结构上不可能检出</em>。</li>
+    <li>100 米外：原生 10 px → <strong>3.3 px</strong>；在 stride 8 上占 0.42 个格子。这不是「难检」，是「不存在」。</li>
+    <li>把输入换成 1280×720（比例 0.667）：50 米外变成 <strong>13.3 px</strong>，stride 8 上 1.67 个格子；100 米外 6.7 px。</li>
+    <li>用原生 1920×1080：50 米外 20 px / 2.5 格，100 米外 10 px / 1.25 格。<strong>同样是 stride 8，检出距离从 30 米推到了 80 米以上。</strong></li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以顺序应该是：<strong>先把输入分辨率提到延迟预算允许的上限，再考虑加 P2，最后才轮到换主干</strong>。原因是——<em>加 P2 只是把同样的信息采得更细，而提高输入分辨率是真的把信息拿回来</em>。一个 6.7 px 的目标无论用多细的网格去采，它也只有 6.7 px 的信息；而把它变回 20 px，是把传感器本来就捕捉到的、被 resize 扔掉的那部分像素找回来。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说，两者的作用可以分解为：<strong>「目标的像素数」决定了信息量上界，「目标占的格子数」决定了网络能不能表示它</strong>。加 P2 只动第二项，提分辨率两项都动。而换主干——把 ResNet-50 换成 ResNet-101 或 Swin——<em>两项都不动</em>，它增加的是「在给定信息量下的表示能力」，而小目标的瓶颈根本不在表示能力，在信息量。<strong>这解释了一个常见的困惑：换了更强的 backbone，AP_m 和 AP_l 都涨了，AP_s 纹丝不动。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">先问分辨率，再谈架构</span>
+    <p><strong>面试里这是一个分水岭问题。</strong> 被问「怎么提升小目标检测」时，如果候选人直接开始讲 FPN / BiFPN / 注意力机制，那是背书；<em>如果候选人先反问「你现在的输入分辨率是多少、原图是多少、目标的像素尺寸分布是什么样」，面试官立刻知道这个人做过真实项目</em>。</p><p>因为在工业界，<strong>「训练时把 1920 缩到 640」这个配置是压倒性常见的默认值</strong>（YOLO 的默认 imgsz=640 就是这么来的），而它在 TSR 上直接把一半以上的目标压到了亚格子尺度。<em>把它改回去往往比任何架构改动的收益都大，而且不需要改一行模型代码。</em> <strong>面试官想听的是：你会先量化问题，再选方案；而不是背一串方法名。</strong></p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>提高输入分辨率不是免费的，有三个必须一起算的代价：<strong>① 全模型 FLOPs 按面积平方增长</strong>（1920 vs 640 是 9 倍）；<strong>② 感受野相对目标变小了</strong>——同一个网络在高分辨率输入上，深层的有效感受野覆盖的<em>物理场景范围</em>变小，可能伤害大目标与上下文；<strong>③ 训练-推理分辨率必须一致</strong>，否则 anchor 尺度、回归范围、归一化尺度全部错位（这是 C60 讲的一致性问题的一个具体实例）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="deformable"><span class="num">6</span>可变形注意力：稀疏采样为什么对小目标天然友好</h2>
+  <p>Transformer 检测器给出了第三条路。但先要说清楚：<strong>朴素的多尺度全局注意力在检测上是算不动的</strong>。把 1536×864 的 P2–P5 全部展平成 token：</p>  <pre><code>P2: 216×384 =  82,944
+P3: 108×192 =  20,736
+P4:  54× 96 =   5,184
+P5:  27× 48 =   1,296
+                -------
+总计            110,160 个 token
+
+全局 self-attention 的复杂度 O(N²·C) = 110160² × 256 ≈ 3.1 × 10¹² MAC
+—— 比整个 ResNet-50 主干贵四个数量级。不可行。</code></pre>  <p><span class="term">Deformable attention</span> 的做法是：<strong>每个 query 不看全部 110,160 个位置，而是只采样 M×L×K 个点</strong>（M 个注意力头 × L 个金字塔层 × 每层 K 个采样点），采样位置由 query 自己预测的偏移量决定。取 M=8、L=4、K=4，就是 <strong>128 个采样点</strong>：</p>  <div class="math-block">\[\frac{\text{全局注意力的 key 数}}{\text{可变形采样点数}} \;=\; \frac{110{,}160}{8\times4\times4} \;=\; \frac{110{,}160}{128} \;\approx\; 861\times\]</div>  <div class="ascii">可变形采样：一个 query 在四个层上各采 K=4 个点（偏移量可学）
+
+           P2 (stride 4)              P3 (stride 8)         P4        P5
+     ┌───┬───┬───┬───┬───┐        ┌───┬───┬───┐        ┌───┬───┐   ┌───┐
+     │   │ ✱ │ ✱ │   │   │        │   │ ✱ │   │        │ ✱ │   │   │ ✱ │
+     ├───┼───┼───┼───┼───┤        ├───┼───┼───┤        ├───┼───┤   └───┘
+     │ ✱ │▓▓▓▓▓▓▓│ ✱ │   │        │ ✱ │▓▓▓│   │        │   │ ✱ │
+     ├───┼▓ GT ▓┼───┼───┤        ├───┼───┼───┤        └───┴───┘
+     │   │▓▓▓▓▓▓▓│   │   │        │   │ ✱ │ ✱ │
+     └───┴───┴───┴───┴───┘        └───┴───┴───┘
+       10 px 目标 = 2.5×2.5 格      = 1.25×1.25 格      0.6 格    0.3 格
+       采样点可以**全部落进目标**    只能落在同一格上      无区分度
+
+  关键：✱ 的位置是 **query 预测出来的偏移**，不是固定网格。
+       所以模型可以学会「小目标 query 把采样点收紧到 P2 的两三个格子里」。</div>  <p>对小目标，这个机制有两个具体的好处，都能量化：</p>  <ol>
+    <li><strong>注意力质量不被背景稀释。</strong> 在全局 softmax attention 里，一个 10 px 的目标在 P2 上只占 6.25 个格子，占全部 110,160 个 key 的 <strong>5.7 × 10⁻⁵</strong>。初始化时注意力接近均匀，<em>目标能拿到的注意力质量是十万分之五</em>——这正是 DETR 收敛慢的根因之一（见 C54 m04）。而可变形注意力用一组学到的偏移把采样点直接放到目标上，notebook 的模拟显示：在 P2 上，采样点落进 10 px 目标框内的比例可达 <strong>62%</strong>。<em>从 5.7×10⁻⁵ 到 0.62，是四个数量级的差别。</em></li>
+    <li><strong>天然跨层。</strong> 一个 query 同时在 P2–P5 上采样，不需要「先决定这个目标属于哪一层」。<em>这等于把上一节讲的「层级分配」问题从硬性划分变成了软性加权</em>——对处在层级边界上的目标（比如 60 px 恰好在 P2/P3 分界处）尤其重要。</li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以可变形注意力对小目标友好，本质上是因为它<strong>把「在哪里取证据」变成了可学的</strong>。卷积的采样位置是固定网格，全局注意力的采样位置是「全部」，可变形注意力的采样位置是「学出来的少数几个」——对一个只有几个格子的目标，这恰好是最有效的形式。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但有两个必须知道的约束。<strong>① 初始化极其关键</strong>：Deformable DETR 把采样偏移的初始值设成围绕参考点的规则网格（不同的头指向不同方向），并且把预测偏移的线性层权重初始化为 0、偏置设成那个网格。<em>如果随机初始化，采样点会散到图像各处，小目标上根本收不回来，训练直接不收敛</em>——这是一个「论文里一句话、复现时踩三天」的细节。<strong>② 采样用双线性插值，梯度可以传到亚像素位置</strong>，这既是优点（定位精度不受网格限制）也是隐患（对 4–8 px 的目标，插值出来的梯度信噪比很低）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把三代方案排成一条线就清楚了：<strong>FPN 是「把语义搬到高分辨率上」，PAN/BiFPN 是「让搬运双向且可加权」，可变形注意力是「不搬了，让需要的人自己去取」</strong>。<em>而所有这些都在同一个前提下工作：高分辨率的那一层必须存在。</em> 如果你的金字塔从 P3 开始，那么再精巧的采样机制也只能在 stride 8 的网格上采——<strong>这就是为什么本模块的顺序是「先分辨率，后融合，再采样」。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="context"><span class="num">7</span>上下文：一个 8 像素的目标必须靠周围</h2>
+  <p>把信息瓶颈算清楚：一个 8×8 px 的标志，在 stride 8 的 P3 上占据<strong>恰好一个格子</strong>。这一个格子是一个 C 维向量（典型 C=256），而它要同时编码：</p>  <ul>
+    <li><strong>objectness</strong>——这里有没有东西</li>
+    <li><strong>类别</strong>——中国 GB 5768 体系下含限速变体有 200+ 类，需要 log₂(200) ≈ 7.6 bit 的可区分度</li>
+    <li><strong>框回归</strong>——中心偏移 + 宽高，4 个连续量</li>
+    <li><strong>（若有）属性</strong>——是否电子牌、是否对向车道、遮挡程度</li>
+  </ul>  <p>而这个向量的输入信息来自原图 8×8 = 64 个像素，经过 ISP、JPEG 压缩、运动模糊、下采样之后，有效信息远低于 64×3 字节的名义上界。<strong>结论是清楚的：仅靠目标自身的像素，不足以完成这个任务。必须用上下文。</strong></p>  <h3>TSR 的上下文是什么</h3>  <table>
+    <thead><tr><th>上下文线索</th><th>具体是什么</th><th>怎么用</th><th>风险</th></tr></thead>
+    <tbody>
+      <tr><td><strong>杆件（pole）</strong></td><td>标志几乎总是装在竖直杆件上；杆件的像素长度远大于标志本身</td><td>扩大感受野让「杆 + 牌」一起被看到</td><td><strong>路灯、电线杆也是竖直杆</strong></td></tr>
+      <tr><td><strong>位置先验</strong></td><td>标志在图像中的位置高度受限：消失点附近、地平线以上、道路两侧带状区域</td><td>位置编码 / ROI 裁剪 / 位置相关的先验分数</td><td>上下坡、弯道会破坏先验；<em>不能做成硬约束</em></td></tr>
+      <tr><td><strong>成组出现</strong></td><td>限速牌下常挂辅助牌；施工区域标志成串出现</td><td>同图内的目标间关系建模（self-attention 天然支持）</td><td>训练数据里的共现偏差会被学成规则</td></tr>
+      <tr><td><strong>与车道的几何关系</strong></td><td>本车道的标志 vs 对向车道 / 辅路的标志</td><td>把车道线检测结果作为额外输入</td><td><strong>关联错误比漏检更危险</strong>（限速 40 误用到主路）</td></tr>
+      <tr><td><strong>路面与场景类型</strong></td><td>高速 / 城市 / 乡道决定了可能出现的标志子集</td><td>场景分类作为条件，或用作后处理先验</td><td>跨域时先验失效</td></tr>
+      <tr><td><strong>时序</strong></td><td>同一块标志在连续帧中由远及近</td><td>多帧融合（见 C55 m04）</td><td>延迟与稳定性的权衡</td></tr>
+    </tbody>
+  </table>  <h3>三种把上下文注入模型的方式</h3>  <table>
+    <thead><tr><th>方式</th><th>代表做法</th><th>有效感受野的变化</th><th>成本</th><th>适用性</th></tr></thead>
+    <tbody>
+      <tr><td><strong>扩大感受野</strong></td><td>5×5 depthwise 大核（RTMDet）、空洞卷积、非局部块</td><td>直接增大</td><td>大核 depthwise 极便宜；非局部很贵</td><td><strong>首选</strong>，尤其大核 depthwise</td></tr>
+      <tr><td><strong>显式上下文特征</strong></td><td>把 ROI 周围 2× 区域的特征一并池化后拼接</td><td>不变，但输入变多</td><td>中（多一路 RoIAlign）</td><td>两级方案里很自然（见 C55 m02）</td></tr>
+      <tr><td><strong>先验编码</strong></td><td>把归一化的 (x, y) 坐标、消失点距离作为额外通道</td><td>不变</td><td>几乎为零</td><td><strong>性价比极高但容易过拟合</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>上下文的收益是真实的：一个 8 px 的红色圆形本身可能是标志、可能是尾灯、可能是广告牌上的圆点；<strong>但「装在竖直杆上、位于地平线上方、在道路右侧带状区域内」的 8 px 红色圆形，几乎一定是禁令标志</strong>。这个联合先验能把一个几乎不可解的分类问题变成可解的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但上下文有一个具体的失效模式，必须提前防：<strong>当目标自身的信息太弱时，模型会退化成「只学上下文」</strong>。症状是——在有杆件的位置产生高置信度误检（而那里其实是路牌背面或者路灯），同时对不在典型位置的标志（临时施工牌放在地上、龙门架上的标志）完全漏检。<em>诊断方法很直接：把目标区域遮黑只留上下文，看模型的置信度掉多少</em>。<strong>如果掉得不多，说明模型根本没在看目标本身。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>所以上下文的大小是一个需要调的超参，而不是「越大越好」。经验区间：<strong>上下文范围取目标尺寸的 3–6 倍</strong>。低于 3 倍拿不到杆件；高于 6 倍开始引入无关背景，并且让模型学到「路边区域 = 有标志」的捷径。<em>在 TSR 上这个捷径的直接后果就是广告牌与车身贴纸的误检——而误检在量产系统里的代价远高于漏检（会触发莫名其妙的减速）。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="superres_light"><span class="num">8</span>超分、特征增强，以及轻量化与小目标的根本矛盾</h2>
+  <p>最后两类做法值得单独一节，因为它们在论文里看起来很有吸引力，但在量产系统里的实际排序<strong>远低于</strong>前面几节的方法。</p>  <h3>超分与特征级增强：为什么排在最后</h3>  <p>这一类方法的思路是：既然小目标像素少，就<strong>先把它放大</strong>——图像级超分（先超分再检测）、特征级超分（<span class="term">Perceptual GAN</span> 把小目标特征映射到大目标特征的分布上）、或者用 GAN 判别器逼迫小目标特征「看起来像」大目标特征。</p>  <table>
+    <thead><tr><th>方法</th><th>做什么</th><th>论文报告增益</th><th>真实代价</th><th>工程建议</th></tr></thead>
+    <tbody>
+      <tr><td><strong>图像级超分</strong></td><td>整图 2–4× 超分后再检测</td><td>AP_s +1–3</td><td><strong>额外一个大网络 + 分辨率翻倍的检测</strong>，延迟不可接受</td><td>❌ 车端不考虑</td></tr>
+      <tr><td><strong>特征级超分</strong>（Perceptual GAN 系）</td><td>把小目标的浅层特征映射到「大目标风格」</td><td>AP_s +1–2</td><td>多一个生成器 + 判别器，训练不稳定</td><td>⚠️ 收益不如直接提分辨率</td></tr>
+      <tr><td><strong>特征重建 / 自蒸馏</strong></td><td>用高分辨率分支的特征蒸馏低分辨率分支</td><td>AP_s +0.5–1.5</td><td><strong>只在训练期，推理零成本</strong></td><td>✅ 值得试，是这类里唯一划算的</td></tr>
+      <tr><td><strong>直接提输入分辨率</strong></td><td>见上一节</td><td>AP_s <strong>+5–15</strong>（TSR 上）</td><td>FLOPs 按面积增长</td><td>✅✅ <strong>先做这个</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">超分不创造信息，它发明信息</span>
+    <p><strong>超分在 TSR 上有一个特有的、安全相关的风险：幻觉（hallucination）。</strong> 超分网络的本质是「用学到的先验补全缺失的高频信息」——它不创造信息，它<em>发明</em>信息。在自然图像上，把模糊的树叶补成清晰的树叶无伤大雅；<strong>但在一个 8 px 的限速牌上，超分网络完全可能把「60」补成「80」，而且补得非常清晰、非常自信。</strong></p><p>下游拿到的是一个高置信度的错误限速。<em>这类错误无法通过置信度过滤，因为超分让整条链路的置信度都升高了。</em> <strong>结论：任何在安全关键路径上引入生成式补全的做法，都必须有一条不依赖它的旁路来交叉验证</strong>（例如地图先验、多帧一致性）。这是量产 TSR 系统的一条红线。</p>
+  </div>  <h3>轻量化与小目标：三板斧，每一斧都砍在小目标上</h3>  <p>车端模型必须轻量化，而轻量化的三个标准手段<strong>恰好都直接伤害小目标</strong>——这不是巧合，是因为小目标依赖的正是被裁掉的那些东西。</p>  <table>
+    <thead><tr><th>轻量化手段</th><th>省了什么</th><th>为什么专门伤小目标</th><th>缓解</th></tr></thead>
+    <tbody>
+      <tr><td><strong>降输入分辨率</strong></td><td>FLOPs ∝ 面积</td><td><strong>直接删除小目标的像素</strong>；20 px → 6.7 px</td><td><strong>不要做</strong>；改用 ROI 裁剪保留关键区域的原生分辨率</td></tr>
+      <tr><td><strong>减通道</strong></td><td>FLOPs ∝ C²</td><td>小目标的判别信息本就集中在少数通道，减通道优先损失细粒度纹理</td><td>只减深层通道，保留 P2/P3 的通道数</td></tr>
+      <tr><td><strong>减深度 / 用 depthwise</strong></td><td>FLOPs 线性下降</td><td>depthwise 去掉了通道间混合，而小目标的语义恰恰需要跨通道组合弱信号</td><td><strong>大核 depthwise + 1×1 pointwise</strong>（RTMDet 的做法）保留混合能力</td></tr>
+      <tr><td><strong>结构化剪枝</strong></td><td>去掉低激活通道</td><td><strong>小目标的激活本来就低</strong> → 负责小目标的通道被优先剪掉</td><td>按分尺寸的 AP 做剪枝敏感度评估，而不是只看总 mAP</td></tr>
+      <tr><td><strong>INT8 量化</strong></td><td>算力 / 带宽</td><td>小目标的 logit 分布集中在低分区，量化后区分度下降更明显</td><td>分类头保 FP16；校准集必须含足量小目标（见 C60 m03）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以「又要轻量又要小目标好」这个需求本身是有内在张力的。<strong>解决张力的方式不是在两者之间折中，而是让计算量花在该花的地方</strong>：整图用低分辨率跑一个粗检测器找 ROI，只在 ROI 上用高分辨率精检（这就是模块 04 要讲的两级级联）；或者只对图像的上半部分算 P2。<em>「均匀地降低所有地方的精度」是最差的一种轻量化。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个容易被忽略的评测陷阱：<strong>剪枝 / 量化的敏感度评估如果只看总 mAP，几乎必然会牺牲小目标</strong>。因为在 COCO 式的评测里 AP_s 只占 mAP 的三分之一权重，而在 TSR 的真实分布里小目标占 84%。<em>一个「总 mAP 只掉 0.5」的剪枝方案，完全可能对应「AP_s 掉 4、AP_l 涨 1」</em>。<strong>正确做法是把按尺寸分桶的 AP 作为剪枝与量化的主指标</strong>——这一点在模块 05 和 C60 m03 会再展开。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把本模块的所有手段按「收益 / 成本」排一次序，对 TSR 场景大致是：<strong>① 把输入分辨率改回接近原生（收益极大，成本 = FLOPs 按面积增长，无工程风险）→ ② 加 P2 且用减半通道 / ROI 限制成本（收益大，1.4× 成本）→ ③ neck 换 BiFPN 或加权融合（收益中，成本小）→ ④ 上下文与位置先验（收益中，成本几乎为零，但要防捷径）→ ⑤ 特征蒸馏（收益小，推理零成本）→ ⑥ 超分（收益不确定，有安全风险）</strong>。<em>注意前两条都是「分辨率」，这不是巧合——小目标问题在架构层面上，八成是分辨率问题。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>架构层面的小目标解法在 2020 年之后进入了一个「大方向已定、细节仍在动」的阶段。以下是几个仍然开放、且与 TSR 直接相关的问题。</p>  <ul>
+    <li><strong>高分辨率主干 vs 编码-解码金字塔。</strong> <span class="term">HRNet</span> 路线主张全程保持高分辨率分支并行交换，而不是「先降采样再上采样」。它在姿态估计上确定性地更好，但在检测上因为计算量分布不友好（高分辨率分支贯穿全网）一直没成为主流。<em>随着车端算力上升、以及「小目标才是瓶颈」的共识增强，这条路线值得重新评估</em>——尤其是「只在浅层保持高分辨率、深层正常下采样」的混合形态。</li>
+    <li><strong>P2 的成本该怎么摊。</strong> 目前的做法（减通道、减头深度、ROI 限制）都是工程折中，缺少原则性的答案。一个开放问题是：<em>能否让 P2 只承担「定位」而把「分类」完全交给上层</em>——即把检测头按任务拆到不同分辨率上（定位需要分辨率，分类需要语义）。已有零星工作（task-decoupled heads across levels），但尚无公认结论。</li>
+    <li><strong>可变形采样在极小目标上的退化。</strong> 当目标只有 2–3 个格子时，K=4 个采样点已经覆盖了目标的大部分，继续增大 K 没有收益；而学到的偏移量的方差可能超过目标本身的尺寸，使采样退化为噪声。<em>「采样点数与目标尺寸的匹配」目前靠调参，缺少自适应机制。</em></li>
+    <li><strong>上下文的可控注入。</strong> 如何在利用上下文的同时防止模型学成「位置捷径」，目前只有经验做法（限制上下文范围、加位置扰动增强）。<em>一个有价值的方向是显式建模「目标证据」与「上下文证据」的分离，并在推理时能报告两者各贡献了多少</em>——这对可解释性与安全论证都有意义。</li>
+    <li><strong>与事件相机 / 多曝光的结合。</strong> 小目标的根本瓶颈是信息量，而传统 RGB 相机在远距离 + 高动态范围场景下的信息采集本身就是受限的。事件相机的高时间分辨率、多曝光 HDR 的高动态范围，都是「在传感器端增加信息」的路线。<em>这一路线绕过了所有架构技巧，直接从源头解决问题，但成本与成熟度仍是障碍。</em></li>
+    <li><strong>神经架构搜索的回归。</strong> NAS-FPN 之后这条路一度沉寂（不可解释、迁移性差）。但在「给定车端芯片的算子支持与延迟模型，搜索最优金字塔拓扑」这个受约束的设定下，它重新变得实用——<em>因为约束足够强，搜索空间小到可以穷举，结果也可解释</em>。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：<em>Feature Pyramid Networks for Object Detection</em>（Lin et al., CVPR 2017，层级分配公式的出处，第 4.2 节）；<em>Path Aggregation Network for Instance Segmentation</em>（Liu et al., CVPR 2018，PAN 的自底向上路径与「路径长度」论证）；<em>EfficientDet: Scalable and Efficient Object Detection</em>（Tan et al., CVPR 2020，BiFPN 与 fast normalized fusion，第 3.2 节）；<em>Deformable DETR: Deformable Transformers for End-to-End Object Detection</em>（Zhu et al., ICLR 2021，多尺度可变形注意力，注意附录里的偏移初始化细节）；<em>Deep High-Resolution Representation Learning</em>（Wang et al., TPAMI 2020，HRNet）。小目标专题综述：<em>Towards Large-Scale Small Object Detection: Survey and Benchmarks</em>（Cheng et al., TPAMI 2023）。相邻课程：C53 m03（RTMDet 的大核与共享头）、C54 m04（可变形注意力的收敛分析）、C57 m03（分配与损失）、C57 m04（切片推理）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_why_hard/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 定量分析：小目标到底难在哪</div></a>
+    <a class="next" href="../03_assignment_loss/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 分配与损失层面的解法</div></a>
+  </div>
+
+</div>
+</body>
+</html>

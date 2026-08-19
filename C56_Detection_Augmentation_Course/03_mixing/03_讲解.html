@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 混合类增强：Mosaic / MixUp / CutMix / Copy-Paste</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 混合类增强：Mosaic / MixUp / CutMix / Copy-Paste</h1>
+  <p class="subtitle">Mosaic 一次给四份上下文并顺带把目标缩小 → <strong>它天然是一个小目标增强器</strong> · 但它造出的分布不是部署分布，<strong>close-mosaic 收尾是标配而不是玄学</strong> · Copy-Paste 是长尾最直接的解法，代价是三条硬约束：尺度服从透视、位置合法、边缘要融合 · 贴到天上的标志会教坏模型 · 小模型 + 强增强 = 欠拟合</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–02（bbox 变换框架、几何增强与标注同步、光度增强）；C55 模块 01（TSR 长尾）与 C58 模块 01（类别不平衡）会让本模块的 copy-paste 部分更有落点</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_mixing_aug.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Bochkovskiy et al. <em>YOLOv4</em>（Mosaic）；Zhang et al. <em>mixup</em>；Yun et al. <em>CutMix</em>；Ghiasi et al. <em>Simple Copy-Paste</em>；Ultralytics 的 <code>close_mosaic</code> 实现</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 65 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">混合类增强是另一个物种：它改变的是「一张图 = 一个场景」这个假设</a></li>
+      <li><a href="#mosaic">Mosaic 解剖：三个作用，以及每一个的量化</a></li>
+      <li><a href="#close">close-mosaic：为什么必须在最后 N 个 epoch 关掉</a></li>
+      <li><a href="#mixcut">MixUp 与 CutMix 在检测里：为什么争议最大</a></li>
+      <li><a href="#copypaste">Copy-Paste：长尾类别最直接的解法</a></li>
+      <li><a href="#constraints">Copy-Paste 的四条合理性约束：贴到天上的标志会教坏模型</a></li>
+      <li><a href="#bank">实例库工程：抠图、质量筛选与采样策略</a></li>
+      <li><a href="#interaction">增强强度 × 模型容量 × 训练时长：三者是耦合的</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>混合类增强是另一个物种：它改变的是「一张图 = 一个场景」这个假设</h2>
+  <p>模块 01 的几何增强改「框在哪」，模块 02 的光度增强改「像素是什么值」。<strong>混合类增强改的是第三样东西：一张训练图里有几个场景、有多少个目标、目标之间是什么关系</strong>。它把两张或四张图的内容与标注揉进同一个样本里。</p>  <p>这一步跨得很大，因为它<strong>同时破坏了两个默认假设</strong>：① 「一张图对应一次真实的相机曝光」——拼接图在物理上不存在；② 「图像内容与标注一一对应」——mixup 之后每个像素同时属于两个目标。<em>正因为跨得大，收益也大；也正因为跨得大，它必须被小心地关掉</em>。</p>  <table>
+    <thead><tr><th></th><th>几何增强</th><th>光度增强</th><th><strong>混合类增强</strong></th></tr></thead>
+    <tbody>
+      <tr><td>改什么</td><td>框的位置/形状</td><td>像素数值</td><td><strong>样本的构成</strong>（几个场景、几个目标）</td></tr>
+      <tr><td>标注变化</td><td>坐标变换</td><td>不变</td><td><strong>标注集合被合并、裁剪、丢弃</strong></td></tr>
+      <tr><td>物理可实现性</td><td>✅（换个视角就是）</td><td>✅（换个天气就是）</td><td><strong>❌ 拼接图不对应任何一次真实曝光</strong></td></tr>
+      <tr><td>主要收益</td><td>视角/尺度不变性</td><td>成像条件不变性</td><td><strong>上下文多样性 + 小目标供给 + 长尾补齐</strong></td></tr>
+      <tr><td>主要代价</td><td>小目标被丢弃</td><td>语义被改掉</td><td><strong>训练分布偏离部署分布</strong></td></tr>
+      <tr><td>是否需要「关掉」</td><td>否</td><td>否</td><td><strong>是 —— close-mosaic 是标配</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么混合类增强这么有效？<strong>因为检测器最缺的从来不是「同一个目标的更多变体」，而是「同一个目标出现在更多上下文里」</strong>。一块限速牌在你的数据集里可能有 2000 个实例，但它们几乎全在「高速公路 + 白天 + 龙门架」这一种上下文里。<em>模型于是学到了一堆和标志本身无关的相关性</em>（有龙门架的地方才有限速牌）。把它拼到城市街景、乡村路口、隧道口旁边，等于强行打断这些相关性。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说，混合类增强攻击的是<span class="term">spurious correlation</span>（虚假相关）与<span class="term">context bias</span>（上下文偏置）。检测器的一个已知病理是：<strong>它会把「共现的背景」当作证据的一部分</strong>。Mosaic 通过让每张训练图包含四个互不相关的场景，把背景与目标的互信息压下去；Copy-Paste 更彻底，直接把目标搬到任意背景上。<em>但代价是同一枚硬币的另一面</em>——<strong>上下文本身在 TSR 里也是有效信息</strong>（标志有杆件、在路侧、在地平线以上），把上下文彻底打散会丢掉这个先验。<strong>这就是为什么 copy-paste 必须带约束、mosaic 必须在最后关掉。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>本模块的一条总纲：<strong>混合类增强的每一个技巧，都在「打散上下文」和「保留合理性」之间取一个位置</strong>。Mosaic 打散得最狠（但只在训练早期用）；Copy-Paste 打散得最有针对性（但必须满足透视/位置/融合/光照四条约束）；MixUp 在检测里打散得最没有道理（所以它是这四个里争议最大的）。<em>知道每个技巧站在这条轴的哪个位置，比记住它们的实现细节有用。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mosaic"><span class="num">2</span>Mosaic 解剖：三个作用，以及每一个的量化</h2>
+  <p><span class="term">Mosaic</span>（YOLOv4 引入）把四张图拼成一张，再从拼接画布上随机裁剪/缩放出一张训练图。实现只有几十行，但它同时做了三件事——<strong>面试里要求「说清 Mosaic 有什么用」，答出三个才算完整</strong>。</p>  <div class="ascii">      画布 2s × 2s，拼接中心 (xc, yc) 在 [0.5s, 1.5s] 内随机
+      ┌──────────────────┬──────────────────────┐
+      │                  │                      │
+      │   img0 (右下角)   │    img1 (左下角)      │   ← 每张图只有靠近中心的
+      │                  │                      │      那一部分被保留
+      │            (xc,yc)●                     │
+      ├──────────────────┼──────────────────────┤
+      │                  │                      │
+      │   img2 (右上角)   │    img3 (左上角)      │
+      │                  │                      │
+      └──────────────────┴──────────────────────┘
+                    ↓ 缩放 + 裁剪回 s × s（真实实现里还叠加随机仿射）
+      ┌────────────┐
+      │            │   目标尺寸约为原来的 0.5–1.5 倍
+      │            │   目标数量约为原来的 4 倍（减去被裁掉/丢弃的）
+      └────────────┘
+
+  三个副产品（不是 bug，是主要收益）：
+    ① **每张训练图包含 4 个不相关场景**  → 背景-目标的虚假相关被打断
+    ② **目标像素尺寸整体变小**            → 小目标样本供给暴涨
+    ③ **大量目标被画布边界截断**          → 强迫模型学「部分可见也要检出」</div>  <table>
+    <thead><tr><th>作用</th><th>机制</th><th>量化（notebook 里会实测）</th><th>对 TSR 的意义</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 变相增大 batch 多样性</strong></td><td>1 张训练图 = 4 个场景</td><td>同 batch size 下，<strong>每步见到的场景数 ×4</strong>；单图目标数 <strong>×3.2</strong>（4 倍减去被过滤规则丢弃的）</td><td>小 batch（车端训练常见）下尤其有用</td></tr>
+      <tr><td><strong>② 制造更多小目标</strong></td><td>拼接后整体缩小</td><td>小目标（边长 &lt; 5% 图宽）占比从 <strong>9.8% → 50.9%</strong></td><td><strong>TSR 本来就是小目标任务，这是直接命中的收益</strong></td></tr>
+      <tr><td><strong>③ 丰富上下文</strong></td><td>目标周围换成别的场景</td><td>背景-类别互信息下降</td><td>打断「龙门架 ⇒ 限速牌」这类捷径</td></tr>
+      <tr><td>（副作用）截断框暴涨</td><td>画布边界裁剪</td><td>贴边框占比 <strong>3.4% → 11.3%（约 3.3×）</strong><sup>*</sup></td><td><strong>这是 close-mosaic 的主要动机之一</strong></td></tr>
+    </tbody>
+  </table>  <p><sup>*</sup> 这四个数字都来自 notebook 的实测（同一份合成数据，mosaic 前后对比）。<em>截断框那一项与实现方式强相关</em>：本课的实现是「拼成 2s 画布后整体缩放回 s」，YOLOv5 的真实实现是「拼成 2s 画布后<strong>裁剪</strong>回 s（叠加随机仿射）」——<strong>裁剪会切掉更多内容，所以真实实现的截断框比例还要高得多（常见报告在 25–40%）</strong>。<em>方向一致、量级更大，close-mosaic 的必要性只会更强。</em></p>  <h3>实现细节：三个必须写对的地方</h3>  <ol>
+    <li><strong>拼接中心随机</strong>。<code>(xc, yc)</code> 在 <code>[0.5s, 1.5s]</code> 内均匀采样，而不是固定在画布正中。<em>固定中心会让「四张图各占一个 1:1 象限」成为定式，模型能学到这个结构</em>（比如「图像正中的十字接缝处从不出现目标」）。随机中心让四个象限的面积比每次都不同。</li>
+    <li><strong>越界框裁剪，而不是丢弃</strong>。跨过画布边界的框要 clip 到画布内。<em>直接丢弃会把「被截断的目标」这一整类样本从训练里抹掉</em>，而真实场景里画面边缘的半个标志是常态。</li>
+    <li><strong>裁剪后的过滤规则</strong>——这是最容易写错的一环。YOLOv5 的 <code>box_candidates</code> 用三个条件：裁剪后宽高都 &gt; 2 px、长宽比 &lt; 20、<strong>裁剪后面积 / 裁剪前面积 &gt; 0.1</strong>。<em>第三条最关键：只剩 10% 的框，其框内内容与「一个完整目标」已经没什么关系，留着就是错误监督。</em></li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第 3 条的阈值选择对 TSR 有特别的含义。<strong><code>area_thr</code> 定得太高（比如 0.5），会把大量小目标误杀</strong>——因为小目标的框本来就小，稍微被裁一点，面积比就掉得快；<em>定得太低（比如 0.02），会留下一堆「只剩一条边」却标着完整类别的框，直接毒化训练</em>。0.1 是一个经验平衡点，但<strong>如果你的数据里小目标占比极高（TSR 正是如此），应该单独验证这个阈值</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个与模块 01 呼应的细节：<strong><code>wh_thr=2</code> 这个「裁剪后宽高必须大于 2 像素」的硬阈值，在 mosaic 场景下会误杀真正的小目标</strong>。原图里 8×8 的标志，经过 mosaic 的 0.5× 缩放变成 4×4，再被边界裁掉一半就是 4×2——刚好卡在阈值上被丢掉。<em>于是出现一个反直觉的现象：Mosaic 号称「制造更多小目标」，但过滤规则又在系统性地删掉最小的那一批</em>。<strong>正确做法是：把 <code>wh_thr</code> 与训练分辨率、与你关心的最小目标尺寸一起定，而不是抄默认值</strong>——notebook 的练习 1 会把这个误杀量算出来。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>Mosaic 与<strong>矩形训练（rect training）</strong>互斥：矩形训练靠「同 batch 内图像长宽比接近，减少 padding」省算力，而 mosaic 输出永远是正方形。<em>两个都开的话，rect 那部分是白配置</em>。同理，Mosaic 与「按图像尺寸分桶采样」也冲突。<strong>凡是依赖「输入图与原图有确定对应关系」的机制，遇到 mosaic 都要重新检查。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="close"><span class="num">3</span>close-mosaic：为什么必须在最后 N 个 epoch 关掉</h2>
+  <p><strong>close-mosaic 是现在所有主流 YOLO 实现的标配</strong>（Ultralytics 默认 <code>close_mosaic=10</code>，即最后 10 个 epoch 关闭）。它的原理很少被讲透，但其实非常干净：<strong>Mosaic 制造的训练分布与部署分布之间有一个可以量化的鸿沟，训练末期必须把这个鸿沟合上，让模型在「真实分布」上完成最后的收敛。</strong></p>  <div class="ascii">训练时间线（总 100 epoch，close_mosaic=10）
+
+  epoch  0 ──────────────────────────────── 90 ──────────── 100
+         │◄────── Mosaic ON (p=1.0) ──────►│◄─ Mosaic OFF ─►│
+         │                                 │                │
+  训练分布 │  目标偏小、目标偏多、大量截断框     │  与验证/部署分布一致 │
+  优化目标 │  学「在杂乱上下文里找小目标」      │  学「在真实构图上精定位」│
+         │                                 │                │
+  与部署分布│      W1 距离 ≈ 大               │   W1 距离 ≈ 0    │
+  的差距   │                                 │                │
+
+  三个鸿沟（notebook 会把每个都量出来）：
+    ① **尺寸分布漂移**：mosaic 下目标像素尺寸整体缩小约 2 倍
+    ② **截断框比例漂移**：贴边框从约 3% 涨到 30%+，模型学到「贴边也算完整目标」
+    ③ **目标密度漂移**：单图目标数 ×4，NMS/分配的竞争强度与部署时不同</div>  <table>
+    <thead><tr><th>鸿沟</th><th>Mosaic 开</th><th>Mosaic 关 / 部署</th><th>不关掉的后果</th></tr></thead>
+    <tbody>
+      <tr><td>目标像素尺寸中位数</td><td><strong>0.50×</strong>（W1 距离 ≈ 9 px）</td><td>1.0×</td><td>模型的尺度先验偏小，大目标定位变差</td></tr>
+      <tr><td>贴边（截断）框占比</td><td><strong>11.3%</strong>（真实实现更高）</td><td>3.4%</td><td><strong>回归头学会「框可以贴边」→ 部署时产生贴边假阳</strong></td></tr>
+      <tr><td>单图目标数</td><td><strong>3.2×</strong></td><td>1×</td><td>分配与 NMS 的竞争强度不匹配</td></tr>
+      <tr><td>背景-目标互信息</td><td>被打断</td><td>真实存在</td><td>丢掉「标志在路侧、有杆件」这类有效先验</td></tr>
+      <tr><td>图像统计（拼接缝）</td><td>有硬接缝</td><td>无</td><td>模型可能把硬边当特征</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么是「最后关掉」而不是「一直不用」或者「一直用」？<strong>因为 Mosaic 在训练早期与晚期的作用完全不同</strong>。早期模型什么都不会，需要的是<em>大量、多样、廉价的监督信号</em>——Mosaic 把每步的有效样本数翻四倍，正好；晚期模型已经会了，需要的是<em>在真实分布上精调定位与置信度</em>——此时 Mosaic 提供的样本反而在把模型往错误的分布上拉。<strong>这本质上是一种课程学习（curriculum）：先学「在困难分布上大致会」，再学「在真实分布上做准」。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>有一个常被误解的点值得澄清：<strong>close-mosaic 的收益主要体现在定位精度（高 IoU 阈值下的 AP）上，而不是召回</strong>。原因是回归头对分布漂移最敏感——它要学的是「框的四个数应该是多少」，而 mosaic 系统性地把框改小、改成截断的。<em>分类头相对不敏感（一块标志在哪个上下文里都还是那块标志）</em>。<strong>所以验证 close-mosaic 是否起作用，要看 AP<sub>75</sub> 和 AP<sub>90</sub> 的变化，而不是 AP<sub>50</sub></strong>；只看 AP<sub>50</sub> 常常看不出差别，然后得出「close-mosaic 没用」的错误结论。</p></div>
+  </div>  <div class="callout danger"><span class="label">别答数字，答机制</span>
+    <p><strong>面试高频追问：「close-mosaic 关多少个 epoch 合适？」</strong>不要答一个数字，要答一个推理：</p><p>「<strong>关闭的 epoch 数要够模型在真实分布上重新收敛，所以它与学习率调度耦合</strong>。如果关闭窗口落在学习率已经衰减到极小的阶段，模型根本动不了，等于没关；<em>所以实践中要保证关闭窗口内学习率还有可用的量级</em>。10 个 epoch 是 100–300 epoch 训练下的经验值；<strong>短训练（如 50 epoch）下按比例缩到 3–5，长训练下不必线性放大——关键是「窗口内的有效更新步数」而不是 epoch 数</strong>。另外关闭时最好同时关掉 mixup 与强 copy-paste，因为它们制造的是同一类分布漂移。」</p><p><em>这个回答的价值在于：它把一个超参数还原成了它背后的机制（分布漂移 + 有效更新步数），这正是面试官想听的。</em></p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个真实的工程坑：<strong>关闭 mosaic 的同时，dataloader 的 collate 逻辑、缓存策略、甚至每个 epoch 的迭代步数都可能变化</strong>（因为 mosaic 会改变有效样本数的计算方式）。Ultralytics 的实现是在 close 时<em>重建 dataloader</em>。<em>自己实现时如果只是把 <code>p_mosaic</code> 设成 0 而没处理这些，可能出现「最后 10 个 epoch 的日志步数对不上」这类诡异现象</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mixcut"><span class="num">4</span>MixUp 与 CutMix 在检测里：为什么争议最大</h2>
+  <p><span class="term">MixUp</span> 与 <span class="term">CutMix</span> 在图像分类上是公认有效的强正则化，但搬到检测上，它们的<strong>理论基础被抽掉了一半</strong>。理解这一点比记住「YOLOv5 默认 mixup=0.0、YOLOv8-x 才开」更重要。</p>  <div class="math-block">\[\text{分类：}\;\tilde{x}=\lambda x_a+(1-\lambda)x_b,\quad \tilde{y}=\lambda y_a+(1-\lambda)y_b \qquad\Big|\qquad \text{检测：}\;\tilde{x}=\lambda x_a+(1-\lambda)x_b,\quad \tilde{\mathcal{B}}=\mathcal{B}_a\cup\mathcal{B}_b\]</div>  <p><strong>差别就在右半边</strong>：分类的标签是一个概率向量，可以线性插值，混合后的标签在数学上仍然是一个合法的目标分布；<em>检测的标签是一个「框的集合」，集合没有线性结构</em>。工程上的做法是取<strong>并集</strong>——于是每个目标都以 <code>λ</code> 或 <code>1-λ</code> 的不透明度出现，却被要求以 100% 的置信度被检出。<strong>「半透明的目标要按完整目标监督」这件事，在真实世界里没有对应物。</strong></p>  <table>
+    <thead><tr><th>方法</th><th>在分类里的依据</th><th>在检测里的变体</th><th>主要问题</th><th>实践建议</th></tr></thead>
+    <tbody>
+      <tr><td><strong>MixUp</strong></td><td>标签可线性插值 → 鼓励线性决策边界</td><td>图像加权平均 + <strong>标注取并集</strong></td><td><strong>目标半透明但按完整监督</strong>；与部署分布差异极大</td><td>大模型 + 长训练下小幅使用（p≈0.1–0.15）；<strong>小模型别开</strong></td></tr>
+      <tr><td><strong>CutMix</strong></td><td>剪贴块的标签按面积加权</td><td>剪贴矩形 + 标注并集/按可见度过滤</td><td><strong>矩形会切断已有目标</strong>：大目标 53% 被部分覆盖，<strong>小目标 27% 变成幽灵框</strong></td><td>检测里基本被 <strong>Copy-Paste 取代</strong></td></tr>
+      <tr><td><strong>Mosaic</strong></td><td>（无分类对应）</td><td>4 图拼接，标注拼接后裁剪</td><td>分布漂移（见上一节）</td><td><strong>默认开，最后 N epoch 关</strong></td></tr>
+      <tr><td><strong>Copy-Paste</strong></td><td>（无分类对应）</td><td>实例级抠图粘贴 + 标注追加</td><td>需要实例掩码；需要合理性约束</td><td><strong>长尾场景的首选</strong>（下一节）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>CutMix 在检测里的具体害处是可以量化的，而且 TSR 落在更糟的那一侧</strong>。notebook 实测：对大目标为主的分布（COCO 式），一次随机 CutMix 让 <strong>53% 的 GT 被部分覆盖</strong>——半个目标标着完整框；<em>而对小目标为主的分布（TSR 式），主要受损方式变成了「<strong>整体被盖住而标注仍在</strong>」（27.5%）</em>。<strong>后者是幽灵框（phantom box）：模型被告知「这里有一块标志」，而那块区域现在是另一张图的内容——它直接教模型在无关纹理上报警，比部分截断更毒。</strong>两种加起来，小目标分布下有 <strong>41% 的 GT 收到了错误监督</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这正是 <strong>Copy-Paste 相对 CutMix 的根本优势</strong>：Copy-Paste 粘贴的是<em>带掩码的实例</em>，它知道自己贴了什么、贴在哪；被遮住的已有目标可以按可见度重新计算或直接删除标注。<strong>「有实例掩码」这一个差别，把一个盲目的操作变成了一个可控的操作</strong>。<em>代价是需要实例级掩码——但对交通标志这种形状规整（圆/三角/矩形）的目标，掩码可以从框 + 形状先验近似出来，成本远低于一般实例分割标注。</em><strong>这是 TSR 特别适合 copy-paste 的一个具体理由，面试可以提。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>MixUp 在检测里还有一个隐蔽问题：<strong>它与 BN 统计不友好</strong>。混合后的图像其像素分布的方差被压缩（两张图平均后，方差约降到 <code>λ²+(1-λ)²</code> 倍，<code>λ=0.5</code> 时只剩一半）。<em>BN 层在训练时看到的是低方差输入，推理时看到的是正常方差输入</em>——这是另一种训练-部署鸿沟。<strong>症状是「训练 loss 很好看、验证一开始就差」，容易被误判成过拟合。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="copypaste"><span class="num">5</span>Copy-Paste：长尾类别最直接的解法</h2>
+  <p>到这里可以下一个明确的判断：<strong>在 TSR 这类「类别极度长尾 + 目标形状规整 + 上下文有强先验」的任务上，Copy-Paste 是混合类增强里价值最高的一个</strong>，而且高出一大截。理由不复杂——它是<em>唯一一个能直接、定向地增加特定类别样本数</em>的增强。</p>  <p>交通标志的长尾有多极端？notebook 里合成的分布（Zipf 指数 1.8、50 类）就是一个真实量级的例子：<strong>头部类 10941 个实例，尾部最稀有的类只有 10 个，比例 1094 : 1；而 37 个尾部类加起来只占实例总数的 5.6%</strong>。对只有 10 个实例的类，任何重采样（C58 模块 01）都只是把同样 10 张图反复喂给模型——<em>模型很快就把这 10 张背下来了，泛化毫无进展</em>。而 Copy-Paste 把这 10 个实例贴到几千个不同的背景、尺度、光照下，虽然实例本身没变多，<strong>「实例 × 上下文 × 尺度 × 光照」的组合数直接放大了几个数量级</strong>。</p>  <div class="math-block">\[N^{\text{eff}}_c = n_c + \sum_{i=1}^{M} k_{c,i}\quad\text{（有效样本数）},\qquad D^{\text{eff}}_c = \underbrace{n^{\text{uniq}}_c}_{\text{不变}}\times\underbrace{|\mathcal{C}|\cdot|\mathcal{S}|\cdot|\mathcal{L}|}_{\text{上下文×尺度×光照}}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>但必须诚实地讲清楚 copy-paste 到底提升了什么、没提升什么</strong>。它提升的是<em>上下文多样性</em>：同一块「注意落石」牌出现在 5000 种背景、5000 种尺度、5000 种光照下。<em>它没有提升的是「这个类别本身的视觉多样性」</em>——如果那 12 个实例全是同一个厂家、同一个角度、同一种褪色程度拍的，copy-paste 之后模型见到的仍然只是这 12 种外观。<strong>所以 copy-paste 能救「上下文过拟合」，救不了「实例外观过拟合」。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这个区分在实践中非常重要，因为它决定了<strong>下一步该做什么</strong>：如果 copy-paste 之后尾部类的召回上来了但精度还是差（大量假阳），说明模型学到的是「见到这个特定外观就报」——问题在实例多样性，<em>解法是去采集/挖掘更多真实实例（C58）</em>，而不是继续加 copy-paste 的比例。<strong>反之如果加了 copy-paste 之后召回明显上来了，说明原来的瓶颈确实是上下文，可以继续加</strong>。<em>能说出「copy-paste 提升有效样本数但不提升有效多样性」这句话，并给出下一步的判据，是这个话题上最有分量的回答。</em></p></div>
+  </div>  <table>
+    <thead><tr><th>长尾解法</th><th>作用机制</th><th>对 12 个实例的稀有类</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td>重采样（repeat factor）</td><td>同样的图看更多次</td><td><strong>过拟合那 12 张</strong></td><td>低，但收益也低</td></tr>
+      <tr><td>重加权（Focal / EQL / CB Loss）</td><td>调梯度权重</td><td>梯度是大了，但信息量没变</td><td>低；可能压制头部类</td></tr>
+      <tr><td>logit adjustment</td><td>推理时按先验修正</td><td>改善排序，不改善特征</td><td><strong>零成本</strong>，值得先试</td></tr>
+      <tr><td><strong>Copy-Paste</strong></td><td><strong>上下文/尺度/光照组合爆炸</strong></td><td><strong>有效样本数：尾部类中位数 ×7，最稀有类 ×20</strong>（notebook 实测，用 1/√n 加权）</td><td>需实例掩码 + 四条约束</td></tr>
+      <tr><td>定向采集/挖掘</td><td>真正增加实例多样性</td><td><strong>唯一能根治的办法</strong></td><td><strong>最高</strong>（时间以周/月计）</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>决策顺序很清楚：<strong>先做零成本的（logit adjustment）→ 再做低成本的（重采样/重加权）→ 然后做 copy-paste（中成本、高收益）→ 最后才是定向采集（高成本、唯一根治）</strong>。<em>copy-paste 的位置恰好在「便宜的都做完了，贵的还没开始」这个中间地带，所以它常常是投入产出比最高的一步。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="constraints"><span class="num">6</span>Copy-Paste 的四条合理性约束：贴到天上的标志会教坏模型</h2>
+  <p>Copy-Paste 的收益完全取决于「贴得合不合理」。<strong>不带约束的随机粘贴，收益会被它制造的错误先验抵消甚至反超</strong>：模型会学到「标志可能出现在任意位置、任意尺度」，而这恰恰否定了 TSR 里最有价值的一条先验。四条约束，按重要性排序。</p>  <h3>约束一：尺度必须符合透视</h3>  <p>这是四条里最能精确表达的一条，而且推导很短。设焦距 <code>f</code>、地平线所在行 <code>y_h</code>、相机高度 <code>h_cam</code>、标志物理直径 <code>S</code>、安装高度（下缘离地）<code>H_m</code>。对距离 <code>Z</code> 处的标志：</p>  <div class="math-block">\[s_{px}=\frac{fS}{Z},\qquad y_h-y_{bot}=\frac{f\,(H_m-h_{cam})}{Z}\quad\Longrightarrow\quad \boxed{\;s_{px}=\frac{S}{H_m-h_{cam}}\;\bigl(y_h-y_{bot}\bigr)\;}\]</div>  <p><strong>距离 <code>Z</code> 被消掉了</strong>：标志的像素尺寸与「它的下边缘在地平线以上多少像素」成<em>严格的正比</em>，比例系数只由物理量决定。因为安装高度有一个范围（柱式牌下缘通常 2.0–3.2 m，取 <code>h_cam = 1.5 m</code>），这条直线变成一条<strong>合法带</strong>：</p>  <div class="ascii">       s_px（标志像素尺寸）
+         ▲
+         │                                    ╱  上界：H_m = 2.0 m（矮杆）
+      80 ┤                                 ╱      斜率 = S/0.5 = 1.20
+         │                              ╱
+      60 ┤                           ╱          ╱
+         │                        ╱          ╱
+      40 ┤        ✗ 太大        ╱  ✅ 合法带 ╱
+         │      （尺寸暗示很近，  ╱        ╱
+      20 ┤        位置暗示很远） ╱      ╱      下界：H_m = 3.2 m（高杆/悬臂）
+         │                  ╱     ╱             斜率 = S/1.7 = 0.35
+       0 ┼───────────────╱───╱────────────────────────►
+         0        20        40        60        80    (y_h − y_bot)：下缘在地平线以上多少像素
+
+  两类必须拒绝的粘贴：
+    ✗ **贴到天上**：y_bot 很小但 s_px 也很小 → 位置暗示 Z 很近、尺寸暗示 Z 很远，自相矛盾
+    ✗ **贴到路面**：y_bot &gt; y_h（地平线以下）→ 柱式标志的下缘不可能低于地平线
+  合法性判据（等价说法）：**由尺寸反推的 Z 与由位置反推的 Z，必须在安装高度范围内自洽。**</div>  <h3>约束二：位置必须合法</h3>  <ul>
+    <li><strong>地平线以上</strong>——柱式/悬臂式标志的下缘高于相机光心，成像必然在地平线之上。<em>贴到路面上等于教模型「路面中央可能有标志」，会直接制造对地面反光、井盖、路面标线的误检。</em></li>
+    <li><strong>不能压住已有目标</strong>——与已有 GT 的 IoU 超过阈值（经验值 0.15）就换位置；否则被压住的那个目标的标注就成了错误监督（框还在，内容被换掉了）。</li>
+    <li><strong>要在图像内完整或近似完整</strong>——贴一个只露出 20% 的实例，等于人为制造截断样本；截断样本应该来自真实截断，而不是粘贴的副产品。</li>
+    <li><strong>（可选，更高级）语义合法区域</strong>——用车道线/可行驶区域/天空分割结果，限定只能贴在「路侧带」。<em>这一条在有分割标注时非常有效，没有时用地平线约束近似即可。</em></li>
+  </ul>  <h3>约束三：边缘要融合</h3>  <p>硬粘贴会留下两种伪影：<strong>① 矩形接缝</strong>（连源背景一起贴过来时最明显）；<strong>② 轮廓锯齿</strong>（缩放时掩码边缘的重采样阶梯）。前者必须消除——它是完全人造的、模型一学一个准的捷径；后者只需要 <strong>1–2 px 的羽化</strong>。</p>  <div class="callout warn"><span class="label"></span>
+    <strong>羽化过头是另一个错误。</strong>真实的交通标志在图像上有<em>清晰的边缘</em>；把粘贴实例羽化 5–9 px，它看起来会像半透明的贴纸，制造出一种真实数据里不存在的「软边目标」。<em>症状是：模型在真实硬边标志上的边界回归变差</em>。<strong>羽化半径应该与图像本身的边缘锐度匹配</strong>——notebook 会把「粘贴实例的边缘对比度 vs 图像里真实目标的边缘对比度」量出来作为判据。
+  </div>  <h3>约束四：光照要匹配</h3>  <p>一个在正午阳光下拍的实例，贴到一张黄昏或隧道内的图上，亮度会明显不协调。<strong>正确做法是把实例的亮度与对比度对齐到粘贴处的局部背景统计</strong>——但<em>只对齐亮度与对比度，绝不对齐色相与饱和度</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么色相不能匹配？<strong>因为模块 02 的结论在这里直接适用：交通标志的颜色就是语义</strong>。做一次完整的 color transfer（把实例的 RGB 均值/方差都对齐到背景），会把一块红牌往背景色调上拉——如果背景偏黄（黄昏），红牌就被拉黄了。<em>这跟色相抖动过强是同一个错误，只是伪装成了「让粘贴更自然」。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨的做法是<strong>在亮度通道上做匹配、在色度通道上保持不变</strong>：计算粘贴处局部背景的平均亮度与源实例所在背景的平均亮度之比 <code>g</code>，把实例整体乘以 <code>g</code>（乘性亮度——模块 02 证明过它<em>色相与饱和度都严格不变</em>），再对齐对比度。<strong>「用乘性亮度做光照匹配」这个选择不是随便定的，它有精确的色彩代数依据</strong>。<em>另外 <code>g</code> 要 clip（比如限制在 [0.5, 2.0]），否则从白天贴到夜景时会把实例压成一团黑，反而制造了不存在的样本。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>四条约束可以记成一句话：<strong>「尺度对得上距离、位置对得上物理、边缘对得上锐度、亮度对得上光照」</strong>。<em>做不到全部就按顺序做——尺度约束的收益远大于边缘融合，先做对的那个。</em><strong>面试里被问「copy-paste 怎么做」，只答「把目标抠出来贴到别的图上」是不及格的；把这四条说出来，并说清楚「为什么贴到天上会教坏模型」，才是及格线。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bank"><span class="num">7</span>实例库工程：抠图、质量筛选与采样策略</h2>
+  <p>Copy-Paste 的另一半工作量在<strong>实例库（instance bank）</strong>上。库的质量直接决定收益上限——<em>一个塞满了模糊、截断、遮挡实例的库，贴得越多伤害越大</em>。</p>  <table>
+    <thead><tr><th>筛选维度</th><th>判据</th><th>阈值（经验起点）</th><th>为什么</th><th>不筛的后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>源尺寸</strong></td><td>原图里的实例边长</td><td><strong>≥ 16 px</strong></td><td>小于这个再放大就是马赛克</td><td>库里全是糊的，模型学到「糊的也算标志」</td></tr>
+      <tr><td><strong>清晰度</strong></td><td>Laplacian 方差</td><td>取分布的 p30 以上</td><td>剔除运动模糊/失焦实例</td><td>同上，且会削弱边缘回归</td></tr>
+      <tr><td><strong>截断</strong></td><td>框是否贴图像边缘</td><td><strong>不入库</strong></td><td>截断实例的掩码不完整</td><td>贴出来是「半块牌标着整框」</td></tr>
+      <tr><td><strong>遮挡</strong></td><td>标注的 occluded 标志 / 掩码连通性</td><td>遮挡 &gt; 20% 不入库</td><td>掩码里混入遮挡物</td><td>把树叶、车辆一起贴过去</td></tr>
+      <tr><td><strong>长宽比</strong></td><td>w/h 偏离类别典型值</td><td>偏离 &gt; 30% 剔除</td><td>多半是标注错误</td><td>错误标注被复制放大数百倍</td></tr>
+      <tr><td><strong>类别可信度</strong></td><td>用现有模型回检的置信度</td><td>&lt; 0.5 人工复核</td><td>库里的标注错误会被指数放大</td><td><strong>一个错标实例污染上千张训练图</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后一行值得单独强调：<strong>实例库是一个「错误放大器」</strong>。普通训练集里一个错标样本影响一个样本；<em>实例库里一个错标实例会被贴进成百上千张训练图，等价于成百上千个错标样本</em>。所以<strong>实例库的标注质量要求比普通训练集高一个数量级</strong>，值得为它单独做一轮人工复核——这是少数几个「人工复核明显划算」的环节。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>采样策略上，一个稳健的默认是<strong>按 <code>1/√n_c</code> 加权采样</strong>（<code>n_c</code> 是类 <code>c</code> 的原始实例数），并只对尾部类做粘贴。<em>用 <code>1/n_c</code> 会过度倾斜到最稀有的那一两个类</em>（它们恰好是实例外观多样性最差的），<code>1/√n_c</code> 是一个更温和的平衡。<strong>每张图粘贴的数量用泊松分布（均值 1–3）而不是固定值</strong>，避免模型学到「每张图恰好多 2 个目标」这种结构。<em>另外要留一部分图完全不粘贴（比如 50%），否则「所有训练图都被动过手脚」，验证时反而不匹配。</em></p></div>
+  </div>  <h3>从框到掩码：TSR 的一个便宜捷径</h3>  <p>通用 copy-paste（Ghiasi et al.）依赖实例分割掩码，标注成本很高。<strong>但交通标志的形状是被标准规定死的</strong>：禁令/指示是圆形，警告是三角形（中国黄底 / 欧洲白底红边），指路是矩形，停车让行是八边形。<em>于是可以从「框 + 类别 → 形状模板 → 掩码」，不需要任何额外标注</em>。</p>  <div class="callout intuition"><span class="label"></span>
+    <strong>「形状先验能替代实例掩码标注」是 TSR 特别适合 copy-paste 的技术理由</strong>，也是一个很好的面试素材：它展示了<em>你会利用领域知识把一个昂贵的需求变便宜</em>。<em>需要注意的边界是：透视会让圆变椭圆、三角变斜三角，所以模板要按框的长宽比做仿射；而严重倾斜（对向车道的侧视标志）用模板会不准，这类实例干脆不入库。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="interaction"><span class="num">8</span>增强强度 × 模型容量 × 训练时长：三者是耦合的</h2>
+  <p>本模块所有技巧都有一个共同的超参：<strong>强度</strong>（mosaic 概率、mixup 的 <code>λ</code> 分布、每图粘贴数）。而强度不是一个可以独立调的旋钮——<strong>它与模型容量、训练时长强耦合</strong>。这条规律解释了大量「照抄大模型配置结果掉点」的事故。</p>  <table>
+    <thead><tr><th></th><th>小模型 + 短训练</th><th>小模型 + 长训练</th><th>大模型 + 长训练</th></tr></thead>
+    <tbody>
+      <tr><td>最优增强强度</td><td><strong>最低</strong></td><td>中</td><td><strong>最高</strong></td></tr>
+      <tr><td>强增强下的症状</td><td><strong>欠拟合</strong>：训练 loss 高、验证也差</td><td>收敛慢但最终能到</td><td>收益最大</td></tr>
+      <tr><td>弱增强下的症状</td><td>尚可（本来容量就有限）</td><td><strong>过拟合</strong></td><td><strong>严重过拟合</strong></td></tr>
+      <tr><td>典型配置例子</td><td>YOLOv8n：mixup=0, copy_paste=0</td><td>YOLOv8s/m：轻度</td><td>YOLOv8x：mixup≈0.15, copy_paste≈0.3</td></tr>
+      <tr><td>最容易犯的错</td><td><strong>抄 x 号模型的增强配置</strong></td><td>训练轮数不够就下结论</td><td>增强不够，浪费容量</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>机制其实很朴素：<strong>增强把训练分布撑宽，而模型能「吸收」多少宽度，取决于它的容量与它被允许训练多久</strong>。撑得比模型能吸收的还宽，模型就在一个学不完的分布上做欠拟合——<em>症状是训练 loss 和验证指标一起差，很容易被误诊成「学习率不对」或「数据有问题」</em>。<strong>「小模型 + 强增强 = 欠拟合」是一个应该形成条件反射的诊断</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个必须知道的推论：<strong>在短训练下比较两套增强配方是不公平的</strong>。强增强需要更长的训练才能兑现收益，短训练下它一定输给弱增强——<em>于是你会得出「强增强没用」的结论，而这个结论只在你那个训练预算下成立</em>。<strong>正确的消融必须在「每套配方都训到收敛」的前提下比较，或者至少明确声明「在 X epoch 预算下」这个限定条件</strong>。<em>这一条在模块 05 会展开成完整的消融设计方法论；在面试里，能主动指出「这个对比在多少 epoch 下做的」是很强的信号。</em></p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>一个真实且高频的事故：<strong>从 YOLOv8x 的配置文件直接改 <code>model=yolov8n</code> 去训车端模型</strong>。x 号模型的默认增强里带 <code>mixup=0.15</code>、<code>copy_paste=0.3</code>、强 mosaic，n 号模型的容量只有它的 1/40。<em>结果是训练 loss 降不下去、mAP 比默认配置还低，然后花两周去查数据和学习率</em>。<strong>换模型规模时，增强强度必须一起改</strong>——这是 Ultralytics 在不同规模的默认配置里给出不同增强参数的原因，但很多人只改了模型名。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>混合类增强是「工程经验远远跑在理论前面」的典型领域。几个真正开放的问题：</p>  <ul>
+    <li><strong>Mosaic 为什么有效，缺少令人满意的解释</strong>。现有说法（增大等效 batch、增加小目标、丰富上下文）都是现象描述，不是机制。<em>特别是「为什么一张物理上不存在的拼接图能提升在真实图上的表现」，与「训练分布必须接近部署分布」这条常识直接冲突</em>——close-mosaic 的存在恰恰说明这个冲突是真实的。<strong>一个可能的方向是把它看作隐式的正则化/课程学习，但目前没有能预测「关多少 epoch 最优」的理论。</strong></li>
+    <li><strong>Copy-Paste 的合理性约束几乎没有被系统研究</strong>。Ghiasi et al. 的 <em>Simple Copy-Paste</em> 的核心发现之一恰恰是「简单地随机粘贴（不做尺度/位置约束）就很有效」——这与本模块强调的四条约束表面矛盾。<em>可能的解释是：COCO 的目标尺度分布本来就宽、上下文先验本来就弱，所以约束的边际收益小；而 TSR 的上下文先验非常强（地平线、路侧、杆件），破坏它的代价就大得多</em>。<strong>「约束的收益随任务的上下文先验强度而变化」这个假设，据我所知还没有被系统验证过</strong>——这是一个很好的小课题。</li>
+    <li><strong>合成实例（而非真实抠图）能否用于 copy-paste</strong>。交通标志的样式是标准化的，理论上可以从矢量图直接渲染任意类别、任意视角、任意褪色程度的实例——<em>这能同时解决「有效样本数」和「有效多样性」两个问题</em>。障碍是渲染实例与真实实例之间的域差（反光膜的各向异性反射、脏污、老化），以及模型会不会学到「渲染指纹」。<strong>这条路对极稀有类别（一年遇不到几次的标志）几乎是唯一可行的方案。</strong></li>
+    <li><strong>增强与标签分配的交互被严重低估</strong>。Mosaic 大幅改变目标密度与尺度分布，而 SimOTA / TaskAligned 这类动态分配策略的行为强依赖于这两者（C53 模块 02）。<em>「同一套分配策略在 mosaic 开与关时表现不同」是可观察的，但几乎没有工作把两者联合设计</em>。<strong>close-mosaic 之所以有效，可能有一部分原因就在分配策略上，而不只是回归头。</strong></li>
+    <li><strong>增强强度的自动调节</strong>。既然强度与容量、训练时长耦合，理想做法是让强度<em>在训练中自适应</em>（早期强、后期弱，或按训练/验证 gap 反馈调节）。close-mosaic 是这个思路最粗糙的一个实例（二值开关）。<strong>连续调度、按类别调度（尾部类保持强 copy-paste、头部类早早关掉）目前都还是手工经验。</strong></li>
+    <li><strong>生成模型做 copy-paste 的实例源</strong>。用扩散模型在给定背景上「画出」一个稀有标志，理论上能同时保证上下文合理与实例多样。<em>但与模块 02 提到的问题一样：生成过程可能改变标志的语义内容（把「限速 40」画成「限速 60」）</em>，而这类错误直接制造错标签。<strong>「可控到语义级别的生成 + 自动校验」是这条路的前提，目前还不成熟。</strong></li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Bochkovskiy, Wang &amp; Liao, <em>YOLOv4: Optimal Speed and Accuracy of Object Detection</em>（2020，Mosaic 的出处与「bag of freebies」的系统整理）；Ghiasi et al., <em>Simple Copy-Paste is a Strong Data Augmentation Method for Instance Segmentation</em>（CVPR 2021，copy-paste 的关键实证，注意它对「简单随机粘贴」的结论与强上下文先验任务的差异）；Zhang et al., <em>mixup: Beyond Empirical Risk Minimization</em>（ICLR 2018）与 Yun et al., <em>CutMix</em>（ICCV 2019）——读的时候重点想「标签插值这一步在检测里怎么办」；Dwibedi, Misra &amp; Hebert, <em>Cut, Paste and Learn</em>（ICCV 2017，copy-paste 的早期形态，其中关于「融合伪影会成为捷径」的分析至今有效）；Ultralytics YOLOv8/v11 的 <code>close_mosaic</code> 与各规模默认超参（工程上最直接的参照，注意不同规模模型的增强强度差异）。相邻课程：C53 模块 02（标签分配与 mosaic 的交互）、C56 模块 04（流水线与吞吐）、C56 模块 05（消融验证）、C57（小目标）、C58 模块 01（长尾处理谱系）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_photometric/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 光度增强与域鲁棒性</div></a>
+    <a class="next" href="../04_pipeline/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 增强流水线工程</div></a>
+  </div>
+
+</div>
+</body>
+</html>

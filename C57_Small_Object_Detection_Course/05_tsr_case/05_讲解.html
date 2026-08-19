@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · TSR 小目标实战：从物理量到工程方案</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · TSR 小目标实战：从物理量到工程方案</h1>
+  <p class="subtitle">针孔模型 px = f·S/Z，像素焦距 f = (W/2)/tan(FOV_h/2) —— 1920 宽 60° FOV 的相机 f ≈ 1663 px · <strong>60 cm 的限速牌：30 m 处 33 px、60 m 处 17 px、100 m 处只有 10 px</strong>，TSR 从物理上就注定是小目标问题 · 从制动距离反推检出距离，再反推分辨率、FOV 与 stride · 广角+长焦的分工：<em>用光学解决小目标比任何算法都直接</em> · 把全课方法按「预期 AP_S 增益 ÷ 延迟与工程成本」排优先级（多数方法的收益不可加）· 评测必须按像素尺寸分桶，否则改进在总 mAP 里根本看不见；首次检出距离比 AP_S 更有说服力</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–04（IoU 位移敏感性、FPN 层级分配、NWD、切片与级联）；C55（TSR 领域知识）与 C53 m05（延迟预算）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_tsr_small_object_case.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">针孔相机模型与标定、TT100K / Mapillary Traffic Sign 基准、COCO 分尺度评测协议、量产 ADAS 多相机配置</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 65 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#pinhole">针孔模型：一个必须能当场推的换算</a></li>
+      <li><a href="#budget">反推配置：要在多远检出，需要什么分辨率与什么 FOV</a></li>
+      <li><a href="#stride">stride 与特征层：像素够了，格子还得够</a></li>
+      <li><a href="#multicam">多相机分工：广角、主摄与长焦，以及一个漂亮的不变量</a></li>
+      <li><a href="#roi">ROI 裁剪：消失点附近的那条窄带</a></li>
+      <li><a href="#plan">把全课方法组合成方案：按收益 / 成本排序</a></li>
+      <li><a href="#eval">按像素尺寸分桶的评测：不分桶就看不见改进</a></li>
+      <li><a href="#ablation">消融计划与上线门禁：把方案变成可执行的日程</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pinhole"><span class="num">1</span>针孔模型：一个必须能当场推的换算</h2>
+  <p>前四个模块都在讲「小目标为什么难、怎么办」。<strong>这一节要回答一个更基础、也更少人算得清的问题：一个交通标志到底有多少像素？</strong>不知道这个数，前面所有方法的取舍都是空谈。</p>  <p>答案来自最基础的<span class="term">pinhole camera model</span>（针孔相机模型）。设物体的物理尺寸为 S（米）、距离相机 Z（米）、相机的<strong>焦距用像素表示</strong>为 f（px），则该物体在图像上的像素尺寸为</p>  <div class="math-block">\[p \;=\; f\cdot\frac{S}{Z}\]</div>  <p>而 f 不是相机参数表上的「28mm」，它要从<strong>分辨率与视场角</strong>换算出来。设图像宽 W（px）、水平视场角 <span class="term">HFOV</span> 为 θ，则</p>  <div class="math-block">\[f \;=\; \frac{W/2}{\tan(\theta/2)}\]</div>  <div class="ascii">                    图像平面（宽 W 像素）
+                    ┌─────────────┐
+                    │      ↕ p px │  ← 标志成的像
+       ┌────────────┤             │
+       │  θ/2       │             │
+   ───●─────────────┼─────────────┼──────────────────  光轴
+    针孔│            │             │                  ↕ S 米（标志实际尺寸）
+       └────────────┤             │                  █ 标志
+                    └─────────────┘
+       |←── f 像素 ──→|
+       |←──────────────── Z 米 ──────────────────────→|
+
+  相似三角形:   p / f  =  S / Z     =&gt;     **p = f · S / Z**
+  焦距换算  :   tan(θ/2) = (W/2) / f  =&gt;   **f = (W/2) / tan(θ/2)**</div>  <h3>代入真实参数：60 米外的 60cm 限速牌是多少像素？</h3>  <p>取一台典型的前视主摄：<strong>1920×1080、水平 FOV 60°</strong>。中国 GB 5768 的一般道路圆形禁令标志直径 60 cm（高速上是 80–120 cm，城区常见 60 cm）。</p>  <div class="math-block">\[f = \frac{1920/2}{\tan 30^\circ} = \frac{960}{0.5774} = \mathbf{1662.8\ \text{px}} \qquad p = 1662.8\times\frac{0.6}{60} = \mathbf{16.6\ \text{px}}\]</div>  <table>
+    <thead><tr><th>距离 Z</th><th>60 cm 标志的像素尺寸</th><th>面积</th><th>COCO 尺度类别</th><th>工程含义</th></tr></thead>
+    <tbody>
+      <tr><td><strong>15 m</strong></td><td><strong>66.5 px</strong></td><td>4422 px²</td><td>medium</td><td>轻松检出并读清内容</td></tr>
+      <tr><td><strong>30 m</strong></td><td><strong>33.3 px</strong></td><td>1107 px²</td><td>medium（刚过 32² 线）</td><td>可检可分类</td></tr>
+      <tr><td><strong>60 m</strong></td><td><strong>16.6 px</strong></td><td>276 px²</td><td><strong>small</strong></td><td>能检出、<strong>读不清是限速几</strong></td></tr>
+      <tr><td><strong>100 m</strong></td><td><strong>10.0 px</strong></td><td>100 px²</td><td><strong>small（极小）</strong></td><td>多数检测器已经检不到</td></tr>
+      <tr><td>150 m</td><td>6.7 px</td><td>44 px²</td><td>small（tiny）</td><td>在 640 输入下只剩 2.2 px，无解</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这张表把整门课的所有讨论钉在了地面上。<strong>「TSR 是小目标问题」不是一句修辞——它是 p = f·S/Z 这个双曲线关系的必然结果</strong>：像素尺寸随距离<em>反比</em>衰减，你想早 1 倍距离看到，就要多 1 倍的焦距（或分辨率）。<em>60 m 外 16.6 px、100 m 外 10 px，这两个数字应该像 lr=3e-4 一样刻在脑子里。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地补三点。<strong>① 这里的 p 是「物体在传感器上的成像尺寸」，还没算镜头 MTF、去马赛克、ISP 降噪、JPEG 压缩带来的有效分辨率损失</strong>——真实可用的判别信息通常比理论像素数还少 20–40%。<strong>② 圆形标志的「直径」在有俯仰/偏航角时会投影成椭圆</strong>，短轴会缩短 cos φ 倍；对向车道与路侧大角度的标志尤其明显。<strong>③ 长焦镜头往往有明显畸变</strong>，f 在画面边缘并非常数，严格计算要用标定得到的内参矩阵 K 而不是这个理想公式。<em>但作为工程估算与面试推导，这个公式的精度完全够用。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>这套推导在面试里极有说服力，原因是它把一个「感觉题」变成了「计算题」。</strong>被问「你怎么提升远距离交通标志的检出」时，绝大多数人会开始罗列方法（多尺度、FPN、增强、切片…）。<em>而正确的开场是：先问「要在多远检出？标志多大？相机什么参数？」，当场算出目标只有 16.6 像素，再说方法。</em><strong>因为「16.6 px」这个数字本身就否决了一半的方案</strong>（比如「换更深的 backbone」——16.6 px 的信息量摆在那里，backbone 再深也变不出信息）。<strong>把问题化归到物理量，是资深工程师最容易被识别的特征。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="budget"><span class="num">2</span>反推配置：要在多远检出，需要什么分辨率与什么 FOV</h2>
+  <p>上一节是正向计算。真正有工程价值的是<strong>反向求解</strong>：给定「必须在 Z<sub>target</sub> 米外检出」这个需求，反推需要什么相机、什么输入分辨率。</p>  <h3>第一步：定「最小可检像素数」p<sub>min</sub></h3>  <p>这是整条推导链里唯一需要经验输入的量。它<strong>不是一个数，而是三个不同任务的三个数</strong>——这一点是本节最重要的洞察：</p>  <table>
+    <thead><tr><th>任务</th><th>典型 p<sub>min</sub></th><th>依据</th><th>在 60° / 1920 主摄上的最大作用距离</th></tr></thead>
+    <tbody>
+      <tr><td><strong>类别无关的提议</strong>（有没有一个牌子）</td><td><strong>8–10 px</strong></td><td>只需颜色团块 + 形状轮廓，不需要细节</td><td><strong>≈ 100–125 m</strong></td></tr>
+      <tr><td><strong>检测</strong>（框 + 粗类：禁令/警告/指示）</td><td><strong>14–16 px</strong></td><td>红圈/黄三角的边缘要能与背景区分</td><td><strong>≈ 62–71 m</strong></td></tr>
+      <tr><td><strong>细分类</strong>（限速 40 还是 60）</td><td><strong>24–32 px</strong></td><td>字形笔画要跨越至少 2–3 个像素才可辨</td><td><strong>≈ 31–42 m</strong></td></tr>
+      <tr><td><strong>可靠细分类</strong>（夜间/逆光/褪色下仍准）</td><td><strong>40+ px</strong></td><td>信噪比下降时需要更多冗余像素</td><td>≈ 25 m</td></tr>
+    </tbody>
+  </table>  <div class="math-block">\[Z_{\max} \;=\; \frac{f\cdot S}{p_{\min}} \qquad\text{例：}\; \frac{1662.8\times 0.6}{16} = \mathbf{62.4\ \text{m}}, \qquad \frac{1662.8\times 0.6}{24} = \mathbf{41.6\ \text{m}}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把这两个数字放在一起会得到一个非常重要、也非常反直觉的结论：<strong>在同一台相机上，「发现一块牌子」的距离（62 m）比「读懂它写什么」的距离（42 m）远了整整 20 米</strong>。100 km/h 时这 20 米只有 0.75 秒。<em>也就是说，系统会有一段「我知道前面有个限速牌，但我还不知道是限速几」的时间窗</em>。<strong>这直接决定了 TSR 必须是两级的、必须有跟踪、必须能表达「已检出但类别未定」这个中间状态</strong>——而不是一个「检测即分类」的单帧模型。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，这个「检出距离 &gt; 识别距离」的间隙是所有远距识别任务的共性（车牌、红绿灯读数、路面文字都一样），根源是<strong>检测所需的空间频率低于识别所需的空间频率</strong>：判断「有个红色圆形」只需要低频轮廓，判断「是 6 还是 8」需要笔画级的高频。<em>工程上的正确应对不是把两者硬塞进一个头，而是①让检测头在更早的距离触发跟踪，②让分类头在目标长大到 p ≥ 24 px 时才给出高置信类别，③在这之前向下游输出「未知限速标志 + 位置 + 置信度」</em>——C59 模块 03 讲的感知接口设计里，这个「已检出但类别待定」的状态必须在 schema 里有位置，否则下游只能当它不存在。</p></div>
+  </div>  <h3>第二步：反解相机参数</h3>  <p>把 Z<sub>max</sub> 的式子倒过来，就得到需要多少焦距、多大分辨率或多窄的 FOV：</p>  <div class="math-block">\[f_{\text{req}} = \frac{p_{\min}\cdot Z_{\text{target}}}{S}, \qquad W_{\text{req}} = 2 f_{\text{req}}\tan\frac{\theta}{2}, \qquad \theta_{\text{req}} = 2\arctan\!\frac{W}{2 f_{\text{req}}}\]</div>  <p>代入「要在 <strong>100 米</strong>外检出（p<sub>min</sub>=16）60cm 标志」：</p>  <table>
+    <thead><tr><th>约束</th><th>求解</th><th>结果</th><th>工程解读</th></tr></thead>
+    <tbody>
+      <tr><td>需要的焦距</td><td>f = 16 × 100 / 0.6</td><td><strong>2667 px</strong></td><td>是现有 1663 px 的 1.60 倍</td></tr>
+      <tr><td>若保持 60° FOV，需要多宽</td><td>W = 2 × 2667 × tan30°</td><td><strong>3079 px</strong></td><td><strong>要上 4K（3840×2160）</strong></td></tr>
+      <tr><td>若保持 1920 宽，需要多窄 FOV</td><td>θ = 2·arctan(960/2667)</td><td><strong>39.6°</strong></td><td><strong>要加一路长焦相机</strong></td></tr>
+      <tr><td>若两者都不动</td><td>—</td><td>不可能</td><td>只能靠时序累积 + 地图先验兜底</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">输入分辨率 ≠ 相机分辨率</span>
+    <p>这里有一个<strong>会在系统设计题里当场翻车的陷阱</strong>：很多人以为「检测距离不够就把输入分辨率调大」。<em>调大网络输入分辨率（比如 640 → 1280）并不能增加信息</em>——如果相机本来就只有 1920 宽，把 letterbox 从 640 改成 1920 确实能把标志从 5.5 px 恢复到 16.6 px（这是真实且巨大的收益，见模块 04），<strong>但它的上限就是 16.6 px，永远到不了 100 米所需的那个尺寸</strong>。<strong>「网络输入分辨率」只能把已有的像素用满，「相机分辨率 × 焦距」才决定像素的天花板。</strong>把这两件事分清楚，是这一节的核心。</p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>反过来也有一个坑：<strong>算出「需要 4K」之后不能直接下单</strong>。4K 输入意味着 4× 的像素吞吐、4× 的 ISP 与传输带宽、更大的存储与回传成本、以及（如果模型输入也跟着变大）平方级增长的推理耗力。<em>模块 04 已经算过：全图原生 1920×1088 就要 25.5 ms，4K 全图更是不可能</em>。<strong>所以「提高分辨率」的正确形态几乎总是「高分辨率 + ROI 裁剪」或「加一路长焦」，而不是「整幅 4K 全跑」。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="stride"><span class="num">3</span>stride 与特征层：像素够了，格子还得够</h2>
+  <p>有了 16.6 px 还不够。检测头的输出是<strong>离散的特征网格</strong>，目标必须在网格上占到足够多的格子，标签分配才有正样本可给。这是模块 01 讲过的第二重损失，这里把它量化。</p>  <div class="math-block">\[n_{\text{cells}} \;=\; \frac{p_{\text{input}}}{\text{stride}} \qquad\text{（目标在该层特征图上横跨的格子数）}\]</div>  <table>
+    <thead><tr><th>特征层</th><th>stride</th><th>16.6 px 标志（全图 letterbox 640）</th><th>16.6 px 标志（原生分辨率）</th><th>33 px 标志（原生）</th></tr></thead>
+    <tbody>
+      <tr><td>P2</td><td>4</td><td>1.4 格</td><td><strong>4.2 格</strong> ✅</td><td>8.3 格 ✅</td></tr>
+      <tr><td>P3</td><td>8</td><td><strong>0.7 格</strong> ❌</td><td>2.1 格 ⚠️</td><td>4.2 格 ✅</td></tr>
+      <tr><td>P4</td><td>16</td><td>0.3 格 ❌</td><td>1.0 格 ❌</td><td>2.1 格 ⚠️</td></tr>
+      <tr><td>P5</td><td>32</td><td>0.2 格 ❌</td><td>0.5 格 ❌</td><td>1.0 格 ❌</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>读法：<strong>n<sub>cells</sub> &lt; 1 表示目标在该层连一个完整格子都占不满</strong>——它的全部信息被压进一个特征点里，与周围背景混叠，标签分配阶段几乎拿不到正样本。<strong>n<sub>cells</sub> ≈ 2 是勉强可用的下限</strong>（中心点分配能找到 1–4 个候选）。<strong>n<sub>cells</sub> ≥ 4 才谈得上稳定</strong>（ATSS/SimOTA 的 top-k 有足够候选可选、回归目标有足够分辨率）。<em>表里最刺眼的一行是：全图 letterbox 到 640 时，16.6 px 的标志在 P3 上只有 0.7 格——这就是「远处标志检不出」最直接的机理。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>再用 FPN 的<strong>标准层级分配规则</strong>验算一遍（模块 02）：<code>k = k₀ + log₂(√(wh)/224)</code>，k₀=4。代入 p=16.6 得 <code>k = 4 + log₂(16.6/224) = 4 − 3.75 = <strong>0.25</strong></code>；代入 p=33.3 得 <strong>k = 1.25</strong>。<strong>也就是说，按 FPN 的原始设计，60 m 外的标志应该被分配到「P0.25 层」——比 P2 还要浅两层，而 P2 已经是绝大多数实现的最浅层。</strong>这不是实现的问题，是 FPN 的层级设计以 224 px 的 ImageNet 尺度为锚点、而交通标志系统性地比它小一个数量级。<em>实践中的应对是把分配规则的 k₀ 或锚点尺度整体下移（例如把 224 换成 64），让 P2/P3 承担主要负载——这是一个只改几行配置、却常常带来 2–4 AP<sub>small</sub> 的改动。</em></p></div>
+  </div>  <p><strong>加 P2 层的代价</strong>要算清楚。P2 的空间尺寸是 P3 的 2×2 = 4 倍，检测头在 P2 上的计算量与显存都按这个倍数增长。以典型的 FPN + 共享头结构估算：</p>  <table>
+    <thead><tr><th>配置</th><th>检测头覆盖层</th><th>头部 FLOPs（相对）</th><th>特征点总数（640×640 输入）</th><th>小目标召回</th></tr></thead>
+    <tbody>
+      <tr><td>P3–P5（YOLO 默认）</td><td>8/16/32</td><td>1.00×</td><td>6400+1600+400 = 8400</td><td>基线</td></tr>
+      <tr><td><strong>P2–P5</strong></td><td><strong>4</strong>/8/16/32</td><td><strong>≈ 4.0×</strong></td><td><strong>25600</strong>+8400 = 34000</td><td><strong>+3–5 AP<sub>small</sub></strong></td></tr>
+      <tr><td>P2–P4（去掉 P5）</td><td>4/8/16</td><td>≈ 3.9×</td><td>25600+6400+1600 = 33600</td><td>省一点，大目标略降</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>加 P2 还有两个容易忽略的连带成本：<strong>① NMS 与后处理的候选框数量涨了 4 倍</strong>——模块 04 算过，NMS 耗时随候选数超线性增长，且延迟方差变大（C53 m05 的重点）；<strong>② 正负样本比例进一步恶化</strong>，25600 个新增特征点里绝大多数是背景，focal loss 的 α/γ 与分配策略可能需要重调。<em>「加 P2」不是一个开关，它牵动分配、损失、后处理三处。</em></p>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把前三节串起来，得到 TSR 小目标的<strong>三个独立瓶颈</strong>，任何方案都要说清楚它解的是哪一个：<strong>① 光学瓶颈</strong>（相机 f 与分辨率决定的像素天花板，只能换硬件或换 FOV）；<strong>② 预处理瓶颈</strong>（letterbox 把 16.6 px 压成 5.5 px，靠原生分辨率/ROI/切片解决）；<strong>③ 网络结构瓶颈</strong>（stride 太大导致格子不够，靠加 P2、改分配规则解决）。<em>面试时把方案挂到这三个瓶颈上讲，逻辑会非常清晰；只罗列方法名则显得零散。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="multicam"><span class="num">4</span>多相机分工：广角、主摄与长焦，以及一个漂亮的不变量</h2>
+  <p>既然单台相机的「作用距离」被 f·S/p<sub>min</sub> 死死卡住，量产方案的答案就是<strong>用多台不同 FOV 的相机分段覆盖</strong>。这是所有 L2+ 前视方案的标准配置。</p>  <table>
+    <thead><tr><th>相机</th><th>HFOV</th><th>分辨率</th><th>f（px）</th><th>检出距离 p<sub>min</sub>=16</th><th>细分类距离 p<sub>min</sub>=24</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr><td><strong>广角 wide</strong></td><td>120°</td><td>1920×1080</td><td><strong>554</strong></td><td>20.8 m</td><td>13.9 m</td><td>路口大范围、切入车辆、<strong>近处大角度标志</strong></td></tr>
+      <tr><td><strong>主摄 main</strong></td><td>60°</td><td>1920×1080</td><td><strong>1663</strong></td><td>62.4 m</td><td>41.6 m</td><td>主力：中距离检测 + 分类</td></tr>
+      <tr><td><strong>长焦 tele</strong></td><td>30°</td><td>1920×1080</td><td><strong>3583</strong></td><td><strong>134.4 m</strong></td><td>89.6 m</td><td><strong>高速远距早发现</strong>、龙门架标志</td></tr>
+      <tr><td>主摄 4K</td><td>60°</td><td>3840×2160</td><td>3326</td><td>124.7 m</td><td>83.1 m</td><td>长焦的替代方案（带宽/算力代价大）</td></tr>
+    </tbody>
+  </table>  <h3>一个漂亮且实用的不变量</h3>  <p>把「最大作用距离」代回「该距离处的横向覆盖半宽」，会得到一个出人意料的结果。相机在距离 Z 处的横向可视半宽是 X = Z·tan(θ/2)，于是</p>  <div class="math-block">\[X_{\max} \;=\; Z_{\max}\tan\frac{\theta}{2} \;=\; \frac{f\,S}{p_{\min}}\cdot\frac{W}{2f} \;=\; \boxed{\;\frac{W\cdot S}{2\,p_{\min}}\;}\]</div>  <p><strong>f 被完全约掉了。</strong>代入 W=1920、S=0.6、p<sub>min</sub>=16，三台相机<em>在各自最大作用距离处的横向覆盖半宽全都是 36.0 米</em>——广角 20.8 m 处、主摄 62.4 m 处、长焦 134.4 m 处，一个不差。</p>  <div class="ascii">三台相机的「能检出标志」的作用域（俯视图，半宽 36 m 是不变量）
+
+        横向 ±36 m
+    ┌───────────────┐
+    │   wide 120°   │  0 ─ 20.8 m
+    └───────────────┘
+    ┌───────────────┐
+    │   main  60°   │  0 ─ 62.4 m
+    └───────────────┘
+    ┌───────────────┐
+    │   tele  30°   │  0 ─ 134.4 m
+    └───────────────┘
+    ●自车  ──────────────────────────────────────►  纵向距离
+
+  X_max = W·S / (2·p_min)  与 FOV 无关！
+  =&gt;  **想同时看得更远 + 看得更宽，唯一的办法是增加像素数 W**
+      （4K 主摄把不变量翻倍到 72 m，而换长焦只是把同一块 36 m 的
+        覆盖区往远处平移，近处就交给广角）</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这个不变量的实用价值在于：<strong>它把「多相机怎么选」从一场关于 FOV 的口水仗，变成了一个只有一个自由度的问题</strong>。FOV 决定的只是「这块 36 m 宽的覆盖区放在多远」，<em>而覆盖区本身的宽度只由传感器像素数与最小可检尺寸决定</em>。所以：<strong>要覆盖更远 → 加长焦（把区间往外挪）；要覆盖更宽 → 只能加像素（换 4K）；两个都要 → 多相机 + 更高分辨率，没有第三条路。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，这个推导假定「可检」的判据只是像素尺寸 p ≥ p<sub>min</sub>，忽略了三个二阶因素：<strong>① 大角度处标志的投影收缩</strong>（cos φ 因子，边缘处 p 实际更小）；<strong>② 镜头畸变与边缘 MTF 下降</strong>（广角尤其严重，边缘的有效分辨率远低于中心）；<strong>③ 长焦对振动与标定误差极其敏感</strong>——f 大 3 倍意味着同样的相机抖动在图像上的位移也大 3 倍，运动模糊与时序抖动都被放大。<em>所以工程上长焦的实际收益通常低于理论值，且必须配合更严格的减振与在线标定。</em>另外，多相机方案的真实成本不只是相机本身，还有<strong>跨相机的目标关联与去重</strong>（同一块牌子会被主摄和长焦同时看到，必须融合成一个航迹）以及标定维护，这部分工程量常被低估。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把不变量与前一节的「检出 62 m / 识别 42 m」合起来，就能推出一套<strong>可以直接讲给面试官的相机分工方案</strong>：<em>长焦负责 60–130 m 的「早发现」，输出「前方有标志、类别未定」，触发跟踪与地图查询；主摄负责 15–62 m 的「检出 + 分类」，是最终类别的主要来源；广角负责 &lt; 20 m 的近处与大角度（路口侧向牌、匝道口），并在主摄被遮挡时兜底。</em><strong>三段的交叠区用于跨相机关联的一致性校验——两台相机同时看到同一块牌且类别一致，置信度可以显著提升；不一致则触发数据回传（C58 的多相机分歧触发器）。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="roi"><span class="num">5</span>ROI 裁剪：消失点附近的那条窄带</h2>
+  <p>模块 04 的结论是「非均匀分辨率是唯一可行的路」，但没说 ROI 该画在哪。<strong>这一节用几何精确地画出来。</strong></p>  <p>设标志中心相对相机光心的高度差为 ΔH（米），距离 Z（米）。它在图像上相对<strong>地平线</strong>（消失点所在的水平线，即主点行 c<sub>y</sub> 在平路上的位置）的垂直偏移为</p>  <div class="math-block">\[\Delta v \;=\; f\cdot\frac{\Delta H}{Z} \qquad\text{（像素，向上为正）}\]</div>  <p>这与 p = f·S/Z 是同一个公式——<strong>距离越远，标志既越小、也越靠近地平线</strong>。两件事是同一个双曲线的两个投影。</p>  <div class="ascii">图像（1920×1080），相机装在 1.3 m 高，标志中心 1.6–4.3 m 高 =&gt; ΔH ∈ [0.3, 3.0] m
+
+  y=0   ┌────────────────────────────────────────────┐
+        │                天空                        │
+        │      ┌──────────────────────────┐          │  Δv = f·ΔH/Z
+  ──────┼──────│  远距标志 ROI 带          │──────────┼── 上界 Δv = 1663×3.0/40 = 125 px
+        │      │  Z ∈ [40, 200] m         │          │
+  地平线├──────┴──────────────────────────┴──────────┤ ← Δv = 0（消失点所在行）
+        │           ↑ 俯仰余量 ±40 px               │
+        │                                            │
+        │            近处大标志 / 路面 / 车辆         │
+  y=1080└────────────────────────────────────────────┘
+
+  纵向：Δv ∈ [f·0.3/200, f·3.0/40] = [2.5, 124.7] px，加俯仰余量 -&gt; 高 ≈ 205 px
+  横向：|Δu| = f·|X|/Z &lt;= 1663×8/40 = 332.6 px，加余量 -&gt; 宽 ≈ 725 px
+  ROI 面积 = 725×205 = 148,625 px  =  全图的 **7.2%**</div>  <table>
+    <thead><tr><th>距离 Z</th><th>标志像素尺寸 p</th><th>距地平线的偏移 Δv（ΔH=1.2 m）</th><th>落在 ROI 带里吗</th></tr></thead>
+    <tbody>
+      <tr><td>200 m</td><td>5.0 px</td><td><strong>10 px</strong></td><td>✅（但已经太小，检不出）</td></tr>
+      <tr><td>100 m</td><td>10.0 px</td><td><strong>20 px</strong></td><td>✅</td></tr>
+      <tr><td><strong>60 m</strong></td><td><strong>16.6 px</strong></td><td><strong>33 px</strong></td><td><strong>✅ 关键区间</strong></td></tr>
+      <tr><td>40 m</td><td>24.9 px</td><td><strong>50 px</strong></td><td>✅</td></tr>
+      <tr><td>20 m</td><td>49.9 px</td><td>100 px</td><td>⚠️ 接近下边缘</td></tr>
+      <tr><td>10 m</td><td>99.8 px</td><td><strong>200 px</strong></td><td>❌ 已出 ROI —— 但它足够大，全图低分辨率那一路就能检到</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>ROI 带只需要负责「远且小」的目标，这正好和它的几何性质吻合</strong>：远目标既小、又必然靠近地平线；近目标虽然跑出了 ROI，但它大到全图下采样那一路轻松能检。<em>两路的分工是几何自动给出的，不需要额外的调度逻辑。</em>用模块 04 的中心凹公式算账：ROI 占 7.2% 面积、内部用 3× 分辨率（原生），总吞吐 = 0.928 + 0.072×9 = <strong>1.58×</strong>——<strong>用 1.58 倍算力买到了远距目标 3 倍的有效分辨率，而全图原生要 9 倍</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，ROI 的边界必须由<strong>三组参数的最坏组合</strong>决定，而不是典型值：① 标志高度 ΔH 的取值范围（路侧矮牌 0.3 m 到龙门架 4 m 以上）；② 要覆盖的距离区间 [Z<sub>min</sub>, Z<sub>max</sub>]；③ <strong>实时的俯仰角与地平线位置</strong>。第 ③ 项是唯一动态的，也是最危险的：相机俯仰变化 Δφ 会让整条带平移 f·tan(Δφ) ≈ f·Δφ 像素——<em>对 f=1663 的主摄，仅 1° 的俯仰变化就是 29 像素</em>，3° 就是 87 像素，足以把整条 205 px 的带推出去大半。上坡、下坡、急加速点头、重载后仰、过减速带，都会产生这个量级的变化。</p></div>
+  </div>  <div class="callout danger"><span class="label">ROI 必须是软的、动态的</span>
+    <p><strong>把 ROI 的垂直位置写成标定常数，是这一节唯一一个会导致真实安全事故的错误。</strong>症状极其典型：平路上一切正常，<em>某段长上坡的限速牌整段全漏</em>——不是偶尔漏一两块，是那段路必然全漏。因为俯仰变化是<strong>系统性的、与地点绑定的、可复现的</strong>，这是最糟糕的失效形态（比随机漏检危险得多，因为它在某些场景下把功能完全清零）。<strong>正确做法三条：① 地平线位置由实时估计给出</strong>（IMU 俯仰角、车道线灭点、或地面平面拟合），<strong>② ROI 上下各留 ±3° 换算成的像素余量</strong>（f=1663 时约 ±87 px），<strong>③ 永远保留一路无 ROI 的全图低分辨率兜底</strong>——ROI 是「在这里多花算力」，不是「只看这里」。</p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>横向边界同样不能拍脑袋。上面用了 |X| ≤ 8 m，那是直路的假设。<strong>弯道上，40 m 外的道路中心可能已经横向偏出 10 米以上</strong>（半径 300 m 的弯道，40 m 弧长对应的横向偏移约 40²/(2×300) = 2.7 m；半径 100 m 时是 8 m）。<em>正确做法是用车道线/道路曲率把 ROI 沿道路走廊「掰弯」，而不是画一个固定的矩形</em>——这也是「ROI 应该由感知的其他模块驱动，而不是常数」的又一个理由。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="plan"><span class="num">6</span>把全课方法组合成方案：按收益 / 成本排序</h2>
+  <p>到这里，C57 全课的方法都齐了。<strong>面试与真实工作里真正要交付的，不是一个方法列表，而是一份带优先级、带代价、带验证计划的方案。</strong>这一节把它排出来。</p>  <table>
+    <thead><tr><th>方法</th><th>解决哪个瓶颈</th><th>ΔAP<sub>small</sub>（估）</th><th>Δ延迟</th><th>工程量</th><th>风险</th></tr></thead>
+    <tbody>
+      <tr><td><strong>ROI 裁剪（消失点带）</strong></td><td>预处理</td><td><strong>+6.0</strong></td><td><strong>−1.0 ms</strong></td><td>2 人周</td><td>俯仰/弯道，需动态地平线</td></tr>
+      <tr><td><strong>用原生分辨率而非 letterbox 640</strong></td><td>预处理</td><td><strong>+8.0</strong></td><td>+6.0 ms</td><td>1 人周</td><td>延迟涨得多</td></tr>
+      <tr><td><strong>NWD 分配与损失</strong>（模块 03）</td><td>分配/损失</td><td>+2.5</td><td>0</td><td>2 人周</td><td>大目标可能微降</td></tr>
+      <tr><td><strong>小目标 copy-paste 增强</strong>（C56 m03）</td><td>数据</td><td>+1.8</td><td>0</td><td>1 人周</td><td>尺度/位置约束要写对</td></tr>
+      <tr><td><strong>多帧时序融合</strong>（C55 m04）</td><td>时序</td><td>+4.0</td><td>+0.5 ms</td><td>3 人周</td><td>增加上报延迟</td></tr>
+      <tr><td><strong>增加 P2 层</strong></td><td>网络结构</td><td>+3.5</td><td>+2.2 ms</td><td>2 人周</td><td>NMS 候选 ×4，正负样本更失衡</td></tr>
+      <tr><td><strong>两级级联</strong>（模块 04）</td><td>预处理 + 长尾</td><td>+5.5</td><td>+3.2 ms</td><td>4 人周</td><td>召回是乘法，L1 必须高召回</td></tr>
+      <tr><td><strong>长焦相机（30° FOV）</strong></td><td><strong>光学</strong></td><td><strong>+12.0</strong></td><td>+5.0 ms</td><td>8 人周 + BOM</td><td>硬件、标定、跨相机关联</td></tr>
+      <tr><td><strong>SAHI 切片推理</strong>（模块 04）</td><td>预处理</td><td>+9.0</td><td><strong>+32 ms</strong></td><td>1 人周</td><td><strong>车端装不下</strong>；离线可用</td></tr>
+    </tbody>
+  </table>  <h3>排序方法：先取「免费的」，再做背包</h3>  <p>正确的排序不是按 ΔAP 降序（那会先做最贵的长焦），而是分两步：</p>  <ol>
+    <li><strong>先无条件采纳所有 Δ延迟 ≤ 0 且 ΔAP &gt; 0 的方法</strong>——它们是严格占优的（strictly dominant），不需要任何权衡。本表里是 ROI 裁剪（还倒赚 1 ms）、NWD、copy-paste，合计 <strong>+10.3 AP<sub>small</sub>，延迟 −1.0 ms</strong>。<em>这三项应该在任何方案的第一个 sprint 里做完。</em></li>
+    <li><strong>剩下的按延迟预算做 0/1 背包</strong>，最大化总 ΔAP。以 8 ms 的 TSR 预算（模块 04 算过）为例，最优解是「长焦 + 两级级联 + 多帧融合」，共 8.7 ms，加上第一步倒赚的 1 ms，<strong>净 7.7 ms、总收益 +31.8 AP<sub>small</sub></strong>。而 SAHI 切片（+9.0）因为 32 ms 的代价，在任何合理预算下都进不了解集。</li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>「先取免费午餐，再做背包」这个两步法本身就是面试可以直接说的方法论</strong>，比逐条罗列方法高一个层次。它传达三件事：你知道每个方法的代价、你知道代价的度量单位是延迟预算而不是「感觉贵」、你知道优化问题的结构（有些选项是占优的，不需要权衡）。<em>而且它天然给出了迭代顺序：第一步的三项在两个 sprint 内就能出结果，长焦相机则要跨季度、要拉硬件团队——两者不该放在同一个计划里比较。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，这张表里的 ΔAP 数字是<strong>估计值而非测量值</strong>，且它们<em>不可加</em>——这是必须主动说明的一点。三个理由：① 多个方法可能解决同一个瓶颈（ROI 裁剪与原生分辨率输入高度重叠，加起来远不到 +14）；② 有些方法互为前提（两级级联的收益依赖 L1 的召回，而 L1 的召回又依赖 ROI）；③ 收益随基线水平递减。<strong>所以正确的表述是「先按估计排序决定做的顺序，每做完一项重新测量并更新表」——这是一个在线的贪心过程，不是一次性的规划。</strong>这也正好接上下一节的分桶评测：<em>没有可靠的分尺度测量，这张表就无法更新，排序就退化成拍脑袋。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>注意表里最有意思的一行：<strong>ROI 裁剪的 Δ延迟是负的</strong>。它同时提高精度和降低延迟，因为它把算力从「处理 93% 无关像素」挪到了「处理 7% 关键像素」。<em>凡是「重新分配已有资源」而不是「增加资源」的改动，都有可能出现这种双赢</em>——而它们在方案里几乎总是被排在「加模型、加分辨率」之后，因为后者更像「在做事」。<strong>先找双赢项，是资源受限系统优化的通用起手式。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">7</span>按像素尺寸分桶的评测：不分桶就看不见改进</h2>
+  <p>上一节的所有排序都依赖一件事：<strong>你能可靠地测出每个改动对「小目标」的影响</strong>。而整体 mAP 做不到这件事。</p>  <h3>为什么整体 mAP 会掩盖真相</h3>  <p>整体 AP 是所有目标混在一起算出来的一个数。它的问题不是「不准」，而是<strong>它把两个完全不同的方案压成了同一个数字</strong>：</p>  <table>
+    <thead><tr><th></th><th>整体 AP</th><th>AP [0,16) px</th><th>AP [16,32) px</th><th>AP [32,64) px</th><th>AP ≥64 px</th></tr></thead>
+    <tbody>
+      <tr><td>baseline</td><td>0.293</td><td><strong>0.005</strong></td><td>0.534</td><td>0.926</td><td>0.857</td></tr>
+      <tr><td><strong>方案 A</strong>（P2 + 原生分辨率）</td><td>0.479</td><td><strong>0.206</strong> ⬆⬆</td><td>0.831 ⬆</td><td>0.842</td><td>0.952</td></tr>
+      <tr><td><strong>方案 B</strong>（更大的 backbone）</td><td>0.358</td><td>0.047 ⬆</td><td>0.655 ⬆</td><td><strong>1.000</strong> ⬆</td><td>0.952</td></tr>
+    </tbody>
+  </table>  <p>这张表（notebook 里会用物理合理的合成数据完整跑出来）藏了两个结论。<strong>第一：baseline 的整体 AP 是 0.293，看起来「一般般」；但拆开看，&lt;16 px 桶只有 0.005——60 米外的标志基本一个都检不到。</strong><em>一个「一般般」的整体分数，掩盖了某个关键子集上的彻底失效。</em></p>  <p><strong>第二：A 与 B 的整体 AP 只差 0.12，但在 &lt;16 px 桶上差了 4.4 倍</strong>（0.206 vs 0.047），而在 [32,64) 桶上 B 反而更好（1.000 vs 0.842）。<em>&lt;16 px 桶对应的正是「60 米外能不能检出限速牌」——直接决定 ADAS 的反应时间；B 的提升则集中在已经很好的大目标上，对安全几乎没有贡献。</em><strong>只看整体 AP，你会觉得两者是同一量级的改进；分桶才知道该选 A。</strong></p>  <p>还有一个更严重、也更少被提及的问题：<strong>整体 mAP 跨数据集根本不可比</strong>。notebook 里会验证：同一个 baseline 模型，换一份尺寸分布不同的测试集（远处样本从 60% 降到 13%），<strong>整体 AP 从 0.293 跳到 0.601，而每个尺寸桶的 AP 几乎不变（差 &lt; 0.10）</strong>。<em>也就是说，报告「我们的模型 mAP 0.60」这句话在不给尺寸分布时几乎不含信息量；而分桶 AP 是模型能力的稳定刻画。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>分桶评测在 TSR 里不是「更细致的分析」，而是「唯一有效的分析」</strong>。原因回到本模块第一节：标志的像素尺寸分布由 p = f·S/Z 决定，Z 在数据集里大致均匀 → <em>p 的分布密度正比于 1/p²，极度偏向小尺寸</em>。合成一份物理合理的分布会发现：60% 以上的标志实例都在 16 px 以下。<strong>而这些实例恰恰是 AP 最低、改进空间最大、也最影响安全的那一批。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，分桶评测要按 <strong>COCO 的忽略规则</strong>实现，否则会得到错误的数字。评某个尺寸桶 b 时：<em>① 只有落在桶 b 的 GT 计入召回分母；② 匹配到桶外 GT 的检测既不算 TP 也不算 FP，而是被<strong>忽略（ignore）</strong>；③ 匹配不到任何 GT 的检测才算 FP</em>。<strong>如果把「匹配到大目标的检测」当成小目标桶的 FP，小目标 AP 会被系统性低估，且低估幅度取决于大目标的数量</strong>——不同数据集之间就不可比了。这个实现细节在 notebook 里会完整写出来。另外，桶的边界应该按<em>业务含义</em>而不是 COCO 惯例来切：TSR 里更有意义的切法是按<strong>距离</strong>（&gt;80 m / 40–80 m / 15–40 m / &lt;15 m）或按<strong>p<sub>min</sub> 阈值</strong>（&lt;8 / 8–16 / 16–24 / ≥24，对应「不可能 / 可提议 / 可检测 / 可分类」四个语义区间）。</p></div>
+  </div>  <p>配套要报告的还有<strong>三个 mAP 之外的工程指标</strong>（C55 模块 05 会展开）：</p>  <ul>
+    <li><strong>首次检出距离的分布</strong>（p50 / p10）——直接对应「留给下游多少反应时间」，比 AP 更贴近产品体验。</li>
+    <li><strong>FP per km</strong> 而不是 precision——precision 依赖于测试集里正样本的密度，换个数据集就不可比；每公里误报数是绝对量，可以直接和产品要求对齐。</li>
+    <li><strong>按位置分桶</strong>（切片边界带 vs 中心区域、图像边缘 vs 中心）——模块 04 的重叠率下界所刻画的失效模式，只有按位置分桶才看得见。<em>几乎没有公开基准报告这一项。</em></li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <p>分桶评测有一个统计上的坑必须防：<strong>桶越小，样本越少，方差越大</strong>。&lt;16 px 桶如果只有 40 个实例，AP 的随机波动可能就有 ±0.05——此时「+0.03 的提升」毫无意义。<em>做法：① 报告每个桶的实例数；② 用 bootstrap 给出置信区间；③ 桶太小就合并或扩充测试集</em>。C61 模块 01 讲的「+0.3 可能是噪声」在分桶后会更严重，因为分母变小了。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ablation"><span class="num">8</span>消融计划与上线门禁：把方案变成可执行的日程</h2>
+  <p>最后一步，把上面的排序变成一份<strong>可以直接放进季度计划的消融与验证方案</strong>。这是面试里「系统设计题」的标准落点，也是真实工作的交付物。</p>  <table>
+    <thead><tr><th>阶段</th><th>改动</th><th>预期收益</th><th>验证方式</th><th>门禁（不过就不合入）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>S0 基线</strong></td><td>冻结代码/数据/评测集，跑 3 个种子</td><td>—</td><td>确定种子方差（典型 ±0.3 AP）</td><td>三个种子的 AP 极差 &lt; 0.8，否则先修训练稳定性</td></tr>
+      <tr><td><strong>S1 免费午餐</strong></td><td>ROI 裁剪 + NWD + copy-paste</td><td>+10 AP<sub>small</sub>，延迟 −1 ms</td><td>分桶 AP + 延迟 p99</td><td><strong>大目标桶不掉超过 0.5</strong>；延迟不增</td></tr>
+      <tr><td><strong>S2 结构</strong></td><td>加 P2 层（含分配规则锚点下移）</td><td>+3.5 AP<sub>small</sub></td><td>分桶 AP + NMS 耗时分布</td><td>延迟 p99 增量 &lt; 2.5 ms；FP/km 不增</td></tr>
+      <tr><td><strong>S3 级联</strong></td><td>两级级联（L1 类别无关 + L2 高分辨率）</td><td>+5.5 AP<sub>small</sub></td><td><strong>级联召回拆解 R1 / R2</strong></td><td><strong>R1 ≥ 0.95</strong>（否则 L2 再好也没用）</td></tr>
+      <tr><td><strong>S4 时序</strong></td><td>多帧融合 + 迟滞状态机</td><td>+4.0，闪烁率下降</td><td>首次检出距离 + 闪烁次数</td><td>上报延迟增量 &lt; 150 ms</td></tr>
+      <tr><td><strong>S5 硬件</strong></td><td>长焦相机 + 跨相机关联</td><td>+12.0</td><td>分距离桶 AP（&gt;80 m 段）</td><td>跨相机类别一致率 &gt; 0.98</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这张表里最值得强调的是「门禁」那一列，而不是「预期收益」那一列。</strong>收益是猜的，门禁是硬的。每一条门禁都对应一个真实会发生的退化：加了 P2 会让 NMS 候选涨 4 倍从而推高 p99 延迟；改了分配偏向小目标会让大目标掉点；级联的 L2 再强也救不了 L1 的漏检；多帧融合会推迟上报。<em>把这些退化写成门禁，等于在开工前就承认了代价，也让每次合入有客观判据。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地说，S3 的门禁「R1 ≥ 0.95」是整张表里最关键的一条，因为<strong>级联的召回是乘法</strong>（模块 04）：R = R1×R2。如果 L1 只有 0.80，那么无论 L2 做到多好，端到端召回上限就是 0.80——<em>而团队很容易把精力全花在 L2 上（因为它更像「模型工作」），却让整个系统被 L1 卡住</em>。<strong>所以级联系统必须把 R1 与 R2 分开测量、分开设门禁</strong>，绝不能只看端到端指标。度量方式：用 GT 框去检查「是否落在某个 L1 提议的 ROI 内（含 padding）」，这就是 R1；再在 L1 命中的子集上测 L2 的召回，这就是 R2。</p></div>
+  </div>  <p><strong>还有三条容易被漏掉的验证纪律：</strong></p>  <ol>
+    <li><strong>同 budget 比较</strong>：加了 P2 的模型算力更大，与基线比时必须要么给基线同样的算力（比如加宽通道），要么明确标注「这是算力换精度」。<em>用一个更大的模型去打败小模型然后宣称「方法有效」，是消融里最常见的不诚实。</em></li>
+    <li><strong>回归集必须覆盖失效模式</strong>：每个已知失效模式（夜间、逆光、雨天、上坡、弯道、切片边界）都要有一个几十到几百张的小集合，并单独设门禁。<em>整体指标涨了但某个失效模式集塌了，必须被拦住。</em></li>
+    <li><strong>离线-在线一致性抽查</strong>：每个阶段结束时，用车端真实管线（含 ISP、量化、C++ 后处理）跑一遍同一批数据，与离线结果对拍。<em>C60 整门课在讲这件事；这里只强调它必须是每个阶段的固定动作，而不是上线前的一次性检查。</em></li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>把整个 C57 压成一句可迁移的话：<strong>小目标检测的所有方案，本质上都是在回答「信息在哪一步被丢掉了，以及要花多少代价把它捡回来」</strong>。<em>光学（相机 f 与分辨率）决定了信息的上限；预处理（letterbox / ROI / 切片）决定了你有没有把已有信息交给模型；网络结构（stride / FPN 层）决定了模型有没有能力把信息读出来；分配与损失决定了训练时这些信息有没有被有效监督；评测分桶决定了你能不能看见自己的改进。</em><strong>把方案挂在这五个环节上讲，逻辑就永远是清晰的。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>「最小可检像素数」缺少理论刻画</strong>：本模块用的 p<sub>min</sub> ∈ {8,16,24} 全是经验值。它到底由什么决定——目标的形状复杂度？类别数？信噪比？是否存在类似 Johnson 判据（军用光电里的 detection/recognition/identification 线对数准则）的、可从任务复杂度推出的定量规则？<em>这是一个横跨信息论与视觉的开放问题，而它一旦解决，整套相机选型就能从经验变成计算。</em></li>
+    <li><strong>跨相机的联合检测与融合</strong>：目前主流做法仍是「每台相机各跑一个检测器，再在 BEV 或跟踪层融合」。让多相机在<em>特征层</em>就联合推理（共享 backbone、跨视角注意力）在理论上能利用重叠视场的互补信息，但受制于标定误差、曝光差异、以及不同 FOV 之间的尺度鸿沟，<em>量产落地仍很少见</em>。</li>
+    <li><strong>可学习的分辨率分配</strong>：ROI 带目前由几何规则给出。让网络端到端地学习「每个区域该用多少分辨率」（延续 FOVEA / Learning-to-Zoom 的路线），在离线基准上有效，但<em>安全关键系统里如何验证「它不会在某类场景下把关键区域降采样」是未解的验证难题</em>。</li>
+    <li><strong>事件相机与高动态范围传感器</strong>：小目标在逆光、隧道出入口、夜间眩光下的失效，本质是传感器动态范围不足而非算法问题。event camera 与 HDR 多曝光融合能从根上改善，但<em>与现有检测器的数据表示不兼容</em>，且缺少大规模标注数据。</li>
+    <li><strong>物理感知的合成数据</strong>：用 p = f·S/Z 这套几何精确地合成「特定距离、特定光照、特定标志类别」的训练样本，理论上能定向补足长尾的远距小目标。难点是<strong>域差主要来自 ISP 与镜头而非几何</strong>——几何容易仿真，成像链路不容易。<em>「合成远距小目标能否替代真实采集」目前答案仍是否定的，但差距在缩小。</em></li>
+    <li><strong>评测协议的空白</strong>：几乎所有公开基准都按像素面积分 small/medium/large，<em>没有一个按「距离」或按「p<sub>min</sub> 语义区间」分桶</em>，也没有报告首次检出距离分布与按位置分桶的结果。这使得学术方法的提升与产品体验的改善之间常常对不上号。<strong>推动一份「距离感知的 TSR 评测协议」是这个方向上性价比很高的贡献。</strong></li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：<strong>Zhu et al., <em>Traffic-Sign Detection and Classification in the Wild</em> (CVPR 2016)</strong>——TT100K 数据集，中国交通标志、小目标与长尾的标准基准，务必看它的尺寸分布统计；<strong>Ertler et al., <em>The Mapillary Traffic Sign Dataset for Detection and Classification on a Global Scale</em> (ECCV 2020)</strong>——全球尺度、区域差异；<strong>Thavamani et al., <em>FOVEA: Foveated Image Magnification for Autonomous Navigation</em> (ICCV 2021)</strong> 与 <strong>Recasens et al., <em>Learning to Zoom</em> (ECCV 2018)</strong>——非均匀分辨率分配；<strong>Akyon et al., <em>SAHI</em> (ICIP 2022)</strong>——切片推理（模块 04）；<strong>Wang et al., <em>NWD: A Normalized Gaussian Wasserstein Distance for Tiny Object Detection</em> (2021)</strong>——模块 03 的度量替换；<strong>Lin et al., <em>Feature Pyramid Networks</em> (CVPR 2017)</strong>——层级分配公式 k = k₀ + log₂(√(wh)/224) 的出处，本模块用它算出「交通标志该去 P0.25 层」；<strong>Hartley &amp; Zisserman, <em>Multiple View Geometry</em>, ch.6</strong>——针孔模型与内参标定的权威出处；<strong>COCO detection evaluation 协议</strong>的官方实现（<code>cocoeval.py</code> 里 <code>areaRng</code> 与 ignore 规则的处理，是本模块分桶评测的参考实现）。相邻课程：C55（TSR 领域知识与安全导向评测）、C56（增强）、C58（长尾数据闭环）、C60（车端部署一致性）、C61（实验设计与误差分析）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_slicing/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 切片推理与高分辨率策略</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · TensorRT 构建与优化</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · TensorRT 构建与优化</h1>
+  <p class="subtitle">PyTorch → ONNX → engine 的完整链路，以及每一步会丢掉什么 · Conv+BN+ReLU 融合是<strong>代数恒等变换</strong>（可逐元素 assert），而中间插一个 reshape、输出被多处消费、或用了非标准激活都会悄悄阻止它 · 动态 shape 的 optimization profile：min/opt/max 三档里 <strong>opt 定错了等于白设动态轴</strong> · kernel autotuning 解释了「为什么构建要几分钟到几十分钟」· engine 与 <em>GPU 型号 × 驱动 × TRT 版本</em> 三元组绑定 → 车端多硬件平台的组合爆炸 · 静默回退的症状是「转了 TRT 但没变快」，要看分区日志而不是端到端延迟</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–01（一致性方法论 / 预处理对齐）；C52 模块 03（ONNX 导出与运行时）强烈建议先读</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_tensorrt_pipeline.ipynb（纯 numpy：迷你图 IR + 融合规则引擎）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">TensorRT Developer Guide / Best Practices · trtexec 文档 · TensorRT OSS plugin 仓库 · ONNX Runtime TensorRT EP</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 75 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#pipeline">链路全景：三次翻译，三类事故</a></li>
+      <li><a href="#builder">builder config：那几个真正决定成败的开关</a></li>
+      <li><a href="#profile">动态 shape 与 optimization profile：min/opt/max 的性能账</a></li>
+      <li><a href="#fusion">层融合：省的不是计算，是访存</a></li>
+      <li><a href="#blockers">什么阻止了融合：图优化的边界与写模型的纪律</a></li>
+      <li><a href="#autotune">kernel auto-tuning：为什么构建要几十分钟</a></li>
+      <li><a href="#hardware-lock">engine 与硬件绑定：车端多平台的组合爆炸</a></li>
+      <li><a href="#fallback">静默回退、plugin，与 trtexec 的常用姿势</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">1</span>链路全景：三次翻译，三类事故</h2>
+  <p>从一个 <code>nn.Module</code> 到一个能在车上跑起来的 <code>.plan</code> 文件，中间要过三道关。<strong>每一道关都是一次「表达力换性能」的翻译，而每一次翻译有它专属的事故形态</strong>——把这三类事故分清楚，是本模块最实用的收获，也是排查时能不能在半小时内定位问题的分水岭。</p>  <div class="ascii">① PyTorch nn.Module            ② ONNX graph                ③ TensorRT engine (.plan)
+   Python 代码 + autograd         静态图 + opset 版本号        kernel 序列 + 内存计划
+   · 任意控制流                    · 算子集被冻结               · 层已融合 / 重排 / 降精度
+   · shape 随便变                  · shape 用符号维表达          · tactic 已按目标 GPU 选定
+   · 可读、可调试、可微            · 可读、可改、跨后端          · 二进制、不可读、绑定硬件
+        │                               │                            │
+        │ torch.onnx.export             │ IBuilder::buildSerialized  │  runtime-&gt;deserialize
+        │ (trace / dynamo)              │ Network()                  │  CudaEngine(...)
+        ▼                               ▼                            ▼
+ ┌──────────────────┐          ┌──────────────────┐        ┌──────────────────┐
+ │ 事故 A：语义错   │          │ 事故 B：不变快   │        │ 事故 C：换机就废 │
+ │ 控制流被固化     │          │ 算子回退成子图   │        │ 型号/版本不匹配  │
+ │ shape 被写死     │          │ 融合被阻断       │        │ tactic 在别的卡  │
+ │ 算子被近似替换   │          │ 精度标志没生效   │        │ 上不是最优       │
+ │ → 数值就是错的   │          │ → 数值对，白干了 │        │ → 直接加载失败   │
+ └──────────────────┘          └──────────────────┘        └──────────────────┘</div>  <p>这三类事故的<strong>排查手段完全不同</strong>，混着查是新手最大的时间浪费：</p>  <table>
+    <thead><tr><th>事故类</th><th>典型症状</th><th>第一手证据</th><th>查错工具</th><th>本课在哪讲</th></tr></thead>
+    <tbody>
+      <tr><td><strong>A · 语义错</strong></td><td>ONNX 输出和 PyTorch 对不上；换个输入尺寸结果就崩</td><td>同一张图，两边 dump 张量逐元素 diff</td><td><code>onnxruntime</code> 逐节点对拍、<code>polygraphy run --onnxrt --trt</code></td><td>C52 m03 / 本课 m01</td></tr>
+      <tr><td><strong>B · 不变快</strong></td><td>「转了 TRT 但只快了 5%」；FP16 开了跟没开一样</td><td>engine 的层数、层名、每层精度、子图数</td><td><code>trtexec --dumpLayerInfo --profilingVerbosity=detailed</code></td><td><strong>本模块第 4–6、8 节</strong></td></tr>
+      <tr><td><strong>C · 换机就废</strong></td><td>开发机上好好的，刷到车上直接反序列化失败</td><td>engine 头里的 TRT 版本 + SM 架构 + 平台标识</td><td>加载时的报错行、<code>trtexec --loadEngine</code></td><td><strong>本模块第 7 节</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一句话概括这条链路：<strong>ONNX 是「模型说了什么」，engine 是「这块芯片打算怎么做」</strong>。ONNX 里一个 <code>Conv</code> 节点在 engine 里可能变成半个层（被融进邻居）、可能变成三个层（被拆开加了两个格式转换）、也可能根本不存在（被常量折叠掉了）。<em>所以拿 ONNX 的节点数去猜 engine 的性能，方向就是错的；你必须去看 engine 自己的层信息。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说，TensorRT 的 <span class="term">builder</span> 做的是一次<strong>目标相关的编译</strong>：输入是网络定义（<code>INetworkDefinition</code>）+ 构建配置（<code>IBuilderConfig</code>）+ <em>目标设备本身</em>，输出是一个序列化的执行计划。它至少做四件事：①图级重写（常量折叠、死层消除、层融合、concat 消除）；②为每层枚举候选实现（tactic）并<strong>在真实设备上计时</strong>选最快的；③规划张量的内存复用（activation memory 是一块被反复覆写的池子，不是每层各占一块）；④插入必要的 reformat 层来对齐相邻层要求的数据布局与精度。<strong>其中②是「必须在目标硬件上构建」的根本原因，也是构建慢的根本原因。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label">分区式集成 = 把失败变成静默降级</span>
+    <p><strong>能不能跳过 ONNX？</strong>可以，路径有 <code>torch-tensorrt</code>（PyTorch 直接编译）、<code>TF-TRT</code>、以及 ONNX Runtime 的 TensorRT ExecutionProvider。它们的共同特点是<strong>「分区式集成」：跑得动的子图交给 TRT，跑不动的留给原框架</strong>。<em>开发期这很省事，但它把「事故 B」变成了默认行为——模型永远能跑，你永远不知道有多少留在了慢路径上。</em>量产链路上，多数团队仍然走「显式导出 ONNX → 显式 build engine」，理由不是性能，是<strong>「不支持的算子必须让我在 CI 里当场看到，而不是在车上悄悄变慢」</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="builder"><span class="num">2</span>builder config：那几个真正决定成败的开关</h2>
+  <p><code>IBuilderConfig</code> 上有几十个设置，但决定成败的就那么几个。这一节只讲这几个，并且讲清楚<strong>「设了会怎样」和「忘了设会怎样」</strong>——后者才是面试和线上真正要命的部分。</p>  <h3>① workspace：它不是「engine 会用多少显存」</h3>  <p>这是被误解最多的一项。<code>config.set_memory_pool_limit(MemoryPoolType.WORKSPACE, N)</code> 设的是<strong>「构建期允许某个 tactic 临时申请多少显存」</strong>，不是 engine 运行时的显存占用。很多高性能实现（需要大块中间缓冲的 implicit GEMM、Winograd 变换、某些 FFT 卷积）会申请可观的 workspace；<strong>你给的额度不够，这些 tactic 直接从候选集里被剔除，TRT 不报错，只是默默选一个慢的</strong>。</p>  <p>典型症状：同一个 ONNX、同一块卡，同事构建出来比你快 20%，唯一差别是他 workspace 给了 4 GB 你给了 64 MB。TensorRT 8.4 之后默认额度是设备总显存，所以新版本上这个坑变少了；<em>但在显存紧张的车端 SoC 上，你常常需要主动调小它来避免构建期 OOM，这时候就得亲手做这个权衡。</em></p>  <h3>② 精度标志：这是「许可证」，不是「命令」</h3>  <p><code>config.set_flag(BuilderFlag.FP16)</code> 的语义是<strong>「允许 TRT 在它认为划算的地方用 FP16」</strong>。TRT 仍然按实测耗时选 tactic——如果某层的 FP32 实现恰好更快（小层、或该层的 FP16 kernel 需要额外的 reformat），它就用 FP32。所以 <strong>「我开了 FP16 但一点没变快」是完全可能的，而且不会有任何警告</strong>。</p>  <table>
+    <thead><tr><th>Flag</th><th>语义</th><th>忘了设会怎样</th><th>设了但没生效的检查方法</th></tr></thead>
+    <tbody>
+      <tr><td><code>FP16</code></td><td>允许 FP16 tactic（需要硬件支持）</td><td>全 FP32，延迟大约是 FP16 的 1.5–2.5×</td><td><code>--dumpLayerInfo</code> 看每层的 <code>Precision</code> 字段还有多少是 FP32</td></tr>
+      <tr><td><code>INT8</code></td><td>允许 INT8 tactic；<strong>还必须提供 scale</strong>（calibrator 或图里的 Q/DQ）</td><td>INT8 完全没启用，或只有部分层启用</td><td>同上；再看 <code>Reformat</code> 层数量是否异常多</td></tr>
+      <tr><td><code>BF16</code></td><td>允许 BF16（Ampere+ / Orin 之后）</td><td>在动态范围大的模型上更容易 FP16 溢出</td><td>同上</td></tr>
+      <tr><td><code>PREFER_PRECISION_CONSTRAINTS</code></td><td>尽量遵守你用 <code>setPrecision()</code> 指定的层精度，做不到就回退并 warn</td><td>你指定的混合精度方案被无声忽略</td><td>看构建日志里的 warning</td></tr>
+      <tr><td><strong><code>OBEY_PRECISION_CONSTRAINTS</code></strong></td><td><strong>必须遵守，做不到就构建失败</strong></td><td>同上，但失败是显式的</td><td><strong>做混合精度时应该用这个</strong>——你要的是「不行就告诉我」</td></tr>
+      <tr><td><code>SPARSE_WEIGHTS</code></td><td>允许利用 2:4 结构化稀疏</td><td>稀疏化训练的收益拿不到</td><td>看 log 里 sparse tactic 是否被选中</td></tr>
+      <tr><td><code>REFIT</code></td><td>构建可重拟合 engine（权重能换而不重建）</td><td>换权重必须完整重建</td><td>—（会略微降低性能，非必要不开）</td></tr>
+      <tr><td><code>timing cache</code></td><td>复用上次的 tactic 计时结果</td><td>每次 CI 都要完整重跑 auto-tuning</td><td>对比两次构建耗时</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把精度标志理解成<strong>「我授权你在这些数据类型里挑」</strong>，而不是「把模型转成 FP16」。同理，<code>INT8</code> 这个 flag 只是授权；<em>没有 scale，TRT 根本不知道怎么把浮点映射到 8 位整数</em>，所以它会把那些层留在 FP16/FP32。这就是为什么「我开了 INT8 但精度一点没掉」通常不是好消息——<strong>多半是根本没量化上</strong>（下一模块会展开）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从优化器的角度看，builder 在做一个受约束的组合优化：对每层 $\ell$ 选一个 tactic $t_\ell$（含实现算法、数据布局、精度），目标是最小化 $\sum_\ell \tau(t_\ell) + \sum_{(\ell,\ell')} \rho(t_\ell, t_{\ell'})$，其中 $\rho$ 是相邻层布局/精度不匹配时插入 reformat 的代价。<strong>精度标志改变的是可行域，不是目标函数</strong>。这解释了两个反直觉现象：<em>①开了 FP16 反而某些层还是 FP32（因为 reformat 代价 $\rho$ 超过了该层的收益）；②手工把某层强制成 FP16 反而整体变慢（因为你在它前后各强加了一次 reformat）。</em></p></div>
+  </div>  <div class="callout danger"><span class="label">「开了 FP16 没变快」的四步排查</span>
+    <p><strong>面试高频题：「你开了 FP16，延迟没变，怎么查？」</strong>标准答法有四步，缺一步就显得没做过：<em>①先确认硬件与 TRT 版本支持（<code>builder.platform_has_fast_fp16</code>）；②用 <code>--dumpLayerInfo --profilingVerbosity=detailed</code> 导出层信息，统计还有多少层是 FP32——如果几乎全是 FP32，问题在构建配置；③如果层精度确实是 FP16，看 <code>Reformat</code> 层的数量与耗时占比——精度在层间反复切换会把收益吃光；④如果层精度对、reformat 也少，那瓶颈根本不在算力，去看 roofline：模型是 memory-bound 的话，FP16 只把权重读取量减半，激活读写量没变，收益天然有限</em>。<strong>第④点是拉开差距的地方</strong>——很多人只会答前两步。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="profile"><span class="num">3</span>动态 shape 与 optimization profile：min/opt/max 的性能账</h2>
+  <p>TensorRT 的性能来自「为具体的 shape 挑具体的 kernel」。所以<strong>动态 shape 与性能天生是对立的</strong>——你每放宽一点输入的自由度，就要付出一点性能或一点显存。这一节讲清楚这笔账怎么算。</p>  <h3>optimization profile 是什么</h3>  <p>对每个动态维度，你要给三个数：<code>min</code> / <code>opt</code> / <code>max</code>。它们的作用<strong>各不相同，别混为一谈</strong>：</p>  <table>
+    <thead><tr><th>档位</th><th>它决定什么</th><th>设错的后果</th></tr></thead>
+    <tbody>
+      <tr><td><code>min</code></td><td>运行时允许的最小 shape（越界直接报错）</td><td>设太大 → 小输入被拒；设太小 → 扩大了搜索范围，可能拖累 tactic 质量</td></tr>
+      <tr><td><strong><code>opt</code></strong></td><td><strong>builder 在这个 shape 上计时并挑 tactic</strong></td><td><strong>设错 = 你的高频 shape 上跑的是为别的 shape 挑的 kernel，实测可慢 10–30%</strong></td></tr>
+      <tr><td><code>max</code></td><td>允许的最大 shape；<strong>activation 显存按它预分配</strong></td><td>设太大 → 显存被无谓占住（车端 SoC 上很致命）；设太小 → 大输入直接报错</td></tr>
+    </tbody>
+  </table>  <div class="ascii">shape 分布（比如两级 TSR 里第二级分类器的 crop 数）
+   频次
+    │        ▄▄█▄▄
+    │      ▄███████▄                          ▄
+    │    ▄███████████▄▄                  ▄▄  ███
+    └────┴──┴───┴────┴──────────────────┴──┴────┴──►  batch
+         2  4   8   12                  48  56  64
+
+ 方案 A · 单 profile [1, 8, 64]
+   ├ opt=8 命中主峰 → 主峰上性能最好
+   ├ batch=56 时用的是为 8 挑的 tactic → 慢 15~30%
+   └ 显存按 batch=64 预留  ← 主峰只用 8，浪费 8 倍
+
+ 方案 B · 双 profile [1,8,16] + [17,56,64]
+   ├ 两个峰各自命中 → 两边都快
+   ├ 构建时间 ×2，engine 变大
+   └ **每个 profile 需要独立的 execution context** → activation 显存 ×2
+
+ 方案 C · 分桶（bucketing）：把 batch padding 到 {8, 16, 32, 64}
+   ├ 每桶一个**静态 shape** engine → 每个都是最优 tactic
+   ├ 显存 = max 桶（可只常驻常用桶，按需加载）
+   └ 代价：padding 的算力浪费 + 多个 engine 的管理成本</div>  <p>三个方案的选择依据不是「哪个先进」，而是<strong>你的 shape 分布长什么样、显存有多紧、以及你能承受多少工程复杂度</strong>。用一个简单的代价模型就能算出来：</p>  <div class="math-block">\[\mathbb{E}[T] \;=\; \sum_{s} p(s)\, t_0(s)\,\Bigl(1 + \alpha \bigl|\ln (s / s_{\text{opt}})\bigr|\Bigr), \qquad M \;=\; m_{\text{w}} + n_{\text{ctx}} \cdot m_{\text{act}}(s_{\max})\]</div>  <p>$t_0(s)$ 是该 shape 在专门为它构建的静态 engine 上的耗时，$\alpha$ 是「偏离 opt 的惩罚系数」（实测常在 0.05–0.25 之间，取决于层类型：GEMM 类对 tile 尺寸敏感，$\alpha$ 大；elementwise 类几乎无所谓）。<strong>notebook 里会用动态规划求出「给定 $k$ 个 profile，怎么切分 shape 区间使期望延迟最小」的最优解</strong>，并画出 $k$ 增加时的边际收益——你会看到典型情况下 $k=2$ 就吃掉了绝大部分收益，$k=4$ 以上基本白花构建时间。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最省事也最快的方案永远是<strong>静态 shape</strong>：把输入尺寸钉死，一个数都不许动。车端感知的主链路基本都这么做——相机分辨率是固定的，letterbox 之后也是固定的，<em>没有任何理由让主检测器接受动态输入</em>。动态 shape 真正不可避免的地方只有少数几处：多相机时激活的相机数会变（batch 维）、两级架构里第二级的 crop 数随场景变、以及需要多分辨率档位来做算力降级的场景。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>值得强调的是 <strong>execution context 与 profile 的绑定关系</strong>：一个 <code>IExecutionContext</code> 同一时刻只能绑定一个 optimization profile，切换 profile 要调 <code>setOptimizationProfileAsync()</code> 并等待同步——<em>在延迟敏感的推理循环里频繁切 profile 是反模式</em>。常见做法是为每个 profile 建一个常驻 context，但每个 context 都要有自己的 activation 显存（除非用 <code>createExecutionContextWithoutDeviceMemory()</code> 手动共享一块足够大的显存并自己保证不并发使用）。<strong>所以「多 profile」的真实代价是显存乘以 context 数，这在只有几 GB 可用显存的车规 SoC 上往往才是硬约束，而不是构建时间。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把这一节压成一句话：<strong><code>opt</code> 决定你有多快，<code>max</code> 决定你占多少显存，<code>min</code> 只决定你会不会崩。</strong>三个数里最该被认真对待的是 <code>opt</code>，而它应该来自<em>线上 shape 分布的实际统计</em>，不是拍脑袋写的中位数。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fusion"><span class="num">4</span>层融合：省的不是计算，是访存</h2>
+  <p><strong>层融合是 TensorRT 收益最大、也最容易被误解的一项优化。</strong>误解在于：很多人以为融合省的是 FLOPs。<em>不是。Conv+BN+ReLU 融合之后，乘加次数一次都没少</em>——省下的是<strong>把中间结果写回显存再读回来</strong>的那几趟，以及两次 kernel launch。</p>  <h3>垂直融合的数值基础：Conv + BN 的等价变换</h3>  <p>推理期的 <span class="term">BatchNorm</span> 是一个逐通道的仿射变换（running stats 已冻结），而卷积也是线性的，所以两者可以合并成一个卷积。设第 $o$ 个输出通道的卷积核为 $W_o$、偏置 $b_o$，BN 参数为 $(\gamma_o, \beta_o, \mu_o, \sigma_o^2, \epsilon)$：</p>  <div class="math-block">\[\mathrm{BN}\bigl(W_o * x + b_o\bigr) \;=\; \gamma_o\,\frac{(W_o * x + b_o) - \mu_o}{\sqrt{\sigma_o^2+\epsilon}} + \beta_o \;=\; \underbrace{\frac{\gamma_o}{\sqrt{\sigma_o^2+\epsilon}}W_o}_{\tilde W_o} * x \;+\; \underbrace{\frac{\gamma_o\,(b_o-\mu_o)}{\sqrt{\sigma_o^2+\epsilon}} + \beta_o}_{\tilde b_o}\]</div>  <p><strong>这是严格恒等，不是近似</strong>（浮点舍入除外）。notebook 里会用 numpy 从零实现卷积与 BN，对随机输入验证融合前后 <code>np.allclose</code> 到 $10^{-10}$ 量级。<em>这个证明值得亲手写一遍：C53 模块 01 讲的结构重参数化（RepVGG 多分支合并）用的是同一套代数，而下一模块讲 QAT 时的「BN folding 必须在插 fake-quant 之前做」也是同一件事。</em></p>  <h3>收益从哪来：一笔访存账</h3>  <p>拿一个 640 输入下 S3 层级（80×80）、256 通道的层来算，FP16 每元素 2 字节，激活张量是 3.28 MB：</p>  <table>
+    <thead><tr><th>形态</th><th>kernel 数</th><th>FLOPs</th><th>访存字节</th><th>算术强度 FLOP/Byte</th><th>估计耗时（含 launch）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>3×3 标准卷积</strong> 拆成 Conv / BN / ReLU 三个 kernel</td><td>3</td><td>7.55 G</td><td>20.8 MB</td><td>整体 <strong>362</strong>（Conv 977 / BN <strong>0.5</strong> / ReLU <strong>0.25</strong>）</td><td>760 + 38 + 38 = <strong>835 µs</strong></td></tr>
+      <tr><td>3×3 标准卷积，<strong>融合成一个</strong></td><td>1</td><td>7.55 G</td><td>7.7 MB</td><td>977</td><td><strong>760 µs（省 9%）</strong></td></tr>
+      <tr><td><strong>5×5 depthwise</strong> 拆成三个 kernel</td><td>3</td><td>0.087 G</td><td>19.7 MB</td><td>整体 <strong>4.4</strong>（DW 本身只有 12.5）</td><td>38 + 38 + 38 = <strong>113 µs</strong></td></tr>
+      <tr><td>5×5 depthwise，<strong>融合成一个</strong></td><td>1</td><td>0.087 G</td><td>6.6 MB</td><td>13.2</td><td><strong>38 µs（省 67%）</strong></td></tr>
+    </tbody>
+  </table>  <p>（假设 10 TFLOPS FP16 + 200 GB/s 带宽 + 每个 kernel 5 µs 启动开销，用 roofline 估计 $t \approx \max(\text{FLOPs}/P,\ \text{Bytes}/B) + t_{\text{launch}}$；notebook 会把这张表逐格算出来。）</p>  <div class="math-block">\[t_{\text{layer}} \;\approx\; \max\!\left(\frac{\text{FLOPs}}{P_{\text{peak}}},\ \frac{\text{Bytes}}{B_{\text{mem}}}\right) \;+\; t_{\text{launch}}\]</div>  <p><strong>结论非常尖锐：融合对「厚重的标准卷积」只值 9%，对「轻薄的 depthwise 卷积」值 67%。</strong>而现代实时检测器（RTMDet 的 CSPNeXt、YOLO 的轻量变体、MobileNet 系 backbone）里 depthwise 遍地都是——<em>越是为「FLOPs 少」而设计的模型，越是 memory-bound，也就越依赖融合</em>。这解释了一个常见困惑：<strong>「我换了个 FLOPs 只有一半的轻量 backbone，延迟怎么只降了 15%？」</strong>因为它本来就不受算力限制，你减的是它不缺的那个东西。</p>  <h3>TensorRT 还做哪些图优化</h3>  <table>
+    <thead><tr><th>类别</th><th>做什么</th><th>典型收益</th></tr></thead>
+    <tbody>
+      <tr><td>常量折叠</td><td>把只依赖常量的子图在构建期算掉（BN 参数、reshape 的 shape 张量）</td><td>去掉一批运行时无用节点</td></tr>
+      <tr><td><strong>垂直融合</strong></td><td>Conv+Bias+BN+激活 → 一个 CBR 层；ConvTranspose、FC 同理</td><td><strong>本节主角</strong></td></tr>
+      <tr><td><strong>水平融合</strong></td><td>同一输入的多个同类卷积（Inception 分支、多头投影）合并成一个大卷积后再切分</td><td>kernel 数下降、GEMM 变大更高效</td></tr>
+      <tr><td>concat 消除</td><td>让上游层直接写进 concat 输出的对应偏移，<strong>concat 本身消失</strong></td><td>省一整趟读写</td></tr>
+      <tr><td>shuffle / transpose 消除</td><td>相邻的 reshape/transpose 相互抵消或被吸进邻居的布局要求</td><td>去掉纯访存层</td></tr>
+      <tr><td>格式与精度重排（reformat）</td><td>在布局/精度不匹配处<strong>插入</strong>转换层</td><td><strong>这是负收益</strong>，越少越好</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>一条可迁移的心法：<strong>融合的本质是把 memory-bound 的算子塞进 compute-bound 算子的 epilogue，让它们免费。</strong>凡是「算术强度低于 1」的算子（BN、激活、逐元素加、scale、cast），单独成 kernel 就是纯粹的带宽浪费。<em>你自己写模型时也该按这个标准判断：新加的这个逐元素操作能不能被融进上一层？如果不能，它就要付一整趟 3 MB 的读写。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="blockers"><span class="num">5</span>什么阻止了融合：图优化的边界与写模型的纪律</h2>
+  <p>融合是<strong>有前提的</strong>。前提被破坏时，TensorRT 不会报错、不会警告，只是安静地少融一次。<em>结果就是「一个看起来毫无问题的改动，让延迟涨了 20%」。</em>这一节把常见的阻断原因和它们的指纹列全。</p>  <h3>最根本的一条：中间张量必须「用完即弃」</h3>  <p>Conv 的输出要能被融进 BN，前提是<strong>这个中间张量除了 BN 没有别的用途</strong>。一旦它有第二个消费者，或者它被标记成网络输出，TensorRT 就必须把它<em>实体化（materialize）</em>到显存里——而一旦要写出去，融合就没意义了。</p>  <div class="ascii">可以融合                              被阻断（中间张量有两个消费者）
+──────────────                        ────────────────────────────────
+  x                                     x
+  │                                     │
+ Conv                                  Conv
+  │  ← 只有 BN 用它                     │  ← BN 用它，Add 也用它
+ BN                                    ├──────────┐
+  │                                    BN         │
+ ReLU                                   │         │
+  │                                   ReLU        │
+  y                                     │         │
+                                       Add ◄──────┘
+ 融合成 1 个 CBR 层                     Conv 的输出必须写回显存
+ 中间张量 0 次落显存                    → Conv+BN 融不了
+                                       → 多一趟 3.28 MB 读 + 3.28 MB 写
+
+
+事故形态：为了 debug 把中间张量 mark 成 output
+  builder network 里多写一行 network-&gt;markOutput(bn_out)
+  → 该张量必须实体化 → 融合链断在这里
+  → **延迟涨 15~25%，没有任何报错，忘了删就上线了**</div>  <table>
+    <thead><tr><th>阻断原因</th><th>指纹（怎么看出来）</th><th>修法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>中间张量有多个消费者</strong></td><td>layer info 里能看到独立的 <code>BatchNormalization</code> 层名</td><td>改结构：把残差加在激活之后；或接受这次不融</td></tr>
+      <tr><td><strong>中间张量被 mark 成 output</strong></td><td>engine 的输出张量数比预期多</td><td><strong>发布前检查输出列表</strong>，debug 输出用单独的 debug engine</td></tr>
+      <tr><td>激活函数不在支持列表</td><td>激活成了独立层，或被拆成 <code>Sigmoid</code>+<code>Mul</code> 两层</td><td>用标准算子（ReLU / LeakyReLU / Clip / Sigmoid / Tanh / HardSwish）；SiLU 要确认你的 TRT 版本能识别</td></tr>
+      <tr><td><strong>相邻层精度不同</strong></td><td>两层之间冒出 <code>Reformat</code> 层</td><td>减少手工精度约束；混合精度按「连续块」划分而不是散点</td></tr>
+      <tr><td><strong>Q/DQ 位置不对（INT8）</strong></td><td>Reformat 层数量异常多、INT8 层反而变少</td><td>遵循 TRT 的 Q/DQ 放置规则（见下一模块）</td></tr>
+      <tr><td>中间插了 Reshape / Transpose / Slice</td><td>conv 链被打断成多段</td><td>把 shape 操作挪到图的两端；避免在 backbone 中段变换布局</td></tr>
+      <tr><td><strong>plugin 边界</strong></td><td>plugin 前后一定有独立层</td><td>plugin 是黑盒，前后不能融——这是写 plugin 的隐性成本</td></tr>
+      <tr><td>group / dilation 等特殊配置</td><td>该融的没融</td><td>查你的 TRT 版本的 fusion 支持矩阵，别想当然</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>怎么<em>知道</em>融合成没成？看层名。TensorRT 融合后的层名是把被融的层名拼起来的，形如 <code>conv1 + conv1/bn + conv1/relu</code>。<strong>所以只要 dump 一次 layer info，你就能一眼看出哪些层名是「一串」（融了）、哪些是「孤零零一个 BatchNormalization」（没融）。</strong>命令是 <code>trtexec --loadEngine=m.plan --dumpLayerInfo --profilingVerbosity=detailed --exportLayerInfo=layers.json</code>，然后写个十行的脚本统计层数、层名里的 <code>+</code> 个数、以及 <code>Reformat</code> 的占比。<em>这个脚本应该进 CI，作为性能回归的门禁之一。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严谨地说，TensorRT 的融合是在其内部图上做<span class="term">模式匹配（pattern matching）</span>+<strong>安全性检查</strong>：模式匹配决定「这几个层在结构上可以合并成哪个融合层」，安全性检查决定「合并之后语义是否仍然等价、以及中间结果是否真的不需要保留」。<em>后者依赖的是 use-def 分析：只有当中间张量的 fan-out 恰好为 1 且它不在图的输出集合中，融合才被允许。</em>这与传统编译器里的 <span class="term">operator fusion</span> / loop fusion 是同一套理论，区别只在于 TensorRT 的融合模式是硬编码的（vendor 手写的 kernel 模板库），而 TVM/XLA 这类编译器会做更一般的调度搜索。<strong>硬编码的好处是命中时性能极强，坏处是没命中你完全没法干预——这正是「写模型时就要照着融合规则写」的原因。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">数值全对 + 延迟涨 18% = 融合被阻断</span>
+    <p><strong>真实事故形态，也是很好的面试故事素材</strong>：某次为了排查一个 badcase，工程师在导出脚本里多加了一个中间特征图作为输出，用完忘了删。<em>ONNX 对拍通过（数值完全正确）、精度评测通过（数值完全正确）、只有延迟涨了 18%。</em>因为没有人把「engine 层数」纳入回归门禁，这个改动一路走到了集成测试才被发现。<strong>教训：一致性检查只能抓「事故 A」，抓不到「事故 B」。你需要一条独立的、针对 engine 结构本身的门禁——层数、融合层占比、Reformat 层占比、FP32 层数、子图数。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="autotune"><span class="num">6</span>kernel auto-tuning：为什么构建要几十分钟</h2>
+  <p>第一次跑 <code>trtexec</code> 的人几乎都会问同一个问题：<strong>「转换一个模型而已，为什么要等二十分钟？」</strong>答案是 TensorRT 根本不是在「转换」，它是在<strong>做实验</strong>。</p>  <h3>builder 到底在忙什么</h3>  <p>对图中的每一个层，TensorRT 会枚举一批候选实现——这些候选叫 <span class="term">tactic</span>，来源包括自带 kernel 库、cuDNN、cuBLAS、以及针对特定 shape/精度的专用实现。同一个 3×3 卷积，候选可能包括：implicit GEMM 的若干种 tile 划分、explicit GEMM + im2col、Winograd 变换、以及不同的数据布局（NCHW / NHWC / NC/32HW32 等 vectorized 格式）。<strong>然后它把每个候选在目标 GPU 上真的跑几遍、计时、取最快的那个。</strong></p>  <div class="math-block">\[N_{\text{timing}} \;\approx\; \underbrace{L}_{\text{层数}} \times \underbrace{K}_{\text{每层候选 tactic 数}} \times \underbrace{R}_{\text{每个候选重复次数}} \times \underbrace{|\mathcal{P}|}_{\text{profile 数}}\]</div>  <p>一个 200 层的检测器，每层 10–100 个候选，每个候选重复 3–8 次，单 profile——<strong>就是几万次真实的 kernel 计时</strong>。INT8 还要更多（更多候选 + 校准本身的前向）。所以构建时间从「小模型 1 分钟」到「大模型 + 多 profile + INT8 半小时以上」都是正常的。</p>  <table>
+    <thead><tr><th>因素</th><th>对构建时间的影响</th><th>能不能省</th></tr></thead>
+    <tbody>
+      <tr><td>层数 / 模型大小</td><td>近似线性</td><td>不能</td></tr>
+      <tr><td><strong>optimization profile 数</strong></td><td><strong>近似线性倍增</strong></td><td>能——少用 profile，优先静态 shape</td></tr>
+      <tr><td>INT8</td><td>显著变慢（更多 tactic + 校准前向）</td><td>校准结果可缓存复用</td></tr>
+      <tr><td><code>builderOptimizationLevel</code>（0–5）</td><td>级别越高搜得越广、越慢</td><td><strong>能——CI 用低级别快速验证，发布用高级别</strong></td></tr>
+      <tr><td><strong>timing cache</strong></td><td>命中后跳过计时</td><td><strong>能——二次构建可快 2–10×，CI 必用</strong></td></tr>
+      <tr><td>构建机的空闲程度</td><td>不影响时长，<strong>影响结果质量</strong></td><td>必须用独占机器</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label">构建是有噪声的过程，engine 不是 ONNX 的确定性函数</span>
+    <p><strong>一个反直觉但极其重要的事实：同一个 ONNX，在同一块卡上构建两次，得到的 engine 性能可能差 3–5%。</strong>因为 tactic 选择依赖的是<em>实测计时</em>，而计时会被机器上的其他负载、时钟频率波动、温度扰动。如果两个候选的真实耗时只差 2%，噪声完全可能让 builder 选错。<em>这是 CI 里「性能测试 flaky」最常见的根因，而团队通常会误以为是测量环节的问题。</em></p><p>缓解手段：①构建用独占机器、锁频（<code>nvidia-smi -lgc</code>）；②增加计时重复次数（<code>trtexec --avgTiming=8</code>）；③<strong>用 timing cache 把「已经选定的 tactic」冻住</strong>——这不只是省时间，更是<u>保证可复现</u>：同一份 cache + 同一份 ONNX 应当产出行为一致的 engine。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把 timing cache 想成「实验记录本」：<strong>(层配置的哈希) → (最优 tactic, 实测耗时)</strong>。下次构建时，遇到同样配置的层就直接查表，不用重跑实验。所以它能把二次构建时间砍掉一大半。<em>但记录本只在同一个实验室有效</em>——换 GPU 型号、换 TRT 版本、甚至换 CUDA 版本，cache 就该失效（TensorRT 会做校验并忽略不匹配的条目，不会给你错误结果，只是白建一次）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从工程流程看，timing cache 把「构建」从<strong>不确定过程</strong>推向<strong>可复现过程</strong>，这对量产链路是刚需：功能安全要求「同一份输入产出同一份二进制」，而 auto-tuning 天然违背这一点。<em>实践中的做法是：在一台锁频的构建机上生成 golden timing cache，把它作为构建产物之一纳入版本管理与签名，之后所有构建（包括 CI 和发布）都必须带上这份 cache。</em><strong>这样 engine 就成了 (ONNX, builder config, timing cache, TRT 版本, 设备型号) 的确定性函数，而不是「那天那台机器碰巧的结果」。</strong>另有 <code>builderOptimizationLevel</code>（TRT 8.6+）把「搜索广度」显式暴露成一个 0–5 的旋钮：级别 0 构建极快但性能可能差不少，级别 5 反之——<em>这本质上是把「构建时间 vs 运行性能」的帕累托前沿交给你自己选点</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hardware-lock"><span class="num">7</span>engine 与硬件绑定：车端多平台的组合爆炸</h2>
+  <p>上一节说清了 tactic 是在<em>目标设备上实测选出来</em>的，那么下面这条结论就是必然的：<strong>engine 是一个硬件相关的产物，不是一个可移植的模型文件。</strong>这条性质在单卡的服务器场景里只是个小麻烦，在车端却直接决定了整条发布流水线的形状。</p>  <h3>engine 绑定了什么</h3>  <table>
+    <thead><tr><th>绑定维度</th><th>变了会怎样</th><th>缓解手段与代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>GPU 架构（SM 版本）</strong></td><td><strong>反序列化直接失败</strong></td><td><code>HardwareCompatibilityLevel::kAMPERE_PLUS</code>：跨 Ampere+ 可移植，<strong>代价是只用架构通用 tactic，典型损失 5–15%</strong></td></tr>
+      <tr><td>具体型号（SM 数、带宽、L2 大小）</td><td>通常能加载，但 tactic 不再最优，性能悄悄下降</td><td>为每个型号单独构建（这是默认做法）</td></tr>
+      <tr><td><strong>TensorRT 版本</strong></td><td><strong>反序列化失败</strong>（序列化格式与版本绑定）</td><td><code>BuilderFlag::VERSION_COMPATIBLE</code>：engine 内嵌 lean runtime，可跨版本加载；代价是体积变大、可能略慢</td></tr>
+      <tr><td>CUDA / cuDNN 版本</td><td>多数情况兼容，边缘情况会失败</td><td>冻结整条工具链版本</td></tr>
+      <tr><td>驱动版本</td><td>有最低要求；低于要求则失败</td><td>在车端镜像里固定驱动版本</td></tr>
+      <tr><td>构建时的 builder config</td><td>engine 行为不同（精度、profile 范围）</td><td>配置纳入版本管理并随 engine 一起签名</td></tr>
+    </tbody>
+  </table>  <p><strong>「反序列化直接失败」其实是好事</strong>——这是一个<em>显式</em>的错误，会在集成阶段就被抓到。真正危险的是「能加载但不是最优」那一类：模型跑得起来、精度也对，只是比应有的慢 20%，而没有人会因为「慢 20%」去怀疑 engine 用错了。</p>  <h3>车端的组合爆炸</h3>  <div class="ascii">engine 矩阵 = 硬件平台 × 精度档 × 分辨率档 × 模型版本 × TRT 版本
+
+  硬件平台     Orin-N (低配)  ·  Orin-X (中配)  ·  双 Orin (高配)  ·  Thor (新平台)
+  精度档       FP16  ·  INT8
+  分辨率档     960x540(省电)  ·  1280x720(标准)  ·  1920x1080(远距)
+  模型版本     同时在路上的灰度版本可能有 2~3 个
+  TRT 版本     升级期会有新旧两版并存
+
+     4 × 2 × 3 = 24 个 engine / 每个模型版本
+     × 3 个在网模型版本  =  72 个 engine
+     × 构建 12 分钟      =  14.4 机器小时（串行）
+     ÷ 6 台并行构建机    =  2.4 小时  ← 每次改模型都要付这个
+     再 × TRT 一次小版本升级 = **全量重建 + 全量回归**
+
+  存储与分发：72 × ~80 MB ≈ 5.8 GB，OTA 只能下发匹配当前硬件的那一个
+  验证：**每一个 engine 都是独立的发布物，都要单独过精度与延迟门禁**</div>  <p>这张账最重要的一行是最后一行。<strong>「一份权重」不等于「一次验证」</strong>——engine 是硬件相关的，所以每一个 (平台, 精度, 分辨率) 组合都必须独立跑完整评测：融合结果可能不同、tactic 不同、INT8 的 scale 甚至可能因为校准在不同平台重跑而不同。<em>这是很多团队在第一次上多硬件平台时严重低估的成本。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>有没有办法只发 ONNX，让车在首次开机时自己构建？<strong>有团队这么做，但要非常小心。</strong>构建要十几分钟、要占用显存与算力、结果还带 3–5% 的随机性；<em>如果构建恰好在用户第一次上车时发生，那就是十几分钟的「感知功能不可用」</em>。现实做法通常是折中：出厂时预置一份 engine，OTA 下发时优先用云端构建好的匹配版本，只有在遇到未预见的硬件/驱动组合时才回退到车端构建，并且必须有明确的降级策略与用户提示。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从发布工程的角度看，engine 的硬件绑定把模型交付从「分发一个文件」变成了<strong>「分发一个按 (硬件指纹, 软件版本) 索引的产物矩阵」</strong>。这需要三件基础设施：<em>①硬件指纹采集</em>（车端上报 SoC 型号、驱动、TRT 版本，服务端据此选包）；<em>②产物血缘</em>（每个 engine 必须能回溯到 ONNX 哈希、权重哈希、builder config、timing cache、构建机标识）；<em>③回退路径</em>（匹配不到时用哪个更保守的 engine，或退回到 FP16 版本）。<strong>值得注意的是，<code>VERSION_COMPATIBLE</code> 与 <code>HardwareCompatibilityLevel</code> 这两个选项本质上是在「用性能买维护性」</strong>——把 24 个 engine 压成 6 个，代价是每个都慢 5–15%。<em>这个交换划不划算，取决于你的延迟预算还剩多少余量，以及你的发布团队有多大。</em></p></div>
+  </div>  <div class="callout danger"><span class="label">答完机制，还要答工程后果</span>
+    <p><strong>面试题：「为什么不能把开发机上建好的 engine 直接拷到车上？」</strong>这题看着简单，但答得完整的人不多。骨架：<em>①engine 是 builder 在<u>目标设备上实测计时</u>后产出的执行计划，tactic 选择依赖 SM 版本、SM 数量、显存带宽、L2 大小——这些换台机器就变了；②序列化格式与 TensorRT 版本绑定，跨版本反序列化会失败；③还绑驱动的最低版本；④即使 TRT 提供了 version-compatible 与 hardware-compatible 模式，它们是用「只选架构通用 tactic」换来的可移植性，典型要付 5–15% 的性能</em>。<strong>加分点是主动补上工程后果：所以 engine 是 (硬件, 软件版本) 索引的产物矩阵，TRT 版本升级 = 全量重建 + 全量回归，这就是为什么量产上 TRT 版本升级频率极低。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fallback"><span class="num">8</span>静默回退、plugin，与 trtexec 的常用姿势</h2>
+  <p>本模块开头的「事故 B」——<strong>转了 TRT 但没变快</strong>——最常见的成因不是融合被阻断，而是<span class="term">静默回退（silent fallback）</span>：一部分图根本没跑在 TensorRT 上。</p>  <h3>静默回退的两种形态</h3>  <ol>
+    <li><strong>算子级回退（分区）</strong>：你用的是 <code>torch-tensorrt</code> / <code>TF-TRT</code> / <code>onnxruntime</code> 的 TensorRT EP 这类<em>分区式集成</em>。它们把图切成「TRT 能跑的子图」和「交回原框架的子图」。模型能跑、数值也对，<strong>但每个子图边界都意味着一次同步、可能还有一次内存拷贝与布局转换</strong>。被切成 30 个子图的模型，比切成 1 个子图的慢一倍毫不稀奇。</li>
+    <li><strong>精度级回退</strong>：你开了 FP16/INT8，但因为缺 scale、因为 reformat 代价太高、或因为该层没有对应精度的实现，TRT 把它留在了更高精度上。<em>症状是「精度一点没掉」——听起来是好消息，实际是没量化上。</em></li>
+  </ol>  <h3>怎么看：三个必须进 CI 的数字</h3>  <table>
+    <thead><tr><th>指标</th><th>健康值</th><th>怎么拿</th><th>不健康说明什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>子图数</strong></td><td><strong>= 1</strong></td><td>ORT-TRT EP 的日志 / <code>ORT_TENSORRT_DUMP_SUBGRAPHS=1</code>；torch-tensorrt 的 partitioning 报告</td><td>有算子没被支持，正在走慢路径</td></tr>
+      <tr><td><strong>非目标精度的层数</strong></td><td>接近 0（纯 FP16 目标下）</td><td><code>trtexec --dumpLayerInfo --profilingVerbosity=detailed</code> 里每层的 <code>Precision</code></td><td>精度标志没真正生效</td></tr>
+      <tr><td><strong>Reformat 层占比</strong></td><td><strong>&lt; 5% 的耗时</strong></td><td><code>--dumpProfile --separateProfileRun</code> 逐层耗时</td><td>精度/布局在层间反复切换，收益被吃光</td></tr>
+      <tr><td>融合层占比</td><td>多数层名里含 <code>+</code></td><td>层名统计脚本</td><td>融合被阻断（第 5 节）</td></tr>
+      <tr><td>engine 层数 vs ONNX 节点数</td><td>engine 层数应<strong>显著少于</strong> ONNX 节点数</td><td>两边分别统计</td><td>几乎没优化发生</td></tr>
+    </tbody>
+  </table>  <h3>trtexec 常用姿势</h3>  <pre><code># ① 构建（静态 shape，最简）
+trtexec --onnx=det.onnx --saveEngine=det.plan --fp16 \
+        --memPoolSize=workspace:2048 \
+        --timingCacheFile=tc.cache --avgTiming=8 \
+        --builderOptimizationLevel=3
+
+# ② 构建（动态 shape：三档必须都给，且要给到每个动态输入）
+trtexec --onnx=det.onnx --saveEngine=det.plan --fp16 \
+        --minShapes=images:1x3x640x640 \
+        --optShapes=images:1x3x640x640 \
+        --maxShapes=images:4x3x640x640
+
+# ③ 强制精度约束（做混合精度时用 obey，不满足就构建失败）
+trtexec --onnx=det.onnx --saveEngine=det.plan --fp16 --int8 \
+        --precisionConstraints=obey \
+        --layerPrecisions=head_reg.*:fp16,backbone.stem.*:fp16
+
+# ④ 逐层耗时剖析（找瓶颈层、找 Reformat）
+trtexec --loadEngine=det.plan --shapes=images:1x3x640x640 \
+        --warmUp=1000 --iterations=2000 --avgRuns=10 \
+        --dumpProfile --separateProfileRun \
+        --exportProfile=prof.json --exportLayerInfo=layers.json \
+        --profilingVerbosity=detailed
+
+# ⑤ 只测 GPU 计算、不含拷贝（注意：这个数字会比端到端好看很多）
+trtexec --loadEngine=det.plan --noDataTransfers --useCudaGraph
+
+# ⑥ 让 TRT 自己在 fp16/int8 里挑（快速摸上限用，不要直接拿去发布）
+trtexec --onnx=det.onnx --best</code></pre>  <div class="callout warn"><span class="label">别用 --noDataTransfers 的数字做预算</span>
+    <p><strong><code>--noDataTransfers</code> 是延迟数字被「美化」的头号来源。</strong>它测的是纯 GPU 计算，不含 H2D/D2H 拷贝。而在车端，输入是 1920×1080×3 的图，<em>H2D 拷贝本身就可能占端到端的 10–30%</em>。供应商与论文报的 FPS 常常就是这个口径，再加上 batch&gt;1、不含预处理、不含 NMS。<strong>拿这个数字去做延迟预算，上车必然超时。</strong>本课模块 05 会给端到端测量的正确姿势。</p>
+  </div>  <h3>plugin：什么时候不得不自己写</h3>  <p>当某个算子既不在 ONNX opset 里、TRT 也不原生支持时，你有四条路，<strong>请严格按这个顺序尝试</strong>：</p>  <ol>
+    <li><strong>改模型</strong>——用等价的标准算子重写。代价最小，但要重训或至少重新验证数值等价。</li>
+    <li><strong>用等价算子组合</strong>——比如把自定义插值拆成 <code>Resize</code>+<code>Slice</code>。代价：可能引入额外访存，且组合出来的图未必能融合。</li>
+    <li><strong>用官方/开源 plugin</strong>——TensorRT OSS 仓库里有 <code>EfficientNMS_TRT</code>、<code>MultiscaleDeformableAttnPlugin</code>（<em>RT-DETR / Deformable DETR 的救命稻草</em>）、<code>GroupNorm</code>、<code>InstanceNormalization</code> 等。代价：要确认版本匹配、要自己编译进 runtime。</li>
+    <li><strong>自己写</strong>——最后的选择。要实现前向 CUDA kernel、序列化/反序列化、动态 shape 支持（<code>IPluginV2DynamicExt</code> / 新版 <code>IPluginV3</code>）、多精度支持、以及 <code>enqueue</code> 的流语义。<em>而且 plugin 是融合黑洞：它前后一定断开，所以一个写得很快的 plugin 也可能因为打断了融合链而净亏。</em></li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>TSR 场景里这条决策链非常具体。如果你选了 <strong>RT-DETR</strong>（C53 模块 04），它的可变形注意力依赖 <code>grid_sample</code>——<em>这在部分后端要 plugin</em>。RT-DETRv2 把它换成离散采样正是为了绕开这一点。如果你选了 YOLO/RTMDet 系，主干全是标准卷积，唯一需要考虑的是<strong>要不要把 NMS 用 <code>EfficientNMS_TRT</code> 塞进 engine</strong>——塞进去可以省一次 D2H 拷贝和 CPU 后处理，但也把「NMS 的实现细节」冻进了 engine，以后想改 IoU 阈值语义就得重建。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更一般地，plugin 的真实成本不在写它的那两天，在<strong>它的生命周期</strong>：<em>①跨 TRT 版本的 API 迁移</em>（<code>IPluginV2Ext</code> → <code>IPluginV2DynamicExt</code> → <code>IPluginV3</code>，每次大版本都可能要改）；<em>②每个目标平台都要交叉编译并验证</em>；<em>③它是融合边界，会永久性地把图切成两半</em>；<em>④它是数值一致性的额外风险点</em>（你自己写的 CUDA kernel 与 PyTorch 参考实现的浮点行为未必一致，需要单独对拍）；<em>⑤功能安全审查时它是一段需要单独论证的自研代码</em>。<strong>所以「能不写就不写」不是懒，是正确的工程判断——选模型架构时就应该把「需要几个自定义 plugin」当作一个选型指标。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>TensorRT 代表的是「vendor 手写 kernel 库 + 实测搜索」这条路线。它的边界在哪、会被什么取代，是一个仍然在演进的问题。</p>  <ul>
+    <li><strong>搜索式编译 vs 手写库。</strong>TVM/Ansor、XLA、Triton、torch.compile+Inductor 走的是「自动生成 kernel + 代价模型/实测搜索调度」，TensorRT 走的是「手写高度优化的模板库 + 在模板间选」。<em>前者覆盖面广、能处理新算子，后者在覆盖到的算子上通常更快</em>。开放问题：随着模型算子越来越多样（各种 attention 变体、状态空间模型），手写库的覆盖率还能撑多久？</li>
+    <li><strong>用学习到的代价模型替代实测计时。</strong>TVM 的 AutoTVM/Ansor 已经在做，TensorRT 的 <code>builderOptimizationLevel</code> 可以看成一个粗粒度的简化版。<em>如果代价模型足够准，构建时间可以从几十分钟降到几十秒，而且构建结果变成确定性的</em>——这对量产发布流水线的价值可能比性能本身还大。</li>
+    <li><strong>可移植性与性能的根本张力。</strong>hardware-compatible engine 要付 5–15% 的性能。这个损失是本质的（不同架构的最优 tactic 就是不同）还是可以靠更好的抽象消掉的？<em>目前没有令人满意的答案，而车端多硬件平台恰恰最需要这个答案。</em></li>
+    <li><strong>融合的粒度正在上移。</strong>FlashAttention 类工作把整个 attention（含 softmax 与在线归一化）融成一个 kernel，这已经超出了「图级模式匹配」能表达的范围——<em>它需要算法层面的重写（分块 + 在线 softmax），而不只是把相邻算子合并</em>。开放问题：如何让编译器自动发现这类需要改变数值算法的融合？这可能需要 kernel 级 DSL 与形式化的重写规则。</li>
+    <li><strong>engine 的数值等价性论证。</strong>怎么向功能安全审查证明「这个 engine 与训练时的模型行为一致」？FP16/INT8 下「等价」本身就没有明确定义。<em>目前的实践是统计性的（大样本上的输出分布对比 + 指标不降），但形式化的边界证明（如给定输入范围下输出误差的上界）在检测模型上仍然做不到。</em></li>
+    <li><strong>构建即代码（build-as-code）与产物血缘。</strong>engine 是 (ONNX, config, timing cache, TRT 版本, 设备型号, 构建机状态) 的函数，其中最后一项还是随机的。<em>如何把这个函数变成可复现、可审计、可签名的流水线</em>，是部署工程里比调 tactic 更重要、却极少被论文讨论的问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>★ 必读（工程文档优先于论文）</strong>：NVIDIA, <em>TensorRT Developer Guide</em> —— 重点读 “Working with Dynamic Shapes”（optimization profile 的完整语义）、“How TensorRT Works / Layer Fusion”（融合规则表，注意它随版本变化）、“Performance Best Practices”（workspace、timing cache、精度约束）。<strong>★</strong> NVIDIA, <em>trtexec 文档与 TensorRT OSS 仓库</em> —— plugin 的参考实现（<code>EfficientNMS_TRT</code>、<code>MultiscaleDeformableAttnPlugin</code>）是理解「plugin 到底要写什么」的最快途径。</p><p>编译器视角的背景阅读：Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI 2018）——图级 + 算子级两层优化的经典框架；Zheng et al., <em>Ansor: Generating High-Performance Tensor Programs for Deep Learning</em>（OSDI 2020）——搜索式调度；Ragan-Kelley et al., <em>Halide</em>（PLDI 2013）——「算法与调度分离」这一思想的源头；Tillet et al., <em>Triton</em>（MAPL 2019）——kernel 级 DSL；Dao et al., <em>FlashAttention</em>（NeurIPS 2022）——需要改变数值算法的融合；Jia et al., <em>TASO</em>（SOSP 2019）——自动生成并验证图重写规则。相邻课程：C52 模块 03（ONNX 导出与算子不支持的四条出路）、本课模块 01（预处理一致性）、模块 03（INT8 校准）、模块 04（后处理与 C++ 管线）、模块 05（延迟剖析与 p99）、C53 模块 05（为什么论文的 FPS 不可信）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_preprocess/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 预处理一致性：最常见也最隐蔽的鸿沟</div></a>
+    <a class="next" href="../03_int8/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · INT8 校准与精度恢复</div></a>
+  </div>
+
+</div>
+</body>
+</html>

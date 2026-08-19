@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 几何增强与标注同步</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 几何增强与标注同步</h1>
+  <p class="subtitle">四角变换后取外接框 → 旋转 15° 就让框面积膨胀约 30%，这是旋转增强的隐性代价 · min-visibility 阈值对小目标是生死线（8×8 的框裁掉一半就该丢还是该留）· <strong>水平翻转会把「左转」变「右转」、把文字镜像</strong>，TSR 必须按类别白名单 · letterbox 的正逆变换要和推理端逐位对齐，否则框会整体偏移</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00（三判据与标注同步框架）；线性代数（矩阵乘法）；C55（TSR 领域）与 C57（小目标）有帮助</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_geometric_aug.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">YOLOv5 <code>random_perspective</code> / <code>letterbox</code> 源码、Albumentations 的 BboxParams、mmdet 的 <code>gt_bboxes_ignore</code> 语义</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 65 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#taxonomy">几何增强谱系：每种变换对应现实中的什么</a></li>
+      <li><a href="#matrix">统一框架：齐次坐标、仿射矩阵与算子顺序</a></li>
+      <li><a href="#bbox">bbox 如何跟随变换：四角法与它的三重失真</a></li>
+      <li><a href="#inflate">旋转的隐性代价：把框膨胀量化到小数点后</a></li>
+      <li><a href="#oob">越界处理：keep / ignore / drop，以及丢弃阈值对小目标的生死线</a></li>
+      <li><a href="#flip">语义敏感变换的禁区：水平翻转在 TSR 里为什么是错的</a></li>
+      <li><a href="#letterbox">多尺度训练与 letterbox：正变换、逆变换与部署一致性</a></li>
+      <li><a href="#crop">随机裁剪家族：它同时解决和制造问题</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="taxonomy"><span class="num">1</span>几何增强谱系：每种变换对应现实中的什么</h2>
+  <p>几何增强只有一个共同的形式——<strong>把像素从一个坐标搬到另一个坐标</strong>——但它们注入的先验完全不同。选哪些、幅度多大，取决于<em>你的相机在真实世界里会经历什么</em>。所以下面这张表的最后两列（「对应的物理现象」和「TSR 里的正确幅度」）才是决策依据，第一列只是名字。</p>  <table>
+    <thead><tr><th>变换</th><th>自由度</th><th>对应的物理现象</th><th>TSR 里的合理幅度与理由</th></tr></thead>
+    <tbody>
+      <tr><td><strong>平移 translate</strong></td><td>2</td><td>标志在画面里的位置随车道、车速、相机安装偏差变化</td><td><strong>±10% 图宽</strong>。TSR 有强位置先验（标志在画面上部/路侧），平移过大会把先验冲掉</td></tr>
+      <tr><td><strong>缩放 scale</strong></td><td>1（或 2）</td><td><strong>标志的远近</strong>——同一块牌子 20 m 处 50 px、60 m 处 17 px</td><td><strong>0.5–1.5×，这是 TSR 收益最高的几何增强</strong>；因为它精确对应距离变化，物理上无误差</td></tr>
+      <tr><td><strong>旋转 rotate</strong></td><td>1</td><td>车身侧倾（过弯/坑洼）、相机滚转安装误差</td><td><strong>±5°～±10°</strong>。真实滚转角很少超过 5°；再大就违反判据②，且外接框膨胀迅速（本模块第 4 节）</td></tr>
+      <tr><td><strong>错切 shear</strong></td><td>2</td><td>相机与标志平面不平行时的一阶近似</td><td><strong>±2°</strong>。作用与轻微透视重叠，通常可省</td></tr>
+      <tr><td><strong>仿射 affine</strong></td><td>6</td><td>上面四种的组合（保持平行线平行）</td><td>把 translate/scale/rotate/shear 合成<strong>一个矩阵一次采样</strong>——见第 2 节，这不只是省事</td></tr>
+      <tr><td><strong>透视 perspective</strong></td><td>8</td><td><strong>斜视角看标志</strong>：不在正前方的标志、弯道上的标志、侧装相机</td><td><strong>幅度极小（0.0005 量级）</strong>。YOLOv5 默认 <code>perspective=0.0</code> 就是因为它容易失控</td></tr>
+      <tr><td><strong>水平翻转 hflip</strong></td><td>0</td><td>——<strong>现实中不存在</strong>：没有哪台相机会拍出镜像的世界</td><td><strong>TSR 里默认关闭</strong>；要开必须配类别白名单（本模块第 6 节，面试加分点）</td></tr>
+      <tr><td><strong>垂直翻转 vflip</strong></td><td>0</td><td>——现实中更不存在：重力方向是恒定的</td><td><strong>永远关闭</strong>。它连「变换族 𝒯 该不该包含它」这一问都过不了</td></tr>
+      <tr><td><strong>letterbox / resize</strong></td><td>1+2</td><td>不是增强，是<strong>输入尺寸归一化</strong>——但它同样改坐标，同样要写 <code>g_T</code></td><td>必需，且<strong>推理端必须逐像素一致</strong>（本模块第 7 节，直连 C60）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>读这张表要抓一条线：<strong>「这个变换在部署环境里真的会发生吗？」</strong>缩放会（车在动，距离一直在变）；轻微旋转会（车身有侧倾）；水平翻转<em>永远不会</em>——世界上没有镜像的交通标志系统。<em>一旦某个变换的答案是「不会」，它就不是在注入先验，而是在教模型一条假规律</em>，模块 00 的判据②（贴近部署分布）直接判它出局。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精细的一层是<strong>幅度</strong>。同一个变换，小幅度是有效先验、大幅度是假规律，中间有一条模糊的边界。判断这条边界的可操作方法是：<em>去问这个物理量的真实分布</em>。车身滚转角在正常驾驶下的 p99 大约在 3°–5°（过弯、路面倾斜），所以 ±10° 的旋转已经覆盖了长尾，±45° 则纯属虚构。<strong>「把增强幅度对齐到物理量的真实分布」比「照抄一份配置」可靠得多</strong>，而且在面试里能立刻显出你是否真的想过。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个能让你少走很多弯路的观察：<strong>几何增强里真正带来收益的几乎只有「缩放」一项，其余都是锦上添花或负收益</strong>。原因很直接——检测器对平移天然近似不变（卷积的平移等变性 + 全图密集预测），对旋转的需求在车载场景里很小，而翻转在 TSR 里是错的。<em>但缩放不一样：尺度是 CNN 唯一不能自动泛化的维度</em>（这也是 FPN 存在的理由，见 C57 模块 02）。所以「多尺度训练 + 大范围缩放」在 TSR 上的收益，通常抵得过其余所有几何增强之和。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="matrix"><span class="num">2</span>统一框架：齐次坐标、仿射矩阵与算子顺序</h2>
+  <p>把上面这些变换<strong>合成一个 3×3 矩阵一次采样</strong>，不只是代码更短——它解决了三个真实问题。</p>  <div class="math-block">\[\mathbf{M} \;=\; \underbrace{T(c_x, c_y)}_{\text{移回中心}} \cdot \underbrace{T(t_x, t_y)}_{\text{平移}} \cdot \underbrace{R(\theta)}_{\text{旋转}} \cdot \underbrace{S(s)}_{\text{缩放}} \cdot \underbrace{H(\phi)}_{\text{错切}} \cdot \underbrace{T(-c_x, -c_y)}_{\text{移到原点}}\]</div>  <ul>
+    <li><strong>问题一：重采样次数</strong>。分步做「先旋转、再缩放、再平移」意味着<em>三次插值</em>，每次插值都在抹平高频细节。<strong>对 15 像素的交通标志，三次双线性插值足以把限速数字的笔画糊掉</strong>。合成一个矩阵只插值一次。</li>
+    <li><strong>问题二：中心点语义</strong>。「旋转」必须指定绕哪个点转。绕图像左上角 (0,0) 转 10°，画面右下角的目标会被甩出去几百像素；绕图像中心转才是你想要的。<code>T(c) · R · T(-c)</code> 这个三明治结构把「绕某点变换」写清楚了——<em>而这正是自己手写仿射时最常错的地方</em>。</li>
+    <li><strong>问题三：标注同步的正确性</strong>。有了矩阵 <code>M</code>，图像用 <code>M</code> 重采样，框的角点用同一个 <code>M</code> 变换——<strong>两条轨道用的是同一个对象，不可能不一致</strong>。分步实现则要求每一步都同步，任何一步漏了就静默出错（模块 00 演示过：图正常、框偏 5 px、IoU 掉到 0.36）。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>矩阵相乘<strong>不可交换</strong>，所以顺序是语义的一部分而不是实现细节。「先缩放 0.5 再平移 100 px」与「先平移 100 px 再缩放 0.5」差了 50 像素。约定俗成的写法是<em>从右往左读</em>：最右边的矩阵最先作用在点上。上式从右读就是「移到原点 → 错切 → 缩放 → 旋转 → 平移 → 移回中心」，这也是 YOLOv5 <code>random_perspective</code> 的顺序。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>透视（perspective）需要完整的 3×3 而不只是仿射的 2×3：<strong>第三行不再是 <code>[0,0,1]</code></strong>，于是变换后齐次坐标的 <code>w</code> 分量不为 1，必须做<span class="term">透视除法</span>（perspective divide）<code>x' = x_h / w_h</code>。<em>忘记做这个除法是透视增强的头号 bug</em>——幅度小的时候误差也小（因为 <code>w ≈ 1</code>），所以它能在代码库里潜伏很久，直到某天有人把 <code>perspective</code> 从 0.0005 调到 0.005，框开始莫名其妙地偏。<strong>这也是为什么本模块的 notebook 里，角点变换函数无条件做透视除法</strong>：仿射时它是恒等操作，透视时它是必需的。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>还有一个「顺序」是跨算子的：<strong>几何增强必须排在光度增强之前</strong>。理由不是美学而是数值——几何变换要插值，插值会在<em>已经被加过噪声/改过对比度</em>的像素上二次混合，把光度增强的统计特性搞乱（例如你加了 σ=5 的高斯噪声，双线性插值后实际方差变成了 σ²·Σwᵢ² &lt; 25）。<em>反过来先几何后光度，噪声的统计量就是你设定的那个。</em>模块 04 会把整条流水线的顺序规则讲完。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bbox"><span class="num">3</span>bbox 如何跟随变换：四角法与它的三重失真</h2>
+  <p>水平竖直的 bbox 在旋转/错切/透视下<strong>不是封闭的</strong>——变换后它不再是一个轴对齐矩形。而检测器的输出格式要求轴对齐，所以工业界统一采用<span class="term">四角法</span>（four-corner method）：把框的 4 个角点变换过去，再取它们的<strong>轴对齐外接框</strong>。</p>  <div class="math-block">\[\mathbf{b}' \;=\; \Big[\;\min_k x'_k,\;\; \min_k y'_k,\;\; \max_k x'_k,\;\; \max_k y'_k \;\Big], \qquad (x'_k, y'_k) = \pi\big(\mathbf{M}\,[x_k, y_k, 1]^\top\big)\]</div>  <div class="ascii">四角法（four-corner method）：唯一被普遍采用的 bbox 变换方式
+
+  原框（轴对齐）            旋转 30° 后的 4 个角点        取外接框
+  (x1,y1)-------(x2,y1)              o                  +-------------+
+     |             |               /   \                |    o        |
+     |    目标      |     ==&gt;     o      o      ==&gt;      |  /   \      |
+     |             |               \   /                | o      o    |
+  (x1,y2)-------(x2,y2)              o                  |   \  /      |
+                                                        |    o        |
+                                                        +-------------+
+                                                        **面积变大了**
+
+  三重失真（按危害排序）：
+   ① 膨胀   —— 外接框面积 &gt; 原框面积，框里混进大量背景（第 4 节量化）
+   ② 过估计 —— 对**旋转不变的形状**（圆形禁令牌！）四角法给出的框是**错的**，
+                真实紧框根本没变，四角法却把它撑大了 41%（45° 时）
+   ③ 不可逆 —— 变换回去得不到原框（min/max 丢掉了角点的对应关系）；
+                所以「增强 -&gt; 逆增强」不能用来做对拍，必须两边各自独立算</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>失真② 是 TSR 特别要注意的一条，多数教材完全不提。<strong>四角法隐含假设「目标恰好填满它的框」</strong>——对一辆车、一个行人，这个假设大致成立；但<em>中国的禁令标志是圆形、警告标志是三角形</em>，它们只填了框的 78.5% 和 50%。圆形对旋转是<strong>完全不变</strong>的：把图旋转 45°，圆还是那个圆，它的真实紧框尺寸<em>一点没变</em>。而四角法会把框放大到边长 √2 倍——<strong>这是一个纯粹由算法引入的、错误的标注</strong>，与原框的 IoU 只有 0.50。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么工业界仍然接受它？因为<strong>替代方案更贵</strong>：要得到真实紧框，你需要目标的掩码或轮廓（实例分割级标注），而检测数据集通常只有框。少数场景会用<span class="term">有向框</span>（oriented bounding box, OBB，见遥感检测的 DOTA 数据集与 GWD/KLD 损失）彻底绕开这个问题，但代价是检测头、NMS、评测协议全都要换一套。<em>TSR 里通常不值得</em>——因为真实旋转角本来就只有几度，膨胀率在 ±5° 时不到 18%。<strong>「知道这个失真存在、并因此把旋转幅度限制在 ±10° 以内」，就是正确的工程处理。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>失真③ 有一个直接的工程后果，容易踩：<strong>不要试图用「增强后再逆增强」来验证增强的正确性</strong>。<code>min/max</code> 是有损的，逆变换回来的框会比原框大，你会看到一个恒定的「误差」并花半天找不存在的 bug。<em>正确的验证方式是模块 00 建立的那条</em>：用目标的掩码/轮廓点在<strong>变换后的图像上</strong>算出真实紧框，与 <code>apply_boxes</code> 的输出比 IoU。notebook 里会把这套断言用在每一个算子上。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="inflate"><span class="num">4</span>旋转的隐性代价：把框膨胀量化到小数点后</h2>
+  <p>「旋转增强会让框变大」这句话人人都会说，但<strong>大多少</strong>？这个数字必须算出来，因为它直接决定旋转幅度的上限。设原框宽 <code>w</code> 高 <code>h</code>，绕中心旋转 <code>θ</code>，四角外接框的宽高是 <code>w|cosθ| + h|sinθ|</code> 与 <code>w|sinθ| + h|cosθ|</code>，展开相乘可得一个非常干净的闭式：</p>  <div class="math-block">\[\frac{A'}{A} \;=\; 1 \;+\; \frac{1}{2}\,\big|\sin 2\theta\big| \left( \frac{w}{h} + \frac{h}{w} \right)\]</div>  <p>这个式子有三个可以直接拿去用的推论：</p>  <ol>
+    <li><strong>膨胀在 45° 达到最大，而不是 90°</strong>（90° 时框只是宽高互换，面积不变）。所以「旋转角越大越糟」是错的，真正最糟的是 45°。</li>
+    <li><strong>正方形框（<code>w=h</code>）膨胀最小</strong>：此时 <code>w/h + h/w = 2</code>，比值退化为 <code>1 + |sin 2θ|</code>，<em>45° 时正好是 2.00×，即面积膨胀 100%</em>。这就是本课反复引用的那个数字。</li>
+    <li><strong>细长框膨胀得更狠</strong>：一块 3:1 的横向指路牌，<code>w/h + h/w = 3.33</code>，45° 时膨胀到 <strong>2.67×</strong>。<em>所以「旋转对哪些类别伤害最大」是可以按长宽比预测的。</em></li>
+  </ol>  <table>
+    <thead><tr><th>旋转角 θ</th><th>正方形框面积膨胀</th><th>圆形标志在框内的占比</th><th>四角框 vs 真实紧框的 IoU</th><th>判断</th></tr></thead>
+    <tbody>
+      <tr><td>0°</td><td>1.00×</td><td>78.5%</td><td>1.00</td><td>基准（圆内接于方框）</td></tr>
+      <tr><td>±5°</td><td><strong>1.17×</strong></td><td>67.0%</td><td>0.85</td><td>✅ 可接受，覆盖真实车身侧倾的 p99</td></tr>
+      <tr><td>±10°</td><td><strong>1.34×</strong></td><td>58.5%</td><td>0.75</td><td>⚠️ 上限。已有 1/3 的框是凭空多出来的背景</td></tr>
+      <tr><td>±15°</td><td><strong>1.50×</strong></td><td>52.4%</td><td>0.67</td><td>⚠️ 框里前景已不到一半</td></tr>
+      <tr><td>±30°</td><td>1.87×</td><td>42.1%</td><td>0.54</td><td>❌ 真实驾驶中不存在</td></tr>
+      <tr><td>±45°</td><td><strong>2.00×</strong></td><td><strong>39.3%</strong></td><td><strong>0.50</strong></td><td>❌ 面积翻倍；<strong>标注 IoU 只剩 0.5，等于给了一个「半错」的标签</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第三列「圆形标志在框内的占比」是这张表里最该被记住的一列。<strong>0° 时圆内接于方框，前景占 π/4 = 78.5%；旋转 45° 后四角法把框撑到 2 倍面积，前景只剩 39.3%</strong>。这意味着你在<em>反复告诉模型：一个只有 39% 是标志、61% 是天空和树的框，是「正样本」</em>。定位头就是这样被慢慢教松的——它不会突然崩，只会让所有框都稍微大一点，表现为高 IoU 阈值下的 AP（AP75）明显低于 AP50。<strong>「AP50 正常但 AP75 偏低」是定位质量问题的典型指纹</strong>，而增强里的框膨胀是它的常见成因之一。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第四列「四角框 vs 真实紧框的 IoU」则量化了失真②：<em>对圆形/多边形这类接近旋转不变的标志，四角法产生的框本身就是错的</em>。45° 时 IoU 只有 0.50——恰好卡在大多数评测协议的正样本阈值上。<strong>换句话说：如果拿这个自动生成的标注去和「人重新标一遍」比对，一半的框会被判为「不匹配」。</strong>而这些标签会被当作 ground truth 用于训练几十个 epoch。<em>这不是「增强让任务变难了」（那是好事），这是「增强让标签变错了」（那是坏事）——两者必须分清。</em></p></div>
+  </div>  <div class="callout danger"><span class="label">旋转幅度应从框膨胀率反推</span>
+    <p>由此得到一条可以直接写进配置评审清单的规则：<strong>旋转幅度的上限应由「可接受的框膨胀率」反推，而不是拍脑袋</strong>。若你能接受 ≤35% 的膨胀，正方形框对应 <code>|θ| ≤ 10.2°</code>（解 <code>sin2θ = 0.35</code>），3:1 长框对应 <code>|θ| ≤ 6.1°</code>（解 <code>1.665·sin2θ = 0.35</code>）。<em>取两者的较小值作为全局上限</em>，或者更好——<strong>按类别的长宽比分别设上限</strong>。notebook 里会把这个反解写成函数。顺带一提：这也是一个很好的面试回答结构——<em>「我不是选了个 ±10°，我是从可接受的标注退化反推出来的」</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="oob"><span class="num">5</span>越界处理：keep / ignore / drop，以及丢弃阈值对小目标的生死线</h2>
+  <p>平移、缩放、旋转、裁剪都会把目标推到画面外——<strong>可能是完全出去，也可能只出去一半</strong>。后一种情况怎么处理，是整条几何增强流水线里<em>最容易做错、后果最严重</em>的一处决策。</p>  <table>
+    <thead><tr><th>策略</th><th>做什么</th><th>监督信号是什么</th><th>什么时候正确</th><th>做错的后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>keep（保留裁剪后的框）</strong></td><td>把框裁到画面内，仍作为正样本</td><td>「这里有一个目标，框是这么大」</td><td>目标可见比例高（&gt;70%），裁剪后的框仍紧贴可见部分</td><td>可见比例低时，模型被要求从一小片边缘去回归一个完整目标 → 定位噪声</td></tr>
+      <tr><td><strong>ignore（标为忽略区域）</strong></td><td>既不算正样本，<strong>也不算负样本</strong>；分配阶段跳过、损失不回传</td><td>「这里的情况不明，别学」</td><td><strong>可见但不足以给出可靠框的目标——这是默认应该选的</strong></td><td>几乎没有下行风险；唯一代价是少了一点点监督</td></tr>
+      <tr><td><strong>drop（从标注里删掉）</strong></td><td>直接删除这条标注</td><td><strong>「这里没有东西」——因为它成了背景</strong></td><td>目标<strong>完全</strong>不在画面里（可见比例 = 0）</td><td><strong>目标仍然可见却被删 → 明确的假负样本监督，模型被训练成漏检</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>三者的差别一句话就能说清：<strong><code>keep</code> 说「有」，<code>ignore</code> 说「不知道」，<code>drop</code> 说「没有」</strong>。而绝大多数实现的默认行为是 <code>drop</code>——因为它最好写（<code>boxes = boxes[keep_mask]</code> 一行），也因为很多框架的标注格式里<em>根本没有「ignore」这个东西</em>。于是「可见比例 40% 的目标被删掉」就成了默认行为，而图像里那 40% 还清清楚楚地留在那里。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>这在 TSR 里是致命的，因为「目标被画面边缘截断」不是异常情况，而是每一次接近标志的必经阶段</strong>：标志从画面上方进入视野，先露出下半截，再逐渐完整。如果流水线把「露出一半」的样本统统标成背景，模型学到的就是「半截标志 = 无」。<em>症状是首次检出距离系统性偏近、图像上边缘区域召回明显低于中心区域</em>——而这两个指标在标准 mAP 里根本看不见（C55 模块 05 的分桶评测就是为了让它们显形）。<strong>正确做法：可见比例 ∈ (0, τ) 的目标一律标为 ignore，绝不 drop。</strong></p></div>
+  </div>  <h3>丢弃阈值对小目标：一条被算出来的生死线</h3>  <p>除了「可见比例」阈值，几乎所有实现还有一个<strong>绝对尺寸阈值</strong>（YOLOv5 的 <code>wh_thr=2</code>、albumentations 的 <code>min_area</code>、mmdet 的 <code>min_bbox_size</code>）：变换后宽或高小于 N 像素的框直接丢弃。这个参数看起来无害，实际上<strong>它单方面决定了整个系统的最大检出距离</strong>。</p>  <p>用针孔模型算一遍就清楚了。1920 px 宽、60° 水平 FOV 的前视相机，焦距 <code>f = 1920 / (2·tan30°) ≈ 1663 px</code>；一块 0.6 m 的圆形限速牌在距离 <code>Z</code> 处的像素尺寸是 <code>f·S/Z</code>。训练输入 640，缩放比 1/3，于是<strong>网络看到的像素尺寸 ≈ 332.6 / Z</strong>：</p>  <table>
+    <thead><tr><th><code>min_side</code>（丢弃阈值）</th><th>对应的最大检出距离</th><th>高速 120 km/h 下的预留反应时间</th><th>判断</th></tr></thead>
+    <tbody>
+      <tr><td>8 px</td><td><strong>41.6 m</strong></td><td><strong>1.2 秒</strong></td><td>❌ 远处标志在标注阶段就被删光了，模型再强也没用</td></tr>
+      <tr><td>4 px</td><td>83.1 m</td><td>2.5 秒</td><td>⚠️ 勉强；且 4 px 的框标注误差相对量级已达 25%</td></tr>
+      <tr><td>2 px</td><td>166 m</td><td>5.0 秒</td><td>✅ YOLOv5 的默认值，对 TSR 是合理下限</td></tr>
+      <tr><td>1 px</td><td>333 m</td><td>10 秒</td><td>⚠️ 已无实际意义（1 px 目标不可检），只是不再人为设限</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">两条 drop 规则叠加 = 远距离样本被系统性清除</span>
+    <p>把上面两条合起来，就是几何增强里最贵的一个 bug：<strong>「变换后过小 → drop」+「被截断 → drop」，两条规则叠加，把「远处的、刚进入视野的标志」这一整类样本从训练集里系统性地清除了，并且把它们变成了背景监督</strong>。而这一类恰恰是 TSR 最关键的样本——<em>早发现才有时间反应</em>。<strong>症状极具迷惑性</strong>：训练集/验证集的 mAP 都正常（因为验证集不做增强，但它也用同一份「已清洗」的标注做匹配），只有实车路测时才发现「标志总是到了近处才跳出来」。<em>排查入口：把增强前后的目标尺寸直方图画出来对比，看小尺寸桶是不是整段消失了。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="flip"><span class="num">6</span>语义敏感变换的禁区：水平翻转在 TSR 里为什么是错的</h2>
+  <p>这是本模块<strong>最值得在面试里主动提</strong>的一节。它足够具体、足够反直觉、又完全不需要复杂知识——面试官能立刻判断你是「跑过 TSR」还是「跑过 COCO 然后把配置抄过来了」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>水平翻转在通用检测里是<strong>最安全、性价比最高</strong>的增强：镜像一只猫还是猫，镜像一辆车还是车，标签一个字都不用改，几乎零成本地把数据翻倍。所以它出现在<em>每一份</em>默认配置里（<code>fliplr=0.5</code>）。而交通标志是<strong>人为设计的符号系统</strong>——它的全部意义就在于形状、颜色和<em>朝向</em>所承载的约定。<strong>镜像一个「向左转弯」，它在物理世界里就是「向右转弯」；镜像一个限速 60，你得到的是一个人类从未见过、也不该存在的图案。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严重的是<strong>文字与数字</strong>。指路牌上的地名、限速牌上的数字、停车让行牌上的「停 / STOP」，镜像之后全部变成不存在的字形。而这些牌子往往<em>是数据集里占比最大的类别</em>（限速牌在 TT100K 中是绝对的头部类）。于是「翻转 50% 的图」实际效果是：<strong>把一半的头部类样本换成了现实中不存在的假图，同时给方向类标错了标签</strong>。<em>这两件事都属于模块 00 判据①（保标签语义）的硬失败——不是收益小，是学错。</em></p></div>
+  </div>  <h3>三问判定法：给任意标志类别定档</h3>  <div class="ascii">对每个标志类别问三个问题，得到三档之一。这套流程可以直接写成代码。
+
+  Q1  外观是否左右镜像对称？（几何）
+       │
+       ├─ 是 ──&gt; Q2  语义是否含方向性（左/右、顺/逆、单向）？
+       │              ├─ 否 ──────────────────&gt; 【SAFE】   直接翻
+       │              └─ 是 ──────────────────&gt; 走 Q3
+       │
+       └─ 否 ──&gt; Q2' 语义是否含方向性？
+                      ├─ 是 ──────────────────&gt; 走 Q3
+                      └─ 否 ──────────────────&gt; 【FORBID】
+                             （不对称但无方向语义：含文字/数字、人形图案 ——
+                               镜像后是现实中不存在的图案，且没有对应类别）
+
+  Q3  标签集里是否存在它的镜像类别？
+       ├─ 是 ──&gt; 【SWAP】  可以翻，**但必须同时把标签换成镜像类**
+       └─ 否 ──&gt; 【FORBID】（翻了就没有正确标签可给）</div>  <table>
+    <thead><tr><th>档位</th><th>判定条件</th><th>TSR 中的典型类别</th><th>正确处理</th></tr></thead>
+    <tbody>
+      <tr><td><strong>SAFE</strong></td><td>外观左右对称 <strong>且</strong> 语义无方向性</td><td>禁止通行、禁止驶入、禁止鸣笛、注意信号灯、停车检查、圆形无文字禁令牌</td><td>直接翻，标签不变</td></tr>
+      <tr><td><strong>SWAP</strong></td><td>语义含方向 <strong>且</strong> 标签集里有镜像类</td><td>向左转弯↔向右转弯、禁止向左转弯↔禁止向右转弯、左侧通行↔右侧通行、向左急弯↔向右急弯、左侧变窄↔右侧变窄、左侧合流↔右侧合流</td><td>翻转 + <strong>同时把标签换成镜像类</strong></td></tr>
+      <tr><td><strong>FORBID</strong></td><td>其余全部</td><td><strong>所有限速牌（含数字）</strong>、停车让行 STOP、所有指路牌（含地名）、注意行人、注意儿童、注意落石等含不对称图形且无镜像类的警告牌</td><td><strong>绝不翻转</strong>；若必须翻整图，该目标标为 <code>ignore</code></td></tr>
+    </tbody>
+  </table>  <h3>三个大多数人想不到的推论</h3>  <ol>
+    <li><strong>判定是逐目标的，但翻转作用在整张图上——两者是「与」的关系。</strong>一张图里只要有<em>一个</em> FORBID 类目标，整张图就不能翻。TSR 场景里 FORBID 类（限速牌 + 指路牌）本身就占大头——按 TT100K 风格的长尾频率算，<strong>单个目标不可翻的概率就有 61%</strong>；加上一张图常有 2–4 块牌子，<strong>整图可翻转的概率只剩 23%</strong>。notebook 里会把这条链算完：<em>你配置里写的 <code>fliplr=0.5</code>，真正被翻的图只有约 <strong>12%</strong>；而其中真正带来新信息的目标（SWAP 类）只占全部目标的 <strong>2.5%</strong></em>。这个增强基本等于没开，却让你误以为已经做了数据增强。</li>
+    <li><strong>对 SAFE 类，翻转的信息增益接近于零。</strong>这一条尤其反直觉：SAFE 的定义就是「外观左右镜像对称」，那么<em>把这个标志的图块镜像之后，它逐像素等于原图</em>。检测器从这个目标身上学到的东西一点没变，唯一变的是它周围的背景（道路走向、杆件位置）。<strong>所以在 TSR 里，翻转要么不安全（FORBID/SWAP），要么安全但没用（SAFE）</strong>——这就是为什么结论是「默认关掉」。</li>
+    <li><strong>SWAP 档是真正的加分答案。</strong>大多数人答到「左转会变右转所以不能翻」就停了；能接着说出「<em>但如果标签集里同时有左转和右转两个类，就可以翻转并交换标签，这样反而给稀有的那一侧补了样本</em>」，才说明你真的想过怎么用它。<em>「向左急转弯」这类方向牌在数据集里通常是长尾类，而左右两侧的样本数往往严重不均衡——SWAP 式翻转正好把两边拉平，这是一个免费的类别平衡手段。</em></li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>把这一节压缩成一个可以直接在面试里说的段落：<strong>「通用检测里 fliplr=0.5 是白送的，但 TSR 不能直接抄。交通标志是符号系统，镜像会改变语义：向左转弯会变成向右转弯，限速数字和地名会变成不存在的字形。我的做法是按类别分三档——外观对称且无方向语义的可以直接翻；有方向语义且标签集里存在镜像类的，翻转的同时交换标签，这还顺带平衡了左右类的样本数；其余一律禁止翻转，如果整图翻转不可避免，就把这些目标标成 ignore 而不是删掉。另外要注意判定是逐目标的而翻转是整图的，两者是与的关系，所以实际生效率远低于配置里的概率——我们量化过，大概只有百分之几。而且对完全对称的标志，镜像后图块逐像素不变，信息增益本来就接近零。所以我们最后是默认关掉水平翻转的。」</strong> <em>——这段话里有判断、有分类、有量化、有结论，是一个完整的工程答案。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="letterbox"><span class="num">7</span>多尺度训练与 letterbox：正变换、逆变换与部署一致性</h2>
+  <p><span class="term">letterbox</span>（信箱填充）是把任意尺寸的图缩放到网络固定输入尺寸、同时<strong>保持长宽比</strong>的标准做法：按最小比例缩放，剩下的空间用常数值填充。它不是「增强」，但它同样改变坐标，同样需要一个 <code>g_T</code>——<strong>而且是全流水线里唯一一个必须与推理端逐像素一致的算子</strong>。</p>  <div class="ascii">1920 x 1080  --letterbox 640x640--&gt;  640 x 640
+
+    r = min(640/1920, 640/1080) = min(0.3333, 0.5926) = **0.3333**
+    new = (round(1920*r), round(1080*r)) = (640, 360)
+    dw, dh = 640-640, 640-360 = (0, 280)
+    居中填充: left = dw/2 = 0,  top = dh/2 = **140**
+
+    +--------------------------------------------------+  y=0
+    |################ padding (114,114,114) ###########|
+    +--------------------------------------------------+  y=140
+    |                                                  |
+    |              缩放后的图像 640 x 360               |
+    |                                                  |
+    +--------------------------------------------------+  y=500
+    |################ padding ##########################|
+    +--------------------------------------------------+  y=640
+
+    正变换  x' = x*r + left        y' = y*r + top
+    逆变换  x  = (x' - left)/r     y  = (y' - top)/r     &lt;-- **推理端必须做这一步**
+
+    ⚠️ 如果推理端漏了 "- top"：y 误差 = top/r = 140/0.3333 = **420 像素**
+       所有框整体下移 420 px —— 而模型本身完全正确。</div>  <p><strong>逆变换是 letterbox 存在的全部理由</strong>：网络输出的框在 640×640 的 letterbox 坐标系里，而下游（跟踪、融合、地图匹配、VLA 接口）需要原图坐标。这一步写错，模型再准也白搭。C60 模块 04 把「letterbox 逆变换写错」列为<em>「框整体偏移」类问题的头号成因</em>，本节是它的入口。</p>  <table>
+    <thead><tr><th>分歧点</th><th>YOLOv5 <code>letterbox()</code></th><th>torchvision / mmdet <code>Resize+Pad</code></th><th>手写 C++ 版常见做法</th><th>不一致的后果</th></tr></thead>
+    <tbody>
+      <tr><td>缩放比</td><td><code>min(H_t/H, W_t/W)</code>，<code>scaleup=False</code> 时不放大</td><td>同（<code>keep_ratio=True</code>）</td><td>有时误用各轴独立缩放</td><td><strong>长宽比被拉伸，框全错</strong></td></tr>
+      <tr><td>填充位置</td><td><strong>居中</strong>（<code>dw/2, dh/2</code>）</td><td><strong>右下</strong>（图像贴左上角）</td><td>两种都常见</td><td><strong>整体偏移 pad/r 像素（本例 420 px）</strong></td></tr>
+      <tr><td>填充值</td><td><strong>114</strong>（灰）</td><td>0（黑）</td><td>0 或 128</td><td>边缘特征分布不同；影响小但真实存在</td></tr>
+      <tr><td>stride 对齐</td><td><code>auto=True</code> 时 pad 到 32 的倍数 → <strong>输出不是 640×640</strong></td><td>否</td><td>否</td><td><strong>导出 ONNX/TRT 时必须 <code>auto=False</code></strong>，否则 shape 对不上</td></tr>
+      <tr><td>取整</td><td><code>int(round(w*r))</code></td><td>有的实现用 <code>floor</code></td><td>常用 <code>(int)</code> 截断</td><td><strong>亚像素偏移；对 8 px 的小标志 IoU 掉到 0.68</strong>——而且<strong>只在源尺寸不整除时暴露</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后一行值得单独说，因为它是唯一一个「看起来无害」的分歧，<strong>而且它有一个让人后背发凉的性质：在标准 1920×1080 上它根本不出现</strong>。因为 <code>1080 × (640/1920) = 360.0</code> 恰好整除，<code>round</code> 与 <code>floor</code> 给出同一个数。<em>可一旦换成车端真实用的 ROI 裁剪图</em>（TSR 常把天空与引擎盖切掉，例如 1920×800），<code>800 × 0.33333 = 266.67</code>——<code>round</code> 得 267、<code>floor</code> 得 266，于是 <code>top</code> 一个是 186.5、一个是 187.0。<strong>0.5 个 padding 像素 = 原图 1.5 像素</strong>：对一辆 200 px 的车完全无感，对一块 <strong>8 px 的远处限速牌，IoU 从 1.00 掉到 0.68</strong>（notebook 里会算给你看）。<em>而 0.68 恰好落在很多训练分配策略的阈值附近</em>，足以让这个目标时而被分为正样本、时而被分为负样本。<strong>「在开发机上永远复现不了、一上车就出现」——这正是它能长期存活的原因。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以 letterbox 的正确工程做法是<strong>把 <code>(r, left, top)</code> 三元组作为「元数据」跟着图像一路传下去，而不是在推理端重新算一遍</strong>。YOLOv5 的 <code>scale_boxes(img1_shape, boxes, img0_shape, ratio_pad=...)</code> 就提供了这个接口——<em><code>ratio_pad</code> 参数存在的唯一理由，就是让你不要重算</em>。重算的风险在于：Python 端和 C++ 端用的是不同的取整、不同的填充约定、甚至不同的输入尺寸（有没有 stride 对齐）。<strong>「传元数据而不是重算」是消除这类不一致的通用手法</strong>，C60 模块 01 会把同样的思路用在归一化参数与通道顺序上。</p></div>
+  </div>  <h3>多尺度训练：letterbox 的近亲</h3>  <p><span class="term">多尺度训练</span>（multi-scale training）每隔若干个迭代随机换一个输入尺寸（如从 <code>{480, 512, …, 800}</code> 里采样），本质上是「把缩放增强做在 letterbox 的目标尺寸上」。它对 TSR 的价值很高——因为<strong>尺度是 CNN 唯一不能自动泛化的维度</strong>——但有两个工程代价必须知道：</p>  <ul>
+    <li><strong>同一 batch 内尺寸必须一致</strong>，所以是「每 N 个 iteration 换一次」而不是「每张图换一次」。这让尺度的采样粒度变粗，需要更长的训练才能覆盖。</li>
+    <li><strong>推理端只能选一个固定尺寸</strong>（TensorRT 的动态 shape 要配 optimization profile，且多档 profile 会拖慢构建、增加显存）。<em>所以多尺度训练是纯训练期技巧，推理端仍然是单一尺寸</em>——这本身就是一个训练-推理的分布差异，属于模块 00 判据③要显式对齐的东西：<strong>训练时尺度分布的中位数，应该对准推理时那个固定尺寸。</strong></li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <p>一个高频面试追问：<strong>「letterbox 的 padding 会不会影响检测？」</strong> 会，而且有两条路径。① <em>感受野污染</em>：padding 区域是常数，靠近边界的目标其感受野里混入大量恒定值，特征统计与图像中心不同——这是靠近画面边缘的目标召回略低的成因之一。② <em>正样本分配</em>：anchor/网格是按 letterbox 后的尺寸铺的，padding 区域也会铺上网格点，这些点永远是负样本，<strong>稀释了正负样本比</strong>（本例中 padding 占 640×640 的 43.75%，接近一半的网格点是纯背景）。<em>这也是 <code>auto=True</code>（只 pad 到 stride 倍数）存在的理由——它把 padding 压到最小。但代价是输出尺寸不固定，导出时必须关掉。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="crop"><span class="num">8</span>随机裁剪家族：它同时解决和制造问题</h2>
+  <p>随机裁剪是检测里最有力也最危险的几何增强。它有两个方向相反的变体，很多人把它们混为一谈：</p>  <table>
+    <thead><tr><th>算子</th><th>做什么</th><th>对目标像素尺寸的影响</th><th>解决什么</th><th>制造什么问题</th></tr></thead>
+    <tbody>
+      <tr><td><strong>RandomCrop（zoom-in）</strong></td><td>裁一块小区域，再 resize 回训练尺寸</td><td><strong>放大</strong>：裁 480×480 再放到 640，目标 ×1.33</td><td><strong>小目标的最直接解法</strong>——它直接提高了目标的相对尺寸</td><td><strong>破坏上下文与位置先验</strong>；可能把目标切成半个</td></tr>
+      <tr><td><strong>Expand / Zoom-out</strong></td><td>把图贴到一张更大的画布上（其余填均值），再 resize 回来</td><td><strong>缩小</strong>：贴到 2× 画布，目标 ×0.5</td><td><strong>制造更多小目标</strong>，补足小尺寸桶的样本</td><td>画布边界是人造的；缩得太小则目标不可检</td></tr>
+      <tr><td><strong>RandomIoUCrop（SSD 式）</strong></td><td>随机采 patch，<strong>要求与至少一个 GT 的 IoU ≥ 阈值</strong>（阈值从 {0.1,0.3,0.5,0.7,0.9,∅} 随机选）</td><td>放大，但保证至少一个目标「基本完整」</td><td>在 zoom-in 的同时<strong>避免把所有目标都切碎</strong></td><td>阈值低时仍会产生大量半截目标 → 回到越界策略问题</td></tr>
+      <tr><td><strong>Mosaic（模块 03）</strong></td><td>4 图拼接后整体缩放</td><td><strong>缩小</strong>：每图只占 1/4 → 目标 ×0.5</td><td>同时给小目标 + 上下文多样性 + 批内多样性</td><td>拼接图不属于真实分布 → 必须 close-mosaic</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>「RandomCrop 是小目标的最直接解法」这一条值得记住，它的道理很朴素：<strong>小目标难，是因为它在特征图上占的格子少</strong>（stride 32 时一个 8 px 的目标只占 0.25 个格子，见 C57 模块 01）。裁一块小区域再放大回训练尺寸，等价于<em>提高了这个目标的有效分辨率</em>，它在特征图上占的格子数按面积平方增长。<strong>从 1920×1080 直接 letterbox 到 640，一个 60 m 外的标志只有 5.5 px；先裁 480×480 再 resize 到 640，同一个标志有 22 px</strong>——这是 4 倍的线性尺寸差距，几乎决定了它能不能被检出。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但代价同样具体：<strong>随机裁剪会摧毁位置先验</strong>。交通标志在真实图像里几乎从不出现在画面下半部（那是路面），它们集中在上部与路侧——这是一个免费且极强的先验，模型会自动学到它，用来压制广告牌与车身贴纸的误检。<em>如果裁剪窗口在整张图上均匀采样，标志的归一化纵坐标分布会从「集中在 0.15–0.45」被拉平成「近似均匀」</em>，模型就失去了这条线索。<strong>症状是 FP 明显上升，尤其是画面下半部的广告牌与后车贴纸被误检成标志</strong>（C55 模块 03 把这类误检单独列为一个失效模式）。notebook 会把这个分布的展宽量化出来。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>所以 TSR 里裁剪的正确用法不是「关掉」也不是「随便开」，而是<strong>加约束的裁剪</strong>：① <em>限制裁剪窗口的纵向范围</em>（只在图像上部 60% 采样中心），保住位置先验；② <em>用 RandomIoUCrop 而不是纯随机裁剪</em>，保证每次至少有一个目标基本完整；③ <em>被切断的目标一律 <code>ignore</code> 而不是 <code>drop</code></em>（第 5 节）；④ <em>裁剪与 zoom-out 成对使用</em>，让尺度分布同时向两端展开而不是单向偏移。<strong>这四条合起来，就是「既拿到小目标的收益，又不牺牲位置先验」的配方</strong>——而它们全都是从「这个变换在部署环境里对应什么」推出来的，没有一条是靠调参试出来的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>几何增强看上去是一个「已经做完了」的题目——仿射矩阵是 19 世纪的数学，四角法是十几行代码。但把它放到检测、放到量产系统里，仍有几处真正开放的问题。</p>  <ul>
+    <li><strong>轴对齐框本身就是问题的根源</strong>。四角法的三重失真（膨胀、过估计、不可逆）全部来自「输出必须是轴对齐矩形」这个约束。<span class="term">有向框</span>（OBB）在遥感检测里已经成熟——<em>RoI Transformer</em>（Ding et al., CVPR 2019）、<em>Gaussian Wasserstein Distance loss</em>（Yang et al., ICML 2021，把框建模成 2D 高斯从而绕开角度的周期性问题）——但它们在车载 TSR 上几乎没有采用。<strong>开放问题：在旋转幅度本来就小（±5°）的场景里，OBB 的收益能否覆盖「检测头 + NMS + 评测协议全换一套」的成本？</strong>目前的经验答案是「不能」，但缺少系统的量化。</li>
+    <li><strong>增强正确性的自动验证仍是空白</strong>。本模块反复强调「用掩码算真实紧框做断言」，但真实数据集只有框、没有掩码，这条断言在生产环境里跑不起来。<em>能否用一个预训练的分割模型（SAM 之类）自动生成掩码，从而把「增强流水线的几何一致性」变成 CI 里的一条自动检查</em>？这是一个工程价值极高、但还没有标准方案的方向——目前所有团队都靠「画出来看一眼」。</li>
+    <li><strong>语义敏感变换的自动发现</strong>。翻转白名单目前完全靠人工维护，而标志类别有成百上千种、还在随法规更新。<em>能否从数据里自动学出镜像对</em>——例如统计「把某类样本镜像后，模型把它判成哪一类」，若稳定地判成另一个已知类，就自动建立 SWAP 关系；若判成一个低置信度的混合分布，就判为 FORBID。<strong>这个思路有明显的鸡生蛋问题（需要一个已经训好的模型），但对「白名单维护」这个长期负担是唯一有希望的自动化路径。</strong></li>
+    <li><strong>可微增强与增强参数的联合优化</strong>。<em>Spatial Transformer Networks</em>（Jaderberg et al., NeurIPS 2015）证明了几何变换可以放进网络里端到端学；<em>Faster AutoAugment</em>、<em>DADA</em> 等把增强策略的搜索变成可微优化。但检测场景下有一个特殊障碍：<strong>标签变换 <code>g_T</code>（四角法 + min/max + 丢弃规则）本身是不可微的</strong>——<code>min/max</code> 有次梯度尚可，「丢弃阈值」则是硬阈值。<em>如何让「增强强度」这个超参可微，是把 AutoAugment 类方法推广到检测的核心障碍之一。</em></li>
+    <li><strong>物理正确的透视增强</strong>。目前的透视增强是在图像平面上随机采一个单应矩阵，与真实的相机-标志几何毫无关系。<em>如果已知相机内参与标志的大致法向，就可以生成物理上正确的视角变化</em>（标志平面绕竖直轴旋转 30° 时图像应该怎么变）。这在自动驾驶里是完全可行的——内参是已知的、标志几乎都是竖直平面——但几乎没有开源实现。<strong>「用已知的物理约束替代随机采样」是增强设计里一个被系统性低估的方向。</strong></li>
+    <li><strong>训练-部署几何一致性的形式化验证</strong>。letterbox 的正逆变换、取整规则、填充约定，目前靠人工对拍（C60 模块 01/04）。<em>能否把这些几何变换写成一份可执行的规范（spec），让 Python 训练端和 C++ 推理端各自实现后自动做属性检查</em>（例如「对任意输入尺寸，forward 后 inverse 的往返误差 &lt; 0.5 px」）？<strong>这类「基于属性的测试」在编译器与数值库里很常见，在感知流水线里却几乎没人做</strong>——而这恰恰是最容易出现静默不一致的地方。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：<em>YOLOv5 / YOLOv8 的 <code>random_perspective()</code> 与 <code>letterbox()</code> 源码</em>（ultralytics 仓库 <code>utils/augmentations.py</code>——工业界事实标准的几何增强实现，四角法、<code>wh_thr</code>/<code>ar_thr</code>/<code>area_thr</code> 三重过滤、<code>scale_boxes</code> 的 <code>ratio_pad</code> 接口全在里面）★；<em>Albumentations: Fast and Flexible Image Augmentations</em>（Buslaev et al., Information 2020，<code>BboxParams</code> 的 <code>min_area</code>/<code>min_visibility</code> 语义是本模块第 5 节的直接对应）★；<em>SSD: Single Shot MultiBox Detector</em>（Liu et al., ECCV 2016，附录里的 RandomIoUCrop 与 Expand 是「裁剪家族」的出处）★；<em>Learning Data Augmentation Strategies for Object Detection</em>（Zoph et al., ECCV 2020，含 bbox 级几何算子的搜索空间设计）；<em>Spatial Transformer Networks</em>（Jaderberg et al., NeurIPS 2015，可微几何变换的起点）；<em>Learning RoI Transformer for Oriented Object Detection in Aerial Images</em>（Ding et al., CVPR 2019）与 <em>Rethinking Rotated Object Detection with Gaussian Wasserstein Distance Loss</em>（Yang et al., ICML 2021，有向框绕开四角法失真的两条主线）；<em>Traffic-Sign Detection and Classification in the Wild</em>（Zhu et al., CVPR 2016，TT100K——本模块尺寸分布与长尾频率的依据）★。相邻课程：C55 模块 03（失效模式：边缘截断与广告牌误检）、C57 模块 01/05（小目标的 IoU 敏感性与像素尺寸物理推导）、C60 模块 01/04（预处理一致性与 letterbox 逆变换对拍）、C56 模块 03（Mosaic 的框裁剪与丢弃规则）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_photometric/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 光度增强与域鲁棒性</div></a>
+  </div>
+
+</div>
+</body>
+</html>

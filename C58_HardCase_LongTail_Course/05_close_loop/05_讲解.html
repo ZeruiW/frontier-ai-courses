@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 闭环验证：证明数据真的有用</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 闭环验证：证明数据真的有用</h1>
+  <p class="subtitle">加完数据必须回答三个问题：<strong>目标场景涨了吗 / 其他场景掉了吗 / 涨的部分是数据的功劳还是种子噪声</strong> · 检测任务同配置换种子的 mAP 波动典型 ±0.2–0.5，所以「+0.3」<em>什么都证明不了</em>——这是面试里能立刻显出水平的一句话 · 分场景切片评测 + 回归门禁：旧场景不掉点是硬门槛，容差必须按<em>实测种子方差</em>设而不是拍脑袋 · 20 个切片同时比较时，即使方法完全无效，在 α = 0.05 下也有 <strong>64%</strong> 的概率至少出现一个「显著」——必须做 BH/FDR 校正 · 新数据配比过高会挤压旧分布，灾难性遗忘在数据闭环里的表现形式是「上一版修好的 bug 又回来了」 · <strong>边际收益曲线 AP(n) ≈ a − b·n^(−c)</strong>：拟合出来就能回答「还值不值得再标 5000 张」——这是数据决策唯一的量化工具 · 挖掘集与评测集的<em>泄漏</em>是这条链上最隐蔽的作弊：同一路口的相邻帧分到两边，指标会假涨 · 闭环真正的度量不是 mAP，是<strong>周期时间</strong>：从发现问题到修复上线要几天</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–04（不平衡 / 难例挖掘 / 触发 / 挖掘基础设施）；C55 模块 05（安全导向评测）与 C61 模块 01（实验设计）强相关</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_closed_loop_validation.ipynb</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Benjamini–Hochberg FDR、bootstrap 置信区间、continual learning 的遗忘度量、A/B 测试与序贯分析</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 60 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#three_q">加了数据之后，必须回答的三个问题</a></li>
+      <li><a href="#slices">分场景切片评测：平均值是用来骗人的</a></li>
+      <li><a href="#significance">涨了多少才不是噪声：配对检验与多重比较</a></li>
+      <li><a href="#gate">回归门禁：旧场景不掉点是硬门槛</a></li>
+      <li><a href="#forgetting">灾难性遗忘与新旧数据配比</a></li>
+      <li><a href="#marginal">边际收益曲线：还值不值得继续标</a></li>
+      <li><a href="#shadow">影子评测与 A/B：离线指标之外的最后一道关</a></li>
+      <li><a href="#pipeline">把闭环做成流水线：产物、门禁与周期时间</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="three_q"><span class="num">1</span>加了数据之后，必须回答的三个问题</h2>
+  <p>模块 04 结束时，1200 张隧道口施工牌已经标完入库了。现在有人把它加进训练集，重训，跑了一遍评测，说「<strong>mAP 从 0.612 涨到 0.618，有效</strong>」。<em>这句话里至少有三处站不住脚</em>。本模块就是把这三处补上——这也是数据闭环里唯一真正难的一环：<strong>挖数据和标数据都有明确的产出物，只有「证明它有用」没有</strong>。</p>  <table>
+    <thead><tr><th>必须回答的问题</th><th>不回答的后果</th><th>本模块对应的工具</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 目标场景涨了吗？</strong></td><td>整体 mAP 涨了 0.6 点，可能全部来自晴天城区；<em>你花钱修的隧道场景纹丝不动</em></td><td>分场景切片评测（第 2 节）</td></tr>
+      <tr><td><strong>② 其他场景掉了吗？</strong></td><td>隧道 +4.1，夜间城区 −2.3。整体看是涨的，<strong>但你刚刚让一个更常见的场景变差了</strong></td><td>回归门禁 + 数据配比（第 4、5 节）</td></tr>
+      <tr><td><strong>③ 涨的部分是数据的功劳，还是噪声？</strong></td><td>换个随机种子重训，+0.6 变成 −0.2。<em>你把一次抽样波动写进了周报</em></td><td>显著性与多重比较（第 3 节）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这三个问题有一个共同的形状：<strong>它们都在追问「这个数字还能不能再被解释成别的东西」</strong>。① 追问平均值掩盖了什么；② 追问收益的另一面代价是什么；③ 追问随机性能不能单独解释它。<em>能把这三问自动化成一套流程，数据闭环才算真正闭上；否则每一轮迭代都是在赌博。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说，这是一个<strong>因果归因问题</strong>：我们想知道「加这批数据」这个干预（treatment）对「目标场景 AP」这个结果的因果效应。理想实验是同一模型、同一超参、同一评测集，只改训练数据这一个变量，重复多次取分布。<em>而实践中几乎所有的「数据有效性结论」都是在单次训练、单个种子、单个整体指标上下的</em>——<strong>这就是为什么「加了数据没效果」在工业界如此普遍：不是数据没用，是验证方法压根没有能力检出效果，或者反过来，把噪声当成了效果。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label">泄漏产生的提升，稳定到没人会怀疑</span>
+    <p>一个真实且极其常见的翻车路径：<strong>目标场景的数据既进了训练集，又（因为是同一批回传、同一段路）进了评测集</strong>。于是目标场景 AP 从 0.34 涨到 0.71，看起来是本季度最大的胜利，实际是数据泄漏。</p><p><em>模块 04 已经给过防线：划分必须按 clip / 路段 / 日期，而不是按帧。</em>但闭环里还有第二道必须做的检查：<strong>新加入的训练 batch 与评测集做一次 ID 与近重复的交集检查，非空就直接拒绝这次实验</strong>——不是警告，是拒绝。<em>因为泄漏产生的指标提升足够大、足够稳定，稳定到没人会怀疑它。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="slices"><span class="num">2</span>分场景切片评测：平均值是用来骗人的</h2>
+  <p>整体 mAP 是一个<strong>按样本数加权的平均</strong>。而车队数据的分布是极度长尾的——晴天白天城区可能占了评测集的 40%，雾天隧道占 1.5%。<strong>于是「雾天隧道 AP 掉 8 个点」在整体 mAP 上只体现为 −0.12，被任何一个其他场景的小幅波动淹没</strong>。这不是统计学的缺陷，是加权平均的定义。</p>  <div class="ascii">同一次实验，两种读法
+
+  整体 mAP:  0.612 -&gt; 0.618   (+0.6 点)   "有效，合入"
+  ─────────────────────────────────────────────────────────────
+  按场景切片看：
+    切片                 n_eval   base    new    Δ        判定
+    day_clear_urban       2400    .861   .869   +0.8      涨（但这不是我们花钱的地方）
+    night_urban            720    .774   .751   -2.3  ◄── **回归！而且是常见场景**
+    rain_highway           310    .706   .712   +0.6      涨
+    fog_tunnel              95    .341   .682  +34.1  ◄── 目标场景，确实修好了
+    snow_any                48    .559   .554   -0.5      噪声范围内
+  ─────────────────────────────────────────────────────────────
+  加权平均 = (2400*.869 + 720*.751 + ...) / 3573 = 0.618
+             ↑ fog_tunnel 的 +34 点，被 95/3573 = 2.7% 的权重压成了 +0.9 点的贡献
+             ↑ night_urban 的 -2.3 点，被 20% 的权重放大成 -0.46 点
+
+  结论：整体 +0.6 点里，**目标场景的贡献和一个未被发现的回归，恰好互相抵消了一部分**</div>  <h3>切片该怎么设计</h3>  <p>切片不是随便切的。一个能用的切片体系要同时满足三条：</p>  <ol>
+    <li><strong>切片来自失效模式，而不是来自数据字段</strong>。有 <code>weather</code> 字段就按天气切，是把工具当目的。<em>正确的顺序是：先列出模块 03 的失效模式清单（远距离小目标、隧道逆光、广告牌误检……），每一个对应一个切片</em>。<strong>切片是失效模式的可度量化身。</strong></li>
+    <li><strong>每个切片有足够的样本量</strong>。切片太细会让每个切片只有二三十张图，此时 AP 的抽样噪声大到任何结论都不可信。经验下界：<em>目标类别的实例数 ≥ 200，或图片数 ≥ 100</em>；不够就先合并，或者专门去补评测数据。</li>
+    <li><strong>切片要正交且可组合</strong>，并且<strong>必须包含一个「整体/常见场景」切片作为回归哨兵</strong>。只盯着目标切片是本模块要反复强调的错误。</li>
+  </ol>  <table>
+    <thead><tr><th>切片维度</th><th>TSR 上的典型取值</th><th>为什么这一维必须切</th></tr></thead>
+    <tbody>
+      <tr><td><strong>像素尺寸 / 距离</strong></td><td>&lt;16px / 16–32px / 32–64px / &gt;64px</td><td><strong>TSR 的核心难点</strong>；不切开就看不见小目标的改进（C57 全课都在讲这个）</td></tr>
+      <tr><td>光照 / 天气</td><td>day / night / dusk / tunnel × clear / rain / fog</td><td>退化类型完全不同，模型对它们的鲁棒性也完全不同</td></tr>
+      <tr><td>遮挡度</td><td>none / partial / heavy</td><td>遮挡样本的 AP 通常比无遮挡低 20+ 点，混在一起看不出改进</td></tr>
+      <tr><td><strong>标志类别</strong></td><td>按 GB 5768 大类，稀有类单列</td><td>长尾类的 AP 波动极大，且<strong>安全权重差异巨大</strong></td></tr>
+      <tr><td><strong>安全关键子集</strong></td><td>stop / yield / 限速下调 / 施工</td><td><em>这一组必须单独设门禁</em>——漏检代价与其他类不是一个量级</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>切片评测最直接的价值是把「模型变好了吗」变成一个有结构的答案</strong>：它在哪里变好了、哪里变差了、代价换在了哪。<em>面试里被问「你怎么验证你的改动有效」，如果回答只有「mAP 涨了 0.8」，基本就到此为止了；如果回答是「整体 +0.8，其中目标切片 +34、夜间城区 −2.3，我们发现后者是数据配比导致的，调整后 −0.4 落在容差内」，这是完全不同的层次。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要警惕切片评测的<strong>反向失效</strong>：切片一多，「至少有一个切片显著变差」就成了必然事件——这是第 3 节要处理的多重比较问题。<em>更隐蔽的是切片本身的漂移</em>：如果切片的标签由 VLM 打（模块 04），而 VLM 换了版本，那么「fog 切片的 AP 变化」里就混进了「哪些图算 fog」的变化。<strong>评测集的切片标签必须冻结、版本化、且尽量人工核过</strong>——评测集是尺子，尺子不能跟着被测物一起变。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>还有一个必须做但常被忘的切片：<strong>「新加入数据所属的场景」与「新数据<em>没有</em>覆盖的场景」要分开报</strong>。前者是你期望涨的，后者是回归风险最高的地方。<em>把它们混在一张大表里，人眼会自动只看涨的那几行</em>——所以报告模板要把「预期收益切片」和「回归哨兵切片」物理分成两块，并且回归块放在前面。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="significance"><span class="num">3</span>涨了多少才不是噪声：配对检验与多重比较</h2>
+  <p>检测任务在<strong>同一配置、只换随机种子</strong>时，mAP 的波动典型在 ±0.2–0.5 个点。<strong>这意味着「+0.3 的提升」本身没有任何信息量</strong>——它落在噪声带里。这是面试里最能立刻显出水平的一个点，也是模块 05 与 C61 模块 01 共享的核心方法论。</p>  <h3>三个层次的随机性，来源不同、对策不同</h3>  <table>
+    <thead><tr><th>随机性来源</th><th>怎么表现</th><th>怎么处理</th></tr></thead>
+    <tbody>
+      <tr><td><strong>评测集抽样噪声</strong></td><td>换一批评测图，AP 就变</td><td><strong>bootstrap 置信区间</strong>（对图像重采样）</td></tr>
+      <tr><td><strong>训练随机性（种子）</strong></td><td>同配置重训，AP 变 ±0.2–0.5</td><td><strong>多种子重复</strong>（3–5 个），报均值 ± 标准差</td></tr>
+      <tr><td><strong>多重比较</strong></td><td>切片一多，总有几个「显著」</td><td><strong>Bonferroni / BH-FDR 校正</strong></td></tr>
+    </tbody>
+  </table>  <p>最容易被跳过的是第二行。<em>但它的代价最大</em>：评测集噪声可以靠 bootstrap 量化（不用重训，几乎免费），种子噪声却必须真的重训 3–5 次。<strong>于是绝大多数团队的做法是「单种子 + 单次评测」，然后把 ±0.4 的随机波动当成结论——这是行业里最普遍的方法论债务。</strong></p>  <h3>配对（paired）比较：免费拿回大量统计功效</h3>  <p>baseline 和新模型是在<strong>同一批图</strong>上评测的，所以两者的误差高度相关：一张本来就很难的图，两个模型都会做得差。<strong>对每张图算差值 <code>d_i = s_new,i − s_base,i</code>，再对 <code>d</code> 做统计，而不是分别对两组分数做统计</strong>——图像固有难度这一大块方差被直接抵消掉了。</p>  <div class="math-block">\[\bar{d} = \frac{1}{n}\sum_i d_i, \quad \mathrm{SE} = \frac{s_d}{\sqrt{n}}, \quad z = \frac{\bar{d}}{\mathrm{SE}}, \quad p = 2\left(1 - \Phi(|z|)\right)\]</div>  <p>配对能把所需样本量降低一个数量级。notebook 里会实测：同一组数据上，<strong>非配对检验说「不显著」，配对检验说「p &lt; 0.001」——而后者才是对的</strong>，因为前者把「有些图天生就难」也算进了噪声。</p>  <h3>多重比较：切片一多，假阳性是必然的</h3>  <p>假设你有 20 个切片，且新模型其实<strong>完全没有变化</strong>。在 α = 0.05 下，每个切片有 5% 的概率被误判为「显著变化」，那么<strong>至少出现一个假阳性的概率是 1 − 0.95²⁰ ≈ 64%</strong>。也就是说：<em>只要你切片够多，每次实验都能「发现」一个回归或一个提升，而它们都是假的</em>。</p>  <div class="math-block">\[\text{FWER} = 1 - (1-\alpha)^m \xrightarrow{\ m=20,\ \alpha=0.05\ } 0.64, \qquad \text{Bonferroni: } \alpha' = \frac{\alpha}{m}\]</div>  <table>
+    <thead><tr><th>校正方法</th><th>控制什么</th><th>怎么算</th><th>什么时候用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>不校正</strong></td><td>什么也不控制</td><td>—</td><td><em>只有一个预先声明的主指标时</em></td></tr>
+      <tr><td><strong>Bonferroni</strong></td><td>FWER（一个假阳性都不要）</td><td>阈值除以 m</td><td><strong>回归门禁</strong>——宁可漏报也别乱报警</td></tr>
+      <tr><td><strong>Benjamini–Hochberg</strong></td><td>FDR（假阳性占比 ≤ q）</td><td>按 p 排序，找最大的 k 使 p₍k₎ ≤ k·q/m</td><td><strong>探索性分析</strong>——找「哪些切片值得深挖」</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>选哪个取决于<strong>你更怕哪种错</strong>。回归门禁怕的是「误报」——每次误报都会浪费一个工程师半天去查一个不存在的回归，久了就没人看门禁了，那才是真正的灾难。<em>所以门禁用 Bonferroni（保守）</em>。而在探索阶段，你想知道「哪几个切片可能有问题、值得看看」，漏掉真问题比多查两个更亏，<strong>所以探索用 BH-FDR（宽松但可控）</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个更本质的做法可以避开整个多重比较问题：<strong>预注册（pre-registration）</strong>——在跑实验<em>之前</em>就声明「这次实验的主指标是 fog_tunnel 切片的 AP，回归哨兵是 day_clear_urban 和 night_urban 两个切片」。<em>预先声明的少数几个指标不需要重校正，事后翻遍 20 个切片找亮点才需要</em>。<strong>「先声明再看数」这个纪律，比任何统计校正都有效</strong>——它把 p-hacking 从源头上堵住了。这条在 C61 模块 01 里会展开。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句能直接用的话：<strong>「我们要求提升必须同时满足三条：① 效应量超过预设容差；② 配对检验在多重比较校正后仍显著；③ 在 3 个种子上方向一致」</strong>。这三条互相独立地排除了三类假象（太小、随机、种子运气）。<em>面试里说出这句，比说任何一个具体的统计量都有说服力。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="gate"><span class="num">4</span>回归门禁：旧场景不掉点是硬门槛</h2>
+  <p>闭环的最后一道闸门是<span class="term">regression gate</span>（回归门禁）：<strong>一个自动运行、输出 PASS/FAIL、且 FAIL 就不允许发布的判定器</strong>。它存在的意义不是「监控」，而是<strong>把「不掉点」这件事从人的自觉变成流程的强制</strong>——因为每一轮迭代都有交付压力，而「先合进去、回归下轮再修」在感知系统上是不可接受的。</p>  <div class="ascii">回归门禁的判定逻辑（每个切片独立跑，全部通过才 PASS）
+
+  对每个切片 s:
+    Δ_s = AP_new(s) - AP_base(s)
+    p_s = paired_test(per_image_scores)         ← 配对检验，不是两组独立比
+    ┌──────────────────────────────────────────────────────────────┐
+    │  Δ_s &gt;= -tol_s                     -&gt; PASS  (在容差内)         │
+    │  Δ_s &lt;  -tol_s  且  p_s &gt; α'       -&gt; WARN  (掉了但不显著)      │
+    │  Δ_s &lt;  -tol_s  且  p_s &lt;= α'      -&gt; **FAIL**                │
+    └──────────────────────────────────────────────────────────────┘
+      α' = α / m   (Bonferroni, m = 切片数)   ← 不校正会天天误报
+
+  容差 tol_s 的分层设置：
+    安全关键切片 (stop / yield / 施工 / 限速下调)  tol = 0.000   ← **零容忍**
+    常见场景切片 (day_clear_urban, night_urban)   tol = 0.005
+    长尾/小样本切片 (snow, n&lt;100)                 tol = 0.015   ← 噪声本来就大
+    目标切片 (本轮要修的)                          不设下限，但要求 Δ &gt; +预期收益
+
+  额外的**全局**门禁（不分切片）：
+    · FP/km 不得上升超过 5%          ← 工程指标，比 precision 更贴近体验
+    · p99 端到端延迟不得上升          ← 模型换了可能变慢
+    · 安全关键类的召回不得下降        ← 与 mAP 无关的独立约束</div>  <table>
+    <thead><tr><th>门禁设计的选择</th><th>宽松的后果</th><th>严格的后果</th><th>实践取法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>容差 tol</strong></td><td>真回归被放过去</td><td>噪声天天触发 FAIL，门禁被绕过</td><td><strong>按切片样本量与安全等级分层</strong>（见上图）</td></tr>
+      <tr><td><strong>显著性 α</strong></td><td>误报多</td><td>真回归漏报</td><td>门禁用 Bonferroni 校正后的 α；探索用 BH</td></tr>
+      <tr><td><strong>种子数</strong></td><td>结论不稳</td><td>算力翻几倍</td><td>关键发布 3 种子；日常迭代 1 种子 + 更大容差</td></tr>
+      <tr><td><strong>WARN 怎么处理</strong></td><td>WARN 变成没人看的噪音</td><td>WARN 等同 FAIL，迭代停滞</td><td><strong>WARN 允许发布但强制建单跟踪</strong>，连续两轮 WARN 升级为 FAIL</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>门禁最大的敌人不是统计学，是<strong>人</strong>。一个天天误报的门禁，三周内就会演化出「加 <code>--skip-gate</code> 参数」的文化，然后它就等于不存在了。<em>所以门禁的第一设计目标是「误报率足够低，低到 FAIL 出现时所有人都相信它是真的」</em>——这比「不漏报」更重要。<strong>宁可容差设宽一点、只守住真正要命的几个切片，也不要建一个覆盖 50 个切片但天天红的门禁。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第二个要提前想清楚的是<strong>门禁的可解释输出</strong>。FAIL 之后，工程师需要在几分钟内知道「哪个切片、掉了多少、置信区间多宽、有多少张图变差了、变差的是哪几张」。<em>一个只输出 FAIL 的门禁，会把定位成本推给下游，最终还是没人用</em>。所以门禁的产物应该是一份结构化报告：<strong>切片表 + 置信区间 + 变差样本的 top-20 列表 + 与上一版的 diff</strong>。<em>这份报告本身就是模块 04 里下一轮挖掘的输入</em>——闭环在这里真正闭上了。</p></div>
+  </div>  <div class="callout danger"><span class="label">门禁的尺子不能跟着被测物一起变</span>
+    <p><strong>门禁必须跑在一个「不参与本轮挖掘」的评测集上。</strong>如果评测集也在按「当前模型最弱的场景」持续补充（模块 04 的缺口矩阵驱动），那么评测集会和训练集一起漂移，门禁就在<em>自己给自己出题</em>。</p><p>规范做法：维护<strong>两套评测集</strong>——① <strong>固定基准集</strong>（按部署真实分布随机采样，冻结，只在版本升级时整体替换，是回归门禁的唯一依据）；② <strong>失效模式集</strong>（每个失效模式一个小集合，随挖掘持续扩充，用来看目标场景有没有修好）。<em>把这两套混用，是数据闭环最常见的系统性错误。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="forgetting"><span class="num">5</span>灾难性遗忘与新旧数据配比</h2>
+  <p>上一节的门禁会 FAIL，最常见的原因不是新数据有问题，而是<strong>新数据太多了</strong>。加进 1200 张隧道场景，如果训练时对它们做了 10× 的重采样（因为「稀有类要加权」），那这一个场景就占了每个 batch 的相当比例，模型会以牺牲其他场景为代价去拟合它。</p>  <h3>两种不同的机制，别混为一谈</h3>  <table>
+    <thead><tr><th>机制</th><th>发生条件</th><th>表现</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>数据饥饿（starvation）</strong></td><td>总训练量固定，新数据挤占了旧数据的采样份额</td><td>旧场景 AP <em>缓慢</em>下降，且与被挤占的比例成正比</td><td><strong>加总训练量</strong>，或按饱和度分配采样权重</td></tr>
+      <tr><td><strong>灾难性遗忘（catastrophic forgetting）</strong></td><td>顺序训练 / 微调，只用新数据更新权重</td><td>旧场景 AP <em>断崖式</em>下降（可以掉 10+ 点）</td><td><strong>混合重放（rehearsal）</strong>：新旧数据混在同一个 batch 里</td></tr>
+      <tr><td><strong>特征竞争</strong></td><td>新旧场景的最优特征互相冲突（如低光增强 vs 正常光）</td><td>两边都不到位，容量不足的小模型尤其明显</td><td>扩容 / 分支 / 场景条件化</td></tr>
+    </tbody>
+  </table>  <p><strong>最关键的一条实践结论：不要「拿新数据微调」，要「把新数据混进全量重训」。</strong> 前者省算力但会触发真正的灾难性遗忘（旧场景断崖下跌）；后者贵，但旧场景只会因为采样份额被稀释而<em>缓慢</em>下降，而且这个下降是可以用配比精确控制的。<em>在量产感知系统里，全量重训几乎总是默认选项——除非算力实在不允许，此时也必须做重放（rehearsal），即把旧数据的一个代表性子集混进微调。</em></p>  <h3>配比的最优点是内点，不是端点</h3>  <p>把新场景数据的比例记为 <code>p</code>（占每个 batch 的比例）。<strong>新场景 AP 随 <code>p</code> 单调上升但很快饱和；旧场景 AP 随 <code>p</code> 单调下降且加速下降</strong>。于是「在旧场景不掉超过 tol 的前提下最大化新场景 AP」这个约束优化问题，答案<strong>几乎总是一个内点</strong>——典型落在 10%–30%。</p>  <div class="math-block">\[p^{\star} = \arg\max_{p\in[0,1]} \ \mathrm{AP}_{\text{new}}(p) \quad \text{s.t.} \quad \mathrm{AP}_{\text{old}}(p) \ \ge\ \mathrm{AP}_{\text{old}}(0) - \text{tol}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么「几乎总是内点」值得单独强调？因为两个端点都对应着一种常见的错误直觉：<strong><code>p</code> 很小（比如按自然分布，隧道场景占 1.5%）= 「加了数据但没效果」的头号原因</strong>；<strong><code>p</code> = 1（只用新数据微调）= 灾难性遗忘</strong>。<em>而中间那一段有一个明确的最优点，它由「新场景的饱和速度」和「旧场景的容差」共同决定，是可以算出来的，不需要猜。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>工程上实现配比有三种粒度，效果和代价递增：① <strong>重复采样（oversampling）</strong>——把新数据在采样列表里重复 k 次，最简单，但会加剧对这几百张图的过拟合；② <strong>加权采样器（weighted sampler）</strong>——按场景标签给采样概率，等价于连续可调的 <code>p</code>，<em>是推荐做法</em>；③ <strong>损失加权</strong>——不改采样，改 loss 权重，梯度效果类似但对 BN 统计量的影响不同（<em>BN 看到的仍是原分布</em>，这个细微差别在小模型上有时会显现）。<strong>面试里能说清「重采样和损失加权不完全等价，差别在 BN 与数据增强的暴露次数」，是一个不错的加分点。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>别忘了<strong>评测集的配比不能跟着训练集动</strong>。有人在调 <code>p</code> 的同时，也把评测集里目标场景的比例调高了「以便看得更清楚」——于是整体 mAP 的含义变了，与历史版本不可比。<em>训练分布可以随便调，评测分布必须冻结</em>。要「看得更清楚」就去看切片 AP，而不是改评测集的构成。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="marginal"><span class="num">6</span>边际收益曲线：还值不值得继续标</h2>
+  <p>这是本模块、也可以说是整门课最有实用价值的一个工具。问题非常具体：<strong>隧道场景已经标了 1200 张，AP 从 0.34 涨到 0.68。要不要再标 2000 张？</strong>「再标标看」不是答案，「标到 AP 0.85 为止」也不是答案——<em>因为你并不知道 0.85 是否可达</em>。</p>  <h3>把 AP 对数据量的关系拟合成一条饱和曲线</h3>  <p>在同一场景内，AP 随该场景训练样本数 <code>n</code> 的增长，经验上非常接近一条<strong>指数饱和曲线</strong>（也有用幂律的，工程上两者都够用，指数式的参数更好解释）：</p>  <div class="math-block">\[\mathrm{AP}(n) = A_\infty - (A_\infty - A_0)\,e^{-n/\tau}\]</div>  <p>三个参数各有明确的工程含义，<strong>这才是这个模型真正的价值</strong>：</p>  <table>
+    <thead><tr><th>参数</th><th>含义</th><th>它回答什么问题</th></tr></thead>
+    <tbody>
+      <tr><td><strong><code>A∞</code>（渐近线）</strong></td><td>数据加到无穷时这个场景能达到的 AP</td><td><strong>「继续标数据的天花板在哪」</strong>——这是最重要的一个数</td></tr>
+      <tr><td><code>τ</code>（时间常数）</td><td>每积累 τ 张样本，与天花板的差距衰减到 1/e</td><td>「还要多久才能接近饱和」</td></tr>
+      <tr><td><code>A₀</code></td><td>零样本（只靠其他场景泛化）时的 AP</td><td>「这个场景的迁移基线有多高」</td></tr>
+    </tbody>
+  </table>  <div class="ascii">边际收益曲线：三个决策区间
+
+  AP
+  0.85 ┤                                        目标线（产品要求）
+       │╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  0.79 ┤                        ┄┄┄┄┄┄┄┄┄┄  A∞ = 0.79  **天花板**
+       │                 ●━━━━━━━━━━━━━━━━━━━━━━━
+  0.70 ┤          ●━━━━━━
+       │     ●━━━━
+  0.60 ┤  ●━━
+       │ ●
+  0.50 ┤●
+       └─┬─────┬─────┬─────┬─────┬─────┬─────┬────► n（该场景样本数）
+         0    1k    2k    3k    4k    5k    6k
+
+   ├─── 陡峭区 ───┤├─ 递减区 ─┤├──── 饱和区 ────┤
+    每 1k 张 +8AP   每 1k +2AP   每 1k +0.3AP
+    **继续标**      **算成本**    **停止标注，改方法**
+
+  关键判读：目标线 0.85 **在 A∞ 之上** -&gt;
+     再标 10 万张也到不了 0.85。此时继续标注是纯浪费，
+     必须换手段：改架构 / 加分辨率 / 换传感器 / 拆成两级 / 重新定义任务。</div>  <h3>三个可以直接拿去用的决策规则</h3>  <p>有了拟合的 <code>(A∞, τ, A₀)</code>，下面三个量都是闭式的：</p>  <div class="math-block">\[\Delta_{\text{next}}(n, B) = \big(A_\infty - \mathrm{AP}(n)\big)\left(1 - e^{-B/\tau}\right), \qquad n^{\star}(\text{target}) = -\tau \ln\!\frac{A_\infty - \text{target}}{A_\infty - A_0}\]</div>  <ol>
+    <li><strong>下一批还能涨多少</strong>：<code>Δ_next(n, B)</code>。这直接给出「再标 B 张的预期收益」，可以和成本对比：<em>每提升 1 个 AP 点要花多少钱</em>。</li>
+    <li><strong>达到目标要标多少</strong>：<code>n*(target)</code>。如果 <code>target ≥ A∞</code>，公式返回无穷——<strong>这就是「不可达」的数学表达</strong>，也是最有价值的一个输出。</li>
+    <li><strong>什么时候停</strong>：当「每千张样本的预期 AP 提升」低于阈值（例如 0.3 点/千张），或者「每 AP 点的成本」超过预算上限时，停止标注。<em>把这条写成自动判据，就不会有人凭感觉说「再标点吧」。</em></li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这条曲线最大的作用是把「还标不标」从一个立场之争变成一个算术题。</strong> 数据团队说「再标」、算法团队说「该改模型」，两边其实在争论同一个未知数 <code>A∞</code>。<em>拟合出来一看：A∞ = 0.79，产品目标 0.85，那就没什么可争的了——继续标注不可能达标，讨论应该立刻转向「换什么方法」。</em>反过来，如果 A∞ = 0.88 而当前 0.68，那就闭嘴接着标。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>拟合本身有几个必须注意的地方。<strong>① 至少要 4–5 个数据点，且要横跨一个数量级</strong>（比如 200 / 500 / 1200 / 3000 张），只有两个点拟合不出饱和形状。<em>这意味着标注必须分批进行、每批都重训并评测——「一次标 5000 张」不但风险高，还让你永远拿不到这条曲线。</em>② <strong>每个点的 AP 本身带噪声</strong>（种子 + 评测抽样），所以要给拟合出的 <code>A∞</code> 一个置信区间，用区间下界做决策更稳。③ <strong>曲线只在「其他条件不变」时成立</strong>——中途换了 backbone 或改了增强，曲线就得重拟。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把这一节压成面试答案：<strong>「我们对每个重点场景维护一条边际收益曲线。标注分批做，每批重训后测该切片 AP，拟合 <code>AP(n) = A∞ − (A∞ − A₀)e^{−n/τ}</code>。用 <code>A∞</code> 判断天花板是否够得着目标，用 <code>ΔAP/千张</code> 与标注单价换算出「每个 AP 点多少钱」，低于阈值就停止标注、转向方法改进。」</strong> <em>这段话同时体现了三件事：数据决策是量化的、你知道数据不是万能的、你会算成本。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="shadow"><span class="num">7</span>影子评测与 A/B：离线指标之外的最后一道关</h2>
+  <p>离线指标全绿了，就能上车吗？<strong>不能</strong>。离线评测集是历史数据的一个快照，而车上跑的是<em>此刻的、连续的、有时序的、经过完整软件栈的</em>真实世界。这两者之间有一条系统性的鸿沟，需要两种额外的验证方式来跨越。</p>  <table>
+    <thead><tr><th>验证方式</th><th>怎么做</th><th>能发现什么</th><th>代价 / 局限</th></tr></thead>
+    <tbody>
+      <tr><td><strong>离线切片评测</strong></td><td>历史数据 + 标注</td><td>精度类问题、回归</td><td><em>看不到时序稳定性、看不到与下游的交互</em></td></tr>
+      <tr><td><strong>影子模式（shadow mode）</strong></td><td>新模型在车上<strong>与旧模型并行推理，但输出不接管控制</strong>，只记录分歧</td><td><strong>真实分布下的差异、分歧场景、算力与延迟的真实表现</strong></td><td>占额外算力；<em>只能看到分歧，没有真值</em></td></tr>
+      <tr><td><strong>回灌 / 重放（replay）</strong></td><td>用录制的原始传感器流重跑完整软件栈</td><td>端到端一致性、时序行为、与跟踪/融合的交互</td><td>需要完整的回放基础设施</td></tr>
+      <tr><td><strong>灰度 A/B</strong></td><td>小比例车辆用新模型，对比业务指标</td><td><strong>接管率、误报投诉、真实体验</strong></td><td><em>周期长、样本量要求高、有安全风险</em></td></tr>
+    </tbody>
+  </table>  <h3>影子模式为什么是数据闭环的枢纽</h3>  <p>影子模式常被当成「上车前的最后一道保险」，但它更大的价值在别处：<strong>它是一个高质量的触发器</strong>。新旧模型的<em>分歧</em>本身就是极好的挖掘信号——<strong>两个模型意见不一致的地方，几乎必然是难例、边界样本、或标注规范有歧义的地方</strong>。这些帧回传去标，就是下一轮的高价值数据。<em>于是「验证」和「挖掘」在这里合成了同一个动作</em>（这也呼应模块 03 讲的一致性触发）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>影子模式的核心限制必须说清楚：它没有真值。</strong> 你只知道「新模型说有牌、旧模型说没有」，不知道谁对。<em>所以影子模式的输出永远是「分歧率」和「分歧样本」，不是「新模型更好」</em>。要把分歧变成结论，必须再走一次人工标注（抽样即可）。<strong>把「分歧率下降」当成「模型变好」是一个典型的误读</strong>——分歧率下降也可能是新模型变得更像旧模型了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>A/B 测试在自动驾驶上有两个和互联网产品完全不同的约束。<strong>① 指标极度稀疏</strong>：接管、误刹这类事件的发生率可能是 10⁻⁵/km 量级，<em>要检出 10% 的相对变化需要天文数字的里程</em>——所以实践中会用代理指标（perception-level 的误报率、规控的介入次数）而不是最终安全指标。<strong>② 有真实安全风险</strong>：不能像做推荐系统那样「先上 5% 流量看看」。<em>所以行业标准路径是「影子 → 内部车队 → 有限 ODD 灰度 → 全量」的分阶段放开</em>，每一阶段都有独立的退出准则与回滚预案。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个反复出现的现象：<strong>离线指标涨了，路测体验反而变差</strong>。最常见的三个原因是——① <em>离线评测是逐帧的、路测体验是时序的</em>（模型变「敏感」了，AP 涨但检测框闪烁，下游状态机反复跳变）；② <em>离线用 mAP、体验取决于某个工作点的 FP 率</em>（PR 曲线整体右移，但你实际用的那个 score 阈值处反而变差）；③ <em>评测集与真实分布脱节</em>。<strong>对策：评测里必须包含时序稳定性指标（闪烁率、首检距离）与固定工作点的 FP/km——这两个是 C55 模块 05 的重点。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pipeline"><span class="num">8</span>把闭环做成流水线：产物、门禁与周期时间</h2>
+  <p>前面所有环节，如果靠人工串联，实际会变成「工程师 A 挖数据 → 邮件给标注 → 三周后收到 → 工程师 B 训练 → 忘了跑切片评测 → 合入」。<strong>闭环的价值不在于每个环节多聪明，而在于它是否真的能一圈一圈自动转起来</strong>。所以最后一步是把它做成一条有明确产物与门禁的流水线。</p>  <div class="ascii">数据闭环流水线：每一步的**产物**与**门禁条件**
+
+  阶段            产物 (artifact)                     门禁 (gate)                典型耗时
+  ─────────────────────────────────────────────────────────────────────────────────
+  ① 触发       badcase ticket + seed frames        必须有 ticket &amp; 失效模式分类     0.5 天
+      │        （来自路测/影子分歧/规则触发）          否则不予排期
+      ▼
+  ② 挖掘       candidate_set (10^4)                 检索 precision@k &gt;= 3x 随机     1 天
+      │        + mining_job.yaml（可复现）           索引与嵌入版本匹配
+      ▼
+  ③ 精选       label_task (10^3)                    去重后重复率 &lt;= 3%              0.5 天
+      │        含 core-set / 分层配额参数            与评测集**交集必须为空**
+      ▼
+  ④ 标注       batch_YYYYwWW (带 QC 报告)           QC 通过率 &gt;= 0.92              **7~14 天** ◄ 瓶颈
+      │        + 血缘记录                            标注一致性 kappa &gt;= 0.7
+      ▼
+  ⑤ 训练       model_rNN + dataset_vX.Y.Z           训练 loss 收敛；配比 p 已记录     2~3 天
+      │        （配比 p 作为超参显式记录）
+      ▼
+  ⑥ 评测       切片报告 + 置信区间 + 变差样本 top-20   评测集与训练集无泄漏             0.5 天
+      │
+      ▼
+  ⑦ 门禁       PASS / WARN / FAIL + 结构化原因       **回归门禁**（第 4 节）          0.2 天
+      │                                             FAIL -&gt; 退回 ③ 或 ⑤（调配比）
+      ▼
+  ⑧ 发布       影子 -&gt; 灰度 -&gt; 全量                   影子分歧率 &amp; 灰度指标达标        3~7 天
+      │
+      └─────► ⑥ 的「变差样本」与 ⑧ 的「影子分歧」**回流成 ① 的新 ticket**
+              —— 这条回边才是「闭环」这个词的真正含义</div>  <h3>闭环的核心度量：周期时间（cycle time）</h3>  <p><strong>闭环系统真正该被优化的指标，不是任何一个模型指标，而是「从发现问题到修复上线」的天数</strong>。因为长尾问题是源源不断的——你永远不可能一次修完，能决定竞争力的是<em>转一圈要多久</em>。</p>  <table>
+    <thead><tr><th>度量</th><th>定义</th><th>典型值</th><th>为什么关注它</th></tr></thead>
+    <tbody>
+      <tr><td><strong>cycle time (p50 / p90)</strong></td><td>ticket 创建 → 修复版本上线</td><td><strong>3–8 周</strong></td><td><em>看 p90 而不是均值</em>：偶发的长尾拖延才是痛点</td></tr>
+      <tr><td><strong>瓶颈阶段占比</strong></td><td>各阶段耗时 / 总周期</td><td>标注通常占 40–60%</td><td><strong>优化非瓶颈阶段的收益接近零</strong></td></tr>
+      <tr><td><strong>返工率</strong></td><td>门禁 FAIL 导致回退的比例</td><td>20–40%</td><td>每次返工把周期时间乘以一个系数——<em>提高一次通过率的杠杆极大</em></td></tr>
+      <tr><td><strong>ticket 消化率</strong></td><td>每轮关闭 ticket 数 / 新增数</td><td>&gt; 1 才是在收敛</td><td>&lt; 1 说明长尾问题在积压，闭环转速不够</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>「返工率」这一行值得特别注意，因为它的影响是乘性的而不是加性的。</strong> 假设一轮 25 天、门禁通过率 60%，那么期望轮数是 1/0.6 ≈ 1.67 轮 → 期望周期 ≈ 42 天。<em>把通过率从 60% 提到 85%，期望周期直接降到 29 天——效果比把标注速度提升 30% 还大，而且便宜得多</em>。<strong>提高一次通过率的手段很具体：在训练前就先跑一遍「配比预演」、在标注前先小批量试标验证规范、在门禁前先跑轻量的自检。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>另一个反直觉但重要的点：<strong>缩短周期时间往往要靠「减少每轮的雄心」，而不是靠加速每个环节</strong>。一轮同时修 5 个失效模式，任何一个出问题整轮都卡住，且归因困难（到底是哪批数据导致夜间回归？）。<em>拆成 5 个独立的小轮次，每轮只改一件事，周期更短、归因更清晰、返工代价更低</em>。<strong>这与软件工程里「小批量、快反馈」的结论完全一致，而且在数据闭环上更成立——因为数据的因果归因比代码难得多。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把整个 C58 压成一句：<strong>「模型架构会趋同，数据飞轮不会。而数据飞轮的竞争力不在于你挖到了多好的数据，在于你转得有多快、每一圈都真的证明了自己有用。」</strong> <em>面试里被问「你怎么看数据闭环」，从「周期时间」和「一次通过率」切入，比罗列一堆挖掘算法更有说服力——因为前者说明你理解这是一个系统工程问题。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <p>闭环验证是工程与统计的交界地带，也正因为如此，它有一批既没有理论答案也没有工程共识的问题。</p>  <ul>
+    <li><strong>数据缩放律在检测与长尾上的形式</strong>。语言模型的 scaling law 已经很成熟，但「某个<em>子分布</em>的性能随该子分布样本数如何增长」缺少同等严谨的刻画。<em>本模块用的指数饱和曲线是经验拟合，幂律形式（<code>AP ≈ A∞ − c·n^{−α}</code>）在有些场景拟合得更好</em>——两者对「天花板」的外推差别很大，而外推恰恰是我们要用它做的事。<strong>「用几个点外推 A∞ 的置信区间」目前没有好方法。</strong></li>
+    <li><strong>数据贡献的因果估计</strong>。「这 1200 张让 AP 涨了多少」严格说是一个反事实问题，现在的答案靠「训两次做对比」，成本极高且被种子噪声污染。<em>influence functions、datamodels、data Shapley 试图给出更便宜的估计</em>，但在检测任务、非凸优化、千万级数据上仍不实用。</li>
+    <li><strong>持续学习的评测标准</strong>。灾难性遗忘的度量（backward transfer、forgetting measure）来自持续学习文献，但工业场景是「全量重训 + 配比」，与学术设定（严格顺序、不能回看旧数据）不同。<em>「工业配比式持续更新」缺少标准的评测协议与基准</em>，导致各家的「不遗忘」都是自己定义的。</li>
+    <li><strong>离线-在线指标的鸿沟</strong>。为什么离线 mAP 涨了路测体验会变差，目前的解释是零散的（时序稳定性、工作点、分布脱节）。<em>「什么样的离线指标能可靠预测在线体验」是一个开放问题</em>，也是自动驾驶评测领域最有价值的研究方向之一。相邻领域（推荐系统的离线-在线一致性）有一些可借鉴的方法论，但迁移得并不好。</li>
+    <li><strong>门禁的自动化与自适应</strong>。容差与显著性阈值目前都是手工设定的常数。<em>能否根据历史波动自动标定每个切片的容差、能否用序贯检验（sequential testing）在样本积累过程中动态决策</em>，是一个明确可做但少有系统工作的方向。序贯分析（always-valid p-values、e-values）在 A/B 领域已有成熟工具，尚未系统进入感知闭环。</li>
+    <li><strong>合成数据与真实数据的等价性度量</strong>。如果一张合成的雪夜施工牌能顶 0.3 张真实数据，边际收益曲线该怎么算？<em>「合成数据的有效样本数」缺少可操作的定义</em>，而这直接影响标注预算该不该花。</li>
+    <li><strong>闭环的长期稳定性</strong>。每一轮都按「当前最弱场景」补数据，长期迭代后训练分布会持续偏离真实分布。<em>这个反馈系统会收敛、震荡、还是发散？</em>目前只有工程上的经验对冲（固定比例随机采样、冻结基准集），缺少理论刻画。<strong>这可能是数据闭环里最深、也最少被讨论的问题。</strong></li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：Benjamini &amp; Hochberg, <em>Controlling the False Discovery Rate</em>（1995，BH 校正原文，本模块多重比较一节的基础）；Efron &amp; Tibshirani, <em>An Introduction to the Bootstrap</em>（置信区间与配对重采样）；Hoiem et al., <em>Diagnosing Error in Object Detectors</em> 与 Bolya et al., <em>TIDE: A General Toolbox for Identifying Object Detection Errors</em>（切片与误差分解，C61 模块 02 会深入）；Kirkpatrick et al., <em>Overcoming catastrophic forgetting in neural networks</em>（EWC）与 Lopez-Paz &amp; Ranzato, <em>GEM</em>（遗忘度量与重放）；Hestness et al., <em>Deep Learning Scaling is Predictable, Empirically</em>（数据缩放律的经验形式）；Mahajan et al., <em>Exploring the Limits of Weakly Supervised Pretraining</em>（大规模数据的边际收益递减实证）；Kohavi et al., <em>Trustworthy Online Controlled Experiments</em>（A/B 实践中的陷阱，稀疏指标一节尤其相关）；Johari et al., <em>Always Valid Inference</em>（序贯检验）。相邻课程：C55 模块 05（安全导向评测与分桶）、C61 模块 01–02（实验设计与误差分析）、C58 模块 03–04（触发与挖掘）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_mining_infra/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 大规模挖掘基础设施</div></a>
+  </div>
+
+</div>
+</body>
+</html>

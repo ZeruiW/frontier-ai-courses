@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>00 · 课程总览与环境</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 00 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>00 · 课程总览与环境</h1>
+  <p class="subtitle">「离线 mAP 0.82，车上跑起来像 0.6」——这条鸿沟只可能来自三层：预处理 / 模型 / 后处理 · <strong>一致性是可验证的工程属性，不是运气</strong>：每一层都有确定的对拍点与容差 · 有了对拍工具，任何不一致都能在 30 分钟内二分到具体算子，而不是靠「再训一版试试」 · 三层各自的症状指纹（框整体偏移 / 分数整体偏低 / 只有小目标掉）与首查顺序</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">Python/numpy；C52（模型导出与运行时）、C27（量化原理）有帮助但不必需</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 00_environment_check.ipynb</div></div>
+    <div class="item"><div class="k">课程模块</div><div class="v">6 个模块 · 纯 numpy 复现对拍、二分定位、校准与延迟统计</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">总览 35 分钟 + notebook 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#story">「离线 mAP 0.82，车上跑起来像 0.6」</a></li>
+      <li><a href="#thesis">核心主张：一致性是可验证的工程属性，不是运气</a></li>
+      <li><a href="#layers">三层鸿沟：预处理 / 模型 / 后处理</a></li>
+      <li><a href="#bisect">方法论：逐层二分，30 分钟定位到具体算子</a></li>
+      <li><a href="#tolerance">容差怎么定：多大的差才算「不一致」</a></li>
+      <li><a href="#map">课程地图与环境</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="story"><span class="num">1</span>「离线 mAP 0.82，车上跑起来像 0.6」</h2>
+  <p>这门课从一个几乎每个感知团队都经历过的场景开始。</p>  <p>模型训完了，验证集 mAP 0.82，分尺寸桶看小目标也还行，回归门禁全绿，模型卡签完字。转 ONNX，转 TensorRT，C++ 管线接上相机，装车，上路。<strong>然后测试同学回来说：「感觉不太行，好多牌子看不见，限速 60 有时候报成 80。」</strong>你问他掉了多少，他说不上来——他只有体感。你自己去看录像，估了个数：<em>大概相当于离线 0.6 的水平</em>。</p>  <p>这时候有两种工程师。</p>  <table>
+    <thead><tr><th></th><th>做法</th><th>结果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>A 类</strong></td><td>「先把训练集里加点夜间数据吧」「要不 QAT 试试」「换个更大的 backbone」</td><td>两周后 mAP 还是 0.6 —— 因为<strong>问题根本不在模型里</strong></td></tr>
+      <tr><td><strong>B 类</strong></td><td>「拿同一张图，两边把每一步的中间张量 dump 出来，逐元素 diff，看第一个对不上的算子是哪个」</td><td><strong>25 分钟后</strong>：C++ 侧的 <code>cv2.resize</code> 用了 <code>INTER_LINEAR</code>，训练侧用的是 <code>INTER_AREA</code></td></tr>
+    </tbody>
+  </table>  <p>A 类的做法看起来更「像在做算法」，但它是<strong>把一个确定性的软件缺陷当成统计问题去治</strong>。这类改动不但修不好问题，还会污染后面所有的实验——你在一个错误的输入分布上调出来的一切超参，等你修好预处理之后全都要作废。</p>  <h3>真实原因的分布</h3>  <p>综合公开的部署事故复盘、框架 issue 与工程经验，「离线好、上车差」的根因大致是这样分布的。<strong>这张表的排序才是你排查的顺序</strong>：</p>  <table>
+    <thead><tr><th>根因层</th><th>占比（经验量级）</th><th>典型表现</th><th>定位成本</th></tr></thead>
+    <tbody>
+      <tr><td><strong>预处理不一致</strong></td><td><strong>≈ 40%</strong></td><td>resize 插值/语义不同、BGR/RGB、letterbox 变体、归一化顺序</td><td><strong>低</strong>（一张图对拍就能看出来）</td></tr>
+      <tr><td><strong>后处理 / 坐标变换不一致</strong></td><td>≈ 25%</td><td>框整体偏移、NMS 语义不同、sigmoid 做了两遍或没做</td><td>低（框的偏移量本身就是线索）</td></tr>
+      <tr><td>数值精度 / 量化</td><td>≈ 15%</td><td>FP16 溢出、INT8 校准集分布不对、敏感层被量化</td><td>中（要逐层敏感度分析）</td></tr>
+      <tr><td>评测口径不一致</td><td>≈ 10%</td><td>离线用 GT crop、离线不含时序、离线的类别表和车上不一样</td><td>中（要重建对齐的评测协议）</td></tr>
+      <tr><td><strong>真实域差</strong>（模型确实不够好）</td><td><strong>≈ 10%</strong></td><td>ISP 输出与 JPEG 训练图的域差、天气/地域分布外</td><td><strong>高</strong>（要数据闭环，见 C58）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>读这张表最重要的收获是：<strong>你以为的「模型不够好」，十次里有八次不是模型的问题。</strong>但绝大多数团队的默认反应是去改模型——因为改模型是他们熟悉的动作，而对拍中间张量不是。<em>这门课要做的，就是把「对拍」变成和「调参」一样自然的动作。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严谨地说：前四行的共同特征是<strong>它们都是可判定的（decidable）</strong>——存在一个有限的、确定性的检查过程，能在有限时间内给出「一致 / 不一致，且不一致在第 k 步」的结论。只有最后一行是<em>统计性</em>的，需要收集数据、重新训练、再用假设检验判断。<strong>工程纪律是：把可判定的部分全部排干净，再动统计的部分。</strong>顺序颠倒的代价是：你无法区分「模型不够好」和「模型没吃到你以为的输入」，于是所有实验结论都不可信。</p></div>
+  </div>  <div class="callout danger"><span class="label">「掉点了怎么查」——不要从模型答起</span>
+    <p><strong>面试高频，而且是分水岭题</strong>：「你训好的模型部署到车上掉点了，你怎么查？」<em>初级答案</em>：「加数据 / 做 QAT / 换更大的模型」——面试官立刻知道你没上过线。<em>合格答案</em>：「先确认这不是软件缺陷：拿同一张图，训练侧和部署侧各 dump 一遍逐阶段的中间张量，从输入开始逐元素比对，二分定位到第一个分歧算子。<strong>只有当逐层张量都在容差内、而端到端指标仍然掉，才轮到讨论量化和域差。</strong>」<em>加分答案</em>：再补一句「而且我会先问一个问题：<strong>车上那个 0.6 是怎么测出来的？</strong>如果离线评测和车上评测的口径本身不一致（比如离线用 GT crop 做分类、车上是端到端），那这两个数根本不可比，先对齐评测协议再说」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="thesis"><span class="num">2</span>核心主张：一致性是可验证的工程属性，不是运气</h2>
+  <p>本课只有一个中心论点，其余五个模块都是它的展开：</p>  <div class="callout intuition"><span class="label"></span>
+    <strong>训练-部署一致性不是「小心一点就能做到」的品质，而是一个可以被<u>定义、被度量、被自动检查、被写进 CI</u> 的工程属性。</strong>你不应该「希望」两边一致，你应该<em>有一个脚本能证明它一致，并在不一致时告诉你是哪一行代码</em>。
+  </div>  <p>这句话的分量在于它的反面。<strong>如果一致性只是「注意事项」，那么它必然会退化</strong>——因为代码会被改、库会升版本、新同事会用他熟悉的写法、C++ 侧的重写会「顺手优化一下」。任何依赖人自觉的约束，在一个 30 人的团队里、在 18 个月的项目周期里，都会归零。</p>  <h3>把一致性变成属性，需要三件东西</h3>  <table>
+    <thead><tr><th>要素</th><th>具体是什么</th><th>缺了它会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 可比较的中间产物</strong></td><td>两侧管线都能按<em>同一组阶段名</em> dump 中间张量到磁盘（<code>.npy</code>），且 dump 是<strong>默认能力</strong>而不是临时插的 print</td><td>只能比端到端结果。看到「框不对」但不知道错在哪一步，只能猜</td></tr>
+      <tr><td><strong>② 明确的容差</strong></td><td>对每个阶段规定「差多少算一致」，并且这个数字有来源（见第 5 节）</td><td>要么把 fp16 的正常抖动当 bug 追一周，要么把真错误当成「正常误差」放过去</td></tr>
+      <tr><td><strong>③ 自动化的判定</strong></td><td>一条命令跑完全部阶段，输出 PASS/FAIL + 首个分歧阶段；接到 CI 上，每次改预处理都跑</td><td>人工比对只会做一次。第二次出问题时，那个脚本已经找不到了</td></tr>
+      <tr><td><strong>④ 黄金样本集</strong></td><td>10–30 张覆盖极端情况的固定图（最亮、最暗、纯色、边界尺寸、含极小目标），连同期望输出一起入库</td><td>只用一张「正常」图对拍，会漏掉只在边界条件下触发的 bug（如 clip、溢出、奇偶尺寸）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>换个角度：<strong>这四件事加起来，就是给感知管线写「单元测试」</strong>。你不会接受一个没有单元测试的后端服务，但整个行业长期接受没有对拍脚本的感知管线——原因只是「模型是黑盒，没法测」。<em>但预处理不是黑盒，后处理不是黑盒，坐标变换不是黑盒。真正是黑盒的只有中间那一坨卷积，而它恰恰是最不容易出错的部分（因为它由框架保证）。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说，本课把端到端管线建模成一个有序的算子序列 $g = f_n \circ \cdots \circ f_1$，训练侧与部署侧分别是 $g^{\text{tr}}$ 与 $g^{\text{dp}}$。<strong>「一致」的形式化定义是：对黄金样本集里的每个输入 $x$ 和每个阶段 $k$，都有 $\lVert h_k^{\text{tr}}(x) - h_k^{\text{dp}}(x)\rVert \le \tau_k$</strong>，其中 $h_k = f_k \circ \cdots \circ f_1$ 是前 $k$ 阶段的复合，$\tau_k$ 是该阶段的容差。<em>注意这是一个比「端到端输出接近」强得多的条件</em>——它排除了「两个错误互相抵消」这种最危险的情况（今天抵消了，明天改一行代码就不抵消了）。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>「端到端结果差不多」<strong>不能</strong>推出「管线一致」。真实案例：训练侧 BGR + 一组 mean/std，部署侧 RGB + 交换过的 mean/std，两个错误互相抵消，端到端完全正确——直到有人「顺手修正」了其中一个。<em>逐阶段比对是唯一能发现这种「稳定的错误」的方法。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="layers"><span class="num">3</span>三层鸿沟：预处理 / 模型 / 后处理</h2>
+  <p>把一条完整的车端检测管线摊开，它长这样。<strong>左边是训练时 Python 里跑的，右边是车上 C++ 跑的；中间每一条虚线都是一个可能的分歧点</strong>：</p>  <div class="ascii">  训练侧（Python / PyTorch）                       部署侧（C++ / TensorRT）
+  ─────────────────────────────                   ─────────────────────────────
+                                     ┌ 第 ① 层 ─ 预 处 理 ─────────┐
+   JPEG 解码 (PIL / cv2)      ⋯⋯⋯⋯⋯⋯⋯│ ISP 输出 (YUV/Bayer→RGB)    │  ← 域差，不是 bug
+   cvtColor BGR→RGB           ⋯⋯⋯⋯⋯⋯⋯│ 通道顺序？                  │  ← **头号杀手之一**
+   resize(INTER_AREA)         ⋯⋯⋯⋯⋯⋯⋯│ resize(INTER_LINEAR)?       │  ← **头号杀手**
+   letterbox(114, 居中, /32)  ⋯⋯⋯⋯⋯⋯⋯│ letterbox(0, 左上, 全 pad)? │  ← 六个自由度
+   uint8 → float32            ⋯⋯⋯⋯⋯⋯⋯│ 何时转？溢出？              │
+   (x - mean) / std           ⋯⋯⋯⋯⋯⋯⋯│ 顺序？先 /255 还是先减？    │
+   HWC → CHW, NCHW            ⋯⋯⋯⋯⋯⋯⋯│ 布局 / stride / 对齐        │
+                                     └─────────────────────────────┘   ← 模块 01
+                                     ┌ 第 ② 层 ─ 模 型 ───────────┐
+   nn.Module forward          ⋯⋯⋯⋯⋯⋯⋯│ ONNX → TRT engine           │
+   fp32                       ⋯⋯⋯⋯⋯⋯⋯│ fp16 / int8                 │  ← 模块 02/03
+   BN 在 eval 模式             ⋯⋯⋯⋯⋯⋯⋯│ Conv+BN 已融合              │
+   动态 shape                  ⋯⋯⋯⋯⋯⋯⋯│ optimization profile        │
+                                     └─────────────────────────────┘
+                                     ┌ 第 ③ 层 ─ 后 处 理 ─────────┐
+   sigmoid / softmax          ⋯⋯⋯⋯⋯⋯⋯│ 在模型里还是模型外？        │  ← 做两遍 = 全错
+   decode (cxcywh→xyxy)       ⋯⋯⋯⋯⋯⋯⋯│ 格式？归一化坐标？          │
+   NMS(class-wise, iou .65)   ⋯⋯⋯⋯⋯⋯⋯│ EfficientNMS(agnostic)?     │  ← 模块 04
+   letterbox 逆变换            ⋯⋯⋯⋯⋯⋯⋯│ 减 pad 了吗？除以 r 了吗？  │  ← **框整体偏移**
+                                     └─────────────────────────────┘
+                                            ▼
+                                     最终框 → 跟踪 → 融合 → 规控</div>  <p>三层的性质完全不同，<strong>因此排查手段也完全不同</strong>：</p>  <table>
+    <thead><tr><th></th><th>① 预处理</th><th>② 模型</th><th>③ 后处理</th></tr></thead>
+    <tbody>
+      <tr><td>错误性质</td><td><strong>确定性</strong>（同一输入必然同一错误）</td><td>数值性（精度损失，随输入分布变化）</td><td><strong>确定性</strong></td></tr>
+      <tr><td>是否可精确对拍</td><td><strong>可以，可以要求 bit 级或 ≤1 灰阶</strong></td><td>不行，只能给统计容差</td><td><strong>可以（除了 NMS 的并列打破）</strong></td></tr>
+      <tr><td>典型症状</td><td>分数整体偏低、类别系统性错、小目标全丢</td><td>个别样本掉、长尾类先掉、小目标先掉</td><td><strong>框整体偏移 / 重复框 / 框数不对</strong></td></tr>
+      <tr><td>定位工具</td><td>逐阶段张量 diff</td><td>逐层敏感度分析 + 校准集检查</td><td>逐阶段中间结果 diff + 反变换单测</td></tr>
+      <tr><td>修复成本</td><td><strong>几行代码</strong></td><td>中（可能要重新校准或混合精度）</td><td><strong>几行代码</strong></td></tr>
+      <tr><td>本课模块</td><td><strong>01</strong></td><td>02（TensorRT）/ 03（INT8）</td><td><strong>04</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>注意第一行和最后一行的组合意味着什么：<strong>65% 的部署事故（预处理 40% + 后处理 25%，见第 1 节的分布）都是确定性的、可精确对拍的、几行代码就能修的</strong>。它们之所以能拖住团队两周，唯一的原因是<em>没人去查</em>——大家在猜。而猜的成本是：每猜一次要重训一次，一次几天。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从软件工程视角，第 ① ③ 层属于<span class="term">deterministic transformation</span>（确定性变换），可以用<strong>等价性测试</strong>（两个实现对同一输入产生相同输出）来验证，这类测试的判定是完备的；第 ② 层属于<span class="term">numerical approximation</span>（数值近似），只能用<strong>统计性验收</strong>（在一个分布上误差的某个分位数小于阈值）。<em>把统计方法用在确定性问题上是过度宽容（会放过真 bug），把确定性方法用在数值问题上是过度严格（会把 fp16 的正常抖动报成失败）。</em><strong>知道每一层该用哪种判据，是这门课想教会你的最基本的判断力。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>别忘了第 ① 层最上面那条虚线——<strong>ISP 输出 vs JPEG 解码图</strong>。这一条<em>不是 bug，而是真实的域差</em>：训练数据是「相机 → ISP → JPEG 编码 → 解码」的产物，车上拿到的是「相机 → ISP」的直出。JPEG 的 8×8 DCT 量化会抹掉高频、引入块效应，而这恰恰改变了小目标的表观。<strong>它不能靠对拍修，只能靠采集端对齐或增强模拟（C56 模块 02）。</strong>把它和真 bug 混在一起查，是很多团队卡住的原因。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bisect"><span class="num">4</span>方法论：逐层二分，30 分钟定位到具体算子</h2>
+  <p>本课的核心主张里还有一句更强的断言：<strong>任何一致性问题都能在 30 分钟内定位到具体的算子，只要你有对拍工具。</strong>这不是修辞，它有一个精确的复杂度依据。</p>  <h3>为什么是「二分」而不是「从头看到尾」</h3>  <p>把管线的 $n$ 个阶段编号为 $1..n$。定义指示函数 $D(k) = \mathbb{1}\bigl[\lVert h_k^{\text{tr}}(x) - h_k^{\text{dp}}(x)\rVert > \tau_k\bigr]$，即「跑到第 $k$ 阶段为止，两侧是否已经分歧」。关键观察是：</p>  <div class="math-block">\[D(k) \text{ 关于 } k \text{ 单调}：\quad D(k)=1 \;\Longrightarrow\; D(k')=1 \ \ \forall k' > k\]</div>  <p>一旦两条管线在某一步产生了实质分歧，后面的算子只会把这个差异传下去或放大，<strong>不会自己愈合</strong>。单调的布尔序列上找第一个 1，就是教科书上的二分查找，代价是：</p>  <div class="math-block">\[\text{探针次数} \;=\; \lceil \log_2 (n+1) \rceil \quad\Longrightarrow\quad n=16 \text{ 阶段只需 } 5 \text{ 次}, \ \ n=1000 \text{ 只需 } 10 \text{ 次}\]</div>  <div class="ascii">管线 12 个阶段，分歧首次出现在第 7 个（resize）
+阶段:  1   2   3   4   5   6   7   8   9  10  11  12
+D(k):  0   0   0   0   0   0   1   1   1   1   1   1
+                               ↑ 要找的就是这个位置
+
+探针 1: k=6   D=0  → 分歧在 (6, 12]        区间 12 → 6
+探针 2: k=9   D=1  → 分歧在 (6,  9]        区间  6 → 3
+探针 3: k=7   D=1  → 分歧在 (6,  7]        区间  3 → 1
+                    ⇒ **第 7 个算子 = resize**       共 3 次探针
+
+对照「从头看到尾」：最坏 12 次，且每次都要人眼看数组
+对照「凭经验猜」   ：无上界，且猜错时你不知道自己猜错了</div>  <h3>30 分钟是怎么来的</h3>  <table>
+    <thead><tr><th>步骤</th><th>内容</th><th>耗时</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>选一张黄金样本图（不要选「正常」图，选一张有小目标 + 有饱和区的）</td><td>2 min</td></tr>
+      <tr><td>2</td><td>两侧各加一次 dump：<code>np.save(f'{stage}_{side}.npy', t)</code></td><td><strong>10 min</strong>（如果 dump 是内建能力则 0）</td></tr>
+      <tr><td>3</td><td>跑一遍二分：$\lceil\log_2 n\rceil \approx 4$ 次比较</td><td>5 min</td></tr>
+      <tr><td>4</td><td>看首个分歧阶段的两个张量：diff 的<strong>空间结构</strong>就是指纹（见下表）</td><td><strong>5 min</strong></td></tr>
+      <tr><td>5</td><td>读那一行代码，改掉，重跑对拍确认全绿</td><td>8 min</td></tr>
+    </tbody>
+  </table>  <h3>diff 的形状就是指纹</h3>  <p>找到分歧阶段之后不要急着读代码，<strong>先看 diff 张量长什么样</strong>——它的空间结构几乎直接告诉你原因：</p>  <table>
+    <thead><tr><th>diff 的样子</th><th>几乎可以确定的原因</th></tr></thead>
+    <tbody>
+      <tr><td><strong>只在边缘一圈非零，中间全 0</strong></td><td><code>align_corners</code> 语义不同 / padding 值不同 / 卷积 padding 模式不同</td></tr>
+      <tr><td><strong>棋盘格 / 条纹状高频结构</strong></td><td><strong>resize 插值方式不同（混叠）</strong>——见模块 01 第 4 节</td></tr>
+      <tr><td><strong>通道 0 与通道 2 互换后 diff 变 0</strong></td><td><strong>BGR/RGB 弄反</strong></td></tr>
+      <tr><td>整幅均匀的常数偏移</td><td>mean 不同 / uint8→float 的时机不同</td></tr>
+      <tr><td>整幅按比例缩放（diff/ref 是常数）</td><td>std 不同 / 少除或多除了一次 255</td></tr>
+      <tr><td>全图几乎恒定、动态范围极小</td><td><strong>归一化顺序错</strong>（先 /255 又减了 0–255 量纲的 mean）</td></tr>
+      <tr><td>整体平移了固定像素</td><td>letterbox 的 pad 位置不同 / 逆变换忘了减 pad</td></tr>
+      <tr><td>零散、无结构、幅值 ~1e-3</td><td><strong>正常的数值噪声</strong>（fp16 / 定点舍入）——不是 bug</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这张表值得贴在工位上。<strong>它把「调试」从「读代码猜」变成「看图认」</strong>——而人眼识别空间结构的速度远快于阅读代码。<em>实际操作中，第 4 步经常在 30 秒内就结束了：一眼看到条纹，直接去查 resize。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>背后的原理是：每一类预处理错误在张量空间里都有<strong>特征性的支撑集（support）与频谱</strong>。插值语义差异的能量集中在高频（因为它改变的是采样相位），padding 差异的支撑集是边界带，通道错误在通道维上是置换，仿射参数错误表现为低秩的常数/线性场。<em>换句话说，diff 张量本身就是一个信道，错误类型是它承载的信号，而你只需要一个粗糙的分类器——你的眼睛。</em><strong>模块 01 的 notebook 会把这个「分类器」写成代码，让它自动输出定位报告。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把方法论压成一句：<strong>不要问「为什么模型效果差」，要问「第一个对不上的张量在哪」。前者没有终点，后者最多 $\lceil\log_2 n\rceil$ 步。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tolerance"><span class="num">5</span>容差怎么定：多大的差才算「不一致」</h2>
+  <p>对拍工具最容易失败的地方不是写不出来，而是<strong>阈值定错</strong>。定得太严，每次都红，团队很快就把它关掉；定得太松，真 bug 混过去，工具形同虚设。<em>容差必须有来源，不能拍脑袋。</em></p>  <p>好消息是：不同来源的差异，量级相隔一到两个数量级，<strong>所以只要你知道每一档的典型值，阈值就是显然的</strong>。下表的数字都会在 notebook 与模块 01 里被实测出来（归一化用 <code>std=58.395</code>，「tensor 单位」指归一化之后的张量）：</p>  <table>
+    <thead><tr><th>差异来源</th><th>性质</th><th>典型量级（tensor 单位）</th><th>该不该报警</th></tr></thead>
+    <tbody>
+      <tr><td>fp32 → fp16 的表示误差</td><td>不可避免</td><td><strong>≈ 5×10⁻⁴</strong>（max）</td><td>❌ 不报</td></tr>
+      <tr><td>定点 resize 的舍入（OpenCV uint8 输出）</td><td>实现细节</td><td>≤ 0.5 灰阶 ≈ <strong>8.6×10⁻³</strong></td><td>❌ 不报（但要知道它的存在）</td></tr>
+      <tr><td>INT8 量化</td><td>有损，可控</td><td>1×10⁻² ~ 1×10⁻¹（逐层放大）</td><td>⚠️ 用<strong>端到端指标</strong>判，不用张量判</td></tr>
+      <tr><td><code>align_corners</code> 语义不同</td><td><strong>语义错误</strong></td><td>≈ <strong>3.8×10⁻²</strong>（自然图，均值）</td><td>✅ <strong>报</strong></td></tr>
+      <tr><td>INTER_LINEAR ↔ INTER_AREA</td><td><strong>语义错误</strong></td><td>≈ <strong>0.37</strong>（自然图，均值 21 灰阶）</td><td>✅ <strong>报</strong></td></tr>
+      <tr><td>BGR/RGB 弄反</td><td><strong>语义错误</strong></td><td>0.5 ~ 2（取决于图像色彩）</td><td>✅ <strong>报</strong></td></tr>
+      <tr><td>归一化顺序错</td><td><strong>灾难</strong></td><td>动态范围被压缩 <strong>255 倍</strong></td><td>✅ <strong>报</strong></td></tr>
+    </tbody>
+  </table>  <p>最上面三行和最下面四行之间有<strong>一个数量级以上的空档</strong>，阈值就放在这个空档里。一个在实践中很好用的默认值：</p>  <pre><code># 预处理阶段（确定性变换）：严
+assert np.abs(a - b).max()  &lt; 0.02      # tensor 单位；fp16 噪声的 20 倍，语义错误的 1/2
+assert np.abs(a - b).mean() &lt; 0.005
+
+# 模型输出（数值近似）：用分位数，别用 max —— 单个离群元素说明不了问题
+d = np.abs(a - b) / (np.abs(b) + 1e-3)
+assert np.percentile(d, 99) &lt; 0.02      # fp16
+assert np.percentile(d, 99) &lt; 0.10      # int8
+
+# 最终框（语义等价）：只比语义，不比浮点
+#   · 框中心偏移 &lt; 0.5 px  且  IoU &gt; 0.99
+#   · 类别完全一致；分数排序的 Kendall tau &gt; 0.99
+#   · **框的个数必须完全相等** —— 个数不等通常是 NMS 语义不同，不是数值问题</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>注意最后一块的思路转变：<strong>到了输出端就不要再比浮点数了，要比「语义」</strong>。两侧 NMS 在分数并列时打破平局的方式不同，会让保留的框换一个（但完全等价）；这时逐元素 diff 会报错，而「框个数相同、IoU>0.99、类别相同」这个判据就正确地放过了它。<em>比什么，比怎么比更重要。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更一般的原则是：<strong>容差应当定义在「该阶段的语义空间」上，而不是统一定义在浮点数上</strong>。预处理阶段的语义空间就是像素张量本身，所以逐元素比对是对的；检测输出的语义空间是「框的集合」，它对元素顺序不敏感、对 1e-6 的坐标抖动不敏感，但对<em>集合的基数</em>极其敏感。<span class="term">metric mismatch</span>（度量错配）——用错误的度量去比较——会同时产生假阳性和假阴性，是对拍工具被团队放弃的最常见原因。</p></div>
+  </div>  <div class="callout danger"><span class="label">别拿 mAP 当一致性检查</span>
+    <p><strong>一个反直觉但极其重要的点：不要用「端到端 mAP 差不多」作为一致性的通过条件。</strong>原因有二：<em>①灵敏度不够</em>——预处理的中等错误可能只让整体 mAP 掉 2–3 点，落在种子方差的量级里（C61 模块 01），你会判它「没问题」；但同一个错误可能让「限速 60/80」这类<u>细粒度小目标类</u>掉 15 点以上（模块 01 会实测出这个数）。<em>②归因不了</em>——mAP 是一个标量，它告诉不了你错在哪。<strong>正确的关系是：逐阶段张量对拍是<u>门禁</u>，端到端指标是<u>验收</u>，两者不能互相替代。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="map"><span class="num">6</span>课程地图与环境</h2>
+  <p>六个模块严格按「三层鸿沟 + 一层工程」的结构排列，<strong>顺序就是排查顺序</strong>——先修概率最高、成本最低的：</p>  <table>
+    <thead><tr><th>模块</th><th>主题</th><th>对应的层</th><th>你会带走的东西</th></tr></thead>
+    <tbody>
+      <tr><td><strong>00</strong></td><td>课程总览与环境（本模块）</td><td>方法论</td><td>三层框架、二分定位、容差表</td></tr>
+      <tr><td><strong>01</strong></td><td>预处理一致性</td><td><strong>第 ① 层（40%）</strong></td><td>从零实现的 resize 家族、letterbox 变体、<strong>预处理对拍工具</strong></td></tr>
+      <tr><td><strong>02</strong></td><td>TensorRT 构建与优化</td><td>第 ② 层</td><td>层融合、动态 shape profile、<strong>静默回退的识别</strong></td></tr>
+      <tr><td><strong>03</strong></td><td>INT8 校准与精度恢复</td><td>第 ② 层</td><td>KL 熵校准的完整实现、敏感层分析、<strong>掉点排查决策树</strong></td></tr>
+      <tr><td><strong>04</strong></td><td>后处理对齐与 C++ 推理管线</td><td><strong>第 ③ 层（25%）</strong></td><td>NMS 变体差异、<strong>letterbox 逆变换</strong>、端到端对拍框架</td></tr>
+      <tr><td><strong>05</strong></td><td>性能剖析与延迟工程</td><td>工程</td><td>p99 延迟、roofline、降频漂移、<strong>发布验收清单</strong></td></tr>
+    </tbody>
+  </table>  <h3>与其他课的关系</h3>  <ul>
+    <li><strong>C52（模型部署与推理）模块 03</strong> 讲的是「怎么导出 ONNX、有哪些运行时」——那是<em>把模型搬过去</em>；本课讲的是<strong>搬过去之后怎么证明它还是同一个模型</strong>。两者互补，不重叠。</li>
+    <li><strong>C27（量化）</strong> 讲量化的原理（scale/zero-point、对称性、PTQ/QAT）；本课模块 03 只讲<strong>检测任务里的校准工程</strong>——校准集怎么构造、敏感层怎么找、掉点怎么排查。</li>
+    <li><strong>C53 模块 05</strong> 讲延迟-精度选型（选哪个模型）；本课模块 05 讲<strong>怎么正确地测</strong>（warmup、同步、p99、降频）——选型的前提是测量可信。</li>
+    <li><strong>C55（TSR）与 C57（小目标）</strong> 给出本课所有例子的场景：<em>为什么预处理错误对 TSR 特别致命</em>——因为目标只有 10–30 像素，任何采样层面的信息损失都直接打在它身上（模块 01 会量化）。</li>
+    <li><strong>C61 模块 03</strong> 是本课的姊妹篇：那里讲训练侧的调试手册（loss 为 NaN、mAP 恒为 0），这里讲部署侧。<em>两边合起来是一份完整的检测工程诊断树。</em></li>
+  </ul>  <h3>环境</h3>  <p>本课全部 notebook <strong>纯 numpy + 标准库，CPU 即可</strong>，不需要 GPU、不需要 TensorRT、不需要联网。这是刻意的设计：</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>你可能会问：讲 TensorRT 的课，为什么 notebook 里没有 TensorRT？因为<strong>本课要教的不是 API，是机制</strong>。<code>trtexec</code> 的参数你随时可以查文档，但「为什么这个 resize 会让小目标消失」「KL 校准到底在最小化什么」，只有自己从零写一遍才会真的懂。<em>而且 API 会过时，机制不会。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更实际的理由是<span class="term">reproducibility</span>（可复现性）：TensorRT 的行为与 GPU 型号、驱动版本、TRT 版本三者绑定（模块 02 会讲这件事本身就是一个部署难题），任何依赖具体硬件的教学代码，半年后就跑不起来了。<strong>纯 numpy 的实现是这门课能长期存在的前提</strong>；而真实的命令、配置与检查单，全部以「🧪 真实工程胶囊」的形式放在每个 notebook 末尾——可以原样复制到你的项目里。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>本模块的 notebook 会让你实现三件事：<strong>①一致性度量与容差表</strong>（把上一节的表算出来）；<strong>②二分定位器</strong>（在一条 12 阶段的管线上用 3 次探针找到 bug）；<strong>③排查顺序的最优性证明</strong>（为什么按「概率/成本」降序排是最优的）。第三件事在面试里很有用——它把「凭经验」变成了「有依据」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>研究前沿与开放问题</h2>
+  <p>训练-部署一致性长期被当作「工程琐事」，但它其实有几个真正开放的问题，而且都在变得更重要：</p>  <ul>
+    <li><strong>预处理缺乏规范，而且没人打算制定。</strong>resize 这个最基础的算子，在 OpenCV / PIL / TensorFlow / PyTorch / ONNX Runtime / TensorRT 之间存在<em>至少 6 种互不等价的语义</em>（坐标映射 2–3 种 × 是否抗锯齿 × 定点/浮点）。ONNX 的 <code>Resize</code> 算子把这些差异编码成属性（<code>coordinate_transformation_mode</code> 等），<strong>这是目前唯一严肃的规范化尝试</strong>，但转换器是否正确保留这些属性、后端是否正确实现，仍然要逐个验证。<em>Parmar et al. 的《On Aliased Resizing》指出这个问题连 GAN 评测指标（FID）都被污染了——学术界的数字也不干净。</em></li>
+    <li><strong>「一致性」还没有公认的度量。</strong>本课用的逐阶段 $L_\infty$/分位数判据是工程实践，不是理论。<em>什么样的度量能同时满足：对不可避免的数值噪声不敏感、对语义错误敏感、且可以在层间给出误差传播的紧界？</em>目前没有好答案——Lipschitz 常数的上界通常松到无用（几个数量级），而经验度量缺乏保证。</li>
+    <li><strong>误差传播的可证明界。</strong>神经网络的 Lipschitz 常数估计（谱范数上界、CLEVER、LipSDP 等）本是为对抗鲁棒性发展的，但正好可以回答一个部署问题：<em>输入张量差 $\epsilon$，输出框最多偏多少？</em>如果这个界足够紧，容差就可以从「经验值」变成「推导值」。<strong>目前对深层检测器还做不到，这是一个有明确工程价值的开放方向。</strong></li>
+    <li><strong>把对拍做进编译器 / 转换器。</strong>理想形态是：转换工具在把 PyTorch 图转成 engine 的同时，<em>自动生成逐层的数值对拍测试</em>，并在 CI 中回归。<code>polygraphy</code> 的 <code>--validate</code> / 逐层比对已经走在这条路上，但它只覆盖模型层，不覆盖预处理与后处理——<strong>而那正是 65% 的问题所在</strong>。</li>
+    <li><strong>端到端可微分预处理。</strong>如果预处理本身是网络的一部分（放进图里、一起导出、一起量化），语义分歧从定义上就消失了。<em>代价是灵活性与效率（ISP 与 resize 常常有硬件加速路径，放进网络就用不上了），以及量化时预处理层会成为新的敏感层。</em>这个取舍在车端还没有定论。</li>
+    <li><strong>ISP 与感知的联合优化。</strong>训练用 JPEG 解码图、部署用 ISP 直出，这个域差目前靠数据增强模拟。<em>更彻底的思路是把 ISP 参数也纳入优化（「为机器视觉而不是为人眼调 ISP」）</em>——已有若干工作显示可以提升下游检测精度，但它需要感知团队与相机团队的组织级协作，量产落地的很少。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>★ 必读</strong>：Parmar, Zhang, Zhu, <em>On Aliased Resizing and Surprising Subtleties in GAN Evaluation</em>（CVPR 2022，arXiv:2104.11222）——用最少的篇幅把「不同库的 resize 不等价、且差异大到污染指标」这件事钉死，本课模块 01 的实验设计直接受它启发。<strong>★</strong> ONNX <em>Operators.md · Resize</em> 与 <em>Resize 的 coordinate_transformation_mode 语义表</em>——这是目前唯一把各家 resize 语义写成规范的文档，<strong>建议逐条读完</strong>，它会解释你遇到的绝大多数插值差异。<strong>★</strong> NVIDIA, <em>TensorRT Developer Guide</em> 的「Working with Dynamic Shapes」与「Optimizing for Accuracy」两章，以及 <code>polygraphy</code> 的逐层比对用法（模块 02/04 会大量用到它的思路）。</p><p>配套背景：Krishnamoorthi, <em>Quantizing deep convolutional networks for efficient inference: A whitepaper</em>（arXiv:1806.08342，量化的系统性综述，C27 与本课模块 03 的基础）；Migacz, <em>8-bit Inference with TensorRT</em>（GTC 2017，KL 熵校准的原始出处）；Buckler et al., <em>Reconfiguring the Imaging Pipeline for Computer Vision</em>（ICCV 2017，ISP-感知联合设计的早期工作）。相邻课程：C52（导出与运行时）、C27（量化原理）、C55（TSR 场景）、C57（小目标）、C61 模块 03（训练侧调试手册）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="next" href="../01_preprocess/01_讲解.html"><div class="dir">下一模块 →</div><div class="t">01 · 预处理一致性：最常见也最隐蔽的鸿沟</div></a>
+  </div>
+
+</div>
+</body>
+</html>

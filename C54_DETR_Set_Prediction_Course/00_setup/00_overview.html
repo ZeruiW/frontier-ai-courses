@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>00 · 课程总览与环境</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 00 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>00 · 课程总览与环境</h1>
+  <p class="subtitle">从「密集预测 + NMS 去重」到「一次输出一个不含重复的集合」· 三个必须搞懂的机制（二分匹配 / 集合损失 / object query）· 端到端换来的是延迟确定性，代价是收敛速度与小目标 · 一个玩具例子直观对比两种范式的输出差异</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">Python/numpy；C18（目标检测基础：IoU / NMS / mAP）与 C53（实时检测器）有帮助但不必需</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 00_environment_check.ipynb</div></div>
+    <div class="item"><div class="k">课程模块</div><div class="v">6 个模块 · 纯 numpy 从零实现匈牙利匹配 / 集合损失 / 注意力 / 可变形采样</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">总览 30 分钟 + 跑 25 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#thesis">核心命题：把「去重」从推理期挪到训练期</a></li>
+      <li><a href="#paradigm">两种范式的逐项对照</a></li>
+      <li><a href="#mech">三个必须搞懂的机制</a></li>
+      <li><a href="#history">DETR 换来了什么，代价是什么</a></li>
+      <li><a href="#tsr">对 TSR 意味着什么</a></li>
+      <li><a href="#map">课程地图与运行环境</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="thesis"><span class="num">1</span>核心命题：把「去重」从推理期挪到训练期</h2>
+  <p>这门课只回答一个问题：<strong>检测器能不能一次就吐出一个「不含重复」的目标集合，而不是先吐出上万个候选框、再用 NMS 把重复的删掉？</strong></p>  <p>这个问题听起来像是工程洁癖，其实不是。传统检测器（Faster R-CNN、YOLO、RetinaNet、FCOS）的输出天生是<strong>密集且重复</strong>的：每个空间位置、每个 anchor 都独立地对「我这里有没有目标」做出判断，它们之间<em>没有任何互相协商的机制</em>。于是一块 24×24 像素的限速牌周围，会有几十个格子同时喊「我看到它了」。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>既然模型自己不去重，就只能在<strong>后处理</strong>里去重——这就是 <span class="term">NMS</span>（non-maximum suppression，非极大值抑制）：按分数排序，留下最高分的，把和它 IoU 超过阈值的全删掉。这套机制统治了目标检测十年，它简单、有效、几乎无参数（就一个 IoU 阈值）。<em>但它有一个无法修补的结构性缺陷：它是一条写死的规则，而不是学出来的行为。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>结构性缺陷具体表现为三条：① <strong>阈值是全局的，而「多重叠算重复」是场景相关的</strong>——远处小标志的重复框 IoU 有 0.6，而套装组合牌（大蓝底指路牌里嵌一块限速牌）两个<em>真目标</em>的 IoU 是 0.69，一个阈值不可能同时满足；② <strong>延迟数据依赖</strong>——NMS 的比较次数随候选框数平方增长，目标越多越慢，这让端到端延迟的 p99 不可控；③ <strong>它不可微</strong>，因此这一步的错误无法反传回模型，模型永远学不会「不要输出重复框」。</p></div>
+  </div>  <p><span class="term">Set prediction</span>（集合预测）给出的答案是：<strong>让模型直接输出一个固定大小的集合，并在训练时就用一对一匹配强迫它「一个目标只准一个预测去认领」</strong>。没被认领的预测被判为「无目标」。于是重复框在<em>训练期</em>就被压制掉了，推理时不需要任何去重步骤。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>把这门课浓缩成一句话：<strong>NMS 是在推理期删掉重复，一对一匹配是在训练期不让重复长出来</strong>。前者是打补丁，后者是改目标函数。<em>面试里如果只能记住一句关于 DETR 的话，就记这句</em>——因为几乎所有「DETR 为什么不需要 NMS」的追问都是它的展开。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="paradigm"><span class="num">2</span>两种范式的逐项对照</h2>
+  <div class="ascii">范式 A：密集预测 + NMS（Faster R-CNN / YOLO / RetinaNet / FCOS）
+
+  图像 ──▶ backbone ──▶ 多尺度特征 ──▶ 每个位置/anchor 独立打分回归
+                                        │
+                                        ▼
+                                  ~10^4–10^5 个候选框（**大量重复**）
+                                        │  score 阈值
+                                        ▼
+                                  ~10^2–10^3 个候选框
+                                        │  **NMS（不可微、O(n^2)、阈值全局）**
+                                        ▼
+                                  最终框（希望没重复）
+
+范式 B：集合预测（DETR 家族）
+
+  图像 ──▶ backbone ──▶ encoder ──▶ decoder(N 个 object query)
+                                        │
+                                        ▼
+                                  **恰好 N 个预测**（N=100/300，含大量 "no-object"）
+                                        │  只需 score 阈值 / top-k
+                                        ▼
+                                  最终框（**结构上就不含重复**）
+
+  训练时多一步：预测集合 ⟷ GT 集合 做**二分图最优匹配**，再算集合损失。
+  推理时少一步：**没有 NMS**。</div>  <table>
+    <thead><tr><th></th><th>范式 A：密集预测 + NMS</th><th>范式 B：集合预测</th></tr></thead>
+    <tbody>
+      <tr><td>输出数量</td><td>随图像内容变化（10⁴ 起，经阈值后仍不定）</td><td><strong>固定 N</strong>（100 / 300 / 900）</td></tr>
+      <tr><td>预测之间是否交互</td><td>❌ 完全独立</td><td><strong>✅ decoder self-attention 里互相协商</strong></td></tr>
+      <tr><td>去重发生在</td><td><strong>推理期</strong>（NMS，不可微）</td><td><strong>训练期</strong>（一对一匹配，可微目标）</td></tr>
+      <tr><td>需要的先验</td><td>anchor 尺寸/比例、层级分配规则、NMS 阈值</td><td><strong>只有 N</strong>（query 数量）</td></tr>
+      <tr><td>后处理延迟</td><td>随目标数增长，<strong>p99 不可控</strong></td><td><strong>常数</strong>（N 次阈值比较）</td></tr>
+      <tr><td>密集重叠目标</td><td>阈值调低会误删真目标</td><td>无抑制步骤，<strong>不存在误删</strong></td></tr>
+      <tr><td>代价</td><td>工程成熟、收敛快</td><td><strong>收敛慢（原版 500 epoch）、小目标弱</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>「预测之间是否交互」这一行是<strong>范式差别的真正源头</strong>，其它几行都是它的后果。密集预测里每个格子只看自己感受野内的证据独立作答，<em>它根本没有「别人是不是也在报这个目标」这个信息</em>，所以必然重复。集合预测在 decoder 里让 N 个 query 之间做 self-attention，一个 query 可以「看到」别的 query 已经认领了某个目标，从而把自己压下去。<em>去重能力是从这个交互里长出来的。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说，<strong>self-attention 提供的是「去重的能力」，一对一匹配提供的是「去重的动机」</strong>。两者缺一不可：只有交互没有一对一监督，模型没理由压制重复（多报几个反而召回高）；只有一对一监督没有交互，query 之间无法协调谁让谁，训练会极不稳定。<em>后面模块 03 会看到，把 decoder 的 self-attention 去掉，重复框立刻回来。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个必须澄清的误解：<strong>「DETR 不需要 NMS」不等于「DETR 的输出里没有重复框」</strong>。训练充分的 DETR 重复率很低但不是零；真实量产系统里常常还会挂一个<em>非常宽松</em>的 NMS（IoU 阈值 0.9）做兜底。<em>面试时说「完全不需要」会被追问，说「结构上不需要，工程上常留兜底」才是准确的。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mech"><span class="num">3</span>三个必须搞懂的机制</h2>
+  <p>集合预测不是一个技巧，是三个机制咬合在一起的系统。<strong>拆掉任何一个，另外两个都失效</strong>——这是本课模块 01–03 的组织依据。</p>  <table>
+    <thead><tr><th>机制</th><th>它解决什么</th><th>拆掉它会怎样</th><th>本课在哪讲</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 二分图最优匹配</strong><br>（Hungarian matching）</td><td>预测集合与 GT 集合都<em>无序</em>，损失必须先建立一一对应</td><td><strong>没有对应关系就没法算损失</strong>；用贪心匹配则会得到次优对应，梯度指错方向</td><td><strong>模块 01</strong>（本课最重要的模块）</td></tr>
+      <tr><td><strong>② 集合预测损失</strong><br>（Hungarian loss）</td><td>对匹配上的 query 算分类+框损失，对没匹配上的判 no-object</td><td><strong>不判 no-object 就没有「压制重复」的力</strong>；no-object 不降权则前景被背景淹没</td><td>模块 02</td></tr>
+      <tr><td><strong>③ Object query</strong><br>+ cross/self-attention</td><td>N 个可学习的「插槽」去图像里取证据，并彼此协商谁认领谁</td><td><strong>没有 self-attention 就没有去重能力</strong>；没有 cross-attention 就取不到图像证据</td><td>模块 03</td></tr>
+    </tbody>
+  </table>  <div class="ascii">一次训练迭代里三个机制怎么咬合：
+
+  图像 ──▶ 模型 ──▶ 预测集合 {(p_1,b_1), ..., (p_N,b_N)}      ← ③ object query 产生
+                                    │
+                     GT 集合 {(c_1,g_1), ..., (c_M,g_M)}
+                                    │
+                        ┌───────────┴───────────┐
+                        │  ① 构造 N×M 代价矩阵   │   C_ij = 分类项 + L1 项 + GIoU 项
+                        │     求**总代价最小**    │
+                        │     的一对一匹配 σ      │   ← 匈牙利算法，O(n^3)
+                        └───────────┬───────────┘
+                                    ▼
+                     matched:  (σ(j), j) ──▶ 分类损失 + 框损失   ┐
+                     unmatched: 其余 N−M 个 ──▶ 判为 no-object   ┘ ② 集合损失
+                                    │
+                                    ▼
+                              反传，更新模型
+
+  关键：**匹配本身不参与梯度**（它是一个离散的 argmin，只决定「跟谁算账」），
+        但它决定了每个 query 收到什么方向的梯度 —— 所以它比损失本身更关键。</div>  <p>写成一个式子，整个训练目标就是下面这一行——<strong>它把三个机制全串起来了</strong>：<code>σ̂</code> 来自机制 ①，中括号里的两项是机制 ② 的前景部分，最后那个求和是机制 ② 的 no-object 部分（<strong>压制重复的力就在这里</strong>），而所有 <code>p̂</code> 与 <code>b̂</code> 都由机制 ③ 的 N 个 query 产生：</p>  <div class="math-block">\[\mathcal{L}_{\text{set}} \;=\; \sum_{j=1}^{M}\Big[\, -\log \hat p_{\hat\sigma(j)}(c_j) \;+\; \mathcal{L}_{\text{box}}\big(\hat b_{\hat\sigma(j)},\, b_j\big) \Big] \;+\; \lambda_{\varnothing} \sum_{i \,\notin\, \mathrm{Im}(\hat\sigma)} -\log \hat p_i(\varnothing)\]</div>  <p>注意 <strong>M 通常只有个位数而 N 是 100</strong>，所以右边那个求和有 90 多项、左边只有几项——<em>这就是 no-object 必须降权（<code>λ_∅</code> 取 0.1）的原因，模块 02 会量化不降权会发生什么。</em></p>  <div class="callout intuition"><span class="label"></span>
+    <p>第三个机制常被误解。<strong>object query 不是「特征」，是「位置/角色的可学习嵌入」</strong>——它更像是一张空白的登记表上的一行，写着「我负责去图像的某个区域找某种尺度的目标」。训练完成后你会发现每个 query 都有明显的空间偏好（模块 03 会实测这个现象）。<em>把 query 理解成「可学习的、带交互能力的 anchor」是最接近本质的类比</em>，但要注意它与 anchor 的三点差别：query 没有显式的几何参数（DAB-DETR 之后才有）、query 之间有 attention 交互、query 与 GT 是一对一而非一对多。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="history"><span class="num">4</span>DETR 换来了什么，代价是什么</h2>
+  <p><strong>DETR</strong>（End-to-End Object Detection with Transformers, ECCV 2020）的历史地位不在于精度——它发布时的 AP 只是<em>持平</em>一个调好的 Faster R-CNN，而且训练要 500 个 epoch。它的地位在于：<strong>它第一次证明了「检测可以不需要 anchor、不需要 NMS、不需要任何手工设计的匹配规则」，整条流水线端到端可微。</strong></p>  <table>
+    <thead><tr><th>它拿掉了什么</th><th>以前这东西带来什么麻烦</th><th>拿掉之后</th></tr></thead>
+    <tbody>
+      <tr><td><strong>anchor</strong></td><td>尺寸/比例/层级分配都要按数据集调；TSR 这种极端小目标数据集尤其难调</td><td>只剩一个超参 N</td></tr>
+      <tr><td><strong>NMS</strong></td><td>阈值全局、不可微、延迟数据依赖</td><td>后处理变成常数时间</td></tr>
+      <tr><td><strong>手工标签分配规则</strong></td><td>MaxIoU / ATSS / SimOTA 各有一堆超参，是精度的胜负手（C53 模块 02）</td><td>分配由匹配算法自动给出</td></tr>
+      <tr><td><strong>RoI 相关模块</strong></td><td>RoIAlign、两阶段的 proposal 机制</td><td>结构大幅简化</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>代价同样明确，而且都很痛。<strong>① 收敛慢</strong>：原版 500 epoch，而 Faster R-CNN 只要 12–36 epoch，差了一个数量级；<strong>② 小目标弱</strong>：DETR 的 AP_S 明显低于同期 CNN 检测器，因为它只用了单尺度（C5）特征；<strong>③ 训练不稳定</strong>：匹配结果在相邻 epoch 之间会跳变，优化目标一直在动。<em>这三条代价正好定义了后续三年整个 DETR 家族的研究议程。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说，② 和 ③ 都是 ① 的原因，而 ① 的两个根因是：<strong>cross-attention 在训练初期几乎是均匀分布</strong>（每个 query 对全图所有位置的注意力权重差不多，有效梯度极度稀疏），以及<strong>匹配不稳定</strong>（同一个 GT 在相邻 epoch 被不同 query 认领，被认领的 query 收到的梯度方向来回震荡）。<em>Deformable DETR 主要解决前者（把全局注意力换成每 query 只采样 K 个可学位置），DN-DETR / DINO 主要解决后者（用带噪 GT 作为绕过匹配的额外 query）</em>。模块 04 会把这条线索完整走一遍。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>不要把「DETR 精度不如 YOLO」当成结论背下来</strong>。这个说法在 2020 年成立，2023 年之后已经反过来了：RT-DETR 在同等延迟下 AP 高于同期 YOLO，DINO 系长期占据 COCO 榜首。<em>面试里说「DETR 慢/不准」会暴露知识停留在 2020 年</em>。准确的说法是：<strong>原始 DETR 的收敛与小目标问题在 Deformable/DN/DINO 之后已被系统性解决，剩下的真实代价是训练数据量需求更大、部署链路（attention 算子、动态形状）比纯 CNN 复杂。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tsr"><span class="num">5</span>对 TSR 意味着什么</h2>
+  <p>这门课属于「交通标志识别（TSR）岗位缺口补全」系列，所以每个机制都要落到 TSR 场景上问一句：<strong>它在车上到底能带来什么、又会带来什么新麻烦？</strong></p>  <table>
+    <thead><tr><th>TSR 的具体痛点</th><th>集合预测怎么帮</th><th>它带来的新麻烦</th></tr></thead>
+    <tbody>
+      <tr><td><strong>延迟 p99 必须可控</strong>：车端 30 FPS 意味着 33 ms 一帧，感知只分到十几毫秒，而 NMS 的耗时随框数波动</td><td>后处理变成 N 次阈值比较，<strong>延迟与场景内容无关</strong>——市区密集标志与高速空旷路段耗时相同</td><td>attention 算子在 TensorRT 上的支持与优化不如纯卷积；动态形状要小心</td></tr>
+      <tr><td><strong>组合标志牌</strong>：大指路牌里嵌一块限速牌，两个真目标 bbox 的 IoU 可达 0.69</td><td><strong>没有抑制步骤，就不存在「把真目标当重复删掉」</strong></td><td>两个高度重叠的目标要靠不同 query 认领，对 query 数量与 self-attention 提出要求</td></tr>
+      <tr><td><strong>类别极多且长尾</strong>：限速 5–120、组合牌、可变电子牌，anchor 与阈值都难以一套通吃</td><td>分配由匹配代价自动决定，<strong>不需要为不同类别调 anchor 或 IoU 阈值</strong></td><td>长尾类的匹配代价里分类项弱，容易被框项主导（模块 02 会量化）</td></tr>
+      <tr><td><strong>小目标为主</strong>：60 m 外的 60 cm 限速牌在 1920×1080 相机上只有约 20 像素</td><td>—（原版 DETR 在这一点上<strong>更差</strong>）</td><td><strong>必须上多尺度可变形注意力</strong>（Deformable DETR），否则 AP_S 不可接受</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以对 TSR 来说，<strong>集合预测的价值主要在「延迟确定性」与「密集重叠场景不误删」，而不是在纸面 AP</strong>。前者直接关系到功能安全（一帧超时就丢一帧感知结果），后者直接关系到组合标志牌这种<em>高频且高危</em>的场景——漏掉主牌下面的辅助牌（「前方 500 m」「货车」），会让限速约束被错误地施加到不该施加的路段上。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要诚实：<strong>如果直接把原版 DETR 放到 TSR 上，结果会很难看</strong>。单尺度 C5 特征的 stride 是 32，一个 20 像素的标志在特征图上占不到一个格子；100 个 query 里绝大多数会去认领大目标。<em>TSR 场景下可用的 DETR 系必须至少满足两个条件：多尺度输入（P3 甚至 P2）+ 可变形注意力（把全局 attention 的计算量压下来）</em>。这就是为什么本课模块 04 的 Deformable DETR 不是「历史演进的一站」，而是<strong>TSR 落地的前提条件</strong>。</p></div>
+  </div>  <div class="callout danger"><span class="label">别说「没有 NMS 所以更快」</span>
+    <p>一个会让面试当场翻车的说法：<strong>「DETR 没有 NMS，所以延迟更低」</strong>。这在多数情况下是<em>错的</em>——DETR 的 backbone+encoder 通常比同级 YOLO 更重，端到端延迟往往<strong>更高</strong>。正确的说法是：<strong>DETR 的延迟<em>方差</em>更小、p99 更接近 p50，因为它没有随目标数变化的后处理</strong>。<em>车端关心的是尾延迟而不是平均延迟</em>——这个区分能立刻显出你有没有真的做过部署。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="map"><span class="num">6</span>课程地图与运行环境</h2>
+  <div class="ascii">模块 00  课程总览与环境            ← 你在这里
+   │     两种范式的输出差异 / 三个机制的分工 / NMS 阈值困境的量化
+   ▼
+模块 01  二分图匹配与匈牙利算法    ★ 本课最重要
+   │     代价矩阵与一对一约束 / 增广路径 / KM 对偶变量 / DETR 三项代价 /
+   │     为什么一对一能替代 NMS / **匹配不稳定性**（后面所有工作的动机）
+   ▼
+模块 02  集合预测损失
+   │     Hungarian loss 完整公式 / no-object 权重 / 为什么必须 L1+GIoU /
+   │     IoU 家族的梯度性质 / 辅助损失为什么加速收敛
+   ▼
+模块 03  Object query 与交叉注意力
+   │     query 到底是什么 / self-attn（去重协商）vs cross-attn（取证据）/
+   │     query 的空间特化 / N 怎么选 / DAB-DETR 的 4D anchor query
+   ▼
+模块 04  收敛难题与 DETR 家族演进
+   │     500 epoch 的两个根因 / Deformable（可变形注意力+多尺度+两阶段）/
+   │     DN-DETR（去噪 query 绕过匹配）/ DINO / 一对多匹配的回归
+   ▼
+模块 05  DETR 工程实践：调参、诊断与选型
+         学习率分组 / 小目标弱的根因与解法 / 训练失败诊断树 /
+         DETR vs YOLO 工程取舍表 / **给 TSR 选哪个的完整论证**</div>  <table>
+    <thead><tr><th>模块</th><th>核心机制</th><th>notebook 里从零做什么</th></tr></thead>
+    <tbody>
+      <tr><td>01 匈牙利匹配</td><td>线性指派问题、增广路径、对偶变量</td><td><strong>手写 O(n³) 匈牙利算法</strong>（不许用 scipy）+ 与暴力枚举全排列对拍 + <strong>匹配翻转率量化</strong></td></tr>
+      <tr><td>02 集合损失</td><td>Hungarian loss、no-object 权重、IoU 家族</td><td><strong>IoU/GIoU/DIoU/CIoU 及其梯度</strong>（数值梯度校验）+ 完整集合损失 + 权重消融</td></tr>
+      <tr><td>03 object query</td><td>多头注意力、decoder 一层的结构</td><td><strong>numpy 版多头注意力</strong> + decoder 层 + query 空间特化可视化</td></tr>
+      <tr><td>04 收敛与演进</td><td>可变形注意力、去噪 query</td><td><strong>可变形采样 + 双线性插值（含梯度）</strong> + DN query 构造与 attention mask</td></tr>
+      <tr><td>05 工程实践</td><td>诊断指标、选型决策</td><td><strong>匹配翻转率 / 前景 query 占比 / 框中心分布熵</strong> + 选型脚本</td></tr>
+    </tbody>
+  </table>  <p><strong>运行环境</strong>：全课 <span class="badge cpu">CPU</span>，纯 numpy + 标准库，不需要 torch / mmdet / GPU，不联网。所有 notebook 在 CPU 上实跑验证，<code>assert</code> 零失败。</p>  <pre><code>pip install -r requirements.txt      # numpy / matplotlib / jupyterlab / ipykernel
+jupyter lab                          # 打开 00_setup/00_environment_check.ipynb</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么不用 torch？<strong>因为本课的难点全部在「机制」而不在「API」</strong>。匈牙利算法是纯组合优化，注意力是三个矩阵乘法，可变形采样是双线性插值——这些用 numpy 写出来<em>反而更清楚</em>，因为没有任何一行被框架藏起来。而 <code>scipy.optimize.linear_sum_assignment</code> 这种一行调用会让你永远不知道匹配是怎么算出来的，<em>而面试恰恰会让你在白板上手写它</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>本课与相邻课程的边界：<strong>C18 讲检测基础（IoU/NMS/mAP/anchor），C53 讲实时检测器架构（YOLO 演进 / RTMDet / RT-DETR 的工程取舍），C57 讲小目标，C60 讲部署</strong>。<em>本课只讲「集合预测」这一条主线的机理</em>——RT-DETR 的<em>工程实现</em>在 C53 模块 04，它背后的<em>匹配与集合损失原理</em>在这里。两门课刻意有一处重叠：RT-DETR 既是「实时检测器」也是「DETR 家族」，从两个角度各讲一遍是有意的。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>学完本课你应当能在白板上完成这几件事：<strong>手写匈牙利算法并说清它为什么是 O(n³) 而不是 O(n!)；写出 DETR 的匹配代价三项并解释为什么分类项用概率而不是 log；解释「一对一匹配为什么能替代 NMS」并说清它和 self-attention 的分工；说出 DETR 收敛慢的两个根因，以及 Deformable / DN / DINO 各自打的是哪一个；给 TSR 场景在 DETR 系与 YOLO 系之间做选型并给出量化理由。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>研究前沿与开放问题</h2>
+  <p>集合预测这条线在 2020–2025 之间已经从「有趣的概念验证」变成「SOTA 检测器的默认骨架」，但下面几个问题仍然是开放的。</p>  <ul>
+    <li><strong>一对一与一对多的真正关系</strong>：Group DETR / H-DETR / Co-DETR 都发现「训练时额外加一对多分支、推理时丢掉」能显著涨点。<em>这说明一对一是「推理端的需求」而不是「训练端的最优」</em>——监督信号太稀疏才是 DETR 收敛慢的本质。但「训练时到底该给多稠密的监督」目前只有经验配方，没有理论。</li>
+    <li><strong>匹配稳定性的理论刻画</strong>：匹配是一个离散 argmin，代价矩阵的微小扰动可以让整个指派翻转。<em>目前对「什么时候会翻转、翻转多严重才影响收敛」只有实验观察</em>（模块 01 的 notebook 会量化它），Stable-DINO 等工作提出用定位质量给分类分数加权来稳定匹配，但仍是启发式。</li>
+    <li><strong>query 数量 N 的自适应</strong>：N 固定意味着「单图目标数超过 N 就必然漏检」，而且 N 越大正样本占比越低。<em>能否让 N 随场景自适应</em>（稀疏场景少算几个 query）是部署上很有价值但尚未解决的问题——对 TSR 这种「大部分帧只有 0–3 块标志、偶尔路口有十几块」的极不均匀分布尤其重要。</li>
+    <li><strong>端到端与可解释性的矛盾</strong>：集合预测把「谁负责哪个目标」交给了匹配算法，好处是不用手工设计规则，坏处是<em>出问题时很难归因</em>——一个目标漏检，是 query 不够、是匹配把它让给了别的 query、还是 cross-attention 没取到证据？模块 05 会给一套诊断指标，但这仍是工程上的痛点。</li>
+    <li><strong>与 VLA / BEV 的接口</strong>：DETR 的输出天然是「一组带语义的 object token」，这比密集特征图更容易接到下游的语言模型或 BEV 融合模块上。<em>「检测器的输出应该是框还是 token」正在被重新讨论</em>（见 C59）。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读（按阅读顺序）：<strong>★ Carion et al., <em>End-to-End Object Detection with Transformers</em>（DETR, ECCV 2020）</strong>——重点读 §3 的 set prediction loss 与匹配定义；<strong>★ Zhu et al., <em>Deformable DETR</em>（ICLR 2021）</strong>——重点读可变形注意力的定义与「为什么 DETR 收敛慢」的分析；<strong>★ Li et al., <em>DN-DETR</em>（CVPR 2022）</strong>——它对「匹配不稳定」的量化实验是本课模块 01 的直接来源；<strong>★ Zhang et al., <em>DINO</em>（ICLR 2023）</strong>；Zhao et al., <em>RT-DETR</em>（CVPR 2024）；Kuhn, <em>The Hungarian Method for the Assignment Problem</em>（1955，匈牙利算法原始论文，只有 12 页，值得读）。相邻课程：C18（检测基础）、C53（实时检测器）、C57（小目标）、C60（车端部署）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="next" href="../01_hungarian/01_讲解.html"><div class="dir">下一模块 →</div><div class="t">01 · 二分图匹配与匈牙利算法</div></a>
+  </div>
+
+</div>
+</body>
+</html>

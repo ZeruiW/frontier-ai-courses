@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 动作表示与输出头设计</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 动作表示与输出头设计</h1>
+  <p class="subtitle">三条路线的取舍是可以算出来的：<strong>离散 token</strong> 的分箱误差有闭式上界 range/(2·B)，256 分箱下 ±6 m/s² 的加速度还剩 ±0.023 m/s² 的量化噪声 · <strong>连续回归</strong>在多模态分布下会输出「平均的错误动作」——路口该左该右，回归给出直行，而这个直行在训练数据里<em>一次都没出现过</em>（notebook 里会把它算给你看）· <strong>扩散 / 流匹配</strong>能表达多模态，但去噪步数直接乘进延迟，10 步就是 10 次前向 · 轨迹参数化（waypoints / 多项式 / 样条 / 控制量）的可执行性差别 · <strong>action chunking</strong>：一次出未来 K 步，把推理频率降到 1/K，顺带消掉块内抖动 · 分层控制的频率账：VLA 2–5 Hz 出粗轨迹，下游控制器 50–100 Hz 跟踪</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00（三代架构）、模块 01（VLM→VLA、动作 token）；C55 模块 04（时序）有帮助但不必需</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_action_representation.ipynb（纯 numpy，含流匹配采样器）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">RT-2 · OpenVLA · ACT（action chunking）· Diffusion Policy · π0（流匹配）· DriveVLM / EMMA</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 75 分钟 + 跑 65 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#last-mile">动作表示：VLA 的最后一公里</a></li>
+      <li><a href="#discrete">离散 token：把控制问题变成语言问题</a></li>
+      <li><a href="#regression-trap">连续回归的致命缺陷：多模态分布下的「平均的错误动作」</a></li>
+      <li><a href="#diffusion">扩散与流匹配：把分布本身学出来</a></li>
+      <li><a href="#trajectory">轨迹参数化：输出什么才是「可执行的」</a></li>
+      <li><a href="#chunking">动作分块（action chunking）：一次输出未来 K 步</a></li>
+      <li><a href="#hierarchy">频率的账：为什么必须分层控制</a></li>
+      <li><a href="#interview">面试标准答案骨架</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="last-mile"><span class="num">1</span>动作表示：VLA 的最后一公里</h2>
+  <p>一个 VLA 的前 95% 计算量花在「看懂」和「想明白」上，但<strong>决定它能不能上车的，是最后那一层输出头</strong>。因为前面两段的错误是渐变的（看错一点、想偏一点），而输出头的设计错误是<em>结构性的</em>——选错了表示，无论堆多少数据、放多大模型，某一类动作你就是表达不出来。</p>  <p>先把「动作」这个词说清楚。自动驾驶 VLA 的输出<strong>几乎从来不是方向盘角度</strong>，而是下面几种之一：</p>  <table>
+    <thead><tr><th>输出形态</th><th>具体内容</th><th>维度量级</th><th>谁在用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>未来轨迹（waypoints）</strong></td><td>未来 3–6 秒、每 0.2–0.5 秒一个 $(x, y)$ 或 $(x, y, v)$</td><td>$K\times2$ 到 $K\times3$，$K$ 约 6–30</td><td><strong>量产自驾的主流</strong>（DriveVLM / EMMA / 端到端规划）</td></tr>
+      <tr><td>曲率 + 纵向速度剖面</td><td>$\kappa(t)$ 与 $v(t)$ 的参数化</td><td>十几个系数</td><td>传统规控接口，便于加约束</td></tr>
+      <tr><td>直接控制量</td><td>前轮转角 $\delta$、加速度 $a$</td><td>2 维 × K 步</td><td>研究性端到端；<strong>量产极少</strong>（见第 5 节）</td></tr>
+      <tr><td><strong>高层意图 + 轨迹</strong></td><td>「减速至 60 / 保持车道」+ 对应轨迹</td><td>离散意图 + 连续轨迹</td><td>分层方案，可解释性最好</td></tr>
+      <tr><td>机械臂关节动作</td><td>7-DoF 关节增量或末端位姿</td><td>7 维 × K 步</td><td>机器人 VLA（RT-2 / OpenVLA / π0）</td></tr>
+    </tbody>
+  </table>  <div class="ascii">VLA 的三段结构，与本模块的位置
+
+  多相机图像 ──► 视觉编码器 ──┐
+                              ├─► 连接器 ─► LLM 主干 ─► **动作输出头** ─► 动作
+  TSR/感知结构化输出 ─► 文本 ──┤        (模块 03 讲这条)      ▲
+  导航指令 / 系统 prompt ──────┘                             │
+                                                    **本模块只讲这里**
+  ┌──────────────────────────────────────────────────────────────┐
+  │ 三条互斥的路线：                                              │
+  │   ① 离散 token   把动作分箱成词表里的 token，复用 LM 头       │
+  │   ② 连续回归     加一个 MLP 头，直接回归实数                  │
+  │   ③ 扩散/流匹配  学一个从噪声到动作分布的映射                 │
+  └──────────────────────────────────────────────────────────────┘</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这三条路线值得单独花一个模块？因为它们在<strong>同一个维度上做了不可兼得的取舍：能不能表达「同一个场景下有多个都对的动作」</strong>。这件事在分类和检测里不存在（一张图里那个标志就是限速 60，没有第二个答案），但在决策里是常态——路口可以左也可以右，前车慢了可以跟也可以变道超车。<em>一个不能表达多解的输出头，会在最需要它做决定的地方给出一个平均意义上的答案，而平均往往是最糟的那个。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说：模仿学习拟合的是专家动作的<strong>条件分布</strong> $p(a \mid o)$，其中 $o$ 是观测（图像 + 语言 + 感知输入）。三条路线的本质区别是它们对这个分布做了什么假设——<em>连续回归隐含地假设 $p(a\mid o)$ 是单峰的（更准确地说，$\ell_2$ 损失只在乎它的一阶矩）；离散 token 与扩散/流匹配则把整个分布显式建模出来</em>。<strong>当真实分布是多峰的，这个假设不是「精度差一点」，而是「输出一个训练集里从未出现过的动作」</strong>。第 3 节会把这件事推到底。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把整个模块压成一句话：<strong>输出头要回答的不是「最可能的动作是什么」，而是「动作的分布长什么样」——因为你需要从分布里<em>挑</em>一个，而不是<em>算</em>一个平均。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="discrete"><span class="num">2</span>离散 token：把控制问题变成语言问题</h2>
+  <p>这是 <span class="term">RT-2</span> 开创、<span class="term">OpenVLA</span> 沿用的路线，也是「VLA」这个名字的由来：<strong>把连续动作离散成有限个 bin，每个 bin 占用词表里的一个 token，于是「预测下一个动作」和「预测下一个词」变成了字面意义上的同一件事</strong>。RT-2 的具体做法是把动作每一维分成 <strong>256 个 bin</strong>，然后征用 LLM 词表里 256 个最少使用的 token 来表示它们。</p>  <h3>① 分箱的精度账</h3>  <p>均匀分箱的量化误差有闭式解。设动作某一维的取值范围是 $[\,a_{\min}, a_{\max}\,]$，分成 $B$ 个 bin，则 bin 宽 $\Delta = (a_{\max}-a_{\min})/B$，量化误差在 $[-\Delta/2, \Delta/2]$ 上近似均匀分布，于是：</p>  <div class="math-block">\[\Delta = \frac{a_{\max}-a_{\min}}{B}, \qquad \mathbb{E}\bigl[e^2\bigr] = \frac{\Delta^2}{12}, \qquad e_{\text{RMS}} = \frac{\Delta}{\sqrt{12}} \approx 0.289\,\Delta\]</div>  <p>代入真实数字：前轮转角范围 $\pm 35^\circ$（共 $70^\circ$），$B=256$ → $\Delta = 0.273^\circ$，$e_{\text{RMS}} = 0.079^\circ$。<strong>看起来小到可以忽略，但控制量的误差会被积分。</strong>用自行车模型，轴距 $L=2.9$ m，前轮角 $\delta$ 对应曲率 $\kappa \approx \delta/L$：</p>  <table>
+    <thead><tr><th>量</th><th>数值</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>$\Delta$（1 个 bin）</td><td>$0.273^\circ = 4.77\times10^{-3}$ rad</td><td>$70^\circ / 256$</td></tr>
+      <tr><td>对应曲率 $\kappa$</td><td>$1.65\times10^{-3}\ \mathrm{m^{-1}}$</td><td>$\kappa=\delta/L$，$L=2.9$ m</td></tr>
+      <tr><td>行驶 3 m（30 m/s 下 0.1 s）的横向偏移</td><td><strong>7.4 mm</strong></td><td>$y\approx\kappa s^2/2$ —— 可以忽略</td></tr>
+      <tr><td>行驶 30 m（30 m/s 下 1.0 s）的横向偏移</td><td><strong>0.74 m</strong></td><td><strong>已经超过半个车道宽的容差</strong></td></tr>
+    </tbody>
+  </table>  <p>结论不是「离散化不能用」，而是：<strong>离散化的可接受性取决于「这个量会被积分多久」</strong>。输出<em>轨迹点</em>时量化误差不积分（每个点独立，误差就是几厘米的位置误差）；输出<em>控制量</em>时误差会沿时间积分成位置误差。<em>这是第 5 节「为什么量产系统输出轨迹而不是控制量」的一个独立理由。</em></p>  <h3>② 非均匀分箱：动作分布是重尾的</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>转向角的真实分布<strong>极度集中在 0 附近</strong>——高速直行时 90% 以上的时间前轮角在 $\pm 1^\circ$ 内，而 $\pm 35^\circ$ 的极值只在低速掉头时出现。均匀分箱把 256 个 bin 平均撒在 $70^\circ$ 上，<em>结果是直行时全部落在 2–3 个 bin 里（分辨率浪费在永远用不到的大转角上），而这恰恰是精度要求最高的工况</em>（高速上 0.1° 的抖动就是可感知的方向盘晃动）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>解法是<strong>按分位数分箱</strong>（quantile binning）：用训练集动作的经验分位数确定 bin 边界，使每个 bin 承载相同的概率质量。等价于先做一次概率积分变换 $u = F(a)$ 再均匀分箱。<em>代价有两个：①bin 边界成了数据的函数，换数据分布就要重标定，而且它必须与模型权重一起版本化（一个极易被忘记的产物）；②极值区的分辨率变得很粗，掉头这类罕见但要求精确的工况反而变差</em>。<strong>实践折中是 $\mu$-law 式的对数压扩</strong>：$\tilde a = \mathrm{sign}(a)\,\log(1+\mu|a|)/\log(1+\mu)$，中心密、边缘疏，但形状由一个超参 $\mu$ 控制而不由数据决定——<em>可复现性好得多</em>。notebook 会把三种分箱的重建误差按工况分桶算出来。</p></div>
+  </div>  <h3>③ token 预算：真正的延迟杀手</h3>  <p>离散 token 路线最被低估的代价是<strong>自回归解码的串行性</strong>。$K$ 步 chunk、$D$ 维动作 = $K\cdot D$ 个 token，而每个 token 要一次完整的前向：</p>  <table>
+    <thead><tr><th>配置</th><th>$K\times D$</th><th>动作 token 数</th><th>@25 ms/token 的解码延迟</th><th>可用性</th></tr></thead>
+    <tbody>
+      <tr><td>单步、2 维（转角+加速度）</td><td>$1\times2$</td><td>2</td><td>50 ms</td><td>✅ 但需 20+ Hz 调用，总算力爆炸</td></tr>
+      <tr><td>8 步轨迹、2 维</td><td>$8\times2$</td><td>16</td><td>400 ms</td><td>⚠️ 勉强（2.5 Hz）</td></tr>
+      <tr><td><strong>16 步轨迹、3 维 $(x,y,v)$</strong></td><td>$16\times3$</td><td><strong>48</strong></td><td><strong>1.2 s</strong></td><td><strong>❌ 车端不可用</strong></td></tr>
+      <tr><td>机器人 7-DoF、16 步</td><td>$16\times7$</td><td>112</td><td>2.8 s</td><td>❌（机器人可接受，因为频率要求低）</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">RT-2 的 token 方案在车上直接不可用</span>
+    <p><strong>这是「机器人 VLA 的方案不能照搬到自驾」的最硬的一条理由。</strong>机械臂的动作频率要求是 5–10 Hz、失败代价是打翻杯子；车的控制频率要求是 50–100 Hz、失败代价是撞车。<em>RT-2 用 256-bin token 输出 7 维动作在机器人上完全可行，同样的方案在车上光解码就要一秒多</em>。<strong>面试里如果你能主动指出这个「频率-代价」的量级差异，比复述 RT-2 的结构有价值得多</strong>——它说明你知道一个方法的适用边界在哪，而不只是知道它存在。绕开的办法有三条：<em>①并行解码（一次预测全部动作 token，牺牲维度间的自回归依赖）；②换成非自回归的动作头（回归或扩散，一次前向出全部 $K\times D$）；③把 VLA 频率降到 2–5 Hz 并用 chunking + 分层控制补上（第 6、7 节）。量产方案基本都是 ②+③ 的组合。</em></p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>还有一个细节容易漏：<strong>LM 头把 256 个 bin 当成 256 个<em>无序</em>的类别</strong>，它不知道 bin 127 和 bin 128 是相邻的、而 bin 127 和 bin 3 差得很远。<em>后果是分类错误的代价分布很奇怪——模型可能以很小的概率输出一个差 100 个 bin 的动作，而普通的交叉熵对此毫无惩罚</em>。缓解手段：对邻近 bin 做 label smoothing（把目标从 one-hot 改成以真值 bin 为中心的窄高斯）、或改用有序回归（ordinal regression）的损失。<strong>这一点也是「离散 token 精度上限受限」之外的第二个隐性代价。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="regression-trap"><span class="num">3</span>连续回归的致命缺陷：多模态分布下的「平均的错误动作」</h2>
+  <p>这一节是整个模块最重要的洞察，也是面试里区分「用过」和「读过」的分水岭。</p>  <h3>先看结论，再看推导</h3>  <div class="ascii">路口场景：专家演示里 50% 左转、50% 右转
+
+                     ┌───────────────────┐
+                     │   隔离墩 / 导流岛   │   直行是**不可通行**的
+                     └───────────────────┘
+        左转 -30°  ↖           ↑           ↗  右转 +30°
+                     ╲         │         ╱
+                      ╲        │        ╱
+                       ╲       │       ╱
+                        ╲      │      ╱
+                         ╲     │     ╱
+                          ╲    │    ╱
+                           ╲   │   ╱      ← 「平均」轨迹 0°
+                            ╲  │  ╱
+                             ╲ │ ╱
+                              ●●●   自车
+
+  专家数据：50% 走左、50% 走右，**没有任何一条走中间**
+  L2 回归的最优解 = 条件期望   = 0°  → 正对隔离墩
+  L1 回归的最优解 = 条件中位数 = 0°  → 同样正对隔离墩
+
+  ★ **两个有效动作的平均，通常不是一个有效动作。**</div>  <h3>为什么这不是「数据不够」或「模型不够大」</h3>  <p>这是关键。回归头的失败是<strong>损失函数的性质，不是拟合能力的不足</strong>。给定观测 $o$，用平方损失训练一个<em>任意强</em>的函数逼近器，它收敛到的最优解是唯一确定的：</p>  <div class="math-block">\[f^{\star}_{\ell_2}(o) \;=\; \arg\min_{\hat a}\ \mathbb{E}_{a\sim p(\cdot\mid o)}\bigl[\lVert \hat a - a\rVert_2^2\bigr] \;=\; \mathbb{E}\bigl[a \mid o\bigr]\]</div>  <p>换成 $\ell_1$ 损失也救不了，只是从均值换成了中位数：</p>  <div class="math-block">\[f^{\star}_{\ell_1}(o) \;=\; \arg\min_{\hat a}\ \mathbb{E}\bigl[\lVert \hat a - a\rVert_1\bigr] \;=\; \mathrm{median}\bigl[a \mid o\bigr]\]</div>  <p><strong>对一个对称双峰分布，均值和中位数<em>都</em>落在两峰正中间——也就是概率密度最低的地方，也就是专家从来没走过的地方。</strong>模型越大、数据越多，它只会<em>更精确地</em>收敛到这个错误答案。<em>这就是为什么「加数据」在这类失败上完全无效，而这恰恰是工程师最容易先试的一招。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>换个说法：回归头输出的是一个<strong>点估计</strong>，而点估计只有在分布单峰时才有意义。真实的驾驶决策里多峰无处不在——<em>路口左转还是右转、前车慢了跟还是超、限速解除牌之后加速还是保持、临时施工是绕左还是绕右、黄灯是冲还是停</em>。<strong>每一个「或者」都是一个峰。</strong>而这些正是最需要 VLA 而不是规则的场景（简单场景规则就能覆盖）——<em>所以回归头恰好在 VLA 唯一有价值的地方失效。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严谨地讲，问题出在<span class="term">behavior cloning</span>（行为克隆）的目标与损失的错配：我们想要的是从 $p(a\mid o)$ 中<em>采样</em>一个 mode，而 $\ell_p$ 回归给的是这个分布的一个<em>矩</em>。<strong>判据因此非常干净：<em>只要 $p(a\mid o)$ 是单峰的，回归就没问题</em></strong>——车道保持、稳态跟车、匝道汇入这类任务上回归头又快又稳，没必要上扩散。<em>反过来，「任务看起来简单」不是回归可用的理由，「条件分布单峰」才是</em>。诊断方法有三条：①同一场景聚类里专家动作的样本方差异常大；②残差 $a - f(o)$ 的分布本身是双峰的（残差直方图一看就出来）；③验证损失早早卡在一个非零高原且怎么加数据都不降——<strong>因为那个高原正是「分布内方差」的理论下界 $\mathbb{E}[\mathrm{Var}(a\mid o)]$，不是模型的错。</strong></p></div>
+  </div>  <h3>TSR 场景里的具体形态</h3>  <p>别以为这只是路口的事。<strong>把 TSR 输出接进 VLA 之后，多模态会直接从标志语义里冒出来</strong>：</p>  <ul>
+    <li><strong>「限速解除」牌</strong>：解除之后可以立刻加速到路段默认限速，也可以因为前方车流密集而保持——两种都是合理驾驶。回归会输出一个「加速一点点」的中间量，<em>既没有果断加速的效率，也没有保持的平稳</em>。</li>
+    <li><strong>「前方施工」牌 + 车道被占</strong>：绕行方向是左还是右取决于地图与对向车流，专家数据里两种都有 → 双峰 → 回归输出「直行撞进锥桶」。</li>
+    <li><strong>可变电子限速牌读数在两档之间跳变</strong>（80/100 交替刷新）：感知输出本身就是双峰的，如果下游用回归融合，得到的是 90——<em>一个牌子上从来没出现过的数字</em>。<strong>这一条同时也是模块 03 的伏笔：感知接口如果只传一个点估计而不传分布，下游连「这里有两个可能」都不知道。</strong></li>
+  </ul>  <div class="callout danger"><span class="label">「加数据能解决」是错的</span>
+    <p><strong>面试高频且极易翻车。</strong>被问「为什么 VLA 的动作头要用扩散/分类而不是直接回归」时，只答「扩散效果更好」会被追问到底。<strong>标准答法是三段</strong>：<em>①给出机制——$\ell_2$ 的最优解是条件期望，$\ell_1$ 是条件中位数，对称双峰下两者都落在两峰中间的低密度区；②给出后果——输出一个训练集里根本不存在的动作，且这个动作往往正是障碍所在（路口的隔离墩、施工的锥桶）；③给出判据与反例——单峰任务（车道保持、稳态跟车）用回归又快又稳，所以这不是「回归不好」而是「回归假设了单峰」</em>。<strong>最后再补一句杀手锏：这是损失函数的性质，不是容量问题，所以加数据、加参数都无效</strong>——能主动说出这句话，基本就把这题答满了。</p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见的错误缓解方案：<strong>「那我在回归输出上加噪声采样不就多模态了？」——不行。</strong>回归头学的是均值，在均值周围加高斯噪声得到的是<em>以错误答案为中心的一团</em>，不是两个正确的峰。<em>采样必须发生在一个真正建模了分布的对象上（softmax 分类分布、扩散的反向过程、或显式的混合密度网络 MDN），而不是在点估计上事后加抖动。</em>notebook 里会把这个对照做出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="diffusion"><span class="num">4</span>扩散与流匹配：把分布本身学出来</h2>
+  <p>既然问题是「点估计表达不了分布」，那就直接学分布。<span class="term">Diffusion Policy</span> 与 <span class="term">flow matching</span>（流匹配，$\pi_0$ 用的就是它）的共同做法是：<strong>学一个把简单噪声分布搬运到动作分布的映射，推理时从噪声出发迭代若干步，落到某一个 mode 上</strong>。它天然能表达任意多峰，代价是推理要跑多步网络。</p>  <h3>流匹配的最小心智模型</h3>  <p>流匹配定义一条从噪声 $a_0\sim\mathcal{N}(0,\sigma_0^2)$ 到数据 $a_1\sim p(a\mid o)$ 的直线路径 $a_t = (1-t)a_0 + t\,a_1$，然后训练网络去预测这条路径上的<strong>速度场</strong>（velocity field）：</p>  <div class="math-block">\[u_\theta(a, t, o) \;\approx\; \mathbb{E}\bigl[\,a_1 - a_0 \;\big|\; a_t = a\,\bigr], \qquad \text{推理: } \frac{\mathrm{d}a}{\mathrm{d}t} = u_\theta(a,t,o),\ \ t: 0\to 1\]</div>  <p>推理就是从 $a_0$ 出发，用 $N$ 步 Euler 积分把这个常微分方程解到 $t=1$。<strong>而这里藏着本节最漂亮的一个事实</strong>：</p>  <div class="callout intuition"><span class="label">1 步扩散 = 回归</span>
+    <p><strong>用 1 步 Euler 积分的流匹配，输出的<em>恰好</em>是条件期望——也就是回归的答案。</strong>推导只有两行：在 $t=0$ 处 $a_t=a_0$，此时噪声还没带任何数据信息，各个 mode 的后验责任度就是先验权重，于是 $u_0(a) = \mathbb{E}[a_1] - a$；一步 Euler 得 $a_1 \leftarrow a + 1\cdot(\mathbb{E}[a_1]-a) = \mathbb{E}[a_1]$。<em>也就是说：<strong>积分步数就是「多模态表达力」的旋钮，1 步 = 退化成回归，步数越多越能落到单个 mode 上。</strong></em>notebook 会用一个有闭式速度场的双峰例子把这条曲线完整跑出来——碰撞率从 1 步的 100% 一路降到 16 步的 0%。</p>
+  </div>  <h3>步数就是延迟</h3>  <p>$N$ 步积分 = $N$ 次动作头前向。好消息是<strong>动作头通常很小</strong>（几 M 参数的 U-Net / MLP），而且它可以<em>复用同一份视觉-语言条件特征</em>——大模型主干只跑一次，只有小动作头跑 $N$ 次。这与自回归 token 解码（每步都要过整个 LLM）是数量级的差别。</p>  <table>
+    <thead><tr><th>方案</th><th>大模型前向次数</th><th>动作头前向次数</th><th>典型总延迟</th><th>多模态表达</th></tr></thead>
+    <tbody>
+      <tr><td>自回归动作 token（RT-2 式）</td><td><strong>$K\cdot D$ 次</strong></td><td>—</td><td>0.4–2.8 s</td><td>✅（softmax 是完整分布）</td></tr>
+      <tr><td>连续回归 MLP 头</td><td>1 次</td><td>1 次</td><td><strong>最低</strong></td><td><strong>❌</strong></td></tr>
+      <tr><td>扩散策略（DDPM，100 步）</td><td>1 次</td><td>100 次</td><td>高</td><td>✅</td></tr>
+      <tr><td><strong>流匹配 / DDIM（4–16 步）</strong></td><td><strong>1 次</strong></td><td><strong>4–16 次</strong></td><td><strong>可接受</strong></td><td>✅</td></tr>
+      <tr><td>一致性/蒸馏（1–2 步）</td><td>1 次</td><td>1–2 次</td><td>极低</td><td>⚠️ 依赖蒸馏质量，易塌回单峰</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以「扩散太慢所以车上不能用」这个说法在 2023 年成立、现在不成立了。<em>关键的三个进展是：①从 DDPM（100+ 步）换到流匹配/DDIM（4–16 步）；②把动作头做小并与主干解耦，让大模型只跑一次；③把动作 chunk 一次性输出（第 6 节），把调用频率从 20 Hz 降到 2–5 Hz</em>。<strong>$\pi_0$ 的动作专家（action expert）就是这个思路的完整落地：一个 300M 的流匹配头挂在 3B 的 VLM 主干上，一次条件编码 + 10 步动作头积分。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但要诚实地说清楚扩散/流匹配的三个真实代价。<em>①训练更难调</em>：噪声调度、路径参数化、条件注入方式都是超参，且训练损失与最终动作质量的相关性远不如回归那么直接（loss 降了不代表动作好了），<strong>这让「训练是否收敛」变成一个需要专门做行为评测才能回答的问题</strong>。<em>②延迟有方差风险</em>：如果实现里做了自适应步数（按残差决定何时停），延迟就重新变成数据的函数——<strong>这正是 C53 模块 04 里 NMS 的同一个病</strong>，车端必须固定步数。<em>③蒸馏到 1–2 步时容易塌回单峰</em>，也就是把好不容易得到的多模态能力又丢掉了——<strong>而且这个退化在平均指标上几乎看不出来，只在多解场景的分桶评测里暴露</strong>。</p></div>
+  </div>  <h3>第三条路：分类头 / 混合密度</h3>  <p>还有一条被低估的中间路线：<strong>把动作空间离散成一个<em>轨迹词表</em>（trajectory anchor / mode set），用分类头选一个，再回归一个小的残差</strong>。这是把「多模态」交给分类、「精度」交给回归，两边各取所长——传统规控里的轨迹候选打分、以及 MultiPath / VectorNet 系的多模态预测都是这个结构。</p>  <table>
+    <thead><tr><th>路线</th><th>表达多模态</th><th>精度上限</th><th>推理成本</th><th>训练稳定性</th><th>可解释性</th><th>代表工作</th></tr></thead>
+    <tbody>
+      <tr><td>离散 token（分箱）</td><td>✅</td><td>受 bin 数限制</td><td><strong>❌ 自回归 $K\cdot D$ 次</strong></td><td>✅ 就是 CE 损失</td><td>中（bin 可读）</td><td>RT-2 / OpenVLA</td></tr>
+      <tr><td><strong>连续回归</strong></td><td><strong>❌ 致命</strong></td><td>✅ 最高</td><td>✅ 1 次</td><td>✅ 最稳</td><td>低</td><td>早期端到端</td></tr>
+      <tr><td>扩散 / 流匹配</td><td>✅ 最强</td><td>✅ 高</td><td>⚠️ $N$ 次小头</td><td>⚠️ 超参敏感</td><td>低</td><td>Diffusion Policy / π0</td></tr>
+      <tr><td><strong>锚点分类 + 残差回归</strong></td><td><strong>✅（受锚点集覆盖限制）</strong></td><td>✅ 高</td><td><strong>✅ 1 次</strong></td><td>✅ 稳</td><td><strong>✅ 最好（每个锚点有语义）</strong></td><td>MultiPath / 多模态预测系</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>锚点分类的隐性代价是<strong>锚点集本身成了一个需要维护的产物</strong>——它由训练集聚类得来，分布漂移了就要重聚类，而重聚类会让所有锚点的编号变化，<em>下游任何按编号写死的逻辑（日志、规则、可解释输出）全部失效</em>。<strong>这与第 2 节 quantile binning 的边界表是同一类问题：凡是「由数据决定的离散化」，都必须和权重一起版本化。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="trajectory"><span class="num">5</span>轨迹参数化：输出什么才是「可执行的」</h2>
+  <p>确定了「用什么头」之后，还有一个独立的问题：<strong>头的输出到底是什么物理量</strong>。这个选择决定了模型与车辆之间的耦合程度，而耦合程度决定了这套系统能不能跨车型复用。</p>  <table>
+    <thead><tr><th>参数化</th><th>输出内容</th><th>参数量（4 s 轨迹）</th><th>平滑性</th><th>跨车型可迁移</th><th>主要问题</th></tr></thead>
+    <tbody>
+      <tr><td><strong>等时间间隔 waypoints</strong></td><td>$(x_i,y_i)$，$\Delta t=0.2$ s</td><td>$20\times2=40$</td><td>❌ 不保证（需后处理）</td><td><strong>✅ 好</strong></td><td>点数多；相邻点噪声导致抖动</td></tr>
+      <tr><td>waypoints + 速度</td><td>$(x_i,y_i,v_i)$</td><td>$20\times3=60$</td><td>❌</td><td>✅ 好</td><td>同上，但速度意图明确</td></tr>
+      <tr><td><strong>多项式（三/五次）</strong></td><td>横纵各一组系数</td><td><strong>$2\times6=12$</strong></td><td><strong>✅ 天然 $C^2$</strong></td><td>✅ 好</td><td>表达力受限，急变道拟合不了</td></tr>
+      <tr><td>B 样条 / 分段多项式</td><td>控制点</td><td>$8\times2=16$</td><td>✅ $C^2$</td><td>✅ 好</td><td>控制点与轨迹形状非直觉，难标注</td></tr>
+      <tr><td><strong>控制量序列</strong></td><td>$(\delta_i, a_i)$</td><td>$20\times2=40$</td><td>⚠️ 需限幅</td><td><strong>❌ 差</strong></td><td><strong>把车辆动力学烧进了权重</strong></td></tr>
+    </tbody>
+  </table>  <h3>为什么量产系统几乎都输出轨迹而不是控制量</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>如果模型直接输出方向盘转角，那它必须<strong>在权重里学会这台车的动力学</strong>：转向比、轮胎侧偏刚度、质量分布、执行器延迟、甚至轮胎磨损。<em>结果是换一个车型（轴距不同）、换一批轮胎、甚至满载与空载，模型的输出都需要重新校准</em>。而输出轨迹时，这些全部被隔离在下游的跟踪控制器里——<strong>控制器是可以按车型参数配置的几百行代码，模型则是要重新收集数据训练的几十 GB 权重</strong>。这个差别在一家有多个车型、多个配置的车企里是决定性的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更深一层：轨迹是一个<strong>可以被独立校验的中间表示</strong>。给定一条轨迹，你可以在毫秒级内检查它的曲率是否超过 $\kappa_{\max}$、纵向加速度是否超过 $a_{\max}$、jerk 是否超过舒适阈值、是否与占用栅格相交、是否违反 TSR 给出的限速约束——<em>这些检查不需要跑任何模型，是纯几何与运动学</em>。<strong>而控制量序列几乎无法直接校验</strong>：给你一串方向盘角度，你必须先积分出轨迹才能判断它安全不安全，而积分需要一个车辆模型，于是你又把动力学引回来了。<em>「输出一个可被廉价校验的中间表示」是安全关键系统里的通用设计原则</em>——这也是模块 04 安全兜底层能够存在的前提。</p></div>
+  </div>  <div class="ascii">可行性投影：把 VLA 的「意图」变成「可执行轨迹」
+
+  VLA 输出（原始 waypoints，可能不平滑、可能违反约束）
+      ●   ●    ●      ●        ●          ●
+       ╲___╱ ╲__╱ ╲___╱  ╲_____╱  ╲________╱
+                │
+                ▼  ① 平滑（样条拟合 / 低通）→ 去掉逐点抖动
+                ▼  ② 运动学投影 → |κ| ≤ κ_max, |a| ≤ a_max, |jerk| ≤ j_max
+                ▼  ③ **约束校验**（来自 TSR）→ v ≤ 限速; 禁左则屏蔽左转候选
+                ▼  ④ 碰撞检查（占用栅格 / 其他 agent 预测）
+                ▼  ⑤ 不过则回退到兜底轨迹（沿当前车道减速）
+  ────────────────────────────────────────────────────────
+  可执行轨迹 ──► 跟踪控制器（MPC/LQR）──► 方向盘 / 油门 / 制动
+
+  ★ 这一整条后处理链耗时 &lt; 5 ms，**且完全不含神经网络**
+    —— 这是它能作为安全层的前提（可分析、可验证、延迟可界定）</div>  <h3>时间参数化 vs 空间参数化</h3>  <p>等时间间隔的 waypoints 隐含了速度信息（点间距 ÷ $\Delta t$），这既是优点也是坑：<strong>低速时相邻点几乎重叠，方向信息被噪声淹没</strong>（0.5 m/s 下 0.2 s 只走 0.1 m，而 waypoint 的预测误差可能就有 0.3 m → 算出来的航向角完全是噪声）。<em>等弧长参数化（每隔固定距离一个点）反过来：几何形状稳定，但速度需要单独一路输出</em>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>一条实用的经验：<strong>把「走哪条路」（几何）和「走多快」（速度剖面）拆成两路输出</strong>。多模态主要发生在几何上（左转还是右转），速度剖面在给定几何后通常是单峰的。<em>于是可以用「几何用扩散/锚点分类（表达多模态）+ 速度用回归（便宜且够用）」的混合方案</em>——这比对整个 $(x,y,v)$ 联合做扩散省很多，而且丢掉的表达力恰好是你不需要的那部分。<strong>这个「按分布形态分配输出头」的思路，比无脑上扩散更能体现工程判断力。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="chunking"><span class="num">6</span>动作分块（action chunking）：一次输出未来 K 步</h2>
+  <p><span class="term">Action chunking</span>（动作分块）是 ACT 提出、现在几乎所有 VLA 都在用的技巧：<strong>模型一次输出未来 $K$ 步动作，机器人/车按顺序执行其中前 $H$ 步（$H \le K$），然后再调用一次模型</strong>。它带来三个收益和一个必须写进安全分析的代价。</p>  <h3>三个收益</h3>  <ol>
+    <li><strong>推理频率降为 $1/H$</strong>。控制需要 50 Hz，但模型只需要 $50/H$ Hz 被调用。$H=16$ 时模型只要跑 3.1 Hz——<em>这是让 200 ms 级的大模型推理进入实时闭环的唯一现实办法</em>。</li>
+    <li><strong>时序一致性</strong>。chunk 内的 $K$ 步是一次前向同时产出的，它们天然自洽（不会出现第 3 步向左、第 4 步向右的抖动）。<em>而逐步预测时，观测的微小变化会让相邻两步的决策跳变——这在多模态场景里尤其严重：模型可能这一帧倾向左转、下一帧倾向右转，两个都是有效动作，但交替执行就是灾难。</em></li>
+    <li><strong>缓解复合误差（compounding error）</strong>。逐步预测时，每一步的误差都会改变下一步的观测分布，让模型逐渐走出训练分布（这就是 DAgger 要解决的问题）。chunking 把 $H$ 步内的闭环反馈换成开环执行，<em>反而减少了「误差 → 分布偏移 → 更大误差」的正反馈次数</em>。</li>
+  </ol>  <h3>一个必须写进安全分析的代价</h3>  <p>chunk 在执行期间<strong>看不到新的观测</strong>。所以对突发事件的最坏反应延迟是：</p>  <div class="math-block">\[T_{\text{react}}^{\max} \;=\; \underbrace{T_{\text{sense}}}_{\text{曝光+ISP+感知}} \;+\; \underbrace{T_{\text{infer}}}_{\text{VLA 前向}} \;+\; \underbrace{H\cdot\Delta t}_{\text{上一个 chunk 剩余的执行时长}} \;+\; \underbrace{T_{\text{act}}}_{\text{执行器}}\]</div>  <table>
+    <thead><tr><th>配置</th><th>$H\cdot\Delta t$</th><th>$T_{\text{react}}^{\max}$（含 $T_{\text{sense}}$=60 ms, $T_{\text{infer}}$=200 ms, $T_{\text{act}}$=100 ms）</th><th>30 m/s 下的反应距离</th><th>评价</th></tr></thead>
+    <tbody>
+      <tr><td>$H=16,\ \Delta t=0.1$ s</td><td>1.60 s</td><td>1.96 s</td><td><strong>58.8 m</strong></td><td><strong>❌ 不可接受</strong></td></tr>
+      <tr><td>$H=8,\ \Delta t=0.1$ s</td><td>0.80 s</td><td>1.16 s</td><td>34.8 m</td><td>⚠️ 勉强，需独立紧急制动</td></tr>
+      <tr><td><strong>$H=4,\ \Delta t=0.1$ s</strong></td><td><strong>0.40 s</strong></td><td><strong>0.76 s</strong></td><td><strong>22.8 m</strong></td><td><strong>✅ 配合 AEB 可接受</strong></td></tr>
+      <tr><td>$H=2,\ \Delta t=0.1$ s</td><td>0.20 s</td><td>0.56 s</td><td>16.8 m</td><td>✅ 但 VLA 需 5 Hz，算力吃紧</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label">K ≠ H，且 H·Δt 就是最坏反应延迟</span>
+    <p><strong>$K$ 和 $H$ 是两个数，不要混为一谈。</strong>$K$ 是<em>预测</em>长度（模型输出多少步），$H$ 是<em>执行</em>长度（实际执行多少步后重新调用）。<strong>$K > H$ 的重叠执行几乎总是正确选择</strong>：多预测的部分用来做时序平滑与兜底（万一下一次推理超时了，还有存量动作可以执行，不至于「无动作可执行」），执行的部分则保持短，把反应延迟压住。<em>典型配置：预测视野 $K\Delta t \approx 3$ s、执行窗口 $H\Delta t \approx 0.4$ s，重叠 85% 以上。</em><strong>把这个数字直接当成「系统对突发障碍的最坏反应延迟」写进安全文档，是这一节最实用的产出</strong>——而且它解释了为什么 <strong>VLA 之外必须有一条独立的、低延迟的紧急制动通路（AEB）</strong>：VLA 的反应延迟在结构上就到不了 200 ms 以内。</p>
+  </div>  <h3>chunk 边界的不连续与 temporal ensembling</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>$K>H$ 的重叠带来一个免费的好处：<strong>同一个时刻 $t$ 会被多个 chunk 预测到</strong>（chunk $i$ 预测它是第 $j$ 步，chunk $i+1$ 预测它是第 $j-H$ 步）。ACT 的 <span class="term">temporal ensembling</span> 就是把这些预测加权平均——<em>权重用指数衰减 $w_j \propto e^{-m j}$，越「新鲜」（$j$ 越小、来自越近的观测）的预测权重越大</em>。效果是 chunk 边界处的跳变被抹平，输出的 jerk 显著下降。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但这里必须小心一个自相矛盾：<strong>temporal ensembling 是在动作上做平均，而第 3 节刚刚论证过「平均是错的」</strong>。两者的调和点在于<em>平均的对象不同</em>——temporal ensembling 平均的是<strong>同一个 mode 在不同时刻的估计</strong>（都是「左转」，只是精度不同），而第 3 节批判的是<strong>跨 mode 的平均</strong>（左转和右转平均成直行）。<em>所以它的前提是相邻 chunk 属于同一个 mode</em>。<strong>一旦模型在两次调用之间「改主意」了（上一个 chunk 决定左转、这一个决定右转），ensembling 就会平均出一条撞向隔离墩的轨迹——这是它在自动驾驶里最危险的失败模式。</strong>正确做法是先做 mode 一致性判断（比如两个 chunk 的终点距离超过阈值就判定为换 mode），换 mode 时<em>直接切换而不是平均</em>，并把这次切换记录下来当作难例回传（C58 的触发器）。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>TSR 相关的一个具体坑：<strong>标志的语义变化是「阶跃」的，而 chunk 是「连续」的</strong>。限速牌从 120 变成 60 的那一帧，正确的动作是立刻改变速度剖面；但如果这一帧落在某个 chunk 的执行中段，那么<em>最多要等 $H\cdot\Delta t$ 才会生效</em>。<strong>所以约束类信息（限速、禁行）不能只走 VLA 这条慢通路，必须同时有一条直达速度规划器的快通路</strong>——这正是模块 04「把标志语义翻译成可执行约束」要解决的问题。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="hierarchy"><span class="num">7</span>频率的账：为什么必须分层控制</h2>
+  <p>把前面几节的数字放在一起，一个结构性的结论就出来了：<strong>大模型的推理频率（2–10 Hz）与车辆控制的需求频率（50–100 Hz）之间差了一个数量级，这个鸿沟不可能靠「把模型做快」填平，只能靠分层填平。</strong></p>  <div class="ascii">┌── VLA（车端大模型，或云端蒸馏而来）───────────────────────┐
+│  输入：多相机图像 + **TSR 结构化输出** + 导航指令 + 历史   │
+│  输出：未来 K=16 步、Δt=0.2 s 的粗轨迹（3.2 s 视野）       │
+│  频率：**2.5 Hz**（每执行 H=2 步换一次）单次推理 250 ms    │
+│  职责：理解语义、处理长尾、做「走哪条路」的决策            │
+└───────────────────────┬───────────────────────────────────┘
+                        │  轨迹 (x, y, v, t) + 意图标签
+                        ▼
+┌── 后处理 / 约束 / 安全层（**无神经网络**）────────────────┐
+│  平滑 · 运动学投影 · 约束校验 · 碰撞检查 · 兜底切换        │
+│  频率：与 VLA 同步       单次 &lt; 5 ms                      │
+│  职责：**把「意图」变成「保证可执行且不违规」的轨迹**      │
+└───────────────────────┬───────────────────────────────────┘
+                        │  可执行轨迹（含时间戳与有效期）
+                        ▼
+┌── 轨迹跟踪控制器（MPC / LQR / Pure-Pursuit）─────────────┐
+│  输入：轨迹 + 高频车辆状态（里程计 / IMU / 轮速）         │
+│  输出：方向盘转角 · 油门 · 制动                           │
+│  频率：**50–100 Hz**     单次 &lt; 5 ms                      │
+│  职责：抵抗扰动、跟住轨迹、处理执行器动力学                │
+└──────────────────────────────────────────────────────────┘
+        ▲                                              ▲
+        │  ★ 旁路：AEB / 碰撞预警（**独立通路，&lt; 100 ms**）
+        └──────────────────────────────────────────────┘</div>  <h3>四个约束把 $(K, H, \Delta t)$ 夹死</h3>  <p>很多人以为 chunk 长度是个调出来的超参。其实它被<strong>四个互相冲突的约束</strong>夹在一个很窄的窗口里，而且这个窗口<em>可能是空的</em>——那时候你必须换模型，调参没用。</p>  <ol>
+    <li><strong>视野约束</strong>：轨迹要够长，下游安全层才有东西可校验。$K\Delta t \ge T_{\text{horizon}}$（典型 3–5 s）。</li>
+    <li><strong>吞吐约束</strong>：每 $H\Delta t$ 换一次 chunk，推理必须赶得上。$H\Delta t \ge T_{\text{infer}} + T_{\text{comm}}$。</li>
+    <li><strong>反应约束</strong>：最坏反应延迟不能超预算。$T_{\text{sense}} + T_{\text{infer}} + H\Delta t + T_{\text{act}} \le T_{\text{budget}}$。</li>
+    <li><strong>鲁棒约束</strong>：某次推理超时了要有存量动作可用。$(K-H)\Delta t \ge T_{\text{overrun}}$。</li>
+  </ol>  <p><strong>约束 ② 和 ③ 从两侧夹 $H\Delta t$</strong>，把两式相加消掉 $H\Delta t$，得到一个<em>与 $K$、$H$、$\Delta t$ 全都无关</em>的可行性条件：</p>  <div class="math-block">\[\boxed{\;2\,T_{\text{infer}} \;+\; T_{\text{sense}} \;+\; T_{\text{comm}} \;+\; T_{\text{act}} \;\le\; T_{\text{budget}}\;}\]</div>  <p><strong>推理耗时在反应延迟预算里被算了两次</strong>——一次是它自己的延迟，一次是「chunk 必须长到够跑完一次推理」所以执行窗口至少有那么长。这是本节最值得记住的一条：<em>它意味着「模型快一倍」对反应延迟的收益是双倍的，而「把 chunk 调短」在推理慢的时候根本无解。</em>代入 $T_{\text{sense}}=60$ ms、$T_{\text{comm}}=30$ ms、$T_{\text{act}}=100$ ms、$T_{\text{budget}}=1.0$ s，可承受的推理上限是 $T_{\text{infer}} \le 405$ ms。</p>  <p>再代入 $\Delta t=0.2$ s、$T_{\text{infer}}=250$ ms、$T_{\text{horizon}}=3.2$ s、$T_{\text{overrun}}=0.4$ s 求解：约束 ② 给 $H\ge 2$，约束 ③ 给 $H\le 2$ —— <strong>$H=2$ 是唯一解</strong>（VLA 调用 2.5 Hz、算力利用率 70%）；约束 ① 给 $K\ge16$、约束 ④ 给 $K\ge4$，取 $K=16$，重叠 87.5%。notebook 会把这个求解器写出来，并扫描 $T_{\text{infer}}$ 看窗口何时变空。</p>  <h3>动作陈旧度（staleness）</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>分层的隐性代价是<strong>正在执行的动作总是基于「过去某个时刻」的观测</strong>。执行 chunk 的第 $j$ 步时，这个动作是基于 $T_{\text{infer}} + j\cdot\Delta t$ 之前的图像算出来的，于是陈旧度在 $[\,T_{\text{infer}},\ T_{\text{infer}}+H\Delta t\,]$ 之间锯齿状往复，<em>平均值是 $T_{\text{infer}} + H\Delta t/2$</em>。<strong>代入 $H=2,\ \Delta t=0.2$ s、$T_{\text{infer}}=0.25$ s：平均 0.45 s、最坏 0.65 s；30 m/s 下这意味着执行的动作平均对应 13.5 米之前的世界</strong>——这就是为什么下游控制器必须用<em>高频的本车状态</em>去闭环，而不能盲跟轨迹。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>工程上处理陈旧度有三招，都值得知道：<em>①<strong>轨迹在空间中定义而不是在时间中定义</strong></em>——输出的是一条路径（几何），跟踪器按当前实际位置在路径上找最近点，这样自车位置的偏差不会累积成时间错位；<em>②<strong>给轨迹打时间戳与有效期</strong></em>，超过有效期未更新则自动退化到兜底轨迹，而不是继续跟一条过期轨迹（这是一个必须实现的看门狗）；<em>③<strong>把快变量交给快系统</strong></em>——障碍物的突然出现由 AEB/占用栅格处理，VLA 只负责慢变量（路线选择、语义理解）。<strong>第 ③ 条是分层设计的核心原则：按「变化的时间尺度」而不是按「任务名字」来分层。</strong></p></div>
+  </div>  <h3>云端-车端的另一层分层</h3>  <p>小鹏公开的 VLA 路线里还有一层：<strong>云端跑超大模型，车端跑蒸馏后的小模型</strong>。这层分层的频率账更极端——云端往返延迟在秒级且不可靠，所以<em>云端不可能出现在实时控制回路里</em>。</p>  <table>
+    <thead><tr><th>层</th><th>延迟量级</th><th>在回路里吗</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr><td><strong>云端大模型</strong></td><td>秒级 + 网络不确定</td><td><strong>❌ 绝对不在</strong></td><td>离线蒸馏、难例标注、场景理解的教师信号</td></tr>
+      <tr><td>车端 VLA</td><td>200–300 ms</td><td>✅ 慢回路</td><td>语义理解、长尾决策、出粗轨迹</td></tr>
+      <tr><td>安全/约束层</td><td>&lt; 5 ms</td><td>✅</td><td>可行性与合规校验、兜底</td></tr>
+      <tr><td>跟踪控制器</td><td>&lt; 5 ms @ 50–100 Hz</td><td>✅ 快回路</td><td>跟住轨迹</td></tr>
+      <tr><td><strong>AEB / 独立安全通路</strong></td><td><strong>&lt; 100 ms</strong></td><td><strong>✅ 旁路</strong></td><td><strong>不依赖 VLA 的最后一道防线</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>把频率账压成一句可迁移的心法：<strong>每一层的更新频率必须匹配它所处理的物理量的变化速率</strong>。「这条路该怎么走」秒级变化 → 3 Hz 够；「车有没有跟住线」毫秒级变化 → 100 Hz 才够；「前面突然窜出个人」→ 需要一条完全独立的、不经过大模型的通路。<em>把这三件事混在一个频率上跑，要么算力爆炸，要么反应太慢。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="interview"><span class="num">8</span>面试标准答案骨架</h2>
+  <p>这一节当作可背诵材料。组织原则同样是：<strong>先给判断，再给机制，然后给数字，最后给代价与边界</strong>。</p>  <h3>Q1 · 为什么 VLA 的动作头不能直接用回归？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>你知道这是<strong>损失函数的性质</strong>而不是拟合能力的问题，并且能说出判据</td></tr>
+      <tr><td><strong>30 秒骨架</strong></td><td>「因为驾驶动作的条件分布常常是<strong>多峰</strong>的，而 $\ell_2$ 回归的最优解是条件期望、$\ell_1$ 是条件中位数——<strong>对称双峰下两者都落在两峰中间的低密度区</strong>。路口专家一半左转一半右转，回归就输出直行，而直行正对隔离墩。<strong>关键是这不是容量问题</strong>：模型再大、数据再多，只会更精确地收敛到那个错误的均值。判据很干净——<em>条件分布单峰就可以用回归（车道保持、稳态跟车），多峰就必须用能表达分布的头</em>（离散分类、锚点分类+残差、扩散/流匹配）。」</td></tr>
+      <tr><td>加分点</td><td>「诊断方法：残差直方图是双峰的；验证 loss 卡在一个非零高原不降，那个高原就是 $\mathbb{E}[\mathrm{Var}(a\mid o)]$，不是模型的错。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>答「回归精度不够所以用扩散」（方向完全错了，回归精度反而最高）；答「加更多数据能解决」</td></tr>
+    </tbody>
+  </table>  <h3>Q2 · 扩散策略推理那么慢，车上怎么用？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>你分得清「大模型前向」和「动作头前向」是两件事</td></tr>
+      <tr><td><strong>30 秒骨架</strong></td><td>「三件事一起做。<strong>①换求解器</strong>：DDPM 的 100 步换成流匹配/DDIM 的 4–16 步。<strong>②解耦</strong>：视觉-语言主干只跑一次产生条件特征，只有几 M 参数的小动作头跑 $N$ 次——这与自回归 token 每步都要过整个 LLM 是数量级差别。<strong>③chunking</strong>：一次输出 16 步、只执行 4 步，把模型调用频率降到 2–5 Hz。$\pi_0$ 就是这个组合：300M 的流匹配动作专家挂在 3B 主干上。<em>补一个反直觉的事实：1 步 Euler 的流匹配输出的恰好是条件期望，也就是退化成回归——所以步数就是多模态表达力的旋钮，不能一味压。</em>」</td></tr>
+      <tr><td>加分点</td><td>「车端必须<strong>固定步数</strong>，不能用自适应步数——否则延迟又变成数据的函数，和 NMS 是同一个病。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>只说「蒸馏到 1 步」而不提它容易塌回单峰、且这个退化在平均指标上看不出来</td></tr>
+    </tbody>
+  </table>  <h3>Q3 · action chunking 的 $K$ 和 $H$ 怎么定？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>你知道 $K\ne H$，且 $H$ 直接等于最坏反应延迟</td></tr>
+      <tr><td><strong>30 秒骨架</strong></td><td>「$K$ 是预测步数，$H$ 是执行步数，$K>H$ 重叠执行。<strong>$H$ 由安全反过来定</strong>：最坏反应延迟 $= T_{\text{sense}} + T_{\text{infer}} + H\Delta t + T_{\text{act}}$，$H=16,\Delta t=0.1$s 时接近 2 秒、30 m/s 下是 58 米，不可接受；$H=4$ 时是 0.76 s、23 米，配合独立 AEB 才勉强可用。<strong>$K$ 由覆盖条件定</strong>：$K\Delta t \ge H\Delta t + T_{\text{infer}} + T_{\text{comm}} + T_{\text{margin}}$，典型算下来 $K\ge16$（视野约束才是主导），重叠 87.5%，这个余量就是「某帧推理超时也不崩」的来源。」</td></tr>
+      <tr><td>加分点</td><td>「$K>H$ 的重叠还免费换来 temporal ensembling 的机会——但<strong>只能在同 mode 内做平均</strong>，模型换主意时必须切换而不是平均，否则就是第一题那个撞隔离墩的均值。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>把 $K$ 和 $H$ 混为一谈；说不出 $H\Delta t$ 就是要写进安全分析的那个数字</td></tr>
+    </tbody>
+  </table>  <h3>Q4 · 为什么输出轨迹而不是方向盘角度？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>耦合度与可校验性两个角度，能说出任意一个就及格，两个都说满分</td></tr>
+      <tr><td><strong>30 秒骨架</strong></td><td>「两个理由。<strong>①解耦</strong>：输出控制量等于把车辆动力学（转向比、侧偏刚度、执行器延迟、载重）烧进模型权重，换车型/换轮胎/满载空载都要重新采数据训练；输出轨迹则把动力学隔离在下游控制器里，那是一份可按车型配置的代码而不是一份权重。<strong>②可校验</strong>：轨迹能在毫秒级用纯几何/运动学检查曲率、加速度、jerk、碰撞、限速合规——不需要跑任何模型；而一串方向盘角度必须先用车辆模型积分成轨迹才能判断安不安全，等于又把动力学引回来了。<em>「输出一个可被廉价校验的中间表示」是安全关键系统的通用原则。</em>」</td></tr>
+      <tr><td>加分点</td><td>「还可以再拆一层：几何用能表达多模态的头，速度剖面用回归——因为给定几何后速度通常是单峰的。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>只说「轨迹更平滑」（那是后处理的事，不是参数化的本质区别）</td></tr>
+    </tbody>
+  </table>  <h3>Q5 · VLA 只有 3 Hz，怎么控 100 Hz 的车？</h3>  <table>
+    <thead><tr><th>项</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>面试官想听</td><td>分层，且分层的依据是「物理量的变化速率」</td></tr>
+      <tr><td><strong>30 秒骨架</strong></td><td>「分层，而且分层依据是<strong>每层处理的物理量变化多快</strong>，不是任务名字。<em>『这条路怎么走』是秒级变化 → VLA 2–5 Hz 出粗轨迹；『车有没有跟住线』是毫秒级 → 跟踪控制器 50–100 Hz；『前面突然窜出个人』→ 一条完全不经过大模型的独立 AEB 通路，&lt;100 ms</em>。中间还要有一层无神经网络的约束/安全层（&lt;5 ms）做可行性投影与合规校验。<strong>陈旧度是这套设计的隐性代价</strong>：$H=2,\Delta t=0.2$ s 时执行中的动作平均基于 0.45 s 前的观测，30 m/s 下是 13.5 米之前的世界——所以轨迹要在<em>空间</em>里定义、要打时间戳与有效期、要有看门狗自动退化。」</td></tr>
+      <tr><td>加分点</td><td>「云端大模型<strong>绝不能在实时回路里</strong>——网络延迟秒级且不可靠。它的位置是离线蒸馏与难例标注的教师。」</td></tr>
+      <tr><td><strong>踩雷点</strong></td><td>答「等硬件变快就好了」；说不出「AEB 必须是独立通路」</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>五题共用一组关键数字，背下来即可：<strong>$\Delta/\sqrt{12}$（量化误差）· 1 步流匹配 = 条件期望 · $K=16/H=2$ · $H\Delta t$ = 最坏反应延迟 · $2T_{\text{infer}}$ 被算两次（$T_{\text{infer}}\le405$ ms）· 陈旧度 0.45 s = 13.5 m</strong>。<em>能把数字和它对应的物理后果连起来说，比背方法名有效十倍。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>一步生成能不能保住多模态？</strong>一致性模型、shortcut model、MeanFlow 等把扩散蒸馏到 1–2 步的方法在图像上已经很成熟，但<em>动作分布的多模态往往是「两个相距很远的窄峰」而不是图像那种连续流形</em>，蒸馏时更容易塌成单峰或落到峰之间。<strong>关键困难在于评测：塌模在平均指标上几乎看不出来，必须专门构造多解场景的分桶评测。</strong>这是一个方法与评测都还没定型的方向。</li>
+    <li><strong>动作表示的统一。</strong>目前离散 token、连续回归、扩散/流匹配、锚点分类四条路线并存，各有各的评测口径，<em>没有一个公认的基准能公平比较它们在「多模态表达 / 精度 / 延迟 / 训练稳定性」四个维度上的取舍</em>。自动驾驶的复杂之处在于它还叠了一层：轨迹 vs 控制量 vs 意图+轨迹的参数化选择与输出头选择是正交的，组合空间很大。</li>
+    <li><strong>chunk 长度的自适应。</strong>固定 $H$ 意味着在空旷高速上浪费（可以更长）、在复杂路口不够（需要更短）。<em>让 $H$ 随场景自适应能同时改善算力与安全，但它会让「最坏反应延迟」重新变成场景的函数——而那正是安全分析最不能接受的性质</em>（与 C53 模块 04 里 NMS 的延迟方差是同构的问题）。目前没有既自适应又能给出静态上界的方案。</li>
+    <li><strong>多模态的「归因」与可控性。</strong>扩散头能采出左转和右转两条轨迹，但<em>系统怎么知道该选哪条？</em>目前主要靠额外的打分器或语言指令来消歧。<strong>把「多模态生成 + 显式选择」拆成两步，比让一个头端到端地隐式决定要可解释得多</strong>，也更容易接入模块 04 的约束与安全层——这条路线（生成候选 → 依约束打分 → 选择）与传统规控的做法正在收敛。</li>
+    <li><strong>动作头的量化与部署。</strong>扩散/流匹配头要跑 $N$ 次，量化误差会沿积分步累积，<em>这与检测头「跑一次」的量化行为完全不同，现有的 PTQ 敏感度分析工具基本没覆盖这个场景</em>（C60 会讲一般方法，但迭代式头的累积效应仍是开放问题）。同样开放的是：固定步数下如何为动作头单独选精度。</li>
+    <li><strong>与感知接口的联合设计。</strong>本模块假定了「观测已经给定」，但<em>动作头的多模态很多时候来自感知的不确定（比如可变限速牌在两档之间跳变），而不是决策本身的多解</em>。<strong>如果感知不把不确定性传下来，下游连「这里应该有两个峰」都不知道，再强的动作头也无从表达</strong>——这就是下一个模块的主题，也是这门课的核心。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p><strong>★ 必读</strong>：Zhao et al., <em>Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware</em>（ACT，RSS 2023，arXiv:2304.13705）——action chunking 与 temporal ensembling 的原始出处，读 §3 即可。<strong>★</strong> Chi et al., <em>Diffusion Policy: Visuomotor Policy Learning via Action Diffusion</em>（RSS 2023，arXiv:2303.04137）——把「多模态动作分布」这个问题讲得最清楚的一篇，<em>它的 Figure 1（回归 vs LSTM-GMM vs 扩散在多模态数据上的对比）应该背下来</em>。<strong>★</strong> Black et al., <em>$\pi_0$: A Vision-Language-Action Flow Model for General Robot Control</em>（arXiv:2410.24164）——流匹配动作专家与 VLM 主干解耦的工程范式。</p><p>配套背景：Brohan et al., <em>RT-2</em>（arXiv:2307.15818，动作 token 化的源头）；Kim et al., <em>OpenVLA</em>（arXiv:2406.09246，开源实现与分箱细节）；Lipman et al., <em>Flow Matching for Generative Modeling</em>（ICLR 2023，arXiv:2210.02747，速度场与条件路径的定义）；Song et al., <em>Consistency Models</em>（ICML 2023，少步生成）；Chai et al., <em>MultiPath</em>（CoRL 2019，锚点分类 + 残差回归的多模态轨迹预测）；Tian et al., <em>DriveVLM</em> 与 Hwang et al., <em>EMMA</em>（自动驾驶 VLA 的轨迹输出形态）。相邻课程：模块 01（动作 token 化）、模块 03（感知接口与不确定性传递）、模块 04（约束化与安全兜底）、模块 05（评测与上车）、C53 模块 04（延迟方差与 WCET 的同构问题）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_vlm_to_vla/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 从 VLM 到 VLA</div></a>
+    <a class="next" href="../03_perception_interface/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · TSR 输出如何进入 VLA：接口设计</div></a>
+  </div>
+
+</div>
+</body>
+</html>

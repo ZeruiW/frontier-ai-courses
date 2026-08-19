@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>00 · 课程总览与环境</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 00 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>00 · 课程总览与环境</h1>
+  <p class="subtitle">增强的本质是<strong>先验注入</strong>——你在告诉模型「这些变化不改变标签」· 三判据：保标签语义 / 贴近部署分布 / 不制造训练-推理鸿沟 · 检测增强比分类增强难的地方全在一句话里：<strong>标注必须跟着像素一起变</strong> · 通用 bbox 变换框架与三判据自检清单</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">Python/numpy；目标检测基础（bbox、IoU、mAP）；C55（TSR 领域知识）与 C57（小目标）有帮助但不必需</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 00_environment_check.ipynb</div></div>
+    <div class="item"><div class="k">课程模块</div><div class="v">6 个模块 · 纯 numpy 手写增强算子 + 可执行的正确性断言</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">总览 30 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#prior">增强的本质：往模型里注入「不变性先验」</a></li>
+      <li><a href="#criteria">三个判据：一个增强到底该不该用</a></li>
+      <li><a href="#vs">增强 vs 正则化 vs 更多数据：三者不能互相替代</a></li>
+      <li><a href="#harder">检测增强难在哪：图变了，标注必须跟着一起变</a></li>
+      <li><a href="#map">课程地图：五个模块与它们各自解决的问题</a></li>
+      <li><a href="#env">环境、运行方式与本课的纪律</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="prior"><span class="num">1</span>增强的本质：往模型里注入「不变性先验」</h2>
+  <p>大多数教材把数据增强讲成「变着法子造更多训练样本」。这个说法不能算错，但它解释不了任何一个真正的工程决策——<strong>为什么 Mosaic 在最后 10 个 epoch 必须关掉？为什么交通标志检测里水平翻转是错的？为什么色相抖动幅度要按类别分开设？</strong>要回答这些，必须换一个更准确的定义。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>增强是<strong>你在告诉模型：「这些变化不改变答案」</strong>。把一张图左右镜像，它还是一只猫——所以你把镜像后的图配上同一个标签喂进去，模型就被迫学到「左右镜像不影响类别」这条规则。<em>数据本身没有变多，变多的是「约束」。</em>你没有采集新信息，你只是把自己已经知道的物理/语义规律，翻译成了模型能听懂的形式（成对的输入-标签样本）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，标准经验风险最小化是在数据分布 <code>D</code> 上最小化损失；增强则是在一个<span class="term">增广分布</span>（augmented distribution）上最小化损失，其中变换 <code>T</code> 从一个变换族 <code>𝒯</code> 中采样，而<strong>标签同时按一个配套映射 <code>g_T</code> 变换</strong>。当 <code>𝒯</code> 恰好是模型任务真正不变的那个群时，增强等价于在假设空间上施加不变性约束，理论上可以看作一种方差缩减（Chen, Dobriban &amp; Lee, 2020）。<em>当 <code>𝒯</code> 超出真实不变性范围时，它就变成了在教模型错误的规律。</em></p></div>
+  </div>  <div class="math-block">\[\mathcal{R}_{\text{aug}}(f)\;=\;\mathbb{E}_{(x,y)\sim\mathcal{D}}\;\mathbb{E}_{T\sim\mathcal{T}}\Big[\;\ell\big(f(T(x)),\;g_T(y)\big)\;\Big]\]</div>  <p>这个公式里藏着本课全部内容的种子，值得逐项拆开看：</p>  <ul>
+    <li><strong><code>𝒯</code>（变换族）选错</strong> → 你在教模型一条现实中不成立的规律。TSR 里的水平翻转就是这个错误的教科书案例：镜像后的「向左转弯」在物理世界里就是「向右转弯」，标签却没跟着变。</li>
+    <li><strong><code>g_T</code>（标签变换）写错</strong> → 图变了标注没变，或者变得不对。这是<em>检测</em>增强独有的失败模式，而且极其隐蔽：图看起来完全正常，框错了却没人看得出来。模块 01 整章都在处理这件事。</li>
+    <li><strong><code>𝒯</code> 的强度过大</strong> → 增广分布与部署分布严重脱节，模型把容量花在了永远不会遇到的输入上。Mosaic 就是典型：拼接图在真实相机里不存在。</li>
+    <li><strong>训练用了 <code>𝒯</code> 而推理没有</strong> → 训练-推理鸿沟。letterbox 与归一化这类「必须两端一致」的算子如果实现不同，框会整体偏移几百像素（模块 01 会给出精确数字，C60 会给出定位方法）。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>把这句话记住，本课后面所有判断都能从它推出来：<strong>增强不是在造数据，是在写一条你相信的物理规律，并且用「成对的样本」这种模型唯一能听懂的语言把它说出来</strong>。既然是「你相信的规律」，那它就<em>可能是错的</em>——而错误的先验比缺少数据更有害，因为模型会稳定地、自信地学会它。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="criteria"><span class="num">2</span>三个判据：一个增强到底该不该用</h2>
+  <p>既然增强是先验注入，那「该不该用某个增强」就有了可操作的判据。本课全程会反复使用下面这三条，它们互相独立、缺一不可，<strong>而且必须按顺序检查</strong>——第一条不过，后两条就不用看了。</p>  <table>
+    <thead><tr><th>判据</th><th>问题</th><th>不满足会发生什么</th><th>本课在哪里展开</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 保标签语义</strong></td><td>变换后，原来的标签<em>还是正确答案</em>吗？（对检测：类别不变、且框仍紧贴目标）</td><td><strong>模型学到错误规律</strong>，而且它学得很扎实。表现为「某一类稳定地被判成另一类」，用更多数据也救不回来</td><td>模块 01（几何/翻转白名单）、模块 02（色相与颜色语义）</td></tr>
+      <tr><td><strong>② 贴近部署分布</strong></td><td>增强产生的图像，车上那台相机<em>有可能拍到</em>吗？</td><td>模型容量被浪费在不存在的输入上；<em>更糟的是</em>它会稀释真实分布的有效样本比例，小模型上直接掉点</td><td>模块 02（天气/低光合成）、模块 03（Mosaic 的 close 策略）</td></tr>
+      <tr><td><strong>③ 不制造训练-推理鸿沟</strong></td><td>推理端会做同样的事吗？如果不会，差异有多大、有没有显式对齐？</td><td>离线 mAP 好看、上车掉一大截。<strong>这是「离线 0.82、路测像 0.6」的头号成因之一</strong></td><td>模块 01（letterbox 逆变换）、模块 04（TTA 与流水线）、C60（一致性对拍）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>三条判据的顺序不是随便排的，<strong>它反映了危害的量级</strong>。判据① 失败是<em>正确性</em>问题：模型学错了，且错得稳定，你在验证集上也看不出来（因为验证集用了同样错误的标注约定，或者根本没有那个类别的镜像样本）。判据② 失败是<em>效率</em>问题：模型没学错，只是把力气花在了没用的地方，多训练一会儿通常能补回来。判据③ 失败是<em>交付</em>问题：训练本身没问题，只是交出去的东西和训练时不是一个东西。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>工程上还有第四个隐含判据：<strong>成本</strong>。增强跑在 CPU 上，而 CPU 常常是训练吞吐的真正瓶颈（模块 04 会量化：一个 GPU 利用率在 40%–95% 之间周期性抖动的训练任务，几乎可以断定卡在数据管线上）。<em>一个只涨 0.1 mAP 却让训练慢 30% 的增强，在有限的调参预算下是净亏损</em>——因为省下的时间本可以多跑两个种子，而模块 05 会证明，两个种子的价值往往超过 0.1 mAP。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>判据① 有一个特别容易被忽略的子情况：<strong>标签「语义上」还对，但「几何上」不再紧贴目标</strong>。旋转增强就是如此——旋转 45° 后取四角外接框，框仍然框住了标志，类别也没变，看起来一切正常；但<em>框的面积膨胀了整整一倍，一半是背景</em>。模型被反复告知「框住一半背景也算对」，定位精度就这么被慢慢教坏了。模块 01 会把这笔账算到小数点后。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="vs"><span class="num">3</span>增强 vs 正则化 vs 更多数据：三者不能互相替代</h2>
+  <p>面试里有一个高频问题：<strong>「增强和 dropout / weight decay 都是防过拟合，有什么区别？」</strong> 很多人答「增强是数据层面的正则化」就停了——这个回答不算错，但它<em>没有回答任何有用的东西</em>。真正的区别在于：三者注入的信息完全不同，因此它们的失效场景也完全不同。</p>  <table>
+    <thead><tr><th></th><th>增强</th><th>正则化（dropout / weight decay / label smoothing）</th><th>更多真实数据</th></tr></thead>
+    <tbody>
+      <tr><td>注入了什么</td><td><strong>关于任务的具体先验</strong>（哪些变化不改变标签）</td><td>对函数复杂度的<strong>通用偏好</strong>（更平滑、更稀疏）</td><td><strong>真实的新信息</strong></td></tr>
+      <tr><td>需要什么知识</td><td>领域知识——你必须知道什么是不变的</td><td>几乎不需要</td><td>钱和时间</td></tr>
+      <tr><td>能覆盖长尾吗</td><td><strong>部分能</strong>：copy-paste 可以把稀有类样本数翻十倍（模块 03）</td><td>❌ 完全不能</td><td>✅ 能，但稀有类正因为稀有才难采集</td></tr>
+      <tr><td>能修正偏差吗</td><td>❌ 不能：增强只在已有样本的邻域内生成，<em>没见过夜间就变不出夜间</em>（合成除外）</td><td>❌ 不能</td><td>✅ 能</td></tr>
+      <tr><td>典型失败</td><td>先验错了 → 稳定学错</td><td>过强 → 欠拟合，且症状不明显</td><td>加的是模型已经会的 → 边际收益≈0（C58）</td></tr>
+      <tr><td>工程代价</td><td><strong>CPU 吞吐</strong> + 实现正确性风险</td><td>几乎为零</td><td>标注成本 + 数据闭环基建</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第四行「能修正偏差吗」是最关键的一行，也是最常被误解的一行。<strong>增强只能在已有样本的邻域里生成新样本</strong>——如果训练集里一张夜间图都没有，你把亮度调低 60% 得到的也不是真正的夜间图（真实夜间的噪声结构、光源眩光、ISP 的自动曝光行为、运动模糊长度全都不同）。<em>它像夜间，但它不是夜间。</em>所以「用低光合成代替夜间采集」在幅度小的时候是有效的鲁棒性训练，幅度大的时候就是自欺欺人。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>反过来，也有一个方向的替代是成立的：<strong>当某个变化确实属于「真实分布内的、可精确建模的」变换时，增强的性价比远高于采集</strong>。TSR 里最典型的就是<span class="term">尺度</span>——同一块标志在 20 米和 60 米处的像素尺寸差 3 倍，而这个变换就是一次缩放，物理上精确、实现上零风险。<em>与其花钱采集「同一块牌子在各个距离下的样本」，不如把缩放增强的范围开对</em>。这就是为什么模块 01 里「随机缩放」被列为 TSR 收益最高的几何增强，而不是翻转。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句可迁移的判断法则：<strong>先问「这个变化在部署环境里是不是真的会发生、并且我能不能精确建模它」</strong>。两个都「是」→ 用增强，性价比最高（缩放、平移、轻微光照、JPEG 压缩）。第一个是、第二个否 → 优先采集真实数据，增强只做兜底（夜间、雨雾、极端逆光）。第一个否 → <em>根本不该做这个增强</em>（垂直翻转、45° 旋转、极端色相抖动）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="harder"><span class="num">4</span>检测增强难在哪：图变了，标注必须跟着一起变</h2>
+  <p>分类增强的标签变换 <code>g_T</code> 是<strong>恒等映射</strong>——不管你怎么翻转裁剪调色，标签还是那个整数。这一点让分类增强几乎不可能写错：图看起来不对，你一眼就发现了。</p>  <p>检测不是这样。检测的 <code>g_T</code> 是一个<strong>真正的函数</strong>：它要把每个框做同样的几何变换，处理越界，决定哪些目标该丢弃，还要在多目标之间保持一致。<strong>而它写错的时候，图看起来完全正常。</strong></p>  <div class="ascii">分类增强：只有一条轨道
+    image ──T──&gt; image'
+    label ───────&gt; label            （g_T = 恒等，不可能写错）
+
+检测增强：两条轨道必须严格同步
+    image  ──────T──────&gt;  image'
+      │                       │
+      └── 必须是同一个 T ──────┘
+    boxes  ─────g_T─────&gt;  boxes'   ← **这里是所有 bug 的产地**
+             │
+             ├─ 几何：四角变换 -&gt; 外接框（模块 01）
+             ├─ 越界：裁剪 / 丢弃 / 标记为 ignore（模块 01）
+             ├─ 尺度：变换后过小的框怎么办（模块 01，对小目标致命）
+             └─ 语义：类别是否需要跟着改（左转 &lt;-&gt; 右转，模块 01）
+
+    ⚠️ 失败的特征：图是对的、框是错的、loss 照样下降、
+       验证集上也「正常」（因为验证集不做增强）——
+       **只有在训练集与验证集的 AP 差距上留下一点点异常。**</div>  <table>
+    <thead><tr><th>维度</th><th>分类增强</th><th>检测增强</th></tr></thead>
+    <tbody>
+      <tr><td>标签变换 <code>g_T</code></td><td>恒等</td><td><strong>框的仿射作用 + 越界规则 + 丢弃规则 + 类别映射</strong></td></tr>
+      <tr><td>越界</td><td>不存在这个概念</td><td>目标可能被切掉一部分、甚至完全切出画面 → <strong>要判「留、裁、丢、还是标为 ignore」</strong></td></tr>
+      <tr><td>多目标交互</td><td>一图一标签</td><td>一图多目标；<strong>规则必须对每个目标独立成立</strong>——一张图里只要有一个目标不能翻，整张图就不能翻</td></tr>
+      <tr><td>尺度的语义</td><td>缩放几乎无害</td><td>缩放<strong>直接改变「小目标」的构成</strong>与正样本数量；缩小后的框可能被 min_size 规则整批删掉</td></tr>
+      <tr><td>遮挡类增强</td><td>Cutout 只是遮住部分特征</td><td>遮住整个目标 → <strong>该框变成纯噪声监督</strong>（要求模型从纯背景里预测一个框）</td></tr>
+      <tr><td>混合类增强</td><td>MixUp 混合标签即可</td><td>框不能「混合」，只能拼接（Mosaic）或粘贴（Copy-Paste）——<strong>这是两个完全不同的算子族</strong>（模块 03）</td></tr>
+      <tr><td>错误的可见性</td><td>肉眼可见</td><td><strong>肉眼几乎不可见</strong>：图正常、框偏了，需要专门的可视化或断言才能发现</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>「错误的可见性」这一行值得展开，因为它决定了本课的工程方法。<strong>检测增强的 bug 不会让程序崩溃，也不会让 loss 变成 NaN，它只会让指标低一点点</strong>——低到你以为是「模型不够好」而不是「数据管线有 bug」。真实项目里，一个「旋转后框没有正确膨胀」的实现错误可以在代码库里活好几个月，直到某个人偶然把增强后的图和框画出来看了一眼。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以本课的纪律是：<strong>每一个增强算子都必须附带一个可执行的正确性断言，而不是靠可视化抽查</strong>。断言的形式在 notebook 里会反复出现——用目标的<em>掩码/轮廓点</em>算出「真实的紧框」，再和算子输出的框比 IoU。<em>能写出这个断言，说明你真的理解了这个算子的 <code>g_T</code>；写不出来，说明你只是抄了一段代码。</em>这条纪律与 C60 的「训练-部署逐层对拍」是同一个思路：<strong>用可验证的断言代替「我看着挺对的」</strong>。</p></div>
+  </div>  <div class="callout danger"><span class="label">被丢弃但仍可见的目标 = 假负样本监督</span>
+    <p>一个在 TSR 项目里真实发生过、且代价极高的错误：<strong>随机裁剪后，对「被裁到画面外超过一半」的目标直接 <code>drop</code>（从标注里删掉），但图像里那半个标志还清清楚楚地留着</strong>。结果是模型被明确训练成「看到半个标志 → 这里没有东西」。<em>而 TSR 里目标被画面边缘截断是极常见的情况</em>（标志从画面上方进入视野的整个过程都是这样）。症状：远处标志的首次检出距离明显偏近，且 recall 在图像边缘区域系统性偏低。<strong>正确做法是标为 <code>ignore</code> 区域（既不算正样本也不算负样本），而不是删除。</strong>模块 01 会把这三种处理方式（keep / ignore / drop）的边界讲清楚并实现出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="map"><span class="num">5</span>课程地图：五个模块与它们各自解决的问题</h2>
+  <div class="ascii">起点：你有一个能跑的检测训练流程，想知道增强该怎么配、以及为什么。
+
+  模块 01  几何增强与标注同步
+     │      仿射矩阵 / 四角法与外接框 / **旋转导致的框膨胀** /
+     │      越界的 keep-ignore-drop 三分法 / **翻转白名单（TSR 必知）** /
+     ▼      letterbox 正逆变换（直接连到 C60 的部署一致性）
+  模块 02  光度增强与域鲁棒性
+     │      HSV / gamma / 噪声 / 模糊 / JPEG /
+     │      **颜色即语义**：红=禁令、蓝=指示、黄=警告，色相抖动的红线 /
+     ▼      大气散射雾化模型 / 运动模糊核 / 卷帘快门 / 低光合成
+  模块 03  混合类增强：Mosaic / MixUp / CutMix / Copy-Paste
+     │      Mosaic 的三个作用与 **close-mosaic 为什么是标配** /
+     │      **Copy-Paste 是长尾最直接的解法**（TSR 价值极高）/
+     ▼      粘贴的合法性约束：尺度符合透视、位置合理、边缘融合
+  模块 04  增强流水线工程
+     │      算子顺序与概率组合（实际触发率远低于直觉）/
+     │      **CPU 是训练吞吐的真正瓶颈** / DataLoader worker 的 RNG 陷阱 /
+     ▼      验证集只能做确定性变换 / TTA 与 WBF / 配置的版本管理
+  模块 05  增强的消融与验证
+            **分场景验证**（整体 +0.3 可能掩盖「雨天 +3、晴天 -1」）/
+            种子方差与显著性 / 增强强度 × 训练时长的交互 /
+            **为 TSR 按失效模式反推一套增强配方**
+
+终点：给定一个检测任务和它的失效模式清单，你能设计一套增强配方，
+      写出每个算子的理由，并给出证明它有用的验证方案。</div>  <table>
+    <thead><tr><th>模块</th><th>核心机制</th><th>notebook 里从零实现什么</th></tr></thead>
+    <tbody>
+      <tr><td>01 几何</td><td>仿射矩阵、四角法外接框、越界规则、letterbox</td><td><strong>完整的 bbox 变换器</strong> + 旋转膨胀量化 + <strong>letterbox 逆变换</strong> + <strong>翻转安全性检查器</strong></td></tr>
+      <tr><td>02 光度</td><td>HSV/gamma/噪声/模糊、大气散射物理模型</td><td><strong>色相偏移的语义破坏量化</strong> + 雾化模型 + 运动模糊核 + 卷帘快门畸变</td></tr>
+      <tr><td>03 混合</td><td>Mosaic 拼接、Copy-Paste 实例粘贴</td><td><strong>Mosaic（含框裁剪与丢弃）</strong> + <strong>透视约束下的 Copy-Paste</strong> + 长尾样本数提升量化</td></tr>
+      <tr><td>04 流水线</td><td>算子组合、并发、可复现、TTA 融合</td><td><strong>流水线与实际触发率统计</strong> + <strong>worker RNG 的正确/错误策略</strong> + <strong>WBF</strong></td></tr>
+      <tr><td>05 消融</td><td>配对显著性检验、分场景切片</td><td><strong>bootstrap + 配对 t 检验</strong> + 分场景对比 + <strong>TSR 增强配方生成器</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>与相邻课程的分界要说清楚，避免重复：<strong>C55 讲 TSR 的领域知识与失效模式（本课的「需求来源」）；C57 讲小目标的架构与损失解法（本课只讲增强这一条路）；C58 讲难例挖掘与长尾数据闭环（增强解决不了的部分靠它）；C60 讲训练-部署一致性（本课模块 01 的 letterbox 逆变换是它的入口）；C61 讲实验设计与显著性（本课模块 05 是它在增强场景的特化）</strong>。<em>本课只回答一个问题：给定一堆图和标注，在把它们喂进网络之前应该做什么变换、为什么、以及怎么证明有用。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="env"><span class="num">6</span>环境、运行方式与本课的纪律</h2>
+  <p>本课全程 <strong>纯 numpy + 标准库、CPU 可跑、不联网</strong>。不需要 OpenCV、albumentations、PyTorch 或任何数据集下载。所有 notebook 在 CPU 上实跑验证、<code>assert</code> 零失败。</p>  <pre><code>pip install -r requirements.txt      # numpy / matplotlib / jupyterlab / ipykernel
+jupyter lab                          # 打开 00_setup/00_environment_check.ipynb</code></pre>  <table>
+    <thead><tr><th>你在真实项目里会用</th><th>本课怎么处理</th></tr></thead>
+    <tbody>
+      <tr><td>OpenCV <code>warpAffine</code> / <code>resize</code></td><td>用 numpy 手写<strong>齐次仿射矩阵与最近邻重采样</strong>——重点在坐标语义，不在插值质量</td></tr>
+      <tr><td>albumentations 的 <code>BboxParams</code></td><td>手写 <strong>bbox 的四种表示互转 + 越界三分法（keep / ignore / drop）</strong>，把库里那些参数的真实含义拆开</td></tr>
+      <tr><td>真实图像数据集（TT100K 等）</td><td>用 <code>np.random</code> 按<strong>物理合理的规则</strong>合成场景（圆形/三角形标志、长尾类别分布、符合透视的尺寸），并说明合成规则</td></tr>
+      <tr><td>YOLO 的 <code>letterbox()</code></td><td>手写正变换 + <strong>逆变换</strong>，并复现三种常见的逆变换 bug，量化它们造成的像素偏移</td></tr>
+      <tr><td>mmdet 的 <code>gt_bboxes_ignore</code></td><td>手写 ignore 区域的生成规则，量化「误删可见目标」对召回的伤害</td></tr>
+    </tbody>
+  </table>  <p>三条贯穿全课的纪律，与前面的三个判据一一对应：</p>  <ul>
+    <li><strong>每个算子都要能写出 <code>g_T</code></strong>。如果你说不清「这个变换对标注做了什么」，就不要把它放进流水线。<em>说不清，通常意味着它对某些类别是错的。</em></li>
+    <li><strong>每个算子都要有可执行的正确性断言</strong>。断言的标准形式：用目标的轮廓点算出「真实紧框」，与算子输出比 IoU。<em>可视化抽查发现不了系统性偏移，断言可以。</em></li>
+    <li><strong>每个增强都要说清它对应部署分布里的什么现象</strong>。说不出来的，八成属于「看起来很酷但没用」那一类，而它还在吃你的 CPU 预算。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>最后提醒一件事，它会让你读这门课时省很多力气：<strong>本课几乎所有「坑」的根源都是同一件事——增强作用在图像上，而标注是另一个对象</strong>。几何变换要同步（模块 01）、颜色变换会破坏「颜色即语义」（模块 02）、拼接与粘贴会创造出标注体系里不存在的构图（模块 03）、并发执行会让随机性失控（模块 04）、而这一切的效果又只能通过分场景切片才看得见（模块 05）。<em>抓住「图像与标注是两个必须同步的对象」这条线，五个模块就串成一条了。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">7</span>研究前沿与开放问题</h2>
+  <p>检测增强是一个「工程上极其成熟、理论上仍很粗糙」的领域。下面几条是目前真正开放的问题，也是面试里聊到深处会碰到的地方。</p>  <ul>
+    <li><strong>增强策略的自动搜索：成本与可迁移性</strong>。AutoAugment 用强化学习搜出的策略在 ImageNet 上很强，但搜索成本以数千 GPU 小时计；RandAugment 证明「只用两个超参（算子数 N、强度 M）随机采样」几乎能达到同等效果——<em>这个结果本身就说明「搜出来的策略」里大部分结构是冗余的</em>。检测版的 <em>Learning Data Augmentation Strategies for Object Detection</em>（Zoph et al., 2020）显示搜到的策略跨数据集迁移性尚可，但<strong>跨任务（分类→检测）几乎不迁移</strong>。为什么？目前没有令人满意的解释。</li>
+    <li><strong>群论视角覆盖不了现代增强</strong>。Chen–Dobriban–Lee 的方差缩减理论要求 <code>𝒯</code> 是一个群（有单位元、逆元、封闭）。翻转、旋转、平移都满足；但 <strong>Mosaic、CutMix、Copy-Paste 都不是群作用</strong>——它们把多个样本组合成一个新样本，根本不在这个框架里。<em>而恰恰是这几个算子贡献了检测上最大的收益。</em>「为什么混合类增强有效」目前只有直觉解释（增大批内多样性、制造更多小目标、丰富上下文），缺少理论。</li>
+    <li><strong>生成式增强的可控性与标注问题</strong>。用扩散模型合成罕见场景（夜间施工区、被树叶遮挡的限速牌）在概念上极有吸引力，但有两个硬问题：① <em>生成图与真实相机图之间存在系统性域差</em>（ISP 特性、噪声结构、镜头畸变），模型可能学到「生成图的指纹」而不是场景内容；② <strong>标注从哪来</strong>——如果标注也是生成的，就有循环论证的风险。目前工业界的主流用法是<em>只用生成图做「难负样本」</em>（例如生成各种广告牌来压误检），而不是生成正样本。</li>
+    <li><strong>增强与大规模预训练的替代关系</strong>。一个反复被观察到但缺少定论的现象：<em>预训练规模越大，增强的边际收益越小</em>。直觉解释是预训练已经把不变性学进去了。但这在检测的<strong>长尾类别</strong>上似乎不成立——copy-paste 对稀有类的提升在有无预训练时都很显著。「哪些增强会被预训练吸收、哪些不会」是一个有实用价值的开放问题。</li>
+    <li><strong>检测增强缺少统一的评测协议</strong>。同一个增强在不同检测器、不同训练时长、不同数据规模下经常给出<em>相反的结论</em>（模块 05 会量化这一点：强增强在 12 epoch 下掉点、在 300 epoch 下涨点）。目前论文里报的增强收益大多不可比。<strong>这也是为什么面试里问「你怎么证明这个增强有用」比问「你用了哪些增强」更能区分水平。</strong></li>
+    <li><strong>语义敏感变换的自动发现</strong>。「哪些类别不能水平翻转」目前完全靠人工整理白名单（模块 01 会给出 TSR 的完整方法）。能否<em>从数据里自动学出来</em>——比如通过「翻转前后模型置信度的类别间转移」来识别镜像对——是一个尚无成熟方案、但工程价值明确的方向：<strong>标志类别有成百上千种，人工维护白名单本身就是长期负担。</strong></li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读：<em>AutoAugment: Learning Augmentation Strategies from Data</em>（Cubuk et al., CVPR 2019，搜索式增强的起点）★；<em>RandAugment: Practical Automated Data Augmentation with a Reduced Search Space</em>（Cubuk et al., 2020，证明搜索大多是冗余的）★；<em>Learning Data Augmentation Strategies for Object Detection</em>（Zoph et al., ECCV 2020，检测专用策略搜索，含 bbox 级算子）★；<em>Bag of Freebies for Training Object Detection Neural Networks</em>（Zhang et al., 2019，把「不增加推理成本的技巧」系统化）；<em>YOLOv4: Optimal Speed and Accuracy of Object Detection</em>（Bochkovskiy et al., 2020，Mosaic 的出处与 BoF/BoS 分类法）★；<em>Simple Copy-Paste is a Strong Data Augmentation Method for Instance Segmentation</em>（Ghiasi et al., CVPR 2021，长尾最直接的解法）★；<em>A Group-Theoretic Framework for Data Augmentation</em>（Chen, Dobriban &amp; Lee, JMLR 2020，增强为何有效的理论视角）；<em>Albumentations: Fast and Flexible Image Augmentations</em>（Buslaev et al., 2020，工业界事实标准库的设计文档）；<em>Traffic-Sign Detection and Classification in the Wild</em>（Zhu et al., CVPR 2016，TT100K 数据集，本课合成数据的分布依据）★。相邻课程：C55（TSR 领域与失效模式）、C57（小目标）、C58（长尾与数据闭环）、C60（训练-部署一致性）、C61（实验设计与显著性）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="next" href="../01_geometric/01_讲解.html"><div class="dir">下一模块 →</div><div class="t">01 · 几何增强与标注同步</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,960 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""构建 C54 · 端到端集合预测检测（DETR 家族）。"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from coursekit import ROOT, lesson, index, notebook, text_file, install_assets, report
+import c54_m00, c54_m01, c54_m02, c54_m03, c54_m04, c54_m05
+
+CID = "C54_DETR_Set_Prediction_Course"
+DIR = os.path.join(ROOT, CID)
+TOTAL = 6
+
+MODULES = [
+    ("00_setup", "00_overview.html", "00_environment_check.ipynb",
+     "00 · 课程总览与环境",
+     "从「密集预测 + NMS 去重」到「一次输出一个不含重复的集合」· 三个必须搞懂的机制（二分匹配 / 集合损失 / object query）· 端到端换来的是延迟确定性，代价是收敛速度与小目标 · 一个玩具例子直观对比两种范式的输出差异",
+     c54_m00),
+    ("01_hungarian", "01_讲解.html", "01_hungarian_matching.ipynb",
+     "01 · 二分图匹配与匈牙利算法",
+     "预测无序、GT 无序，所以损失必须先对齐 · 匈牙利/KM = 对偶顶标 + 增广路径，O(n³) 且不是瓶颈 · 匹配代价的分类项用概率而非 log（否则量纲压垮 L1/GIoU）· 一对一在训练期就压制重复，而不是推理期删重复 · 匹配翻转率是 DN-DETR 的动机",
+     c54_m01),
+    ("02_set_loss", "02_讲解.html", "02_set_prediction_loss.ipynb",
+     "02 · 集合预测损失：匹配之后怎么算账",
+     "只有匹配上的 query 才算框损失，这个不对称是集合损失的骨架 · eos_coef=0.1 是因为背景 query 占 90%+，不降权模型会塌到「全预测 ∅」· L1 对尺度敏感、IoU 在不相交时零梯度，两者必须组合 · DIoU/CIoU 各补了什么 · 每层 decoder 都算辅助损失，去掉掉 ~2 AP",
+     c54_m02),
+    ("03_queries", "03_讲解.html", "03_object_queries.ipynb",
+     "03 · Object query 与交叉注意力：模型如何「认领」目标",
+     "query 是可学习的位置查询而不是图像特征 · self-attention 负责 query 之间去重协商、cross-attention 负责从图像取证据——这个分工是理解 DETR 的关键 · 训练后 query 出现空间与尺度特化，事实上学成了数据驱动的 anchor · N 必须 > 单图最大目标数 · DAB-DETR 把 query 显式解释成 4D anchor box 并用 w/h 调制注意力范围",
+     c54_m03),
+    ("04_convergence", "04_讲解.html", "04_convergence_family.ipynb",
+     "04 · 收敛难题与 DETR 家族演进",
+     "500 epoch 的两个独立根因：cross-attention 初期近似均匀 + 匹配不稳定，且解法完全不同 · Deformable 每个 query 只采 K 个可学采样点、权重不走点积，50 epoch 打平 · DN 把带噪 GT 当 query 绕过匹配、attention mask 防泄漏 · DINO = 对比去噪 + mixed query selection + look forward twice · 一对多匹配的回归说明「一对一」是推理需求而非训练最优",
+     c54_m04),
+    ("05_practice", "05_讲解.html", "05_detr_practice.ipynb",
+     "05 · DETR 工程实践：调参、诊断与选型",
+     "backbone 用 0.1× 学习率不是惯例而是必须项 · DETR 弱在小目标有三个独立根因，要分别用多尺度/增大 N/换尺度不敏感度量来解 · 训练失败诊断树（全背景 / 框聚中心 / 重复框 / loss 尖刺）· 无 NMS 真正买到的是 p99 延迟的确定性 · DETR 系 vs YOLO 系工程取舍表与 TSR 选型的完整论证",
+     c54_m05),
+]
+
+
+def build():
+    install_assets(DIR)
+    for i, (folder, html_name, nb_name, h1, subtitle, mod) in enumerate(MODULES):
+        prev = nxt = None
+        if i > 0:
+            p = MODULES[i - 1]; prev = ("../%s/%s" % (p[0], p[1]), p[3])
+        if i < len(MODULES) - 1:
+            n = MODULES[i + 1]; nxt = ("../%s/%s" % (n[0], n[1]), n[3])
+        lesson(os.path.join(DIR, folder, html_name),
+               num="%02d" % i, total=TOTAL, h1=h1, subtitle=subtitle,
+               meta=mod.META, sections=mod.SECTIONS, prev=prev, nxt=nxt)
+        notebook(os.path.join(DIR, folder, nb_name), mod.NB)
+
+    index(
+        os.path.join(DIR, "index.html"),
+        title="端到端集合预测检测（DETR 家族）",
+        subtitle="把检测从「在每个位置猜一遍、再用 NMS 删重复」改造成「一次输出一个不含重复的集合」：二分图匹配与匈牙利算法 · 集合预测损失 · object query 与交叉注意力 · 收敛难题与 DETR→Deformable→DAB/DN→DINO→RT-DETR 的演进 · 工程实践与选型",
+        pills=["6 模块",
+               "Hungarian · GIoU/DIoU/CIoU · object query · deformable attention · denoising",
+               "一对一匹配 · 无 NMS · 端到端",
+               "DETR → Deformable → Conditional/Anchor/DAB → DN → DINO → Group/H-/Co- → RT-DETR",
+               "CPU only · 纯 numpy · 无需 GPU/torch/mmdet"],
+        howto=(
+            "每个模块先读 <em>HTML 讲解</em>，再跑 <em>notebook</em>——后者用纯 numpy 把每个机制从零复现："
+            "一个自己写的匈牙利算法（<strong>不许用 <code>scipy.optimize.linear_sum_assignment</code></strong>，"
+            "增广路径版本，与暴力枚举对拍）、一份完整的 DETR 代价矩阵与 Hungarian loss、"
+            "IoU/GIoU/DIoU/CIoU 及其解析梯度（用数值梯度校验）、一层手写的 decoder"
+            "（self-attention + cross-attention + FFN）、可变形注意力的双线性采样与反传、"
+            "以及 DN-DETR 去噪 query 的完整构造（噪声框生成 + 标签翻转 + attention mask 隔离）。"
+            "每个练习都有紧跟的 <code>assert</code> 自测判分。配套 <a href=\"glossary.md\">术语词典</a> 与 "
+            "<a href=\"references.md\">参考清单</a>。"
+            "<strong>本课的主张是：DETR 不是「用 Transformer 做检测」，而是「换了一个训练目标」</strong>——"
+            "真正的分界线在<em>一对一分配 + 集合损失</em>，而不在网络结构；"
+            "所以纯卷积的 DeFCN / YOLOv10 一样可以无 NMS，而挂着 NMS 的 Transformer 检测器一点也不端到端。"
+            "把这条线看清楚，你就能把 2020 年以来几十篇 DETR 变体压缩成<em>两条主线</em>："
+            "一条在治「注意力初期不聚焦」（Deformable / Conditional / Anchor / DAB），"
+            "一条在治「监督信号太稀疏、匹配还会抖」（DN / DINO / Group / H- / Co-）。"
+            "<strong>本环境不需要 GPU，也不需要装 torch / mmdetection</strong>："
+            "我们复现的是这些机制的<em>数学与语义</em>（指派问题的对偶性、IoU 变体的梯度性质、"
+            "注意力的信息通路、去噪分支的隔离条件），而这恰恰是可迁移的那部分——实现会变，机制不会。"
+            "每个模块末尾都有一个 🧪 <strong>真实工程胶囊</strong>，把当天学到的东西翻译成可以原样"
+            "复制到 <code>detrex</code> / <code>mmdetection</code> 配置里的代码与超参。"
+            "全课始终锚定 <strong>TSR（交通标志识别）</strong>场景：小目标、类别长尾、延迟预算紧、"
+            "对 p99 延迟极敏感——这恰好落在 DETR 家族最强与最弱的两端，是练习「选型论证」的最好靶子。"
+        ),
+        tracks=[
+            ("范式与地基 · The Paradigm", [
+                ("00_setup/00_overview.html", "MODULE 00", "课程总览与环境",
+                 "集合预测的核心命题：把「去重」从推理期的后处理搬进训练目标；三个必须搞懂的机制（二分匹配 / 集合损失 / object query）；DETR 用收敛速度和小目标精度换来了什么——延迟不再随目标数波动、没有 IoU 阈值这类不可微超参。"),
+                ("01_hungarian/01_讲解.html", "MODULE 01", "二分图匹配与匈牙利算法",
+                 "预测无序、GT 无序，所以损失第一步必须是「谁对谁」；匈牙利/KM 的完整机理——对偶顶标给出最优性证书、增广路径批量取反从而跳出贪心；代价矩阵三项（概率而非 log 的分类项、L1、GIoU）与权重敏感性；一对一匹配为什么能替代 NMS；匹配翻转率——DETR 慢的第二个根因，也是 DN-DETR 的起点。"),
+                ("02_set_loss/02_讲解.html", "MODULE 02", "集合预测损失：匹配之后怎么算账",
+                 "只有匹配上的 query 算框损失、未匹配的只算 ∅ 分类——这个不对称就是集合损失的骨架；eos_coef=0.1 是训练能否起步的开关；L1 提供绝对尺度、GIoU 提供不相交时的梯度，两者缺一即退化；DIoU 补中心对齐、CIoU 补长宽比但在小框上不稳；每层 decoder 都算辅助损失，去掉直接掉 ~2 AP。"),
+            ]),
+            ("模型内部 · Inside the Decoder", [
+                ("03_queries/03_讲解.html", "MODULE 03", "Object query 与交叉注意力",
+                 "query 是纯参数、与图像无关，图像信息只从 cross-attention 进来；decoder 的 self-attention 是去重的执行者（删掉它立刻出现大量重复框）、cross-attention 是证据的来源；训练后 query 自发出现空间与尺度特化，事实上学成了数据驱动的 anchor；N 的选择账；DAB-DETR 把 query 定义成 4D 框并用 w/h 调制注意力范围——「query 到底是什么」这道面试题的最终答案。"),
+                ("04_convergence/04_讲解.html", "MODULE 04", "收敛难题与 DETR 家族演进",
+                 "500 epoch 的两个独立根因与两条各自的解法主线；可变形注意力的真相——注意力权重由 query 直接回归、完全跳过 key，这才是它省算力的来源；DN 用带噪 GT 绕过匹配、attention mask 是防泄漏的硬条件；DINO 三件套（对比去噪 / mixed query selection / look forward twice）各自解决什么；Group/H-/Co-DETR 与 DETA 共同证明：一对一是推理的需求，不是训练的最优。"),
+            ]),
+            ("上车 · Making It Ship", [
+                ("05_practice/05_讲解.html", "MODULE 05", "DETR 工程实践：调参、诊断与选型",
+                 "backbone 0.1× 学习率、AdamW、梯度裁剪 0.1 这几项不是调优而是复现的必要条件；DETR 弱在小目标的三个独立根因要分别处方；训练失败诊断树（loss 不降 / 全预测背景 / 框聚在中心 / 重复框）与三个可直接监控的诊断量（匹配翻转率、前景 query 占比、框中心分布熵）；无 NMS 真正买到的是 p99 的确定性而非均值；DETR 系 vs YOLO 系的取舍表与「给 TSR 选哪个」的完整论证。"),
+            ]),
+        ],
+    )
+
+    text_file(os.path.join(DIR, "README.md"), README)
+    text_file(os.path.join(DIR, "requirements.txt"), REQUIREMENTS)
+    text_file(os.path.join(DIR, "glossary.md"), GLOSSARY)
+    text_file(os.path.join(DIR, "references.md"), REFERENCES)
+    return report(DIR)
+
+
+README = r"""
+# 端到端集合预测检测（DETR 家族）
+
+这门课只讲一件事：**当你把检测的训练目标从「在每个位置各猜一遍、推理时再用 NMS 删重复」
+换成「一次输出一个不含重复的集合」，会连锁地改变什么。**
+
+答案比想象中长：你需要一个匹配算法（因为预测和 GT 都无序）、
+一个只对匹配上的 query 算框损失的非对称损失、一组能在框不相交时仍给梯度的 IoU 变体、
+一批可学习的 query 来充当「认领目标的槽位」，以及——因为上面这套东西的监督实在太稀疏——
+后来五年里几十篇专门治「收敛慢」的论文。
+
+**分界线不在网络结构，而在训练目标。** 一对一分配 + 集合损失才是 DETR 的本质；
+用不用 Transformer 是次要的（纯卷积的 DeFCN / YOLOv10 一样能无 NMS，
+而挂着 NMS 的 Transformer 检测器一点也不端到端）。这门课从头到尾围绕这条线组织。
+
+| 模块 | 主题 | 目录 |
+|---|---|---|
+| 00 | 课程总览与环境 | `00_setup/` |
+| 01 | 二分图匹配与匈牙利算法 | `01_hungarian/` |
+| 02 | 集合预测损失：匹配之后怎么算账 | `02_set_loss/` |
+| 03 | Object query 与交叉注意力 | `03_queries/` |
+| 04 | 收敛难题与 DETR 家族演进 | `04_convergence/` |
+| 05 | DETR 工程实践：调参、诊断与选型 | `05_practice/` |
+
+## 三个必须搞懂的机制
+
+DETR 只有三块地基，其余全是它们的推论：
+
+1. **二分匹配** — 预测无序、GT 无序，所以算损失之前必须先解一个线性指派问题。
+   匹配是确定性求解的（没有梯度回传到匹配本身），网络只负责生产代价矩阵。
+2. **集合损失** — 匹配上的 query 算「分类 + L1 + GIoU」，没匹配上的只算 ∅ 分类。
+   这个**不对称**加上 `eos_coef` 的降权，就是整个损失的骨架。
+3. **Object query** — N 个可学习的槽位。decoder 里 self-attention 让它们互相协商去重、
+   cross-attention 让它们各自去图像里取证据。**这个分工是理解 DETR 的关键**，
+   也是所有后续改进（Conditional / DAB / Deformable）动刀的位置。
+
+## 两条演进主线
+
+把 2020 年以来的几十篇 DETR 变体压缩成两句话：
+
+- **主线 A：治「cross-attention 初期不聚焦」** —— Deformable（只采 K 个可学采样点）、
+  Conditional（解耦内容与位置 query）、Anchor-DETR / DAB-DETR（把 query 显式变成框先验）。
+- **主线 B：治「监督太稀疏 + 匹配会抖」** —— DN-DETR（带噪 GT 绕过匹配）、
+  DINO（对比去噪 + mixed query selection + look forward twice）、
+  Group / H-DETR / Co-DETR（训练时加一对多分支，推理时丢掉）。
+
+主线 B 的存在本身就是一个结论：**一对一是推理的需求，不是训练的最优。**
+这句话是面试里能立刻显出理解深度的一句。
+
+## 学习路径
+
+**完整路径（推荐，约 12–16 小时）**：00 → 01 → 02 → 03 → 04 → 05，顺序不可跳。
+01 的匈牙利算法与 02 的 GIoU 梯度是后面所有内容的前置。
+
+**快速路径（只为面试准备，约 5 小时）**：00 → 01（重点：为什么需要匹配、
+一对一如何替代 NMS、匹配不稳定）→ 02（重点：为什么 L1 必须配 GIoU、eos_coef）
+→ 04（重点：两个根因 + 两条主线 + 一对多的回归）→ 05 的选型表。
+03 可以只读「self-attention 去重 / cross-attention 取证据」这一节。
+
+**只关心部署（约 3 小时）**：00 → 05，再回头补 04 里的 Deformable 与 RT-DETR 部分。
+
+每个模块的 notebook 都是**纯 numpy、CPU 可跑、带 `assert` 自测**的，
+练习题请先自己写再看参考答案——匈牙利算法与双线性采样反传这两题，
+自己写一遍和读一遍的差距非常大。
+
+## 与相邻课程的分工
+
+- **C18 计算机视觉** 给的是前置：IoU、NMS、anchor、Faster R-CNN / FPN 这套经典检测框架。
+  本课默认你知道 mAP 怎么算、NMS 在做什么。**如果这些还不熟，先回 C18。**
+- **C53 实时检测器架构** 与本课是**同一枚硬币的两面**：C53 从「延迟预算」出发讲 YOLO 演进、
+  标签分配与 RT-DETR 的实时化改造；本课从「训练目标」出发讲集合预测的原理。
+  RT-DETR 在两门课里都出现，但 C53 关心的是 hybrid encoder 的 FLOPs 账与延迟方差，
+  本课关心的是它的 query selection 为什么要 IoU-aware。**两门课建议交替读。**
+- **C57 小目标检测** 承接本课模块 05 留下的问题：DETR 弱在小目标的三个根因里，
+  「L1 在归一化坐标下对小框不公平」「IoU 对位移极度敏感」这两条在 C57 被彻底量化
+  （包括 NWD 这类尺度不敏感度量）。**做 TSR 的话 C57 是必读续集。**
+- 更下游：**C55** 讲 TSR 领域知识与安全导向评测，**C58** 讲长尾与数据闭环，
+  **C60** 讲车端部署与训练-部署一致性。
+
+## 环境
+
+见 `requirements.txt`。**纯 numpy + matplotlib，CPU 可跑，不需要 GPU、
+不需要装 torch / mmdetection / detrex。** 本课复现的是这些机制的数学与语义，
+而不是调用现成 API。每个模块末尾的 🧪 胶囊给出可原样复制到真实项目的配置与代码。
+
+配套：[术语词典](glossary.md) · [参考清单](references.md)
+"""
+
+
+REQUIREMENTS = r"""
+# 端到端集合预测检测（DETR 家族）—— 依赖清单
+# 纯 numpy + 标准库、CPU 可跑（notebook 里的 assert 全过）。
+# **不需要 GPU，也不需要装 torch / mmdetection / detrex**：
+# 本课从零复现的是匈牙利匹配、集合损失、IoU 变体的梯度、注意力与可变形采样、
+# 以及去噪 query 的构造——复现的是机制本身，而不是调用现成实现。
+# 特别地：模块 01 的练习**禁止使用 scipy.optimize.linear_sum_assignment**，
+# 必须自己写增广路径版本，再与暴力枚举对拍。
+
+numpy          # 核心：匈牙利算法、代价矩阵、GIoU/DIoU/CIoU 梯度、注意力、双线性采样
+matplotlib     # 可视化：匹配二分图、IoU 变体的等高线、query 空间特化、注意力图
+jupyterlab     # 运行 notebook
+ipykernel      # 注册 Jupyter kernel
+
+# —— 可选（不装也能跑完全部练习）——
+# scipy        # 仅用于模块 01 最后的"对照检查"：拿 linear_sum_assignment 验证自己的实现
+#              # 注意：练习本身要求不用它
+
+# —— 以下是真机上训练 DETR 才会用到的（本环境不装，🧪 胶囊里给出用法）——
+# torch>=2.0                # 训练与推理
+# torchvision               # 官方 DETR 参考实现 (facebookresearch/detr)
+# mmdet>=3.0 mmengine       # mmdetection 里的 DINO / Deformable DETR / RT-DETR 配置
+# detrex                    # DETR 家族最全的复现库（DAB/DN/DINO/Group/H-DETR）
+# pycocotools               # COCO 评测
+"""
+
+
+GLOSSARY = r"""
+# 术语词典 · Glossary（端到端集合预测检测 · DETR 家族）
+
+> 按主题分组。每个术语给：**英文 / 中文 / 一句话定义 / 为什么重要 / 常见误解**。
+> 「常见误解」那一栏是刻意写的——DETR 这套东西的坑几乎都在「你以为的」和「实际的」之间。
+> 读论文、复现代码或准备面试时遇到生词回这里查；英文术语一律保留原文。
+
+---
+
+## 一、集合预测范式 · Set Prediction
+
+### `set prediction` · 集合预测
+- **定义**：模型一次输出一个**无序、不含重复**的预测集合，而不是逐位置输出上万个候选再去重。
+- **为什么重要**：它把「去重」从推理期的不可微后处理搬进了训练目标，于是整条链路端到端可微，
+  且推理延迟不再随图中目标数波动。
+- **常见误解**：以为「集合预测 = 用 Transformer」。集合预测是**训练目标的性质**
+  （一对一分配 + 集合损失），和网络结构无关——纯卷积的 DeFCN / OneNet / YOLOv10 一样做到了无 NMS。
+
+### `dense prediction` · 密集预测
+- **定义**：在特征图每个位置（× 每个 anchor）都输出一份预测，一张图产生 10⁴ 量级的候选。
+- **为什么重要**：这是 Faster R-CNN / YOLO / FCOS 的共同范式，也是 NMS 存在的**唯一原因**——
+  同一个目标必然被相邻的多个位置同时命中。
+- **常见误解**：以为密集预测是「浪费」。密集正样本恰恰是它收敛快的原因：
+  一个 GT 能拿到几十个正样本的梯度，而一对一只有 1 个。
+
+### `NMS` (Non-Maximum Suppression) · 非极大值抑制
+- **定义**：按分数排序，逐个保留最高分框并删掉与它 IoU 超过阈值的其余框。
+- **为什么重要**：DETR 存在的直接动机。它**不可微**（挡住端到端）、**带超参**（IoU 阈值一改结果就变）、
+  **耗时随目标数变化**（密集场景 p99 延迟飙升）。
+- **常见误解**：以为 NMS 的问题只是「慢」。均值上它并不慢；真正致命的是**延迟方差**——
+  车端 33 ms 预算里排期看的是 p99，一个会随场景抖动的后处理是排期噩梦。
+
+### `permutation invariance` · 置换不变性
+- **定义**：集合的损失不应依赖于预测输出的排列顺序。
+- **为什么重要**：这是必须做匹配的根本原因——第 7 号 query 吐出的框，和标注文件里第 3 个 GT，
+  之间没有任何先天对应关系。
+- **常见误解**：以为「按位置或面积排个序就行」。排序需要一个全序，而 2D 平面上的框没有自然全序；
+  且任何人为顺序都会逼模型去拟合这个顺序，而不是去拟合目标。
+
+### `one-to-one assignment` · 一对一分配
+- **定义**：每个 GT 只分配给一个预测，其余预测全部判为背景。
+- **为什么重要**：训练期就教会模型「一个目标只出一个框」，所以推理期不需要 NMS。
+  它是端到端检测的**充要条件**。
+- **常见误解**：以为一对一「天然更好」。它的正样本极度稀缺（10 个 GT 就只有 10 个正样本），
+  监督密度只有一对多的几十分之一——这正是 DETR 收敛慢的第一个根因。
+
+### `one-to-many assignment` · 一对多分配
+- **定义**：一个 GT 分配给多个预测（IoU 阈值、ATSS、SimOTA 都属于这一类，见 C53）。
+- **为什么重要**：监督密集、收敛快。DETR 家族后来又把它作为**辅助训练分支**请了回来
+  （Group DETR / H-DETR / Co-DETR），推理时丢掉。
+- **常见误解**：以为一对多和端到端互斥。它们完全可以共存：训练用一对多喂饱梯度，
+  推理只保留一对一分支，无 NMS 的性质丝毫不受影响。
+
+### `end-to-end detection` · 端到端检测
+- **定义**：从图像直接到最终框集合，中间不含任何需要手工调参的不可微后处理。
+- **为什么重要**：「端到端」在检测里有精确含义——**没有 NMS、没有 anchor 匹配规则**，
+  而不是泛泛的「一个网络搞定」。
+- **常见误解**：以为「一次网络前向 = 端到端」。YOLO 也是一次前向，但后面挂着 NMS，
+  改一下 IoU 阈值指标就变，这不叫端到端。
+
+### `anchor` · 先验框
+- **定义**：预设在特征图上、覆盖多种尺度与长宽比的参考框，网络只回归相对它的偏移。
+- **为什么重要**：DETR 最初想取消的东西之一；而「query 与 anchor 的本质异同」是高频面试题。
+- **常见误解**：以为 DETR「没有先验」。DAB-DETR 之后 query 就是可学习的 4D anchor——
+  DETR 家族的演进史很大程度上是**把 anchor 以可学习、可逐层更新的形式请回来**的历史。
+
+### `num_queries (N)` · query 数量
+- **定义**：decoder 输入的固定槽位数。DETR 默认 100，Deformable 用 300，DINO 常用 900。
+- **为什么重要**：N 是**硬上界**——单图目标数超过 N 必然漏检；N 太大又会稀释前景 query 比例。
+- **常见误解**：以为「N 越大越好」。N 从 100 提到 900 有效，是因为同时换了 focal loss
+  并加了去噪监督；单纯调大 N 而不改损失，只会让背景 query 更加压倒前景。
+
+### `no-object (∅)` · 空类 / 背景类
+- **定义**：额外的一个类别，表示「这个 query 没认领到任何目标」。
+- **为什么重要**：它让「固定输出 N 个」与「图里目标数可变」得以调和——多余的 query 全输出 ∅。
+- **常见误解**：以为 ∅ 就是普通的背景类。它的样本占比通常 90% 以上，必须显式降权
+  （DETR 用 `eos_coef=0.1`），否则模型的最优策略就是**全部预测 ∅**，训练直接塌掉。
+
+### `padding to N` · 补齐到 N
+- **定义**：把 GT 集合用 ∅ 补齐到 N 个，使匹配变成 N×N 的方阵指派问题。
+- **为什么重要**：匈牙利算法要求完美匹配存在，补齐是让它可用的标准做法。
+- **常见误解**：以为这只是实现细节。补齐直接定义了「未匹配 query 的损失怎么算」——
+  它们**只算分类损失、不算框损失**，这个不对称就是集合损失的骨架。
+
+### `bipartite graph` · 二分图
+- **定义**：顶点分成两组（预测 / GT），边只在组间存在，边权就是匹配代价。
+- **为什么重要**：DETR 的匹配在形式上就是二分图最小权完美匹配，因此可以直接搬用 1955 年的算法。
+- **常见误解**：以为需要「学一个匹配器」。匹配是**确定性求解**的，
+  匈牙利算法外面包着 `torch.no_grad()`，没有任何梯度回传到匹配过程本身。
+
+---
+
+## 二、匹配与损失 · Matching & Loss
+
+### `bipartite matching` · 二分图匹配
+- **定义**：在预测与 GT 之间找一组一对一对应，使总代价最小。
+- **为什么重要**：DETR 的第一块地基——损失必须先知道「谁对谁」才能算。
+- **常见误解**：以为可以贪心（每个 GT 挑代价最低的预测）。贪心会冲突（两个 GT 抢同一个 query）
+  且非最优；必须全局求解。
+
+### `cost matrix` · 代价矩阵
+- **定义**：`C[i][j]` = 第 i 个预测认领第 j 个 GT 的代价，由分类项 + L1 项 + GIoU 项加权而成。
+- **为什么重要**：匹配质量完全由它决定，权重配比直接影响「模型倾向于按类别认领还是按位置认领」。
+- **常见误解**：以为代价矩阵和损失函数是同一个东西。**匹配代价的分类项用的是概率 `−p̂(c)`
+  而不是 `−log p̂(c)`**——log 的量纲（可到 10 以上）会压倒 L1 与 GIoU，
+  让匹配几乎只看分类分数、完全不看位置。
+
+### `Hungarian algorithm` · 匈牙利算法
+- **定义**：求解线性指派问题的多项式算法，维护对偶变量并反复寻找增广路径直到得到完美匹配。
+- **为什么重要**：DETR 名字里那个 "Hungarian" 的来源。复杂度 O(n³)，N=100 时在 CPU 上是
+  百微秒级——**完全不是瓶颈**。
+- **常见误解**：以为「DETR 慢是因为匈牙利算法慢」。匹配开销可以忽略不计；
+  DETR 慢是因为 cross-attention 初期不聚焦 + 监督稀疏 + 匹配不稳定。
+
+### `Kuhn–Munkres (KM)` · KM 算法
+- **定义**：匈牙利算法在带权完全二分图上的形式，用顶标（对偶变量）把带权问题归约为
+  「在相等子图上找无权最大匹配」。
+- **为什么重要**：「顶标 + 相等子图」是理解它为什么最优的关键——对偶可行性 + 互补松弛
+  给出了最优性证书。
+- **常见误解**：以为 KM 和匈牙利是两个不同算法。它们是同一思想的两种表述；
+  工程上 `scipy.optimize.linear_sum_assignment` 用的是 Jonker–Volgenant 变体，更快但结论相同。
+
+### `augmenting path` · 增广路径
+- **定义**：起于未匹配点、交替经过非匹配边与匹配边、终于未匹配点的路径；沿它取反可使匹配数 +1。
+- **为什么重要**：匈牙利算法的核心操作。理解它就理解了「每轮至多增加一个匹配，所以最多 n 轮」
+  这个复杂度来源。
+- **常见误解**：以为增广就是「换一条边」。它是沿整条路径**批量取反**，
+  可能同时改动多条已有匹配边——这正是它能跳出贪心局部解的机制。
+
+### `dual variables / potentials` · 对偶变量 / 顶标
+- **定义**：每个顶点一个数值 `u[i]`、`v[j]`，满足 `u[i] + v[j] ≤ C[i][j]`；取等的边构成相等子图。
+- **为什么重要**：它是**最优性证书**——在相等子图上找到完美匹配，就同时证明了原问题已达最优，
+  不需要枚举验证。
+- **常见误解**：以为顶标只是加速技巧。没有它就只能暴力枚举 n! 种匹配（n=100 时是天文数字）。
+
+### `linear sum assignment (LAP)` · 线性指派问题
+- **定义**：给定 n×n 代价矩阵，求一个置换使总代价最小。
+- **为什么重要**：这是匹配问题的标准学名，查文献和库函数都用这个词。它是**多项式可解**的，
+  这是 DETR 方案可行的前提。
+- **常见误解**：以为它是 NP-hard。不是。但一旦加上「每个 GT 可以匹配 k 个预测」这类约束，
+  就变成更一般的最优传输问题（OTA / SimOTA 走的是那条路，见 C53）。
+
+### `matching instability` · 匹配不稳定
+- **定义**：相邻两个 epoch 里，同一个 GT 被不同的 query 认领。
+- **为什么重要**：**优化目标本身在抖**——query A 上一轮学着拟合这个 GT，
+  这一轮任务被抢走并被判为背景，梯度方向相互抵消。这是 DETR 需要 500 epoch 的第二个根因。
+- **常见误解**：以为它会自己收敛。会，但要几百个 epoch；DN-DETR 正是为绕过它而设计的。
+
+### `flip rate` · 匹配翻转率
+- **定义**：相邻 epoch 匹配结果发生变化的 GT 占比，量化匹配不稳定的实用指标。
+- **为什么重要**：可以直接在训练里监控；DN 系方法能把它显著压低，
+  这是「去噪确实有用」最直接的实证。
+- **常见误解**：以为只看 loss 曲线就够。翻转率能在 loss 还看不出差别时，
+  提前暴露优化目标的抖动——这是 DETR 训练诊断最有信息量的一个量。
+
+### `Hungarian loss` · 匈牙利损失 / 集合损失
+- **定义**：在最优匹配 σ 下，对每个 GT 算 `分类 CE + λ_L1·L1 + λ_giou·GIoU`，
+  未匹配的 query 只算 ∅ 的分类损失。
+- **为什么重要**：DETR 的第二块地基。注意它与匹配代价**共享项但不共享形式**。
+- **常见误解**：以为「匹配用什么代价，损失就用什么」。分类项在匹配里用概率、在损失里用 log 概率；
+  而且匹配阶段整体是 `no_grad` 的。
+
+### `eos_coef` · 空类权重
+- **定义**：给 ∅ 类分类损失乘的系数，DETR 取 0.1。
+- **为什么重要**：背景 query 占 90% 以上，不降权模型会迅速塌到「全部预测 ∅」这个局部最优。
+  它是 DETR 训练能否起步的**开关**。
+- **常见误解**：以为它只是个不重要的小超参。调到 1.0 通常直接不收敛；调到 0.01 则误检暴增。
+  Deformable DETR 之后改用 focal loss，某种意义上是把这个超参的职责交给了 γ。
+
+### `IoU` · 交并比
+- **定义**：两框交集面积 ÷ 并集面积。
+- **为什么重要**：检测的通用度量。但作为**损失**有致命缺陷。
+- **常见误解**：以为 IoU 可以直接当损失。两框**不相交时 IoU 恒为 0、梯度也为 0**——
+  模型完全不知道该往哪个方向移动，而这在训练早期几乎是常态。
+
+### `GIoU` · 广义交并比
+- **定义**：`GIoU = IoU − (C − U)/C`，其中 C 是包住两框的最小闭包框面积，U 是并集面积。取值 [−1, 1]。
+- **为什么重要**：不相交时它仍随距离单调变化，补上了 IoU 缺失的梯度；且它**尺度不敏感**，
+  这正是 L1 缺的那一半。
+- **常见误解**：以为 GIoU 可以完全替代 L1。DETR 论文的消融明确显示：只用 GIoU 或只用 L1 都会掉点，
+  必须组合——GIoU 管形状对齐、L1 管绝对尺度。
+
+### `DIoU` · 距离交并比
+- **定义**：在 IoU 基础上直接惩罚两框中心点距离的归一化平方。
+- **为什么重要**：比 GIoU 收敛更快。GIoU 在「一框包含另一框」时会退化成 IoU
+  （闭包框就是外框），只能靠慢慢扩大闭包间接对齐；DIoU 把「对齐中心」显式化了。
+- **常见误解**：以为 DIoU 只是 GIoU 的小改。它在包含关系下依然有明确的下降方向，
+  这是一个定性区别而不是量的改进。
+
+### `CIoU` · 完整交并比
+- **定义**：DIoU 再加一项长宽比一致性惩罚 `αv`。
+- **为什么重要**：补上了形状这一维，是 YOLO 系的常用默认。
+- **常见误解**：以为 CIoU 一定最好。它的长宽比项在小框上梯度会很大且不稳定，
+  小目标场景（**如 TSR**）常常反而选 DIoU 或 EIoU。
+
+### `L1 loss (box)` · 框的 L1 损失
+- **定义**：对归一化的 `(cx, cy, w, h)` 四个分量取绝对值误差之和。
+- **为什么重要**：提供了 IoU 类损失缺乏的**绝对尺度**信息，尤其在框很小或完全错位时。
+- **常见误解**：以为 L1 天然公平。**同样 0.02 的归一化误差，对 300 px 的大框微不足道，
+  对 15 px 的小框是灾难**——这是 DETR 对小目标不友好的三个独立根因之一，
+  也是 TSR 场景必须正视的问题。
+
+### `focal loss` · 焦点损失
+- **定义**：用 `(1−p)^γ` 对易分样本降权的分类损失。
+- **为什么重要**：Deformable DETR 之后，集合损失的分类项普遍从 CE 换成 focal——
+  因为 N 提到 300/900 后正负样本比更加极端。
+- **常见误解**：以为 focal 只是「难例挖掘的软化版」。在 DETR 语境里它同时接管了
+  `eos_coef` 原本承担的类别不平衡处理职责，两者不该叠加使用。
+
+### `auxiliary loss (deep supervision)` · 辅助损失
+- **定义**：在 decoder 的**每一层**输出上都接预测头，各自独立做一次匹配并计算完整集合损失。
+- **为什么重要**：DETR 论文消融显示去掉它掉约 2 AP。它把 6 层的梯度路径缩短，
+  是让集合损失训得动的关键工程手段。
+- **常见误解**：以为辅助头推理时也要用。推理只取最后一层输出；辅助头是纯训练期结构，
+  **不增加任何部署成本**——这是性价比极高的一类技巧。
+
+### `loss weight ratio` · 损失权重配比
+- **定义**：DETR 默认 `λ_cls=1, λ_L1=5, λ_giou=2`，匹配与损失共用同一组权重。
+- **为什么重要**：三项量纲差异巨大，配比错了会让某一项完全主导。这是复现 DETR 最容易踩的坑之一。
+- **常见误解**：以为可以随手调。`λ_L1` 从 5 降到 1，框会明显变糊，
+  因为 GIoU 单独无法约束绝对尺度。
+
+---
+
+## 三、Query 与注意力 · Queries & Attention
+
+### `object query` · 目标查询
+- **定义**：decoder 的 N 个输入槽位，每个是一个可学习向量，职责是「去图里认领一个目标」。
+- **为什么重要**：DETR 的第三块地基。它是可学习的、与图像无关的，训练完就固定成一组常数。
+- **常见误解**：以为 query 是从图像里提取的特征。原始 DETR 的 query 是**纯参数**，
+  对所有输入图像都一模一样；图像信息只通过 cross-attention 进来。
+
+### `content query vs positional query` · 内容查询 vs 位置查询
+- **定义**：decoder 每个槽位由两部分构成：负责「长什么样」的内容嵌入，与负责「在哪」的位置嵌入。
+- **为什么重要**：Conditional DETR / DAB-DETR 的出发点就是把两者解耦——
+  原始 DETR 把它们混在一起，逼着 cross-attention 同时干两件事，这是收敛慢的直接原因。
+- **常见误解**：以为这只是实现上的加法拆分。解耦之后，位置部分可以由 anchor 坐标经正弦编码生成，
+  从而在**每一层被更新**——这才是 DAB 的关键。
+
+### `self-attention (in decoder)` · 解码器自注意力
+- **定义**：N 个 query 之间互相看，交换「我认领了哪个目标」的信息。
+- **为什么重要**：它是**去重的执行者**。删掉 decoder 的 self-attention，DETR 会立刻输出大量重复框。
+- **常见误解**：以为去重完全由一对一匹配损失完成。损失只提供训练信号；
+  推理时抑制重复必须靠 self-attention 这条**结构性通道**——没有它，损失也教不会。
+
+### `cross-attention` · 交叉注意力
+- **定义**：query 作为 Q、encoder 输出的图像特征作为 K/V，query 从图像里取证据来填充自己。
+- **为什么重要**：它是**证据的唯一来源**，也是 DETR 收敛慢的第一个根因所在：
+  随机初始化时注意力近似均匀地铺满整张图。
+- **常见误解**：以为「注意力自己会学会聚焦」。会，但在 COCO 上要几百个 epoch；
+  Deformable attention 的贡献就是用结构强行把它变稀疏、变局部。
+
+### `attention map` · 注意力图
+- **定义**：某个 query 对各空间位置的权重分布，可以直接可视化成热力图。
+- **为什么重要**：调试 DETR 最有用的工具。糊成一片 = 还没收敛；
+  落在目标边缘的极值点上 = 已经学会定位（DETR 论文里可以看到注意力聚在目标的四个端点）。
+- **常见误解**：以为注意力图等于「模型看哪里」的因果解释。它只是相关性权重；
+  但作为**训练进度指示器**极其可靠。
+
+### `query specialization` · query 空间特化
+- **定义**：训练收敛后，每个 query 会稳定地偏好特定的图像区域与目标尺度
+  （DETR 论文附录里 20 个 query 的分布图是经典插图）。
+- **为什么重要**：它说明 query 事实上学成了一种**数据驱动的 anchor**——
+  这是回答「query 到底是什么」这道面试题的标准论据。
+- **常见误解**：以为特化是被显式设计出来的。它是一对一匹配的**自发结果**：
+  query 之间必须分工，否则会反复互抢同一个 GT。
+
+### `reference point` · 参考点
+- **定义**：每个 query 关联的一个 2D 坐标（Deformable）或 4D 框（DAB / DINO），
+  作为采样与框回归的原点。
+- **为什么重要**：它把「query 在哪」从隐式变成显式且可迭代更新的量，
+  Deformable / DAB / DINO 全都围绕它构建。
+- **常见误解**：以为参考点是固定的。在两阶段与迭代精修里它**每层都被更新**，
+  而「更新时要不要 detach」正是 look forward twice 讨论的对象。
+
+### `deformable attention` · 可变形注意力
+- **定义**：每个 query 只在参考点附近采样 K 个位置（K 常取 4），
+  采样偏移与注意力权重**都由 query 线性预测**。
+- **为什么重要**：把每个 query 的注意力复杂度从 O(HW) 降到 O(K)，同时自带「聚焦」先验，
+  把 500 epoch 压到 50。
+- **常见误解**：以为它是「稀疏化的 softmax 注意力」。它的注意力权重
+  **不是 Q·K 点积算出来的，而是直接由 query 回归出来的**——完全跳过了 key。
+  这才是它省算力的真正来源，也是它和「稀疏 Transformer」的根本区别。
+
+### `sampling offset` · 采样偏移
+- **定义**：由 query 预测的、相对参考点的 K 个位移向量（每个头、每个尺度各一组）。
+- **为什么重要**：它让采样位置可学；配合双线性插值使整条路径可微。
+- **常见误解**：以为偏移是整数像素。它是连续值，落在特征图格点之间，
+  必须靠双线性插值取值——这一步的梯度实现是 notebook 里的重点练习。
+
+### `multi-scale deformable attention` · 多尺度可变形注意力
+- **定义**：同一个 query 在多个尺度的特征图上各采 K 个点，再加权融合。
+- **为什么重要**：这是 DETR 系终于能用上多尺度特征的关键——
+  稠密注意力在高分辨率特征图上算不动（复杂度随 HW 平方增长）。
+- **常见误解**：以为它等价于「加了个 FPN」。它**没有层级分配规则**：
+  同一个 query 可以自由跨尺度取证据，这对尺寸跨度极大的交通标志尤其友好
+  （同一块限速牌从 200 m 外的 8 px 到 20 m 外的 120 px）。
+
+### `bilinear sampling` · 双线性采样
+- **定义**：在非整数坐标处按四邻域加权取特征值。
+- **为什么重要**：可变形注意力可微的技术前提，梯度同时回传到特征值与采样坐标。
+- **常见误解**：以为它只是插值。**它对坐标的梯度是分片常数**（等于邻域特征的差分），
+  在特征平坦区域会直接消失——这是可变形方法调试时的隐性陷阱。
+
+### `two-stage (encoder proposals)` · 两阶段 query 初始化
+- **定义**：先用 encoder 输出预测一批候选框，取 top-k 作为 decoder query 的初始参考点。
+- **为什么重要**：让 query 一开始就落在目标附近，而不是从随机位置慢慢挪过去，显著加速收敛。
+- **常见误解**：以为这就退回 Faster R-CNN 了。区别在于第二阶段仍是一对一集合预测，
+  且第一阶段不需要 NMS、不需要 RoIAlign。
+
+### `query selection` · query 选择
+- **定义**：从 encoder 的密集输出里挑出 top-k，用来初始化 decoder query。
+- **为什么重要**：选择准则直接决定 decoder 的起点质量。RT-DETR 的
+  IoU-aware / uncertainty-minimal query selection 改的就是这个准则。
+- **常见误解**：以为按分类分数选就行。**分类分数高不代表框准**——
+  按分数选会挑到「认得出但框不准」的位置，这正是 mixed query selection 与
+  IoU-aware selection 要解决的问题。
+
+### `mixed query selection` · 混合 query 选择
+- **定义**：只用 encoder 挑出的位置来初始化 query 的**位置部分**，内容部分仍保持静态可学习。
+- **为什么重要**：DINO 三件套之一。encoder 特征作为内容初始化往往含噪声和歧义，用了反而拖累。
+- **常见误解**：以为「位置和内容都用 encoder 初始化更好」。DINO 的消融明确显示纯静态内容 query 更稳——
+  这是「不是所有先验都值得注入」的好例子。
+
+### `look forward twice` · 前瞻两次
+- **定义**：让第 i 层的框预测同时接受第 i 层与第 i+1 层的监督（即不对参考点做 detach）。
+- **为什么重要**：DINO 三件套之二。原始迭代精修必须 detach 参考点才稳定，
+  代价是每层只能改善自己那一步、看不到下一层的反馈。
+- **常见误解**：以为它是「多算一次损失」。它改的是**梯度的传播路径**（是否 detach），
+  损失项数量并没有变。
+
+### `iterative box refinement` · 迭代框精修
+- **定义**：每层 decoder 在上一层输出框的基础上预测残差修正，而不是每层各自从头回归。
+- **为什么重要**：把 6 层 decoder 变成 6 步逐次逼近，显著提升定位精度，是 Deformable DETR 的标配。
+- **常见误解**：以为可以直接不 detach。原始实现必须 detach 才稳定；
+  怎么安全地放开正是 look forward twice 的贡献。
+
+---
+
+## 四、家族演进 · Family Evolution
+
+### `DETR` · 检测 Transformer
+- **定义**：CNN backbone + Transformer encoder-decoder + 一对一匈牙利匹配 + 集合损失。
+- **为什么重要**：第一个真正端到端的检测器。后续五年所有工作都在修它的两个病：慢、小目标弱。
+- **常见误解**：以为 DETR 精度输给 Faster R-CNN。总 AP 是相当的——
+  它在**大目标上更强**（全局注意力）、**小目标上明显更弱**；
+  真正被诟病的是它要 500 epoch。
+
+### `convergence problem (500 epochs)` · 收敛难题
+- **定义**：DETR 在 COCO 上需要约 500 epoch 才收敛，是 Faster R-CNN（12–36 epoch）的 10–40 倍。
+- **为什么重要**：这是理解整条演进主线的入口——之后每一篇论文都在回答「怎么让它更快收敛」。
+- **常见误解**：以为原因只有一个。**至少两个独立根因**：
+  ① cross-attention 初期近似均匀、梯度稀疏；② 匹配不稳定导致优化目标抖动。
+  两者解法完全不同（Deformable 治前者、DN 治后者），面试里能分开讲就是加分项。
+
+### `Deformable DETR` · 可变形 DETR
+- **定义**：用多尺度可变形注意力替代稠密注意力，加上两阶段与迭代框精修，50 epoch 达到更高 AP。
+- **为什么重要**：事实上的现代 DETR 骨架，后面 DAB / DN / DINO / RT-DETR 全建在它上面。
+- **常见误解**：以为它只是「加速版」。它同时把 APs（小目标）大幅提升——
+  因为它第一次让 DETR 能用多尺度特征，这才是它对 TSR 场景真正的价值。
+
+### `Conditional DETR` · 条件 DETR
+- **定义**：从 decoder 内容嵌入生成**条件空间 query**，让 cross-attention 显式地去找目标的端点区域。
+- **为什么重要**：首次明确指出「cross-attention 同时依赖内容与位置」是收敛慢的直接原因，
+  给出 6.7–10× 加速。
+- **常见误解**：以为它和 DAB 是一回事。Conditional 生成的是 2D 条件空间 query；
+  DAB 更进一步，把 query 定义成 4D 框并逐层更新。
+
+### `Anchor-DETR` · 锚点 DETR
+- **定义**：把 query 直接定义为图像上的 2D anchor point，并允许每个 anchor 携带多个 pattern。
+- **为什么重要**：给出了「query = anchor」这一解释最直白的版本，
+  同时用多 pattern 解决了「一个位置有多个目标」的问题。
+- **常见误解**：以为 anchor 化会丢掉端到端性。它仍是一对一匹配、仍无 NMS——
+  anchor 在这里只是 query 的**参数化方式**，不是分配规则。
+
+### `DAB-DETR` · 动态锚框 DETR
+- **定义**：query 显式表示为 4D 锚框 `(x, y, w, h)`，逐层更新；并用 w/h 调制 cross-attention 的
+  高斯注意力空间范围。
+- **为什么重要**：「query 到底是什么」这个问题的最终答案——它就是一个可学习、可迭代更新的框先验。
+- **常见误解**：以为宽高只用于框回归。DAB 的关键是**用 w/h 去调制注意力的空间尺度**：
+  大目标看得宽、小目标看得窄，这直接改善了尺度适应性。
+
+### `DN-DETR` · 去噪 DETR
+- **定义**：训练时额外送入一批「加了噪声的 GT 框」作为 query，任务是把它们还原回原 GT，
+  这批 query **跳过匈牙利匹配**。
+- **为什么重要**：直接绕开匹配不稳定——去噪分支的监督是固定的，梯度方向不再抖动，收敛再快一倍。
+- **常见误解**：以为去噪 query 会泄漏答案。它们被 attention mask 与匹配分支**严格隔离**，
+  且推理时整个分支被丢弃，不存在测试期泄漏。
+
+### `denoising query` · 去噪 query
+- **定义**：由 GT 框加噪（中心偏移 + 尺度缩放）与标签随机翻转构造出来的额外 query。
+- **为什么重要**：它给模型一个「已知该认领谁」的稳定学习任务，
+  等价于把一对一分配的正样本数放大数倍——直接补上了 DETR 最缺的监督密度。
+- **常见误解**：以为噪声越大越好。噪声超过一定尺度后，任务实际上变成了「去找另一个目标」，
+  反而有害；DN 用 λ 显式限定噪声上界。
+
+### `contrastive denoising (CDN)` · 对比去噪
+- **定义**：每个 GT 同时构造一个小噪声的正样本（要求还原）与一个大噪声的负样本（要求判为 ∅）。
+- **为什么重要**：DINO 三件套之三。它显式教模型「多近算同一个目标、多远就该放弃」，
+  直接压制重复框与近距离误检。
+- **常见误解**：以为它就是「DN 加了负样本」这么简单。负样本的作用是给出**决策边界**——
+  DN 只教会了「靠近就认领」，却没教「远了要放弃」，CDN 补的正是后半句。
+
+### `attention mask (DN isolation)` · 注意力掩码隔离
+- **定义**：在 decoder 的 self-attention 里屏蔽「匹配 query 看去噪 query」以及「不同去噪组互看」的通路。
+- **为什么重要**：没有它就是信息泄漏——匹配 query 能从去噪 query 里读出 GT 位置，
+  训练指标虚高、推理直接崩。
+- **常见误解**：以为「推理时删掉去噪分支就安全」。泄漏发生在**训练期的 self-attention 里**，
+  推理时删分支救不回来，模型早已学会依赖这条捷径。
+
+### `DINO` (DETR with Improved deNoising anchOr boxes)
+- **定义**：Deformable 骨架 + 对比去噪 + mixed query selection + look forward twice。
+- **为什么重要**：长期 SOTA 骨架，也是后续 Grounding DINO / 开放词表检测 / Mask DINO 的基础。
+- **常见误解**：与自监督方法 **DINO（Caron et al. 2021）同名但完全无关**——
+  检索文献、写简历、面试口述时务必区分，说错会被认为没读过原文。
+
+### `Group DETR` · 分组 DETR
+- **定义**：训练时并行使用 K 组 query，每组独立做一对一匹配，等价于给每个 GT 提供 K 个正样本；
+  推理只留一组。
+- **为什么重要**：用「多组一对一」实现了一对多的监督密度，同时完整保留无 NMS 性质。
+- **常见误解**：以为等价于把 N 调大 K 倍。K 组之间通过 self-attention 分组掩码**互相隔离**，
+  组内仍是一对一竞争——这和「所有 query 挤在同一组里抢」完全不同。
+
+### `H-DETR` (hybrid matching) · 混合匹配
+- **定义**：一个一对一分支 + 一个一对多分支联合训练，推理只用前者。
+- **为什么重要**：最直接地证明了 **「一对一是推理的需求，不是训练的最优」**——
+  这句话是本课最重要的一个结论。
+- **常见误解**：以为一对多分支会破坏无 NMS 性质。它在推理时被整个丢弃，
+  一对一分支的去重能力丝毫不受影响。
+
+### `Co-DETR` (Collaborative Hybrid Assignment) · 协同混合分配
+- **定义**：在 encoder 输出上并联多个传统一对多检测头（ATSS、Faster R-CNN 头等）提供密集监督。
+- **为什么重要**：它指出 DETR 的**encoder 因正样本太少而训练不充分**，用辅助头把它喂饱；
+  一度是 COCO 榜首（COCO test-dev 66+ AP）。
+- **常见误解**：以为它只是多任务堆叠。核心洞察在于**定位到了监督稀疏具体伤到了哪个部件**，
+  辅助头是对症下药而不是撒网。
+
+### `DETA` (Detection Transformers with Assignment)
+- **定义**：把 DETR 的一对一匹配换回 IoU 阈值式一对多分配 + NMS，收敛极快且精度不掉。
+- **为什么重要**：提供了反方向的证据——端到端的收益主要在**部署侧**（无 NMS、延迟确定），
+  训练侧的一对一是净负担。
+- **常见误解**：以为它否定了 DETR。它否定的是「一对一在训练期更优」这个信念，
+  而不是 Transformer 检测器本身。
+
+### `RT-DETR` · 实时 DETR
+- **定义**：高效混合编码器（只在最高层 S5 做 self-attention + CNN 做跨尺度融合）+
+  IoU-aware query selection，首个在实时区间打赢 YOLO 的 DETR。
+- **为什么重要**：让 DETR 系真正具备量产可行性；**decoder 层数可调使一份权重支持多档速度**，
+  这在多硬件平台的车端是大杀器。
+- **常见误解**：以为「无 NMS 所以一定更快」。RT-DETR 的均值提速主要来自 encoder 重设计；
+  无 NMS 买到的是**延迟方差变小**（C53 模块 04/05 详讲）。
+
+### `Sparse DETR / Efficient DETR` · 稀疏化支线
+- **定义**：只更新 encoder token 的一个子集 / 用密集先验初始化 query 从而减少 decoder 层数。
+- **为什么重要**：代表「减计算」这条支线，与「加监督」那条主线互补。
+- **常见误解**：以为它们已被 DINO 取代。在算力极紧的车端芯片上，token 稀疏化仍是有效手段。
+
+### `Grounding DINO` · 开放词表 DETR
+- **定义**：在 DINO 基础上加入文本编码器与跨模态特征融合，实现开放词表 / 短语定位检测。
+- **为什么重要**：集合预测框架向开放集扩展的代表；对 TSR 的长尾类别探索有直接价值。
+- **常见误解**：以为开放词表会替代闭集检测上车。当前精度与延迟都不足以量产，
+  它的现实用途是**数据挖掘与自动预标注**（见 C58）。
+
+---
+
+## 五、工程实践 · Engineering Practice
+
+### `backbone lr multiplier` · backbone 学习率倍率
+- **定义**：backbone 用 0.1× 学习率，Transformer 与预测头用基础学习率（DETR 基础 lr = 1e-4）。
+- **为什么重要**：backbone 已在 ImageNet 上收敛，而 Transformer 从零开始；
+  同一学习率会在训练早期直接破坏预训练特征。
+- **常见误解**：以为这只是「微调惯例」。在 DETR 上它不是可选优化——
+  去掉后 AP 掉好几个点，属于**复现的必要条件**。
+
+### `AdamW + weight decay` · 优化器配置
+- **定义**：DETR 用 AdamW，lr 1e-4、weight decay 1e-4、梯度裁剪 0.1，
+  在 200/500 epoch 处 drop lr。
+- **为什么重要**：Transformer 检测器对优化器远比 CNN 检测器敏感。
+- **常见误解**：以为可以照搬 YOLO 的 SGD + momentum + cosine 配方。
+  换成 SGD 通常直接不收敛，这是「复现失败」最常见的原因之一。
+
+### `gradient clipping` · 梯度裁剪
+- **定义**：按全局范数裁到 0.1。
+- **为什么重要**：DETR 训练早期梯度尖峰频繁（匹配翻转导致目标突变），不裁会出现 loss 尖刺甚至 NaN。
+- **常见误解**：以为 0.1 太小、是笔误。这是官方值；它反映的是集合损失的梯度尺度本来就大。
+
+### `small object weakness` · 小目标弱
+- **定义**：原始 DETR 的 APs 明显落后于 Faster R-CNN。
+- **为什么重要**：与 **TSR 直接相关**——交通标志在 1920×1080 图上常常只有 10–30 px。
+- **常见误解**：以为原因只是「分辨率不够」。**至少三个独立根因**：
+  ① 只用 stride 32 的 C5 单尺度特征；② N 固定，小目标在 query 竞争中输给大目标；
+  ③ L1 在归一化坐标下对小框严重不公平。
+  三者要分别用多尺度可变形注意力、增大 N + 去噪监督、换尺度不敏感度量（见 C57 的 NWD）来解。
+
+### `foreground query ratio` · 前景 query 占比
+- **定义**：预测为非 ∅ 的 query 数 ÷ N，训练诊断指标。
+- **为什么重要**：塌到 0 就说明模型走了「全预测背景」的捷径，通常是 eos_coef 太大或 lr 太高。
+- **常见误解**：以为这个指标越高越好。健康值应接近「平均每图目标数 / N」；
+  过高意味着误检泛滥，在 TSR 里直接表现为 FP/km 爆炸。
+
+### `box center entropy` · 框中心分布熵
+- **定义**：所有预测框中心在图像平面上分布的熵，训练诊断指标。
+- **为什么重要**：熵异常低 = 框全挤在图像中心，是训练早期的典型病态（query 还没特化）。
+- **常见误解**：以为中心聚集只是数据集偏置。训练中期若仍不散开，
+  说明 cross-attention 没学会定位，应检查位置编码是否加对、学习率是否过高。
+
+### `top-k inference` · top-k 推理
+- **定义**：推理时不取每个 query 的 argmax 类别，而是把 `N × C` 个 (query, 类别) 得分拉平取 top-k
+  （DETR 官方评测取 100）。
+- **为什么重要**：允许同一个 query 贡献多个类别候选，能提升召回；这是官方评测脚本的实际做法。
+- **常见误解**：以为「一个 query 只出一个框」。评测时一个 query 确实可以贡献多个候选——
+  这是 DETR 的 AP 数字里常被忽略的实现细节。
+
+### `score threshold` · 分数阈值
+- **定义**：上车时按置信度过滤输出。
+- **为什么重要**：端到端**不代表不用调阈值**；工作点仍要按 FP/km 这类工程指标来定（见 C55）。
+- **常见误解**：以为无 NMS = 无后处理超参。阈值仍是超参，
+  只是它比 NMS 的 IoU 阈值更直观、对指标的影响也更单调。
+
+### `NMS as safety net` · NMS 兜底
+- **定义**：在 DETR 输出后仍挂一个高 IoU 阈值（如 0.7–0.9）的 NMS。
+- **为什么重要**：训练不足或域外场景下确实能捞回少量重复框，代价极小（框只有 100 个）。
+- **常见误解**：以为加了 NMS 就「不端到端了、不该加」。工程上这是廉价保险；
+  DETR 论文自己也报告过：训练早期加 NMS 有增益，收敛后收益趋零。
+
+### `latency determinism` · 延迟确定性
+- **定义**：无 NMS 意味着推理耗时与图中目标数几乎无关。
+- **为什么重要**：车端排期看的是 **p99 而非均值**，这是 DETR 系最被低估的部署优势。
+- **常见误解**：以为均值延迟才是关键。密集场景下 NMS 能让 p99 比 p50 高出数倍，
+  感知在 33 ms 预算里就排不进去了。
+
+### `data hunger` · 数据需求
+- **定义**：DETR 系在小规模数据集上通常明显弱于正样本更密的 CNN 检测器。
+- **为什么重要**：选型的硬约束——只有几千张标注的自建 TSR 数据集，用 DINO 可能不如 RTMDet。
+- **常见误解**：以为「用 DINO 就一定更强」。DN/CDN 缓解了这个问题但没消除它；
+  **数据量与 epoch 预算必须和架构一起考虑**，这是模块 05 选型论证的核心。
+
+### `epochs budget` · 训练预算
+- **定义**：DETR 500 ep → Deformable 50 ep → DINO 12 ep（1× schedule）即可有竞争力。
+- **为什么重要**：训练成本直接进选型表。同样一块卡，12 ep 和 500 ep 是「一天」和「一个月」的差别。
+- **常见误解**：以为论文报的最高 AP 就是可用配置。多数 SOTA 数字用的是 Swin-L / 36 ep +
+  大分辨率，换成车端可用的 backbone 与 12 ep 后，排名可能完全不同。
+"""
+
+
+REFERENCES = r"""
+# 参考清单 · References（端到端集合预测检测 · DETR 家族）
+
+> 每条注明**它解决了什么问题**、为什么值得读。先读 ★ 标记的必读。
+> DETR 家族论文极多，但真正引入新机制的只有十来篇——本清单按"机制"而不是按时间组织，
+> 读完 ★ 的那些，剩下的论文你基本能自己推出来它在改哪一块。
+>
+> 与相邻课程的分工：**C18** 讲经典检测（IoU / NMS / anchor / Faster R-CNN / FPN，本课的前置）；
+> **C53** 讲实时检测器架构与标签分配（YOLO 演进 / RTMDet / RT-DETR 的实时侧）；
+> **C57** 讲小目标检测（把本课模块 05 留下的问题彻底量化）；
+> **C55** 讲 TSR 领域知识与安全导向评测；**C60** 讲车端部署。
+
+## 集合预测与端到端范式 · The Paradigm
+
+- ★ **Carion et al. 2020, _End-to-End Object Detection with Transformers_ (DETR, ECCV 2020)**
+  —— **本课的一手来源，从头到尾都要读，包括附录**。它解决的问题是：检测长期依赖 anchor 与 NMS
+  这两个不可微、需手工调参的组件。读法建议：先读 §3（匈牙利匹配 + 集合损失，只有两页但是全课地基），
+  再读 §4.2 的**消融表**（辅助损失去掉掉多少、GIoU/L1 各去掉掉多少、decoder self-attention 去掉重复框有多少），
+  最后读附录里 query 空间特化的可视化——那张图是回答"query 是什么"最有力的证据。
+- ★ **Zhu et al. 2021, _Deformable DETR: Deformable Transformers for End-to-End Object Detection_ (ICLR 2021)**
+  —— 解决 DETR 的两个致命问题：收敛要 500 epoch、小目标差。核心是可变形注意力
+  （每个 query 只采 K 个可学采样点，**注意力权重直接由 query 回归、不走 Q·K 点积**）
+  与多尺度。**读 §3.1 的复杂度分析**，它解释了为什么原始 DETR 用不了多尺度特征。
+  两阶段与迭代精修也出自这里。
+- ★ **Wang et al. 2021, _End-to-End Object Detection with Fully Convolutional Networks_ (DeFCN, CVPR 2021)**
+  —— **证明"端到端不需要 Transformer"的关键论文**：纯 FCN + 一对一分配（POTO）+ 3D Max Filtering
+  同样可以无 NMS。读它是为了把"集合预测"从"Transformer"里剥离出来——
+  这是本课反复强调的分界线，也是面试里区分"读过论文"和"跟过热点"的地方。
+- **Sun et al. 2021, _OneNet: Towards End-to-End One-Stage Object Detection_**
+  —— 指出一对一分配里**分类代价必不可少**（只用位置代价做一对一会失败）。
+  与 DeFCN 互为补充，一起构成"一对一分配到底需要什么"的答案。
+- **Sun et al. 2021, _Sparse R-CNN: End-to-End Object Detection with Learnable Proposals_ (CVPR 2021)**
+  —— 用一组可学习 proposal + 一对一匹配做端到端，但完全不用注意力做全局交互。
+  读它能看清"可学习 query"这个想法可以有多少种实现形态。
+- **Chen et al. 2022, _Pix2Seq: A Language Modeling Framework for Object Detection_ (ICLR 2022)**
+  —— 把检测变成序列生成（框坐标离散化成 token 自回归输出）。它给出了集合预测的第三条路，
+  也解释了为什么"顺序"在检测里是个人为强加的东西。与 C59 的 VLA 有直接思想联系。
+- **Wang et al. 2024, _YOLOv10: Real-Time End-to-End Object Detection_**
+  —— 一致双分配（consistent dual assignments）：训练时一对多头与一对一头共存且监督一致，
+  推理只用一对一头。**这是"一对一是推理需求"这一结论在 YOLO 系的落地**，C53 有详讲。
+
+## 匹配算法 · Matching
+
+- ★ **Kuhn 1955, _The Hungarian Method for the Assignment Problem_ (Naval Research Logistics Quarterly)**
+  —— 匈牙利算法的原始文献，也是 "Hungarian" 这个名字的来历（Kuhn 致敬了 Kőnig 与 Egerváry 的工作）。
+  解决的问题：n×n 指派问题的多项式时间求解。**值得真的读一遍**——十几页，
+  顶标（对偶变量）与相等子图的思想比任何二手教程都清楚。
+- ★ **Munkres 1957, _Algorithms for the Assignment and Transportation Problems_ (SIAM J.)**
+  —— 给出严格的 O(n³) 实现与复杂度证明，这也是 "Kuhn–Munkres / KM 算法"这个叫法的来源。
+  模块 01 的练习实现就照这篇的流程走。
+- **Jonker & Volgenant 1987, _A Shortest Augmenting Path Algorithm for Dense and Sparse Linear Assignment Problems_**
+  —— `scipy.optimize.linear_sum_assignment` 实际用的算法。常数因子小很多。
+  读它是为了知道"库里那个函数到底在做什么"，以及为什么练习里禁止直接调它。
+- **Kőnig 1931 / Egerváry 1931（二分图匹配的经典结果）**
+  —— Kőnig 定理（最大匹配 = 最小顶点覆盖）是匈牙利算法正确性的组合基础。
+  只需要知道结论，但知道它能让"为什么增广路径找不到了就说明已最优"变得显然。
+- **Cuturi 2013, _Sinkhorn Distances: Lightspeed Computation of Optimal Transport_**
+  —— 指派问题的软化版本。**读它是为了理解 OTA / SimOTA 那条支线**（一个 GT 匹配 k 个预测，
+  就从指派问题变成了最优传输问题）；C53 模块 02 详讲。
+- **Ge et al. 2021, _OTA: Optimal Transport Assignment for Object Detection_ (CVPR 2021)**
+  —— 把标签分配显式建模成最优传输。与本课的一对一匹配是同一数学家族的两端：
+  一端要求严格一对一，一端允许可变的一对多。
+
+## 框回归损失 · Box Losses
+
+- ★ **Rezatofighi et al. 2019, _Generalized Intersection over Union: A Metric and A Loss for Bounding Box Regression_ (CVPR 2019)**
+  —— GIoU 的原始文献。解决的问题：**IoU 在两框不相交时恒为 0、梯度也为 0**，
+  而训练早期不相交是常态。读 §3 的定义与 §4 的梯度分析即可。DETR 的匹配代价与损失都用它。
+- ★ **Zheng et al. 2020, _Distance-IoU Loss: Faster and Better Learning for Bounding Box Regression_ (AAAI 2020)**
+  —— DIoU 与 CIoU 一次给全。**关键洞察**：GIoU 在"一框包含另一框"时退化成 IoU，
+  只能靠慢慢扩大闭包框间接对齐；DIoU 直接惩罚中心距离，收敛快得多。CIoU 再加长宽比项。
+  这篇也是 DIoU-NMS 的出处。
+- **Zhang et al. 2022, _Focal-EIoU: Focal and Efficient IOU Loss for Accurate Bounding Box Regression_**
+  —— EIoU 把 CIoU 的长宽比项拆成宽和高各自的惩罚，避免了 CIoU 在小框上的梯度不稳。
+  **小目标 / TSR 场景值得试**，C57 会再提。
+- **Lin et al. 2017, _Focal Loss for Dense Object Detection_ (RetinaNet, ICCV 2017)**
+  —— Deformable DETR 之后集合损失的分类项普遍换成 focal loss。
+  在 DETR 语境里它同时接管了 `eos_coef` 的职责，所以两者不该叠加。C18/C53 有更详细的讨论。
+- **Li et al. 2020, _Generalized Focal Loss_ (GFL/GFLv2)**
+  —— 分类-定位质量联合表示 + 框的分布式表示。**读它是为了理解 RT-DETR 的 IoU-aware
+  query selection 和 D-FINE 的细粒度分布优化在做什么**。
+
+## 收敛加速：注意力这条线 · Faster Convergence (Attention)
+
+- ★ **Meng et al. 2021, _Conditional DETR for Fast Training Convergence_ (ICCV 2021)**
+  —— **第一篇把"收敛慢"的根因明确定位到 cross-attention 的论文**：
+  内容与位置耦合在一起，逼着注意力同时干两件事。解法是生成条件空间 query，6.7–10× 加速。
+  读 §3 的注意力分解推导，它是理解 DAB 的前置。
+- ★ **Liu et al. 2022, _DAB-DETR: Dynamic Anchor Boxes are Better Queries for DETR_ (ICLR 2022)**
+  —— **回答"query 到底是什么"最彻底的一篇**：query 就是 4D anchor box，
+  且用 w/h 调制注意力的空间范围（大目标看得宽、小目标看得窄），逐层更新。
+  面试被问 "query 和 anchor 有什么区别" 时，这篇是标准答案的来源。
+- **Wang et al. 2022, _Anchor DETR: Query Design for Transformer-Based Detector_ (AAAI 2022)**
+  —— query = 2D anchor point + 多 pattern（解决同一位置多目标）。
+  与 DAB 是同一时期的两种参数化，对比读收获最大。
+- **Gao et al. 2021, _Fast Convergence of DETR with Spatially Modulated Co-Attention_ (SMCA)**
+  —— 用高斯权重图直接给 cross-attention 加空间先验。思路最简单直接，
+  适合作为"给注意力加先验"这类方法的最小示例。
+- **Roh et al. 2022, _Sparse DETR: Efficient End-to-End Object Detection with Learnable Sparsity_ (ICLR 2022)**
+  —— 只更新 encoder token 的一个子集。解决的问题是 encoder 计算量，
+  **在车端算力受限时这条支线仍然有用**。
+- **Yao et al. 2021, _Efficient DETR: Improving End-to-End Object Detector with Dense Prior_**
+  —— 用密集先验初始化 query，从而把 decoder 从 6 层减到 1 层。
+  是"两阶段 query 初始化"这个想法的早期形态。
+- ★ **Vaswani et al. 2017, _Attention Is All You Need_**
+  —— Transformer 原文。本课只需要 §3.2（多头注意力）与位置编码那部分，
+  但模块 03 的 notebook 会从零实现它们，读一遍原始定义能避免很多细节偏差。
+- **Dai et al. 2017, _Deformable Convolutional Networks_ / Zhu et al. 2019, _DCNv2_**
+  —— 可变形注意力的思想源头（可学习采样偏移 + 双线性插值取值）。
+  读它能理解"为什么梯度可以回传到坐标上"这件事最初是怎么被做出来的。
+
+## 收敛加速：监督这条线 · Faster Convergence (Supervision)
+
+- ★ **Li et al. 2022, _DN-DETR: Accelerate DETR Training by Introducing Query DeNoising_ (CVPR 2022)**
+  —— **把"匹配不稳定"这个根因量化并解决的论文**。它先用"匹配翻转率"证明不稳定确实存在，
+  再用带噪 GT 作为额外 query 绕过匹配。读 §3 的噪声构造与 **attention mask 设计**——
+  后者是防信息泄漏的硬条件，实现时最容易写错。
+- ★ **Zhang et al. 2023, _DINO: DETR with Improved DeNoising Anchor Boxes for End-to-End Object Detection_ (ICLR 2023)**
+  —— 三件套：**对比去噪（CDN）**、**mixed query selection**、**look forward twice**。
+  每一件都值得单独理解它解决什么：CDN 给出"多远该放弃"的决策边界；
+  mixed query selection 说明不是所有先验都值得注入（内容部分用 encoder 特征反而更差）；
+  look forward twice 改的是 detach 与否而不是损失项。**注意与自监督的 DINO 完全无关。**
+- ★ **Chen et al. 2023, _Group DETR: Fast DETR Training with Group-Wise One-to-Many Assignment_ (ICCV 2023)**
+  —— K 组 query 各自做一对一，等价于一对多但保留无 NMS。
+  它与下面两篇一起构成本课最重要的结论：**一对一是推理的需求，不是训练的最优**。
+- ★ **Jia et al. 2023, _DETRs with Hybrid Matching_ (H-DETR, CVPR 2023)**
+  —— 一对一分支 + 一对多分支联合训练，推理只用前者。最直白地把这个结论摆出来。
+- ★ **Zong et al. 2023, _DETRs with Collaborative Hybrid Assignments Training_ (Co-DETR, ICCV 2023)**
+  —— 进一步定位到"**encoder 因正样本太少而训练不充分**"，用并联的传统一对多头喂饱它。
+  一度是 COCO 榜首。这篇的价值在于它演示了"把稀疏监督的伤害定位到具体部件"的分析方法。
+- **Ouyang-Zhang et al. 2022, _NMS Strikes Back_ (DETA)**
+  —— 反方向证据：把一对一换回 IoU 阈值一对多 + NMS，收敛极快且精度不掉。
+  **读它是为了不把"端到端"当信仰**——端到端的收益在部署侧，训练侧是净成本。
+- **Liu et al. 2023, _Detection Transformer with Stable Matching_ (Stable-DINO)**
+  —— 用位置度量参与分类损失来稳住匹配。对"匹配不稳定"这条线的进一步收敛。
+- **Zhang et al. 2023, _Dense Distinct Query for End-to-End Object Detection_ (DDQ, CVPR 2023)**
+  —— 指出 query 既要"密"（覆盖率）又要"互不重复"（去重），并给出显式的 query 去重设计。
+
+## 实时与部署 · Real-Time & Deployment
+
+- ★ **Zhao et al. 2024, _DETRs Beat YOLOs on Real-time Object Detection_ (RT-DETR, CVPR 2024)**
+  —— 首个在实时区间打赢 YOLO 的 DETR。两个设计要点：
+  **efficient hybrid encoder**（只在最高层做 self-attention，跨尺度融合用 CNN）与
+  **IoU-aware query selection**（按分类分数选会挑到定位差的）。
+  外加一个部署上的大杀器：**decoder 层数可调，一份权重支持多档速度-精度而无需重训**。
+  C53 模块 04 从延迟预算的角度再讲一遍，两边对照读。
+- **Lv et al. 2024, _RT-DETRv2_ / Peng et al. 2024, _D-FINE_ / Chen et al. 2024, _LW-DETR_**
+  —— RT-DETR 之后的三条延续：离散采样与灵活缩放 / 细粒度分布优化 /
+  纯 ViT 的轻量实时 DETR。选型时值得各扫一眼 benchmark 表。
+- **Zheng et al. 2023, _Less is More: Focus Attention for Efficient DETR_ (Focus-DETR)**
+  —— 前景 token 打分 + 稀疏化，兼顾精度与效率。车端算力紧时的候选方案。
+- **facebookresearch/detr（官方代码库）**
+  —— ★ **`models/matcher.py` 与 `models/detr.py` 的 `SetCriterion` 这两个文件必须逐行读**，
+  加起来不到 300 行，本课模块 01–02 的全部内容都在里面。
+  特别注意 matcher 里分类项用的是 `-out_prob[:, tgt_ids]`（概率）而不是 log 概率。
+- **IDEA-Research/detrex 与 IDEA-Research/DINO（代码库）**
+  —— DETR 家族最全的统一复现（DAB / DN / DINO / Group / H-DETR 都有）。
+  **要看 DN 的 attention mask 怎么写、去噪组怎么分，直接读这里最快。**
+- **open-mmlab/mmdetection（代码库）**
+  —— Deformable DETR / DINO / RT-DETR 的配置文件是查超参的最快途径
+  （学习率分组、num_queries、去噪组数、损失权重都在配置里一目了然）。
+
+## 相关扩展 · Beyond Detection
+
+- **Cheng et al. 2022, _Masked-attention Mask Transformer for Universal Image Segmentation_ (Mask2Former)**
+  —— 集合预测在分割上的形态：query = 一个 mask。读它能看到"一对一匹配 + 集合损失"
+  这套东西的通用性远超检测。
+- **Li et al. 2023, _Mask DINO_** —— DINO 的检测+分割统一版本，说明这套骨架可以直接扩展。
+- **Liu et al. 2024, _Grounding DINO: Marrying DINO with Grounded Pre-Training for Open-Set Object Detection_ (ECCV 2024)**
+  —— 开放词表检测的代表作。对 TSR 长尾类别的价值目前主要在**数据挖掘与自动预标注**（C58），
+  而不是直接上车。
+- **Wang et al. 2022, _DETR3D_ / Liu et al. 2022, _PETR_**
+  —— 把 object query 搬到 3D / BEV 空间（query 直接在 3D 里定义并投影回多相机图像取特征）。
+  **这是自动驾驶感知的主流范式**，也是本课内容在量产系统里的真正落点；C55 会再接上。
+- **Zhang et al. 2021, _Deep Sets_ / Lee et al. 2019, _Set Transformer_**
+  —— 集合上的置换不变函数该怎么构造。想把"为什么必须匹配"这件事从第一性原理讲清楚时，
+  这两篇是理论背景。
+"""
+
+
+if __name__ == "__main__":
+    ok = build()
+    print("\n构建完成 ✅" if ok else "\n⚠️ 有讲解页可见字符不足，请补充")

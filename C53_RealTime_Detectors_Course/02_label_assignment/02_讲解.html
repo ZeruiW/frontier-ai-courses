@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 标签分配：检测器真正的胜负手</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 标签分配：检测器真正的胜负手</h1>
+  <p class="subtitle">同一个 backbone 换一套分配策略能差 3–5 AP，比换 backbone 更划算 · 静态 IoU 阈值对不同尺度极不公平（8×8 的框位移 2 px，IoU 就掉到 0.39）· ATSS 用「均值 + 标准差」把阈值自适应算出来 · OTA/SimOTA 的最优传输视角与 dynamic-k：正样本数量该由目标自己决定 · TaskAligned 的 t = s^α · u^β 把分类分数与定位质量对齐 · RTMDet 的 dynamic soft label · <strong>一对一 vs 一对多的本质：一对一是推理需求，不是训练最优</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00–01（YOLO 演进、anchor-free、解耦头）；C18 的 IoU / NMS 基础</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_label_assignment.ipynb（纯 numpy 从零实现 ATSS / SimOTA / TaskAligned）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">ATSS (CVPR20) · OTA (CVPR21) · YOLOX 的 SimOTA · TOOD (ICCV21) · RTMDet 的 DynamicSoftLabelAssigner</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 70 分钟 + 跑 70 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what">标签分配：训练开始前的那一步，决定了训练的一切</a></li>
+      <li><a href="#static">静态分配：固定 IoU 阈值的三个致命问题</a></li>
+      <li><a href="#atss">ATSS：让阈值自己从数据里长出来</a></li>
+      <li><a href="#simota">OTA / SimOTA：把分配看成最优传输问题</a></li>
+      <li><a href="#aligned">TaskAligned：让分类分数与定位质量绑在一起</a></li>
+      <li><a href="#soft">RTMDet 的 dynamic soft label：把硬标签换成软标签</a></li>
+      <li><a href="#tsr">落到交通标志检测：分配策略在这里意味着什么</a></li>
+      <li><a href="#o2o">一对一 vs 一对多：这是推理需求，不是训练最优</a></li>
+      <li><a href="#frontier">研究前沿与开放问题</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what"><span class="num">1</span>标签分配：训练开始前的那一步，决定了训练的一切</h2>
+  <p>一个检测器在每张图上会吐出成千上万个预测单元——本课的合成设定里是 640×640 输入、stride 8/16/32 三层 FPN，一共 <code>80²+40²+20² = 8400</code> 个格点。而这张图里可能只有 5 个真实目标。<strong>「哪些格点该学成前景、学哪个 GT、哪些该学成背景」——这个决定就叫 <span class="term">label assignment</span>（标签分配）</strong>。它发生在算损失<em>之前</em>，不参与反向传播，却决定了每一步梯度长什么样。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>分配是<strong>唯一一个「不产生任何参数、却能决定几个点 AP」的环节</strong>。backbone 换一个更大的、neck 加一层 BiFPN，收益通常在 0.5–1 AP；而把 MaxIoU 换成 SimOTA，在 YOLOX 的消融里是 <strong>+2.3 AP</strong>（44.6 → 47.3，YOLOX-L）。原因很直白：<em>分配决定了训练信号的分布本身</em>——你告诉模型「这个位置是正的」，模型就往那个方向走；分配错了，再大的模型也只是把错误学得更牢。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说：分配定义了损失函数的<strong>作用域</strong>。设格点集合 $A$、真值集合 $G$，分配是一个映射 $\pi: A \to G \cup \{\varnothing\}$。分类损失对所有 $a \in A$ 计算（正样本目标为 $\pi(a)$ 的类别，负样本目标为背景），<em>回归损失只对 $\pi(a) \neq \varnothing$ 的格点计算</em>。所以 $\pi$ 同时决定了：① 正负样本比例（前景-背景不平衡的直接来源）；② 每个 GT 得到多少监督（尺度间的公平性）；③ 回归损失看到的样本分布（决定回归头学到的先验）。<strong>这三件事都不是超参数能补救的。</strong></p></div>
+  </div>  <div class="ascii">一张图的训练信号是怎么来的（分配在最前面）
+
+  图像 ──► backbone ──► neck ──► head ──► 8400 个格点的 (cls, box)
+                                              │
+                                              ▼
+   GT (5 个框) ────────────────────► 【标签分配 π】 ◄── 有时也看预测本身
+                                              │           (SimOTA/TaskAligned)
+                    ┌─────────────────────────┼──────────────────────┐
+                    ▼                         ▼                      ▼
+              正样本 (~40 个)            忽略样本 (~0-200)        负样本 (~8300)
+              cls=对应类别               不算任何损失             cls=背景
+              box=回归到该 GT                                     无 box 损失
+
+  ⇒ 分配 π 一变，上面三个集合全变，梯度的方向与量级全变。
+  ⇒ 它不含任何可学参数，却是「同一个网络能不能训出来」的分水岭。</div>  <div class="callout intuition"><span class="label"></span>
+    <p>记住一句话：<strong>网络结构决定了「模型能表达什么」，标签分配决定了「模型实际学到什么」</strong>。<em>面试里如果只会说「我换了个更强的 backbone」，深度就止步于此；能把分配讲清楚的人，面试官会立刻认为你真的调过检测器。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="static"><span class="num">2</span>静态分配：固定 IoU 阈值的三个致命问题</h2>
+  <p><span class="term">static assignment</span>（静态分配）指的是：<strong>分配规则只看 anchor 与 GT 的几何关系，不看模型当前的预测</strong>。Faster R-CNN / SSD / RetinaNet 全是这一套——「IoU ≥ 0.5 为正，&lt; 0.4 为负，中间忽略；此外每个 GT 强制认领它 IoU 最高的那个 anchor」。它简单、可复现、与训练进度无关，也正因如此，它有三个绕不过去的问题。</p>  <table>
+    <thead><tr><th>问题</th><th>机理</th><th>在本课合成实验里的实测</th><th>谁来解</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 阈值对尺度不公平</strong></td><td>IoU 上界由 <code>min(A_gt,A_anc)/max(A_gt,A_anc)</code> 决定。GT 尺寸与 anchor 尺寸差得多，IoU 天花板就低于阈值</td><td>16×16 的标志对 32/64/128 三档 anchor 的<strong>理论最大 IoU 只有 0.25 / 0.063 / 0.016</strong>，全部低于 0.5 —— 它<em>永远</em>拿不到一个正样本</td><td>ATSS 的自适应阈值</td></tr>
+      <tr><td><strong>② 正样本数量与尺度强相关</strong></td><td>大目标覆盖的 anchor 多、IoU 高的也多；小目标只能靠「强制认领」拿到 1 个</td><td>MaxIoU 全图只给出 <strong>6 个正样本</strong>（正负比 1:1400），4 个 GT 各只有 1 个；其中 16/18px 那两个<em>完全靠兜底规则硬塞</em>，塞进来的 anchor IoU 只有 0.25 / 0.32</td><td>SimOTA 的 dynamic-k</td></tr>
+      <tr><td><strong>③ 与预测质量脱钩</strong></td><td>几何上最匹配的 anchor，未必是当前模型预测得最好的那个；模型被迫在一个它学不动的位置上硬学</td><td>MaxIoU 正样本的<strong>预测框平均 IoU 只有 0.808</strong>，而 TaskAligned 选出的是 0.885</td><td>OTA / TaskAligned</td></tr>
+    </tbody>
+  </table>  <div class="math-block">\[\text{IoU}_{\max}(\text{gt}, \text{anchor}) \;=\; \frac{\min(A_{gt}, A_{anc})}{\max(A_{gt}, A_{anc})} \quad\Longrightarrow\quad \text{IoU} \ge \tau \iff \sqrt{\tau}\, s \;\le\; L_{gt} \;\le\; \frac{s}{\sqrt{\tau}}\]</div>  <p>上式里 $s$ 是 anchor 边长、$L_{gt}$ 是 GT 边长（同宽高比、同心的理想情况）。代入 $\tau=0.5$、$s=32$：<strong>只有边长落在 [22.6, 45.3] 这个窄带里的目标才可能被 IoU 0.5 匹配上</strong>。这不是一个「小目标稍微吃亏」的问题——<em>它是一道硬门：门外的目标，正样本数恒等于兜底给的那 1 个</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>很多人以为「小目标难检」是因为像素少、信息不够。<strong>信息不足是原因之一，但在静态分配下，更直接的原因是它<em>根本没有得到训练信号</em></strong>。一个 16 像素的限速牌，整张图 8400 个格点里只有 1 个被标成正样本，回归损失就只在这一个位置算——<em>而同一张图里 96 像素的指示牌可能有十几个正样本</em>。梯度的量级差了一个数量级，模型自然优先学会大目标。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格说，这是<strong>正样本数量随尺度的系统性偏斜</strong>，它同时污染分类与回归两条支路：分类支路上，小目标类别的正样本极少，等价于人为制造了一个类别不平衡（哪怕数据集里各类样本数一样多）；回归支路上，回归头见到的框尺寸分布被严重偏向大框，<em>学到的回归先验对小框是失配的</em>。<strong>「强制认领最大 IoU 的 anchor」这个兜底规则救不了它</strong>——恰恰相反，它把一个 IoU 只有 0.25 的低质量 anchor 也标成正样本，逼着模型在一个几乎没有目标信息的位置上做回归，<em>引入的是噪声监督</em>。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>面试高频陷阱：<strong>「为什么小目标 AP 低？」如果只答「分辨率不够、下采样丢信息」，只答了一半。</strong> 完整答案要包含：① IoU 对小框的位移极敏感（8×8 的框偏 2 px，IoU 从 1.0 掉到 0.39）；② <strong>因此固定 IoU 阈值对小目标是系统性歧视，正样本数量极度稀缺</strong>；③ 所以解法有两条独立的路——改架构（P2 层、高分辨率）和<strong>改分配</strong>（ATSS/SimOTA/NWD）。<em>能把「分配」这条路讲出来，是区分「读过论文」和「真的训过小目标检测器」的分水岭。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="atss"><span class="num">3</span>ATSS：让阈值自己从数据里长出来</h2>
+  <p><span class="term">ATSS</span>（Adaptive Training Sample Selection, CVPR 2020）的出发点是一个漂亮的观察实验：把 RetinaNet（anchor-based）和 FCOS（anchor-free）的所有差异逐条对齐后，<strong>唯一还剩下的、真正造成 AP 差距的因素，就是正负样本的选择方式</strong>。anchor 有没有、有几个，都不是关键。</p>  <p>ATSS 的规则只有四步，且<strong>没有任何需要手调的 IoU 阈值</strong>：</p>  <ol>
+    <li>对每个 GT，在<strong>每一层 FPN</strong> 上按「anchor 中心到 GT 中心的 L2 距离」取最近的 <code>k=9</code> 个 anchor，合并成候选集 $\Omega_g$（三层就是 27 个）。</li>
+    <li>计算候选集里每个 anchor 与该 GT 的 IoU，得到 $\{u_i\}_{i \in \Omega_g}$。</li>
+    <li><strong>阈值 = 这组 IoU 的均值 + 标准差</strong>：$t_g = m_g + v_g$。</li>
+    <li>候选集中 IoU ≥ $t_g$ <strong>且中心落在 GT 框内</strong>的 anchor 为正样本；一个 anchor 被多个 GT 选中时，归给 IoU 最大的那个。</li>
+  </ol>  <div class="math-block">\[t_g \;=\; m_g + v_g, \qquad m_g = \frac{1}{|\Omega_g|}\sum_{i \in \Omega_g} u_i, \qquad v_g = \sqrt{\frac{1}{|\Omega_g|-1}\sum_{i \in \Omega_g} (u_i - m_g)^2}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么 <strong>均值 + 标准差</strong> 这么朴素的统计量管用？因为它把「多好算好」变成了<strong>相对判断</strong>：均值代表「这个 GT 在当前 anchor 配置下大致能匹配到什么程度」，标准差代表「候选集里质量的分散程度」。<em>标准差大 → 说明有一层特别匹配，阈值抬高，只选那一层；标准差小 → 说明各层都差不多，阈值降低，多选一些</em>。<strong>于是「该用哪一层」和「该选几个」这两件原本要手工设计的事，被同一个公式自动解决了。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>本课合成实验里，五个 GT（16/18/24/48/96 像素）算出来的阈值分别是 <strong>0.212 / 0.234 / 0.369 / 0.478 / 0.462</strong>。<em>注意 16 像素的标志阈值只有 0.212，而 48 像素的是 0.478</em>——如果用固定的 0.5，前者一个正样本都拿不到，后者刚好能拿到。<strong>这组数字就是「固定阈值对尺度不公平」的直接证据</strong>。同时也暴露了 ATSS 的边界：$t_g$ 是<em>候选集内部</em>的相对阈值，如果整个候选集质量都很差（小目标就是这样），它选出的正样本绝对质量依然很低；而「中心必须落在 GT 框内」这条硬约束，对 16×16 的目标来说<strong>物理上只有 2 个格点满足</strong>（stride 8 上 1 个、stride 16 上 1 个、stride 32 上 0 个）——<em>阈值再自适应也变不出格点来</em>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>两个实现细节，写错了会静默降点：<strong>① 标准差用无偏（ddof=1）还是有偏（ddof=0）</strong>——mmdet 跟随 PyTorch 默认用无偏，候选集只有 27 个样本时两者差约 2%，虽小但会改变边界样本的归属；<strong>② topk 是「每层各取 k 个」而不是「全局取 k 个」</strong>——写成全局的话，高分辨率层（格点密）会垄断候选集，ATSS 的跨层自适应能力就没了。<em>这两个坑在复现 ATSS 时都出现过。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="simota"><span class="num">4</span>OTA / SimOTA：把分配看成最优传输问题</h2>
+  <p>ATSS 仍然是<strong>纯几何</strong>的——它只看 anchor 与 GT 的框，不看模型现在预测得怎么样。<span class="term">OTA</span>（Optimal Transport Assignment, CVPR 2021）提出了一个更本质的视角：<strong>分配是一个全局的供需匹配问题</strong>。每个 GT 是一个「供应方」，要把 $k_g$ 单位的正样本标签分发出去；背景是另一个供应方，供应量是剩下的全部；每个格点是一个「需求方」，需求量恒为 1。把「格点 $i$ 领取 GT $g$ 的标签」的成本记为 $c_{ig}$，<strong>整张图的分配就是一个最小代价的运输方案</strong>。</p>  <div class="math-block">\[\min_{\pi \ge 0} \sum_{g}\sum_{i} \pi_{ig}\, c_{ig} \quad \text{s.t.} \quad \sum_i \pi_{ig} = k_g,\;\; \sum_g \pi_{ig} \le 1, \qquad c_{ig} = \mathcal{L}^{cls}_{ig} + \lambda\, \mathcal{L}^{reg}_{ig}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>OTA 的关键在于「<strong>全局</strong>」二字。逐个 GT 独立地挑最好的格点（ATSS/TaskAligned 都是这么做的）在目标不重叠时没问题；<em>但当两个标志上下紧贴（TSR 里主牌 + 辅助牌是最常见的构型），同一批格点对两个 GT 都很有吸引力</em>，逐个挑就会打架。最优传输在<strong>全局代价</strong>下同时决定所有 GT 的分配，能自动把有争议的格点分给「更需要它」的那一方。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>代价是计算量：精确解要跑 Sinkhorn 迭代，OTA 论文里用了 50 轮，<strong>训练速度慢约 20–25%</strong>。YOLOX 因此提出 <span class="term">SimOTA</span>——<em>去掉 Sinkhorn，用「每个 GT 独立取代价最小的前 $k_g$ 个，再对冲突的格点做一次仲裁」来近似</em>。这是一个<strong>贪心近似</strong>：它放弃了全局最优性，换回几乎全部的速度。YOLOX 的消融显示这个近似在 AP 上的损失可以忽略（OTA 与 SimOTA 差距 &lt; 0.2 AP），<strong>但它的「无冲突」是靠事后仲裁保证的，而不是约束保证的</strong>——所以密集场景下仍会出现「某个 GT 被抢走名额、正样本变少」的现象。</p></div>
+  </div>  <div class="ascii">SimOTA 四步（这就是 notebook 里要你从零写出来的东西）
+
+ ① 几何先验筛候选（把 8400 个格点砍到几百个）
+    in_box   = 格点中心落在 GT 框内
+    in_ctr   = 格点中心落在 GT 中心 ±2.5·stride 的方框内
+    候选池 fg_mask = (in_box OR in_ctr).any(gt)          ← 本课实验：8400 → 399
+    先验掩码 both  = in_box AND in_ctr                    ← 进代价矩阵当惩罚项
+
+ ② 建代价矩阵 C ∈ R^(G×M)
+    C[g,i] = BCE(sqrt(p_i), onehot_g)          分类代价
+           + 3.0 · (-log IoU(box_i, gt_g))     定位代价（λ=3）
+           + 100000 · (1 - both[g,i])          不满足中心先验 -&gt; 天价惩罚
+
+ ③ dynamic-k：每个 GT 该领几个正样本，由「预测质量」自己说了算
+    k_g = clamp( floor( Σ_{i ∈ top10 IoU} IoU(box_i, gt_g) ), min=1 )
+    直觉：周围有 9 个格点各预测出 IoU≈1 的框 -&gt; 这个 GT 供得起 9 个正样本
+          周围最好的框才 IoU 0.3 -&gt; 只给 1 个，别拿噪声当监督
+    本课实验：k = [6, 6, 8, 9, 9]  (GT 尺寸 16/18/24/48/96 px)
+
+ ④ 去冲突：某个格点被多个 GT 选中 -&gt; 归给代价最小的那个 GT
+    （被抢走的 GT 就少一个正样本，不补——这是 SimOTA 的已知缺陷）</div>  <p>第 ③ 步的 <span class="term">dynamic-k</span> 是 SimOTA 最值得记住的设计。<strong>它把「每个 GT 分几个正样本」从超参数变成了模型自己的输出</strong>：把该 GT 周围 IoU 最高的 10 个预测框的 IoU 加起来取整，就是配额。这个式子看起来很土，但它编码了一个正确的直觉——<em>能提供 $k$ 个高质量预测的目标，就说得起 $k$ 份监督；提供不出来的，多给就是灌噪声</em>。而且它<strong>随训练自动变化</strong>：训练初期预测都很差，$k$ 普遍为 1–2，相当于自动退化成一对一；训练后期预测变好，$k$ 涨到 8–10，监督密度自动提高。</p>  <div class="callout warn"><span class="label"></span>
+    <p>一个几乎没人讲、但你在 notebook 里会亲眼看到的<strong>真实边界行为</strong>：当 $k_g$ 大于「满足中心先验的候选数」时，SimOTA <em>依然会</em>把带 100000 惩罚的格点选进来。本课实验里 16×16 的标志 $k=6$，而满足 <code>in_box AND in_ctr</code> 的格点只有 <strong>2 个</strong>——于是<strong>另外 4 个正样本落在了 GT 框外</strong>。这不是 bug，是 YOLOX 原版代码的行为（那 100000 只影响排序、不构成硬约束）。<em>它意味着：对极小目标，SimOTA 会把框外的格点也标成正样本，回归目标是负数宽度/越界偏移——这正是 RTMDet 用<strong>软中心先验</strong>替换硬先验的动机之一。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="aligned"><span class="num">5</span>TaskAligned：让分类分数与定位质量绑在一起</h2>
+  <p>检测器有一个长期存在、却直到 <span class="term">TOOD</span>（Task-aligned One-stage Object Detection, ICCV 2021）才被明确命名的病：<strong>分类分数最高的那个预测，往往不是框最准的那个</strong>。而 NMS 是按分类分数排序的——<em>于是排序第一的框被保留、框最准的框被抑制掉，AP 白白损失</em>。这个现象叫 <span class="term">task misalignment</span>（任务错配）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>错配的根源是<strong>两条支路的监督目标不同</strong>：分类支路学的是「这里有没有物体、是什么类」，回归支路学的是「框应该往哪挪」。<em>它们共享特征、却各自优化各自的目标，没有任何机制要求「分数高的地方框也准」</em>。在本课的合成检测器里，同一个 GT 附近，分类分数与预测框 IoU 的相关系数只有 <strong>0.60–0.82</strong>——<em>相关但远不是同一件事</em>。真实检测器上这个数还会更低。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>TaskAligned 的解法是引入一个<strong>把两者相乘的对齐度量</strong> $t = s^{\alpha} \cdot u^{\beta}$（$s$ 是该 GT 类别的分类分数，$u$ 是预测框与 GT 的 IoU），并<strong>同时用它做两件事</strong>：① <em>分配</em>——每个 GT 取 $t$ 最高的 top-$k$ 个格点为正样本；② <em>监督</em>——把分类的目标值从 1 换成归一化后的 $t$（即软标签），让「对齐度高的位置分数也高」。<strong>这个「同一个度量既选样本又当标签」的设计是 TOOD 的精髓</strong>，YOLOv8 的 <code>TaskAlignedAssigner</code>（$\alpha=0.5,\beta=6$）与 YOLOv6 v3 都直接继承了它。</p></div>
+  </div>  <div class="math-block">\[t \;=\; s^{\alpha} \cdot u^{\beta}, \qquad \text{(TOOD: } \alpha{=}1,\ \beta{=}6;\ \text{YOLOv8: } \alpha{=}0.5,\ \beta{=}6)\]</div>  <p>$\beta$ 远大于 $\alpha$ 这件事本身就是设计意图：<strong>定位质量的权重压倒性地高于分类分数</strong>。取 $\beta=6$ 时，IoU 从 0.9 掉到 0.8，$u^{\beta}$ 从 0.53 掉到 0.26——<em>腰斩</em>；而分类分数从 0.9 掉到 0.8，$s^{0.5}$ 只从 0.95 掉到 0.89。<strong>换句话说：TaskAligned 主要是按「框准不准」选样本，分类分数只是一个温和的修正项。</strong></p>  <table>
+    <thead><tr><th></th><th>候选池</th><th>选多少</th><th>选择依据</th><th>去冲突规则</th></tr></thead>
+    <tbody>
+      <tr><td><strong>MaxIoU</strong></td><td>全部 anchor</td><td>阈值决定（不定）</td><td>anchor 与 GT 的几何 IoU</td><td>IoU 最大者胜</td></tr>
+      <tr><td><strong>ATSS</strong></td><td>每层最近 9 个</td><td>阈值 $m+v$ 决定</td><td>anchor 与 GT 的几何 IoU</td><td>IoU 最大者胜</td></tr>
+      <tr><td><strong>SimOTA</strong></td><td>in_box ∪ in_center</td><td><strong>dynamic-k（预测决定）</strong></td><td>分类代价 + 3×定位代价</td><td><strong>代价最小者胜</strong></td></tr>
+      <tr><td><strong>TaskAligned</strong></td><td>in_box</td><td>固定 top-k（10–13）</td><td><strong>对齐度 $s^{\alpha}u^{\beta}$</strong></td><td>IoU 最大者胜</td></tr>
+      <tr><td><strong>RTMDet DSLA</strong></td><td>全部（靠软先验衰减）</td><td>dynamic-k（top-13 IoU 和）</td><td><strong>软标签分类代价 + IoU + 软中心先验</strong></td><td>代价最小者胜</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>把这一列「选择依据」竖着读，就是标签分配十年演进的全部内容：<strong>几何 IoU → 几何 IoU 的自适应统计 → 预测的分类+定位联合代价 → 分类与定位的乘性对齐度</strong>。<em>一句话总结：分配的信息源从「框和框的关系」一路搬到了「模型当前的预测本身」。</em>面试被问到「标签分配的演进」，按这条线讲，比背五篇论文的名字有力得多。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="soft"><span class="num">6</span>RTMDet 的 dynamic soft label：把硬标签换成软标签</h2>
+  <p>RTMDet 的 <span class="term">DynamicSoftLabelAssigner</span>（下一模块会完整解剖）把上面几条线索合成了一个代价函数。它值得单独讲，因为<strong>它是目前工业界实时检测器里综合表现最稳的一个分配器</strong>，也是 MMDetection 里默认给 RTMDet / RTMDet-Ins 用的那个。</p>  <div class="math-block">\[C_{ig} \;=\; \underbrace{\mathrm{BCE}(p_i,\, y^{soft}_{ig}) \cdot \left| y^{soft}_{ig} - p_i \right|^2}_{\text{软标签分类代价}} \;+\; \underbrace{3 \cdot \big(-\log u_{ig}\big)}_{\text{定位代价}} \;+\; \underbrace{10^{\,d_{ig}/s_i - 3}}_{\text{软中心先验}}, \qquad y^{soft}_{ig} = u_{ig} \cdot \mathbf{1}_{c_g}\]</div>  <p>三项各自解决一个具体问题：</p>  <ul>
+    <li><strong>软标签分类代价</strong>：分类目标不再是硬 1，而是 <em>该格点预测框与 GT 的 IoU</em>。含义是「你框得多准，就该报多高的分」——这直接把 TaskAligned 的对齐思想写进了代价。后面乘的 $|y-p|^2$ 是一个 focal 式的调制：<em>已经对齐的格点代价接近 0，不再争抢；差得远的格点代价被放大</em>。当 $p_i$ 恰好等于软标签时代价<strong>严格为 0</strong>——这是一个可以在 notebook 里 assert 出来的性质。</li>
+    <li><strong>定位代价</strong> $-\log u$：IoU 越低代价越高，且在 $u \to 0$ 时发散，天然排除了框离得远的格点。权重 3 与 YOLOX 一致。</li>
+    <li><strong>软中心先验</strong> $10^{d/s-3}$：$d$ 是格点到 GT 中心的像素距离、$s$ 是该格点所在层的 stride。<em>距离 = 0 时代价 $10^{-3}$（几乎不惩罚）；距离 = 3·stride 时代价 1（与一个中等的定位代价相当）；距离 = 5·stride 时代价 100（实质排除）</em>。<strong>关键差别：它是连续衰减的，不是 SimOTA 那种 0/100000 的悬崖</strong>——于是不会出现「候选数不够就跳崖去选框外格点」的边界行为。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么「软」这么重要？因为<strong>硬标签在数值上撒了谎</strong>。一个格点预测出 IoU 0.62 的框，硬标签告诉它「你的分类目标是 1.0」，等于要求它<em>和一个预测 IoU 0.95 的格点报一样高的分</em>。这个要求在推理时是有害的：NMS 按分数排序，两个分数一样高但一个框准一个框不准的预测，保留哪个就成了掷骰子。<em>软标签把「框的质量」直接编码进了分数的目标值，让分数变成了可用于排序的定位质量估计。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这也解释了为什么现代检测器普遍<strong>去掉了独立的 IoU/centerness 分支</strong>。FCOS 时代要额外学一个 centerness 分数、推理时与分类分数相乘；而软标签把这件事直接融进了分类目标，<em>省掉一个分支、省掉一次乘法、还避免了「两个分支各自校准不一致」的问题</em>。<strong>YOLOv8 去掉 objectness、RTMDet 不用 centerness，本质上都是软标签带来的红利。</strong> 代价是分类分数不再是概率——它是「分类置信度 × 定位质量」的混合物，<em>做置信度标定（calibration）或者把分数传给下游 VLA/融合模块时，必须知道这一点</em>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>落到工程上有个真实的坑：<strong>软标签让分类分数的绝对值整体下降</strong>（目标值从 1.0 变成 IoU，通常 0.6–0.9）。如果你把 score 阈值从旧模型（硬标签）原样搬到新模型（软标签），<em>召回会莫名其妙掉一截</em>。<strong>换分配器时，score 阈值必须重新在验证集上扫一遍</strong>——这条在 TSR 这种要求「特定 FP/km 下最大化召回」的系统里尤其致命。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tsr"><span class="num">7</span>落到交通标志检测：分配策略在这里意味着什么</h2>
+  <p>把上面的机制放回 <span class="term">TSR</span>（Traffic Sign Recognition，交通标志检测）场景，会看到两个别的任务上不那么突出、但在这里决定成败的问题。</p>  <h3>① 小目标：正样本的绝对上限被 stride 卡死</h3>  <p>用针孔模型算一笔账：焦距 1200 px（1920×1080、约 60° 水平 FOV 的前视相机）、限速牌物理直径 0.6 m，则 80 米外它在图像上是 <code>1200 × 0.6 / 80 = 9 px</code>，60 米外是 12 px，40 米外是 18 px。<strong>要在 80 米外检出，意味着要在一个 9 像素的目标上做检测</strong>——而 stride 8 的特征图上，9 像素的目标只覆盖约 1 个格点。</p>  <div class="ascii">16×16 的标志在三层 FPN 上有几个格点中心落在框内（实测）
+
+  stride  8  格点间距 8px   │ ●   ●   ●   ●        框内: 1 个 ← 唯一的天然正样本
+                            │   ┌───────┐
+  stride 16  格点间距 16px  │ ●─┼─●     ●          框内: 1 个
+                            │   │ 16px  │
+  stride 32  格点间距 32px  │ ● └───────┘  ●       框内: 0 个
+                            │
+  ⇒ 全图 8400 个格点，落在这个 GT 里的一共 **2 个**。
+  ⇒ ATSS 给 1 个正样本、TaskAligned 给 2 个（被格点数卡死）、
+     SimOTA 给 6 个（但其中 4 个在框外，是先验惩罚被 dynamic-k 顶穿的结果）。
+  ⇒ 结论：**再聪明的分配器也变不出格点**。小目标的正样本上限
+     是由 stride 和输入分辨率决定的物理量，不是分配算法能突破的。</div>  <div class="callout danger"><span class="label"></span>
+    <p>这条结论直接决定架构选型：<strong>TSR 系统必须在「加 P2 层（stride 4）」「提高输入分辨率」「ROI 裁剪只处理消失点附近区域」三者中至少选一个</strong>，否则再换多少个分配器都是在 2 个格点上做文章。<em>面试里如果对方问「你会怎么提升远距离标志的召回」，答「换 SimOTA」是不够的——正确答案要先说清「正样本的物理上限在哪」，再谈分配。</em>这也是 C57（小目标检测）整门课的起点。</p>
+  </div>  <h3>② 密集场景：主牌 + 辅助牌的名额争夺</h3>  <p>中国道路上极常见的构型是「限速牌 + 下方的辅助说明牌」，两个标志上下紧贴、尺寸相近。<strong>它们的候选格点几乎完全重叠</strong>。此时不同分配器的行为差别很大：</p>  <table>
+    <thead><tr><th>分配器</th><th>冲突处理</th><th>对密集小目标的后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>MaxIoU</strong></td><td>IoU 最大者胜，且「强制认领」可能互相覆写</td><td>两个 GT 各拿 1 个正样本，谁也没学好</td></tr>
+      <tr><td><strong>ATSS</strong></td><td>IoU 最大者胜</td><td>阈值按各自候选集算，互不干扰；但被抢走的名额<em>不补</em></td></tr>
+      <tr><td><strong>SimOTA</strong></td><td><strong>代价最小者胜</strong>（全局代价视角）</td><td>仲裁更合理，但仍<em>不补名额</em>：被抢的 GT 正样本数直接减少</td></tr>
+      <tr><td><strong>OTA（完整版）</strong></td><td>最优传输约束里就带 $\sum_i \pi_{ig} = k_g$</td><td>理论上每个 GT 都拿满配额，代价是 Sinkhorn 的开销</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以在 TSR 这种「小 + 密」双重困难的场景里，<strong>「被抢走的名额不补」是一个真实的性能漏洞</strong>：本来就只有 2 个格点的辅助牌，被主牌抢走 1 个，就只剩 1 个正样本。<em>线上表现就是「主牌检得到、辅助牌时有时无」——而辅助牌恰恰携带了「限速仅限雨天」「距离 500 m」这类改变驾驶决策的语义。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>工程上的可行对策有三条，按成本递增：① <strong>把中心先验半径调小</strong>（SimOTA 的 <code>center_radius</code> 从 2.5 降到 1.5），减少两个 GT 候选池的重叠；② <strong>换成 RTMDet 的软中心先验</strong>，让距离衰减连续化，仲裁时距离信息不会被 0/100000 的悬崖抹平；③ <strong>在分配后做名额补齐</strong>（被抢名额的 GT 从剩余候选里再补一个），这是若干工业代码库里的私有改动，论文里不常见。<em>面试里能说出第 ① 条就已经很具体了，能说出第 ③ 条说明真的在密集场景上调过。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="o2o"><span class="num">8</span>一对一 vs 一对多：这是推理需求，不是训练最优</h2>
+  <p>最后一条主线：<strong>一个 GT 到底该配几个正样本？</strong> 上面讲的全是<span class="term">one-to-many</span>（一对多）；而 DETR 系用的是 <span class="term">one-to-one</span>（一对一，每个 GT 恰好一个预测）。这两者的取舍是本门课与 C54 的接缝，也是面试里区分度极高的一题。</p>  <table>
+    <thead><tr><th></th><th>一对多（YOLO/RTMDet 系）</th><th>一对一（DETR 系 / YOLOv10 的 o2o 头）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>监督密度</strong></td><td>每 GT 数个到十几个正样本，梯度密集</td><td>每 GT 仅 1 个正样本，<strong>梯度极稀疏</strong></td></tr>
+      <tr><td><strong>收敛速度</strong></td><td>快（12–300 epoch）</td><td>慢（DETR 原版 500 epoch；Deformable 降到 50）</td></tr>
+      <tr><td><strong>推理是否需要 NMS</strong></td><td><strong>需要</strong>——多个正样本必然产生多个高分重复框</td><td>不需要——训练期就学会了「只有一个该赢」</td></tr>
+      <tr><td><strong>延迟稳定性</strong></td><td>NMS 耗时随目标数与阈值波动，<strong>p99 不可控</strong></td><td>端到端固定，<em>这是车端最看重的性质</em></td></tr>
+      <tr><td><strong>密集小目标</strong></td><td>较强（监督密集）</td><td>较弱（query 数固定、匹配对小框敏感）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最反直觉、也最值得记住的一点：<strong>一对一是「推理端的需求」，不是「训练端的最优」</strong>。证据非常硬——Group DETR、H-DETR、Co-DETR 这一批工作全都在<em>训练时额外加一个一对多分支</em>提供密集监督，<strong>推理时把它丢掉</strong>，AP 显著提升。也就是说：一对一之所以被采用，唯一的理由是「推理时不想要 NMS」；<em>但它带来的稀疏监督对训练是纯粹的损失，需要额外手段补回来。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>YOLOv10 的 <span class="term">consistent dual assignments</span>（一致双分配）把这个洞察做到了极致：<strong>训练时同时挂一对多头（提供密集监督）和一对一头（学会去重），并且要求两个头用<em>同一个</em>度量做匹配</strong>（这就是「一致」的含义——如果两个头各用各的排序标准，一对一头选中的样本在一对多头里排名靠后，两条监督就互相打架）。推理时只留一对一头，<strong>真正做到无 NMS，且不损失一对多的训练收益</strong>。<em>这是 2024 年以来最干净的一个「鱼与熊掌」解法，面试里能完整讲出「一致」二字的含义会很加分。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>面试标准答案骨架（背下来）：<strong>「NMS 之所以能被去掉，不是因为发明了更好的后处理，而是因为把去重这件事从<em>推理期</em>搬到了<em>训练期</em>——一对一匹配让模型自己学会「同一个物体只让一个预测出头」。代价是监督信号密度降到 1/k，所以后续所有工作（辅助头、去噪 query、双分配）都在想办法把这份密度补回来。」</strong> <em>能把「代价是什么、后续怎么补」讲出来，比只说「DETR 不需要 NMS」高一个层次。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="frontier"><span class="num">9</span>研究前沿与开放问题</h2>
+  <ul>
+    <li><strong>分配与损失的界限正在消失</strong>：软标签让「谁是正样本」变成了连续的权重而非 0/1 判定（Generalized Focal Loss、VarifocalNet、RTMDet 的 DSLA 都在这条线上）。<em>极端形态是「全部格点都是带权正样本」——分配退化成一个权重函数</em>。这条路的开放问题是：权重函数的形状能不能学出来，而不是手工设计？</li>
+    <li><strong>分配的不稳定性尚无好的度量</strong>：SimOTA / TaskAligned 都依赖模型当前的预测，<em>同一个格点在相邻 epoch 可能一会儿是正一会儿是负</em>，造成梯度方向震荡。DETR 系用 DN-DETR 的去噪 query 缓解匹配不稳定，而一对多分配器这边<strong>连「翻转率」这个指标都还没有标准定义</strong>。这是一个门槛低、价值高的可做方向。</li>
+    <li><strong>训练初期的冷启动</strong>：预测感知的分配器在第 0 个 epoch 面对随机预测，代价矩阵基本是噪声。实践里靠「前若干 epoch 用静态分配 warmup」绕过，<em>但这个切换点怎么定、切换是否引入分布突变，缺少系统研究</em>。</li>
+    <li><strong>尺度公平性的度量</strong>：AP_S/AP_M/AP_L 只能事后看结果，<strong>缺少一个能在训练期直接监控「各尺度得到的监督量是否公平」的指标</strong>。本模块 notebook 里的「每 GT 正样本数 × 尺度」统计是一个雏形——<em>把它做成训练期的实时诊断，是很实用的工程改进</em>。</li>
+    <li><strong>一对一与一对多的统一</strong>：YOLOv10 的一致双分配给出了一个工程解，但「为什么一致性是必要的」尚无理论刻画。<em>更进一步：能否设计一个单一的分配，其正样本数随训练进度从多平滑地退火到一？</em></li>
+    <li><strong>三维与多模态下的分配</strong>：BEV 检测、点云检测里「中心先验」的定义完全不同（BEV 网格没有透视缩放，但有极端稀疏），<em>直接搬 SimOTA 效果并不好</em>。TSR 走向多相机+BEV 融合后，这会是一个直接相关的开放问题。</li>
+  </ul>  <div class="callout paper"><span class="label"></span>
+    <p>必读（按阅读顺序）：<em>Bridging the Gap Between Anchor-based and Anchor-free Detection via Adaptive Training Sample Selection</em>（ATSS, CVPR 2020，★ 先读它的对照实验设计，那是全文最有价值的部分）；<em>OTA: Optimal Transport Assignment for Object Detection</em>（CVPR 2021，★ 最优传输的形式化）；<em>YOLOX: Exceeding YOLO Series in 2021</em>（SimOTA 的工程近似与消融表）；<em>TOOD: Task-aligned One-stage Object Detection</em>（ICCV 2021，★ 任务错配的定义与 $t=s^{\alpha}u^{\beta}$）；<em>RTMDet: An Empirical Study of Designing Real-Time Object Detectors</em>（DynamicSoftLabelAssigner，下一模块精读）；<em>Generalized Focal Loss</em>（分类-定位联合表示，软标签的理论支撑）；<em>YOLOv10: Real-Time End-to-End Object Detection</em>（一致双分配）。相邻课程：C54（一对一匹配与集合预测）、C57（小目标的分配与 NWD 度量）、C18（IoU/NMS 基础）。完整清单见 <code>references.md</code>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_yolo_evolution/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · YOLO 家族演进：每一代到底改了什么</div></a>
+    <a class="next" href="../03_rtmdet/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · RTMDet 解剖：大核、共享头与软标签</div></a>
+  </div>
+
+</div>
+</body>
+</html>
