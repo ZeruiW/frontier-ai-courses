@@ -19,7 +19,7 @@ SECTIONS = [
     # ============================================================== 1
     ("why", "这门课讲什么：RAG 的失败大多不在检索算法里", "".join([
         P("C11 已经把检索算法讲透了：嵌入、BM25、混合检索、IVF/HNSW/PQ、"
-          "cross-encoder 重排、Precision@k / nDCG、faithfulness 与 context recall。"
+          "cross-encoder 重排、precision@k / nDCG、faithfulness 与 context recall。"
           "<strong>这门课从一个不同的观察出发：在真实系统里，「答不上来」这件事"
           "绝大多数时候和这些算法没有关系。</strong>"),
         ASCII("""
@@ -78,7 +78,7 @@ SECTIONS = [
              "01"],
             ["3", "<strong>答案跨块边界</strong>",
              "答案说一半",
-             "召回的块<em>确实是最相关的那个</em>——Precision@k 满分，"
+             "召回的块<em>确实是最相关的那个</em>——precision@k 满分，"
              "但答案的后半截在下一个块里",
              "02"],
             ["4", "<strong>词汇鸿沟</strong>",
@@ -155,7 +155,7 @@ SECTIONS = [
         TABLE(["课程", "它讲什么", "与本课的关系"], [
             ["<strong>C11</strong> · 检索增强与长上下文评测",
              "嵌入与相似度、BM25、混合检索、IVF/HNSW/PQ、bi- vs cross-encoder 重排、"
-             "MMR、RRF、Precision@k / MRR / MAP / nDCG、faithfulness / RAGAS、"
+             "MMR、RRF、precision@k / MRR / MAP / nDCG、faithfulness / RAGAS、"
              "NIAH 与 lost-in-the-middle",
              "<strong>本课的上游与下游</strong>。C11 讲「在索引里怎么找」，"
              "本课讲「索引里装的是什么、查询长什么样、索引怎么维护」。"
@@ -173,6 +173,13 @@ SECTIONS = [
              "spec / runner / store / report、版本化、CI 门禁、线上监控",
              "<strong>本课每一层的 A/B 都按 C68 的规矩做</strong>："
              "分块参数进 spec、参数变了指纹就变、门禁阈值从方差推"],
+            ["<strong>C71</strong> · 提示与上下文的程序化优化（同批新课）",
+             "prompt program 与签名、示例选择与顺序、自动提示优化、受限解码、提示运维",
+             "<strong>本课管「数据与查询怎么进来、索引怎么活下去」，"
+             "C71 管「prompt 本身的结构、优化与运维」</strong>。"
+             "<em>两者的交界在「组装上下文」这一步：本课把召回的块交出去，"
+             "C71 决定它们与指令、示例、格式一起怎么组织成一次调用</em>；"
+             "而两者都不碰 C11（检索算法）与 C33（上下文预算）"],
             ["<strong>C46</strong> · 图机器学习",
              "message passing、GCN/GAT、图 transformer",
              "本课模块 04 的图检索<strong>只用图的结构（邻域扩展），不训练任何图神经网络</strong>；"
@@ -444,7 +451,7 @@ print('   这就是「检索指标正常，端到端错」的第一种形态—�
     md("""## 5 · 故障二（模块 02）：答案跨块边界
 
 把块调小，让答案字符串正好横跨两个块的边界。
-**Precision@k 满分**——召回的确实是最相关的块；但答案说了一半。
+**precision@k 满分**——召回的确实是最相关的块；但答案说了一半。
 
 然后加 overlap，看它怎么被修回来。这是模块 02 的核心可测量。"""),
 
@@ -549,7 +556,7 @@ print('   注意删除是靠 provenance 字段 doc_id 做到的：没有它就�
 
     code("""SUMMARY = [
     ('01 解析丢结构',   '表格行列对应丢失',   '块被召回、字都在、答案不可恢复', False),
-    ('02 答案跨块',     '答案横跨块边界',     'Precision@k 满分但答案不完整',   False),
+    ('02 答案跨块',     '答案横跨块边界',     'precision@k 满分但答案不完整',   False),
     ('03 词汇鸿沟',     '查询与文档无共享词', '相似度掉到 0（这个能看见）',     True),
     ('05 索引过期/删除', '索引落后于源库',     '离线快照里没有时间维',           False),
 ]

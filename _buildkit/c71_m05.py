@@ -3,7 +3,8 @@
 from coursekit import P, H3, DUAL, CALLOUT, ASCII, CODE, MATH, TABLE, UL, OL, md, code
 
 META = [
-    ("前置知识", "读过本课模块 01（签名 / 三个量 / 版本化）与 03（优化与留出集）；"
+    ("前置知识", "（术语：本课的「灰度」对应 C66–C69 的<strong>金丝雀发布</strong>）· "
+                 "读过本课模块 01（签名 / 三个量 / 版本化）与 03（优化与留出集）；"
                  "C70 模块 05（索引运维：影子 + 双写 + 原子切换）读过更好——本课复用它的结构"),
     ("配套 notebook", '<span class="badge cpu">CPU</span> 05_prompt_ops.ipynb'
                        '（四个「模型」的模拟器 / 同一个 prompt 的跨模型分数跨度 / '
@@ -158,7 +159,7 @@ SECTIONS = [
             "所以<strong>「换模型省钱」这个判断必须按 token 数重算，"
             "不能只看单价</strong>。"
             "<em>notebook 第 4 节把这两项一起算出来，"
-            "并给出一个「单价更低但总成本更高」的例子。</em>",
+            "并算出让「单价最低」与「总成本最低」分家的 token_ratio 临界值——<strong>而在本课的参数下这两个口径其实指向同一个模型，所以不能拿它当反例</strong>。</em>",
         ),
     ])),
 
@@ -219,7 +220,7 @@ SECTIONS = [
             "之后才是「修不动了 → 解析失败」</em>。"
             "<strong>所以修复率是解析率的前导指标。</strong>"
             "<em>而它只有在修复被显式记录时才存在——静默修复会把这个信号丢掉"
-            "（模块 04 第 7 节）。</em>",
+            "（模块 04 第 6 节）。</em>",
             "第四项是本课特有的、成本极低的一个监控点："
             "<strong>无内容探针每小时一次调用，就能持续跟踪标签先验。</strong>"
             "<em>它变化时，要么是模型变了、要么是示例池变了、要么是有人改了顺序</em>——"
@@ -453,7 +454,7 @@ NB = [
 1. **四个「模型」的模拟器** —— 它们在近因偏置、格式依从度、标签先验上不同
 2. **同一个 prompt 的跨模型分数跨度** —— 以及**为 A 优化的 prompt 在 B 上比基线更差**
 3. **迁移的分层复核** —— 总分看不出来的那一层
-4. **成本模型** —— token 数 × 单价 × (1 − 缓存命中率)，含一个「单价更低但总成本更高」的例子
+4. **成本模型** —— token 数 × 单价 × (1 − 缓存命中率)，并算出让两个口径分家的 token_ratio 临界值
 5. **灰度分桶** —— 某一层塌了而总分完全没动
 6. **监控四项** —— 修复率是解析率的前导指标
 7. **prompt 运维卡 + 门禁**
@@ -739,7 +740,7 @@ assert ps > 0.0"""),
 
     md("""## 4 · 成本：token × 单价 × (1 − 缓存命中率)
 
-一个「单价更低但总成本更高」的例子。"""),
+以及让「单价最低」与「总成本最低」分家的临界 token_ratio。"""),
 
     code("""def count_tokens(b):
     text = b['instruction'] + ''.join(a + c for a, c in b['demos'])
@@ -758,11 +759,48 @@ for m in MODELS:
     print(f'{m:<20}{n_in:>12.0f}{MODELS[m]["price_in"]:>7.1f}'
           f'{cost_per_request(b, 0.9):>12.5f}{cost_per_request(b, 0.0):>11.5f}')
 
-# 「单价更低但总成本更高」
-b_a = make_bundle('model-a@2026-06', BASELINE_ORDER)
-b_c = make_bundle('model-c@2026-06', BASELINE_ORDER)
-print(f'\\nmodel-c 的单价是 a 的 {MODELS["model-c@2026-06"]["price_in"]:.1f} 倍，'
-      f'但它的 token 数只有 {MODELS["model-c@2026-06"]["token_ratio"]:.2f} 倍')
+# 「单价最低」与「总成本最低」是不是同一个模型？—— 本课参数下**是**，
+# 所以不能拿它当反例。诚实的做法是把翻转的临界值算出来。
+cheapest_by_price = min(MODELS, key=lambda m: MODELS[m]['price_in'])
+cheapest_by_cost = min(MODELS, key=lambda m: cost_per_request(
+    make_bundle(m, BASELINE_ORDER), cache_hit=0.9))
+print(f'\\n单价最低: {cheapest_by_price} | h=0.9 时总成本最低: {cheapest_by_cost}')
+print('  → 本课的参数下**是同一个模型**，所以这里没有反例可看。')
+
+def breakeven_token_ratio(cheap, ref, cache_hit=0.9, step=0.01, hi=6.0):
+    \"\"\"cheap 的 token_ratio 要涨到多少，它才不再比 ref 便宜。\"\"\"
+    saved = MODELS[cheap]['token_ratio']
+    ref_cost = cost_per_request(make_bundle(ref, BASELINE_ORDER), cache_hit=cache_hit)
+    r = saved
+    try:
+        while r < hi:
+            MODELS[cheap]['token_ratio'] = r
+            if cost_per_request(make_bundle(cheap, BASELINE_ORDER),
+                               cache_hit=cache_hit) >= ref_cost:
+                return r
+            r += step
+        return None
+    finally:
+        MODELS[cheap]['token_ratio'] = saved
+
+for h in (0.9, 0.5, 0.0):
+    r = breakeven_token_ratio('model-b@2026-06', 'model-a@2026-06', cache_hit=h)
+    cur = MODELS['model-b@2026-06']['token_ratio']
+    print(f'  h={h:.1f}: model-b 的 token_ratio 要从 {cur:.2f} 涨到 '
+          f'{("%.2f" % r) if r else ">6"} 才不再比 model-a 便宜')
+
+r90 = breakeven_token_ratio('model-b@2026-06', 'model-a@2026-06', cache_hit=0.9)
+r00 = breakeven_token_ratio('model-b@2026-06', 'model-a@2026-06', cache_hit=0.0)
+assert cheapest_by_price == cheapest_by_cost, '本课参数下两个口径给出同一个模型'
+assert r00 is not None and r00 < 2.0, '缓存命中率低时，临界 token_ratio 很容易被跨过'
+assert (r90 is None) or (r90 > r00), '缓存命中率高时，token 数的影响被 (1-h) 压小了'
+print()
+print('✅ 这一节的诚实结论比「单价低不等于总成本低」精细：')
+print(f'   在本课参数下两个口径**一致**（都是 {cheapest_by_price}）——所以不要把它当反例讲。')
+print(f'   真正可算的是**临界值**：h=0 时 token_ratio 超过 {r00:.2f} 排序就翻转，')
+print('   而 h=0.9 时输入 token 只按 (1-h) 计费，临界值被推得很远甚至不存在。')
+print('   **也就是说：tokenizer 的影响被缓存命中率放大或压制**——')
+print('   两个乘数必须一起看，而不是各自看。')
 
 # 关键对比：示例策略改变缓存命中率
 print(f"\\n{'示例策略':<22}{'缓存命中率':>12}{'model-b 成本':>14}{'相对固定示例':>14}")
@@ -1182,7 +1220,8 @@ dict(model_id -> dict(n_in_tokens, price_in, cache_hit, cost_per_req, cost_per_h
 
 然后实现 `cheapest(models, hit)`：返回按 `cost_per_req` 最便宜的 model_id。
 
-用它验证一个反直觉的结论：**单价最低的模型不一定总成本最低。**"""),
+用它检验一个常见的说法：**「单价最低的模型不一定总成本最低」**——
+在本课的参数下这个反例**并不存在**，所以这道题的重点是把结论改成可算的形式。"""),
 
     code("""def total_cost_compare(models, demo_strategy_hit, n_out=8, qps_hours=1.0):
     \"\"\"返回 {model_id: dict(...)}。\"\"\"
@@ -1402,7 +1441,7 @@ MODEL = 'claude-x@2026-06-01'     # ← 不是 'latest'、不是不带版本
 | 迁移的门禁必须按层判，不按总分判 | 有层显著下降而总分几乎没动 | 第 3 节 |
 | PSI 是观测量不是门禁 | 换模型必然让分布变化 | 第 3 节 |
 | 只改示例策略，成本涨几倍 | 缓存命中率 0.95 → 0 | 第 4 节 |
-| 单价最低不等于总成本最低 | tokenizer 差 30%+ | 第 4 节 / 练习 3 |
+| tokenizer 的影响被缓存命中率放大或压制 | h=0 时 token_ratio 超过临界值排序就翻转；h=0.9 时临界值被推得很远 | 第 4 节 / 练习 3 |
 | 灰度分流按稳定 ID，不按请求随机 | 否则同一会话遇到两套 prompt | 第 5 节 |
 | 修复率是解析率的前导指标 | 8 周里它的变化幅度更大 | 第 6 节 |
 | 「解析率 < 1.0 而修复率 = 0」自相矛盾 | 修复是静默的，信号丢了 | 练习 4 |

@@ -107,7 +107,7 @@ SECTIONS = [
             "结果："
             "<strong>真实条件分布 <code>{bug: 0.188, feature: 0.562, other: 0.250}</code>，"
             "逐步掩码 <code>{bug: 0.083, feature: 0.750, other: 0.167}</code></strong>，"
-            "<em>$\\mathrm{KL} = 0.081$ nat，而 <code>bug</code> 被低估了 2.3 倍</em>。"
+            "<em>$\\mathrm{KL} = 0.081$ nat，而 <code>bug</code> 被低估了 2.25 倍</em>。"
             "<strong>机制在例子里是显式的：<code>bug</code> 被选中的概率低（0.05），"
             "但它之后「正确收尾」的概率高（0.90）；"
             "逐步掩码只看见前者。</strong>",
@@ -204,7 +204,7 @@ SECTIONS = [
 
     # ============================================================== 5
     ("retry", "重试的选择偏倚（定量）", "".join([
-        P("模块 01 第 6 节定性地说明了它。这一节给出定量结果与成本。"),
+        P("模块 01 第 6 节定性地说明了它（那里是「初探」）。这一节给出定量结果与成本。"),
         MATH(r"\mathbb{E}[\text{calls}] = \frac{1}{p_{\text{parse}}}, \qquad "
              r"\mathbb{E}[\text{correct} \mid \text{parse ok}] > \mathbb{E}[\text{correct}]"),
         DUAL(
@@ -355,7 +355,7 @@ SECTIONS = [
             ["<strong>schema-constrained output</strong>",
              "保证符合给定 JSON schema",
              "<strong>区间约束（<code>minimum</code>）通常不被保证</strong>"
-             "（第 5 节的那个例外）；<em>而 schema 的哪些关键字被支持要查文档</em>"],
+             "（第 4 节的那个例外）；<em>而 schema 的哪些关键字被支持要查文档</em>"],
             ["<strong>tool-calling</strong>",
              "保证参数符合工具的参数 schema",
              "<em>它同时改变了模型的行为（模型知道自己在「调工具」）</em>，"
@@ -423,7 +423,7 @@ NB = [
 本 notebook 你会亲手实现：
 1. **一个 token 级玩具 LM** —— 小到可以**全量枚举**所有输出串及其概率
 2. **语法掩码** —— 把非法率从 74% 压到 0
-3. **逐步掩码 vs 真实条件分布的精确对比** —— KL = 0.081 nat，`bug` 被低估 2.3 倍
+3. **逐步掩码 vs 真实条件分布的精确对比** —— KL = 0.081 nat，`bug` 被低估 2.25 倍
 4. **失真什么时候重要** —— argmax 不变 vs 采样/置信度场景；
    而练习 2 会证明**失真的唯一来源是分支的收尾能力差异，与掩掉多少质量无关**
 5. **JSON schema 编译成掩码** —— 枚举 / 类型 / 必填 / 正则，以及区间的例外
@@ -584,7 +584,7 @@ assert abs(sum(MASKED.values()) - 1.0) < 1e-9 and abs(sum(COND.values()) - 1.0) 
 assert kl > 0.05, f'两个分布必须明显不同，KL = {kl}'
 assert ratios['bug'] < 0.5, 'bug 被低估了一倍以上'
 assert ratios['feature'] > 1.2, 'feature 被高估'
-print(f'\\n✅ 两个分布明显不同：bug 被低估 {1 / ratios["bug"]:.1f} 倍，'
+print(f'\\n✅ 两个分布明显不同：bug 被低估 {1 / ratios["bug"]:.2f} 倍，'
       f'feature 被高估 {ratios["feature"]:.2f} 倍。')"""),
 
     code("""# --- 机制：把两条链路的概率摊开 ---
@@ -771,7 +771,7 @@ h, b, pr, corr = simulate_retry_bias()
 print(f'解析成功率            {pr:.1%}')
 print(f'诚实口径（分母=全部）  {h:.1%}')
 print(f'有偏口径（只看解析成功）{b:.1%}')
-print(f'高估 {b - h:.1f} 个百分点（相对 {(b - h) / h:.0%}）')
+print(f'高估 {(b - h) * 100:.1f} 个百分点（相对 {(b - h) / h:.0%}）')
 print(f'解析成功与答对的相关系数 {corr:.3f}')
 
 assert b > h, '在解析成功的子集上报分会高估'
@@ -1307,15 +1307,18 @@ print('   变成了一个可以在配置层面拦住的具体风险。')"""),
 # ══════════════════════════════════════════════════════════════════
 # A. 首选：让推理栈做（讲解第 2/4 节）
 # ══════════════════════════════════════════════════════════════════
-# Outlines
-from outlines import models, generate
-model = models.transformers('...')
-gen = generate.json(model, Classification)        # ← 从 pydantic 直接编译约束
-result = gen(prompt)                              # 类型上就是 Classification
+# Outlines（**API 在 1.0 变过**，用之前先对一下版本）
+#   1.0+ :
+import outlines
+model = outlines.from_transformers(hf_model, hf_tokenizer)
+result = model(prompt, Classification)            # ← 从 pydantic 直接编译约束
+#   0.x（已移除）: models.transformers(...) + generate.json(model, Classification)
 
 # llama.cpp / vLLM：GBNF 或 JSON schema
 #   llama-cli --grammar-file schema.gbnf
-#   vLLM: SamplingParams(guided_decoding=GuidedDecodingParams(json=SCHEMA))
+#   vLLM 新版: SamplingParams(structured_outputs=StructuredOutputsParams(json=SCHEMA))
+#   vLLM 旧版: SamplingParams(guided_decoding=GuidedDecodingParams(json=SCHEMA))
+#   —— 这两处重命名本身就是模块 05 那条纪律的例子：**依赖的版本要钉死**。
 
 # HuggingFace 原生：LogitsProcessor（C50 讲接口）
 class GrammarProcessor(LogitsProcessor):
@@ -1370,7 +1373,7 @@ log.info('decode', extra=dict(
 |---|---|---|
 | 约束是唯一能把解析率**保证**到 1.0 的路 | 而重试与修复都不能保证 | 讲解 1 |
 | 掩码必须由「合法前缀」定义，不能只看局部转移 | 后者必然产生死局 | 第 2 节 / 练习 1 |
-| **逐步掩码 ≠ 条件分布** | KL = 0.081 nat；`bug` 被低估 2.3 倍 | 第 3 节 |
+| **逐步掩码 ≠ 条件分布** | KL = 0.081 nat；`bug` 被低估 2.25 倍 | 第 3 节 |
 | 失真的机制：掩码看不见「分支的收尾能力」 | bug: 被选 0.05 但收尾 0.90 | 第 3 节 |
 | **失真只由分支的收尾能力差异决定，与掩掉多少质量无关** | 尾部同质时 KL 恰好为 0（掩掉 56%~91% 都一样） | 练习 2 |
 | 温度 0 取 argmax 时失真通常不影响结果 | 这解释了为什么它很少被发现 | 第 4 节 |

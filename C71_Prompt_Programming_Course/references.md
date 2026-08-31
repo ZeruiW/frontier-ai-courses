@@ -44,12 +44,18 @@
   无内容探针（content-free input）与减先验校准出自这里。
   **本课模块 02 第 5 节实现了它，并明确说清它的两个前提**：
   需要 logprobs、且隐含假设真实标签分布接近均匀。
-- **Sewon Min, Xinxi Lyu, Ari Holtzman, et al.,
+- ★ **Sewon Min, Xinxi Lyu, Ari Holtzman, et al.,
   _Rethinking the Role of Demonstrations: What Makes In-Context Learning Work?_
   （EMNLP 2022）** —
-  解决「示例到底提供了什么」（输入分布、标签空间、格式，而非严格的输入-标签映射）。
-  它是本课选用「demos 上的 kNN」作为模拟器机制的经验依据之一。
-- **Carlos Guestrin 等关于 MMR 与多样性重排的经典工作（IR 领域）** —
+  解决「示例到底提供了什么」：随机替换示例的标签几乎不掉分，
+  所以示例提供的是**标签空间 + 输入分布 + 格式**，而不是严格的输入→标签映射。
+  <strong>它恰好是本课模拟器的一个反例</strong>——
+  既然随机化标签几乎不掉分，那么「照抄最近邻的标签」就不是真实机制。
+  <em>本课仍然用 kNN 作为替身，因为它能复现选择 / 数量 / 顺序三个效应；
+  但这是一个**方便的替身，不是一个有经验依据的机制模型**，
+  这一点在模块 00 第 5 节写明了。</em>
+- **Jaime Carbonell, Jade Goldstein, _The Use of MMR, Diversity-Based Reranking
+  for Reordering Documents and Producing Summaries_（SIGIR 1998）** —
   **本课模块 02 的 MMR 式多样性选择直接借用**；算法本身在 C11 模块 03。
 
 ---
@@ -95,7 +101,7 @@
   Loris D'Antoni, _Grammar-Aligned Decoding_（NeurIPS 2024）** —
   解决「逐步掩码得到的分布不是条件分布，怎么修」。
   **本课模块 04 第 3 节的全部内容就是把这个失真精确算出来**
-  （KL = 0.081 nat，`bug` 被低估 2.3 倍），
+  （KL = 0.081 nat，`bug` 被低估 2.25 倍），
   而练习 2 进一步证明了一个更强的结论：
   <em>失真的唯一来源是分支之间的「收尾能力」差异，与被掩掉多少质量无关</em>。
 - **_guidance_ / _llama.cpp GBNF_ / _xgrammar_（软件文档）** —

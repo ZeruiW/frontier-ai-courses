@@ -20,7 +20,9 @@
 
 ## 二 · 文档解析与版面理解（模块 01）
 
-- ★ **`unstructured` 的 element 模型与 `pypdf` / `pdfplumber` 的坐标 API（软件文档）** —
+- ★ **`unstructured` 的 element 模型与 `pdfplumber` 的坐标 API（软件文档）** —
+  （`pypdf` 没有 element 模型，坐标只能靠 `extract_text(visitor_text=...)` 的变换矩阵
+  间接拿到，其官方文档说明在复杂 PDF 上不可靠。）
   解决「怎么在拿到文字的同时拿到结构与位置」。
   关键是 `Title / NarrativeText / Table / ListItem` 这套 element 类型与 `coordinates`、
   `page_number`、`category_depth`。
@@ -49,10 +51,12 @@
 - ★ **`langchain-text-splitters` 的 `RecursiveCharacterTextSplitter`
   与 LlamaIndex 的 `SentenceWindowNodeParser` / `AutoMergingRetriever`（软件文档）** —
   解决「怎么让切点落在语义边界上」以及「怎么把检索粒度与上下文粒度解耦」。
-  分隔符优先级列表（`\n## ` → `\n\n` → `\n` → `。` → ``）与父子块是这两个库的核心设计。
+  分隔符优先级列表与父子块是这两个库的核心设计。
+  <strong>注意默认值只到「段落 / 行 / 词 / 字符」（`["\n\n", "\n", " ", ""]`）</strong>——
+  标题与中文句号要自己传进 `separators=`（标题也可以交给 `MarkdownHeaderTextSplitter`）。
   **本课模块 02 第 4/6 节实现了它们的最小版本，并补上两个必做细节**
   （父块去重、归因指向子块）。
-- **Greg Kamradt, _5 Levels of Text Splitting_（2023，教程）** —
+- **Greg Kamradt, _5 Levels of Text Splitting_（2024，教程；概念雏形 2023）** —
   解决「分块方案有哪几档、各自的成本」。
   语义分块（相邻句相似度谷点切分）的流行实现来自这里。
   **本课模块 02 第 5 节量出了它的两个退化情形**（分位数阈值在
@@ -88,8 +92,11 @@
   **本课只用它的结论（改写有收益、且不能替换原查询）**，不训练改写器。
 - **Ori Ram, Yoav Levine, Itay Dalmedigos, et al.,
   _In-Context Retrieval-Augmented Language Models_（TACL 2023）** —
-  解决「检索该多频繁、该不该检索」。
-  它对「不是所有生成步骤都需要检索」的讨论是本课路由一节的背景。
+  解决「检索该多频繁」。
+  <strong>注意它的结论方向</strong>：retrieval stride 越小（检索越频繁）困惑度越低，
+  最终取 $s=4$ 是**成本折中**而不是效果上限。
+  所以本课路由一节用它作为「检索频率是一个成本旋钮」的背景；
+  而「该不该检索」这个问题来自 Self-RAG / FLARE 那条线，不是这篇。
 
 ---
 
