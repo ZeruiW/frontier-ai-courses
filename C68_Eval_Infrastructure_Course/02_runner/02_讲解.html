@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Runner 工程</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · Runner 工程</h1>
+  <p class="subtitle"><strong>缓存键直接用执行指纹，不要手写「要包含哪些字段」的列表</strong>——手写列表必然会漏，因为新加配置项时没有任何机制提醒你更新它；漏了的症状是<em>「我明明改了 prompt，分数却一点没变」，而它会被误读成「这个改动没有效果」</em> · <strong>估方差、算区间、跑 pass^k 时必须关缓存</strong>——开着缓存重跑两次得到同样的分数，说明的不是「可复现」而是「你根本没有重跑」 · <strong>失败五分类</strong>：只有 <code>scorer_error</code> 可以从分母排除，而<strong>超时必须算失败</strong>——它是混合信号，把它当基础设施错误重试到成功，等于系统性地掩盖真实的能力信号 · <strong>重试的判断只能看异常类型，不能看判分结果</strong>：「重试到成功为止」把 55% 的真实能力抬到了 78%，而且不会报错、日志看起来完全正常；<em>结构上的落实方式是让重试逻辑物理上拿不到 scorer</em> · <strong>并发上限与限流器管的不是一件事，两个都要有</strong>；限流等待占比 &gt; 30% 说明并发白加 · <strong>「首次运行的缓存命中率非 0」= run_id 被复用</strong>，这是一个连指纹校验都抓不到的污染</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 01（spec 与指纹）；知道「限流」「指数退避」两个词即可，实现全部从零写</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_runner.ipynb（缓存键设计与「改了 prompt 却读到旧结果」的复现 / 重试与指数退避 + 抖动 / 失败分类与两个分母 / 令牌桶限流与并发上限 / 预算熔断 / 重试引入的选择偏倚 / 断点续跑）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Google SRE Book（重试、退避、抖动、过载处理）· Nygard, <em>Release It!</em>（熔断器模式）· inspect_ai 的 <code>--max-connections</code> 与 retry 语义 · 本课程 C66 模块 05（并发是 harness 的一部分）· C24（推理服务与限流）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#cache-key">缓存：本课最贵的一个 bug 就藏在这里</a></li>
+      <li><a href="#failures">失败分类：静默跳过是最常见的数据污染</a></li>
+      <li><a href="#retry">重试：退避、抖动，以及它悄悄引入的偏倚</a></li>
+      <li><a href="#concurrency">并发与限流：为什么并发是 harness 的一部分</a></li>
+      <li><a href="#budget">预算控制：熔断、上限、以及「先跑一小批」</a></li>
+      <li><a href="#resume">断点续跑：三个层次</a></li>
+      <li><a href="#observability">Runner 本身的可观测性：五个必报的数</a></li>
+      <li><a href="#cost-attribution">成本归因：钱到底花在哪</a></li>
+      <li><a href="#agent-runner">Agent 场景的额外复杂度：轨迹、环境、嵌套调用</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cache-key"><span class="num">1</span>缓存：本课最贵的一个 bug 就藏在这里</h2>
+  <p>先讲缓存，因为它是 runner 里<strong>收益最大、也最容易出错</strong>的一块。收益很直接：重跑时省 90% 以上的调用成本。而错误的形态是模块 00 反模式清单里的第四条——<strong>它不会报错。</strong></p>  <div class="ascii">   ❌ 缓存键 = hash(输入文本)
+   ┌──────────────────────────────────────────────────────────┐
+   │ 第一次跑:  prompt_v1 + 输入 X  →  调用模型  →  存进缓存    │
+   │ 改了 prompt 的一句措辞                                     │
+   │ 第二次跑:  prompt_v2 + 输入 X  →  **缓存命中** → 返回旧结果 │
+   │                                                          │
+   │ 症状: 「我明明改了 prompt，分数却一点没变」                 │
+   │ 误读: 「这个改动没有效果」  ← 实际上它根本没被执行           │
+   └──────────────────────────────────────────────────────────┘
+
+   ✓ 缓存键 = hash(输入内容) + 完整配置指纹
+     prompt 变了 → 指纹变了 → 缓存不命中 → 真的重新调用</div>  <div class="math-block">\[\text{cache\_key} = H\big(\underbrace{\text{input}}_{\text{内容}} \;\|\; \underbrace{\text{fp}(\text{spec}_{\text{exec}})}_{\text{配置}}\big)\]</div>  <table>
+    <thead><tr><th>必须进缓存键的东西</th><th>为什么</th><th>漏了会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><strong>输入内容</strong></td><td>显然</td><td>所有样本共用一个结果</td></tr>
+      <tr><td><strong>模型 ID 与快照</strong></td><td>换模型就是换实验</td><td>拿 A 的结果当 B 的</td></tr>
+      <tr><td><strong>采样参数</strong>（temperature/top_p/seed/max_tokens）</td><td>改了会改变输出分布</td><td>温度扫描全部读到同一个结果</td></tr>
+      <tr><td><strong>prompt / 模板的哈希</strong></td><td><strong>最常被漏的一个</strong></td><td>改了 prompt 分数不动，被误读成「改动无效」</td></tr>
+      <tr><td><strong>工具集与 schema</strong>（agent 场景）</td><td>工具变了行为就变了</td><td>同上</td></tr>
+      <tr><td><strong>缓存格式版本</strong></td><td>存储结构变更时要整体失效</td><td>新代码读到无法解析的旧记录</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>有一条纪律可以一劳永逸地避免这类 bug：<strong>缓存键直接用模块 01 的 <code>exec_fp</code>（执行指纹），而不是手写一个「要包含哪些字段」的列表。</strong><em>手写列表必然会漏——因为新加一个配置项时，没有任何机制提醒你去更新那个列表。</em>而 exec_fp 是整个执行配置的哈希，加了字段它自动就变了。</p>
+  </div>  <h3>什么时候<strong>不该</strong>缓存</h3>  <ul>
+    <li><strong>估计方差、算置信区间、跑 pass^k 时必须关缓存</strong>——开着缓存重跑两次得到同样的分数，说明的不是「结果可复现」，而是「你根本没有重跑」（这条与 C66 模块 05 第 8 节完全一致）；</li>
+    <li><strong>非确定性判分器</strong>（LLM judge）的缓存要更谨慎：它可以缓存，但缓存键里必须包含 judge 的完整指纹，且<em>做 swap 探针时两次调用的键必须不同</em>（否则第二次直接命中第一次的结果，探针失效）；</li>
+    <li><strong>调试期</strong>——加一个 <code>--no-cache</code> 开关，并让它<em>显式打印「缓存已禁用」</em>，避免自己被自己骗。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="failures"><span class="num">2</span>失败分类：静默跳过是最常见的数据污染</h2>
+  <p>模块 00 讲过「失败样本必须计入分母」。这一节讲得更细：<strong>失败不是一类，而是至少五类，它们该被区别对待。</strong></p>  <table>
+    <thead><tr><th>失败类型</th><th>典型来源</th><th>该不该重试</th><th>该不该计入分母</th><th>该怎么记</th></tr></thead>
+    <tbody>
+      <tr><td><strong>瞬时基础设施错误</strong></td><td>网络抖动、502、连接重置</td><td><strong>该</strong></td><td>重试成功后按成功计</td><td>记重试次数</td></tr>
+      <tr><td><strong>限流</strong>（429）</td><td>并发太高</td><td><strong>该</strong>（退避后）</td><td>同上</td><td>单独统计，用于调并发</td></tr>
+      <tr><td><strong>超时</strong></td><td>模型慢、任务难</td><td><strong>看情况</strong></td><td><strong>计入，且算失败</strong></td><td>超时是一种能力信号，不是纯粹的基础设施问题</td></tr>
+      <tr><td><strong>模型拒答 / 内容过滤</strong></td><td>安全策略触发</td><td><strong>不该</strong></td><td><strong>计入，且单独统计</strong></td><td>拒答率是一个独立指标（C67-05）</td></tr>
+      <tr><td><strong>输出格式错误</strong></td><td>没按 schema 返回</td><td>可以重试 1 次</td><td><strong>计入</strong></td><td>解析失败率必须报告（C67-01）</td></tr>
+      <tr><td><strong>判分器崩溃</strong></td><td>validator 有 bug</td><td>不该（先修 bug）</td><td><strong>标记为 <code>scorer_error</code>，从主指标里排除但要显式报告</strong></td><td>这是唯一可以排除的一类</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么超时要算失败而不是算基础设施错误？<strong>因为超时是混合的：</strong>一部分来自基础设施（服务器慢），一部分来自任务本身（这道题模型想太久）。<em>而后者是真实的能力信号</em>——一个总是超时的 agent，在产品里就是不可用的。<strong>把超时算成「基础设施错误并重试到成功」，等于系统性地掩盖了这个信号。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确的处理是<strong>把超时按原因拆开</strong>：如果同一批任务在低并发下不超时、高并发下超时，那是基础设施；如果在任何并发下都超时，那是任务/模型。<em>C66 模块 05 的「并发敏感性检查」正是用来做这个区分的</em>——分数对并发不敏感，才说明超时阈值有足够余量、超时反映的是真实能力。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>最后一行的 <code>scorer_error</code> 是唯一可以从主指标排除的失败类型，但<strong>它必须被显式报告，而且它的比例应该趋近于零</strong>。<em>如果 5% 的样本因为判分器崩溃被排除，那么这份报告的可信度就取决于「崩溃是不是随机发生的」——而它通常不是</em>（判分器更容易在奇怪的输出上崩溃，而奇怪的输出更可能是失败的）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="retry"><span class="num">3</span>重试：退避、抖动，以及它悄悄引入的偏倚</h2>
+  <p>重试是必需的，但它有两个层面的问题：<strong>工程层面</strong>（怎么退避才不打垮上游）和<strong>统计层面</strong>（重试会不会污染结果）。后者更少被讨论，但更重要。</p>  <h3>工程层面：指数退避 + 抖动</h3>  <div class="math-block">\[\text{delay}_k = \min\big(\text{base} \cdot 2^{k},\ \text{cap}\big) \cdot U(0.5,\ 1.5)\]</div>  <p><strong>抖动（jitter）那一项不是可选的。</strong>没有抖动时，一批同时被限流的请求会在同一时刻同时重试，形成<span class="term">惊群</span>（thundering herd），把上游再打垮一次。<em>乘一个 $U(0.5, 1.5)$ 的随机因子，就能把重试时刻摊开。</em></p>  <h3>统计层面：重试引入的选择偏倚</h3>  <div class="callout danger"><span class="label"></span>
+    <strong>这是本模块最重要的一条：重试的触发条件必须与「结果好坏」无关。</strong>如果你对失败的样本重试、对成功的样本不重试，就引入了一个<em>只朝一个方向的选择效应</em>——<strong>「重试到成功为止」是评测里最隐蔽的一种作弊，而且很多时候是无意的。</strong><em>C66 模块 02 第 8 节的三级复核流水线里已经出现过同一条纪律。</em>
+  </div>  <table>
+    <thead><tr><th>重试触发条件</th><th>有没有偏倚</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td>HTTP 5xx / 连接错误</td><td><strong>没有</strong></td><td>与模型输出的内容无关</td></tr>
+      <tr><td>429 限流</td><td><strong>没有</strong></td><td>同上</td></tr>
+      <tr><td>输出解析失败</td><td><strong>有轻微偏倚</strong></td><td>难题更容易输出不合规格式（C67-01）；<em>可以重试，但要记录并报告重试率</em></td></tr>
+      <tr><td><strong>判分为 0</strong></td><td><strong>严重偏倚</strong></td><td>这就是「重试到成功为止」——绝对禁止</td></tr>
+      <tr><td><strong>输出「看起来不对」</strong></td><td><strong>严重偏倚</strong></td><td>同上，只是更隐蔽</td></tr>
+    </tbody>
+  </table>  <p>一条可执行的规则：<strong>重试的判断函数只能看异常类型与 HTTP 状态码，不能看模型输出的内容，更不能看判分结果。</strong>在代码结构上，这意味着<em>重试逻辑必须在判分之前完成</em>——拿到判分结果之后就不许再重试了。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="concurrency"><span class="num">4</span>并发与限流：为什么并发是 harness 的一部分</h2>
+  <p>C66 模块 05 的复现清单第 7 条说「并发度必须写进报告」。这一节讲清楚为什么。</p>  <div class="ascii">   并发度 ↑
+     │
+     ├─ 吞吐 ↑            （想要的）
+     ├─ 单请求延迟 ↑      （上游排队）
+     ├─ 超时率 ↑          ← **分数会变**
+     ├─ 429 率 ↑          ← 重试变多，成本变高
+     └─ 容器/CPU 争抢 ↑   ← 代码类任务里测试跑得更慢，更容易超时
+
+   结论：**并发度是一个会影响分数的自变量**，不是一个纯粹的性能旋钮。</div>  <h3>并发敏感性检查：一个必做的健康检查</h3>  <p>做法很简单：<strong>在 1 / 4 / 8 / 16 四个并发度上各跑一遍 smoke 子集，看分数是否稳定。</strong></p>  <table>
+    <thead><tr><th>现象</th><th>说明</th><th>该做什么</th></tr></thead>
+    <tbody>
+      <tr><td>分数对并发不敏感</td><td>超时阈值有足够余量</td><td>✅ 正常，记录并发度即可</td></tr>
+      <tr><td><strong>高并发下分数下降</strong></td><td>超时阈值设得太紧，高并发下大量任务撞上超时</td><td><strong>放宽超时或降低并发</strong>；不要接受这个分数</td></tr>
+      <tr><td>高并发下 429 率暴涨</td><td>超过了上游配额</td><td>上限流器（下一节）</td></tr>
+      <tr><td>低并发下也不稳定</td><td>不是并发的问题</td><td>回去查随机源（模块 00 第 3 节）</td></tr>
+    </tbody>
+  </table>  <h3>限流：令牌桶</h3>  <p>直接用固定并发数是不够的，因为上游的限额通常是<strong>按速率</strong>（每分钟多少请求 / 多少 token）而不是按并发数。标准做法是<span class="term">令牌桶</span>：</p>  <pre><code>桶容量 = burst（允许的突发量）
+补充速率 = rate（每秒补多少个令牌）
+
+请求前: 取 1 个令牌；没有就等到有为止
+        （token 计费的场景：按预估 token 数取多个令牌）
+
+好处: 平时允许突发，长期严格遵守平均速率——正好匹配多数 API 的限额语义</code></pre>  <div class="callout intuition"><span class="label"></span>
+    <p>限流器和并发上限<strong>要同时存在</strong>，它们管的不是一件事：<em>并发上限管的是「同时有多少请求在飞」（保护内存与连接数），限流器管的是「单位时间发出多少请求」（遵守上游配额）</em>。<strong>只有并发上限没有限流器，会在请求快速返回时超速；只有限流器没有并发上限，会在请求变慢时堆积。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="budget"><span class="num">5</span>预算控制：熔断、上限、以及「先跑一小批」</h2>
+  <p>评测可以很贵。一个没有预算保护的 runner，有可能在你去吃午饭的时候花掉一个月的额度——<strong>而这类事故通常不是因为写错了循环，而是因为某个环节开始疯狂重试。</strong></p>  <table>
+    <thead><tr><th>保护机制</th><th>触发条件</th><th>动作</th><th>为什么需要</th></tr></thead>
+    <tbody>
+      <tr><td><strong>硬性总预算</strong></td><td>累计成本 &gt; 上限</td><td><strong>立即停止</strong>并保存已有结果</td><td>最后一道防线</td></tr>
+      <tr><td><strong>单任务上限</strong></td><td>单条任务成本 &gt; 上限</td><td>终止该任务，标记 <code>budget_exceeded</code></td><td>防止一条失控的轨迹吃掉全部预算（呼应 C66-03 的循环检测）</td></tr>
+      <tr><td><strong>错误率熔断</strong></td><td>最近 N 次调用的失败率 &gt; 阈值</td><td><strong>暂停并告警</strong></td><td>上游挂了的时候不要继续烧钱重试</td></tr>
+      <tr><td><strong>预检（dry run）</strong></td><td>正式跑之前</td><td>跑 5–10 条，外推总成本并<strong>要求确认</strong></td><td><strong>最有效的一个</strong>：把「事故」变成「预估」</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>第四条值得强调，因为它便宜到几乎没有理由不做：<strong>先跑 10 条，用实测的单条成本 × 总任务数，打印出「本次运行预计花费 X」，然后再继续。</strong><em>这一步能抓住绝大多数「配置写错导致成本爆炸」的情况</em>——比如不小心把 max_tokens 写成了 100000，或者 attempts 写成了 50。</p>
+  </div>  <h3>熔断器的三个状态</h3>  <p>熔断器（circuit breaker）不是简单的「失败就停」，它有三个状态，这个设计是为了<strong>能自动恢复</strong>：</p>  <ul>
+    <li><strong>closed</strong>（正常）：请求正常通过，统计失败率；</li>
+    <li><strong>open</strong>（熔断）：失败率超阈值，<em>直接拒绝所有请求</em>，不再打上游；</li>
+    <li><strong>half-open</strong>（试探）：熔断一段时间后，<strong>放一个请求过去试试</strong>；成功就回到 closed，失败就回到 open 并延长等待。</li>
+  </ul>  <p><strong>关键在 half-open 这个状态</strong>——没有它，熔断之后需要人工介入才能恢复；而评测经常在无人值守时跑（夜间、CI），<em>自动恢复的价值远大于它的实现成本</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="resume"><span class="num">6</span>断点续跑：三个层次</h2>
+  <p>模块 00 已经实现了最基本的续跑（主键去重）。这一节讲它的三个层次，以及为什么第三层经常被忽略。</p>  <table>
+    <thead><tr><th>层次</th><th>能续什么</th><th>实现</th><th>什么时候不够用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 任务级</strong></td><td>已完成的任务不重跑</td><td>主键 <code>(run_id, task_id, attempt)</code> 去重</td><td>单条任务本身很贵时（agent 跑 40 步）</td></tr>
+      <tr><td><strong>② 调用级</strong></td><td>同一任务内已完成的模型调用不重发</td><td><strong>缓存</strong>（第 1 节）</td><td>调用之间有状态时（agent 的环境已经变了）</td></tr>
+      <tr><td><strong>③ 状态级</strong></td><td>agent 的中间状态（环境快照、上下文）</td><td>检查点 + 环境快照</td><td>环境不可序列化时</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>第三层有一个必须知道的陷阱：<strong>从检查点恢复的运行，与从头跑到底的运行，未必是同一个实验。</strong><em>如果 agent 的行为依赖于「已经花了多少预算」「上下文里有什么」，那么恢复点的状态就成了一个隐藏变量。</em><strong>实践建议：状态级续跑只用于「省钱地重跑失败任务」，不要用于产出正式报告的运行</strong>——正式运行应当从头跑完，并在 spec 里记录 <code>resumed: false</code>。</p>
+  </div>  <h3>run_id 的设计</h3>  <p>续跑的一切都建立在 <code>run_id</code> 上，所以它的设计值得单独说：</p>  <ul>
+    <li><strong>run_id 应当由 spec 指纹 + 时间戳组成</strong>，例如 <code>f2a91b7c-20260829-1430</code>。<em>前半段让你一眼看出「这次跑的是什么配置」，后半段保证唯一。</em></li>
+    <li><strong>复用 run_id 必须是显式的</strong>：加 <code>--resume &lt;run_id&gt;</code> 参数，而不是默认复用。<em>模块 00 练习 3 的「跳过数 &gt; 0」就是检测意外复用的信号</em>；</li>
+    <li><strong>续跑时必须校验指纹</strong>：如果 <code>--resume</code> 的那个 run_id 对应的指纹与当前 spec 不同，<strong>直接报错退出</strong>——<em>否则你会得到一个「一半用旧配置、一半用新配置」的运行，而且完全看不出来</em>。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="observability"><span class="num">7</span>Runner 本身的可观测性：五个必报的数</h2>
+  <p>最后一节：runner 自己也需要被监控。下面五个数应当在每次运行结束时打印，并落到结果里——<strong>它们不是「性能指标」，而是「这份结果可不可信」的判据</strong>。</p>  <pre><code>RUN SUMMARY · run_id=f2a91b7c-20260829-1430
+  完成:            512 / 512 tasks × 3 attempts = 1536 rows
+  失败分解:        ok 1489 | timeout 22 | refusal 11 | parse_error 9 | scorer_error 5
+  ────────────────────────────────────────────────────────────────
+  ① 缓存命中率:     0.0%      ← 首次运行应为 0；非 0 说明 run_id 被复用了
+  ② 重试率:         3.2%      （其中 429 占 2.1%，5xx 占 1.1%）
+  ③ 并发实际值:     8         （配置 8，未被限流器压低）
+  ④ 限流等待占比:   11.4%     ← 超过 30% 说明并发设得比配额高，纯粹在浪费墙钟时间
+  ⑤ 成本:           $12.47    （预检估计 $11.80，偏差 +5.7%）
+  ────────────────────────────────────────────────────────────────
+  scorer_error 0.33%          ← 必须趋近于零；超过 1% 就该去修判分器</code></pre>  <table>
+    <thead><tr><th>指标</th><th>健康范围</th><th>异常时说明什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>缓存命中率</strong></td><td>首次 0%，重跑 &gt; 90%</td><td>首次运行非 0 → <strong>run_id 被意外复用</strong>；重跑很低 → 缓存键里混进了不该有的东西（比如时间戳）</td></tr>
+      <tr><td><strong>重试率</strong></td><td>&lt; 5%</td><td>高 → 上游不稳或并发过高；<em>同时要看重试是否只发生在失败样本上（第 3 节的偏倚）</em></td></tr>
+      <tr><td><strong>限流等待占比</strong></td><td>&lt; 30%</td><td>高 → 并发设得比配额高，加并发只会增加等待，不会提高吞吐</td></tr>
+      <tr><td><strong>成本 vs 预检估计</strong></td><td>偏差 &lt; 20%</td><td>偏差大 → 预检样本不代表整体（通常是难题更贵）</td></tr>
+      <tr><td><strong>scorer_error 率</strong></td><td><strong>趋近 0</strong></td><td>&gt; 1% → 判分器有 bug，这份结果的可信度存疑</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>这五个数里最容易被忽略、也最有诊断价值的是<strong>「首次运行的缓存命中率非 0」</strong>。<em>它几乎总是意味着有人复用了 run_id</em>——而复用 run_id 会让新配置的结果与旧配置的结果混在同一个 run 里，<strong>这是一个「指纹校验都抓不到」的污染</strong>（因为写入时用的是当前指纹，混进去的旧行用的是旧指纹，而聚合时如果没检查「一个 run 内指纹唯一」就发现不了）。<strong>所以模块 00 里那条 <code>assert len(fingerprints) == 1</code> 是必须的。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost-attribution"><span class="num">8</span>成本归因：钱到底花在哪</h2>
+  <p>模块 02 第 5 节讲了怎么<strong>不超支</strong>，这一节讲怎么<strong>知道钱花在哪</strong>——因为「总共花了 12 美元」这个数字不足以做任何优化决策。</p>  <table>
+    <thead><tr><th>切分维度</th><th>回答什么问题</th><th>典型发现</th></tr></thead>
+    <tbody>
+      <tr><td><strong>按任务</strong></td><td>哪些题最贵</td><td>长尾极端：5% 的任务吃掉 40% 的预算（通常是循环或超长轨迹）</td></tr>
+      <tr><td><strong>按失败类型</strong></td><td>钱有多少花在了失败上</td><td><strong>失败样本的成本占比经常超过一半</strong>——因为失败往往伴随重试与超长轨迹</td></tr>
+      <tr><td><strong>按重试</strong></td><td>重试消耗了多少</td><td>重试率 5% 但成本占比 15%（重试的都是难题，本身就更贵）</td></tr>
+      <tr><td><strong>按缓存命中</strong></td><td>缓存省了多少</td><td>用来验证缓存是不是真的在工作</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>第二行的发现最有行动价值：<strong>如果一半的预算花在了最终失败的样本上，那么「提前放弃明显没救的任务」就是一个立竿见影的优化</strong>（C66 模块 03 的循环检测 + 本模块第 5 节的单任务预算）。<em>而这个判断只有在成本按失败类型切分之后才能做出</em>——看总成本永远看不出来。</p>
+  </div>  <p>实现上这不需要新字段：<strong>模块 02 已经在每行结果里记了 <code>cost_usd</code> 与 <code>status</code></strong>，切分只是一句 <code>GROUP BY</code>（模块 03）。<em>这是「存最细粒度事实」这条设计的又一次兑现</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="agent-runner"><span class="num">9</span>Agent 场景的额外复杂度：轨迹、环境、嵌套调用</h2>
+  <p>前七节讲的 runner 假定「一个任务 = 一次模型调用」。<strong>agent 场景下这个假定不成立</strong>，而它带来的复杂度值得单独说清楚。</p>  <table>
+    <thead><tr><th>维度</th><th>单次调用场景</th><th>agent 场景</th><th>runner 要多做什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>调用次数</strong></td><td>1 次</td><td>几十到几百次</td><td>预算控制要下沉到<strong>单任务</strong>粒度（第 5 节）</td></tr>
+      <tr><td><strong>缓存</strong></td><td>输入 → 输出，直接缓存</td><td><strong>调用之间有状态</strong>，第 3 步的输入依赖第 2 步的输出</td><td>只能缓存<em>确定性前缀</em>，或整条轨迹一起缓存</td></tr>
+      <tr><td><strong>失败</strong></td><td>一次调用失败</td><td><strong>第 17 步失败</strong>——前 16 步的成本已经花掉了</td><td>记录失败发生在第几步；决定是重跑整条还是从检查点续</td></tr>
+      <tr><td><strong>环境</strong></td><td>无状态</td><td>容器/数据库/浏览器，<strong>必须在任务之间重置</strong></td><td>环境生命周期管理；重置失败也是一类失败</td></tr>
+      <tr><td><strong>超时</strong></td><td>单次调用超时</td><td><strong>两级</strong>：单步超时 + 整条轨迹超时</td><td>两个都要配，且都要进 spec</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>第四行是 agent 评测里最常见的一类<strong>静默污染</strong>：<strong>环境没有在任务之间被正确重置。</strong><em>上一个任务往数据库里写的数据还在，下一个任务读到了它——结果可能变好（信息泄漏）也可能变坏（状态冲突），而且完全不报错。</em><strong>防御方式是在每个任务开始前做一次「环境指纹」校验</strong>：对初始状态取哈希，与预期值比对，不一致就判为 <code>env_error</code> 并跳过——<em>这与本课反复出现的「确定性检查优先」是同一条思路</em>。</p>
+  </div>  <h3>agent 场景的缓存：只能缓存确定性前缀</h3>  <p>由于状态依赖，agent 的调用无法逐个独立缓存。可行的两种做法：</p>  <ul>
+    <li><strong>整条轨迹缓存</strong>：键 = <code>(task_id, exec_fp)</code>，值 = 完整轨迹。<em>命中率低（任何配置变化都失效），但语义绝对正确</em>；</li>
+    <li><strong>确定性前缀缓存</strong>：如果 agent 的前 $k$ 步在给定配置下是确定的（temperature=0 且环境已重置），可以缓存这个前缀。<strong>但必须把「环境初始状态的哈希」也放进键里</strong>——<em>否则环境变了而缓存命中，会得到一条在错误环境上产生的轨迹</em>。</li>
+  </ul>  <h3>嵌套调用的成本归因</h3>  <p>agent 场景还有一个成本侧的细节：<strong>一次任务的成本要归因到哪一步</strong>。<em>如果只记总成本，你会知道「这个任务花了 0.8 美元」，但不知道其中 0.6 美元花在了一个反复重试的工具调用上。</em></p>  <p>解法是让每一步的成本都单独落库，并在聚合时提供两个视角：<strong>按任务</strong>（这道题贵不贵）与<strong>按步骤类型</strong>（钱花在规划、工具调用、还是最后的总结上）。<em>后者是优化成本时唯一有用的视角</em>——而它需要的字段在 C66 模块 03 的轨迹 schema 里已经有了，<strong>这里只是把它接进 runner 的成本统计</strong>。</p>  <h3>单任务预算：与 C66-03 的循环检测接在一起</h3>  <p>模块 02 第 5 节讲的预算控制，在 agent 场景下有一个额外的抓手：<strong>C66 模块 03 的循环检测</strong>。<em>检出循环就提前终止这条轨迹，省下的预算拿去跑别的任务</em>。<strong>但被终止的轨迹必须单独标记为 <code>terminated_by_loop_detector</code>，而不是简单记成失败</strong>——因为「被我们主动掐掉的」和「模型自己做不出来的」是两个不同的量，混在一起会让失败分类失去意义（第 2 节）。</p>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_task_spec/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · Task spec 与数据集版本化</div></a>
+    <a class="next" href="../03_result_store/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 结果存储与分析</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 沙箱与权限边界</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 沙箱与权限边界</h1>
+  <p class="subtitle">把「最小权限」从口号变成可计算的量：<strong>能力有四个维度</strong>——操作 / <strong>范围</strong> / 信任门槛 / 可逆性，四条<em>合取</em>，因此有四个独立的收紧点；而<strong>「范围」这一维最常被完全忽略</strong>：把「读文件」收窄成「读 <code>/work/</code>」，就把「读 <code>~/.ssh/</code>」变成了不可达 · <strong><code>startswith</code> 做路径检查会被两类输入绕过</strong>：<code>..</code> 穿越与同前缀目录（<code>/workspace_other</code>）——必须先规范化再比 · <strong>沙箱隔离的是「代码执行的副作用」，不隔离「被授权的 API 调用」</strong>——后者是合法调用，沙箱不会拦；<em>所以权限边界通常比沙箱更重要</em>，而<strong>「凭证不进沙箱」能把最严重的一类后果直接消除</strong> · <strong>「给所有操作都加确认」不是更安全，而是更不安全</strong>：notebook 的模拟显示确认频率从每小时 1 次涨到 60 次，拦住率从 87% 掉到 8%；<strong>目标是提高每次确认的基率，而不是频率</strong> · <strong>TOCTOU</strong>：确认的与执行的必须是同一个<em>冻结的</em>动作对象 + digest 校验 + 令牌一次性 · <strong>provenance 是审计记录里唯一无法事后补上的字段</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 02（工具与供应链）；知道「容器」「文件系统权限」的基本概念即可</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_sandbox_permissions.ipynb（能力模型与最小权限的求解 / 隔离层级的成本-强度矩阵 / 确认疲劳的模拟：确认率与它的衰减 / TOCTOU 与确认内容不一致 / 审计日志的完整性与 provenance 链 / 权限变更的影响面分析）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Saltzer &amp; Schroeder, <em>The Protection of Information in Computer Systems</em>（1975，最小权限等八条设计原则）· POSIX capabilities / seccomp / Linux namespaces 的隔离模型 · gVisor、Firecracker、WebAssembly 沙箱的隔离强度对比 · OAuth 2.0 的 scope 与 token 交换（下游最小权限）· 本课程 C34 模块 03（权限实现）· C68 模块 04（告警疲劳，与确认疲劳同构）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#least-privilege">最小权限：从口号到可计算的量</a></li>
+      <li><a href="#capability-model">能力模型：四个维度而不是一个布尔值</a></li>
+      <li><a href="#isolation">隔离层级：五档，以及各自的成本与强度</a></li>
+      <li><a href="#confirmation">确认：怎么设计才不会变成橡皮图章</a></li>
+      <li><a href="#toctou">TOCTOU：确认的内容与执行的内容不一致</a></li>
+      <li><a href="#audit">审计：让「事后能查清」变成一个可验证的属性</a></li>
+      <li><a href="#change-impact">权限变更的影响面：加一个工具之前先算一下</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="least-privilege"><span class="num">1</span>最小权限：从口号到可计算的量</h2>
+  <p>「最小权限」这四个字几乎没人反对，但它在 agent 系统里通常停留在口号阶段——<strong>因为没人算过「最小」到底是多少。</strong>这一节把它变成一个可解的问题。</p>  <div class="math-block">\[\text{minimal}(T) = \bigcup_{s \in \text{steps}(T)} \text{required}(s)\]</div>  <p>对一个任务 $T$，最小权限集是<strong>它的每一步实际需要的能力的并集</strong>——而不是「这个 agent 可能会做的所有事」。<em>这两者的差距通常大到令人惊讶</em>，因为后者是按「以后可能有用」累积出来的。</p>  <table>
+    <thead><tr><th>权限授予方式</th><th>怎么决定给什么</th><th>典型规模</th><th>问题</th></tr></thead>
+    <tbody>
+      <tr><td><strong>按角色</strong></td><td>「这是一个编码 agent，给它编码需要的全部权限」</td><td>很大</td><td><strong>角色是按人设计的，而 agent 的任务粒度比人细得多</strong></td></tr>
+      <tr><td><strong>按会话</strong></td><td>会话开始时根据任务类型授予</td><td>中</td><td>同一会话内不同步骤的需求不同，仍然过宽</td></tr>
+      <tr><td><strong>按步骤（即时授权）</strong></td><td>每次工具调用时按当前意图授予</td><td><strong>最小</strong></td><td>实现复杂；需要「当前意图」这个概念</td></tr>
+      <tr><td><strong>按数据范围</strong></td><td>不只限制「能不能读文件」，还限制「能读哪些文件」</td><td>—</td><td><strong>常被完全忽略的一维</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>第四行是本节最容易被忽略、也最有效的一条：<strong>权限有两个维度——<em>能做什么操作</em> 与 <em>能作用于哪些对象</em>。</strong><em>大多数系统只做了第一维（「有 read_file 能力」），而第二维（「只能读 ./workspace/ 下的文件」）同样重要，而且实现成本很低</em>。<strong>把「读文件」收窄成「读工作目录下的文件」，就把「读 ~/.ssh/」这条路径变成了不可达</strong>——又是一个不变量。</p>
+  </div>  <h3>Saltzer & Schroeder 的八条原则，哪几条在 agent 里最相关</h3>  <ul>
+    <li><strong>最小权限</strong>（least privilege）——本节主题；</li>
+    <li><strong>失败时默认拒绝</strong>（fail-safe defaults）——<em>权限检查出错时应当拒绝，而不是放行</em>。听起来显然，但「配置文件里没写这个工具的权限」这种情况的默认行为经常是「不检查」；</li>
+    <li><strong>完全仲裁</strong>（complete mediation）——<strong>每一次访问都要检查，不能缓存授权决定</strong>。<em>agent 里的典型违反是：第一次调用时检查了，同一会话后续调用直接放行</em>；</li>
+    <li><strong>机制经济性</strong>（economy of mechanism）——<em>权限系统本身要足够简单以便能被验证</em>。一个有二十个特例的权限系统，它自己就是漏洞的来源；</li>
+    <li><strong>心理可接受性</strong>（psychological acceptability）——<strong>这条在 agent 里格外重要</strong>：如果确认弹得太频繁，人就会盲目点确认（第 4 节的确认疲劳）。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="capability-model"><span class="num">2</span>能力模型：四个维度而不是一个布尔值</h2>
+  <p>要把最小权限算出来，先要有一个足够细的能力表示。<strong>「有 / 没有某个工具」是不够的</strong>——它至少需要四个维度。</p>  <table>
+    <thead><tr><th>维度</th><th>含义</th><th>例子</th><th>不做这一维的后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>操作</strong></td><td>能做什么</td><td>read / write / execute / send</td><td>—（这一维大家都有）</td></tr>
+      <tr><td><strong>范围</strong></td><td>能作用于哪些对象</td><td><code>./workspace/**</code>、<code>*.example.test</code>、<code>只读自己的邮件</code></td><td>「读文件」= 能读 <code>~/.ssh/</code></td></tr>
+      <tr><td><strong>信任门槛</strong></td><td>触发它需要的最低上下文信任等级</td><td>L2 才能 send_email</td><td><strong>L0 内容可以直接触发动作</strong>（模块 00/01）</td></tr>
+      <tr><td><strong>可逆性</strong></td><td>做错了能不能撤回</td><td>read 可逆 / send_email 不可逆</td><td>不可逆操作与可逆操作被同等对待</td></tr>
+    </tbody>
+  </table>  <div class="math-block">\[\text{allow}(a) \iff \underbrace{a.\text{op} \in G}_{\text{授予}} \;\wedge\; \underbrace{a.\text{target} \in S}_{\text{范围}} \;\wedge\; \underbrace{\text{trust}(\text{ctx}) \ge \tau_a}_{\text{信任}} \;\wedge\; \underbrace{(\text{rev}(a) \vee \text{confirmed})}_{\text{可逆性}}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这个式子的实用价值在于：<strong>四个条件是<em>合取</em>的，所以只要有一条不满足，动作就不可达。</strong><em>这意味着你有四个独立的收紧点</em>——而收紧任何一个都不需要依赖其他三个的正确性。<strong>这正是纵深防御在权限层的具体形态。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说，这是一个<span class="term">能力安全</span>（capability-based security）模型与<span class="term">信息流控制</span>的合成：前两个条件是经典的 capability（持有即可用），第三个条件把<em>信息流的完整性标签</em>引入了授权判断，第四个条件引入了<em>可撤销性</em>这个时间维度。<em>三者合起来才能表达「L0 上下文下不许做不可逆的对外操作」这条规则</em>——<strong>而这条规则用任何单一模型都表达不出来。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>关于「范围」这一维有一个非常常见的实现错误：<strong>用字符串前缀匹配做路径范围检查。</strong><em><code>path.startswith('./workspace/')</code> 会被 <code>./workspace/../../.ssh/id_rsa</code> 绕过</em>——<strong>必须先规范化路径（解析 <code>..</code> 与符号链接）再比较，而且要比较的是规范化之后的绝对路径。</strong>notebook 第 2 节会把这个绕过与修法都跑出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="isolation"><span class="num">3</span>隔离层级：五档，以及各自的成本与强度</h2>
+  <p>权限检查决定「允不允许」，隔离决定「即使它做了，能影响到什么」。两者是互补的：<strong>权限是白名单，隔离是爆炸半径。</strong></p>  <div class="ascii">   强度 ↑                                                   成本 ↑
+   ┌──────────────────────────────────────────────────────────────┐
+   │ ⑤ 独立机器 / 独立账号     强隔离，网络与身份都分开             │
+   ├──────────────────────────────────────────────────────────────┤
+   │ ④ 微 VM（Firecracker 等）  内核级隔离，启动百毫秒级            │
+   ├──────────────────────────────────────────────────────────────┤
+   │ ③ 用户态内核（gVisor 等）  拦截系统调用，兼容性好              │
+   ├──────────────────────────────────────────────────────────────┤
+   │ ② 容器 + seccomp + 只读挂载  常见的默认选择                    │
+   ├──────────────────────────────────────────────────────────────┤
+   │ ① 进程内（Wasm / 受限解释器）  最轻，但只隔离计算，不隔离网络   │
+   └──────────────────────────────────────────────────────────────┘
+   注意：**①–⑤ 隔离的是"执行"，而 agent 的主要风险在"它被授权调用的 API"。**</div>  <div class="callout danger"><span class="label"></span>
+    <p>上面那句注意值得展开，因为它是一个很常见的误解：<strong>把 agent 放进一个强隔离的沙箱，并不会降低「它拿着你的 API token 去发邮件」这类风险。</strong><em>沙箱隔离的是「代码执行的副作用」——文件系统、进程、内核；而 agent 的主要能力来自它被显式授予的 API 调用权限，那些调用是「合法」的，沙箱不会拦。</em><strong>所以沙箱与权限边界必须同时做，而且权限边界通常更重要。</strong></p>
+  </div>  <table>
+    <thead><tr><th>风险类型</th><th>沙箱能防吗</th><th>权限边界能防吗</th><th>出站控制能防吗</th></tr></thead>
+    <tbody>
+      <tr><td>执行任意代码破坏本机</td><td><strong>✅ 主要靠它</strong></td><td>部分</td><td>❌</td></tr>
+      <tr><td>读取本机敏感文件</td><td>✅（只读挂载 + 范围限制）</td><td><strong>✅</strong></td><td>❌</td></tr>
+      <tr><td><strong>用授权的 API 做坏事</strong></td><td><strong>❌</strong></td><td><strong>✅</strong></td><td>部分</td></tr>
+      <tr><td><strong>把数据发到外部</strong></td><td>部分（网络命名空间）</td><td>部分</td><td><strong>✅ 主要靠它（04 模块）</strong></td></tr>
+      <tr><td>消耗资源（算力/配额）</td><td>✅（cgroups）</td><td>部分（预算）</td><td>❌</td></tr>
+    </tbody>
+  </table>  <h3>沙箱设计的四条实用规则</h3>  <ol>
+    <li><strong>默认无网络</strong>，需要时通过一个显式的出站代理（04 模块）。<em>「容器里能直接连外网」是一个默认配置，而它应当被显式关掉</em>；</li>
+    <li><strong>文件系统只读 + 一个可写的工作目录</strong>，而工作目录在每个任务之间被<strong>销毁重建</strong>（呼应 C68 模块 02 的「环境必须在任务之间重置」）；</li>
+    <li><strong>凭证不进沙箱</strong>——<em>agent 需要调用 API 时，请求经过一个持有凭证的代理，而沙箱内只有一个短期、窄范围的令牌</em>。<strong>这条能把「凭证泄漏」这类最严重的后果直接消除。</strong></li>
+    <li><strong>资源与时间上限</strong>：CPU、内存、墙钟、以及调用配额。<em>这既是安全措施也是成本措施（C68 模块 02 的预算熔断）。</em></li>
+  </ol>
+
+  <!-- ========================================================= -->
+  <h2 id="confirmation"><span class="num">4</span>确认：怎么设计才不会变成橡皮图章</h2>
+  <p>模块 00 的防御姿态第 3 条是「不可逆操作必须有确认环节」。但确认这件事有一个和 C68 模块 04 的告警疲劳<strong>完全同构</strong>的失败模式。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>确认弹得越频繁，人就越倾向于不看内容直接点「同意」。</strong><em>而一旦形成这个肌肉记忆，确认环节就从「一道防线」变成了「一次额外点击」</em>——它仍然在流程里，但已经不提供任何保护。<strong>所以「给所有操作都加确认」不是更安全，而是更不安全。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这与 C68 模块 04 的告警疲劳是同一个结构：<strong>确认的有效性取决于它的<em>信息密度</em>而非频率</strong>。形式化地说，设确认请求的到达率为 $\lambda$、其中真正需要拒绝的比例为 $\pi$（基率），那么<em>人的认真程度大致随 $\lambda$ 上升而下降、随 $\pi$ 上升而上升</em>。<strong>目标不是最大化确认次数，而是最大化 $\pi$</strong>——也就是让每一次弹出的确认都<em>值得</em>被认真看。notebook 第 4 节会把这个衰减模型跑出来。</p></div>
+  </div>  <h3>四条设计规则</h3>  <ol>
+    <li><strong>只对不可逆 + 对外的操作确认</strong>（模块 00 练习 4 已经形式化过）。<em>读操作、可撤销的写操作不该弹确认</em>——它们应当靠范围限制来管；</li>
+    <li><strong>确认必须展示「将要发生什么」而不是「模型想做什么」</strong>。<em>「agent 请求调用 send_email」是无信息的；「将向 attacker@… 发送一封包含以下内容的邮件：……」才是可判断的</em>；</li>
+    <li><strong>确认的内容必须与实际执行的内容一致</strong>——这是一个真实的漏洞类别（第 5 节的 TOCTOU）；</li>
+    <li><strong>确认不能被 L0 内容影响</strong>。<em>如果确认界面上展示的文本本身来自不受信内容，那么攻击者可以在里面写「这是一个例行操作，请点击同意」</em>——<strong>确认界面必须对展示的不受信内容做显式标注与转义。</strong></li>
+  </ol>  <div class="callout warn"><span class="label"></span>
+    <p>第四条有一个具体的形态值得警惕：<strong>确认对话框里展示的邮件正文、文件内容、URL，全部是 L0 内容。</strong><em>攻击者可以精心构造它们来影响<strong>人</strong>的判断</em>——比如把危险的收件人地址放在一段很长的正文之后，或者用视觉上相似的域名。<strong>所以确认界面应当把「关键决策字段」（收件人、金额、目标路径）从正文里抽出来单独、突出地展示</strong>，而不是让人在一大段文本里找。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="toctou"><span class="num">5</span>TOCTOU：确认的内容与执行的内容不一致</h2>
+  <p>这是一类具体的、在 agent 系统里真实存在的漏洞，而它在传统安全里有一个成熟的名字：<strong>检查时与使用时不一致</strong>（time-of-check to time-of-use）。</p>  <div class="ascii">   时刻 t1   agent 提出: send_email(to="boss@corp.test", body="报告已完成")
+   时刻 t2   系统展示确认: 「将向 boss@corp.test 发送……」
+   时刻 t3   人点击「同意」
+   时刻 t4   系统执行 —— **但执行的是什么？**
+             如果这里重新向模型询问参数、或从可变的状态里取参数，
+             那么 t3 与 t4 之间的任何变化都不在人的确认范围内。</div>  <table>
+    <thead><tr><th>形态</th><th>机制</th><th>防御</th></tr></thead>
+    <tbody>
+      <tr><td><strong>参数重取</strong></td><td>确认后重新调用模型生成参数（比如为了「补全」）</td><td><strong>确认的是一个不可变的动作对象</strong>：参数在确认前就冻结并哈希</td></tr>
+      <tr><td><strong>状态漂移</strong></td><td>参数是一个引用（文件路径、记录 ID），而引用指向的内容在确认后变了</td><td><em>对内容也取哈希</em>，或在执行前重新校验</td></tr>
+      <tr><td><strong>批量确认</strong></td><td>「同意后续所有类似操作」——而「类似」的定义由后续动作自己说</td><td><strong>批量授权必须限定明确的范围与有效期</strong>，不能是开放式的</td></tr>
+      <tr><td><strong>确认复用</strong></td><td>一次确认被用于多次执行（重试路径上尤其常见）</td><td>确认令牌一次性，且绑定动作哈希</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>第三行的「批量确认」在实践中最常见，也最容易失控：<strong>用户点了「不要再问我了」，而这个授权的范围是由后续动作自己解释的。</strong><em>攻击者只需要让第一次操作看起来无害（从而获得批量授权），后续的操作就都不再需要确认</em>。<strong>正确做法：批量授权必须绑定到具体的范围</strong>——「本次会话内，向 <code>*.corp.test</code> 发邮件不再询问」，而不是「send_email 不再询问」。</p>
+  </div>  <h3>动作对象：一个可以直接抄的实现</h3>  <pre><code># 确认的对象必须是**不可变的、可哈希的**，而不是「一个意图」
+@dataclass(frozen=True)
+class Action:
+    op: str                     # "send_email"
+    target: str                 # "boss@corp.test"
+    payload_sha: str            # 正文的哈希（内容也被冻结）
+    ctx_trust: int              # 提出这个动作时的上下文信任等级
+    provenance: tuple           # 完整的来源链（模块 02 第 4 节）
+
+    def digest(self) -&gt; str:
+        return sha256(f"{self.op}|{self.target}|{self.payload_sha}|{self.ctx_trust}")
+
+# 确认令牌绑定动作摘要，一次性，有有效期
+token = confirm_ui.request(action)          # 人看到的是 action 的字段，不是"意图"
+assert token.action_digest == action.digest()   # ← 执行前必须校验
+assert not token.used and token.not_expired()
+execute(action)                              # 执行的就是被确认的那个对象</code></pre>  <p><strong>这个实现里最重要的一行是那个 <code>assert</code></strong>：<em>它把「确认的内容 == 执行的内容」从一条约定变成了一个会失败的检查</em>。而 <code>frozen=True</code> 保证了动作对象在确认与执行之间不可能被修改。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="audit"><span class="num">6</span>审计：让「事后能查清」变成一个可验证的属性</h2>
+  <p>前五节都在讲预防。这一节讲一个同等重要但常被推后的东西：<strong>当事情真的发生了，你能不能查清。</strong></p>  <h3>一条完整的审计记录需要什么</h3>  <pre><code>{
+  "ts": "2026-08-31T10:14:22Z",
+  "session": "sess-9f21",
+  "action": {"op": "send_email", "target": "boss@corp.test",
+             "payload_sha": "7d2e…", "digest": "a91c…"},
+  "decision": "allowed",
+  "checks": {"granted": true, "scope": true, "trust": true, "confirmed": true},
+  "ctx_trust": 2,
+  "provenance": [                       // ← **最重要的一段**
+    {"source": "user",            "trust": 2, "ref": "msg-118"},
+    {"source": "web",             "trust": 0, "ref": "https://example.test/a"},
+    {"source": "subagent:summarizer", "trust": 0, "ref": "sub-77"}
+  ],
+  "confirmation": {"token": "cnf-3b1", "by": "user-42", "shown_digest": "a91c…"},
+  "tool_manifest_sha": "c04d…"          // 这次会话暴露了哪些工具（模块 02）
+}</code></pre>  <table>
+    <thead><tr><th>字段</th><th>回答什么问题</th><th>缺了它会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><code>provenance</code></td><td><strong>这个动作是被什么内容触发的</strong></td><td><strong>只能看到「agent 决定发邮件」，查不出源头</strong></td></tr>
+      <tr><td><code>ctx_trust</code></td><td>当时的上下文信任等级是多少</td><td>无法判断「这次授权是否本该被拒绝」</td></tr>
+      <tr><td><code>checks</code></td><td>四个条件各自的结果</td><td>只知道「放行了」，不知道哪一条本该拦住</td></tr>
+      <tr><td><code>action.digest</code> + <code>shown_digest</code></td><td>确认的与执行的是不是同一个</td><td>TOCTOU 类问题无法被事后发现</td></tr>
+      <tr><td><code>tool_manifest_sha</code></td><td>当时模型看到了哪些工具</td><td>动态裁剪之后无法复现当时的工具集</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <strong><code>provenance</code> 是这份记录里唯一无法事后补上的字段。</strong><em>其余字段都能从配置和代码里重建，但「这个动作是被哪一段内容触发的」这个信息，如果当时没记，事后永远拿不回来</em>（呼应 C66 模块 03 的「schema 是事前决定」）。<strong>而它恰恰是安全事故复盘时最需要的那一个。</strong>
+  </div>  <h3>审计日志自己的完整性</h3>  <p>最后一个容易被忽略的点：<strong>审计日志必须是 agent 无法篡改的。</strong></p>  <ul>
+    <li><strong>agent 不持有写审计日志的权限</strong>——日志由包裹它的运行时写；</li>
+    <li><strong>只追加</strong>，且最好写到 agent 的沙箱之外；</li>
+    <li><strong>关键动作的日志写入必须在动作执行<em>之前</em>完成</strong>（<em>先记「即将执行」，再执行，再记「执行结果」</em>）——<strong>否则一个在执行中崩溃的动作会没有任何记录</strong>；</li>
+    <li><strong>日志缺口本身是一个告警</strong>：序号不连续、时间跳变都应当触发调查。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="change-impact"><span class="num">7</span>权限变更的影响面：加一个工具之前先算一下</h2>
+  <p>最后一节讲流程：<strong>怎么让「加一个工具」这件事不悄悄扩大攻击面。</strong></p>  <p>模块 02 第 5 节已经给出了核心判据（危险组合数）。这一节把它变成一个变更检查清单：</p>  <ol>
+    <li><strong>这个工具需要哪些能力</strong>（<code>requires</code>）？<em>它声明的与它实际用的是否一致</em>？</li>
+    <li><strong>加上它之后，危险组合数从几变成几</strong>？<em>从 0 变成非 0 是一个需要安全 review 的变更，而不是一次普通提交</em>；</li>
+    <li><strong>它的范围（scope）能收多窄</strong>？<em>「读文件」能不能收成「读 ./workspace/」</em>；</li>
+    <li><strong>它可逆吗</strong>？不可逆 → 需要确认 → 会增加确认频率 →<em>可能推高确认疲劳（第 4 节）</em>；</li>
+    <li><strong>它引入了新的出站通道吗</strong>？（04 模块）</li>
+    <li><strong>它的 description 与参数说明审过了吗</strong>？（模块 02 第 1 节）</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>这六条里最有价值的是第 2 条，因为它是<strong>可自动计算的</strong>：<em>在 CI 里跑一遍「加上这个工具之后的危险组合数」，从 0 变成非 0 就要求一个安全 review 的标签</em>。<strong>这把「攻击面扩大」从一件靠人记得的事，变成了一次会失败的构建</strong>——而这正是 C68 模块 04 「确定性检查优先」在安全侧的应用。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这个流程重要？因为<strong>攻击面的扩大几乎从来不是一次决定，而是几十次「就加这一个」累积出来的。</strong><em>每一次单独看都合理（「产品需要这个功能」），而累积效应没有任何人在看</em>——这与 C68 模块 03 讲的「渐进式退化」是完全同一个结构。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以防御手段也是同一个：<strong>除了「相对上次」的检查，还需要一个「锚定基线」</strong>。<em>每个季度算一次「当前的危险组合数 / 不可逆操作数 / 出站通道数」，与三个月前的锚点比较</em>——<strong>让那些「每次只加一点」的累积变得可见</strong>。notebook 第 7 节会把这个季度快照实现出来。</p></div>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_tool_supply_chain/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 工具与供应链</div></a>
+    <a class="next" href="../04_exfiltration/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 数据外泄与出站控制</div></a>
+  </div>
+
+</div>
+</body>
+</html>

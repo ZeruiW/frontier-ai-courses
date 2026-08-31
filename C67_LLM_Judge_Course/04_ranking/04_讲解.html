@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 从成对比较到排名</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 从成对比较到排名</h1>
+  <p class="subtitle"><strong>朴素胜率被赛程污染</strong>：只和弱模型比过的模型胜率虚高，Bradley–Terry 的全部价值就是同时估计所有强度、让「赢了谁」被正确加权 · <strong>Elo 只是 BT 参数的仿射变换</strong>：20 个 Elo 分 = 52.9% 的胜率，而把它与 50% 区分开需要上千场直接对局——<strong>榜单上相差 30 分以内的名次基本可以当成并列</strong> · <strong>在线 Elo 的分数不是数据的函数，是「数据 + 你处理它的顺序」的函数</strong>；批量 BT 对顺序完全不敏感 · <strong>看区间，不看名次</strong>——自举必须重采样「比较记录」而非模型，而 rank CI 比 Elo CI 更直接地回答读者关心的问题 · <strong>总榜第一常常在每个子榜上都不是第一</strong>，这不矛盾：总榜是各子任务按「任务集构成比例」这个隐含权重加权的结果 · <strong>主动配对不是全面更好，而是把精度搬了个地方</strong>——相邻名次更容易分开，但悬殊对的估计变成纯外推 · <strong>风格控制 BT 的 Δrank 是最有信息量的一列</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 03（元评测与校准）；逻辑回归在模块 02 已经从零写过，本模块继续复用同一套 numpy 代码</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_ranking.ipynb（Bradley–Terry 的 MLE 拟合与自举区间 / Elo 与在线更新的路径依赖 / 传递性违反的检测与后果 / 主动配对：不确定性最大化 vs 随机配对 / 排名稳定性与「多少分才算真差距」/ 风格控制的 BT 扩展）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Bradley &amp; Terry, <em>Rank Analysis of Incomplete Block Designs</em>（Biometrika 1952）· Chiang et al., <em>Chatbot Arena</em>（ICML 2024，BT 模型与 Arena 排名方法）· Elo, <em>The Rating of Chessplayers</em>（1978）· Zermelo（1929，BT 的更早形式与 MM 迭代解法）· 本课程 C66 模块 04（配对设计与自举）· C13（bandits 与主动选择）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#problem">问题：手上是一堆胜负，想要的是一个排行榜</a></li>
+      <li><a href="#bt">Bradley–Terry 模型：定义、拟合与它的三个性质</a></li>
+      <li><a href="#elo-online">在线 Elo：为什么它的结果依赖比赛顺序</a></li>
+      <li><a href="#intervals">置信区间：排行榜上相差 20 分算不算差距</a></li>
+      <li><a href="#transitivity">传递性：BT 假设了它，而 LLM judge 经常违反它</a></li>
+      <li><a href="#active">主动配对：同样的预算，多买到多少信息</a></li>
+      <li><a href="#style-control">把去偏接进排名：带协变量的 BT</a></li>
+      <li><a href="#reporting">排行榜的报告规范</a></li>
+      <li><a href="#leaderboard-hygiene">榜单卫生：三个会安静毁掉排行榜的操作</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="problem"><span class="num">1</span>问题：手上是一堆胜负，想要的是一个排行榜</h2>
+  <p>模块 01–03 解决的是「一次比较可不可信」。这一节开始解决下一个问题：<strong>你有几千条「A 赢 B」的记录，涉及十几个模型，怎么把它们变成一个带误差棒的排行榜？</strong></p>  <div class="ascii">   输入：稀疏的成对比较矩阵                输出：一维分数 + 区间
+   ┌─────────────────────────┐            ┌──────────────────────────┐
+   │      M1  M2  M3  M4  M5 │            │ 1. M3   1247  [1231,1263] │
+   │ M1    -  12/20  3/5  -  │            │ 2. M1   1198  [1180,1215] │
+   │ M2  8/20  -   -  9/15 - │   ─────►   │ 3. M2   1176  [1154,1198] │  ← 与 M1 区间重叠
+   │ M3  2/5   -   -   -  7/9│            │ 4. M5   1102  [1068,1136] │
+   │ M4   -  6/15  -   -  4/8│            │ 5. M4   1089  [1051,1127] │  ← 与 M5 区间重叠
+   │ M5   -   -  2/9  4/8  - │            └──────────────────────────┘
+   └─────────────────────────┘            排名 3 vs 2、4 vs 5 实为并列
+   注意：矩阵是**稀疏**的（不是每对都比过），而且每格的样本量差别很大。</div>  <p>这一步引入了一个新的假设，它必须被显式说出来：<strong>「模型的质量可以被一个标量刻画」</strong>。这个假设在多数情况下够用，但它不是免费的——第 5 节会讲它什么时候崩掉。</p>  <table>
+    <thead><tr><th>方法</th><th>核心思想</th><th>优点</th><th>缺点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>朴素胜率</strong></td><td>每个模型对所有对手的总胜率</td><td>极简单</td><td><strong>被对手强度污染</strong>：只和弱模型比过的模型胜率虚高</td></tr>
+      <tr><td><strong>Bradley–Terry</strong></td><td>极大似然拟合每个模型的强度参数</td><td><strong>正确处理对手强度与稀疏性</strong>；有标准误</td><td>假设传递性；批量计算</td></tr>
+      <tr><td><strong>Elo</strong></td><td>在线逐条更新评分</td><td>可增量更新，适合流式数据</td><td><strong>结果依赖比赛顺序</strong>；K 因子是个自由参数</td></tr>
+      <tr><td><strong>带协变量的 BT</strong></td><td>BT + 长度/风格作为协变量</td><td>可以同时做去偏（模块 02）与排名</td><td>需要更多数据</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么不能直接用胜率？<strong>因为对手不一样。</strong>一个只和弱模型比过 200 场的模型，胜率可能高达 80%；一个专挑强对手比的模型可能只有 45%。<em>朴素胜率把这两者放在同一个尺度上比较，是没有依据的。</em>BT 模型的全部价值就是：<strong>它同时估计所有模型的强度，让「赢了谁」这件事被正确地加权。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bt"><span class="num">2</span>Bradley–Terry 模型：定义、拟合与它的三个性质</h2>
+  <p>BT 模型只有一个式子。设模型 $i$ 的强度参数为 $\theta_i$，则</p>  <div class="math-block">\[\Pr(i \succ j) = \frac{e^{\theta_i}}{e^{\theta_i} + e^{\theta_j}} = \sigma(\theta_i - \theta_j)\]</div>  <p>其中 $\sigma$ 是 sigmoid。<strong>这等价于一个逻辑回归</strong>：把每场比较编码成一个只有两个非零元素的特征向量（胜者位置 +1、败者位置 −1），标签是「前者是否获胜」，拟合出来的系数就是 $\theta$。<em>所以模块 02 写的那个 <code>fit_logistic</code> 可以直接复用。</em></p>  <h3>三个必须知道的性质</h3>  <ol>
+    <li><strong>只有差值有意义，绝对值没有。</strong>$\theta_i \to \theta_i + c$ 对所有 $i$ 同时加一个常数，所有预测概率都不变。<em>所以必须固定一个基准</em>（把某个模型设为 0，或让所有 $\theta$ 之和为 0），否则拟合出来的绝对数字每次都不一样。</li>
+    <li><strong>差值直接翻译成胜率</strong>：$\theta_i - \theta_j = 0$ → 50%；$= 1$ → 73%；$= 2$ → 88%。<em>这条让 BT 分数比 Elo 分数更容易解释</em>——它就是 logit 尺度上的距离。</li>
+    <li><strong>存在性条件</strong>：如果比较图不连通（有一组模型从没和另一组比过），两组之间的相对强度<em>无法确定</em>；如果某个模型全胜或全败，它的 $\theta$ 会发散到无穷。<strong>两种情况都需要正则化（等价于加一个先验）来处理。</strong></li>
+  </ol>  <div class="callout warn"><span class="label"></span>
+    <p>第 3 条在真实数据上非常常见，尤其是刚加入榜单的新模型（比赛场次少、可能全胜）。<strong>标准处理是加 L2 正则（等价于给 $\theta$ 一个高斯先验），或者用「加一个虚拟的平局对手」的方式做平滑。</strong><em>不做正则化的 BT 拟合在这类数据上会给出荒谬的巨大分数，而且这个问题不会报错，只会安静地毁掉你的排行榜。</em></p>
+  </div>  <h3>Elo 分数：BT 的一个仿射变换</h3>  <p>Arena 类榜单常报的 Elo 分数，本质上是 BT 参数的线性重标：</p>  <div class="math-block">\[\text{Elo}_i = 1000 + \frac{400}{\ln 10}\,\theta_i \approx 1000 + 173.7\,\theta_i\]</div>  <p>这个换算的意义是让「差 400 分 = 胜率 10:1」这条国际象棋的老约定成立。<strong>它不增加任何信息，只是换了一个更多人熟悉的刻度。</strong><em>知道这一点很重要：当有人说「A 比 B 高 20 个 Elo 分」，你可以立刻换算成 $20/173.7 = 0.115$ 的 logit 差，即约 <strong>52.9% 的胜率</strong>——一个远比「20 分」听起来更小的差距。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="elo-online"><span class="num">3</span>在线 Elo：为什么它的结果依赖比赛顺序</h2>
+  <p>在线 Elo 是另一条路线：不做批量拟合，而是每来一场比赛就更新一次评分。</p>  <div class="math-block">\[\theta_i \leftarrow \theta_i + K\left(y - \sigma(\theta_i - \theta_j)\right), \qquad \theta_j \leftarrow \theta_j - K\left(y - \sigma(\theta_i - \theta_j)\right)\]</div>  <p>其中 $y \in \{0, 1\}$ 是实际结果，$K$ 是学习率（国际象棋里叫 K 因子）。<strong>这就是对 BT 对数似然做随机梯度上升</strong>——它是 BT 的在线版本，不是另一个模型。</p>  <table>
+    <thead><tr><th>性质</th><th>在线 Elo</th><th>批量 BT (MLE)</th><th>实践含义</th></tr></thead>
+    <tbody>
+      <tr><td><strong>顺序依赖</strong></td><td><strong>有</strong>：打乱比赛顺序会得到不同的分数</td><td>无：只取决于胜负计数</td><td>报告 Arena 类分数时，<em>批量 BT 是更可复现的选择</em></td></tr>
+      <tr><td><strong>增量更新</strong></td><td>天然支持</td><td>需要重新拟合（但通常很快）</td><td>流式场景用 Elo，定期发布用 BT</td></tr>
+      <tr><td><strong>自由参数</strong></td><td>K 因子（大 = 跟得快但噪声大）</td><td>只有正则化强度</td><td>K 选不好会让榜单剧烈抖动</td></tr>
+      <tr><td><strong>不确定度</strong></td><td>没有原生的标准误</td><td><strong>有</strong>（Hessian 或自举）</td><td>要画误差棒必须用 BT 或对 Elo 做自举</td></tr>
+      <tr><td><strong>处理能力漂移</strong></td><td><strong>能</strong>（旧比赛权重自然衰减）</td><td>不能（所有比赛等权）</td><td>如果模型本身在变，Elo 反而更合适</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>顺序依赖不是一个理论洁癖问题。<strong>同一批比赛数据，换一个随机顺序跑一遍在线 Elo，模型的名次可能改变。</strong>这意味着「Elo 分数」这个数字本身不是数据的函数，而是<em>数据加上你处理它的顺序</em>的函数。<strong>公开榜单如果用在线 Elo，必须固定并公布顺序，否则不可复现</strong>——这与 C66 模块 05 的 harness 指纹是同一件事。notebook 第 2 节会把这个抖动量化出来。</p>
+  </div>  <p>一个折中方案在实践中很常用：<strong>用批量 BT 出正式排名，用在线 Elo 做实时预览。</strong>两者的差距本身也是一个有用的监控信号——差得越大，说明数据里的时间结构越强（可能是模型在漂移，也可能是配对策略随时间变了）。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="intervals"><span class="num">4</span>置信区间：排行榜上相差 20 分算不算差距</h2>
+  <p>这是本模块最有实际价值的一节。<strong>没有区间的排行榜，是一份鼓励过度解读的文档。</strong></p>  <h3>两种算区间的方式</h3>  <table>
+    <thead><tr><th>方法</th><th>怎么做</th><th>优点</th><th>注意</th></tr></thead>
+    <tbody>
+      <tr><td><strong>自举</strong></td><td>对<em>比较记录</em>重采样，每次重新拟合 BT，取分位数</td><td>不依赖渐近假设；能处理正则化</td><td>慢（要拟合几百次）；<strong>重采样单位必须是「一场比较」而不是「一个模型」</strong></td></tr>
+      <tr><td><strong>Fisher 信息 / Hessian</strong></td><td>从对数似然的二阶导算标准误</td><td>快</td><td>是渐近结果，小样本或稀疏图上不准</td></tr>
+    </tbody>
+  </table>  <p>推荐<strong>自举</strong>——它慢，但 BT 拟合本身很快（几千场比较、十几个模型，一次拟合是毫秒级），跑 500 次自举也就几秒钟。</p>  <h3>从区间到「名次」</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>有了每个模型的区间，怎么报名次？<strong>正确做法不是按点估计排 1、2、3，而是给出「排名区间」</strong>：在自举的每一次重采样里都算一遍名次，然后报这个名次的分布。<strong>Arena 类榜单报的「rank」通常就是这个意思：与你区间重叠的模型都算并列。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：设自举重采样得到 $B$ 组参数 $\{\theta^{(b)}\}$，模型 $i$ 的排名分布为 $\{r_i^{(b)}\}$。报告 <strong>$[\text{quantile}_{2.5\%}(r_i),\ \text{quantile}_{97.5\%}(r_i)]$</strong>。<em>这个区间比分数区间更直接地回答了读者关心的问题——「这个模型到底是第几名」。</em>另一个等价的报法是<span class="term">显著优于计数</span>：模型 $i$ 显著优于多少个其他模型（区间不重叠且方向为正），用这个数排序得到的名次天然是并列友好的。</p></div>
+  </div>  <h3>那 20 个 Elo 分到底算不算</h3>  <p>把第 2 节的换算和区间宽度放在一起，就能回答这个问题：</p>  <ul>
+    <li>20 个 Elo 分 ≈ 0.115 logit ≈ <strong>52.9% 的胜率</strong>；</li>
+    <li>要把 52.9% 与 50% 区分开（$z = 2$），按模块 03 的公式需要约 <strong>1200 场</strong>比较；</li>
+    <li><strong>而 Arena 类榜单上一对模型之间的直接对局往往只有几百场</strong>（其余信息来自与共同对手的间接比较）。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>所以一条可以直接用的读榜规则：<strong>看区间，不看名次。</strong>区间重叠的模型就是并列，无论它们的点估计差了多少分。<em>而如果一份榜单不给区间，你可以用一个粗糙的心算：几千场比较对应的区间半宽通常在 ±10 到 ±20 Elo 分之间，所以相差 30 分以内的名次基本可以当成并列。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="transitivity"><span class="num">5</span>传递性：BT 假设了它，而 LLM judge 经常违反它</h2>
+  <p>BT 模型把每个模型压缩成一个标量，这隐含了一个强假设：<strong>如果 A 通常赢 B、B 通常赢 C，那么 A 通常赢 C。</strong>这叫<span class="term">随机传递性</span>。</p>  <p><strong>而 LLM judge 的成对偏好经常违反它。</strong>违反的典型来源有两个：</p>  <ol>
+    <li><strong>能力不是一维的。</strong>A 擅长代码、B 擅长写作、C 擅长推理，在一个混合任务集上，三者可能形成一个循环——这不是 judge 出错，而是<em>「一个标量」这个模型本身不够用</em>。</li>
+    <li><strong>judge 的偏差与对局有关。</strong>如果 A 长 B 短、B 结构化 C 不结构化，长度偏差与格式偏差在不同对局里权重不同，也会造出循环。<em>这一种是真的错，可以靠模块 02 的去偏减轻。</em></li>
+  </ol>  <h3>怎么检测</h3>  <table>
+    <thead><tr><th>方法</th><th>怎么做</th><th>读法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>三元环计数</strong></td><td>枚举所有三元组，统计形成循环（A&gt;B&gt;C&gt;A）的比例</td><td>与「随机胜负下的期望循环率」比较，显著更高才算异常</td></tr>
+      <tr><td><strong>BT 拟合优度</strong></td><td>用拟合出的 $\theta$ 预测每一对的胜率，与实际胜率比较</td><td><strong>系统性的残差结构</strong>（不是随机噪声）说明一维不够用</td></tr>
+      <tr><td><strong>分任务类型拟合</strong></td><td>在代码/写作/推理子集上各拟合一套 BT，看排名是否一致</td><td><strong>最有信息量</strong>：排名不一致直接证明能力是多维的</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>有一个特别值得警惕的现象：<strong>「总榜第一」经常在每个子任务上都不是第一。</strong>这不矛盾——总榜是各子任务按<em>某个隐含权重</em>加权的结果，而这个权重来自任务集的构成比例，往往没人显式选择过。<strong>换句话说，总榜的排名有一部分是由「任务集里代码题占多少比例」决定的。</strong><em>这就是为什么分任务榜比总榜更有决策价值。</em></p>
+  </div>  <p>如果检测到严重的传递性违反，处理方式按代价从低到高：</p>  <ul>
+    <li><strong>分维度报告</strong>——最简单也最诚实：不出总榜，出几个子榜；</li>
+    <li><strong>先去偏再拟合</strong>——如果循环来自 judge 偏差（第 2 类来源），去偏能减轻；</li>
+    <li><strong>多维模型</strong>——把 $\theta_i$ 换成向量，用类似 Blade-Chest 的低秩模型。<em>数据需求大幅上升，通常只在数据非常充足时才值得。</em></li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="active"><span class="num">6</span>主动配对：同样的预算，多买到多少信息</h2>
+  <p>配对策略是排名系统里一个经常被忽略、但收益很大的杠杆。<strong>随机配对会把大量预算浪费在「早就知道结果」的对局上。</strong></p>  <div class="ascii">   随机配对                          主动配对（不确定性最大化）
+   ┌─────────────────────┐          ┌─────────────────────────────┐
+   │ 最强 vs 最弱: 大量场次│          │ 最强 vs 最弱: 少量场次(结果已知)│
+   │ 结果几乎确定 → 0 bit  │          │ 强度接近的对: 大量场次        │
+   │                     │          │ 预测胜率≈50% → 接近 1 bit/场   │
+   └─────────────────────┘          └─────────────────────────────┘
+      信息效率低                        信息效率高（但引入了选择偏倚）</div>  <div class="math-block">\[\text{单场信息量} \approx H\big(\sigma(\theta_i - \theta_j)\big) \quad\text{（二元熵，在 } \theta_i = \theta_j \text{ 时最大）}\]</div>  <table>
+    <thead><tr><th>策略</th><th>怎么选下一对</th><th>收益</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>随机</strong></td><td>均匀抽两个模型</td><td>无偏；覆盖均匀；实现最简单</td><td>把预算浪费在结果已知的悬殊对局上</td></tr>
+      <tr><td><strong>不确定性最大化</strong></td><td>选当前预测胜率最接近 50% 的一对</td><td><strong>相邻名次的区间显著变窄</strong></td><td>悬殊对的估计变成纯外推，那些对的区间反而变宽</td></tr>
+      <tr><td><strong>方差缩减</strong></td><td>选能最大程度缩小<em>某个特定名次判断</em>不确定度的一对</td><td>针对性最强</td><td>需要先声明你关心哪个判断</td></tr>
+      <tr><td><strong>混合</strong></td><td>$\epsilon$ 概率随机 + $1-\epsilon$ 主动</td><td><strong>推荐</strong>：兼顾效率与覆盖</td><td>多一个超参数</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>notebook 第 6 节会跑出一个值得记住的结果：<strong>主动配对并不是「全面更好」，而是「把精度搬了个地方」</strong>——相邻名次的差值区间窄了，但「能被显著区分开的模型对」总数反而<em>少了</em>。这完全说得通：预算是守恒的，你把它挪到难分的对上，悬殊的对就只能靠模型外推。<em>所以「用哪种配对策略」取决于你要回答哪个问题——「谁是第一」用主动，「给我一个完整可信的全表」用随机。</em></p>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>主动配对有一个必须处理的副作用：<strong>它让数据不再是「随机缺失」的。</strong>如果你只在强度接近的对之间收集数据，那么「强弱悬殊的对」的估计就完全依赖模型外推——<em>而这恰恰是传递性假设发挥作用最强、也最可能失效的地方</em>。<strong>缓解：保留一定比例的随机配对（$\epsilon \ge 0.1$），并在报告里注明配对策略。</strong></p>
+  </div>  <p><em>顺带一提：这个问题与 C13 的 bandit 探索-利用是同一个结构</em>——「利用」是去比最有信息量的对，「探索」是保持覆盖。区别在于这里的目标不是最大化累积回报，而是最小化排名的不确定度。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="style-control"><span class="num">7</span>把去偏接进排名：带协变量的 BT</h2>
+  <p>模块 02 讲了长度控制回归，模块本节讲排名。两者可以合成一个模型——<strong>这是目前 Arena 类榜单「风格控制」版本的做法。</strong></p>  <div class="math-block">\[\operatorname{logit}\Pr(i \succ j) = (\theta_i - \theta_j) + \gamma^\top (x_i - x_j)\]</div>  <p>其中 $x$ 是风格特征向量（长度、markdown 标题数、列表项数、代码块数…），$\gamma$ 是这些特征的效应。<strong>拟合后把 $x_i - x_j$ 设为 0，得到的 $\theta$ 就是「控制风格后的强度」。</strong></p>  <table>
+    <thead><tr><th>版本</th><th>$\theta$ 的含义</th><th>什么时候看这个</th></tr></thead>
+    <tbody>
+      <tr><td><strong>原始 BT</strong></td><td>「模型在这个 judge 眼里有多受欢迎」</td><td>你关心真实用户偏好，且用户也吃这一套</td><td>—</td></tr>
+      <tr><td><strong>风格控制 BT</strong></td><td>「排除掉长度与格式效应后的强度」</td><td><strong>你关心内容质量本身</strong>，或者担心模型在优化风格</td><td>—</td></tr>
+      <tr><td><strong>两者之差</strong></td><td><strong>这个模型的排名有多少来自风格</strong></td><td><em>这个差值本身是最有信息量的一列</em></td><td>—</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>第三行值得强调：<strong>「原始名次 vs 风格控制后名次」的变化量，是一个直接可读的诊断量。</strong>一个模型在风格控制后掉了五名，说明它的优势有相当部分来自「写得长、排版好」；<em>这未必是坏事（如果用户确实喜欢），但它必须被知道，而不是被混在一个总分里。</em></p>
+  </div>  <p>实现上有两个细节值得注意：</p>  <ul>
+    <li><strong>风格特征要标准化</strong>，理由与模块 02 相同——量纲不同会让某个特征获得不成比例的杠杆；</li>
+    <li><strong>$\gamma$ 应当全局共享而不是每个模型一份</strong>：$\gamma$ 描述的是<em>judge 的偏好</em>，不是模型的属性。<em>如果你给每个模型一个自己的 $\gamma$，模型就能通过「假装自己的风格特别有效」来吸收掉质量差异，参数不可识别。</em></li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="reporting"><span class="num">8</span>排行榜的报告规范</h2>
+  <p>把本模块的结论压缩成一份可以照抄的模板：</p>  <pre><code>LEADERBOARD · judge=claude-sonnet-5, prompt e3a1f9c, swap=on
+拟合方法: Bradley–Terry MLE, L2 正则 λ=0.01, 基准=M4 固定为 0
+区间: 对**比较记录**自举 1000 次的 2.5%/97.5% 分位
+比较总数: 18,432 场   模型数: 12   比较图: 连通（最小边度 = 3）
+配对策略: 0.15 随机 + 0.85 不确定性最大化
+
+rank  model    Elo    95% CI        rank CI   显著优于  风格控制后 Elo   Δrank
+ 1    M3      1247  [1231, 1263]    [1,1]      11        1238            0
+ 2    M1      1198  [1180, 1215]    [2,3]       9        1152           -1
+ 2    M2      1176  [1154, 1198]    [2,4]       9        1183           +1
+ 4    M5      1102  [1068, 1136]    [4,6]       6        1096            0
+...
+注: rank CI 重叠的模型视为并列（M1 与 M2 并列第 2）。
+    Δrank = 风格控制后的名次变化。M1 掉一名说明其优势中有一部分来自长度/格式。
+
+传递性检查: 三元环比例 4.1%（随机期望 3.7%，n=220 三元组）→ 未见异常
+分任务榜: code / writing / reasoning 三个子榜的 Spearman 两两相关 0.71-0.88
+          → **总榜排名对任务集构成比例敏感，请优先看子榜**</code></pre>  <ul>
+    <li><strong>rank CI 比 Elo CI 更重要</strong>——读者真正关心的是名次；</li>
+    <li><strong>比较图连通性必须报</strong>——不连通时跨组比较毫无意义；</li>
+    <li><strong>配对策略必须报</strong>——它决定了哪些对的区间可信；</li>
+    <li><strong>风格控制版必须与原始版并列</strong>，且报出 Δrank；</li>
+    <li><strong>如果子榜之间相关不高，就该说「优先看子榜」</strong>——把这句话写出来，比让读者自己发现要负责得多。</li>
+  </ul>  <div class="callout danger"><span class="label"></span>
+    <p>最后重申模块 03 的那条前提，因为它在排名场景下同样成立且更隐蔽：<strong>本模块所有的统计工具，都建立在「judge 没有共有的系统偏差」这个前提上。</strong>如果所有比较都被同一个长度偏差污染，那么再精确的 BT 拟合、再窄的自举区间，也只是<em>对一个偏了的量的精确估计</em>。<strong>顺序永远是：先做偏差探针（02）→ 再做元评测（03）→ 最后才拟合排名（本模块）。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="leaderboard-hygiene"><span class="num">9</span>榜单卫生：三个会安静毁掉排行榜的操作</h2>
+  <p>最后一节讲三件在实践中反复出现、而且<strong>都不会报错</strong>的操作。它们的共同点是：数字照样算得出来，只是不再有意义。</p>  <h3>① 把不同 judge / 不同 prompt 的比较混在一起拟合</h3>  <p>这是最常见也最严重的一个。<strong>judge 换了，或者 prompt 改了一句，之前所有的比较记录就不能与新记录混在一起拟合 BT</strong>——因为 BT 假设所有比较来自同一个「评判者」。混拟合的结果是：<em>早期用旧 judge 比得多的模型，与后期用新 judge 比得多的模型，它们之间的相对位置由两个 judge 的系统差异决定，而不是由模型质量决定。</em></p>  <div class="callout danger"><span class="label"></span>
+    <strong>缓解办法只有两个，没有第三个</strong>：① judge 变更时<strong>作废历史数据</strong>，重新开始积累；② 在变更时设一个<strong>双跑重叠期</strong>，用同一批样本同时跑新旧 judge，估计出两者的系统差异，把它作为一个额外的协变量放进 BT（形式上与第 7 节的风格控制完全一样，只是协变量换成了「哪个 judge 判的」）。<em>第二个办法更好，但需要提前计划——变更之后再想做就来不及了。</em>
+  </div>  <h3>② 让新模型只和强对手比（或只和弱对手比）</h3>  <p>BT 能修正赛程不均衡（第 2 节演示过），但它<strong>修正的能力是有限的</strong>：一个模型只和 2 个对手比过 50 场，它的区间会非常宽——<em>而宽区间在按点估计排的榜单上是看不见的</em>。<strong>规范：榜单必须列出每个模型的总场次与对手数，并对场次低于阈值的模型显式标记「数据不足」而不是给它一个名次。</strong></p>  <h3>③ 在同一个榜单里混合「不同任务分布」的比较</h3>  <p>这是第 5 节传递性讨论的实践版本。如果早期的比较大多来自代码任务、后期大多来自写作任务，那么<strong>拟合出来的「总强度」实际上是一个随时间变化的加权平均</strong>，而这个权重从来没有人显式选择过。<em>症状是：一个模型的名次随着榜单积累新数据而缓慢漂移，而它自己一行代码都没改。</em></p>  <table>
+    <thead><tr><th>操作</th><th>症状</th><th>为什么不会报错</th><th>规范</th></tr></thead>
+    <tbody>
+      <tr><td>混合不同 judge</td><td>早期模型与后期模型的相对位置莫名其妙</td><td>BT 拟合对「谁判的」一无所知</td><td>作废历史 或 双跑重叠期 + judge 作为协变量</td></tr>
+      <tr><td>赛程严重不均衡</td><td>某些模型的名次每周都在跳</td><td>点估计照样算得出来</td><td>列出场次与对手数；场次不足的标「数据不足」</td></tr>
+      <tr><td>混合不同任务分布</td><td>模型自己没变，名次却在漂</td><td>总强度是一个隐含加权平均</td><td>按任务分榜；总榜必须公布任务构成比例</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>三条的共同教训：<strong>排行榜的可信度，主要不取决于拟合方法有多精巧，而取决于<em>喂进去的比较记录是不是同质的</em>。</strong><em>而「同质」这件事必须靠流程保证（记录 judge 指纹、监控赛程、按任务打标），拟合阶段已经来不及了。</em></p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_meta_eval/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 元评测与校准</div></a>
+    <a class="next" href="../05_reward_models/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 奖励模型与过优化</div></a>
+  </div>
+
+</div>
+</body>
+</html>

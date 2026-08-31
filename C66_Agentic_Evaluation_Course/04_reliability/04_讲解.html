@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 可靠性与统计</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 可靠性与统计</h1>
+  <p class="subtitle">四个方差源分处不同层级：任务间与任务内可用统计处理，<strong>模拟器与 harness 的方差不是随机误差，是没被控制住的自变量</strong>，只能用工程消除 · <strong>pass@k 与 pass^k 只差一个位置，含义完全相反</strong>——判断标准只有一条：结果被执行之前，有没有人（或验证器）能挑一挑 · <strong>加重复的收益有天花板，加任务数的收益没有</strong>：$k\to\infty$ 只能把标准差压到 $\sqrt{\rho}$ 倍 · <strong>配对设计</strong>把最大的方差源直接消掉——500 道任务里往往只有两三成的不一致对携带信息 · <strong>把 $Nk$ 条 rollout 当独立样本是错的</strong>：独立单位是任务不是 rollout，朴素自举的区间窄近一半、覆盖率显著低于名义值 · <strong>「不显著」必须配着 MDE 一起报</strong> · <strong>胜者诅咒</strong>：20 个能力完全相同的模型，榜首平均虚高约 4–5 个点且复现时几乎必然易主</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 03（轨迹指标）；C03 模块 02（评测统计）读过更好，但本模块的自举、配对检验、功效分析都会从零推一遍</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_reliability_stats.ipynb（方差分解：任务间 vs 任务内 / pass@k 与 pass^k 的无偏估计 / 任务数与重复数的预算最优分配 / 聚类自举 vs 朴素自举的覆盖率对比 / McNemar 与配对自举 / 胜者诅咒模拟）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Chen et al., <em>Evaluating LLMs Trained on Code</em>（2021，pass@k 无偏估计器）· Yao et al., <em>τ-bench</em>（2024，pass^k）· Efron &amp; Tibshirani, <em>An Introduction to the Bootstrap</em>（1993，聚类自举）· Miller, <em>Adding Error Bars to Evals</em>（2024）· 本课程 C03 模块 02（统计显著性）· C10 模块 07（在线 A/B）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#variance-sources">一个 agent 分数的方差从哪来：四个来源与它们的层级</a></li>
+      <li><a href="#passk">pass@k 与 pass^k：两个指标，两种产品</a></li>
+      <li><a href="#paired">配对设计：把最大的方差源直接消掉</a></li>
+      <li><a href="#clustered-ci">置信区间：把 $Nk$ 次 rollout 当独立样本是错的</a></li>
+      <li><a href="#power">功效分析：要跑多少才够，以及预算该怎么切</a></li>
+      <li><a href="#winner-curse">排行榜上的胜者诅咒：为什么第一名的分数总是虚高</a></li>
+      <li><a href="#reporting">报告规范：一行不误导人的结果长什么样</a></li>
+      <li><a href="#sequential">序贯评测：跑到一半能不能停</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="variance-sources"><span class="num">1</span>一个 agent 分数的方差从哪来：四个来源与它们的层级</h2>
+  <p>模块 00 说过 agentic 评测有两个随机源。现在把它拆细——实际有四个，而且它们处在<strong>不同的层级</strong>，这决定了压方差的手段完全不同。</p>  <div class="ascii">   ┌─ ① 任务间方差 σ²_between ────────────────────────────────────┐
+   │   不同任务的难度不同。这是**最大**的方差来源，常占一半以上。   │
+   │   压制手段：**配对设计**（同一批任务比较两个 agent）           │
+   ├─ ② 任务内方差 σ²_within ─────────────────────────────────────┤
+   │   同一任务重复跑，结果时对时错。来自采样温度 + 环境随机性。     │
+   │   压制手段：**每个任务多跑几次**（k 次重复）                   │
+   ├─ ③ 用户/环境模拟器方差 ──────────────────────────────────────┤
+   │   模拟用户是另一个 LLM；页面加载时序、外部 API 抖动。          │
+   │   压制手段：钉死模拟器模型与温度；录制回放                     │
+   └─ ④ harness / 基础设施方差 ───────────────────────────────────┘
+       超时阈值、并发度、重试策略、容器调度。**换个并发度分数就变**。
+       压制手段：钉死配置并写进报告（05 模块）</div>  <p>四者中，只有 ① 和 ② 能用统计手段处理，③ 和 ④ 必须靠工程手段消除——<strong>它们不是随机误差，是没被控制住的自变量。</strong></p>  <div class="math-block">\[\operatorname{Var}(\bar{X}) = \frac{\sigma^2_{\text{between}}}{N} + \frac{\sigma^2_{\text{within}}}{N k}\]</div>  <p>其中 $N$ 是任务数、$k$ 是每个任务的重复次数。这个式子有一个非常实用的推论：</p>  <div class="callout intuition"><span class="label"></span>
+    <strong>加重复次数 $k$ 的收益有天花板，加任务数 $N$ 的收益没有。</strong>把 $k$ 从 1 加到无穷，方差最多降到 $\sigma^2_{\text{between}}/N$——换算成标准差，最多只能压到 $k=1$ 时的 $\sqrt{\rho}$ 倍（$\rho$ 是组内相关系数，见第 4 节）。agent 评测的 $\rho$ 常在 0.4–0.8，也就是说<strong>把重复次数加到无穷，标准差最多只降三到四成</strong>。<em>反过来，$N$ 翻倍两项一起减半。所以「先扩任务集，再加重复」几乎总是对的</em>——除非你的目标是 pass^k 这种<strong>本身就定义在重复上</strong>的指标。
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>但是——这里有个真实的成本约束把上面这条建议部分推翻了：<strong>agentic 任务的边际成本极高</strong>。加一道任务要写环境、写判分器、做人工审核；加一次重复只要多花一次 API 调用。所以现实里的最优解通常是「任务数被预算卡死在 $N$，然后在剩下的钱里选 $k$」。notebook 第 3 节会把这个取舍算成一道最优化题。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：在预算约束 $N c_{\text{task}} + N k c_{\text{run}} \le B$ 下最小化 $\frac{\sigma^2_b}{N} + \frac{\sigma^2_w}{Nk}$，可以解出最优重复次数 $k^{*} = \sqrt{\dfrac{\sigma^2_w}{\sigma^2_b} \cdot \dfrac{c_{\text{task}}}{c_{\text{run}}}}$。<strong>这是经典的整群抽样最优分配公式</strong>：任务越贵（$c_{\text{task}}$ 大）、任务内噪声越大（$\sigma^2_w$ 大），就越该在每个任务上多跑几次。<em>它同时解释了为什么 SWE-bench 类基准（任务极贵）值得多跑几个 epoch，而合成任务集（任务几乎免费）应该直接扩任务数。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="passk"><span class="num">2</span>pass@k 与 pass^k：两个指标，两种产品</h2>
+  <p>这是本模块最需要被记住的一节。两个符号只差一个位置，含义完全相反。</p>  <table>
+    <thead><tr><th>指标</th><th>问的问题</th><th>公式（$n$ 次采样中成功 $c$ 次的无偏估计）</th><th>适用场景</th></tr></thead>
+    <tbody>
+      <tr><td><strong>pass@k</strong></td><td>试 $k$ 次，<strong>至少</strong>成功一次的概率</td><td>$1 - \dfrac{\binom{n-c}{k}}{\binom{n}{k}}$</td><td>结果<strong>有人复核或有验证器</strong>：代码补全、候选生成、best-of-n</td></tr>
+      <tr><td><strong>pass^k</strong></td><td>试 $k$ 次，<strong>全部</strong>成功的概率</td><td>$\dfrac{\binom{c}{k}}{\binom{n}{k}}$</td><td>结果<strong>直接执行、没人复核</strong>：自动退款、自动改配置、自动发邮件</td></tr>
+    </tbody>
+  </table>  <p>为什么必须用无偏估计器而不是「跑 $k$ 次数一数」？因为后者只用了一次实验的信息，方差极大。无偏估计器的思路是：<strong>跑 $n \gg k$ 次，然后计算「从这 $n$ 次里随机抽 $k$ 次会发生什么」的期望</strong>，这等价于对 $\binom{n}{k}$ 种抽法求平均，方差大幅降低。</p>  <div class="ascii">   单任务成功率 p = 0.7 时：
+
+   k:        1      2      3      5      8
+   pass@k  0.700  0.910  0.973  0.998  1.000   ← 随 k 单调**上升**，很快饱和到 1
+   pass^k  0.700  0.490  0.343  0.168  0.058   ← 随 k 单调**下降**，指数衰减
+
+   同一个 agent，报 pass@8 是"接近完美"，报 pass^8 是"基本不可用"。
+   两个数字都没撒谎——它们回答的是两个不同的产品问题。</div>  <div class="callout danger"><span class="label"></span>
+    <strong>用错指标是 agent 评测里最常见、也最有实际后果的错误。</strong>一个客服 agent 的 pass@8 有 99%，听起来可以上线；但它每次处理一个真实工单只有<em>一次</em>机会，没人会帮它挑八个候选里最好的那个——真正决定产品体验的是 pass^1（即单次成功率）和它在重复运行下的稳定性。<strong>判断标准只有一条：<em>结果被执行之前，有没有人（或验证器）能挑一挑？</em></strong>有 → pass@k；没有 → pass^k。
+  </div>  <h3>pass^k 的另一层含义：它在测「一致性」而不只是「能力」</h3>  <p>如果一个 agent 的行为完全确定（同一输入永远同一输出），那么 $\text{pass}^k = \text{pass}^1$ 对所有 $k$ 成立——曲线是水平的。<strong>pass^k 随 $k$ 下降得越快，说明这个 agent 的行为越不稳定。</strong>所以 $\text{pass}^1 - \text{pass}^k$ 这个差值本身就是一个有用的<em>不一致性指标</em>，它把「能力」和「可靠性」分开了：<em>能力决定曲线的起点，可靠性决定曲线的斜率</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="paired"><span class="num">3</span>配对设计：把最大的方差源直接消掉</h2>
+  <p>回到第 1 节的结论：任务间方差占大头。配对设计的全部思想就是<strong>不去估计它</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>独立设计问的是「A 的平均分是多少？B 的平均分是多少？两者差多少？」——这里面「任务有难有易」的波动被算了两遍。配对设计问的是「<strong>在同一道题上</strong>，A 和 B 谁赢？」——题目难度对两者是同一个数，做差的时候直接消掉了。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：设任务 $i$ 上 A 与 B 的得分为 $X_i, Y_i$，差值 $D_i = X_i - Y_i$。则 $\operatorname{Var}(D_i) = \operatorname{Var}(X_i) + \operatorname{Var}(Y_i) - 2\operatorname{Cov}(X_i, Y_i)$。<strong>由于两个 agent 在同一批任务上的得分高度正相关（难题对谁都难），$\operatorname{Cov}$ 项很大，$\operatorname{Var}(D_i)$ 远小于 $\operatorname{Var}(X_i) + \operatorname{Var}(Y_i)$。</strong>在二值结果的情形下，这直接退化为 <span class="term">McNemar 检验</span>：只有「一个对一个错」的<em>不一致对</em>携带信息，一致对（都对/都错）对差值的检验完全无贡献。</p></div>
+  </div>  <div class="math-block">\[\chi^2_{\text{McNemar}} = \frac{(|b - c| - 1)^2}{b + c}, \quad b, c \text{ 是两类不一致对的计数}\]</div>  <table>
+    <thead><tr><th>设计</th><th>需要的任务数（区分 3 个点）</th><th>前提条件</th><th>什么时候不能用</th></tr></thead>
+    <tbody>
+      <tr><td>独立设计</td><td>每组约 4000+</td><td>无</td><td>—</td></tr>
+      <tr><td><strong>配对设计</strong></td><td>约 1500–2000（不一致率 20% 时）</td><td><strong>两个 agent 必须跑同一批任务、同一套 harness</strong></td><td>任务集在两次运行之间变过；harness 版本变过</td></tr>
+      <tr><td>配对 + 多次重复</td><td>更少（用任务内均值代替 0/1，进一步降方差）</td><td>同上 + 记录了 <code>attempt</code> 字段</td><td>预算不允许</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>配对设计有一个必须遵守的纪律：<strong>两个 agent 的运行必须在同一次评测运行里完成，或者至少共享完全相同的环境快照</strong>。如果你今天跑 A、下周跑 B，中间容器镜像更新过、外部 API 改过、任务集补过题，那么这就<em>不是</em>配对设计——你以为消掉了任务难度，实际上引入了一个更大的时间混杂因素。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="clustered-ci"><span class="num">4</span>置信区间：把 $Nk$ 次 rollout 当独立样本是错的</h2>
+  <p>一个极其常见的错误：跑了 500 道任务 × 每题 5 次 = 2500 条轨迹，然后按 $n = 2500$ 算置信区间。<strong>这会把区间宽度低估到只有真实值的一半左右。</strong></p>  <p>原因是同一任务的 5 次重复<strong>不独立</strong>——它们共享同一个任务难度。统计学上这叫<span class="term">整群结构</span>（clustered data），有效样本量不是 $Nk$，而是</p>  <div class="math-block">\[n_{\text{eff}} = \frac{Nk}{1 + (k-1)\rho}\]</div>  <p>其中 $\rho$ 是<strong>组内相关系数</strong>（intra-cluster correlation）。在 agent 评测里 $\rho$ 通常很高（0.4–0.8），因为任务难度主导一切。取 $\rho = 0.7$、$k = 5$：$n_{\text{eff}} = 2500 / (1 + 4 \times 0.7) = 658$——<strong>不到名义样本量的三成。</strong></p>  <h3>正确做法：按任务重采样的聚类自举</h3>  <pre><code># 错误：把每条轨迹当独立样本
+boot = rng.choice(all_2500_rollouts, size=2500)          # ✗ 区间会窄一半
+
+# 正确：重采样「任务」，每个被抽中的任务连同它的全部 k 次重复一起进来
+task_ids = rng.choice(unique_tasks, size=N, replace=True) # ✓
+boot = concat(rollouts_of(t) for t in task_ids)</code></pre>  <div class="callout intuition"><span class="label"></span>
+    <p>记忆口诀：<strong>自举要重采样「最外层的独立单位」</strong>。在 agent 评测里，独立单位是<em>任务</em>，不是 rollout，也不是步骤。同理，如果你的任务集里同一个仓库贡献了 30 道题，严格来说独立单位是<em>仓库</em>而不是任务——这会让区间进一步变宽。<em>要不要做到这一层，取决于你的结论是想推广到「这些任务」还是「这类仓库」。</em></p>
+  </div>  <p>notebook 第 4 节会用模拟验证这件事：构造一个已知真值的场景，分别用朴素自举和聚类自举算 95% 区间，统计<strong>覆盖率</strong>（真值落在区间内的比例）。朴素自举的覆盖率会显著低于 95%——<em>这是评测报告里「误差棒画得太窄」的直接来源</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="power"><span class="num">5</span>功效分析：要跑多少才够，以及预算该怎么切</h2>
+  <p>把前四节合起来，就能回答那个每次都会被问到的问题：<strong>「我要跑多少才够？」</strong></p>  <h3>三个必须先回答的前置问题</h3>  <ol>
+    <li><strong>你要检测多大的差异？</strong>（最小实际重要差异 MDE）「任何差异都想检测」等价于「需要无穷样本」。先想清楚：差 1 个点会改变你的决策吗？如果不会，就别把它设成 MDE。</li>
+    <li><strong>你能接受多大的假阳性率与假阴性率？</strong>研究场景常用 $\alpha = 0.05, \text{power} = 0.8$；<em>但 CI 门禁场景（C68-04）应该用完全不同的取值</em>——误报会让整个团队开始忽略告警，所以 $\alpha$ 要设得很低。</li>
+    <li><strong>你的预算是多少？</strong>如果算出来需要 4000 道任务而你只有 500 道，正确的反应不是「凑合跑」，而是<strong>改变结论的形式</strong>：从「A 比 B 强」改成「在 500 道任务上没有观察到显著差异，检测下限是 8 个点」。</li>
+  </ol>  <div class="callout danger"><span class="label"></span>
+    <p>第 3 条值得特别强调，因为它是这门课里最容易被跳过、也最影响诚信的一步。<strong>「没有观察到显著差异」和「两者相同」不是一回事</strong>。一份负责任的报告必须给出<em>检测下限</em>：「本次评测能以 80% 的功效检出 ≥8 个百分点的差异；实测差异 3 个点，不显著」——这句话既诚实又有信息量，而「A 和 B 差不多」这句话两样都不是。</p>
+  </div>  <h3>预算分配的实用结论</h3>  <table>
+    <thead><tr><th>场景</th><th>$\sigma^2_w / \sigma^2_b$</th><th>任务边际成本</th><th>推荐 $k$</th><th>理由</th></tr></thead>
+    <tbody>
+      <tr><td>合成任务集、判分确定性高</td><td>低（0.1–0.3）</td><td>极低</td><td><strong>1–2</strong></td><td>把钱全花在扩任务数上</td></tr>
+      <tr><td>公开基准（SWE-bench 类）</td><td>中（0.3–0.6）</td><td>高（任务是别人建好的，但每次跑很贵）</td><td><strong>3–5</strong></td><td>常见的 <code>--epochs 5</code> 就是这么来的</td></tr>
+      <tr><td>自建高保真环境（客服/GUI）</td><td>高（0.6–1.0）</td><td>极高（每道题要写环境+判分器）</td><td><strong>5–10</strong></td><td>任务贵、噪声大，多跑几次比多写一道题便宜</td></tr>
+      <tr><td>要报 pass^k</td><td>—</td><td>—</td><td><strong>$n \ge 2k$</strong></td><td>无偏估计器需要 $n > k$，实践上取 $n \ge 2k$ 才够稳</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="winner-curse"><span class="num">6</span>排行榜上的胜者诅咒：为什么第一名的分数总是虚高</h2>
+  <p>最后一个统计陷阱，它解释了一个反复出现的现象：<strong>榜单第一名的成绩，在独立复现时往往会掉几个点。</strong>这不需要任何人作弊就会发生。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>机制很简单：如果 20 个模型的<em>真实</em>能力都差不多，那么榜首那个只是<strong>运气最好的那个</strong>——它的观测分数 = 真实能力 + 一个恰好为正的噪声。换一批任务重跑，噪声重新掷骰子，它就掉下来了。<strong>「取最大值」这个操作本身就是有偏的。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：设 $\hat{\theta}_i = \theta_i + \varepsilon_i$，$\varepsilon_i \sim \mathcal{N}(0, \sigma^2)$。则 $\mathbb{E}[\max_i \hat{\theta}_i] > \max_i \theta_i$，且当所有 $\theta_i$ 相等时，偏差约为 $\sigma \sqrt{2 \ln m}$（$m$ 为参赛者数量）。<em>$m = 20$、$\sigma = 2$ 个点时，榜首的期望虚高约 $2\sqrt{2\ln 20} \approx 4.9$ 个点</em>——这个量级完全足以解释「排行榜前几名挤在几个点内」的现象，也解释了为什么复现时会系统性地掉分。</p></div>
+  </div>  <table>
+    <thead><tr><th>缓解手段</th><th>怎么做</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>报置信区间而不是点估计</strong></td><td>榜单每一行都带误差棒；重叠的名次视为并列</td><td>榜单不再有唯一的第一名（这是好事）</td></tr>
+      <tr><td><strong>留出集</strong></td><td>榜单用公开集排名，最终结论用从未被优化过的留出集复核</td><td>需要额外维护一套任务</td></tr>
+      <tr><td><strong>收缩估计</strong></td><td>把各模型的分数向总体均值收缩（James–Stein / 经验贝叶斯）</td><td>单个模型的分数不再是「它自己的成绩」</td></tr>
+      <tr><td><strong>多重比较校正</strong></td><td>比较 $m$ 个模型时对 $\alpha$ 做 Bonferroni/BH 校正</td><td>更保守，可能漏掉真实差异</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>对读榜单的人，一条极其实用的经验法则：<strong>看排名前，先看误差棒宽度和任务数。</strong>500 道任务的基准，95% 区间大约是 ±4 个点——<em>这意味着榜单上相差 4 个点以内的名次，本质上是并列</em>。把它们读成「A 优于 B」是过度解读。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="reporting"><span class="num">7</span>报告规范：一行不误导人的结果长什么样</h2>
+  <p>把本模块的全部内容压缩成一个可以照抄的模板：</p>  <pre><code>resolve_rate (pass^1, micro):  34.2%  [30.1%, 38.4%]   N=500 tasks × k=5 attempts
+  ├─ 置信区间方法:              按任务聚类自举, 2000 次重采样
+  ├─ 有效样本量 n_eff:          658  (ρ=0.70, 名义 2500)
+  ├─ pass@5:                    58.1%     ← 有验证器/人复核时才看这个
+  ├─ pass^5:                    12.7%     ← 直接执行、无复核时看这个
+  └─ 最小可检测差异 (MDE):      8.1 个百分点 (α=0.05, power=0.8, 配对设计)
+
+vs baseline (配对):             +3.1 个百分点  [-1.2, +7.5]   McNemar p = 0.14
+  └─ 结论: 未观察到显著差异；本次评测的检测下限是 8.1 个点，
+           实测差异 3.1 点落在检测能力之下——**不能得出「A 更强」的结论**。</code></pre>  <ul>
+    <li><strong>指标名要写全</strong>：<code>pass^1</code> 而不是「成功率」，<code>micro</code> 而不是「平均」——模块 02 已经证明了这些词各自对应不同的数字。</li>
+    <li><strong>$N$ 和 $k$ 必须分开写</strong>：写成「2500 次运行」是在误导读者，因为它们不是 2500 个独立样本。</li>
+    <li><strong>MDE 必须出现</strong>：没有 MDE 的「不显著」是没有信息量的。</li>
+    <li><strong>置信区间的计算方法必须写明</strong>：朴素自举和聚类自举给出的区间可以差一倍。</li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <p>最后一条容易被忽略的提醒：<strong>本模块所有的统计工具，都建立在「判分器是准确的」这个前提上。</strong>如果判分器有 5% 的假阳率（模块 02），那么再漂亮的置信区间也只是「对一个有偏的量的精确估计」。<em>顺序永远是：先量 bias，再压 var，最后写区间。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sequential"><span class="num">8</span>序贯评测：跑到一半能不能停</h2>
+  <p>agentic 评测很贵，所以一个很自然的想法是：<strong>边跑边看，差距明显了就提前停。</strong>这个想法是对的，但<em>朴素地执行会让假阳性率暴涨</em>——它是评测里最常见的统计错误之一。</p>  <h3>为什么「边跑边看」会作弊</h3>  <p>如果你每跑 50 道题就看一次 $p$ 值，一旦 $p &lt; 0.05$ 就停下来宣布显著，那么即使两个 agent 完全相同，你也<strong>迟早会碰到一次 $p &lt; 0.05$</strong>。检查 10 次的话，实际假阳性率会从 5% 涨到 20% 以上——这叫<span class="term">窥视问题</span>（peeking / optional stopping）。</p>  <div class="callout danger"><span class="label"></span>
+    <p>这个错误在 agent 评测里特别容易犯，因为评测是<strong>逐任务流式产出结果</strong>的，人天然会在跑的过程中盯着看。<strong>「跑到 300 题的时候看起来 A 明显更好，我们就停了」——这句话描述的是一次无效的实验。</strong></p>
+  </div>  <h3>三种正确做法</h3>  <table>
+    <thead><tr><th>方法</th><th>怎么做</th><th>适用场景</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>固定样本量</strong></td><td>事先按 MDE 算出 $N$，跑完再看</td><td>最简单、最不容易出错，<strong>默认选它</strong></td><td>不能提前停，跑满才有结论</td></tr>
+      <tr><td><strong>alpha spending</strong></td><td>把总的 $\alpha=0.05$ 按检查次数分配（如 O'Brien–Fleming 边界：早期极严、后期放宽）</td><td>评测很贵、希望有机会早停</td><td>需要事先声明检查时点与边界</td></tr>
+      <tr><td><strong>始终有效的推断</strong></td><td>用序贯置信序列（anytime-valid CI），它在任何时刻都成立</td><td>持续监控型评测（C68 的线上门禁）</td><td>区间比固定样本量的宽（这是随时可看的代价）</td></tr>
+    </tbody>
+  </table>  <p>三者的共同点是：<strong>「什么时候可以停」这件事必须在开始之前就定好</strong>，而不是看着数据决定。这一条纪律，和模块 05 的「harness 要事先钉死」是同一种性质的要求——<em>都是在防止一个自由度被事后利用</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>反过来说，有一种「提前停」是完全合法的，而且应该多用：<strong>停掉那些明显没救的单条轨迹</strong>（模块 03 的循环检测）。这不是统计上的提前停止——它不改变任务的判定结果，只是省下了本来也要浪费的预算，然后把这些预算投到别的任务上。<strong>省下的钱直接变成更大的 $N$，这是纯赚。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>区别在于停止规则作用的层级：<span class="term">序贯检验</span>的停止规则作用在<em>推断</em>层面（决定何时下结论），因此会影响第一类错误率；循环检测的停止规则作用在<em>单个样本的生成过程</em>上，只要它<strong>与该样本的最终标签独立</strong>（检出循环的轨迹本来就会失败），就不引入偏倚。<em>但这个「独立」必须被验证</em>——如果你的循环检测器偶尔会误杀本来能成功的轨迹，它就变成了一个有偏的截断，此时被终止的轨迹必须单独统计而不能简单记成失败。</p></div>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_trajectory/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 轨迹级与过程级评测</div></a>
+    <a class="next" href="../05_cost_harness/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 成本感知评测与 harness 可复现性</div></a>
+  </div>
+
+</div>
+</body>
+</html>

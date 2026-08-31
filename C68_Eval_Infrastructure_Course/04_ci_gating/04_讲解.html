@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · CI 回归门禁</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · CI 回归门禁</h1>
+  <p class="subtitle"><strong>门禁最可能的死法不是漏报，是误报太多以至于被关掉</strong>——漏报的代价是有限的（下一道防线还在），<strong>误报的代价是复利的</strong>（信任被持续消耗）；模拟显示 α=5% 的门禁 20/20 都在三周内被关掉，α=0.25% 的 20/20 全部存活 · <strong>α=0.05 是统计学的默认值，在论文里合理（一篇论文一次检验），在 CI 里是灾难性的（一天二十次检验 = 每天一次误报）</strong> · <strong>阈值三步法</strong>：测噪声 → 定误报预算 → 算阈值；<strong>阈值大到十几个点时，正确动作是去降噪而不是接受宽阈值</strong> · <strong>那四类阻断条件全是确定性的、误报率天然为零</strong>（完整性 / 指纹可比 / 绝对下限 / 安全断言），<em>很多团队一上来就去调统计阈值，却没先把这些建起来——顺序反了</em> · <strong>分数异常「升高」也必须告警</strong>：「只在下降时告警」会漏掉整整一类流水线事故 · <strong>配对把噪声砍到不到一半，而且零成本</strong>；<strong>regression-only 门禁</strong>更符合 CI 语义——职责是防止把东西弄坏，不是确认变好了 · <strong>连续两次才阻断：误报降两个数量级，检出率只掉 9 个点</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 03（结果存储与 run diff）；C66 模块 04（方差、MDE、配对检验）读过更好，但本模块会复述必要的部分</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_ci_gating.ipynb（用重复运行的方差推导门禁阈值 / 误报率与漏报率的权衡曲线 / 两级门禁：smoke 快检 + full 慢检 / 配对门禁 vs 绝对阈值门禁 / 告警疲劳的模拟：误报如何让门禁被关掉 / 金丝雀与分阶段放行）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Google, <em>Testing on the Toilet</em> 与 flaky test 治理实践 · Continuous Delivery 的门禁分层思想 · Wald 序贯概率比检验（SPRT，用于早停判定）· 本课程 C66 模块 04（MDE 与配对设计）· C10 模块 07（在线 A/B）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#failure-mode">门禁的终极失败模式：被关掉</a></li>
+      <li><a href="#threshold-from-variance">阈值必须从方差推出来，不能拍脑袋</a></li>
+      <li><a href="#what-to-gate">什么该阻断、什么只该警告</a></li>
+      <li><a href="#paired-gating">配对门禁：零成本地把噪声砍一半</a></li>
+      <li><a href="#two-tier">两级门禁：smoke 快检 + full 慢检</a></li>
+      <li><a href="#alert-fatigue">告警疲劳：把「误报率」翻译成「多久没人信了」</a></li>
+      <li><a href="#canary">金丝雀与分阶段放行</a></li>
+      <li><a href="#gate-ops">门禁的运维：override、基线更新与例外流程</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="failure-mode"><span class="num">1</span>门禁的终极失败模式：被关掉</h2>
+  <p>先说结论，因为它决定了本模块所有的设计取向：<strong>一个评测门禁最可能的死法，不是漏掉了真实退化，而是误报太多以至于团队把它关掉了。</strong></p>  <div class="ascii">   门禁的生命周期（最常见的那条）
+   ┌────────────────────────────────────────────────────────────┐
+   │ 第 1 周   上线，阈值拍脑袋定成「掉 2% 就阻断」              │
+   │ 第 2 周   开始零星误报，大家手动 override                   │
+   │ 第 4 周   误报变成常态，override 成了肌肉记忆                │
+   │ 第 6 周   有人说「这个门禁总是乱报」→ 改成只警告不阻断        │
+   │ 第 8 周   警告没人看                                        │
+   │ 第 12 周  一个真实退化上线了，而门禁**当时确实报了**         │
+   └────────────────────────────────────────────────────────────┘
+   教训：**门禁的可信度是一种会被消耗的资源。**</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以门禁设计的第一原则不是「尽可能敏感」，而是<strong>「误报率必须低到人们愿意相信它」</strong>。<em>一个每周误报一次的门禁，在第四次误报之后就不再是门禁了</em>——它变成了一个需要被绕过的障碍。<strong>而漏报的代价是有限的（下一道防线还在），误报的代价是复利的（信任被持续消耗）。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，门禁是一个假设检验：$H_0$「没有退化」vs $H_1$「有退化」。常规统计里我们通常固定 $\alpha = 0.05$；<strong>但 CI 门禁的场景要求 $\alpha$ 显著更低</strong>，因为它每天要被执行几十次——<em>$\alpha = 0.05$ 意味着每 20 次提交就有一次误报，一周下来就是好几次</em>。把「每次运行的误报率」换算成「每周的误报次数」，是设定阈值时唯一有意义的口径。本模块 notebook 第 2 节会把这个换算做出来。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一条可以直接用的目标：<strong>把误报频率定在「每月至多一次」</strong>。<em>按每天 20 次 CI 运行算，这对应单次误报率约 $1/400 = 0.25\%$</em>——比常规的 5% 严格 20 倍。<strong>这个约束会直接推出你需要多大的样本量和多宽的阈值</strong>，而不是反过来「先定阈值再看误报多不多」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="threshold-from-variance"><span class="num">2</span>阈值必须从方差推出来，不能拍脑袋</h2>
+  <p>模块 00 的反模式清单第六条是「CI 门禁阈值拍脑袋定」。这一节给出替代方案。</p>  <h3>三步法</h3>  <ol>
+    <li><strong>测噪声</strong>：<em>用同一个配置、同一份任务集，重复跑 $R$ 次</em>（$R \ge 10$），得到分数的标准差 $\sigma_{\text{run}}$。<strong>这一步是不可跳过的</strong>——没有它，后面全是猜。</li>
+    <li><strong>定误报预算</strong>：把「每月至多一次误报」换算成单次误报率 $\alpha$。</li>
+    <li><strong>算阈值</strong>：$\text{threshold} = z_{\alpha} \cdot \sigma_{\text{run}} \cdot \sqrt{2}$（$\sqrt{2}$ 是因为「当前」与「基线」两次运行都有噪声）。</li>
+  </ol>  <div class="math-block">\[\text{threshold} = z_{\alpha}\,\sigma_{\text{run}}\sqrt{2}, \qquad \alpha = \frac{1}{\text{每月运行次数}}\]</div>  <table>
+    <thead><tr><th>$\sigma_{\text{run}}$</th><th>每天 20 次 CI 的阈值（月误报 1 次）</th><th>能检出的最小退化</th><th>评价</th></tr></thead>
+    <tbody>
+      <tr><td>0.5 个点</td><td>±1.9 个点</td><td>≥ 2 个点</td><td><strong>健康</strong>：噪声小，门禁灵敏</td></tr>
+      <tr><td>1.5 个点</td><td>±5.8 个点</td><td>≥ 6 个点</td><td>勉强：只能抓大退化</td></tr>
+      <tr><td>3.0 个点</td><td>±11.6 个点</td><td>≥ 12 个点</td><td><strong>门禁基本没用</strong>：先去降噪，别调阈值</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>最后一行是本节最重要的一条：<strong>当噪声大到阈值必须放宽到十几个点时，正确的动作不是「接受这个宽阈值」，而是去降噪</strong>——增加样本量、固定温度、增加重复次数、改用配对门禁（第 4 节）。<em>一个只能检出 12 个点退化的门禁，几乎不可能抓到任何真实问题，它的存在只是给人一种「我们有门禁」的错觉。</em></p>
+  </div>  <h3>降噪的四条路径，按性价比排序</h3>  <ul>
+    <li><strong>配对门禁</strong>（第 4 节）——把任务难度这个最大的方差源消掉，通常能把 $\sigma$ 砍掉一半以上，<em>而且是零额外成本</em>；</li>
+    <li><strong>temperature = 0</strong>——消掉采样随机性；代价是失去了对随机性的覆盖；</li>
+    <li><strong>增加重复次数 $k$</strong>——方差降到 $\sigma_b^2/N + \sigma_w^2/(Nk)$，<em>有天花板</em>（C66-04）；</li>
+    <li><strong>增加任务数 $N$</strong>——两项一起降，但 smoke 集要跑得快，这条有上限。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="what-to-gate"><span class="num">3</span>什么该阻断、什么只该警告</h2>
+  <p>不是所有异常都该拦住合并。<strong>门禁分级是降低误报感知的关键手段</strong>——把「必须停」和「值得看一眼」分开，前者才有资格打断人。</p>  <table>
+    <thead><tr><th>级别</th><th>触发条件</th><th>动作</th><th>为什么是这一级</th></tr></thead>
+    <tbody>
+      <tr><td><strong>BLOCK 阻断</strong></td><td>① 完整性校验失败（模块 03）<br>② 指纹与基线不可比（模块 01）<br>③ 分数低于绝对下限<br>④ <strong>安全/合规类断言失败</strong></td><td>阻止合并</td><td>这四类<strong>不涉及统计判断</strong>——它们是确定性的，误报率天然为零</td></tr>
+      <tr><td><strong>BLOCK（统计）</strong></td><td>配对检验 p &lt; α 且 净退化 ≥ MDE</td><td>阻止合并</td><td><strong>唯一一类基于统计的阻断</strong>，阈值必须从方差推出</td></tr>
+      <tr><td><strong>WARN 警告</strong></td><td>分数下降但不显著；churn 异常高；成本上升 &gt; 20%</td><td>在 PR 上留言，不阻断</td><td>值得看一眼，但不足以停下所有人</td></tr>
+      <tr><td><strong>INFO</strong></td><td>切片变化、延迟变化、缓存命中率</td><td>写进报告</td><td>诊断用</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>第一行值得特别强调：<strong>那四类阻断条件全都是确定性的，不涉及任何统计推断</strong>——「数据集版本不一致」「行数对不上」「指纹与基线不同」「模型输出了不该输出的东西」，这些要么是要么不是。<em>它们的误报率天然为零，所以它们是门禁里最可信、也最该优先建设的部分</em>。<strong>很多团队一上来就去调统计阈值，却没有先把这些零误报的确定性检查建起来——顺序反了。</strong></p>
+  </div>  <h3>绝对下限：一个便宜的兜底</h3>  <p>模块 01 的 datasheet 里有一条「预期分数区间」。它在门禁里的用法很直接：<strong>分数掉出这个区间就阻断，无论统计上显不显著。</strong><em>这条能抓住「判分器坏了」「任务集被换成了 smoke」「答案泄漏进 prompt」这类流水线事故——它们造成的分数变化通常是灾难性的，不需要统计检验就能看出来。</em></p>  <p>同样地，<strong>分数异常<em>升高</em>也应当触发检查</strong>。一个预期 30–50% 的任务集突然跑出 95%，几乎肯定是流水线出了问题。<em>「只在分数下降时告警」是一个非常常见、但会漏掉整整一类事故的设计。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="paired-gating"><span class="num">4</span>配对门禁：零成本地把噪声砍一半</h2>
+  <p>这是本模块投入产出比最高的一条工程建议。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>绝对阈值门禁问的是：「这次的分数 $s_{\text{new}}$ 比基线分数 $s_{\text{base}}$ 低多少？」——这里面混着<strong>任务难度的波动</strong>（如果任务集有任何变化）和<strong>两次运行各自的采样噪声</strong>。配对门禁问的是：「<em>在同一批任务上</em>，有多少题从对变错了、多少题从错变对了？」<strong>任务难度对两边是同一个数，做差时直接消掉。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：绝对差的方差是 $\operatorname{Var}(s_A) + \operatorname{Var}(s_B)$；配对差的方差是 $\operatorname{Var}(s_A) + \operatorname{Var}(s_B) - 2\operatorname{Cov}(s_A, s_B)$。<strong>由于两次运行在同一批任务上高度正相关（难题对谁都难），$\operatorname{Cov}$ 项很大</strong>，配对差的方差远小于绝对差。<em>在二值结果下这直接退化为 McNemar 检验：只有 fixed 与 regressed 这两类不一致对携带信息，一致对（都对/都错）完全不贡献</em>——这正是 C66 模块 04 与本课模块 03 已经出现过两次的同一个结构。</p></div>
+  </div>  <table>
+    <thead><tr><th>门禁类型</th><th>看什么</th><th>$\sigma$ 的量级</th><th>前提条件</th></tr></thead>
+    <tbody>
+      <tr><td><strong>绝对阈值</strong></td><td>$s_{\text{new}} - s_{\text{base}}$</td><td>基准</td><td>无</td></tr>
+      <tr><td><strong>配对</strong></td><td>fixed / regressed 的差</td><td><strong>通常只有一半或更小</strong></td><td>两次运行必须跑<strong>同一批任务</strong>（模块 03 的任务集一致性检查）</td></tr>
+      <tr><td>配对 + 多次重复</td><td>任务内均值的配对差</td><td>更小</td><td>同上 + 记录了 attempt</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>配对门禁有一个必须自动检查的前提：<strong>两次运行的任务集必须完全相同。</strong><em>如果基线跑了 500 条而当前只跑了 487 条（13 条超时被跳过），那么「配对」就名不副实</em>——而且被跳过的那些通常是最难的，<strong>这会系统性地让当前运行看起来更好</strong>。所以模块 03 练习 2 的 <code>same_task_set</code> 必须作为配对门禁的前置断言。</p>
+  </div>  <h3>regression-only 门禁：只看退化，不看净变化</h3>  <p>还有一个更严格、也更符合 CI 语义的变体：<strong>只要 regressed 超过阈值就阻断，不管 fixed 有多少。</strong></p>  <p>理由是：<em>CI 门禁的职责是「防止把东西弄坏」，不是「确认变好了」</em>。一个「修好 50 道、弄坏 30 道」的改动，净变化是 +20，但那 30 道退化可能包含核心路径。<strong>把 regressed 单独设一个阈值，并要求作者逐条解释，比看净变化更符合 CI 的目的</strong>——<em>而且这个规则本身也是零统计假设的，误报率只取决于噪声下的自发翻转率。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="two-tier"><span class="num">5</span>两级门禁：smoke 快检 + full 慢检</h2>
+  <p>成本与灵敏度是矛盾的：跑得快就样本少、噪声大、只能抓大退化。标准解法是分两级。</p>  <div class="ascii">   每次提交                      合并前 / 每日定时
+   ┌─────────────────────┐      ┌──────────────────────────┐
+   │ SMOKE               │      │ FULL                     │
+   │ 60 条 × 1 次        │      │ 500 条 × 3 次            │
+   │ 3-5 分钟            │      │ 1-3 小时                 │
+   │ σ ≈ 3-5 个点        │      │ σ ≈ 0.5-1 个点           │
+   │                     │      │                          │
+   │ 抓: 崩了/大退化      │      │ 抓: 2-3 个点的真实退化    │
+   │     确定性检查全套   │      │     统计门禁 + 切片分析   │
+   └─────────────────────┘      └──────────────────────────┘
+   关键: smoke 的**统计阈值要设得很宽**（甚至不设），
+         主要靠**确定性检查**（第 3 节第一行的那四类）来拦。</div>  <table>
+    <thead><tr><th>级别</th><th>跑什么</th><th>统计门禁</th><th>确定性门禁</th><th>触发时机</th></tr></thead>
+    <tbody>
+      <tr><td><strong>smoke</strong></td><td>60 条 × 1</td><td><strong>只在掉出绝对下限时阻断</strong></td><td><strong>全套</strong>（完整性/指纹/schema/安全断言）</td><td>每次提交</td></tr>
+      <tr><td><strong>full</strong></td><td>500 条 × 3</td><td>配对检验 + regression-only</td><td>全套</td><td>合并前 + 每日定时</td></tr>
+      <tr><td><strong>deep</strong></td><td>全量 × 5 + 多切片 + judge 体检</td><td>全套 + 元评测</td><td>全套</td><td>发版前 + 每周</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>这个分级里最容易做错的是<strong>给 smoke 配统计门禁</strong>。<em>60 条样本的 $\sigma$ 大约在 3–5 个点，按月误报一次算，阈值要放到 ±12 个点以上——</em><strong>而 12 个点的退化根本不需要统计检验就能看出来</strong>。所以 smoke 的正确定位是：<strong>跑确定性检查 + 抓灾难性变化</strong>，统计判断留给 full。</p>
+  </div>  <h3>smoke 真正该抓的东西</h3>  <ul>
+    <li><strong>流水线崩了</strong>——异常、超时率暴涨、判分器崩溃率暴涨；</li>
+    <li><strong>配置不可比</strong>——指纹与基线不同却没声明；</li>
+    <li><strong>灾难性变化</strong>——分数掉出预期区间（含异常升高）；</li>
+    <li><strong>安全/格式断言</strong>——输出不合 schema、触发了安全规则；</li>
+    <li><em>以及：跑得完</em>——smoke 本身跑挂了也是一个重要信号。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="alert-fatigue"><span class="num">6</span>告警疲劳：把「误报率」翻译成「多久没人信了」</h2>
+  <p>第 1 节说门禁会被关掉。这一节把它量化，因为<strong>只有量化了，「降低误报率」才会被当成一个优先级而不是一句正确的废话。</strong></p>  <div class="math-block">\[\Pr(\text{k 周内至少发生 } m \text{ 次误报}) \quad\text{—— 用它来选 } \alpha\]</div>  <p>一个简单的信任模型：<strong>每次误报消耗一定的信任，每次真报恢复一些信任；信任降到阈值以下，门禁就被降级或关掉。</strong>notebook 第 5 节会把这个模型跑出来，结论是：</p>  <table>
+    <thead><tr><th>单次误报率 $\alpha$</th><th>每天 20 次运行下的误报频率</th><th>门禁存活时间（模拟）</th><th>评价</th></tr></thead>
+    <tbody>
+      <tr><td>5%（常规统计默认）</td><td><strong>每天 1 次</strong></td><td>约 1–2 周</td><td>必然被关掉</td></tr>
+      <tr><td>1%</td><td>每周 1.4 次</td><td>约 1–2 个月</td><td>仍然偏高</td></tr>
+      <tr><td><strong>0.25%</strong></td><td><strong>每月 1.5 次</strong></td><td>长期存活</td><td><strong>推荐目标</strong></td></tr>
+      <tr><td>0.05%</td><td>每年 3.6 次</td><td>长期存活</td><td>过严，会漏掉真实退化</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>这张表最反直觉的一行是第一行：<strong>$\alpha = 0.05$ 这个统计学的默认值，在 CI 场景下意味着每天一次误报</strong>——<em>它在论文里是合理的（一篇论文做一次检验），在 CI 里是灾难性的（一天做二十次）。</em><strong>多重比较在 CI 门禁里不是一个理论问题，是一个每天都在发生的现实问题。</strong></p>
+  </div>  <h3>除了压低 α，还能做什么</h3>  <ol>
+    <li><strong>连续两次才阻断</strong>——单次异常只警告，连续两次运行都异常才阻断。<em>误报率从 $\alpha$ 降到约 $\alpha^2$，而真实退化会持续存在因此几乎不受影响</em>。<strong>这是性价比最高的一条</strong>；</li>
+    <li><strong>自动重跑一次再判</strong>——与上一条类似，但要注意<em>重跑的触发条件是「统计异常」而不是「结果不好」</em>（呼应模块 02 第 3 节的偏倚讨论），所以必须<strong>无条件重跑并取两次的合并结果</strong>，而不是「取更好的那次」；</li>
+    <li><strong>把 WARN 和 BLOCK 分开</strong>（第 3 节）——大部分异常只该 WARN；</li>
+    <li><strong>告警里带足够的诊断信息</strong>——<em>一个说「分数掉了 3.2 个点，其中 hard 切片掉了 8 个点，退化的 12 道题里有 9 道在 billing 子系统」的告警，比一个说「REGRESSION DETECTED」的告警更容易被相信</em>。</li>
+  </ol>
+
+  <!-- ========================================================= -->
+  <h2 id="canary"><span class="num">7</span>金丝雀与分阶段放行</h2>
+  <p>门禁不是二元的。当一个改动通过了 CI 但你仍不完全放心时，<strong>分阶段放行</strong>比「合还是不合」提供了更多选项。</p>  <table>
+    <thead><tr><th>阶段</th><th>暴露范围</th><th>看什么</th><th>回滚条件</th></tr></thead>
+    <tbody>
+      <tr><td><strong>影子运行</strong>（shadow）</td><td>0% 用户，但对真实流量跑一遍</td><td>离线指标 + 与现网输出的 diff</td><td>任何异常</td></tr>
+      <tr><td><strong>金丝雀</strong></td><td>1–5% 流量</td><td><strong>线上指标</strong>（模块 05）+ 错误率 + 延迟</td><td>线上指标显著劣化</td></tr>
+      <tr><td><strong>逐步放量</strong></td><td>5% → 25% → 50% → 100%</td><td>同上，每一档观察足够长的时间</td><td>同上</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>影子运行是这三档里最被低估的一个：<strong>它零风险</strong>（用户看不到输出），却能提供离线评测提供不了的东西——<em>真实流量的分布</em>。<strong>离线任务集永远只是真实分布的一个样本，而且通常是有偏的样本</strong>（人挑出来的、覆盖已知问题的）。影子运行能告诉你「在真实的用户提问上，新版本和旧版本的输出差多少」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从统计的角度，影子运行提供的是<span class="term">配对的线上样本</span>：同一个真实请求，两个版本各产出一个回答。<strong>这让「新旧对比」的方差被压到最低</strong>（同样的配对原理，第 4 节），而且样本量是免费的（跟着真实流量走）。<em>唯一的成本是双倍推理开销，以及需要一个能比较两个输出的判分器</em>——而后者正是 C67 的内容。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个实用的组合：<strong>CI 的 full 门禁 + 影子运行的输出 diff</strong>。<em>前者在固定的任务集上抓退化，后者在真实分布上抓「离线没覆盖到的场景」</em>。<strong>两者的失败模式互补</strong>——离线任务集抓不到的（分布偏移、真实用户的奇怪输入），影子运行能抓到；影子运行没有金标准，但离线任务集有。</p>
+  </div>  <p><strong>分阶段放行的观察窗口该多长？</strong>由你要检出的效应量与线上流量决定——这就是 C66 模块 04 的 MDE 计算，只是把「任务数」换成了「这一档能积累多少请求」。<em>一个常见的错误是「放 5% 观察十分钟」——十分钟的 5% 流量通常远不够检出几个点的差异。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="gate-ops"><span class="num">8</span>门禁的运维：override、基线更新与例外流程</h2>
+  <p>门禁上线之后的日常运维，决定了它是变成一道真实的防线还是一个橡皮图章。这一节讲三个必须提前设计好的流程。</p>  <h3>① Override：必须存在，但必须留痕</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>「不允许 override」是行不通的</strong>——总会有紧急修复需要绕过门禁，而一个无法绕过的门禁最终会被整个关掉（第 1 节）。<em>所以正确的设计不是禁止 override，而是让它<strong>有成本、有记录、可统计</strong></em>：需要填写理由、需要另一个人批准、<strong>并且每月统计 override 次数</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>把 override 率当成一个一级指标来看：<strong>override 率突然升高，说明门禁的误报率升高了</strong>（或者阈值该重新校准了）；<em>而 override 率长期为零也是一个信号</em>——要么门禁太松（从没拦住过什么），要么有人在用别的方式绕过它。<strong>健康的 override 率大约在每月一到两次</strong>，这与「每月至多一次误报」的设计目标是自洽的。</p></div>
+  </div>  <h3>② 基线更新：什么时候、怎么更新</h3>  <table>
+    <thead><tr><th>更新时机</th><th>做法</th><th>风险</th></tr></thead>
+    <tbody>
+      <tr><td><strong>每次成功合并后</strong></td><td>滚动基线</td><td><strong>渐进式退化</strong>（模块 03 第 8 节）——每次退化 0.3 个点都通过</td></tr>
+      <tr><td><strong>每个季度</strong></td><td>锚定基线</td><td>更新不及时会让锚定基线失去意义</td></tr>
+      <tr><td><strong>模型/任务集大版本变更时</strong></td><td>强制重建基线</td><td>必须<strong>显式声明配置变更</strong>，否则确定性门禁会拦住</td></tr>
+    </tbody>
+  </table>  <p><strong>推荐同时维护滚动基线与锚定基线</strong>：滚动基线抓突发退化（阈值严），锚定基线抓渐进退化（阈值宽但必须有）。<em>只有一个基线的门禁，一定会漏掉两类退化中的一类。</em></p>  <h3>③ 例外流程：已知问题的白名单</h3>  <p>有些任务会因为已知的、暂时不打算修的原因持续失败（依赖了一个待下线的服务、任务本身有争议）。<strong>正确处理不是把它们从任务集删掉，而是加白名单</strong>：</p>  <pre><code>// known_failures.json —— 白名单本身也要版本化、也要过期
+[
+  {"task_id": "billing-047",
+   "reason": "依赖的 legacy 接口将于 2026-10 下线，届时重写此题",
+   "added": "2026-06-01",
+   "expires": "2026-11-01",          // ← **必须有过期时间**
+   "owner": "billing-team"},
+]</code></pre>  <div class="callout warn"><span class="label"></span>
+    <strong><code>expires</code> 这个字段是白名单机制里最重要的一个。</strong><em>没有过期时间的白名单会无限增长，最终任务集里一半的题都在白名单上，而没人记得为什么</em>。<strong>CI 里应当有一条检查：白名单条目过期即失败</strong>，强迫团队要么修掉它、要么显式续期（并写明为什么又推迟了）。<em>这与模块 01「任务集只增不改」的精神一致——让所有的妥协都是显式的、有时限的、可被审计的。</em>
+  </div>  <h3>④ 门禁失败时该给什么信息</h3>  <p>最后一个运维细节，它直接决定了 override 率：<strong>门禁失败的输出必须让人在三十秒内判断出「这是真的还是误报」。</strong><em>一个只说「REGRESSION DETECTED, score dropped 3.2%」的告警，会让作者的第一反应是 override</em>——因为核实的成本比绕过的成本高。</p>  <ul>
+    <li><strong>退化集中在哪</strong>：按子系统与难度分解（模块 03 的逐题变化矩阵）——<em>「全部集中在 billing」是一个可行动的线索，「均匀分布」通常是噪声</em>；</li>
+    <li><strong>具体是哪几道题</strong>：给出 task_id 与逐题 diff 的链接，<em>让作者能一眼看出「哦这个我知道为什么」</em>；</li>
+    <li><strong>对照信息</strong>：同时给出 fixed 数与 churn 的噪声基线，<strong>让作者能自己判断这是不是波动</strong>；</li>
+    <li><strong>历史</strong>：这条规则最近一个月触发过几次、其中几次是真的。<em>这一行本身就是门禁可信度的凭证</em>。</li>
+  </ul>  <p>最后，白名单上的任务<strong>仍然要被执行和记录</strong>，只是不进门禁。<em>因为你需要知道「它什么时候自己好了」</em>——而如果直接跳过执行，这个信息就永远拿不到。</p>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_result_store/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 结果存储与分析</div></a>
+    <a class="next" href="../05_online/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 线上监控与漂移</div></a>
+  </div>
+
+</div>
+</body>
+</html>

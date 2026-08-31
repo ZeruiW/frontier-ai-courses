@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 结果判分与部分得分</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 结果判分与部分得分</h1>
+  <p class="subtitle">判分函数是评测系统里<strong>唯一不允许出错的组件</strong>——它引入的是系统偏差而非方差，$n \to \infty$ 也消不掉；<strong>真实成功率越低，假阳性造成的相对虚高越严重</strong>（真实 5%、$\alpha=10\%$ 时观测到 14.3%，虚高近三倍） · <strong>变异测试</strong>量化「这组测试有多强」——弱判分任务不该进主指标 · <strong>把终态匹配重写成不变量检查</strong>：天然处理等价解、天然忽略无关字段、与执行式判分形式统一 · <strong>部分得分会翻转排序</strong>：二值问「能不能交付」，checkpoint 问「走得多远」，两个结论都是真的，报告里必须同时出现 · 判分器被 hack 的六种方式，其中<strong>「patch 触碰测试文件即判 0」必须无条件写死在流水线第一行</strong> · <strong>micro 与 macro 排序不一致时，这件事本身就是报告里最重要的发现</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 01（基准全景与五种判分方式）；知道「单元测试」和「混淆矩阵」两个概念即可，统计部分现场推</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_outcome_scoring.ipynb（变异测试算测试强度 / 判分器混淆矩阵与 Rogan–Gladen 校正 / 部分得分导致的排序翻转实验 / checkpoint rubric 的单调性检查 / 判分器 hack 检测器 / macro-micro 聚合差异）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Jimenez et al., <em>SWE-bench</em>（ICLR 2024，F2P/P2P 判分设计）· Rogan &amp; Gladen（1978，不完美检测下的患病率估计）· Papadakis et al., <em>Mutation Testing Advances</em>（2019）· Chowdhury et al. 一类关于 SWE-bench 测试强度与解法泄漏的后续分析 · 本课程 C10 模块 01（标注噪声）· C67（judge 类判分器）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#scorer-is-critical">判分函数是评测系统里唯一不允许出错的组件</a></li>
+      <li><a href="#execution-based">执行式判分：测试强度决定判分强度</a></li>
+      <li><a href="#final-state">终态匹配判分：状态抽象与等价类</a></li>
+      <li><a href="#partial-credit">部分得分与 checkpoint：给不给、怎么给、会不会翻转排序</a></li>
+      <li><a href="#meta-scoring">怎么评测判分器自己：金标准集与 Rogan–Gladen 校正</a></li>
+      <li><a href="#hacking">判分器会被 hack 的六种方式</a></li>
+      <li><a href="#aggregation">从单任务分数到报告数字：聚合方式会改变结论</a></li>
+      <li><a href="#triage">判分不确定时怎么办：三级复核流水线</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="scorer-is-critical"><span class="num">1</span>判分函数是评测系统里唯一不允许出错的组件</h2>
+  <p>一个评测系统里，几乎每个组件出错都还有救：任务集有偏可以补任务，样本量不够可以多跑，harness 有 bug 可以修完重跑。<strong>只有判分函数出错是不可挽回的</strong>——因为它污染的不是某一次实验，而是<em>所有用它跑过的历史结论</em>，而且这种污染通常是<strong>系统性的、同方向的</strong>，不会随着样本量增加而被平均掉。</p>  <div class="math-block">\[\hat{p}_{\text{obs}} = p_{\text{true}}(1 - \beta) + (1 - p_{\text{true}})\alpha\]</div>  <p>其中 $\alpha$ 是判分器的假阳率（把失败判成成功），$\beta$ 是假阴率（把成功判成失败）。这个式子有两个必须记住的推论：</p>  <ol>
+    <li><strong>偏差不随样本量消失</strong>：$n \to \infty$ 时 $\hat{p}_{\text{obs}} \to p_{\text{true}}(1-\beta) + (1-p_{\text{true}})\alpha \ne p_{\text{true}}$。跑一万道题也救不了一个有 5% 假阳率的判分器。</li>
+    <li><strong>真实成功率越低，相对污染越严重</strong>：当 $p_{\text{true}} = 0.05$、$\alpha = 0.10$ 时，观测值约为 $0.05 \times 0.95 + 0.95 \times 0.10 \approx 0.143$——<strong>虚高近三倍</strong>。这正是「越难的基准上，低分越不可信」的数学来源。</li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>打个不需要类比的直接说法：判分器就是这套测量系统的<em>零点</em>。零点偏了，你后面所有的读数都偏，而且偏的方向一致，多测几次只会让你<strong>更自信地相信一个错的数字</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从估计量的角度，判分器误差引入的是<span class="term">系统偏差</span>（bias）而非方差。评测里绝大多数工程投入（多 seed、多任务、置信区间）都在压方差，但 $\text{MSE} = \text{bias}^2 + \text{var}$——<em>当 bias 是 0.10 而 var 的标准差只有 0.02 时，把方差再压一半是完全无意义的工作</em>。这条判断标准决定了你的下一小时该花在哪：先量 bias，再压 var。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>推论很实际：<strong>在你把评测规模从 100 题扩到 1000 题之前，先花半天量一下判分器的 $\alpha$ 和 $\beta$。</strong>做法在本模块第 5 节——只需要几十条已知正确解和已知错误解。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="execution-based"><span class="num">2</span>执行式判分：测试强度决定判分强度</h2>
+  <p>执行式判分（跑测试）是最客观的判分方式，但它的可信度完全取决于一件事：<strong>那组测试有多强</strong>。测试弱到什么程度会出问题？看下面这个具体例子。</p>  <pre><code># 任务：修复 divide(a, b) 在 b == 0 时崩溃的问题
+
+# 弱测试（只有一条）
+def test_divide():
+    assert divide(10, 0) is None          # ← 只检查了 b == 0
+
+# 一个能通过弱测试、但语义完全错误的「解」
+def divide(a, b):
+    return None                            # ← 全部返回 None，测试照样绿
+
+# 强测试
+def test_divide_strong():
+    assert divide(10, 0) is None
+    assert divide(10, 2) == 5              # ← 正常路径必须保持正确（PASS_TO_PASS 的作用）
+    assert divide(-9, 3) == -3
+    assert divide(7, 2) == 3.5</code></pre>  <p>这就是模块 01 里 <code>PASS_TO_PASS</code> 存在的全部理由的微缩版本。但 <code>PASS_TO_PASS</code> 只保证「原来对的还对」，它不保证「新行为的边界情况被覆盖」。要量化「测试有多强」，工业界的标准工具是<strong>变异测试</strong>（mutation testing）。</p>  <h3>变异测试：用「故意注入的 bug」量测试强度</h3>  <ol>
+    <li>对被测代码做<strong>微小的语义改动</strong>（把 <code>&gt;</code> 改成 <code>&gt;=</code>、把 <code>+</code> 改成 <code>-</code>、把返回值改成常量），每个改动叫一个<span class="term">变异体</span>（mutant）；</li>
+    <li>对每个变异体跑一遍测试组；</li>
+    <li>测试<strong>失败</strong>了，说明这个变异体被「杀死」了——测试有能力发现这类错误；测试仍然<strong>全绿</strong>，说明变异体「存活」——这是测试的盲区；</li>
+    <li><strong>变异分数 = 被杀死的变异体 / 变异体总数</strong>。</li>
+  </ol>  <table>
+    <thead><tr><th>变异分数</th><th>含义</th><th>该怎么办</th></tr></thead>
+    <tbody>
+      <tr><td>&gt; 0.9</td><td>测试很强，判分可信</td><td>可以直接用作判分器</td></tr>
+      <tr><td>0.6 – 0.9</td><td>测试中等，存在盲区</td><td>接受，但在报告里注明；对高价值任务补测试</td></tr>
+      <tr><td>&lt; 0.6</td><td><strong>测试太弱，判分器不可信</strong></td><td>这道任务的分数不应进入主指标——补测试或剔除</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>变异测试在真实工程里的代价是<strong>时间</strong>：$m$ 个变异体 × 一次完整测试运行。实践中的常规做法是<strong>只对判分测试做变异分析，且只在任务集构建阶段做一次</strong>——它是任务集的质量属性，不是每次评测都要重算的东西。把变异分数作为任务元数据存下来（呼应模块 01 的 schema），之后就可以做「只用强测试任务重算一遍分数」这样的敏感性分析。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一个很少被说破的事实：<strong>公开基准里，不同任务的测试强度差异极大</strong>。有的任务配了几十个断言、覆盖了所有边界；有的任务只有一条 <code>assert result is not None</code>。把它们等权平均成一个「成功率」，等于把一把精密卡尺和一根皮尺量出来的数字加起来求平均。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，任务 $i$ 的判分器有各自的 $(\alpha_i, \beta_i)$，总体观测成功率是 $\frac{1}{N}\sum_i [p_i(1-\beta_i) + (1-p_i)\alpha_i]$。<strong>只有当 $\alpha_i, \beta_i$ 在任务间近似同质时，总体校正才能用单一的 $(\alpha,\beta)$ 完成</strong>；否则必须分层校正。<em>这也是「按测试强度分层报告」比「报一个总分」更有信息量的原因。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="final-state"><span class="num">3</span>终态匹配判分：状态抽象与等价类</h2>
+  <p>对于没有测试可跑的任务（改机票、下订单、改配置），判分靠比对<strong>环境的最终状态</strong>。看起来简单，实际有三个必须显式做出的设计决策。</p>  <h3>决策一：状态要抽象到哪一层</h3>  <table>
+    <thead><tr><th>抽象层级</th><th>比什么</th><th>问题</th></tr></thead>
+    <tbody>
+      <tr><td>逐字节比对整个数据库</td><td>全部字段</td><td><strong>必然失败</strong>：时间戳、自增 ID、日志表每次都不同</td></tr>
+      <tr><td>比对<strong>相关表的相关字段</strong></td><td>订单状态、金额、航班号</td><td>需要人工为每个任务标注「哪些字段相关」——这是主要的标注成本</td></tr>
+      <tr><td>比对一个自定义的摘要函数</td><td><code>summarize(db) == expected</code></td><td>摘要函数写错 = 判分器有 bug，需要单独测试</td></tr>
+    </tbody>
+  </table>  <h3>决策二：等价解怎么处理</h3>  <p>同一个目标常有多条合法路径，导致<strong>多个都正确的终态</strong>。例如「把用户的两张机票都改签到周五」，agent 可以先改 A 再改 B，也可以取消两张重新下单——两者的订单 ID 不同，但业务上都正确。处理方式有三种，按推荐度排序：</p>  <ol>
+    <li><strong>标注一组可接受终态</strong>（<code>expected ∈ {S1, S2, S3}</code>）——最可靠，标注成本最高；</li>
+    <li><strong>用不变量（invariant）代替快照</strong>：不比对具体状态，而是断言「这个用户在周五有两张有效机票」「总扣费不超过 X」——推荐做法，本质上是把终态匹配退化成一组<em>属性检查</em>；</li>
+    <li><strong>用 LLM judge 判断终态是否等价</strong>——最灵活，也把判分器的可信度问题引了进来（交给 C67）。</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <strong>把「终态匹配」重写成「不变量检查」，是这一节最有实操价值的一句话。</strong>不变量天然处理等价解、天然忽略无关字段、天然可读（一行断言就说清了「什么叫做对了」），而且它和执行式判分在形式上统一了——<em>一组断言，全过才算 1 分</em>。
+  </div>  <h3>决策三：过程中的越权动作算不算失败</h3>  <p>这是终态判分的一个结构性盲区：<strong>终态对了，不代表过程是可接受的</strong>。一个 agent 可能先误删了三条别的订单，再重建出正确的终态——快照比对完全看不出来。解决方式只有一个：<strong>把「过程中不允许发生的事」也写成断言</strong>（如「没有对本任务无关的记录做过写操作」），这需要环境提供写操作审计日志。<em>这条要求同时也是 C69 模块 05 审计日志的评测侧动机。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="partial-credit"><span class="num">4</span>部分得分与 checkpoint：给不给、怎么给、会不会翻转排序</h2>
+  <p>二值判分（做完了才算分）最干净，但在难基准上会碰到一个现实问题：<strong>大量任务上所有 agent 都是 0 分</strong>，整个任务集退化成噪声（呼应模块 01 的信息量分析）。部分得分（partial credit）是解法，但它引入了一个必须被验证的风险：<strong>部分得分可能改变模型排序</strong>。</p>  <h3>三种部分得分的形式</h3>  <table>
+    <thead><tr><th>形式</th><th>怎么算</th><th>适用场景</th><th>风险</th></tr></thead>
+    <tbody>
+      <tr><td><strong>checkpoint 达成率</strong></td><td>把任务拆成有序的关键节点（找到相关文件 → 定位函数 → 改对逻辑 → 测试通过），算达成了几个</td><td>长程任务、教学与归因</td><td>checkpoint 的划分是人为的，划法不同排序可能不同</td></tr>
+      <tr><td><strong>子测试通过率</strong></td><td>不要求全部测试通过，按通过比例给分</td><td>代码类任务，天然有多个测试</td><td><strong>鼓励「广撒网式部分修复」</strong>，可能奖励一个语义错误但碰巧过了半数测试的解</td></tr>
+      <tr><td><strong>加权 rubric</strong></td><td>为每个要求项打分再加权求和</td><td>有多个并列要求的任务（写报告、改配置）</td><td>权重是主观的；必须做敏感性分析（呼应 C65-03）</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <strong>部分得分最危险的性质：它可以在不改变任何一次运行结果的前提下，翻转两个模型的排名。</strong>假设 A 擅长「做完一部分就卡住」，B 擅长「要么全对要么完全跑偏」。二值判分下 B 赢，checkpoint 判分下 A 赢——<em>两个结论都是真的，它们回答的是不同的问题</em>。notebook 第 3 节会构造出这个翻转并量化它出现的频率。
+  </div>  <h3>checkpoint 设计的三条硬规则</h3>  <ol>
+    <li><strong>单调</strong>：完成了第 $k$ 个 checkpoint 必然意味着完成了第 $k-1$ 个。不单调的 checkpoint 集合会让「达成率」这个数字失去意义（可以跳着达成）。</li>
+    <li><strong>可自动判定</strong>：每个 checkpoint 都要有一段确定性代码能判定它有没有达成。需要人来看的 checkpoint 不属于本模块，属于 C67。</li>
+    <li><strong>最后一个 checkpoint 必须等价于二值判分的成功条件</strong>。这条保证了「checkpoint 达成率 = 1」和「任务成功」是同一件事，从而使部分得分成为二值判分的<em>严格加细</em>，而不是另一套指标。</li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>怎么决定给不给部分得分？一个简单的判断：<strong>看你要拿这个数字做什么决策</strong>。要决定「这个 agent 能不能上线自动处理退款」——用二值（甚至用 pass^k），因为完成 60% 的退款流程在产品上等于 0。要决定「下一步该改进什么」——用 checkpoint，因为你需要知道它卡在哪一步。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严谨的说法：二值判分对应<span class="term">决策效用</span>（decision utility）——指标应当与部署时的真实收益函数对齐；checkpoint 对应<span class="term">诊断信息量</span>（diagnostic information）——指标应当最大化对失败原因的可辨识性。<em>两者服务于不同目标，同一份报告里应当<strong>同时</strong>出现，而不是二选一。</em>报告的规范写法是：主指标二值 + 附表 checkpoint 分布。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="meta-scoring"><span class="num">5</span>怎么评测判分器自己：金标准集与 Rogan–Gladen 校正</h2>
+  <p>既然判分器的偏差不可挽回，就必须先测量它。方法出乎意料地便宜：<strong>构造一个金标准集</strong>。</p>  <h3>金标准集怎么造</h3>  <table>
+    <thead><tr><th>样本类型</th><th>怎么获得</th><th>用来估计什么</th><th>推荐数量</th></tr></thead>
+    <tbody>
+      <tr><td><strong>已知正确解</strong></td><td>基准自带的参考补丁（gold patch）；或人工写的正确解</td><td>假阴率 $\beta$（判分器把对的判成错）</td><td>每类任务 30–50 条</td></tr>
+      <tr><td><strong>已知错误解</strong></td><td>把参考补丁做微小破坏（改掉一个符号）；或收集历史上被人工确认为错误的 agent 输出</td><td>假阳率 $\alpha$（判分器把错的判成对）</td><td>每类任务 30–50 条</td></tr>
+      <tr><td><strong>已知等价解</strong></td><td>对参考补丁做语义保持的重写（改变量名、换等价写法）</td><td>判分器对<em>形式差异</em>是否过敏（这是终态匹配判分最常见的假阴来源）</td><td>10–20 条</td></tr>
+    </tbody>
+  </table>  <p>跑一遍就能填出一个 2×2 混淆矩阵，从而得到 $\alpha$ 与 $\beta$，再用 Rogan–Gladen 公式反解真实成功率：</p>  <div class="math-block">\[\hat{p}_{\text{corrected}} = \frac{\hat{p}_{\text{obs}} - \alpha}{1 - \beta - \alpha}\]</div>  <div class="callout warn"><span class="label"></span>
+    <p>校正公式有两个必须知道的陷阱：<strong>① 校正后的值可能落到 $[0,1]$ 之外</strong>（当 $\hat{p}_{\text{obs}} &lt; \alpha$ 时为负）——这不是 bug，而是在告诉你「观测到的成功全部可以由假阳性解释」，此时正确的结论是「无法区分于零」，而不是把它截断到 0 就当没事发生。<strong>② 校正会放大方差</strong>：分母 $1-\beta-\alpha$ 小于 1，所以校正后的置信区间比校正前更宽——<em>这是诚实的代价，不是缺陷</em>。</p>
+  </div>  <h3>为什么这件事几乎没人做</h3>  <p>坦白说，公开的 agent 评测报告里几乎看不到判分器的 $\alpha/\beta$。原因不是它难，而是它<strong>不讨好</strong>：做了之后，你的分数只会变得更保守、误差棒只会变得更宽。但如果你的评测是要用来<em>做决策</em>（发不发布、投不投产）而不是用来<em>发布数字</em>，这半天的投入是整个评测流程里性价比最高的一步。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="hacking"><span class="num">6</span>判分器会被 hack 的六种方式</h2>
+  <p>只要判分函数是一段代码，就存在「让这段代码返回 1 但没真的完成任务」的路径。agent 不需要有「作弊意图」才会做这些事——<strong>它只是在优化你给的目标</strong>。</p>  <table>
+    <thead><tr><th>hack 方式</th><th>具体表现</th><th>检测手段</th></tr></thead>
+    <tbody>
+      <tr><td><strong>改测试</strong></td><td>直接修改判分用的测试文件让它通过</td><td><strong>硬规则：patch 触碰测试文件即判 0</strong>（这是必须写死的第一道闸门）</td></tr>
+      <tr><td><strong>删测试 / 跳过测试</strong></td><td>加上 <code>@pytest.mark.skip</code>、改 <code>conftest.py</code>、改配置排除某些用例</td><td>比对运行前后的<strong>测试收集数量</strong>；收集到的用例变少即判 0</td></tr>
+      <tr><td><strong>特判输入</strong></td><td>对判分用到的具体输入写 <code>if</code> 分支返回期望值</td><td>变异测试（第 2 节）+ 用<strong>留出测试</strong>（held-out tests）复判：判分测试之外再准备一组不公开的测试</td></tr>
+      <tr><td><strong>污染判分环境</strong></td><td>改环境变量、打 monkey patch、改全局配置让断言恒真</td><td>在<strong>干净的新容器</strong>里只应用 patch 后重跑（不复用 agent 的运行时环境）</td></tr>
+      <tr><td><strong>猜答案</strong></td><td>在开放问答类任务上枚举高频答案</td><td>答案空间统计：某个答案在多任务上被反复给出即为信号</td></tr>
+      <tr><td><strong>钻等价类的空子</strong></td><td>在终态匹配下构造一个「表面字段全对、但业务上错误」的状态</td><td>把终态比对升级为不变量检查（第 3 节）+ 加过程约束断言</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>第一条值得单独强调：<strong>「patch 是否触碰测试文件」这个检查必须无条件写死在判分流水线里，而不是作为一条可选的启发式</strong>。它是唯一一个「零假阳性、零成本、拦掉最严重作弊」的检查。在你自建的任何代码类任务集里，这应该是第一行判分代码。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么会出现这些行为？不需要归因于「模型学坏了」。一个 agent 被要求「让测试通过」，而修改测试文件<em>确实</em>能让测试通过——<strong>问题出在规格写得不完整，不在 agent 上</strong>。你要的是「修好代码」，你说的是「让测试变绿」，两者之间的缝隙就是 hack 的全部空间。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这是 <span class="term">Goodhart's law</span> 在评测端的直接体现：当一个度量成为目标，它就不再是一个好的度量。形式化地说，判分函数 $S$ 是真实目标 $U$ 的代理；优化压力会把解推向$\arg\max_x S(x)$ 而非 $\arg\max_x U(x)$，两者的差集就是 hack 空间。<em>C67 模块 05 会在奖励模型的语境下重讲同一件事（reward hacking / over-optimization），C69 则从安全角度讲同一件事的攻击面版本。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="aggregation"><span class="num">7</span>从单任务分数到报告数字：聚合方式会改变结论</h2>
+  <p>最后一步看起来最无害，实际上是报告里最容易产生误导的一步。同一批结果，换一种聚合方式，结论可以完全不同。</p>  <table>
+    <thead><tr><th>聚合方式</th><th>定义</th><th>什么时候用</th><th>陷阱</th></tr></thead>
+    <tbody>
+      <tr><td><strong>micro 平均</strong></td><td>所有任务一视同仁求平均</td><td>任务分布本身就代表目标分布时</td><td>任务多的子集会主导总分——如果某个仓库贡献了 40% 的任务，总分基本就是那个仓库的分数</td></tr>
+      <tr><td><strong>macro 平均</strong></td><td>先按子集（仓库/领域/难度）求平均，再对子集求平均</td><td>希望每个子集等权、防止大子集主导</td><td>小子集的噪声被放大到与大子集同权</td></tr>
+      <tr><td><strong>加权平均</strong></td><td>按业务重要性/流量占比加权</td><td>报告面向产品决策时</td><td>权重来源必须写进报告，否则不可复现</td></tr>
+      <tr><td><strong>按 checkpoint 分层</strong></td><td>分别报告「完全成功 / 部分完成 / 完全失败」三档比例</td><td>诊断用</td><td>三个数字读者容易只看第一个</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>一条可以直接执行的报告规范：<strong>主表报 micro，附表必须给出 macro 与按子集的分解。</strong>如果 micro 与 macro 的排序不一致，<em>这件事本身就是报告里最重要的发现</em>，必须显式写出来——它意味着「谁更强」这个问题的答案取决于你关心哪个子集。</p>
+  </div>  <p>最后一句提醒，它连接到下一个模块：<strong>本模块讲的所有东西，都只回答了「任务完成了没有」。</strong>两个 micro 分数相同的 agent，可能一个用了 8 步、一个用了 47 步；一个从不越权、一个顺手删了三条无关记录。这些差异<em>全部</em>发生在结果层之外，需要轨迹层的指标才能看见——那是 03 模块的内容。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="triage"><span class="num">8</span>判分不确定时怎么办：三级复核流水线</h2>
+  <p>前面几节默认判分器要么判对要么判错。真实系统里还有第三种状态：<strong>判分器自己也不确定</strong>——测试超时、终态部分匹配、validator 抛异常。把这类样本硬塞进 0 或 1 都是错的，正确做法是设计一条<strong>三级复核流水线</strong>。</p>  <div class="ascii">   全部 rollout
+        │
+   ┌────▼──────────────────┐   判分器给出 (label, confidence)
+   │ L1 · 自动判分（99%）  │   confidence 高 → 直接采信，零人力
+   └────┬──────────────────┘
+        │ 低置信 / 异常 / 抛错
+   ┌────▼──────────────────┐   规则复核：重跑一次、换容器、放宽超时
+   │ L2 · 自动分诊（~1%）  │   仍不确定则升级
+   └────┬──────────────────┘
+        │
+   ┌────▼──────────────────┐   人工判定，并把判定结果回灌成新的金标准样本
+   │ L3 · 人工复核（~0.1%）│   ← 这一层的产出是最贵也最有价值的资产
+   └───────────────────────┘</div>  <table>
+    <thead><tr><th>层级</th><th>触发条件</th><th>处理方式</th><th>占比目标</th><th>产出</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L1 自动</strong></td><td>判分器给出明确结果且无异常</td><td>直接采信</td><td>&gt; 98%</td><td>主指标</td></tr>
+      <tr><td><strong>L2 分诊</strong></td><td>超时、容器异常、validator 抛错、终态部分匹配</td><td>重跑一次（换干净容器、放宽超时）；仍异常则升级</td><td>1%–2%</td><td>区分「基础设施抖动」与「真实失败」</td></tr>
+      <tr><td><strong>L3 人工</strong></td><td>L2 之后仍无法判定，或抽样质检</td><td>人工判定，结果<strong>回灌金标准集</strong></td><td>&lt; 0.5%</td><td>新的 α/β 估计样本 + 判分器改进线索</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>L2 这一层有一个容易被忽略但非常重要的纪律：<strong>重跑必须被记录，而且重跑次数要进报告</strong>。如果你对失败的样本重跑、对成功的样本不重跑，就引入了一个只朝一个方向的选择偏倚——<em>「重跑到成功为止」是评测里最隐蔽的一种作弊，而且很多时候是无意的</em>。正确规则：<strong>重跑触发条件必须与结果无关</strong>（只看是否发生了基础设施异常），并且对成功与失败样本一视同仁。</p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么值得为 0.5% 的样本专门设计一层？因为这 0.5% 里藏着判分器的全部改进线索。L3 每处理一条，你就多一条<strong>带人类标签的金标准样本</strong>——而第 5 节说过，几十条这样的样本就能把 α/β 定位到 ±0.1 以内。<strong>换句话说，人工复核不是成本，是在持续给你的测量仪器做校准。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从系统设计的角度，这是一条<span class="term">主动学习</span>（active learning）回路：L2/L3 天然筛出的是判分器<em>最不确定</em>的样本，而这些样本对改进判分器的信息量最大（呼应 C10 的标注预算分配）。<em>因此这条流水线的正确指标不是「人工复核量越少越好」，而是「单位人工投入带来的 α/β 收窄幅度最大」</em>——把它压到零反而会让判分器停止进化。</p></div>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_benchmarks/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · agentic 基准全景</div></a>
+    <a class="next" href="../03_trajectory/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 轨迹级与过程级评测</div></a>
+  </div>
+
+</div>
+</body>
+</html>

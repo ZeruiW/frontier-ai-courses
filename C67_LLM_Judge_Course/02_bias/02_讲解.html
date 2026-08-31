@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Judge 偏差与去偏</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · Judge 偏差与去偏</h1>
+  <p class="subtitle">「我知道 judge 有偏差」和「我量过这个 judge 的偏差有多大」，在工程上是两件完全不同的事——前者只能加一句免责声明，后者能把偏差从数字里减掉 · <strong>swap 一致率低有两种成因，修法完全相反</strong>：位置偏差靠 swap 平均，纯噪声靠多采样；notebook 给出把两者分开的判据 · <strong>长度控制回归</strong>的好处是它<em>估计</em>长度效应而不是<em>假设</em>它——没有偏差时 $\gamma$ 拟合成 0，方法自动退化成不做任何事 · <strong>最危险的配置是「用模型 M 做 judge 来评测 M 的新版本」</strong>，而这恰恰是最常见的内部评测配置 · <strong>统一的探针范式</strong>：造一批只差某个表面属性的成对样本 + 配对检验，几十到一两百对就能把任何新怀疑的偏差量出来 · <strong>多 judge 集成只能治噪声，治不了所有 judge 共有的偏差</strong>，而且会让区间变窄——让你更自信地相信一个偏了的结论 · <strong>去偏的正确输出不是一个更准的数字，而是一个更窄的区间加一句关于假设的说明</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 01（judge 设计）；线性回归的最小二乘解在 notebook 里从零写，不需要 sklearn</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_judge_bias.ipynb（位置偏差探针与 swap 去偏 / 长度控制回归 LC 版胜率 / 自偏好探针 / 风格偏差与去风格化对照 / 多 judge 集成：独立偏差 vs 共同偏差 / 可识别性演示：长度与质量真相关时去偏会矫枉过正）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Zheng et al., <em>MT-Bench &amp; Chatbot Arena</em>（NeurIPS 2023，位置/冗长/自增强偏差）· Dubois et al., <em>Length-Controlled AlpacaEval</em>（2024，长度控制回归）· Panickssery et al., <em>LLM Evaluators Recognize and Favor Their Own Generations</em>（2024）· Chiang &amp; Lee, <em>Can Large Language Models Be an Alternative to Human Evaluations?</em>（ACL 2023）· 本课程 C10 模块 01/02（标注噪声与一致性）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#landscape">四大偏差全景：机制、探针、去偏手段</a></li>
+      <li><a href="#position">位置偏差：最容易测、也最容易修的一个</a></li>
+      <li><a href="#length">长度偏差与长度控制回归</a></li>
+      <li><a href="#self-pref">自偏好：最难证明、也最难修的一个</a></li>
+      <li><a href="#style">风格与格式偏差：以及「格式什么时候真的算质量」</a></li>
+      <li><a href="#probe-pattern">统一的探针范式：加一个无关变量，看读数变不变</a></li>
+      <li><a href="#ensemble">多 judge 集成：什么时候真的有用</a></li>
+      <li><a href="#identifiability">去偏的极限：当长度与质量真的相关时</a></li>
+      <li><a href="#bias-budget">偏差预算：一份评测该花多少钱在探针上</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="landscape"><span class="num">1</span>四大偏差全景：机制、探针、去偏手段</h2>
+  <p>模块 00 把 judge 的读数写成 $\hat{q} = q + f(\cdot) + \varepsilon$。这一节把 $f$ 拆开：它主要由四个分量构成，每一个都有<strong>明确的探针</strong>（怎么把它量出来）和<strong>明确的去偏手段</strong>（怎么把它减掉）。</p>  <table>
+    <thead><tr><th>偏差</th><th>机制（为什么会有）</th><th>探针（怎么量）</th><th>去偏手段</th><th>残留问题</th></tr></thead>
+    <tbody>
+      <tr><td><strong>位置偏差</strong><br>position</td><td>自回归生成 + 提示结构，使得某个位置的候选被系统性偏好</td><td><strong>swap 一致性</strong>：交换 A/B 位置再判一次，看翻转比例</td><td><strong>两个位置各判一次取平均</strong>（成本翻倍）</td><td>翻转样本怎么处理（记平局最保守）</td></tr>
+      <tr><td><strong>长度/冗长偏差</strong><br>verbosity</td><td>更长的回答提供更多「看起来相关」的内容，也更像训练数据里的高质量回答</td><td>控制质量后，看长度对胜率的边际效应（回归系数）</td><td><strong>长度控制回归</strong>：把长度作为协变量回归掉</td><td>长度与质量<em>真的</em>相关时会矫枉过正（第 8 节）</td></tr>
+      <tr><td><strong>自偏好</strong><br>self-preference</td><td>judge 对自己的生成分布有更高的似然，可能把「熟悉」误读为「好」</td><td>同一批内容分别由同族/异族模型改写后再评</td><td><strong>换异族 judge</strong>；多 judge 集成</td><td>「异族」的边界不清晰（同一批数据训出来的模型可能共享偏好）</td></tr>
+      <tr><td><strong>风格与格式偏差</strong><br>style</td><td>markdown 标题、要点列表、自信语气被系统性奖励</td><td>把同一内容重排成不同格式，看分数变化</td><td><strong>去风格化</strong>（统一格式后再评）或在 prompt 里显式禁止</td><td>格式在某些任务上<em>确实是</em>质量的一部分</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>这张表最重要的是第三列。<strong>「我知道 judge 有偏差」和「我量过这个 judge 的偏差有多大」，在工程上是两件完全不同的事。</strong>前者只能让你在报告里加一句免责声明，后者能让你把偏差从数字里减掉、或者至少判断出「这个 3 个点的差距是不是完全由长度差异造成的」。<em>本模块的每一个探针都只需要几十到几百次额外的 judge 调用</em>——相对于评测本身的成本，这是很便宜的。</p>
+  </div>  <p>除了这四个主要分量，还有几个二级偏差值得知道名字：<strong>bandwagon</strong>（告诉 judge「多数人认为 A 更好」会改变它的判断）、<strong>authority</strong>（虚构的引用与权威署名会提高分数）、<strong>身份偏差</strong>（提到作者身份会改变判断）。它们的共同点是：<em>都可以用「加/不加某个无关信息，看分数变不变」这个统一的探针范式来测</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="position"><span class="num">2</span>位置偏差：最容易测、也最容易修的一个</h2>
+  <p>位置偏差是四个里唯一有<strong>干净修法</strong>的：因为「A 在前」和「B 在前」是一个完全对称的操作，把两种顺序各跑一次取平均，位置项就被消掉了。</p>  <div class="math-block">\[\hat{P}(A \succ B) = \tfrac{1}{2}\left[\Pr(\text{judge 说 A} \mid A \text{ 在前}) + \Pr(\text{judge 说 A} \mid A \text{ 在后})\right]\]</div>  <h3>swap 一致率：一个必须报告的数字</h3>  <table>
+    <thead><tr><th>swap 一致率</th><th>含义</th><th>该怎么办</th></tr></thead>
+    <tbody>
+      <tr><td>&gt; 90%</td><td>位置偏差很小，judge 判断稳定</td><td>正常使用；仍建议做 swap 平均</td></tr>
+      <tr><td>80% – 90%</td><td>存在可观的位置偏差或判断噪声</td><td><strong>必须做 swap 平均</strong>；不一致样本记平局</td></tr>
+      <tr><td>70% – 80%</td><td>偏差严重，或任务本身区分度低</td><td>先检查是不是任务太难分——如果是，加大平局比例反而更诚实</td></tr>
+      <tr><td>&lt; 70%</td><td><strong>这个 judge 的胜率数字不可用</strong></td><td>回到模块 01 重新设计（rubric 化、加参考答案、换更强的 judge 模型）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一个容易混淆的点：<strong>swap 不一致 ≠ 位置偏差</strong>。不一致有两个来源：位置偏差（系统性地偏向某个位置）和随机噪声（judge 就是不稳定）。<strong>区分方式很简单：看不一致样本里，「两次都说前面那个赢」占多少。</strong>如果不一致主要表现为「总是选第一个」，那是位置偏差；如果不一致是随机分布的，那是噪声。<em>两者的修法完全不同</em>——前者靠 swap 平均，后者靠多次采样或换更强的 judge。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：设 $p_1 = \Pr(\text{选第一个} \mid \text{顺序 AB})$、$p_2 = \Pr(\text{选第一个} \mid \text{顺序 BA})$。<strong>位置偏差的强度是 $\frac{p_1 + p_2}{2} - \frac{1}{2}$</strong>（两种顺序下「选第一个」的平均倾向偏离 0.5 的程度），而这个量与 A、B 的真实质量差无关——这正是它可以被消掉的原因。<em>噪声则表现为不一致率高但上述偏差量接近 0。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>工程上还有一个细节容易忘：<strong>swap 之后要把 verdict 翻译回来</strong>。第二次调用时 <code>"A"</code> 指的是原来的 B。这个翻译如果写错，你会得到一个看起来「一致率极低」的假象——<em>而且这个 bug 极其常见，因为它不会报错，只会让数字变难看。</em>自检方法：拿一批「A 明显优于 B」的样本跑一遍，如果 swap 一致率异常地低，先怀疑翻译写反了。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="length"><span class="num">3</span>长度偏差与长度控制回归</h2>
+  <p>长度偏差是四个里<strong>影响最大、修起来最微妙</strong>的一个。它的麻烦之处在于：<strong>长度与质量之间存在真实的相关性</strong>——一个完整回答确实通常比一个敷衍的短回答长。所以不能简单地「惩罚长回答」。</p>  <h3>探针：控制质量后看长度的边际效应</h3>  <p>正确的探针必须<strong>控制住质量</strong>。三种做法，成本递增、可信度也递增：</p>  <ol>
+    <li><strong>回归法</strong>：拿现有的 judge 结果，把「胜负」对「质量代理变量 + 长度差」做回归，看长度差的系数。便宜，但需要一个质量代理变量（例如人类标注的子集）。</li>
+    <li><strong>改写法</strong>：把同一个回答扩写/精简成不同长度但<em>信息量相同</em>的版本，送 judge 打分，看分数随长度的变化。中等成本，最直观。</li>
+    <li><strong>配对法</strong>：找出「人类判为平局」的成对样本，看 judge 在这些样本上是否系统性偏向长的那个。需要人类标注，但结论最硬。</li>
+  </ol>  <h3>去偏：长度控制回归</h3>  <p>这是 AlpacaEval 的 LC（length-controlled）版本采用的思路，也是目前最实用的去偏方法。核心是一个逻辑回归：</p>  <div class="math-block">\[\operatorname{logit}\Pr(A \succ B) = \theta_m + \gamma \cdot \Delta_{\text{len}} + \beta^\top x\]</div>  <p>其中 $\theta_m$ 是模型 $m$ 的<strong>质量参数</strong>（我们真正想要的量）、$\Delta_{\text{len}}$ 是两个回答的长度差（通常取 token 数之差或其某种标准化形式）、$\gamma$ 是长度偏差的强度。<strong>拟合完之后，把 $\Delta_{\text{len}}$ 设为 0 再算胜率，就得到「长度控制后的胜率」</strong>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>为什么这个做法比「直接惩罚长回答」好？因为它<strong>估计</strong>了长度效应而不是<strong>假设</strong>了它。$\gamma$ 是从数据里拟合出来的：如果这个 judge 其实没有长度偏差，$\gamma$ 会接近 0，去偏后的胜率与去偏前几乎一样——<em>方法自动退化成不做任何事</em>。<strong>这是一个好的去偏方法应有的性质：没有偏差时不引入伤害。</strong></p>
+  </div>  <p>需要注意的实现细节：<strong>长度差要做某种归一化</strong>（例如除以两者长度之和，或者取对数长度之差），否则一条 5000 token 的回答会在回归里占据不成比例的杠杆。<em>另外，$\gamma$ 应当<strong>按 judge 分别估计</strong>——不同的 judge 模型长度偏差差别很大，共用一个 $\gamma$ 是没有依据的。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="self-pref"><span class="num">4</span>自偏好：最难证明、也最难修的一个</h2>
+  <p>自偏好（self-preference / self-enhancement）指的是：<strong>judge 在评价自己（或同族模型）生成的内容时，倾向于给更高的分。</strong></p>  <h3>为什么难证明</h3>  <p>困难在于<strong>混杂</strong>：如果 judge 模型 M 评价 M 的输出得分更高，有两种同样合理的解释——① M 偏爱自己的输出（偏差）；② M 的输出确实更好（事实）。<strong>要分开这两者，必须控制住质量。</strong></p>  <table>
+    <thead><tr><th>实验设计</th><th>怎么做</th><th>能证明什么</th><th>局限</th></tr></thead>
+    <tbody>
+      <tr><td><strong>交叉评审</strong></td><td>让 M1、M2 互评对方与自己的输出</td><td>如果每个模型都把自己排第一，那至少有一个是偏差</td><td>不能定量给出偏差幅度</td></tr>
+      <tr><td><strong>人类锚定</strong></td><td>取一批人类判为等质量的成对样本，看 judge 在其中是否偏向同族输出</td><td><strong>能定量</strong></td><td>需要人类标注</td></tr>
+      <tr><td><strong>风格迁移</strong></td><td>把 M2 的内容用 M1 改写成 M1 的风格（保持信息不变），看分数是否上升</td><td>能分离「内容偏好」与「风格偏好」</td><td>改写可能无意中改变了内容质量</td></tr>
+      <tr><td><strong>识别度关联</strong></td><td>先问 judge「这是不是你写的」，再看它给的分与识别度的相关</td><td>揭示机制（自我识别 → 偏好）</td><td>识别本身可能不准</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>自偏好在一个具体场景下危害最大：<strong>用模型 M 做 judge 来评测 M 的新版本</strong>。这是最常见的内部评测配置，而它恰好踩中了自偏好——<em>新版本相对旧版本的「提升」，可能有一部分只是「新版本的输出更像 judge 自己」</em>。<strong>最低限度的缓解：用一个异族 judge 做交叉验证，至少确认两个 judge 给出的排序一致。</strong></p>
+  </div>  <h3>缓解手段</h3>  <ul>
+    <li><strong>换异族 judge</strong>——最直接，但要注意「异族」的边界并不清晰：在相似数据上训练、用相似方法对齐的模型，可能共享同样的风格偏好。</li>
+    <li><strong>多 judge 集成</strong>——如果各 judge 的自偏好指向不同方向，集成会部分抵消（第 7 节）。</li>
+    <li><strong>rubric 化</strong>（模块 01）——把整体判断拆成客观检查项，自偏好在「有没有引用正确条款」这种项上很难发挥作用。<em>这是被低估的一条</em>。</li>
+    <li><strong>去风格化</strong>——如果自偏好主要通过风格起作用，统一格式能消掉一部分。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="style"><span class="num">5</span>风格与格式偏差：以及「格式什么时候真的算质量」</h2>
+  <p>markdown 标题、要点列表、加粗、开头的一句总结、自信而不含糊的语气——这些都被观察到能<strong>系统性地提高 judge 给的分</strong>，即使内容不变。</p>  <h3>探针：同内容、不同格式</h3>  <pre><code>原始回答（纯文本）:
+  要解决这个问题，先检查配置文件里的超时设置，然后确认网络策略允许出站请求，
+  最后看一下日志里有没有 429 错误。
+
+重排后（结构化）:
+  ## 排查步骤
+  1. **检查超时设置** — 配置文件中的 timeout 值
+  2. **确认网络策略** — 是否允许出站请求
+  3. **查看日志** — 搜索 429 错误
+
+  信息量完全相同。如果 judge 给第二个更高的分，差值就是格式偏差。</code></pre>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>关键问题来了：<strong>格式偏差到底算不算偏差？</strong>如果最终用户读的就是这段文本，那么「更好读」<em>确实是</em>质量的一部分，judge 给它更高分是对的。但如果这段文本要被程序解析、或者你评测的是「事实准确性」，那么格式就是纯粹的噪声。<strong>所以答案取决于你的评测目标——而这必须被显式声明，不能靠默认。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>用测量学的语言：格式是不是<span class="term">构念的一部分</span>（part of the construct）还是<span class="term">构念无关方差</span>（construct-irrelevant variance），取决于构念的定义。<em>同一个 judge 读数，在「整体有用性」这个构念下格式是信号，在「事实准确性」这个构念下格式是噪声。</em><strong>这也是为什么模块 01 主张 rubric 化：把「格式清晰」单列成一项，它就从一个隐藏的混杂变量变成了一个可以被显式加权（甚至权重设为 0）的维度。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个实际会发生的坏结果：如果你用一个有格式偏差的 judge 做训练信号或选型标准，<strong>模型会学会「把简单答案包装成有标题有列表的长文」</strong>——在需要简洁回答的场景，这是纯粹的退化。<em>而且这个退化在 judge 的分数上表现为「提升」</em>，所以只看分数你永远发现不了。<strong>唯一的发现方式是监控输出的长度分布与格式分布</strong>——这条监控在 C68 模块 05 里是一条标准的漂移告警。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="probe-pattern"><span class="num">6</span>统一的探针范式：加一个无关变量，看读数变不变</h2>
+  <p>前面五节的探针看起来各不相同，其实是同一个模式的实例。把它抽象出来，你就能给任何新怀疑的偏差<strong>自己设计探针</strong>。</p>  <div class="ascii">   探针范式（反事实对照）
+   ┌─────────────────────────────────────────────────────────────┐
+   │ 1. 选一个你怀疑的表面属性 X（位置/长度/风格/署名/引用/…）      │
+   │ 2. 构造成对样本：内容与质量完全相同，只有 X 不同               │
+   │ 3. 送同一个 judge 打分                                        │
+   │ 4. 分数差的均值 = X 的偏差幅度；差的方差 = 这个探针的噪声      │
+   │ 5. 用配对检验（同一内容成对）判断偏差是否显著                  │
+   └─────────────────────────────────────────────────────────────┘
+   关键在第 2 步：「质量完全相同」这件事必须是**构造出来的**，
+   不能靠"我觉得这两个差不多"。最可靠的构造方式是「同一份内容的变体」。</div>  <table>
+    <thead><tr><th>怀疑的属性 X</th><th>怎么构造只差 X 的成对样本</th><th>注意</th></tr></thead>
+    <tbody>
+      <tr><td>位置</td><td>交换 A/B 顺序</td><td>最干净——交换是严格保内容的</td></tr>
+      <tr><td>长度</td><td>扩写/精简到不同长度但信息量相同</td><td>很难做到「信息量严格相同」，需要人工核对</td></tr>
+      <tr><td>格式</td><td>把同一内容重排成纯文本 / markdown</td><td>相对容易保内容</td></tr>
+      <tr><td>署名 / 身份</td><td>在 prompt 里加上「这是 X 写的」</td><td>干净，但要注意 judge 可能拒绝回答</td></tr>
+      <tr><td>虚构引用</td><td>加一条格式正确但不存在的引用</td><td><strong>这条同时也是安全探针</strong>——judge 被虚构权威提分，说明它没在核实</td></tr>
+      <tr><td>自信语气</td><td>把「可能是……」改成「就是……」</td><td>保内容但改变认知标记，是校准相关的重要探针</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>第 5 步用<strong>配对检验</strong>而不是独立检验，理由与 C66 模块 04 完全相同：成对样本共享内容，内容质量这个最大的方差源被直接消掉。<em>这意味着探针需要的样本量比你想象的少得多</em>——几十到一两百对通常就足以把偏差幅度定位到有用的精度。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ensemble"><span class="num">7</span>多 judge 集成：什么时候真的有用</h2>
+  <p>「用三个 judge 投票」是一个被广泛推荐的做法。它有效，但<strong>只对某一类误差有效</strong>，而人们常常把它当成万能解药。</p>  <table>
+    <thead><tr><th>误差类型</th><th>集成有没有用</th><th>原因</th></tr></thead>
+    <tbody>
+      <tr><td><strong>随机噪声</strong></td><td>✅ 非常有用</td><td>独立噪声按 $1/\sqrt{K}$ 衰减，这是集成的标准收益</td></tr>
+      <tr><td><strong>各 judge 方向不同的偏差</strong></td><td>✅ 有用</td><td>方向不同的系统项在平均后部分抵消</td></tr>
+      <tr><td><strong>各 judge 共有的偏差</strong></td><td>❌ <strong>完全无用</strong></td><td>所有 judge 都偏向长回答时，平均之后还是偏向长回答——而且置信区间会变窄，让你<em>更自信地相信一个偏了的结论</em></td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>第三行是这一节的全部重点。<strong>长度偏差、格式偏差在几乎所有主流 judge 模型上都存在，且方向一致。</strong>对这类偏差，多 judge 集成<em>不但没用，还有害</em>——它把随机噪声压下去，使得残留的系统偏差在统计上显得更「显著」。<strong>集成只能治噪声，不能治共有的偏差。</strong></p>
+  </div>  <h3>那什么时候值得做集成</h3>  <ul>
+    <li><strong>judge 之间确实异质</strong>——不同厂商、不同规模、不同对齐方式。<em>先用第 6 节的探针测一下它们的偏差方向，方向一致的 judge 集成起来没有额外收益</em>；</li>
+    <li><strong>你已经把共有偏差处理掉了</strong>——先做 swap 平均、先做长度控制，剩下的才交给集成；</li>
+    <li><strong>预算允许</strong>——集成的成本是线性的，而收益是 $1/\sqrt{K}$ 的。<em>三个 judge 通常是性价比拐点</em>，五个以上很少划算。</li>
+  </ul>  <p>最后一个实用提示：<strong>集成的聚合方式要与用法匹配</strong>。pairwise 场景用多数投票（并把「无多数」记为平局）；pointwise 场景用均值（并<strong>报告 judge 间的标准差</strong>——这个标准差本身就是一个有用的「这个样本难判」信号，可以拿去做人工复核的分诊）。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="identifiability"><span class="num">8</span>去偏的极限：当长度与质量真的相关时</h2>
+  <p>最后一节讲一个必须诚实面对的问题：<strong>去偏不是免费的，它有可能矫枉过正。</strong></p>  <p>长度控制回归的隐含假设是：<strong>在控制住模型身份之后，长度差与质量差无关</strong>。但这个假设并不总成立——如果模型 A 真的因为「回答更完整」而更长，那么把长度效应全部回归掉，就<em>把 A 的一部分真实优势也一起减掉了</em>。</p>  <div class="math-block">\[\Delta_{\text{len}} = \underbrace{\delta_{\text{quality}}}_{\text{因为更完整而更长}} + \underbrace{\delta_{\text{padding}}}_{\text{纯粹的注水}}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>问题在于：<strong>这两项在观测数据里是无法分离的</strong>——你看到的只有总长度差。这是一个典型的<em>不可识别</em>问题：同一份数据可以由「A 更完整」和「A 更爱注水」两种假设同样好地解释。<strong>所以长度控制后的胜率不是「真值」，而是「假设长度全是注水时的下界」。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>要打破不可识别，必须引入<span class="term">额外的识别假设</span>或额外的数据。实践中有三条路：<strong>① 用人类标注的子集去估计 $\delta_{\text{quality}}$</strong>（人类判定「这段额外内容有没有增加信息」）；<strong>② 构造反事实样本</strong>（第 6 节的改写法：造出「同信息量不同长度」的对照，此时 $\delta_{\text{quality}} = 0$ 被构造性地保证了）；<strong>③ 报告一个区间而不是一个点</strong>——「原始胜率 62%，长度控制后 54%，真值在两者之间」。<em>第三条最诚实，也最容易执行。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把这条推广成本模块的总结论：<strong>去偏的正确输出不是一个更准的数字，而是一个更窄的区间加上一句关于假设的说明。</strong>「LC 胜率 54%」如果不附带「原始 62%」和「差值 8 个点全部归因于长度」这个假设，它给读者的确定感就超过了它实际拥有的信息。</p>
+  </div>  <h3>本模块的报告规范</h3>  <pre><code>judge:              claude-sonnet-5, prompt e3a1f9c, temp 0.0
+swap consistency:   0.883        ← &lt; 0.80 时胜率不可用
+position bias:      +0.041       ← (两种顺序下"选第一个"的平均倾向) - 0.5
+win rate (raw):     62.1%  [58.4%, 65.7%]
+win rate (LC):      54.3%  [50.6%, 58.0%]   ← 长度控制后
+  └─ gamma (长度系数):  0.31 per unit normalized length diff
+  └─ 假设: 长度差全部归因于注水；真值在 raw 与 LC 之间
+style probe:        +0.18 分 (markdown 重排 vs 纯文本, 同内容, n=120, 配对 p&lt;0.001)
+self-pref probe:    +0.09 分 (同族 vs 异族改写, n=150)
+judge ensemble:     未使用（三个候选 judge 的长度偏差方向一致，集成无额外收益）</code></pre>
+
+  <!-- ========================================================= -->
+  <h2 id="bias-budget"><span class="num">9</span>偏差预算：一份评测该花多少钱在探针上</h2>
+  <p>本模块给了五个探针。它们都很便宜，但加起来也是成本。这一节回答一个很实际的问题：<strong>该按什么顺序做、做到什么程度就可以停。</strong></p>  <table>
+    <thead><tr><th>优先级</th><th>探针</th><th>额外调用量</th><th>什么时候可以跳过</th></tr></thead>
+    <tbody>
+      <tr><td><strong>P0 必做</strong></td><td>swap 一致性</td><td>×2（全量）</td><td><strong>永远不能跳过</strong>——它同时是去偏手段和质量指标</td></tr>
+      <tr><td><strong>P0 必做</strong></td><td>长度偏差（回归法）</td><td><strong>0</strong>（用已有结果拟合）</td><td>永远不能跳过：零边际成本，只需要日志里有长度字段</td></tr>
+      <tr><td><strong>P1 强烈推荐</strong></td><td>风格探针（同内容不同格式）</td><td>~200 对</td><td>被评内容的格式高度统一时可跳过</td></tr>
+      <tr><td><strong>P1 强烈推荐</strong></td><td>自偏好探针</td><td>~300 对</td><td>judge 与被评模型确定异族时可跳过</td></tr>
+      <tr><td><strong>P2 按需</strong></td><td>虚构引用 / 权威 / 从众探针</td><td>各 ~150 对</td><td>非事实密集任务可跳过</td></tr>
+      <tr><td><strong>P2 按需</strong></td><td>多 judge 集成</td><td>×K（全量）</td><td><strong>先确认候选 judge 的偏差方向不同</strong>，方向一致就别做</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>注意第二行：<strong>长度偏差的回归法探针边际成本是零</strong>——它只需要你在日志里记了 <code>a_len_tokens</code> 与 <code>b_len_tokens</code>，然后对已有的判断结果拟合一个逻辑回归。<em>这可能是整个评测流程里性价比最高的一件事：几行代码，换来「这 6 个点的差距有多少来自长度」这个关键答案。</em><strong>而它的前提只是「日志里有那两个字段」——这又一次说明 schema 是事前决定（呼应 C66-03）。</strong></p>
+  </div>  <h3>什么时候可以停</h3>  <p>一个可操作的停止规则，按结论的用途分：</p>  <ul>
+    <li><strong>只是内部看看趋势</strong>：做完 P0 两项即可，把 raw 与 LC 两个数一起看；</li>
+    <li><strong>要写进报告或做选型决策</strong>：P0 + P1 全做，并在报告里给出 raw–LC 区间与两个探针的幅度；</li>
+    <li><strong>judge 要被用作训练信号</strong>：<strong>全部做完，而且要定期重做</strong>——因为模块 05 会讲到，训练信号的误差会被优化过程主动放大，<em>你在这里量到的每一个偏差，都会在训练后变成一种 reward hacking 形态</em>。</li>
+  </ul>  <p>最后一条值得展开一句：<strong>偏差探针的结果，是可以直接预测 hack 方向的</strong>。如果你量到长度系数 $\gamma = 0.8$，那么用这个 judge 训出来的模型<em>一定</em>会把输出推长——这不需要等实验结果，可以提前布置监控。模块 05 第 3 节会把这条对应关系列成一张完整的表。</p>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_judge_design/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · Judge 设计</div></a>
+    <a class="next" href="../03_meta_eval/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 元评测与校准</div></a>
+  </div>
+
+</div>
+</body>
+</html>

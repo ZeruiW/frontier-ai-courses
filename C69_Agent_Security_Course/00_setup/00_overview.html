@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>00 · 课程总览与环境</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 00 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>00 · 课程总览与环境</h1>
+  <p class="subtitle">agent 安全不是模型安全的延伸：<strong>LLM 没有「数据 / 代码」的结构性分隔</strong>（SQL 注入能被参数化查询彻底解决，是因为数据库分得开；而这里都是同一串 token），所以<strong>本课的全部思路不是「消除注入」，而是「限制注入成功后的后果」</strong> · <strong>致命三要素</strong>——不受信内容 + 私密数据 + 对外通信——三者齐备则外泄链路完整；<em>而三者中最容易去掉、也最有效的是第三个</em> · <strong><code>trust(输出) = min(上下文)</code></strong> 是全课最重要的形式化规则，它等价于信息流控制里「完整性等级只能单调下降」；由此得到一条反直觉的推论：<strong>「让模型自己判断这段内容可不可信」在结构上无效</strong>——因为做这个判断的那次调用，上下文里就含有那段不可信内容 · <strong>六个入口</strong>里最常被漏掉的三个是<strong>工具描述、子 agent 的输出、长期记忆</strong>——共同点是「开发者倾向于信任自己接的东西」 · <strong>架构 &gt; 检测</strong>：不变量与攻击者水平无关，概率保证对自适应攻击者没有下界</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过 C04 或 C30 任一门的前三个模块（知道 agent 的循环与工具调用长什么样）；C66（agent 评测）读过更好，本课 05 模块会大量复用它的统计规范</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 00_environment_check.ipynb（环境自检 / 最小注入实验台：可控 agent + 可注入内容源 / 信任等级传播的形式化与验证 / 「致命三要素」组合的风险矩阵 / 攻击面自检器）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Simon Willison 关于 prompt injection 与「lethal trifecta」的系列分析 · Greshake et al., <em>Not What You've Signed Up For</em>（AISec 2023，间接注入）· OWASP <em>Top 10 for LLM Applications</em>（LLM01 Prompt Injection）· Debenedetti et al., <em>AgentDojo</em>（NeurIPS 2024）· 本课程 C05（模型安全评测）· C44（对抗攻击）· C68 模块 05（guardrail）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why-new">为什么 agent 安全是一个新问题，而不是旧问题的延伸</a></li>
+      <li><a href="#trifecta">致命三要素：什么时候一个 agent 是危险的</a></li>
+      <li><a href="#trust-levels">信任等级：一个能写进代码的模型</a></li>
+      <li><a href="#attack-surface">攻击面地图：六个入口</a></li>
+      <li><a href="#division">与既有课程的分工</a></li>
+      <li><a href="#env">环境、依赖与本课的运行约定</a></li>
+      <li><a href="#posture">防御姿态：三条排序原则</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why-new"><span class="num">1</span>为什么 agent 安全是一个新问题，而不是旧问题的延伸</h2>
+  <p>模型安全（C05）问的是「模型会不会说不该说的话」。对抗攻击（C44）问的是「输入扰动能不能改变模型的判断」。<strong>agent 安全问的是第三个问题：当模型能<em>行动</em>时，谁在实际控制这些行动。</strong></p>  <div class="ascii">   聊天模型                          Agent
+   ┌────────────────────┐            ┌──────────────────────────────────┐
+   │ 输入: 用户的话       │            │ 输入: 用户的话 **+ 网页 + 文件    │
+   │                    │            │        + 工具返回 + 其他 agent**  │
+   │ 输出: 一段文字       │            │ 输出: **真实动作**（改文件/发请求 │
+   │                    │            │        /转账/发邮件）             │
+   │                    │            │                                  │
+   │ 危害上限: 说错话     │            │ 危害上限: **它有权限做的任何事**  │
+   └────────────────────┘            └──────────────────────────────────┘
+   关键差别不是"更危险"，而是**输入里混进了不受信任的内容，
+   而模型无法在结构上区分"用户的指令"和"网页里的一句话"。**</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把这个差别说得再具体一点：<strong>传统软件里，「数据」和「代码」是两种东西</strong>——SQL 注入之所以能被参数化查询彻底解决，是因为数据库能在结构上分开「这是查询语句」和「这是用户填的值」。<strong>而在 LLM 里，两者都是同一个 token 序列，模型没有任何机制去区分</strong>。<em>这就是为什么 prompt injection 至今没有「参数化查询」那样的彻底解法。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，传统系统里存在一个<span class="term">解析边界</span>：输入被解析成一棵语法树，用户数据只能占据叶子节点，无法变成控制节点。<strong>LLM 的「解析」是一个连续的注意力过程，不存在这样的结构性分隔</strong>——上下文里的任何 token 都可能影响后续生成。<em>因此本课的全部防御思路都不是「消除注入」，而是<strong>限制注入成功后能造成的后果</strong></em>——这是一个从「阻止攻击」到「控制爆炸半径」的根本转变，也是理解后面五个模块的关键。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>这条要说得非常清楚，因为它决定了你会不会把工程投入放对地方：<strong>不存在一个「能挡住 95% 提示注入」的过滤器，能让你安心地给 agent 高权限。</strong><em>剩下的 5% 在一个能自动执行的系统里就足够造成完整的危害，而且攻击者可以针对你的过滤器自适应地调整（05 模块）。</em><strong>正确的投入顺序是：先做权限边界（03 模块）与出站控制（04 模块），再做检测——而不是反过来。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="trifecta"><span class="num">2</span>致命三要素：什么时候一个 agent 是危险的</h2>
+  <p>并不是所有 agent 都有严重的安全问题。判断一个 agent 危不危险，有一个非常实用的三要素判据。</p>  <div class="ascii">              ① 接触不受信任内容
+             （网页 / 邮件 / 用户上传文件 / 第三方工具返回）
+                        ╲
+                         ╲
+    ② 能访问私密数据       ╳        ③ 能对外通信
+   （你的邮箱/代码库/       ╱         （发请求 / 发邮件 / 写公开位置
+     数据库/凭证）        ╱            / 甚至只是渲染一张外链图片）
+                        ╱
+
+   **三个同时具备 = 数据外泄的完整链路已经就绪。**
+   只要缺任意一个，最严重的那类危害就不成立。</div>  <table>
+    <thead><tr><th>配置</th><th>①不受信内容</th><th>②私密数据</th><th>③对外通信</th><th>风险</th><th>典型例子</th></tr></thead>
+    <tbody>
+      <tr><td>只读摘要器</td><td>✅</td><td>❌</td><td>❌</td><td><strong>低</strong></td><td>把网页总结给用户看，无其他权限</td></tr>
+      <tr><td>内部知识问答</td><td>❌</td><td>✅</td><td>❌</td><td><strong>低</strong></td><td>只查内部文档，不接触外部内容</td></tr>
+      <tr><td>无数据的外呼</td><td>✅</td><td>❌</td><td>✅</td><td>中</td><td>可被当成攻击跳板，但泄不了你的数据</td></tr>
+      <tr><td><strong>邮件助理</strong></td><td>✅</td><td>✅</td><td>✅</td><td><strong>高</strong></td><td><strong>读邮件（不受信）+ 有邮箱访问 + 能发邮件</strong></td></tr>
+      <tr><td><strong>编码 agent</strong></td><td>✅</td><td>✅</td><td>✅</td><td><strong>高</strong></td><td>读 issue/依赖（不受信）+ 有代码库与密钥 + 能推送/发请求</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>这个判据的实用价值在于它给出了<strong>明确的设计动作</strong>：<em>与其纠结「怎么挡住注入」，不如先问「我能不能把这三个里的某一个去掉」</em>。<strong>三者中最容易去掉、也最有效的通常是第三个（对外通信）</strong>——把出站限制在白名单内，数据外泄的链路就断了（04 模块）。<em>而这不需要任何检测能力，是一个纯粹的架构决策。</em></p>
+  </div>  <p>需要补充一点：<strong>「对外通信」的定义比直觉宽得多</strong>。它不只是「调用 HTTP 接口」——<em>渲染一张外链图片、生成一个可点击链接、写入一个会被别人读到的位置，都是对外通信</em>。04 模块会把这些侧信道逐一拆开。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="trust-levels"><span class="num">3</span>信任等级：一个能写进代码的模型</h2>
+  <p>要在工程上管住这件事，需要一个比「可信 / 不可信」更细的模型。本课用一个四级的信任等级，它的关键性质是<strong>可传播、可计算</strong>。</p>  <table>
+    <thead><tr><th>等级</th><th>含义</th><th>典型来源</th><th>允许触发什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L3 系统</strong></td><td>由你部署的、不可被外部影响的内容</td><td>系统提示、工具 schema、策略文档</td><td>任何操作</td></tr>
+      <tr><td><strong>L2 用户</strong></td><td>来自已认证用户的直接输入</td><td>用户在对话框里打的字</td><td>该用户有权做的操作</td></tr>
+      <tr><td><strong>L1 半可信</strong></td><td>来自内部系统但可能被间接影响</td><td>内部数据库里由用户填的字段、内部 wiki</td><td>读操作；写操作需确认</td></tr>
+      <tr><td><strong>L0 不受信</strong></td><td>任何外部内容</td><td>网页、邮件正文、上传文件、第三方 API 返回、其他 agent 的输出</td><td><strong>不允许触发任何操作</strong>，只能作为「被处理的数据」</td></tr>
+    </tbody>
+  </table>  <div class="math-block">\[\text{trust}(\text{输出}) = \min_{i \in \text{上下文}} \text{trust}(i)\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这个式子是本课最重要的一条形式化规则，值得念一遍：<strong>一次模型调用的输出，信任等级等于它上下文里所有内容的<em>最低</em>等级。</strong><em>只要有一段 L0 的网页内容进了上下文，这次调用的输出就是 L0 的</em>——哪怕系统提示写得再严格。<strong>而 L0 的输出不允许触发任何操作。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这条规则等价于信息流控制里的<span class="term">no-read-up / no-write-down</span>格结构（Bell–LaPadula 与 Biba 的混合形态）：<strong>完整性等级只能单调下降，不能凭空提升。</strong><em>「提升」只能通过一个显式的、被审计的<strong>降级/提权点</strong>发生</em>——在 agent 系统里，这个点就是<strong>人类确认</strong>或<strong>一个不接触 L0 内容的独立验证器</strong>。notebook 第 2 节会把这条规则写成代码并验证它的传播行为。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>这条规则最反直觉、也最容易被违反的推论：<strong>「让模型自己判断这段内容可不可信」是无效的</strong>——因为做这个判断的那次调用，<em>它的上下文里就包含了那段不可信内容，所以它的判断本身也是 L0 的</em>。<strong>不可信内容不能被用来判断它自己是否可信。</strong>这不是模型能力问题，是结构问题。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="attack-surface"><span class="num">4</span>攻击面地图：六个入口</h2>
+  <p>把 agent 的输入侧展开，一共有六类不受信任的内容入口。本课后面五个模块基本就是沿着这张图展开的。</p>  <div class="ascii">   ┌─────────────────────────── AGENT ────────────────────────────┐
+   │                                                              │
+   │  ① 用户输入        直接注入（越狱、角色扮演）      → C05 覆盖 │
+   │  ② 检索/浏览内容    **间接注入**（网页、文档、邮件）→ 01 模块 │
+   │  ③ 工具的返回值     被污染的 API 响应              → 01/02   │
+   │  ④ 工具的**描述**   工具 schema 投毒、工具影子      → 02 模块 │
+   │  ⑤ 其他 agent 的输出 多智能体间的注入传播           → 02 模块 │
+   │  ⑥ 记忆/历史       持久化注入（写进长期记忆）      → 01 模块 │
+   │                                                              │
+   └──────────────────────────────────────────────────────────────┘
+             │                              │
+             ▼                              ▼
+        权限边界（03 模块）           出站通道（04 模块）</div>  <table>
+    <thead><tr><th>入口</th><th>为什么容易被忽略</th><th>本课哪里讲</th></tr></thead>
+    <tbody>
+      <tr><td><strong>② 检索/浏览内容</strong></td><td>最主流的入口，但很多系统把它当成「数据」而没有降级信任</td><td>01 模块</td></tr>
+      <tr><td><strong>③ 工具返回值</strong></td><td>开发者倾向于信任「自己调的 API」，但 API 返回的内容可能来自外部</td><td>01 模块</td></tr>
+      <tr><td><strong>④ 工具描述</strong></td><td><strong>schema 与描述文本也进上下文</strong>——一个第三方工具的 description 字段就是一条注入通道</td><td>02 模块</td></tr>
+      <tr><td><strong>⑤ 其他 agent 的输出</strong></td><td>编排系统里子 agent 的返回被当成可信，<em>但子 agent 可能读过网页</em></td><td>02 模块</td></tr>
+      <tr><td><strong>⑥ 记忆</strong></td><td><strong>注入可以被持久化</strong>：这次读到的恶意内容被写进长期记忆，影响以后所有会话</td><td>01 模块</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>第 ⑥ 项是危害持续时间最长的一类，值得单独警惕：<strong>如果 agent 有长期记忆，一次成功的注入可以变成永久的后门。</strong><em>攻击者只需要让 agent 读一次被污染的内容，而恶意指令被写进记忆之后，后续每一次会话都会加载它</em>——<strong>而且此时上下文里已经看不到原始的攻击内容了，排查会非常困难。</strong>所以记忆的写入必须遵守第 3 节的信任规则：<em>L0 内容不允许直接进入长期记忆</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="division"><span class="num">5</span>与既有课程的分工</h2>
+  <table>
+    <thead><tr><th>课程</th><th>它讲什么</th><th>本课的关系</th></tr></thead>
+    <tbody>
+      <tr><td><strong>C05</strong> · 模型安全评测与红队</td><td>危险能力评估、拒答与鲁棒性、越狱、安全案例</td><td><strong>C05 的对象是「模型会说什么」，本课的对象是「agent 会做什么」</strong>。越狱（① 用户直接注入）归 C05，间接注入与权限边界归本课</td></tr>
+      <tr><td><strong>C44</strong> · 对抗与安全</td><td>对抗样本、扰动、后门、模型窃取</td><td>那门课的攻击目标是<em>模型的判断</em>，本课的攻击目标是<em>系统的动作</em>。手法不同，威胁模型不同</td></tr>
+      <tr><td><strong>C45</strong> · 隐私与可信</td><td>差分隐私、成员推断、数据保护</td><td>本课 04 模块的数据外泄是<strong>运行时</strong>的泄漏路径，C45 讲的是<strong>训练时</strong>的泄漏——两者互补</td></tr>
+      <tr><td><strong>C26 模块 05</strong> · agent eval & safety</td><td>前沿 agent 的评测与安全概览（一节）</td><td>本课是那半节的六倍展开</td></tr>
+      <tr><td><strong>C30–C34</strong> · 动手造 agent</td><td>harness、工具系统、编排、权限（C34-03）</td><td><strong>C34-03 讲权限怎么实现，本课 03 模块讲权限该怎么设计以及怎么评测它</strong></td></tr>
+      <tr><td><strong>C66</strong> · Agent 评测（同批）</td><td>任务集、判分器、轨迹、统计、成本</td><td><strong>本课 05 模块的攻击成功率评测完全复用 C66 的统计规范</strong>——只是被测量的量从「能力」换成了「攻击面」</td></tr>
+      <tr><td><strong>C68 模块 05</strong> · 线上监控（同批）</td><td>质量 guardrail、漂移、闭环</td><td><strong>那里的 guardrail 是质量护栏，本课的是安全护栏</strong>：机制相似（分层、误伤率），但触发条件与失败代价完全不同</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话记住这批新课的分工：<strong>C66 量 agent · C67 量判分器 · C68 把评测变成基础设施 · C69 量攻击面。</strong><em>本课是链条的最后一环，也是唯一一个「被测量的对象会主动对抗你的测量」的一环</em>——这个性质会在 05 模块彻底改变评测方法（静态基准的分数会系统性高估防御效果）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="env"><span class="num">6</span>环境、依赖与本课的运行约定</h2>
+  <p>本课<strong>全程 CPU、断网可跑、不需要任何 API key</strong>，而且有一条比前几课更重要的约定需要说明。</p>  <div class="callout warn"><span class="label"></span>
+    <strong>本课的 notebook 里不包含针对任何真实系统的可用攻击载荷。</strong>所有的「攻击」都是在一个<em>本地的、完全模拟的</em> agent 上进行的：被攻击的 agent 是一个几十行的规则匹配器，「注入内容」是形如 <code>[[INJECT:read_secret]]</code> 的占位符标记。<strong>这样做不是为了回避，而是因为它更适合教学</strong>——<em>你要学的是「信任等级怎么传播」「权限边界怎么设计」「攻击成功率怎么统计」这些结构性的东西，而这些东西用模拟器验证得更清楚、更可复现</em>。真实的注入手法在讲解里以<strong>机制层面</strong>描述（足以让你设计防御），不给可直接复制的载荷。
+  </div>  <ul>
+    <li><strong>模拟 agent</strong>：一个可控的执行器，它会「服从」上下文里的指令标记——<em>服从概率是一个可调的旋钮</em>，让你能研究「防御把成功率从 40% 降到 8%」这类定量问题；</li>
+    <li><strong>可注入的内容源</strong>：模拟网页/邮件/工具返回，可以插入指令标记；</li>
+    <li><strong>权限系统与出站控制</strong>：真实实现（能力检查、白名单、审计日志），<em>因为这些本来就不需要真实模型</em>；</li>
+    <li><strong>真实工程胶囊</strong>：把防御机制落到真实系统的代码（工具权限声明、出站代理配置、审计埋点、AgentDojo 类基准的接入）。</li>
+  </ul>  <pre><code>pip install numpy jupyterlab ipykernel
+jupyter lab      # 或直接在 Colab 里点每个 notebook 顶部的徽章</code></pre>
+
+  <!-- ========================================================= -->
+  <h2 id="posture"><span class="num">7</span>防御姿态：三条排序原则</h2>
+  <p>最后给出本课的整体主张，它决定了后面五个模块的顺序。</p>  <ol>
+    <li><strong>架构 &gt; 检测。</strong>去掉「致命三要素」里的一个，比训练一个更好的注入分类器有效得多，<em>而且它的效果不依赖于攻击者的水平</em>。<strong>先做权限与出站，再做检测。</strong></li>
+    <li><strong>假设注入会成功，设计爆炸半径。</strong>所有的防御目标不是「让注入失败」，而是「注入成功之后，攻击者能做的最坏的事是什么」。<em>这个问题有确定的答案（= agent 的权限集），而且可以被系统性地缩小。</em></li>
+    <li><strong>可逆操作与不可逆操作分开对待。</strong>读文件、查数据可以自动做；<strong>发邮件、转账、删除、推送代码必须有一个不接触 L0 内容的确认环节</strong>。<em>这条与 C66 模块 05 的「失败代价高时，加人工确认点比提分更划算」是同一条结论，只是这里的「失败」是被攻击。</em></li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么把「架构」排在「检测」前面？因为两者的<strong>失败模式完全不同</strong>。<em>检测失败是概率性的、且随攻击者水平变化</em>——你今天挡住了 95%，明天有人换个写法就绕过了。<strong>而架构约束是确定性的</strong>：如果 agent 在结构上没有发邮件的能力，那么无论注入写得多巧妙，它都发不出邮件。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>用形式化的话说：检测提供的是<span class="term">概率性保证</span>（$\Pr[\text{阻止}] = 1 - \text{绕过率}$，而绕过率对<em>自适应攻击者</em>没有下界），架构提供的是<span class="term">不变量</span>（某类动作在系统中不可达，与攻击者能力无关）。<strong>安全工程的基本原则是：能用不变量保证的，就不要用概率保证。</strong><em>检测的正确定位是「减少噪声、提供告警信号」，而不是「作为主要防线」。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>把这三条压成一句可以贴在墙上的话：<strong>不要问「怎么挡住提示注入」，要问「注入成功之后它能做什么，以及我怎么把那个集合缩小」。</strong></p>
+  </div>
+
+
+  <div class="pager">
+    <a class="next" href="../01_indirect_injection/01_讲解.html"><div class="dir">下一模块 →</div><div class="t">01 · 间接提示注入</div></a>
+  </div>
+
+</div>
+</body>
+</html>

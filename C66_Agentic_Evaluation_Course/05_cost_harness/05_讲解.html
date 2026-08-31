@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 成本感知评测与 harness 可复现性</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 成本感知评测与 harness 可复现性</h1>
+  <p class="subtitle"><strong>「谁更强」在不固定预算时没有定义</strong>——任何 agent 的成功率都能靠多花钱提高，正确提法只有「同预算谁更准」和「同精度谁更便宜」两种 · 成本归一化必须报 <strong>$/success 而不是 $/task</strong>，否则重蹈 03 模块 Goodhart 的覆辙（早放弃的 agent 每任务成本最低） · <strong>帕累托前沿</strong>上被支配的配置在任何预算下都不该选，而它们在真实评测里非常常见——通常意味着 scaffold 没调好 · <strong>best-of-n 对判分器假阳率极度敏感</strong>：$n$ 越大，交付出去的「成功」里假阳解占比越高 · <strong>scaffold 的主效应与交互项常常大于模型主效应</strong>——2×2 实验里换套 scaffold 就能翻转「哪个模型更强」的结论 · <strong>十项复现清单压成一个指纹</strong>，让「不可比较」变成机器可判定的一行 assert · 最后把成功率翻译成期望效用：<strong>失败代价高时，加一个人工确认点比提分更划算</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 04（pass@k / pass^k 与统计）；知道「容器镜像」和「哈希」两个概念即可</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_cost_and_harness.ipynb（成本模型与归一化 / 成本-成功率帕累托前沿 / best-of-n 的边际收益 / scaffold 方差实验：同模型不同 harness / 配置指纹与漂移检测 / 评测卡自动生成器 / 上线门槛的期望效用计算）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Kapoor et al., <em>AI Agents That Matter</em>（2024，成本-精度前沿与 agent 评测的可复现性）· SWE-bench 官方 harness 与容器化评测实践 · Mitchell et al., <em>Model Cards</em>（FAT* 2019，报告规范的思想来源）· 本课程 C08（算力与成本账本）· C24（推理服务）· C68（评测基础设施）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#cost-first">不带成本的成功率是不可比的</a></li>
+      <li><a href="#cost-model">成本模型：四种成本与归一化</a></li>
+      <li><a href="#pareto">成本-成功率前沿：怎么读，怎么用</a></li>
+      <li><a href="#scaffold">harness / scaffold：影响常常大于模型本身的差异</a></li>
+      <li><a href="#repro">可复现性清单：十个必须钉死的东西</a></li>
+      <li><a href="#eval-card">评测卡：一份完整报告的最小集合</a></li>
+      <li><a href="#to-decision">从评测到决策：上线门槛该怎么定</a></li>
+      <li><a href="#cheaper-eval">评测本身的成本控制：用更少的钱得到同样的结论</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost-first"><span class="num">1</span>不带成本的成功率是不可比的</h2>
+  <p>先说结论：<strong>「agent A 在 SWE-bench Verified 上得 48%」这句话，在没有成本信息时是一个无法使用的数字。</strong>原因很直接——任何 agent 的成功率都可以通过<em>多花钱</em>提高。</p>  <table>
+    <thead><tr><th>花钱的方式</th><th>怎么提高成功率</th><th>成本增幅</th><th>是否算「模型更强」</th></tr></thead>
+    <tbody>
+      <tr><td><strong>提高重试/采样次数</strong></td><td>跑 $n$ 次取最好的（需要验证器）</td><td>线性 $\times n$</td><td>❌ 这是 best-of-n，不是模型能力</td></tr>
+      <tr><td><strong>放宽步数上限</strong></td><td>从 30 步放到 200 步</td><td>近似线性</td><td>❌ 换个预算数字就能复制</td></tr>
+      <tr><td><strong>更长的上下文 / 更多检索</strong></td><td>把整个仓库塞进上下文</td><td>token 成本可能涨十倍</td><td>❌ 这是 scaffold 的选择</td></tr>
+      <tr><td><strong>更强的 scaffold</strong></td><td>加反思、加子 agent、加验证步骤</td><td>视实现而定，常 2–5 倍</td><td>❌ 这是 harness 能力，不是模型能力</td></tr>
+      <tr><td><strong>模型本身更强</strong></td><td>同样预算下做对更多</td><td>不变</td><td>✅ 只有这一行才是</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>所以「谁更强」这个问题<strong>在不固定预算的情况下没有定义</strong>。正确的提法只有两种：<strong>①「给定相同预算，谁的成功率更高」；②「达到相同成功率，谁的成本更低」</strong>。这两种提法都要求你把成本作为一等公民记录下来——<em>而这正是绝大多数公开 agent 评测报告缺失的那一栏。</em></p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>换个说法：报告一个不带成本的 agent 分数，等价于报告一辆车的最高时速却不说油耗。两辆车都能跑到 200 公里，一辆烧 8 升一辆烧 30 升——<strong>「都能跑到 200」这句话本身是真的，但用它做采购决策是荒谬的。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，agent 的能力不是一个标量，而是一条<span class="term">成本-效用曲线</span> $s(b)$：给定预算 $b$（token、时间、调用次数），可达到的期望成功率。报告单点 $s(b_0)$ 只在 $b_0$ 被明确写出时才有意义；<strong>比较两个 agent 等价于比较两条曲线，而两条曲线可以相交</strong>——低预算下 A 更好、高预算下 B 更好，是完全正常的情况。<em>这也解释了为什么「哪个模型最强」这个问题在产品语境下经常没有答案，而「在我们的预算下哪个更合适」永远有答案。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost-model"><span class="num">2</span>成本模型：四种成本与归一化</h2>
+  <p>要把成本记进报告，先要定义什么叫成本。agent 评测里有四种，它们的单位不同、可比性也不同。</p>  <table>
+    <thead><tr><th>成本类型</th><th>单位</th><th>怎么测</th><th>陷阱</th></tr></thead>
+    <tbody>
+      <tr><td><strong>token 成本</strong></td><td>美元 / 任务</td><td>$\sum(\text{in} \times p_{\text{in}} + \text{out} \times p_{\text{out}})$</td><td><strong>缓存命中会让实际账单远低于名义 token</strong>；跨模型比较时价格会变，应<em>同时</em>记 token 数与当时的单价</td></tr>
+      <tr><td><strong>墙钟时间</strong></td><td>秒 / 任务</td><td>端到端计时</td><td>受并发度、限流、外部服务抖动影响极大；<strong>不同并发下测出的时间不可比</strong></td></tr>
+      <tr><td><strong>工具/环境成本</strong></td><td>调用次数、容器分钟</td><td>计数 + 计时</td><td>容易被忽略；跑测试套件的 CPU 时间在代码类任务里可能超过 token 成本</td></tr>
+      <tr><td><strong>人力成本</strong></td><td>人分钟 / 任务</td><td>人工复核、人工判分的耗时</td><td>在半自动评测里是真正的瓶颈；<em>它决定了评测能跑多大规模</em></td></tr>
+    </tbody>
+  </table>  <h3>归一化：三种做法，各自的适用面</h3>  <ol>
+    <li><strong>固定预算</strong>：给所有 agent 同样的 token/步数上限，比成功率。最简单、最公平，<strong>推荐作为默认做法</strong>。缺点是预算选得不好会让某些 agent 的曲线被截断在拐点之前。</li>
+    <li><strong>成本归一成功率</strong>：报「每美元买到多少次成功」。适合成本敏感的产品决策，但它<em>隐含假设成功的边际价值恒定</em>——对「必须做完否则一分不值」的任务不成立。</li>
+    <li><strong>报整条曲线</strong>：在多个预算档位各跑一遍，画成本-成功率前沿。信息最完整、成本最高，<strong>适合模型选型这种一次性决策</strong>。</li>
+  </ol>  <div class="callout warn"><span class="label"></span>
+    <p>一个非常容易踩的坑：<strong>用「平均 token 数」做成本归一化，会重蹈模块 03 的 Goodhart 覆辙</strong>——失败的轨迹往往更短更便宜，所以「降低平均成本」的最省事路径依然是「早点放弃」。<strong>正确做法是报「每次成功的平均成本」</strong>（总成本 ÷ 成功次数），它天然把失败的开销摊到了成功头上。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pareto"><span class="num">3</span>成本-成功率前沿：怎么读，怎么用</h2>
+  <p>把每个配置（模型 × scaffold × 预算）画成 (成本, 成功率) 平面上的一个点，取<strong>帕累托前沿</strong>——不存在另一个点同时更便宜且更准的那些配置。</p>  <div class="ascii">  成功率
+    │                                      ● D (贵且强)
+ 60%│                          ● C
+    │              ● B
+ 40%│      ● A                       ○ E (被 C 支配：更贵且更差)
+    │  ○ F (被 A 支配)
+ 20%│
+    └──────────────────────────────────────────────► 每任务成本
+      $0.05    $0.2      $1.0        $4.0     $18
+
+  前沿 = {A, B, C, D}。E 和 F 被支配 —— 它们在任何预算下都不该被选。
+  选哪个取决于你的预算线落在哪里，而不是"谁的分数最高"。</div>  <table>
+    <thead><tr><th>读法</th><th>问题</th><th>答案在图上哪里</th></tr></thead>
+    <tbody>
+      <tr><td><strong>预算给定</strong></td><td>我每任务最多花 $1，选谁</td><td>在 $x = 1$ 处作垂线，取前沿上左侧最高的点（B 或 C）</td></tr>
+      <tr><td><strong>目标给定</strong></td><td>我要 55% 成功率，最便宜多少</td><td>在 $y = 0.55$ 处作水平线，取前沿上最左的交点</td></tr>
+      <tr><td><strong>边际成本</strong></td><td>从 C 提到 D 值不值</td><td>看两点间的斜率：多花的钱除以多得的成功率</td></tr>
+      <tr><td><strong>被支配点</strong></td><td>E 为什么永远不该选</td><td>存在 C 同时更便宜更准——<strong>这类点在真实评测里非常常见</strong>，通常是 scaffold 没调好</td></tr>
+    </tbody>
+  </table>  <h3>best-of-n 的特殊地位</h3>  <p>best-of-n（跑 $n$ 次取最好）是成本-成功率曲线上最容易被误用的一段。它的成功率就是模块 04 的 <strong>pass@n</strong>，成本近似线性增长。三条必须记住的性质：</p>  <ul>
+    <li><strong>它需要一个验证器</strong>。没有验证器就没法「取最好的」，此时 $n$ 次采样的实际价值接近 $n = 1$——<em>这是 best-of-n 最常见的误用</em>。</li>
+    <li><strong>边际收益急剧递减</strong>：pass@n 随 $n$ 增长很快饱和；从 1 到 2 通常涨十几个点，从 8 到 16 可能只涨一两个点，而成本翻倍。</li>
+    <li><strong>验证器本身有假阳率</strong>：$n$ 越大，「被验证器错判为成功的失败解」被选中的概率越高。<em>这是模块 02 的 $\alpha$ 在 best-of-n 场景下的放大效应</em>——$n$ 大到一定程度，best-of-n 会开始<strong>系统性地挑出 hack 解</strong>。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>第三条值得记牢：<strong>best-of-n 是一个对判分器质量极其敏感的操作。</strong>判分器完美时它单调有益；判分器有 5% 假阳率时，$n = 32$ 的 best-of-n 有很大概率选中一个假阳解。notebook 第 3 节会把这个概率算出来——<em>它同时也是 C67 模块 05 里 reward hacking 的评测侧同构现象。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="scaffold"><span class="num">4</span>harness / scaffold：影响常常大于模型本身的差异</h2>
+  <p>这是整门课里最反直觉、也最重要的工程事实：<strong>在 agentic 基准上，同一个模型换一套 scaffold，分数的变化幅度经常超过两代模型之间的差距。</strong></p>  <h3>scaffold 包含什么</h3>  <table>
+    <thead><tr><th>组成部分</th><th>具体选择</th><th>对分数的影响机制</th></tr></thead>
+    <tbody>
+      <tr><td><strong>工具集</strong></td><td>给不给 <code>grep</code>？文件编辑是全文替换还是行级 patch？</td><td>工具的表达力直接决定了 agent 需要多少步；行级编辑工具能显著降低格式错误</td></tr>
+      <tr><td><strong>提示与角色</strong></td><td>系统提示、few-shot、是否要求先规划</td><td>影响探索策略与放弃倾向</td></tr>
+      <tr><td><strong>循环结构</strong></td><td>单 agent / 反思循环 / planner-executor / 多子 agent</td><td>结构越复杂，成本越高，收益不一定单调</td></tr>
+      <tr><td><strong>预算与终止</strong></td><td>最大步数、最大 token、超时、重试次数</td><td><strong>最容易被忽略、影响最大的一组</strong></td></tr>
+      <tr><td><strong>上下文管理</strong></td><td>压缩策略、记忆、检索（C33）</td><td>长任务上决定成败</td></tr>
+      <tr><td><strong>错误处理</strong></td><td>工具报错怎么回传给模型、要不要自动重试</td><td>直接决定模块 03 的恢复率</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>由此得到一条必须遵守的报告纪律：<strong>任何 agent 基准分数，如果没有附带 scaffold 的完整描述，都不构成一个可比较、可复现的结果。</strong>「模型 A 得 48%，模型 B 得 42%」这句话，如果 A 用的是精心调过的自研 scaffold、B 用的是官方最简 baseline，那么这个 6 个点的差距<em>可能完全来自 scaffold</em>。</p>
+  </div>  <h3>怎么做一次公平的模型对比</h3>  <ol>
+    <li><strong>固定 scaffold，只换模型</strong>——这是唯一能支持「模型 A 比 B 强」这个结论的设计；</li>
+    <li><strong>但要意识到它的局限</strong>：一个为 A 调优过的 scaffold 在 B 上可能水土不服。更公平（也更贵）的做法是<strong>各自用各自的最佳 scaffold</strong>，然后明确声明「这比较的是「模型+scaffold」这个组合，不是模型本身」；</li>
+    <li><strong>报告 scaffold 消融</strong>：至少给出「最简 baseline scaffold」下的分数作为参照，让读者能把 scaffold 贡献和模型贡献分开。</li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这件事在静态基准时代不存在？因为静态基准的 scaffold 只是一个 prompt 模板，变化空间很小。agent 的 scaffold 是<strong>一整个程序</strong>——它决定了模型能看到什么、能做什么、什么时候停。<strong>说得直白些：agent 基准测的从来不是模型，而是「模型 + 你写的那个程序」的组合。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从测量的角度，scaffold 是一个未被控制的<span class="term">调节变量</span>（moderator）。当调节变量的效应量与主效应量同阶时，不报告它就使得整个实验缺乏<span class="term">内部效度</span>。<em>正确的实验设计是把 scaffold 作为一个显式因子纳入：至少做 2×2（两个模型 × 两个 scaffold），从而能估计交互项。</em>notebook 第 4 节会把这个 2×2 设计跑一遍，展示交互项如何翻转结论。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="repro"><span class="num">5</span>可复现性清单：十个必须钉死的东西</h2>
+  <p>「可复现」在 agent 评测里的含义是：<strong>另一个人拿到你的报告，能在正负一个误差棒内重现你的数字。</strong>下面这十项缺一项就做不到。</p>  <table>
+    <thead><tr><th>#</th><th>要钉死的东西</th><th>怎么钉</th><th>不钉会怎样</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><strong>容器镜像</strong></td><td>记 <code>sha256:</code> digest，不是 tag</td><td>tag 会被覆盖，几个月后同一个 tag 是不同的镜像</td></tr>
+      <tr><td>2</td><td><strong>任务集版本</strong></td><td>数据集哈希 + 版本号，且只增不改（模块 01）</td><td>悄悄修过的题会让历史分数全部失效</td></tr>
+      <tr><td>3</td><td><strong>scaffold 版本</strong></td><td>git commit + 配置文件哈希</td><td>第 4 节的全部理由</td></tr>
+      <tr><td>4</td><td><strong>模型标识</strong></td><td>完整模型 ID + 快照日期（若可用）</td><td>「最新版」是一个会移动的目标</td></tr>
+      <tr><td>5</td><td><strong>采样参数</strong></td><td>temperature / top_p / seed（若支持）</td><td>温度不同，方差与均值都不同</td></tr>
+      <tr><td>6</td><td><strong>预算参数</strong></td><td>max_steps / max_tokens / 超时 / 重试次数</td><td>这是最影响分数、也最常被漏写的一组</td></tr>
+      <tr><td>7</td><td><strong>并发度</strong></td><td>worker 数</td><td><strong>并发会改变超时行为</strong>——高并发下容器变慢，超时任务变多</td></tr>
+      <tr><td>8</td><td><strong>网络策略</strong></td><td>断网 / 白名单 / 录制回放</td><td>联网的评测在两个时间点跑就是两个实验</td></tr>
+      <tr><td>9</td><td><strong>判分器版本</strong></td><td>判分代码的 commit + 金标准集的 α/β（模块 02）</td><td>判分器也会被修 bug</td></tr>
+      <tr><td>10</td><td><strong>重复次数与聚合方式</strong></td><td>$N$、$k$、micro/macro、CI 方法（模块 04）</td><td>同一批数据能算出好几个不同的数字</td></tr>
+    </tbody>
+  </table>  <h3>把十项压成一个指纹</h3>  <p>实践上的做法是把这十项序列化后取哈希，得到一个 <strong>run fingerprint</strong>，写进每一条结果记录。<strong>两次运行的指纹相同，分数却差很多——这本身就是一个需要调查的告警</strong>（说明还有没被记录的变量在动）；指纹不同的两次运行，则从一开始就不该被直接比较。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>指纹机制的额外好处是<strong>它让「不可比较」这件事变成机器可判定的</strong>。在 C68 的 CI 门禁里，这一条直接变成一个断言：<code>assert current.fingerprint == baseline.fingerprint</code>，不相等就不允许做回归对比，而不是让人去肉眼核对配置。</p>
+  </div>  <h3>网络：录制回放（record/replay）</h3>  <p>对必须联网的评测，唯一可行的可复现方案是<strong>录制回放</strong>：第一次运行时把所有 HTTP 请求与响应录下来，之后的运行从录制里回放。代价是录制会过期（页面改版后录制内容与真实世界脱节），所以正确的用法是<strong>双轨</strong>：<em>录制回放用于回归门禁（要可复现），定期的真实联网小样本用于校验录制是否已经失真</em>（呼应模块 01 的离线-在线取舍）。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="eval-card"><span class="num">6</span>评测卡：一份完整报告的最小集合</h2>
+  <p>把模块 02、04、05 的报告规范合并，得到一张<strong>评测卡</strong>（eval card）。它的作用和模型卡类似：<em>让读者在不重跑实验的情况下判断这个数字能不能用</em>。</p>  <pre><code># ════════════════════════════════════════════════════════════
+# EVAL CARD · agent-billing-v3 @ 2026-08-28
+# ════════════════════════════════════════════════════════════
+## 1. 被测对象
+model:            claude-sonnet-5 (snapshot 2026-05)
+scaffold:         inhouse-harness @ a3f19c2   (loop=reflect, tools=8, max_steps=40)
+baseline scaffold: minimal-react @ a3f19c2    ← scaffold 消融的参照
+
+## 2. 任务集
+dataset:          billing-tasks v12  (sha256:7d2e…)   N=420  (含 8% 不可能任务)
+task provenance:  自建, 2026-06 之后创建, 与训练截止无重叠
+scorer:           final_state 不变量检查 + 过程约束断言
+scorer alpha/beta: 0.031 / 0.022   (金标准集 n=140)
+
+## 3. 结果
+pass^1 (micro):   41.7%  [37.9%, 45.6%]   ← 按任务聚类自举, 2000 次
+pass^1 (macro):   38.2%                    ← 与 micro 排序一致
+pass@5:           66.3%     pass^5:  18.4%
+corrected pass^1: 40.3%  [36.2%, 44.4%]   ← Rogan–Gladen 校正后
+n_eff:            861  (N=420 × k=5, ρ=0.68)
+MDE (配对):        6.8 个百分点  (α=0.05, power=0.8)
+
+## 4. 成本
+$/task (全部):     0.83      $/success:  1.99    ← 后者才是可比的口径
+median steps (成功): 11        P90: 34
+early-quit rate:   4.1%       loop rate: 6.8%
+
+## 5. 复现指纹
+fingerprint:      f2a91b7c   (镜像 sha256:… / 并发 8 / 超时 300s / 重试 2 / 断网)</code></pre>  <div class="callout warn"><span class="label"></span>
+    <p>评测卡里最容易被砍掉、但绝对不能砍的三行是：<strong>① scorer 的 α/β</strong>（没有它，所有数字都可能是系统性偏的）；<strong>② MDE</strong>（没有它，「不显著」没有信息量）；<strong>③ fingerprint</strong>（没有它，这份报告不可复现）。这三行的共同点是：它们都在<em>限制</em>你能从数字里得出的结论，所以在追求好看的压力下最先被删掉。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="to-decision"><span class="num">7</span>从评测到决策：上线门槛该怎么定</h2>
+  <p>最后一步，也是整门课的落点：<strong>这些数字怎么变成「能不能上线」这个二值决策。</strong></p>  <h3>把指标翻译成期望效用</h3>  <div class="math-block">\[\mathbb{E}[U] = p_{\text{success}} \cdot V_{\text{success}} - p_{\text{fail}} \cdot C_{\text{fail}} - C_{\text{run}}\]</div>  <p>其中 $V_{\text{success}}$ 是一次成功的业务价值、$C_{\text{fail}}$ 是一次失败的代价（包括人工返工、用户流失、可能的赔付）、$C_{\text{run}}$ 是运行成本。<strong>上线门槛就是 $\mathbb{E}[U] > \mathbb{E}[U_{\text{现状}}]$。</strong></p>  <table>
+    <thead><tr><th>场景</th><th>$C_{\text{fail}}$ 的量级</th><th>需要的成功率门槛</th><th>该用的指标</th></tr></thead>
+    <tbody>
+      <tr><td>草稿建议（人来定稿）</td><td>很低——人会改</td><td>低（40% 就有价值）</td><td>pass@k 或 pass^1</td></tr>
+      <tr><td>自动执行、可撤销</td><td>中等——出错要回滚</td><td>中（80%+）</td><td><strong>pass^k</strong>，$k$ 取一次会话的操作数</td></tr>
+      <tr><td>自动执行、不可撤销（转账、发邮件）</td><td><strong>极高</strong></td><td>很高，且必须有人工确认点</td><td>pass^k + 越权/副作用率（模块 03）</td></tr>
+      <tr><td>安全相关</td><td>灾难性</td><td>无论多高都要加保护层</td><td>以上全部 + C69 的攻击面评测</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>有一个必须显式说破的推论：<strong>当 $C_{\text{fail}}$ 很高时，提高成功率的边际价值会低于「加一个人工确认点」的价值。</strong>换句话说，<em>把 41% 提到 47% 可能远不如「在不可逆操作前停下来问一句」有用</em>。评测报告如果只报成功率，会让整个团队一直往「提分」的方向使劲，而错过这个在产品上更划算的选项。</p>
+  </div>  <h3>三个必须报给决策者的数字</h3>  <ol>
+    <li><strong>给定预算下的成功率与其置信区间</strong>——它决定 $p_{\text{success}}$；</li>
+    <li><strong>失败的构成</strong>（模块 03 的七分类）——它决定 $C_{\text{fail}}$，因为「没做完」和「做错了还删了东西」的代价差几个数量级；</li>
+    <li><strong>每次成功的成本</strong>——它决定 $C_{\text{run}}$，也决定这件事在规模化后还成不成立。</li>
+  </ol>  <p>到这里，本课的闭环就完成了：模块 01 选/建任务集，02 定义并验证判分器，03 从轨迹里挖归因信息，04 给出可信的不确定度，05 把成本与可复现性钉死并翻译成决策。<strong>下一步：判分器如果是一个 LLM 呢？那整套「先验证测量仪器」的逻辑要怎么做？——那是 C67。</strong></p>
+
+  <!-- ========================================================= -->
+  <h2 id="cheaper-eval"><span class="num">8</span>评测本身的成本控制：用更少的钱得到同样的结论</h2>
+  <p>最后一个实用主题：前面所有内容都在教你把评测做严谨，而严谨通常意味着更贵。这一节反过来——<strong>在不牺牲结论质量的前提下，把评测成本降下来。</strong></p>  <table>
+    <thead><tr><th>手段</th><th>怎么做</th><th>省多少</th><th>代价 / 前提</th></tr></thead>
+    <tbody>
+      <tr><td><strong>剔除零信息任务</strong></td><td>所有候选 agent 都过或都不过的任务，对<em>区分</em>它们贡献 0 bit（模块 01）</td><td>常能省 30%–50% 的运行量</td><td>只对「比较」有效；做回归门禁时这些任务仍然有用（它们检测退化）</td></tr>
+      <tr><td><strong>分层抽样</strong></td><td>按难度/子系统分层，从每层抽样而不是全跑</td><td>线性节省</td><td>需要任务元数据；小层要有保底名额</td></tr>
+      <tr><td><strong>循环与预算早停</strong></td><td>检出循环即终止（模块 03）</td><td>省掉长尾轨迹的大部分开销</td><td>终止规则必须与最终标签独立（04 模块第 8 节）</td></tr>
+      <tr><td><strong>缓存</strong></td><td>同一 (prompt, 模型, 参数) 的结果复用</td><td>重跑时可省 90%+</td><td><strong>会掩盖非确定性</strong>——测方差时必须关掉缓存</td></tr>
+      <tr><td><strong>两阶段筛选</strong></td><td>先用便宜的小任务集粗筛掉明显不行的配置，再用全量任务集精测存活者</td><td>候选多时省得最多</td><td>粗筛的排序必须与精测相关；相关性要先验证过</td></tr>
+      <tr><td><strong>配对设计</strong></td><td>同一批任务同时跑两个 agent（模块 04）</td><td>样本量省一半以上</td><td>两者必须共享完全相同的环境快照</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>第四条的缓存值得单独警告：<strong>缓存会让你的评测看起来非常稳定，而这种稳定是假的</strong>。开着缓存重跑两次得到完全一样的分数，说明的不是「结果可复现」，而是「你根本没有重跑」。<strong>规则：估计方差、算置信区间、跑 pass^k 时必须关闭缓存；只有在做确定性回归对比（配置没变、只想确认没退化）时才开。</strong></p>
+  </div>  <h3>最贵的那一项通常不是算力</h3>  <p>一个反直觉但普遍的事实：<strong>成熟评测体系里最贵的成本项往往是人力</strong>——写任务、写判分器、做人工审核、复核 L3 样本（模块 02 第 8 节）。算力可以线性扩容，人力不行。所以真正的成本优化重点是：</p>  <ol>
+    <li><strong>让判分器可复用</strong>：把判分逻辑做成不变量库而不是每个任务一段一次性脚本（模块 02 第 3 节）；</li>
+    <li><strong>让任务可生成</strong>：能参数化生成的任务（同一模板换参数）边际成本接近零，但要小心它们的<em>难度分布过于集中</em>，通常需要与人工任务混合使用；</li>
+    <li><strong>让人工只做机器做不了的事</strong>：人不该去判「测试过没过」，只该去判「这条判分器都拿不准的样本到底算不算成功」——这正是三级流水线的设计目的。</li>
+  </ol>  <p><strong>把这三条做到位，评测的边际成本会从「每次都要投入人力」变成「一次投入、长期复用」</strong>，而这正是 C68 那门课要展开的主题：把评测从一次性的实验变成一套基础设施。</p>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_reliability/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 可靠性与统计</div></a>
+  </div>
+
+</div>
+</body>
+</html>

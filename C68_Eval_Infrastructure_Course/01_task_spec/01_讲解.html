@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · Task spec 与数据集版本化</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · Task spec 与数据集版本化</h1>
+  <p class="subtitle"><strong>prompt 模板的哈希必须进 spec</strong>——模板本身可以放文件里，但不存哈希就等于「改了一句措辞，指纹不变，两次运行看起来可比而实际不可比」 · <strong>样本 ID 分配一次永不改变、永不复用</strong>；<code>content_sha</code> 用来<em>检测</em>内容变化，不用来当 ID——用内容哈希当 ID，改一个错别字这条样本的历史结果就永远对不上了 · <strong>新增走次版本，修改/删除走主版本</strong>，因为后两者改变了聚合分母；<strong>跨版本比较唯一正确的做法是交集重算，而且要排除 content_sha 变过的样本</strong> · <strong>只要抽样数量 N 固定，任务集增长时抽中的那批就必然会变</strong>——这不是实现问题；CI 的 smoke 子集应当<strong>按比例选 + 分层保底</strong> · schema 演化三条：只增字段、<strong>新字段的默认值必须保持旧 spec 的行为不变</strong>、<strong>指纹在规范化之后算</strong> · datasheet 的七个必答问题里，<strong>「预期分数区间」最便宜也最实用</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 00（四层架构与三个性质）；知道「哈希」与「语义化版本」两个概念即可</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_task_spec.ipynb（spec 的 schema 校验与默认值 / 内容哈希 vs 稳定 ID 的对比实验 / 数据集版本链与 diff / 坏题的三种处理路径与它们对历史可比性的影响 / 分层抽样的子集选择器 / spec 迁移器与向后兼容）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">OpenAI Evals 的 registry / YAML spec 设计 · UK AISI <em>inspect_ai</em> 的 Task/Dataset 抽象 · Preston-Werner, <em>Semantic Versioning 2.0.0</em> · Gebru et al., <em>Datasheets for Datasets</em>（2018/2021） · 本课程 C43（数据版本与血缘）· C66 模块 01（任务集设计的六条规则）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#spec-as-data">Spec 必须是纯数据：三条后果</a></li>
+      <li><a href="#stable-ids">样本 ID：为什么不能用内容哈希</a></li>
+      <li><a href="#versioning">数据集版本：只增不改，以及三种变更的语义</a></li>
+      <li><a href="#subsets">子集与切片：一份数据集，多种跑法</a></li>
+      <li><a href="#schema-migration">Schema 演化：只增字段、给默认值、写迁移器</a></li>
+      <li><a href="#datasheet">数据集也要有一张卡：来源、构造、已知缺陷</a></li>
+      <li><a href="#checklist">本模块的落地清单</a></li>
+      <li><a href="#who-writes">谁来写任务：三种来源与各自的偏倚</a></li>
+      <li><a href="#multi-dataset">多数据集与组合评测：一次运行跑多个任务集</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="spec-as-data"><span class="num">1</span>Spec 必须是纯数据：三条后果</h2>
+  <p>模块 00 说过「spec 是纯数据」是投入产出比最高的结构决策。这一节讲清楚它换来了什么。</p>  <table>
+    <thead><tr><th>性质</th><th>因为 spec 是数据，所以…</th><th>如果 spec 是代码，就要…</th></tr></thead>
+    <tbody>
+      <tr><td><strong>可哈希</strong></td><td>指纹 = <code>sha256(json)</code>，自动、完整、零维护</td><td>人工维护一份「要记录哪些字段」的清单，且<em>必然会漏</em></td></tr>
+      <tr><td><strong>可 diff</strong></td><td>两次运行的差异是一个结构化的 diff，能精确到字段</td><td>读两份脚本的 git diff，靠人判断哪些改动会影响结果</td></tr>
+      <tr><td><strong>可生成 / 可扫描</strong></td><td>「跑 5 个模型 × 3 个温度」是 15 个 spec 的笛卡尔积</td><td>写循环，而循环里的配置又回到了代码里</td></tr>
+    </tbody>
+  </table>  <h3>怎么划界：什么进 spec，什么留在代码里</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一条实用的判据：<strong>「改这个东西，会不会让结果变得不可与之前比较？」</strong>会 → 进 spec；不会 → 留在代码里。<em>模型 ID、温度、prompt 模板、判分器版本、任务集版本、步数上限、超时——全部会；日志格式、进度条样式、重试的退避曲线——通常不会</em>（注意「重试次数」会，因为它影响错误率）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更严格的说法：spec 应当包含所有<span class="term">会改变被测量分布</span>的因素。形式化地，设一次运行产生的结果分布是 $P(\text{result} \mid \text{spec}, \text{code}, \text{env})$。<strong>基础设施的目标是让 $\text{code}$ 与 $\text{env}$ 对这个分布的影响可忽略</strong>——$\text{env}$ 靠容器 digest 与录制回放固定（C66-05），$\text{code}$ 靠「把影响分布的东西全搬进 spec」。<em>剩下的、确实会影响分布但又无法进 spec 的部分（比如并发导致的超时行为），就是模块 00 里「指纹相同却结果不同」那类告警要抓的东西。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个反复出现的边界情况：<strong>prompt 模板该进 spec 还是留在代码里？</strong>答案是<strong>它的哈希必须进 spec</strong>。模板本身可以放在文件里（便于编辑与 review），但 spec 里要存它的哈希——<em>否则改了一句措辞，指纹不变，两次运行看起来可比但实际不可比</em>。这与 C67 模块 01 第 8 节的「judge prompt 是 harness 的一部分」是同一条。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="stable-ids"><span class="num">2</span>样本 ID：为什么不能用内容哈希</h2>
+  <p>这是评测数据集特有的一个问题，在普通的数据工程里不常见，但在评测里它<strong>直接决定了历史结果还能不能用</strong>。</p>  <div class="ascii">   用内容哈希当 ID（❌）              用稳定 ID（✓）
+   ┌────────────────────────┐        ┌────────────────────────┐
+   │ id = sha(问题文本)      │        │ id = "billing-017"     │
+   │                        │        │ （分配一次，永不改变）   │
+   │ 修正一个错别字          │        │ 修正一个错别字          │
+   │   → 文本变了            │        │   → 文本变了            │
+   │   → **ID 变了**         │        │   → ID **不变**         │
+   │   → 历史结果全部对不上   │        │   → 历史结果照样对得上   │
+   └────────────────────────┘        └────────────────────────┘
+                                      内容哈希单独存一列 content_sha，
+                                      用来**检测**内容变化，而不是当 ID。</div>  <h3>稳定 ID 的四条规则</h3>  <ol>
+    <li><strong>ID 分配一次，永不改变</strong>——哪怕内容被修正、被重写。</li>
+    <li><strong>ID 永不复用</strong>——删掉的样本，它的 ID 也退休，不能给新样本。<em>复用 ID 会让历史结果指向一个完全不同的样本，这是最难查的一类污染</em>。</li>
+    <li><strong>ID 里不编码可变信息</strong>——不要用 <code>hard_billing_017</code> 这种，因为「难度」和「所属子集」都会变；<em>那些应该是元数据字段，不是 ID 的一部分</em>。</li>
+    <li><strong>同时存 <code>content_sha</code></strong>——它不当 ID，但它是「这条样本的内容变过没有」的唯一可靠信号。</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>第 4 条带来一个很有用的能力：<strong>当你比较两个数据集版本时，可以精确地把变化分成四类</strong>——新增（ID 只在新版有）、删除（只在旧版有）、<strong>内容修改</strong>（ID 同但 content_sha 不同）、以及元数据修改（两个都同，但难度/标签变了）。<em>这四类对「历史结果还能不能用」的影响完全不同</em>——notebook 第 3 节会把这个 diff 器写出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="versioning"><span class="num">3</span>数据集版本：只增不改，以及三种变更的语义</h2>
+  <p>模块 00 的反模式清单里有一条「就地修改任务集」。这一节讲替代方案。</p>  <div class="math-block">\[\text{dataset} = (\text{id},\ \text{version},\ \text{sha}) \quad\text{三元组唯一确定一份任务集}\]</div>  <h3>三种变更，三种版本语义</h3>  <table>
+    <thead><tr><th>变更类型</th><th>版本怎么走</th><th>历史结果还能用吗</th><th>典型场景</th></tr></thead>
+    <tbody>
+      <tr><td><strong>新增样本</strong></td><td><code>v1 → v1.1</code>（次版本）</td><td><strong>能</strong>：旧样本的结果原样有效，只需补跑新增的</td><td>扩充任务集</td></tr>
+      <tr><td><strong>修改样本内容</strong></td><td><code>v1 → v2</code>（主版本）</td><td><strong>该样本的历史结果作废</strong>，其余仍有效</td><td>修正坏题、补充缺失信息</td></tr>
+      <tr><td><strong>删除样本</strong></td><td><code>v1 → v2</code>（主版本）</td><td>该样本的历史结果保留但<em>不再进入聚合</em></td><td>剔除不可解的题（SWE-bench Verified 的做法）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么修改和删除都要走主版本？因为它们都<strong>改变了聚合分母</strong>。「v1 上 42%」和「v2 上 45%」这两个数字，如果 v2 剔除了 20 道最难的题，那么这 3 个点的提升可能<em>完全来自分母的变化</em>。<strong>主版本号的作用就是让这件事在文件名里就能看见</strong>，而不是藏在某次 commit 里。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说，评测结果是一个定义在<strong>特定任务集上</strong>的量：$\hat{p}_{v} = \frac{1}{|D_v|}\sum_{i \in D_v} s_i$。当 $D_v \ne D_{v'}$ 时，$\hat{p}_v$ 与 $\hat{p}_{v'}$ <strong>估计的是两个不同的总体参数</strong>，直接比较是无意义的。<em>唯一可比的做法是在交集 $D_v \cap D_{v'}$ 上重算两边</em>——这正是 notebook 第 4 节要实现的「交集重算」。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>发现坏题时最诱人、也最错误的做法是<strong>「就把那道题改一下，反正只是一道」</strong>。后果是：<em>所有引用过 v1 的历史报告，从此都指向一个不存在的东西</em>——文件名说 v1，内容已经不是 v1 了。<strong>正确做法是发 v2，并且把 v1 保留为只读。</strong>存储成本几乎为零（任务集通常只有几 MB），换来的是历史的完整性。</p>
+  </div>  <h3>坏题的三条处理路径</h3>  <ul>
+    <li><strong>剔除并发新版</strong>——最干净，SWE-bench Verified 走的就是这条；代价是分母变了，需要在交集上重算历史。</li>
+    <li><strong>保留但标记 <code>excluded_from_main</code></strong>——样本还在，只是不进主指标。<em>好处是历史分母不变，可以直接比较</em>；坏处是需要在聚合逻辑里处理这个标记。</li>
+    <li><strong>修正内容并发主版本</strong>——适用于「题本身是好的，只是描述不全」。</li>
+  </ul>  <p><strong>推荐第二条作为默认</strong>：它对历史可比性的破坏最小，而且「为什么剔除」这个信息被保留在数据集里而不是某个 commit message 里。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="subsets"><span class="num">4</span>子集与切片：一份数据集，多种跑法</h2>
+  <p>真实系统里，同一份任务集需要被以不同规模跑：CI 门禁要快（几十条），选型要全（几百条），而分析要能按维度切片。这些需求<strong>不应该靠拷贝出多份数据集来满足</strong>。</p>  <table>
+    <thead><tr><th>机制</th><th>怎么做</th><th>关键性质</th></tr></thead>
+    <tbody>
+      <tr><td><strong>元数据标签</strong></td><td>每条样本带 <code>tags</code>（难度、子系统、来源、创建时间）</td><td>切片是查询，不是拷贝</td></tr>
+      <tr><td><strong>命名子集</strong></td><td>spec 里声明 <code>subset: "smoke"</code>，由标签定义</td><td>子集定义本身也要版本化</td></tr>
+      <tr><td><strong>确定性抽样</strong></td><td><code>sample_n=50, sample_seed=0</code>，用 ID 排序后取</td><td><strong>同 seed 必然抽到同一批</strong>——这是可复现的前提</td></tr>
+      <tr><td><strong>分层抽样</strong></td><td>按标签分层，每层保底 N 条</td><td>小类不会被抽没（呼应 C66-01 的信息量分析）</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>确定性抽样有一个比想象中更深的坑，值得把话说透：<strong>只要你固定抽样数量 N，任务集增长时，抽中的那批就<em>必然</em>会变。</strong>这不是实现问题——「从 46 条里抽 15 条」和「从 246 条里抽 15 条」本来就是两个不同的均匀样本，原有样本被挤出去是数学上必然的。<strong>唯一真正稳定的做法是按<em>比例</em>选而不是按数量选</strong>：<code>include = int(hash(task_id), 16) % 1000 &lt; rate * 1000</code>。这样<em>已有样本的入选与否永远不变</em>，新增样本只是按同样的比例被纳入。notebook 第 5 节会把三种做法的稳定性对比出来。</p>
+  </div>  <h3>固定数量 vs 固定比例：该选哪个</h3>  <table>
+    <thead><tr><th>需求</th><th>该用</th><th>理由</th></tr></thead>
+    <tbody>
+      <tr><td><strong>CI smoke 子集</strong></td><td><strong>固定比例 + 分层保底</strong></td><td>membership 稳定，分数波动才能被归因到模型而不是「换了一批题」</td></tr>
+      <tr><td>「我只有 20 分钟预算」</td><td>固定数量</td><td>接受 membership 会变，但要在报告里注明抽样是变化的</td></tr>
+      <tr><td>调试单条样本</td><td>显式列 ID</td><td>不抽样</td></tr>
+    </tbody>
+  </table>  <h3>smoke / full 两档是最常见的配置</h3>  <p><strong>smoke 子集</strong>（30–80 条，覆盖各类型各一点，跑几分钟）用于 CI 每次提交；<strong>full 集</strong>（全量，跑几小时）用于合并前或每日定时。<em>smoke 的设计目标不是「准确估计分数」，而是「抓住明显的退化」</em>——所以它的抽样应当<strong>偏向覆盖度而不是代表性</strong>：每个子系统、每种难度都要有，哪怕各只有两三条。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="schema-migration"><span class="num">5</span>Schema 演化：只增字段、给默认值、写迁移器</h2>
+  <p>spec 的字段一定会变——加新参数、拆旧字段、改语义。这一节讲怎么让它变得不痛。</p>  <ol>
+    <li><strong>只增字段，不改语义。</strong>把 <code>timeout</code> 从「秒」改成「毫秒」是最坏的一类变更——<em>旧 spec 依然能解析，但含义变了，而且不会报错</em>。需要改语义时，<strong>加一个新字段并废弃旧的</strong>。</li>
+    <li><strong>新字段必须有默认值</strong>，且默认值要让旧 spec 的行为<strong>保持不变</strong>。例如新增 <code>retries</code> 时默认设为 0（而不是 2），否则所有历史 spec 的语义都被悄悄改了。</li>
+    <li><strong>spec 自带 <code>schema_version</code></strong>，并写一个 <code>migrate(spec)</code> 函数把旧版本升到当前版本。<em>迁移必须是纯函数且幂等</em>：<code>migrate(migrate(x)) == migrate(x)</code>。</li>
+    <li><strong>指纹在迁移后计算</strong>——否则同一个语义的 spec，旧格式和新格式会算出不同的指纹，历史结果又对不上了。</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>第 4 条是个容易忽略但很关键的细节。<strong>指纹应该是「规范化之后的 spec」的哈希</strong>，而不是「用户写的那份 spec」的哈希。<em>规范化包括：迁移到当前 schema、填上所有默认值、把等价的写法归一（比如 <code>1</code> 与 <code>1.0</code>）。</em><strong>这样「显式写了默认值」和「没写」会算出同一个指纹</strong>——这正是你想要的语义。</p>
+  </div>  <h3>向后兼容的一个反例</h3>  <pre><code># ❌ 危险的变更：新字段的默认值改变了旧 spec 的行为
+# v1 的 spec 没有 retries 字段，当时的行为等价于 retries=0
+{"budget": {"timeout_s": 30}}
+
+# v2 加了 retries，默认值设成 2
+DEFAULTS = {"retries": 2}          # ← 所有历史 spec 的错误率都被悄悄改了
+
+# ✓ 正确：默认值保持旧行为，需要重试的显式写出来
+DEFAULTS = {"retries": 0}</code></pre>
+
+  <!-- ========================================================= -->
+  <h2 id="datasheet"><span class="num">6</span>数据集也要有一张卡：来源、构造、已知缺陷</h2>
+  <p>最后一节讲一个经常被跳过、但半年后必然后悔没做的东西：<strong>给任务集配一份说明（datasheet）</strong>。</p>  <p>它要回答的问题很具体——<em>都是「半年后有人会问、而当时的人已经离职」的那些</em>：</p>  <table>
+    <thead><tr><th>问题</th><th>为什么会被问到</th><th>不记的后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>样本从哪来</strong></td><td>评估污染风险（C66-01）</td><td>无法判断分数是不是被污染撑起来的</td></tr>
+      <tr><td><strong>创建/采集时间</strong></td><td>做时间截断检验</td><td>污染检测最有力的手段直接用不了</td></tr>
+      <tr><td><strong>谁标注的、标注规范是什么</strong></td><td>怀疑标签质量时要追溯</td><td>只能重新标一遍</td></tr>
+      <tr><td><strong>已知坏题清单</strong></td><td>「这道题为什么被剔除」</td><td>同一道坏题被反复发现、反复讨论</td></tr>
+      <tr><td><strong>不可能任务的比例</strong></td><td>解读「放弃率」这个指标</td><td>把正确的放弃误判成失败（C66-01）</td></tr>
+      <tr><td><strong>判分器与它的 α/β</strong></td><td>校正观测值（C66-02）</td><td>所有数字都可能是系统性偏的</td></tr>
+      <tr><td><strong>预期的合理分数区间</strong></td><td>判断「跑出 95%」是好消息还是 bug</td><td><strong>最容易被忽略、也最实用的一条</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>最后一行值得展开：<strong>给每个任务集写一句「合理的分数应该落在哪个区间」</strong>，是一条极其便宜的健康检查。<em>如果一个预期 30–50% 的任务集突然跑出 95%，那几乎肯定是流水线出了问题（判分器坏了、答案泄漏进 prompt 了、或者任务集被换成了 smoke 子集），而不是模型突然变强了。</em><strong>这条检查在 CI 里就是一行断言</strong>（04 模块）。</p>
+  </div>  <p>datasheet 应当和数据集<strong>放在一起并一起版本化</strong>——放在 wiki 里的说明，三个月后必然与数据集脱节。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="checklist"><span class="num">7</span>本模块的落地清单</h2>
+  <pre><code>dataset/
+  qa-tasks/
+    v1/
+      tasks.jsonl          # 每行: {task_id, content_sha, input, target, tags, meta}
+      datasheet.md         # 来源 / 时间 / 标注 / 已知坏题 / 预期分数区间
+      MANIFEST.json        # {"sha": "...", "n": 512, "created": "2026-03-01", "frozen": true}
+    v2/
+      tasks.jsonl
+      datasheet.md
+      MANIFEST.json
+      CHANGELOG.md         # 相对 v1: 新增 12 / 修改 3 / 剔除 8（附每条的理由）
+  subsets/
+    smoke.json             # {"name":"smoke","filter":{"tags":["core"]},"sample_n":60,"seed":0}
+
+spec/
+  demo-qa.json             # 引用 dataset id+version+sha，不内联任务内容</code></pre>  <ul>
+    <li><strong><code>frozen: true</code> 是一条硬约束</strong>：已发布的版本目录设为只读，CI 里加一条检查——<em>已冻结版本的 sha 与 MANIFEST 不一致就直接失败</em>。</li>
+    <li><strong>CHANGELOG 要逐条记理由</strong>，尤其是剔除的那些。「为什么剔除这道题」是最容易丢失、也最容易被重复讨论的信息。</li>
+    <li><strong>spec 不内联任务内容</strong>，只引用 <code>(id, version, sha)</code>。<em>内联会让 spec 变得巨大且无法 diff</em>。</li>
+    <li><strong>子集定义是独立文件且要版本化</strong>——改了 smoke 的定义，等于换了一个任务集。</li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <p>最后强调一遍本模块的核心纪律，因为它是所有后续模块的地基：<strong>任务集只增不改；改了就发新版本；已发布的版本永远只读。</strong><em>违反这一条的代价不是「不够规范」，而是「所有历史数字失去意义」</em>——而这件事发生时不会有任何报错。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="who-writes"><span class="num">8</span>谁来写任务：三种来源与各自的偏倚</h2>
+  <p>补一个模块 01 之前没说的问题：<strong>这些任务是谁写的，以及这件事怎么影响结果。</strong></p>  <table>
+    <thead><tr><th>来源</th><th>怎么产生</th><th>系统性偏倚</th><th>该怎么标注</th></tr></thead>
+    <tbody>
+      <tr><td><strong>人工构造</strong></td><td>工程师/领域专家按经验写</td><td><strong>偏向「已知的失败模式」</strong>——写题的人写的是他想到的问题</td><td><code>source: manual</code></td></tr>
+      <tr><td><strong>线上回灌</strong></td><td>从真实流量的问题样本转化（模块 05）</td><td><strong>偏向模型的弱项</strong>，占比过高会让任务集漂成疑难杂症集</td><td><code>source: from_production</code>，且设占比上限</td></tr>
+      <tr><td><strong>公开基准</strong></td><td>直接引入</td><td><strong>污染风险最高</strong>（C66-01）；分类体系可能与你的产品定义不一致</td><td><code>source: public</code> + 原始基准的版本</td></tr>
+      <tr><td><strong>合成生成</strong></td><td>用模型批量造题</td><td><strong>偏向生成模型自己擅长的形态</strong>；难度分布过于集中</td><td><code>source: synthetic</code> + 生成配置的哈希</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <strong><code>source</code> 这个字段的价值在于它让上面这些偏倚变得可分析。</strong><em>「这次提升主要来自 from_production 的那批题」和「主要来自 manual 的那批」，是两个完全不同的结论</em>——前者说明修好了真实问题，后者可能只是拟合了写题人的偏好。<strong>而没有这个字段，这两种情况在数据里长得一模一样。</strong>
+  </div>  <p>合成任务还有一个特有的要求：<strong>生成配置必须被记录并版本化</strong>（用什么模型、什么 prompt、什么参数生成的）。<em>否则你无法回答「这批合成题为什么和上批不一样」</em>——而这正是本课模块 00「可归因性」在数据侧的同一条要求。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="multi-dataset"><span class="num">9</span>多数据集与组合评测：一次运行跑多个任务集</h2>
+  <p>真实系统里很少只有一个任务集。典型的配置是「核心能力集 + 安全集 + 回归集 + 线上回灌集」四个一起跑。<strong>这带来两个模块 01 之前没处理的问题：怎么聚合、怎么版本化。</strong></p>  <h3>问题一：跨数据集怎么聚合</h3>  <table>
+    <thead><tr><th>方式</th><th>怎么算</th><th>适合</th><th>陷阱</th></tr></thead>
+    <tbody>
+      <tr><td><strong>不聚合</strong></td><td>每个数据集单独报一个数</td><td><strong>推荐默认</strong></td><td>读者需要自己综合，但这是诚实的</td></tr>
+      <tr><td><strong>等权平均</strong></td><td>各数据集分数取平均</td><td>各集重要性相当时</td><td>小数据集的噪声被放大到与大数据集同权</td></tr>
+      <tr><td><strong>按样本量加权</strong></td><td>等价于把所有样本合并求 micro</td><td>各集来自同一分布时</td><td><strong>大数据集主导总分</strong>（C66-02 的 micro 陷阱）</td></tr>
+      <tr><td><strong>按业务重要性加权</strong></td><td>人为指定权重</td><td>对外报告一个数时</td><td>权重来源必须写进报告，否则不可复现</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <strong>「不聚合」应当是默认选择</strong>，理由和 C66 模块 02 的 micro/macro 讨论一致：<em>把安全集的 98% 和核心能力集的 43% 平均成 70.5%，这个数字既不能用来判断能力，也不能用来判断安全</em>。<strong>如果一定要一个总分（比如给管理层看），那么权重必须显式写出来，并且要做敏感性分析</strong>——权重扰动 ±20% 会不会翻转结论（呼应 C67-01 的 rubric 权重）。
+  </div>  <h3>问题二：组合的版本化</h3>  <p>每个数据集有自己的版本，那么<strong>「这次跑的是哪个组合」也需要一个版本</strong>：</p>  <pre><code>// suite.json —— 组合本身也是一个可版本化的对象
+{
+  "suite_id": "prod-eval",
+  "suite_version": "v7",
+  "datasets": [
+    {"id": "core-tasks",   "version": "v12", "sha": "7d2e…", "weight": null},
+    {"id": "safety-tasks", "version": "v4",  "sha": "a91c…", "weight": null},
+    {"id": "regression",   "version": "v23", "sha": "3f8b…", "weight": null},
+    {"id": "prod-replay",  "version": "v9",  "sha": "c04d…", "weight": null}
+  ],
+  "aggregation": "none",        // none | equal | micro | weighted
+  "report_separately": true
+}</code></pre>  <ul>
+    <li><strong>suite 的指纹 = 各数据集三元组 + 聚合方式的哈希</strong>——<em>换掉任何一个子集的版本，suite 版本就要走</em>；</li>
+    <li><strong>子集之间的样本 ID 必须全局唯一</strong>：<em>如果 core-tasks 和 regression 里都有 <code>t001</code>，结果表的主键就会冲突</em>。实践做法是给 ID 加数据集前缀（<code>core:t001</code>）；</li>
+    <li><strong>回归集是一个特殊的子集</strong>——它由线上回灌构成（模块 05），<em>只增不删，而且它的分数应当接近 100%</em>（因为都是已经修过的问题）。<strong>回归集的分数下降是一个比总分下降严重得多的信号。</strong></li>
+  </ul>  <h3>一个实践细节：数据集之间会有重叠</h3>  <p>组合评测里一个容易被忽略的问题：<strong>同一道题可能同时出现在两个数据集里</strong>——线上回灌的问题被加进了回归集，而它恰好也被人工加进了核心能力集。<em>如果两边用了不同的 task_id，这道题会被算两遍；如果用了同一个 ID，结果表的主键就会冲突。</em></p>  <p><strong>正确处理：在 suite 层面做一次去重检查，并显式声明「同一道题归属哪个集」。</strong>推荐的归属规则是<em>「最严格的那个集优先」</em>——同时出现在核心集与回归集时归回归集，因为回归集的门禁更严（下一段），归到那边不会漏掉问题。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>最后一条值得展开：<strong>回归集的语义与其他集完全不同。</strong>核心能力集问「能做到多少」，回归集问「有没有把修好的又弄坏」。<em>前者的分数是 40% 也很正常，后者掉到 95% 就该拉警报</em>——<strong>所以它们的门禁阈值也应当完全不同</strong>（模块 04）。把它们平均成一个数，等于同时毁掉两个信号。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_runner/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · Runner 工程</div></a>
+  </div>
+
+</div>
+</body>
+</html>

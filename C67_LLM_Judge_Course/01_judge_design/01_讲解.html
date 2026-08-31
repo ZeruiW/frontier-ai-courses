@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · Judge 设计</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · Judge 设计</h1>
+  <p class="subtitle">设计 judge 的第一步不是写 prompt，而是<strong>把问题往可判定的方向改写</strong>——一个「这个回复好不好」的 L0 问题，往往能拆成三四个 L2/L3 的可判定小问题 · pointwise 的头号病症是<strong>分数分布压缩</strong>：五档量表常常只有效用到一档半，而<strong>把量表从 5 档改成 100 档并不创造信息</strong>，它只是把同样的噪声铺得更开 · <strong>rubric 分解是全课性价比最高的工具</strong>：独立噪声按 $1/\sqrt{K}$ 衰减，4–6 项是甜点区；而<strong>「编造引用」这类问题必须用否决项归零，不能按权重扣分</strong> · pairwise 的三个决策：允不允许平局、平局怎么进统计（推荐算半分）、以及<strong>必须成对调用（swap）</strong>——swap 一致率低于 80% 时胜率数字不可信 · <strong>参考答案是双刃的</strong>：提升一致性，但会让 judge 奖励「像参考」而不是「同样正确」 · <strong>解析失败与判断难度相关，悄悄丢弃会让一致率虚高</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 00（judge 是测量仪器 / 三种用法 / 体检六项）；会读简单的 JSON schema</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_judge_design.ipynb（分数分布压缩的度量与三种缓解 / 平局处理的三种口径 / rubric 分解 vs 整体分的分辨力 / 参考答案的效果 / 结构化输出解析失败率与重试策略 / few-shot 锚点对分布的影响）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Zheng et al., <em>MT-Bench &amp; Chatbot Arena</em>（NeurIPS 2023，pairwise 与 single-answer grading 的对比）· Liu et al., <em>G-Eval</em>（EMNLP 2023，CoT + 概率加权打分）· Kim et al., <em>Prometheus</em>（2023/2024，细粒度 rubric 与参考答案）· Zhou et al., <em>IFEval</em>（2023，可验证指令的思想）· 本课程 C10 模块 04（人类评测的量表设计）· C66 模块 02（不变量检查）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#decidability">先问「问什么」：判分问题的可判定性阶梯</a></li>
+      <li><a href="#pointwise">pointwise 打分：分数分布压缩，以及三种缓解</a></li>
+      <li><a href="#pairwise">pairwise 比较：平局、置信度，以及「必须成对调用」</a></li>
+      <li><a href="#rubric">rubric 设计：把主观质量拆成客观检查项</a></li>
+      <li><a href="#reference">参考答案：有 vs 无，以及参考答案本身的质量</a></li>
+      <li><a href="#cot-structured">CoT 与结构化输出：顺序、schema 与解析失败</a></li>
+      <li><a href="#anchors">few-shot 锚点与量表校准</a></li>
+      <li><a href="#versioning">judge prompt 的版本管理与回归</a></li>
+      <li><a href="#multi-turn">多轮对话与长文档：judge 设计的两个特例</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="decidability"><span class="num">1</span>先问「问什么」：判分问题的可判定性阶梯</h2>
+  <p>设计 judge 的第一步不是写 prompt，而是<strong>把你想问的问题，往可判定的方向改写</strong>。同一个评测目标，可以被写成阶梯上的不同高度，而高度决定了这个 judge 能有多可靠。</p>  <div class="ascii">   可判定性 ↑（越上面越可靠、越便宜、越不需要 LLM）
+   ┌──────────────────────────────────────────────────────────────┐
+   │ L4 程序可判定    "输出是不是合法 JSON / 有没有调用 tool X"      │  → 不该用 LLM（C66）
+   ├──────────────────────────────────────────────────────────────┤
+   │ L3 语义可判定    "有没有提到用户问的那个日期"                   │  → LLM 校验，一致率 &gt;95%
+   ├──────────────────────────────────────────────────────────────┤
+   │ L2 规则可裁决    "是否符合这条 rubric：给出了至少两个反例"       │  → LLM rubric 项，一致率 85-95%
+   ├──────────────────────────────────────────────────────────────┤
+   │ L1 有序比较      "A 和 B 哪个更好"                              │  → pairwise，一致率 70-85%
+   ├──────────────────────────────────────────────────────────────┤
+   │ L0 绝对打分      "给这个回答打 1-5 分"                          │  → pointwise，最不可靠
+   └──────────────────────────────────────────────────────────────┘</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这张梯子的实用价值在于：<strong>你手上那个「主观」的评测目标，往往可以被拆成一堆 L2/L3 的小问题</strong>，而不是被迫停在 L0。「这个客服回复好不好」这个 L0 问题，可以拆成：有没有回答用户实际问的问题（L3）、有没有引用正确的政策条款（L3）、有没有承诺公司做不到的事（L2）、语气是否得体（L1，只能停在这一层）。<strong>拆完之后，四项里有三项都爬到了梯子上层。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，这是把一个<span class="term">整体判断</span>（holistic judgment）分解为一组<span class="term">分析性判断</span>（analytic judgments）。分解的收益有两层：<strong>① 每个子判断的方差更小</strong>（问题更窄 → judge 的不确定性更低）；<strong>② 子判断可以被独立验证与独立监控</strong>（哪一项在退化，一眼看得出来）。代价是引入了聚合权重这个新的自由度——它必须做敏感性分析（notebook 第 3 节）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一条可以立刻执行的检查：<strong>把你的 judge prompt 里那个问题读出来，问自己「两个认真的人类看同一份材料，会不会给出不同答案？」</strong>如果会，说明这个问题还停在 L0/L1，值得再往上拆一层。<em>停在 L0 有时是不可避免的（审美、语气），但绝不应该是默认选择。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pointwise"><span class="num">2</span>pointwise 打分：分数分布压缩，以及三种缓解</h2>
+  <p>pointwise（给单个回答打 1–5 分）是最常见也最容易出问题的用法。它的头号病症是<strong>分数分布压缩</strong>：让 judge 给一百个回答打分，你会发现七八十个都是 4 分。</p>  <h3>压缩为什么发生</h3>  <ul>
+    <li><strong>没有锚点</strong>：judge 不知道「4 分」相对于什么。人类标注员在校准会上会看一批标好的例子，judge 通常什么都没看到。</li>
+    <li><strong>回避极端</strong>：模型倾向于避免 1 分和 5 分这种强判断（与 RLHF 训出的谨慎倾向一致）。</li>
+    <li><strong>量表本身太粗</strong>：五档要覆盖从「完全错误」到「无可挑剔」，中间的差异被压进同一档。</li>
+  </ul>  <p>压缩的直接后果是<strong>判别力归零</strong>：如果 80% 的样本都是 4 分，那么这个 judge 在这 80% 之间提供的信息是 0 bit。量化方式就是分数分布的<strong>熵</strong>——或者更直观的<strong>有效档位数</strong> $\exp(H)$：五档量表如果有效档位数只有 1.6，说明你实际上在用一个「一档半」的量表。</p>  <table>
+    <thead><tr><th>缓解手段</th><th>怎么做</th><th>效果</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>rubric 分解</strong></td><td>拆成 4–6 个二元/三元的子项，再加权聚合（第 4 节）</td><td><strong>最有效</strong>：每个子项的分布都不压缩，聚合后连续化</td><td>要设计 rubric、要定权重</td></tr>
+      <tr><td><strong>few-shot 锚点</strong></td><td>给出每一档的 1–2 个标注样例</td><td>有效，尤其是给出 1 分与 5 分的样例</td><td>占上下文；锚点选得不好会引入新偏差</td></tr>
+      <tr><td><strong>更细的量表 + 强制分布</strong></td><td>改成 0–100 分，或要求「不许连续给同一分」</td><td>有效但脆弱：模型会集中在 70/80/85 这些整十整五上</td><td>分数的语义变得更模糊</td></tr>
+      <tr><td><strong>改用 pairwise</strong></td><td>直接换用法（第 3 节）</td><td>彻底绕开该问题</td><td>失去绝对分数，无法设阈值</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>有一个看起来很聪明、实际上要小心的做法：<strong>用 token 概率做加权平均分</strong>（如 G-Eval 的思路：取 1–5 这五个 token 的概率，算期望分）。它确实能把整数分变成连续分、缓解压缩；但它<strong>要求你能拿到 logprobs</strong>，而且<em>把「模型对某个分数的不确定性」当成了「质量的中间态」</em>——这两件事并不等价。作为缓解手段可以用，但不要把它当成校准过的概率（03 模块会讲怎么检验）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pairwise"><span class="num">3</span>pairwise 比较：平局、置信度，以及「必须成对调用」</h2>
+  <p>pairwise 把「打多少分」换成「谁更好」，绕开了绝对量表的全部问题，代价是引入了三个新的设计决策。</p>  <h3>决策一：允不允许平局</h3>  <table>
+    <thead><tr><th>口径</th><th>做法</th><th>适用</th><th>陷阱</th></tr></thead>
+    <tbody>
+      <tr><td><strong>强制二选一</strong></td><td>不给平局选项</td><td>样本量小、需要最大分辨力时</td><td>把「确实分不出」的样本变成了纯噪声，<strong>并可能放大位置偏差</strong>（分不出时就选默认位置）</td></tr>
+      <tr><td><strong>允许平局</strong></td><td>A / B / tie 三选一</td><td><strong>推荐默认</strong></td><td>平局比例过高（&gt; 40%）时分辨力下降，需要检查是不是任务本身没有区分度</td></tr>
+      <tr><td><strong>五档</strong></td><td>A 明显更好 / A 略好 / 平 / B 略好 / B 明显更好</td><td>需要区分「差多少」时（如构造偏好数据）</td><td>档位越多，一致性越低；<em>「略好」这一档的一致率通常很差</em></td></tr>
+    </tbody>
+  </table>  <h3>决策二：平局怎么进统计</h3>  <div class="math-block">\[\text{win rate} = \frac{W + \tfrac{1}{2}T}{W + L + T} \quad\text{（推荐）}\qquad\text{vs}\qquad \frac{W}{W+L}\ \text{（丢弃平局）}\]</div>  <p>两种口径会给出不同的数字，而且在平局率高时差别很大。<strong>推荐左边这种（平局算半分）</strong>——它与 Bradley–Terry 模型的处理方式一致（04 模块），而且不会因为「平局多」而人为放大胜负差距。<em>无论选哪种，都必须在报告里写明</em>。</p>  <h3>决策三：必须成对调用（swap）</h3>  <div class="callout danger"><span class="label"></span>
+    <strong>这是本节最重要的一条工程纪律：任何 pairwise judge 调用都必须做两次，第二次交换 A/B 的位置。</strong>理由在 02 模块会量化：位置偏差普遍存在且幅度可观。两次结果不一致时，标准处理是<strong>记为平局</strong>（最保守）。而 <strong>swap 一致率本身是一个必须报告的指标</strong>——低于 80% 时，这个 judge 给出的胜率基本不可信。
+  </div>  <p>成对调用把成本翻倍。这是值得付的——但它也意味着你在设计评测规模时要把这一倍算进去（呼应 C66 模块 05 的成本模型）。<em>一个常见的折中：全量做单次调用，随机抽 10%–20% 做 swap 用于监控一致率</em>；但请注意这只适合<strong>监控</strong>，不适合<strong>出结论</strong>——出结论的那一次评测应该全量 swap。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="rubric"><span class="num">4</span>rubric 设计：把主观质量拆成客观检查项</h2>
+  <p>rubric 是这门课里性价比最高的一个工具。它把第 1 节的「往梯子上爬」变成了具体做法。</p>  <h3>一个好 rubric 的五条标准</h3>  <ol>
+    <li><strong>每一项都能独立判定</strong>：判定第 3 项时不需要看第 1 项的结论。互相依赖的项会让 judge 的错误在项之间传播。</li>
+    <li><strong>每一项都是二元或三元的</strong>：「有 / 没有」「完全满足 / 部分满足 / 不满足」。<em>不要在 rubric 项内部再放一个 1–5 分量表</em>——那等于把压缩问题复制了 N 份。</li>
+    <li><strong>项与项之间尽量正交</strong>：「准确性」和「是否有事实错误」是同一项的两种说法，放两遍等于给它加了双倍权重（而且是隐式的）。</li>
+    <li><strong>覆盖失败模式而不是覆盖优点</strong>：从「这类回答通常怎么坏掉」倒推 rubric 项，比从「一个好回答应该有什么」正推更有效——<em>后者容易写出一堆无法区分的空泛项</em>。</li>
+    <li><strong>包含一条否决项</strong>：某些问题（编造引用、承诺做不到的事、违反安全策略）应该<strong>直接把总分归零</strong>，而不是按权重扣分。</li>
+  </ol>  <h3>聚合：权重从哪来，以及怎么检验</h3>  <p>rubric 分项之后必须聚合成一个数。权重是一个新引入的自由度，处理方式：</p>  <ul>
+    <li><strong>先试等权</strong>：等权是一个诚实的默认值，而且经常已经够用；</li>
+    <li><strong>用人类偏好拟合权重</strong>：如果有一批人类的整体偏好标注，可以把「rubric 分项 → 人类偏好」拟合成一个线性模型，权重就是回归系数。<em>这同时也检验了 rubric 的完备性——如果拟合得很差，说明你漏了某个维度</em>；</li>
+    <li><strong>无论怎么定，都要做敏感性分析</strong>：权重扰动 ±20%，结论会不会翻转（呼应 C65 模块 03 与 C66 模块 02 的做法）。<strong>一扰动就翻的结论，真正的分歧点在权重上而不在数据上。</strong></li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>rubric 还有一个常被忽略的好处：<strong>它让 judge 的输出变得可解释、可申诉。</strong>「B 得 3.4 分、A 得 3.1 分」没法讨论；「B 在『引用了正确条款』这一项通过、A 没通过」可以被具体检查、被具体反驳。<em>在需要跟业务方对齐评测口径的场景，这一点的价值往往超过分辨力本身。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="reference"><span class="num">5</span>参考答案：有 vs 无，以及参考答案本身的质量</h2>
+  <p>给 judge 一份参考答案（reference / gold answer），是提升一致性最直接的手段之一——但它有三个必须知道的边界。</p>  <table>
+    <thead><tr><th>设置</th><th>judge 与人类的一致性</th><th>适用场景</th><th>风险</th></tr></thead>
+    <tbody>
+      <tr><td><strong>无参考</strong></td><td>最低</td><td>开放式创作、无唯一解的任务</td><td>judge 只能凭自己的先验判断，自偏好偏差最强</td></tr>
+      <tr><td><strong>有参考答案</strong></td><td>显著提升</td><td>有标准答案或范例的任务</td><td><strong>judge 会奖励「像参考答案」而不是「同样正确」</strong></td></tr>
+      <tr><td><strong>有参考 + 评分要点</strong></td><td>最高</td><td>有明确得分点的任务（考试式）</td><td>要点写得不全时，正确但不在要点里的答案被判错</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>中间那一行的风险值得展开：<strong>给了参考答案之后，judge 的判断会向「与参考答案的相似度」漂移</strong>，而相似度不等于正确性。一个用完全不同但同样正确的方法解题的回答，可能因为「和参考不像」被判低分。<em>这与 C66 模块 03 里「把轨迹相似度当主指标等于惩罚探索」是完全同构的错误。</em><strong>缓解办法：在 prompt 里显式写「参考答案只是一种正确解法，其他正确解法应同等评分」，并在 rubric 里用「是否得出正确结论」替代「是否与参考一致」。</strong></p>
+  </div>  <h3>参考答案自己有多好</h3>  <p>一个常被跳过的问题：<strong>你的参考答案是谁写的？</strong>如果它是某个模型生成后人工快速过了一遍的，那么它可能本身就带着那个模型的风格与错误，而 judge 会把这些一并当成标准。<em>检验方式很简单：把参考答案本身送进 judge 打分，看它得多少分。如果参考答案自己只能得 3.5 分，那么用它当标准是有问题的。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="cot-structured"><span class="num">6</span>CoT 与结构化输出：顺序、schema 与解析失败</h2>
+  <h3>先理由后结论，还是先结论后理由</h3>  <p><strong>先理由后结论</strong>几乎总是更好，原因不是「让模型思考」这种笼统说法，而是一个具体的机制：<strong>先输出的 token 会成为后面 token 的条件</strong>。如果先写 <code>"verdict": "A"</code>，后面的 reasoning 就变成了对既有结论的辩护，而不是导向结论的推理——这在结构上就无法起到纠错作用。</p>  <pre><code>// ✓ 推荐：理由在前，结论在后
+{"reasoning": "…", "verdict": "A"}
+
+// ✗ 不推荐：结论在前，理由变成事后辩护
+{"verdict": "A", "reasoning": "…"}
+
+// ⚠ 注意：JSON 对象的字段顺序在生成时是有意义的（模型按序生成），
+//    即使解析后字段顺序无关紧要。</code></pre>  <h3>结构化输出的三个工程问题</h3>  <table>
+    <thead><tr><th>问题</th><th>表现</th><th>处理</th></tr></thead>
+    <tbody>
+      <tr><td><strong>解析失败</strong></td><td>返回的不是合法 JSON（多了解释文字、截断、markdown 代码块包裹）</td><td>① 用原生结构化输出/工具调用约束；② 兜底做一次宽松解析（剥离代码块、找第一个 <code>{</code>）；③ <strong>重试，并记录重试率</strong></td></tr>
+      <tr><td><strong>枚举越界</strong></td><td>verdict 返回了 <code>"A is better"</code> 而不是 <code>"A"</code></td><td>schema 里用 enum 约束；解析时做归一化映射</td></tr>
+      <tr><td><strong>截断</strong></td><td>reasoning 太长把 verdict 挤出了 max_tokens</td><td><strong>限制 reasoning 长度</strong>（「2–3 句」）并给足 max_tokens；这是「理由在前」的主要代价</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <strong>解析失败率必须被记录并报告。</strong>原因不只是工程洁癖：<em>解析失败往往不是随机的</em>——遇到难判的样本时，judge 更可能输出一堆解释而不是干净的 JSON。如果你悄悄丢掉了这些样本，就引入了一个<strong>与判断难度相关的选择偏倚</strong>，剩下样本的一致率会虚高。正确做法是重试；重试仍失败的记为平局并<strong>计入分母</strong>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="anchors"><span class="num">7</span>few-shot 锚点与量表校准</h2>
+  <p>如果最终还是要用 pointwise，那么锚点是把分布拉开的最有效手段。但锚点的选择本身是一个需要小心的设计。</p>  <ol>
+    <li><strong>优先给两端</strong>：1 分和 5 分的样例比中间档更有价值——它们定义了量表的<em>范围</em>，而中间档会被内插出来。</li>
+    <li><strong>锚点必须来自与被评样本相同的分布</strong>：用一批「精心挑选的漂亮回答」当 5 分锚点，会让所有真实回答都显得平庸，整体分数下移（严厉度偏差）。</li>
+    <li><strong>锚点数量要少</strong>：每档 1–2 个。锚点占的上下文越多，被评内容在上下文里的相对权重越低；而且<em>过多的锚点会让 judge 去做「最近邻匹配」而不是按标准判断</em>。</li>
+    <li><strong>锚点要版本化</strong>：换了锚点就等于换了量表，历史分数不可直接比较——这与 C66 模块 05 的 harness 指纹是同一件事。</li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>一个实用的自检：把锚点样例本身当作待评样本，送进 judge 跑一遍。<strong>如果 5 分锚点被打成 4 分，说明你的 prompt 与锚点之间存在矛盾</strong>，judge 并没有真的把锚点当作标准。这个自检便宜、快，而且经常能抓到问题。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更一般地说，这是在检验量表的<span class="term">内部一致性</span>：锚点定义了从质量到分数的映射 $g$，judge 的实际打分函数是 $\hat{g}$，自检就是在检查 $\hat{g}(\text{anchor}_k) = k$ 是否成立。<em>不成立说明 prompt 中的文字描述（「5 分表示……」）与锚点样例给出的隐式定义不一致，而模型通常更信样例</em>——所以修锚点比修文字描述更有效。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="versioning"><span class="num">8</span>judge prompt 的版本管理与回归</h2>
+  <p>最后一节讲一件几乎所有团队都会在半年后后悔没做的事：<strong>judge prompt 的版本管理</strong>。</p>  <p>judge prompt 是评测系统里<strong>唯一一个「随时会被人顺手改一下」的组件</strong>——有人觉得措辞不好改一句，有人加了一条 rubric，有人调了锚点。而每一次改动，都意味着<strong>之前所有用这个 judge 跑出来的分数，与之后的分数不可比较</strong>。</p>  <table>
+    <thead><tr><th>要做的事</th><th>怎么做</th><th>不做的后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>prompt 哈希进结果</strong></td><td>把 judge prompt 模板（含锚点）的哈希写进每一条结果记录</td><td>半年后没人说得清某个历史数字是哪版 prompt 跑的</td></tr>
+      <tr><td><strong>金标准回归集</strong></td><td>留一批人类标注好的样本，每次改 prompt 都重跑，看一致率变化</td><td>改动是「改好了」还是「改坏了」全靠感觉</td></tr>
+      <tr><td><strong>双跑重叠期</strong></td><td>改版时新旧 judge 并行跑一段，量化两者的系统性差异</td><td>指标曲线上出现一个无法解释的跳变</td></tr>
+      <tr><td><strong>锚点与 rubric 单独版本化</strong></td><td>它们改动频率最高，单独管理便于定位</td><td>无法回答「这次分数变化是模型变了还是量表变了」</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>最后强调一遍这条与 C66 模块 05 完全同构的纪律：<strong>judge prompt 是 harness 的一部分。</strong>「我们的模型这个月分数涨了 3 个点」——如果这个月里有人动过 judge prompt，这句话就是无意义的。<em>把 prompt 哈希放进指纹，让「不可比较」变成机器可判定的一行 assert，而不是靠人回忆。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="multi-turn"><span class="num">9</span>多轮对话与长文档：judge 设计的两个特例</h2>
+  <p>前八节默认被评的是「一个 prompt 对应一个回答」。真实系统里有两类常见情形需要额外的设计决策，值得单独说清楚。</p>  <h3>多轮对话：评哪一轮</h3>  <table>
+    <thead><tr><th>评法</th><th>怎么做</th><th>适用</th><th>问题</th></tr></thead>
+    <tbody>
+      <tr><td><strong>只评最后一轮</strong></td><td>把前面的轮次当上下文，只判最后一个回复</td><td>客服、问答类的单点质量监控</td><td>看不出「前面几轮把对话带偏了」这类失败</td></tr>
+      <tr><td><strong>逐轮评再聚合</strong></td><td>每一轮独立打分，取平均或最小值</td><td>需要定位「第几轮开始崩」时</td><td><strong>轮次之间不独立</strong>——第 3 轮的差，可能完全是第 2 轮造成的</td></tr>
+      <tr><td><strong>整段对话评一次</strong></td><td>把整个对话当一个整体判断</td><td>评「这次会话有没有解决用户问题」</td><td>长上下文里 judge 的注意力分布不均，<em>结尾的内容权重更高</em></td></tr>
+      <tr><td><strong>目标达成检查</strong></td><td>不评「好不好」，只查「用户的目标达成了没有」</td><td><strong>推荐</strong>：任务型对话</td><td>需要为每个会话标注目标——但这正是 C66 终态判分的思路</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>多轮场景里最容易被忽略的一条：<strong>逐轮打分的平均值，会系统性地低估「前期埋雷、后期爆炸」这类失败</strong>——因为前面几轮单看都还不错。<em>如果你关心的是「这次会话成功了吗」，就应该用目标达成检查（一个可判定的 L3 问题）而不是逐轮打分（一堆 L0 问题）。</em>这又是第 1 节那把梯子的应用。</p>
+  </div>  <h3>长文档：位置效应与分块</h3>  <p>当被评内容很长（几千到几万 token）时，会出现两个 pointwise/pairwise 都要面对的问题：</p>  <ul>
+    <li><strong>位置效应</strong>：长上下文中间部分的内容更容易被忽略。这意味着<em>同样的错误，出现在文档中间比出现在开头或结尾更不容易被 judge 发现</em>——这是一种与内容无关的系统偏差，可以用「把同一个错误插到不同位置」的探针测出来（模块 02 的范式）；</li>
+    <li><strong>整体判断被稀释</strong>：一份 8000 字的报告里有一个致命的事实错误，整体打分可能只掉 0.5 分。<strong>解法是 rubric 化 + 否决项</strong>——「有没有事实错误」作为一个独立的二元项，触发即否决，而不是混进整体印象里。</li>
+  </ul>  <h3>一个两类情形共用的原则：先问「失败长什么样」</h3>  <p>多轮与长文档看起来是两个问题，但它们的正确解法来自同一句话：<strong>先列出这类内容<em>典型的失败形态</em>，再据此设计 judge，而不是先写一个「请评价这段内容的质量」的通用 prompt。</strong></p>  <p>多轮对话的典型失败是「前期把用户的需求理解偏了，后面几轮都在解决错误的问题」；长文档的典型失败是「整体结构不错，但中间藏着一个致命的事实错误」。<em>这两种失败，通用的「整体质量」prompt 都抓不到</em>——前者需要「目标达成检查」，后者需要「事实错误」作为否决项。<strong>而一旦你列出了失败形态，rubric 项其实是被这份清单直接决定的</strong>（呼应第 4 节的第 4 条：覆盖失败模式而不是覆盖优点）。</p>  <p><strong>分块评测</strong>是一个常见但需要小心的做法：把长文档切成块分别评再聚合。它能缓解位置效应，但引入了新问题——<em>跨块的一致性问题（前后矛盾）在分块评测里完全看不见</em>。实践中的折中是<strong>「分块评局部质量 + 整体评一致性」两条线分开跑</strong>，各自报告，不要合成一个数。</p>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_bias/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · Judge 偏差与去偏</div></a>
+  </div>
+
+</div>
+</body>
+</html>

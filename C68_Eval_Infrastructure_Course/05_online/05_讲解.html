@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 线上监控与漂移</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 线上监控与漂移</h1>
+  <p class="subtitle">「离线涨了线上没涨」有<strong>两层不匹配</strong>——分布（$D_{off} \ne D_{on}$）与口径（$s \ne u$），<strong>两层的修法完全不同，混在一起谈会做错方向</strong>；<em>最常见的是分布，最容易被误诊成「提升太小」</em>，<strong>正确的诊断顺序是：先查覆盖率，再谈效应量</strong> · <strong>PSI/KS 能告诉你「输入输出变了」，不能告诉你「变差了」</strong>——模拟里「模型变啰嗦」让 KS 强烈报警而真实质量几乎没变；<strong>所以漂移告警的正确动作是触发一次带标签的抽样评测，而不是直接回滚</strong> · 三个无标签信号覆盖三个失败方向：<strong>自一致性</strong>（模型不稳定）· <strong>行为分布</strong>（长度/格式密度/拒答率，正是 C67-05 的 hack 形态）· <strong>重问率</strong>（用户没被满足）——三者全自动、零标注成本 · <strong>guardrail 分层的意义不只是省成本</strong>：L0 确定性可放心拦截，<strong>L2 的误伤落在真实用户身上，通常只该降级不该拒答</strong> · <strong>尾部采样的数据不能直接算平均</strong>，必须记 <code>sample_kind</code> 与 <code>sample_p</code> · 闭环里 <strong>复发率是唯一的硬指标</strong>，而 <code>from_production</code> 必须设占比上限，否则任务集会漂成一个「疑难杂症集」</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 04（CI 门禁与告警疲劳）；C67 模块 03（judge 漂移与哨兵集）读过更好，本模块会把它接到线上</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_online_monitoring.ipynb（离线-在线相关性与「离线涨了线上没涨」的诊断 / 分布漂移检测：PSI 与 KS / guardrail 的分层与误伤率 / 抽样策略：均匀 vs 分层 vs 不确定性驱动 / 线上信号回灌离线任务集的闭环 / 无标签监控：用代理指标预警）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">OpenTelemetry GenAI 语义约定（trace 与 span 属性）· Population Stability Index 与 KS 检验在模型监控中的常规用法 · Kohavi et al., <em>Trustworthy Online Controlled Experiments</em>（2020）· 本课程 C10 模块 07（在线 A/B）· C66 模块 03（轨迹埋点）· C67 模块 03（哨兵集与 CUSUM）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#offline-online">离线指标与线上表现：为什么它们经常对不上</a></li>
+      <li><a href="#drift">分布漂移：PSI、KS，以及它们各自的盲区</a></li>
+      <li><a href="#guardrails">Guardrail：线上的实时护栏</a></li>
+      <li><a href="#sampling">抽样：全量记录不现实，随机抽样浪费预算</a></li>
+      <li><a href="#no-label">无标签监控：没有金标准时能看什么</a></li>
+      <li><a href="#feedback-loop">闭环：把线上信号送回离线任务集</a></li>
+      <li><a href="#wrap">全课收尾：五层之间的信息流</a></li>
+      <li><a href="#shadow">影子运行：零风险地拿到真实分布上的配对样本</a></li>
+      <li><a href="#cost-of-monitoring">监控本身的成本与优先级</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="offline-online"><span class="num">1</span>离线指标与线上表现：为什么它们经常对不上</h2>
+  <p>这门课到这里为止讲的都是<strong>离线</strong>评测：固定的任务集、可控的环境、可复现的结果。这一节讲那个所有人迟早会撞上的问题：<strong>离线涨了三个点，线上一点感觉都没有。</strong></p>  <table>
+    <thead><tr><th>原因</th><th>机制</th><th>怎么诊断</th><th>怎么修</th></tr></thead>
+    <tbody>
+      <tr><td><strong>分布偏移</strong></td><td>离线任务集是人挑的，真实流量的分布完全不同</td><td>把线上请求聚类，看离线任务集覆盖了哪些簇</td><td><strong>从线上采样回灌任务集</strong>（第 6 节）</td></tr>
+      <tr><td><strong>指标口径不同</strong></td><td>离线测「答案对不对」，线上看「用户满不满意」</td><td>在同一批样本上同时算两个指标，看相关系数</td><td>对齐口径，或明确声明离线是代理指标</td></tr>
+      <tr><td><strong>饱和</strong></td><td>离线任务集上大家都 90%+，提升发生在离线覆盖不到的尾部</td><td>看离线分数的分布是否压在上界</td><td>换更难的任务集（C66-01 的信息量分析）</td></tr>
+      <tr><td><strong>提升太小</strong></td><td>3 个点的离线提升，在线上被其他因素的方差淹没</td><td>算线上的 MDE（C66-04）</td><td>接受它检测不出来，或改用配对/影子设计</td></tr>
+      <tr><td><strong>非模型因素主导</strong></td><td>线上体验主要由延迟、UI、检索质量决定</td><td>分解线上指标的方差来源</td><td>先修那个主导因素</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这五个原因里，<strong>最常见的是第一个，最容易被误诊成第四个</strong>。「可能是提升太小了」听起来很合理，于是团队去做更大的改动；<em>而真实原因往往是离线任务集根本不覆盖线上的主要场景</em>——改动再大也白搭，因为它优化的是一个不重要的分布。<strong>区分方法很直接：先看覆盖率，再谈效应量。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，离线指标估计的是 $\mathbb{E}_{x \sim D_{\text{offline}}}[s(x)]$，而你关心的是 $\mathbb{E}_{x \sim D_{\text{online}}}[u(x)]$。两者之间隔着<strong>两层不匹配</strong>：$D_{\text{offline}} \ne D_{\text{online}}$（分布）与 $s \ne u$（指标口径）。<em>「离线涨了线上没涨」这件事，必须先确定是哪一层出的问题</em>——第一层用覆盖率诊断（第 2 节），第二层用同批样本上的相关系数诊断。<strong>两层的修法完全不同，混在一起谈会导致做错方向。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一条实用的诊断顺序：<strong>① 覆盖率（离线任务集覆盖了多少线上流量的分布）→ ② 口径相关性（在同一批样本上，离线指标与线上指标的相关系数）→ ③ 效应量与 MDE。</strong><em>按这个顺序查，通常在第一步就能找到答案</em>；而很多团队直接从第三步开始，于是永远在讨论「是不是要做更大的改动」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="drift"><span class="num">2</span>分布漂移：PSI、KS，以及它们各自的盲区</h2>
+  <p>线上监控的第一层是<strong>无标签监控</strong>——不需要知道答案对不对，只看输入和输出的分布有没有变。它便宜、实时、覆盖全量流量。</p>  <h3>两个标准工具</h3>  <div class="math-block">\[\text{PSI} = \sum_{b} (p_b - q_b)\ln\frac{p_b}{q_b}, \qquad \text{KS} = \sup_x |F_p(x) - F_q(x)|\]</div>  <table>
+    <thead><tr><th>指标</th><th>适用</th><th>判读</th><th>盲区</th></tr></thead>
+    <tbody>
+      <tr><td><strong>PSI</strong>（群体稳定性指数）</td><td>分箱后的分布对比，类别型与数值型都行</td><td>&lt; 0.1 稳定 · 0.1–0.25 需关注 · &gt; 0.25 显著漂移</td><td><strong>对分箱方式敏感</strong>；零频次桶要做平滑</td></tr>
+      <tr><td><strong>KS 统计量</strong></td><td>连续变量的分布对比</td><td>配合样本量算 p 值</td><td>只看最大偏离点，<em>对分布形状的局部变化不敏感</em></td></tr>
+      <tr><td><strong>类别频次的卡方</strong></td><td>离散类别（意图、语言、来源）</td><td>同上</td><td>类别很多时功效低</td></tr>
+      <tr><td><strong>嵌入空间的分布距离</strong></td><td>语义漂移</td><td>MMD / 分类器双样本检验</td><td>计算贵；结果不可解释</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>无标签漂移监控有一个结构性的局限，必须提前说清楚：<strong>它能告诉你「输入变了」，但不能告诉你「变得更差了」。</strong><em>输入分布漂移了，模型可能表现更好、更差、或者没变化</em>——PSI 高只是一个「该去看看」的信号，不是一个「出问题了」的结论。<strong>所以漂移告警的正确动作是「触发一次带标签的抽样评测」，而不是直接回滚。</strong></p>
+  </div>  <h3>该监控哪些分布</h3>  <ul>
+    <li><strong>输入侧</strong>：请求长度、语言、意图类别、来源渠道、是否带附件/图片；</li>
+    <li><strong>输出侧</strong>：<em>响应长度、格式元素密度、拒答率、置信度分布</em>——<strong>这四个正是 C67 模块 05 里 reward hacking 的四种形态</strong>，在线上它们同样是「模型行为漂移」的最早信号；</li>
+    <li><strong>系统侧</strong>：延迟分位数、错误率、重试率、工具调用次数（agent 场景）、成本；</li>
+    <li><strong>判分器侧</strong>：如果线上有 LLM judge 在跑，它自己的分布也要监控（C67-03 的哨兵集）。</li>
+  </ul>  <p><strong>输出侧的四个指标值得单独强调</strong>：它们不需要任何标签，却能抓住模型行为的实质性变化。<em>「平均响应长度一周内涨了 40%」这个信号，比任何离线指标都更早地告诉你「有什么东西变了」。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="guardrails"><span class="num">3</span>Guardrail：线上的实时护栏</h2>
+  <p>漂移监控是<strong>事后</strong>的（发现了才去查）。Guardrail 是<strong>实时</strong>的：在响应返回给用户之前做一次检查。</p>  <div class="ascii">   用户请求 ──► 模型 ──► ┌─────────────────────────────┐ ──► 用户
+                        │ GUARDRAIL                   │
+                        │  L0 规则   (微秒级, 零成本)  │
+                        │  L1 小模型 (毫秒级, 极便宜)  │
+                        │  L2 LLM    (百毫秒, 贵)      │
+                        └─────────────────────────────┘
+                                    │ 触发
+                                    ▼
+                           降级 / 重生成 / 转人工 / 拒答</div>  <table>
+    <thead><tr><th>层</th><th>检查什么</th><th>延迟</th><th>误伤率</th><th>触发后的动作</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L0 规则</strong></td><td>格式合法性、必填字段、长度上限、禁用词、PII 正则</td><td>&lt; 1ms</td><td><strong>极低</strong>（确定性）</td><td>重生成或用兜底模板</td></tr>
+      <tr><td><strong>L1 小模型</strong></td><td>安全分类、意图偏离、语言不匹配</td><td>10–50ms</td><td>低但非零</td><td>降级到保守回答</td></tr>
+      <tr><td><strong>L2 LLM judge</strong></td><td>事实一致性、是否回答了问题、语气</td><td>100–800ms</td><td><strong>取决于 judge 质量（C67）</strong></td><td>转人工或重生成</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>Guardrail 有一个与 CI 门禁完全同构的失败模式（模块 04 第 1 节）：<strong>误伤率过高时，它会被降级成「只记录不拦截」，然后被忘掉。</strong><em>而线上 guardrail 的误伤代价比 CI 误报更直接——它伤的是真实用户的体验。</em><strong>所以分层的意义不只是省成本，更是把「零误伤的确定性检查」和「有误伤的模型判断」分开</strong>：L0 可以放心拦截，L2 通常只该降级或标记，不该直接拒答。</p>
+  </div>  <h3>Guardrail 的三个必报指标</h3>  <ol>
+    <li><strong>触发率</strong>（按层分开）——突然升高说明模型或流量变了；</li>
+    <li><strong>误伤率</strong>——<em>需要人工抽查被拦截的样本</em>。<strong>这个数不测就等于不知道 guardrail 在做什么</strong>；</li>
+    <li><strong>漏放率</strong>——从用户投诉、事后审计里反推。<em>最难测，但也最重要。</em></li>
+  </ol>  <p>最后一条实践建议：<strong>guardrail 的每一次触发都要落一条结构化日志</strong>（哪一层、哪条规则、原始输出、最终动作）。<em>这些日志是回灌离线任务集最好的原料</em>（第 6 节）——被 guardrail 拦下来的样本，正是模型最容易出问题的地方。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="sampling"><span class="num">4</span>抽样：全量记录不现实，随机抽样浪费预算</h2>
+  <p>线上流量可能是每天几百万条，而人工标注预算可能是每天几百条。<strong>怎么抽这几百条，决定了你能发现什么。</strong></p>  <table>
+    <thead><tr><th>策略</th><th>怎么抽</th><th>适合发现什么</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>均匀随机</strong></td><td>固定比例随机抽</td><td><strong>估计整体质量</strong>（唯一无偏的）</td><td>难样本太少，发现不了具体问题</td></tr>
+      <tr><td><strong>分层</strong></td><td>按意图/渠道/长度分层，每层保底</td><td>各细分场景的质量</td><td>需要分层维度</td></tr>
+      <tr><td><strong>不确定性驱动</strong></td><td>抽 judge 置信度低、swap 不一致的（C67-03）</td><td><strong>判分器的薄弱区 + 模型的边界</strong></td><td>结果有偏，不能直接外推</td></tr>
+      <tr><td><strong>异常驱动</strong></td><td>抽 guardrail 触发的、超时的、用户负反馈的</td><td><strong>真实问题</strong></td><td>极度有偏</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>推荐的组合与 C67 模块 03 的元评测集设计完全同构：<strong>「均匀随机的主集」+「不确定性驱动的加强集」+「异常驱动的问题集」，三者分开统计、绝不混算。</strong><em>主集回答「整体质量是多少」（无偏），加强集回答「难的地方怎么样」，问题集提供「该修什么」的线索。</em><strong>把它们混成一个数字，三个问题一个都答不了。</strong></p>
+  </div>  <h3>追踪采样率与统计的关系</h3>  <p>如果你对 trace 做了采样（比如只记录 1% 的完整轨迹），<strong>那么基于 trace 的任何统计都要做逆概率加权</strong>——而且要注意<em>采样本身可能是有偏的</em>：</p>  <ul>
+    <li><strong>头部采样</strong>（在请求开始时决定记不记）——无偏，但会漏掉罕见的错误；</li>
+    <li><strong>尾部采样</strong>（请求结束后按结果决定记不记，比如「出错的全记」）——<strong>信息量高得多，但引入了强选择偏倚</strong>。<em>用尾部采样的数据估计整体错误率会严重高估</em>；</li>
+    <li><strong>实践组合</strong>：<strong>头部固定比例（用于无偏统计）+ 尾部全量记录异常（用于诊断）</strong>，<em>并在数据里用一个字段标明这条 trace 是怎么被采到的</em>——没有这个字段，两类数据混在一起就再也分不开了。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="no-label"><span class="num">5</span>无标签监控：没有金标准时能看什么</h2>
+  <p>线上绝大多数请求是没有标签的——没人告诉你这个回答对不对。但<strong>没有标签不等于没有信号</strong>。</p>  <table>
+    <thead><tr><th>信号</th><th>怎么得到</th><th>能预警什么</th><th>可信度</th></tr></thead>
+    <tbody>
+      <tr><td><strong>自一致性</strong></td><td>同一请求采样两次，比较两个回答</td><td>模型在这类输入上不稳定</td><td>★★★（C67-03 的 swap 一致性同构）</td></tr>
+      <tr><td><strong>拒答/兜底率</strong></td><td>直接统计</td><td>模型开始回避（或安全策略变了）</td><td>★★★</td></tr>
+      <tr><td><strong>输出行为分布</strong></td><td>长度、格式密度、置信表述</td><td>行为漂移（C67-05 的 hack 形态）</td><td>★★★</td></tr>
+      <tr><td><strong>用户行为代理</strong></td><td>重问率、复制率、点踩率、会话轮数</td><td><strong>用户满意度的代理</strong></td><td>★★☆（受 UI 影响大）</td></tr>
+      <tr><td><strong>下游任务成功</strong></td><td>用户是否完成了目标动作</td><td><strong>最接近真实效用</strong></td><td>★★★（但归因难）</td></tr>
+      <tr><td><strong>工具调用成功率</strong>（agent）</td><td>直接统计</td><td>工具误用、环境变化</td><td>★★★</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这里面最有价值、也最容易被忽略的是<strong>「重问率」</strong>：用户在收到回答后立刻换一种说法再问一遍，<em>几乎必然意味着上一个回答没解决问题</em>。<strong>它不需要任何标注，实时可得，而且与真实满意度高度相关。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从测量的角度，这类信号是<span class="term">行为代理指标</span>：它们与真实效用相关，但混杂了 UI、用户习惯、流量构成等因素。<strong>因此它们适合做<em>相对比较</em>（新版本 vs 旧版本，同期同流量）而不适合做<em>绝对判断</em></strong>（「重问率 12% 说明质量不好」）。<em>这与 C67 模块 03 里「样本级 vs 系统级」的结论同构：带噪声的信号在配对比较里依然有用，在绝对判断里不可靠。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个便宜且强推荐的组合：<strong>「自一致性抽样」+「行为分布监控」+「重问率」</strong>。<em>三者都不需要标注、都能全自动跑、成本近乎为零</em>，而且覆盖了三个不同的失败方向——<strong>模型不稳定、行为漂移、用户没被满足。</strong>（这与 C67 模块 05 第 6 节推荐的「可验证任务正确率 + 行为分布监控」是同一个思路。）</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="feedback-loop"><span class="num">6</span>闭环：把线上信号送回离线任务集</h2>
+  <p>这是本课的落点，也是把「评测基础设施」与「模型改进」连起来的那一环。</p>  <div class="ascii">   ┌──────────────────────────────────────────────────────────────┐
+   │                                                              │
+   │   线上流量 ──► guardrail 触发 / 负反馈 / 低置信 / 高重问      │
+   │                          │                                   │
+   │                          ▼                                   │
+   │              ① 采样与去标识化（PII）                          │
+   │                          ▼                                   │
+   │              ② 人工确认「这确实是个问题」                     │
+   │                          ▼                                   │
+   │              ③ 写成可判分的任务（C66-01 的六条规则）           │
+   │                          ▼                                   │
+   │              ④ 进入任务集的**新版本**（C68-01：只增不改）      │
+   │                          ▼                                   │
+   │   离线评测 ──► CI 门禁 ──► 发布 ──────────────────────────────┘
+   │                                                              │
+   └──── 从此这个问题**永远不会再悄悄回来**（这就是回归测试的意义）  ┘</div>  <h3>四个必须做对的细节</h3>  <ol>
+    <li><strong>去标识化必须在采样时做，不是在入库后做</strong>——<em>一旦真实用户数据进了任务集仓库，清理成本就高得多</em>；而且任务集通常会被更多人访问。</li>
+    <li><strong>人工确认这一步不能省</strong>：guardrail 触发不等于模型错了（可能是 guardrail 误伤）。<em>不确认就入库，等于把 guardrail 的误伤固化成了「标准答案」</em>。</li>
+    <li><strong>写成可判分的任务</strong>：这是 C66 模块 01 的六条规则（先写判分函数再写任务、要有防回归检查项、难度要有梯度……）。<em>「把线上 case 直接贴成一道题」通常判不了分</em>。</li>
+    <li><strong>进新版本而不是改旧版本</strong>（模块 01）——而且要<strong>标注来源为 <code>from_production</code></strong>，<em>因为这批任务的分布与人工构造的任务不同，分析时需要能分开</em>。</li>
+  </ol>  <div class="callout warn"><span class="label"></span>
+    <p>闭环有一个必须防的退化模式：<strong>任务集逐渐被「线上出过问题的 case」填满</strong>。<em>这些 case 按定义是模型的弱项，所以任务集会变得越来越难、分数越来越低</em>，而且<strong>它不再代表真实流量的分布</strong>。<strong>缓解：给 <code>from_production</code> 的任务设一个占比上限（比如 30%），并且同时从线上做<em>均匀随机</em>采样来补充「正常」的任务</strong>——否则任务集会漂成一个「疑难杂症集」。</p>
+  </div>  <h3>闭环的健康指标</h3>  <ul>
+    <li><strong>回灌延迟</strong>：从线上发现问题到它进入任务集的时间。<em>超过一个月，闭环基本等于不存在</em>；</li>
+    <li><strong>复发率</strong>：<strong>已经进了任务集的问题，有没有在线上再次出现</strong>。<em>这是闭环有没有真的起作用的唯一硬指标</em>；</li>
+    <li><strong>任务集的来源构成</strong>：人工构造 vs 线上回灌的比例，以及后者是否超了上限。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="wrap"><span class="num">7</span>全课收尾：五层之间的信息流</h2>
+  <p>把本课五个模块串起来，是一条从「声明」到「反馈」的完整回路：</p>  <div class="ascii">   ① SPEC      评什么、怎么判、版本与指纹        ─┐
+        │                                        │
+   ② RUNNER    并发/重试/缓存/预算，幂等可续      │  离线
+        │                                        │
+   ③ STORE     一条 rollout 一行，只追加          │
+        │                                        │
+   ④ CI GATE   确定性检查 + 配对统计门禁         ─┘
+        │
+        ▼  发布
+   ⑤ ONLINE    漂移 / guardrail / 无标签信号
+        │
+        └──────────► 回灌 ──► ① 的新版本任务集</div>  <table>
+    <thead><tr><th>模块</th><th>它保证的性质</th><th>缺了它会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><strong>01 SPEC</strong></td><td>可归因（差异指向配置项）</td><td>两次运行的差异说不清楚</td></tr>
+      <tr><td><strong>02 RUNNER</strong></td><td>执行不污染结果</td><td>缓存读到旧结果、重试抬高分数——都不报错</td></tr>
+      <tr><td><strong>03 STORE</strong></td><td>未来能问出新问题</td><td>换个口径就要重跑，于是大多数问题不会被问</td></tr>
+      <tr><td><strong>04 CI GATE</strong></td><td>退化进不了主干</td><td>退化上线；或门禁误报太多被关掉</td></tr>
+      <tr><td><strong>05 ONLINE</strong></td><td>离线看不见的问题被抓住</td><td>离线一直涨，线上一直没感觉</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>回头看，这五层解决的其实是同一个问题的五个面：<strong>怎么让「这个数字变了」这件事变得可解释。</strong><em>可归因（01）、不被执行污染（02）、可重新切片（03）、可被自动判断（04）、可被真实世界校验（05）</em>——五层都在服务同一个目标。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>而这个目标本身来自 C66 与 C67 的那条主线：<strong>先验证测量仪器，再相信读数。</strong><em>C66 教你怎么量一个 agent，C67 教你怎么验证判分器，本课教你怎么让这套测量能被可靠地、重复地、便宜地执行。</em><strong>三者合起来，才构成一个可以支撑决策的评测体系</strong>——而缺了本课这一环，前两课的方法只能被执行一次，然后在第二次执行时因为某个没被记录的配置项而失去可比性。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>如果这门课只带走一句话：<strong>基础设施的价值不在于跑得快，而在于它让「结果变了」这件事有唯一的解释。</strong><em>而所有的工程决策——spec 是纯数据、缓存键含指纹、主键三元组、聚合后置、阈值从方差推、线上信号回灌——都是在服务这一条。</em></p>
+  </div>  <p><strong>下一门课 C69 · Agent 安全与提示注入</strong>：本课模块 03 的 guardrail 是<em>质量护栏</em>，而当输入里有人<strong>主动</strong>想让 agent 做坏事时，需要的是另一套东西——攻击面在哪、怎么量它、怎么防。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="shadow"><span class="num">8</span>影子运行：零风险地拿到真实分布上的配对样本</h2>
+  <p>C66 模块 05 第 7 节提到过影子运行。这一节把它放在监控的语境里重讲，因为它填补了离线评测与线上 A/B 之间的一个空档。</p>  <div class="ascii">   真实请求 ──┬──► 现网模型 ──► 返回给用户
+              │
+              └──► 候选模型 ──► **不返回**，只落库
+                                    │
+                                    ▼
+                   两个输出在同一个真实请求上配对 ──► 判分器比较</div>  <table>
+    <thead><tr><th>方式</th><th>用户暴露</th><th>样本分布</th><th>配对</th><th>需要金标准吗</th></tr></thead>
+    <tbody>
+      <tr><td>离线评测</td><td>0%</td><td><strong>人挑的，通常有偏</strong></td><td>是（同一批任务）</td><td>是</td></tr>
+      <tr><td><strong>影子运行</strong></td><td><strong>0%</strong></td><td><strong>真实流量</strong></td><td><strong>是</strong>（同一个请求）</td><td><strong>否</strong>（比较两个输出即可）</td></tr>
+      <tr><td>金丝雀 / A-B</td><td>1–100%</td><td>真实流量</td><td>否（不同用户）</td><td>否（看线上指标）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>影子运行填的空档很具体：<strong>它同时具备「真实分布」与「配对」两个性质，而离线评测只有配对、A/B 只有真实分布。</strong><em>配对意味着方差极低（同一个请求，两个版本），真实分布意味着它测的是用户实际会问的东西</em>——这两条加起来，让影子运行成为检测「离线覆盖不到的退化」最灵敏的手段。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>代价有两个，都要提前想清楚：<strong>① 双倍推理成本</strong>（可以靠采样比例控制，1–5% 通常就够）；<strong>② 需要一个能比较两个输出的判分器</strong>——<em>而这正好是 C67 的内容，包括它的全部偏差问题</em>。<strong>特别要注意的是位置偏差：比较现网输出与候选输出时，必须做 swap 双跑</strong>（C67-02），<em>否则「候选更好」这个结论可能只是因为它被放在了第二位。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>影子运行还有一个必须处理的工程细节：<strong>副作用。</strong><em>如果候选模型是一个 agent，它可能会真的去调用工具、写数据库</em>——<strong>影子运行必须跑在只读或沙箱化的工具集上</strong>，否则「零用户暴露」这个前提就不成立了。这与 C69 的沙箱与权限边界是同一套机制。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost-of-monitoring"><span class="num">9</span>监控本身的成本与优先级</h2>
+  <p>本课列了十几种监控信号。全部都上是不现实的，这一节给出<strong>按性价比排序的建设顺序</strong>。</p>  <table>
+    <thead><tr><th>优先级</th><th>建什么</th><th>成本</th><th>覆盖什么失败</th><th>为什么是这个顺序</th></tr></thead>
+    <tbody>
+      <tr><td><strong>P0</strong></td><td>错误率 / 延迟 / 成本的基础监控</td><td>极低（通常已有）</td><td>系统挂了</td><td>不建这个，后面所有信号都不可信</td></tr>
+      <tr><td><strong>P0</strong></td><td><strong>输出行为分布</strong>（长度、格式密度、拒答率）</td><td><strong>极低</strong>（纯统计，无标注无调用）</td><td>模型行为漂移</td><td><strong>零成本，且是最早的预警信号</strong></td></tr>
+      <tr><td><strong>P1</strong></td><td>重问率 / 用户行为代理</td><td>低（需要会话拼接）</td><td>用户没被满足</td><td>与真实满意度强相关，且无需标注</td></tr>
+      <tr><td><strong>P1</strong></td><td>L0 确定性 guardrail</td><td>低</td><td>格式错误、越界输出</td><td>零误伤，可放心拦截</td></tr>
+      <tr><td><strong>P2</strong></td><td>输入分布漂移（PSI/KS）</td><td>低</td><td>流量构成变化</td><td>它只说「变了」，需要配合抽样才有结论</td></tr>
+      <tr><td><strong>P2</strong></td><td>自一致性抽样</td><td>中（双倍推理，但只抽 1%）</td><td>模型不稳定</td><td>抽样比例可以很低</td></tr>
+      <tr><td><strong>P3</strong></td><td>每周人工抽样标注</td><td><strong>高</strong>（人力）</td><td>真实质量</td><td>唯一的金标准，但要等前面几层把范围缩小</td></tr>
+      <tr><td><strong>P3</strong></td><td>L2 LLM guardrail</td><td>高（每请求一次额外调用）</td><td>语义问题</td><td>误伤落在用户身上，要先把 α/β 量出来（C67）</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>这张表最重要的是第二行：<strong>输出行为分布监控是零成本的</strong>——它不需要标注、不需要额外调用、不需要金标准，只是对已有日志做几个统计。<em>而它覆盖的正是 C67 模块 05 里那四种 reward hacking 形态</em>（长度膨胀、格式套路化、自信化、拒答漂移）。<strong>如果你只能建一样东西，建这个。</strong></p>
+  </div>  <h3>从监控到诊断：三层漏斗</h3>  <p>上面那张表还隐含了一个结构：<strong>这些信号构成一个漏斗，每一层的作用是把「需要人看」的范围缩小一个数量级。</strong></p>  <div class="ascii">   全量流量 (10^6/天)
+        │  P0: 行为分布 + 错误率     ← 零成本，全量覆盖
+        ▼
+   异常时段/切片 (10^4)
+        │  P1: 重问率 + guardrail    ← 低成本，定位到具体场景
+        ▼
+   可疑样本 (10^2)
+        │  P2: 自一致性 + PSI 驱动抽样
+        ▼
+   人工标注 (10^1-10^2/周)          ← 唯一的金标准，也是唯一贵的一层</div>  <p><strong>建设顺序应当自上而下</strong>：先建全量的零成本层，让它把范围缩小，再让昂贵的人力只处理最后那一小撮。<em>反过来做（一上来就大规模人工标注）的问题不是「太贵」，而是「抽样是随机的，因此大概率抽不到真正出问题的地方」</em>——这与第 4 节抽样策略的讨论是同一件事。</p>  <h3>一个容易被忽略的成本：监控自己的可靠性</h3>  <p><strong>监控系统本身也会坏，而且它坏了的时候不会告警</strong>（因为告警就是它的职责）。三条便宜的防御：</p>  <ul>
+    <li><strong>心跳指标</strong>：监控管道每分钟写一个计数器。<em>「指标停止上报」应当触发告警，而不是被当成「一切正常」</em>；</li>
+    <li><strong>合成流量</strong>：定期发几条已知答案的请求走完整链路，<em>它同时验证了服务与监控两条链路</em>；</li>
+    <li><strong>告警的告警</strong>：如果某个指标连续 N 天没有任何波动，<em>那通常不是「非常稳定」，而是「数据源断了」</em>。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后一条值得单独说：<strong>「指标异常地平稳」是一个被严重低估的故障信号。</strong><em>真实指标总是有噪声的；一条完全水平的曲线，十有八九是采集断了、或者读到了缓存、或者除数被写死了。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这与模块 02 的「首次运行缓存命中率非 0」是同一类诊断：<strong>都是在检查「一个本该变化的量为什么没有变化」</strong>。<em>这类检查的共同特点是：它们抓的不是「值超出了范围」，而是「值的<strong>行为</strong>不对」</em>——而后者往往对应着更根本的故障（数据没进来、代码路径没被执行），却几乎不会被常规的阈值告警覆盖。</p></div>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_ci_gating/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · CI 回归门禁</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 奖励模型与过优化</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 奖励模型与过优化</h1>
+  <p class="subtitle"><strong>奖励模型的训练目标就是模块 04 的 BT 对数似然</strong>，只是「强度参数」从查找表变成了函数——推广带来泛化，也带来外推：<strong>RM 只在训练分布上被约束，而优化过程恰恰会把策略推到分布之外</strong> · <strong>过优化的倒 U 曲线是数学上必然的，不是实现缺陷</strong>；致命之处在于<em>代理奖励单调上升，在监控面板上看起来像成功</em> · <strong>每一种 hack 形态都对应模块 02 的一个 judge 偏差</strong>——量过 judge 的长度偏差，就能事先预测 RM 会把输出推长，并提前布置监控 · <strong>集成治各 RM 独有的误差，治不了偏好数据里的共有偏差</strong>（与模块 02 第 7 节是同一条结论） · RM 评测<strong>报 worst slice，不报 macro</strong>：一个在风格陷阱片上低于 50% 的 RM，总分再高也不该做训练信号 · <strong>必须有一条与 RM 误差不相关的独立信号</strong>——同门 RM 在过优化区域会一路上升，在你最需要它的时候恰好失效 · <strong>能验证的部分绝不交给 RM</strong>，这是 RLVR 与 RLHF 的分界线</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 04（BT 与排名）——奖励模型的训练目标就是 BT 的对数似然；C02（后训练与对齐）读过更好，但本模块只需要知道「RLHF 用一个奖励模型给策略打分」</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_reward_models.ipynb（BT 损失训练一个奖励模型 / KL–奖励过优化曲线与拐点定位 / best-of-n 与 RL 两条优化路径的对比 / 分布外退化 / RewardBench 风格的分片评测 / 奖励集成与保守化 / 代理指标 vs 真实指标的背离）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Gao, Schulman &amp; Hilton, <em>Scaling Laws for Reward Model Overoptimization</em>（ICML 2023）· Stiennon et al., <em>Learning to Summarize from Human Feedback</em>（NeurIPS 2020）· Lambert et al., <em>RewardBench</em>（2024）· Coste et al., <em>Reward Model Ensembles Help Mitigate Overoptimization</em>（ICLR 2024）· Rafailov et al., <em>DPO</em>（NeurIPS 2023，隐式奖励模型）· 本课程 C02（RLHF/DPO/RLVR）· C22（推理 RL 与 PRM）· C23（可扩展监督）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#rm-is-judge">奖励模型就是一个被固化下来的 judge</a></li>
+      <li><a href="#overopt">过优化：那条必然出现的倒 U 曲线</a></li>
+      <li><a href="#hacking-modes">奖励 hacking 的具体形态：从长度到谄媚</a></li>
+      <li><a href="#rm-eval">怎么评测一个奖励模型：分片准确率与它的局限</a></li>
+      <li><a href="#mitigations">缓解手段：集成、保守化、迭代</a></li>
+      <li><a href="#independent-signal">那条独立信号：过优化的唯一可靠检测方式</a></li>
+      <li><a href="#rlvr-boundary">边界：什么该交给验证器，什么只能交给 judge</a></li>
+      <li><a href="#checklist">上线前的 judge/RM 检查清单</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rm-is-judge"><span class="num">1</span>奖励模型就是一个被固化下来的 judge</h2>
+  <p>前四个模块讲的 judge，都是<strong>用来测量</strong>的。这一节开始讲当它<strong>被用来训练</strong>时，会发生什么本质不同的事。</p>  <p>先说一个结构上的连续性：<strong>奖励模型（reward model, RM）的训练目标，就是模块 04 的 Bradley–Terry 对数似然。</strong></p>  <div class="math-block">\[\mathcal{L}_{\text{RM}} = -\mathbb{E}_{(x,\,y_w,\,y_l)}\left[\log \sigma\big(r_\phi(x, y_w) - r_\phi(x, y_l)\big)\right]\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>对照模块 04 的 BT：那里每个<em>模型</em>有一个标量 $\theta_i$；这里每个 <em>(问题, 回答)</em> 对有一个标量 $r_\phi(x,y)$，由一个神经网络算出来。<strong>数学形式完全一样，区别只是「强度参数」从一张查找表变成了一个函数。</strong>所以模块 04 关于 BT 的一切——只有差值有意义、需要正则化、假设了传递性——<em>全部原样适用于奖励模型</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说，RM 是 BT 模型的<span class="term">参数化推广</span>：BT 的参数空间是 $\mathbb{R}^{|M|}$（每个模型一个数），RM 的参数空间是函数空间 $\{r_\phi: \mathcal{X}\times\mathcal{Y}\to\mathbb{R}\}$。<strong>推广带来的能力是泛化</strong>（能给没见过的回答打分），<strong>推广带来的风险是外推</strong>——<em>在训练分布之外，$r_\phi$ 的值没有任何数据约束，而优化过程恰恰会把策略推到那里去。</em>这句话就是本模块后面所有内容的种子。</p></div>
+  </div>  <table>
+    <thead><tr><th>身份</th><th>被谁消费</th><th>关键性质</th><th>本课程哪里讲</th></tr></thead>
+    <tbody>
+      <tr><td><strong>LLM judge</strong>（prompt 驱动）</td><td>评测流程</td><td>可解释、易改、无需训练</td><td>本课 01–04</td></tr>
+      <tr><td><strong>奖励模型</strong>（训练出来的打分网络）</td><td><strong>RL / best-of-n</strong></td><td>快、便宜、可微；<strong>但会被优化压力主动攻击</strong></td><td>本模块</td></tr>
+      <tr><td><strong>隐式奖励模型</strong>（DPO 等）</td><td>直接进策略更新</td><td>不显式存在，但数学上等价于一个 RM</td><td>C02 讲训练，本模块讲它的评测</td></tr>
+      <tr><td><strong>可验证奖励</strong>（RLVR）</td><td>RL</td><td><strong>不可被 hack</strong>（只要验证器正确）</td><td>第 7 节的边界讨论</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>一个值得记住的判断：<strong>把 judge 用作测量，误差让你得到错误的读数；把 judge 用作训练信号，误差会被<em>主动放大</em>——因为优化过程会专门去找它出错的地方。</strong>这就是为什么「够用的 judge」和「够用的奖励模型」是两个不同的标准。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="overopt"><span class="num">2</span>过优化：那条必然出现的倒 U 曲线</h2>
+  <p>这是本模块的核心现象，也是 RLHF 工程里最重要的一条经验规律。</p>  <div class="ascii">   分数
+    │        代理奖励 (RM 分数)
+    │      ╱─────────────────────────  单调上升，永远不会告诉你出问题了
+    │    ╱
+    │  ╱      真实质量 (人类/金标准)
+    │ ╱     ╱────╲
+    │╱    ╱        ╲______             倒 U：先升后降
+    │   ╱                    ╲____
+    └──┴────────┴──────────────────────► 优化强度（KL 距离 / best-of-n 的 n / RL 步数）
+              拐点
+       ← 有效优化 →│← 过优化（RM 分涨、真实质量跌）→
+
+   致命之处：**你只能看到上面那条线。**下面那条需要人类标注才能画出来。</div>  <p>这条曲线在 best-of-n 和 RL 两种优化方式下都会出现，而且它们与 KL 距离的关系有一个已被反复验证的经验形式：</p>  <div class="math-block">\[R(d) \;\approx\; d\,(\alpha - \beta d), \qquad d = \sqrt{\mathrm{KL}(\pi \,\|\, \pi_{\text{ref}})}\]</div>  <p>其中 $R$ 是<strong>真实</strong>质量的提升，$d$ 是 KL 距离的平方根。$\alpha$ 是有效优化的斜率，$\beta$ 是过优化的惩罚项。<strong>拐点在 $d^{*} = \alpha/(2\beta)$。</strong><em>关键的经验发现是：$\alpha$ 和 $\beta$ 都随奖励模型的规模与数据量变化，更大的 RM 推得更远、掉得更慢，但拐点<strong>依然存在</strong>。</em></p>  <table>
+    <thead><tr><th>优化方式</th><th>「优化强度」是什么</th><th>KL 与它的关系</th><th>实践含义</th></tr></thead>
+    <tbody>
+      <tr><td><strong>best-of-n</strong></td><td>候选数 $n$</td><td>$\mathrm{KL} \approx \log n - \frac{n-1}{n}$</td><td>便宜、可控、随时能退回去；<strong>调试期的首选</strong></td></tr>
+      <tr><td><strong>RL (PPO 等)</strong></td><td>训练步数 / KL 惩罚系数</td><td>直接被 KL 项控制</td><td>更强但更贵，且<em>退不回去</em>——权重已经变了</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>过优化最危险的地方不是它会发生，而是<strong>它在你的监控面板上看起来像成功</strong>。代理奖励单调上升，训练曲线漂亮，而真实质量的下降<em>只有在人类看到输出时才会被发现</em>——通常是在上线之后。<strong>所以任何 RLHF 流程都必须有一条独立于 RM 的验证信号</strong>，哪怕它很小、很慢、很贵（第 6 节展开）。</p>
+  </div>  <h3>为什么必然发生</h3>  <p>机制在第 1 节的 DUAL 里已经埋好了：<strong>RM 只在训练分布上被约束</strong>。优化过程的本质就是<em>去找 RM 给高分的地方</em>，而 RM 给高分最容易的地方，恰恰是它没见过、因此外推得很离谱的区域。<strong>这是 Goodhart 定律的一个数学上必然的版本，不是实现缺陷。</strong></p>
+
+  <!-- ========================================================= -->
+  <h2 id="hacking-modes"><span class="num">3</span>奖励 hacking 的具体形态：从长度到谄媚</h2>
+  <p>抽象地说「过优化」不够用，工程上需要知道<strong>它具体长什么样</strong>。下面这些形态的共同点是：<em>它们全部对应模块 02 里的某个 judge 偏差</em>——偏差在测量时是误差，在训练时就是被优化的目标。</p>  <table>
+    <thead><tr><th>形态</th><th>表现</th><th>对应的 judge 偏差（模块 02）</th><th>检测手段</th></tr></thead>
+    <tbody>
+      <tr><td><strong>长度膨胀</strong></td><td>输出越来越长，信息密度下降</td><td>长度偏差</td><td>监控输出长度分布；长度控制版指标</td></tr>
+      <tr><td><strong>格式套路化</strong></td><td>什么问题都用标题 + 编号列表</td><td>风格/格式偏差</td><td>监控 markdown 元素密度</td></tr>
+      <tr><td><strong>谄媚</strong>（sycophancy）</td><td>顺着用户的错误前提说、不纠正</td><td>标注者偏好「让人舒服」的回答</td><td>构造「用户说了错话」的探针集</td></tr>
+      <tr><td><strong>自信化</strong></td><td>含糊表述消失，一律给确定的答案</td><td>自信语气被奖励</td><td>校准检查（模块 03）：ECE 恶化</td></tr>
+      <tr><td><strong>套话开场</strong></td><td>「这是一个很好的问题」类的固定前缀</td><td>标注者对礼貌的偏好</td><td>前缀 n-gram 频率监控</td></tr>
+      <tr><td><strong>拒答漂移</strong></td><td>该答的也拒答（安全 RM 过强）或该拒的不拒</td><td>安全维度的权重失衡</td><td>拒答率的双向监控</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>这张表最有价值的是第三列。<strong>如果你在模块 02 已经量过 judge 的偏差，你就已经知道你的 RM 会往哪个方向被 hack 了。</strong><em>长度偏差 $\gamma = 0.8$ 的 judge，训出来的 RM 一定会把输出推长</em>——这不需要等实验结果，可以事先预测并提前布置监控。</p>
+  </div>  <h3>一个反直觉的点：hack 不需要「聪明」</h3>  <p>这些形态没有一个需要模型「理解」奖励模型的漏洞。<strong>梯度下降只是在做它该做的事：沿着奖励上升最快的方向走。</strong>如果「加一句礼貌开场」能稳定地涨 0.1 分，那么在几万次更新之后，模型必然学会永远加这句开场——<em>这和「模型在钻空子」这种拟人化描述无关，它就是优化。</em></p>  <p>这个视角有一个实用推论：<strong>与其试图让 RM「更聪明地识破 hack」，不如从一开始就把可 hack 的维度从奖励里去掉。</strong>长度控制的 RM（在训练时就把长度回归掉）比事后惩罚长输出有效得多——<em>这正是模块 02 的去偏方法在训练侧的对应物。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="rm-eval"><span class="num">4</span>怎么评测一个奖励模型：分片准确率与它的局限</h2>
+  <p>RM 的评测有一个天然的形式：<strong>给一批 (prompt, chosen, rejected) 三元组，看 RM 是否给 chosen 更高的分。</strong>这就是 RewardBench 类基准的核心。</p>  <div class="math-block">\[\text{RM accuracy} = \Pr\big[r_\phi(x, y_w) > r_\phi(x, y_l)\big]\]</div>  <h3>分片是关键</h3>  <p>总准确率几乎没有信息量。有信息量的是<strong>按能力维度分片</strong>：</p>  <table>
+    <thead><tr><th>分片</th><th>考察什么</th><th>典型难点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Chat</strong></td><td>一般对话的偏好</td><td>容易饱和——多数 RM 都在 95% 以上</td></tr>
+      <tr><td><strong>Chat-Hard</strong></td><td><strong>刻意构造的困难对</strong>：拒绝对比、细微事实差异、风格诱导</td><td><strong>最能区分 RM</strong>；许多 RM 在这一片掉到 60% 以下</td></tr>
+      <tr><td><strong>Safety</strong></td><td>该拒的拒、不该拒的别拒（双向）</td><td>单向优化会在另一个方向翻车</td></tr>
+      <tr><td><strong>Reasoning</strong></td><td>数学/代码的正确性偏好</td><td>RM 常常偏好「看起来严谨」而非「实际正确」</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>RM 基准准确率有一个必须知道的局限：<strong>它是在<em>固定的、静态的</em>偏好对上测的，而 RM 在实际使用时面对的是<em>被自己的梯度推着走</em>的分布。</strong><em>一个在 RewardBench 上 90% 的 RM，完全可能在 RL 训练的第 2000 步就开始给垃圾输出打高分</em>——因为那些输出不在任何静态基准的分布里。<strong>静态准确率是必要条件，不是充分条件。</strong></p>
+  </div>  <h3>必须补的两类评测</h3>  <ol>
+    <li><strong>分布外探针</strong>：拿被优化过的策略的输出（而不是静态数据集）去测 RM，看它是否仍然与人类一致。<em>这是唯一能提前发现过优化的离线手段</em>；</li>
+    <li><strong>校准</strong>：RM 的分差应当能被翻译成胜率（模块 04 的 BT 性质）。<strong>分差 1.0 应当对应 73% 的胜率——如果实测只有 55%，说明 RM 的分数尺度是虚的</strong>，用它做 best-of-n 的截断阈值会完全失准（第 6 节）。</li>
+  </ol>
+
+  <!-- ========================================================= -->
+  <h2 id="mitigations"><span class="num">5</span>缓解手段：集成、保守化、迭代</h2>
+  <p>过优化不能被消除（第 2 节说过它是数学上必然的），但可以被<strong>推后</strong>和<strong>检测</strong>。</p>  <table>
+    <thead><tr><th>手段</th><th>怎么做</th><th>效果</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>KL 惩罚</strong></td><td>在目标里加 $-\beta\,\mathrm{KL}(\pi\|\pi_{\text{ref}})$</td><td><strong>最基本、必做</strong>：直接限制走多远</td><td>$\beta$ 是超参；太大则学不动</td></tr>
+      <tr><td><strong>奖励模型集成</strong></td><td>训练 $K$ 个 RM（不同 seed / 数据划分），取<strong>最小值</strong>或均值减方差</td><td><strong>显著推后拐点</strong>：分歧大的区域自动被压低</td><td>训练与推理成本 $\times K$</td></tr>
+      <tr><td><strong>保守化 / 悲观估计</strong></td><td>用 $\bar{r} - \lambda\,\mathrm{std}(r)$ 代替 $\bar{r}$</td><td>把「不确定的高分」自动折价</td><td>$\lambda$ 需要调；过大则过于保守</td></tr>
+      <tr><td><strong>迭代式数据收集</strong></td><td>训练一轮 → 用新策略的输出收集新偏好 → 重训 RM</td><td><strong>最根本的解法</strong>：把分布外变成分布内</td><td>每轮都要人类标注，最贵</td></tr>
+      <tr><td><strong>早停</strong></td><td>用独立验证信号定位拐点，停在那里</td><td>简单有效</td><td>需要那条独立信号（第 6 节）</td></tr>
+      <tr><td><strong>可验证奖励</strong></td><td>能用程序验证的部分不交给 RM（第 7 节）</td><td><strong>该部分完全免疫 hack</strong></td><td>只适用于可验证的任务</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>集成为什么有效，有一个很直观的解释：<strong>过优化找到的是「某一个 RM 的漏洞」，而不同 seed 训出来的 RM，漏洞位置不一样。</strong>取最小值意味着<em>要骗过所有 RM 才能拿高分</em>，这比骗过一个难得多。<strong>但它治不了「所有 RM 共有的偏差」</strong>——如果偏好数据本身就奖励长回答，那么每个 RM 都会奖励长回答，集成毫无帮助。<em>这与模块 02 第 7 节「集成只能治噪声，治不了共有偏差」是完全同一条结论。</em></p>
+  </div>  <h3>迭代式为什么是根本解法</h3>  <p>回到第 1 节的病根：<strong>RM 只在训练分布上被约束</strong>。迭代式数据收集直接解决这个问题——把优化后策略产生的输出拿去标注，那些原本的「分布外区域」就变成了分布内。<em>代价是每一轮都需要新的人类标注，所以实践中通常是「几轮迭代 + 每轮内用集成与 KL 惩罚」的组合。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="independent-signal"><span class="num">6</span>那条独立信号：过优化的唯一可靠检测方式</h2>
+  <p>本模块反复提到「独立于 RM 的验证信号」。这一节把它讲清楚——<strong>因为它是整个 RLHF 流程里最容易被省掉、也最不该被省掉的一环。</strong></p>  <h3>为什么必须独立</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>如果你用同一个 RM（或它的同门兄弟）来验证训练效果，那么你测到的只是「优化是否有效地提高了 RM 分数」——<strong>而这在过优化阶段依然是真的</strong>。换句话说，非独立的验证信号<em>在你最需要它的时候恰好失效</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：设真实效用 $U$、代理奖励 $\hat{R}$。过优化的定义就是 $\frac{\partial U}{\partial d} < 0$ 而 $\frac{\partial \hat{R}}{\partial d} > 0$。<strong>任何与 $\hat{R}$ 高度相关的验证量，在这个区域都会继续上升</strong>，因此无法检出。<em>要检出，验证量必须与 $\hat{R}$ 的<strong>误差项</strong>不相关</em>——这正是「独立」的技术含义，也是为什么「用一个更强的模型当 judge」经常不够（它可能共享同样的偏差，呼应模块 03 第 1 节）。</p></div>
+  </div>  <table>
+    <thead><tr><th>候选信号</th><th>独立性</th><th>成本</th><th>评价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>人类偏好抽样</strong></td><td>★★★ 最独立</td><td>最高</td><td><strong>金标准</strong>。哪怕每轮只标 200 条，也比没有强得多</td></tr>
+      <tr><td><strong>可验证任务的正确率</strong>（数学/代码/单元测试）</td><td>★★★</td><td>低</td><td><strong>性价比最高</strong>：完全客观，且能自动跑（C66 的判分器）</td></tr>
+      <tr><td><strong>异族 LLM judge</strong></td><td>★★☆</td><td>中</td><td>有用，但要先确认它与 RM 的偏差方向不同（模块 02 的探针）</td></tr>
+      <tr><td><strong>行为分布监控</strong>（长度、格式、拒答率、校准）</td><td>★★★</td><td>极低</td><td><strong>不测质量，但能测「有没有在被 hack」</strong>——第 3 节的形态清单</td></tr>
+      <tr><td><strong>留出的 RM</strong>（不参与训练的同门 RM）</td><td>★☆☆</td><td>低</td><td>只能检出「训练 RM 的过拟合」，检不出共有偏差</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>一个便宜且强烈推荐的组合：<strong>「可验证任务正确率」+「行为分布监控」</strong>。两者都能全自动跑、成本近乎为零，而且覆盖了过优化的两类表现——<em>能力退化</em>（数学题做错了）与<em>形态漂移</em>（输出变长变套路）。<strong>人类抽样再补在上面，作为最终的校验。</strong></p>
+  </div>  <h3>拐点怎么定位</h3>  <p>有了独立信号，定位拐点就是一个曲线拟合问题。实用做法：</p>  <ol>
+    <li>在若干个优化强度上取检查点（best-of-n 取几个 $n$；RL 取几个 step）；</li>
+    <li>在每个检查点上跑独立信号，得到 $(d_k, U_k)$；</li>
+    <li>拟合 $U \approx d(\alpha - \beta d)$，解出 $d^{*} = \alpha/(2\beta)$；</li>
+    <li><strong>把生产用的 KL 预算设在 $d^{*}$ 之前留有余量的位置</strong>——因为 $d^{*}$ 本身是有估计误差的，而越过它的代价是不对称的。</li>
+  </ol>
+
+  <!-- ========================================================= -->
+  <h2 id="rlvr-boundary"><span class="num">7</span>边界：什么该交给验证器，什么只能交给 judge</h2>
+  <p>本课最后一节，回到模块 00 第 2 节埋下的那条线：<strong>校验（verification）与 judge 的分界。</strong>在训练语境下，这条线就是 RLVR 与 RLHF 的分界。</p>  <div class="ascii">   ┌────────────────────────────────────────────────────────────────┐
+   │ 可验证奖励 RLVR                    │ 学习到的奖励 RLHF/RM        │
+   ├────────────────────────────────────┼─────────────────────────────┤
+   │ 数学答案对不对（对答案）            │ 这段解释清不清楚             │
+   │ 代码过不过测试                      │ 这个回答有没有帮到人         │
+   │ 格式合不合 schema                   │ 语气是否得体                 │
+   │ 引用的条款存不存在                  │ 优先级排得对不对             │
+   ├────────────────────────────────────┼─────────────────────────────┤
+   │ **不可被 hack**（验证器正确的前提下）│ **必然可被 hack**            │
+   │ 信号稀疏（只有对错）                │ 信号密集（连续分数）          │
+   │ 覆盖窄                              │ 覆盖宽                       │
+   └────────────────────────────────────┴─────────────────────────────┘
+        实践：**能验证的部分绝不交给 RM**，剩下的才用 RM，并接受它会被 hack。</div>  <div class="callout warn"><span class="label"></span>
+    <p>一个必须补充的诚实说明：<strong>RLVR 的「不可被 hack」是有条件的</strong>——条件是验证器本身正确且完整。<em>如果测试写得弱，策略照样能学会「让测试变绿但代码是错的」</em>——这正是 C66 模块 02 讲的判分器 hack，只是发生在训练侧。<strong>所以「用可验证奖励」不等于「不用操心奖励设计」，它只是把问题从「RM 会不会外推错」换成了「验证器写得全不全」。</strong>后者通常容易得多，但不是零。</p>
+  </div>  <h3>组合的实践形态</h3>  <p>真实系统里两者几乎总是组合使用，常见形态：</p>  <ul>
+    <li><strong>可验证部分做硬约束</strong>：格式不合法、测试不通过直接给 0 或负奖励，不进入 RM 打分——<em>这一步能挡掉大量最粗糙的 hack</em>；</li>
+    <li><strong>RM 只负责剩余维度</strong>，并且这些维度<strong>尽量 rubric 化</strong>（模块 01）——rubric 项越接近可判定，可 hack 空间越小；</li>
+    <li><strong>把已知的 hack 形态写成负向验证器</strong>：「开头是不是套话」「markdown 元素密度是否异常」都可以写成程序检查，<em>直接扣分，而不是指望 RM 学会不喜欢它们</em>。</li>
+  </ul>  <h3>全课收尾</h3>  <p>把这门课的五个模块串起来看，是同一条逻辑的五次展开：</p>  <ol>
+    <li><strong>00</strong> judge 是测量仪器，误差与被测物相关，所以要先验证仪器；</li>
+    <li><strong>01</strong> 仪器的设计决定了它的量程与噪声——能写成校验就别打分；</li>
+    <li><strong>02</strong> 把系统偏差量出来、减掉，并诚实报告残留的不可识别性；</li>
+    <li><strong>03</strong> 用人类上界校准你对「一致率」的解读，用校准度决定分诊；</li>
+    <li><strong>04</strong> 把成对比较聚合成排名时，看区间不看名次；</li>
+    <li><strong>05</strong> 一旦仪器变成目标，它就开始失效——<strong>所以永远要有一条独立于它的信号。</strong></li>
+  </ol>  <p><strong>下一门课 C68</strong> 把这一切工程化：judge 与 RM 的调用怎么缓存、怎么接进 CI、怎么监控漂移、怎么做线上线下的双回路。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="checklist"><span class="num">8</span>上线前的 judge/RM 检查清单</h2>
+  <p>把这门课的六个模块压缩成一份可以逐项打勾的清单。<strong>按用途分三档——用途越重，要求越严。</strong></p>  <h3>档位 A · judge 只用于内部看趋势</h3>  <ul>
+    <li>☐ swap 一致性 ≥ 0.80，且已做 swap 平均（模块 01/02）</li>
+    <li>☐ 长度系数 $\gamma$ 已拟合，raw 与 LC 两个数一起看（模块 02）</li>
+    <li>☐ judge prompt 有版本指纹，改动会让指纹变（模块 01）</li>
+    <li>☐ 解析失败率已记录，失败样本按重试→平局处理而非丢弃（模块 01）</li>
+  </ul>  <h3>档位 B · judge 用于选型或对外报告</h3>  <p>在档位 A 之上追加：</p>  <ul>
+    <li>☐ 与人类的一致率，<strong>且给出人类之间的一致率作为上界</strong>（模块 03）</li>
+    <li>☐ 风格探针与自偏好探针的幅度已量化（模块 02）</li>
+    <li>☐ 报告了系统级分辨力：能检出多大的差距（模块 03）</li>
+    <li>☐ 若出榜单：名次区间、比较图连通性、配对策略、传递性检查（模块 04）</li>
+    <li>☐ 若出榜单：风格控制版与 Δrank 并列给出（模块 04）</li>
+    <li>☐ 有哨兵集，且<strong>从未被用来调 prompt</strong>（模块 03）</li>
+  </ul>  <h3>档位 C · judge/RM 用作训练信号</h3>  <p>在档位 B 之上追加——<strong>这一档的要求显著更严，因为误差会被优化过程主动放大</strong>：</p>  <ul>
+    <li>☐ RM 的<strong>分片评测</strong>已做，且 <strong>worst slice 达标</strong>（不是 macro）（本模块）</li>
+    <li>☐ RM 的校准已检验：分差 1.0 是否真的对应约 73% 的胜率（本模块）</li>
+    <li>☐ 已在<strong>被优化过的策略输出</strong>上测过 RM 一致率（分布外探针）（本模块）</li>
+    <li>☐ <strong>存在一条与 RM 误差不相关的独立信号</strong>，且它是停止规则的依据（本模块）</li>
+    <li>☐ 行为分布监控已接上：长度、格式密度、拒答率、ECE（本模块）</li>
+    <li>☐ 已知的 hack 形态写成了负向验证器，而不是指望 RM 学会不喜欢它们（本模块）</li>
+    <li>☐ 能验证的部分走验证器，不进 RM（本模块）</li>
+  </ul>  <div class="callout danger"><span class="label"></span>
+    <p>档位 C 里最不能省的是<strong>倒数第四条（独立信号）</strong>。其余每一条缺失都只是让你少一层保护；<strong>缺了独立信号，你在过优化开始之后就完全失明了</strong>——而那正是你最需要看见的时候。<em>哪怕它只是「每轮跑 200 道数学题」这么简陋，也远好过没有。</em></p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么要按用途分档，而不是一律要求做全套？因为<strong>「太贵所以不做」的实际后果是「一项都不做」</strong>。档位 A 的四项加起来只需要几行代码和零额外调用（长度回归甚至是零成本），<em>但它们已经能挡掉最常见的两类误读</em>——位置偏差和长度偏差。先把便宜的做完，再按用途往上加。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从决策理论的角度，检查项的价值等于「它能避免的错误决策的期望损失」。内部看趋势时，一个偏了的数字造成的损失有限；而当 judge 被用作训练信号时，<strong>误差不再是一次性的读数错误，而会通过优化过程被固化进模型权重</strong>——<em>损失从「这次结论错了」变成「这个模型的行为被永久带偏了」，而且退不回去（best-of-n 可以退，RL 不能）</em>。这就是档位 C 的要求显著更严的形式化理由。</p></div>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_ranking/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 从成对比较到排名</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 安全评测</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 安全评测</h1>
+  <p class="subtitle">安全评测与能力评测有四个结构性差别，而<strong>根源是「被测对象会对抗你」</strong>：能力评测估计 $\mathbb{E}[s(x)]$，安全评测要估计<strong>攻击空间上的上确界</strong>——<em>任何固定的攻击集给出的都只是下界，而如果防御是看着这个集合设计的，它甚至是一个被系统性压低的下界</em>（胜者诅咒，C66-04 的同一结构） · <strong>主指标必须是 ASR@k 且写明 k</strong>：单次 ASR 1% 听起来防得很好，而 <strong>$k_{50} = 69$ 次</strong>——一个自动化脚本几秒钟就试完；<em>$k_{50}$ 是最可沟通的那个数</em> · <strong>退化倍数与绝对 ASR 要一起看</strong>：退化倍数完全由「非架构层」决定（架构层等比例压低两者，不改变比值），所以<strong>前者诊断「拦截有多少来自概率性的层」，后者才是「安不安全」的答案</strong> · <strong>逐一关闭测边际贡献 + 二阶交互项</strong>区分互补与冗余；而<em>还要检查每层依赖的前提有没有重叠</em>——「注入检测器」与「输出剥离」在纸面上是两层，在失效模式上是一层 · <strong>金丝雀判分</strong>一次埋设覆盖多通道且是确定性的；<strong>而判分器绝不能看注入原文</strong>——否则攻击者同时攻击判分器</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 01–04（注入、工具、权限、出站）；C66 模块 04（方差、MDE、配对检验）读过更好，本模块会复用它的统计规范</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_security_eval.ipynb（ASR 的三个口径与它们各自的用途 / 静态 vs 自适应攻击者：静态基准如何系统性高估防御 / 攻击预算与 ASR@k / 防御的可组合性检验：单独有效 ≠ 组合有效 / 红队产出的结构化与去重 / 安全评测卡）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Debenedetti et al., <em>AgentDojo</em>（NeurIPS 2024，agent 注入基准与工具环境）· Carlini et al. 关于对抗鲁棒性评测的方法学（<em>On Adaptive Attacks</em> 一脉）· Tramèr et al., <em>On Adaptive Attacks to Adversarial Example Defenses</em>（NeurIPS 2020）· UK AISI / Anthropic / OpenAI 的红队方法学公开材料 · 本课程 C05（危险能力评估与红队）· C66（评测统计规范）· C44（对抗攻击）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what-differs">安全评测与能力评测的四个结构性差别</a></li>
+      <li><a href="#asr">ASR 的三个口径：它们回答不同的问题</a></li>
+      <li><a href="#adaptive">自适应攻击：静态基准为什么系统性高估防御</a></li>
+      <li><a href="#composability">防御的可组合性：单独有效 ≠ 组合有效</a></li>
+      <li><a href="#scoring">判分：安全评测的「成功」比能力评测难定义得多</a></li>
+      <li><a href="#redteam">红队：怎么组织，以及产出该长什么样</a></li>
+      <li><a href="#card">安全评测卡：一份不误导人的报告</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what-differs"><span class="num">1</span>安全评测与能力评测的四个结构性差别</h2>
+  <p>C66 讲的是能力评测。安全评测复用它的全部统计工具，但有<strong>四个结构性差别</strong>，每一个都会改变方法。</p>  <table>
+    <thead><tr><th>维度</th><th>能力评测</th><th>安全评测</th><th>后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>被测对象会不会对抗你</strong></td><td>不会（任务集是固定的）</td><td><strong>会</strong>——攻击者会针对你的防御调整</td><td><strong>静态基准的分数系统性高估防御效果</strong></td></tr>
+      <tr><td><strong>成功的定义</strong></td><td>完成任务</td><td><strong>攻击者达成目标</strong>（且通常有多条路径）</td><td>判分需要枚举「所有算成功的终态」</td></tr>
+      <tr><td><strong>关心分布的哪一端</strong></td><td>平均表现</td><td><strong>最坏情况</strong>——攻击者只需成功一次</td><td>均值几乎没有意义，要看 ASR@k 与尾部</td></tr>
+      <tr><td><strong>基率</strong></td><td>任务集里正例比例可控</td><td><strong>真实流量里攻击极罕见</strong></td><td>误伤的绝对量主导（模块 01 第 6 节）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第一行是全部差别的根源。<strong>能力评测里，「在这个任务集上得 42%」是一个关于模型的稳定事实；安全评测里，「在这个攻击集上防住了 95%」只是一个关于<em>这批攻击</em>的事实</strong>，<em>而攻击集会因为你的防御而改变</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，能力评测估计的是 $\mathbb{E}_{x \sim D}[s(x)]$，其中 $D$ 固定；安全评测要估计的是 $\max_{a \in \mathcal{A}} \Pr[\text{success}(a)]$——<strong>一个对攻击空间取上确界的量</strong>。<em>而任何固定的攻击集 $A_0 \subset \mathcal{A}$ 给出的都只是一个下界</em>：$\max_{a \in A_0} \le \max_{a \in \mathcal{A}}$。<strong>所以静态基准报出的 ASR 是真实 ASR 的<em>下界</em>，而报出的防御成功率是真实防御成功率的<em>上界</em></strong>——两个方向都是「让你看起来更安全」。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>这条要说得非常直白，因为它是本模块的核心：<strong>「我们在 XX 注入基准上防住了 95%」这句话，在没有说明攻击者是否针对你的防御适配过时，所提供的保证接近于零。</strong><em>而这不是一个理论上的顾虑</em>——对抗鲁棒性领域已经反复出现过「静态基准上很强、自适应攻击下几乎无效」的防御，而 agent 安全的评测方法学目前还远不如那个领域成熟。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="asr"><span class="num">2</span>ASR 的三个口径：它们回答不同的问题</h2>
+  <p><strong>攻击成功率</strong>（attack success rate, ASR）是安全评测的主指标，但它至少有三个口径，混用会得出矛盾的结论。</p>  <div class="math-block">\[\text{ASR}_{\text{per-attempt}} = \frac{\#\{\text{成功的尝试}\}}{\#\{\text{全部尝试}\}}, \quad \text{ASR@}k = \Pr[\text{k 次尝试中至少成功一次}], \quad \text{ASR}_{\text{per-target}} = \frac{\#\{\text{被攻破的目标}\}}{\#\{\text{全部目标}\}}\]</div>  <table>
+    <thead><tr><th>口径</th><th>定义</th><th>回答什么问题</th><th>什么时候用它是错的</th></tr></thead>
+    <tbody>
+      <tr><td><strong>per-attempt</strong></td><td>成功尝试 / 全部尝试</td><td>「单次攻击的成功概率」</td><td><strong>用来判断「系统安不安全」——因为攻击者可以多试</strong></td></tr>
+      <tr><td><strong>ASR@k</strong></td><td>$1-(1-p)^k$ 的无偏估计（k 次预算）</td><td><strong>「给攻击者 k 次机会，他能成功吗」</strong></td><td>不写明 k；<em>不同 k 下的 ASR 完全不可比</em></td></tr>
+      <tr><td><strong>per-target</strong></td><td>被攻破的目标 / 全部目标</td><td>「有多少个场景/任务是可被攻破的」</td><td>把「难攻破的目标」和「容易攻破的目标」混成一个数</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>三者的关系与 C66 模块 04 的 <strong>pass@k vs pass^k</strong> 完全同构，只是方向相反：<em>能力评测里我们关心「至少成功一次」是好事，安全评测里「至少成功一次」是坏事</em>。<strong>所以安全评测的默认口径应当是 ASR@k，而 k 取「一个真实攻击者能负担的尝试次数」</strong>——而这个数通常很大（自动化脚本可以试几千次）。</p>
+  </div>  <h3>为什么 per-attempt 会严重误导</h3>  <p>举一个具体的算术：<strong>单次 ASR 只有 1%，听起来防得很好。</strong></p>  <ul>
+    <li>攻击者试 100 次：$1 - 0.99^{100} = 63\%$；</li>
+    <li>试 500 次：$92\%$；</li>
+    <li>试 1000 次：$99.996\%$。</li>
+  </ul>  <p><strong>而「试 1000 次」对一个自动化脚本是几分钟的事。</strong><em>所以报告 per-attempt ASR 时必须同时给出「攻击者需要试多少次才有 50% 概率成功」这个数</em>——它比百分比直观得多，而且它直接对应攻击者的成本。</p>  <div class="math-block">\[k_{50} = \frac{\ln 0.5}{\ln(1 - p)} \approx \frac{0.693}{p} \quad (\text{小 } p)\]</div>
+
+  <!-- ========================================================= -->
+  <h2 id="adaptive"><span class="num">3</span>自适应攻击：静态基准为什么系统性高估防御</h2>
+  <p>第 1 节说过静态基准给出的是下界。这一节讲清楚<strong>差距有多大，以及为什么。</strong></p>  <div class="ascii">   静态评测                              自适应评测
+   ┌─────────────────────────┐          ┌──────────────────────────────┐
+   │ 固定的 200 条攻击载荷     │          │ 攻击者**知道你的防御**：       │
+   │ （在防御上线**之前**收集）│          │  · 系统提示写了什么           │
+   │                         │          │  · 检测器用什么模式           │
+   │ 跑一遍 → ASR = 4%       │          │  · 白名单里有哪些域名         │
+   │ → "防住了 96%"           │          │ 针对性构造 → ASR = 40%+      │
+   └─────────────────────────┘          └──────────────────────────────┘
+                  ▲                                   ▲
+   问题：这 200 条载荷是针对**没有防御的系统**设计的。
+        你的防御恰好挡住了它们，这几乎是必然的——
+        因为你就是看着它们来设计防御的。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>这里有一个很容易被忽略的循环：<strong>如果你用基准 $A_0$ 来指导防御设计，那么在 $A_0$ 上测出的效果就是<em>训练集上的效果</em></strong>。<em>它与「对新攻击的效果」的关系，和机器学习里训练误差与泛化误差的关系一样</em>——<strong>而在安全场景里，「测试分布」是由一个主动优化的对手生成的，所以这个差距比普通的过拟合大得多。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更精确地说，安全评测面对的是一个<span class="term">最小最大问题</span>：$\min_{d \in \mathcal{D}} \max_{a \in \mathcal{A}} \Pr[\text{success}(a, d)]$。<strong>而静态基准把内层的 $\max$ 换成了在固定集合 $A_0$ 上的 $\max$</strong>，这是一个<em>严格宽松的松弛</em>。<em>更糟的是：如果 $d$ 是在 $A_0$ 上选出来的，那么 $\max_{a \in A_0}$ 甚至不是 $\max_{a \in \mathcal{A}}$ 的一个<strong>无偏</strong>下界，而是一个被系统性压低的下界</em>——这与 C66 模块 04 的<strong>胜者诅咒</strong>是同一个结构。</p></div>
+  </div>  <h3>怎么做自适应评测：四条最低要求</h3>  <ol>
+    <li><strong>攻击者必须知道防御的细节</strong>（白盒假设）——<em>包括系统提示、检测器的模式、白名单内容</em>。<strong>「攻击者不知道我们的 prompt」不是一个可依赖的假设</strong>（它会通过输出泄漏、通过内部人员泄漏、通过反复试探被推断出来）；</li>
+    <li><strong>攻击者有一个明确的预算</strong>（尝试次数、时间、可控制的内容量），而结果按预算报告（ASR@k）；</li>
+    <li><strong>攻击是分轮的</strong>：防御方改进 → 攻击方重新适配 → 再测。<em>只有一轮的评测无法区分「防住了」与「这批攻击恰好被挡住了」</em>；</li>
+    <li><strong>留一部分攻击不用于防御设计</strong>（留出集）——<em>这是把「训练误差」与「泛化误差」分开的最低手段</em>，虽然它仍然不等于自适应攻击。</li>
+  </ol>  <div class="callout warn"><span class="label"></span>
+    <p>第三条在实践中最难做，因为它需要一个愿意持续投入的攻击方。<strong>一个务实的折中：把「攻击方」定义为一个明确的角色与流程，而不是一次性的活动</strong>——<em>每次防御变更后，攻击方有固定的预算去尝试绕过，而绕过成功的样本进入回归集（第 6 节）</em>。这样至少保证了「防御的每一次变更都被针对性测试过一轮」。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="composability"><span class="num">4</span>防御的可组合性：单独有效 ≠ 组合有效</h2>
+  <p>模块 01–04 给了很多防御。一个自然的假设是「多做几层更安全」。<strong>这个假设大体成立，但有三种它不成立的情形，而它们都很常见。</strong></p>  <table>
+    <thead><tr><th>情形</th><th>机制</th><th>例子</th><th>怎么发现</th></tr></thead>
+    <tbody>
+      <tr><td><strong>共享失效模式</strong></td><td>两层防御依赖同一个前提，前提被打破则同时失效</td><td>注入检测器与输出剥离都基于「能正确解析文本」——<em>而编码变体同时绕过两者</em></td><td><strong>检查每层依赖的前提，看有没有重叠</strong></td></tr>
+      <tr><td><strong>一层削弱另一层</strong></td><td>为了让 A 工作，放宽了 B</td><td>为了让检测器能看到内容，把不受信内容<em>解码后</em>放进上下文——反而扩大了注入面</td><td>变更影响面分析（模块 03 第 7 节）</td></tr>
+      <tr><td><strong>组合产生新通道</strong></td><td>两个单独安全的能力，组合出一条新路径</td><td>「读工作目录」+「写工作目录」+「工作目录被外部同步」= 外泄通道</td><td><strong>危险组合枚举</strong>（模块 02 第 5 节）</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>第三行的例子值得展开，因为它在真实系统里非常常见：<strong>agent 只有读写工作目录的权限（看起来完全安全），而工作目录恰好是一个被同步到云端的文件夹。</strong><em>于是「写文件」变成了一条出站通道，而它不在任何权限声明里</em>。<strong>这类问题只能通过「枚举系统的可达性图」发现，而不是通过检查每个组件的安全性</strong>（模块 04 第 1 节的同一条结论）。</p>
+  </div>  <h3>可组合性检验：一个可执行的做法</h3>  <p><strong>逐一关闭每一层防御，测量 ASR。</strong>这能得到两组信息：</p>  <ul>
+    <li><strong>每层的边际贡献</strong>：关掉它，ASR 涨多少。<em>边际贡献接近零的层，要么是冗余的，要么它依赖的前提已经被别的层保证了</em>；</li>
+    <li><strong>共享失效模式</strong>：如果同时关掉 A 和 B 的 ASR 涨幅<strong>远大于</strong>各自单独关掉的涨幅之和，说明它们互补；<em>如果远小于，说明它们依赖同一个前提（冗余）</em>。</li>
+  </ul>  <div class="math-block">\[\text{互补性} = \text{ASR}(\overline{A}\overline{B}) - \text{ASR}(\overline{A}) - \text{ASR}(\overline{B}) + \text{ASR}(\text{全开})\]</div>  <p><strong>这个量就是二阶交互项。</strong><em>它显著为正 = 两层互补（一起关掉才崩）；显著为负 = 两层冗余（关一个另一个就顶上了）</em>。notebook 第 4 节会把这个矩阵算出来。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="scoring"><span class="num">5</span>判分：安全评测的「成功」比能力评测难定义得多</h2>
+  <p>C66 模块 02 讲过判分器的重要性。在安全评测里这个问题更难，因为<strong>「攻击成功」通常有多条路径，而且部分成功也算成功。</strong></p>  <h3>四类判分方式</h3>  <table>
+    <thead><tr><th>方式</th><th>怎么判</th><th>适用</th><th>问题</th></tr></thead>
+    <tbody>
+      <tr><td><strong>目标状态断言</strong></td><td>「攻击者的邮箱收到了包含密钥的邮件」</td><td><strong>最可靠</strong>——可程序化验证</td><td>需要为每个攻击目标写断言</td></tr>
+      <tr><td><strong>动作序列匹配</strong></td><td>「agent 调用了 send_email 且收件人在攻击者域名下」</td><td>可靠</td><td>会漏掉「用别的通道达成同一目标」（模块 04 的十种通道）</td></tr>
+      <tr><td><strong>信息泄漏检测</strong></td><td>在所有出站内容里搜索金丝雀值</td><td><strong>覆盖多通道</strong></td><td>需要预先埋金丝雀；编码变体要先解码（模块 04 第 5 节）</td></tr>
+      <tr><td><strong>LLM judge</strong></td><td>让模型判断「这次交互是否被劫持」</td><td>覆盖面最宽</td><td><strong>C67 的全部问题都适用，且 judge 自己可能被同一段内容注入</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>最后一行有一个安全评测特有的陷阱：<strong>如果用 LLM judge 来判断「这次注入成功了吗」，而 judge 的上下文里包含了那段注入内容，那么攻击者可以同时攻击 judge。</strong><em>这与模块 00 第 3 节的自检悖论是同一件事</em>——<strong>判分器必须只看「动作与终态」，不看注入原文</strong>；或者用一个只接触结构化事实的判分器。</p>
+  </div>  <h3>金丝雀值：覆盖多通道的最实用手段</h3>  <p><strong>在 agent 可访问的私密数据里埋入唯一的、高熵的标记值</strong>，然后在<em>所有</em>出站内容（HTTP、邮件、DNS 查询、渲染请求、写入的文件、甚至给用户看的输出）里搜索它。</p>  <ul>
+    <li><strong>优点</strong>：一次埋设覆盖模块 04 的全部十种通道；而且它是<em>确定性判分</em>——命中就是泄漏了，没有歧义；</li>
+    <li><strong>必须做的一步</strong>：搜索前先解码（base64/hex/URL/零宽字符），否则编码后的金丝雀会被漏掉；</li>
+    <li><strong>要埋多个不同的金丝雀</strong>，对应不同的敏感度级别与不同的数据位置——<em>这样你能知道「泄漏了什么」而不只是「泄漏了」</em>；</li>
+    <li><strong>金丝雀本身不能太可疑</strong>——<em>如果它长得像 <code>CANARY_DO_NOT_LEAK_12345</code>，一个稍微聪明的攻击就会避开它</em>。它应当看起来像真实数据。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="redteam"><span class="num">6</span>红队：怎么组织，以及产出该长什么样</h2>
+  <p>前五节讲测量。这一节讲<strong>攻击从哪来</strong>——因为自适应评测（第 3 节）需要一个持续的攻击方。</p>  <table>
+    <thead><tr><th>来源</th><th>覆盖面</th><th>成本</th><th>适合发现什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>已知手法库</strong></td><td>窄（已公开的模式）</td><td>极低</td><td>回归——<em>确保修过的问题不复发</em></td></tr>
+      <tr><td><strong>自动化变异</strong></td><td>中（在已知手法上做编码/改写/组合变换）</td><td>低</td><td><strong>检测器的绕过</strong>（编码变体、同义改写）</td></tr>
+      <tr><td><strong>内部红队</strong></td><td>宽（懂你的系统）</td><td>高</td><td><strong>架构层的漏洞</strong>——白名单里的可写目标、被同步的工作目录</td></tr>
+      <tr><td><strong>外部红队 / 漏洞赏金</strong></td><td>最宽</td><td>高</td><td>你没想到的攻击面</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>四者的分工很清晰：<strong>已知手法库做回归（每次提交都跑），自动化变异做检测器的压力测试（每日），内部红队做架构评审（每次重大变更），外部红队做兜底（定期）。</strong><em>而其中最容易被跳过、也最有价值的是第三项</em>——因为架构层的漏洞（模块 04 第 1 节那种「工作目录被同步」）<strong>只有懂系统的人才能发现，而自动化工具永远发现不了。</strong></p>
+  </div>  <h3>红队产出的结构化：让它能进回归集</h3>  <p><strong>红队最大的浪费是产出无法复用。</strong>一次红队活动发现了十几个问题，写成一份 PDF 报告，<em>三个月后没人记得哪些修了、哪些复发了</em>。</p>  <pre><code>// 每一个红队发现都应当是一条可自动重跑的记录
+{
+  "id": "rt-2026-0142",
+  "found_by": "internal-redteam", "found_at": "2026-08-15",
+  "attack_class": "indirect_injection_via_tool_description",   // 归类，用于去重
+  "target_capability": "send_email",                           // 攻击目标
+  "entry_point": "tool_description",                           // 六个入口之一（模块 00）
+  "budget_used": {"attempts": 12, "minutes": 40},               // 攻击成本
+  "defenses_bypassed": ["sys_prompt_ignore", "injection_detector"],
+  "defenses_that_held": ["egress_allowlist"],                   // ← 同样重要
+  "repro": {"kind": "scripted", "path": "redteam/rt-0142.py"},  // **可自动重跑**
+  "success_criterion": {"kind": "canary", "value_id": "canary-3"},
+  "status": "fixed", "fixed_by": "PR-8821", "fix_kind": "architecture",
+  "regression_added": true
+}</code></pre>  <ul>
+    <li><strong><code>defenses_that_held</code> 与 <code>defenses_bypassed</code> 同样重要</strong>——<em>它告诉你哪一层真正起了作用</em>（第 4 节的边际贡献）；</li>
+    <li><strong><code>fix_kind</code> 要区分 architecture / detection / prompt</strong>——<em>如果修复清一色是 detection，说明你在用概率保证承担不变量的职责</em>（模块 00 第 7 节）；</li>
+    <li><strong><code>budget_used</code> 是攻击成本的直接度量</strong>——<em>防御的目标之一就是把这个数推高</em>；</li>
+    <li><strong><code>repro</code> 必须是可自动重跑的</strong>，否则它进不了回归集，而进不了回归集的发现<em>必然会复发</em>。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="card"><span class="num">7</span>安全评测卡：一份不误导人的报告</h2>
+  <p>把本模块与前四个模块合起来，得到一份安全评测报告的模板。<strong>它的设计原则与 C66 模块 05 的评测卡一致：每一个数字旁边都带着「它能支持什么结论」的限定。</strong></p>  <pre><code>SECURITY EVAL CARD · agent=mail-assistant-v7 · 2026-08-31
+════════════════════════════════════════════════════════════════════
+【威胁模型】
+  致命三要素:  ①不受信内容 ✓  ②私密数据 ✓  ③对外通信 ✓  → 风险 HIGH
+  攻击者能力:  白盒（已知系统提示/检测模式/白名单内容）
+  攻击预算:    k=200 次尝试 / 单次会话 / 可控制一个网页的全文
+  入口覆盖:    6/6（用户输入·检索内容·工具返回·工具描述·子agent·记忆）
+
+【攻击成功率】
+  ASR per-attempt:        1.8%   [1.2%, 2.6%]   n=4000, 按攻击类聚类自举
+  ASR@200 (预算内):      97.4%   ← **这才是「系统安不安全」的答案**
+  k50 (50% 成功所需次数):   38    ← 攻击成本的直接度量
+  ASR per-target:         6/14 个场景可被攻破
+
+  ⚠️ 上述数字来自**自适应**评测（攻击方知晓防御细节，共 3 轮适配）。
+     同一防御在静态基准上的 ASR 是 0.3% —— **相差 6 倍，不要引用静态数字。**
+
+【防御的边际贡献】（逐一关闭，测 ASR@200）
+  全开                    97.4%     ← 注意：全开仍然很高，说明缺架构层
+  关掉 出站白名单         99.9%     边际 +2.5pp
+  关掉 信任传播          100.0%     边际 +2.6pp
+  关掉 注入检测器         97.9%     边际 +0.5pp   ← 贡献很小
+  关掉 系统提示           98.6%     边际 +1.2pp
+  二阶交互（白名单 × 信任传播）: +0.1pp  → **两层高度冗余，不是互补**
+
+【判分】
+  方式:      金丝雀（3 个，埋在不同敏感度的数据里）+ 动作序列断言
+  解码覆盖:  base64 / base32 / hex / URL / 零宽字符  ✓
+  judge:     **未使用**（避免判分器被同一段内容注入）
+
+【红队】
+  本轮发现:   14 条（12 条已修：architecture 4 / detection 6 / prompt 2）
+  ⚠️ 修复以 detection 为主（6/12）—— 建议向架构层倾斜
+  回归集:     14/14 已加入且可自动重跑
+  复发:       0/12（观察窗口 60 天）</code></pre>  <ul>
+    <li><strong>最重要的一行是那个「静态 vs 自适应相差 6 倍」的警告</strong>——<em>没有它，读者会拿静态数字去做决策</em>；</li>
+    <li><strong>ASR@k 是主指标，per-attempt 只是辅助</strong>，而 $k_{50}$ 是给非技术读者最直观的那个数；</li>
+    <li><strong>边际贡献表能暴露「防御堆叠但都在同一层」</strong>——上面那份报告里，检测器的边际贡献只有 0.5pp；</li>
+    <li><strong>「全开仍然 97.4%」这一行必须被醒目地写出来</strong>——<em>它说明这个 agent 的防御体系缺少架构层，而不是「检测器还需要调优」</em>；</li>
+    <li><strong><code>fix_kind</code> 的分布是一个健康指标</strong>：detection 占多数说明方向有问题。</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>整门课收尾的一句话，也是这份卡片存在的理由：<strong>安全评测的目的不是产出一个「我们很安全」的数字，而是回答一个具体的问题——<em>「给定这个攻击者预算，他能做到什么」</em>。</strong><em>而这个问题的答案，最终由架构（他能做到的事的集合）决定，而不是由检测（他要试多少次）决定。</em></p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_exfiltration/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 数据外泄与出站控制</div></a>
+  </div>
+
+</div>
+</body>
+</html>

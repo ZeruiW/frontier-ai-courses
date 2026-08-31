@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 结果存储与分析</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 结果存储与分析</h1>
+  <p class="subtitle"><strong>存最细粒度的事实，把聚合留到查询时做</strong>——「这个提升在难题上也成立吗」「只算判分器强的任务呢」这类问题，<em>在存了明细的系统里是一句查询，在只存聚合的系统里是一次几百美元的重跑</em>，而在那种成本下大多数问题最终不会被问 · <strong><code>output</code> 列不能砍——至少失败样本不能砍</strong>：「为什么这道题失败了」没有原始输出就只能重跑，而重跑时那次失败可能不再复现 · 聚合函数三条约束：纯函数、显式声明分母、<strong>空输入返回 nan 而不是 0</strong>（返回 0 会让「没有数据」和「全错」在下游无法区分） · <strong>Simpson 悖论在评测里真实发生</strong>，而且成因通常不是有人故意，而是两次运行的任务集不完全相同（超时被跳过的题不一样）——<strong>比较前必须先检查任务集是否一致，不一致就交集重算</strong> · <strong>run diff 比总分有用得多</strong>：fixed / regressed / churn / net，而 <strong>churn 要和噪声基线比，不是和净变化比</strong> · 五条完整性校验必须放进<strong>加载函数</strong>，而不是一个「记得跑一下」的脚本</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 02（runner 与失败分类）；会写基本的 SQL SELECT / GROUP BY，或者能读懂等价的 Python 聚合</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_result_store.ipynb（宽表 schema 与只追加写入 / 切片查询与 Simpson 悖论复现 / 聚合逻辑与结果分离：同一批结果算出四个不同的数 / 两次运行的结构化 diff 与逐题变化矩阵 / 存储规模与保留策略 / 结果的完整性校验）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Kimball 的事实表/维度表建模思想（本课只借「宽事实表 + 后置聚合」这一条）· Simpson (1951) 与分层悖论的经典讨论 · inspect_ai 的 <code>.eval</code> 日志格式（每条 sample 一条记录 + 全局配置快照）· 本课程 C66 模块 02（micro/macro 聚合）· C66 模块 03（轨迹 schema）· C43（数据建模）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#one-row">一条 rollout 一行：宽事实表与后置聚合</a></li>
+      <li><a href="#separate-agg">聚合逻辑必须与结果分离</a></li>
+      <li><a href="#slicing">切片分析：Simpson 悖论会在评测里真实发生</a></li>
+      <li><a href="#run-diff">两次运行的 diff：从「分数变了」到「哪些题变了」</a></li>
+      <li><a href="#integrity">结果的完整性校验：五条应当自动跑的检查</a></li>
+      <li><a href="#retention">存储规模与保留策略</a></li>
+      <li><a href="#report-shape">报告的形状：从明细到一份可以贴出去的东西</a></li>
+      <li><a href="#schema-evolution">结果表的 schema 演化：加字段容易，改语义要命</a></li>
+      <li><a href="#trend">趋势与基线：一条时间序列比两个点有用得多</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="one-row"><span class="num">1</span>一条 rollout 一行：宽事实表与后置聚合</h2>
+  <p>结果层的核心设计只有一句话：<strong>存最细粒度的事实，把聚合留到查询时做。</strong>听起来平淡，但它决定了这套系统能不能回答半年后才被问出来的问题。</p>  <div class="ascii">   ❌ 存聚合结果                          ✓ 存最细粒度事实
+   ┌──────────────────────────┐          ┌────────────────────────────────┐
+   │ run_id | score | n       │          │ run_id | task_id | attempt |…  │
+   │ r-001  | 0.412 | 512     │          │ r-001  | t001    | 0       |…  │
+   │ r-002  | 0.447 | 498     │          │ r-001  | t001    | 1       |…  │
+   └──────────────────────────┘          │ r-001  | t002    | 0       |…  │
+                                          └────────────────────────────────┘
+   能回答: "总分是多少"                    能回答: 总分 / macro / 按难度切片 /
+   不能回答: 按难度切片？pass^k？          pass^k / 与上次逐题 diff / 只用强判分
+             哪些题变了？只用强判分任务？   任务重算 / 任何**当时没想到**的问题
+                                          ——**而且不用重跑**</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这条如此重要？因为<strong>你现在想不到的问题，半年后一定会被问到</strong>。「这个提升在难题上也成立吗」「是不是只在某个子系统上涨的」「如果只算判分器强的那些任务呢」——<em>这些问题在存了明细的系统里是一句查询，在只存了聚合的系统里是一次重跑</em>（几百美元 + 几小时）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>从数据建模的角度，这是<span class="term">事实表</span>的标准形态：每行是一个不可再分的观测事件（一次 rollout 的结果），所有能想到的维度（任务属性、配置、时间）都作为列或外键存在。<strong>聚合是这张表上的视图，而不是表本身。</strong><em>存储成本换来的是分析的自由度</em>——而评测结果的存储量通常很小（几十万行、几百 MB），这个交换几乎总是划算的。</p></div>
+  </div>  <h3>最小 schema：11 个字段</h3>  <pre><code>-- 主键三元组（模块 00）
+run_id        TEXT     -- 一次运行
+task_id       TEXT     -- 稳定样本 ID（模块 01）
+attempt       INTEGER  -- 第几次重复（pass^k 需要）
+
+-- 可归因性
+fingerprint   TEXT     -- 执行配置指纹（模块 01/02）
+dataset_ver   TEXT     -- 任务集版本（跨版本比较需要）
+scorer_ver    TEXT     -- 判分器版本
+
+-- 结果
+status        TEXT     -- ok | timeout | refusal | parse_error | scorer_error
+score         REAL     -- NULL when status != 'ok'
+output        TEXT     -- 原始输出（失败样本尤其要留，否则永远查不出原因）
+
+-- 成本与诊断
+cost_usd      REAL
+latency_ms    INTEGER
+
+PRIMARY KEY (run_id, task_id, attempt)</code></pre>  <div class="callout warn"><span class="label"></span>
+    <code>output</code> 这一列经常被以「太占空间」为由砍掉。<strong>不要砍——至少对失败样本不要砍。</strong><em>「为什么这道题失败了」这个问题，没有原始输出就只能重跑；而重跑时的随机性可能让那次失败不再复现</em>。如果确实需要省空间，正确做法是<strong>对成功样本做压缩或抽样保留，对失败样本全量保留</strong>——因为你要看的永远是失败的那些。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="separate-agg"><span class="num">2</span>聚合逻辑必须与结果分离</h2>
+  <p>上一节说「聚合留到查询时做」。这一节说清楚为什么这不只是灵活性问题，更是<strong>正确性</strong>问题。</p>  <p>同一批结果，可以算出好几个都「对」但含义不同的数字（C66 模块 02 已经展示过 micro/macro）。如果聚合逻辑被写死在 runner 里，那么<strong>换一个口径就要重跑</strong>——而重跑的成本会让人倾向于「就用现在这个数」，即使它不是回答当前问题的正确口径。</p>  <table>
+    <thead><tr><th>口径</th><th>定义</th><th>回答什么问题</th><th>什么时候是错的</th></tr></thead>
+    <tbody>
+      <tr><td><strong>micro</strong></td><td>所有 rollout 一视同仁求平均</td><td>「在这个任务分布上表现如何」</td><td>任务数不均衡时，大子集主导总分</td></tr>
+      <tr><td><strong>macro（按任务）</strong></td><td>先按 task_id 求平均，再对任务求平均</td><td>「典型任务上表现如何」</td><td>各任务重复次数不同时，等权可能不是你要的</td></tr>
+      <tr><td><strong>macro（按子集）</strong></td><td>先按子系统/难度求平均，再等权</td><td>「各类任务都还行吗」</td><td>小子集的噪声被放大到与大子集同权</td></tr>
+      <tr><td><strong>pass^k</strong></td><td>每个任务 k 次全对的比例</td><td>「可靠性如何」（C66-04）</td><td>结果有人复核时（那时该看 pass@k）</td></tr>
+      <tr><td><strong>加权</strong></td><td>按线上流量占比加权</td><td>「对用户的实际影响」</td><td>权重来源没写进报告时</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>一条实践规范：<strong>把聚合写成一组独立的、可组合的函数，并让报告同时输出至少两个口径。</strong><em>如果 micro 与 macro 给出相反的排序，这件事本身就是报告里最重要的发现</em>（C66 模块 02 第 7 节已经说过一次，这里是它的工程落实）。<strong>而这一切的前提，是明细还在。</strong></p>
+  </div>  <h3>聚合函数的三条约束</h3>  <ol>
+    <li><strong>纯函数</strong>：输入是明细行，输出是数字。不读文件、不发请求、不依赖全局状态。<em>这样它可以被单元测试，而聚合逻辑的 bug 是最难被发现的一类</em>；</li>
+    <li><strong>显式声明分母</strong>：每个聚合函数都要能报出它用了多少行、排除了多少行、为什么排除。<em>「分数 0.412」和「分数 0.412（n=498，排除 14 条判分器崩溃）」是两个可信度完全不同的陈述</em>；</li>
+    <li><strong>对空输入有定义</strong>：分母为 0 时返回 <code>nan</code> 而不是 0——<em>返回 0 会让「没有数据」和「全错」在下游变得无法区分</em>。</li>
+  </ol>
+
+  <!-- ========================================================= -->
+  <h2 id="slicing"><span class="num">3</span>切片分析：Simpson 悖论会在评测里真实发生</h2>
+  <p>有了明细，切片就是一句 <code>GROUP BY</code>。但切片会暴露一个<strong>在评测里真实发生、且经常被误读</strong>的现象。</p>  <div class="ascii">                       模型 A        模型 B
+   easy  (400 题)      95% (380)     98% (98)      ← B 每一片都更好
+   hard  (100 题)      40% (40)      45% (45)      ←
+   ──────────────────────────────────────────
+   总计                84%           58%           ← 但 A 的总分更高
+
+   原因: 两个模型跑的**任务构成比例不同**
+         A: 400 easy + 100 hard    B: 100 easy + 100 hard
+   这不是矛盾，是 Simpson 悖论——总分被"跑了哪些题"这个混杂变量污染了。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>在评测里这个现象最常见的成因不是有人故意，而是<strong>两次运行的任务集不完全相同</strong>：有些任务超时被排除了、有些是新加的、有些在一次运行里失败被跳过了。<em>只要两边的任务构成不同，总分就不可直接比较</em>——这和模块 01 的「跨版本比较要做交集重算」是同一件事，只是这里发生在同一个数据集版本内部。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地说，总分是各层分数按各层<strong>样本占比</strong>加权的结果：$\bar{s} = \sum_g w_g \bar{s}_g$，其中 $w_g = n_g / n$。<strong>当两次运行的 $\{w_g\}$ 不同时，$\bar{s}_A - \bar{s}_B$ 里混着「各层分数差」与「权重差」两部分</strong>，而后者与模型能力无关。<em>解法是标准化权重：用同一套 $\{w_g\}$（通常取两边的交集或目标分布）重算两边</em>——这在流行病学里叫<span class="term">直接标准化</span>，在评测里就是「按共同任务集重算」。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>所以报告里有一条硬规范：<strong>比较两次运行时，必须先检查它们的任务集是否一致；不一致就在交集上重算。</strong><em>这条检查应当是自动的</em>——notebook 第 3 节会把它写成一个函数，而模块 04 会把它变成 CI 里的一行断言。</p>
+  </div>  <h3>哪些切片维度值得预留</h3>  <ul>
+    <li><strong>任务属性</strong>：难度、子系统、来源、创建时间（污染检验用）、判分器强度（C66-02）；</li>
+    <li><strong>执行属性</strong>：attempt 序号（看首次 vs 重试）、并发度、是否命中缓存；</li>
+    <li><strong>结果属性</strong>：失败类型（模块 02 的五分类）、延迟分桶、成本分桶；</li>
+    <li><strong>时间</strong>：run 的时间戳——<em>用来画趋势图，也用来定位「什么时候开始变的」</em>。</li>
+  </ul>  <p><strong>这些维度不需要在存储时预聚合，只需要保证它们能被 join 到</strong>——任务属性来自数据集（模块 01 的 tags），执行属性来自 spec，结果属性来自明细行本身。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="run-diff"><span class="num">4</span>两次运行的 diff：从「分数变了」到「哪些题变了」</h2>
+  <p>「分数从 41.2% 涨到 44.7%」——这句话几乎不包含可行动的信息。<strong>有信息的是：哪些题从错变对了，哪些题从对变错了。</strong></p>  <div class="math-block">\[\Delta = \underbrace{|\{i: s_i^{A}=0,\ s_i^{B}=1\}|}_{\text{fixed}} - \underbrace{|\{i: s_i^{A}=1,\ s_i^{B}=0\}|}_{\text{regressed}}\]</div>  <table>
+    <thead><tr><th>量</th><th>含义</th><th>为什么比总分有用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>fixed</strong></td><td>从错变对的题数</td><td>直接对应「这个改动修好了什么」</td></tr>
+      <tr><td><strong>regressed</strong></td><td><strong>从对变错的题数</strong></td><td><strong>最重要的一个</strong>——净提升为正也可能伴随大量退化</td></tr>
+      <tr><td><strong>churn</strong></td><td>$\text{fixed} + \text{regressed}$</td><td>衡量「改动有多大」；churn 高而净变化小 = 只是噪声在翻转</td></tr>
+      <tr><td><strong>net</strong></td><td>$\text{fixed} - \text{regressed}$</td><td>这才是总分变化的来源</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <strong>churn 是一个被严重低估的量。</strong>如果 fixed=30、regressed=25，净提升只有 5 题，但有 55 道题的结果翻转了——<em>这说明模型的行为在这些题上本来就不稳定，那 5 题的「提升」很可能只是这次采样的运气</em>。<strong>正确的判读是：先看 churn 与净变化的比例。churn 远大于净变化时，应该增加重复次数而不是宣布提升</strong>（呼应 C66 模块 04 的方差分析）。
+  </div>  <h3>配对分析：这里可以直接用 McNemar</h3>  <p>逐题 diff 天然是一个配对设计（同一批任务、两个配置），所以 C66 模块 04 的 <strong>McNemar 检验</strong>可以原样用上：只有 fixed 与 regressed 这两类不一致对携带信息，$\chi^2 = (|f - r| - 1)^2 / (f + r)$。<em>这让「这次提升是不是显著」变成一个可以自动计算的判断</em>，而不需要人去感觉「3.5 个点好像挺多的」。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="integrity"><span class="num">5</span>结果的完整性校验：五条应当自动跑的检查</h2>
+  <p>存储层还有一个容易被忽略的职责：<strong>在把结果交给分析之前，先检查它自己是不是完整的。</strong>下面五条检查很便宜，但每一条都对应一类真实发生过的事故。</p>  <table>
+    <thead><tr><th>检查</th><th>断言</th><th>不通过说明什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>指纹唯一</strong></td><td>一个 run 内 <code>fingerprint</code> 只有一个值</td><td><strong>run_id 被复用</strong>，新旧配置的结果混在一起（模块 02 第 7 节）</td></tr>
+      <tr><td><strong>覆盖完整</strong></td><td>行数 == 任务数 × attempts</td><td>有任务被静默跳过了——通常是异常被吞了</td></tr>
+      <tr><td><strong>无重复</strong></td><td>主键三元组唯一</td><td>幂等写入被绕过了</td></tr>
+      <tr><td><strong>状态合法</strong></td><td><code>status</code> 只取枚举内的值；<code>status='ok'</code> ⟺ <code>score</code> 非空</td><td>runner 里有分支忘了赋值</td></tr>
+      <tr><td><strong>数据集一致</strong></td><td>所有行的 <code>dataset_ver</code> 相同</td><td>跑到一半数据集被换了</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>第二条「覆盖完整」有一个容易被绕过的情况值得单说：<strong>如果 runner 在任务级别 catch 了所有异常并 <code>continue</code>，那么失败的任务连一行都不会写入</strong>——<em>行数少了，而分数看起来正常甚至更高</em>（因为最难的那些任务恰恰最容易抛异常）。<strong>所以这条检查必须比对「预期行数」而不是「已有行数的内部一致性」</strong>，而预期行数只能从 spec 里算出来（任务数 × attempts）。</p>
+  </div>  <p>这五条应当作为<strong>加载函数的一部分</strong>，而不是一个「记得跑一下」的脚本——<em>放在加载函数里，它就不可能被忘记；放在脚本里，它半年后一定会被忘记。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="retention"><span class="num">6</span>存储规模与保留策略</h2>
+  <p>最后一个工程问题：这些明细会不会撑爆存储。答案通常是<strong>不会</strong>，但值得算一笔账，因为这笔账会影响你要不要保留 <code>output</code> 列。</p>  <div class="math-block">\[\text{行数} = N_{\text{tasks}} \times k_{\text{attempts}} \times N_{\text{runs}}\]</div>  <table>
+    <thead><tr><th>场景</th><th>单次行数</th><th>一年的运行次数</th><th>总行数</th><th>含 output 的体量</th></tr></thead>
+    <tbody>
+      <tr><td>CI smoke</td><td>60 × 1</td><td>每天 20 次 × 250 天 = 5000</td><td>30 万</td><td>约 1–3 GB</td></tr>
+      <tr><td>每日全量</td><td>500 × 3</td><td>365</td><td>55 万</td><td>约 5–15 GB</td></tr>
+      <tr><td>模型选型</td><td>500 × 5</td><td>每月几十次</td><td>约 100 万</td><td>约 10–30 GB</td></tr>
+      <tr><td><strong>合计量级</strong></td><td>—</td><td>—</td><td><strong>百万行</strong></td><td><strong>几十 GB</strong></td></tr>
+    </tbody>
+  </table>  <p><strong>百万行、几十 GB——对任何数据库都是小数据。</strong>所以默认策略应当是<strong>全部保留</strong>，而不是一上来就设计复杂的归档流程。</p>  <h3>如果确实需要缩减</h3>  <ol>
+    <li><strong>先压缩 output，不要先删它</strong>——文本压缩率通常有 5–10 倍；</li>
+    <li><strong>按状态差异化保留</strong>：失败样本的 output 全留，成功样本的可以只留哈希或抽样留；</li>
+    <li><strong>冷热分层</strong>：三个月以上的运行归档到对象存储，<em>但保留每个 run 的聚合摘要在热库里</em>（趋势图需要它）；</li>
+    <li><strong>永远不要删的</strong>：主键、fingerprint、status、score。<em>这四列加起来每行不到 100 字节，百万行也只有几十 MB</em>——删它们省不了多少空间，却会让历史彻底不可用。</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>关于保留策略有一条经验：<strong>决定「删什么」时，想的不是「现在需要什么」，而是「半年后有人会问什么」。</strong><em>而半年后被问得最多的问题是「这道题当时为什么错了」——答这个问题需要的恰恰是失败样本的原始输出。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="report-shape"><span class="num">7</span>报告的形状：从明细到一份可以贴出去的东西</h2>
+  <p>把 C66/C67 的报告规范与本课的存储层接起来，得到一份完整报告的生成路径：</p>  <pre><code>明细行 (store)
+  │
+  ├─ 完整性校验（第 5 节）───────────► 不通过就停，不要出报告
+  │
+  ├─ 主指标 ────► micro + macro + 分母与排除说明
+  ├─ 不确定度 ──► 按任务聚类自举（C66-04）
+  ├─ 切片 ──────► 按难度/子系统/判分器强度（第 3 节）
+  ├─ 与基线 diff ► fixed / regressed / churn / McNemar（第 4 节）
+  ├─ 成本 ──────► $/success 而不是 $/task（C66-05）
+  └─ 运行健康 ──► 五个数（模块 02 第 7 节）
+  │
+  └──► EVAL CARD（C66-05 的模板 + 本课的运行健康块）</code></pre>  <ul>
+    <li><strong>完整性校验是一个门</strong>，不是一个提示——不通过就不该产出报告；</li>
+    <li><strong>每一个数字旁边都要带分母</strong>，这是本课能提供的最便宜的可信度提升；</li>
+    <li><strong>与基线的 diff 优先于绝对分数</strong>——因为读者真正要决策的是「这个改动能不能合」；</li>
+    <li><strong>运行健康块必须在报告里</strong>，而不是只在日志里。<em>「缓存命中率 30%（首次运行）」这种异常，只有出现在报告顶部才会被看见。</em></li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>最后一句总结本模块：<strong>存储层的价值不在于存得快，而在于它决定了你未来能问出什么问题。</strong><em>存了明细，半年后的新问题是一句查询；只存了聚合，同一个问题是一次几百美元的重跑</em>——而在那种成本下，大多数问题最终不会被问。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="schema-evolution"><span class="num">8</span>结果表的 schema 演化：加字段容易，改语义要命</h2>
+  <p>结果表会活很多年，字段一定会变。这一节的规则与模块 01 的 spec 演化同构，但有一个结果表特有的约束。</p>  <table>
+    <thead><tr><th>变更</th><th>安全吗</th><th>怎么做</th></tr></thead>
+    <tbody>
+      <tr><td><strong>加一列</strong>（可空）</td><td>✅ 安全</td><td>历史行为 NULL；聚合函数要能处理 NULL</td></tr>
+      <tr><td><strong>加一个 status 枚举值</strong></td><td>⚠️ 要小心</td><td><strong>必须同时更新「哪些计入分母」的策略表</strong>，否则新状态会被默认计入或默认排除</td></tr>
+      <tr><td><strong>改一列的语义</strong></td><td>🚫 危险</td><td><em>历史行照样能读，但含义变了</em>——必须加新列而不是改旧列</td></tr>
+      <tr><td><strong>删一列</strong></td><td>🚫 危险</td><td>历史分析脚本会静默地少一个维度</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>第二行是结果表特有的坑：<strong>新增一个 <code>status</code> 值时，所有历史聚合都会被影响。</strong><em>比如加了 <code>env_error</code>（环境重置失败，见模块 02 第 8 节）——如果聚合函数用的是「除了 scorer_error 都计入」，那么这个新状态会被当成失败计入分母，历史数据与新数据的口径就不一致了。</em><strong>所以策略表（哪些计入分母）必须与 status 枚举<em>一起</em>版本化，并且聚合结果要记录它用的是哪个版本的策略。</strong></p>
+  </div>  <p>一条便宜的防御：<strong>聚合函数遇到未知的 status 值时抛异常，而不是默默归类。</strong><em>这把「新状态被静默错误分类」从一个数据问题变成了一个立刻可见的报错</em>——而这正是本课反复主张的：<strong>让不会报错的问题变得会报错。</strong></p>
+
+  <!-- ========================================================= -->
+  <h2 id="trend"><span class="num">9</span>趋势与基线：一条时间序列比两个点有用得多</h2>
+  <p>前七节都在讲「两次运行的比较」。这一节讲<strong>时间维度</strong>——因为很多问题只有在时间序列上才看得见。</p>  <h3>三类只有趋势才能回答的问题</h3>  <table>
+    <thead><tr><th>问题</th><th>两点比较能答吗</th><th>趋势能答什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>「什么时候开始变的」</strong></td><td>✗</td><td>定位到具体的某一天/某个 commit</td></tr>
+      <tr><td><strong>「这是波动还是趋势」</strong></td><td>✗</td><td>看方差带与斜率——单次下降 2 个点可能是噪声，连续五次下降不是</td></tr>
+      <tr><td><strong>「基线该更新了吗」</strong></td><td>✗</td><td>基线与当前的距离持续拉大 = 基线过期了</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第三个问题在实践中最容易被忽略。<strong>CI 门禁需要一个基线，而基线用久了会过期</strong>——模型改进了很多次之后，拿三个月前的基线做比较，<em>「相对基线没有退化」这句话已经没有信息量了</em>。<strong>正确做法是滚动基线：每次成功合并后更新基线</strong>，让门禁始终比较的是「相对上一个已知良好状态」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但滚动基线有一个必须警惕的副作用：<span class="term">渐进式退化</span>（creeping regression）。<em>如果每次都只退化 0.3 个点（远低于门禁阈值），滚动基线会把每一次都判为通过，而二十次之后总共退化了 6 个点</em>。<strong>防御方式是<em>同时</em>维护两个基线</strong>：<strong>滚动基线</strong>（比上一次，抓突发退化）与<strong>锚定基线</strong>（比一个季度前的固定版本，抓渐进退化）。<em>两个都要在门禁里检查，阈值可以不同——锚定基线的阈值应当更宽但绝不能没有。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>渐进式退化是所有「只比上一次」的门禁的共同盲区，而它在真实项目里非常常见——<strong>因为每一次单独看都是合理的取舍</strong>（「这次为了修 bug 稍微牺牲一点分数」）。<em>锚定基线的作用就是让这些取舍的<strong>累积效应</strong>可见。</em></p>
+  </div>  <h3>基线更新的一个反直觉细节</h3>  <p>滚动基线还有一个容易做错的地方：<strong>基线应当在「合并后」更新，而不是在「门禁通过后」更新。</strong><em>两者的差别在于：门禁通过的 PR 可能最终没有被合并（作者放弃了、被别的 PR 取代了）。如果基线跟着「通过的门禁」走，它就会指向一个从未进入主干的状态</em>——而后续所有 PR 都在和这个不存在的状态比较。</p>  <p><strong>实现上这意味着基线更新必须由「合并事件」触发，而不是由「CI 成功」触发。</strong><em>这个细节不做对的症状是：主干上的分数与基线记录的分数长期对不上</em>，而且很难查——因为每一次单独看都是正常的。</p>  <h3>趋势图上该画什么</h3>  <ul>
+    <li><strong>主指标 + 置信带</strong>——没有置信带的趋势图会让人过度解读每一个小波动；</li>
+    <li><strong>标注事件</strong>：模型版本变更、任务集版本变更、judge prompt 变更。<em>指标跳变时第一件事是看有没有事件对齐——通常有</em>；</li>
+    <li><strong>分子集的趋势</strong>：核心能力集与回归集的趋势应当分开画，<em>它们的正常形态完全不同</em>（前者缓慢上升，后者应当贴着 100%）；</li>
+    <li><strong>运行健康的趋势</strong>（模块 02 的五个数）——<em>成本或重试率的缓慢上升，往往比分数变化更早地预告问题</em>。</li>
+  </ul>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_runner/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · Runner 工程</div></a>
+    <a class="next" href="../04_ci_gating/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · CI 回归门禁</div></a>
+  </div>
+
+</div>
+</body>
+</html>
