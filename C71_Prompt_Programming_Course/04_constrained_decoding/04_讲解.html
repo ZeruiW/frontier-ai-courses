@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 受限解码与结构化输出</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 受限解码与结构化输出</h1>
+  <p class="subtitle"><strong>约束是唯一能把解析率<em>保证</em>到 1.0 的路</strong>，而重试与修复都不能保证 · 掩码必须由「合法前缀」定义——<strong>只看位置的掩码<em>不保证输出合法</em></strong>（它在「所有合法串结构相同」时才侥幸安全，而真实 schema 几乎总有可选字段与联合类型）· <strong>核心结果：逐步掩码 ≠ 条件分布</strong>。全量枚举精确算出 KL = 0.081 nat，<code>bug</code> 被低估 2.3 倍；<em>机制是掩码看不见「分支的下游收尾能力」</em> · <strong>而失真的<em>唯一</em>来源就是收尾能力的差异，与掩掉多少质量无关</strong>——<em>尾部同质时 KL 恰好为 0（掩掉 56% 还是 91% 都一样），所以「语法越紧失真越大」这个直觉是错的</em> · 温度 0 取 argmax 时通常不受影响（这解释了它为什么很少被发现）；<strong>采样多候选与「把 logprob 当置信度」两类场景下它重要</strong> · <strong>区间约束无法用逐步掩码表达</strong>，所以不变量校验不能被约束替代 · 重试的期望调用是 $1/p$ 且带选择偏倚；修复只能做语法层不能做语义猜测 · <strong>「启用约束但解析率 &lt; 1.0」是一个逻辑矛盾</strong>——零误报的检查</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 01（三个量与解析失败）；知道「自回归采样」与「有限状态机」两个概念即可</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_constrained_decoding.ipynb（一个 token 级玩具 LM 与全量枚举 / 语法掩码把非法率压到 0 / **逐步掩码 vs 真实条件分布的精确对比与 KL** / JSON schema 编译成掩码 / 重试的选择偏倚定量 / 修复的可行与有害两种情形 / 三条路的选择树与门禁）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Willard & Louf, <em>Efficient Guided Generation for Large Language Models</em>（Outlines, 2023）——正则/CFG 到 FSM 的编译 · <em>guidance</em> / <em>llama.cpp GBNF</em> / <em>xgrammar</em> 的语法约束实现 · Park et al., <em>Grammar-Aligned Decoding</em>（NeurIPS 2024）——逐步掩码的分布失真与它的修正 · HuggingFace <em>LogitsProcessor</em> 接口（C50）· 本课程 C01 模块（采样与解码）· C68 模块 02（重试只能看异常类型）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#three-roads">保证输出合法的三条路</a></li>
+      <li><a href="#mechanism">受限解码的机制：掩码 + 状态机</a></li>
+      <li><a href="#distortion">逐步掩码 ≠ 条件分布（本模块的核心）</a></li>
+      <li><a href="#schema">从 JSON schema 编译到掩码</a></li>
+      <li><a href="#retry">重试的选择偏倚（定量）</a></li>
+      <li><a href="#repair">修复：可行与有害的两种情形</a></li>
+      <li><a href="#decision">选择树</a></li>
+      <li><a href="#tokenizer">tokenizer 带来的复杂度</a></li>
+      <li><a href="#api-structured-output">API 上的 structured output 与 tool-calling</a></li>
+      <li><a href="#recap">本模块的四条可执行结论</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="three-roads"><span class="num">1</span>保证输出合法的三条路</h2>
+  <p>模块 01 把「解析失败」量化了。这一节给出三条修法，<strong>它们的成本与副作用完全不同。</strong></p>  <table>
+    <thead><tr><th>路</th><th>怎么做</th><th>成本</th><th>解析率能到 1.0 吗</th><th>副作用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>重试</strong></td><td>解析失败就重新采样</td><td><em>期望 $1/p$ 次调用</em>；$p$ 小时爆炸</td><td><strong>不能保证</strong>（可能一直失败）</td><td><strong>选择偏倚</strong>——被重试掉的样本不是随机的（第 5 节）</td></tr>
+      <tr><td><strong>修复</strong></td><td>对不合法的输出做后处理（补括号、抽取、映射）</td><td>近零</td><td>不能保证</td><td><strong>可能改变语义</strong>——修得越激进越危险（第 6 节）</td></tr>
+      <tr><td><strong>约束（受限解码）</strong></td><td>在每一步把不合法的 token 的 logit 设成 $-\infty$</td><td>近零（一次掩码计算）</td><td><strong>能</strong>——不合法输出在生成时就不可能产生</td><td><strong>分布失真</strong>——本模块第 3 节会把它精确算出来</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>约束是唯一能把解析率保证到 1.0 的路</strong>，而且它同时消掉了重试的偏倚与修复的语义风险。<em>所以在能用约束的地方，它应当是默认选择。</em><strong>但它不是免费的：它换来的是一个更微妙的问题——分布失真。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>三条路的关系不是「三选一」，而是<strong>有优先级的组合</strong>：<em>能约束的字段用约束（枚举、数值、正则、JSON schema）；约束不了的部分（自由文本）用修复兜底；两者都失败时才重试，而且重试次数与结果必须被记录</em>。<strong>这个顺序不能反：先重试再考虑约束，等于用钱买一个本可以免费拿到的性质。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一条判断能不能上约束的实用问题：<strong>「你的输出规范能写成一个正则或 JSON schema 吗？」</strong><em>能 → 直接约束；不能（比如「一段自然语言的解释」）→ 那部分只能修复兜底</em>。而大多数结构化任务的输出<strong>大部分</strong>是可约束的——枚举标签、数值区间、字段名、括号配对。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mechanism"><span class="num">2</span>受限解码的机制：掩码 + 状态机</h2>
+  <div class="ascii">   每一步的三件事
+
+   1. 模型给出 logits over vocab            [v0, v1, …, v_{|V|-1}]
+   2. 语法状态机告诉你哪些 token 合法        mask ∈ {0, 1}^{|V|}
+   3. 把非法位置设成 -inf，再 softmax        p_i ∝ exp(v_i) · mask_i
+
+   状态机从哪来：
+     正则 / CFG / JSON schema  ──编译──►  FSM（状态 × token → 状态 或 ⊥）
+     每一步：当前状态 + 候选 token → 有后继状态就合法
+
+   关键性质：**掩码是"这一步这个 token 能不能出现"，
+             而不是"选了它之后还能不能合法收尾"** —— 第 3 节的失真就来自这里。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>掩码的构造有一个容易忽略的要求：<strong>合法的定义必须是「存在一条路径能走到接受状态」，而不是「这一步在语法里出现过」</strong>。<em>前者需要在 FSM 上做一次可达性分析（哪些状态能到接受态），后者只看局部转移</em>——<strong>用后者会产生「走到一半发现无路可走」的死局</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>工程上的实现要点：<strong>掩码要能被缓存</strong>。<em>状态数通常远小于序列数</em>，所以 <code>(状态) → 允许的 token 集合</code> 是一张可以预计算的表。<strong>这让约束的运行时开销接近零</strong>——<em>这也是为什么第 1 节的表里它的成本写「近零」</em>。而 tokenizer 会带来一个真实的复杂度：<strong>同一个字符串可能有多种 token 切分</strong>，所以 FSM 要建在 token 层而不是字符层（Outlines 这条线的主要工程贡献就在这里）。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="distortion"><span class="num">3</span>逐步掩码 ≠ 条件分布（本模块的核心）</h2>
+  <p>这一节是本模块存在的理由。<strong>受限解码通常被理解成「从模型分布里只保留合法的部分」——而这个理解是错的。</strong></p>  <div class="math-block">\[P_{\text{mask}}(y) \neq P_{\text{model}}(y \mid y \in \mathcal{S})\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么不等？<strong>因为逐步掩码在每一步只看「这一步哪些 token 合法」，它不知道「选了这个 token 之后，还有多少概率质量能合法收尾」。</strong><em>两个分支在这一步的概率相同，但一个分支之后大概率跑偏、另一个大概率能收好尾——真实的条件分布会偏向后者，而逐步掩码不会。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>notebook 第 3 节用一个可以<strong>全量枚举</strong>的玩具 LM 把两个分布精确算出来。结果：<strong>真实条件分布 <code>{bug: 0.188, feature: 0.562, other: 0.250}</code>，逐步掩码 <code>{bug: 0.083, feature: 0.750, other: 0.167}</code></strong>，<em>$\mathrm{KL} = 0.081$ nat，而 <code>bug</code> 被低估了 2.3 倍</em>。<strong>机制在例子里是显式的：<code>bug</code> 被选中的概率低（0.05），但它之后「正确收尾」的概率高（0.90）；逐步掩码只看见前者。</strong></p></div>
+  </div>  <div class="ascii">   为什么 bug 被低估
+
+   在 {"label":" 之后，模型给出：
+     bug 0.05   feature 0.45   other 0.10   oops 0.40
+
+   逐步掩码：去掉 oops，归一化 → bug 0.083  feature 0.75  other 0.167
+                                   ↑ 到此为止，不再往后看
+
+   真实条件分布：还要乘上「之后能合法收尾」的概率
+     bug     : 0.05 × 0.90 = 0.045
+     feature : 0.45 × 0.30 = 0.135
+     other   : 0.10 × 0.60 = 0.060
+                归一化   → bug 0.188  feature 0.562  other 0.250
+
+   **bug 是一个"不常被想起、但一旦想起就写得对"的选项。**
+   逐步掩码看不见它的这个优点。</div>  <h3>失真的唯一来源：分支之间的收尾能力差异</h3>  <p>这一点值得单独立一小节，因为它与直觉相反。<strong>notebook 练习 2 会精确证明两件事</strong>：</p>  <ol>
+    <li><strong>如果所有分支的「下游收尾概率」相同，那么逐步掩码 <em>恰好等于</em> 条件分布——$\mathrm{KL} = 0$，无论被掩掉了多少质量。</strong><em>被掩掉 56% 还是 91%，KL 都精确地是 0。</em></li>
+    <li><strong>失真随「分支之间收尾概率的差异」增长。</strong><em>把某个分支的收尾概率从 0.60 压到 0.15，KL 从 0.007 涨到 0.270（近 40 倍）。</em></li>
+  </ol>  <p><strong>所以「语法越紧失真越大」这个直觉是错的</strong>：<em>紧不紧（掩掉多少）根本不影响失真；只有「不同分支之后有多容易合法收尾」才影响</em>。<strong>这也给出了一个实用的判断：如果你的语法在所有分支之后的结构都一样（比如枚举一个标签然后固定收尾），那么失真为零，可以完全不管它。</strong></p>  <h3>这个失真什么时候重要</h3>  <ul>
+    <li><strong>分支之后的结构不同时才有失真</strong>——<em>比如联合类型、可选字段、变长数组：选了 A 之后还要写很多东西、选了 B 之后马上就能收尾</em>。</li>
+    <li><strong>只取 argmax（贪心/温度 0）时通常不重要</strong>——<em>因为失真改变的是概率，而 argmax 常常不变</em>。<strong>这也解释了为什么大多数生产系统没被它咬到：它们跑温度 0。</strong></li>
+    <li><strong>需要采样多个候选、或需要用概率做后续判断时重要</strong>——<em>best-of-n、自一致性投票、把 logprob 当置信度</em>。<strong>这些场景下失真会系统性地偏向「容易开头但不容易收尾」的分支。</strong></li>
+  </ul>  <div class="callout warn"><span class="label"></span>
+    <p>修正它需要在解码时做前瞻（估计每个分支的「可完成质量」），<strong>而那很贵</strong>——<em>这是 grammar-aligned decoding 这条研究线在做的事</em>。<strong>工程上的现实结论是：知道它存在、知道它在什么条件下重要，并在那些条件下不要把掩码后的概率当成条件概率来用。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="schema"><span class="num">4</span>从 JSON schema 编译到掩码</h2>
+  <p>实践里最常用的约束来源是 JSON schema。<strong>它的四类约束各自对应一种掩码。</strong></p>  <table>
+    <thead><tr><th>schema 约束</th><th>掩码怎么做</th><th>注意</th></tr></thead>
+    <tbody>
+      <tr><td><strong>枚举</strong> <code>enum: [...]</code></td><td>在值的位置只允许能前缀匹配某个枚举项的 token</td><td><strong>最有价值的一类</strong>——它直接把模块 01 的「取值域」变成硬保证</td></tr>
+      <tr><td><strong>类型</strong> <code>type: integer</code></td><td>只允许数字 token；小数点/负号按类型放行</td><td><em>区间约束（<code>minimum</code>）无法完全用掩码表达</em>——前几位数字合法但整体越界；只能生成后校验</td></tr>
+      <tr><td><strong>必填字段</strong> <code>required</code></td><td>状态机在字段未齐时不允许 <code>}</code></td><td>这一条把「缺字段」这类解析失败彻底消掉</td></tr>
+      <tr><td><strong>字符串格式</strong> <code>pattern</code></td><td>正则编译成 FSM</td><td><em>复杂正则的 FSM 会很大</em>；要缓存</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第二行那个例外值得记住</strong>：<em>区间约束不能完全用掩码表达</em>。「生成一个 0 到 1 之间的数」时，<strong>掩码可以保证它是一个合法的小数，但不能保证它 ≤ 1</strong>（<code>0.9</code> 的前缀 <code>0.</code> 与 <code>7.5</code> 的前缀 <code>7</code> 在字符层都合法）。<em>所以「不变量校验」这一步（模块 01 的 signature）不能被约束替代。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个纯工程的坑：<strong>schema 与解析器必须由同一个来源生成</strong>。<em>手写 schema 给模型、手写解析器读结果，两者会漂移</em>——而模块 01 练习 1 的第 3 项检查正是抓这个。<strong>正确做法是从一个类型定义（pydantic / dataclass）同时导出schema、掩码与解析器。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="retry"><span class="num">5</span>重试的选择偏倚（定量）</h2>
+  <p>模块 01 第 6 节定性地说明了它。这一节给出定量结果与成本。</p>  <div class="math-block">\[\mathbb{E}[\text{calls}] = \frac{1}{p_{\text{parse}}}, \qquad \mathbb{E}[\text{correct} \mid \text{parse ok}] > \mathbb{E}[\text{correct}]\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>成本：期望调用次数是 $1/p$。</strong><em>$p = 0.9$ 时是 1.11 次（可以接受）；$p = 0.5$ 时是 2 次；$p = 0.2$ 时是 5 次</em>。<strong>而「重试上限」把它变成一个截断分布：上限 $R$ 时仍有 $(1-p)^R$ 的比例最终失败。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>偏倚：解析成功与答对正相关（都受样本难度影响），所以在解析成功的子集上算准确率会高估。</strong><em>notebook 第 5 节把这个偏差量出来</em>。<strong>而受限解码让 $p = 1$，于是成本回到 1 次、偏倚消失</strong>——<em>这是「约束优于重试」最直接的论证：它同时便宜且无偏。</em></p></div>
+  </div>  <h3>如果必须重试（约束不可用时）</h3>  <ol>
+    <li><strong>重试的触发条件只能是「解析失败」</strong>——<em>不能是「结果看起来不对」</em>（那是在用真值调参，与 C68 模块 02 的重试纪律同构）。</li>
+    <li><strong>报分的分母是全部样本，最终失败记为错</strong>。</li>
+    <li><strong>重试次数的分布必须进报告</strong>——<em>它是成本，也是「解析率其实不是 1.0」的证据</em>。</li>
+    <li><strong>重试要带温度扰动</strong>——<em>温度 0 时重试会得到完全相同的输出，等于白花一次钱</em>。而这又意味着重试引入了不确定性，<strong>于是配置的可复现性下降（C68 模块 02 的老问题）。</strong></li>
+  </ol>
+
+  <!-- ========================================================= -->
+  <h2 id="repair"><span class="num">6</span>修复：可行与有害的两种情形</h2>
+  <table>
+    <thead><tr><th>修复动作</th><th>可行吗</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td>去掉 markdown 代码块围栏</td><td><strong>可行</strong></td><td>纯语法层，不触碰内容；<em>而且它对应模块 01 的「禁止项」槽位</em></td></tr>
+      <tr><td>去掉前后的解释文字，抽取 JSON 块</td><td><strong>可行</strong></td><td>同上；用「第一个 <code>{</code> 到匹配的 <code>}</code>」定位</td></tr>
+      <tr><td>补上缺失的右括号</td><td><em>谨慎</em></td><td><strong>可能把一个被截断的输出补成一个「看起来完整」的错误结果</strong>——<em>而截断通常意味着 max_tokens 不够，那是一个应当被发现的配置问题</em></td></tr>
+      <tr><td>把不在枚举里的值映射到最近的合法值</td><td><strong>有害</strong></td><td><em>它把「模型不知道答案」伪装成了「模型给了一个答案」</em>；<strong>而下游无法区分这两者</strong></td></tr>
+      <tr><td>用另一个模型把输出改写成合法格式</td><td><strong>有害（通常）</strong></td><td>引入第二个不确定环节，且<em>错误传播变成乘法</em>（模块 01 第 3 节）；<strong>能用约束的地方绝不该用这个</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>分界线很清楚：<strong>只做语法层的清洗，不做语义层的猜测。</strong><em>去围栏、抽 JSON 块是语法；把 <code>BUG</code> 映射成 <code>bug</code> 是灰色（大小写可以规范化）；把 <code>maybe_bug</code> 映射成 <code>bug</code> 是语义猜测</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一条记录纪律：<strong>修复必须被记录，而且被修复过的样本要能被单独统计。</strong><em>因为「修复率」是一个健康指标</em>——<strong>它上升通常意味着 prompt 的格式槽位或模型行为变了</strong>，而如果修复是静默的，这个信号就丢了。<em>这与 C68 模块 02 的「失败分类必须报告比例」是同一条。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="decision"><span class="num">7</span>选择树</h2>
+  <div class="ascii">   输出规范能写成正则 / JSON schema 吗？
+     │
+     ├─ 能 ────► **用受限解码**（解析率保证 1.0）
+     │            │
+     │            ├─ 需要采样多个候选 / 用 logprob 当置信度？
+     │            │     ├─ 是 → 注意第 3 节的分布失真，别把掩码后的概率当条件概率
+     │            │     └─ 否（温度 0 取 argmax）→ 失真通常不影响结果
+     │            │
+     │            └─ 有区间/跨字段不变量？→ 生成后仍要做 validate（掩码表达不了）
+     │
+     └─ 不能（输出含自由文本）
+                  │
+                  ├─ 把**可约束的部分**单独成字段并约束它
+                  │   （比如 {"label": &lt;枚举&gt;, "reason": &lt;自由文本&gt;}）
+                  │
+                  ├─ 自由文本部分用**语法层修复**兜底（去围栏、抽 JSON 块）
+                  │
+                  └─ 仍然失败 → 重试（带温度扰动 + 上限 + 记录次数）
+                                └─ 报分的分母仍然是全部样本</div>  <p><strong>这棵树的形状本身是结论</strong>：<em>约束在最上层、修复在中层、重试在最下层</em>，而<strong>「把可约束的部分拆成独立字段」是一个几乎总是值得做的重构</strong>——它把一次「全或无」的解析变成「结构化字段有保证 + 自由文本尽力而为」。</p>  <h3>门禁（按 C68 模块 04 分级）</h3>  <ul>
+    <li><strong>确定性阻断</strong>：schema 与解析器不是同源生成的；启用了约束但 <code>parse_rate < 1.0</code>（说明掩码有 bug）；<code>required</code> 字段在 schema 里但掩码没实现</li>
+    <li><strong>统计阻断</strong>：修复率或重试率相对基线上升超过阈值</li>
+    <li><strong>报警</strong>：修复率 > 0 且在上升（<em>它是格式槽位或模型行为变化的早期信号</em>）</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>最后一条确定性检查值得单独说：<strong>「启用了约束但解析率不是 1.0」是一个逻辑矛盾</strong>——<em>约束的定义就是不合法输出不可能产生</em>。所以它出现时一定是实现有 bug（掩码漏了某条规则、或者约束根本没生效），<strong>而这是一个零误报的检查。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tokenizer"><span class="num">8</span>tokenizer 带来的复杂度</h2>
+  <p>前七节把掩码当成「token 集合」来处理。<strong>而把语法从字符层搬到 token 层，是这一层最真实的工程难点。</strong></p>  <div class="ascii">   问题：同一个字符串有多种 token 切分
+
+   目标：输出 "feature"
+   可能的切分:  [feature]  |  [feat][ure]  |  [f][eature]  |  [fe][at][ure] …
+
+   如果掩码只允许 [feature] 这一个 token，
+   那么当模型倾向于先出 [feat] 时，这条路被掩掉了 ——
+   **而它本来能走到一个合法结果**。
+
+   于是掩码必须允许「任何能拼出某个合法后续的 token」，
+   也就是要在 token 层重建 FSM，而不是在字符层。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这不是理论问题，它有两个真实后果。</strong><em>① 掩码过严 → 把合法路径掩掉 → 模型被迫走一条概率更低的路，输出质量下降</em>（而这看起来像「加了约束效果变差了」）；<em>② 掩码过松 → 生成出无法回到合法状态的前缀 → 死局</em>（练习 1 那个问题的另一种形态）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>正确做法是预计算一张 <code>(FSM 状态) → (允许的 token 集合)</code> 的表</strong>，其中「允许」的定义是：<em>这个 token 的字符串是某条合法路径的一个前缀片段</em>。<strong>状态数远小于序列数，所以这张表可以在启动时算好并缓存</strong>——这也是为什么受限解码的运行时开销可以接近零。<em>而这张表依赖具体的 tokenizer，所以<strong>换模型时要重算</strong></em>（模块 05 会把这一点归到「保留但需重测」那一档）。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个实践建议：<strong>不要自己实现 token 层的语法编译。</strong><em>用 Outlines / xgrammar / GBNF 这类成熟实现</em>——它们的主要价值恰恰在这个又琐碎又容易出错的地方。<strong>本课从零实现的是「掩码的语义」，不是它的高效实现。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="api-structured-output"><span class="num">9</span>API 上的 structured output 与 tool-calling</h2>
+  <p>拿不到 logits 时，还有一条路：<strong>服务方提供的 structured output / tool-calling —— 它们内部就是约束。</strong></p>  <table>
+    <thead><tr><th>形式</th><th>它给你什么</th><th>要注意什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>JSON mode</strong></td><td>保证输出是合法 JSON</td><td><em>只保证语法，不保证 schema</em>——<strong>字段名、枚举值、类型仍然要自己 validate</strong></td></tr>
+      <tr><td><strong>schema-constrained output</strong></td><td>保证符合给定 JSON schema</td><td><strong>区间约束（<code>minimum</code>）通常不被保证</strong>（第 5 节的那个例外）；<em>而 schema 的哪些关键字被支持要查文档</em></td></tr>
+      <tr><td><strong>tool-calling</strong></td><td>保证参数符合工具的参数 schema</td><td><em>它同时改变了模型的行为（模型知道自己在「调工具」）</em>，所以<strong>它与「输出 JSON」不是等价的两种写法</strong>——效果要分别测</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>三者的共同点：它们把「保证」从你这边移到了服务方那边。</strong><em>好处是省事；代价是你不知道它内部怎么实现的</em>——<strong>包括本模块第 3 节那个分布失真是否被修正过。</strong><em>所以在采样多候选或用 logprob 当置信度的场景下，仍然要按「可能有失真」来对待。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一条纯工程的纪律：<strong>无论用哪种形式，本地仍然要跑一次 <code>validate</code>。</strong><em>理由有三个：区间与跨字段不变量通常不被保证；服务方的实现可能在某些边缘情况下失效；而且这一步让你的解析率指标是自己测出来的，而不是相信来的。</em><strong>「启用了约束但解析率不是 1.0」这个矛盾（练习 4 的第一条检查）只有在你自己 validate 时才可能被发现。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="recap"><span class="num">10</span>本模块的四条可执行结论</h2>
+  <ol>
+    <li><strong>能约束的字段全部上约束。</strong><em>它是唯一能把解析率<strong>保证</strong>到 1.0 的路，同时消掉重试的成本（$1/p$）与偏倚</em>。<strong>而它还是可迁移的</strong>——换模型时它原样保留（模块 05）。</li>
+    <li><strong>把可约束的部分拆成独立字段。</strong><em>比如 <code>{"label": &lt;枚举&gt;, "reason": &lt;自由文本&gt;}</code></em>——<strong>这把一次「全或无」的解析变成「结构化字段有保证 + 自由文本尽力而为」</strong>，是一个几乎总是值得做的重构。</li>
+    <li><strong>不变量校验不能被约束替代。</strong><em>区间约束（<code>0 ≤ x ≤ 1</code>）无法用逐步掩码表达</em>，而跨字段的约束更不行。<strong>所以模块 01 的 <code>signature.validate</code> 这一步永远保留。</strong></li>
+    <li><strong>在三类场景下不要把掩码后的概率当条件概率：</strong><em>采样多个候选（best-of-n）、自一致性投票、把 logprob 当置信度</em>。<strong>而判断有没有失真的判据很具体：看语法在不同分支之后的结构是否相同</strong>——相同则失真恰好为 0（练习 2），不同则要小心。</li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这四条里第 2 条最容易被忽略，而它的收益最直接。</strong><em>很多系统的输出是「一段带解释的自然语言，里面藏着一个结论」</em>，于是解析永远是概率性的。<strong>把结论抽成一个枚举字段之后，那部分就变成了确定的</strong>——而解释部分即使解析失败，也不影响结论可用。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第 4 条的判据值得再说一次，因为它把一个抽象结论变成了一次检查：<strong>如果你的 schema 是「一个枚举 + 固定的收尾」，那么所有分支之后的结构相同，失真恰好为 0，可以完全不管它。</strong><em>需要警惕的是联合类型、可选字段、变长数组</em>——那里「选了 A 还要写很多、选了 B 马上收尾」，<strong>而这类 schema 恰恰是最常见的复杂输出形态。</strong></p></div>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_optimization/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 自动提示优化</div></a>
+    <a class="next" href="../05_prompt_ops/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 提示的运维与跨模型迁移</div></a>
+  </div>
+
+</div>
+</body>
+</html>

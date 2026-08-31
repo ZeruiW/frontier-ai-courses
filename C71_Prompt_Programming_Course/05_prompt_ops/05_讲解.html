@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 提示的运维与跨模型迁移</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 提示的运维与跨模型迁移</h1>
+  <p class="subtitle"><strong>签名 / 取值域 / 格式 / 解码约束跨模型保留；示例顺序 / 指令措辞 / 校准参数不保留</strong>——<em>把两半分开存，「换模型」就只换那一半</em> · <strong>本模块的核心结论比预期更锋利</strong>：一个<em>没有针对任何模型调过</em>的 prompt，在四个模型上端到端分数<strong>完全相同</strong>（而预测分布明显不同）；<strong>而一旦为模型 A 调过，它搬到 B 上就从 70% 掉到 50%——低于 B 的基线</strong>。<em>也就是说：迁移风险是<strong>优化的副产物</strong>，不是换模型本身的代价</em> · 位置偏置的方向在不同模型上可以相反（+0.35 近因 vs −0.30 首因）· <strong>迁移门禁必须按层判不按总分判</strong>；PSI 是观测量不是门禁 · <strong>只改示例策略，成本涨几倍</strong>（缓存命中率 0.95 → 0）；而<em>单价最低不等于总成本最低</em>（tokenizer 差 30%+）· 灰度分流按<strong>稳定 ID</strong> 不按请求随机；指标按分桶 × 分层同时切 · <strong>修复率是解析率的前导指标</strong>，而它只在修复被显式记录时才存在 · <strong>回滚必须是切指针</strong>——需要手动编辑 prompt = 不可回滚 = 不该上线</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 01（签名 / 三个量 / 版本化）与 03（优化与留出集）；C70 模块 05（索引运维：影子 + 双写 + 原子切换）读过更好——本课复用它的结构</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_prompt_ops.ipynb（四个「模型」的模拟器 / 同一个 prompt 的跨模型分数跨度 / **为 A 优化的 prompt 在 B 上可能比基线更差** / 迁移的分层复核与阈值 / token 成本与前缀缓存 / 灰度与回滚 / 监控四项 / prompt 运维卡与门禁）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">本课程 C70 模块 05（影子 + 双写 + 原子切换 + 回滚，本课直接复用这套结构）· C68 模块 04（门禁分级与阈值从方差推）· C68 模块 05（漂移与 PSI）· C33 模块 05（前缀缓存与稳定前缀）· C03 模块 03（prompt 敏感性——它解释了为什么迁移必然出问题）· C48 / C37（灰度发布与回滚的一般做法）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#asset-that-rots">prompt 是会腐烂的资产</a></li>
+      <li><a href="#what-transfers">迁移时什么会失效、什么会保留</a></li>
+      <li><a href="#migration">迁移流程：直接复用 C70 模块 05 的结构</a></li>
+      <li><a href="#cost">成本：token、缓存、以及它们与示例策略的耦合</a></li>
+      <li><a href="#rollout">灰度与回滚</a></li>
+      <li><a href="#monitoring">监控四项（都不需要真值）</a></li>
+      <li><a href="#failures">六个失效模式</a></li>
+      <li><a href="#ops-card">prompt 运维卡 + 门禁</a></li>
+      <li><a href="#timeline">一次真实迁移的时间线</a></li>
+      <li><a href="#ownership">prompt 的所有权与评审</a></li>
+      <li><a href="#course-recap">全课回顾：五个模块为什么是这个顺序</a></li>
+      <li><a href="#last-word">最后一条：这一层的价值不在分数上</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="asset-that-rots"><span class="num">1</span>prompt 是会腐烂的资产</h2>
+  <p>前四个模块把 prompt 做成了一个可测、可搜、可保证的对象。<strong>这一节处理一个不同性质的问题：它会失效，而失效的原因通常不在你这边。</strong></p>  <table>
+    <thead><tr><th>失效类型</th><th>触发</th><th>症状</th><th>能不能提前发现</th></tr></thead>
+    <tbody>
+      <tr><td><strong>模型换小版本</strong></td><td>服务方静默更新</td><td><em>分数缓慢变化；预测分布偏移</em></td><td><strong>能</strong>——把模型版本钉死 + 监控预测分布（第 6 节）</td></tr>
+      <tr><td><strong>模型换家族</strong></td><td>你主动换供应商 / 换尺寸</td><td><strong>为旧模型调出来的示例顺序、指令措辞、格式偏好全部失效</strong></td><td>能——这是一次<em>计划内的迁移</em>（第 3 节）</td></tr>
+      <tr><td><strong>行为漂移</strong></td><td>同一版本、同一 prompt，输出分布随时间变</td><td>解析率或修复率缓慢上升</td><td><strong>只能靠监控</strong>（第 6 节的四项）</td></tr>
+      <tr><td><strong>示例池腐烂</strong></td><td>线上话题变了（模块 02 第 7 节）</td><td>选中示例与输入的相似度下降</td><td>能——它有一个无真值指标</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第二行是本模块的主线，因为它的代价最容易被低估。</strong><em>「换一个更强的模型」听起来是纯增益</em>，而实际上<strong>你为旧模型做的所有 prompt 层优化都可能不再成立</strong>——示例顺序（模块 02 量到三倍差距）、指令措辞、格式偏好、以及模块 03 搜出来的那套配置。<em>notebook 第 2 节量出这件事：为模型 A 优化的 prompt 在模型 B 上可能比基线还差。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么必然如此？因为<strong>prompt 层的优化本质上是在拟合某个模型的具体行为</strong>（近因偏置的强度、对格式的依从度、标签先验）。<em>这些行为在不同模型上不同，而且没有理由相同</em>。<strong>C03 模块 03 的 prompt 敏感性研究就是这件事的另一面：既然同一个模型对措辞都敏感，那么跨模型不迁移是预期而不是意外。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>一个具体的、常见的事故：<strong>模型 ID 写成 <code>latest</code> 或不带版本。</strong><em>服务方更新后，你的 prompt 面对的是一个不同的模型，而所有指标只是「慢慢变差」</em>。<strong>这与 C70 模块 05 的「embedding 模型写 latest」是同一类错误，而且同样不报错。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what-transfers"><span class="num">2</span>迁移时什么会失效、什么会保留</h2>
+  <table>
+    <thead><tr><th>prompt 的组成</th><th>跨模型迁移</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>签名（契约）</strong></td><td><strong>完全保留</strong></td><td>它不依赖任何模型；<em>这是模块 01「签名先于 prompt」的一个额外回报</em></td></tr>
+      <tr><td><strong>取值域声明</strong></td><td><strong>保留</strong></td><td>「把标签集写进指令」对任何模型都有效</td></tr>
+      <tr><td><strong>输出格式规范 + 解析器</strong></td><td>基本保留，<em>需重测解析率</em></td><td>不同模型对格式的依从度不同——<strong>解析率必须重测，不能假设</strong></td></tr>
+      <tr><td><strong>解码约束</strong></td><td><strong>保留（如果新栈支持）</strong></td><td>它是外部施加的保证，与模型行为无关——<em>这是「约束优于提示」的又一个理由</em></td></tr>
+      <tr><td><strong>示例的选择</strong></td><td>部分保留</td><td>「与输入相似的示例更好」这条规律比较稳；<em>但最优 k 会变</em></td></tr>
+      <tr><td><strong>示例的顺序</strong></td><td><strong>基本不保留</strong></td><td>它拟合的是具体模型的位置偏置——<em>方向都可能反过来</em></td></tr>
+      <tr><td><strong>指令的具体措辞</strong></td><td><strong>不保留</strong></td><td>模块 03 搜出来的措辞是对某个模型的拟合</td></tr>
+      <tr><td><strong>标签先验校准</strong></td><td><strong>不保留</strong></td><td>先验是模型 × 示例的联合产物（模块 02 第 5 节）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这张表给出了一个很实用的设计原则：把可迁移的部分与不可迁移的部分分开存。</strong><em>签名、取值域、格式规范、解码约束 → 与模型无关，一份就够；示例顺序、指令措辞、校准参数 → 每个模型一份</em>。<strong>于是「换模型」变成「换掉那一半」，而不是「重做一遍」。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这也解释了为什么<strong>模块 04 的解码约束在长期上比模块 03 的指令优化更值</strong>：<em>约束是一个外部施加的、与模型无关的保证；而搜出来的指令措辞是一次性资产，换模型就报废</em>。<strong>所以在两者都能解决同一个问题时（比如输出格式），优先选约束。</strong><em>模块 03 第 6 节说的「搜出来的 prompt 要能被审阅」也是同一条：看不懂的咒语在迁移时既不知道能不能留，也不知道该怎么改。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="migration"><span class="num">3</span>迁移流程：直接复用 C70 模块 05 的结构</h2>
+  <p>换模型是一次<strong>有状态的切换</strong>，而 C70 模块 05 已经把这类切换的正确形状定下来了。<strong>这里只需要把「索引」换成「prompt bundle + 模型」。</strong></p>  <div class="ascii">   t0  ACTIVE = (bundle_A, model_A)
+   t1  影子评测：(bundle_A, model_B) 与 (bundle_B*, model_B) 都跑一遍
+         │        └─ 直接搬过去        └─ 为 B 重新调过的（顺序/措辞/校准）
+   t2  一致性校验（三条，见下）
+   t3  灰度：1% → 10% → 50% → 100%，每一档看监控四项
+   t4  ACTIVE = (bundle_B*, model_B)；保留旧配置 N 天
+   t5  回滚 = 反向切那一个指针
+
+   **中途状态必须不可达**：一个请求要么完全走旧配置，要么完全走新配置。
+   混着走（新模型 + 旧示例顺序）是一个既没被评测过、也不会报错的组合。</div>  <h3>一致性校验的三条</h3>  <ol>
+    <li><strong>确定性：解析率必须仍是 1.0</strong>（若用了解码约束）或<strong>不低于旧配置</strong>（若没用）。<em>这一项零误报，直接阻断。</em></li>
+    <li><strong>统计：分层准确率——每一层都不能显著下降</strong>。<em>只看总分会掩盖「某一类塌了」</em>（与 C68 模块 03 的切片分析、C70 模块 04 的分层报分是同一条）。</li>
+    <li><strong>观测：预测标签分布的 PSI</strong>。<em>它不设阻断阈值</em>——<strong>换模型必然让分布变化，所以它高不代表坏</strong>；<em>但它是「新模型的先验与旧模型不同」的量化证据，用来决定要不要重做校准。</em></li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>第 3 条的处理方式与 C70 模块 05 的「top-k 重叠率」完全同构：<strong>有些指标是观测量而不是门禁</strong>。<em>它们的用途是解释变化的原因，而不是判定好坏。</em>把观测量设成门禁，结果是门禁在正确的变更上误报。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost"><span class="num">4</span>成本：token、缓存、以及它们与示例策略的耦合</h2>
+  <div class="math-block">\[\text{cost/req} = \big(n_{\text{instr}} + \textstyle\sum_i n_{d_i} + n_x\big)\cdot c_{\text{in}} \cdot (1 - h) + n_y \cdot c_{\text{out}}\]</div>  <p>其中 $h$ 是<strong>前缀缓存命中率</strong>。<em>这一项把成本与模块 02 的示例选择策略直接绑在了一起。</em></p>  <table>
+    <thead><tr><th>示例策略</th><th>前缀是否稳定</th><th>缓存命中率 $h$</th><th>相关性</th></tr></thead>
+    <tbody>
+      <tr><td><strong>固定示例</strong></td><td><strong>完全稳定</strong></td><td>接近 1（只有输入 $x$ 是变的）</td><td>最低</td></tr>
+      <tr><td><strong>分桶 kNN（N 桶）</strong></td><td>只有 N 种</td><td>较高</td><td>中</td></tr>
+      <tr><td><strong>全局 kNN</strong></td><td><strong>每个请求都不同</strong></td><td><strong>≈ 0</strong></td><td>最高</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这个耦合常被忽略：模块 02 量到 kNN 的准确率收益很大，而这一节说明它的成本也很大。</strong><em>在长 prompt、高 QPS 的场景下，「示例占 2000 token、缓存命中率从 0.9 掉到 0」带来的成本增长可能超过准确率提升的价值</em>。<strong>分桶 kNN 存在的理由就是这个权衡。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个与迁移相关的成本项：<strong>不同模型的单价与 tokenizer 都不同</strong>。<em>同一段中文 prompt 在两个 tokenizer 下的 token 数可以差 30% 以上</em>，所以<strong>「换模型省钱」这个判断必须按 token 数重算，不能只看单价</strong>。<em>notebook 第 4 节把这两项一起算出来，并给出一个「单价更低但总成本更高」的例子。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rollout"><span class="num">5</span>灰度与回滚</h2>
+  <p>prompt 变更的灰度比模型变更简单（它是纯配置），<strong>但有两个 prompt 特有的注意点。</strong></p>  <ol>
+    <li><strong>灰度的分流必须按稳定 ID，不能按请求随机。</strong><em>按请求随机会让同一个用户在同一个会话里遇到两套 prompt</em>——而多轮对话里这会产生不一致的行为（模块 03 提过的指代改写就依赖历史）。</li>
+    <li><strong>回滚必须是「切一个指针」，而不是「把 prompt 改回去」。</strong><em>改回去意味着有人要手动编辑，而手动编辑会引入新的差异</em>（模块 01 练习 4 的 <code>audit</code> 正是抓这个）。<strong>正确形状：<code>ACTIVE -> v3</code> 这一个指针，旧版本文件原样保留。</strong></li>
+  </ol>  <div class="ascii">   灰度期间必须分桶看指标（否则新旧被平均掉）
+
+              旧配置 (90%)        新配置 (10%)
+   parse_rate     1.00               1.00      ✓
+   end_to_end     0.72               0.75      ✓
+   by_label:
+     bug          0.80               0.85
+     other        0.65               0.40      ← **这一层塌了**
+   pred_dist PSI    —                0.31      ← 与「other 塌了」一致
+
+   总分（加权平均）: 0.723 → 0.723   ← **看不出任何问题**</div>  <p><strong>上面那张表是灰度里最常见的失败模式</strong>：<em>新配置在某一层塌了，但因为它只占 10% 流量，总分完全看不出来</em>。<strong>所以灰度期间的指标必须按分桶 × 分层同时切。</strong></p>  <div class="callout warn"><span class="label"></span>
+    <p>还有一条容易忘的：<strong>灰度期间两套配置的指纹都要出现在每一条日志里。</strong><em>否则你无法把指标归因到具体哪一套</em>——而这正是 C68 模块 00「可归因性」的要求。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="monitoring"><span class="num">6</span>监控四项（都不需要真值）</h2>
+  <table>
+    <thead><tr><th>指标</th><th>怎么算</th><th>它能抓到什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>解析率</strong></td><td>解析成功的请求占比</td><td><strong>模型换版本、格式依从度下降</strong>；<em>用了解码约束时它恒为 1，掉下来就是实现 bug（模块 04 练习 4）</em></td></tr>
+      <tr><td><strong>修复率 / 重试率</strong></td><td>被语法修复过 / 重试过的占比</td><td><strong>最灵敏的早期信号</strong>——<em>它在解析率还是 1.0 的时候就会先动</em></td></tr>
+      <tr><td><strong>预测标签分布</strong></td><td>各标签占比 + 相对基线的 PSI</td><td>顺序偏置、示例池漂移、模型换版本（三者都表现为分布偏移）</td></tr>
+      <tr><td><strong>无内容探针的输出</strong></td><td>定时用 <code>N/A</code> 打一次</td><td><strong>标签先验的变化</strong>——<em>它是一次调用，而且它把「模型的默认倾向变了」变成一个可比的字符串</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第二项是这四项里最有价值的一个</strong>，因为它的灵敏度最高：<em>模型的格式依从度下降时，先出现的是「需要修复」，之后才是「修不动了 → 解析失败」</em>。<strong>所以修复率是解析率的前导指标。</strong><em>而它只有在修复被显式记录时才存在——静默修复会把这个信号丢掉（模块 04 第 7 节）。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第四项是本课特有的、成本极低的一个监控点：<strong>无内容探针每小时一次调用，就能持续跟踪标签先验。</strong><em>它变化时，要么是模型变了、要么是示例池变了、要么是有人改了顺序</em>——<strong>三种原因都值得知道，而三种都不会在准确率上立刻显现。</strong>（探针的机制在模块 02 第 5 节。）</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="failures"><span class="num">7</span>六个失效模式</h2>
+  <table>
+    <thead><tr><th>失效</th><th>根因</th><th>信号</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>模型静默更新</strong></td><td>模型 ID 没钉版本</td><td>预测分布 PSI + 探针输出变化</td><td><strong>钉死版本并写进指纹</strong></td></tr>
+      <tr><td><strong>换模型后效果掉</strong></td><td>prompt 层优化拟合的是旧模型</td><td>分层准确率某几层下降</td><td>为新模型重做顺序 + 校准（第 2 节那张表的下半部分）</td></tr>
+      <tr><td><strong>解析率缓慢下降</strong></td><td>格式依从度漂移</td><td><strong>修复率先上升</strong></td><td>上解码约束（模块 04）</td></tr>
+      <tr><td><strong>某一层塌了但总分没动</strong></td><td>灰度流量占比小 / 类别不平衡</td><td>分桶 × 分层的指标</td><td><strong>门禁按层判，不按总分判</strong></td></tr>
+      <tr><td><strong>成本涨了但没人知道为什么</strong></td><td>换了示例策略 → 前缀缓存失效</td><td>缓存命中率 + 输入 token 数</td><td>分桶 kNN；把 $h$ 写进成本模型（第 4 节）</td></tr>
+      <tr><td><strong>回滚失败</strong></td><td>回滚需要手动改 prompt</td><td>—</td><td><strong>回滚必须是切指针；旧版本文件原样保留</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>六条里有四条的信号都不是准确率。<strong>这正是本模块的要点：prompt 层的问题大多在准确率上「反应很慢」，而在解析率、修复率、分布、探针上「反应很快」。</strong><em>只监控准确率，等于把所有问题都延迟到它们变严重之后才发现。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ops-card"><span class="num">8</span>prompt 运维卡 + 门禁</h2>
+  <div class="ascii">   prompt 运维卡（每次变更 / 迁移 / 灰度推进时生成）
+
+   bundle:            classify_feedback/v7
+   model:             model-b@2026-06-01        ← **钉死，不写 latest**
+   prompt_fp:         9c31a7f2   （签名+指令+示例(有序)+格式+解码+模型+温度）
+   changelog:         v7: 为 model-b 重做示例顺序与校准（迁移）
+   decoding:          constrained(json schema)  → parse_rate 应恒为 1.0
+
+   可迁移部分:        signature / domain / format / decoding    （未改）
+   不可迁移部分:      demo_order / instruction_wording / calib  （已为 b 重做）
+
+   离线:  parse_rate 1.00 ✓   分层准确率 每层 ≥ 基线−2σ ✓
+   观测:  pred_dist PSI 0.28（换模型必然变，不设阻断）
+          无内容探针 other → billing（先验变了，已重做校准）
+   成本:  输入 token 1,840（+12%，tokenizer 不同）× 单价 0.6× → 总成本 0.67×
+          前缀缓存命中率 0.88（分桶 kNN，8 桶）
+
+   灰度:  1% → 10%（当前）；分桶 × 分层指标均达标
+   回滚:  ACTIVE -&gt; v6，旧版本文件保留至 2026-09-30</div>  <h3>门禁（按 C68 模块 04 分级）</h3>  <ul>
+    <li><strong>确定性阻断</strong>：模型 ID 含 <code>latest</code> 或不带版本；指纹变了但 CHANGELOG 没动；启用约束但解析率 &lt; 1.0；<em>回滚指针缺失或指向不存在的版本</em></li>
+    <li><strong>统计阻断</strong>：<em>任一分层</em>的准确率相对基线下降超过 $2\sigma$</li>
+    <li><strong>报警</strong>：修复率或重试率上升；探针输出变化；总成本上升超过阈值</li>
+    <li><strong>观测（不设阈值）</strong>：预测分布 PSI</li>
+  </ul>  <p><strong>这张卡里最重要的一行仍然是最后一行</strong>——<em>与 C70 模块 05 完全一致</em>：<strong>如果回滚需要手动编辑 prompt，那么这次变更是不可回滚的，不该上线。</strong></p>
+
+  <!-- ========================================================= -->
+  <h2 id="timeline"><span class="num">9</span>一次真实迁移的时间线</h2>
+  <p>把第 3 节的流程放到日历上。<strong>这个时间线的形状本身是结论：影子期比切换期长得多。</strong></p>  <div class="ascii">   第 1 周  建影子环境
+            portable/ 原样复用（签名 / 取值域 / 格式 / 解码约束）
+            为新模型建一份 models/model-b@.../，先直接搬旧配置
+            **先只跑离线**：分层准确率 + 解析率
+
+   第 2 周  为新模型重做不可迁移的那一半
+            示例顺序（搜一遍）· 指令措辞（小幅搜）· 校准（重测先验）
+            产出一份优化报告（按模块 03 的规矩：空间大小 / 候选数 / 留出集分数）
+
+   第 3 周  一致性校验 + 决定要不要迁
+            三条校验（解析率 / 分层准确率 / PSI 观测）
+            **允许的结论包括「不迁」**（练习 2 的 'stay'）
+
+   第 4 周  灰度 1% → 10%，按稳定 ID 分流
+            每天看分桶 × 分层的指标 + 监控四项
+
+   第 5 周  灰度 50% → 100%
+   第 6 周  观察期结束，删除旧配置（在此之前回滚随时可用）</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>三个容易被压缩掉、但不该压缩的环节。</strong><em>① 第 2 周「重做那一半」经常被跳过</em>——直接搬旧配置上线，而第 2 节量过它会掉到基线以下。<em>② 第 3 周「允许不迁」经常不被当成一个真实选项</em>——而一旦迁了，你就失去了对照。<em>③ 第 6 周之前不删旧配置</em>——<strong>删得太早等于放弃回滚。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>反过来，<strong>有一个环节经常被过度投入：灰度的档位数。</strong><em>prompt 变更是纯配置，它不像模型部署那样有资源风险</em>，所以 1% → 10% → 50% → 100% 四档通常够了。<strong>真正决定安全性的不是档位多细，而是每一档有没有按「分桶 × 分层」看指标</strong>——<em>第 5 节量过：新配置在某一层塌了，而总分完全看不出来。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ownership"><span class="num">10</span>prompt 的所有权与评审</h2>
+  <p>最后一个问题是组织性的，<strong>但它决定了前面所有机制会不会被执行。</strong></p>  <table>
+    <thead><tr><th>资产</th><th>谁拥有</th><th>评审要看什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>portable/</strong>（签名 / 取值域 / 格式 / 解码约束）</td><td><em>与下游消费方共同拥有</em></td><td><strong>改它等于改接口</strong>——取值域增删、字段增删都要通知下游</td></tr>
+      <tr><td><strong>models/&lt;model&gt;/</strong>（指令 / 示例 / 校准）</td><td>做这个功能的团队</td><td><em>指纹变了吗？CHANGELOG 写了吗？留出集分数报了吗？</em>（模块 01/03 的门禁）</td></tr>
+      <tr><td><strong>示例池</strong></td><td><em>与标注/运营共同拥有</em></td><td>覆盖度、泄漏检查、回灌占比（模块 02 第 6/7 节）</td></tr>
+      <tr><td><strong>ACTIVE 指针</strong></td><td>值班/发布负责人</td><td><strong>改它就是一次发布</strong>——要有发布记录与回滚预案</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这张表最重要的一行是第一行。</strong><em>取值域与输出格式是接口</em>，而「加一个标签」「把 <code>confidence</code> 从必填改成可选」<strong>是一次会破坏下游的变更</strong>——<em>但因为它「只是改了 prompt」，通常不会走接口变更的流程</em>。<strong>把 portable/ 单独成目录、单独设 owner，就是为了让这件事变得显眼。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>评审的最小要求可以压成三个问题，<strong>而它们全都能从门禁的输出里直接读到</strong>：<em>① 指纹变了吗、CHANGELOG 写了吗？② 留出集（不是搜索集）上的分层结果是什么？③ 回滚指针指向哪里、旧配置保留到什么时候？</em><strong>三个都答得上来时，这次变更就是可追溯、可评估、可撤销的</strong>——<em>而这三条恰好就是本课五个模块想要换来的全部东西。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="course-recap"><span class="num">11</span>全课回顾：五个模块为什么是这个顺序</h2>
+  <p>这是本课的最后一节。<strong>五个模块的顺序不是叙述方便，它是由效应量与成本决定的。</strong></p>  <table>
+    <thead><tr><th>模块</th><th>它换来什么</th><th>成本</th><th>为什么排在这个位置</th></tr></thead>
+    <tbody>
+      <tr><td><strong>01 契约</strong></td><td>「哪一层出了问题」变成可判定的</td><td>几百行代码 + 一次目录重构</td><td><strong>它是其余四个模块的前提</strong>——<em>没有分层指标，后面所有改动都无法被评估</em></td></tr>
+      <tr><td><strong>02 示例</strong></td><td>覆盖度（正确性）+ 顺序（三倍差距）</td><td><strong>前三步成本为零</strong></td><td>效应量最大而成本最低的一层，所以排第二</td></tr>
+      <tr><td><strong>03 优化</strong></td><td>在已定的空间里找一个更好的点</td><td>一整套评测的算力 + 留出集</td><td><em>它的前提是「噪声已知、目标可靠、有留出集」</em>——所以必须在 01/02 之后</td></tr>
+      <tr><td><strong>04 约束</strong></td><td><strong>解析率的保证（而不是改善）</strong></td><td>改推理栈或用现成实现</td><td><em>它能替代掉一部分 03 的工作</em>（格式问题不必再搜），<strong>而且它跨模型保留</strong></td></tr>
+      <tr><td><strong>05 运维</strong></td><td>这套东西在换模型、换版本之后还成立</td><td>目录结构 + 门禁 + 监控四项</td><td><strong>它保护前四个模块的产出</strong>；<em>而它同时告诉你哪一半会报废</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>把 05 的结论反向套回全课，会得到一个有点意外的排序建议。</strong><em>本模块第 2 节量到：没调过的 prompt 跨模型分数完全相同，而调过的会掉到基线以下</em>。<strong>也就是说：模块 03 的产出是最容易报废的资产，而模块 01 与 04 的产出（契约、约束）是最耐久的。</strong><em>如果你预期一年内会换模型，那么把预算从 03 挪到 01 与 04 是一个理性的选择。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>而模块 02 的位置很特殊：<strong>它的前三步（覆盖、泄漏、顺序）成本为零，但顺序那一项是不可迁移的。</strong><em>所以正确的做法是「做，但记录它是模型特定的」</em>——把它放进 <code>models/&lt;model&gt;/</code> 而不是 <code>portable/</code>，<strong>换模型时重跑那个零成本的搜索就行</strong>。<em>这也是本课最后一个具体建议：不可迁移不等于不该做，它只决定了这份产出该放在哪个目录里。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="last-word"><span class="num">12</span>最后一条：这一层的价值不在分数上</h2>
+  <p>本课量了很多分数：三倍的顺序差距、$10^8$ 的空间压缩、0.081 nat 的分布失真。<strong>但这一层最终交付的东西不是分数。</strong></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>把五个模块的产出列出来看：<em>三个可分层的指标、一套零误报的契约检查、一份可 diff 的示例文件、一个带候选数与留出集分数的优化报告、一个解析率的保证、一张运维卡与一个回滚指针</em>。<strong>它们全部是「让变化变得可见、可评估、可撤销」的机制</strong>，而不是「让分数更高」的技巧。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么这个区分重要？<em>因为分数会随模型变化（模块 05 第 2 节：为 A 调的东西在 B 上更差），而这些机制不会</em>。<strong>换模型时，你的示例顺序报废了，但「三个量分别打点」「指纹与 CHANGELOG 对齐」「留出集与搜索集分开」这些机制原样继续工作</strong>——<em>而正是它们让你在第二次、第三次换模型时越来越快。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>所以如果要给这门课一句真正的总结，不是「怎么把 prompt 写好」，而是：<strong>怎么让「prompt 变好了还是变坏了」这个问题有一个可以被回答的形式。</strong><em>而这个形式一旦建立，写好它就变成了一件可以迭代的常规工作</em>——这也是「把 prompt 当程序」这句话的全部意思。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_constrained_decoding/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 受限解码与结构化输出</div></a>
+  </div>
+
+</div>
+</body>
+</html>

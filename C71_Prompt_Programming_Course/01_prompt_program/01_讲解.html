@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · prompt program 与可组合结构</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · prompt program 与可组合结构</h1>
+  <p class="subtitle"><strong>签名先于 prompt</strong>——契约可以被机械检查，prompt 不能；<em>三个检查（取值域在指令里 / 格式字段名一致 / 解析器读的字段已声明）全都不需要调用模型</em> · <strong>端到端 = 解析率 × 给定解析的正确率</strong>，两个因子的改进手段完全不同；<em>只报乘积时，「放宽取值域」这种有害改动看起来是改进</em> · <strong>取值域是唯一「缺了就归零」的槽位</strong>；而消融还暴露出一件更有意思的事——<em>只删取值域时端到端是 20% 而不是 0，因为兜底槽位那句话「意外地」声明了一个标签</em>：<strong>指令的槽位不是独立的，边际贡献不可加</strong> · <strong>组合的错误传播是<em>精确的</em>乘法</strong>（$p_1 \times p_2$ 与实测端到端相等），所以拆成多级要满足三个条件之一，否则不该拆 · <strong>上一级解析失败时下一级不该被调用</strong>——否则 <code>None</code> 被渲染进 prompt · <strong>每多一个输出字段就多一个解析失败入口</strong>；而解析失败是全或无的 · <strong>「指纹变了但 CHANGELOG 没动」是一条零误报的检查</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 00（四个部件与三个量）；会用 <code>json</code> 与简单的类</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_prompt_program.ipynb（Signature 作为一等对象与它的 validate / 指令的五个槽位逐个删掉并量症状 / 两级流水线的错误传播是乘法 / 三种输出格式的解析鲁棒性 / 重试的选择偏倚初探 / prompt 版本化与回归门禁）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Omar Khattab et al., <em>DSPy: Compiling Declarative Language Model Calls into Self-Improving Pipelines</em>（2023）——signature / module / compile 三层抽象 · <em>pydantic</em> / <em>JSON Schema</em>（输出契约的事实标准）· 本课程 C03 模块 03（答案抽取与 unparseable）· C68 模块 01（spec 是纯数据）· C34（多步编排的错误传播）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#signature">签名先于 prompt</a></li>
+      <li><a href="#three-numbers">三个量必须一起报（这一节给出为什么）</a></li>
+      <li><a href="#compose">组合：错误传播是乘法</a></li>
+      <li><a href="#instruction-slots">指令的五个槽位</a></li>
+      <li><a href="#format-choice">输出格式三选：不是越结构化越好</a></li>
+      <li><a href="#retry-bias">重试的选择偏倚（初探）</a></li>
+      <li><a href="#versioning">变更即发布</a></li>
+      <li><a href="#antipatterns">五个反模式</a></li>
+      <li><a href="#checklist">一个 prompt program 的最小工程清单</a></li>
+      <li><a href="#dspy-map">与 DSPy 的概念对应</a></li>
+      <li><a href="#summary-discipline">三条纪律的完整形式</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="signature"><span class="num">1</span>签名先于 prompt</h2>
+  <p>模块 00 把一次调用拆成了四个部件。<strong>这一节再往前一步：先定义契约，再写 prompt。</strong></p>  <div class="ascii">   Signature（契约）                        prompt（实现）
+
+   inputs:  {feedback: str}                「把用户反馈分类。
+   output:  {label: Label,                  标签只能是 bug / feature / …
+             reason: str}                   输出 JSON：{"label": …, "reason": …}」
+   Label:   bug|feature|billing|
+            account|other                   ↑ 这一段是**可替换的**
+   parse:   json → validate                   而上面那个契约不是
+
+   关系：**一个签名可以有很多种 prompt 实现**（模块 03 的搜索空间就是它们）；
+        而换 prompt 不该改签名 —— 改签名意味着下游要改。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这个顺序重要？因为<strong>签名是可以被机械检查的，而 prompt 不是</strong>。<em>「输出必须是这五个标签之一」是一个断言；「这段指令写得清楚吗」不是</em>。<strong>把契约独立出来之后，你得到了一个不依赖任何模型就能跑的测试</strong>——而这是这一层能进 CI 的前提。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更实际的一点：<strong>签名决定了「解析失败」这件事是否可判定</strong>。<em>没有取值域声明时，<code>parse</code> 只能返回模型说的那个字符串，而「模型自创了一个标签」与「模型答错了」无法区分</em>。<strong>有取值域之后，前者变成 <code>None</code>，后者变成一个错标签</strong>——两个不同的失败，两套修法（模块 00 第 4 节量过：一个是 100% 解析失败，一个是准确率掉一半）。</p></div>
+  </div>  <h3>签名的四个字段，每一个都有具体用途</h3>  <table>
+    <thead><tr><th>字段</th><th>内容</th><th>谁用它</th></tr></thead>
+    <tbody>
+      <tr><td><strong>inputs</strong></td><td>输入字段名与类型</td><td>渲染器；<em>以及组合时的类型检查（第 3 节）</em></td></tr>
+      <tr><td><strong>output</strong></td><td>输出字段名</td><td>解析器；<em>它必须与格式规范里的字段名一致——不一致是一个真实的 bug 源</em></td></tr>
+      <tr><td><strong>domain</strong>（取值域）</td><td>枚举、区间、正则或 schema</td><td><strong>解析器的合法性判定</strong>；以及模块 04 的解码约束</td></tr>
+      <tr><td><strong>invariants</strong>（不变量）</td><td>跨字段的约束，比如「reason 非空」「置信度在 [0,1]」</td><td><em>它抓的是「格式对但内容荒谬」这一类</em>，比如 <code>confidence = 7.5</code></td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>一个立刻可用的检查：<strong>把签名里的取值域和指令里出现的取值域做字符串比对。</strong><em>不一致 → 阻断</em>。这一项是确定性的、零误报的，而它防住的是模块 00 第 4 节那个「解析失败率 100%」的故障。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="three-numbers"><span class="num">2</span>三个量必须一起报（这一节给出为什么）</h2>
+  <p>模块 00 已经引入了三个量。<strong>这一节说明为什么它们不能互相替代——以及为什么只报端到端会让优化走向错误的方向。</strong></p>  <div class="math-block">\[\text{end-to-end} = \underbrace{P(\text{parse ok})}_{\text{契约层}} \times \underbrace{P(\text{correct} \mid \text{parse ok})}_{\text{能力层}}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这是一个乘法分解，而两个因子的改进手段完全不同。</strong><em>第一个因子靠指令、格式规范、解码约束提高（便宜、确定、可以做到 1.0）；第二个因子靠示例选择、更强的模型、微调提高（贵、不确定、有上界）</em>。<strong>只报乘积时，你不知道该动哪一个。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更糟的是：<strong>只报乘积会让某些「改进」看起来有效而实际有害</strong>。<em>例子：把取值域放宽（允许模型输出任意字符串）会让解析率变成 1.0，于是端到端上升</em>——<strong>但这只是把「解析失败」重新标记成了「答错」，而下游拿到的是一个不在枚举里的值，可能直接崩</strong>。<em>三个量一起报时，这个「改进」会立刻暴露：解析率 1.0 而 acc-given-parsed 掉了。</em></p></div>
+  </div>  <table>
+    <thead><tr><th>情形</th><th>parse_rate</th><th>acc\|parsed</th><th>end-to-end</th><th>该做什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>契约没定清</strong></td><td>0.0–0.6</td><td>可能很高</td><td>低</td><td><strong>先修契约</strong>（指令写全取值域、规定格式）；<em>不要碰示例</em></td></tr>
+      <tr><td><strong>能力不够</strong></td><td>1.0</td><td>低</td><td>低</td><td>示例选择（模块 02）→ 自动优化（模块 03）→ 才考虑换模型</td></tr>
+      <tr><td><strong>部分解析失败</strong></td><td>0.6–0.95</td><td>偏高（<em>有偏</em>）</td><td>中</td><td><strong>最危险</strong>：被丢掉的样本不是随机的（第 5 节）</td></tr>
+      <tr><td><strong>健康</strong></td><td>1.0</td><td>高</td><td>高</td><td>看分层指标找残余问题</td></tr>
+    </tbody>
+  </table>  <p><strong>第三行的「偏高」是一个真实的估计偏差</strong>：<em>解析失败的样本往往是模型「更不确定、更想多说话」的那些，而它们也更可能答错</em>。所以在解析成功的子集上算准确率，<strong>系统性地高估了模型的能力</strong>。第 5 节会量出这个偏差，模块 04 会给出修法。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="compose"><span class="num">3</span>组合：错误传播是乘法</h2>
+  <p>把一个任务拆成两步（先粗分再细分）是一个很自然的想法。<strong>但它有一个不那么直观的代价。</strong></p>  <div class="ascii">   单级                        两级
+
+   feedback ──► [5 分类] ──► label     feedback ──► [是不是技术问题?] ──┬─► [bug/feature]
+                                                                       └─► [billing/account/other]
+
+   两级的端到端准确率 = P(第一级对) × P(第二级对 | 第一级对)
+
+   0.90 × 0.90 = 0.81   ← 两个「都挺好」的模块，合起来是 0.81
+   0.95 × 0.95 = 0.90
+   三级: 0.95³ = 0.857</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>错误传播是乘法，所以级数是一个成本。</strong><em>而人们拆分任务的直觉通常是「每一步更简单所以每一步更准」</em>——这没错，但要赢下来，<strong>每一步的准确率提升必须补偿掉多乘一次的损失</strong>。notebook 第 3 节在同一个任务上把单级与两级都跑一遍，<em>结果是单级更好</em>——这在小标签集上很常见。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>什么时候两级会赢？三种情况：<strong>① 第一级近乎无误</strong>（比如靠规则而不是模型判定），于是乘法的损失接近 0；<strong>② 子任务的标签集差异很大</strong>，合成一级会让指令与示例互相干扰；<strong>③ 子任务需要不同的上下文</strong>（比如一支只需要产品文档、另一支只需要账务规则），<em>合成一级会让每次调用都带上两倍的上下文</em>。<strong>反过来说：如果三条都不成立，就不该拆。</strong></p></div>
+  </div>  <h3>组合时必须显式处理的三件事</h3>  <ol>
+    <li><strong>类型检查</strong>：上一级的 <code>output</code> 必须能喂进下一级的 <code>inputs</code>。<em>这是签名的直接用途，而它可以在不调用模型的情况下检查</em>。</li>
+    <li><strong>解析失败的传播</strong>：上一级解析失败时，下一级<em>根本不该被调用</em>。<strong>否则你会把 <code>None</code> 渲染进下一级的 prompt</strong>——而那通常表现为「模型答了一个莫名其妙的东西」，很难定位。</li>
+    <li><strong>每一级的三个量都要分别记录</strong>。<em>只记端到端时，「第一级解析失败率上升」这件事在指标上表现为「整体效果下降」，而你会去优化第二级。</em></li>
+  </ol>  <div class="callout warn"><span class="label"></span>
+    <p>一个具体的反模式：<strong>把「重试」当成一级</strong>。<em>「解析失败就重试三次」看起来是提高鲁棒性，但它同时改变了你的样本分布</em>——第 5 节会量出这个偏倚，而模块 04 会说明为什么<strong>约束优于重试</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="instruction-slots"><span class="num">4</span>指令的五个槽位</h2>
+  <p>指令看起来是一段自由文本，<strong>但它实际上有五个功能不同的槽位，而每个槽位缺失的症状不一样。</strong></p>  <table>
+    <thead><tr><th>槽位</th><th>内容</th><th>缺失的症状</th><th>严重程度</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 任务</strong></td><td>要做什么</td><td>输出跑题；<em>但通常示例能救回来</em></td><td>中</td></tr>
+      <tr><td><strong>② 取值域</strong></td><td>标签集 / 值域 / schema</td><td><strong>模型自创值 → 解析失败率 100%</strong></td><td><strong>致命</strong></td></tr>
+      <tr><td><strong>③ 输出格式</strong></td><td>怎么输出、字段名</td><td>部分解析失败（<em>最麻烦的一种</em>）</td><td><strong>高</strong></td></tr>
+      <tr><td><strong>④ 边界与兜底</strong></td><td>「都不符合时输出 other」「信息不足时输出 unknown」</td><td><strong>模型被迫在不合适的选项里挑一个</strong>，<em>于是错误集中在边缘样本上</em></td><td>高</td></tr>
+      <tr><td><strong>⑤ 禁止项</strong></td><td>「不要解释」「不要输出 markdown 代码块」</td><td>输出里裹了一层 ```json，解析器要么处理它要么失败</td><td>中</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第 4 个槽位最容易被忘，而它的症状最容易被误读。</strong><em>没有兜底选项时，模型必须在给定的类里挑一个</em>，于是「其实不属于任何一类」的样本会被随机分配。<strong>在指标上这表现为「某几个类的精确率低」，而实际原因是缺一个 <code>other</code>。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第 5 个槽位（禁止项）值得单独一提：<strong>它是唯一一个「不加也能工作，但加了能显著降低解析器复杂度」的槽位。</strong><em>每一条禁止项都对应解析器里的一段清洗代码</em>——去代码块围栏、去前后解释、去 markdown 加粗。<strong>把它写进指令，等于把清洗成本从每次调用移到一次性的一句话上。</strong><em>但也不要指望它 100% 生效——解析器仍然要能处理没生效的情况。</em></p></div>
+  </div>  <p><strong>notebook 第 2 节把五个槽位逐个删掉</strong>，量出每一个的边际贡献。<em>结论是取值域与格式两项占了绝大部分</em>，而它们恰好是最便宜、最确定的两项——<strong>这也解释了为什么「先修契约」是正确的顺序。</strong></p>
+
+  <!-- ========================================================= -->
+  <h2 id="format-choice"><span class="num">5</span>输出格式三选：不是越结构化越好</h2>
+  <table>
+    <thead><tr><th>格式</th><th>例子</th><th>解析鲁棒性</th><th>成本</th><th>什么时候用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>裸值</strong></td><td><code>bug</code></td><td><em>只要模型多说一个字就失败</em></td><td>最低（几个 token）</td><td><strong>配上解码约束时最优</strong>（模块 04）；不配约束时最脆</td></tr>
+      <tr><td><strong>JSON 单字段</strong></td><td><code>{"label": "bug"}</code></td><td>较好；<em>能容忍前后有解释（可以正则抽取）</em></td><td>低</td><td><strong>默认选择</strong></td></tr>
+      <tr><td><strong>JSON 多字段（带理由）</strong></td><td><code>{"reason": "…", "label": "bug"}</code></td><td>好；<em>而且字段顺序会影响质量</em></td><td>高（理由的 token 数远超标签）</td><td>需要可解释性、或需要理由参与后续判断时</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>「带理由的 JSON」有一个容易被忽略的设计点：字段顺序。</strong><em>把 <code>reason</code> 放在 <code>label</code> 之前，模型在生成标签时已经写过理由</em>；<strong>反过来则理由是对已给答案的事后合理化</strong>。<em>这两者在质量上通常不同，而它是一个纯粹的格式设计选择。</em>notebook 不模拟这个效应（它需要真实模型的自回归性质），<strong>但工程上必须知道「字段顺序是一个可调项」，并把它写进指纹。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>另一个反直觉的点：<strong>更结构化不一定更鲁棒</strong>。<em>嵌套很深的 schema 会引入更多可能出错的地方（少一个括号、字段名拼错、类型不对）</em>，而<strong>解析失败是全或无的</strong>。<em>所以 schema 的复杂度应当由下游<strong>真正需要</strong>的字段决定，而不是「顺便多要几个」</em>。<strong>每多一个字段，就多一个解析失败的入口。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一条实用的规则：<strong>先用 JSON 单字段跑通并把解析率做到 1.0，再考虑加字段。</strong><em>而每加一个字段都要重新量解析率</em>——它不会自动保持 1.0。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="retry-bias"><span class="num">6</span>重试的选择偏倚（初探）</h2>
+  <p>解析失败时重试，是几乎所有系统的默认做法。<strong>它有效，但它会改变你测到的分布。</strong></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>机制：<strong>「重试直到解析成功」会系统性地丢掉那些「模型倾向于不按格式回答」的样本</strong>。<em>而这些样本通常是模型更不确定的那些，也就是更可能答错的那些。</em><strong>于是在「解析成功」的样本上算准确率，会高估真实能力。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：设样本的难度是 $d$，解析成功概率 $P(\text{parse} \mid d)$ 随 $d$ 递减，正确概率 $P(\text{correct} \mid d)$ 也随 $d$ 递减。<strong>则条件期望 $E[\text{correct} \mid \text{parse ok}] > E[\text{correct}]$</strong>——<em>因为条件化在一个与正确性正相关的事件上</em>。notebook 第 5 节把这个偏差量出来：<strong>只在解析成功的样本上报分，比真实端到端高出可观的一截。</strong></p></div>
+  </div>  <h3>三条纪律</h3>  <ol>
+    <li><strong>重试的次数与最终是否成功必须被记录</strong>，<em>而且报告里要写明「N 个样本经过重试」</em>。这与 C68 模块 02 的「失败分类必须报告比例」是同一条。</li>
+    <li><strong>报分的分母必须是全部样本，解析失败记为错</strong>。<em>「在解析成功的样本上准确率 92%」这句话可以说，但不能单独说</em>——它必须与解析率一起出现。</li>
+    <li><strong>重试的触发条件只能是「解析失败」，不能是「结果看起来不对」</strong>。<em>后者是在用真值调参</em>——与 C68 模块 02 的「重试只能看异常类型，不能看判分结果」完全同构。</li>
+  </ol>  <p><strong>而根本的修法是模块 04 的解码约束</strong>：<em>让不合法的输出在生成时就不可能产生</em>，于是解析率恒为 1.0，重试与它带来的偏倚一起消失。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="versioning"><span class="num">7</span>变更即发布</h2>
+  <p>prompt 是<strong>唯一一处「改一个字就直接改变生产行为、却通常不进 code review、不进 CI、不进版本记录」的地方</strong>。</p>  <div class="ascii">   一个最小可用的 prompt 版本化
+
+   prompts/
+     classify_feedback/
+       v3/
+         signature.json     ← 契约（inputs/output/domain/invariants）
+         instruction.txt    ← 五个槽位
+         demos.jsonl        ← **有序**，顺序是内容的一部分
+         format.json        ← 输出格式规范
+         decoding.json      ← 解码约束（模块 04）
+         CHANGELOG.md       ← 为什么改，量到的变化是多少
+       v4/ ...
+     ACTIVE -&gt; v3           ← 一个指针（与 C70 模块 05 的索引切换同构）
+
+   指纹 = sha256(signature + instruction + demos(有序) + format + decoding
+                 + model_id + temperature)</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>把 demos 存成文件而不是代码里的列表，是这套结构里最有价值的一步。</strong><em>它让「示例集合与顺序」变成可 diff、可 review、可回滚的数据</em>，而不是散落在代码里的字符串。<strong>而模块 03 的自动优化产出的正是这个文件</strong>——于是「人手改」与「自动搜」产出同一种资产。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>回归门禁按 C68 模块 04 分级：<strong>确定性阻断</strong>（签名里的取值域与指令里的不一致；格式规范的字段名与解析器不一致；指纹变了但 CHANGELOG 没动），<strong>统计阻断</strong>（分层准确率相对基线下降超过按方差推出的阈值），<strong>报警</strong>（预测标签分布的 PSI —— 它抓的是顺序偏置与示例漂移）。<em>把统计项设成阻断是「门禁被关掉」这一结局的起点。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>最后一条确定性检查值得单独说：<strong>「指纹变了但 CHANGELOG 没动」是一个纯粹的算术检查</strong>，零误报，而它防住的是本模块最想防的那件事——<em>一次没人知道发生过的 prompt 变更</em>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="antipatterns"><span class="num">8</span>五个反模式</h2>
+  <table>
+    <thead><tr><th>反模式</th><th>为什么有人这么做</th><th>后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>只报端到端一个数</strong></td><td>「一个数好比较」</td><td>格式问题与能力问题混在一起；<em>放宽取值域这种有害改动看起来是改进</em>（第 2 节）</td></tr>
+      <tr><td><strong>示例硬编码在代码里</strong></td><td>「就几个例子」</td><td>顺序不进版本、不进 diff、不进指纹；<strong>而顺序有真实影响</strong>（模块 00 第 6 节量过）</td></tr>
+      <tr><td><strong>指令里不写取值域</strong></td><td>「示例里已经有了」</td><td><strong>解析失败率 100%</strong>——示例不能替代取值域声明（第 4 节）</td></tr>
+      <tr><td><strong>为了「更结构化」加字段</strong></td><td>「以后可能有用」</td><td>每多一个字段就多一个解析失败入口，而解析失败是全或无的（第 5 节）</td></tr>
+      <tr><td><strong>拆成多级流水线</strong></td><td>「每一步更简单」</td><td><em>错误传播是乘法</em>；两个 0.9 合起来是 0.81（第 3 节）。<strong>拆分要满足三个条件之一，否则不该拆</strong></td></tr>
+    </tbody>
+  </table>  <p><strong>这五条有一个共同点：它们都让「哪一层出了问题」变得不可判定。</strong><em>而本模块的全部内容就是把这件事变回可判定的</em>——签名给出契约、三个量给出分层、组合显式化错误传播、版本化让每次变更留下痕迹。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="checklist"><span class="num">9</span>一个 prompt program 的最小工程清单</h2>
+  <p>把前八节压成一张可勾选的清单。<strong>它的顺序就是投入的顺序。</strong></p>  <ol>
+    <li><strong>写签名，不写 prompt</strong>——输入字段、输出字段、取值域、不变量。<em>这一步不需要任何模型，而它产出的三个检查可以立刻进 CI。</em></li>
+    <li><strong>把解析器与格式规范一起写</strong>，并让它们同源生成。<em>手写 schema 给模型、手写解析器读结果，两者必然漂移。</em></li>
+    <li><strong>指令按五个槽位写全</strong>，尤其是取值域（缺了就归零）与边界兜底（缺了会让错误集中在边缘样本上）。</li>
+    <li><strong>三个量分别打点</strong>：解析率 / 给定解析的正确率 / 端到端。<em>只报第三个时，第一个的问题会被误读成模型能力问题。</em></li>
+    <li><strong>示例存成有序文件</strong>（不是代码里的列表），并进指纹。<em>顺序是内容的一部分。</em></li>
+    <li><strong>加一个 <code>ACTIVE</code> 指针</strong>与 CHANGELOG，并在 CI 里跑 <code>audit</code>。<em>没有这一步，「改一个字」就是一次没人知道的发布。</em></li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这张清单里没有一项是「把 prompt 写得更好」。</strong><em>全部六项都是结构性的：契约、解析、打点、版本</em>。这不是因为措辞不重要，而是因为<strong>在结构没建起来之前，你无法判断一次措辞改动是好是坏</strong>——而那正是模块 03 要处理的问题。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>一个常见的反对意见是「我们的场景简单，不需要这些」。<em>判据很具体：如果你能回答「上一次改 prompt 是什么时候、改了什么、效果变化多少」这三个问题，那确实不需要</em>。<strong>而如果三个都答不上来，那么这套结构的成本（大约几百行代码与一次目录重构）远低于「某天发现效果掉了但不知道是什么时候开始的」的代价。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dspy-map"><span class="num">10</span>与 DSPy 的概念对应</h2>
+  <p>本课从零实现这一层，但落地时大概率会用现成框架。<strong>这一节把概念对齐，方便两边互译。</strong></p>  <table>
+    <thead><tr><th>本课的概念</th><th>DSPy 里的对应</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Signature</strong>（本模块第 1 节）</td><td><code>dspy.Signature</code></td><td>DSPy 用类的 docstring 当指令、字段注解当取值域；<em>本课把它们拆开是为了让「取值域是否在指令里出现」可以被单独检查</em></td></tr>
+      <tr><td><strong>PromptProgram</strong>（渲染 + 解析）</td><td><code>dspy.Predict</code> / <code>dspy.Module</code></td><td>DSPy 的 Module 可以组合，对应本模块第 3 节的 Pipeline</td></tr>
+      <tr><td><strong>三个量</strong></td><td>需要自己在 <code>metric</code> 里实现</td><td><strong>框架默认只给一个分数</strong>；<em>解析率与「给定解析的正确率」要自己打点</em></td></tr>
+      <tr><td><strong>示例集合与顺序</strong></td><td><code>compile()</code> 产出的 <code>demos</code></td><td><em>它是有序列表</em>——所以第 7 节「顺序进指纹」这条同样适用</td></tr>
+      <tr><td><strong>bundle 与指纹</strong></td><td><code>save()</code> / <code>load()</code> 的 JSON</td><td><strong>框架不会替你算指纹或检查 CHANGELOG</strong>——这一层要自己加</td></tr>
+      <tr><td><strong>ACTIVE 指针与回滚</strong></td><td>没有对应物</td><td><em>这是纯运维层，属于模块 05</em></td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>两句话总结这张表：<strong>框架帮你做「渲染 + 优化」，不帮你做「契约检查 + 分层打点 + 版本运维」。</strong><em>而后三件事恰好是本课模块 01 的全部内容</em>——所以用不用框架，这一层都得自己建。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="summary-discipline"><span class="num">11</span>三条纪律的完整形式</h2>
+  <p>模块 00 给出了三条贯穿全课的纪律。<strong>本模块把第一条与第三条补完了，这里写出它们的完整形式。</strong></p>  <ol>
+    <li><strong>格式合规与任务正确必须分开计。</strong>完整形式：<em>报三个量（解析率 / 给定解析的正确率 / 端到端），而且「解析成功的样本上准确率 X%」这句话不能单独出现</em>——它必须与解析率一起出现，<strong>因为解析成功与答对正相关，条件化在它上面会高估（第 5 节）</strong>。</li>
+    <li><strong>任何 prompt 改动都要在留出集上复核。</strong><em>这一条在模块 03 展开</em>，但本模块已经给出了它的前提：<strong>没有分层指标时，「复核」只能看一个总分，而总分会掩盖某一层的塌陷。</strong></li>
+    <li><strong>prompt 的每一个组成部分都要进指纹。</strong>完整形式：<em>签名、指令、示例集合<strong>与顺序</strong>、格式规范、解码约束、模型 ID、温度</em>；<strong>而 CHANGELOG 不进指纹</strong>——正因为它不进，「指纹变了但 CHANGELOG 没动」才成为一个可检查的矛盾。</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>三条纪律有一个共同的形状：<strong>它们都把一个「靠人记得」的要求，变成了一个机器可以判定的条件。</strong><em>而这正是「把 prompt 当程序」这句话的实际含义</em>——不是让 prompt 看起来像代码，而是让它享有代码已有的那些保障：类型检查、测试、版本、评审。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_demo_selection/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · few-shot 示例选择与顺序</div></a>
+  </div>
+
+</div>
+</body>
+</html>

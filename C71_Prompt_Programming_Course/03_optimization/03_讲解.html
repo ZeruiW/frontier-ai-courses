@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 自动提示优化</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 自动提示优化</h1>
+  <p class="subtitle">一次优化 = <strong>搜索空间 + 评分函数 + 搜索算法</strong>，而<em>投入顺序要反过来</em>：先把目标做可靠，最后才换强算法——<strong>因为更强的算法只是更快地找到你目标函数里的缺陷</strong> · 朴素空间 $1.5\times10^{11}$；三个<em>有依据的</em>压缩降到千量级（压缩 $10^8$ 倍）· <strong>解析率必须是硬约束不是加权项</strong>——<em>加权版本会选中解析率只有 60% 的候选</em> · <strong>候选真实能力全同时，搜索集分数也一路上涨</strong>：N=1000 时搜索集 0.836 而留出集 0.591——<em>「+24 个点」纯粹是选择造成的（C66-04 的胜者诅咒，参赛者换成了 prompt）</em> · <strong>「搜索集提升 / 留出集提升」是一个免费的过拟合指标</strong> · <strong>有偏 judge 会被优化精确利用</strong>：judge 分数升、真实准确率降、k 变大 · <strong>bootstrap 示例会自我强化</strong>（只挑当前已做对的），必须配覆盖保底 · 「留出集提升不超过 2σ 就阻断」会否掉大多数看起来漂亮的优化——<strong>而这是正确的</strong> · 「搜索集该多大」可以从 N 与目标 gap 反解</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 01（签名与三个量）与 02（示例选择与顺序）；C66 模块 04（胜者诅咒与多重比较）读过更好——本课会直接用它的结论</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_prompt_optimization.ipynb（搜索空间的大小与枚举 / 随机搜索与坐标上升 / bootstrap 示例 / 过拟合：gap 随候选数增长的精确曲线 / 有偏 judge 会被优化直接放大 / 优化器的 spec 与指纹 / 什么时候不值得优化）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Khattab et al., <em>DSPy</em>（2023）与 Opsahl-Ong et al., <em>MIPRO</em>（EMNLP 2024）——bootstrap 示例 + 指令搜索 · Yang et al., <em>Large Language Models as Optimizers</em>（OPRO, ICLR 2024）· Zhou et al., <em>Large Language Models Are Human-Level Prompt Engineers</em>（APE, ICLR 2023）· 本课程 C66 模块 04（胜者诅咒 / 多重比较 / MDE）· C67（目标函数是一个 judge，而它的偏差会被放大）· C68 模块 04（门禁阈值）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#anatomy">一次优化 = 空间 + 目标 + 算法</a></li>
+      <li><a href="#space">搜索空间：先算它有多大</a></li>
+      <li><a href="#objective">评分函数：优化器会精确利用它的每一个缺陷</a></li>
+      <li><a href="#algorithms">三种搜索算法</a></li>
+      <li><a href="#overfit">过拟合：gap 随候选数增长的精确曲线</a></li>
+      <li><a href="#when-not">什么时候不该优化</a></li>
+      <li><a href="#gate">优化器本身也要有 spec 与指纹</a></li>
+      <li><a href="#output-asset">优化的产出是一份资产，不是一次调参</a></li>
+      <li><a href="#human-vs-auto">人工改与自动搜的分工</a></li>
+      <li><a href="#recap">把三个风险重新排一遍</a></li>
+      <li><a href="#boundary">这一层的边界</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="anatomy"><span class="num">1</span>一次优化 = 空间 + 目标 + 算法</h2>
+  <p>「自动提示优化」听起来像魔法。<strong>它的机制很朴素：定义一个搜索空间、一个评分函数，然后搜。</strong>而它的全部风险也都在这三样东西里。</p>  <table>
+    <thead><tr><th>组成</th><th>它是什么</th><th>它的风险</th><th>本课在哪里处理</th></tr></thead>
+    <tbody>
+      <tr><td><strong>搜索空间</strong></td><td>候选 prompt 的集合（指令变体 × 示例子集 × 顺序 × 格式）</td><td><strong>空间越大，在搜索集上过拟合越容易</strong>——而 prompt 的空间通常大得离谱</td><td>第 2 节（大小）+ 第 5 节（过拟合的定量关系）</td></tr>
+      <tr><td><strong>评分函数</strong></td><td>评测集上的一个数（准确率 / judge 打分 / 加权组合）</td><td><strong>它的偏差会被优化过程直接放大</strong>——<em>优化器会精确地利用你目标函数里的每一个缺陷</em></td><td>第 3 节 + 第 6 节</td></tr>
+      <tr><td><strong>搜索算法</strong></td><td>随机 / 坐标上升 / 进化 / 让模型自己提候选（OPRO 式）</td><td>成本；以及<em>更强的算法会更快地过拟合</em></td><td>第 4 节</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>最后一行括号里那句话值得重读</strong>：<em>搜索算法变强不总是好事</em>。更强的算法在同样的预算下评估更多候选、或者更有效地朝着目标函数上升——<strong>而如果目标函数有缺陷，它就更快地找到那个缺陷。</strong><em>这与 C67 模块 05 的奖励模型过优化是同一个现象，只不过这里被优化的是 prompt 而不是权重。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以三者的正确投入顺序是<strong>反过来</strong>的：<strong>① 先把评分函数做可靠</strong>（评测集够大、judge 验证过、噪声量化过）；<strong>② 再把搜索空间定得<em>小而有意义</em></strong>（而不是「把所有能变的都变一遍」）；<strong>③ 最后才考虑用更强的搜索算法。</strong><em>反过来做（先上一个花哨的 optimizer）几乎必然得到「搜索集分数很好、上线没效果」这个结局。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个开工前必须回答的问题：<strong>「你的评测集上，两次相同配置的重复测量差多少？」</strong><em>答不上来 → 先去测这个方差</em>（C68 模块 04 的第一步）。因为<strong>搜索出来的提升如果小于这个方差，它就是噪声</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="space"><span class="num">2</span>搜索空间：先算它有多大</h2>
+  <p>prompt 的搜索空间通常比人们以为的大得多。<strong>而它的大小直接决定了过拟合的程度（第 5 节），所以第一步是把它算出来。</strong></p>  <div class="math-block">\[|\mathcal{S}| = |I| \times \binom{|P|}{k} \times k! \times |F|\]</div>  <table>
+    <thead><tr><th>维度</th><th>本课的规模</th><th>组合数</th></tr></thead>
+    <tbody>
+      <tr><td>指令变体 $|I|$</td><td>5 个槽位各有 2–3 种写法</td><td>≈ 数十</td></tr>
+      <tr><td>示例子集 $\binom{|P|}{k}$</td><td>从 20 条池子里选 8 条</td><td><strong>125,970</strong></td></tr>
+      <tr><td>顺序 $k!$</td><td>8 条的排列</td><td><strong>40,320</strong></td></tr>
+      <tr><td>格式 $|F|$</td><td>3 种</td><td>3</td></tr>
+      <tr><td><strong>合计</strong></td><td>—</td><td><strong>≈ $1.5 \times 10^{11}$</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>$10^{11}$ 这个数说明两件事。</strong><em>第一，穷举不可能，所以必须搜</em>。<strong>第二，也是更重要的：在一个 $10^{11}$ 的空间里，「在 40 条评测样本上表现最好的那个候选」几乎肯定是运气好而不是真的好。</strong><em>这正是 C66 模块 04 的胜者诅咒，只不过参赛者从「模型」换成了「prompt」。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>所以工程上的第一个动作是<strong>把空间砍小</strong>，而且要砍得有依据：<strong>① 顺序维度用「最后一条放谁」代替全排列</strong>（模块 02 量到它解释了顺序效应的六成，把 $k!$ 从 40320 降到 $k$）；<strong>② 示例子集用选择策略代替自由子集</strong>（kNN / 分桶 kNN 把 $\binom{20}{8}$ 降到几种）；<strong>③ 指令用「槽位开关」代替自由文本</strong>（$2^5 = 32$ 种，可枚举）。<em>砍完之后空间是几千量级——可以真正搜完，而且过拟合可控。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>「让模型自由生成指令」（APE / OPRO 式）会把空间重新放回无限大。<strong>它能找到人想不到的写法，代价是过拟合风险回到最高档。</strong><em>用它的前提是评测集足够大、并且有一个从未参与搜索的留出集</em>——而这两条通常比 optimizer 本身更难满足。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="objective"><span class="num">3</span>评分函数：优化器会精确利用它的每一个缺陷</h2>
+  <p>评分函数是优化的目标。<strong>而优化过程不知道你「真正想要」什么，它只知道这个数。</strong></p>  <table>
+    <thead><tr><th>目标函数</th><th>它漏掉了什么</th><th>优化器会怎么利用这个漏洞</th></tr></thead>
+    <tbody>
+      <tr><td><strong>只用准确率</strong></td><td>解析率、成本、延迟</td><td><em>搜出一个又长又慢的 prompt</em>；或者搜出一个「放宽取值域」的格式（模块 01 讲解第 2 节的那个陷阱）</td></tr>
+      <tr><td><strong>用一个有偏的 judge</strong></td><td>judge 自己的偏差（长度、位置、自偏好）</td><td><strong>搜出一个专门迎合 judge 偏差的 prompt</strong>——<em>它在 judge 上分很高，在人类看来更差</em>（notebook 第 5 节量出来）</td></tr>
+      <tr><td><strong>准确率的样本量太小</strong></td><td>噪声</td><td><em>搜出一个恰好拟合这 20 条样本的配置</em>；<strong>提升全部是噪声</strong></td></tr>
+      <tr><td><strong>只在一个分层上看</strong></td><td>其它分层</td><td>牺牲稀有类换总分——<em>而稀有类往往是业务上最重要的那些</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第二行是最危险的一个，因为<strong>它的失败是不可见的</strong>：<em>优化后 judge 分数上升，所有指标都变好，而真实质量下降</em>。<strong>这与 C67 模块 05 的奖励模型过优化完全同构</strong>——只不过那里优化的是权重（贵、不可逆），这里优化的是 prompt（便宜、可回滚），<em>所以这里更容易发生，而且更容易被忽略</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>三条对策，与 C67 一致：<strong>① 目标函数用组合而不是单一指标</strong>（准确率 + 解析率 + 成本惩罚，且解析率是硬约束不是加权项）；<strong>② 保留一个 judge 从未参与的独立信号</strong>（人工抽检、或一个规则化的可验证子集）；<strong>③ 报保守分数 $\mu - \lambda\sigma$ 而不是点估计</strong>——<em>它天然惩罚了「在小样本上运气好」的候选</em>。</p></div>
+  </div>  <p><strong>还有一条形式上的纪律</strong>：<em>解析率必须是硬约束（<code>parse_rate == 1.0</code> 才允许进入排名），不能作为加权项</em>。<strong>因为加权项可以被「牺牲一点解析率换很多准确率」的候选钻空子，而下游拿到不合法的值可能直接崩。</strong></p>
+
+  <!-- ========================================================= -->
+  <h2 id="algorithms"><span class="num">4</span>三种搜索算法</h2>
+  <table>
+    <thead><tr><th>算法</th><th>怎么搜</th><th>评估次数</th><th>什么时候用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>随机搜索</strong></td><td>从空间里随机采 N 个候选，取最好的</td><td>$N$</td><td><strong>基线，永远先做这个</strong>；<em>而且它的过拟合行为最容易分析（第 5 节）</em></td></tr>
+      <tr><td><strong>坐标上升</strong></td><td>固定其它维度，逐个维度扫到最优，循环几轮</td><td>$\sum_d |D_d| \times \text{rounds}$</td><td><strong>维度之间近似独立时性价比最高</strong>；<em>本课的空间正是这种（指令槽位 / 选择策略 / 末条 / 格式）</em></td></tr>
+      <tr><td><strong>bootstrap 示例</strong></td><td><em>用「当前 prompt 在训练集上答对的样本」当示例</em>，迭代几轮</td><td>$\text{rounds} \times |train|$</td><td><strong>示例维度上最有效的一个</strong>（DSPy 的核心手段）；<em>它不需要人工标注新示例</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>bootstrap 示例的想法很漂亮</strong>：<em>示例不必是人挑的，可以是「当前系统自己做对的那些」</em>。<strong>它的自举性质带来一个真实的好处：示例的风格与格式天然与模型一致。</strong>notebook 第 3 节实现它并量出收益。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但它也有一个必须知道的偏倚：<strong>它只会挑「当前 prompt 已经能做对的」样本</strong>，<em>于是它倾向于强化当前的行为，而不是纠正它</em>。<strong>症状是：bootstrap 几轮之后在训练集上很好，而在「当前 prompt 一直做错的那类样本」上没有改善。</strong><em>对策是把 bootstrap 与「覆盖保底」结合（模块 02 练习 1 的混合选择器）</em>——<strong>让每个标签至少有一条示例，即使那一类当前一条都没做对。</strong></p></div>
+  </div>  <h3>成本的可比口径</h3>  <p><strong>比较算法时必须固定「评估次数」这个预算</strong>，而不是固定轮数。<em>因为一次评估 = 在评测集上跑一遍 = 真实的钱</em>。notebook 第 2/3 节在同样的评估预算下比较随机搜索与坐标上升，<strong>结论是坐标上升在这个（近似独立的）空间上更高效</strong>——<em>但这个结论依赖空间的结构，不能推广</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="overfit"><span class="num">5</span>过拟合：gap 随候选数增长的精确曲线</h2>
+  <p>这是本模块最重要的一节。<strong>它说明「搜索集上提升了 20 个点」这句话在什么条件下毫无意义。</strong></p>  <div class="ascii">   实验设定：N 个候选，**真实能力完全相同**（纯噪声）
+   搜索集 40 条、留出集 40 条
+
+     N       搜索集最优    该候选在留出集上    gap
+     1          0.590          0.601        -0.011
+     2          0.648          0.610         0.038
+     5          0.691          0.599         0.091
+    10          0.716          0.601         0.115
+    50          0.770          0.607         0.163
+   200          0.805          0.599         0.206
+  1000          0.836          0.591         0.245
+
+   留出集分数**始终在真值 0.60 附近**，而搜索集分数一路涨到 0.836。
+   → 「搜索集上的提升」里，有 24 个点纯粹是选择造成的。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这就是 C66 模块 04 的胜者诅咒，参赛者从「模型」换成了「prompt 候选」。</strong><em>取 $N$ 个带噪声估计的最大值，这个最大值系统性地高于真实最优</em>，而偏差的量级随 $\ln N$ 增长。<strong>关键结论：搜索集上的分数不是效果，它是「效果 + 选择偏差」。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>定量地：设每个候选在搜索集上的估计$\hat s_i = s_i + \varepsilon_i$，$\varepsilon_i \sim \mathcal{N}(0, \sigma^2)$，$\sigma \approx \sqrt{p(1-p)/n}$。<strong>则 $\mathbb{E}[\max_i \hat s_i] - \max_i s_i$ 的量级是 $\mathcal{O}(\sigma\sqrt{2\ln N})$</strong>（<em>注意 $\sigma\sqrt{2\ln N}$ 是一个上界，$N$ 不大时实际值更小——这一点在 C66 模块 04 里量过</em>）。<strong>所以搜索集样本量 $n$ 与候选数 $N$ 必须一起看：$n$ 太小时，$N$ 越大结论越假。</strong></p></div>
+  </div>  <h3>三条可执行的对策</h3>  <ol>
+    <li><strong>留出集必须从未参与搜索</strong>，<em>而且报告里报的是留出集分数，不是搜索集分数</em>。<strong>这一条是硬要求，不是最佳实践。</strong></li>
+    <li><strong>用 C66 模块 04 的 MDE 反推「搜索集该多大」</strong>：<em>如果你想可靠地检出 3 个点的提升，先算需要多少样本</em>；<strong>样本不够时正确的动作是「不搜」而不是「搜了再说」。</strong></li>
+    <li><strong>候选数进报告</strong>——<em>「我们评估了 N 个候选」是解读搜索集分数的必要信息</em>。报告里没有 $N$ 时，搜索集分数无法被评估。<strong>这与 C66 模块 05 评测卡里必须报「参赛者数量」是同一条。</strong></li>
+  </ol>  <div class="callout danger"><span class="label"></span>
+    <p>一个具体的、常见的失败：<strong>用同一个评测集反复搜了几个月。</strong><em>即使每次只搜十几个候选，累积下来 $N$ 已经是几千</em>，而那个评测集早就被拟合掉了。<strong>对策：留出集要定期轮换，而且轮换记录要写进 CHANGELOG</strong>（与 C03 模块 05 的污染管理同构）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="when-not"><span class="num">6</span>什么时候不该优化</h2>
+  <ol>
+    <li><strong>评测集的噪声大于你想找的效应</strong>——<em>先量 $\sigma$，再算 MDE</em>。<strong>MDE 大于你期望的提升时，搜索只会产出噪声。</strong></li>
+    <li><strong>目标函数还没被验证过</strong>——<em>用一个没做过元评测的 judge 当目标函数，等于把 judge 的偏差直接写进 prompt</em>（C67 模块 03）。</li>
+    <li><strong>契约层还没做对</strong>——<em>解析率还不是 1.0 时，优化会在「准确率」上打转而真正的损失在解析层</em>（模块 01 的三个量）。<strong>先修契约。</strong></li>
+    <li><strong>模块 02 的免费收益还没拿</strong>——<em>选择策略与顺序是零/低成本的，而它们的效应量可以是三倍</em>。<strong>先把它们做完再谈自动搜索。</strong></li>
+    <li><strong>没有留出集</strong>——<em>没有留出集的优化不是优化，是在给评测集拟合一个 prompt</em>。</li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>反过来，<strong>什么时候该优化</strong>：<em>契约层已经 1.0、选择与顺序已经调过、评测集的 $\sigma$ 已知且 MDE 小于目标提升、有一个独立的留出集</em>。<strong>这四条同时成立时，自动优化是这一层最后一块、也确实有收益的一块。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个常被忽略的判据：<strong>优化的产出要能被审阅</strong>。<em>搜出来的 prompt 如果是一段人类看不懂的咒语，那么它的可维护性是负的</em>——<strong>换模型时它大概率失效（模块 05），而没人知道该怎么改它</strong>。<em>所以「槽位开关 + 示例集合与顺序」这种结构化的搜索空间，比「自由文本指令」在长期上更值</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="gate"><span class="num">7</span>优化器本身也要有 spec 与指纹</h2>
+  <p>优化是一次<strong>会产出资产的运行</strong>，所以它要按 C68 的规矩来。</p>  <div class="ascii">   优化报告（每次优化后生成）
+
+   optimizer:        coordinate_ascent(rounds=2)
+   space_size:       3,840            ← **必须报**（解读搜索集分数的前提）
+   n_evaluated:      184              ← **必须报**（胜者诅咒的 N）
+   objective:        accuracy − 0.02·cost，且 parse_rate == 1.0 为硬约束
+   search_set:       dev-2026w35 (n=40)   σ=0.062（重复 10 次测得）
+   holdout:          holdout-2026w30 (n=40)  ← **从未参与搜索**
+   optimizer_fp:     4a1c88e2          ← 空间定义 + 目标函数 + 算法 + 种子
+
+   基线   → 搜索集 0.60  留出集 0.60
+   优化后 → 搜索集 0.78  留出集 0.65
+            └─ 搜索集提升 +18pp，**其中只有 +5pp 在留出集上成立**
+
+   判读: 留出集提升 5pp vs 2σ = 12.4pp → **不显著，不予上线**</div>  <p><strong>最后一行是这一节的重点</strong>：<em>一次搜索集上 +18pp 的优化，按正确口径判读是「不显著」</em>。<strong>而如果只报搜索集分数，它会被当成一次巨大的成功。</strong></p>  <h3>门禁（按 C68 模块 04 分级）</h3>  <ul>
+    <li><strong>确定性阻断</strong>：报告里缺 <code>space_size</code> 或 <code>n_evaluated</code>；留出集与搜索集有交集；优化后的 <code>parse_rate < 1.0</code></li>
+    <li><strong>统计阻断</strong>：<em>留出集</em>提升不超过 $2\sigma$</li>
+    <li><strong>报警</strong>：搜索集提升与留出集提升的比值 > 3（<em>过拟合的直接信号</em>）；预测标签分布的 PSI</li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>那条报警值得单独说：<strong>「搜索集提升 / 留出集提升」这个比值是过拟合最直接的指标</strong>，而它几乎是免费的（两个数你都已经有了）。<em>比值接近 1 → 搜索是真的在找效果；比值很大 → 搜索在拟合噪声。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="output-asset"><span class="num">8</span>优化的产出是一份资产，不是一次调参</h2>
+  <p>一次优化跑完，你得到的不是「更好的效果」，<strong>而是一份具体的、可 diff、可回滚、会过期的资产。</strong></p>  <div class="ascii">   一次优化的产出
+
+   optimized/
+     instruction.txt        ← 槽位组合（或搜出来的措辞）
+     demos.jsonl            ← **有序**的示例集合
+     calib.json             ← 校准参数（如果做了）
+     REPORT.md              ← 空间大小 / 候选数 / 搜索集与留出集分数 / 过拟合比值
+     optimizer_fp.txt       ← 空间定义 + 目标函数 + 算法 + 种子
+
+   它与「人手改出来的 prompt」是同一种资产 —— 走同一套版本与门禁（模块 01 第 7 节）。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>把它当资产而不是「调好的参数」，有三个直接后果。</strong><em>① 它要进版本控制并带 CHANGELOG</em>——<strong>「这套 demos 是自动搜出来的」本身就是一条必须记录的信息</strong>，因为它决定了下次该怎么改（重跑优化，而不是手改）。<em>② 它会过期</em>——模块 05 会说明：换模型时它基本报废。<em>③ 它要能被审阅</em>——搜出来的东西如果人看不懂，可维护性是负的。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>第三点值得展开，因为它反过来约束了搜索空间的设计。<strong>「槽位开关 + 示例集合与顺序」这种结构化空间的产出是可读的</strong>：<em>你能看出「它关掉了禁止项、把覆盖示例放到了最后」</em>。而<strong>自由文本指令搜索的产出常常是一段读不懂的咒语</strong>——<em>它在离线指标上更好，但没人知道它为什么有效、换模型时该保留哪一句、出问题时该改哪里</em>。<strong>所以在长期上，结构化空间的价值不只是「过拟合可控」，还包括「产出是可维护的」。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="human-vs-auto"><span class="num">9</span>人工改与自动搜的分工</h2>
+  <p>自动优化不取代人。<strong>两者擅长的东西不同，而分工的判据很具体。</strong></p>  <table>
+    <thead><tr><th>工作</th><th>谁做</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>定契约（签名、取值域、格式）</strong></td><td><strong>人</strong></td><td>它来自业务需求，搜不出来；<em>而且它是可迁移的那一半（模块 05）</em></td></tr>
+      <tr><td><strong>写边界与兜底规则</strong></td><td><strong>人</strong></td><td>「信息不足时输出 unknown」这类规则来自对下游的理解</td></tr>
+      <tr><td><strong>选择策略与 k</strong></td><td>人定候选，机器扫</td><td>候选很少（几种策略 × 几个 k），扫一遍就完了</td></tr>
+      <tr><td><strong>示例顺序</strong></td><td><strong>机器</strong></td><td><em>人对位置偏置没有直觉，而且方向依模型而异</em>（模块 05）</td></tr>
+      <tr><td><strong>示例集合</strong></td><td><strong>机器</strong>（bootstrap）</td><td>人挑示例会不自觉地选「自己觉得典型」的，而那不等于「对模型有用」</td></tr>
+      <tr><td><strong>指令措辞</strong></td><td><em>先人后机器</em></td><td>人写出五个槽位齐全的版本；<strong>机器只在这个基础上做小幅搜索</strong>——<em>让机器从零写指令会把空间放回无限大（第 2 节）</em></td></tr>
+      <tr><td><strong>判读结果、决定上不上</strong></td><td><strong>人</strong></td><td>第 7 节那条「留出集提升不超过 2σ 就阻断」需要人接受这个结论</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话概括这张表：<strong>人负责「什么是对的」，机器负责「哪个排列更好」。</strong><em>而混淆这两件事的典型症状是：让机器去搜一个本该由业务决定的取值域，或者让人去猜一个本该被扫出来的示例顺序。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="recap"><span class="num">10</span>把三个风险重新排一遍</h2>
+  <p>本模块开头说「风险全在空间、目标、算法这三个定义里」。<strong>这一节按「多常见 × 多严重」把它们重排，并给出每一个的最小对策。</strong></p>  <table>
+    <thead><tr><th>风险</th><th>常见程度</th><th>严重程度</th><th>最小对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>没有留出集</strong></td><td>极常见</td><td><strong>最严重</strong></td><td><em>切一个从未参与搜索的集合出来</em>——<strong>这一条零成本，而没有它整个优化不可评估</strong></td></tr>
+      <tr><td><strong>报搜索集分数而不是留出集分数</strong></td><td>极常见</td><td>最严重</td><td>报告模板里把 <code>holdout_best</code> 放在 <code>search_best</code> 前面</td></tr>
+      <tr><td><strong>报告里不写候选数 N</strong></td><td>常见</td><td>严重</td><td><em>没有 N，搜索集分数无法被解读</em>（第 4 节）</td></tr>
+      <tr><td><strong>解析率当加权项</strong></td><td>常见</td><td>严重</td><td>改成可行性判断（第 2 节的一行代码）</td></tr>
+      <tr><td><strong>用未验证的 judge 当目标</strong></td><td>常见</td><td><strong>最隐蔽</strong></td><td><em>先做 C67 的元评测；或保留一个 judge 从未参与的独立信号</em></td></tr>
+      <tr><td><strong>评测集反复被搜了几个月</strong></td><td>常见</td><td>严重（累积）</td><td>留出集定期轮换，轮换记录进 CHANGELOG</td></tr>
+      <tr><td><strong>搜索空间是自由文本</strong></td><td>较少</td><td>中</td><td>换成槽位开关；<em>它同时让产出可审阅（第 8 节）</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>前两行是同一件事的两面，而它们的对策都是零成本的。</strong><em>这意味着：绝大多数「优化没效果」的案例，问题不在优化算法上，而在评估口径上</em>。<strong>而第 5 行是唯一一个「所有指标都变好而实际变差」的风险</strong>——所以它最隐蔽，也最值得在开工前处理。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>反过来，<strong>有一个风险被高估了：搜索算法不够强。</strong><em>本模块第 3 节在同样的评估预算下比较随机搜索与坐标上升，差别远小于「有没有留出集」造成的差别</em>。<strong>换句话说：把预算花在扩评测集、验证 judge、切留出集上，回报远高于换一个更花哨的 optimizer。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="boundary"><span class="num">11</span>这一层的边界</h2>
+  <p>自动提示优化是本课最容易被过度期待的一层。<strong>这一节说清它的天花板在哪。</strong></p>  <ul>
+    <li><strong>它不改变模型的能力上界。</strong><em>C03 模块 06 的 elicitation 阶梯里，prompt 优化只是其中一格</em>；<strong>「模型根本不会做这类题」不是搜索能解决的问题。</strong></li>
+    <li><strong>它不能替代评测集。</strong><em>而且它对评测集的要求比人工改 prompt 更高</em>——因为搜索会消耗评测集的统计能力（第 4 节的胜者诅咒）。<strong>所以「没有好评测集所以让机器自己搜」是一个反向的结论。</strong></li>
+    <li><strong>它的产出会随模型报废</strong>（模块 05 会量出来）。<em>所以在预期一年内换模型的项目里，把预算从这一层挪到契约层与约束层更理性。</em></li>
+    <li><strong>它不改善可维护性，通常还会降低它。</strong><em>搜出来的东西如果人看不懂，出问题时没人知道该改哪里</em>——这正是第 8 节要求「结构化搜索空间」的原因。</li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>反过来，它确实能做到一件人做不好的事：扫排列。</strong><em>人对位置偏置没有直觉，而模块 02 量到顺序造成三倍差距</em>。<strong>所以「顺序搜索」是这一层性价比最高的应用</strong>——它零成本、效应大、而且产出是可读的（一个排列）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>如果要给这一层一句总结：<strong>它适合在一个<em>已经定义清楚</em>的小空间里做穷尽的比较，不适合用来「探索该怎么写 prompt」。</strong><em>前者是它的强项（机器不会漏、不会累、不会自我说服）；后者需要对任务的理解，而那是人的工作（第 9 节那张分工表）。</em></p></div>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_demo_selection/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · few-shot 示例选择与顺序</div></a>
+    <a class="next" href="../04_constrained_decoding/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 受限解码与结构化输出</div></a>
+  </div>
+
+</div>
+</body>
+</html>

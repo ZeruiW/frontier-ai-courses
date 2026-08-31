@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · few-shot 示例选择与顺序</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · few-shot 示例选择与顺序</h1>
+  <p class="subtitle">示例有三个独立维度，<strong>收益量级差一个数量级</strong>：<strong>选择是阶跃（kNN 的 k=1 不输随机的 k=20）· 数量是缓坡 · 顺序是免费的三倍</strong> · <strong>同一批示例只改顺序：0.90 vs 0.30</strong>；而「最后一条放谁」这一个自由度就解释了顺序效应的六成 · <strong>一个诚实的负面结果：流行的「打散标签」在本课模拟器上没有稳定收益</strong>——<em>可迁移的是方法（顺序要搜、要在留出集上复核），不是规则</em> · <strong>kNN 与前缀缓存直接冲突</strong>（前缀从 1 种变成每请求一种），分桶 kNN 是那个折中 · <strong>无内容探针一次调用测出标签先验</strong>；减先验校准把最差顺序从 50% 救到 70%——<em>但它需要 logprobs，且隐含假设真实标签分布接近均匀</em> · <strong>kNN 让示例泄漏几乎必然发生</strong>（10/10 道题的示例里包含它自己）· <strong>某类没有示例 → 该类准确率归零</strong>（这是正确性问题不是效果问题）· 「选中示例与输入的平均相似度」是这一层最好的<strong>无真值</strong>指标</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 00（模拟器）与 01（签名与三个量）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_demo_selection.ipynb（五种选择策略的对比 / 数量的收益曲线与「选对 1 条胜过随机 20 条」/ 顺序造成的三倍差距与「最后一条放谁」/ 无内容探针揭示标签先验 / 减先验校准 / 示例泄漏 / 示例池运维与门禁）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Liu et al., <em>What Makes Good In-Context Examples for GPT-3?</em>（DeeLIO 2022，kNN 选择）· Lu et al., <em>Fantastically Ordered Prompts and Where to Find Them</em>（ACL 2022，顺序敏感性）· Zhao et al., <em>Calibrate Before Use</em>（ICML 2021，无内容探针与减先验）· Min et al., <em>Rethinking the Role of Demonstrations</em>（EMNLP 2022）· 本课程 C03 模块 03 第 6 节（few-shot 的坑：选择、顺序与泄漏）· C11（kNN 检索）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#three-dims">示例的三个维度，收益量级差一个数量级</a></li>
+      <li><a href="#selection">五种选择策略</a></li>
+      <li><a href="#count">数量：成本线性，收益次线性</a></li>
+      <li><a href="#order">顺序：零成本的三倍差距</a></li>
+      <li><a href="#calibration">标签偏置：用无内容探针把它测出来</a></li>
+      <li><a href="#leakage">泄漏：示例来自评测集 = 一次不诚实的评测</a></li>
+      <li><a href="#pool-ops">示例池的运维</a></li>
+      <li><a href="#gate">把示例选择做成一个可门禁的流程</a></li>
+      <li><a href="#where-demos-come-from">示例从哪来：四个来源与它们的偏倚</a></li>
+      <li><a href="#vs-retrieval">示例选择与文档检索：像但不是一回事</a></li>
+      <li><a href="#what-to-do-first">拿到一个新任务时，这一层该按什么顺序做</a></li>
+      <li><a href="#boundary">这一层的边界</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="three-dims"><span class="num">1</span>示例的三个维度，收益量级差一个数量级</h2>
+  <p>「加几个例子」是最常见的 prompt 改动。<strong>但示例有三个独立的维度，而它们的收益量级完全不同。</strong></p>  <table>
+    <thead><tr><th>维度</th><th>问题</th><th>本课量到的效应</th><th>成本</th></tr></thead>
+    <tbody>
+      <tr><td><strong>选择</strong></td><td>选哪些？</td><td><strong>选对 1 条 ≈ 随机 20 条</strong>（0.90 vs 0.70）</td><td>一次检索（可缓存）</td></tr>
+      <tr><td><strong>数量</strong></td><td>放几个？</td><td>随机选时收益缓慢上升；<em>按相似度选时 k=1 就饱和了</em></td><td><strong>线性的 token 成本</strong></td></tr>
+      <tr><td><strong>顺序</strong></td><td>什么顺序？</td><td><strong>同一批示例，只改顺序：0.30 vs 0.90（三倍）</strong></td><td>零</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第三行是本模块最值得记住的一个数。<strong>顺序是零成本的，而它的影响可以比「示例数量翻四倍」更大。</strong><em>而绝大多数系统里示例顺序是「代码里列表的书写顺序」，既没被测过也没进版本</em>（模块 01 第 6 节把它做成了一个可 diff 的文件正是为了这个）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么会这样？在本课的模拟器里机制是明确的：<strong>近因偏置让靠后的示例被系统性偏好</strong>，所以「把最相似的示例放最后」与「放最前」是两个不同的算法。<em>在真实模型上这个效应同样被反复报告（<span class="term">order sensitivity</span>），只是方向与强度依模型而异</em>——<strong>这恰恰意味着它必须被<em>测</em>，不能被<em>假设</em>。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个立刻可做的实验：<strong>把你现有的示例列表反转一次，重跑评测。</strong><em>如果分数变了（它很可能会变），说明你的示例顺序是一个未被测量、未被版本化的超参数</em>——而它是免费可调的。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="selection"><span class="num">2</span>五种选择策略</h2>
+  <table>
+    <thead><tr><th>策略</th><th>怎么选</th><th>优点</th><th>代价 / 风险</th></tr></thead>
+    <tbody>
+      <tr><td><strong>随机</strong></td><td>从池子里随机取 k 条</td><td>零成本，且<em>对所有输入用同一批示例 → prompt 前缀稳定，缓存友好</em>（C33）</td><td>收益最低；<strong>而且方差大</strong>——换个种子分数就变</td></tr>
+      <tr><td><strong>kNN（按输入相似度）</strong></td><td>取与当前输入最相似的 k 条</td><td><strong>收益最高</strong>（本课量到 k=1 即达 0.90）</td><td><em>每个请求的示例都不同 → prompt 前缀不稳定，缓存全部失效</em>；这是一个真实的成本权衡</td></tr>
+      <tr><td><strong>覆盖（每类若干）</strong></td><td>保证每个标签至少 n 条</td><td><strong>防「某类完全没示例」</strong>——那会让该类准确率直接归零</td><td>只保证覆盖，不保证相关</td></tr>
+      <tr><td><strong>多样性（MMR 式）</strong></td><td>相似度 − λ×已选集合内的冗余</td><td>避免 k 条示例几乎是同一句话</td><td>λ 是一个要调的超参；<em>在小池子上收益有限</em></td></tr>
+      <tr><td><strong>难度（课程式）</strong></td><td>按难度排，简单在前难在后</td><td>与顺序维度天然结合</td><td><strong>需要难度标注</strong>；而难度本身不好定义</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>kNN 与「缓存友好」是直接冲突的，而这个冲突常被忽略。</strong><em>固定示例 → prompt 前缀完全稳定 → 前缀缓存命中率接近 100%；kNN 示例 → 每个请求的前缀都不同 → 缓存全丢</em>。<strong>在高 QPS、长 prompt 的场景下，这个成本可能超过 kNN 带来的收益。</strong><em>（前缀缓存的机制在 C33 模块 05。）</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>有一个折中：<strong>分桶 kNN</strong>——先把输入粗分成少量桶（比如按意图或按 embedding 聚类到 8 个簇），<em>每个桶预先算好一套固定示例</em>。<strong>于是前缀只有 8 种，缓存仍然有效，而示例的相关性远好于全局随机。</strong><em>notebook 第 3 节实现了它，并量出它落在随机与 kNN 之间的什么位置。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>「覆盖」这一条不是可选项：<strong>如果某个标签在示例里一次都没出现，那么它的准确率通常直接是 0</strong>（模块 00 练习 4 的 <code>demos_coverage</code> 诊断就是抓这个）。<em>而这在真实系统里很容易发生——「从最近 20 条标注里取示例」的自然结果就是稀有类被完全漏掉。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="count"><span class="num">3</span>数量：成本线性，收益次线性</h2>
+  <p>「多放几个例子」是最容易做的改动，<strong>也是收益/成本比最差的一个。</strong></p>  <div class="ascii">   本课量到的曲线（10 道测试题）
+
+   准确率
+   0.9 │ ●───────●───────●───────●   ← kNN 选择：k=1 就饱和
+       │
+   0.7 │                         ○   ← 随机选择：k=20 才到这里
+       │                    ○
+   0.5 │               ○
+       │      ○    ○
+   0.2 │ ○────○
+       └──┬───┬───┬───┬───┬───┬──►  k
+          1   2   3   5   8  12  20
+
+   token 成本 ∝ k（线性）
+   → 「选对」是一次阶跃，「加量」是一条缓坡</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这条图的工程含义很直接：先做选择，再考虑数量。</strong><em>而绝大多数团队的顺序是相反的</em>——先把示例从 3 条加到 10 条（因为这最容易），<strong>然后发现效果提升不明显，于是得出「few-shot 没什么用」的结论</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有两个与数量相关的、容易被忽略的成本：<strong>① 上下文预算</strong>——<em>示例占掉的 token 是从「能塞多少检索到的文档」里扣的</em>（C33 的预算分配）；<strong>② 延迟</strong>——<em>输入 token 数直接影响首 token 延迟</em>。<strong>所以 k 不是一个只看效果的旋钮，它同时是一个容量参数。</strong></p></div>
+  </div>  <h3>怎么定 k</h3>  <ol>
+    <li><strong>先把选择策略定下来</strong>（kNN 或分桶 kNN），<em>因为它决定了曲线的形状</em>。</li>
+    <li><strong>扫 k 并找拐点</strong>——<em>本课的 kNN 曲线在 k=1 就饱和，真实任务上通常在 4–16 之间</em>。</li>
+    <li><strong>把「拐点之后的 k」当成成本浪费直接砍掉</strong>。<em>而如果拐点之后还在涨，说明选择策略还有改进空间</em>——回到第 1 步而不是继续加 k。</li>
+  </ol>
+
+  <!-- ========================================================= -->
+  <h2 id="order"><span class="num">4</span>顺序：零成本的三倍差距</h2>
+  <p>同一批 5 条示例，只改排列顺序。</p>  <div class="ascii">   kNN 选出 5 条，两种摆法
+
+   最相似的放**最前**：  [最像的, 次像的, …, 最不像的]  → 准确率 0.30
+   最相似的放**最后**：  [最不像的, …, 次像的, 最像的]  → 准确率 0.90
+
+   机制（本课模拟器里是显式的）：
+     score_i = sim(x, x_i) + recency · (i / (n-1))
+                              └── 靠后的示例得到正向加成
+
+   于是「最像的放最后」= 相似度与位置加成叠加，指向同一个示例
+       「最像的放最前」= 两者相互抵消，最终选中的可能是最不像的那条</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这不是一个模拟器的人造效应</strong>：<em>示例顺序对真实模型的影响被反复报告过，而且在某些任务上「换一个排列」造成的分数差距可以达到十几个点</em>。<strong>本课模拟器只是把这个效应做成了可控、可解释的形式。</strong><em>方向依模型而异——所以工程上的结论不是「把最像的放最后」，而是<strong>「必须测，并且把测出来的顺序固定下来」</strong>。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>三种处理顺序的手段，成本递增：<strong>① 固定并版本化</strong>（零成本，必做）——<em>把顺序当成配置的一部分，进指纹（模块 01 第 6 节）</em>；<strong>② 搜一遍顺序</strong>（零成本）——<em>顺序的自由度往往高度集中：本课量到「最后一条放谁」这一个选择就解释了顺序效应的六成</em>；<strong>③ 多排列投票</strong>（k 倍成本）——<em>跑多个排列取多数投票；它降的是方差</em>（与 C70 模块 03 的多查询融合同构：<strong>降方差不保证提高均值</strong>）。</p></div>
+  </div>  <p>notebook 第 4 节还量了一件<strong>与流行做法相反</strong>的事：<em>「打散标签」在本课的模拟器上<strong>没有</strong>稳定收益</em>——因为这里的偏置来自「最后一条是谁」，而不是「末尾有一串同标签」。<strong>可迁移的是方法（顺序要搜、要在留出集上复核），不是规则。</strong></p>
+
+  <!-- ========================================================= -->
+  <h2 id="calibration"><span class="num">5</span>标签偏置：用无内容探针把它测出来</h2>
+  <p>示例会给模型一个<strong>先验</strong>：某些标签更容易被输出，与输入内容无关。<strong>而这个先验可以被一个极便宜的实验测出来。</strong></p>  <div class="ascii">   无内容探针（content-free probe）
+
+   把输入换成一个没有信息的占位符：
+     "N/A" / "" / "[MASK]"
+   然后看模型输出什么。
+
+   输出的分布 = 这套 prompt 的**标签先验**
+
+   本课量到的：
+     示例里 other 放最后 → 探针输出 other
+     示例里 other 放最前 → 探针输出 billing
+   同一个示例集合，只改顺序，先验就变了。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>探针的价值是它把「偏置」从一个模糊的担忧变成一个可测的量</strong>，而且<em>它只需要一次调用</em>。<strong>而它测出来的东西可以直接用来校准</strong>：<em>把每个标签的分数减去探针给它的分数，再取 argmax</em>（这就是 <span class="term">contextual calibration</span> 的思路）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>notebook 第 5 节把模拟器展开成一个<strong>标签分数向量</strong>再做校准——<em>这一步不是实现细节，而是校准的前提</em>：<strong>减先验作用在分数上，所以拿不到 logprobs 的 API 上这条路走不通。</strong>本课量到的效果是：<em>它把偏置最严重的顺序配置从 50% 救到 70%，与最好的顺序配置持平；而在本来没有偏置的配置上不造成损害。</em><strong>还有一个隐含前提：减先验假设真实标签分布接近均匀</strong>——<em>若真实分布本身严重倾斜（比如八成都是兜底类），该减到「真实分布」而不是「均匀」。</em>拿不到 logprobs 时的替代是<strong>搜一遍顺序</strong>与<strong>多排列投票</strong>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一条必须放进监控的指标：<strong>预测标签分布</strong>。<em>它相对真实分布的偏移（PSI）会同时抓到顺序偏置、示例漂移、以及模型换版本</em>——而这三件事在端到端准确率上都表现为「效果变差了」。（模块 01 第 6 节的门禁里已经放了这一项。）</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="leakage"><span class="num">6</span>泄漏：示例来自评测集 = 一次不诚实的评测</h2>
+  <p><strong>这是本模块唯一一个「正确性」问题而不是「效果」问题。</strong></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>如果示例池与评测集有交集，<em>那么被选中当示例的那些测试样本，答案已经写在 prompt 里了</em>。<strong>kNN 选择让这件事变得几乎必然发生</strong>——<em>因为「与输入最相似的示例」在有交集时就是输入自己</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>notebook 第 6 节量出这个虚高。<strong>而修法是纯纪律性的</strong>：<em>示例池与评测集必须来自不相交的样本 ID 集合，并且这件事要在 CI 里检查（一次集合求交，零成本）</em>。<strong>这与 C03 模块 05 的污染检测是同一类问题，只不过这里的污染是自己在 prompt 里造出来的</strong>——<em>所以它也更容易被彻底解决。</em></p></div>
+  </div>  <h3>三条必须在 CI 里检查的</h3>  <ul>
+    <li><strong>示例池 ∩ 评测集 = ∅</strong>（按稳定 ID，不是按内容）</li>
+    <li><strong>示例池 ∩ 留出集 = ∅</strong>——<em>模块 03 的自动优化会用留出集，而优化过程会「见过」示例池</em></li>
+    <li><strong>示例的答案字段不能出现在评测集的任何输入里</strong>——这条抓的是更隐蔽的泄漏（比如示例的理由文本被拼进了测试输入）</li>
+  </ul>  <div class="callout danger"><span class="label"></span>
+    <p>一个真实的、很容易发生的路径：<strong>「我们用线上日志做示例池，也用线上日志做评测集」</strong>。<em>两者按时间切分不够——同一个用户的同一个问题可能出现在两边</em>。<strong>必须按稳定 ID 去重后再切分。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pool-ops"><span class="num">7</span>示例池的运维</h2>
+  <p>示例池是一个<strong>会腐烂的资产</strong>，而它的腐烂方式与 C70 模块 05 的索引腐烂同构。</p>  <table>
+    <thead><tr><th>腐烂</th><th>怎么发生</th><th>症状</th><th>检查</th></tr></thead>
+    <tbody>
+      <tr><td><strong>覆盖退化</strong></td><td>新样本按时间追加，稀有类被稀释</td><td><strong>某个标签的准确率突然归零</strong></td><td><em>每类示例数的最小值</em>（确定性检查，可阻断）</td></tr>
+      <tr><td><strong>标签漂移</strong></td><td>标注标准变了，池里新旧标准混存</td><td>同类样本给出矛盾的信号，整体准确率缓慢下降</td><td>抽样复核；<em>池里样本要带标注时间与标注标准版本</em></td></tr>
+      <tr><td><strong>分布漂移</strong></td><td>线上话题变了，池里还是旧话题</td><td>kNN 选出来的示例与输入越来越不相似</td><td><strong>监控「选中示例与输入的平均相似度」</strong>——<em>它掉下来就是漂移的直接信号</em></td></tr>
+      <tr><td><strong>规模膨胀</strong></td><td>只加不删</td><td>kNN 变慢；而效果不再提升</td><td><em>按「被选中的频率」淘汰：从未被选中的示例可以删</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第三行那个指标值得单独强调：<strong>「选中示例与输入的平均相似度」是这一层最有信息量的无真值指标</strong>。<em>它不需要标注，而它同时反映了池子的覆盖度与线上分布的变化</em>。<strong>它掉下来时，该做的是补池子，而不是改 prompt。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一条与 C68 模块 05 同构的纪律：<strong>从线上回灌样本进示例池时，要限制回灌占比</strong>。<em>因为回灌的样本是「当前系统答对/答错的那些」，它们的分布已经被当前系统塑造过了</em>——<strong>全部用回灌样本会让池子越来越像系统自己的输出，形成闭环</strong>。<em>与 C68 模块 05 的 <code>from_production</code> 占比上限是同一条。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="gate"><span class="num">8</span>把示例选择做成一个可门禁的流程</h2>
+  <div class="ascii">   示例卡（每次改示例池或选择策略时生成）
+
+   pool_id:          demos-2026w35
+   pool_size:        842        min_per_label: 31     ← 确定性检查
+   selector:         bucket_knn(buckets=8, k=6)
+   order_policy:     interleave_labels + most_similar_last   ← **必须写明**
+   prompt_fp:        7c2a91be   （示例集合与顺序都在里面）
+
+   泄漏检查:  pool ∩ test = ∅ ✓   pool ∩ holdout = ∅ ✓        ← 阻断项
+   覆盖检查:  每类 ≥ 20 条 ✓                                   ← 阻断项
+   相似度:    选中示例与输入的平均相似度 0.61（基线 0.63）      ← 报警项
+   效果:      分层准确率 每类都 ≥ 基线 − 2σ ✓                   ← 阻断项
+   先验:      无内容探针 → other；预测分布 PSI 0.04 ✓           ← 报警项</div>  <p><strong>分级仍然是 C68 模块 04 的那一条</strong>：<em>确定性检查（泄漏、覆盖、指纹）阻断，统计检查（相似度、PSI）报警，效果回归按方差推阈值后阻断</em>。</p>  <h3>一个容易被忽略的确定性检查</h3>  <p><strong><code>order_policy</code> 必须是一个显式声明的字符串，而不是「代码里的顺序」。</strong><em>检查方式：给定 pool 与 selector，用声明的 policy 重算一次示例序列，与实际发送的序列逐条比对</em>。<strong>不一致 → 阻断。</strong><em>这一项抓的是「有人在代码里插了一条示例但没改配置」——而那正是本模块第 1 节说的「未被测量、未被版本化的超参数」的来源。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="where-demos-come-from"><span class="num">9</span>示例从哪来：四个来源与它们的偏倚</h2>
+  <p>前八节都假设有一个示例池。<strong>这一节讨论它从哪来——而每个来源都带一种特定的偏倚。</strong></p>  <table>
+    <thead><tr><th>来源</th><th>成本</th><th>带进来的偏倚</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>人工标注</strong></td><td>高</td><td>标注者的理解偏好；<em>而标注指南的歧义会变成示例里的噪声</em></td><td>标注一致性检查（C10 的 kappa 工具）</td></tr>
+      <tr><td><strong>线上日志 + 人工复核</strong></td><td>中</td><td><strong>分布已经被当前系统塑造过</strong>——用户学会了「怎么问才能得到答案」</td><td>限制回灌占比（C68 模块 05 的 <code>from_production</code> 上限）</td></tr>
+      <tr><td><strong>bootstrap（当前系统做对的样本）</strong></td><td>低</td><td><strong>自我强化</strong>——只挑已经做对的（模块 03 第 3 节）</td><td>配覆盖保底：每类至少一条，<em>即使那一类当前一条都没做对</em></td></tr>
+      <tr><td><strong>合成数据</strong></td><td>低</td><td><em>它继承生成模型的偏好与盲区</em></td><td>人工抽检；<strong>而且不要用被评测的同一个模型来生成</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>四个来源里最容易出问题的是第二个</strong>，因为它看起来最「贴近真实」。<em>而线上日志里的问题分布已经是「当前系统能处理的那些」</em>——用户遇到几次答不上来之后就不再那样问了。<strong>于是从日志里取示例会系统性地漏掉「系统本来就不擅长」的那类输入。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>一个便宜的对策：<strong>保留一个「困难样本」子池，专门放当前系统做错的输入</strong>，并<em>强制它在示例池里占一个固定的最小比例</em>。<strong>它与覆盖保底是同一类机制——用约束抵抗自我强化。</strong><em>而这与 C70 模块 04 的「迭代作为兜底路径」也是同一个思路：让系统的薄弱面被显式地保留在流程里，而不是被优化过程平均掉。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="vs-retrieval"><span class="num">10</span>示例选择与文档检索：像但不是一回事</h2>
+  <p>「按相似度选示例」和「按相似度检索文档」在实现上几乎一样，<strong>但它们的目标函数不同，所以最优做法不同。</strong></p>  <table>
+    <thead><tr><th>维度</th><th>文档检索（C11 / C70）</th><th>示例选择（本模块）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>目标</strong></td><td>找到含答案的段落</td><td><strong>给模型一个「该怎么做这类题」的示范</strong></td></tr>
+      <tr><td><strong>「相关」的含义</strong></td><td>内容相关</td><td><em>任务形态相关</em>——<strong>示例的内容甚至可以与输入无关，只要它示范的是同一类推理</strong></td></tr>
+      <tr><td><strong>多样性的作用</strong></td><td>避免 top-k 被近重复占满</td><td><strong>覆盖标签空间</strong>（缺一类就归零）</td></tr>
+      <tr><td><strong>k 的收益曲线</strong></td><td>随 k 缓升（更多候选）</td><td><strong>很小的 k 就饱和</strong>（第 2 节量到 k=1）</td></tr>
+      <tr><td><strong>顺序</strong></td><td>影响的是「模型先看到什么」</td><td><strong>直接改变结果（三倍差距）</strong></td></tr>
+      <tr><td><strong>缓存</strong></td><td>索引侧缓存，与 prompt 无关</td><td><em>前缀缓存——示例变了缓存就失效</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>最有实践价值的一行是第二行。</strong><em>文档检索里「不相关的段落」是纯噪声；而示例里「内容不相关但形态相同」的样本仍然有用</em>——它示范的是输出格式、推理步骤的粒度、边界情况怎么处理。<strong>这解释了为什么「每类一条覆盖示例」即使与输入完全不相关也有价值。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>反过来也有一个陷阱：<strong>把示例选择完全等同于检索，会让人只优化「内容相似度」，而忽略覆盖度与顺序这两个更便宜的维度。</strong><em>本模块第 1/2 节的数字正是这件事的证据：覆盖（每类一条）就拿到了随机的两倍多，而它不需要任何相似度计算。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what-to-do-first"><span class="num">11</span>拿到一个新任务时，这一层该按什么顺序做</h2>
+  <p>本模块给出了很多可调的东西。<strong>这一节把它们排成一个顺序，依据是本课量到的效应量与成本。</strong></p>  <table>
+    <thead><tr><th>顺序</th><th>动作</th><th>成本</th><th>本课量到的效应</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><strong>覆盖保底：每类至少一条示例</strong></td><td>零</td><td><strong>缺一类 → 该类准确率归零</strong>（正确性问题）</td></tr>
+      <tr><td>2</td><td><strong>泄漏检查：池 ∩ 评测集 = ∅</strong></td><td>零（一次集合求交）</td><td>泄漏会让所有后续测量失去意义</td></tr>
+      <tr><td>3</td><td><strong>搜一遍顺序，在留出集上复核</strong></td><td>零（只是重排）</td><td><strong>三倍差距</strong>；而「最后一条放谁」占六成</td></tr>
+      <tr><td>4</td><td><strong>换成 kNN 或分桶 kNN</strong></td><td>一次检索（可缓存）</td><td><strong>kNN 的 k=1 不输随机的 k=20</strong></td></tr>
+      <tr><td>5</td><td>扫 k 找拐点，砍掉拐点之后的 k</td><td>零（省钱）</td><td>kNN 曲线很小的 k 就饱和</td></tr>
+      <tr><td>6</td><td>无内容探针 + 减先验校准（若有 logprobs）</td><td>一次调用 + 实现</td><td>把最差顺序从 50% 救到 70%</td></tr>
+      <tr><td>7</td><td>示例池运维：监控平均相似度、淘汰未被选中的</td><td>低</td><td>漂移流量上平均相似度明显下降</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>前三步的总成本是零，而它们覆盖了本模块效应量最大的两项</strong>（覆盖度这个正确性问题、以及顺序这个三倍差距）。<em>第 4 步开始才需要真正的实现工作</em>。<strong>所以如果只能做一件事，做第 1 步；只能做三件，做前三步。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>一个常见的次序错误：<strong>直接从第 4 步开始</strong>（因为 kNN 听起来最像「正确做法」）。<em>后果是：泄漏没查（于是 kNN 让每道题的示例包含它自己，分数虚高到无意义）、覆盖没保底（于是稀有类归零）、顺序没搜（于是白丢一个三倍的免费收益）</em>。<strong>而这三件事都比 kNN 便宜。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="boundary"><span class="num">12</span>这一层的边界</h2>
+  <p>示例是一个很容易被当成万能药的东西。<strong>这一节说清它解决不了什么。</strong></p>  <table>
+    <thead><tr><th>问题</th><th>示例能解决吗</th><th>该去哪一层</th></tr></thead>
+    <tbody>
+      <tr><td><strong>输出格式不对</strong></td><td><em>部分</em>——示例会示范格式，但不保证</td><td><strong>模块 04 的解码约束</strong>（它是保证而不是示范）</td></tr>
+      <tr><td><strong>取值域没声明</strong></td><td><strong>不能</strong></td><td>模块 01 的指令槽位；<em>示例不能替代取值域声明</em></td></tr>
+      <tr><td><strong>模型不知道某个领域事实</strong></td><td><strong>不能</strong></td><td>检索（C11 / C70）——<em>示例示范的是「怎么做」，不是「事实是什么」</em></td></tr>
+      <tr><td><strong>需要多步推理</strong></td><td><em>有限</em></td><td>C09（推理与测试时计算）；<em>本课的模拟器没有推理能力，所以不讨论</em></td></tr>
+      <tr><td><strong>上下文塞不下</strong></td><td><strong>不能</strong>（示例本身就占预算）</td><td>C33 的预算分配与压缩</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第三行是最容易混淆的一条。</strong><em>「模型答错了，多给几个例子」这个反应在「格式/形态」类问题上有效，在「缺事实」类问题上完全无效</em>——<strong>而两者在指标上都表现为「准确率低」。</strong><em>区分方式很直接：把答案所需的事实列出来，看它在不在 prompt 里。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>而第一行值得反过来读一遍：<strong>如果你正在用示例来「教模型输出正确的 JSON」，那么你在用一个概率性手段解决一个可以被保证的问题。</strong><em>模块 04 的解码约束能把解析率钉在 1.0，而示例只能让它「更常对」</em>。<strong>把示例的预算省下来用在「示范任务形态」上，收益更高。</strong></p></div>
+  </div>  <h3>一句话记住这一层的定位</h3>  <p><strong>示例回答的是「这类题该怎么做」，不是「这道题的答案是什么」，也不是「输出必须长成什么样」。</strong><em>前者交给检索（C11 / C70），后者交给解码约束（模块 04）。</em><strong>而在「怎么做」这件事上，本模块量到的三个数值得记住：选对 1 条 ≈ 随机 20 条、顺序造成三倍差距、某类没示例则该类归零。</strong><em>三个数对应三个不同的动作——选择、排序、覆盖——而它们的总成本接近于零。</em></p>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_prompt_program/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · prompt program 与可组合结构</div></a>
+    <a class="next" href="../03_optimization/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 自动提示优化</div></a>
+  </div>
+
+</div>
+</body>
+</html>
