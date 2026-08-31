@@ -33,7 +33,7 @@ SECTIONS = [
    │ 误读: 「这个改动没有效果」  ← 实际上它根本没被执行           │
    └──────────────────────────────────────────────────────────┘
 
-   ✓ 缓存键 = hash(输入内容) + 完整配置指纹
+   ✓ 缓存键 = hash(输入内容) + 完整运行指纹
      prompt 变了 → 指纹变了 → 缓存不命中 → 真的重新调用
 """),
         MATH(r"\text{cache\_key} = H\big(\underbrace{\text{input}}_{\text{内容}} \;\|\; \underbrace{\text{fp}(\text{spec}_{\text{exec}})}_{\text{配置}}\big)"),
@@ -66,7 +66,7 @@ SECTIONS = [
     # ============================================================== 2
     ("failures", "失败分类：静默跳过是最常见的数据污染", "".join([
         P("模块 00 讲过「失败样本必须计入分母」。这一节讲得更细："
-          "<strong>失败不是一类，而是至少五类，它们该被区别对待。</strong>"),
+          "<strong>失败不是一类，而是六类，它们该被区别对待。</strong>"),
         TABLE(["失败类型", "典型来源", "该不该重试", "该不该计入分母", "该怎么记"], [
             ["<strong>瞬时基础设施错误</strong>", "网络抖动、502、连接重置", "<strong>该</strong>", "重试成功后按成功计", "记重试次数"],
             ["<strong>限流</strong>（429）", "并发太高", "<strong>该</strong>（退避后）", "同上", "单独统计，用于调并发"],
@@ -325,7 +325,7 @@ NB = [
 
 本 notebook 你会亲手实现：
 1. **缓存键设计** —— 复现「改了 prompt 却读到旧结果」这个不报错的 bug，再修好它
-2. **失败分类器** —— 五类失败，各自的重试策略与分母归属
+2. **失败分类器** —— 六类失败，各自的重试策略与分母归属
 3. **指数退避 + 抖动** —— 以及不加抖动时的惊群效应
 4. **重试引入的选择偏倚** —— 「重试到成功为止」会把分数抬高多少
 5. **令牌桶限流 + 并发上限** —— 两者管的不是一件事
@@ -393,7 +393,7 @@ class FakeAPI:
 TASKS = [{'task_id': f't{i:03d}', 'input': f'q{i}', 'target': f'a{i}'} for i in range(120)]
 api = FakeAPI(seed=1)
 print('一次调用:', api(TASKS[0]), '| 累计成本:', f'${api.total_cost:.3f}')
-print('\\n✅ 五类失败都可以被精确注入——这比真实 API 更适合验证 runner 的正确性。')"""),
+print('\\n✅ 六类失败都可以被精确注入——这比真实 API 更适合验证 runner 的正确性。')"""),
 
     md("""## 1 · 缓存键：复现那个不报错的 bug，再修好它"""),
 
@@ -427,7 +427,7 @@ def key_bad(task, spec):
     return stable_hash(task['input'], 16)                       # ❌ 只有输入内容
 
 def key_good(task, spec):
-    return stable_hash([task['input'], exec_fingerprint(spec)], 16)   # ✓ 内容 + 配置指纹
+    return stable_hash([task['input'], exec_fingerprint(spec)], 16)   # ✓ 内容 + 运行指纹
 
 
 SPEC_V1 = {'model': {'id': 'm1', 'temperature': 0.0},
@@ -471,7 +471,7 @@ assert c2.hit_rate >= 0.5
 print('✅ 缓存该省的钱一分没少省，该失效的时候准确失效——关键是键里用了 exec_fingerprint，')
 print('   而不是手写一份「要包含哪些字段」的列表（那种列表加新字段时没人会记得更新）。')"""),
 
-    md("""## 2 · 失败分类：五类失败，五种处理"""),
+    md("""## 2 · 失败分类：六类失败，六种处理"""),
 
     code("""FAILURE_POLICY = {
     'RateLimited': dict(retry=True,  in_denominator=True,  counts_as='retryable'),
@@ -1000,7 +1000,7 @@ print(RECIPE)"""),
 |---|---|---|
 | 缓存键 | 用 `exec_fingerprint` 而不是手写字段列表 | 每个 runner |
 | 何时关缓存 | 估方差、算区间、跑 pass^k 时必须关 | 统计分析 |
-| 失败五分类 | 只有 `scorer_error` 可以从分母排除，且必须报告比例 | 结果聚合 |
+| 失败六分类 | 只有 `scorer_error` 可以从分母排除，且必须报告比例 | 结果聚合 |
 | 退避 + 抖动 | 抖动不是可选的——没有它重试就是下一次雪崩 | 重试实现 |
 | 重试的偏倚 | **重试只看异常类型，不看判分结果**；结构上让重试拿不到 scorer | 最重要的一条 |
 | 并发 vs 限流 | 两者管的不是一件事，都要有；等待占比 >30% = 并发白加 | 性能与成本 |

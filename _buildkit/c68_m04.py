@@ -8,7 +8,7 @@ META = [
     ("配套 notebook", '<span class="badge cpu">CPU</span> 04_ci_gating.ipynb'
                        '（用重复运行的方差推导门禁阈值 / 误报率与漏报率的权衡曲线 / '
                        '两级门禁：smoke 快检 + full 慢检 / 配对门禁 vs 绝对阈值门禁 / '
-                       '告警疲劳的模拟：误报如何让门禁被关掉 / 金丝雀与分阶段放行）'),
+                       '告警疲劳的模拟：误报如何让门禁被关掉 / 金丝雀发布与分阶段放行）'),
     ("核心参考", "Google, <em>Testing on the Toilet</em> 与 flaky test 治理实践 · "
                  "Continuous Delivery 的门禁分层思想 · "
                  "Wald 序贯概率比检验（SPRT，用于早停判定）· "
@@ -47,7 +47,7 @@ SECTIONS = [
             "本模块 notebook 第 2 节会把这个换算做出来。",
         ),
         CALLOUT("intuition", "一条可以直接用的目标：<strong>把误报频率定在「每月至多一次」</strong>。"
-                             "<em>按每天 20 次 CI 运行算，这对应单次误报率约 $1/400 = 0.25\\%$</em>——"
+                             "<em>按每天 20 次 CI 运行、每月 20 个工作日算，这对应单次误报率约 $1/400 = 0.25\\%$（若按 30 个自然日计，同样的目标需要 $\\alpha \\approx 1/600 = 0.17\\%$）</em>——"
                              "比常规的 5% 严格 20 倍。"
                              "<strong>这个约束会直接推出你需要多大的样本量和多宽的阈值</strong>，"
                              "而不是反过来「先定阈值再看误报多不多」。"),
@@ -67,9 +67,9 @@ SECTIONS = [
         ]),
         MATH(r"\text{threshold} = z_{\alpha}\,\sigma_{\text{run}}\sqrt{2}, \qquad \alpha = \frac{1}{\text{每月运行次数}}"),
         TABLE(["$\\sigma_{\\text{run}}$", "每天 20 次 CI 的阈值（月误报 1 次）", "能检出的最小退化", "评价"], [
-            ["0.5 个点", "±1.9 个点", "≥ 2 个点", "<strong>健康</strong>：噪声小，门禁灵敏"],
-            ["1.5 个点", "±5.8 个点", "≥ 6 个点", "勉强：只能抓大退化"],
-            ["3.0 个点", "±11.6 个点", "≥ 12 个点", "<strong>门禁基本没用</strong>：先去降噪，别调阈值"],
+            ["0.5 个点", "±2.0 个点", "≥ 2 个点", "<strong>健康</strong>：噪声小，门禁灵敏"],
+            ["1.5 个点", "±6.0 个点", "≥ 6 个点", "勉强：只能抓大退化"],
+            ["3.0 个点", "±11.9 个点", "≥ 12 个点", "<strong>门禁基本没用</strong>：先去降噪，别调阈值"],
         ]),
         CALLOUT("danger", "最后一行是本节最重要的一条：<strong>当噪声大到阈值必须放宽到十几个点时，"
                           "正确的动作不是「接受这个宽阈值」，而是去降噪</strong>——"
@@ -122,8 +122,9 @@ SECTIONS = [
             "<strong>两次运行各自的采样噪声</strong>。"
             "配对门禁问的是：「<em>在同一批任务上</em>，有多少题从对变错了、多少题从错变对了？」"
             "<strong>任务难度对两边是同一个数，做差时直接消掉。</strong>",
-            "形式化：绝对差的方差是 $\\operatorname{Var}(s_A) + \\operatorname{Var}(s_B)$；"
-            "配对差的方差是 $\\operatorname{Var}(s_A) + \\operatorname{Var}(s_B) - 2\\operatorname{Cov}(s_A, s_B)$。"
+            "形式化：两种门禁看的都是同一个量 "
+            "$\\operatorname{Var}(s_A - s_B) = \\operatorname{Var}(s_A) + \\operatorname{Var}(s_B) - 2\\operatorname{Cov}(s_A, s_B)$，"
+            "<em>区别只在 $\\operatorname{Cov}$：不配对（两边跑的题不完全相同）时它被构造成约等于 0</em>。"
             "<strong>由于两次运行在同一批任务上高度正相关（难题对谁都难），"
             "$\\operatorname{Cov}$ 项很大</strong>，配对差的方差远小于绝对差。"
             "<em>在二值结果下这直接退化为 McNemar 检验：只有 fixed 与 regressed 这两类"
@@ -212,6 +213,7 @@ SECTIONS = [
         OL([
             "<strong>连续两次才阻断</strong>——单次异常只警告，连续两次运行都异常才阻断。"
             "<em>误报率从 $\\alpha$ 降到约 $\\alpha^2$，而真实退化会持续存在因此几乎不受影响</em>。"
+            "<strong>前提是两次运行的噪声独立</strong>——若噪声里有持续性成分（某道题一直 flaky、上游一直慢），实际误报率会明显高于 $\\alpha^2$。"
             "<strong>这是性价比最高的一条</strong>；",
             "<strong>自动重跑一次再判</strong>——与上一条类似，但要注意"
             "<em>重跑的触发条件是「统计异常」而不是「结果不好」</em>（呼应模块 02 第 3 节的偏倚讨论），"
@@ -225,12 +227,12 @@ SECTIONS = [
     ])),
 
     # ============================================================== 7
-    ("canary", "金丝雀与分阶段放行", "".join([
+    ("canary", "金丝雀发布与分阶段放行", "".join([
         P("门禁不是二元的。当一个改动通过了 CI 但你仍不完全放心时，"
           "<strong>分阶段放行</strong>比「合还是不合」提供了更多选项。"),
         TABLE(["阶段", "暴露范围", "看什么", "回滚条件"], [
             ["<strong>影子运行</strong>（shadow）", "0% 用户，但对真实流量跑一遍", "离线指标 + 与现网输出的 diff", "任何异常"],
-            ["<strong>金丝雀</strong>", "1–5% 流量", "<strong>线上指标</strong>（模块 05）+ 错误率 + 延迟", "线上指标显著劣化"],
+            ["<strong>金丝雀发布</strong>", "1–5% 流量", "<strong>线上指标</strong>（模块 05）+ 错误率 + 延迟", "线上指标显著劣化"],
             ["<strong>逐步放量</strong>", "5% → 25% → 50% → 100%", "同上，每一档观察足够长的时间", "同上"],
         ]),
         DUAL(
@@ -250,7 +252,7 @@ SECTIONS = [
         CALLOUT("intuition", "一个实用的组合：<strong>CI 的 full 门禁 + 影子运行的输出 diff</strong>。"
                              "<em>前者在固定的任务集上抓退化，后者在真实分布上抓「离线没覆盖到的场景」</em>。"
                              "<strong>两者的失败模式互补</strong>——"
-                             "离线任务集抓不到的（分布偏移、真实用户的奇怪输入），"
+                             "离线任务集抓不到的（分布漂移、真实用户的奇怪输入），"
                              "影子运行能抓到；影子运行没有金标准，"
                              "但离线任务集有。"),
         P("<strong>分阶段放行的观察窗口该多长？</strong>"
@@ -279,7 +281,7 @@ SECTIONS = [
         ),
         H3("② 基线更新：什么时候、怎么更新"),
         TABLE(["更新时机", "做法", "风险"], [
-            ["<strong>每次成功合并后</strong>", "滚动基线", "<strong>渐进式退化</strong>（模块 03 第 8 节）——每次退化 0.3 个点都通过"],
+            ["<strong>每次成功合并后</strong>", "滚动基线", "<strong>渐进式退化</strong>（模块 03 第 9 节）——每次退化 0.3 个点都通过"],
             ["<strong>每个季度</strong>", "锚定基线", "更新不及时会让锚定基线失去意义"],
             ["<strong>模型/任务集大版本变更时</strong>", "强制重建基线", "必须<strong>显式声明配置变更</strong>，否则确定性门禁会拦住"],
         ]),
@@ -327,7 +329,7 @@ SECTIONS = [
 ]
 
 NB = [
-    md("""# 04 · CI 回归门禁（阈值推导 / 门禁分级 / 配对门禁 / 两级架构 / 告警疲劳 / 金丝雀）
+    md("""# 04 · CI 回归门禁（阈值推导 / 门禁分级 / 配对门禁 / 两级架构 / 告警疲劳 / 金丝雀发布）
 
 目标：把「掉 2% 就报警」这种拍脑袋的规则，替换成**从方差和误报预算推导出来**的门禁。
 
@@ -574,7 +576,7 @@ print('   而且必须**无条件重跑并合并两次结果**，不能「取更
     if len(run['fingerprints']) != 1:
         problems.append(f"指纹不唯一: {run['fingerprints']} → run_id 被复用")
     if run['fingerprints'] != baseline['fingerprints'] and not run.get('declared_config_change'):
-        problems.append('配置指纹与基线不同，但未声明配置变更 → 结果不可比')
+        problems.append('运行指纹与基线不同，但未声明配置变更 → 结果不可比')
     lo, hi = spec['expected_score_range']
     if not (lo <= run['score'] <= hi):
         direction = '低于' if run['score'] < lo else '**高于**'

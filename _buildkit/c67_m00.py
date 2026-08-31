@@ -130,7 +130,7 @@ SECTIONS = [
             ["<strong>C10</strong> · 评测数据与测量科学", "标注、一致性系数、IRT、校准、A/B", "本课 03 模块的 kappa / Krippendorff / 校准全部复用 C10 的工具；<strong>本课的新东西是「人类上界」与「judge 分辨力」这两个 judge 特有的量</strong>"],
             ["<strong>C02</strong> · 后训练与对齐", "SFT → RLHF/DPO → RLVR 的训练流程", "C02 教你<strong>用</strong>奖励模型训练；本课 05 模块教你<strong>评测</strong>奖励模型，以及识别过优化"],
             ["<strong>C23</strong> · 前沿对齐", "CAI、可扩展监督、weak-to-strong", "那门课关心「用 AI 监督 AI 的可行性边界」，本课关心「用 AI 打分的测量学性质」——问题相关但层面不同"],
-            ["<strong>C68</strong> · Eval 基础设施（同批新课）", "task spec、runner、缓存、CI 门禁、线上监控", "judge 的调用、缓存、成本控制、漂移监控在 C68 落地；<strong>本课只管 judge 的正确性</strong>"],
+            ["<strong>C68</strong> · Eval 基础设施（同批新课）", "task spec、runner、缓存、CI 门禁、线上监控", "judge 的调用、缓存、成本控制在 C68 落地；judge 漂移的<strong>检测方法</strong>在本课 03 模块，<strong>线上告警的落地</strong>在 C68 05 模块；<strong>本课只管 judge 的正确性</strong>"],
         ]),
         CALLOUT("intuition", "一句话记住这批新课的分工：<strong>C66 量 agent · C67 量判分器 · "
                              "C68 把评测变成基础设施 · C69 量攻击面。</strong>"

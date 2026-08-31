@@ -11,7 +11,7 @@ META = [
                        'DLP 检测的召回-误伤权衡 / 出站预算：把「泄多少」变成可计算的量）'),
     ("核心参考", "Johann Rehberger（wunderwuzzi）关于 markdown 图片渲染外泄与 ASCII smuggling 的公开研究 · "
                  "Simon Willison 关于 <em>exfiltration vectors</em> 的系列记录 · "
-                 "OWASP LLM02（敏感信息泄露）与 LLM06 · "
+                 "OWASP LLM02（敏感信息泄露）与 LLM06（2025 版编号）· "
                  "DNS 隧道与隐蔽信道的经典文献（Kaminsky 等）· "
                  "本课程 C45（隐私与可信）· C68 模块 05（guardrail 分层）"),
     ("预计时长", "读 60 分钟 + 跑 55 分钟"),
@@ -79,7 +79,7 @@ SECTIONS = [
             ["多次请求（分块）", "无上限", "分块 + 序号", "<strong>无上限</strong>", "<strong>速率限制是唯一的约束</strong>"],
         ]),
         CALLOUT("intuition", "第五行是关键：<strong>单次带宽的上限不重要，因为可以分块。</strong>"
-                             "<em>一个 4 KB 的密钥文件，用 100 字节/次的 DNS 通道也只需要 40 次查询</em>——"
+                             "<em>一个 4 KB 的密钥文件，用 100 字节/次的 DNS 通道也只需要 41 次查询</em>——"
                              "而 40 次 DNS 查询在任何监控里都不显眼。"
                              "<strong>所以「限制单次请求大小」几乎没有防御价值；"
                              "有价值的是「限制出站的目标」（白名单）与「限制总量」（预算）。</strong>"),

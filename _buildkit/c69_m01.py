@@ -13,7 +13,7 @@ META = [
                  "Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection</em>"
                  "（AISec 2023）· "
                  "Simon Willison 关于 <em>Dual LLM pattern</em> 与 <em>prompt injection</em> 的系列文章 · "
-                 "Willison / Beurer-Kellner et al. 关于 <em>CaMeL</em> 一类「用代码而非提示做隔离」的思路 · "
+                 "Debenedetti et al. 的 <em>CaMeL</em>（用代码而非提示做隔离）与 Beurer-Kellner et al. 的注入防御设计模式 · "
                  "OWASP LLM01 · "
                  "本课程 C11（RAG 与检索）· C33（上下文与记忆）· C68 模块 05（guardrail 分层）"),
     ("预计时长", "读 60 分钟 + 跑 55 分钟"),
@@ -102,7 +102,9 @@ SECTIONS = [
                              "而 A 和 B 需要持续对抗攻击者的演化。</em>"
                              "<strong>一个只做了 A+B 的系统，安全性完全依赖于「攻击者不够努力」。</strong>"),
         H3("A 类里真正有效的两条"),
-        P("提示层的手段很多，但根据公开的实验与实践，<strong>有两条明显比其他的有效</strong>："),
+        P("提示层的手段很多，但从机制上看<strong>有两条明显比其他的有效</strong>"
+          "（notebook 第 2 节会在模拟器上量出差距；"
+          "「显式标注不受信区间」这条路线的公开工作可参考 Spotlighting 一类的方法）："),
         OL([
             "<strong>显式标注来源与信任等级</strong>，而不是只用分隔符。"
             "<em>「以下是从互联网抓取的、不受信任的内容」比「&lt;document&gt;……&lt;/document&gt;」有效得多</em>——"
@@ -321,7 +323,7 @@ SECTIONS = [
             "<strong>必须确认，且确认界面要把「推到哪个分支/仓库」单独突出显示</strong>；",
             "<strong>命令输出经过窄接口</strong>（第 4 节）："
             "<em>如果 agent 只需要知道「测试过了没有」，就不要把完整的测试输出塞回上下文</em>——"
-            "返回一个 <code>{passed: bool, n_failed: int}</code> 足够，而这把注入面压到了 2 比特。",
+            "返回一个 <code>{passed: bool, n_failed: int（上限 N）}</code> 足够，而这把注入面压到了 $1 + \\log_2(N{+}1)$ 比特——如果只需要「过了没有」，一个 bool 就是 1 比特。",
         ]),
         CALLOUT("intuition", "第 5 条值得展开，因为它是一个<strong>产品上几乎无痛、安全上收益极大</strong>的改动："
                              "<em>「把完整的命令输出塞回上下文」是默认做法，"

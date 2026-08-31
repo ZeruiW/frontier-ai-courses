@@ -72,7 +72,7 @@ SECTIONS = [
         P("压缩的直接后果是<strong>判别力归零</strong>：如果 80% 的样本都是 4 分，"
           "那么这个 judge 在这 80% 之间提供的信息是 0 bit。"
           "量化方式就是分数分布的<strong>熵</strong>——或者更直观的<strong>有效档位数</strong> "
-          "$\\exp(H)$：五档量表如果有效档位数只有 1.6，说明你实际上在用一个「一档半」的量表。"),
+          "$2^{H}$（$H$ 以 bit 为单位，与 notebook 里的实现一致）：五档量表如果有效档位数只有 1.6，说明你实际上在用一个「一档半」的量表。"),
         TABLE(["缓解手段", "怎么做", "效果", "代价"], [
             ["<strong>rubric 分解</strong>", "拆成 4–6 个二元/三元的子项，再加权聚合（第 4 节）", "<strong>最有效</strong>：每个子项的分布都不压缩，聚合后连续化", "要设计 rubric、要定权重"],
             ["<strong>few-shot 锚点</strong>", "给出每一档的 1–2 个标注样例", "有效，尤其是给出 1 分与 5 分的样例", "占上下文；锚点选得不好会引入新偏差"],
@@ -100,7 +100,9 @@ SECTIONS = [
         H3("决策二：平局怎么进统计"),
         MATH(r"\text{win rate} = \frac{W + \tfrac{1}{2}T}{W + L + T} \quad\text{（推荐）}\qquad\text{vs}\qquad \frac{W}{W+L}\ \text{（丢弃平局）}"),
         P("两种口径会给出不同的数字，而且在平局率高时差别很大。"
-          "<strong>推荐左边这种（平局算半分）</strong>——它与 Bradley–Terry 模型的处理方式一致（04 模块），"
+          "<strong>推荐左边这种（平局算半分）</strong>——它与 Elo 以及 Arena 类榜单拟合 Bradley–Terry 时的"
+          "实际做法一致（把平局记成 $y=0.5$，见 04 模块）。"
+          "<em>严格来说 BT 本身没有平局项，处理平局的正统扩展是 Davidson 或 Rao–Kupper 模型；半分是一个好用的近似，但要在报告里写明。</em>"
           "而且不会因为「平局多」而人为放大胜负差距。"
           "<em>无论选哪种，都必须在报告里写明</em>。"),
         H3("决策三：必须成对调用（swap）"),
@@ -216,7 +218,7 @@ SECTIONS = [
             "被评内容在上下文里的相对权重越低；而且<em>过多的锚点会让 judge 去做「最近邻匹配」"
             "而不是按标准判断</em>。",
             "<strong>锚点要版本化</strong>：换了锚点就等于换了量表，历史分数不可直接比较——"
-            "这与 C66 模块 05 的 harness 指纹是同一件事。",
+            "这与 C66 模块 05 的 运行指纹是同一件事。",
         ]),
         DUAL(
             "一个实用的自检：把锚点样例本身当作待评样本，送进 judge 跑一遍。"
@@ -446,7 +448,7 @@ print('   **这类问题必须用否决项处理，不能靠权重。**')"""),
 
     code("""def win_rate(w, l, t, mode='half'):
     total = w + l + t
-    if mode == 'half':      # 平局算半分（推荐，与 Bradley-Terry 一致）
+    if mode == 'half':      # 平局算半分（推荐；这是 Elo/Arena 拟合 BT 时的惯例）
         return (w + 0.5 * t) / total if total else float('nan')
     if mode == 'drop':      # 丢弃平局
         return w / (w + l) if (w + l) else float('nan')
@@ -772,7 +774,7 @@ print(RECIPE)"""),
 | 分布压缩 | 五档量表常常只有效用到一档半；把量表变细不创造信息 | pointwise |
 | rubric 分解 | 独立噪声按 1/sqrt(K) 衰减；4–6 项是甜点区 | 提升判别力 |
 | 否决项 | 编造引用这类问题必须归零，不能按权重扣分 | rubric 设计 |
-| 平局口径 | 平局算半分（与 BT 一致），且必须写明 | pairwise 报告 |
+| 平局口径 | 平局算半分（Arena 拟合 BT 的惯例），且必须写明 | pairwise 报告 |
 | 参考答案 | 提升一致性，但会奖励「像参考」而非「同样正确」 | 有标准答案的任务 |
 | 解析失败 | 失败与难度相关，悄悄丢弃会让一致率虚高 | 工程记账 |
 | prompt 版本化 | judge prompt 是 harness 的一部分 | 长期可比性 |

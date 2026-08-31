@@ -117,7 +117,7 @@
 - **OpenTelemetry _Semantic Conventions for Generative AI_（`gen_ai.*` span 属性）** —
   解决「轨迹字段名该怎么起」。沿用标准字段名的理由不是它更优雅，
   而是**现成的 trace 查看器（Jaeger / Tempo / Phoenix 等）可以直接用**——这个理由已经足够。
-- **Yuri Papadakis et al., _Mutation Testing Advances: An Analysis and Survey_
+- **Mike Papadakis, Marinos Kintis, Jie Zhang et al., _Mutation Testing Advances: An Analysis and Survey_
   （Advances in Computers, 2019）** —
   解决「怎么量化一组测试的强度」。本课模块 02 用它来回答「这个判分器可不可信」，
   工具层面对应 `mutmut` / `cosmic-ray`。

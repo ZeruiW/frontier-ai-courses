@@ -11,7 +11,7 @@
 - ★ **Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, et al., _Judging LLM-as-a-Judge with MT-Bench
   and Chatbot Arena_（NeurIPS 2023 Datasets & Benchmarks）** —
   解决三件事，而且是本课引用最多的一篇：
-  **① 系统性地命名并测量了位置偏差、冗长偏差、自增强偏差**（本课模块 02 的四大偏差里有三个出自这里）；
+  **① 系统性地命名并测量了位置偏差、长度偏差、自偏好偏差**（本课模块 02 的四大偏差里有三个出自这里）；
   **② 给出了 judge 与人类一致率、以及人类之间一致率的对照**（模块 03「人类上界」的直接来源）；
   **③ 对比了 pairwise 与 single-answer grading 两种用法**（模块 01 第 2–3 节）。
   如果这份清单只读一篇，读这篇。
@@ -55,7 +55,9 @@
 - ★ **Klaus Krippendorff, _Content Analysis: An Introduction to Its Methodology_** —
   解决「多个评判者、有缺失值、有序或名义数据时，一致性该怎么算」。
   Krippendorff's α 是本课模块 03 推荐的通用系数；
-  **Cohen's kappa 只是它在「两个评判者 + 名义数据」这个特例下的近亲**。
+  **在「两个评判者 + 名义数据」这个特例下 α 退化为 Scott's π；
+  它与 Cohen's kappa 的差别正是「期望一致率用合并边缘还是各自边缘」**——
+  这个差别在边缘极不均衡时会变得可观（下一条的 kappa 悖论）。
 - **Jacob Cohen（1960）与关于 kappa 悖论的方法学讨论（Feinstein & Cicchetti, 1990 等）** —
   解决「为什么原始一致率 0.9 而 kappa 只有 0.2」。
   本课模块 03 把它讲成一条实践结论：**kappa 塌陷是信号不是缺陷**，
@@ -97,7 +99,7 @@
 - ★ **Leo Gao, John Schulman, Jacob Hilton,
   _Scaling Laws for Reward Model Overoptimization_（ICML 2023）** —
   解决「过优化会不会发生、什么时候发生、更大的 RM 能不能避免」。
-  给出了 $R(d) \approx d(\alpha - \beta d)$ 这个经验形式（$d = \sqrt{\mathrm{KL}}$），
+  给出了两个**随优化方式不同而不同**的经验形式（$d = \sqrt{\mathrm{KL}}$）：best-of-n 是 $R_{\text{bon}}(d) \approx d(\alpha - \beta d)$，RL 是 $R_{\text{RL}}(d) \approx d(\alpha - \beta \log d)$，
   并证明 **best-of-n 与 RL 两条路径都会出现倒 U，更大的 RM 推得更远但拐点依然存在**。
   **本课模块 05 第 2–3 节完全建立在这篇之上。**
 - ★ **Nisan Stiennon, Long Ouyang, Jeff Wu, et al.,
@@ -105,8 +107,8 @@
   解决「RLHF 的完整流程长什么样」，并**最早清晰地展示了「优化 RM 分数到一定程度后人类评价反而下降」**。
   它也是「必须有一条独立于 RM 的人类验证信号」这条实践的来源。
 - ★ **Nathan Lambert, Valentina Pyatkin, Jacob Morrison, et al., _RewardBench_（2024）** —
-  解决「怎么系统地评测一个奖励模型」：**按能力分片**（chat / chat-hard / safety / reasoning），
-  而不是报一个总准确率。**本课模块 05 第 4 节与第 6 节的分片思想与「报 worst slice」的主张来自这里**，
+  解决「怎么系统地评测一个奖励模型」：**按能力切片**（chat / chat-hard / safety / reasoning），
+  而不是报一个总准确率。**本课模块 05 第 4 节与第 6 节的切片思想与「报 worst slice」的主张来自这里**，
   同时本课补充了它的局限：静态偏好对上的准确率是必要条件而非充分条件。
 - **Thomas Coste, Usman Anwar, Robert Kirk, David Krueger,
   _Reward Model Ensembles Help Mitigate Overoptimization_（ICLR 2024）** —

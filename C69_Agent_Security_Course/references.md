@@ -24,8 +24,10 @@
   **① 怎么快速判断一个 agent 危不危险**（不受信内容 + 私密数据 + 对外通信 = 外泄链路完整）；
   **② 在无法消除注入的前提下怎么设计架构**（隔离 LLM 无权限、特权 LLM 不接触不受信内容）。
   **模块 00 第 2 节与模块 01 第 4 节基本是这两个想法的展开与量化。**
-- **OWASP, _Top 10 for Large Language Model Applications_（LLM01 Prompt Injection、
-  LLM02 Sensitive Information Disclosure、LLM06 Excessive Agency）** —
+- **OWASP, _Top 10 for Large Language Model Applications_（**2025 版**：LLM01 Prompt Injection、
+  LLM02 Sensitive Information Disclosure、LLM06 Excessive Agency；
+  注意 2023 版的编号不同——LLM02 是 Insecure Output Handling、LLM06 是敏感信息泄露，
+  所以引用编号时必须带版本年份）** —
   解决「怎么把 LLM 应用的风险讲给安全团队听」。
   它的价值主要在**共同词汇**，而不在技术深度；
   本课在需要与安全团队对齐时建议直接引用它的编号。
@@ -43,8 +45,10 @@
   **本课模块 00 的 `trust(输出) = min(上下文)` 就是 Biba 模型的「完整性等级只能单调下降」**，
   而「提权只能通过显式的、被审计的降级点」是它的标准补充。
   <em>把这条经典规则搬到 LLM 上下文，是本课最重要的一个结构性借用。</em>
-- **Beurer-Kellner, Fischer, Tramèr 等关于「用代码而非提示做隔离」的路线
-  （CaMeL 一类的设计）** —
+- **Debenedetti, Shumailov, Carlini, Tramèr 等, _Defeating Prompt Injections by Design_
+  （CaMeL, arXiv:2503.18813, 2025），以及 Beurer-Kellner, Fischer, Tramèr 等,
+  _Design Patterns for Securing LLM Agents against Prompt Injections_
+  （arXiv:2506.08837, 2025）关于「用代码而非提示做隔离」的路线** —
   解决「双 LLM 模式的窄接口能不能推广」。
   思路是让特权侧生成一段**受限 DSL / 受限执行图**，由确定性解释器执行，
   而不受信内容只作为数据流过这段计划。

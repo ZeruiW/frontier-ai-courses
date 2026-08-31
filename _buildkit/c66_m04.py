@@ -162,7 +162,8 @@ boot = concat(rollouts_of(t) for t in task_ids)"""),
             "<strong>你要检测多大的差异？</strong>（最小实际重要差异 MDE）"
             "「任何差异都想检测」等价于「需要无穷样本」。先想清楚：差 1 个点会改变你的决策吗？"
             "如果不会，就别把它设成 MDE。",
-            "<strong>你能接受多大的假阳性率与假阴性率？</strong>"
+            "<strong>你能接受多大的误报率（Type I）与漏报率（Type II）？</strong>"
+            "<em>注意这里的 $\\alpha$ 是显著性水平，与模块 02 里判分器的假阳率 $\\alpha$ 是两个不同的量。</em>"
             "研究场景常用 $\\alpha = 0.05, \\text{power} = 0.8$；"
             "<em>但 CI 门禁场景（C68-04）应该用完全不同的取值</em>——"
             "误报会让整个团队开始忽略告警，所以 $\\alpha$ 要设得很低。",
@@ -195,8 +196,9 @@ boot = concat(rollouts_of(t) for t in task_ids)"""),
             "<strong>「取最大值」这个操作本身就是有偏的。</strong>",
             "形式化：设 $\\hat{\\theta}_i = \\theta_i + \\varepsilon_i$，$\\varepsilon_i \\sim \\mathcal{N}(0, \\sigma^2)$。"
             "则 $\\mathbb{E}[\\max_i \\hat{\\theta}_i] > \\max_i \\theta_i$，"
-            "且当所有 $\\theta_i$ 相等时，偏差约为 $\\sigma \\sqrt{2 \\ln m}$（$m$ 为参赛者数量）。"
-            "<em>$m = 20$、$\\sigma = 2$ 个点时，榜首的期望虚高约 $2\\sqrt{2\\ln 20} \\approx 4.9$ 个点</em>——"
+            "且当所有 $\\theta_i$ 相等时，偏差的量级是 $\\mathcal{O}(\\sigma \\sqrt{2 \\ln m})$（$m$ 为参赛者数量），"
+            "其中 $\\sigma\\sqrt{2\\ln m}$ 是一个<strong>上界</strong>，$m$ 不大时实际值明显更小。"
+            "<em>$m = 20$、$\\sigma = 2$ 个点时 $\\mathbb{E}[\\max_i \\varepsilon_i] \\approx 1.87\\sigma$，榜首的期望虚高约 3.7 个点（上界给出 4.9）</em>——"
             "这个量级完全足以解释「排行榜前几名挤在几个点内」的现象，"
             "也解释了为什么复现时会系统性地掉分。",
         ),
@@ -241,11 +243,11 @@ vs baseline (配对):             +3.1 个百分点  [-1.2, +7.5]   McNemar p = 
     # ============================================================== 8
     ("sequential", "序贯评测：跑到一半能不能停", "".join([
         P("agentic 评测很贵，所以一个很自然的想法是：<strong>边跑边看，差距明显了就提前停。</strong>"
-          "这个想法是对的，但<em>朴素地执行会让假阳性率暴涨</em>——它是评测里最常见的统计错误之一。"),
+          "这个想法是对的，但<em>朴素地执行会让误报率暴涨</em>——它是评测里最常见的统计错误之一。"),
         H3("为什么「边跑边看」会作弊"),
         P("如果你每跑 50 道题就看一次 $p$ 值，一旦 $p &lt; 0.05$ 就停下来宣布显著，"
           "那么即使两个 agent 完全相同，你也<strong>迟早会碰到一次 $p &lt; 0.05$</strong>。"
-          "检查 10 次的话，实际假阳性率会从 5% 涨到 20% 以上——"
+          "检查 10 次的话，实际误报率会从 5% 涨到 20% 以上——"
           "这叫<span class=\"term\">窥视问题</span>（peeking / optional stopping）。"),
         CALLOUT("danger", "这个错误在 agent 评测里特别容易犯，因为评测是<strong>逐任务流式产出结果</strong>的，"
                           "人天然会在跑的过程中盯着看。<strong>「跑到 300 题的时候看起来 A 明显更好，"
@@ -584,8 +586,8 @@ print('   没有它，「不显著」这三个字没有任何信息量。')"""),
 sigma = math.sqrt(0.40 * 0.60 / 500)
 for m in [2, 5, 20, 100]:
     gap, rev = winner_curse(m_models=m)
-    theory = sigma * math.sqrt(2 * math.log(m)) if m > 1 else 0.0
-    print(f'm={m:>4} 模型 | 榜首平均虚高 {gap:+.2%} (理论 ≈ {theory:+.2%}) | 复现时榜首易主 {rev:.0%}')
+    bound = sigma * math.sqrt(2 * math.log(m)) if m > 1 else 0.0
+    print(f'm={m:>4} 模型 | 榜首平均虚高 {gap:+.2%} (上界 {bound:+.2%}) | 复现时榜首易主 {rev:.0%}')
 
 gap20, rev20 = winner_curse(m_models=20)
 gap2, _ = winner_curse(m_models=2)
@@ -768,7 +770,7 @@ print(rep)
 # 3. 区间与方法      [30.1%, 38.4%] 按任务聚类自举, 2000 次
 # 4. n_eff 与 ρ      658 (ρ=0.70)
 # 5. MDE             8.1 个百分点 (α=0.05, power=0.8, 配对)
-# 6. harness 指纹    harness@1.7.2, image sha256:..., concurrency=8
+# 6. 运行指纹    harness@1.7.2, image sha256:..., concurrency=8
 '''
 print(RECIPE)"""),
 
@@ -782,7 +784,7 @@ print(RECIPE)"""),
 | 配对设计 | 只有不一致对携带信息，样本量省一半以上 | 模型对比 |
 | 聚类自举 | 独立单位是任务不是 rollout；朴素自举区间窄近一半 | 算区间 |
 | MDE | 「不显著」必须配着检测下限一起报 | 写结论 |
-| 胜者诅咒 | 20 个同水平模型，榜首虚高约 5 个点且复现必易主 | 读榜单 |
+| 胜者诅咒 | 20 个同水平模型，榜首虚高约 4 个点且复现必易主 | 读榜单 |
 
 下一模块：**05 · 成本感知评测与 harness 可复现性**——
 把「谁更强」这个问题改写成「给定预算谁更强」，并把 harness 钉死到可以被别人复现。""")

@@ -111,8 +111,10 @@ SECTIONS = [
             "<strong>一次模型调用的输出，信任等级等于它上下文里所有内容的<em>最低</em>等级。</strong>"
             "<em>只要有一段 L0 的网页内容进了上下文，这次调用的输出就是 L0 的</em>——"
             "哪怕系统提示写得再严格。<strong>而 L0 的输出不允许触发任何操作。</strong>",
-            "这条规则等价于信息流控制里的<span class=\"term\">no-read-up / no-write-down</span>格结构"
-            "（Bell–LaPadula 与 Biba 的混合形态）："
+            "这条规则就是信息流控制里 <span class=\"term\">Biba</span> 完整性模型的"
+            "<span class=\"term\">low-water-mark</span>（低水位标记）策略——它的两条公理是"
+            "<span class=\"term\">no-read-down / no-write-up</span>，"
+            "与 Bell–LaPadula 的保密性版本（no-read-up / no-write-down）正好互为对偶："
             "<strong>完整性等级只能单调下降，不能凭空提升。</strong>"
             "<em>「提升」只能通过一个显式的、被审计的<strong>降级/提权点</strong>发生</em>——"
             "在 agent 系统里，这个点就是<strong>人类确认</strong>或"

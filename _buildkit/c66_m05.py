@@ -7,7 +7,7 @@ META = [
                  "知道「容器镜像」和「哈希」两个概念即可"),
     ("配套 notebook", '<span class="badge cpu">CPU</span> 05_cost_and_harness.ipynb'
                        '（成本模型与归一化 / 成本-成功率帕累托前沿 / best-of-n 的边际收益 / '
-                       'scaffold 方差实验：同模型不同 harness / 配置指纹与漂移检测 / '
+                       'scaffold 方差实验：同模型不同 harness / 运行指纹与漂移检测 / '
                        '评测卡自动生成器 / 上线门槛的期望效用计算）'),
     ("核心参考", "Kapoor et al., <em>AI Agents That Matter</em>（2024，成本-精度前沿与 agent 评测的可复现性）· "
                  "SWE-bench 官方 harness 与容器化评测实践 · "
@@ -210,8 +210,8 @@ scorer alpha/beta: 0.031 / 0.022   (金标准集 n=140)
 pass^1 (micro):   41.7%  [37.9%, 45.6%]   ← 按任务聚类自举, 2000 次
 pass^1 (macro):   38.2%                    ← 与 micro 排序一致
 pass@5:           66.3%     pass^5:  18.4%
-corrected pass^1: 40.3%  [36.2%, 44.4%]   ← Rogan–Gladen 校正后
-n_eff:            861  (N=420 × k=5, ρ=0.68)
+corrected pass^1: 40.8%  [36.6%, 45.0%]   ← Rogan–Gladen 校正后
+n_eff:            565  (N=420 × k=5, ρ=0.68)
 MDE (配对):        6.8 个百分点  (α=0.05, power=0.8)
 
 ## 4. 成本
@@ -303,7 +303,7 @@ NB = [
 2. **成本-成功率帕累托前沿** —— 找出被支配的配置，按预算线选配置
 3. **best-of-n 的边际收益与陷阱** —— 判分器假阳率如何在大 n 时系统性选出 hack 解
 4. **scaffold 2×2 实验** —— 交互项如何翻转「哪个模型更强」的结论
-5. **配置指纹与漂移检测** —— 十项清单压成一个哈希，让「不可比较」变成机器可判定
+5. **运行指纹与漂移检测** —— 十项清单压成一个哈希，让「不可比较」变成机器可判定
 6. **评测卡生成器** —— 从原始结果直接产出一张完整的 eval card
 
 > 心智模型：**agent 的能力不是一个标量，是一条成本-成功率曲线。
@@ -515,7 +515,7 @@ print('\\n✅ scaffold 的效应和交互项都大于模型主效应——')
 print('   这就是「agent 基准测的是「模型+你写的那个程序」的组合」这句话的定量形式。')
 print('   报告规范：至少给出一个最简 baseline scaffold 下的分数作为参照。')"""),
 
-    md("""## 5 · 配置指纹与漂移检测"""),
+    md("""## 5 · 运行指纹与漂移检测"""),
 
     code("""REPRO_FIELDS = [
     'image_digest', 'dataset_hash', 'scaffold_commit', 'model_id',

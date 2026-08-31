@@ -8,7 +8,7 @@ META = [
     ("配套 notebook", '<span class="badge cpu">CPU</span> 05_reward_models.ipynb'
                        '（BT 损失训练一个奖励模型 / KL–奖励过优化曲线与拐点定位 / '
                        'best-of-n 与 RL 两条优化路径的对比 / 分布外退化 / '
-                       'RewardBench 风格的分片评测 / 奖励集成与保守化 / 代理指标 vs 真实指标的背离）'),
+                       'RewardBench 风格的切片评测 / 奖励集成与保守化 / 代理指标 vs 真实指标的背离）'),
     ("核心参考", "Gao, Schulman &amp; Hilton, <em>Scaling Laws for Reward Model Overoptimization</em>（ICML 2023）· "
                  "Stiennon et al., <em>Learning to Summarize from Human Feedback</em>（NeurIPS 2020）· "
                  "Lambert et al., <em>RewardBench</em>（2024）· "
@@ -71,11 +71,15 @@ SECTIONS = [
    致命之处：**你只能看到上面那条线。**下面那条需要人类标注才能画出来。
 """),
         P("这条曲线在 best-of-n 和 RL 两种优化方式下都会出现，"
-          "而且它们与 KL 距离的关系有一个已被反复验证的经验形式："),
-        MATH(r"R(d) \;\approx\; d\,(\alpha - \beta d), \qquad d = \sqrt{\mathrm{KL}(\pi \,\|\, \pi_{\text{ref}})}"),
+          "但 Gao et al. (2023) 强调<strong>两者的经验形式并不相同</strong>："),
+        MATH(r"R_{\text{bon}}(d) \approx d\,(\alpha - \beta d), \qquad "
+             r"R_{\text{RL}}(d) \approx d\,(\alpha - \beta \log d), \qquad "
+             r"d = \sqrt{\mathrm{KL}(\pi \,\|\, \pi_{\text{ref}})}"),
         P("其中 $R$ 是<strong>真实</strong>质量的提升，$d$ 是 KL 距离的平方根。"
           "$\\alpha$ 是有效优化的斜率，$\\beta$ 是过优化的惩罚项。"
-          "<strong>拐点在 $d^{*} = \\alpha/(2\\beta)$。</strong>"
+          "<strong>best-of-n 的拐点在 $d^{*} = \\alpha/(2\\beta)$，"
+          "RL 的拐点在 $d^{*} = \\exp(\\alpha/\\beta - 1)$——"
+          "形式不同，但都有拐点，这才是那篇论文的核心结论。</strong>"
           "<em>关键的经验发现是：$\\alpha$ 和 $\\beta$ 都随奖励模型的规模与数据量变化，"
           "更大的 RM 推得更远、掉得更慢，但拐点<strong>依然存在</strong>。</em>"),
         TABLE(["优化方式", "「优化强度」是什么", "KL 与它的关系", "实践含义"], [
@@ -125,13 +129,13 @@ SECTIONS = [
     ])),
 
     # ============================================================== 4
-    ("rm-eval", "怎么评测一个奖励模型：分片准确率与它的局限", "".join([
+    ("rm-eval", "怎么评测一个奖励模型：切片准确率与它的局限", "".join([
         P("RM 的评测有一个天然的形式：<strong>给一批 (prompt, chosen, rejected) 三元组，"
           "看 RM 是否给 chosen 更高的分。</strong>这就是 RewardBench 类基准的核心。"),
         MATH(r"\text{RM accuracy} = \Pr\big[r_\phi(x, y_w) > r_\phi(x, y_l)\big]"),
-        H3("分片是关键"),
-        P("总准确率几乎没有信息量。有信息量的是<strong>按能力维度分片</strong>："),
-        TABLE(["分片", "考察什么", "典型难点"], [
+        H3("切片是关键"),
+        P("总准确率几乎没有信息量。有信息量的是<strong>按能力维度切片</strong>："),
+        TABLE(["切片", "考察什么", "典型难点"], [
             ["<strong>Chat</strong>", "一般对话的偏好", "容易饱和——多数 RM 都在 95% 以上"],
             ["<strong>Chat-Hard</strong>", "<strong>刻意构造的困难对</strong>：拒绝对比、细微事实差异、风格诱导", "<strong>最能区分 RM</strong>；许多 RM 在这一片掉到 60% 以下"],
             ["<strong>Safety</strong>", "该拒的拒、不该拒的别拒（双向）", "单向优化会在另一个方向翻车"],
@@ -291,7 +295,7 @@ SECTIONS = [
         H3("档位 C · judge/RM 用作训练信号"),
         P("在档位 B 之上追加——<strong>这一档的要求显著更严，因为误差会被优化过程主动放大</strong>："),
         UL([
-            "☐ RM 的<strong>分片评测</strong>已做，且 <strong>worst slice 达标</strong>（不是 macro）（本模块）",
+            "☐ RM 的<strong>切片评测</strong>已做，且 <strong>worst slice 达标</strong>（不是 macro）（本模块）",
             "☐ RM 的校准已检验：分差 1.0 是否真的对应约 73% 的胜率（本模块）",
             "☐ 已在<strong>被优化过的策略输出</strong>上测过 RM 一致率（分布外探针）（本模块）",
             "☐ <strong>存在一条与 RM 误差不相关的独立信号</strong>，且它是停止规则的依据（本模块）",
@@ -321,7 +325,7 @@ SECTIONS = [
 ]
 
 NB = [
-    md("""# 05 · 奖励模型与过优化（BT 损失训练 RM / KL–奖励曲线 / hack 形态 / 集成 / 分片评测）
+    md("""# 05 · 奖励模型与过优化（BT 损失训练 RM / KL–奖励曲线 / hack 形态 / 集成 / 切片评测）
 
 目标：把「judge 变成训练信号之后会发生什么」从一句警告，变成**能画出来、能定位拐点的曲线**。
 
@@ -331,7 +335,7 @@ NB = [
 3. **拐点定位** —— 拟合 $R(d) = d(\\alpha - \\beta d)$，解出 $d^* = \\alpha/2\\beta$
 4. **分布外退化** —— RM 在训练分布内很准，在被优化推到的区域完全失准
 5. **奖励集成与保守化** —— 取最小值 / 均值减方差，把拐点推后多少
-6. **RewardBench 风格的分片评测** —— 为什么总准确率没有信息量
+6. **RewardBench 风格的切片评测** —— 为什么总准确率没有信息量
 7. **独立信号** —— 用一个与 RM 误差不相关的验证量，把拐点真的抓出来
 
 > 心智模型：**RM 只在训练分布上被约束，而优化过程恰恰会把策略推到分布之外。
@@ -584,7 +588,7 @@ print('⚠️ 但注意第一行的观察：**所有 RM 的 length 权重方向�
 print('   所以集成治不了长度偏差这类「共有偏差」——它只能治各 RM 独有的那部分误差。')
 print('   （与模块 02 第 7 节「集成只能治噪声，治不了共有偏差」是同一条结论。）')"""),
 
-    md("""## 6 · RewardBench 风格的分片评测：总准确率没有信息量"""),
+    md("""## 6 · RewardBench 风格的切片评测：总准确率没有信息量"""),
 
     code("""def make_slice(kind, n, rng):
     \"\"\"造不同难度/类型的偏好对。返回 (A, B, 真实偏好标签)。\"\"\"
@@ -603,7 +607,7 @@ print('   （与模块 02 第 7 节「集成只能治噪声，治不了共有偏
     label = (true_utility(A) > true_utility(B)).astype(int)
     return A, B, label
 
-print(f"{'分片':<14}{'单个 RM':>12}{'集成最小值':>14}{'样本数':>8}")
+print(f"{'切片':<14}{'单个 RM':>12}{'集成最小值':>14}{'样本数':>8}")
 accs = {}
 for kind in ['easy', 'hard', 'style_trap']:
     A_, B_, lab = make_slice(kind, 4000, np.random.default_rng(23))
@@ -621,7 +625,7 @@ print(f'\\n✅ 三个数字讲了完全不同的故事：')
 print(f'   easy {accs["easy"][0]:.0%}（饱和，无信息）· '
       f'hard {accs["hard"][0]:.0%} · style_trap {accs["style_trap"][0]:.0%}')
 print('   **风格陷阱片上比瞎猜还差**——因为 RM 学到的长度偏好在这里直接指向错误答案。')
-print('   而这三片的平均值把这个致命弱点完全掩盖了。→ 分片报告，不报总分。')"""),
+print('   而这三片的平均值把这个致命弱点完全掩盖了。→ 切片报告，不报总分。')"""),
 
     md("""## 7 · 独立信号：把拐点真的抓出来"""),
 
@@ -738,10 +742,10 @@ assert hack_monitor(p1, p1, names) == [], '没有漂移时不应告警'
 print('\\n✅ 练习 3 通过：这就是「行为分布监控」的最小实现——')
 print('   它不测质量，但能告诉你「模型正在往哪个方向被 hack」，而且成本近乎为零。')"""),
 
-    md("""## ✏️ 练习 4：分片评测卡
+    md("""## ✏️ 练习 4：切片评测卡
 
-实现 `rm_eval_card(w, slices, n=3000, seed=0)`：对每个分片算准确率，
-返回 `{'per_slice': {分片: 准确率}, 'macro': 宏平均, 'worst_slice': (名字, 准确率)}`。
+实现 `rm_eval_card(w, slices, n=3000, seed=0)`：对每个切片算准确率，
+返回 `{'per_slice': {切片: 准确率}, 'macro': 宏平均, 'worst_slice': (名字, 准确率)}`。
 **`worst_slice` 才是决定 RM 能不能用的那个数。**"""),
 
     code("""def rm_eval_card(w, slices, n=3000, seed=0):
@@ -880,7 +884,7 @@ print(RECIPE)"""),
 | 拐点 $d^*=\\alpha/2\\beta$ | 拟合独立信号的曲线定位，KL 预算留余量 | 设 KL 惩罚 / 选 n |
 | hack 形态 | 每一种都对应模块 02 的一个 judge 偏差——可以事先预测 | 布置监控 |
 | 集成的边界 | 治各 RM 独有的误差，治不了偏好数据里的共有偏差 | 选缓解手段 |
-| 分片评测 | 报 worst slice，不报 macro；静态准确率是必要不充分条件 | 发布 RM |
+| 切片评测 | 报 worst slice，不报 macro；静态准确率是必要不充分条件 | 发布 RM |
 | 独立信号 | 与 RM 误差不相关才叫独立；可验证任务 + 行为监控最划算 | RLHF 流程必备 |
 
 **全课收尾**：00 仪器 → 01 设计 → 02 去偏 → 03 元评测 → 04 排名 → 05 训练信号。

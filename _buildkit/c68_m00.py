@@ -34,7 +34,7 @@ SECTIONS = [
             "一个判断标准比「跑几次」更准：<strong>「如果这次结果和上次不一样，你能在十分钟内说清楚为什么吗？」</strong>"
             "答不上来，就说明你需要基础设施——不是为了跑得更快，"
             "<em>而是为了让「结果变了」这件事变得可解释</em>。"
-            "C66 模块 05 的 harness 指纹已经埋下了这个种子，本课把它长成完整的系统。",
+            "C66 模块 05 的 运行指纹已经埋下了这个种子，本课把它长成完整的系统。",
             "更形式化地说，评测基础设施要保证三个性质："
             "<strong>① 确定性</strong>（同样的输入与配置产生同样的输出，或至少产生<em>同分布</em>的输出）；"
             "<strong>② 可归因性</strong>（任何两次运行的差异，都能被归因到某个显式记录的配置项）；"
@@ -122,8 +122,8 @@ SECTIONS = [
     # ============================================================== 4
     ("division", "与既有课程的分工", "".join([
         TABLE(["课程", "它讲什么", "本课的关系"], [
-            ["<strong>C66</strong> · Agent 评测", "评什么、怎么判分、怎么算统计、成本与 harness 指纹", "<strong>C66 给出「一次评测该怎么做对」，本课给出「怎么把它跑一千次」</strong>。C66 模块 05 的十项复现清单，在本课变成 spec 的字段"],
-            ["<strong>C67</strong> · LLM Judge", "judge 的设计、偏差、元评测、排名、奖励模型", "<strong>C67 管 judge 的正确性，本课管 judge 的工程</strong>：调用、缓存、成本、漂移监控、prompt 版本管理"],
+            ["<strong>C66</strong> · Agent 评测", "评什么、怎么判分、怎么算统计、成本与 运行指纹", "<strong>C66 给出「一次评测该怎么做对」，本课给出「怎么把它跑一千次」</strong>。C66 模块 05 的十项复现清单，在本课变成 spec 的字段"],
+            ["<strong>C67</strong> · LLM Judge", "judge 的设计、偏差、元评测、排名、奖励模型", "<strong>C67 管 judge 的正确性，本课管 judge 的工程</strong>：调用、缓存、成本、以及把 C67 模块 03 的漂移哨兵接到线上告警（judge prompt 的版本管理本身在 C67 模块 01）"],
             ["<strong>C37</strong> · MLOps", "模型训练与部署的生命周期、实验追踪、模型注册", "有重叠但视角不同：C37 的中心是<em>模型</em>，本课的中心是<em>评测</em>。评测有自己的特殊性（判分器也是被评对象、指标本身会漂移）"],
             ["<strong>C43</strong> · 数据工程", "数据管道、版本化、血缘", "本课模块 01 的数据集版本化直接复用 C43 的思想，不重复推导；<strong>本课的新东西是「样本 ID 的稳定性」这个评测特有的问题</strong>"],
             ["<strong>C10</strong> · 测量科学", "标注、一致性、校准、A/B", "本课模块 05 的线上 A/B 与离线-在线相关性建立在 C10 之上"],
@@ -166,7 +166,7 @@ jupyter lab      # 或直接在 Colab 里点每个 notebook 顶部的徽章"""),
             ["<strong>配置写在代码里</strong>", "省事", "无法比较两次运行的差异；无法生成指纹", "01：spec 是纯数据"],
             ["<strong>就地修改任务集</strong>", "「就改一道坏题」", "<strong>所有历史分数一夜之间失去意义</strong>", "01：只增不改，发新版本"],
             ["<strong>用行号或哈希内容当样本 ID</strong>", "不用另外维护 ID", "改一个错别字，样本 ID 就变了，历史结果对不上", "01：稳定 ID"],
-            ["<strong>缓存里不含配置指纹</strong>", "缓存命中率高", "<strong>改了 prompt 却读到旧结果</strong>——最隐蔽的一个", "02：缓存键设计"],
+            ["<strong>缓存里不含运行指纹</strong>", "缓存命中率高", "<strong>改了 prompt 却读到旧结果</strong>——最隐蔽的一个", "02：缓存键设计"],
             ["<strong>失败样本直接跳过</strong>", "报告看起来干净", "分母变小，成功率虚高（与 C67-01 的解析失败同构）", "02：失败必须分类并计入"],
             ["<strong>CI 门禁阈值拍脑袋定</strong>", "「掉 2% 就报警」", "噪声不断误报 → 团队关掉门禁 → 门禁形同虚设", "04：用重复运行的方差定阈值"],
         ]),
@@ -175,7 +175,7 @@ jupyter lab      # 或直接在 Colab 里点每个 notebook 顶部的徽章"""),
                           "那么你改了 prompt 之后再跑，会安静地读到旧结果</strong>。"
                           "<em>症状是「我明明改了 prompt，分数却一点没变」，"
                           "而很多人会把它误读成「这个改动没有效果」</em>。"
-                          "<strong>规则：缓存键 = 输入内容哈希 + 完整配置指纹，缺一不可。</strong>"),
+                          "<strong>规则：缓存键 = 输入内容哈希 + 完整运行指纹，缺一不可。</strong>"),
         P("这六条会在后面五个模块里被逐一解决。"
           "notebook 的最后一节给出一个自检器：把你现有的评测流程按这六条打分。"),
     ])),
@@ -293,7 +293,7 @@ print('数据集 sha:', SPEC['dataset']['sha'])
 reordered = {k: SPEC[k] for k in reversed(list(SPEC))}
 assert fingerprint(reordered) == fp, '字段顺序不应影响指纹'
 changed = json.loads(json.dumps(SPEC)); changed['model']['temperature'] = 0.7
-assert fingerprint(changed) != fp, '改了配置指纹必须变'
+assert fingerprint(changed) != fp, '改了运行指纹必须变'
 print('\\n✅ spec 是纯数据 → 指纹是它的哈希，不需要人去维护一份「要记录哪些字段」的清单。')
 print('   这就是 C66-05 的运行指纹，只是现在它是架构上必然做到的，而不是一条纪律。')"""),
 
@@ -540,7 +540,7 @@ print('   而且这还没算「误报让团队关掉门禁」的隐性成本—�
     ('spec_is_data',    '配置是纯数据（可序列化、可哈希），不是写死在代码里'),
     ('dataset_append_only', '任务集只增不改；发现坏题时发新版本而非就地修改'),
     ('stable_task_ids', '样本 ID 稳定：改内容不改 ID，删样本不复用 ID'),
-    ('cache_key_has_fp','缓存键包含完整配置指纹（模型/prompt/参数）'),
+    ('cache_key_has_fp','缓存键包含完整运行指纹（模型/prompt/参数）'),
     ('failures_counted','失败样本被分类并计入分母，不是静默跳过'),
     ('ci_threshold_from_variance', 'CI 门禁阈值由重复运行的方差推出，不是拍脑袋'),
 ]
@@ -736,7 +736,7 @@ REQUIRED_COLUMNS = [
     "run_id",        # 一次运行
     "task_id",       # 稳定的样本 ID（01 模块）
     "attempt",       # 第几次重复（C66-04 的 pass^k 需要）
-    "fingerprint",   # 配置指纹（C66-05）
+    "fingerprint",   # 运行指纹（C66-05）
     "status",        # ok | error | timeout | filtered —— 失败必须可分类
 ]
 # 缺 attempt → 算不了 pass^k；缺 fingerprint → 两次运行不可比；

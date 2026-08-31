@@ -40,7 +40,7 @@
 
 ## 三 · 执行工程 · Runner Engineering
 
-- ★ **Google, _Site Reliability Engineering_（第 22 章「处理过载」、第 4 章「SLO」）** —
+- ★ **Google, _Site Reliability Engineering_（第 21 章「处理过载」、第 22 章「级联故障」、第 4 章「SLO」）** —
   解决重试、退避、抖动、过载保护的标准做法。
   **本课模块 02 第 3 节的「指数退避 + 抖动」与惊群效应，直接来自这一章**。
   它强调的一点在评测里同样成立：*重试本身可能是下一次雪崩的原因*。
