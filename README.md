@@ -1,6 +1,6 @@
 # Frontier AI Researcher / Engineer Courses · 前沿 AI 研究工程师课程体系
 
-**53 courses · 346 lesson pages · 346 runnable notebooks · Colab-ready, CPU-first, from-scratch.**
+**70 courses · 448 lesson pages · 448 runnable notebooks · Colab-ready, CPU-first, from-scratch.**
 一套从 model evaluation 起步、长成全栈的前沿 AI 研究/工程课程体系 —— 深度 HTML 讲解 + 真实可跑 notebook，纯 numpy/CPU 优先、优雅降级到真实框架/GPU。
 
 📖 中文 → [跳转](#中文) · 🇬🇧 English → [jump](#english)
@@ -13,7 +13,7 @@
 ### 目录
 - [这是什么](#zh-what)
 - [快速开始](#zh-quickstart)
-- [课程总览（53 门）](#zh-catalog)
+- [课程总览（70 门）](#zh-catalog)
 - [每门课的格式](#zh-format)
 - [学习路径建议](#zh-paths)
 - [仓库结构](#zh-layout)
@@ -49,7 +49,7 @@ jupyter lab
 先打开某模块的 `NN_讲解.html`（或先看 `index.html` 选路径），读完讲解再跑同名的 `.ipynb`。所有课程共用同一份 `assets/style.css`。
 
 <a name="zh-catalog"></a>
-### 课程总览（53 门）
+### 课程总览（70 门）
 
 #### C00–C09 · 核心 LLM / 评测主线
 | 课 | 目录 | 主题 |
@@ -143,6 +143,25 @@ jupyter lab
 
 > 缺口分析与复习路线见根目录 [`INTERVIEW_PREP_XPENG_TSR.md`](INTERVIEW_PREP_XPENG_TSR.md)。
 
+#### C62–C65 · 面试形式补缺课（HR 明确的一面三板块）
+| 课 | 目录 | 主题 | 补的洞 |
+|----|------|------|--------|
+| C62 | `C62_Coding_Interview_Course/` | 编程面试实战：算法与数据结构（六步答题协议 · 双指针/滑窗/前缀和 · 哈希排序二分 · 树图与搜索 · DP 与贪心 · 模拟面试） | 全库最大缺口：前 62 门课里「链表」「双指针」零命中 |
+| C63 | `C63_ML_System_Design_Course/` | ML 系统设计面试（七步框架 · 需求与指标 · 数据系统 · 建模评测 · 容量估算 · 六案例库） | C07 仅一节 system design 框架，无方法论与案例库 |
+| C64 | `C64_ML_Knowledge_QA_Course/` | ML/DL 技术知识问答（三段式答法 · ML 基础 · 优化训练 · 架构 · 评估统计 · 快问快答题库） | C07 教推导，缺「60 秒讲清 + 接住追问」的广度题库 |
+| C65 | `C65_ProblemSolving_Communication_Course/` | 结构化问题求解与面试沟通（估算 · 诊断归因 · 权衡决策 · 模糊需求澄清 · 白板与英文表达） | 估算/诊断/权衡/澄清/沟通均无系统覆盖 |
+
+#### C66–C69 · Agent 评测与 AI 系统评估
+| 课 | 目录 | 主题 | 补的洞 |
+|----|------|------|--------|
+| C66 | `C66_Agentic_Evaluation_Course/` | Agent 评测与基准（三层评测对象 · 基准全景 · 判分器 α/β 偏差校正 · 轨迹指标 · pass@k vs pass^k · 成本与 harness 指纹） | agent 评测此前只有 C04-06 与 C26-05 两个子模块，讲了「有这回事」没讲「怎么真做一次」 |
+| C67 | `C67_LLM_Judge_Course/` | LLM-as-a-Judge 与评分模型（可判定性阶梯 · rubric 设计 · 四大偏差与去偏 · 人类上界与元评测 · BT/Elo 排名 · 奖励模型与过优化） | judge 此前只有 C03-04 一节，偏差量化/元评测/排名/RM 评测全无 |
+| C68 | `C68_Eval_Infrastructure_Course/` | Eval 基础设施与线上监控（spec/runner/store/report 四层 · 数据集版本化与抽样 · 缓存键与失败语义 · CI 门禁阈值 · 漂移与数据闭环） | 「怎么把一次评测跑一千次」零覆盖；C37 MLOps 的中心是模型不是评测 |
+| C69 | `C69_Agent_Security_Course/` | Agent 安全与提示注入（信任传播 · 间接注入与双 LLM 架构 · 工具供应链 · 权限四维与沙箱边界 · 出站控制 · 攻击面评测） | C05 是模型安全、C44 是对抗攻击，都不覆盖「agent 会做什么」 |
+
+> 这批课的分工：**C66 量 agent · C67 量判分器 · C68 把评测变成基础设施 · C69 量攻击面**。
+> C69 的 notebook 不包含针对任何真实系统的可用攻击载荷（攻击手法只在讲解里做机制层面描述），防御侧代码全部是真实实现。
+
 <a name="zh-format"></a>
 ### 每门课的格式
 
@@ -153,7 +172,7 @@ CXX_Xxx_Course/
 ├── glossary.md          术语词典（≥12KB）
 ├── references.md        参考清单（论文/文档，标★必读）
 ├── requirements.txt      依赖（绝大多数课只需要 numpy/pandas/jupyterlab）
-├── assets/style.css      全站共用同一份样式（53 门课字节级一致）
+├── assets/style.css      全站共用同一份样式（70 门课字节级一致）
 ├── 00_setup/
 │   ├── 00_overview.html         课程总览
 │   └── 00_environment_check.ipynb
@@ -188,9 +207,9 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 ├── index.html               全站课程总览页
 ├── COURSES_PLAN.md            课程规划与构建历史的完整记录
 ├── ENV_SETUP.md                本地 conda 环境搭建笔记
-├── requirements-all.txt        全部 53 门课依赖的合集（装一次跑所有课）
+├── requirements-all.txt        全部 70 门课依赖的合集（装一次跑所有课）
 ├── _buildkit/                  house-style 生成器（coursekit.py）+ 各课构建脚本
-├── C00_..._Course/ … C52_..._Course/   53 门课，每门结构见上
+├── C00_..._Course/ … C69_..._Course/   70 门课，每门结构见上
 └── README.md                   就是这份文件
 ```
 
@@ -204,7 +223,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 <a name="zh-env"></a>
 ### 环境与依赖
 
-- **本地全量环境**：一个 conda env（`courses`，Python 3.11）配好 PyTorch + HuggingFace 全家桶 + 常用科学计算库即可跑完全部 53 门课，详见 [`ENV_SETUP.md`](./ENV_SETUP.md)；合集依赖在 [`requirements-all.txt`](./requirements-all.txt)。
+- **本地全量环境**：一个 conda env（`courses`，Python 3.11）配好 PyTorch + HuggingFace 全家桶 + 常用科学计算库即可跑完全部 70 门课，详见 [`ENV_SETUP.md`](./ENV_SETUP.md)；合集依赖在 [`requirements-all.txt`](./requirements-all.txt)。
 - **只想跑单门课**：进对应课程目录 `pip install -r requirements.txt` 即可——大多数课这份文件只有 `numpy`/`pandas`/`jupyterlab`/`ipykernel` 四五行。
 - 所有需要 `transformers`/`bitsandbytes`/`qwen-vl-utils` 等重依赖的真实模型 cell 都包了 `try/except`：装不上/没网/没 GPU 时会优雅降级到纯 Python/numpy 的替代实现或跳过，**不会让整本 notebook 崩掉**。
 
@@ -215,6 +234,9 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 - 2026-06-27 ~ 06-28：全谱深化到「极深」标准 + 新增 C38–C47 十门补缺课；引入统一生成器 `coursekit.py`。全谱达到 48 门 · 364 讲解 HTML · 316 notebook。
 - 2026-08-06：对照 `LLM Research Engineer` JD 做覆盖度比对，新增 C48–C52 五门课（纯追加，未改动既有 48 门）。全谱达到 **53 门 · 346 讲解 HTML · 346 notebook**。
 - 2026-08-12：全站适配 Colab（T4/CPU 均可）——移除非讲量化课程里默认的显存优化用 4-bit 量化，改为默认 fp16；给全部 346 个 notebook 与 53 个课程主页加上一键 Colab 徽章。
+- 2026-08-17：按 XPENG「TSR 2D Detection」JD 做覆盖度比对，新增 C53–C61 九门课（纯追加）。
+- 2026-08-19：按 HR 说明的一面三板块（编程 / ML 系统设计 / 技术知识问答 + 沟通）新增 C62–C65 四门课。全谱达到 **66 门 · 424 讲解 HTML · 424 notebook**。
+- 2026-08-31：按「AI Agent + 大模型 Evaluation」的诉求做覆盖度比对，新增 C66–C69 四门课（纯追加）。四门课共 24 个 notebook、549 个 code cell、96 道 ✏️ 练习自测 assert，全部两遍实跑通过。全谱达到 **70 门 · 448 讲解 HTML · 448 notebook**。
 
 完整细节见 [`COURSES_PLAN.md`](./COURSES_PLAN.md)。
 
@@ -226,7 +248,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 ### Table of Contents
 - [What This Is](#en-what)
 - [Quick Start](#en-quickstart)
-- [Course Catalog (53 courses)](#en-catalog)
+- [Course Catalog (70 courses)](#en-catalog)
 - [Format of Each Course](#en-format)
 - [Suggested Learning Paths](#en-paths)
 - [Repository Layout](#en-layout)
@@ -262,7 +284,7 @@ jupyter lab
 Read a module's `NN_讲解.html` lesson first (or start from `index.html` to pick a path), then run the matching `.ipynb`. All courses share one `assets/style.css`.
 
 <a name="en-catalog"></a>
-### Course Catalog (53 courses)
+### Course Catalog (70 courses)
 
 #### C00–C09 · Core LLM & Evaluation Track
 | # | Folder | Topic |
@@ -354,6 +376,25 @@ Read a module's `NN_讲解.html` lesson first (or start from `index.html` to pic
 | C60 | `C60_Edge_Deployment_Consistency_Course/` | Edge deployment & train-deploy consistency (preprocessing parity · TensorRT · INT8 calibration · postprocessing & C++ · latency profiling) | Hands-on TensorRT/C++ and consistency debugging |
 | C61 | `C61_Detection_Practice_Interview_Course/` | Detection engineering practice & interview readiness (experiment design · TIDE error decomposition · debug playbook · project narrative · drills) | Production instincts and interview delivery |
 
+#### C62–C65 · Interview-Format Gap Courses (the three blocks HR named for round one)
+| # | Directory | Topic | Gap filled |
+|---|-----------|-------|------------|
+| C62 | `C62_Coding_Interview_Course/` | Coding interviews: algorithms & data structures (six-step answering protocol · two pointers/sliding window/prefix sums · hashing, sorting, binary search · trees, graphs, search · DP & greedy · mock interviews) | The single biggest gap: "linked list" and "two pointers" had zero hits across the first 62 courses |
+| C63 | `C63_ML_System_Design_Course/` | ML system design interviews (seven-step framework · requirements & metrics · data systems · modeling & evaluation · capacity estimation · six case studies) | C07 had one section on the framework, no methodology and no case library |
+| C64 | `C64_ML_Knowledge_QA_Course/` | ML/DL knowledge Q&A (three-part answer shape · ML basics · optimization & training · architectures · evaluation & statistics · rapid-fire bank) | C07 teaches derivations; missing the "explain it in 60 seconds and survive the follow-up" breadth bank |
+| C65 | `C65_ProblemSolving_Communication_Course/` | Structured problem solving & interview communication (estimation · diagnosis · trade-off decisions · clarifying vague requirements · whiteboard & English delivery) | Estimation/diagnosis/trade-offs/clarification/communication had no systematic coverage |
+
+#### C66–C69 · Agent Evaluation & AI System Assessment
+| # | Directory | Topic | Gap filled |
+|---|-----------|-------|------------|
+| C66 | `C66_Agentic_Evaluation_Course/` | Agentic evaluation & benchmarks (three evaluation layers · benchmark landscape · scorer α/β bias correction · trajectory metrics · pass@k vs pass^k · cost and harness fingerprints) | Agent evaluation existed only as C04-06 and C26-05 — "this is a thing," never "how to actually run one" |
+| C67 | `C67_LLM_Judge_Course/` | LLM-as-a-judge & reward models (decidability ladder · rubric design · four biases and de-biasing · human ceiling & meta-evaluation · BT/Elo ranking · reward models and overoptimization) | Judges had one section (C03-04); bias quantification, meta-evaluation, ranking and RM evaluation were absent |
+| C68 | `C68_Eval_Infrastructure_Course/` | Eval infrastructure & online monitoring (spec/runner/store/report layers · dataset versioning & sampling · cache keys & failure semantics · CI gate thresholds · drift and the data loop) | "How to run one evaluation a thousand times" had zero coverage; C37 MLOps centers on the model, not the evaluation |
+| C69 | `C69_Agent_Security_Course/` | Agent security & prompt injection (trust propagation · indirect injection and the dual-LLM pattern · tool supply chain · four permission dimensions and sandbox boundaries · egress control · attack-surface evaluation) | C05 is model safety and C44 is adversarial attacks; neither covers what an *agent* can do |
+
+> Division of labour: **C66 measures the agent · C67 measures the scorer · C68 turns evaluation into infrastructure · C69 measures the attack surface**.
+> C69 notebooks contain no working attack payloads against any real system (attack techniques are described at the mechanism level in prose only); the defense-side code is all real implementation.
+
 <a name="en-format"></a>
 ### Format of Each Course
 
@@ -364,7 +405,7 @@ CXX_Xxx_Course/
 ├── glossary.md          Glossary (≥12KB)
 ├── references.md        Reference list (papers/docs, ★ = must-read)
 ├── requirements.txt      Dependencies (most courses need only numpy/pandas/jupyterlab)
-├── assets/style.css      One shared stylesheet across all 53 courses (byte-identical)
+├── assets/style.css      One shared stylesheet across all 70 courses (byte-identical)
 ├── 00_setup/
 │   ├── 00_overview.html         Course overview
 │   └── 00_environment_check.ipynb
@@ -399,9 +440,9 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 ├── index.html               Site-wide course overview page
 ├── COURSES_PLAN.md            Full record of the curriculum plan & build history
 ├── ENV_SETUP.md                Notes for setting up the local conda environment
-├── requirements-all.txt        Union of all 53 courses' dependencies (install once, run all)
+├── requirements-all.txt        Union of all 70 courses' dependencies (install once, run all)
 ├── _buildkit/                  House-style generator (coursekit.py) + each course's build scripts
-├── C00_..._Course/ … C52_..._Course/   53 courses, layout described above
+├── C00_..._Course/ … C69_..._Course/   70 courses, layout described above
 └── README.md                   This file
 ```
 
@@ -415,7 +456,7 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 <a name="en-env"></a>
 ### Environment & Dependencies
 
-- **Full local environment**: one conda env (`courses`, Python 3.11) with PyTorch + the HuggingFace stack + common scientific-computing libraries covers all 53 courses — see [`ENV_SETUP.md`](./ENV_SETUP.md); the combined dependency list is [`requirements-all.txt`](./requirements-all.txt).
+- **Full local environment**: one conda env (`courses`, Python 3.11) with PyTorch + the HuggingFace stack + common scientific-computing libraries covers all 70 courses — see [`ENV_SETUP.md`](./ENV_SETUP.md); the combined dependency list is [`requirements-all.txt`](./requirements-all.txt).
 - **Just want one course**: `cd` into that course's folder and `pip install -r requirements.txt` — for most courses that file is only 4–5 lines (`numpy`/`pandas`/`jupyterlab`/`ipykernel`).
 - Every cell that needs a heavier dependency (`transformers`/`bitsandbytes`/`qwen-vl-utils`, etc.) is wrapped in `try/except`: if it's not installed, there's no network, or no GPU, it degrades gracefully to a pure Python/numpy fallback or is skipped — **it will not crash the whole notebook**.
 
@@ -426,5 +467,8 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 - 2026-06-27 – 06-28: Full curriculum deepened to the "极深" (deep-dive) bar; 10 gap-filling courses (C38–C47) added; unified generator `coursekit.py` introduced. Reached 48 courses · 364 lesson pages · 316 notebooks.
 - 2026-08-06: Gap analysis against an `LLM Research Engineer` job description added 5 more courses, C48–C52 (purely additive, the existing 48 were untouched). Reached **53 courses · 346 lesson pages · 346 notebooks**.
 - 2026-08-12: Made the whole site Colab-ready (T4 or CPU runtime) — removed default memory-saving 4-bit quantization from courses that aren't about quantization (switched to fp16 default), and added an Open-in-Colab badge to all 346 notebooks and all 53 course home pages.
+- 2026-08-17: Gap analysis against an XPENG "TSR 2D Detection" job description added 9 courses, C53–C61 (purely additive).
+- 2026-08-19: Added C62–C65 for the three round-one interview blocks HR spelled out (coding / ML system design / ML knowledge Q&A + communication). Reached **66 courses · 424 lesson pages · 424 notebooks**.
+- 2026-08-31: Gap analysis for "AI agents + LLM evaluation" added 4 courses, C66–C69 (purely additive). Across the four: 24 notebooks, 549 code cells, 96 exercise self-test asserts, all executed end to end in a two-pass run. Reached **70 courses · 448 lesson pages · 448 notebooks**.
 
 Full details in [`COURSES_PLAN.md`](./COURSES_PLAN.md).
