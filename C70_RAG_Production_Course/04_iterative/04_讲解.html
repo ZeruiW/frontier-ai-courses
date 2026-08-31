@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 迭代与图检索</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 迭代与图检索</h1>
+  <p class="subtitle"><strong>多跳问题的单轮 recall 天然是 0</strong>——不是排序不够好：十条邮箱块与查询的相似度**完全相等**，<em>剩下那 12% 的命中率来自并列组里抽签，所以它不随模型变强而提高</em> · <strong>后续查询必须锚定原问题的目标谓词</strong>；而实体要从**检索排名最高的证据**里取——<em>取字典序最小的实体就是漂移的起点</em> · <strong>停止准则只改变期望跳数，不改变最坏情况</strong>（期望 2.00 → 1.43，最坏都由 <code>MAX_HOPS</code> 封住）；<em>边际收益准则在并列组大的语料上会完全退化成固定轮数——新块数不等于新信息量</em> · <strong>漂移护栏要用结构性条件而不是相似度阈值</strong>：锚定的查询本身与原问题的相似度也只有 0.25 · <strong>关系/共同点类问题的答案不在任何块里</strong>——它是图算出来的；而实体→块倒排这一档的成本全在摄取侧 · <strong><code>$/success</code> 不是一个自动偏向迭代的口径</strong>：用 LLM 做停止判断时它比单轮更贵，换成结构性信号后才反过来 · <strong>文档级 recall 在多跳题上系统性误导</strong>：同一批结果给出 1.00 / 0.50 / 0.00 三个数，只有 fact-recall 与可答率一致 · <strong>迭代能掩盖分块问题</strong>——上线前先跑模块 02 的 intact 检查</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 03（查询改写与融合）；知道「有向图」与「广度优先」即可，<strong>不需要任何图神经网络</strong></div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_iterative.ipynb（多跳问题的单轮 recall 天然为 0 / 两跳补上它 / 三种停止准则与它们的成本上界 / 查询漂移的量化 / 实体图的邻域扩展 / 迭代的成本模型 / 四个失败模式 / 多跳题的 recall 必须按「事实集合」算）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Trivedi et al., <em>IRCoT: Interleaving Retrieval with CoT</em>（ACL 2023）· Asai et al., <em>Self-RAG</em>（ICLR 2024）· Jiang et al., <em>FLARE: Active Retrieval Augmented Generation</em>（EMNLP 2023）· Edge et al., <em>GraphRAG: From Local to Global</em>（2024）· 本课程 C09 模块 04（搜索与 MCTS：停止准则的一般形式）· C46（图机器学习）· C66 模块 05（成本感知评测）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#multihop">多跳问题的单轮 recall 天然是 0</a></li>
+      <li><a href="#loop">迭代检索的循环：四个必须显式写出来的部件</a></li>
+      <li><a href="#stopping">三种停止准则：成本与效果的三个点</a></li>
+      <li><a href="#drift">查询漂移：迭代最常见的失效方式</a></li>
+      <li><a href="#graph">图检索：只用图的结构，不训练任何模型</a></li>
+      <li><a href="#cost">迭代的成本模型：三个乘数</a></li>
+      <li><a href="#failures">四个失败模式</a></li>
+      <li><a href="#eval">多跳题的 recall 必须按事实集合算</a></li>
+      <li><a href="#when-not">什么时候不该用迭代</a></li>
+      <li><a href="#interleave">与生成交错：为什么本课把它们分开讲</a></li>
+      <li><a href="#checklist">上线迭代检索的七项清单</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="multihop"><span class="num">1</span>多跳问题的单轮 recall 天然是 0</h2>
+  <p>前面三个模块都假设<strong>答案在某一个块里</strong>。这一节处理它不成立的情况，<strong>而这类问题的单轮检索不是「效果差」，是数学上不可能</strong>。</p>  <div class="ascii">   问题：差旅报销的审批人邮箱是什么？
+
+   块 A: 「差旅报销由财务部的王敏负责审批。」      ← 查询能碰到（有「差旅报销」）
+   块 B: 「王敏的联系邮箱是 wangmin@acme.com。」   ← 查询碰不到（没有「王敏」）
+
+   单轮检索:
+     查询词 = {差旅, 报销, 审批人, 邮箱}
+     块 B 的词 = {王敏, 联系, 邮箱}
+     共享词 = {邮箱}  → 相似度极低，排不进 top-k
+
+   **注意这不是「排序不够好」**：
+   查询里根本没有「王敏」这个信息——它要等块 A 被读到之后才存在。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以多跳问题的结构是：<strong>第二跳的查询是第一跳结果的函数</strong>。<em>$q_2 = f(q_1, \text{docs}_1)$</em>，而单轮检索只能算 $\text{retrieve}(q_1)$。<strong>把 top-k 从 5 加到 50、把 embedding 换成最强的那个——都不改变这一点。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>定量地说：设问题需要的证据集合是 $E = \{e_1, e_2\}$，$e_2$ 与 $q_1$ 的相似度低于第 $k$ 名。则单轮的<span class="term">事实级 recall</span>$= |E \cap \text{retrieved}| / |E| \le 1/2$，<strong>而端到端可答需要它等于 1</strong>。<em>这也说明多跳题的 recall 必须按「事实集合是否被完整覆盖」算，而不是按「召回了几条相关文档」算</em>——后者会给出 0.5 这个看起来还行的数，而真实的可答率是 0。第 8 节会把这个定义写清楚。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个诊断技巧：<strong>如果某类问题无论怎么调检索都上不去，先检查它是不是多跳的。</strong><em>把答案需要的事实一条条列出来，看有没有哪一条的「可检索线索」只存在于另一条里</em>。有 → 这是迭代问题，不是检索问题。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="loop"><span class="num">2</span>迭代检索的循环：四个必须显式写出来的部件</h2>
+  <p>迭代检索的骨架很短，但<strong>它的四个部件里有三个经常被省掉，而省掉任何一个都会让它在生产上失控</strong>。</p>  <div class="ascii">   while True:
+       ① docs = retrieve(q_current)              ← 检索（C11 + 本课 03）
+       ② if sufficient(question, evidence):      ← **停止准则**（第 3 节）
+              break
+       ③ q_current = next_query(question, evidence)   ← 后续查询生成
+       ④ if hops &gt;= MAX_HOPS or cost &gt;= BUDGET:  ← **硬上界**（不可省）
+              break
+       hops += 1
+
+   常被省掉的三个:
+     ② 没有 sufficient() → 只能跑固定轮数，要么不够要么浪费
+     ④ 没有硬上界        → **成本没有上界**，这是最危险的一个
+     去重              → 每一跳都可能召回同一批文档，浪费预算（第 6 节）</div>  <table>
+    <thead><tr><th>部件</th><th>最简实现</th><th>省掉的后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>停止准则 <code>sufficient</code></strong></td><td>问题里的必需槽位是否都被证据覆盖</td><td>固定轮数：简单题浪费 2–3 倍成本，难题仍然答不上来</td></tr>
+      <tr><td><strong>后续查询 <code>next_query</code></strong></td><td>从已有证据里抽出<em>新实体</em>，拼上原问题的谓词</td><td>查询漂移（第 4 节）</td></tr>
+      <tr><td><strong>硬上界 <code>MAX_HOPS</code> / <code>BUDGET</code></strong></td><td>两个整数</td><td><strong>成本没有上界</strong>；一次 pathological 查询能烧掉整天的预算</td></tr>
+      <tr><td><strong>去重</strong></td><td>见过的 <code>chunk_id</code> 集合</td><td>每一跳召回同一批文档，上下文被重复内容占满</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>第三行值得强调：<strong>没有硬上界的迭代检索是一个开放的成本漏洞。</strong><em>它不需要恶意输入——一个措辞含糊的问题就足以让 <code>sufficient()</code> 永远返回 False</em>。<strong><code>MAX_HOPS</code> 必须是代码里的常量，而不是配置里的可选项。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="stopping"><span class="num">3</span>三种停止准则：成本与效果的三个点</h2>
+  <p>停止准则决定了迭代的全部成本特性。三种做法，<strong>成本上界都一样，但期望成本差很多</strong>。</p>  <table>
+    <thead><tr><th>准则</th><th>怎么判断</th><th>期望轮数</th><th>问题</th></tr></thead>
+    <tbody>
+      <tr><td><strong>固定轮数</strong></td><td>跑 $H$ 轮就停</td><td>恒为 $H$</td><td><em>简单题浪费、难题不够</em>；但它是唯一完全可预测的一个</td></tr>
+      <tr><td><strong>覆盖度</strong></td><td>问题的必需槽位是否都在证据里找到了</td><td><strong>随题目难度自适应</strong></td><td>需要一个能抽槽位的解析器；<em>槽位抽错会导致提前停或停不下来</em></td></tr>
+      <tr><td><strong>边际收益</strong></td><td>这一跳有没有带来新信息（新块 / 新实体）</td><td>接近覆盖度，但不需要理解问题</td><td><strong>容易被近重复骗</strong>——召回一批新的但内容重复的块会被判成「有新信息」</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>实践中最稳的组合是<strong>「覆盖度 + 边际收益 + 硬上界」三条同时用</strong>：覆盖度满足就停（正常路径）；覆盖度不满足但边际收益为 0 就停（说明再查也查不到，<em>这条防的是「答案根本不在库里」</em>）；硬上界兜底。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>成本的形式化：设每跳成本 $c$（嵌入 + 检索 + 一次判断），则<strong>最坏成本恒为 $H_{\max} \cdot c$</strong>（由硬上界保证），而期望成本是 $c \cdot \mathbb{E}[H]$。<em>三种准则的区别<strong>只在 $\mathbb{E}[H]$</strong></em>——这也是为什么「加停止准则」是一次纯粹的成本优化，<strong>它不改变最坏情况，只改变账单</strong>。notebook 第 3 节把三种准则的 $\mathbb{E}[H]$ 与可答率一起量出来。</p></div>
+  </div>  <p><strong>一条容易被忽略的纪律</strong>：<em>停止准则的判断不能看「答案对不对」</em>——线上没有真值。它只能看<strong>结构性的信号</strong>：槽位覆盖、新信息量、检索分数分布。<em>这与 C68 模块 02 的「重试只能看异常类型，不能看判分结果」是同一条纪律</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="drift"><span class="num">4</span>查询漂移：迭代最常见的失效方式</h2>
+  <p>后续查询是从上一跳的证据里生成的。<strong>如果生成规则不锚定原问题，查询会一跳一跳地走远。</strong></p>  <div class="ascii">   问题: 差旅报销的审批人邮箱是什么
+
+   ❌ 不锚定（用上一跳文档里的显著词当新查询）
+      hop1: 差旅报销的审批人邮箱是什么   → 「差旅报销由财务部的王敏负责审批」
+      hop2: 财务部 负责 审批            → 「财务部的报销审批时限为三个工作日」
+      hop3: 报销 审批 时限              → 「审批时限为三个工作日」
+      → 越走越远，**再也回不到「邮箱」这个目标**
+
+   ✅ 锚定（新实体 + 原问题的目标谓词）
+      hop1: 差旅报销的审批人邮箱是什么   → 「…财务部的王敏负责审批」
+      hop2: 王敏 邮箱                  → 「王敏的联系邮箱是 wangmin@acme.com」
+      → 命中</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>漂移是可以量出来的：<strong>算每一跳的查询与<em>原问题</em>的相似度</strong>。<em>不锚定时它单调下降；锚定时它保持在一个水平上。</em>notebook 第 4 节把两条曲线画在一起。<strong>这个量应当作为线上指标监控</strong>——它掉下去通常意味着后续查询生成的 prompt 出了问题。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>锚定的最小实现只有一句话：<strong>$q_{i+1} = (\text{新实体}) \oplus (\text{原问题的目标谓词})$</strong>。<em>新实体来自上一跳的证据，目标谓词来自原问题且永不改变。</em>更强的做法是把原问题原样拼进每一跳的查询里（代价是查询变长、相似度被稀释——模块 02 第 7 节的稀释效应在这里以另一种形式出现）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个便宜的护栏：<strong>要求每一跳的查询与原问题的相似度不低于第一跳的某个比例（比如 0.5 倍），否则丢弃这一跳的查询并停止。</strong><em>它拦不住所有漂移，但能拦住「走到完全不相关的话题上」这种严重情况。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="graph"><span class="num">5</span>图检索：只用图的结构，不训练任何模型</h2>
+  <p>有一类问题连迭代也做不好：<strong>「A 和 B 之间有什么关系」「谁同时负责 X 和 Y」</strong>。<em>它们需要的不是「找到某一段文字」，而是「在实体之间走几步」。</em></p>  <div class="ascii">   从块里抽出三元组，得到一张图
+
+   块: 「差旅报销由财务部的王敏负责审批。」
+        → (差旅报销, 审批人, 王敏)  (王敏, 部门, 财务部)
+   块: 「王敏的联系邮箱是 wangmin@acme.com。」
+        → (王敏, 邮箱, wangmin@acme.com)
+   块: 「合同审批由法务部的李强负责。」
+        → (合同审批, 审批人, 李强)  (李强, 部门, 法务部)
+
+           差旅报销 ──审批人──► 王敏 ──邮箱──► wangmin@acme.com
+                                 │
+                                部门
+                                 ▼
+                               财务部 ◄──部门── 张伟 ◄──审批人── 采购申请
+
+   问「差旅报销和采购申请的审批人有什么共同点」：
+     flat 检索：两个块各自能召回，但「共同点」这个信息**在任何块里都不存在**
+     图检索  ：从两个实体各走两步，取交集 → {财务部}  ← 答案是图算出来的</div>  <table>
+    <thead><tr><th>问题类型</th><th>flat 检索</th><th>迭代检索</th><th>图检索</th></tr></thead>
+    <tbody>
+      <tr><td>单跳事实（「差旅上限多少」）</td><td><strong>最好</strong>（最便宜）</td><td>浪费</td><td>浪费</td></tr>
+      <tr><td>多跳事实（「审批人邮箱」）</td><td><strong>不可能</strong></td><td><strong>最好</strong></td><td>可以（如果三元组抽全了）</td></tr>
+      <tr><td>关系/聚合（「共同点」「一共几个」）</td><td>不可能</td><td>很难（需要很多跳）</td><td><strong>最好</strong>——答案是图算出来的，不在任何块里</td></tr>
+      <tr><td>全局摘要（「这批文档讲了什么」）</td><td>不可能</td><td>不可能</td><td>社区检测 + 分层摘要（GraphRAG 的主要贡献）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>图检索的成本几乎全在摄取侧</strong>：抽三元组要跑一遍模型（或规则），而且文档更新时要增量维护图。<em>查询侧反而很便宜——邻域扩展是几次索引查找。</em><strong>所以图检索的决策点是「值不值得在摄取时多花这一遍」，而不是「查询时快不快」。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>它的两个真实风险：<strong>① 三元组抽取的召回率决定了上限</strong>——抽不到的关系在图里不存在，<em>而这个上限在查询侧完全看不到</em>（表现为「答不上来」，与检索失败无法区分）；<strong>② 图会腐烂</strong>——文档更新后旧三元组必须删掉，<em>而「删一条边」比「删一个块」难得多</em>，因为一条边可能有多个来源块支持（模块 05 会讨论这个 provenance 问题）。</p></div>
+  </div>  <p><strong>一个实用的中间档</strong>：不建完整的知识图谱，只抽<strong>实体 → 块</strong>的倒排表。<em>这已经能支持「同时提到 X 和 Y 的块」「提到 X 的所有块」这类查询</em>，而成本只是一次实体识别。notebook 第 5 节实现的就是这一档。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="cost"><span class="num">6</span>迭代的成本模型：三个乘数</h2>
+  <p>迭代检索的成本很容易失控，<strong>因为它的三个乘数都不显眼</strong>。</p>  <div class="math-block">\[\text{cost} \le H_{\max} \times m \times (c_{\text{embed}} + c_{\text{search}}) + H_{\max} \times c_{\text{judge}} + c_{\text{gen}}\]</div>  <ul>
+    <li><strong>$H_{\max}$</strong>：最大跳数。<em>$H = 3$ 已经是三倍成本。</em></li>
+    <li><strong>$m$</strong>：每跳的查询扩展路数（模块 03 第 4 节）。<strong>这一项最容易被忘</strong>——<em>迭代 3 跳 × 融合 3 路 = 9 次检索</em>，而两个改动是分别上线的，没人把它们乘起来算过。</li>
+    <li><strong>$c_{\text{judge}}$</strong>：每跳的停止判断。<em>如果它是一次 LLM 调用，那么它可能比检索本身贵。</em><strong>所以停止判断应当优先用结构性信号（槽位、新块数），不要默认用模型。</strong></li>
+  </ul>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>还有一项不在公式里但同样真实的成本：<strong>上下文预算</strong>。<em>每一跳都往证据里加块，$H$ 跳之后上下文可能是单轮的 $H$ 倍</em>（如果不去重，还会更多）。<strong>而上下文长度直接影响生成成本与延迟。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>把它写进 C66 模块 05 的口径：<strong>迭代检索要报的是 <code>$/success</code> 而不是 <code>$/query</code></strong>。<em>迭代的价值恰恰是把一部分「本来必然失败」的查询变成成功</em>，所以按 <code>$/query</code> 看它一定更贵，按 <code>$/success</code> 看才可能划算。notebook 第 6 节把两个口径都算出来，<strong>它们给出的结论可以是相反的</strong>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个直接可用的部署策略：<strong>只对「单轮判定为证据不足」的查询开启迭代。</strong><em>这让 $\mathbb{E}[H]$ 接近 1（大多数查询单轮就够），而多跳查询仍然能被答对</em>——本质上是把迭代当成一条<strong>兜底路径</strong>而不是默认路径。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="failures"><span class="num">7</span>四个失败模式</h2>
+  <table>
+    <thead><tr><th>失败</th><th>症状</th><th>根因</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td><strong>成本失控</strong></td><td>少量查询烧掉大量预算</td><td>没有硬上界，或 <code>sufficient()</code> 永远 False</td><td><code>MAX_HOPS</code> 写成代码常量；<em>按查询记录跳数分布并监控 P99</em></td></tr>
+      <tr><td><strong>查询漂移</strong></td><td>多跳题答得比单轮更差</td><td>后续查询没锚定原问题（第 4 节）</td><td>锚定 + 相似度护栏 + 监控每跳与原问题的相似度</td></tr>
+      <tr><td><strong>重复召回</strong></td><td>上下文很长但信息很少</td><td>没有跨跳去重</td><td>维护 <code>seen_chunk_ids</code>；<em>把「新块数」当边际收益信号</em></td></tr>
+      <tr><td><strong>迭代掩盖了上游问题</strong></td><td>「加了迭代效果就好了」，但成本翻了三倍</td><td><strong>答案本来在一个块里，只是被分块切断了（模块 02）</strong></td><td><em>先跑模块 02 的 intact 检查</em>；intact 不达标时先修分块，不要用迭代去补</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>最后一行是本模块最重要的一条工程忠告。<strong>迭代检索能掩盖分块问题、解析问题、查询问题——它会让指标变好，同时让成本变高、延迟变长、系统变复杂。</strong><em>上线迭代之前，先确认前面三个模块的检查都是绿的。</em>顺序仍然是模块 00 说的那个：<strong>parse → chunk → query → 才是 iterate</strong>。</p>
+  </div>  <h3>必须记录的四个字段</h3>  <p>每次迭代检索都要记录：<code>hops</code>（实际跳数）、<code>new_chunks_per_hop</code>（每跳的新块数）、<code>drift</code>（每跳查询与原问题的相似度）、<code>stop_reason</code>（<code>sufficient</code> / <code>no_gain</code> / <code>max_hops</code> / <code>budget</code>）。<strong><code>stop_reason</code> 的分布是最有信息量的一个</strong>——<em><code>max_hops</code> 占比高说明上界在兜底而不是准则在工作，这通常意味着 <code>sufficient()</code> 太严或者答案不在库里。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="eval"><span class="num">8</span>多跳题的 recall 必须按事实集合算</h2>
+  <p>这一节修正一个会系统性误导人的指标定义。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>常规 recall 的分母是「标注为相关的文档数」，<strong>而多跳题的标注通常只标了第一跳能找到的那一条</strong>（因为标注者也是搜出来的）。<em>于是单轮检索在这类题上能拿到不低的 recall，而端到端可答率是 0。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>正确的定义：<strong>把每道题的答案拆成必需事实集合 $E$，recall 定义为「$E$ 被<em>完整</em>覆盖的题目比例」</strong>——$$\text{fact-recall} = \frac{|\{\text{题} : E \subseteq \text{retrieved}\}|}{|\text{题数}|}$$<em>注意它是一个全或无的量</em>。<strong>覆盖了 $E$ 的一半，端到端就是 0，所以指标也应当是 0。</strong></p></div>
+  </div>  <table>
+    <thead><tr><th>指标</th><th>单轮在多跳题上的值</th><th>端到端可答率</th><th>会不会误导</th></tr></thead>
+    <tbody>
+      <tr><td>文档级 recall@5（只标第一跳）</td><td><strong>高（~1.0）</strong></td><td>0</td><td><strong>会</strong>——这是最常见的误导来源</td></tr>
+      <tr><td>文档级 recall@5（标全两跳）</td><td>0.5</td><td>0</td><td>会（0.5 看起来还行）</td></tr>
+      <tr><td><strong>fact-recall</strong>（全或无）</td><td><strong>0</strong></td><td>0</td><td><strong>不会</strong></td></tr>
+    </tbody>
+  </table>  <p><strong>推论：评测集必须为多跳题标出完整的事实集合</strong>，而这件事只能在造题时做——<em>事后从日志里补是不可能的，因为你不知道当时需要哪些事实</em>。</p>  <div class="callout intuition"><span class="label"></span>
+    <p>还有一个更朴素的检查值得放进 CI：<strong>把评测集按「需要几个事实」分层报分。</strong><em>单事实题与多事实题的分数混在一起报，会让多跳能力的改动完全看不见</em>——多跳题通常只占评测集的 10–20%，而它们的分数变化会被另外 80% 冲淡。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="when-not"><span class="num">9</span>什么时候不该用迭代</h2>
+  <p>迭代检索是本课最贵、最复杂、最容易被滥用的一层。<strong>这一节给出四个「先别上」的判据。</strong></p>  <ol>
+    <li><strong>模块 02 的 <code>intact</code> 还没达标</strong>——<em>答案本来在一个块里，只是被切断了</em>。此时迭代能让指标变好，但成本是修分块的几倍（第 7 节量过），<strong>而且它把一个已解决的问题变成了一个持续的成本</strong>。</li>
+    <li><strong>多跳题在评测集里占比很低而且没被单独标注</strong>——<em>你无法证明迭代有收益</em>（第 8 节：混在一起报会把 +1.00 冲淡成 +0.43）。先造多跳评测集并标出完整事实集合，再谈上线。</li>
+    <li><strong>还没有 <code>MAX_HOPS</code> 与单查询预算</strong>——<em>没有硬上界的迭代是一个开放的成本漏洞</em>，而它不需要恶意输入，一个措辞含糊的问题就够（第 2 节）。</li>
+    <li><strong>停止判断只能用 LLM</strong>——<em>第 6 节量过：用 LLM 判断时迭代连 <code>$/success</code> 都比单轮更贵</em>。先找到一个结构性的充分性信号（槽位覆盖、新实体、检索分数分布），找不到就说明这类问题的「够不够」还没被定义清楚。</li>
+  </ol>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>反过来，<strong>什么时候该上</strong>：<em>评测集里有一个明确的多跳子集、它的 fact-recall 是 0、而这个子集对业务重要</em>。<strong>这三条同时成立时，迭代是唯一的解</strong>——因为单轮 recall 在这类题上不是「差一点」，是结构上的 0（第 1 节）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一个中间选项常被忽略：<strong>把多跳问题在<em>摄取侧</em>解掉</strong>。<em>如果「审批人 → 邮箱」这类关联在语料里是稳定的，那么在摄取时把它们物化成一个块（或一条三元组）</em>，多跳问题就变成了单跳问题。<strong>代价是摄取侧的复杂度与派生资产的维护（模块 05 第 7 节），收益是查询时零额外成本。</strong>这个权衡与第 5 节图检索的决策点是同一个：<em>钱花在摄取侧还是查询侧</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="interleave"><span class="num">10</span>与生成交错：为什么本课把它们分开讲</h2>
+  <p>IRCoT / Self-RAG / FLARE 这条线的做法是<strong>把检索与生成交错</strong>：生成一步 → 用生成的内容触发检索 → 继续生成。本课刻意把它们分开，理由值得说明。</p>  <div class="ascii">   本课的形态（检索循环独立）        交错形态（IRCoT 式）
+
+   retrieve → judge → next_query    generate 一句
+      ▲                    │           │
+      └────────────────────┘           ├─► 用这句话当查询去检索
+   然后一次性 generate                  │
+                                       └─► 把结果拼进上下文，继续 generate
+   ✓ 每一跳的查询是可检查的            ✓ 查询更自然（就是模型的思路）
+   ✓ 停止准则是结构性的                ✗ 停止准则耦合在生成里，难以单独测试
+   ✓ 可以完全不调用大模型来测试         ✗ 每一步都要真实模型，无法离线复现</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>分开讲的理由是可测试性</strong>：本课全部的实验（并列组、锚定、停止准则、漂移、成本）<em>都能在没有真实模型的条件下跑出来并断言</em>。交错形态把「查询生成」这一步塞进了生成过程，<strong>于是它的行为与模型强耦合，无法离线复现</strong>——而不可复现的东西没法在 CI 里守住。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>工程上的建议是<strong>分阶段</strong>：<em>先把独立的检索循环做对（本课的四个部件 + 监控四字段），确认它在多跳子集上把 fact-recall 从 0 提到可用</em>；<strong>之后如果还需要更自然的查询，再把它交错进生成</strong>。反过来（一上来就做交错）的问题是：<em>当效果不好时，你分不清是检索循环的问题还是生成的问题</em>——而这正是 C68 模块 00 的第一条性质（差异可归因）要避免的情形。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一句话：<strong>交错形态更强，独立形态更可测。</strong><em>而在一个还没有多跳评测集、还没有 <code>MAX_HOPS</code>、还没有 stop_reason 看板的系统里，可测比强更值钱。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="checklist"><span class="num">11</span>上线迭代检索的七项清单</h2>
+  <p>把本模块压成一张可勾选的清单。<strong>前四项是前置条件，后三项是上线动作。</strong></p>  <ol>
+    <li><strong>模块 01/02/03 的门禁全绿</strong>——<em>尤其是模块 02 的 <code>intact</code></em>（第 7 节：迭代会掩盖分块问题）。</li>
+    <li><strong>评测集里有一个明确的多跳子集，标出了完整的事实集合</strong>，并按「需要几个事实」分层报分（第 8 节）。</li>
+    <li><strong><code>MAX_HOPS</code> 由单查询预算反解，写成代码常量</strong>（练习 2）。</li>
+    <li><strong>停止判断用结构性信号</strong>——<em>找不到这样的信号说明「够不够」还没被定义清楚</em>（第 3/6 节）。</li>
+    <li><strong>迭代只对「单轮证据不足」的查询开启</strong>（第 6 节：覆盖度准则的自然结果）。</li>
+    <li><strong>记录四个字段并上看板</strong>：<code>hops</code> 的 P50/P99、<code>new_per_hop</code>、<code>drift</code>、<code>stop_reason</code> 分布（第 7 节）。</li>
+    <li><strong>报 <code>$/success</code> 而不是 <code>$/query</code></strong>，<em>并把它与单轮基线并排放</em>（第 6 节：它不是一个自动偏向迭代的口径）。</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>清单里最容易被跳过的是第 2 项。<strong>没有多跳子集时，迭代的收益在整体指标上只有几个点，而成本是可见的三倍</strong>——<em>于是它看起来像一个不划算的改动，然后被砍掉</em>。而实际上它在那个子集上把 0 变成了 1。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_query_side/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 查询侧改写与路由</div></a>
+    <a class="next" href="../05_index_ops/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 索引运维</div></a>
+  </div>
+
+</div>
+</body>
+</html>

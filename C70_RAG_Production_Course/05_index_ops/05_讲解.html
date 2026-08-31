@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 索引运维</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 索引运维</h1>
+  <p class="subtitle"><strong>内容腐烂能局部修；结构腐烂与模型腐烂必须整体换</strong>——<em>把它们当同一类问题处理会产生一个既不是旧的也不是新的索引，而它的行为无法解释</em> · <strong>「更新时只写新块」的症状是间歇性的</strong>：3 个措辞里 1 个返回旧值，取决于查询与旧块的相似度，<em>因此不可复现</em> · <strong>删除必须断言删除条数</strong>——「执行了删除但删掉 0 条」看起来是一次成功的删除 · <strong>过期文档比例 = $1-(1-p)^L$</strong>，而<em>按「文档均匀」估会低估 2 倍以上</em>（π 与 p 正相关：热门文档也是改得最勤的） · <strong>跨 embedding 空间的内积接近 0，而它看起来完全正常</strong>；混版本索引里跨空间的块<em>连用自己的原文去查都排不到第一名</em>——等于那部分索引对检索不可见而账单照付 · <strong>模型腐烂的线上信号在分数分布的左尾，中位数可能一点不动</strong> · <strong>top-k 重叠率是观测量不是门禁</strong>：等于 1.0 时先怀疑配置没生效 · <strong>切换后旧进程会继续用旧索引</strong>——读取方必须每次请求重读那个指针 · <strong>缓存键不含 tenant 就是一条泄漏路径</strong>，且在低流量测试里不出现 · <strong>评测集绑 chunk_id 会造成一次「假事故」</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 01（摄取契约与 provenance）与 03（过滤前置）；C68 模块 05（线上监控与漂移）读过更好</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_index_ops.ipynb（三种腐烂 / 新鲜度公式与模拟对拍 / 新旧 embedding 混用的相似度失真 / 影子索引与原子切换 / 切换中途的混版本状态 / 派生资产（摘要、三元组）的静默过期 / 多租户的两种隔离 / 检索层监控四项与门禁）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">C68 模块 05（PSI/KS、漂移、数据闭环——本课直接复用不重推）· C68 模块 01（版本语义与交集重算）· 本课模块 01（摄取契约）· 模块 03（过滤前置）· 模块 04（图的腐烂）· C12 / C45（删除的合规要求）· Kleppmann, <em>Designing Data-Intensive Applications</em>（双写与切换）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#rot">索引会腐烂：三种腐烂，三种修法</a></li>
+      <li><a href="#incremental">增量索引：三种语义，其中删除最容易做错</a></li>
+      <li><a href="#freshness">新鲜度：过期答案率是可以算的</a></li>
+      <li><a href="#embedding-migration">换 embedding 模型：不可混用的全量迁移</a></li>
+      <li><a href="#switch">双写与原子切换：中途状态必须不可达</a></li>
+      <li><a href="#tenant">多租户：两种隔离，选错了是安全问题</a></li>
+      <li><a href="#derived">派生资产会静默过期</a></li>
+      <li><a href="#monitoring">检索层的监控四项 + 门禁</a></li>
+      <li><a href="#capacity">索引的容量与成本：三个乘数</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rot"><span class="num">1</span>索引会腐烂：三种腐烂，三种修法</h2>
+  <p>前面四个模块的产物都是<strong>一次性的决策</strong>：解析器选定了、分块参数解出来了、查询流水线上线了。<strong>而索引是有状态的——它从建成的那一刻起就开始与现实脱节。</strong></p>  <table>
+    <thead><tr><th>腐烂类型</th><th>什么变了</th><th>症状</th><th>修法</th><th>能不能局部修</th></tr></thead>
+    <tbody>
+      <tr><td><strong>内容腐烂</strong></td><td>源文档改了 / 删了</td><td>答出旧政策；答出已删除内容</td><td>增量索引（第 2 节）</td><td><strong>能</strong>——按 <code>doc_id</code> 定位</td></tr>
+      <tr><td><strong>结构腐烂</strong></td><td>分块参数 / 解析器换了</td><td>同一份内容以两种粒度共存，top-k 被自己造的近重复占满</td><td>全量重建 + 原子切换（第 5 节）</td><td><strong>不能</strong>——新旧块混在一个索引里就是错的</td></tr>
+      <tr><td><strong>模型腐烂</strong></td><td>embedding 模型升级</td><td><strong>相似度失去意义</strong>（第 4 节量这件事）</td><td>全量重建 + 原子切换</td><td><strong>绝对不能</strong>——两个向量空间之间的距离没有含义</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最后一列是这一节的重点。<strong>内容腐烂可以一份份修，而结构腐烂与模型腐烂必须整体换。</strong><em>把它们当成同一类问题处理（「那就慢慢迁移吧，先写新格式，旧的以后再说」）会产生一个既不是旧的也不是新的索引</em>，<strong>而这个中间状态的行为是无法解释的</strong>——违反了 C68 模块 00 的第一条性质（差异可解释）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>为什么模型腐烂「绝对不能」局部修？因为<span class="term">向量空间之间没有对齐关系</span>。两个不同模型（甚至同一模型的两个版本）产生的向量，<strong>其内积不是相似度，而是一个没有含义的数</strong>。<em>而它是一个「看起来很正常」的数</em>——在 $[-1, 1]$ 之间，有分布，能排序。<strong>所以混用不会报错，只会安静地给出错误的排序</strong>，这是本模块最危险的一个失败。第 4 节把失真量出来。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>有一个部署惯例会直接触发模型腐烂：<strong>把 embedding 模型名写成 <code>latest</code> 或不写版本。</strong><em>服务方更新模型后，新写入的向量与索引里的旧向量属于不同空间，而系统一切正常、没有任何报错。</em><strong>模型 ID 与版本必须钉死，并且写进索引的元数据里</strong>——这与 C69 模块 02「钉内容哈希而不是版本号」是同一类纪律。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="incremental"><span class="num">2</span>增量索引：三种语义，其中删除最容易做错</h2>
+  <p>模块 01 已经给出了摄取契约。这一节把它扩展到<strong>持续运行</strong>的场景。</p>  <div class="ascii">   增量索引的三种操作
+
+   ┌──────────┬─────────────────────────┬──────────────────────────┐
+   │ 操作     │ 正确实现                 │ 常见错误                  │
+   ├──────────┼─────────────────────────┼──────────────────────────┤
+   │ 新增     │ upsert，主键 (doc,v,i)   │ append → 重复摄取变两份    │
+   │ 更新     │ **先删该 doc 全部旧块**   │ 只写新块 → 新旧块共存      │
+   │          │ 再写新块                 │  （旧块永远不会被访问到     │
+   │          │                         │   ……除非它比新块更像查询）  │
+   │ 删除     │ 删块 + 写 tombstone      │ 只从源库删 → 索引里还在     │
+   │          │ + **断言删除数 == 预期**  │ 不断言 → 「删了 0 条」不报错 │
+   └──────────┴─────────────────────────┴──────────────────────────┘</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>「更新时只写新块」这个错误值得展开，因为它的症状很迷惑：<strong>大部分查询表现正常</strong>（新块通常更像查询，排在前面），<em>但偶尔会返回旧内容</em>——而「偶尔」取决于查询措辞与旧块的相似度。<strong>这类间歇性错误极难定位，因为它不可复现。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>删除则有一个额外的<strong>可验证性</strong>要求：<em>删除操作必须返回删掉了几条，调用方必须断言这个数</em>。<strong>「执行了删除但删掉 0 条」是一个必须能被发现的失败</strong>——它的成因通常是过滤条件写错（<code>doc_id</code> 大小写、路径归一化差异），而没有断言时它看起来是一次成功的删除。<em>这在合规语境下是实质性的：用户被告知数据已删除，而它还在被检索。</em></p></div>
+  </div>  <h3>删除的三层</h3>  <ol>
+    <li><strong>索引里的向量与块</strong>——必须删。这是唯一决定「还能不能被检索到」的一层。</li>
+    <li><strong>派生资产</strong>：摘要、三元组、实体倒排、缓存（第 7 节）。<em>它们不删的话，内容会从另一条路回来。</em></li>
+    <li><strong>日志与评测集</strong>——<em>这一层通常不能简单删</em>（会破坏历史可比性），<strong>正确做法是标记而不是物理删除，并在聚合时排除</strong>（与 C68 模块 01 的「坏题三条处理路径」同构）。</li>
+  </ol>
+
+  <!-- ========================================================= -->
+  <h2 id="freshness"><span class="num">3</span>新鲜度：过期答案率是可以算的</h2>
+  <p>「索引多久重建一次」通常是拍出来的。<strong>它可以从两个可测的量算出来：滞后时间与变更率。</strong></p>  <div class="math-block">\[P(\text{某文档已过期}) = 1 - (1-p)^{L} \approx pL \quad (pL \ll 1)\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>$p$ 是<strong>单篇文档单位时间的变更概率</strong>（可以从源库的修改时间统计出来），$L$ 是<strong>索引滞后的时间</strong>（单位与 $p$ 一致）。<em>$p = 1\%/\text{天}$、$L = 7$ 天时，约 6.8% 的文档在索引里是旧的。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>但真正要报的不是这个数，而是<strong>它对答案的影响</strong>：$$P(\text{答案过期}) = \sum_d \pi(d) \cdot \left(1 - (1-p_d)^{L}\right)$$其中 $\pi(d)$ 是文档 $d$ 被查中的概率。<strong>关键洞察：$\pi$ 与 $p$ 通常<em>正相关</em></strong>——<em>热门文档也是改得最频繁的文档</em>（政策、价格、排班）。所以按「文档均匀」估出来的过期率会<strong>系统性偏低</strong>。notebook 第 3 节把两种估法的差距量出来。</p></div>
+  </div>  <table>
+    <thead><tr><th>变更率 p</th><th>滞后 L</th><th>过期文档比例</th><th>该怎么办</th></tr></thead>
+    <tbody>
+      <tr><td>1%/天</td><td>7 天</td><td>6.8%</td><td>可接受（多数内部文档库）</td></tr>
+      <tr><td>1%/天</td><td>30 天</td><td>26%</td><td><strong>太高</strong>——缩短到周级</td></tr>
+      <tr><td>5%/天</td><td>7 天</td><td>30%</td><td><strong>太高</strong>——需要事件驱动增量</td></tr>
+      <tr><td>5%/天</td><td>1 天</td><td>5%</td><td>可接受</td></tr>
+      <tr><td>20%/天</td><td>1 天</td><td>20%</td><td><em>批量重建救不了</em>——必须近实时增量</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>这张表给出的工程结论很直接：<strong>先测 $p$，再定重建周期，而不是反过来。</strong><em>而 $p$ 几乎总是能从源库的 <code>updated_at</code> 免费算出来</em>——它是本模块成本最低、收益最高的一次测量。</p>
+  </div>  <h3>两种更新策略</h3>  <ul>
+    <li><strong>批量重建</strong>：定时全量或增量扫描。<em>简单、可预测；滞后等于周期的一半（平均）到一个周期（最坏）。</em></li>
+    <li><strong>事件驱动</strong>：源库变更触发单篇重索引。<em>滞后可以做到分钟级，但需要一个可靠的变更流</em>，<strong>而且必须有一条定时的对账任务</strong>——<em>事件会丢，而丢了的那一篇会永久过期</em>。对账做法：比对源库与索引里的 <code>(doc_id, content_sha)</code> 集合。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="embedding-migration"><span class="num">4</span>换 embedding 模型：不可混用的全量迁移</h2>
+  <p>这是本模块最重要的一节，<strong>因为它的错误做法不会报错</strong>。</p>  <div class="ascii">   ❌ 渐进迁移（错）
+      新写入的块用新模型，旧块保持旧模型，同一个索引
+      → 查询用哪个模型编码？
+        用新模型 → 与旧块的内积没有含义
+        用旧模型 → 与新块的内积没有含义
+      → 无论怎么选，**一半的索引在给出无意义的分数**
+      → 而这些分数长得很正常：在 [-1,1] 之间，有分布，能排序
+
+   ✅ 双索引 + 原子切换（对）
+      1. 建影子索引（新模型），与主索引并存
+      2. 一致性校验：同一批查询在两个索引上的结果对比
+      3. 原子切换：改一个指针（别名 / 配置项 / DNS）
+      4. 保留旧索引 N 天，随时可回滚</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么内积「没有含义」而不只是「不太准」？因为<strong>两个模型的向量空间的基是无关的</strong>。<em>模型 A 的第 17 维编码的东西与模型 B 的第 17 维毫无关系</em>，所以逐维相乘再求和这个操作，<strong>在数学上是一个随机投影的内积</strong>——它的期望是 0，方差取决于维度。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>notebook 第 4 节用两个「模型」（不同的哈希盐）把这件事量出来：<strong>同一段文本在两个空间里的向量，内积接近 0</strong>；而「一段文本与它自己的改写」在<em>同一个空间里</em>内积很高。<em>于是混用索引时，跨空间的那一半块的分数会系统性地偏低</em>——<strong>它们不是排在后面，而是几乎永远排在后面</strong>，等于那部分索引对检索不可见（而存储与账单照付）。</p></div>
+  </div>  <h3>一致性校验该比什么</h3>  <p>影子索引建好后不能直接切。<strong>但也不能要求「结果完全一致」——那等于要求新模型没有任何改进。</strong>正确的校验是三条：</p>  <ol>
+    <li><strong>覆盖率</strong>：两个索引的块数、doc 数、向量数必须<em>完全相等</em>。<strong>这是确定性检查，不相等就是漏了内容，直接阻断。</strong></li>
+    <li><strong>离线指标不降</strong>：在同一套评测集上跑 recall / fact-recall，<em>按 C68 模块 04 的方法从方差推阈值</em>，不要拍一个百分比。</li>
+    <li><strong>结果重叠率作为观测量而不是门禁</strong>：报 top-k 的 Jaccard，<em>但不设阈值</em>——<strong>它低可能意味着新模型更好，也可能意味着更差，这个数本身不能判定方向。</strong><em>它的用途是：如果重叠率是 1.0，说明你其实没换成新模型（配置没生效）。</em></li>
+  </ol>  <div class="callout warn"><span class="label"></span>
+    <p>第 3 条的最后一句是一个真实的、便宜的自检：<strong>迁移后如果结果一点没变，先怀疑配置没生效，而不是高兴「新模型很稳」。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="switch"><span class="num">5</span>双写与原子切换：中途状态必须不可达</h2>
+  <p>切换的正确性只有一个要求：<strong>任何一个请求看到的，要么是完整的旧索引，要么是完整的新索引，不存在第三种状态。</strong></p>  <div class="ascii">   时间线
+
+   t0  主索引=A(旧模型)          影子=B(新模型，空)
+   t1  主索引=A                  影子=B  ← 全量回填中
+   t2  主索引=A                  影子=B  ← 回填完成，跑一致性校验
+   t3  主索引=B                  旧=A    ← **原子切换：改一个指针**
+   t4  主索引=B                  旧=A    ← 观察期（保留 N 天）
+   t5  主索引=B                             ← 删除 A
+
+   回填期间的新增/更新怎么办？
+     **双写**：写 A 也写 B。B 用新模型编码。
+     漏了双写的后果：切换后 B 缺了回填期间的所有变更，
+     而这个缺口**不会报错**——只是有些内容检索不到。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>「原子」在实现上通常就是一个指针：<em>向量库的 collection alias、配置中心的一个键、或者一个 <code>ACTIVE_INDEX</code> 环境变量</em>。<strong>关键是它必须是单一来源，且读取方每次请求都重新读它</strong>——<em>进程启动时读一次并缓存的实现，会让切换后旧进程继续用旧索引，于是同一时刻不同实例返回不同结果</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>回滚同样重要：<strong>切换后要保留旧索引 N 天</strong>，$N$ 至少覆盖「一个完整的业务周期 + 发现问题需要的时间」。<em>而回滚必须是同一个指针的反向操作</em>——<strong>如果回滚需要重建索引，那就等于没有回滚。</strong>notebook 第 5 节把切换与回滚都实现了，并演示<em>中途状态（混版本）下的错误行为</em>。</p></div>
+  </div>  <h3>切换清单（六项，缺一项都可能出事）</h3>  <ul>
+    <li>回填期间<strong>双写</strong>，且双写失败要报警而不是静默丢弃</li>
+    <li>回填完成后<strong>覆盖率完全相等</strong>（确定性检查）</li>
+    <li><strong>离线指标不降</strong>（统计检查，阈值从方差推）</li>
+    <li><strong>切换是改一个指针</strong>，读取方每次请求重新读</li>
+    <li><strong>旧索引保留 N 天</strong>，回滚是同一指针的反向操作</li>
+    <li><strong>切换前后各跑一次监控基线</strong>（第 8 节的四项），<em>否则切换后指标变差时你分不清是新模型的问题还是切换的问题</em></li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="tenant"><span class="num">6</span>多租户：两种隔离，选错了是安全问题</h2>
+  <p>模块 03 说过「过滤必须前置」。这一节讨论更基本的一层：<strong>要不要给每个租户单独的索引。</strong></p>  <table>
+    <thead><tr><th>方案</th><th>隔离强度</th><th>成本</th><th>什么时候用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>元数据过滤</strong>（共享索引）</td><td><em>取决于每一次调用都带对了过滤条件</em></td><td>低（一个索引）</td><td>租户多、每个租户数据少；<strong>且过滤是不可绕过的默认值</strong></td></tr>
+      <tr><td><strong>独立索引 / 独立 collection</strong></td><td><strong>结构性隔离</strong>——错误的租户根本连不到那个索引</td><td>高（N 个索引的元数据与内存开销）</td><td>租户少而大；或<strong>合规要求物理隔离</strong></td></tr>
+      <tr><td><strong>混合</strong>：大租户独立、小租户共享</td><td>分档</td><td>中</td><td>最常见的落地形态；<em>但要注意「小租户升级成大租户」时的迁移</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>选择的判据不是成本，而是<strong>「一次漏写的距离」</strong>：<em>共享索引 + 可选的过滤参数 → 一行漏写就是一次跨租户泄漏；共享索引 + 必填的过滤参数 → 漏写会报错；独立索引 → 连错索引才可能出问题，而那是一个更显眼的错误。</em><strong>这是一个纵深防御的排序，而不是三个等价选项。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>无论选哪个，有两条必须做：<strong>① 租户维度的监控要分租户看</strong>——<em>「某个租户的零结果率突然 100%」在总体指标里完全看不见</em>；<strong>② 删除与新鲜度也是按租户的</strong>——一个租户要求删除数据时，<em>你需要能枚举「属于这个租户的全部块」</em>，而这依赖模块 01 把 <code>tenant</code> 写进了每个块的元数据。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>一个具体的、常见的泄漏路径：<strong>缓存。</strong><em>查询侧缓存（模块 03 第 7 节）的键如果不含 <code>tenant</code>，那么租户 A 的结果会被租户 B 的相同查询命中。</em><strong>缓存键必须含租户标识——这一条与检索侧的过滤同等重要，而它更容易被忘。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="derived"><span class="num">7</span>派生资产会静默过期</h2>
+  <p>索引里不只有块的向量。<strong>凡是从文档「算出来」的东西，都必须跟着文档版本失效。</strong></p>  <table>
+    <thead><tr><th>派生资产</th><th>来自哪个模块</th><th>不失效的后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>父块 / 摘要索引</strong></td><td>模块 02 第 6 节</td><td>答案引用了新版本的子块，而<em>喂给模型的父块是旧的</em></td></tr>
+      <tr><td><strong>三元组 / 实体倒排</strong></td><td>模块 04 第 5 节</td><td>图里还有一条已经不存在的关系；<strong>而图检索答出来的东西「不在任何块里」，所以无法通过引用核查发现</strong></td></tr>
+      <tr><td><strong>查询侧缓存</strong></td><td>模块 03 第 7 节</td><td>文档更新了但缓存里是旧结果</td></tr>
+      <tr><td><strong>同义词表 / 别名表</strong></td><td>模块 03 第 3 节</td><td>指向了已删除的文档用词</td></tr>
+      <tr><td><strong>离线评测集的 gold chunk id</strong></td><td>本课全程</td><td><strong>评测集悄悄失效</strong>——<em>gold 块被重新分块后 id 变了，于是所有题的 recall 都是 0，而这看起来像一次严重的效果退化</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>统一的做法只有一条：<strong>每个派生资产都带上它依赖的 <code>(doc_id, version)</code> 或<code>content_sha</code>，并在读取时校验。</strong><em>不匹配就当缓存未命中（重新计算）或报警，而不是照用。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>最后一行值得单独说，因为它会造成一次<strong>假的效果事故</strong>：换了分块方案后，评测集里记录的 <code>gold_chunk_id</code> 全部失效，<em>recall 掉到 0，看起来像新分块方案彻底失败</em>。<strong>正确做法是评测集记录「答案文本 + doc_id」而不是 chunk_id</strong>——<em>本课全程用「答案字符串是否在召回的块里」判定，正是为了避免这个问题</em>。这与 C68 模块 01「不要用内容哈希当 ID」是同一类教训：<strong>不要把标注绑在会变的东西上。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="monitoring"><span class="num">8</span>检索层的监控四项 + 门禁</h2>
+  <p>C68 模块 05 讲了线上监控的一般框架（PSI/KS、漂移、闭环）。这一节只给<strong>检索层特有的四个指标</strong>，它们都不需要真值。</p>  <table>
+    <thead><tr><th>指标</th><th>怎么算</th><th>它能抓到什么</th><th>分租户看吗</th></tr></thead>
+    <tbody>
+      <tr><td><strong>零结果率</strong></td><td>候选集为空或 top-1 分数低于阈值的请求占比</td><td>过滤条件写错（模块 03 第 5 节）、索引被清空、租户配置错</td><td><strong>必须</strong></td></tr>
+      <tr><td><strong>top-1 分数分布</strong></td><td>分位数（P10/P50/P90）</td><td><strong>embedding 模型被换掉了 / 混用了两个空间</strong>（<em>左尾变重，中位数可能不动</em>）、索引损坏</td><td>建议</td></tr>
+      <tr><td><strong>引用率</strong></td><td>生成的答案里带引用的比例 / 引用被点击的比例</td><td>召回质量下降（模型找不到可引用的依据）</td><td>建议</td></tr>
+      <tr><td><strong>新鲜度滞后</strong></td><td>$\max_d (\text{now} - \text{indexed\_at}_d)$ 与 P99</td><td>增量任务挂了、事件流丢消息（第 3 节的对账）</td><td><strong>必须</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>四个指标里<strong>「top-1 分数分布」最容易被忽略，但它是模型腐烂的唯一线上信号</strong>。<em>混用了两个 embedding 空间时，跨空间那部分块的分数会被压到接近 0，于是分布的左尾变重——而中位数可能一点不动</em>——<strong>而其它三个指标都可能完全正常。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>门禁按 C68 模块 04 的分级：<strong>确定性项阻断</strong>（新旧索引的块数不等、任一租户的零结果率 100%、新鲜度滞后超过 SLA），<strong>统计项报警</strong>（分数分布的 PSI、引用率的变化）。<em>把统计项设成阻断是「门禁被关掉」这一结局的起点。</em></p></div>
+  </div>  <h3>一张运维卡</h3>  <div class="ascii">   索引运维卡（每次重建/切换后生成）
+
+   index_id:        kb-v7-e5large-2026w35
+   embedding:       e5-large@2026-06-01   ← **钉死版本，不写 latest**
+   chunker:         structure_aware s=400 o=62
+   fingerprint:     3f9a71c2              ← 参数变了指纹就变（C68-01）
+   docs / chunks:   12,480 / 51,203       ← 与旧索引必须完全相等
+   built_at:        2026-08-31T04:12Z
+   freshness_p99:   3.4 小时              ← SLA 6 小时 ✓
+   change_rate p:   0.9%/天（从源库 updated_at 统计）
+   → 预期过期文档比例 = 1-(1-0.009)^(3.4/24) ≈ 0.13%  ✓
+
+   离线: fact-recall 0.83 → 0.86 (+3pp, 阈值 ±1.8pp) ✓
+   重叠: top5 Jaccard 0.71  ← **观测量，不设门禁**
+   零结果率（分租户最大）: 0.4%  ✓
+   top1 分数 P10/P50: 0.31/0.62 → 0.30/0.61   PSI 0.03  ✓  ← 报分位数
+
+   回滚: 指针 kb-active → kb-v6-...，旧索引保留至 2026-09-14</div>  <div class="callout intuition"><span class="label"></span>
+    <p>这张卡最重要的一行是最后一行：<strong>如果它写不出来（回滚需要重建索引），那么这次切换是不可回滚的，不该上线。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="capacity"><span class="num">9</span>索引的容量与成本：三个乘数</h2>
+  <p>索引运维的最后一件事是账。<strong>向量索引的成本有三个乘数，而它们都容易被低估。</strong></p>  <div class="math-block">\[\text{cost} \approx N_{\text{doc}} \times \frac{L_{\text{doc}}}{s-o} \times \big(d \cdot b + m_{\text{meta}}\big) \times (1 + r_{\text{shadow}})\]</div>  <table>
+    <thead><tr><th>乘数</th><th>它是什么</th><th>容易被低估的原因</th></tr></thead>
+    <tbody>
+      <tr><td><strong>$\frac{L_{\text{doc}}}{s-o}$</strong>（每文档的块数）</td><td>由分块参数决定</td><td><strong>重叠是分母里的减项</strong>：$s=400, o=62$ 时块数是无重叠的 1.18 倍，而 $s=100,o=59$ 时是 2.44 倍（模块 02 第 3 节）</td></tr>
+      <tr><td><strong>$d \cdot b$</strong>（每向量的字节数）</td><td>维度 × 每维字节</td><td><em>换一个「更好的」嵌入模型经常同时把维度从 768 提到 1024–3072</em>，<strong>而这是一个 1.3–4 倍的存储与内存乘数</strong>，还会同时抬高检索延迟</td></tr>
+      <tr><td><strong>$1 + r_{	ext{shadow}}$</strong>（影子索引期间）</td><td>迁移期间两份索引并存</td><td><strong>迁移期间容量翻倍</strong>，而「保留旧索引 N 天」意味着这个翻倍要持续 N 天（第 5 节）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第二行值得展开，因为它是一个常见的、被低估的决策。<strong>「升级到更强的嵌入模型」在账面上不只是一次重建</strong>：<em>维度变大 → 向量存储与内存按比例增长 → 检索延迟增长 → 如果用了量化（C11 模块 02 的 PQ），量化参数也要重调</em>。<strong>所以这个决策该先在离线集上量出「fact-recall 提升多少」，再和这一串成本一起看。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一项不在公式里的成本：<strong>元数据的基数</strong>。<em>本课要求每个块带 <code>doc_id / version / chunk_index / start / end / section_path / tenant / effective_date / element_type</code></em>——<strong>这些字段的存储通常与向量本身同量级</strong>，而且它们上面的索引（用于前置过滤）还要额外开销。<em>但它们不是可以省的：模块 01 第 5 节已经说过，缺任一个都会让某个运维操作变得不可能。</em><strong>正确的做法不是砍字段，而是把它们放在合适的存储里</strong>——过滤要用的进向量库的 metadata，只用于展示的放外部表按需取。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个能立刻用上的估算：<strong>先算「每文档块数 × 向量字节数」，再乘 2（影子期）</strong>。<em>如果这个数已经超出预算，那么在选嵌入模型之前，先回去看模块 02 的成本倍数——把重叠从「块长的 20%」改成「最长答案 −1」通常能省掉一大截</em>。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_iterative/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · 迭代与图检索</div></a>
+  </div>
+
+</div>
+</body>
+</html>

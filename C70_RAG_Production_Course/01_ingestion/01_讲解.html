@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 文档摄取与解析</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 文档摄取与解析</h1>
+  <p class="subtitle"><strong>解析是整条流水线里唯一一个「做错了无法在下游补救」的环节</strong>——结构、阅读顺序、位置这三样丢了就是丢了 · <strong>「拍平表格必然丢结构」是个错的说法</strong>：行主序拍平在小表上其实保住了行对应，<em>真正让它崩掉的是两个具体条件——列主序读取（PDF 按 x 坐标排序的真实结果）与块边界落在行内</em>；而行转句对两者都免疫，实现只有五行 · <strong>按 y 排序在单栏文档上完全正确</strong>，所以双栏交错这个 bug 在测试文档上常常不出现；分栏后仍有交界处的块会同时含两个实体——<em>那已经是块边界问题</em> · OCR 的<strong>词级破坏率是 $1-(1-\varepsilon)^L$</strong>，<em>ε=3% 时 12 字词有 31% 被毁，而专有名词恰恰都是长串</em>；<strong>词法检索的衰减比语义快一个量级</strong> · <strong>元数据过滤没有「排名靠后」这个中间状态</strong>——写窄一格 recall 直接 0 · 近重复<strong>占满 top-k</strong>，浪费的是上下文预算而不是存储 · <strong>幂等性只能靠「把同一批数据再摄取一遍，断言什么都没发生」验证</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 00（四段流水线与四个静默失败）；知道「哈希」；不需要任何解析库</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_ingestion.ipynb（三种解析方式的可答性对比 / 双栏版面的阅读顺序恢复 / OCR 字符错误率到词级破坏率的推导与实测 / 元数据过滤的收益与它的 recall 风险 / 近重复怎么占满 top-k / 幂等摄取契约 / 摄取质量门禁六项）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v"><em>unstructured</em> 与 <em>pypdf</em> 的 element / 坐标模型 · Nougat / LayoutLM 一类版面理解工作的问题设定 · Broder, <em>On the Resemblance and Containment of Documents</em>（1997，MinHash） · 本课程 C43（去重与流式）· C11 模块 01（BM25 与词法检索）· C69 模块 01（摄取边界与不可信内容）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#three-things">解析的目标不是「拿到文字」</a></li>
+      <li><a href="#structure-loss">结构损失的实验：四种解析，同一份表格</a></li>
+      <li><a href="#reading-order">阅读顺序：最隐蔽的一种结构损失</a></li>
+      <li><a href="#ocr">OCR 噪声：从字符错误率到「答不出来」</a></li>
+      <li><a href="#metadata">元数据：摄取时几乎免费，之后无法补</a></li>
+      <li><a href="#dedup">去重：RAG 里它有一个特有的后果</a></li>
+      <li><a href="#contract">摄取契约：让摄取可重放、可回滚、可删除</a></li>
+      <li><a href="#gate">摄取质量门禁：六项可机器判定的检查</a></li>
+      <li><a href="#order">摄取流水线的执行顺序：六步，顺序不能换</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="three-things"><span class="num">1</span>解析的目标不是「拿到文字」</h2>
+  <p>几乎所有 RAG 项目的第一行代码都是<code>text = extract_text(pdf)</code>。<strong>这一行同时决定了这个系统的上限</strong>，因为它决定了语料里存在什么、不存在什么。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>解析必须同时拿到<strong>三样东西</strong>，而不是一样：<em>文字</em>（说了什么）、<em>结构</em>（谁属于谁）、<em>来源</em>（这段字在哪一页哪一节）。<strong>只拿文字的代价是：结构与来源在下游无法恢复。</strong>不是「难恢复」——是<em>信息已经不在了</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>把它写成一个映射：一份文档 $D$ 的解析结果应当是一个三元组序列$\{(t_i, s_i, p_i)\}$，其中 $t_i$ 是文本片段、$s_i$ 是它的结构角色（标题 / 正文 / 表格单元 / 列表项 / 脚注）、$p_i$ 是它的位置（页、区间、章节路径）。<strong>常见的 <code>extract_text</code> 返回的是 $\text{concat}(t_i)$——一个把 $s_i$ 与 $p_i$ 全部投影掉的映射。</strong><em>投影是不可逆的</em>，这就是「无法恢复」的准确含义。</p></div>
+  </div>  <table>
+    <thead><tr><th>丢掉的东西</th><th>下游哪一步会因此失败</th><th>能不能事后补回来</th></tr></thead>
+    <tbody>
+      <tr><td><strong>表格的行列对应</strong></td><td>「A 行 B 列的值是多少」——块被召回、数字也在，但答案不可恢复</td><td><strong>不能</strong>。拍平后 <code>1580</code> 与「上海/2023」的关联已经消失</td></tr>
+      <tr><td><strong>标题层级</strong></td><td>分块（模块 02）无法按章节切；检索无法按章节过滤</td><td>部分可以（靠字号/编号启发式），<em>但不可靠</em></td></tr>
+      <tr><td><strong>阅读顺序</strong></td><td>实体与属性错配——<strong>这类错误的答案读起来完全通顺</strong></td><td><strong>不能</strong>，除非重新解析</td></tr>
+      <tr><td><strong>位置（页/区间）</strong></td><td>引用核查、删除、更新、权限过滤（模块 05 全靠它）</td><td><strong>不能</strong></td></tr>
+      <tr><td><strong>列表的层级</strong></td><td>「第二类的第三条」被拉平成同级，条件被错误地并列</td><td>部分可以（靠缩进），<em>PDF 里缩进常常已经没了</em></td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>这张表最重要的一列是第三列。<strong>解析是整条流水线里唯一一个「做错了就无法在下游补救」的环节</strong>——分块参数可以改、查询可以改写、索引可以重建，<em>但解析时丢掉的信息只能靠重新解析拿回来</em>。所以它值得被当成一次性的、需要认真做的工程决策，而不是一行 <code>extract_text</code>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="structure-loss"><span class="num">2</span>结构损失的实验：四种解析，同一份表格</h2>
+  <p>把上一节的第一行做成一个可复现的实验。一份四行三列的营收表，四种解析方式。<strong>其中第二种的结论和多数人预期的不一样</strong>，值得先看：</p>  <div class="ascii">   原始表格
+   ┌────────┬────────┬────────┐
+   │  地区  │  年份  │  营收  │
+   ├────────┼────────┼────────┤
+   │  北京  │  2023  │  1240  │
+   │  北京  │  2024  │  1310  │
+   │  上海  │  2023  │  1580  │   ← 问：上海 2023 年营收多少？
+   │  上海  │  2024  │  1620  │
+   └────────┴────────┴────────┘
+
+   ① 保结构（行 → 句）
+      "上海 在 2023 年的营收是 1580 万元。"        ✅ 可答
+
+   ② 行主序拍平（按行连起来）
+      "地区 年份 营收 北京 2023 1240 … 上海 2023 1580 …"   ⚠️ 行对应扛住了
+      ↑ 单元格与行名恰好相邻；但「营收」只在开头出现一次 → **列名丢了**
+
+   ③ 列主序拍平（按列读——PDF 里按 x 坐标优先排序的真实结果）
+      "地区 北京 北京 上海 上海 年份 2023 2024 … 营收 1240 … 1580 …"  ❌ 不可答
+      ↑ 每个字都在，检索照样召回，但 1580 与「上海+2023」隔了几十个 token
+
+   ④ 行主序拍平 + 按字符数硬切
+      块1: "… 北京 2024 1310 上海 2023 "
+      块2: "1580 上海 2024 1620"     ← 「上海 2023」与「1580」被切开   ❌ 不可答
+      ↑ 几百行的大表上，这件事必然发生在某些行上</div>  <p>notebook 第 1 节会把四种都量一遍，结论有三条：</p>  <ol>
+    <li><strong>只有行转句（①）在所有条件下都可恢复。</strong></li>
+    <li><strong>行主序拍平（②）在小表上扛住了「哪一行」</strong>——单元格与它的行名恰好相邻；<em>但它丢了「哪一列」</em>——「营收」只在开头出现一次，离 <code>1580</code> 几十个 token。<em>所以「拍平必然丢结构」是一个错的说法</em>；丢失发生在两个具体条件下：<strong>列主序读取（③）</strong>，以及<strong>行与行名被块边界切开（④）</strong>。而这两个条件在真实文档上都很常见——PDF 按 x 坐标优先排序就会得到 ③，几百行的大表必然遇到 ④。</li>
+    <li><strong>不可恢复的那些块，检索指标依然正常。</strong>相似度 > 0.3、<code>1580</code> 这个数字<em>确实在召回的块里</em>——Precision@1 是满分，端到端是错的。</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <p>第 2 条的工程含义不是「拍平有时可以」，而是相反：<strong>不要把「表格能不能扛住」当成一个概率事件去赌。</strong><em>行转句对 ③ 和 ④ 都免疫，而它的实现只有五行。</em></p>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么会这样？因为<strong>相似度衡量的是词的重叠，而不是关系的保留</strong>。拍平后的块包含「上海」「2023」「1580」这三个词，查询也包含前两个——重叠很高。<em>但「哪个数字属于哪一对」这个信息不在词袋里。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更一般地：设关系 $R = \{(\text{行}, \text{列}, \text{值})\}$。保结构的解析产生的文本 $T_1$ 满足 $R$ 可从 $T_1$ 唯一恢复；拍平的文本 $T_2$ 只保留了 $\pi(R)$——三个投影的并集，而 $|\{R' : \pi(R') = \pi(R)\}|$ 在 $m$ 行 $n$ 列时是组合级的。<strong>检索指标是 $T$ 与 $q$ 的函数，与 $R$ 是否可恢复无关</strong>——这就是「指标正常但答案错」的形式化来源。</p></div>
+  </div>  <h3>落地做法：表格必须走单独的路径</h3>  <ul>
+    <li><strong>行转句</strong>（最简单、最有效）：每一行渲染成一句自然语言，<em>把列名带上</em>。四行表变成四个可独立检索的句子。</li>
+    <li><strong>保留原表 + 摘要句</strong>：块的正文是行转句，但 metadata 里挂着这张表的 markdown 原文，供需要时整表喂给模型。</li>
+    <li><strong>大表要分块</strong>：几百行的表整块喂进去等于把上下文烧掉；行转句之后天然就是可检索单元。</li>
+    <li><strong>永远记录 <code>element_type='table'</code></strong>——下游要知道这个块的来源是表格才能正确使用它（也才能在评测时单独看表格类问题的准确率）。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="reading-order"><span class="num">3</span>阅读顺序：最隐蔽的一种结构损失</h2>
+  <p>PDF 里没有「段落」这个概念，只有<strong>一堆带坐标的文本块</strong>。把它们拼成文本需要一个顺序，而<em>选错顺序不会报错</em>。</p>  <div class="ascii">   一个双栏版面（左右两栏，各三段）
+
+        x=50                    x=320
+   y=100 ┌──────────┐      ┌──────────┐
+         │ 左栏 段1  │      │ 右栏 段1  │
+   y=200 ├──────────┤      ├──────────┤
+         │ 左栏 段2  │      │ 右栏 段2  │
+   y=300 ├──────────┤      ├──────────┤
+         │ 左栏 段3  │      │ 右栏 段3  │
+         └──────────┘      └──────────┘
+
+   ❌ 按 y 排序（"从上到下"）：
+      左1 右1 左2 右2 左3 右3      ← 两栏交错，语义被打断
+
+   ✅ 先按 x 分栏、栏内按 y 排序：
+      左1 左2 左3 右1 右2 右3      ← 正确
+
+   注意：**按 y 排序在单栏文档上是对的**，
+        所以这个 bug 在测试文档上常常不出现。</div>  <p>交错的后果比「读起来别扭」严重得多。<strong>如果左栏讲的是 A 产品的参数、右栏讲 B 产品的参数，交错之后每一段的上下文里都同时有 A 和 B</strong>——分块之后一个块里会出现「A 的名字 + B 的参数」，<em>而这个块读起来完全通顺</em>。</p>  <div class="callout warn"><span class="label"></span>
+    <p>这是本课最推荐加进 CI 的一项检查：<strong>解析后随机抽 5 页，人工确认阅读顺序。</strong><em>它便宜、一次性，而它防住的错误在任何自动指标里都看不见。</em>notebook 第 2 节给出一个自动版本：在已知实体-属性配对的合成版面上，量出错配率。</p>
+  </div>  <h3>分栏的判定</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>实用的启发式：<strong>看 x 坐标的直方图有没有明显的双峰</strong>。有 → 双栏，按峰分组；没有 → 单栏，直接按 y 排。<em>再加两条：页眉页脚按 y 的极值剔除；跨栏的大标题（宽度接近页宽）单独处理。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>更稳的做法是<span class="term">XY-cut</span>：递归地在投影直方图的最大空白处切分——先找垂直投影的最大间隙（切栏），再在每栏内找水平投影的间隙（切段），递归直到块足够小。<strong>它的好处是同时给出了阅读顺序和一棵版面树</strong>，而版面树正好是模块 02 结构感知分块需要的输入。<em>代价是它对表格与图文混排会过切，需要配合 element 类型做例外。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ocr"><span class="num">4</span>OCR 噪声：从字符错误率到「答不出来」</h2>
+  <p>扫描件与图片 PDF 必须走 OCR，而 OCR 一定有错。关键问题是：<strong>字符级错误率 $\varepsilon$ 传导到检索上会放大多少倍？</strong></p>  <div class="math-block">\[P(\text{一个长度 } L \text{ 的词被破坏}) = 1 - (1-\varepsilon)^{L}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直觉：<strong>错误率是按字符算的，但检索是按词匹配的</strong>，所以长词更容易被毁掉。$\varepsilon = 3\%$ 时，两字词被毁的概率是 5.9%，八字词是 21.7%。<em>而专有名词、型号、法条编号恰恰都是长串</em>——<strong>OCR 噪声优先毁掉的正是最有检索价值的那些词。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>这个式子还解释了两类检索的不同斜率。<span class="term">词法检索</span>（BM25）依赖<strong>精确</strong>词匹配，所以一个词被破坏就等于这个词的信号完全丢失，查询里 $m$ 个关键词全部存活的概率是 $(1-\varepsilon)^{\sum L_i}$——<em>随查询长度指数衰减</em>。<span class="term">语义检索</span>用子词/字符 n-gram，一个字符错误只毁掉包含它的那几个 n-gram，<strong>降级是渐进的而不是断崖的</strong>。notebook 第 3 节把两条曲线画在一起。</p></div>
+  </div>  <table>
+    <thead><tr><th>OCR 错误率 ε</th><th>2 字词被毁</th><th>8 字词被毁</th><th>含 3 个关键词的精确匹配存活率</th></tr></thead>
+    <tbody>
+      <tr><td><strong>0.5%</strong></td><td>1.0%</td><td>3.9%</td><td>≈ 91%</td></tr>
+      <tr><td><strong>1%</strong></td><td>2.0%</td><td>7.7%</td><td>≈ 83%</td></tr>
+      <tr><td><strong>3%</strong></td><td>5.9%</td><td>21.7%</td><td>≈ 57%</td></tr>
+      <tr><td><strong>5%</strong></td><td>9.8%</td><td>33.7%</td><td>≈ 38%</td></tr>
+    </tbody>
+  </table>  <p><em>最后一列按查询含 3 个词、平均词长 6 计算。</em><strong>它给出的结论很直接：ε 到 3% 时，纯词法检索已经不能作为唯一召回路径了</strong>——必须配一路语义检索（这正是 C11 模块 01 混合检索的一个非常实际的动机）。</p>  <h3>摄取侧能做什么</h3>  <ol>
+    <li><strong>记录 OCR 置信度并把低置信页标出来</strong>——大多数 OCR 引擎给每个词一个置信度。<em>把页级平均置信度写进 metadata，低于阈值的页进人工复核队列</em>。</li>
+    <li><strong>对关键实体做词典纠错</strong>：产品名、人名、法条号是封闭集合，用编辑距离对齐到词典。<em>这一步的收益远大于对全文做纠错</em>。</li>
+    <li><strong>不要在摄取时「顺便」用 LLM 清洗全文</strong>——它会安静地改写内容（C69 的视角：这等于让不可信内容经过一个会重写它的环节），<em>而你会失去与原文的对齐</em>，引用核查就没了。</li>
+    <li><strong>把 ε 当成一个需要被监控的量</strong>：抽样人工标注 200 个词，算字符错误率，写进摄取报告。<em>它变差通常意味着上游换了扫描设备。</em></li>
+  </ol>
+
+  <!-- ========================================================= -->
+  <h2 id="metadata"><span class="num">5</span>元数据：摄取时几乎免费，之后无法补</h2>
+  <p>元数据是本课后面三个模块的燃料。<strong>它在摄取时抽取几乎不要钱，而事后补几乎不可能</strong>（因为原文已经不在手上了）。</p>  <table>
+    <thead><tr><th>元数据</th><th>怎么来</th><th>下游用途</th><th>缺了会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><code>doc_id</code> / <code>version</code></td><td>摄取时分配（永不复用）</td><td>幂等、更新、删除（模块 05）</td><td><strong>删不掉、更不了</strong></td></tr>
+      <tr><td><code>source_uri</code> / 页码 / 字符区间</td><td>解析器给的位置</td><td>引用核查、给用户跳转</td><td>答案无法被验证，用户不信</td></tr>
+      <tr><td><code>section_path</code>（章节路径）</td><td>标题层级栈</td><td>结构感知分块（02）、按章节过滤（03）</td><td>分块只能按字符数硬切</td></tr>
+      <tr><td><code>effective_date</code> / <code>updated_at</code></td><td>文档内容或文件属性</td><td>时效过滤、新鲜度监控（05）</td><td><strong>旧政策与新政策同时被召回</strong></td></tr>
+      <tr><td><code>tenant</code> / <code>acl</code>（权限标签）</td><td>来源系统</td><td>多租户隔离（05）</td><td><strong>跨租户泄漏</strong>——这是安全事故</td></tr>
+      <tr><td><code>element_type</code></td><td>解析器（Title/Table/List/Text）</td><td>表格特殊处理（02）、按类型评测</td><td>表格与正文被同样对待</td></tr>
+      <tr><td><code>lang</code></td><td>语言检测</td><td>分块的字符/词切分、embedding 选择</td><td>中英混排的块被按错误的粒度切</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>有一个判据可以决定「这个元数据要不要抽」：<strong>它会不会出现在某个查询的过滤条件里，或者出现在某个运维操作的 WHERE 子句里？</strong><em>会 → 抽。</em>「删除这个用户的所有文档」「只看 2024 年之后生效的版本」「只看这个租户的」——这些都是 WHERE 子句。</p>
+  </div>  <h3>元数据过滤是双刃的</h3>  <p>过滤能把候选池缩小、把 precision 拉高。<strong>但它同时是一个 recall 风险：过滤条件写错，答案会被直接排除在候选之外，而检索层完全不会察觉。</strong></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>notebook 第 4 节量了这件事：加上正确的章节过滤，precision@3 明显上升；而把过滤条件写窄一格（少包含一个章节），<em>recall 直接掉到 0——不是掉一点，是完全召不回</em>。<strong>过滤是硬约束，它的失败模式是断崖式的。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化：无过滤时候选集是 $C$，过滤后是 $C \cap F$。则 $\text{recall} = 0$ 当且仅当所有相关块都不在 $F$ 里。<strong>与相似度不同，$F$ 里没有「排名靠后」这个中间状态。</strong><em>工程上的对策是双路召回：一路带过滤、一路不带，再合并（C11 的 RRF）；并把「过滤后候选数为 0」当成一个必须报警的事件。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dedup"><span class="num">6</span>去重：RAG 里它有一个特有的后果</h2>
+  <p>去重算法本身在 C43 讲过（MinHash / SimHash）。这一节只讲它在 RAG 里的一个特有后果，<strong>这个后果不是「浪费存储」，而是「浪费上下文预算」</strong>。</p>  <div class="ascii">   语料里有 4 份近重复文档（同一份合同的四个版本）
+
+   查询 → top-5 召回：
+   ┌─────────────────────────────────────────┐
+   │ 1. 合同v3 第2段   ← 内容 A               │
+   │ 2. 合同v1 第2段   ← 内容 A（几乎同一句）  │
+   │ 3. 合同v4 第2段   ← 内容 A               │
+   │ 4. 合同v2 第2段   ← 内容 A               │
+   │ 5. 附件说明 第1段 ← 内容 B               │
+   └─────────────────────────────────────────┘
+   有效独立信息量 = 2 条，而不是 5 条。
+   **你花了 5 个块的上下文预算，买到了 2 个块的信息。**</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么近重复必然占满 top-k？因为<strong>相似度是内容的函数</strong>——内容几乎一样的块，得分也几乎一样，<em>所以它们会作为一个整体一起进 top-k 或一起不进</em>。<strong>k 越大，这个问题越严重，而不是越轻。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>定义<span class="term">有效独立文档数</span>$\text{eff}@k = |\{\text{去重后的内容簇}\} \cap \text{top-}k|$。如果语料里某个内容有 $r$ 份近重复，那么在它们都排在前面的情况下 $\text{eff}@k \approx k - r + 1$。<strong>把 $\text{eff}@k / k$ 当成一个监控指标</strong>——它掉下来通常意味着上游灌进了一批重复文档。<em>C11 的 MMR 可以在检索时缓解，但摄取时去重更便宜也更彻底。</em></p></div>
+  </div>  <h3>三层去重，各管一件事</h3>  <table>
+    <thead><tr><th>层次</th><th>手段</th><th>抓什么</th><th>注意</th></tr></thead>
+    <tbody>
+      <tr><td><strong>文档级精确</strong></td><td><code>content_sha</code> 相同</td><td>同一份文件被灌了两遍</td><td>最便宜，一定要做</td></tr>
+      <tr><td><strong>文档级近重复</strong></td><td>MinHash / SimHash（C43）</td><td>同一份文档的多个版本、格式转换副本</td><td><strong>不要直接删</strong>——保留最新版并用 <code>supersedes</code> 链接</td></tr>
+      <tr><td><strong>块级近重复</strong></td><td>块的 shingle 指纹</td><td>页眉页脚、免责声明、模板文字</td><td>这些块<em>与任何查询都有一点相关</em>，是噪声的主要来源</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>块级去重有一个容易踩的坑：<strong>不要跨文档合并块</strong>。两份不同合同里的同一句条款看起来是重复的，但用户问「合同 X 里有没有这条」时，<em>答案必须来自合同 X</em>。正确做法是保留两份块、在检索时按 <code>doc_id</code> 做多样性约束（每个 doc 最多进 n 个块）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="contract"><span class="num">7</span>摄取契约：让摄取可重放、可回滚、可删除</h2>
+  <p>摄取是一个写操作，而写操作需要契约。本课的契约是四条，全部可以用几行代码实现（notebook 第 6 节）。</p>  <ol>
+    <li><strong><code>doc_id</code> 一次分配、永不改变、永不复用</strong>。<em>它必须来自来源系统的稳定标识（文件路径 + 来源系统 ID），不能是内容哈希</em>——用内容哈希当 ID，改一个错别字这份文档的历史就断了（与 C68 模块 01 的稳定 ID 是同一条）。</li>
+    <li><strong>版本单调递增，<code>content_sha</code> 用来检测变化</strong>。<em>摄取时先算 sha：与当前版本相同就整份跳过（这是幂等性），不同就 version+1 并替换该 doc 的全部块。</em></li>
+    <li><strong>块的主键是 <code>(doc_id, version, chunk_index)</code></strong>。写入用 upsert 而不是 append。<em>「同一份文档摄取两次索引里出现两份块」这个 bug 的唯一根因就是用了 append。</em></li>
+    <li><strong>删除必须传播到索引，并且是可验证的</strong>。<em>删除操作要返回「删掉了几个块」，调用方要断言这个数与预期一致</em>——「删了但一个块都没删掉」是一个必须能被发现的失败。</li>
+  </ol>  <div class="ascii">   一次摄取的完整状态机
+
+   新文档 ─────────────► [v1 已索引]
+                             │
+              内容变了       │      内容没变
+         ┌───────────────────┴──────────────┐
+         ▼                                  ▼
+   [删 v1 全部块]                     [整份跳过]
+   [写 v2 全部块]                     n_written = 0
+   [v2 已索引]                        （幂等）
+         │
+         │  源库删除
+         ▼
+   [删该 doc 全部块] ──► 断言 n_deleted == 该 doc 的块数
+   [写一条 tombstone]     ← 防止「被重新灌回来」</div>  <p><strong>最后一行的 tombstone 值得解释</strong>：如果只是删了块，而上游的全量同步任务下一轮又把这份文档送进来，<em>它会被当成新文档重新索引</em>。删除记录（<code>doc_id</code> + 删除时间 + 原因）让摄取器能拒绝它，也让「为什么这份文档不在索引里」有答案。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="gate"><span class="num">8</span>摄取质量门禁：六项可机器判定的检查</h2>
+  <p>这一节把整个模块变成一段能放进 CI 的代码。<strong>六项检查，每一项都对应前面某一节的失败。</strong></p>  <table>
+    <thead><tr><th>#</th><th>检查</th><th>阈值怎么定</th><th>抓的是哪一节的问题</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><strong>零文本页比例</strong></td><td>> 5% 报警</td><td>扫描件走错了路径（没走 OCR）</td></tr>
+      <tr><td>2</td><td><strong>表格块的比例与行转句覆盖率</strong></td><td>有表格但行转句为 0 → 阻断</td><td>第 2 节：表格被拍平</td></tr>
+      <tr><td>3</td><td><strong>元数据完整率</strong></td><td><code>doc_id/version/source_uri/section_path</code> 缺任一 → 阻断</td><td>第 5 节：元数据事后补不回来</td></tr>
+      <tr><td>4</td><td><strong>OCR 平均置信度 / 抽样字符错误率</strong></td><td>低于基线 2σ 报警</td><td>第 4 节：上游换了扫描设备</td></tr>
+      <tr><td>5</td><td><strong>块级近重复比例</strong></td><td>> 20% 报警；<code>eff@10 / 10 < 0.6</code> 报警</td><td>第 6 节：近重复占满 top-k</td></tr>
+      <tr><td>6</td><td><strong>幂等性自检</strong></td><td>同一批重放一次，<code>n_written == 0</code>，否则阻断</td><td>第 7 节：摄取契约</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>注意第 6 项的形式：<strong>它不是「检查代码写对了没有」，而是「把同一批数据再摄取一遍，断言什么都没发生」</strong>。<em>这是幂等性唯一可靠的验证方式</em>，也是 C68 模块 00 的 <code>run ∘ run = run</code> 在摄取侧的对应物。</p>
+  </div>  <p>门禁的两条使用纪律，与 C68 模块 04 一致：<strong>确定性的检查（2/3/6）直接阻断，因为它们的误报率是零；统计性的检查（1/4/5）只报警，阈值从历史基线的方差推。</strong><em>把统计检查设成阻断是「门禁被关掉」这一结局最常见的起点。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="order"><span class="num">9</span>摄取流水线的执行顺序：六步，顺序不能换</h2>
+  <p>这一节把前八节合成一条可执行的流水线。<strong>六个步骤的顺序是有约束的——换一个位置就会有信息永久丢失。</strong></p>  <div class="ascii">   ① 解析（拿文字 + element 类型 + 坐标 + 页码）
+        │   ← 唯一能拿到坐标的时刻。之后坐标就没了。
+   ② 阅读顺序修正（分栏 / 剔页眉页脚 / 跨栏标题）
+        │   ← 必须在 ① 之后（要坐标）、在 ③ 之前（表格分流要按修正后的顺序找上下文）
+   ③ 表格分流（行转句 + 保留 markdown 原文）
+        │   ← 必须在拼接成纯文本**之前**。拼完就分不出哪段是表格了。
+   ④ 元数据抽取（section_path / effective_date / tenant / lang）
+        │   ← 标题层级栈只在遍历 element 时存在
+   ⑤ 去重（文档级精确 → 文档级近重复 → 块级）
+        │   ← 必须在 ⑥ 之前：写进去再删比不写贵，而且中间状态会被检索到
+   ⑥ 幂等写入（先删该 doc 旧版本，再 upsert；tombstone 检查）</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>最容易被换错位置的是 ③ 和 ⑤。<strong>③ 放到「拼成纯文本之后」是最常见的错误</strong>——<em>一旦拼接完成，表格与正文就不可区分了</em>，而表格需要完全不同的处理路径（第 2 节）。<strong>⑤ 放到 ⑥ 之后（「先写进去，之后再跑一个去重任务」）会让近重复块在两次任务之间被检索到</strong>，而这段时间的行为无法解释。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>还有一条不在图里的约束：<strong>① 到 ⑥ 必须是同一个事务边界内的一次操作</strong>，或者至少是<em>可重放的</em>。<strong>如果流水线在 ④ 之后崩溃，重跑必须从 ① 开始，而不是从 ⑤ 继续</strong>——因为中间产物里没有坐标了。<em>实现上最简单的保证是：中间产物全部在内存里，只有 ⑥ 写外部存储</em>。这也意味着单篇文档的处理不应该跨进程拆分。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>一个检验流水线设计的问题：<strong>「如果我想给已经索引过的文档补一个元数据字段，需要重新解析吗？」</strong><em>需要 → 说明这个字段只能在解析时拿到，那它就必须在第一遍就抽出来（第 5 节的判据）。</em></p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_chunking/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 分块</div></a>
+  </div>
+
+</div>
+</body>
+</html>

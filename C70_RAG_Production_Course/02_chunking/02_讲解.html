@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 分块</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 分块</h1>
+  <p class="subtitle"><strong>分块是一个有约束的优化问题</strong>：在答案完整率 ≥ 阈值的前提下最小化块数——<em>而这个约束不需要试，可以算</em> · <strong>$\text{intact}(s,o,a) = \min(1, (s-a+1)/(s-o))$</strong>，与穷举实测差 $10^{-4}$ · <strong>重叠的正确取值只由最长答案决定：$o \ge a-1$</strong>，在 s=60…500 上都成立——<em>「重叠设块长的 10%」把重叠绑在了错误的量上</em> · <strong>达到完整率 1 的索引成本倍数是 $s/(s-a+1)$</strong>：s=500,a=50 时 1.11×（直接加），s=80,a=70 时 7.3×（<em>该换分块方式而不是继续调重叠</em>） · 主题纯度要用<strong>「块有没有跨越文档自己的结构边界」</strong>这个精确定义，<em>不要用块内句相似度——那个代理依赖的正是你要评估的嵌入</em> · <strong>语义分块的分位数阈值有两个真实的退化</strong>（相似度大量为 0 时 q 完全失效；相似度全相等时处处切），修法是绝对阈值 + 双向硬约束 · <strong>父子块同时拿到大块的命中率与接近小块的上下文成本</strong>，前提是父块去重 + 归因指向子块 · 稀释是 $1/\sqrt{1+\|z\|^2/\|r\|^2}$ 型的，<em>比线性慢</em></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">读过本课模块 01（元数据 <code>section_path</code> / <code>element_type</code> 是本模块的输入）；会读简单的概率推导</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_chunking.ipynb（三个竞争指标随块大小的曲线 / 答案完整率的精确公式与实测对拍 / 重叠的饱和点与索引成本倍数 / 结构感知分块的主题纯度 / 语义分块的谷点切分 / 父子块让 precision 与完整率同时上升 / 稀释效应 / 分块 A/B 报告与门禁）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">LangChain / LlamaIndex 的 <em>RecursiveCharacterTextSplitter</em> 与 <em>SentenceWindowNodeParser</em> 的设计取舍 · Kamradt 的语义分块（semantic chunking）实践 · 本课程 C11 模块 03（重排与候选集大小）· C33 模块 01（注入预算）· C68 模块 01（参数进 spec 与指纹）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 65 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#objective">分块的目标函数：三个互相竞争的量</a></li>
+      <li><a href="#fixed-window">固定窗口的两个失败</a></li>
+      <li><a href="#intact-formula">答案完整率的精确公式（本模块最有用的一条）</a></li>
+      <li><a href="#structure">结构感知分块：用模块 01 拿到的东西</a></li>
+      <li><a href="#semantic">语义分块：在相似度的谷点切</a></li>
+      <li><a href="#parent-child">父子块：让 precision 与完整率同时上升</a></li>
+      <li><a href="#dilution">稀释效应：为什么大块的检索分数会偏低</a></li>
+      <li><a href="#ab-gate">分块的 A/B 与门禁：四个必须一起报的数</a></li>
+      <li><a href="#antipatterns">分块的三个反模式</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="objective"><span class="num">1</span>分块的目标函数：三个互相竞争的量</h2>
+  <p>「块该多大」是 RAG 里被问得最多、被回答得最差的问题。常见答案是「512 token，重叠 50」——<strong>这个答案的问题不是数字错了，而是它没有说这个数字在优化什么。</strong></p>  <p>分块要同时管三个量，而它们互相竞争：</p>  <table>
+    <thead><tr><th>量</th><th>定义</th><th>块变大时</th><th>块变小时</th></tr></thead>
+    <tbody>
+      <tr><td><strong>答案完整率</strong> <code>intact</code></td><td>答案<em>完整落在某一个块内</em>的比例</td><td><strong>上升</strong>（大块装得下）</td><td>下降（答案被切断）</td></tr>
+      <tr><td><strong>主题纯度</strong> <code>1 − cross</code></td><td>块<em>没有</em>跨越文档自己的结构边界的比例</td><td>下降（一个块里混了几个主题）</td><td><strong>上升</strong></td></tr>
+      <tr><td><strong>索引成本</strong> <code>n_chunks</code></td><td>块的数量（存储、向量、检索延迟、上下文预算）</td><td><strong>下降</strong></td><td>上升</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>所以「块该多大」不是一个有唯一答案的问题，而是一个<strong>有约束的优化问题</strong>：<em>在答案完整率不低于某个阈值的前提下，最小化块数</em>。<strong>阈值来自你的业务（答案说一半是不可接受的失败），而不是来自某篇博客的默认值。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>写成规划问题：$\min_{s, o} \; n(s, o)$ s.t. $\text{intact}(s, o) \ge \tau$，$\text{purity}(s) \ge \rho$。本模块的核心贡献是：<strong>$\text{intact}(s, o)$ 有一个精确的解析式</strong>（第 3 节），所以这个约束<em>不需要试，可以算</em>。$n(s, o) = L / (s - o)$，也是解析的。<em>而第 4 节的纯度定义也是算术</em>——所以这三个量全都不需要试，可以算。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>有一个判据能立刻看出一个分块方案有没有想清楚：<strong>问「你们的最长答案有多长？」</strong><em>答不上来，那么重叠设多少都是猜的</em>——第 3 节会证明重叠的正确取值<strong>只由这一个量决定</strong>。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fixed-window"><span class="num">2</span>固定窗口的两个失败</h2>
+  <p>固定字符/token 窗口是所有分块的基线。它有两个失败，<strong>而它们的方向相反</strong>——这正是上一节那张表的来源。</p>  <div class="ascii">   失败一：块太小 → 答案被切断
+
+   文档: ...正式员工每年享有 15 天带薪年假。试用期员工...
+                        │              │
+   块边界 ──────────────┴──────────────┘
+   块 k:   "...正式员工每年享有 15 "
+   块 k+1: "天带薪年假。试用期员工..."
+   → 召回块 k（它确实最相关），答案说一半。**Precision@1 满分。**
+
+
+   失败二：块太大 → 主题混在一起
+
+   块 j: "...年假需提前三日申请。报销流程说明。餐饮报销单次上限 200 元..."
+          └────── 主题 A ──────┘└────────── 主题 B ──────────┘
+   → 查「报销上限」时，这个块的向量被主题 A 稀释了（第 7 节量这件事）；
+     查「年假申请」时，喂给模型的上下文里混进了无关的报销规定。</div>  <p><strong>失败一是断崖式的、可以被精确计算的；失败二是渐进式的、需要测量。</strong>这个不对称决定了工程上的处理顺序：<em>先用公式把完整率钉在阈值之上，再在满足约束的配置里挑纯度最好的那个。</em></p>  <h3>为什么「按 token 切」不比「按字符切」更安全</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>很多实现从字符换成 token 后就认为问题解决了。<strong>不是——切断的概率只与「块长/答案长」的比值有关，与单位无关。</strong><em>换单位只是换了刻度</em>。唯一真正有用的改变是<strong>让边界落在语义边界上</strong>（句号、段落、标题），这是第 4、5 节的内容。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说：设答案长 $a$、块长 $s$、步长 $s-o$，这三个量用同一个单位度量时，第 3 节的公式只依赖 $a/s$ 与 $o/s$。<strong>换单位等于同时缩放 $a, s, o$，公式的值不变。</strong><em>唯一的例外是当单位本身携带语义信息时</em>——「按句切」的分块，答案（通常是一到两句）被切断的概率天然更低，因为切点与答案的边界对齐了。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="intact-formula"><span class="num">3</span>答案完整率的精确公式（本模块最有用的一条）</h2>
+  <p>这一节给出 <code>intact</code> 的解析式。<strong>它的价值是让「重叠设多少」从一个玄学问题变成一次算术。</strong></p>  <p>设文档长 $L$、块长 $s$、重叠 $o$、步长 $\text{step} = s - o$，答案是一个长 $a$ 的连续片段，起点在文档里近似均匀分布。块的起点是 $0, \text{step}, 2\,\text{step}, \dots$</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>答案能完整落进第 $i$ 个块，当且仅当它的起点 $p$ 满足$i \cdot \text{step} \le p$ 且 $p + a \le i \cdot \text{step} + s$。<strong>也就是说，每个块提供了一段长 $s - a + 1$ 的「安全区」</strong>，而相邻块的起点相差 $\text{step}$。<em>安全区盖不满的那部分，就是答案必然被切断的位置。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>把它写出来：$$\text{intact}(s, o, a) = \begin{cases} 0, & s < a \\ \min\!\left(1, \dfrac{s - a + 1}{s - o}\right), & s \ge a \end{cases}$$<strong>notebook 第 2 节把它与穷举实测对拍，误差在 $10^{-3}$ 量级</strong>（差异只来自文档两端的边界效应）。</p></div>
+  </div>  <h3>三个立刻可用的推论</h3>  <ol>
+    <li><strong>要让完整率达到 1，重叠必须满足 $o \ge a - 1$。</strong><em>把 $\min$ 里的分式设为 $\ge 1$ 解一下即可。</em><strong>也就是说：重叠的正确取值只由最长答案的长度决定，和块大小无关。</strong>「重叠设块长的 10%」这个流行做法之所以经常不够，就是因为它把重叠绑在了错误的量上。</li>
+    <li><strong>达到完整率 1 的索引成本倍数是 $\dfrac{s}{s - a + 1}$。</strong><em>$s = 500, a = 50$ 时是 1.11 倍（很便宜）；$s = 100, a = 60$ 时是 2.44 倍；$s = 80, a = 70$ 时是 7.3 倍（这时候该换分块方式，而不是加重叠）。</em></li>
+    <li><strong>$s < a$ 时完整率是 0，加多少重叠都没用。</strong><em>这听起来显然，但它给出了块大小的硬下界：$s \ge a$。</em>所以流程是先由最长答案定下界，再由纯度与成本定具体值。</li>
+  </ol>  <table>
+    <thead><tr><th>块长 s</th><th>最长答案 a</th><th>达到完整率 1 所需 o</th><th>索引成本倍数 s/(s−a+1)</th></tr></thead>
+    <tbody>
+      <tr><td>500</td><td>50</td><td>49</td><td><strong>1.11×</strong>（便宜，直接加）</td></tr>
+      <tr><td>500</td><td>200</td><td>199</td><td>1.66×</td></tr>
+      <tr><td>200</td><td>50</td><td>49</td><td>1.33×</td></tr>
+      <tr><td>100</td><td>60</td><td>59</td><td>2.44×</td></tr>
+      <tr><td>80</td><td>70</td><td>69</td><td><strong>7.3×</strong>（别加重叠，换方案）</td></tr>
+      <tr><td>40</td><td>60</td><td>—</td><td><strong>不可能</strong>（$s < a$）</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>这张表的最后两行是重点。<strong>当最长答案接近块长时，用重叠去救完整率的代价会爆炸。</strong><em>此时正确的动作是换分块方式（结构感知 / 父子块），而不是继续调重叠。</em>notebook 第 3 节把成本倍数画成曲线，拐点非常明显。</p>
+  </div>  <h3>怎么知道 a</h3>  <p>$a$ 是<strong>可以测的</strong>，而且很便宜：从你的评测集里取答案（或答案证据）的字符/token 长度，<em>取 95 分位数而不是最大值</em>——最大值通常是一个异常长的表格类答案，为它把重叠拉满不划算。<strong>把这个 P95 写进分块配置的注释里</strong>，它是整个配置唯一的自由输入。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="structure"><span class="num">4</span>结构感知分块：用模块 01 拿到的东西</h2>
+  <p>固定窗口的边界是任意的。而模块 01 已经把 <code>section_path</code> 与 <code>element_type</code> 拿到手了——<strong>用它们当边界，纯度会立刻改善，而且不花任何额外成本。</strong></p>  <div class="ascii">   结构感知分块的三条规则（按优先级）
+
+   ① 绝不跨 element 边界切表格
+      表格块 = 行转句（模块 01），一行一块或几行一块，永不与正文混合
+
+   ② 优先在结构边界切：标题 &gt; 段落 &gt; 句子 &gt; 字符
+      这就是 RecursiveCharacterTextSplitter 的分隔符优先级列表在做的事
+
+   ③ 每个块继承它所在的 section_path，并把它**拼进块的文本**
+      块文本 = "第三章 / 报销制度\n\n餐饮报销的单次上限是 200 元。"
+      ↑ 这一步让「章节名里的词」也参与检索——
+        用户问「报销制度里餐饮怎么规定」时，章节名提供了关键的匹配信号</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>第三条常被忽略，但它的收益/成本比是本模块最高的。<strong>标题里的词往往正是用户查询里的词</strong>，而正文里可能一次都没出现。<em>把 section_path 拼进块文本，等于给每个块免费加了一组关键词。</em>代价是每个块多了十几个字符。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>形式化地看，这是一次<span class="term">上下文增强</span>：块的可检索表示从 $\text{emb}(c)$ 变成 $\text{emb}(\text{path}(c) \oplus c)$。<strong>注意它同时改变了两件事</strong>：召回（好事，多了匹配信号）与<em>同章节块之间的相似度</em>（副作用——同一章的块彼此变得更像，可能挤占 top-k 的多样性）。<em>所以路径要短：只拼最近一两级，不要拼整棵树。</em></p></div>
+  </div>  <h3>主题纯度怎么测：用文档自己的结构，不要用相似度</h3>  <p>纯度需要一个可计算的定义。一个看起来很自然的选择是<em>「块内句子两两相似度的平均值」</em>——<strong>但它在实践中不好用</strong>：同一小节里的两句话（「餐饮报销上限 200 元」与「交通报销需提供发票」）共享的表层词很少，相似度并不比跨小节的两句高。<em>这个代理依赖嵌入模型的质量，而它本身正是我们要评估的东西之一。</em></p>  <p>本课用一个<strong>精确、不依赖任何模型</strong>的定义：</p>  <div class="math-block">\[\text{cross}(C) = \frac{|\{c \in C : |\text{sections}(c)| > 1\}|}{|C|},\qquad \text{purity} = 1 - \text{cross}(C)\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>也就是<strong>「有多少比例的块跨越了文档自己的结构边界」</strong>。<em>文档作者已经把主题边界标出来了（标题、小节），跨越它就是把两个主题混进了一个块。</em><strong>这个量是算术，不是测量——没有噪声，可以直接进门禁。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>它有一个明显的性质：<strong>结构感知分块的 cross 恒为 0</strong>（按构造）。<em>所以「结构感知比固定窗口纯」这个对比在这个指标下是同义反复</em>——这正好说明了结构感知分块的价值来源：<strong>它不是「更聪明」，而是直接把这个指标设成了最优。</strong>有意义的对比是<span class="term">语义分块</span>——它不知道小节在哪，只能从相似度谷点猜；notebook 第 5 节量出它猜得有多准（本例约 1/3 的块跨了小节）。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="semantic"><span class="num">5</span>语义分块：在相似度的谷点切</h2>
+  <p>语义分块的想法很直接：<strong>逐句算与下一句的相似度，在相似度的「谷点」切开</strong>——那里大概就是话题转换的地方。</p>  <div class="ascii">   相邻句相似度序列
+
+   sim
+    │      ●───●         ●───●───●
+    │     ╱     ╲       ╱         ╲
+    │    ●       ●     ●           ●
+    │             ╲   ╱             ╲
+    │              ● ●               ●
+    └──────────────┬─────────────────┬────────► 句序
+                  谷点              谷点
+                 （切）             （切）
+
+   实现：sim_i = cos(emb(句i), emb(句i+1))
+        切点 = { i : sim_i &lt; 分位数(sims, q) }      q 常取 0.1~0.2</div>  <table>
+    <thead><tr><th>方案</th><th>边界质量</th><th>成本</th><th>什么时候用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>固定窗口</strong></td><td>任意</td><td>$O(n)$，零额外开销</td><td><strong>默认起点</strong>；结构信息缺失时也只能用它</td></tr>
+      <tr><td><strong>结构感知</strong></td><td>好（跟着文档自己的结构）</td><td>$O(n)$，只需要解析元数据</td><td><strong>只要模块 01 做对了就该用</strong>——几乎没有理由不用</td></tr>
+      <tr><td><strong>语义分块</strong></td><td>在无结构长文本上最好</td><td>$O(n)$ 次嵌入调用（<em>摄取时一次性</em>）</td><td>长篇无标题文本（访谈记录、会议转录、爬取的网页正文）</td></tr>
+      <tr><td><strong>LLM 分块</strong></td><td>最好</td><td><strong>贵，且不确定</strong></td><td>很少值得；<em>如果一定要用，缓存结果并把它当解析的一部分固化下来</em></td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>语义分块有一个容易被忽略的问题：<strong>它产生的块大小方差很大。</strong><em>一段话题连续的长篇会被切成一个巨大的块</em>，而这个块可能装不进上下文预算，也会在检索时因为稀释效应（第 7 节）而分数偏低。<strong>所以语义分块必须配一个硬上限：超过 $s_{\max}$ 就在内部再切。</strong></p>
+  </div>  <p><strong>一条实用的结论</strong>：在有结构的文档上（绝大多数企业文档），<em>结构感知分块的收益已经拿到了大部分，语义分块的边际收益很小</em>。把预算花在把模块 01 的解析做对上，回报比换分块算法高得多。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="parent-child"><span class="num">6</span>父子块：让 precision 与完整率同时上升</h2>
+  <p>前面所有讨论都假设<strong>「被检索的单元」和「被喂给模型的单元」是同一个东西</strong>。<em>放弃这个假设，三个竞争的量里有两个可以同时改善。</em></p>  <div class="ascii">   父子块（small-to-big）
+
+   父块（喂给模型）           子块（进索引，被检索）
+   ┌─────────────────────┐   ┌──────────────────┐
+   │ 第三章 报销制度       │──►│ 子1: 餐饮报销...  │  ← 小、主题纯、
+   │                     │   ├──────────────────┤    向量不被稀释
+   │ 餐饮报销的单次上限是  │──►│ 子2: 差旅报销...  │
+   │ 200 元。差旅报销的    │   ├──────────────────┤
+   │ 单次上限是 3000 元。  │──►│ 子3: 提交时限...  │
+   │ 所有报销需在 30 天内  │   └──────────────────┘
+   │ 提交。               │
+   └─────────────────────┘
+        ▲                          │
+        └──── 命中子块 → 返回父块 ──┘
+
+   索引里存子块的向量，返回时按 parent_id 换成父块。</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>为什么这样能同时改善两个量？因为<strong>它把「检索粒度」和「上下文粒度」解耦了</strong>。检索要小块（纯、不被稀释、precision 高）；喂模型要大块（答案完整、有上下文）。<em>把它们绑在一起是固定窗口方案的一个隐含约束，而这个约束是不必要的。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>代价有三个，都要清楚：<strong>① 上下文预算</strong>——返回父块意味着 token 用量按父/子的大小比放大，去重（同一个父块被多个子块命中）是必须的；<strong>② 存储</strong>——父块要另存一份（或存偏移量）；<strong>③ 归因</strong>——引用要指向命中的<em>子块</em>而不是父块，否则用户拿到一大段话却不知道具体依据在哪一句。<em>notebook 第 6 节把去重和归因都实现了。</em></p></div>
+  </div>  <h3>三个变体，成本递增</h3>  <ul>
+    <li><strong>句窗口</strong>（sentence-window）：子块 = 一句，父块 = 该句 ± k 句。<em>最轻，不需要额外存储（父块由偏移量算出来）</em>。</li>
+    <li><strong>段落父块</strong>：子块 = 句/小段，父块 = 所在段落或小节。<em>最常用的一档。</em></li>
+    <li><strong>摘要索引</strong>：子块 = 父块的 LLM 摘要，父块 = 原文。<em>召回质量最好，但摘要要花钱、要缓存、要跟着文档版本失效</em>——<strong>它是一个派生资产，必须进摄取流水线并带版本，否则文档更新后摘要会静默过期</strong>（模块 05 的问题）。</li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="dilution"><span class="num">7</span>稀释效应：为什么大块的检索分数会偏低</h2>
+  <p>这一节解释第 2 节「失败二」的机制，<strong>并给出一个反直觉的推论：把块做大不只是降低纯度，它还会降低召回本身。</strong></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>机制：块的向量是块内所有词的聚合。<strong>相关的那一句被无关的内容按比例摊薄了。</strong><em>一个块里只有 1/5 的内容与查询相关时，它的相似度明显低于「只有那一句」的块</em>——于是它可能排不进 top-k，<strong>哪怕它确实包含答案</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>在词袋型嵌入下这可以算出来。设相关句的词向量为 $r$、无关内容为 $z$（与查询近似正交），块的未归一化向量是 $r + z$，归一化后与查询 $q$ 的相似度是$$\cos = \frac{\langle r, q\rangle}{\|r + z\|} \approx \frac{\langle r, q\rangle}{\sqrt{\|r\|^2 + \|z\|^2}}$$<strong>分子不变，分母随无关内容的量增长</strong>——所以相似度大致按 $1/\sqrt{1 + \|z\|^2/\|r\|^2}$ 衰减。<em>notebook 第 7 节把这条曲线量出来，并验证它比线性衰减慢</em>（这也是为什么大块不是灾难，只是次优）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>稀释效应给出了一个很实用的直觉：<strong>「把 top-k 从 3 加到 10」和「把块从 200 加到 600」不是同一件事</strong>。<em>前者只是多看几个候选；后者改变了候选的分数本身</em>，会让真正相关的块与不相关的块之间的差距变小。</p>
+  </div>  <p><strong>父子块正是对稀释效应的直接回应</strong>：让进索引的单元保持小（分数不被稀释），让喂给模型的单元保持大（上下文完整）。<em>这就是上一节能同时改善两个量的物理原因。</em></p>
+
+  <!-- ========================================================= -->
+  <h2 id="ab-gate"><span class="num">8</span>分块的 A/B 与门禁：四个必须一起报的数</h2>
+  <p>分块参数是本课里最容易被随手改、也最容易改坏的东西。<strong>纪律：分块参数进 spec、进指纹；任何改动跑同一套离线集，报四个数。</strong></p>  <table>
+    <thead><tr><th>数</th><th>怎么算</th><th>怎么读</th></tr></thead>
+    <tbody>
+      <tr><td><strong>intact</strong></td><td>答案完整落在单块内的比例（或用公式算）</td><td><strong>硬约束</strong>。低于阈值直接否决，不看其它三个数</td></tr>
+      <tr><td><strong>recall@k</strong></td><td>C11 的定义，不重复</td><td>改分块的主要收益应当体现在这里</td></tr>
+      <tr><td><strong>n_chunks / 索引体积</strong></td><td>块数与向量总量</td><td>成本；与 recall 的提升一起看性价比</td></tr>
+      <tr><td><strong>context_tokens@k</strong></td><td>top-k 拼起来的 token 数（父子块下会放大）</td><td><strong>这一项最常被漏报</strong>——父子块把 recall 提上去的同时可能让上下文翻倍（C33 的预算）</td></tr>
+    </tbody>
+  </table>  <div class="ascii">   分块 A/B 报告模板
+
+   spec: chunker=structure_aware  s=400  o=80  parent=section
+   fingerprint: 7c2a91be          （参数变了指纹就变——C68-01）
+   answer_len P95 = 62 字符        （o=80 ≥ a-1 ✓）
+
+                        baseline(固定400/0)   candidate(结构400/80)
+   intact                    0.87                 1.00   ← 硬约束达标
+   recall@5                  0.71                 0.83
+   n_chunks                 1,240                1,510   (+22%)
+   context_tokens@5         1,980                2,310   (+17%)
+   cross(跨小节块比例)       0.86                 0.00
+
+   判读: recall +12pp，成本 +22% 索引 / +17% 上下文 → 接受
+        （若 intact 未达标，无论 recall 多高都否决）</div>  <h3>放进 CI 的三项检查</h3>  <ol>
+    <li><strong>确定性：<code>o >= answer_len_p95 - 1</code></strong>。<em>这一项是纯算术，误报率为零，可以直接阻断</em>（C68 模块 04 的分级）。</li>
+    <li><strong>确定性：块数与向量数一致，且每个块都有 <code>doc_id/version/chunk_index/section_path</code></strong>。<em>缺一项就阻断——模块 01 已经说过这些事后补不回来。</em></li>
+    <li><strong>统计：recall@k 相对基线的变化超过阈值才算真的变了</strong>。阈值按 C68 模块 04 的三步走从方差推，<em>不要拍脑袋</em>。</li>
+  </ol>  <div class="callout warn"><span class="label"></span>
+    <p>最后一条纪律，也是最常被违反的：<strong>换分块方案必须重建全部索引，而且不能与旧块混在一个索引里。</strong><em>混着的后果是同一份内容以两种粒度存在，top-k 被同一段内容的两个版本占满</em>（模块 01 第 5 节的近重复问题，只不过这次是自己造的）。模块 05 会给出双索引 + 原子切换的做法。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="antipatterns"><span class="num">9</span>分块的三个反模式</h2>
+  <p>这三个都很常见，而且都会让前面八节的工作白做。</p>  <table>
+    <thead><tr><th>反模式</th><th>为什么有人这么做</th><th>后果</th><th>正确做法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>把分块参数放在代码里而不是 spec 里</strong></td><td>「就一个数字，改起来方便」</td><td><em>指纹不变，两次评测看起来可比而实际不可比</em>；半年后没人知道当前索引是用什么参数建的</td><td>参数进 spec、进指纹（C68 模块 01）；<strong>并把 <code>answer_len_p95</code> 作为注释写在旁边</strong>——它是这组参数唯一的自由输入</td></tr>
+      <tr><td><strong>换了分块方案但复用旧索引</strong></td><td>「重建太慢，先增量迁移」</td><td><strong>同一份内容以两种粒度共存</strong>，top-k 被自己造的近重复占满（第 6 节的问题，只不过这次是自己造的）</td><td>全量重建 + 双索引原子切换（模块 05 第 5 节）；<em>结构腐烂不能局部修</em></td></tr>
+      <tr><td><strong>用 recall 的提升为分块改动辩护，但不报 intact</strong></td><td>recall 是大家都认的指标</td><td><em>intact 不达标时 recall 的提升可能来自「召回了更多碎片」</em>——而碎片拼不出完整答案</td><td><strong>intact 是硬约束，先看它；不达标就否决，不看 recall</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>第三条值得展开，因为它是一个真实的指标误导：<strong>把块切小会让 recall@k 上升</strong>（同样的 k，小块能覆盖更多不同的位置），<em>但答案完整率同时下降</em>。<strong>如果只报 recall，「把块切小」看起来是一次改进；而端到端可能变差。</strong>这就是为什么第 8 节要求四个数一起报，且 intact 排在第一位。</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_ingestion/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 文档摄取与解析</div></a>
+    <a class="next" href="../03_query_side/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 查询侧改写与路由</div></a>
+  </div>
+
+</div>
+</body>
+</html>
