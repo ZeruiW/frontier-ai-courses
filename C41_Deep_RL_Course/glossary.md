@@ -39,15 +39,15 @@
 
 | 术语 (EN) | 中文 | 释义 |
 |-----------|------|------|
-| policy gradient | 策略梯度 | 直接对参数化策略 $\pi_\theta$ 的期望回报求梯度并上升。基本形式 $\nabla J=\mathbb E[\nabla\log\pi_\theta(a|s)\,\hat A]$。C13 讲了 REINFORCE/Actor-Critic，本课接着做信赖域与 clip。 |
-| importance sampling ratio | 重要性采样比 | $r_t(\theta)=\pi_\theta(a_t|s_t)/\pi_{\theta_{\text{old}}}(a_t|s_t)$。让用旧策略采的数据能评估新策略，是 PPO/TRPO 复用数据做多次更新的关键；比值偏离 1 太多则估计方差爆炸。 |
+| policy gradient | 策略梯度 | 直接对参数化策略 $\pi_\theta$ 的期望回报求梯度并上升。基本形式 $\nabla J=\mathbb E[\nabla\log\pi_\theta(a\vert s)\,\hat A]$。C13 讲了 REINFORCE/Actor-Critic，本课接着做信赖域与 clip。 |
+| importance sampling ratio | 重要性采样比 | $r_t(\theta)=\pi_\theta(a_t\vert s_t)/\pi_{\theta_{\text{old}}}(a_t\vert s_t)$。让用旧策略采的数据能评估新策略，是 PPO/TRPO 复用数据做多次更新的关键；比值偏离 1 太多则估计方差爆炸。 |
 | surrogate objective | 代理目标 | 用重要性比把策略改进写成可对采样数据优化的目标 $\mathbb E[r_t(\theta)\hat A_t]$。直接最大化它会步子过大，故需信赖域或 clip 约束。 |
 | trust region / TRPO | 信赖域 / TRPO | 限制新旧策略的 KL 散度在一个「信赖域」内，保证单调改进（Schulman 2015）。理论漂亮但需二阶优化（共轭梯度 + 线搜索），实现复杂——PPO 是它的一阶廉价近似。 |
 | PPO (Proximal Policy Optimization) | 近端策略优化 | 用 clip 把重要性比限制在 $[1-\epsilon,1+\epsilon]$ 来近似信赖域：$\min(r_t\hat A_t,\ \text{clip}(r_t,1-\epsilon,1+\epsilon)\hat A_t)$。一阶、好实现、稳健，是当今最常用的策略优化算法（含 RLHF）。 |
 | clipped surrogate | 裁剪代理目标 | PPO 的核心目标（上条公式）。取裁剪与未裁剪的较小值，使「优势为正时不奖励过大的比、优势为负时不惩罚过小的比」，从而抑制过大更新。 |
 | KL penalty / early stopping | KL 惩罚 / 提前停止 | PPO 的两种辅助约束：在目标里加 $-\beta\,\mathrm{KL}$ 惩罚，或当本轮 KL 超阈值时提前停止本批更新。防止多轮 epoch 把策略推离旧策略太远。 |
 | entropy bonus | 熵奖励 | 在策略目标里加策略熵 $\mathcal H(\pi)$ 鼓励随机性、维持探索、防过早收敛到次优确定策略。PPO/A2C 的常见正则项。 |
-| maximum entropy RL | 最大熵强化学习 | 优化目标改为「回报 + 温度 × 策略熵」：$\sum_t\mathbb E[r_t+\alpha\mathcal H(\pi(\cdot|s_t))]$。鼓励在获得高回报的同时尽量随机，提升探索与鲁棒性。SAC 的理论框架。 |
+| maximum entropy RL | 最大熵强化学习 | 优化目标改为「回报 + 温度 × 策略熵」：$\sum_t\mathbb E[r_t+\alpha\mathcal H(\pi(\cdot\vert s_t))]$。鼓励在获得高回报的同时尽量随机，提升探索与鲁棒性。SAC 的理论框架。 |
 | SAC (Soft Actor-Critic) | 软演员-评论家 | 离策略 + 最大熵的连续控制算法（Haarnoja 2018）：双 Q 削过估计、随机策略（高斯 + tanh 压缩）、自动调温度 $\alpha$。采样高效、稳健，是连续控制的主力之一。 |
 | temperature $\alpha$ | 温度系数 | 最大熵目标里熵项的权重。大 $\alpha$ 更随机更探索，小 $\alpha$ 更贪婪。SAC 把它设成可学习参数，自动维持目标熵水平，省去手调。 |
 | reparameterization trick | 重参数化技巧 | 把随机采样 $a\sim\mathcal N(\mu,\sigma)$ 写成 $a=\mu+\sigma\cdot\epsilon,\ \epsilon\sim\mathcal N(0,1)$，使梯度能穿过采样回传到 $\mu,\sigma$。SAC/VAE 用它对随机策略做低方差梯度估计。 |
@@ -63,7 +63,7 @@
 | distribution shift | 分布偏移 | 学到的策略想执行的动作分布，偏离了数据集里行为策略的分布。一旦策略偏到数据稀疏处，值估计无从校验，错误被自举放大。离线 RL 的万恶之源。 |
 | extrapolation error | 外推误差 | 在数据集没覆盖的 (s,a) 上，Q 网络只能外推、且无真实回报来纠正。$\max_a Q$ 会专挑这些被高估的 OOD 动作，导致策略追逐幻觉价值。 |
 | OOD action (out-of-distribution) | 分布外动作 | 行为策略几乎没在该状态尝试过的动作。离线 RL 的危险全在这里：对它们的 Q 估计不可信，却最容易被 max 选中。 |
-| behavior cloning (BC) | 行为克隆 | 把离线数据当监督学习，直接模仿 $\pi(a|s)\approx$ 数据中的动作。简单稳健，但天花板是数据的平均水平，无法超过示范者，也不会「拼接」次优轨迹。 |
+| behavior cloning (BC) | 行为克隆 | 把离线数据当监督学习，直接模仿 $\pi(a\vert s)\approx$ 数据中的动作。简单稳健，但天花板是数据的平均水平，无法超过示范者，也不会「拼接」次优轨迹。 |
 | behavior policy $\pi_\beta$ | 行为策略 | 采集离线数据集所用的（未知）策略。离线算法的约束大多围绕「别离 $\pi_\beta$ 的支撑集太远」展开。 |
 | policy constraint | 策略约束 | 显式限制学到的策略接近行为策略（如 KL、MMD、BC 正则项）。BCQ/BEAR/TD3+BC 等的思路：在数据支撑内改进，避开 OOD。 |
 | CQL (Conservative Q-Learning) | 保守 Q 学习 | 在标准 TD 损失上加一项，主动压低 OOD 动作的 Q、抬高数据内动作的 Q（Kumar 2020）。学到一个真实值的下界，从根上杜绝「追逐高估的 OOD 动作」。 |
@@ -76,7 +76,7 @@
 
 | 术语 (EN) | 中文 | 释义 |
 |-----------|------|------|
-| model-based RL (MBRL) | 基于模型的 RL | 先学一个环境动态模型 $\hat T(s'|s,a)$、$\hat r(s,a)$，再用它做规划或生成想象经验来训练策略。通常比无模型法采样高效得多，但受模型误差拖累。 |
+| model-based RL (MBRL) | 基于模型的 RL | 先学一个环境动态模型 $\hat T(s'\vert s,a)$、$\hat r(s,a)$，再用它做规划或生成想象经验来训练策略。通常比无模型法采样高效得多，但受模型误差拖累。 |
 | dynamics model | 动态模型 | 预测「给定 (s,a) 下一状态与奖励」的学习模型。可确定性（回归 $s'$）或概率性（输出分布）。模型质量直接决定规划/想象的可信度。 |
 | model-free vs model-based | 无模型 vs 有模型 | 无模型直接从经验学 $V/Q/\pi$（DQN/PPO/SAC），简单但费样本；有模型多学一个动态模型换取样本效率，代价是误差与复杂度。两者可混合（Dyna）。 |
 | planning | 规划 | 在（学到的或已知的）模型里前瞻搜索/优化动作序列，而非靠试错。MPC、蒙特卡洛树搜索（MCTS）、值迭代都是规划。 |

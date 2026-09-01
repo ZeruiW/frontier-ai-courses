@@ -26,7 +26,7 @@
 | DFT (Discrete Fourier Transform) | 离散傅里叶变换 | 对有限长离散信号的傅里叶变换：$X[k]=\sum_n x[n]e^{-i2\pi kn/N}$。本课从零实现并与 `np.fft` 对拍。 |
 | FFT (Fast Fourier Transform) | 快速傅里叶变换 | 计算 DFT 的高效算法，把 $O(N^2)$ 降到 $O(N\log N)$。结果与 DFT 完全相同，只是更快；`np.fft` 即其实现。 |
 | rfft / real FFT | 实数 FFT | 对实信号的 FFT：因共轭对称只需保留前 $N/2+1$ 个频点（$0$ 到 Nyquist），省一半计算与存储。语音特征几乎都用它。 |
-| magnitude / power spectrum | 幅度谱 / 功率谱 | DFT 系数的模 $|X[k]|$（幅度）或其平方 $|X[k]|^2$（功率），表示各频率的强弱。丢弃相位、只保留幅度是大量语音特征的共同操作。 |
+| magnitude / power spectrum | 幅度谱 / 功率谱 | DFT 系数的模 $\vert X[k]\vert $（幅度）或其平方 $\vert X[k]\vert ^2$（功率），表示各频率的强弱。丢弃相位、只保留幅度是大量语音特征的共同操作。 |
 | spectrogram | 谱图 / 声谱图 | 把 STFT 的幅度（或功率）画成「时间×频率」的二维热图，是观察语音随时间频率变化的标准视图。 |
 | bin / frequency bin | 频点 / 频率桶 | DFT 输出的离散频率刻度，第 $k$ 个对应频率 $k\cdot f_s/N$。频点间隔 $f_s/N$ 即频率分辨率。 |
 

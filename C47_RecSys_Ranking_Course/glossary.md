@@ -84,7 +84,7 @@
 | listwise | 列表 | 直接对整个候选列表的排序质量建损失（如 ListNet、ListMLE、Softmax loss、LambdaMART 的 NDCG 优化）。理论最优但实现复杂。 |
 | BPR (Bayesian Personalized Ranking) | 贝叶斯个性化排序 | Rendle 2009 提出的 pairwise 隐式反馈损失：对每个 (用户, 正例 i, 负例 j) 三元组最大化 $\ln\sigma(\hat x_{ui}-\hat x_{uj})$。隐式推荐的奠基损失。 |
 | RankNet | —— | Burges 2005 的 pairwise 神经排序：用交叉熵建模「i 排在 j 前」的概率 $\sigma(s_i-s_j)$。LambdaRank/LambdaMART 的前身。 |
-| LambdaRank / LambdaMART | —— | 在 RankNet 梯度上乘以「交换 i,j 带来的 nDCG 变化」$|\Delta\text{NDCG}|$，从而间接优化不可导的 nDCG。LambdaMART（GBDT 版）长期是 LTR 竞赛 SOTA。 |
+| LambdaRank / LambdaMART | —— | 在 RankNet 梯度上乘以「交换 i,j 带来的 nDCG 变化」$\vert \Delta\text{NDCG}\vert $，从而间接优化不可导的 nDCG。LambdaMART（GBDT 版）长期是 LTR 竞赛 SOTA。 |
 | nDCG (normalized DCG) | 归一化折损累计增益 | 排序质量指标：DCG 按位置对数折损累加相关性，再除以理想排序的 DCG 归一到 [0,1]。最常用的排序离线指标（Järvelin 2002）。 |
 | DCG / IDCG | 折损累计增益 / 理想 DCG | $\text{DCG}@k=\sum_{i=1}^k \frac{2^{rel_i}-1}{\log_2(i+1)}$；IDCG 是把相关性降序排得到的最大 DCG。两者之比即 nDCG。 |
 | MAP / MRR | 平均精度均值 / 平均倒数排名 | MAP 对每个查询算 average precision 再平均；MRR 取第一个相关结果排名的倒数。都是 Top-N 排序的常用指标。 |

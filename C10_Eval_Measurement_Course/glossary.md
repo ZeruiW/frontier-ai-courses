@@ -108,7 +108,7 @@
 | calibration | 校准 | 预测概率是否「说话算数」：在所有「自信 70%」的预测里，是否约 70% 真的正确。校准与准确率正交——可以准但不校准，也可以校准但不准。 |
 | confidence / predicted probability | 置信度 / 预测概率 | 模型对其预测赋予的概率（如 softmax 最大值）。校准研究的对象就是这个数与真实正确频率的关系。 |
 | reliability diagram | 可靠性图 | 把预测按置信度分箱，画「箱内平均置信度 vs 箱内真实准确率」。对角线=完美校准，曲线在对角线下方=过度自信。 |
-| ECE (Expected Calibration Error) | 期望校准误差 | 各置信度箱里 |准确率 − 平均置信度| 按样本数加权的平均。最常用的单数字校准指标，但对分箱方式敏感、会掩盖箱内异质。 |
+| ECE (Expected Calibration Error) | 期望校准误差 | 各置信度箱里 \|准确率 − 平均置信度\| 按样本数加权的平均。最常用的单数字校准指标，但对分箱方式敏感、会掩盖箱内异质。 |
 | MCE (Maximum Calibration Error) | 最大校准误差 | 所有箱中校准差距的最大值，关注最坏情形的校准。风险敏感场景比 ECE 更该看它。 |
 | overconfidence / underconfidence | 过度 / 不足自信 | 平均置信度高于（低于）实际准确率。现代神经网络（尤其交叉熵训练 + 高容量）普遍过度自信，是温度缩放要解决的问题。 |
 | temperature scaling | 温度缩放 | 训练后用单个标量 T 去除 logits（softmax(z/T)）再归一，只调校准不改 argmax 预测。最简单有效的事后校准法（Guo 等 2017）。 |

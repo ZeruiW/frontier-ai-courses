@@ -12,7 +12,7 @@
 | Byte-level BPE | 字节级 BPE | 以 256 个字节为初始词表的 BPE，任何 Unicode 文本都能编码、永无 OOV。 |
 | Vocabulary | 词表 | token 与整数 id 的映射表，大小是模型的超参数（如 GPT-2 的 50257）。 |
 | OOV (Out-of-Vocabulary) | 未登录词 | 词表里没有的词；byte-level 方案从根本上消除了这个问题。 |
-| Special Token | 特殊标记 | 词表里有特定功能的 token，如 `<|endoftext|>` 标记文档边界。 |
+| Special Token | 特殊标记 | 词表里有特定功能的 token，如 `<\|endoftext\|>` 标记文档边界。 |
 
 ## 注意力与架构 · Attention & Architecture
 

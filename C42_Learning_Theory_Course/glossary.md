@@ -21,10 +21,10 @@
 | 术语 (EN) | 中文 | 释义 |
 |-----------|------|------|
 | PAC (Probably Approximately Correct) | 可能近似正确 | Valiant 1984 的学习框架：以高概率（$1-\delta$，probably）学到一个误差小于 $\varepsilon$（approximately correct）的假设。它把「学习成功」形式化为概率 + 精度的双参数保证。 |
-| sample complexity | 样本复杂度 | 达到 $(\varepsilon,\delta)$-PAC 保证所需的最少样本数 $m(\varepsilon,\delta)$。有限类约 $\frac1\varepsilon(\ln|\mathcal H|+\ln\frac1\delta)$；VC 类约 $\frac{d}{\varepsilon}$（可实现）或 $\frac{d}{\varepsilon^2}$（不可知）。 |
-| uniform convergence | 一致收敛 | 对类内<em>所有</em> $h$ 同时让 $|\hat R_n(h)-R(h)|$ 一致地小。它是 ERM 泛化的充分条件：一致收敛成立 ⇒ ERM 选出的（数据依赖的）$h$ 也有小间隙。 |
-| union bound | 联合界 | $\Pr(\cup_i A_i)\le\sum_i\Pr(A_i)$。把单个假设的 Hoeffding 集中不等式「乘以类大小」推广到有限类一致收敛的最朴素工具，代价是 $\ln|\mathcal H|$ 项。 |
-| Hoeffding's inequality | Hoeffding 不等式 | 对 $[0,1]$ 有界独立随机变量，$\Pr(|\bar X-\mathbb E\bar X|\ge t)\le 2e^{-2nt^2}$。是「经验均值以 $1/\sqrt n$ 速率集中到期望」的定量来源，几乎所有泛化界的基石。 |
+| sample complexity | 样本复杂度 | 达到 $(\varepsilon,\delta)$-PAC 保证所需的最少样本数 $m(\varepsilon,\delta)$。有限类约 $\frac1\varepsilon(\ln\vert \mathcal H\vert +\ln\frac1\delta)$；VC 类约 $\frac{d}{\varepsilon}$（可实现）或 $\frac{d}{\varepsilon^2}$（不可知）。 |
+| uniform convergence | 一致收敛 | 对类内<em>所有</em> $h$ 同时让 $\vert \hat R_n(h)-R(h)\vert $ 一致地小。它是 ERM 泛化的充分条件：一致收敛成立 ⇒ ERM 选出的（数据依赖的）$h$ 也有小间隙。 |
+| union bound | 联合界 | $\Pr(\cup_i A_i)\le\sum_i\Pr(A_i)$。把单个假设的 Hoeffding 集中不等式「乘以类大小」推广到有限类一致收敛的最朴素工具，代价是 $\ln\vert \mathcal H\vert $ 项。 |
+| Hoeffding's inequality | Hoeffding 不等式 | 对 $[0,1]$ 有界独立随机变量，$\Pr(\vert \bar X-\mathbb E\bar X\vert \ge t)\le 2e^{-2nt^2}$。是「经验均值以 $1/\sqrt n$ 速率集中到期望」的定量来源，几乎所有泛化界的基石。 |
 | concentration inequality | 集中不等式 | 一族「随机量高概率接近其期望」的不等式（Hoeffding、Bernstein、McDiarmid、bounded differences）。学习理论用它们把「有限样本估计」变成「高概率保证」。 |
 | McDiarmid / bounded differences | McDiarmid 不等式 | 若改动单个样本最多让函数变化 $c_i$，则该函数高概率接近其期望。证明 Rademacher 复杂度界、推导一致收敛的核心工具。 |
 
@@ -38,7 +38,7 @@
 | Sauer–Shelah lemma | Sauer–Shelah 引理 | 若 VC 维为 $d$，则增长函数被多项式上界 $\Pi_{\mathcal H}(n)\le\sum_{i=0}^d\binom ni\le (en/d)^d$。它把「VC 维有限」翻译成「有效假设数多项式增长」，是 VC 泛化界的关键。 |
 | Rademacher complexity | Rademacher 复杂度 | $\hat{\mathfrak R}_S(\mathcal F)=\mathbb E_\sigma\sup_{f\in\mathcal F}\frac1n\sum_i\sigma_i f(x_i)$，$\sigma_i\in\{\pm1\}$ 均匀。衡量类「拟合随机噪声」的能力——能拟合随机标签越强，复杂度越高，泛化越难。它是数据依赖、比 VC 维更紧的复杂度度量。 |
 | empirical vs expected Rademacher | 经验 vs 期望 Rademacher | 经验版固定样本 $S$ 取 $\sigma$ 的期望；期望版再对 $S$ 取期望。McDiarmid 保证两者高概率接近，所以可用单份样本估计。 |
-| Massart's finite class lemma | Massart 有限类引理 | 对有限向量集 $A$，$\hat{\mathfrak R}(A)\le\frac{\max_{a\in A}\|a\|_2\sqrt{2\ln|A|}}{n}$。把有限类的 Rademacher 复杂度用「集大小的对数」上界，是从 Rademacher 推回 VC 风格界的桥。 |
+| Massart's finite class lemma | Massart 有限类引理 | 对有限向量集 $A$，$\hat{\mathfrak R}(A)\le\frac{\max_{a\in A}\|a\|_2\sqrt{2\ln\vert A\vert }}{n}$。把有限类的 Rademacher 复杂度用「集大小的对数」上界，是从 Rademacher 推回 VC 风格界的桥。 |
 | contraction lemma (Talagrand) | 收缩引理 | 若 $\phi$ 是 $L$-Lipschitz，则 $\hat{\mathfrak R}(\phi\circ\mathcal F)\le L\,\hat{\mathfrak R}(\mathcal F)$。让我们把损失类的复杂度归约到假设类本身的复杂度（剥掉损失函数）。 |
 | covering number / metric entropy | 覆盖数 / 度量熵 | 用半径 $\varepsilon$ 的球覆盖函数类所需的最少球数（取对数即熵）。Dudley 积分把覆盖数链式累加成 Rademacher 复杂度，是处理无限类的另一条主线。 |
 
@@ -54,7 +54,7 @@
 | stationary point | 驻点 | 梯度为零的点 $\nabla f(x)=0$。凸问题里驻点即全局最优；非凸里可能是局部最优、鞍点或局部最大。 |
 | saddle point | 鞍点 | 梯度为零但既非极小也非极大的点（Hessian 有正有负特征值）。高维非凸地形中鞍点远多于局部极小，是非凸优化的主要障碍而非坏的局部极小。 |
 | PL condition (Polyak–Łojasiewicz) | PL 条件 | $\frac12\|\nabla f(x)\|^2\ge\mu(f(x)-f^\*)$。比强凸弱（允许非凸、多个全局最优），却仍给出 GD 线性收敛。过参数网络的损失常近似满足 PL，是它们「好优化」的一种解释。 |
-| Lipschitz continuity | Lipschitz 连续 | 函数变化被输入变化线性控制：$|f(x)-f(y)|\le L\|x-y\|$。Lipschitz 常数同时进入优化步长与泛化界（控制损失类复杂度）。 |
+| Lipschitz continuity | Lipschitz 连续 | 函数变化被输入变化线性控制：$\vert f(x)-f(y)\vert \le L\|x-y\|$。Lipschitz 常数同时进入优化步长与泛化界（控制损失类复杂度）。 |
 
 ## 优化算法与收敛率 · Optimizers & Convergence Rates
 

@@ -82,7 +82,7 @@
 | credit assignment | 信用分配 | 把整条轨迹的最终成败归因到沿途各个动作：哪几步是关键、哪几步无关。长程稀疏奖励下这是核心难题，是 RL 比模仿学习难的根本原因。 |
 | return / discounted return | 回报 / 折扣回报 | 从某一步往后累计的（可折扣）奖励 $G_t=\sum_k \gamma^k r_{t+k}$。折扣因子 $\gamma\in(0,1]$ 让近期奖励权重更高，也保证无限时域收敛。 |
 | policy | 策略 | 从状态到动作（分布）的映射，即 agent 的「大脑」。LLM 本身就是策略：给定上下文，输出下一个动作的概率分布。 |
-| policy gradient / REINFORCE | 策略梯度 | 直接对策略参数求「期望回报」的梯度并上升：$\nabla J=\mathbb{E}[G_t\nabla\log\pi(a_t|s_t)]$。直觉是「让得到高回报的动作概率更大」。本课用它的最朴素形式演示轨迹级更新。 |
+| policy gradient / REINFORCE | 策略梯度 | 直接对策略参数求「期望回报」的梯度并上升：$\nabla J=\mathbb{E}[G_t\nabla\log\pi(a_t\vert s_t)]$。直觉是「让得到高回报的动作概率更大」。本课用它的最朴素形式演示轨迹级更新。 |
 | baseline / advantage | 基线 / 优势 | 从回报里减去一个基线（如平均回报）得到优势 $A=G-b$，降低策略梯度的方差。优势为正的动作被强化、为负的被抑制。 |
 | rejection sampling / best-of-n | 拒绝采样 / 取优 | 对同一任务采样多条轨迹，只保留成功（高奖励）的那些，用它们做监督微调（即 reject sampling fine-tuning / STaR 式自举）。是 RL 之外另一条用可验证奖励改进 agent 的简单路线。 |
 | pass@k | —— | 评测指标：对一个任务采样 k 次，只要有一次成功就算通过。衡量「多试几次能不能做出来」，对应有验证器可挑选的场景。 |

@@ -42,7 +42,7 @@
 | timeout | 超时 | 给命令设的最长运行时间，超过就强制终止。防止 agent 触发死循环或卡住的命令把整个会话挂死，是 shell 工具<strong>必备</strong>的安全阀（`subprocess` 的 `timeout=` 参数）。 |
 | output truncation | 输出截断 | 把命令输出限制在一定长度（如前后各若干行/字符），中间用省略标记。一条命令可能吐出几万行，不截断会瞬间撑爆 LLM 的上下文窗口、烧掉大量 token。 |
 | working directory (cwd) | 工作目录 | 命令执行时的当前目录。agent 必须把它固定在工作区内（`subprocess.run(..., cwd=workspace)`），命令里的相对路径才不会乱跑。 |
-| command allow/deny list | 命令白/黑名单 | 限制 agent 能跑哪些命令的策略。黑名单拦截危险命令（`rm -rf /`、`sudo`、`:(){ :|:& };:` fork 炸弹、`curl ... | sh`）；白名单更严，只放行已知安全的命令。 |
+| command allow/deny list | 命令白/黑名单 | 限制 agent 能跑哪些命令的策略。黑名单拦截危险命令（`rm -rf /`、`sudo`、`:(){ :\|:& };:` fork 炸弹、`curl ... \| sh`）；白名单更严，只放行已知安全的命令。 |
 | shell injection | shell 注入 | 当用 `shell=True` 且命令里拼接了不可信内容时，攻击者可用 `;`、`&&`、反引号注入额外命令。安全做法是尽量用参数列表（`shell=False`）或严格校验。 |
 | environment isolation | 环境隔离 | 控制子进程能看到的环境变量、网络、文件系统范围。生产 agent 常在容器/沙箱里跑命令，防止它访问密钥或破坏宿主。本课用临时目录做轻量隔离。 |
 | dry run | 试运行 | 在真正执行有副作用的命令前，先展示「将要执行什么」给人确认（或让 agent 自检）。降低破坏性操作误触的风险。 |

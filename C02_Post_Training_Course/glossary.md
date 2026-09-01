@@ -8,7 +8,7 @@
 |-----------|------|-----------|
 | Post-training | 后训练 | 预训练之后让基座模型变得"有用且对齐"的全部训练阶段（SFT / RLHF / RLVR 等）。 |
 | SFT (Supervised Fine-Tuning) | 监督微调 | 用"指令→回答"示范数据做下一 token 预测，教会基座模型遵循指令。 |
-| Chat Template | 对话模板 | 把多轮对话序列化成带特殊标记（如 `<|im_start|>`）的训练文本的固定格式。 |
+| Chat Template | 对话模板 | 把多轮对话序列化成带特殊标记（如 `<\|im_start\|>`）的训练文本的固定格式。 |
 | Loss Masking | 损失掩码 | 只在 assistant 回答 token 上计算损失、把 prompt 部分 label 置 -100 的技巧。 |
 | Instruction Following | 指令遵循 | 模型按用户指令的内容与格式要求作答的能力，SFT 的直接目标。 |
 | LoRA | 低秩适配 | 给权重矩阵加低秩增量 ΔW=BA 来微调，只训极少参数、省显存的主流方法。 |

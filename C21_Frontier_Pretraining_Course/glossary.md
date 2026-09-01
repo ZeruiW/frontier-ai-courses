@@ -35,7 +35,7 @@
 | deduplication (dedup) | 去重 | 删除语料里重复或近重复的文档/段落。Lee 2021 证明去重能显著降低记忆、提升下游效果、减少训练步数——是性价比极高的一步。 |
 | exact dedup | 精确去重 | 用哈希（如对整篇文档求 hash）删掉逐字节相同的副本。简单但只能抓完全一样的，抓不到「改了一个词」的近重复。 |
 | near-duplicate | 近重复 | 内容高度相似但非逐字相同的文档（转载、模板填充、轻微改写）。是网页语料里的重灾区，需要 MinHash/SimHash 这类近似方法检测。 |
-| Jaccard similarity | Jaccard 相似度 | 两个集合交集大小除以并集大小，$J(A,B)=\frac{|A\cap B|}{|A\cup B|}$。用文档的 n-gram（shingle）集合算 Jaccard，是衡量近重复的标准度量。 |
+| Jaccard similarity | Jaccard 相似度 | 两个集合交集大小除以并集大小，$J(A,B)=\frac{\vert A\cap B\vert }{\vert A\cup B\vert }$。用文档的 n-gram（shingle）集合算 Jaccard，是衡量近重复的标准度量。 |
 | shingle / k-gram | shingle | 把文档切成所有长度为 k 的连续 token 片段构成的集合，用于算 Jaccard。k 越大越严格（要求更长的连续重合才算相似）。 |
 | MinHash | —— | 用一组随机哈希、每个取集合中的最小哈希值，得到一个签名向量。两个集合签名对应位相等的比例，是其 Jaccard 相似度的无偏估计。把「比集合」变成「比短签名」。 |
 | SimHash | —— | 另一种局部敏感哈希：把特征加权投影到随机超平面、按符号生成位串，两个文档的 SimHash 海明距离越小越相似。Google 用它做网页去重。 |

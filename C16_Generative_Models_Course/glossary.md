@@ -84,7 +84,7 @@
 | 术语 (EN) | 中文 | 释义 |
 |-----------|------|------|
 | normalizing flow | 归一化流 | 用一串可逆变换把简单分布（高斯）映成复杂数据分布，靠变量替换公式精确算出似然。需要可逆且雅可比行列式易算，限制了网络结构（RealNVP、Glow）。Rezende & Mohamed 2015。 |
-| change of variables | 变量替换公式 | $\log p_x(x)=\log p_z(z)-\log\bigl|\det \tfrac{\partial f}{\partial z}\bigr|$。可逆变换下密度如何变换的法则，是归一化流能精确算似然的数学基础。 |
+| change of variables | 变量替换公式 | $\log p_x(x)=\log p_z(z)-\log\bigl\vert \det \tfrac{\partial f}{\partial z}\bigr\vert $。可逆变换下密度如何变换的法则，是归一化流能精确算似然的数学基础。 |
 | continuous normalizing flow (CNF) | 连续归一化流 | 把离散的可逆层取极限，用一个 ODE $\tfrac{dx}{dt}=v_\theta(x,t)$ 定义连续形变；样本沿向量场 $v$ 流动。似然由瞬时变量替换给出，但训练需积分 ODE，曾经很贵。Chen 等 2018（Neural ODE）。 |
 | vector field / velocity field | 向量场 / 速度场 | $v(x,t)$：在时间 $t$、位置 $x$ 处粒子的移动速度。CNF / Flow Matching 学的就是它——一个把噪声分布「搬运」成数据分布的速度场。 |
 | probability path | 概率路径 | 一条随时间 $t\in[0,1]$ 从先验 $p_0$（噪声）连续过渡到数据 $p_1$ 的分布序列 $\{p_t\}$。Flow Matching 先选定一条好算的路径，再回归能实现它的速度场。 |

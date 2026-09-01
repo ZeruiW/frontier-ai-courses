@@ -15,7 +15,7 @@
 | degree matrix $D$ | 度矩阵 | 对角矩阵 $D_{ii}=d_i=\sum_j A_{ij}$。它是各种归一化（行归一化 $D^{-1}A$、对称归一化 $D^{-1/2}AD^{-1/2}$）的分母来源。 |
 | feature matrix $X$ | 特征矩阵 | $n\times F$ 矩阵，第 $i$ 行是节点 $i$ 的输入特征。GNN 的输入是 $(A, X)$，输出是每节点 $H\in\mathbb{R}^{n\times F'}$ 的表示。 |
 | self-loop | 自环 | 节点连到自己的边（$A_{ii}=1$）。GCN 用 $\tilde A=A+I$ 加自环，让节点聚合邻居时也保留自身信息，否则会"忘掉自己"。 |
-| sparsity | 稀疏性 | 真实图的边数 $|E|\ll n^2$，邻接矩阵绝大多数是 0。利用稀疏性（只遍历真实边）是 GNN 能扩展到百万节点的前提。 |
+| sparsity | 稀疏性 | 真实图的边数 $\vert E\vert \ll n^2$，邻接矩阵绝大多数是 0。利用稀疏性（只遍历真实边）是 GNN 能扩展到百万节点的前提。 |
 
 ## 谱图理论 · Spectral Graph Theory
 
