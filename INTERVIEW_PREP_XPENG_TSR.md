@@ -1,8 +1,9 @@
 # XPENG TSR（交通标志识别）ML/CV 工程师 · 面试复习计划
 
 > 对照 JD：Machine Learning Engineer / Computer Vision Engineer — Traffic Sign Recognition (TSR) 2D Detection
-> 基于本课程库（C00–C52，53 门课）逐项扫描后的结论。
-> 生成日期：2026-08-17
+> 基于本课程库当时的全部内容（C00–C52，53 门课）逐项扫描后的结论。
+> 生成日期：2026-08-17。**此后课程库已扩到 C00–C71（72 门）**——
+> 下面 §三 的「缺口」是相对 2026-08-17 那 53 门课说的，§六 记录了其中 9 个缺口后来是怎么补的。
 
 ---
 
