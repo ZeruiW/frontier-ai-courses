@@ -26,7 +26,7 @@
 | pure DP / ε-DP | 纯差分隐私 | δ=0 的特例，保证更强（对任何输出都成立的最坏情况界）。Laplace 机制给的就是纯 ε-DP。 |
 | privacy budget ε | 隐私预算 | 衡量累计隐私损失的「钱」。每次对数据做带噪查询都花掉一部分预算，组合定理告诉你总共花了多少。ε 越小越私密但噪声越大、效用越差；它是隐私-效用权衡的旋钮，一旦花完就不该再碰数据。 |
 | privacy loss (random variable) | 隐私损失（随机变量） | $\ln\frac{\Pr[M(D)=o]}{\Pr[M(D')=o]}$，刻画单次输出 o 泄露了多少。ε 是它的（近似）上界；RDP / moments accountant 直接追踪它的矩，给出更紧的组合界。 |
-| sensitivity (L1 / L2) | 敏感度 | 一个查询函数 $f$ 在相邻数据集上输出能变化的最大幅度：$\Delta_1 f=\max\|f(D)-f(D')\|_1$（L1，配 Laplace），$\Delta_2 f$ 用 L2 范数（配 Gaussian）。敏感度决定了要加多少噪声——这是 DP 机制的核心计算量。 |
+| sensitivity (L1 / L2) | 敏感度 | 一个查询函数 $f$ 在相邻数据集上输出能变化的最大幅度：$\Delta_1 f=\max\Vert f(D)-f(D')\Vert _1$（L1，配 Laplace），$\Delta_2 f$ 用 L2 范数（配 Gaussian）。敏感度决定了要加多少噪声——这是 DP 机制的核心计算量。 |
 | Laplace mechanism | 拉普拉斯机制 | 给查询结果加均值 0、尺度 $b=\Delta_1 f/\varepsilon$ 的 Laplace 噪声，给出纯 ε-DP。适合 L1 敏感度有界的数值查询（计数、求和）。 |
 | Gaussian mechanism | 高斯机制 | 给查询加方差 $\sigma^2$ 的高斯噪声，其中 $\sigma\ge \Delta_2 f\sqrt{2\ln(1.25/\delta)}/\varepsilon$，给出 (ε,δ)-DP。配 L2 敏感度，是 DP-SGD 的默认机制（高斯噪声与梯度的 L2 裁剪天然匹配）。 |
 | randomized response | 随机化回应 | 最早的 DP 思想（Warner 1965）：回答敏感是非题时以一定概率说真话、一定概率随机翻转，使任何人都能否认自己的真实答案，却仍能从群体里估计总体比例。是 local DP 的原型。 |
@@ -54,7 +54,7 @@
 |-----------|------|------|
 | DP-SGD | 差分隐私随机梯度下降 | 把 DP 装进训练的标准算法（Abadi 2016）：对每个样本单独算梯度、裁剪其 L2 范数到上界 C、把一个 batch 的裁剪梯度求和、加高斯噪声、再做平均与更新。每步是一次高斯机制，全程由隐私会计器累加 ε。 |
 | per-sample gradient | 逐样本梯度 | 不是整个 batch 的平均梯度，而是每条样本各自的梯度。DP-SGD 必须先拿到它们才能逐个裁剪——这是 DP-SGD 比普通 SGD 慢且费显存的根源，也是工程实现（vmap / 扩展层）的难点。 |
-| gradient clipping (per-sample) | 逐样本梯度裁剪 | 把每条样本梯度的 L2 范数限制在 C 以内：$g\leftarrow g\cdot\min(1, C/\|g\|_2)$。它把单样本对总梯度的影响（敏感度）硬性限制为 C，从而能用 Gaussian 机制标定噪声。 |
+| gradient clipping (per-sample) | 逐样本梯度裁剪 | 把每条样本梯度的 L2 范数限制在 C 以内：$g\leftarrow g\cdot\min(1, C/\Vert g\Vert _2)$。它把单样本对总梯度的影响（敏感度）硬性限制为 C，从而能用 Gaussian 机制标定噪声。 |
 | clipping norm (C) | 裁剪范数 | 逐样本梯度的 L2 范数上界。它同时是高斯机制的敏感度。C 太小丢失梯度信息，C 太大需要更多噪声——是 DP-SGD 的关键超参，常取梯度范数的中位数附近。 |
 | noise calibration | 噪声标定 | 根据敏感度（这里是 C）、目标 ε/δ、采样率、步数算出该加多大噪声。DP 的「算账」核心：标定对了才能既满足隐私又尽量保效用。 |
 | utility cost (of DP) | DP 的效用代价 | 为隐私付出的准确率 / 性能下降。DP-SGD 在小数据、强隐私（小 ε）下代价显著；大数据、大模型、合适超参下代价可控。理解并压低这个代价是 DP 落地的主战场。 |

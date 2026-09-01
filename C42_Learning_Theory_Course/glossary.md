@@ -38,7 +38,7 @@
 | Sauer–Shelah lemma | Sauer–Shelah 引理 | 若 VC 维为 $d$，则增长函数被多项式上界 $\Pi_{\mathcal H}(n)\le\sum_{i=0}^d\binom ni\le (en/d)^d$。它把「VC 维有限」翻译成「有效假设数多项式增长」，是 VC 泛化界的关键。 |
 | Rademacher complexity | Rademacher 复杂度 | $\hat{\mathfrak R}_S(\mathcal F)=\mathbb E_\sigma\sup_{f\in\mathcal F}\frac1n\sum_i\sigma_i f(x_i)$，$\sigma_i\in\{\pm1\}$ 均匀。衡量类「拟合随机噪声」的能力——能拟合随机标签越强，复杂度越高，泛化越难。它是数据依赖、比 VC 维更紧的复杂度度量。 |
 | empirical vs expected Rademacher | 经验 vs 期望 Rademacher | 经验版固定样本 $S$ 取 $\sigma$ 的期望；期望版再对 $S$ 取期望。McDiarmid 保证两者高概率接近，所以可用单份样本估计。 |
-| Massart's finite class lemma | Massart 有限类引理 | 对有限向量集 $A$，$\hat{\mathfrak R}(A)\le\frac{\max_{a\in A}\|a\|_2\sqrt{2\ln\vert A\vert }}{n}$。把有限类的 Rademacher 复杂度用「集大小的对数」上界，是从 Rademacher 推回 VC 风格界的桥。 |
+| Massart's finite class lemma | Massart 有限类引理 | 对有限向量集 $A$，$\hat{\mathfrak R}(A)\le\frac{\max_{a\in A}\Vert a\Vert _2\sqrt{2\ln\vert A\vert }}{n}$。把有限类的 Rademacher 复杂度用「集大小的对数」上界，是从 Rademacher 推回 VC 风格界的桥。 |
 | contraction lemma (Talagrand) | 收缩引理 | 若 $\phi$ 是 $L$-Lipschitz，则 $\hat{\mathfrak R}(\phi\circ\mathcal F)\le L\,\hat{\mathfrak R}(\mathcal F)$。让我们把损失类的复杂度归约到假设类本身的复杂度（剥掉损失函数）。 |
 | covering number / metric entropy | 覆盖数 / 度量熵 | 用半径 $\varepsilon$ 的球覆盖函数类所需的最少球数（取对数即熵）。Dudley 积分把覆盖数链式累加成 Rademacher 复杂度，是处理无限类的另一条主线。 |
 
@@ -47,14 +47,14 @@
 | 术语 (EN) | 中文 | 释义 |
 |-----------|------|------|
 | convex function | 凸函数 | 任意两点连线在函数图像之上：$f(\lambda x+(1-\lambda)y)\le\lambda f(x)+(1-\lambda)f(y)$。凸性保证「局部最优=全局最优」，是收敛性证明的前提。 |
-| $L$-smoothness | $L$-光滑 | 梯度 $L$-Lipschitz：$\|\nabla f(x)-\nabla f(y)\|\le L\|x-y\|$，等价于 $f$ 被一个二次函数从上夹住。它给出 GD 的安全步长上限 $1/L$。 |
-| $\mu$-strong convexity | $\mu$-强凸 | $f$ 减去 $\frac\mu2\|x\|^2$ 仍凸，等价于被二次函数从下夹住。它把次线性收敛 $O(1/t)$ 提升为线性（指数）收敛。 |
+| $L$-smoothness | $L$-光滑 | 梯度 $L$-Lipschitz：$\Vert \nabla f(x)-\nabla f(y)\Vert \le L\Vert x-y\Vert $，等价于 $f$ 被一个二次函数从上夹住。它给出 GD 的安全步长上限 $1/L$。 |
+| $\mu$-strong convexity | $\mu$-强凸 | $f$ 减去 $\frac\mu2\Vert x\Vert ^2$ 仍凸，等价于被二次函数从下夹住。它把次线性收敛 $O(1/t)$ 提升为线性（指数）收敛。 |
 | condition number $\kappa$ | 条件数 | $\kappa=L/\mu$（二次问题即 Hessian 最大/最小特征值之比）。它决定病态程度：GD 迭代数 $\propto\kappa$，加速法 $\propto\sqrt\kappa$。越大越难优化。 |
 | gradient / subgradient | 梯度 / 次梯度 | 梯度是可微点的最速上升方向；次梯度把它推广到不可微凸函数（如 hinge、$\ell_1$），是任意支撑超平面的斜率。 |
 | stationary point | 驻点 | 梯度为零的点 $\nabla f(x)=0$。凸问题里驻点即全局最优；非凸里可能是局部最优、鞍点或局部最大。 |
 | saddle point | 鞍点 | 梯度为零但既非极小也非极大的点（Hessian 有正有负特征值）。高维非凸地形中鞍点远多于局部极小，是非凸优化的主要障碍而非坏的局部极小。 |
-| PL condition (Polyak–Łojasiewicz) | PL 条件 | $\frac12\|\nabla f(x)\|^2\ge\mu(f(x)-f^\*)$。比强凸弱（允许非凸、多个全局最优），却仍给出 GD 线性收敛。过参数网络的损失常近似满足 PL，是它们「好优化」的一种解释。 |
-| Lipschitz continuity | Lipschitz 连续 | 函数变化被输入变化线性控制：$\vert f(x)-f(y)\vert \le L\|x-y\|$。Lipschitz 常数同时进入优化步长与泛化界（控制损失类复杂度）。 |
+| PL condition (Polyak–Łojasiewicz) | PL 条件 | $\frac12\Vert \nabla f(x)\Vert ^2\ge\mu(f(x)-f^\*)$。比强凸弱（允许非凸、多个全局最优），却仍给出 GD 线性收敛。过参数网络的损失常近似满足 PL，是它们「好优化」的一种解释。 |
+| Lipschitz continuity | Lipschitz 连续 | 函数变化被输入变化线性控制：$\vert f(x)-f(y)\vert \le L\Vert x-y\Vert $。Lipschitz 常数同时进入优化步长与泛化界（控制损失类复杂度）。 |
 
 ## 优化算法与收敛率 · Optimizers & Convergence Rates
 
@@ -82,7 +82,7 @@
 | NNGP (NN Gaussian Process) | 神经网络高斯过程 | 无限宽网络在随机初始化下，其输出在函数空间是一个高斯过程，协方差核可逐层递推。它刻画「训练前」的先验，NTK 刻画「训练后」的解。 |
 | feature learning | 特征学习 | 训练中隐层表示发生实质改变（与惰性训练相对）。有限宽、大学习率、长时间训练会偏离 NTK 区进入特征学习区，这被认为是深度学习超越固定核的来源。 |
 | implicit bias / regularization | 隐式偏置 / 隐式正则 | 在有无穷多个零训练误差解时，优化算法（而非显式正则项）自发偏好其中某一个的倾向。如 GD 在可分数据上偏好 max-margin 解、在最小二乘上偏好最小范数解。 |
-| max-margin solution | 最大间隔解 | 把两类分得最开的分隔超平面（hard-margin SVM 解）。Soudry 2018 证明：logistic/指数损失上 GD 的方向 $w_t/\|w_t\|$ 缓慢（$\sim 1/\log t$）收敛到它。 |
+| max-margin solution | 最大间隔解 | 把两类分得最开的分隔超平面（hard-margin SVM 解）。Soudry 2018 证明：logistic/指数损失上 GD 的方向 $w_t/\Vert w_t\Vert $ 缓慢（$\sim 1/\log t$）收敛到它。 |
 | min-norm interpolation | 最小范数插值 | 在所有插值训练数据的解中范数最小的那个。最小二乘上从零初始化的 GD 收敛到它（$w=X^\top(XX^\top)^{-1}y$），是过参数化下泛化的一种几何解释。 |
 | flat minima | 平坦极小 | 损失地形中曲率小、周围一大片都接近最优的极小点。经验上平坦极小泛化更好；与 PAC-Bayes / 最小描述长度有形式联系，但「平坦」的尺度依赖也引发争议。 |
 | double descent | 双下降 | 测试误差随模型容量先降后升（经典 U 型）、过插值阈值后<em>再次</em>下降的现象。它直接挑战经典偏差–方差权衡，C14 讲现象、本课从最小范数/有效容量角度讲机制。 |
@@ -93,8 +93,8 @@
 | 术语 (EN) | 中文 | 释义 |
 |-----------|------|------|
 | margin-based bound | 间隔界 | 用归一化间隔（margin / 范数）而非参数数量来度量容量的泛化界。对深度网络，Bartlett 1998 / 2017 用各层谱范数之积 × 间隔倒数给出与宽度弱相关的界。 |
-| PAC-Bayes bound | PAC-Bayes 界 | 对后验分布 $Q$（随机预测器）的泛化界：间隙被 $\sqrt{(\mathrm{KL}(Q\|P)+\ln\frac{2\sqrt n}\delta)/(2n)}$ 之类的量上界，$P$ 是任选的先验。McAllester 1999 提出，是目前对真实网络<em>非平凡</em>（non-vacuous）数值界的主力工具（Dziugaite & Roy 2017）。 |
-| KL divergence | KL 散度 | $\mathrm{KL}(Q\|P)=\mathbb E_Q\ln\frac{dQ}{dP}$，衡量后验偏离先验的程度。在 PAC-Bayes 里它扮演「复杂度惩罚」，后验越贴近数据无关的先验，界越紧。 |
+| PAC-Bayes bound | PAC-Bayes 界 | 对后验分布 $Q$（随机预测器）的泛化界：间隙被 $\sqrt{(\mathrm{KL}(Q\Vert P)+\ln\frac{2\sqrt n}\delta)/(2n)}$ 之类的量上界，$P$ 是任选的先验。McAllester 1999 提出，是目前对真实网络<em>非平凡</em>（non-vacuous）数值界的主力工具（Dziugaite & Roy 2017）。 |
+| KL divergence | KL 散度 | $\mathrm{KL}(Q\Vert P)=\mathbb E_Q\ln\frac{dQ}{dP}$，衡量后验偏离先验的程度。在 PAC-Bayes 里它扮演「复杂度惩罚」，后验越贴近数据无关的先验，界越紧。 |
 | non-vacuous bound | 非平凡界 | 数值上 $<1$（对 0-1 损失而言有意义）的泛化界。多数经典界在深度网络上 $\gg1$（平凡/vacuous），能否给出非平凡界是当代理论的试金石。 |
 | compression bound | 压缩界 | 若一个网络可被压缩到 $k$ 个有效参数仍保持精度，则其泛化间隙 $\sim\sqrt{k/n}$。Arora 2018 用噪声稳定性形式化压缩，给出比参数计数紧得多的界。 |
 | effective capacity | 有效容量 | 模型在某数据/算法下<em>实际</em>表现出的容量，远小于参数计数。随机标签实验（Zhang 2017）证明网络的「最坏情形容量」很大，但 SGD 在真实数据上只动用其一小部分。 |

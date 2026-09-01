@@ -38,7 +38,7 @@
 | collaborative filtering (CF) | 协同过滤 | 仅用「谁和谁交互过」的协同信号做推荐，不需要物品内容。核心假设：行为相似的用户会喜欢相似的物品。 |
 | user-based CF | 基于用户的 CF | 找与目标用户口味最相似的 k 个邻居，用他们的评分加权预测。直观但用户数大时邻居计算贵、用户兴趣易漂移。 |
 | item-based CF | 基于物品的 CF | 用「物品间相似度」预测：你喜欢的物品的相似物品也推给你。物品相似度比用户相似度更稳定、可离线预计算，是 Amazon 早年的主力（Sarwar 2001、Linden 2003）。 |
-| cosine similarity | 余弦相似度 | 两个向量夹角的余弦 $\frac{a\cdot b}{\|a\|\|b\|}\in[-1,1]$，只看方向不看模长。CF 里最常用的相似度。 |
+| cosine similarity | 余弦相似度 | 两个向量夹角的余弦 $\frac{a\cdot b}{\Vert a\Vert \Vert b\Vert }\in[-1,1]$，只看方向不看模长。CF 里最常用的相似度。 |
 | Pearson correlation | 皮尔逊相关 | 先减去各自均值再算余弦，等价于中心化余弦。能抵消用户/物品的评分基准差异（有人习惯打高分），CF 里常优于裸余弦。 |
 | adjusted cosine | 调整余弦 | item-based CF 中减去**用户**均值再算物品间余弦，消除用户评分尺度差异，Sarwar 2001 证明优于普通余弦。 |
 | neighborhood / kNN | 邻域 / k 近邻 | 预测时只用最相似的 k 个邻居（而非全部），既降噪又提速。k 是 CF 的关键超参。 |
@@ -54,7 +54,7 @@
 | bias term | 偏置项 | 预测里加上全局均值 $\mu$、用户偏置 $b_u$、物品偏置 $b_i$：$\hat r=\mu+b_u+b_i+p_u\cdot q_i$。捕捉「这个用户总打高分」「这部电影普遍受欢迎」，常贡献相当大一部分准确率。 |
 | SGD (stochastic gradient descent) | 随机梯度下降 | MF 的一种训练法：每次抽一个观测 $(u,i)$ 算梯度更新 $p_u,q_i$。实现简单、可在线，但需调学习率。 |
 | ALS (alternating least squares) | 交替最小二乘 | MF 的另一训练法：固定 $Q$ 解 $P$（凸的最小二乘）、再固定 $P$ 解 $Q$，交替迭代。每步有闭式解、易并行，特别适合隐式反馈（iALS）。 |
-| regularization (L2) | L2 正则 | 在损失里加 $\lambda(\|p_u\|^2+\|q_i\|^2)$ 防止过拟合稀疏数据。推荐里正则强度对效果影响极大。 |
+| regularization (L2) | L2 正则 | 在损失里加 $\lambda(\Vert p_u\Vert ^2+\Vert q_i\Vert ^2)$ 防止过拟合稀疏数据。推荐里正则强度对效果影响极大。 |
 | SVD / truncated SVD | 奇异值分解 / 截断 SVD | 线代里把矩阵分解为 $U\Sigma V^\top$。MF 常被叫「SVD」但其实不同：真 SVD 要求矩阵无缺失，而推荐矩阵大量缺失，所以只在**观测项**上最小化误差（Funk 的 "SVD"）。 |
 | FunkSVD | —— | Simon Funk 在 Netflix Prize 中用 SGD 训练带偏置 MF 的方法（2006 博客），是现代 MF 的起点，严格说不是 SVD。 |
 | WALS / iALS | 加权/隐式 ALS | 针对隐式反馈的 ALS：对所有 (u,i) 对（含未观测的当负例）按置信度加权做最小二乘。Hu 2008 提出，工业召回常用。 |

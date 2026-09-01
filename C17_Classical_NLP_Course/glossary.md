@@ -15,7 +15,7 @@
 | word embedding | 词嵌入 / 词向量 | 把每个词映射到一个稠密低维实向量（如 100–300 维），使语义/句法关系对应向量空间中的几何关系。相对 one-hot 的稀疏高维，embedding 稠密、可泛化、可做算术。|
 | one-hot vector | 独热向量 | 长度为 $V$、只有对应词那一位为 1 其余为 0 的向量。它把任意两个不同词的相似度都视为 0，无法表达语义关系，是 embedding 要取代的起点。|
 | dense / sparse representation | 稠密 / 稀疏表示 | 稠密向量每一维都可能非零、维度低（embedding）；稀疏向量绝大多数为零、维度高（one-hot、词袋）。稠密表示能泛化到未见组合，是分布式表示的核心优势。|
-| cosine similarity | 余弦相似度 | 两向量夹角的余弦 $\cos\theta = \frac{u\cdot v}{\|u\|\|v\|}\in[-1,1]$，衡量方向是否一致而忽略长度。是比较词向量语义接近程度的标准度量。|
+| cosine similarity | 余弦相似度 | 两向量夹角的余弦 $\cos\theta = \frac{u\cdot v}{\Vert u\Vert \Vert v\Vert }\in[-1,1]$，衡量方向是否一致而忽略长度。是比较词向量语义接近程度的标准度量。|
 
 ## 词嵌入与 word2vec · Word Embeddings & word2vec
 

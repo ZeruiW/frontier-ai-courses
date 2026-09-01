@@ -74,7 +74,7 @@
 | label shift / prior shift | 标签偏移 / 先验偏移 | 类别比例 $P(y)$ 变了（如欺诈率从 1% 升到 5%）。它会让阈值、校准、甚至准确率的解读全部失真。 |
 | PSI (Population Stability Index) | 群体稳定性指数 | 衡量同一变量在两个时期分布差异的工业界常用指标：按分箱比较占比，$\sum (p_i-q_i)\ln(p_i/q_i)$。经验阈值 0.1 / 0.25 区分轻微/显著漂移。 |
 | KS statistic | KS 统计量 | Kolmogorov–Smirnov 两样本检验的统计量：两个经验累积分布函数（ECDF）之间的最大纵向距离 $\sup_x\vert F_1(x)-F_2(x)\vert $。对连续变量漂移敏感且无分布假设。 |
-| KL / JS divergence | KL / JS 散度 | 衡量两个概率分布差异的信息论量。KL 不对称（$D_{KL}(P\|Q)\ne D_{KL}(Q\|P)$），JS 是其对称、有界的变体。PSI 本质是对称化的 KL。 |
+| KL / JS divergence | KL / JS 散度 | 衡量两个概率分布差异的信息论量。KL 不对称（$D_{KL}(P\Vert Q)\ne D_{KL}(Q\Vert P)$），JS 是其对称、有界的变体。PSI 本质是对称化的 KL。 |
 | ECDF (Empirical CDF) | 经验累积分布函数 | 由样本估计的累积分布：$\hat F(x)=\frac1n\sum \mathbb 1[x_i\le x]$。KS 检验、分位数、QQ 图都建立在它之上。 |
 | sliding / rolling window | 滑动窗口 | 只用最近一段时间的数据来估计当前分布/性能（如最近 7 天）。窗口太短噪声大、太长反应慢，是漂移监控的关键调参。 |
 | reference / baseline window | 参考 / 基线窗口 | 被当作「正常」的历史分布（常是训练集或上线初期），用来和当前窗口比对。漂移 = 当前窗口显著偏离参考窗口。 |

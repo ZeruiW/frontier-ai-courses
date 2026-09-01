@@ -58,7 +58,7 @@
 | symmetric normalization $\hat A$ | 对称归一化邻接 | $\hat A=\tilde D^{-1/2}(A+I)\tilde D^{-1/2}$。它在聚合时按两端度数缩放每条边，防止高度数节点的表示尺度爆炸，让谱半径稳定在 1 附近。 |
 | propagation rule | 传播规则 | 一层 GNN 把 $H$ 映射到 $H'$ 的具体公式（如 GCN 的 $\sigma(\hat A H W)$）。它 = 先按图结构混合邻居（$\hat A H$）、再线性变换（$W$）、再非线性（$\sigma$）。 |
 | over-smoothing | 过平滑 | 堆太多 GNN 层后，所有节点表示趋同、无法区分的现象。本质是反复用 $\hat A$ 平均，等价于随机游走收敛到与度成正比的平稳分布，丢失了判别信息。 |
-| Dirichlet energy | 狄利克雷能量 | $\mathcal{E}(H)=\operatorname{tr}(H^\top L H)=\tfrac12\sum_{(i,j)}\|h_i-h_j\|^2$，度量节点表示的不光滑度。过平滑表现为它随层数指数衰减到 0，是诊断过平滑的定量指标。 |
+| Dirichlet energy | 狄利克雷能量 | $\mathcal{E}(H)=\operatorname{tr}(H^\top L H)=\tfrac12\sum_{(i,j)}\Vert h_i-h_j\Vert ^2$，度量节点表示的不光滑度。过平滑表现为它随层数指数衰减到 0，是诊断过平滑的定量指标。 |
 
 ## 注意力与采样 GNN · Attention & Sampling
 

@@ -20,7 +20,7 @@
 
 | 术语 (EN) | 中文 | 释义 |
 |-----------|------|------|
-| autoencoder (AE) | 自编码器 | 把输入压缩成低维编码再重建回来的神经网络，由编码器 $f$、瓶颈 $z$、解码器 $g$ 组成，训练目标是最小化重建误差 $\|x-g(f(x))\|^2$。它学的是表示与压缩，本身不是生成模型。 |
+| autoencoder (AE) | 自编码器 | 把输入压缩成低维编码再重建回来的神经网络，由编码器 $f$、瓶颈 $z$、解码器 $g$ 组成，训练目标是最小化重建误差 $\Vert x-g(f(x))\Vert ^2$。它学的是表示与压缩，本身不是生成模型。 |
 | encoder / decoder | 编码器 / 解码器 | 编码器把数据映到低维隐空间 $z=f(x)$；解码器把隐编码映回数据空间 $\hat{x}=g(z)$。生成模型几乎都有一个「解码」方向：从隐变量造出样本。 |
 | bottleneck | 瓶颈 | 自编码器中维度被压窄的隐层。它强迫网络丢弃冗余、只保留重建所必需的信息，是表示学习与降维的来源。 |
 | reconstruction loss | 重建损失 | 度量重建 $\hat{x}$ 与原输入 $x$ 的差距，常用 MSE（对应高斯似然）或交叉熵（对应伯努利似然）。它是 AE 与 VAE 重建项的共同核心。 |
@@ -36,10 +36,10 @@
 | 术语 (EN) | 中文 | 释义 |
 |-----------|------|------|
 | variational autoencoder (VAE) | 变分自编码器 | 给自编码器加上概率结构：编码器输出隐变量的分布 $q_\phi(z\mid x)$ 而非一个点，先验 $p(z)=\mathcal{N}(0,I)$，从而既能重建又能从先验采样生成。Kingma & Welling 2013 提出。 |
-| ELBO (Evidence Lower BOund) | 证据下界 | 对数似然 $\log p_\theta(x)$ 的一个可优化下界：$\mathbb{E}_{q}[\log p(x\mid z)] - \mathrm{KL}(q\,\|\,p)$。最大化它等价于「尽量拉高似然」。VAE 的全部训练就是最大化 ELBO。 |
+| ELBO (Evidence Lower BOund) | 证据下界 | 对数似然 $\log p_\theta(x)$ 的一个可优化下界：$\mathbb{E}_{q}[\log p(x\mid z)] - \mathrm{KL}(q\,\Vert \,p)$。最大化它等价于「尽量拉高似然」。VAE 的全部训练就是最大化 ELBO。 |
 | variational inference | 变分推断 | 用一族可优化的简单分布 $q_\phi$ 去逼近难算的真后验 $p(z\mid x)$，把推断问题变成优化问题。ELBO 正是这套框架的目标函数。 |
 | reconstruction term | 重建项 | ELBO 中的 $\mathbb{E}_{q_\phi(z\mid x)}[\log p_\theta(x\mid z)]$，鼓励从隐编码能重建出原数据。高斯解码下退化为 MSE，伯努利解码下为交叉熵。 |
-| KL term / regularizer | KL 项 / 正则项 | ELBO 中的 $\mathrm{KL}(q_\phi(z\mid x)\,\|\,p(z))$，把后验拉向先验，使隐空间规整、可从先验采样。它是 VAE 区别于普通 AE 的关键。 |
+| KL term / regularizer | KL 项 / 正则项 | ELBO 中的 $\mathrm{KL}(q_\phi(z\mid x)\,\Vert \,p(z))$，把后验拉向先验，使隐空间规整、可从先验采样。它是 VAE 区别于普通 AE 的关键。 |
 | reparameterization trick | 重参数化技巧 | 把随机采样 $z\sim\mathcal{N}(\mu,\sigma^2)$ 改写成 $z=\mu+\sigma\odot\epsilon,\ \epsilon\sim\mathcal{N}(0,I)$，把随机性挪到与参数无关的 $\epsilon$ 上，从而梯度能穿过采样、可反向传播。VAE 可训练的核心技巧。 |
 | closed-form KL (Gaussian) | 高斯 KL 闭式解 | 当 $q=\mathcal{N}(\mu,\sigma^2)$、$p=\mathcal{N}(0,1)$ 时，$\mathrm{KL}=\tfrac12\sum(\mu^2+\sigma^2-1-\log\sigma^2)$。有解析式，无需采样估计，是 VAE 训练高效稳定的原因之一。 |
 | posterior collapse | 后验坍塌 | 解码器过强或 KL 权重过大时，模型干脆让 $q_\phi(z\mid x)\approx p(z)$、忽略 $z$，隐变量不携带信息。表现为 KL 项趋零、重建靠解码器自身，是 VAE 的典型病。 |
@@ -72,7 +72,7 @@
 | reverse / denoising process | 反向 / 去噪过程 | 可学习的链 $p_\theta(x_{t-1}\mid x_t)$，每步去掉一点噪声。训练好后从 $x_T\sim\mathcal{N}(0,I)$ 一路采样回 $x_0$ 即生成新样本。 |
 | closed-form marginal $q(x_t\mid x_0)$ | 任意时刻边缘的闭式 | 前向过程可一步跳到任意 $t$：$x_t=\sqrt{\bar\alpha_t}\,x_0+\sqrt{1-\bar\alpha_t}\,\epsilon$，其中 $\bar\alpha_t=\prod_{s\le t}(1-\beta_s)$。无需逐步模拟即可生成训练样本，是 DDPM 高效训练的关键。 |
 | noise schedule | 噪声调度 | 一组随步数变化的方差 $\{\beta_t\}$（线性、cosine 等），决定加噪快慢。调度的好坏显著影响样本质量与所需步数。 |
-| noise prediction ($\epsilon$-prediction) | 噪声预测 | DDPM 让网络 $\epsilon_\theta(x_t,t)$ 预测加在 $x_t$ 上的噪声 $\epsilon$，训练目标是简单的 $\mathbb{E}\|\epsilon-\epsilon_\theta(x_t,t)\|^2$。这是 DDPM 出奇有效又好训的形式。 |
+| noise prediction ($\epsilon$-prediction) | 噪声预测 | DDPM 让网络 $\epsilon_\theta(x_t,t)$ 预测加在 $x_t$ 上的噪声 $\epsilon$，训练目标是简单的 $\mathbb{E}\Vert \epsilon-\epsilon_\theta(x_t,t)\Vert ^2$。这是 DDPM 出奇有效又好训的形式。 |
 | variational bound (diffusion) | 扩散的变分界 | 扩散的对数似然有一个类 ELBO 的变分下界，由各步 KL 之和构成；DDPM 证明它在重参数化后简化为上面的去噪 MSE。把扩散与 VAE 在数学上连了起来。 |
 | score function / score matching | 得分函数 / 得分匹配 | $\nabla_x\log p(x)$，指向数据概率上升最快的方向。预测噪声等价于（按尺度）估计 score，所以 DDPM 与 score-based 模型（Song & Ermon）是一回事的两种视角。 |
 | reverse sampling step | 反向采样步 | 给定 $x_t$ 与预测的 $\epsilon_\theta$，按公式算出 $x_{t-1}$ 的均值并加入适量噪声。重复 $T$ 步把噪声变成样本。 |
@@ -101,7 +101,7 @@
 | 术语 (EN) | 中文 | 释义 |
 |-----------|------|------|
 | Monte Carlo estimate | 蒙特卡洛估计 | 用有限采样的样本均值近似一个期望（如 ELBO 的重建项、Flow Matching 的回归损失）。生成模型训练里无处不在；方差大小直接影响梯度质量。 |
-| KL divergence | KL 散度 | $\mathrm{KL}(q\|p)=\mathbb{E}_q[\log\frac{q}{p}]\ge 0$，度量用 $p$ 近似 $q$ 的信息损失，不对称。VAE 的正则项、扩散变分界、变分推断都建立在它上面。 |
+| KL divergence | KL 散度 | $\mathrm{KL}(q\Vert p)=\mathbb{E}_q[\log\frac{q}{p}]\ge 0$，度量用 $p$ 近似 $q$ 的信息损失，不对称。VAE 的正则项、扩散变分界、变分推断都建立在它上面。 |
 | Gaussian reparameterization | 高斯重参数 | 把对高斯的采样写成 $\mu+\sigma\epsilon$ 的可微形式（见 VAE）。同一思想也支撑扩散的前向闭式与 Flow Matching 的条件路径采样。 |
 | mode coverage vs sample quality | 模式覆盖 vs 样本质量 | 生成模型的两难：覆盖数据所有模式（多样性）与每个样本都逼真（保真度）常此消彼长。VAE 偏模糊但覆盖广，GAN 偏锐利但易坍塌，扩散两者兼顾但慢。 |
 | FID / Inception Score | FID / IS | 评估生成图像质量的常用指标：FID 比较生成与真实特征分布的距离（越低越好），IS 衡量清晰度与多样性。本课玩具数据用更直接的分布距离替代。 |

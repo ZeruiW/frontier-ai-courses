@@ -114,7 +114,7 @@
 | **per-tensor / per-channel / per-group（量化粒度）** | 整张量共用一个 $s$（最省、但一个离群值撑大 $s$）/ 每列每行一个 $s$ / 每 $G$ 个元素一组一个 $s$。粒度越细误差越小，只多存少量 scale；本课在真实 GPT-2 权重上实测 per-channel RMSE 明显低于 per-tensor。 |
 | **group size（组大小 $G$）** | per-group 量化里每组共享一个 scale 的元素数（常用 64/128）。$G$ 越小越贴合局部分布、误差越低，但 scale 的存储开销 $\propto 1/G$ 越大，是精度与开销的旋钮。 |
 | **quantization error variance $s^2/12$（量化误差方差）** | 把数四舍五入到步长 $s$ 的网格，误差近似均匀分布于 $[-s/2,s/2]$，期望 0、方差 $s^2/12$、RMSE $=s/\sqrt{12}$。据此减小 $s$（更细粒度）直接按比例减小误差，是量化误差分析的基石公式。 |
-| **RMSE / relative error（均方根误差 / 相对误差）** | 量化误差的常用度量：$\text{RMSE}=\sqrt{\mathbb E[(\hat W-W)^2]}\approx s/\sqrt{12}$；相对误差再除以 $\|W\|$。本课在真实 GPT-2 权重张量上实测这两个量来对比各种粒度与位宽。 |
+| **RMSE / relative error（均方根误差 / 相对误差）** | 量化误差的常用度量：$\text{RMSE}=\sqrt{\mathbb E[(\hat W-W)^2]}\approx s/\sqrt{12}$；相对误差再除以 $\Vert W\Vert $。本课在真实 GPT-2 权重张量上实测这两个量来对比各种粒度与位宽。 |
 | **int4 packing（int4 打包）** | int4 只 16 个值，两个 int4 塞进一字节：$\text{byte}=(q_{\text{hi}}\ll4)\,\vert\,q_{\text{lo}}$，解包 $q_{\text{hi}}=\text{byte}\gg4$、$q_{\text{lo}}=\text{byte}\,\&\,\text{0xF}$。显存降到 fp16 的 1/4，是 4-bit 推理省显存的物理手段。 |
 | **GPTQ** | 误差感知的逐列量化：每量化一列就用二阶（Hessian）信息调整剩余未量化列以补偿引入的误差，最小化整体输出误差。int4 下保精度的主力方法，几分钟即可量化大模型（Frantar 2023）。 |
 | **AWQ（Activation-aware Weight Quantization）** | 观察到少数「被大激活乘」的权重通道对输出影响最大，对它们做保护性缩放再量化，使量化更不伤要害通道（Lin 2023）。无需反传、对指令模型友好。 |

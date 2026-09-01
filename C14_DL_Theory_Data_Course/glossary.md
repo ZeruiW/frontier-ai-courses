@@ -28,7 +28,7 @@
 | min-norm solution | 最小范数解 | 在所有能插值训练集的解里，参数范数最小的那个（如最小二乘的伪逆解 $X^+y$）。过参数化区优化器隐式偏向它，范数小 → 函数平滑 → 泛化好，是双下降第二段下降的主因。 |
 | implicit regularization | 隐式正则 | 优化算法（如 GD/SGD）本身、而非显式惩罚项，对解施加的偏好。例如梯度下降从 0 出发在过参数化线性回归上收敛到最小范数解——「没加正则，却像加了」。 |
 | pseudo-inverse / Moore-Penrose | 伪逆 | $X^+=X^\top(XX^\top)^{-1}$（行满秩时）等，给出最小二乘/最小范数解的闭式。本课用它直接构造过参数化区的最小范数插值解。 |
-| ridge regression / Tikhonov | 岭回归 | 在最小二乘上加 $\lambda\|w\|^2$ 惩罚。显式正则的代表，可平滑掉插值阈值处的尖峰——把它与隐式正则对照，是理解双下降的好抓手。 |
+| ridge regression / Tikhonov | 岭回归 | 在最小二乘上加 $\lambda\Vert w\Vert ^2$ 惩罚。显式正则的代表，可平滑掉插值阈值处的尖峰——把它与隐式正则对照，是理解双下降的好抓手。 |
 | random features | 随机特征 | 用随机权重把输入映射到高维特征 $\phi(x)=\sigma(Wx)$ 再做线性回归 [Rahimi & Recht 2007]。特征数 = 可调容量，是在 CPU 上复现双下降最干净的玩具模型，本课模块 01 主力。 |
 | benign overfitting | 良性过拟合 | 模型完美拟合含噪训练集却仍泛化良好的现象 [Bartlett 2020]。是双下降第二段的理论解释方向：高维下噪声被「吸收」进无害的方向。 |
 
@@ -90,10 +90,10 @@
 | 术语 (EN) | 中文 | 释义 |
 |-----------|------|------|
 | FID (Fréchet Inception Distance) | FID | 把真实与生成图像各自送进 Inception 网络取特征，假设两组特征服从高斯，计算两高斯间的 Fréchet（2-Wasserstein）距离 [Heusel 2017]。越低越接近真实分布；图像生成的主指标。 |
-| Fréchet distance (between Gaussians) | 高斯间 Fréchet 距离 | $\|\mu_1-\mu_2\|^2+\mathrm{Tr}\big(\Sigma_1+\Sigma_2-2(\Sigma_1\Sigma_2)^{1/2}\big)$。同时惩罚均值差（保真）与协方差差（多样性/结构），是 FID 的数学本体。本课从零实现含矩阵平方根。 |
+| Fréchet distance (between Gaussians) | 高斯间 Fréchet 距离 | $\Vert \mu_1-\mu_2\Vert ^2+\mathrm{Tr}\big(\Sigma_1+\Sigma_2-2(\Sigma_1\Sigma_2)^{1/2}\big)$。同时惩罚均值差（保真）与协方差差（多样性/结构），是 FID 的数学本体。本课从零实现含矩阵平方根。 |
 | matrix square root | 矩阵平方根 | 满足 $S^2=M$ 的对称半正定矩阵 $S=M^{1/2}$。Fréchet 公式里 $(\Sigma_1\Sigma_2)^{1/2}$ 需要它；本课用特征分解（对称化后）从零算。 |
-| Inception Score (IS) | Inception 分数 | $\exp\big(\mathbb{E}_x\,\mathrm{KL}(p(y\mid x)\,\|\,p(y))\big)$ [Salimans 2016]。奖励单图分类**置信**（保真）且整体类别**均匀**（多样）。无需真实图像，但有不参考真实分布、易被钻空子等缺陷。 |
-| KL divergence | KL 散度 | $\mathrm{KL}(p\|q)=\sum_i p_i\log(p_i/q_i)\ge 0$，度量分布 $p$ 相对 $q$ 的信息差异，非对称。IS 的核心运算（条件分布 vs 边际分布）。 |
+| Inception Score (IS) | Inception 分数 | $\exp\big(\mathbb{E}_x\,\mathrm{KL}(p(y\mid x)\,\Vert \,p(y))\big)$ [Salimans 2016]。奖励单图分类**置信**（保真）且整体类别**均匀**（多样）。无需真实图像，但有不参考真实分布、易被钻空子等缺陷。 |
+| KL divergence | KL 散度 | $\mathrm{KL}(p\Vert q)=\sum_i p_i\log(p_i/q_i)\ge 0$，度量分布 $p$ 相对 $q$ 的信息差异，非对称。IS 的核心运算（条件分布 vs 边际分布）。 |
 | marginal class distribution | 边际类别分布 | $p(y)=\mathbb{E}_x\,p(y\mid x)$，对所有生成样本的预测类别分布求平均。IS 用它衡量多样性：越接近均匀越好。 |
 | precision / recall (for generative models) | 生成模型的精确率 / 召回率 | 把保真与多样拆成两个量 [Kynkäänniemi 2019]：precision = 生成样本落在真实分布支撑内的比例（保真）；recall = 真实样本被生成分布覆盖的比例（多样）。用 k-NN 流形估计支撑集。 |
 | fidelity vs diversity | 保真 vs 多样 | 生成评测的两个正交维度：单个样本像不像真的（fidelity/precision）vs 整体覆盖不覆盖真实的全部模式（diversity/recall）。单一标量（如 FID）会把两者混在一起。 |
