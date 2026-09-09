@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 相机模型与畸变</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 相机模型与畸变</h1>
+  <p class="subtitle">三步投影里<strong>只有透视除法不可逆，而它恰好不引入误差</strong>——所以「反投影不准」从来不是精度问题，是信息问题 · <strong>畸变是纯边缘现象</strong>：10% 对角处 0.26 px vs 画幅角 197.71 px，<em>相差 750 倍，位移 $\propto r^3$</em>——而标志恰好常在画幅边缘 · <strong>去畸变没有闭式解</strong>，而不动点迭代的收敛速度强烈依赖半径：<em>很多实现的默认值 $n{=}5$ 在画幅角上还剩 0.60 px ≈ 0.81 m @50m</em> · <strong>主点与 pitch 精确等价</strong>（$f{=}1200$ 时 1° ≈ 20.9 px）· <strong>resize 后忘记同步 $K$ 的四种错法里，两种给负距离（响的），一种静默地错 2 倍</strong>——<em>「部分正确」比「全错」危险</em> · 换模组时的三个不变量：换分辨率不用重标畸变，换镜头必须全部重标</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00 的坐标系约定与那条投影链；矩阵乘法</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_camera_model.ipynb（三步投影的分解 / 内参各项的消融 / 畸变位移随半径的完整表（0.26 → 197.7 px）/ 去畸变不动点迭代的收敛速度依赖半径 / <strong>resize 与 letterbox 之后 K 怎么变，以及四种错法里哪一种是静默的</strong>）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Brown, <em>Close-Range Camera Calibration</em>（1971）· Kannala &amp; Brandt, <em>A Generic Camera Model … for Conventional, Wide-Angle, and Fish-Eye Lenses</em>（TPAMI 2006）· 本课程 C60 模块 01（训练-部署预处理对齐）· C57（尺度与小目标）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 45 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#pinhole">针孔模型：三步里只有一步是非线性的</a></li>
+      <li><a href="#intrinsics">内参 K 的每一项分别改变什么</a></li>
+      <li><a href="#distortion-model">畸变模型：多项式的形状是从哪来的</a></li>
+      <li><a href="#edge-phenomenon">畸变是纯边缘现象：0.26 px vs 197.7 px</a></li>
+      <li><a href="#undistort">去畸变没有闭式解：迭代多少轮才够</a></li>
+      <li><a href="#model-limits">模型的表达边界：什么时候多项式不够</a></li>
+      <li><a href="#K-under-preprocessing">缩放、裁剪、letterbox 之后的 K：四种错法里哪一种是静默的</a></li>
+      <li><a href="#sensor-lens">从物理参数到像素焦距：换模组时哪些量不变</a></li>
+      <li><a href="#checklist">本模块的验收清单</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pinhole"><span class="num">1</span>针孔模型：三步里只有一步是非线性的</h2>
+  <p>相机模型经常被写成一个矩阵乘法 $\tilde{u}=K[R\,|\,t]\tilde{X}$，而这个写法掩盖了它最重要的性质。<strong>把它拆成三步，就能看出误差在哪一步被放大。</strong></p>  <div class="ascii">   三步投影
+
+   ① 刚体变换（线性、可逆）
+        P_c = R^T (P_v - t)          外参：换坐标系，不丢信息
+                                     误差来源：标定（模块 02）
+
+   ② 透视除法（**非线性、不可逆**）
+        (x, y) = (X_c/Z_c, Y_c/Z_c)  ← 这一步把三维压成二维
+                                     **深度在这里被丢掉，永远回不来**
+                                     误差来源：无（它是精确的），但信息在此丢失
+
+   ③ 内参与畸变（线性 + 一个多项式）
+        (x_d, y_d) = distort(x, y)
+        u = f_x x_d + c_x,  v = f_y y_d + c_y
+                                     误差来源：内参标定、畸变模型不够、
+                                               **以及图像被缩放却没改 K**
+        </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>关键在第②步：它是唯一不可逆的一步，而它恰好不引入任何误差。</strong><em>这意味着「反投影不准」从来不是精度问题，是信息问题</em>——你不是算错了，是那个数根本不在图像里。而第①③步则相反：<strong>它们完全可逆，但每一项参数都会引入误差</strong>。所以本课把它们分开处理：模块 01 管③、模块 02 管①、模块 03/04 管「怎么把②丢掉的东西补回来」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>还有一个常被忽略的顺序问题：畸变作用在②之后、③的线性部分之前。</strong>也就是说<em>畸变是定义在归一化平面上的，不是定义在像素上的</em>。这解释了两件事：① 为什么畸变系数是无量纲的、换个分辨率不用重标；② <strong>为什么「先缩放图像再去畸变」和「先去畸变再缩放」结果不同</strong>——而 C60 模块 01 讲的训练-部署不一致有相当一部分就是这个顺序被换了。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>一个立刻可用的判据</strong>：如果你的预处理流水线里 <code>undistort</code> 与 <code>resize</code> 的相对顺序在训练和部署时不一样，<strong>那么两边的几何是不同的，而两边的图看起来完全一样。</strong><em>这类 bug 不会让指标崩，只会让它「差一点」——而它在画幅边缘最明显（下面第 4 节会量出边缘有多大）。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="intrinsics"><span class="num">2</span>内参 K 的每一项分别改变什么</h2>
+  <div class="math-block">\[K=\begin{pmatrix} f_x & s & c_x \\ 0 & f_y & c_y \\ 0 & 0 & 1\end{pmatrix}\]</div>  <table>
+    <thead><tr><th>参数</th><th>几何含义</th><th>标错了会怎样</th><th>怎么自查</th></tr></thead>
+    <tbody>
+      <tr><td>$f_x, f_y$</td><td>焦距（像素单位）= 物理焦距 / 像元尺寸</td><td><strong>距离等比例错</strong>：$f$ 大 10% → 由已知尺寸测出的距离大 10%</td><td>拍一个已知尺寸的物体、放在已知距离上，<strong>反解 $f$ 与标定值比</strong></td></tr>
+      <tr><td>$f_x/f_y$</td><td>像素长宽比（现代传感器基本是 1）</td><td>圆形标志被读成椭圆 → 影响按尺寸测距</td><td>比值应在 $1\pm0.002$ 内；<em>偏离超过 1% 通常意味着图像被非等比缩放过</em></td></tr>
+      <tr><td>$c_x, c_y$</td><td>主点：光轴与成像面的交点</td><td><strong>整个世界被平移</strong>；$c_y$ 错等价于 pitch 错（见模块 02 第 5 节）</td><td>$c$ 应接近图心。<strong>偏离超过图幅 2% 就要怀疑标定或裁剪</strong></td></tr>
+      <tr><td>$s$（skew）</td><td>成像面两轴不垂直</td><td>现代传感器上它是 0，<strong>标出非零的 skew 几乎总是过拟合的信号</strong></td><td>标定时直接固定 $s=0$，<em>然后看重投影误差有没有变差——通常不会</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>$c_y$ 与 pitch 的等价性是这一节最有用的一条。</strong>主点向下移 $\Delta c_y$ 个像素，与相机低头 $\arctan(\Delta c_y/f)$ 度，<em>对地面点的成像位置有完全相同的影响</em>。$f=1200$ 时 1° 约等于 21 个像素——<strong>所以「主点标偏 20 px」和「外参 pitch 错 1°」是同一件事，而模块 00 已经量过后者在 50m 处值 70 m。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>这个等价性也带来一个真实的标定陷阱</strong>：内参标定与外参标定如果分两次做、各自最小化自己的重投影误差，<em>那么 $c_y$ 的误差会被外参的 pitch 吸收掉，两边的残差都很小，而合起来在远处是错的</em>。<strong>对策是模块 02 第 7 节的做法：验收指标必须是「在远处的米数」，而不只是「重投影误差」。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="distortion-model"><span class="num">3</span>畸变模型：多项式的形状是从哪来的</h2>
+  <p>Brown–Conrady 模型把畸变拆成径向和切向两部分：</p>  <div class="math-block">\[\begin{aligned}x_d &= x\,(1+k_1r^2+k_2r^4+k_3r^6) + 2p_1xy + p_2(r^2+2x^2)\\y_d &= y\,(1+k_1r^2+k_2r^4+k_3r^6) + p_1(r^2+2y^2) + 2p_2xy\end{aligned}\]</div>  <table>
+    <thead><tr><th>部分</th><th>物理来源</th><th>为什么是这个形式</th></tr></thead>
+    <tbody>
+      <tr><td>径向 $k_1,k_2,k_3$</td><td>透镜的球面像差：边缘光线的折射与中心不同</td><td><strong>只含 $r$ 的偶次幂</strong>——因为径向畸变对旋转是对称的，<em>而任何旋转对称的标量函数只能依赖 $r^2$</em>。$k_1<0$ 是桶形（边缘被拉向中心），$k_1>0$ 是枕形</td></tr>
+      <tr><td>切向 $p_1,p_2$</td><td>透镜与成像面不平行（装配公差）</td><td>它不是旋转对称的，所以出现了 $xy$ 交叉项。<strong>量级通常比径向小 1–2 个数量级</strong>，<em>但在广角镜头与低成本模组上不能省</em></td></tr>
+      <tr><td>为什么截到 $r^6$</td><td>工程折中</td><td>多项式次数越高越容易在标定数据的覆盖范围外<strong>发散</strong>。<strong>$k_3$ 只在广角上需要</strong>；普通镜头标 $k_3$ 常常是拟合噪声</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <strong>判断该标几个系数的实用方法</strong>：分别用 $\{k_1\}$、$\{k_1,k_2\}$、$\{k_1,k_2,k_3\}$ 标三次，看重投影误差的 <strong>P95</strong>（不是均值）。<em>如果加了 $k_3$ 之后 P95 只降了不到 5%，那它带来的是过拟合风险而不是精度</em>——而这与 C40 模块 03 的消融纪律是同一件事。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="edge-phenomenon"><span class="num">4</span>畸变是纯边缘现象：0.26 px vs 197.7 px</h2>
+  <p>把 notebook 里那组系数（$k_1=-0.28$、$k_2=0.09$、$k_3=-0.012$、$p_1=0.0012$、$p_2=-0.0008$，一个典型的车载广角前视）沿图像对角线扫一遍，位移是这样的：</p>  <table>
+    <thead><tr><th>位置（占对角线半长）</th><th>归一化半径 $r$</th><th>去畸变前后位移</th></tr></thead>
+    <tbody>
+      <tr><td>10%</td><td>0.092</td><td><strong>0.26 px</strong></td></tr>
+      <tr><td>25%</td><td>0.229</td><td>4.01 px</td></tr>
+      <tr><td>50%</td><td>0.459</td><td>30.43 px</td></tr>
+      <tr><td>75%</td><td>0.688</td><td>94.16 px</td></tr>
+      <tr><td>90%</td><td>0.826</td><td>151.92 px</td></tr>
+      <tr><td>100%（画幅角）</td><td>0.918</td><td><strong>197.71 px</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>角上与 10% 处相差 750 倍。</strong>位移大致按 $r^3$ 走（因为主导项是 $k_1r^2$ 再乘上 $r$），<em>所以它不是「整幅图都有一点点畸变」，而是「中间几乎没有、边缘要命」</em>。<strong>而交通标志恰好长期出现在画幅左右边缘</strong>——路侧立杆在近处必然靠边，龙门架在近处必然靠上。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>这条性质有两个直接的工程含义。</strong>① <strong>评测必须按图像位置分层</strong>：一个「整体 mAP 没变」的预处理改动，可能在边缘那一档掉了很多，<em>而边缘那一档正是 TSR 近距离样本所在</em>（分层门禁见 C68 模块 04）。② <strong>裁剪能省掉大部分畸变问题</strong>——如果任务允许只用中心 50% 区域，畸变位移就从 197 px 降到 30 px。<em>但对 TSR 不允许，因为近处标志就在边缘。</em></p></div>
+  </div>  <h3>「标志在边缘」这句话要说精确</h3>  <p>路侧标志的横向偏移大约 3.2 m、离地 2.2 m。算一下它在各距离落在画幅的哪一圈：</p>  <table>
+    <thead><tr><th>距离</th><th>距图心的像素距离</th><th>归一化半径</th><th>落在哪一圈</th></tr></thead>
+    <tbody>
+      <tr><td>5 m</td><td>786.2 px</td><td><strong>0.714</strong></td><td><strong>外 1/3</strong>——畸变最大的区域</td></tr>
+      <tr><td>10 m</td><td>393.1 px</td><td>0.357</td><td>中 1/3</td></tr>
+      <tr><td>20 m</td><td>196.5 px</td><td>0.178</td><td>内 1/3</td></tr>
+      <tr><td>50 m</td><td>78.6 px</td><td>0.071</td><td>内 1/3</td></tr>
+    </tbody>
+  </table>  <p><strong>所以准确的说法是：只有近处（约 10 m 以内）的路侧标志才落在畸变要命的区域。</strong><em>远处的标志反而集中在画幅中心附近——那里畸变可以忽略</em>。这条修正很重要，因为它把「畸变影响 TSR」这个笼统担忧缩小成一个具体的场景：<strong>近距离、大横向偏移的标志</strong>（<em>路口右转前看右侧的牌、或者本车道正上方的龙门架</em>）。</p>  <div class="callout danger"><span class="label"></span>
+    <strong>一个真实且常见的错误</strong>：用<strong>中心区域</strong>的棋盘格图像做标定，然后把模型用到<strong>整幅图</strong>。多项式在标定数据覆盖之外会发散，<em>于是画幅角上的「去畸变」可能比不去更差</em>。对策：<strong>标定采集必须覆盖到角落</strong>，并在验收时单独报「角落区域的重投影误差」（模块 02 第 4 节）。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="undistort"><span class="num">5</span>去畸变没有闭式解：迭代多少轮才够</h2>
+  <p>正向畸变是一个显式多项式，而<strong>反向（从 $(x_d,y_d)$ 求 $(x,y)$）没有闭式解</strong>。标准做法是不动点迭代：</p>  <pre><code>x, y = x_d, y_d                      # 初值：就用畸变后的点
+for _ in range(n):
+    r2 = x*x + y*y
+    rad = 1 + k1*r2 + k2*r2**2 + k3*r2**3
+    dx = 2*p1*x*y + p2*(r2 + 2*x*x)
+    dy = p1*(r2 + 2*y*y) + 2*p2*x*y
+    x = (x_d - dx) / rad             # 用当前估计算出的 r2 去反解
+    y = (y_d - dy) / rad</code></pre>  <p>notebook 第 4 节量出的收敛行为是这样的（残差单位：像素）：</p>  <table>
+    <thead><tr><th>位置</th><th>n=1</th><th>n=2</th><th>n=3</th><th>n=5</th><th>n=8</th><th>n=12</th></tr></thead>
+    <tbody>
+      <tr><td>25% 对角</td><td>1.2e-1</td><td>3.4e-3</td><td>9.8e-5</td><td>8.3e-8</td><td>2.1e-12</td><td>6.9e-14</td></tr>
+      <tr><td>50% 对角</td><td>3.2e+0</td><td>3.5e-1</td><td>3.8e-2</td><td>4.5e-4</td><td>5.9e-7</td><td>8.3e-11</td></tr>
+      <tr><td>75% 对角</td><td>2.0e+1</td><td>4.2e+0</td><td>9.1e-1</td><td>4.3e-2</td><td>4.4e-4</td><td>9.9e-7</td></tr>
+      <tr><td><strong>100%（角）</strong></td><td>6.0e+1</td><td>1.9e+1</td><td>5.9e+0</td><td><strong>6.0e-1</strong></td><td>1.9e-2</td><td>1.9e-4</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>收敛速度强烈依赖半径</strong>，这是这一节的要点。在 25% 处 5 轮就到 $10^{-8}$ px；<strong>而在画幅角上，5 轮之后还剩 0.6 px</strong>。<em>而「迭代 5 次」正是很多实现里的默认值</em>。0.6 px 在 50m 处值多少米？用模块 00 的换算：1 px ≈ 1.35 m，<strong>所以 0.6 px ≈ 0.8 m</strong>——对一个静止的标志来说，这已经超过一个车道宽度的十分之一。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>三种修法，成本递增：</strong>① <strong>按半径自适应迭代次数</strong>（练习 3）——中心 2 轮、边缘 12 轮，总开销几乎不变；② <strong>预计算一张去畸变查找表</strong>——标定固定后 LUT 也固定，运行时零迭代（<em>这也是真实系统的普遍做法，而它顺带消除了迭代次数这个隐藏参数</em>）；③ 用牛顿法替代不动点法——收敛更快但要算雅可比，<em>在有 LUT 的情况下没必要</em>。<strong>本课的建议是②，并把 LUT 的最大残差写进标定验收项。</strong></p></div>
+  </div>  <h3>LUT 这条路值得多说两句</h3>  <p>查找表的做法是：标定固定之后，对每个整数像素位置离线算好去畸变后的坐标（迭代到收敛为止，反正是离线，跑 50 轮也无所谓），存成两张 $H\times W$ 的 float 图。<strong>运行时只剩一次双线性采样。</strong></p>  <table>
+    <thead><tr><th>性质</th><th>迭代法</th><th>查找表</th></tr></thead>
+    <tbody>
+      <tr><td>运行时开销</td><td>$n$ 轮多项式求值 × 每个点</td><td><strong>一次采样</strong></td></tr>
+      <tr><td>精度</td><td>取决于 $n$，<strong>而 $n$ 是一个隐藏参数</strong></td><td>离线迭代到收敛，<strong>精度写进验收项</strong></td></tr>
+      <tr><td>内存</td><td>0</td><td>两张 float 图（1920×1080 约 16 MB）</td></tr>
+      <tr><td>标定变更时</td><td>自动跟随</td><td><strong>必须重新生成——所以 LUT 要带标定文件的哈希</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <p>LUT 的那条「必须带标定哈希」不是形式主义。<strong>它是这一层唯一会「过期」的产物</strong>：标定更新了而 LUT 没重生成，<em>结果是整套几何静静地用着上一次的标定</em>——而图像看起来完全正常。这与 C70 模块 05 的「索引滞后」是同一类失效，对策也一样：<strong>产物带上游的指纹，不匹配就拒绝加载。</strong></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="model-limits"><span class="num">6</span>模型的表达边界：什么时候多项式不够</h2>
+  <p>Brown–Conrady 是围绕「近似针孔 + 小畸变」设计的。视场越大，它越吃力。</p>  <table>
+    <thead><tr><th>镜头类型</th><th>水平 FOV</th><th>适用模型</th><th>判据</th></tr></thead>
+    <tbody>
+      <tr><td>长焦 / 标准</td><td>&lt; 60°</td><td>$k_1$（甚至可以忽略）</td><td>画幅角位移 &lt; 几个像素</td></tr>
+      <tr><td>车载广角前视</td><td>60°–120°</td><td><strong>Brown–Conrady $k_1,k_2,k_3+p_1,p_2$</strong></td><td>本课用的就是这一档</td></tr>
+      <tr><td>超广角 / 鱼眼</td><td>&gt; 120°</td><td><strong>等距/等立体角模型，或 Kannala–Brandt</strong></td><td>针孔投影本身失效：<em>入射角接近 90° 时 $\tan\theta\to\infty$，而鱼眼镜头是有限像高的</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>判据不是「FOV 多少度」，而是「投影模型本身还成不成立」。</strong>针孔模型说像高 $\propto\tan\theta$，$\theta\to90°$ 时像高发散——<em>所以任何真正的 180° 镜头都不可能是针孔的，无论加多少个畸变系数</em>。鱼眼镜头的设计目标通常是像高 $\propto\theta$（等距投影），<strong>这是一个不同的函数族，不是「针孔加畸变」</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>工程上的判别只要一步</strong>：把标定得到的畸变模型<strong>反过来用</strong>——取画幅角上的点，去畸变，看它对应的入射角。<em>如果算出来的 $\theta$ 超过 70–75°，或者去畸变后的归一化坐标出现非单调（同一个 $r_d$ 对应两个 $r$），就说明多项式已经在发散区</em>。notebook 第 6 节把这个单调性检查写成一个函数——<strong>它是一条零成本、可进 CI 的标定验收项。</strong></p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <p>本课不实现鱼眼模型（那需要一整套自己的标定流程）。<strong>需要知道的是分界线在哪、以及怎么判自己越界了。</strong><em>而一个实际的经验是：车载环视（4 路鱼眼）与前视（广角）用的是两套模型，混用是拼接错位的常见原因</em>（模块 04 第 4 节）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="K-under-preprocessing"><span class="num">7</span>缩放、裁剪、letterbox 之后的 K：四种错法里哪一种是静默的</h2>
+  <p>深度学习流水线几乎总会改变图像的几何：resize 到网络输入尺寸、center crop、letterbox padding。<strong>每一次都必须同步改 $K$，而它们都可以写成一个 $3\times3$ 的左乘。</strong></p>  <div class="math-block">\[K' = S\,K,\qquad S=\begin{pmatrix} s_x & 0 & t_x\\ 0 & s_y & t_y\\ 0&0&1\end{pmatrix}\]</div>  <table>
+    <thead><tr><th>操作</th><th>$S$ 的参数</th><th>变换后的 $K$（原 $f=1200$, $c=(960,540)$）</th></tr></thead>
+    <tbody>
+      <tr><td>resize 到一半</td><td>$s=0.5$, $t=0$</td><td>$f=(600,600)$, $c=(480,270)$</td></tr>
+      <tr><td>center-crop 到 1280×720</td><td>$s=1$, $t=(-320,-180)$</td><td>$f=(1200,1200)$, $c=(640,360)$</td></tr>
+      <tr><td>letterbox 到 640×640</td><td>$s=1/3$, $t=(0,92)$</td><td>$f=(400,400)$, $c=(320,272)$</td></tr>
+    </tbody>
+  </table>  <p>现在把「忘记同步」的四种情形各算一次。场景：10 m 处的地面点，图像缩放到一半：</p>  <table>
+    <thead><tr><th>情形</th><th>用的 $f$ / $c_y$</th><th>读出距离</th><th>严重程度</th></tr></thead>
+    <tbody>
+      <tr><td>全对</td><td>600 / 270</td><td><strong>10.00 m</strong></td><td>—</td></tr>
+      <tr><td>两个都忘了改</td><td>1200 / 540</td><td><strong>−10.00 m</strong></td><td><strong>响的</strong>：负距离，任何 sanity check 都能抓住</td></tr>
+      <tr><td>只改了焦距，忘了主点</td><td>600 / 540</td><td><strong>−5.00 m</strong></td><td><strong>响的</strong>：同样是负数</td></tr>
+      <tr><td><strong>只改了主点，忘了焦距</strong></td><td>1200 / 270</td><td><strong>20.00 m</strong></td><td><strong>静默</strong>：一个完全合理的数字，静静地错 2 倍</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这张表的结论是：「部分正确」比「全错」危险。</strong>全错时几何直接自相矛盾（点落到地平线上方 → 负距离），<em>而只改一半时，所有 sanity check 都过，距离却系统性地错一个固定倍数</em>。<strong>而系统性偏差是最难被发现的一类错误</strong>——它不增加方差，看起来就像「我们的测距一直偏保守」。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>所以验收不能靠「看图对不对」，要靠一条闭环断言。</strong>练习 4 实现的检查是：取一组已知三维坐标的点，<strong>用变换后的 $K'$ 走完整条投影链，再反投影回去，断言与原坐标一致</strong>。<em>这个检查不需要任何真实数据、跑一次不到一毫秒，而它能抓住上表里的三种错法（第二、三、四行）全部</em>。本课的建议是把它放进预处理流水线的单元测试里，<strong>而不是放进模型评测里</strong>——因为模型评测发现它时，你已经在调超参了。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <p>还有一个更隐蔽的变体：<strong>只在训练侧做了 letterbox</strong>。部署侧直接喂原图（因为「反正网络是全卷积的」），<em>于是两边的 $c_y$ 差了 92 个像素</em> —— 按第 2 节的等价性，这相当于 pitch 差了 4.4°，<strong>而模块 00 量过 1° 在 50 m 处值 70 m</strong>。这正是 C60 模块 01 说的「预处理必须逐位对齐」在几何层的形态。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sensor-lens"><span class="num">8</span>从物理参数到像素焦距：换模组时哪些量不变</h2>
+  <p>$f$ 的单位是像素，而镜头规格书上的焦距单位是毫米。两者的关系是</p>  <div class="math-block">\[f_{\text{px}} = \frac{f_{\text{mm}}}{\text{像元尺寸}},\qquad \text{HFOV} = 2\arctan\frac{W\cdot\text{像元尺寸}}{2f_{\text{mm}}}\]</div>  <p><strong>注意两个式子依赖的量不同</strong>：$f_{	ext{px}}$ 只看<strong>像元尺寸</strong>，而视场只看<strong>靶面物理尺寸</strong>（像元尺寸 × 像素数）。于是「换模组」这件事有四种完全不同的后果：</p>  <table>
+    <thead><tr><th>改动</th><th>$f_{	ext{mm}}$</th><th>分辨率</th><th>像元</th><th>$f_{	ext{px}}$</th><th>HFOV</th><th>0.8 m 的牌在 50 m 处</th></tr></thead>
+    <tbody>
+      <tr><td><strong>基线</strong></td><td>3.6</td><td>1920</td><td>3.0 µm</td><td>1200</td><td>77.3°</td><td>19.2 px</td></tr>
+      <tr><td>换小像元（靶面尺寸不变）</td><td>3.6</td><td>2880</td><td>2.0 µm</td><td><strong>1800</strong></td><td>77.3°（不变）</td><td><strong>28.8 px</strong></td></tr>
+      <tr><td>换大靶面（像元不变）</td><td>3.6</td><td>2560</td><td>3.0 µm</td><td>1200（不变）</td><td><strong>93.7°</strong></td><td>19.2 px（不变）</td></tr>
+      <tr><td>换长焦镜头</td><td><strong>6.0</strong></td><td>1920</td><td>3.0 µm</td><td>2000</td><td><strong>51.3°</strong></td><td>32.0 px</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第二行是最有价值的一行。</strong>换成小像元的同尺寸靶面：视场一点没变、装车位置不用动、<em>而远处标志的像素尺寸涨了 1.5 倍</em>。按模块 00 练习 2 的 $d^2$ 定律，<strong>50 m 处 ±1 px 的深度区间从 5.22 m（10.4%）收窄到 3.48 m（7.0%）</strong>。这是一次纯硬件换来的测距精度提升，<em>而它对检测器是完全透明的（只是输入更大了）</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>但有一个前提必须说清楚，否则上面那个收益是假的</strong>：它假设定位误差<strong>以像素计</strong>保持不变。<em>而真实情况是，小像元通常意味着更低的单像素信噪比，所以亚像素定位精度（以像素为单位）可能反而变差</em>。<strong>所以这个收益必须实测，不能按公式承诺。</strong>实测的办法：同一块牌、同一距离、两套模组各拍 50 帧，<em>比较牌宽测量值的标准差（以像素为单位）</em>——如果它没变大 1.5 倍，收益就是真的。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>三个换模组时的不变量，记住它们能省掉很多重标</strong>：① <strong>畸变系数与分辨率无关</strong>（它定义在归一化平面上），所以同一颗镜头换传感器分辨率<strong>不需要重标畸变</strong>；② <strong>外参与内参无关</strong>——换传感器不改变相机的安装位姿；③ <strong>而换镜头会同时改变 $f$ 与畸变，必须全部重标</strong>。<em>把这三条写在标定流程文档的第一页，比写十页操作步骤有用。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="checklist"><span class="num">9</span>本模块的验收清单</h2>
+  <ol>
+    <li><strong>$K$ 与图像尺寸是绑定的</strong>：任何改变图像几何的操作都要返回一个新的 $K$。<em>把它做成函数签名的一部分：<code>img, K = resize(img, K, ...)</code></em></li>
+    <li><strong>畸变与缩放的顺序在训练/部署两侧必须一致</strong>，并写进配置而不是靠约定</li>
+    <li><strong>去畸变的残差要按半径分层报</strong>：只报平均值会把画幅角上的 0.6 px 平均掉</li>
+    <li><strong>标定采集必须覆盖画幅角</strong>，验收时单独报角落区域的重投影误差</li>
+    <li><strong>skew 固定为 0</strong>；标出非零 skew 视为过拟合信号</li>
+    <li><strong>主点偏离图心超过 2% 要人工确认</strong>（通常意味着有一次未记录的裁剪）</li>
+    <li><strong>畸变模型的单调性检查进 CI</strong>（第 6 节），越界即报警</li>
+    <li><strong>投影链闭环断言进单元测试</strong>（练习 4），这是抓「静默地错 2 倍」的唯一便宜手段</li>
+    <li><strong>换模组时按第 9 节的三个不变量判断要重标什么</strong>：换传感器分辨率不用重标畸变，换镜头必须全部重标</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <strong>如果只能做一条，做第 8 条。</strong>闭环断言是本模块唯一能抓住「静默系统性偏差」的检查，而它的实现不到 20 行、不需要任何真实数据。<em>其余七条都是在缩小误差，只有它是在防止一整类错误。</em>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与环境</div></a>
+    <a class="next" href="../02_calibration/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 标定：内参、外参与验收</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · BEV 投影与多相机融合</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · BEV 投影与多相机融合</h1>
+  <p class="subtitle">BEV 就是<strong>一台俯视的虚拟相机</strong>，而它<em>不产生任何新信息</em> · <strong>均匀网格是一个内在矛盾的设计</strong>：0.1 m 网格在 3.33–10 m 过采样 5.4×、在 50–100 m 欠采样 27.8×，<em>而前向映射在那一档留下 96.4% 的空洞——所以 IPM 必须反向映射</em> · <strong>中心结论：1% 的坡度在 50 m 处值 +50%</strong>，临界距离 $H/s$，<em>2% 坡度下 75 m 之外根本无解</em>；<strong>而上坡高估（不安全方向）的幅度远大于下坡低估</strong> · 地面假设的分界线在 $z\approx0.15$ m，<strong>而检测框底边被当接地点时，车辆近似成立、标志完全不成立——代码里却走同一个函数</strong> · <strong>重叠区一致性是这一层唯一不需要真值、行驶中每帧都有的指标</strong>：0.5° 外参误差 → 50 m 处 22.6% 的两路不一致；<em>但共同误差不产生不一致（车体 $Z{=}0$ 定义错了照样全过）</em></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00 的中心公式、模块 01 的反投影、模块 03 第 5 节的单应</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_bev_fusion.ipynb（IPM 网格与采样率（过采样 5.4× / 欠采样 27.8×）/ <strong>坡度：1% 在 50 m 处值 +50%，临界距离 $H/s$</strong> / 地面假设破坏清单 / 多相机拼接 / <strong>重叠区一致性作为无真值的外参监控</strong>）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">本课程 C59 模块 03（BEV 作为感知接口）· C55 模块 04（时序传播）· Philion &amp; Fidler, <em>Lift, Splat, Shoot</em>（ECCV 2020）· Li et al., <em>BEVFormer</em>（ECCV 2022）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 45 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#bev-is-a-camera">BEV 是一个俯视的虚拟相机</a></li>
+      <li><a href="#grid">网格分辨率：均匀网格必然一头过采样、一头欠采样</a></li>
+      <li><a href="#forward-vs-inverse">实现细节：IPM 必须用反向映射</a></li>
+      <li><a href="#assumption-breaks">地面假设何时崩：一张带代价的清单</a></li>
+      <li><a href="#which-point">投影检测框的哪个点？</a></li>
+      <li><a href="#slope">本模块的中心结论：1% 的坡度值 50%</a></li>
+      <li><a href="#multicam">多相机拼接：重叠区是唯一的免费真值</a></li>
+      <li><a href="#consistency-monitor">重叠区一致性：把它做成线上监控</a></li>
+      <li><a href="#fusion-level">融合的层级：在哪一步把多路合起来</a></li>
+      <li><a href="#back-projection">反向校验：把 BEV 的结果投回图像</a></li>
+      <li><a href="#checklist">BEV 的验收清单</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bev-is-a-camera"><span class="num">1</span>BEV 是一个俯视的虚拟相机</h2>
+  <p>「鸟瞰图」听起来像一种表示，<strong>而在几何上它就是「把地面重新拍一次」——用一台放在正上方、光轴垂直向下的虚拟相机。</strong></p>  <div class="ascii">   真实相机                                虚拟俯视相机（BEV）
+   ┌──────────┐                          ┌──────────┐
+   │ 装在 1.5m │  ── 同一个地平面 z=0 ──►  │ 正上方    │
+   │ 光轴水平  │                          │ 光轴向下  │
+   └──────────┘                          └──────────┘
+        │                                      │
+        └──────►  两者之间是一个**单应** H_ipm ◄──┘
+                  （模块 03 第 5 节：平面场景的两视角关系）
+
+   H_ipm = K_bev · (R_bev - t_bev n^T / d) · K_cam^{-1}
+                                    └── 平面：n=(0,0,1), d=H
+        </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>把它当相机来想，两件事立刻清楚了。</strong>① <strong>BEV 图有自己的「内参」</strong>——每像素多少米、原点在哪、覆盖多大范围，<em>这些是设计选择，而它们决定了下游能分辨什么</em>（第 2 节）。② <strong>这个单应只对 $z=0$ 的点正确</strong>，<em>而模块 00 已经给出偏离的精确代价</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>还有一个常被忽略的推论：BEV 变换不产生任何新信息。</strong><em>它是一次重采样——所以它只会丢信息，不会增加</em>。它的价值全在于<strong>把「像素域的距离」换成「米域的距离」</strong>，从而让下游（融合、跟踪、规控）能在一个物理一致的坐标系里工作。<strong>所以判断 BEV 做得好不好，标准不是「图看起来对不对」，而是「米数对不对」</strong>——<em>而这两件事的相关性比想象的低（第 4 节的坡度就是例子）。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="grid"><span class="num">2</span>网格分辨率：均匀网格必然一头过采样、一头欠采样</h2>
+  <p>先算一个基本量：<strong>一个图像行往下一像素，在地面上覆盖多少米。</strong></p>  <table>
+    <thead><tr><th>距离</th><th>像素行 $v$</th><th>该行 ±1 px 覆盖的米数</th></tr></thead>
+    <tbody>
+      <tr><td>3.33 m（画幅底边）</td><td>1080</td><td>0.006 m</td></tr>
+      <tr><td>10 m</td><td>720</td><td>0.055 m</td></tr>
+      <tr><td>20 m</td><td>630</td><td>0.220 m</td></tr>
+      <tr><td>30 m</td><td>600</td><td>0.492 m</td></tr>
+      <tr><td>50 m</td><td>576</td><td><strong>1.351 m</strong></td></tr>
+      <tr><td>80 m</td><td>562.5</td><td>3.404 m</td></tr>
+    </tbody>
+  </table>  <p><strong>可见地面从 3.33 m 开始（$v=1080$ 对应的距离），到 100 m 一共只占 522 个图像行——画幅 1080 行的 48%。</strong>而一个均匀的 0.1 m BEV 网格在 0–100 m 需要 1000 格。把两者对上：</p>  <table>
+    <thead><tr><th>距离段</th><th>占多少图像行</th><th>0.1 m 网格的格数</th><th>每格几行</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>3.33–10 m</td><td>360.0</td><td>67</td><td><strong>5.400</strong></td><td><strong>过采样 5.4×</strong>（同一像素被复制到多格）</td></tr>
+      <tr><td>10–20 m</td><td>90.0</td><td>100</td><td>0.900</td><td>大致匹配</td></tr>
+      <tr><td>20–50 m</td><td>54.0</td><td>300</td><td>0.180</td><td><strong>欠采样 5.6×</strong></td></tr>
+      <tr><td>50–100 m</td><td>18.0</td><td>500</td><td><strong>0.036</strong></td><td><strong>欠采样 27.8×</strong>——28 格共享一行</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这张表说明「均匀 BEV 网格」是一个内在矛盾的设计。</strong>近处它把一个像素摊到 5 格上（<em>制造出不存在的细节</em>），远处它把 28 格压进一个像素（<em>丢掉本来有的区分度</em>）。<strong>而 50–100 m 恰好是 TSR 与规控最关心的区间。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>三种常见应对，代价递增：</strong>① <strong>限制 BEV 的作用范围</strong>——只在采样率合适的区间（本例约 10–30 m）用 IPM，<em>远处走别的通路</em>（模块 03 的已知尺寸）；② <strong>非均匀网格</strong>——近处粗、远处细，<em>让每格对应大致相同的图像行数</em>；③ <strong>学习式提升</strong>（Lift-Splat / BEVFormer 一类）——不做单应重采样，而是让网络为每个 BEV 格去图像里取特征，<em>它绕开了「一个像素对应几格」这个问题，代价是需要训练</em>。<strong>本课只实现①②，因为③有学习成分，属于 C73–C75。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>一条零成本的自查</strong>：算出你的 BEV 网格在最远关心距离处「每格几行」。<em>如果它远小于 1，那么那个区域的 BEV 图是插值出来的，而不是观测到的</em>——<strong>下游对它的任何细节判断都是在读噪声。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="forward-vs-inverse"><span class="num">3</span>实现细节：IPM 必须用反向映射</h2>
+  <p>知道了单应 $H_{\text{ipm}}$，还有一个方向问题：<strong>是遍历图像像素往 BEV 里填，还是遍历 BEV 格去图像里取？</strong><em>两者的结果完全不同。</em></p>  <table>
+    <thead><tr><th>做法</th><th>怎么写</th><th>问题</th></tr></thead>
+    <tbody>
+      <tr><td><strong>前向映射</strong></td><td>对每个图像像素算它的 BEV 格并写入</td><td><strong>留下大量空洞</strong>——见下表</td></tr>
+      <tr><td><strong>反向映射</strong>（正确）</td><td>对每个 BEV 格算它的图像坐标并采样（双线性）</td><td>无空洞；<em>代价是远处在重复采样同一批像素</em></td></tr>
+    </tbody>
+  </table>  <p>空洞率可以精确算出来——它就是第 2 节采样率的另一种说法：</p>  <table>
+    <thead><tr><th>距离段</th><th>图像行数</th><th>BEV 格数</th><th>最多能填</th><th><strong>空洞率</strong></th></tr></thead>
+    <tbody>
+      <tr><td>3.33–10 m</td><td>360.5</td><td>67</td><td>67</td><td>0.0%</td></tr>
+      <tr><td>10–20 m</td><td>90.0</td><td>100</td><td>90</td><td>10.0%</td></tr>
+      <tr><td>20–50 m</td><td>54.0</td><td>300</td><td>54</td><td><strong>82.0%</strong></td></tr>
+      <tr><td>50–100 m</td><td>18.0</td><td>500</td><td>18</td><td><strong>96.4%</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>50–100 m 那一档有 96.4% 的格子填不上。</strong><em>而前向映射的实现看起来是完全正常的代码——它不会报错，只会产出一张远处布满黑洞的 BEV 图</em>。<strong>常见的「修补」是做形态学闭运算或用近邻填洞，而那等于用插值伪造观测</strong>——<em>结果与反向映射几乎一样，但多了一层看不见的假设。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>反向映射还顺带解决了横向的问题。</strong>一个 0.1 m 宽的 BEV 格在 5 m 处对应 24 个图像列、在 80 m 处只对应 <strong>1.5 列</strong>。<em>反向映射时这自然变成「在源图上做一次双线性采样」，而前向映射需要显式处理「多个像素落进同一格」的聚合</em>。<strong>所以结论很干脆：IPM 一律用反向映射，并且把插值方式写进配置</strong>——<em>因为最近邻与双线性在远处（1.5 列/格）会给出可见的差别。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>反向映射有一个必须处理的边界情况：<strong>地平线以上的 BEV 格。</strong><em>它们对应的图像坐标在地平线之上，或者干脆在画幅之外</em>。<strong>必须显式标成「无观测」而不是采样到某个边缘像素</strong>——否则 BEV 图的远端会填上天空的颜色，<em>而下游无法区分「那里是空的」与「那里没被观测」。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="assumption-breaks"><span class="num">4</span>地面假设何时崩：一张带代价的清单</h2>
+  <p>模块 00 给出了偏离地面的精确代价 $d_{\text{read}}=d\cdot H/(H-z)$，相对误差 $z/(H-z)$。把它套到实际情形上：</p>  <table>
+    <thead><tr><th>情形</th><th>等效的 $z$</th><th>50 m 处的读数</th><th>严重程度</th></tr></thead>
+    <tbody>
+      <tr><td>路面起伏 / 减速带</td><td>±0.05 m</td><td>51.7 / 48.4 m（±3%）</td><td>可忽略</td></tr>
+      <tr><td>路肩、排水沟</td><td>−0.15 m</td><td>45.5 m（−9%）</td><td>需注意</td></tr>
+      <tr><td><strong>1% 上坡</strong>（$z=0.5$ m @50 m）</td><td>0.5 m</td><td><strong>75.0 m（+50%）</strong></td><td><strong>致命</strong>（第 4 节）</td></tr>
+      <tr><td>低矮施工牌</td><td>1.0 m</td><td>150 m（+200%）</td><td>致命</td></tr>
+      <tr><td><strong>限速牌</strong></td><td>2.0–2.5 m</td><td><strong>无解</strong>（$z>H$）</td><td><strong>不适用</strong></td></tr>
+      <tr><td>龙门架悬挂标志</td><td>5.5 m</td><td>无解</td><td>不适用</td></tr>
+      <tr><td>车辆顶部 / 卡车尾板</td><td>1.5–3 m</td><td>无解或极大</td><td>不适用</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这张表的分界线在 $z\approx0.15$ m。</strong><em>低于它的都可以忽略，高于它的很快变成致命</em>——因为 $z/(H-z)$ 在 $z\to H$ 时发散。<strong>所以 IPM 的正确用法是：只用于「贴地」的目标</strong>（车道线、路面箭头、可行驶区域边界），<em>而对任何有高度的目标都要换补法</em>（模块 03 第 8 节的选择树）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而实践里最常见的错误不是「知道不该用却用了」，而是「不知道自己在用」。</strong><em>一个检测框的底边被当作「接地点」送进 IPM——这对车辆是近似成立的（轮胎接地），对交通标志则完全不成立（底边是立杆或牌面下沿）</em>。<strong>而代码里这两种目标走的是同一个函数。</strong>所以模块 00 那条纪律在这里落地为一个具体要求：<strong>IPM 函数必须拿到目标类别，并对「不贴地」的类别直接拒绝，而不是返回一个数</strong>——<em>而下一节说明「取框的哪个点」这个问题对两类目标有完全不同的答案</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="which-point"><span class="num">5</span>投影检测框的哪个点？</h2>
+  <p>上一节说「检测框底边被当作接地点」。<strong>那就该问清楚：一个框有上边、中心、下边，投哪一个？</strong>答案对两类目标完全不同。</p>  <h3>贴地目标（车辆，轮胎接地）</h3>  <table>
+    <thead><tr><th>取的点</th><th>等效 $z$</th><th>真距 30 m 时读出</th><th>真距 50 m 时读出</th></tr></thead>
+    <tbody>
+      <tr><td>框下边（接地）</td><td>0.00 m</td><td><strong>30.0 m ✓</strong></td><td><strong>50.0 m ✓</strong></td></tr>
+      <tr><td>框中心</td><td>0.75 m</td><td><strong>60.0 m（2× 错）</strong></td><td>100.0 m（2× 错）</td></tr>
+      <tr><td>框上边（车高 1.5 m）</td><td>1.50 m</td><td><strong>无解</strong></td><td>无解</td></tr>
+    </tbody>
+  </table>  <h3>交通标志（0.8 m 直径的限速牌，牌心离地 2.2 m）</h3>  <table>
+    <thead><tr><th>取的点</th><th>等效 $z$</th><th>真距 30 m 时读出</th><th>真距 50 m 时读出</th></tr></thead>
+    <tbody>
+      <tr><td>框上边</td><td>2.6 m</td><td><strong>无解</strong></td><td><strong>无解</strong></td></tr>
+      <tr><td>框中心</td><td>2.2 m</td><td><strong>无解</strong></td><td><strong>无解</strong></td></tr>
+      <tr><td>框下边</td><td>1.8 m</td><td><strong>无解</strong></td><td><strong>无解</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>两张表合起来给出一条很干脆的规则。</strong><em>对贴地目标：必须取框下边；取框中心会错整整 2 倍</em>（因为 $H/(H-0.75)=2$，而这正是中心公式）。<strong>对交通标志：三个点全部无解</strong>——<em>因为整块牌都在相机高度之上，所以「换一个点」根本救不了</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而「取框中心会错 2 倍」这个错误特别值得警惕，因为它是「响的」的反面：它给出一个完全合理的数字。</strong><em>60 m 与 30 m 都是一个正常的距离，没有任何 sanity check 会拦它</em>。<strong>相比之下标志那三行反而是安全的——无解会被立刻发现。</strong><em>所以这一节的结论是：真正危险的不是「假设完全不成立」，而是「假设部分成立」</em>——这与模块 01 第 7 节「部分正确比全错危险」是同一条。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>把这条规则写进类型，而不是写进注释。</strong><em>让 IPM 函数接收的不是一个框，而是一个显式的「接地点」</em>：<code>ipm_range(contact_point_v: float, cls: str)</code>，<strong>并且由目标类别决定「接地点」怎么从框里取</strong>（贴地类取 <code>y2</code>，非贴地类<strong>直接拒绝</strong>）。<em>这样「投哪个点」就不再是每个调用点各自决定的事。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="slope"><span class="num">6</span>本模块的中心结论：1% 的坡度值 50%</h2>
+  <p>道路坡度让地面不再是 $z=0$ 的平面。距离 $d$ 处的地面高度是 $z=s\cdot d$（$s$ 为坡度），代入中心公式：</p>  <div class="math-block">\[d_{\text{read}} = \frac{d\,H}{H - s\,d},\qquad \text{临界距离 } d_{\text{crit}} = \frac{H}{s}\]</div>  <table>
+    <thead><tr><th>坡度</th><th>临界距离 $H/s$</th><th>20 m</th><th>30 m</th><th>50 m</th><th>80 m</th></tr></thead>
+    <tbody>
+      <tr><td>0.5%（很平缓）</td><td>300 m</td><td>21.4</td><td>33.3</td><td>60.0（+20%）</td><td>109.1</td></tr>
+      <tr><td><strong>1%</strong></td><td><strong>150 m</strong></td><td>23.1</td><td>37.5</td><td><strong>75.0（+50%）</strong></td><td>171.4</td></tr>
+      <tr><td>2%</td><td><strong>75 m</strong></td><td>27.3</td><td>50.0</td><td>150.0（+200%）</td><td><strong>无解</strong></td></tr>
+      <tr><td>3%</td><td><strong>50 m</strong></td><td>33.3</td><td>75.0</td><td><strong>无解</strong></td><td>无解</td></tr>
+      <tr><td>−1%（下坡）</td><td>—</td><td>17.6</td><td>25.0</td><td>37.5（−25%）</td><td>52.2</td></tr>
+      <tr><td>−2%（下坡）</td><td>—</td><td>15.8</td><td>21.4</td><td>30.0（−40%）</td><td>38.7</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>1% 的坡度在 50 m 处造成 50% 的距离误差。</strong>而 1% 是<em>非常平缓</em>的坡——高速公路的纵坡限值通常在 3–6%，<strong>城市道路随处都是 1–2%。</strong><em>所以「地面是平的」这个假设在真实道路上几乎从不严格成立。</em>更麻烦的是<strong>临界距离</strong>：2% 的坡度下，<strong>75 m 之外 IPM 根本无解</strong>——而这不是「精度下降」，是几何上射线与地面不再相交。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>方向也要注意：上坡高估、下坡低估。</strong><em>上坡时地面「迎向」射线，交点被推远；下坡则相反</em>。<strong>而上坡的误差幅度远大于下坡</strong>（+50% vs −25% 在同样 1% 坡度下），因为分母 $H-sd$ 在上坡时变小。<strong>所以「保守」不是自动的</strong>：<em>上坡时你的系统会认为障碍物比实际更远——这是不安全的方向。</em><strong>而下坡时它认为更近，是安全但会造成误刹的方向。</strong></p></div>
+  </div>  <h3>三种应对</h3>  <ol>
+    <li><strong>在线估计坡度</strong>——用车道线在 BEV 里的收敛程度、或 IMU 的俯仰积分，把 $s$ 估出来代进公式。<em>这是生产系统的标准做法，而它把坡度从「未建模误差」变成「一个参数」</em></li>
+    <li><strong>限制 IPM 的作用距离</strong>到 $d\ll H/s$。取 $s=2\%$ 的最坏情况，$H/s=75$ m，<em>那么把 IPM 限制在 25 m 以内（$d<H/3s$）能把误差控制在 50% 以下</em></li>
+    <li><strong>对有高度的目标根本不用 IPM</strong>（第 3 节）——<em>这条最便宜，而且它同时解决了坡度问题</em>，因为已知尺寸测距不依赖地面</li>
+  </ol>  <div class="callout danger"><span class="label"></span>
+    <strong>坡度还有一个隐蔽的耦合：它与外参 pitch 不可分辨。</strong><em>相机低头 $\delta$ 与地面上坡 $s$ 在近处对成像的影响几乎一样</em>——所以<strong>「在线估计 pitch」实际上估的是「pitch + 坡度」的和</strong>。这未必是坏事（对 IPM 来说和才是需要的量），<em>但它意味着你无法用这个估计去校验静态标定</em>——而模块 02 第 6 节的可辨识性问题在这里又出现了一次。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="multicam"><span class="num">7</span>多相机拼接：重叠区是唯一的免费真值</h2>
+  <p>多路相机各自做 IPM，再拼到同一张 BEV 图上。<strong>关键性质是：重叠区里同一个地面点被观测了两次，而两次的读数应当相等。</strong></p>  <div class="ascii">   俯视图
+
+        侧相机视场          主相机视场
+      ╲                 ╱   │   ╲
+       ╲     重叠区 ───┼───┐ │ ┌─┼───
+        ╲             ╱  │ │ │ │
+         ╲___________╱   └─┼─┘ │
+                            车
+
+   重叠区里同一个地面点：
+     主相机读出  d_main
+     侧相机读出  d_side
+     **|d_main − d_side| 就是外参误差的直接读数**
+     └── 而它不需要任何真值
+        </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这是本课少有的、完全不需要真值的检查。</strong><em>它抓的是「相对」外参误差——两路之间的不一致</em>。而它抓不住「共同」误差（两路一起偏，比如车体 $Z=0$ 平面定义错了）——<strong>这与模块 03 第 9 节三视角一致性的局限是同一条。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>拼接还有一个必须显式决定的问题：重叠区用谁的值。</strong>三种做法：① <strong>硬边界</strong>（各管一块）——<em>简单，但边界上会出现跳变，而跟踪最怕跳变</em>；② <strong>按距离加权混合</strong>——平滑，<em>但两路不一致时混出来的是一个「两边都不对」的值</em>；③ <strong>按不确定度加权</strong>（模块 03 的 $\sigma$）——<em>正确的做法，而它要求每路都诚实地报 $\sigma$</em>。<strong>本课推荐③，并且在 $|d_{\text{main}}-d_{\text{side}}|$ 超过两者 $\sigma$ 之和时不混合而是报警</strong>——<em>因为那说明模型（外参）错了，而加权平均无法修复模型错误。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="consistency-monitor"><span class="num">8</span>重叠区一致性：把它做成线上监控</h2>
+  <p>上一节说重叠区的不一致量是外参误差的读数。这一节量它有多灵敏。notebook 第 5 节把侧相机的 pitch 故意拧错 0.5°，然后读两路的差：</p>  <table>
+    <thead><tr><th>距离</th><th>主相机</th><th>侧相机（pitch 错 0.5°）</th><th>差值</th><th>相对差</th></tr></thead>
+    <tbody>
+      <tr><td>10 m</td><td>10.00 m</td><td>9.44 m</td><td>0.56 m</td><td>5.6%</td></tr>
+      <tr><td>20 m</td><td>20.00 m</td><td>17.90 m</td><td>2.10 m</td><td>10.5%</td></tr>
+      <tr><td>30 m</td><td>30.00 m</td><td>25.53 m</td><td>4.47 m</td><td>14.9%</td></tr>
+      <tr><td><strong>50 m</strong></td><td>50.00 m</td><td>38.72 m</td><td><strong>11.28 m</strong></td><td><strong>22.6%</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>0.5° 的外参误差在 50 m 处造成 22.6% 的两路不一致——这是一个非常容易检出的信号。</strong><em>而 0.5° 恰好是「静态标定合格但已经开始漂移」的量级</em>（模块 02 的验收要求 σ(pitch) &lt; 0.05°，所以 0.5° 是十倍于验收阈值）。<strong>灵敏度随距离上升，所以监控应当在重叠区的<em>远端</em>取样。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>做成监控的三个要点：</strong>① <strong>报分位数而不是均值</strong>——个别错误关联会污染均值（与模块 02 第 7 节同理）；② <strong>分距离档报</strong>——<em>近端一致而远端不一致是外参角度误差的特征；两端都不一致更可能是相机高度或主点错了</em>；③ <strong>它是观测量而不是门禁</strong>——<em>重叠区一致性会随载重、温度正常波动</em>，<strong>所以设阈值报警、不设阻断</strong>（与 C70/C71 模块 05 的「观测量 vs 门禁」是同一条原则）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>这一项的价值在于它是「几何层唯一的线上指标」。</strong><em>模块 01–03 的检查全都需要标定板或真值，只能离线做；而重叠区一致性用的是行驶中每一帧都有的数据</em>。所以它应当是这一层最先接上监控的东西——<strong>哪怕只在停车时跑一次也比不跑好。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fusion-level"><span class="num">9</span>融合的层级：在哪一步把多路合起来</h2>
+  <table>
+    <thead><tr><th>层级</th><th>怎么做</th><th>优点</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>像素/图像层</strong></td><td>先把多路图拼成一张全景，再检测</td><td>只跑一次检测器</td><td><strong>拼接缝会切断目标</strong>；<em>而缝的位置取决于外参，所以外参漂移会改变检测行为</em></td></tr>
+      <tr><td><strong>特征层</strong></td><td>各路提特征，投到共同的 BEV 网格再融合</td><td>信息损失最小；<em>能利用两路的互补性</em></td><td>需要训练；<strong>而第 2 节的采样率问题在这里最尖锐</strong></td></tr>
+      <tr><td><strong>结果层</strong></td><td>各路独立检测 + 测距，在 BEV 里做关联与融合</td><td><strong>各路可独立验证</strong>；<em>而重叠区一致性只有在这一层能算</em></td><td>重复计算；关联可能出错</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>本课的立场是：结果层是唯一能被几何验证的层级。</strong><em>因为只有在这一层，「同一个物理目标的两个独立测量」是显式存在的</em>——而那正是第 6 节那个监控的前提。<strong>特征层融合把这两个测量在网络内部就合并了，于是外参漂移变成一个无法从输出观察的内部误差。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而实际系统通常两者都要。</strong>特征层给效果，结果层给可观测性。<em>一个实用的组合是：主通路走特征层，同时保留一条轻量的结果层通路专门用于一致性监控</em>——<strong>后者不需要很准，它只需要「两路用同一套外参各算一遍」。</strong><em>这与 C68 模块 05 的「影子指标」是同一个结构：用一条便宜的旁路来观测主通路无法暴露的状态。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="back-projection"><span class="num">10</span>反向校验：把 BEV 的结果投回图像</h2>
+  <p>BEV 是正向链路的终点，<strong>而把 BEV 里的结果<em>投回图像</em>是一条几乎免费的校验通路。</strong></p>  <div class="ascii">   正向（生产）                      反向（校验）
+   图像 → 检测 → IPM → BEV 目标   ──►  BEV 目标 → 投影 → 图像上的框
+                                          │
+                                          ▼
+                                  与原检测框比较
+                                  ├── 重合   → 几何链路自洽
+                                  └── 不重合 → **链路里有一步错了**
+        </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这个校验能抓的东西，和它抓不到的东西，都很明确。</strong><em>它能抓：$K$ 与 BEV 内参不一致、外参用错了一路、坐标系约定反了（模块 01 第 0 节那个左右镜像）、以及任何一步的代码 bug</em>。<strong>它抓不到：假设本身错了。</strong><em>把标志当地面点做 IPM，再投回来——它会精确地回到原位</em>，因为投影和反投影用的是同一个错误假设。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>所以它是「自洽性检查」而不是「正确性检查」</strong>——与模块 01 练习 4 的闭环断言是同一类工具，<em>而模块 01 已经说过：闭环抓自洽，交叉检查抓一致</em>。<strong>在这一层，「交叉检查」的角色由第 6 节的重叠区一致性承担。</strong><em>两者合起来覆盖了「代码错」与「外参错」；而「假设错」只能靠第 3 节的类别拒绝与第 4 节的坡度处理来防。</em><strong>三类错误，三种手段，不能互相替代——这是本模块的总结构。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>实践上这条校验最值得跑在标注环节。</strong><em>把标注好的 BEV 真值投回图像叠在原图上，人眼一眼就能看出坐标系或外参是不是接错了</em>——而这类错误在纯数值检查里可能一直不显形（<strong>因为它自洽</strong>）。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="checklist"><span class="num">11</span>BEV 的验收清单</h2>
+  <ol>
+    <li><strong>BEV 的「内参」写进配置</strong>：每像素多少米、原点、覆盖范围。<em>并且和相机 $K$ 一样，它与 BEV 图尺寸绑定</em></li>
+    <li><strong>算出最远关心距离处的「每格几行」</strong>（第 2 节）。<em>远小于 1 就说明那一段是插值出来的</em></li>
+    <li><strong>IPM 函数必须拿到目标类别并拒绝「不贴地」的类别</strong>（第 3 节）——不要返回一个数</li>
+    <li><strong>坡度要么在线估计、要么把 IPM 限制在 $d<H/3s$ 以内</strong>（第 4 节）</li>
+    <li><strong>重叠区一致性接监控</strong>，按距离档报分位数，<strong>设报警不设阻断</strong>（第 6 节）</li>
+    <li><strong>重叠区的融合按 $\sigma$ 加权</strong>，且不一致超过 $\sigma$ 之和时报警而不是混合（第 5 节）</li>
+    <li><strong>IPM 一律用反向映射</strong>，插值方式写进配置；地平线以上的格子标成「无观测」而不是采样到边缘像素（第 2b 节）</li>
+    <li><strong>把 BEV 结果投回图像做自洽校验</strong>，并明确它<em>抓不住假设错误</em>（第 7b 节）</li>
+    <li><strong>BEV 映射表带标定文件的哈希</strong>（模块 01 第 5 节的同一条纪律）</li>
+  </ol>  <div class="callout paper"><span class="label"></span>
+    <strong>如果只做两条：第 3 条和第 4 条。</strong><em>它们合起来防住了这一层最大的两个误差源——「把有高度的目标当地面点」与「假设地面是平的」</em>，而两者的代价分别是「无解」与「50%」。<strong>其余五条都是在缩小误差，只有这两条是在防止一整类错误。</strong>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_multiview/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 多视角几何：对极、三角测量、单应、PnP</div></a>
+    <a class="next" href="../05_spatiotemporal/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 时空对齐与跨镜关联</div></a>
+  </div>
+
+</div>
+</body>
+</html>

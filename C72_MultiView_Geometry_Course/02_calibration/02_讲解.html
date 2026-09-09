@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 标定：内参、外参与验收</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 02 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>02 · 标定：内参、外参与验收</h1>
+  <p class="subtitle">标定是<strong>找一组参数</strong>而不是测量几个独立物理量——<em>所以参数之间可以互相补偿，单看某一个数对不对没有意义</em> · <strong>Zhang 的约束计数：1/2/3 个视角给 rank 2/4/5，在 5 就饱和</strong>；而<strong>纯平移或只绕光轴转，拍 5 张仍然只有 rank 2</strong>——<em>多拍不能替代换朝向，而这条检查只要一次 SVD</em> · <strong>归一化的收益是数值条件（4 个数量级）而不是精度</strong>：<em>无噪声时值 45.8 倍，而 0.2 px 角点噪声一加上，差别只剩 13% 且归一化略差</em> · <strong>中心结论：$c_y$ 与 pitch 近乎不可分辨</strong>——把 $c_y$ 拧错 10 px 再用 pitch 补偿，测距残差只有 0.012 m、投影残差 0.21 px；<strong>想把它们分开，唯一的办法是扩大图像行覆盖：σ(pitch) 从 3.74° 降到 0.035°，改善 106 倍</strong>，<em>而最方便的采集方式（只对着远处拍）恰好是最差的</em> · <strong>重投影误差是必要非充分条件</strong>，且必须报 P95 与外圈分层</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01 的 $K$ 与畸变模型；最小二乘与 SVD 会用就行</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 02_calibration.ipynb（合成棋盘格与多视角 / Zhang 约束矩阵的 rank / DLT 与归一化对条件数的影响 / 重投影误差的分位数与分层 / <strong>可辨识性实验：σ(pitch) 从 3.74° 降到 0.035°，靠的不是多拍而是扩大图像行覆盖</strong>）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Zhang, <em>A Flexible New Technique for Camera Calibration</em>（TPAMI 2000）· Hartley, <em>In Defense of the Eight-Point Algorithm</em>（TPAMI 1997，归一化的必要性）· 本课程 C40 模块 03（消融与验收纪律）· C68 模块 04（分层门禁）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 45 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#what-is-calibration">标定在求什么：一个最小化问题</a></li>
+      <li><a href="#zhang">Zhang 的方法：一块平面板为什么够</a></li>
+      <li><a href="#degenerate">退化配置：多拍不能替代换朝向</a></li>
+      <li><a href="#dlt">线性解与非线性精化的分工</a></li>
+      <li><a href="#extrinsics">外参：1° 值多少米，以及它在行驶中会变</a></li>
+      <li><a href="#extrinsic-methods">外参怎么标：三种方法与它们各自缺什么</a></li>
+      <li><a href="#identifiability">本模块的中心结论：想标好远处，必须采近处</a></li>
+      <li><a href="#acceptance">重投影误差：必要但不充分，且必须报分位数</a></li>
+      <li><a href="#versioning">标定件的版本化与清单</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="what-is-calibration"><span class="num">1</span>标定在求什么：一个最小化问题</h2>
+  <p>标定常被说成「测量镜头的参数」。<strong>更准确的说法是：找一组参数，使得「用它们预测的像素位置」与「实际观测到的像素位置」差得最小。</strong></p>  <div class="math-block">\[\min_{K,\;\text{dist},\;\{R_i,t_i\}}\ \sum_i\sum_j \bigl\lVert u_{ij} - \pi(K,\text{dist},R_i,t_i,X_j)\bigr\rVert^2\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这个写法有三个立刻可用的推论。</strong>① <strong>标定结果是「一组参数」，不是「几个独立的物理量」</strong>——<em>参数之间可以互相补偿，所以单看某一个数对不对是没有意义的</em>（第 6 节会量出这件事有多严重）。② 目标函数是<strong>像素</strong>域的，所以它对「远处一米」和「近处一米」的权重完全不同。③ 外参 $\{R_i,t_i\}$ 是<strong>被顺带求出来的</strong>——标定板每摆一次就多一组，它们不是产物而是中间变量。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这三条合起来解释了标定最常见的失败方式</strong>：重投影误差很小、参数看起来很合理、<em>而把它拿去测远处的距离时系统性地偏</em>。因为像素域的目标函数在远处几乎没有梯度：<strong>50 m 处 1 px ≈ 1.35 m</strong>（模块 00 已量），所以远处的米级误差在像素域里根本看不见。<strong>本模块的态度是：重投影误差是必要条件，不是充分条件</strong>——第 7 节给出必须补上的那几项。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="zhang"><span class="num">2</span>Zhang 的方法：一块平面板为什么够</h2>
+  <p>直觉上标定需要一个三维标定物。Zhang（2000）的贡献是说明<strong>一块平面板、换几个朝向拍几张，就够了</strong>。论证只有三步：</p>  <ol>
+    <li>标定板在自己的坐标系里是 $Z=0$ 的平面，所以「板 → 图像」是一个<strong>单应</strong> $H=K[r_1\;r_2\;t]$（8 个自由度，可由 4 个以上角点解出）</li>
+    <li>$r_1,r_2$ 是旋转矩阵的两列，因此<strong>正交且等长</strong>。把这两个条件写出来，就得到关于 $\omega=K^{-\top}K^{-1}$ 的<strong>两个线性方程</strong></li>
+    <li>$\omega$ 是对称的 $3\times3$、齐次，所以有 <strong>5 个自由度</strong>；每个视角给 2 个方程 → <strong>至少 3 个视角</strong>。解出 $\omega$ 后由 Cholesky 反解 $K$</li>
+  </ol>  <p>notebook 第 2 节把约束矩阵的 rank 直接算出来，验证这个计数：</p>  <table>
+    <thead><tr><th>采集配置</th><th>约束矩阵</th><th>rank</th><th>可解？</th></tr></thead>
+    <tbody>
+      <tr><td>1 个视角</td><td>2×6</td><td>2</td><td>❌ 欠定</td></tr>
+      <tr><td>2 个视角（不同朝向）</td><td>4×6</td><td>4</td><td>❌ 欠定</td></tr>
+      <tr><td><strong>3 个视角（不同朝向）</strong></td><td>6×6</td><td><strong>5</strong></td><td><strong>✅ 刚好可解</strong></td></tr>
+      <tr><td>5 个视角（不同朝向）</td><td>10×6</td><td>5</td><td>✅（rank 已饱和）</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <p>注意第四行：<strong>rank 在 5 就饱和了。</strong>再多拍不会增加<em>可辨识性</em>，只会降低<em>噪声</em>。<strong>这是两件不同的事</strong>——而下一节说明「多拍」在某些配置下连噪声都降不了。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="degenerate"><span class="num">3</span>退化配置：多拍不能替代换朝向</h2>
+  <p>上一节的关键词是「<strong>不同朝向</strong>」。如果几张图之间只差平移、或只绕光轴旋转，<strong>那么无论拍多少张，约束都是同一批。</strong></p>  <table>
+    <thead><tr><th>采集配置</th><th>张数</th><th>rank</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>纯平移（板只在前后左右移动，朝向不变）</td><td>5</td><td><strong>2</strong></td><td><strong>❌ 与只拍 1 张等价</strong></td></tr>
+      <tr><td>只绕光轴转（板在图像里转圈，法向不变）</td><td>5</td><td><strong>2</strong></td><td><strong>❌ 同样等价于 1 张</strong></td></tr>
+      <tr><td>只绕一个轴倾斜（每张倾斜 8°、方向相同）</td><td>5</td><td>5</td><td>✅ 可解——<em>倾斜一个轴就够了</em></td></tr>
+      <tr><td>不同朝向（俯仰 + 偏航 + 滚转都变）</td><td>5</td><td>5</td><td>✅ 可解且条件数最好</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>前两行是真实采集里最常犯的错。</strong>「把板举着在相机前面走一圈」——那是纯平移；「把板转着拍一圈」——如果板始终正对相机，那是绕光轴转。<em>两者都会得到一堆看起来很不一样的图片，而数学上它们是同一张</em>。<strong>症状是：标定「成功」了、重投影误差也不大，但 $f$ 与主点的解严重依赖初值。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>第三行是个好消息</strong>：只需要绕<em>一个</em>轴倾斜就能让 rank 到 5。所以采集协议可以很简单：<strong>把板往前后倾一倾、再往左右倾一倾，各拍几张</strong>，覆盖 ±30° 左右。<em>而「倾斜」必须是板法向相对光轴的倾斜，不是板在画面里的位置变化——这是最容易被采集人员误解的一句话。</em>notebook 第 2 节把这两种情形都跑出来，<strong>rank 的差别是 2 vs 5，非常好判</strong>。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <strong>把 rank 检查写进标定脚本，在优化之前跑。</strong>它只需要各视角的单应矩阵，代价是一次 SVD。<em>而它能在采集现场就告诉你「这批图不够，再倾一倾重拍」</em>——比拿回去标完发现不对便宜得多。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dlt"><span class="num">4</span>线性解与非线性精化的分工</h2>
+  <p>标定几乎总是两段式：</p>  <div class="ascii">   ① 线性解（DLT / Zhang 的闭式解）
+        把约束写成 A h = 0，取最小奇异向量
+        优点：无需初值、一步出结果
+        缺点：**最小化的是代数误差，不是像素误差**
+
+   ② 非线性精化（Levenberg–Marquardt）
+        以①为初值，最小化真正的重投影误差
+        同时把畸变系数放进来一起优化
+        优点：目标函数是我们真正关心的量
+        缺点：需要初值，会陷局部极小
+        </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>为什么不能只做①？</strong>因为代数误差 $\lVert Ah\rVert$ 与像素误差之间差一个依赖点位置的权重——<em>结果是①会系统性地偏向图像中远离主点的点</em>。<strong>而为什么不能只做②？</strong>因为它需要初值，<em>而 $f$ 的初值差一倍时 LM 经常收敛到一个荒谬的解</em>（畸变系数会把一切吸收掉）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>①里有一个几乎总被建议的预处理：点坐标归一化</strong>（Hartley 1997）。直接用像素坐标（量级 $10^3$）与齐次 1 混在一起，$A$ 的列量级差很大，<em>本课的配置下条件数到 $1.8\times10^{7}$</em>。标准做法是先把点平移到质心、缩放到平均距离 $\sqrt2$，解完再变换回去。<strong>notebook 第 3 节把它量了一遍，而结果与教科书的常见说法不完全一样。</strong></p></div>
+  </div>  <h3>归一化到底换来什么：一个诚实的测量</h3>  <table>
+    <thead><tr><th>条件</th><th>归一化</th><th>cond($A$)</th><th>$H$ 的相对误差</th></tr></thead>
+    <tbody>
+      <tr><td><strong>无噪声</strong></td><td>否</td><td>1.7×10¹⁹</td><td>1.04×10⁻¹³</td></tr>
+      <tr><td><strong>无噪声</strong></td><td>是</td><td>2.8×10¹⁵</td><td><strong>2.27×10⁻¹⁵</strong></td></tr>
+      <tr><td>角点噪声 0.2 px</td><td>否</td><td>1.8×10⁷</td><td>1.62×10⁻³</td></tr>
+      <tr><td>角点噪声 0.2 px</td><td>是</td><td>1.7×10³</td><td>1.86×10⁻³</td></tr>
+      <tr><td>角点噪声 1.0 px</td><td>否</td><td>3.6×10⁶</td><td>9.88×10⁻³</td></tr>
+      <tr><td>角点噪声 1.0 px</td><td>是</td><td>3.2×10²</td><td>9.93×10⁻³</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>无噪声那两行：归一化把误差从 $1.04\times10^{-13}$ 降到 $2.27\times10^{-15}$，改善 45.8 倍——数值收益是真实的。</strong><em>而一旦加上 0.2 px 的角点噪声，两者都变成 $\sim1.7\times10^{-3}$，差别只有 13%，而且是归一化<strong>略差</strong>；噪声升到 1.0 px 时差别是 0%</em>。notebook 里还试了点聚集（只占板的一角）与点近共线两种更糟的分布，<strong>以及把 $A$ 降到 float32——归一化在这些条件下同样测不出精度收益</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>所以准确的说法是：归一化改善的是「数值条件」，而不是真实标定里的精度上限。</strong><em>因为真实标定的误差被角点检测噪声支配（$\sim10^{-3}$），它比任何数值误差都大好几个数量级</em>。<strong>结论不是「别做归一化」——它零成本、把条件数改善 4 个数量级（$1.1\times10^{4}$）、而且在无噪声或极低噪声的合成/仿真场景里确实值 45.8 倍。</strong>结论是：<strong>不要把它当成精度手段</strong>。<em>想提高标定精度，该投入的是角点检测的亚像素精度与采集配置（第 6 节的 106 倍就在那里），而不是数值技巧。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="extrinsics"><span class="num">5</span>外参：1° 值多少米，以及它在行驶中会变</h2>
+  <p>模块 00 已经量过俯仰角误差的代价，这里把它放到标定的语境里复述一遍，因为它是决定「标定要做到多准」的唯一依据：</p>  <table>
+    <thead><tr><th>距离</th><th>1 px 定位误差</th><th>1° 俯仰误差</th><th>1° 相当于</th></tr></thead>
+    <tbody>
+      <tr><td>10 m</td><td>0.055 m</td><td>1.35 m</td><td>24.4 px</td></tr>
+      <tr><td>30 m</td><td>0.492 m</td><td>16.13 m</td><td>32.8 px</td></tr>
+      <tr><td><strong>50 m</strong></td><td>1.351 m</td><td><strong>69.63 m</strong></td><td><strong>51.5 px</strong></td></tr>
+      <tr><td>80 m</td><td>2.667 m</td><td>1078.74 m</td><td>404.5 px</td></tr>
+    </tbody>
+  </table>  <p><strong>注意 80 m 那一行：抬头 1° 时地面交点跑到 1158 m。</strong>这不是数值不稳定，是几何本身——射线快要与地面平行了。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>所以外参的精度要求不是「越准越好」，而是可以反解出来的。</strong>如果规控要求 50 m 处的纵向误差不超过 2 m，那么按上表的斜率反解，俯仰角误差必须小于 <strong>0.066°</strong>（notebook 第 6 节用二分法算出这个阈值）。<em>而第 6 节会告诉你：用最常见的采集方式，σ(pitch) 是 3.74°——差 57 倍</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>还有一个静态标定管不了的问题：外参在行驶中会变。</strong>悬挂在加减速时让车体俯仰，<em>而相机是固定在车体上的</em>。急刹时车头下沉造成的俯仰变化通常在<strong>零点几度</strong>的量级——按上表，这已经足以在 50 m 处产生十几米的误差。<strong>所以生产系统里 pitch 通常是「在线估计」的</strong>：用地平线、车道线的消失点、或 IMU 来逐帧修正。<em>本课不实现在线估计（那需要真实序列），但把它列为模块 05 的一个输入</em>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个常见的误解是「静态标定做准了就行」。<strong>上表说明：静态标定的精度上限和行驶中的动态变化是同一个量级</strong>，<em>所以只做静态标定、不做在线修正，远距离的米数在物理上就是不可靠的</em>——这不是工程质量问题，是设计选择问题，而它必须被显式记录在感知接口的 `sigma_m` 里（C59 模块 03）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="extrinsic-methods"><span class="num">6</span>外参怎么标：三种方法与它们各自缺什么</h2>
+  <p>内参可以在实验室里用标定板搞定，而<strong>外参必须在装车之后、在车体坐标系里标</strong>。常用的三种方法解决的是不同的自由度。</p>  <table>
+    <thead><tr><th>方法</th><th>怎么做</th><th>能定几个自由度</th><th>缺什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>地面标定板</strong></td><td>在车前地面上按已知位置摆几块板/贴几个标记，用 PnP（模块 03 第 4 节）解 $R,t$</td><td><strong>全部 6 个</strong></td><td>需要一块平整、可测量的场地；<em>而地面不平会直接变成 pitch 误差</em></td></tr>
+      <tr><td><strong>已知场景点</strong></td><td>用全站仪/卷尺测出若干固定点的车体坐标，再 PnP</td><td>全部 6 个，精度最高</td><td>最贵；<em>且每台车都要做一次</em></td></tr>
+      <tr><td><strong>车道线消失点</strong></td><td>直行时两条车道线在图像上的交点 = 前进方向的消失点，由它直接读出 pitch 与 yaw</td><td><strong>只有 2 个</strong>（pitch, yaw）</td><td><strong>定不了 roll、也定不了相机高度</strong>；<em>但它可以逐帧做，所以是在线修正的标准手段</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第三行值得单独说，因为它是「静态标定 + 在线修正」这个组合的基础。</strong>消失点法只需要一段直路和车道线检测，<em>而它恰好定的是第 5 节里最贵的那两个自由度</em>。所以生产系统的分工通常是：<strong>装车时用地面标定板把 6 个自由度都标一次（离线、慢、准），行驶中用消失点把 pitch/yaw 逐帧修正（在线、快、只管 2 个）</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而三种方法有一个共同的坑：它们都依赖「车体坐标系」这个约定。</strong>$Z=0$ 是什么——地面？后轴中心所在的水平面？空车还是满载？<em>相机高度 $H$ 随载重变化几厘米，而模块 00 的中心公式里 $H$ 出现在分母上</em>：$H$ 从 1.50 m 变到 1.45 m，<strong>对离地 1 m 的目标，读出距离的倍数从 3.00 变成 3.22（差 7.4%）</strong>。所以标定文档必须写明「$Z=0$ 指哪个平面、车辆处于什么载荷状态」——<strong>这句话看起来像形式主义，而它值几个百分点。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>一个可以立刻加的自查：<strong>把标定得到的相机高度与卷尺量的值比一比。</strong><em>如果差超过 3 cm，说明你的 $Z=0$ 平面定义与标定时的假设不一致</em>——而这个偏差会以第 6 节那种「参数互相吸收」的方式藏进 pitch 里，在重投影误差上完全看不出来。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="identifiability"><span class="num">7</span>本模块的中心结论：想标好远处，必须采近处</h2>
+  <p>$c_y$ 与俯仰角对成像位置的影响几乎相同（模块 01 第 2 节的等价性）。<strong>那么标定能把它们分开吗？先看一个直接的实验。</strong></p>  <p>把 $c_y$ 故意标错 10 px，再用一个俯仰角去补偿。结果是：</p>  <table>
+    <thead><tr><th>任务</th><th>补偿后的误差</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>单相机测距（像素 → 米）</td><td>最大 <strong>0.012 m</strong></td><td>误差<strong>几乎完全抵消</strong></td></tr>
+      <tr><td>把已知三维点投影到图像</td><td>最大 <strong>0.21 px</strong></td><td>同样<strong>几乎完全抵消</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <strong>这是一个我原本以为会相反的结果。</strong>常见说法是「内外参分开标会互相吸收误差，合起来在远处是错的」。<em>而实测是：吸收得非常干净，两个任务上都只剩厘米级/亚像素级残差。</em><strong>所以问题不是「补偿会失效」，而是「这两个参数根本分不开」</strong>——它是一个可辨识性问题，不是精度问题。
+  </div>  <p>既然分不开，就该问：<strong>什么条件下能分开？</strong>把 $v$ 对 $(c_y,\text{pitch})$ 的雅可比写出来，$\partial v/\partial c_y=1$ 而 $\partial v/\partial \text{pitch}=f\sec^2\theta\approx f\bigl(1+(\tfrac{v-c_y}{f})^2\bigr)$。<strong>第二列只在 $v$ 变化很大时才与第一列分开。</strong>于是有了这张表（角点噪声 0.2 px）：</p>  <p>下表每一档用 20 个观测点。<strong>σ 随观测数按 $1/\sqrt{n}$ 缩小</strong>，所以这些数只在「同样 20 个点」的前提下可比——<em>重要的是各档之间的比例，它与 $n$ 无关</em>。</p>  <table>
+    <thead><tr><th>采集覆盖的图像行范围（各 20 点）</th><th>$\Delta v$</th><th>条件数</th><th>σ($c_y$)</th><th>σ(pitch)</th></tr></thead>
+    <tbody>
+      <tr><td>只用远处地面（$v$ 570–600）</td><td>30 px</td><td>2.1×10⁶</td><td>78.4 px</td><td><strong>3.74°</strong></td></tr>
+      <tr><td>中等范围（$v$ 570–720）</td><td>150 px</td><td>1.8×10⁵</td><td>6.7 px</td><td>0.316°</td></tr>
+      <tr><td><strong>全画幅地面（$v$ 570–1070）</strong></td><td>500 px</td><td>2.3×10⁴</td><td>0.79 px</td><td><strong>0.035°</strong></td></tr>
+      <tr><td>再加上地平线以上的标志（$v$ 380–1070）</td><td>690 px</td><td>2.3×10⁴</td><td>0.65 px</td><td>0.030°</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第一行与第三行差 106 倍</strong>，而两者的区别只是「有没有采近处的地面点」。<em>这条结论是反直觉的：我们关心的是远处的距离，而想把远处标准，采集必须覆盖近处</em>——因为近处的点才提供把 pitch 与 $c_y$ 分开所需的 $v$ 跨度。<strong>而最方便的采集方式（只对着远处那段路拍）恰好是最差的：σ(pitch)=3.74°，比它要防的 1° 误差还大 3.7 倍。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>第四行说明这个收益会饱和。</strong>从 500 px 扩到 690 px，条件数几乎不动（2.3×10⁴ → 2.3×10⁴），σ(pitch) 只从 0.035° 降到 0.030°。<em>所以「把地平线以上的目标也纳入标定」不值得为它额外设计流程</em>。<strong>该做的是把地面覆盖从 30 px 扩到 500 px，而这只要求标定场地里既有近处也有远处的参照物。</strong>回到第 5 节的需求（50 m 处 2 m ⇒ pitch &lt; 0.066°）：<em>全画幅覆盖的 0.035° 有约 1.9 倍余量，而只采远处的 3.74° 差 57 倍</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="acceptance"><span class="num">8</span>重投影误差：必要但不充分，且必须报分位数</h2>
+  <p>重投影误差是标定唯一的<strong>内生</strong>质量指标——它不需要外部真值。但它有两个用法上的陷阱。</p>  <h3>陷阱一：只报均值</h3>  <p>角点检测偶尔会失手（反光、遮挡、板边缘）。<strong>几个离群点能让 P95 翻几倍而均值几乎不动</strong>，而恰恰是离群点在污染解。所以验收要报 <strong>中位数 / P95 / 最大值</strong> 三个数，<em>并把 P95 作为门禁阈值</em>。</p>  <h3>陷阱二：不按图像位置分层</h3>  <p>模块 01 量过畸变是纯边缘现象（0.26 → 197.7 px）。<strong>相应地，畸变模型的误差也集中在边缘</strong>。只报全图平均，会把画幅角上的问题平均掉——<em>而画幅角正是近处标志所在的位置</em>。</p>  <h3>陷阱三：重投影误差可以靠「把板拍远」变小</h3>  <p>固定一个物理角点定位误差（比如 0.5 mm），它对应的像素误差是 $f\delta/D$——<strong>与板到相机的距离成反比</strong>：</p>  <table>
+    <thead><tr><th>板距 $D$</th><th>0.5 mm 物理误差 → 像素误差</th><th>0.24 m 宽的板占多少像素</th></tr></thead>
+    <tbody>
+      <tr><td>0.5 m</td><td>1.20 px</td><td>576 px</td></tr>
+      <tr><td>1.0 m</td><td>0.60 px</td><td>288 px</td></tr>
+      <tr><td>2.0 m</td><td><strong>0.30 px</strong></td><td><strong>144 px</strong></td></tr>
+    </tbody>
+  </table>  <p><strong>把板从 0.5 m 挪到 2 m，重投影误差降到 1/4，而板的像素面积降到 1/16。</strong><em>后者意味着约束变弱、畸变的边缘区域根本覆盖不到</em>——也就是说<strong>这是一次「指标变好而标定变差」的改动</strong>。所以重投影误差必须与「角点总数」和「板覆盖的图像面积比例」一起报，<em>单独一个 0.3 px 是无法解读的</em>。</p>  <table>
+    <thead><tr><th>验收项</th><th>阈值（示例）</th><th>为什么是这一项</th></tr></thead>
+    <tbody>
+      <tr><td>重投影误差中位数</td><td>&lt; 0.3 px</td><td>基本质量</td></tr>
+      <tr><td><strong>重投影误差 P95</strong></td><td>&lt; 0.8 px</td><td><strong>抓离群点污染</strong></td></tr>
+      <tr><td><strong>离群点占比</strong>（&gt; 5×中位数）</td><td>&lt; 0.02</td><td><strong>P95 只在离群点占比 &gt; 5% 时才动</strong>；<em>占比 1.2% 时 P95 完全看不见，只有这一项抓得住</em>。阈值取 5 倍而非 3 倍，因为 3 倍在干净数据上就有 4.3% 假阳性</td></tr>
+      <tr><td><strong>画幅外圈 1/3 区域的 P95</strong></td><td>&lt; 1.2 px</td><td><strong>抓「只用中心区域标定」</strong>（模块 01 第 4 节的陷阱）</td></tr>
+      <tr><td>畸变模型余量</td><td>&ge; 1.2</td><td>模块 01 练习 3 的单调性检查</td></tr>
+      <tr><td>Zhang 约束 rank</td><td>= 5</td><td>第 3 节：抓退化采集</td></tr>
+      <tr><td><strong>标定采集的 $\Delta v$ 覆盖</strong></td><td>&ge; 400 px</td><td><strong>第 6 节：抓「只采远处」</strong></td></tr>
+      <tr><td>σ(pitch)（由雅可比反解）</td><td>&lt; 0.05°</td><td>第 5/6 节：与下游需求挂钩</td></tr>
+      <tr><td><strong>角点总数与板覆盖面积比</strong></td><td>&ge; 400 点 / &ge; 15%</td><td><strong>陷阱三：让重投影误差变得可解读</strong></td></tr>
+      <tr><td><strong>外圈 1/3 的角点数</strong></td><td>&ge; 20</td><td><strong>覆盖率高不代表覆盖到了<em>边缘</em></strong>。<em>notebook 里本课自己的 5 视角配置在这一项上只有 1 个点——其余七项全部合格</em></td></tr>
+    </tbody>
+  </table>  <div class="callout paper"><span class="label"></span>
+    <strong>最后两项是本模块新增的、而在常见标定流程里没有的。</strong>它们的共同点是<em>只依赖采集配置，不依赖优化结果</em>——所以可以在<strong>拍完就算、优化之前就拒绝</strong>。这与 C68 模块 04 的「确定性阻断优先于统计阻断」是同一个原则。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="versioning"><span class="num">9</span>标定件的版本化与清单</h2>
+  <p>标定的产物是一个<strong>会过期的资产</strong>：换镜头、换传感器、重新装车、甚至一次碰撞都会让它失效。</p>  <pre><code># intrinsics.yaml —— 每一项都不是装饰
+camera_id:      front_wide
+calib_date:     2026-09-05
+image_size:     [1920, 1080]      # ← K 与尺寸绑定（模块 01 第 7 节）
+K:              [[1200.0, 0, 960.0], [0, 1200.0, 540.0], [0, 0, 1]]
+dist_model:     brown_conrady
+dist:           [-0.28, 0.09, 0.0012, -0.0008, -0.012]   # k1 k2 p1 p2 k3
+acceptance:
+  reproj_median_px:   0.21
+  reproj_p95_px:      0.63
+  reproj_p95_outer_px: 0.94      # ← 外圈单独报
+  distortion_margin:  2.03
+  zhang_rank:         5
+  delta_v_coverage_px: 512
+  sigma_pitch_deg:    0.034
+sha:            4a1c88e2          # ← 供 LUT / 下游校验（模块 01 第 5 节）</code></pre>  <ol>
+    <li><strong>没有 <code>acceptance</code> 段的标定文件不允许上车</strong>——它是唯一能事后判断「这次标定行不行」的依据</li>
+    <li><strong>$K$ 与 <code>image_size</code> 必须同时出现</strong>，缺一个就无法判断它对应哪一级预处理</li>
+    <li><strong>畸变系数的顺序要写清</strong>（OpenCV 是 $k_1k_2p_1p_2k_3$，与公式书写顺序不同，<em>这是一个真实的、静默的错误来源</em>）</li>
+    <li><strong>外参单独一个文件</strong>，因为它的更新频率不同（重新装车要重标外参，不用重标内参——模块 01 第 9 节的不变量②）</li>
+    <li><strong>标定文件带 <code>sha</code></strong>，所有派生产物（去畸变 LUT、BEV 映射表）都记录它，不匹配拒绝加载</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <strong>如果只加一项，加 <code>delta_v_coverage_px</code>。</strong>它计算代价为零（就是角点行号的极差），<em>而它抓的是第 6 节那个 106 倍的差距</em>——本模块所有验收项里，只有它能防住一整类「标定看起来成功、远处系统性偏」的失败。
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../01_camera/01_讲解.html"><div class="dir">← 上一模块</div><div class="t">01 · 相机模型与畸变</div></a>
+    <a class="next" href="../03_multiview/03_讲解.html"><div class="dir">下一模块 →</div><div class="t">03 · 多视角几何：对极、三角测量、单应、PnP</div></a>
+  </div>
+
+</div>
+</body>
+</html>

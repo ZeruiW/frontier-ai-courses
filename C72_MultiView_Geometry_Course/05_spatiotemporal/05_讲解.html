@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 时空对齐与跨镜关联</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 05 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>05 · 时空对齐与跨镜关联</h1>
+  <p class="subtitle"><strong>时间层的误差与距离无关</strong>，所以它在近处是主导项：<em>120 km/h × 33 ms = 1.10 m，而 10 m 处 IPM 的 σ 只有 0.03 m</em> · <strong>rolling shutter 对小目标可以忽略</strong>（80 m 处的牌只跨 12 行，牌高畸变 0.005 px），<strong>但「整帧一个时间戳」值 0.667 m——按像素行插值，一行代码</strong> · <strong>曝光拖影的距离依赖是反的</strong>：8 ms 曝光在 10 m 处是 4.93 px、50 m 处只有 0.19 px，<em>这是本课唯一「近处才需要担心」的项，而它在白天的评测集上看不见</em> · <strong>该外推就外推</strong>：等一个 IMU 周期的延迟代价（0.333 m）比外推同样时长的位姿误差（0.15 mm）大 2222 倍 · <strong>不做运动补偿时，关联门被自车运动支配</strong>（3.33 m）而不是被测量噪声支配（0.68–2.93 m）· <strong>时间不同步会伪装成外参误差</strong>——<em>区分方法：前者与车速严格成正比，后者与车速无关</em></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00 的投影链、模块 03 的 Sampson 距离、模块 04 的 BEV</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 05_spatiotemporal.ipynb（时间戳 × 车速的误差表 / <strong>rolling shutter 对小目标可忽略（50 m 处牌高只变 0.005 px）</strong> / 线性插值的 $aT^2/8$ 上界 / <strong>运动补偿：关联门被自车运动支配而不是被测量噪声支配</strong> / 跨镜关联的几何门）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">本课程 C55 模块 04（单相机时序融合：ByteTrack / 卡尔曼 / 贝叶斯 log-odds / 迟滞双阈值）· C60 模块 05（延迟剖析）· ROS REP-105（坐标系与时间约定）· Ait-Aider et al., <em>Simultaneous Object Pose and Velocity Computation … Rolling Shutter</em>（ECCV 2006）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 40 分钟 + 跑 40 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#time-is-a-coordinate">时间是第五个坐标</a></li>
+      <li><a href="#timestamp">时间戳错位 × 车速 = 米</a></li>
+      <li><a href="#rolling-shutter">rolling shutter：对小目标可以忽略</a></li>
+      <li><a href="#exposure">曝光时长：一个观测是一段区间，而它的距离依赖是反的</a></li>
+      <li><a href="#interpolation">线性插值就够了：$aT^2/8$</a></li>
+      <li><a href="#motion-compensation">运动补偿：关联门被自车运动支配</a></li>
+      <li><a href="#cross-camera">跨镜关联：用几何而不是外观</a></li>
+      <li><a href="#boundary-c55">与 C55 模块 04 的分界</a></li>
+      <li><a href="#output-validity">端到端延迟：结果对哪个时刻有效</a></li>
+      <li><a href="#budget">时间层的误差预算：钱花在哪</a></li>
+      <li><a href="#checklist">本模块的验收清单</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="time-is-a-coordinate"><span class="num">1</span>时间是第五个坐标</h2>
+  <p>模块 00 那条链走完之后，得到的是「某个时刻、某个坐标系里的一个米数」。<strong>而多路相机、IMU、上一帧——它们的「某个时刻」都不一样。</strong></p>  <div class="ascii">   一个目标的米数，实际上带四个标签
+
+        (X, Y, Z)  @  frame=base_link  @  t=1757320000.033  @  exposure=8ms
+         └ 米数         └ 空间坐标系          └ 时间戳             └ 有效时长
+
+   四个标签里，工程上最常被丢掉的是**第三个**。
+   而丢掉它的代价：
+
+        误差(米) = |时间戳错位| × 车速
+
+        120 km/h × 33 ms = **1.10 m**
+        └── 比模块 03 里双目在 50 m 处的 σ（2.9 m）小，但比 IPM 的 σ（0.68 m）大
+        </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这一层的特点是：它的误差与距离无关。</strong><em>模块 01–04 的误差都随距离放大（$1/\text{px}$、$Z^2$、$H/(H-z)$），而时间误差是纯运动学的——它在 10 m 和 80 m 处一样大</em>。<strong>所以它在近处反而是主导项</strong>：10 m 处 IPM 的 σ 只有 0.03 m，而 33 ms 的时间戳错位值 1.10 m。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>本模块的结论会有点反直觉：时间层的误差预算高度集中在一项上。</strong><em>rolling shutter 对小目标可以忽略（第 3 节）、线性插值已经足够精确（第 4 节）</em>——<strong>钱全部花在「时间戳到底对不对」上。</strong>而这恰好是一个工程问题而不是算法问题：<em>它取决于硬件同步、驱动的时间戳语义、以及有没有人验证过它。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="timestamp"><span class="num">2</span>时间戳错位 × 车速 = 米</h2>
+  <table>
+    <thead><tr><th>车速</th><th>5 ms</th><th>10 ms</th><th>16 ms</th><th>33 ms</th><th>50 ms</th><th>100 ms</th></tr></thead>
+    <tbody>
+      <tr><td>30 km/h</td><td>0.042</td><td>0.083</td><td>0.133</td><td>0.275</td><td>0.417</td><td>0.833</td></tr>
+      <tr><td>60 km/h</td><td>0.083</td><td>0.167</td><td>0.267</td><td>0.550</td><td>0.833</td><td>1.667</td></tr>
+      <tr><td>90 km/h</td><td>0.125</td><td>0.250</td><td>0.400</td><td>0.825</td><td>1.250</td><td>2.500</td></tr>
+      <tr><td><strong>120 km/h</strong></td><td>0.167</td><td>0.333</td><td>0.533</td><td><strong>1.100</strong></td><td>1.667</td><td><strong>3.333</strong></td></tr>
+    </tbody>
+  </table>  <p>单位是米。<strong>33 ms 是 30 fps 的一帧，100 ms 是一个常见的端到端延迟预算。</strong></p>  <h3>时间戳的四种常见错位，以及它们的量级</h3>  <table>
+    <thead><tr><th>错位来源</th><th>典型量级</th><th>@120 km/h</th><th>怎么发现</th></tr></thead>
+    <tbody>
+      <tr><td><strong>用「收到帧的时刻」当曝光时刻</strong></td><td>10–50 ms（传输 + 解码）</td><td>0.33–1.67 m</td><td><strong>与硬触发信号比</strong>；<em>没有硬触发时几乎无法发现</em></td></tr>
+      <tr><td><strong>曝光中点 vs 曝光开始</strong></td><td>曝光时长的一半，1–10 ms</td><td>0.03–0.33 m</td><td>读驱动文档；<em>不同厂商约定不同</em></td></tr>
+      <tr><td><strong>多路相机不同步</strong></td><td>无硬同步时可达一帧（33 ms）</td><td><strong>1.10 m</strong></td><td><strong>模块 04 第 6 节的重叠区一致性</strong>（但它会把这误判成外参误差）</td></tr>
+      <tr><td><strong>时钟漂移</strong>（相机时钟 vs 主机时钟）</td><td>无 PTP 时每分钟数毫秒</td><td>累积</td><td>长时间记录里看时间戳差的趋势</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <p>第三行那个括号很重要：<strong>时间不同步会伪装成外参误差。</strong><em>两路相机在不同时刻拍同一个地面点，自车已经动了，于是两路读出的距离不一致</em>——而模块 04 的一致性监控会把它归到「外参漂移」。<strong>区分方法：不同步造成的不一致与车速成正比，而外参误差与车速无关。</strong><em>所以监控要按车速分档看——这是练习 3 的内容。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rolling-shutter"><span class="num">3</span>rolling shutter：对小目标可以忽略</h2>
+  <p>CMOS 逐行曝光，整幅读出通常 10–30 ms。<strong>所以同一帧里，不同行对应的是不同时刻。</strong>直觉上这该是个大问题——而算一下会发现要分两种情形。</p>  <p>取整幅读出 20 ms、车速 120 km/h（33.3 m/s）：</p>  <table>
+    <thead><tr><th>目标跨多少行</th><th>行间时差</th><th>对应的世界位移</th></tr></thead>
+    <tbody>
+      <tr><td>12 行（80 m 处的 0.8 m 牌）</td><td>0.22 ms</td><td><strong>0.007 m</strong></td></tr>
+      <tr><td>20 行</td><td>0.37 ms</td><td>0.012 m</td></tr>
+      <tr><td>50 行</td><td>0.93 ms</td><td>0.031 m</td></tr>
+      <tr><td>100 行</td><td>1.85 ms</td><td>0.062 m</td></tr>
+      <tr><td><strong>1080 行（整幅）</strong></td><td><strong>20.00 ms</strong></td><td><strong>0.667 m</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>结论分两半。</strong>① <strong>对单个小目标，rolling shutter 可以忽略</strong>：80 m 处的标志只跨 12 行，牌高的畸变是 <em>0.005 px</em>（notebook 第 3 节量出的），<strong>比任何检测器的定位精度都小两个数量级</strong>。<em>所以「给标志建 rolling shutter 模型」是不值得的工程投入。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>② <strong>而对「同一帧里的不同目标」，它不可忽略</strong>：画幅顶部（远处）与底部（近处）差了整个读出时长，<strong>@120 km/h 就是 0.667 m。</strong><em>于是同一帧里，近处目标的时间戳比远处目标晚 20 ms</em>。<strong>正确的处理是：给每个目标一个「按其像素行插值出来的时间戳」，而不是给整帧一个时间戳。</strong><em>这只需要一行代码，而它把 0.667 m 的误差降到第 3 节表里对应的行数那一档。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>rolling shutter 真正会咬人的是快速旋转与横向高速运动</strong>（<em>螺旋桨、快速转向、以及相机自身的振动</em>）。而 TSR 的场景是<strong>纵向匀速</strong>为主，所以本课的结论是「按行给时间戳，不建畸变模型」。<em>换到无人机或手持场景时，这个结论需要重测。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="exposure"><span class="num">4</span>曝光时长：一个观测是一段区间，而它的距离依赖是反的</h2>
+  <p>时间戳标的是一个<strong>时刻</strong>，而曝光是一段<strong>区间</strong>。区间内自车在动，所以像素上留下拖影。<strong>把它换算成像素，会发现一件和本课其它误差都相反的事。</strong></p>  <p>车速 120 km/h，地面点的行位移：</p>  <table>
+    <thead><tr><th>曝光时长</th><th>曝光期间的世界位移</th><th>10 m 处</th><th>20 m 处</th><th>50 m 处</th><th>80 m 处</th></tr></thead>
+    <tbody>
+      <tr><td>2 ms</td><td>0.067 m</td><td>1.21 px</td><td>0.30 px</td><td>0.05 px</td><td>0.02 px</td></tr>
+      <tr><td><strong>8 ms</strong></td><td>0.267 m</td><td><strong>4.93 px</strong></td><td>1.22 px</td><td><strong>0.19 px</strong></td><td>0.08 px</td></tr>
+      <tr><td>20 ms（夜间/隧道）</td><td>0.667 m</td><td><strong>12.86 px</strong></td><td>3.10 px</td><td>0.49 px</td><td>0.19 px</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>近处显著、远处可忽略——这个方向和本课其它所有误差都相反。</strong><em>标定误差、测距误差、地面假设误差全都随距离放大；而曝光拖影随距离<strong>缩小</strong></em>，因为远处目标的像素位置对距离变化不敏感（$\partial v/\partial d = -f(H-z)/d^2$）。<strong>所以它是这一层唯一「近处才需要担心」的项。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>两个可操作的推论。</strong>① <strong>夜间/隧道里曝光变长，近处的定位精度会掉</strong>——<em>而这在白天的评测集上完全看不出来</em>。所以评测集必须按曝光时长分层（<strong>曝光时长是一个应当被记录进每帧元数据的字段</strong>）。② <strong>时间戳应当标在曝光中点</strong>，<em>因为那是拖影的重心；标在开始或结束都会引入半个曝光时长的系统偏差</em>（8 ms 曝光下是 4 ms，@120 km/h 值 0.13 m）。<strong>而第 2 节说过：三种约定差 1–50 ms，没写清就等于没有。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>一条便宜的自查</strong>：在数据里找同一块标志在近处（&lt;15 m）的连续几帧，<em>比较它的像素高度的帧间抖动</em>。<strong>如果夜间的抖动明显大于白天，那就是曝光拖影</strong>——<em>而它不是检测器的问题，调模型修不了。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="interpolation"><span class="num">5</span>线性插值就够了：$aT^2/8$</h2>
+  <p>把不同时刻的观测对齐到共同时刻，需要在时间上插值自车位姿。<strong>该用线性还是更高阶？</strong>线性插值对二阶项的最大误差有闭式上界：</p>  <div class="math-block">\[\varepsilon_{\max} = \frac{a\,T^2}{8}\]</div>  <table>
+    <thead><tr><th>采样间隔 $T$</th><th>$a=1$ m/s²</th><th>$a=3$ m/s²</th><th>$a=8$ m/s²（紧急制动）</th></tr></thead>
+    <tbody>
+      <tr><td>10 ms</td><td>0.013 mm</td><td>0.037 mm</td><td>0.100 mm</td></tr>
+      <tr><td><strong>20 ms</strong></td><td>0.050 mm</td><td><strong>0.150 mm</strong></td><td>0.400 mm</td></tr>
+      <tr><td>50 ms</td><td>0.313 mm</td><td>0.938 mm</td><td>2.500 mm</td></tr>
+      <tr><td>100 ms</td><td>1.250 mm</td><td>3.750 mm</td><td>10.000 mm</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>全表都在毫米级。</strong><em>而这一层其它误差源是米级（时间戳错位）到分米级（rolling shutter 整幅）</em>——<strong>相差三到四个数量级。</strong>所以答案很干脆：<strong>线性插值，不需要更高阶。</strong><em>把工程投入放在「让时间戳正确」上，而不是「让插值更精细」上。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>但有两个前提必须成立，否则上面的表不适用。</strong>① <strong>要插值的是位姿而不是像素</strong>——<em>在图像上插值目标位置会引入透视非线性，那不是 $aT^2/8$ 能界定的</em>；② <strong>不能外推</strong>。<em>$aT^2/8$ 是插值（在两个采样点之间）的界；外推 $\Delta t$ 的误差是 $a\Delta t^2/2$——同样时长下大 4 倍，而且它随外推距离二次增长、没有上界</em>。</p></div>
+  </div>  <h3>那么该外推，还是该等下一个采样？</h3>  <p><strong>这个取舍可以算，而算出来的答案是压倒性的。</strong>等待一个采样周期的代价不是精度，是<em>延迟</em>——而延迟同样换算成米：等 $T$ 的时间，自车前进 $vT$。</p>  <table>
+    <thead><tr><th>IMU 频率</th><th>一个周期</th><th>等待的延迟代价（120 km/h）</th><th>外推同样时长的位姿误差（$a=3$）</th><th>比值</th></tr></thead>
+    <tbody>
+      <tr><td>50 Hz</td><td>20.0 ms</td><td>0.667 m</td><td>0.000600 m</td><td><strong>1111×</strong></td></tr>
+      <tr><td><strong>100 Hz</strong></td><td>10.0 ms</td><td><strong>0.333 m</strong></td><td><strong>0.000150 m</strong></td><td><strong>2222×</strong></td></tr>
+      <tr><td>200 Hz</td><td>5.0 ms</td><td>0.167 m</td><td>0.000037 m</td><td>4444×</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>外推的误差比等待的代价小三个数量级——所以应该外推。</strong><em>这与「插值比外推准」的直觉不矛盾：外推确实更不准，但它不准的那个量（亚毫米）与它省下的那个量（分米）差 2000 倍</em>。<strong>本课的结论是：在这一层，为了精度而增加延迟几乎总是错的取舍。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这条结论有一个边界：它假设 $a$ 是有界的。</strong><em>紧急制动（8 m/s²）下 20 ms 外推的误差是 1.6 mm，仍然可忽略；但碰撞、失控、路面剧烈起伏时加速度可以高一个量级以上</em>。<strong>所以正确的实现是外推 + 把 $a\Delta t^2/2$ 加进 σ</strong>——<em>这样在剧烈机动时不确定度会自动放大，而下游按 σ 加权时会自动降低对它的信任</em>。<strong>这与模块 03 的四元组是同一个设计：不确定度必须随条件变化，而不是一个常数。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="motion-compensation"><span class="num">6</span>运动补偿：关联门被自车运动支配</h2>
+  <p>跟踪要把上一帧的目标和这一帧的目标关联起来。<strong>而对一个静止的交通标志，帧间的「距离变化」全部来自自车运动。</strong></p>  <table>
+    <thead><tr><th>车速</th><th>10 fps</th><th>20 fps</th><th>30 fps</th></tr></thead>
+    <tbody>
+      <tr><td>60 km/h</td><td>1.667 m</td><td>0.833 m</td><td>0.556 m</td></tr>
+      <tr><td><strong>120 km/h</strong></td><td><strong>3.333 m</strong></td><td>1.667 m</td><td>1.111 m</td></tr>
+    </tbody>
+  </table>  <p>单位是米，即<strong>帧间自车前进的距离</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>把它和模块 03 的测量不确定度放在一起，结论就出来了。</strong><em>50 m 处，IPM 的 σ 是 0.68 m、已知尺寸 1.30 m、双目 2.93 m；而 120 km/h @10 fps 的帧间位移是 3.33 m</em>。<strong>所以不做运动补偿时，关联门必须开到 5 m 以上——而那时它是被自车运动支配的，不是被测量噪声支配的。</strong><em>门开得越大，误关联越多（尤其是连续多块标志的路段）。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>运动补偿把这一项几乎完全消掉。</strong>做法是：用自车位姿把上一帧的目标搬到当前时刻的车体坐标系里，<em>再和当前帧的观测比</em>。<strong>补偿之后，关联门只需要覆盖测量噪声</strong>——按上面的数，从 5 m 降到 1–3 m（<em>取决于用哪种补法</em>）。<strong>而这条推理链给出了一个可计算的门宽</strong>：$\text{gate} = k\sqrt{\sigma_1^2+\sigma_2^2}$，<em>其中 σ 就是模块 03 练习 4 返回的那个值</em>。<strong>所以「四元组」在这里第二次派上用场</strong>——第一次是融合加权（模块 04 第 5 节），这次是关联门宽。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>运动补偿的误差来源是自车位姿，而它自己也有时间戳。</strong><em>用错了时刻的位姿去补偿，等于把第 2 节的时间戳错位又引入一次</em>——而这次它藏在跟踪器内部，更难发现。<strong>所以补偿函数应当强制要求「位姿的时间戳」与「观测的时间戳」一起传，并断言两者的差在容许范围内。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cross-camera"><span class="num">7</span>跨镜关联：用几何而不是外观</h2>
+  <p>同一块标志同时出现在两路相机里，要判断它们是不是同一个目标。<strong>这一层能给的是几何证据，而它比外观相似度更硬。</strong></p>  <table>
+    <thead><tr><th>门</th><th>怎么算</th><th>适用</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>BEV 距离门</strong></td><td>两路各自测距、投到车体坐标，比欧氏距离</td><td><strong>首选</strong>：物理量、可解释、门宽由 σ 决定</td><td>需要两路都能测距（模块 03 的四种补法之一）</td></tr>
+      <tr><td><strong>Sampson 距离门</strong>（模块 03 练习 1）</td><td>用两路的相对外参算 $F$，判对极残差</td><td><strong>不需要测距</strong>，只要外参</td><td><em>只能否决、不能确认</em>——极线上所有点都通过</td></tr>
+      <tr><td>外观相似度</td><td>特征向量的余弦</td><td>几何门通过后的二次确认</td><td><strong>跨视角外观差异大</strong>，且它不是几何证据</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>Sampson 门那一行的「只能否决」值得强调。</strong><em>对极约束把候选从「整幅图」缩小到「一条线」，而线上还有无穷多个点</em>。<strong>所以它是一个必要条件检查器，不是匹配器</strong>——这与模块 03 第 2 节说的「对极几何的工程价值是否决匹配」是同一条。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而 BEV 距离门的门宽有一个正确的算法。</strong><em>两路的 σ 不一样（一路可能走 IPM、另一路走已知尺寸），所以门宽应当是 $k\sqrt{\sigma_1^2+\sigma_2^2}$ 而不是一个常数</em>。<strong>取 $k=3$ 时，50 m 处 IPM(0.68) 与已知尺寸(1.30) 配对的门宽是 4.4 m</strong>；<em>而如果两路都走双目（2.93），门宽要开到 12.4 m</em>。<strong>这个差别说明：提高测距精度的收益会传导到关联正确率上</strong>——<em>而这条链在只看「跟踪指标」时是看不见的。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="boundary-c55"><span class="num">8</span>与 C55 模块 04 的分界</h2>
+  <p>C55 模块 04 是一整个模块的时序融合，本课模块 05 不重复它。<strong>分界线是「一路还是多路」。</strong></p>  <table>
+    <thead><tr><th>问题</th><th>在哪门课</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>同一路相机的时间轴上怎么融合</td><td><strong>C55 模块 04</strong></td><td>ByteTrack 两阶段关联 · 卡尔曼滤波 · 贝叶斯 log-odds 累积 · 迟滞双阈值 · 生命周期状态机 · 「越稳越晚」的取舍</td></tr>
+      <tr><td>多路之间怎么对齐到同一时刻</td><td><strong>本课模块 05</strong></td><td>时间戳语义 · rolling shutter · 位姿插值 · 运动补偿 · 跨镜关联的几何门</td></tr>
+      <tr><td>时间戳本身对不对</td><td><strong>本课模块 05 第 2 节</strong></td><td><em>C55 假设它是对的；本课量它错了值多少米</em></td></tr>
+      <tr><td>延迟怎么剖析与优化</td><td><strong>C60 模块 05</strong></td><td>端到端延迟分解、各段耗时</td></tr>
+    </tbody>
+  </table>  <div class="callout paper"><span class="label"></span>
+    <strong>两门课的交界点是「时间戳」这一个字段。</strong><em>C55-04 的卡尔曼滤波需要一个正确的 $\Delta t$，而本课第 2 节说明这个 $\Delta t$ 的常见错位值 0.3–1.7 m</em>。<strong>所以先修本课第 2 节，再谈 C55-04 的滤波调参</strong>——<em>否则你会在一个错误的时间轴上调一个正确的滤波器。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="output-validity"><span class="num">9</span>端到端延迟：结果对哪个时刻有效</h2>
+  <p>前面几节都在对齐<strong>输入</strong>的时间。<strong>还有一个对称的问题：输出对哪个时刻有效？</strong>感知从曝光到被规控读到，中间有一整条流水线。</p>  <table>
+    <thead><tr><th>端到端延迟</th><th>@60 km/h 自车已前进</th><th>@120 km/h 自车已前进</th></tr></thead>
+    <tbody>
+      <tr><td>30 ms</td><td>0.500 m</td><td>1.000 m</td></tr>
+      <tr><td>60 ms</td><td>1.000 m</td><td>2.000 m</td></tr>
+      <tr><td><strong>100 ms</strong></td><td>1.667 m</td><td><strong>3.333 m</strong></td></tr>
+      <tr><td>150 ms</td><td>2.500 m</td><td>5.000 m</td></tr>
+    </tbody>
+  </table>  <p><strong>这是一个<em>系统偏差</em>，不是噪声</strong>——所有目标都被一致地报得比实际更远（因为自车已经靠近了）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>修法是把结果预测到「被使用的时刻」，而它几乎免费。</strong><em>按第 4 节的算法，线性预测 100 ms 的残差是 $a\Delta t^2/2 = 15.0$ mm（$a{=}3$）</em>——<strong>而不预测的系统偏差是 3.333 m，相差 222 倍</strong>。<em>150 ms 时残差 33.8 mm vs 偏差 5.000 m，仍然是 148 倍。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这条推理和第 4 节的「外推 vs 等待」是同一条，只是用在了链路的另一端。</strong><em>前者说「不要为了等一个更准的位姿而增加延迟」，后者说「已经产生的延迟要靠预测补掉」</em>。<strong>两者合起来是一条统一的原则：在这一层，延迟是一种系统偏差，而预测的残差是二阶小量——所以永远选预测。</strong><em>代价同样是必须把 $a\Delta t^2/2$ 加进 σ，这样剧烈机动时下游会自动降低对它的信任。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>要预测，就必须知道延迟是多少——而这个数常常没人测过。</strong><em>它不是「模型推理耗时」，而是「曝光中点到规控读到」的全链路</em>：曝光 + 读出 + 传输 + 预处理 + 推理 + 后处理 + 序列化 + 传输 + 排队。<strong>C60 模块 05 讲的就是怎么把它分解出来</strong>，<em>而本节说明为什么值得去测：每 30 ms 值 1 米。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="budget"><span class="num">10</span>时间层的误差预算：钱花在哪</h2>
+  <p>把本模块量出来的四项放在同一张表上（120 km/h、20 ms 读出、30 fps）：</p>  <table>
+    <thead><tr><th>误差源</th><th>量级</th><th>与距离的关系</th><th>修它的成本</th></tr></thead>
+    <tbody>
+      <tr><td><strong>时间戳错位（一帧）</strong></td><td><strong>1.10 m</strong></td><td><strong>无关</strong></td><td><strong>硬同步 / 验证驱动语义——工程，不是算法</strong></td></tr>
+      <tr><td>整帧一个时间戳（rolling shutter）</td><td>0.667 m</td><td>无关</td><td><strong>一行代码</strong>：按像素行插值时间戳</td></tr>
+      <tr><td>不做运动补偿（关联门被迫开大）</td><td>1.111 m（@30 fps）</td><td>无关</td><td>中等：需要自车位姿</td></tr>
+      <tr><td>单目标内的 rolling shutter 畸变</td><td><strong>0.007 m</strong></td><td>无关</td><td><em>不值得修</em></td></tr>
+      <tr><td><strong>曝光拖影（8 ms）</strong></td><td>4.93 px @10 m / 0.19 px @50 m</td><td><strong>反的（近处才大）</strong></td><td>低：时间戳标曝光中点 + 记录曝光时长并分层评测</td></tr>
+      <tr><td>位姿线性插值</td><td><strong>0.00015 m</strong></td><td>无关</td><td><em>不值得修</em></td></tr>
+      <tr><td>外推 10 ms（而不是等待）</td><td>0.00015 m vs 等待的 0.333 m</td><td>无关</td><td><em>应当外推，并把 $a\Delta t^2/2$ 加进 σ</em></td></tr>
+      <tr><td><strong>端到端延迟未补偿（100 ms）</strong></td><td><strong>3.333 m</strong>（系统偏差）</td><td>无关</td><td><strong>预测到使用时刻，残差 15 mm——改善 222 倍</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>前三项差不多是同一个量级（0.7–1.1 m），后两项小三到四个数量级。</strong><em>所以这一层的优化顺序是确定的</em>：先验证时间戳（最贵也最大）、再按行给时间戳（最便宜的一米级收益）、最后做运动补偿。<strong>而「rolling shutter 建模」与「高阶插值」应当被明确地放弃。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>把这张表和模块 01–04 的合起来，就是这门课的全部交付物。</strong><em>50 m 处的总误差预算大致是</em>：标定 σ(pitch)=0.035° 贡献约 2.4 m（模块 02）、测距 σ 0.68–2.93 m（模块 03）、未建模坡度 1% 贡献 25 m（模块 04，<strong>如果不处理</strong>）、时间 1.1 m（本模块）。<strong>坡度那一项是压倒性的——所以模块 04 第 4 节的三种应对里，选一个做，比这一层所有优化加起来都值。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="checklist"><span class="num">11</span>本模块的验收清单</h2>
+  <ol>
+    <li><strong>每个观测带时间戳，而不是每帧带一个</strong>（第 3 节）——按像素行插值，一行代码换 0.667 m</li>
+    <li><strong>时间戳的语义写进文档</strong>：曝光开始 / 曝光中点 / 收到帧。<em>三者差 1–50 ms，而没写清就等于没有</em></li>
+    <li><strong>多路相机硬同步；没有硬同步就把「一帧」的误差写进 σ</strong>（第 2 节）</li>
+    <li><strong>重叠区一致性按车速分档看</strong>（第 2 节的告警）——<em>与车速成正比的不一致是时间问题，不是外参问题</em></li>
+    <li><strong>位姿该外推就外推</strong>——等一个采样周期的延迟代价比外推误差大 2222 倍；<em>但必须把 $a\Delta t^2/2$ 加进 σ</em>（第 4 节）</li>
+    <li><strong>时间戳标在曝光中点，并把曝光时长记进每帧元数据</strong>（第 3b 节）——<em>否则夜间近处的精度下降在评测里看不见</em></li>
+    <li><strong>运动补偿函数强制传两个时间戳并断言其差</strong>（第 5 节）</li>
+    <li><strong>关联门宽用 $k\sqrt{\sigma_1^2+\sigma_2^2}$，不用常数</strong>（第 6 节）</li>
+    <li><strong>把端到端延迟测出来，并把结果预测到使用时刻</strong>（第 6b 节）——<em>每 30 ms 值 1 米，而预测的残差是毫米级</em></li>
+    <li><strong>明确不做：rolling shutter 畸变建模、高阶位姿插值</strong>（第 8 节）——<em>把「决定不做」也记录下来，否则它会被反复重新提出</em></li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <strong>最后一条是本课最想留下的一条工作习惯。</strong><em>这门课量出了不少「不值得修」的项——单目标的 rolling shutter（0.007 m）、高阶插值（0.15 mm）、归一化的精度收益（模块 02 第 4 节）、PnP 正交化的精度收益（模块 03 第 6 节）</em>。<strong>把这些结论连同数字一起写进文档，比只记录「我们做了什么」有用得多</strong>——<em>因为「为什么没做」是最容易丢失、也最容易被重新踩的知识。</em>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../04_bev_fusion/04_讲解.html"><div class="dir">← 上一模块</div><div class="t">04 · BEV 投影与多相机融合</div></a>
+  </div>
+
+</div>
+</body>
+</html>

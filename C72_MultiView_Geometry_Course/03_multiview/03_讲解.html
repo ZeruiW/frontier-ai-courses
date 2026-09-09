@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 多视角几何：对极、三角测量、单应、PnP</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 多视角几何：对极、三角测量、单应、PnP</h1>
+  <p class="subtitle"><strong>四种补法的精度排序与通用性排序恰好相反</strong>：地面 IPM ±0.68 m &lt; 已知尺寸 ±1.30 m &lt; 双目 ±2.08 m（@50m, 0.5 px）——<em>所以 IPM 不是差，是「非常准但适用范围很窄」</em> · 对极几何的工程价值是<strong>否决匹配</strong>，而 Sampson 距离才是像素单位的度量 · <strong>$Z^2$ 定律里的 $\Delta d$ 是<em>视差</em>误差</strong>——两图各 0.5 px 独立噪声给出 $0.5\sqrt2$，<strong>实测/公式恒为 1.41，直接代入会低估 41%</strong> · 深度分布<strong>右偏</strong>，所以多帧融合取中位数 · <strong>PnP 正交化的收益不是精度而是合法性</strong>：方向误差只改善 1.24 倍、重投影 RMS 反而变差；<em>而顺带暴露一个度量陷阱——用 trace 公式量非正交矩阵的旋转误差，47% 的实现给出恰好 0.00°</em> · 已知尺寸测距的主要风险是<strong>分类错误</strong>（错一档 = +50%），而不是测量误差</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01 的相机模型、模块 02 的外参；SVD</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_multiview.ipynb（本质矩阵与极线约束（残差 1e-17）/ 线性 DLT 三角测量 / <strong>Z² 定律，以及「实测 σ(Z) 恒为公式的 √2 倍」的原因</strong> / 基线取舍 / DLT-PnP / 已知尺寸测距 / 四种补法的精度对照）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Hartley &amp; Zisserman, <em>Multiple View Geometry</em>（第 9–12 章：对极几何、三角测量、单应）· Lepetit et al., <em>EPnP</em>（IJCV 2009）· 本课程 C57（小目标：远处标志只有十几个像素）· C55 模块 02（TSR 两级 vs 端到端管线）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 45 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#four-ways">补上那个自由度的四种办法，以及它们的精度排序</a></li>
+      <li><a href="#epipolar">对极几何：两个视角之间唯一的硬约束</a></li>
+      <li><a href="#triangulation">三角测量：$Z^2$ 定律，以及公式里的「视差误差」是什么</a></li>
+      <li><a href="#baseline">基线的取舍：几何上越长越好，真正的限制在别处</a></li>
+      <li><a href="#homography-2view">单应：平面场景的完整关系，以及它与 IPM 的关系</a></li>
+      <li><a href="#pnp">PnP：已知三维点求相机位姿</a></li>
+      <li><a href="#known-size">已知尺寸测距：TSR 里最实用的一种补法</a></li>
+      <li><a href="#matching">三角测量真正的瓶颈是匹配精度</a></li>
+      <li><a href="#three-view">第三个视角：从「求解」到「否决」</a></li>
+      <li><a href="#decision">四种补法的选择树，以及为什么顺序不能反</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="four-ways"><span class="num">1</span>补上那个自由度的四种办法，以及它们的精度排序</h2>
+  <p>模块 00 说过：一个像素对应一条射线，落到三维必须补一个自由度，补法只有四种。<strong>这一节先把结论放出来——它们的精度差别比想象的大，而排序也和直觉相反。</strong></p>  <table>
+    <thead><tr><th>补法</th><th>需要什么</th><th>50 m 处的不确定度（0.5 px 测量误差）</th><th>适用对象</th></tr></thead>
+    <tbody>
+      <tr><td><strong>地面平面假设（IPM）</strong></td><td>相机高度 + 外参</td><td><strong>±0.68 m（1.4%）</strong> ← 最准</td><td><strong>只对 $z=0$ 的目标</strong>：车道线、路面箭头</td></tr>
+      <tr><td><strong>已知物理尺寸</strong></td><td>目标的真实边长</td><td>±1.30 m（2.6%）</td><td><strong>交通标志</strong>（法规钉死了尺寸）</td></tr>
+      <tr><td>双目三角测量（$B=0.5$ m）</td><td>第二个视角 + 匹配</td><td>±2.08 m（4.2%，公式值）</td><td>任意目标</td></tr>
+      <tr><td>双目三角测量（$B=0.25$ m）</td><td>同上</td><td>±4.17 m（8.3%）</td><td>任意目标</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第一行是反直觉的：地面假设在它成立时精度最高。</strong><em>原因是几何杠杆——射线与地面的交点对像素行的敏感度，在小俯角下比视差对深度的敏感度更有利</em>。所以模块 00 那个「IPM 对标志不适用」的结论要正确理解：<strong>IPM 不是差，是「非常准但适用范围很窄」。</strong><em>把它用在标志上是用错了工具，不是工具不好。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>第二行是 TSR 的正解。</strong>交通标志的尺寸是被法规规定的（圆形限速牌常见 0.6 / 0.8 / 1.2 m 直径），<em>所以「已知尺寸」这个条件在这里是免费的</em>——而它给出的精度是双目的两倍好。<strong>代价是必须先把标志分类对</strong>（尺寸取决于牌种与道路等级），<em>而分类错一档（0.8 → 1.2 m）会让距离错 50%</em>。所以这条路把「测距精度」耦合到了「分类正确率」上——<strong>这个耦合必须显式记录在感知接口里</strong>（C59 模块 03）。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>选择树只有三个问题</strong>：① 目标在地面上吗 → 用 IPM；② 目标的物理尺寸已知吗 → 用已知尺寸；③ 两个都不行 → 才用双目/多视角。<em>而第 8 节会说明为什么这个顺序不能反</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="epipolar"><span class="num">2</span>对极几何：两个视角之间唯一的硬约束</h2>
+  <p>两台相机看同一个点，这件事在图像上留下一个<strong>不依赖三维坐标</strong>的约束：</p>  <div class="math-block">\[\tilde{u}_2^\top F\,\tilde{u}_1 = 0,\qquad F = K_2^{-\top}\,[t]_\times R\,K_1^{-1}\]</div>  <p>$[t]_\times R$ 就是<strong>本质矩阵</strong> $E$，它只含外参；$F$ 是把内参也吸收进去的版本，直接作用在像素上。</p>  <table>
+    <thead><tr><th>矩阵</th><th>作用在</th><th>自由度</th><th>它能做什么</th></tr></thead>
+    <tbody>
+      <tr><td>$E$（本质矩阵）</td><td>归一化坐标</td><td>5</td><td>已知内参时的两视角相对位姿</td></tr>
+      <tr><td>$F$（基础矩阵）</td><td>像素坐标</td><td>7</td><td><strong>不需要内参</strong>——所以它可以先算出来再谈标定</td></tr>
+      <tr><td>$H$（单应）</td><td>像素坐标</td><td>8</td><td><strong>只在场景是平面时</strong>才是两视角的完整关系（第 5 节）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>对极约束的工程价值不是用来求位姿，而是用来<em>否决</em>匹配。</strong>给定一对候选匹配点，$\tilde{u}_2^\top F\tilde{u}_1$ 离 0 有多远（换算成像素距离）就是它有多不可能是同一个三维点。<em>notebook 第 2 节验证纯水平平移的双目里极线是水平的，而残差量级是 $10^{-17}$（代数）/ $10^{-14}$ px（Sampson）</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>要注意代数残差与像素距离不是一回事。</strong>$\tilde{u}_2^\top F\tilde{u}_1$ 的量级依赖 $F$ 的尺度，<em>所以它不能直接和一个像素阈值比</em>。标准做法是 <strong>Sampson 距离</strong>——把代数残差按 $F$ 的梯度归一化，得到一个真正以像素为单位的量。<strong>它是「几何门」的正确度量</strong>（模块 05 第 5 节的跨镜关联会用到它）。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="triangulation"><span class="num">3</span>三角测量：$Z^2$ 定律，以及公式里的「视差误差」是什么</h2>
+  <p>两条射线求交。深度误差有一个精确的一阶表达式：</p>  <div class="math-block">\[\Delta Z \approx \frac{Z^2}{B f}\,\Delta d\]</div>  <p>其中 $B$ 是基线、$f$ 焦距、$\Delta d$ 是<strong>视差</strong>误差。<strong>$Z^2$ 是这一层最重要的一个数字：距离翻倍，误差变四倍。</strong></p>  <table>
+    <thead><tr><th>$Z$</th><th>视差（$B=0.5$ m）</th><th>公式：$\Delta d=0.5$ px</th><th>实测：两图各 0.5 px 噪声</th><th>实测/公式</th></tr></thead>
+    <tbody>
+      <tr><td>10 m</td><td>60.00 px</td><td>0.083 m</td><td>0.118 m</td><td>1.42</td></tr>
+      <tr><td>20 m</td><td>30.00 px</td><td>0.333 m</td><td>0.460 m</td><td>1.38</td></tr>
+      <tr><td>30 m</td><td>20.00 px</td><td>0.750 m</td><td>1.077 m</td><td>1.44</td></tr>
+      <tr><td>50 m</td><td>12.00 px</td><td>2.083 m</td><td>2.929 m</td><td>1.41</td></tr>
+      <tr><td>80 m</td><td>7.50 px</td><td>5.333 m</td><td>7.495 m</td><td>1.41</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <strong>最后一列恒为 $\sqrt2$，这不是巧合。</strong>公式里的 $\Delta d$ 是<em>视差</em>的误差，而视差 $=u_1-u_2$ 是两个独立测量的差——<strong>两图各有 $\sigma$ 的独立噪声时，视差的噪声是 $\sigma\sqrt2$</strong>。<em>所以「像素定位精度 0.5 px」代入公式时要先乘 $\sqrt2$，否则会系统性地低估 41% 的深度不确定度。</em>这是一个很容易在设计文档里出现的错误。
+  </div>  <p>另外两个必须知道的性质：</p>  <ul>
+    <li><strong>误差是不对称的</strong>：视差偏小 → 深度偏大，而 $Z=Bf/d$ 的凸性让「偏远」的一侧幅度更大。<em>所以三角测量的输出天然是右偏的，取多帧<strong>中位数</strong>比取均值更合适</em></li>
+    <li><strong>视差为零就无解</strong>：$Z\to\infty$。而 $B=0.5$ m、$f=1200$ 时 80 m 处视差只有 7.5 px——<em>亚像素匹配精度直接决定了「最远能测多远」</em></li>
+  </ul>
+
+  <!-- ========================================================= -->
+  <h2 id="baseline"><span class="num">4</span>基线的取舍：几何上越长越好，真正的限制在别处</h2>
+  <table>
+    <thead><tr><th>基线 $B$</th><th>50 m 处视差</th><th>$\Delta Z$（0.5 px）</th><th>两路视场开始重叠的距离</th></tr></thead>
+    <tbody>
+      <tr><td>0.12 m</td><td>2.88 px</td><td>8.68 m</td><td>0.08 m</td></tr>
+      <tr><td>0.25 m</td><td>6.00 px</td><td>4.17 m</td><td>0.16 m</td></tr>
+      <tr><td>0.50 m</td><td>12.00 px</td><td>2.08 m</td><td>0.31 m</td></tr>
+      <tr><td>1.00 m</td><td>24.00 px</td><td>1.04 m</td><td>0.63 m</td></tr>
+      <tr><td>1.80 m（车宽极限）</td><td>43.20 px</td><td><strong>0.58 m</strong></td><td>1.13 m</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>常见说法是「基线越长盲区越大」，而上表说明这个顾虑在前视双目里几乎不存在</strong>：77° 水平视场下，$B=1.8$ m 的两路在 1.13 m 处就开始重叠，<em>而那已经在车头以内</em>。$\Delta Z\propto 1/B$，所以从 0.25 m 加到 1.0 m 是四倍的精度提升。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>真正的限制有三个，而它们都不是几何的。</strong>① <strong>安装</strong>：挡风玻璃后能拉开的距离有限，而分置两侧则要跨过车身刚度的变化；② <strong>标定稳定性</strong>：基线越长，两台相机的<em>相对</em>角度漂移越难控制（温度、振动、形变），<em>而 0.1° 的相对偏转就是 2.1 px 的视差偏差</em>；③ <strong>匹配难度</strong>：基线越长，同一目标在两图里的外观差异越大（透视、遮挡、反光角度），<strong>于是匹配误差（以像素计）变大，把 $1/B$ 的收益吃掉一部分</strong>。<em>这三条都无法在合成场景里量出来，所以本课只给出机制，不给数字。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>第②条值得单独强调：<strong>双目的标定是「相对外参」，而它的漂移不会被单目的任何检查发现。</strong><em>可用的自查是「同一目标两路各自单目测距（各用已知尺寸）应当一致」</em>——而这正是模块 04 第 5 节的重叠区一致性检查在双目上的形态。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="homography-2view"><span class="num">5</span>单应：平面场景的完整关系，以及它与 IPM 的关系</h2>
+  <p>如果所有点都在同一个平面上，两视角之间的关系不再需要深度——<strong>一个 $3\times3$ 的单应就完全确定了</strong>：</p>  <div class="math-block">\[H = K_2\Bigl(R - \frac{t\,n^\top}{d}\Bigr)K_1^{-1}\]</div>  <p>其中 $n,d$ 是平面在第一台相机坐标系里的法向与距离。</p>  <table>
+    <thead><tr><th>情形</th><th>两视角关系</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td>场景是平面</td><td><strong>单应（8 自由度）完全确定</strong></td><td>深度被平面方程消掉了</td></tr>
+      <tr><td>场景不是平面</td><td>只有对极约束（$F$，7 自由度）</td><td>每个点还剩一个自由度（沿极线的位置）</td></tr>
+      <tr><td><strong>纯旋转（$t=0$）</strong></td><td><strong>单应，与场景无关</strong></td><td><em>这是全景拼接能工作的原因；也意味着纯旋转下无法三角测量</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>IPM 就是这个式子的一个特例</strong>：把「第二台相机」换成一台<em>俯视地面的虚拟相机</em>，平面取 $z=0$ 的地面，于是「原图 → BEV 图」是一个单应。<em>模块 04 就是把这个虚拟相机建出来</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而模块 00 那个中心公式，就是「平面取错了」的代价。</strong>$H$ 里的 $n,d$ 描述的是<em>你假设的那个平面</em>；目标不在这个平面上时，<strong>误差不是随机的，而是被 $H$ 精确地、系统地映射到一个错误位置</strong>——$d_{\text{read}}=dH/(H-z)$ 就是这个映射的显式形式。<em>所以「用单应做 BEV」和「假设目标在地面上」是同一句话的两种说法。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pnp"><span class="num">6</span>PnP：已知三维点求相机位姿</h2>
+  <p>标定板、已知场景点、地面标记——凡是「三维坐标已知、图像位置可测」的点，都能用来求相机位姿。这就是 PnP（Perspective-n-Point）。</p>  <div class="ascii">   线性 DLT-PnP（notebook 第 5 节实现）
+
+   对每个点 (X, u)：  u × (P X) = 0   给出 2 个线性方程
+   P 是 3x4、11 个自由度  -&gt;  **至少 6 个点**
+
+   ① 解 P（SVD 最小奇异向量）
+   ② 已知 K：R_raw = K^{-1} P[:, :3]
+   ③ 把 R_raw 投影回最近的旋转矩阵（SVD：R = U V^T）
+      └── 这一步必须做，否则 R 不正交，后续一切都错
+
+   实践里用 EPnP / SQPnP 起手，再用 LM 精化重投影误差
+        </div>  <p><strong>第③步值得单独说，因为它的理由和大多数人以为的不一样。</strong>线性解出来的 $R_{	ext{raw}}$ 在有噪声时不是正交矩阵。<em>直觉上会以为「正交化能提高精度」——而实测不是。</em></p>  <table>
+    <thead><tr><th>角点噪声</th><th>正交化</th><th>方向误差</th><th>$\lVert R^\top R-I\rVert$</th><th>重投影 RMS</th></tr></thead>
+    <tbody>
+      <tr><td>0.5 px</td><td>否</td><td>0.0478°</td><td>3.2×10⁻³</td><td><strong>0.655 px</strong></td></tr>
+      <tr><td>0.5 px</td><td>是</td><td><strong>0.0385°</strong></td><td>9.6×10⁻¹⁶</td><td>0.724 px</td></tr>
+      <tr><td>2.0 px</td><td>否</td><td>0.1908°</td><td>1.3×10⁻²</td><td><strong>2.619 px</strong></td></tr>
+      <tr><td>2.0 px</td><td>是</td><td>0.1538°</td><td>1.1×10⁻¹⁵</td><td>2.895 px</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>正交化只把方向误差改善 1.24 倍，而且让重投影误差<em>变差</em> 0.905 倍。</strong><em>后者是有道理的：非正交的 $R$ 多出三个自由度（尺度与剪切），所以它能更好地拟合噪声——代价是它不再是一个旋转</em>。<strong>所以正交化的理由不是精度，是<em>合法性</em></strong>：下游要用它做坐标变换，<em>而一个带尺度和剪切的「旋转」会把这些畸变悄悄传到每一个变换过的点上</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这一节还有一个更值得记的陷阱：怎么<em>度量</em>旋转误差。</strong>常用的 $\arccos\frac{\mathrm{tr}(R^\top R_{\text{true}})-1}{2}$ <strong>只对正交矩阵有效</strong>。<em>非正交时 $\frac{\mathrm{tr}-1}{2}$ 会跑到 $[-1,1]$ 之外，被 <code>clip</code> 之后 <code>arccos</code> 给出恰好 0° 或 180°</em>。<strong>notebook 第 5 节量到：30 个随机实现里有 47% 得到「误差恰好 0.00°」</strong>——一个看起来完全合理、实际上无意义的数字。<em>正确的度量是「把一组单位方向向量用 $R$ 变换后与真值的夹角」，它对任意矩阵都有定义。</em></p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <strong>这个陷阱值得推广：一个度量在它的定义域之外会静默地给出合理的数字。</strong><em>本课作者第一版就栽在这里——用 trace 公式量出「正交化改善 14.5 倍」，而那 14.5 倍完全是 <code>clip</code> 的产物</em>。对策是：<strong>先检查输入是否满足度量的前提</strong>（这里就是 <code>assert</code> 正交性），而不是先看数字合不合理。
+  </div>  <p><strong>PnP 在本课语境里的用途是标定外参</strong>（模块 02 第 5b 节的前两种方法），而不是逐帧求位姿。<em>逐帧位姿属于 VIO/SLAM，那需要时序与 IMU，是另一门课</em>。但有一个逐帧的轻量用法值得知道：<strong>用车道线上若干已知间距的虚线端点做 PnP，可以在线估计 pitch</strong>——<em>它比消失点法多定一个自由度（相机高度），代价是需要车道线的纵向标记间距</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="known-size"><span class="num">7</span>已知尺寸测距：TSR 里最实用的一种补法</h2>
+  <p>相似三角形，一行公式：</p>  <div class="math-block">\[Z = \frac{f\cdot S}{s},\qquad \Delta Z \approx \frac{Z^2}{f\cdot S}\,\Delta s\]</div>  <p>$S$ 是物理边长、$s$ 是像素边长。<strong>注意误差式与三角测量同构——把基线 $B$ 换成了物体尺寸 $S$。</strong>所以它同样服从 $Z^2$ 定律（模块 00 练习 2 验证过「宽度/$d^2$」在 1% 内恒定）。</p>  <table>
+    <thead><tr><th>误差来源</th><th>量级</th><th>对 50 m 处距离的影响</th></tr></thead>
+    <tbody>
+      <tr><td>像素边长测量误差 ±1 px</td><td>$s=19.2$ px 时约 5%</td><td><strong>±2.6 m</strong></td></tr>
+      <tr><td><strong>牌种分类错一档</strong>（0.8 → 1.2 m）</td><td>$S$ 错 50%</td><td><strong>+25 m（错 50%）</strong> ← 最致命</td></tr>
+      <tr><td>牌面倾斜（非正对）</td><td>投影缩短 $\cos\theta$</td><td>$\theta=30°$ 时低估 13%（±6.7 m）</td></tr>
+      <tr><td>牌面被部分遮挡</td><td>边长被低估</td><td><strong>系统性高估距离</strong>，且无法从单帧判断</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第二行说明这条路的风险结构与其它三种完全不同</strong>：它的主要误差不是<em>测量</em>误差，而是<strong>分类</strong>误差。<em>而分类误差是离散的、跳变的，不是高斯的</em>——所以「±2.6 m」这个不确定度只在分类正确时成立，<strong>分类错时误差是 +25 m 而不是 ±2.6 m</strong>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>工程上的处理办法是把两种不确定度分开报。</strong>感知接口给出 <code>range_m</code> 与 <code>sigma_m</code> 之外，还要给 <strong><code>size_prior_id</code> 与它的置信度</strong>——<em>下游才能知道「这个 ±2.6 m 是在哪个前提下的」</em>。而后两行（倾斜、遮挡）都会造成<strong>系统性高估</strong>，<strong>所以已知尺寸测距的偏差方向是可预测的：它倾向于把目标报得更远。</strong><em>这一点对下游是有用的信息——保守方向取决于场景，而不是自动安全。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="matching"><span class="num">8</span>三角测量真正的瓶颈是匹配精度</h2>
+  <p>上一节的 $\Delta d$ 不是相机给的，是<strong>匹配算法</strong>给的。把 $Z^2$ 定律反解，就能得到「最远能测多远」：</p>  <div class="math-block">\[Z_{\max}\Big|_{\Delta Z/Z\le 10\%} = \frac{0.1\,Bf}{\sqrt2\,\Delta d}\]</div>  <table>
+    <thead><tr><th>亚像素精度 $\Delta d$</th><th>$B=0.25$ m</th><th>$B=0.5$ m</th><th>$B=1.0$ m</th><th>$B=1.8$ m</th></tr></thead>
+    <tbody>
+      <tr><td>1.0 px</td><td>21 m</td><td>42 m</td><td>85 m</td><td>153 m</td></tr>
+      <tr><td><strong>0.5 px</strong></td><td>42 m</td><td><strong>85 m</strong></td><td>170 m</td><td>305 m</td></tr>
+      <tr><td>0.2 px</td><td>106 m</td><td>212 m</td><td>424 m</td><td>764 m</td></tr>
+      <tr><td>0.1 px</td><td>212 m</td><td>424 m</td><td>849 m</td><td>1527 m</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这张表把「测多远」变成了「匹配多准」的函数。</strong>反过来看：要在 80 m 处做到 10% 的相对精度，<em>$B=0.5$ m 需要 0.53 px 的匹配精度，而 $B=0.25$ m 需要 0.265 px</em>。<strong>所以「加长基线」与「提高匹配精度」是可以互换的两条路</strong>，而前者是一次性的硬件成本、后者是持续的算法成本。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而对 TSR 来说，这张表其实说明双目不是主路。</strong>交通标志在 80 m 处只有十几个像素（C57 的主题），<em>而在一个十几像素的目标上做到 0.5 px 的匹配精度，意味着 3–4% 的相对定位精度</em>——可能但不容易。<strong>相比之下「已知尺寸」这条路在同样的十几像素上只需要测边长，而边长是一个更稳的量</strong>（<em>它对匹配误差的两端有平均效应</em>）。所以第 1 节的精度排序不只是数字好看，它是有机制支撑的。</p></div>
+  </div>  <h3>什么样的目标是「好匹配目标」</h3>  <ul>
+    <li><strong>高对比、独特的纹理</strong>——交通标志恰好是（人为设计成远距离可辨识的）</li>
+    <li><strong>没有重复结构</strong>——护栏、斑马线、栅栏是最坏的情形（<em>沿极线有多个同样好的匹配</em>）</li>
+    <li><strong>不在遮挡边界上</strong>——两图看到的不是同一个物理表面</li>
+    <li><strong>不是镜面/反光</strong>——外观依赖视角，<em>而这恰好是湿路面与车漆的常态</em></li>
+  </ul>  <div class="callout intuition"><span class="label"></span>
+    <p>一条实用的自查：<strong>把匹配得到的视差沿极线画出置信度曲线，看它有几个峰。</strong><em>单峰且尖 → 可信；多峰 → 重复纹理，该丢弃；平坦 → 弱纹理，该丢弃。</em><strong>而丢弃比给一个错的视差好</strong>——因为错的视差会被下游当成一个自信的距离（第 10 节）。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="three-view"><span class="num">9</span>第三个视角：从「求解」到「否决」</h2>
+  <p>两个视角能解出三维点，第三个视角<strong>不增加可解性，但增加可验证性</strong>。这与模块 02 第 2 节「rank 在 5 就饱和」是同一个结构。</p>  <table>
+    <thead><tr><th>视角数</th><th>能做什么</th><th>不能做什么</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>一条射线</td><td>任何三维定位（除非补假设）</td></tr>
+      <tr><td>2</td><td><strong>解出三维点</strong></td><td><strong>无法判断这个解对不对</strong>——<em>错误匹配也会给出一个完全合法的三维点</em></td></tr>
+      <tr><td>3</td><td>同上，外加<strong>一个可检验的一致性条件</strong></td><td>仍然无法处理系统性的外参偏差（三路都偏时它一致地错）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第二行是双目系统最危险的性质：错误匹配不报错。</strong>把左图的 A 点错配到右图的 B 点，<em>三角测量照样给出一个三维点，而且它的重投影误差是零</em>（因为两条射线确实在那里相交）。<strong>所以双目的错误不是噪声，是离群点</strong>——而它们无法从单次测量里被发现。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>第三个视角提供的检验是：把两视角解出的点投影到第三路，看它落在哪。</strong><em>正确匹配 → 落在观测点附近；错误匹配 → 落在别处</em>。这个检验的代价是一次投影，<strong>而它是这一层唯一不需要真值就能否决错误匹配的手段</strong>。<em>只有两路时的替代方案是「时间上的第三个视角」——用上一帧的结果做一致性检查，而那属于模块 05。</em></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>括号里那句要记住：<strong>三路一起偏时，一致性检查全都通过。</strong><em>而「三路一起偏」正是共同外参基准出错时的表现</em>（比如车体坐标系的 $Z=0$ 定义错了，模块 02 第 5b 节）。<strong>所以一致性检查只能抓「相对」错误，抓不住「共同」错误</strong>——后者只能靠模块 02 的验收项与另一种传感器。</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="decision"><span class="num">10</span>四种补法的选择树，以及为什么顺序不能反</h2>
+  <div class="ascii">   给一个检测框，要一个米数
+
+   目标在地面上吗（车道线/箭头/可行驶区域）？
+     ├── 是 ──► **IPM**            ±0.68 m @50m   ← 最准，但只对 z=0
+     └── 否
+          物理尺寸已知吗（交通标志/车牌/红绿灯）？
+            ├── 是 ──► **已知尺寸**  ±1.30 m @50m   ← 依赖分类正确
+            └── 否
+                 有第二个视角吗？
+                   ├── 是 ──► **三角测量** ±2.08 m @50m（B=0.5，还要乘 √2）
+                   └── 否 ──► **只能给一条射线 + 一个先验区间**
+                                └── 而这必须诚实地告诉下游
+        </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>顺序不能反的理由是：越靠前的补法用的假设越强、精度越高。</strong><em>而「用更通用的方法」在这里意味着「用更弱的假设」，也就是更大的不确定度</em>。所以正确的策略是<strong>用尽你已知的所有先验</strong>——地面就是地面，法规尺寸就是法规尺寸，<strong>不要为了统一而把它们都退化成三角测量。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而最后那个分支是这一节真正想说的。</strong>四种补法都不成立时，<em>正确的输出不是「随便给一个距离」，而是「一条射线 + 一个区间」</em>。<strong>把「我不知道」编码成一个宽区间，比编码成一个带假 <code>sigma_m</code> 的点估计安全得多</strong>——因为下游的融合会按 $\sigma$ 加权，<em>一个自信的错误答案比一个诚实的宽区间更有破坏力</em>。这与 C67 模块 01 的「可判定性阶梯」是同一个原则：<strong>先判断这件事能不能被回答，再回答。</strong></p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <strong>本模块的交付物是练习 4 的 <code>range_estimator</code></strong>：它按上面的树选补法、返回 <code>(range_m, sigma_m, assumption, prior_id)</code> 四元组。<em>四个字段一起给，是让下游能正确融合的最低要求。</em>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_calibration/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 标定：内参、外参与验收</div></a>
+    <a class="next" href="../04_bev_fusion/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · BEV 投影与多相机融合</div></a>
+  </div>
+
+</div>
+</body>
+</html>
