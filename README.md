@@ -1,6 +1,6 @@
 # Frontier AI Researcher / Engineer Courses · 前沿 AI 研究工程师课程体系
 
-**73 courses · 466 lesson pages · 466 runnable notebooks · Colab-ready, CPU-first, from-scratch.**
+**74 courses · 472 lesson pages · 472 runnable notebooks · Colab-ready, CPU-first, from-scratch.**
 一套从 model evaluation 起步、长成全栈的前沿 AI 研究/工程课程体系 —— 深度 HTML 讲解 + 真实可跑 notebook，纯 numpy/CPU 优先、优雅降级到真实框架/GPU。
 
 📖 中文 → [跳转](#中文) · 🇬🇧 English → [jump](#english)
@@ -13,7 +13,7 @@
 ### 目录
 - [这是什么](#zh-what)
 - [快速开始](#zh-quickstart)
-- [课程总览（73 门）](#zh-catalog)
+- [课程总览（74 门）](#zh-catalog)
 - [每门课的格式](#zh-format)
 - [学习路径建议](#zh-paths)
 - [仓库结构](#zh-layout)
@@ -49,7 +49,7 @@ jupyter lab
 先打开某模块的 `NN_讲解.html`（或先看 `index.html` 选路径），读完讲解再跑同名的 `.ipynb`。所有课程共用同一份 `assets/style.css`。
 
 <a name="zh-catalog"></a>
-### 课程总览（73 门）
+### 课程总览（74 门）
 
 #### C00–C09 · 核心 LLM / 评测主线
 | 课 | 目录 | 主题 |
@@ -181,6 +181,21 @@ jupyter lab
 > 中心结论：$d_{\text{read}} = d\cdot H/(H-z)$，所以**地面 IPM 对交通标志不是误差大，
 > 而是根本无解**（$z \ge H$）；而相对误差 $z/(H-z)$ **与距离无关**。
 > 它同时是同批后续 3D 课的**共同前提**（分界线是「有没有学习成分」）。
+
+#### C73 · 3D 表示与点云深度学习
+
+| 课 | 目录 | 主题 | 补的洞 |
+|----|------|------|--------|
+| C73 | `C73_3D_Representation_Course/` | 3D 表示与点云深度学习（四种表示的代价账 · 置换不变性与 max-pool · 体素化与稀疏卷积 · 3D 检测：锚框到中心点 · 分割与 3D 评测） | 热门 3D 方向整块零覆盖：`PointNet` 0、`PointPillars` 0、`体素/voxel` 0、`点云分割` 0、`双目` 0、`单目深度` 0、`SDF` 0；而 C53–C61 的所有 3D 讨论都假设这套工具已知 |
+
+> **有学习成分，但全程 numpy、不训练任何真实网络**——因为 3D 网络的关键设计几乎都由
+> **结构性质**决定（恒等式、定理、集合运算、几何计算），而这些与权重取值无关。
+> 中心链条：**从 2D 到 3D，几乎每个量都从两个因子的积变成三个因子的积**，
+> 而它们互相加强（网格规模 → 量化误差 → IoU → 正样本）。
+> 最硬的一条结论：$\text{IoU}=q/(2-q)$ ⇒ 单轴容差恰好 $s_i/3$ ⇒
+> 交通标志的容差 0.049 m 与典型标注噪声 0.05 m 之比是 **0.98×** ⇒
+> **一个完美模型在标志上的 AP@IoU0.5 上界只有 0.392**（中心距离口径下是 1.000）。
+> 以 C72 为前提；与 C74/C75 的分工是「离散表示 + 判别式」vs「连续表示 + 生成式」。
 > 两者都明确不碰 C11（检索算法）与 C33（上下文预算），并全程复用它们的定义而不重新定义。
 
 <a name="zh-format"></a>
@@ -193,7 +208,7 @@ CXX_Xxx_Course/
 ├── glossary.md          术语词典（≥12KB）
 ├── references.md        参考清单（论文/文档，标★必读）
 ├── requirements.txt      依赖（绝大多数课只需要 numpy/pandas/jupyterlab）
-├── assets/style.css      全站共用同一份样式（73 门课字节级一致）
+├── assets/style.css      全站共用同一份样式（74 门课字节级一致）
 ├── 00_setup/
 │   ├── 00_overview.html         课程总览
 │   └── 00_environment_check.ipynb
@@ -228,9 +243,9 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 ├── index.html               全站课程总览页
 ├── COURSES_PLAN.md            课程规划与构建历史的完整记录
 ├── ENV_SETUP.md                本地 conda 环境搭建笔记
-├── requirements-all.txt        全部 73 门课依赖的合集（装一次跑所有课）
+├── requirements-all.txt        全部 74 门课依赖的合集（装一次跑所有课）
 ├── _buildkit/                  house-style 生成器（coursekit.py）+ 各课构建脚本
-├── C00_..._Course/ … C72_..._Course/   73 门课，每门结构见上
+├── C00_..._Course/ … C73_..._Course/   74 门课，每门结构见上
 └── README.md                   就是这份文件
 ```
 
@@ -244,7 +259,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 <a name="zh-env"></a>
 ### 环境与依赖
 
-- **本地全量环境**：一个 conda env（`courses`，Python 3.11）配好 PyTorch + HuggingFace 全家桶 + 常用科学计算库即可跑完全部 73 门课，详见 [`ENV_SETUP.md`](./ENV_SETUP.md)；合集依赖在 [`requirements-all.txt`](./requirements-all.txt)。
+- **本地全量环境**：一个 conda env（`courses`，Python 3.11）配好 PyTorch + HuggingFace 全家桶 + 常用科学计算库即可跑完全部 74 门课，详见 [`ENV_SETUP.md`](./ENV_SETUP.md)；合集依赖在 [`requirements-all.txt`](./requirements-all.txt)。
 - **只想跑单门课**：进对应课程目录 `pip install -r requirements.txt` 即可——大多数课这份文件只有 `numpy`/`pandas`/`jupyterlab`/`ipykernel` 四五行。
 - 所有需要 `transformers`/`bitsandbytes`/`qwen-vl-utils` 等重依赖的真实模型 cell 都包了 `try/except`：装不上/没网/没 GPU 时会优雅降级到纯 Python/numpy 的替代实现或跳过，**不会让整本 notebook 崩掉**。
 
@@ -260,6 +275,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 - 2026-08-31：按「AI Agent + 大模型 Evaluation」的诉求做覆盖度比对，新增 C66–C69 四门课（纯追加）。四门课共 24 个 notebook、549 个 code cell、96 道 ✏️ 练习自测 assert，全部两遍实跑通过。全谱达到 **70 门 · 448 讲解 HTML · 448 notebook**。
 - 2026-08-31（同日第二轮）：继续扩课，新增 C70（RAG 生产工程）与 C71（提示与上下文的程序化优化）。**先纠正了一次错误的缺口判断**——最初提议的「RAG 评测」与「多 agent 编排」已分别被 C11 与 C34 覆盖，会产出重复课；重新对全库 448 个讲解页做关键词扫描后才定下真实缺口。12 个 notebook、272 个 code cell、48 道练习自测 assert 全部两遍实跑通过。全谱达到 **72 门 · 460 讲解 HTML · 460 notebook**。
 - 2026-09-08：新增 C72（多视角几何与多传感器时空对齐）。**先扫全库 460 个讲解页做缺口验证**，并先列出「查过、确认不用建」的五个方向（缩放律 / 投机解码 / 持续学习 / 标注运维 / 蒸馏，全部已覆盖）；确认为零覆盖的是「像素 → 米」这条几何链。6 个 notebook、115 个 code cell、24 道练习自测两遍实跑通过。**本轮有五处结论是被真实计算否掉后重写的**：DLT 归一化的精度收益在有噪声时消失（无噪声 45.8 倍 → 0.2 px 噪声下只剩 13% 且归一化略差）；「内外参分开标会互相吸收误差」是错的（吸收得非常干净，真正的问题是可辨识性——而分开它们靠扩大图像行覆盖，σ(pitch) 3.74° → 0.035°，改善 106 倍）；PnP 正交化不提高精度（方向误差只改善 1.24 倍、重投影 RMS 反而变差），且第一版量出的「14.5 倍」是一个**度量陷阱**的产物（trace 公式只对正交矩阵有效，非正交时 40–47% 的实现被 clip 成恰好 0.00°）；「等下一个 IMU 采样比外推准」是错的取舍（等待的代价大 2222 倍）；rolling shutter 对小目标不值得建模（0.005 px），而「整帧一个时间戳」值 0.667 m。另有**两处「本课自己的配置通不过自己的验收」**（模块 02 的 5 视角标定栽在边缘覆盖、模块 04 的均匀网格栽在采样率与坡度）——那是设计而非失误。全谱达到 **73 门 · 466 讲解 HTML · 466 notebook**。
+- 2026-09-09：新增 C73（3D 表示与点云深度学习）。扫全库 466 个讲解页确认热门 3D 方向整块零覆盖（PointNet / PointPillars / 体素 / 点云分割 / 双目 / 单目深度 / SDF 全部 0 命中）。6 个 notebook、117 个 code cell、24 道练习自测两遍实跑通过。**本轮有七处结论被真实计算否掉后重写**，其中三处最值得记：`sum`/`mean` 不是逐位置换不变的（浮点加法不满足结合律，相对差 1.43e-15；而 `max`/`min` 是选择操作所以逐位不变）——所以置换不变性的单元测试不能一律用「恰好相等」；`max` 并没有完全丢弃点数（线性探针 $R^2=0.76$，因为极值统计量依赖样本量）；膨胀最快的不是薄结构而是完全散开的点（22.05× vs 薄片 4.32×），而规则密度的排序恰好相反、两者之积被核大小 27 框住。**最硬的一条结论**（推导闭合）：单轴容差恰好 $s_i/3$ ⇒ 交通标志的容差 0.049 m 与典型标注噪声 0.05 m 之比 **0.98×** ⇒ 让预测等于真值、只给真值加标注噪声，AP@IoU0.5 上界只有 **0.392**（卡车与轿车都是 1.000，中心距离口径下四类恒为 1.000）——**所以那一列量的是标注噪声而不是模型能力**。另有三处「本课自己的配置通不过自己的审计」。全谱达到 **74 门 · 472 讲解 HTML · 472 notebook**。
 
 完整细节见 [`COURSES_PLAN.md`](./COURSES_PLAN.md)。
 
@@ -271,7 +287,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 ### Table of Contents
 - [What This Is](#en-what)
 - [Quick Start](#en-quickstart)
-- [Course Catalog (73 courses)](#en-catalog)
+- [Course Catalog (74 courses)](#en-catalog)
 - [Format of Each Course](#en-format)
 - [Suggested Learning Paths](#en-paths)
 - [Repository Layout](#en-layout)
@@ -307,7 +323,7 @@ jupyter lab
 Read a module's `NN_讲解.html` lesson first (or start from `index.html` to pick a path), then run the matching `.ipynb`. All courses share one `assets/style.css`.
 
 <a name="en-catalog"></a>
-### Course Catalog (73 courses)
+### Course Catalog (74 courses)
 
 #### C00–C09 · Core LLM & Evaluation Track
 | # | Folder | Topic |
@@ -440,6 +456,26 @@ Read a module's `NN_讲解.html` lesson first (or start from `index.html` to pic
 > and the relative error $z/(H-z)$ is **independent of distance**.
 > This course is also the shared prerequisite for the 3D courses that follow in the same
 > batch (the dividing line being whether there is a learning component).
+
+#### C73 · 3D Representations & Point-Cloud Deep Learning
+
+| # | Directory | Topic | Gap it fills |
+|---|-----------|-------|--------------|
+| C73 | `C73_3D_Representation_Course/` | 3D representations and point-cloud deep learning (the cost ledger of four representations · permutation invariance and max-pool · voxelization and sparse convolution · 3D detection from anchors to centers · segmentation and 3D evaluation) | The whole cluster of current 3D directions had no coverage: `PointNet` 0 hits, `PointPillars` 0, `voxel` 0, `point-cloud segmentation` 0, `stereo` 0, `monocular depth` 0, `SDF` 0 — while every 3D discussion in C53–C61 assumes these tools are already known |
+
+> **There is a learning component, but nothing is ever trained** — all of it is plain numpy.
+> The reason is that the decisive design choices in 3D networks follow from **structural
+> properties** (identities, theorems, set operations, geometric computations), and those can
+> be verified exactly without training and do not depend on the weights.
+> Central thread: going from 2D to 3D turns almost every quantity from a product of two
+> factors into a product of three, and those three reinforce each other
+> (grid size → quantization error → IoU → positive samples).
+> The sharpest result: $\text{IoU}=q/(2-q)$ gives a per-axis tolerance of exactly $s_i/3$,
+> so a traffic sign's 0.049 m tolerance sits at **0.98×** typical annotation noise (0.05 m) —
+> which means **a perfect model's AP@IoU0.5 ceiling on signs is only 0.392**
+> (it is 1.000 under the center-distance criterion).
+> Builds on C72; splits with C74/C75 as "discrete representations + discriminative tasks"
+> versus "continuous representations + generative tasks".
 > Neither touches C11 (retrieval algorithms) or C33 (context budget); both reuse those courses' definitions rather than redefining them.
 
 <a name="en-format"></a>
@@ -452,7 +488,7 @@ CXX_Xxx_Course/
 ├── glossary.md          Glossary (≥12KB)
 ├── references.md        Reference list (papers/docs, ★ = must-read)
 ├── requirements.txt      Dependencies (most courses need only numpy/pandas/jupyterlab)
-├── assets/style.css      One shared stylesheet across all 73 courses (byte-identical)
+├── assets/style.css      One shared stylesheet across all 74 courses (byte-identical)
 ├── 00_setup/
 │   ├── 00_overview.html         Course overview
 │   └── 00_environment_check.ipynb
@@ -487,9 +523,9 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 ├── index.html               Site-wide course overview page
 ├── COURSES_PLAN.md            Full record of the curriculum plan & build history
 ├── ENV_SETUP.md                Notes for setting up the local conda environment
-├── requirements-all.txt        Union of all 73 courses' dependencies (install once, run all)
+├── requirements-all.txt        Union of all 74 courses' dependencies (install once, run all)
 ├── _buildkit/                  House-style generator (coursekit.py) + each course's build scripts
-├── C00_..._Course/ … C72_..._Course/   73 courses, layout described above
+├── C00_..._Course/ … C73_..._Course/   74 courses, layout described above
 └── README.md                   This file
 ```
 
@@ -503,7 +539,7 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 <a name="en-env"></a>
 ### Environment & Dependencies
 
-- **Full local environment**: one conda env (`courses`, Python 3.11) with PyTorch + the HuggingFace stack + common scientific-computing libraries covers all 73 courses — see [`ENV_SETUP.md`](./ENV_SETUP.md); the combined dependency list is [`requirements-all.txt`](./requirements-all.txt).
+- **Full local environment**: one conda env (`courses`, Python 3.11) with PyTorch + the HuggingFace stack + common scientific-computing libraries covers all 74 courses — see [`ENV_SETUP.md`](./ENV_SETUP.md); the combined dependency list is [`requirements-all.txt`](./requirements-all.txt).
 - **Just want one course**: `cd` into that course's folder and `pip install -r requirements.txt` — for most courses that file is only 4–5 lines (`numpy`/`pandas`/`jupyterlab`/`ipykernel`).
 - Every cell that needs a heavier dependency (`transformers`/`bitsandbytes`/`qwen-vl-utils`, etc.) is wrapped in `try/except`: if it's not installed, there's no network, or no GPU, it degrades gracefully to a pure Python/numpy fallback or is skipped — **it will not crash the whole notebook**.
 
@@ -519,5 +555,6 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 - 2026-08-31: Gap analysis for "AI agents + LLM evaluation" added 4 courses, C66–C69 (purely additive). Across the four: 24 notebooks, 549 code cells, 96 exercise self-test asserts, all executed end to end in a two-pass run. Reached **70 courses · 448 lesson pages · 448 notebooks**.
 - 2026-08-31 (second round, same day): Added C70 (RAG production engineering) and C71 (prompt and context programming). **A wrong gap analysis was corrected first** — the initially proposed "RAG evaluation" and "multi-agent orchestration" were already covered by C11 and C34 respectively and would have produced duplicate courses; the real gaps were only settled after re-scanning all 448 lesson pages. 12 notebooks, 272 code cells, 48 exercise self-test asserts, all verified two-pass. Reached **72 courses · 460 lesson pages · 460 notebooks**.
 - 2026-09-08: Added C72 (multi-view geometry and multi-sensor spatio-temporal alignment). **The gap was verified by scanning all 460 lesson pages first**, and the five directions that were checked and found *already covered* were listed up front (scaling laws, speculative decoding, continual learning, annotation ops, distillation); what turned out to be genuinely absent was the pixel-to-metre geometric chain. 6 notebooks, 115 code cells, 24 exercise self-tests, all verified two-pass. **Five conclusions in this round were rewritten after real computation contradicted them**: the textbook accuracy benefit of DLT point normalization disappears once there is noise (45.8× with no noise, but only a 13% difference at 0.2 px corner noise — and normalization is *slightly worse*); "calibrating intrinsics and extrinsics separately makes them absorb each other\'s errors and be wrong at range" is false (the absorption is remarkably clean — the real issue is *identifiability*, and the only way to separate $c_y$ from pitch is to widen the image-row coverage: σ(pitch) 3.74° → 0.035°, a **106× improvement**, while the most convenient collection pattern is the worst one); PnP orthogonalization does not improve accuracy (direction error improves only 1.24× and reprojection RMS actually gets *worse*) — and the "14.5×" measured in the first draft was an artefact of a **metric used outside its domain** (the trace formula is only valid for orthogonal matrices; for non-orthogonal ones 40–47% of realizations get clipped to exactly 0.00°); "waiting for the next IMU sample beats extrapolating" is the wrong trade-off (waiting costs 2222× more); and rolling shutter is not worth modelling for small targets (0.005 px) while "one timestamp per frame" costs 0.667 m. There are also **two places where the course\'s own configuration fails its own acceptance checks** (the 5-view calibration set in module 02 fails on edge coverage; the uniform BEV grid in module 04 fails on both sampling rate and slope) — by design, not by accident. Reached **73 courses · 466 lesson pages · 466 notebooks**.
+- 2026-09-09: Added C73 (3D representations and point-cloud deep learning). A scan of all 466 lesson pages confirmed that the whole cluster of current 3D directions had zero coverage (PointNet, PointPillars, voxels, point-cloud segmentation, stereo, monocular depth, SDF — all 0 hits). 6 notebooks, 117 code cells, 24 exercise self-tests, all verified two-pass. **Seven conclusions were rewritten after real computation contradicted them**, three worth singling out: `sum`/`mean` are *not* bitwise permutation-invariant (floating-point addition is not associative; the relative difference is 1.43e-15, whereas `max`/`min` are, being pure selections) — so a permutation-invariance unit test cannot use exact equality for all aggregations; `max` does *not* discard the point count entirely (a linear probe gives $R^2=0.76$, because extreme-value statistics depend on sample size); and the fastest-dilating active set is not a thin structure but a fully scattered one (22.05× versus 4.32× for a sheet), while the rule density orders the opposite way and the product of the two is bounded by the kernel size 27. **The sharpest result** (a closed derivation): the per-axis tolerance is exactly $s_i/3$, so a traffic sign's 0.049 m tolerance sits at **0.98×** typical annotation noise (0.05 m); setting the prediction equal to the ground truth and adding only annotation noise to the labels, the AP@IoU0.5 ceiling on signs is just **0.392** (trucks and cars are both 1.000, and under the center-distance criterion all four classes are 1.000) — **so that column measures annotation noise, not model capability**. There are also three places where the course's own configuration fails its own audits. Reached **74 courses · 472 lesson pages · 472 notebooks**.
 
 Full details in [`COURSES_PLAN.md`](./COURSES_PLAN.md).

@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 四种三维表示的代价账</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 四种三维表示的代价账</h1>
+  <p class="subtitle">点云的三个性质（无序 / 无邻域 / <strong>密度不均匀</strong>）各自排除了什么 · <strong>用一个真实的 64 线环扫模型量出密度衰减</strong>：面密度 67.7 → 0.13 点/m²（约 520 倍），<strong>73 m 处相邻激光环在地面上相距 31 米</strong>，一块 0.8 m 的标志从 <strong>255 点掉到 4.6 点</strong> · <strong>多帧累积对静止目标是免费增益</strong>：120 km/h 下 10 帧给 <strong>17.2×</strong>（大于帧数，因为自车在靠近），<em>而 1 秒窗口对相对 20 km/h 的目标拖影 5.56 m——超过车长</em> · <strong>柱体把第三个乘子换成 1</strong>：同为 0.16 m，柱体占用 7.642% 而体素只有 0.156%——<strong>密 49 倍</strong>，<em>这才是 PointPillars 快的真正原因</em> · <strong>FPS 不是「更好的采样」，是方向相反的偏倚</strong>（远处点占比 10.4% → 77.7%）</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00 的三个乘子与合成场景；C72 的坐标系约定</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_representations.ipynb（一个真实的 64 线 LiDAR 环扫模型 / <strong>面密度从 67.7 掉到 0.13 点/m²，一块 0.8 m 的标志从 255 点掉到 4.6 点</strong> / 体素 vs 柱体的占用率（0.506% vs 21.36%）/ 表示转换的可逆性表 / 分辨率选型器）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Lang et al., <em>PointPillars</em>（CVPR 2019）· Zhou &amp; Tuzel, <em>VoxelNet</em>（CVPR 2018）· Park et al., <em>DeepSDF</em>（CVPR 2019）· Velodyne HDL-64E 数据手册（垂直 FOV 与角分辨率）· 本课程 C72 模块 04（BEV 网格的采样率问题——同一个矛盾的另一面）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 45 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#point-cloud-properties">点云的三个性质，以及它们各自的后果</a></li>
+      <li><a href="#lidar-sampling">真实 LiDAR 的采样几何：远处到底有多疏</a></li>
+      <li><a href="#accumulation">多帧累积：对静止目标的免费增益，对运动目标的毁灭</a></li>
+      <li><a href="#voxel-tradeoff">体素：$(L/r)^3$ 与占用率的对抗</a></li>
+      <li><a href="#pillars">柱体：把第三个乘子直接换成 1</a></li>
+      <li><a href="#mesh-implicit">网格与隐式：另外两条路各自解决什么</a></li>
+      <li><a href="#sampling">采样：FPS 不是「更好」，是一个方向相反的偏倚</a></li>
+      <li><a href="#conversions">表示之间的转换：哪些是有损的</a></li>
+      <li><a href="#picking">选型：把精度要求翻译成 $r$，再看内存装不装得下</a></li>
+      <li><a href="#checklist">本模块的清单</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="point-cloud-properties"><span class="num">1</span>点云的三个性质，以及它们各自的后果</h2>
+  <p>「点云是一堆无序的点」这个说法只讲了三分之一。<strong>点云有三个互相独立的性质，而后面所有的网络设计都在应对其中某一个。</strong></p>  <table>
+    <thead><tr><th>性质</th><th>含义</th><th>它排除了什么</th><th>谁在应对它</th></tr></thead>
+    <tbody>
+      <tr><td><strong>无序（unordered）</strong></td><td>$N!$ 种排列表示同一个物体</td><td><strong>任何依赖输入顺序的算子</strong>——全连接层、RNN、普通卷积全都不行</td><td><strong>对称函数</strong>（max / sum / mean）——模块 02</td></tr>
+      <tr><td><strong>无邻域（no neighbourhood）</strong></td><td>点之间没有预定义的连接关系</td><td><strong>卷积的「感受野」概念</strong>；<em>要做局部操作必须先建 kNN 或球查询</em></td><td>PointNet++ 的分组、体素化、图卷积</td></tr>
+      <tr><td><strong>密度不均匀（non-uniform density）</strong></td><td>近处密、远处疏；且随材质与入射角变化</td><td><strong>「点数 ∝ 物体大小」这个假设</strong>；<em>也让「采样 K 个点」这种归一化产生偏倚</em></td><td>多尺度分组、按距离分层评测——下一节量它</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>三个性质里，第三个最常被忽略，而它对 TSR 影响最大。</strong><em>「无序」有一个干净的数学答案（对称函数），「无邻域」有一个干净的工程答案（建近邻结构）；而「密度不均匀」没有干净的答案</em>——<strong>它只能靠「知道它有多不均匀」来管理。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>所以本模块第 2 节先把它量出来。</strong><em>而量它需要一个真实的 LiDAR 采样模型——模块 00 的合成场景是均匀采样的，那是一个刻意的简化，而这一节要把这个简化补上</em>。<strong>结论会很直接：一块 0.8 m 的交通标志在 10 m 处有 255 个点，在 73 m 处只有 4.6 个点。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="lidar-sampling"><span class="num">2</span>真实 LiDAR 的采样几何：远处到底有多疏</h2>
+  <p>旋转式 LiDAR 的采样是<strong>角度均匀</strong>的：$N$ 条固定俯角的激光束 × 水平方向按固定角步进。<strong>而角度均匀在距离上就是极度不均匀。</strong></p>  <div class="ascii">   64 线 LiDAR（垂直 FOV −24.9°..2.0°，水平 0.2°）打在地面上
+
+   雷达 1.8m 高
+      │╲
+      │ ╲╲╲╲                环 i 的距离  d_i = H / tan(−φ_i)
+      │  ╲ ╲ ╲ ╲            相邻环间距  Δd = d_{i+1} − d_i
+      │   ╲  ╲   ╲    ╲     同环点间距  d·Δaz
+   ───┴────╫───╫─────╫──────╫──────────────────
+          4m  10m   20m    50m        80m
+          │←─→│      │←───→│          │←─────────→│
+          密           渐疏               极疏
+        </div>  <table>
+    <thead><tr><th>距离</th><th>相邻环间距</th><th>同环点间距</th><th>面密度（点/m²）</th></tr></thead>
+    <tbody>
+      <tr><td>9.8 m</td><td>0.431 m</td><td>0.034 m</td><td><strong>67.73</strong></td></tr>
+      <tr><td>19.6 m</td><td>1.738 m</td><td>0.068 m</td><td>8.43</td></tr>
+      <tr><td>29.0 m</td><td>3.975 m</td><td>0.101 m</td><td>2.48</td></tr>
+      <tr><td>45.4 m</td><td>10.532 m</td><td>0.159 m</td><td>0.60</td></tr>
+      <tr><td><strong>72.8 m</strong></td><td><strong>31.456 m</strong></td><td>0.254 m</td><td><strong>0.13</strong></td></tr>
+    </tbody>
+  </table>  <p><strong>72.8 m 处，相邻两个激光环在地面上相距 31 米。</strong><em>也就是说那个距离上的地面几乎没有被采样——而这正是「远处的地面估计要靠相机而不是 LiDAR」的原因</em>（C72 的 IPM）。</p>  <h3>一块 0.8 × 0.8 m 的交通标志能得到多少点</h3>  <table>
+    <thead><tr><th>距离</th><th>竖直方向</th><th>水平方向</th><th>总点数</th></tr></thead>
+    <tbody>
+      <tr><td>9.8 m</td><td>10.9 行</td><td>23.3 列</td><td><strong>≈ 255 点</strong></td></tr>
+      <tr><td>19.6 m</td><td>5.5 行</td><td>11.7 列</td><td>≈ 64 点</td></tr>
+      <tr><td>29.0 m</td><td>3.7 行</td><td>7.9 列</td><td>≈ 29 点</td></tr>
+      <tr><td>45.4 m</td><td>2.4 行</td><td>5.0 列</td><td>≈ 12 点</td></tr>
+      <tr><td><strong>72.8 m</strong></td><td><strong>1.5 行</strong></td><td>3.1 列</td><td><strong>≈ 4.6 点</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>面密度从 67.7 掉到 0.13 点/m²——衰减 520 倍。</strong><em>而它的形式是 $1/d^2$：环间距 $\propto d^2$（因为 $d=H/\tan(-\varphi)$ 的导数），同环点间距 $\propto d$</em>。<strong>所以「点数 ∝ 面积」只在同一距离上成立；跨距离比较点数是没有意义的。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>这张表有三个立刻可用的推论。</strong>① <strong>「至少 N 个点才算一个有效目标」这个过滤条件必须按距离设，而不是一个常数</strong>——<em>否则它等价于「只检测近处目标」</em>；② <strong>点云上采样 K 个点做归一化，会系统性地偏向近处目标</strong>（<em>远处目标不够 K 个点，只能重复采样</em>）；③ <strong>对 TSR，LiDAR 在 50 m 之外基本不提供形状信息</strong>（<em>1.5 行 × 3 列</em>），所以远距离标志识别必须靠相机——<strong>而 C72 模块 03 的「已知尺寸测距」正好在这个区间提供 ±1.30 m 的精度。</strong></p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>本节的模型仍然是简化的</strong>：它假设完美反射、无遮挡、无大气衰减、标志正对雷达。<em>真实情况只会更差——反光标志牌在斜入射时回波可能直接丢失</em>。<strong>所以表里的点数是<em>上界</em>。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="accumulation"><span class="num">3</span>多帧累积：对静止目标的免费增益，对运动目标的毁灭</h2>
+  <p>上一节说 73 m 处的标志只有 4.6 个点。<strong>而交通标志是静止的——所以可以把连续几帧的点，用自车位姿搬到同一个坐标系里累加起来。</strong>（<em>这正是 C72 模块 05 的运动补偿，只不过用途从关联变成了增密</em>。）</p>  <table>
+    <thead><tr><th>配置</th><th>自车前进</th><th>标志的距离区间</th><th>累积点数</th><th>相对单帧</th></tr></thead>
+    <tbody>
+      <tr><td>60 km/h @10 Hz，10 帧（1.0 s）</td><td>16.7 m</td><td>73.0 → 58.0 m</td><td>58.3</td><td><strong>12.6×</strong></td></tr>
+      <tr><td><strong>120 km/h @10 Hz，10 帧（1.0 s）</strong></td><td>33.3 m</td><td>73.0 → 43.0 m</td><td><strong>79.6</strong></td><td><strong>17.2×</strong></td></tr>
+      <tr><td>120 km/h @10 Hz，5 帧（0.5 s）</td><td>16.7 m</td><td>73.0 → 59.7 m</td><td>28.4</td><td>6.1×</td></tr>
+      <tr><td>60 km/h @20 Hz，10 帧（0.5 s）</td><td>8.3 m</td><td>73.0 → 65.5 m</td><td>51.5</td><td>11.2×</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>注意 17.2× 大于帧数 10——这是一个非直觉的加成。</strong><em>因为自车在这一秒里前进了 33 m，标志从 73 m 走到 43 m，而点密度按 $1/d^2$ 增长</em>。<strong>所以「累积」的收益不只是帧数，还包括「越来越近」这件事</strong>——<em>而车速越快、收益越大（120 km/h 的 17.2× vs 60 km/h 的 12.6×）。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而代价落在运动目标上：它们会被拖成一条。</strong><em>累积 1 秒时，相对速度 20 km/h 的目标拖影 5.56 m——已经超过一辆车的长度（4.5 m）</em>。<strong>所以累积窗口是一个显式取舍：</strong></p></div>
+  </div>  <table>
+    <thead><tr><th>累积窗口</th><th>相对 10 km/h</th><th>相对 20 km/h</th><th>相对 50 km/h</th></tr></thead>
+    <tbody>
+      <tr><td>10 帧 @10 Hz（1.00 s）</td><td>2.78 m</td><td><strong>5.56 m（超过车长）</strong></td><td>13.89 m</td></tr>
+      <tr><td>5 帧 @10 Hz（0.50 s）</td><td>1.39 m</td><td>2.78 m</td><td><strong>6.94 m（超过车长）</strong></td></tr>
+      <tr><td><strong>3 帧 @20 Hz（0.15 s）</strong></td><td>0.42 m</td><td>0.83 m</td><td>2.08 m</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <strong>所以对 TSR 有一个特别干净的结论：静止目标可以用长窗口累积，而这恰好是 LiDAR 最缺点的那一类目标。</strong><em>实践上的做法是「按类别分窗口」——对标志/杆/建筑用长窗口，对车/人用短窗口或不累积</em>。<strong>而这要求你在累积<em>之前</em>就知道类别，所以它通常是一个二阶段流程</strong>（<em>与 C55 模块 02 的两级 TSR 管线同构</em>）。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="voxel-tradeoff"><span class="num">4</span>体素：$(L/r)^3$ 与占用率的对抗</h2>
+  <p>体素化的唯一理由是<strong>让卷积可用</strong>。而代价是第一个乘子。</p>  <p>下表用<strong>本模块的环扫点云</strong>（102,668 点，全 360°，89% 命中率），并与模块 00 的<em>均匀采样</em>场景对照——<strong>后者会把占用率高估约 2.5 倍</strong>。</p>  <table>
+    <thead><tr><th>$r$</th><th>格数</th><th>内存（1 B/格）</th><th>占用率（环扫）</th><th>占用率（均匀假设）</th><th>平均每格点数</th></tr></thead>
+    <tbody>
+      <tr><td>0.16 m</td><td>19,531,250</td><td>19.53 MB</td><td>0.156%</td><td>—</td><td>3.37</td></tr>
+      <tr><td>0.10 m</td><td>80,000,000</td><td>80.00 MB</td><td><strong>0.055%</strong></td><td><strong>0.137%</strong>（高估 2.5×）</td><td>2.33</td></tr>
+      <tr><td><strong>0.05 m</strong></td><td><strong>640,000,000</strong></td><td><strong>640.00 MB</strong></td><td><strong>0.011%</strong></td><td>0.018%（高估 1.7×）</td><td><strong>1.52</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <strong>「均匀假设高估占用率」这件事本身值得记。</strong><em>因为容量规划（`max_num_voxels` 该设多少）通常是拍一个数或按均匀假设估的，而真实点云更集中——所以估出来的值偏大，看起来是安全的</em>。<strong>但反过来的情形更危险：按<em>近处</em>的密度估，会低估远处需要的分辨率。</strong>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>最后两列一起看，才能看出体素化的困境。</strong><em>占用率掉到 0.018% 说明 99.98% 的内存与算力花在空气上；而平均每格点数掉到 1.03 说明体素化已经<strong>不再压缩任何东西</strong></em>——<strong>它只是给点云套上了 6.4 亿个格子的外壳。</strong>所以在这个分辨率上，「用体素」的唯一好处只剩「能用卷积」，<em>而那个好处要靠稀疏卷积才能真正拿到</em>（模块 03）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>「平均每格点数」是一个很好用的选型指标，因为它给出了一个明确的停止条件。</strong><em>当它接近 1 时，继续减小 $r$ 只增加空格子、不增加信息</em>。<strong>本课的合成场景在 $r\approx0.05$ m 时饱和</strong>；<em>而真实 LiDAR 因为远处更疏（第 2 节），会更早饱和</em>——<strong>所以这个指标应当在你自己的数据上算一次，而不是照抄别人的分辨率。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <p>顺带说明一件常见的困惑：<strong>为什么 $z$ 方向常用更粗的分辨率</strong>（比如 $0.05\times0.05\times0.1$ m）。<em>因为自动驾驶场景在 $z$ 上的结构远少于 $xy$：地面 + 车顶 + 标志高度，就那么几个层次</em>。<strong>把 $z$ 的分辨率放粗一倍，格数直接减半，而丢掉的信息比 $xy$ 少得多</strong>——<em>这是「三个乘子」里最容易砍的那一个。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pillars"><span class="num">5</span>柱体：把第三个乘子直接换成 1</h2>
+  <p>既然 $z$ 方向最容易砍，那就砍到底：<strong>把整根柱子里的点交给一个逐柱 MLP，输出一个特征向量——于是三维网格变成二维网格。</strong>这就是 PointPillars。</p>  <table>
+    <thead><tr><th>方案</th><th>格数</th><th>内存</th><th>占用率</th><th>平均每格/柱点数</th></tr></thead>
+    <tbody>
+      <tr><td>体素 $r{=}0.05$ m</td><td>640,000,000</td><td>640.00 MB</td><td>0.011%</td><td>1.52</td></tr>
+      <tr><td>体素 $r{=}0.10$ m</td><td>80,000,000</td><td>80.00 MB</td><td>0.055%</td><td>2.33</td></tr>
+      <tr><td>体素 $r{=}0.16$ m</td><td>19,531,250</td><td>19.53 MB</td><td>0.156%</td><td>3.37</td></tr>
+      <tr><td>柱体 $0.10$ m</td><td>1,000,000</td><td>1.00 MB</td><td>4.332%</td><td>2.37</td></tr>
+      <tr><td><strong>柱体 $0.16$ m（PointPillars）</strong></td><td><strong>390,625</strong></td><td><strong>0.39 MB</strong></td><td><strong>7.642%</strong></td><td>3.44</td></tr>
+      <tr><td>柱体 $0.32$ m</td><td>97,656</td><td>0.10 MB</td><td><strong>16.324%</strong></td><td>6.44</td></tr>
+    </tbody>
+  </table>  <p>同分辨率下柱体与体素的占用率之比：<strong>$r{=}0.10$ m 时 78.8×，$r{=}0.16$ m 时 49.0×，$r{=}0.32$ m 时 24.3×</strong>——<em>比值随 $r$ 减小而增大，因为体素被第三个乘子按 $1/r$ 继续稀释</em>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>关键是这个数量级差：柱体 0.16 m 是 7.642%，而同分辨率的体素只有 0.156%——密了 49.0 倍。</strong><em>7.6% 仍然算稀疏，但它已经落在「密集 2D 卷积可以接受」的区间；而 0.156% 的三维网格用密集 3D 卷积是完全不可行的</em>（<strong>模块 03 会算出那是 283 GFLOP，其中 99.9% 花在空气上</strong>）。<strong>这就是 PointPillars 快的真正原因</strong>——<em>不是网络更小，而是它把问题搬到了一个卷积友好的表示上。</em>（<em>真实城市场景的柱体占用率通常更高（10–20%），因为本课场景只有 4 辆车 + 3 块标志</em>。）</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>代价必须说清楚：柱体丢掉了 $z$ 方向的<em>空间</em>结构。</strong><em>逐柱 MLP 能把柱内点的 $z$ 当特征学进去，但柱与柱之间在 $z$ 上不再有卷积连接</em>。<strong>所以柱体对「高度差异是关键线索」的任务不利</strong>——<em>而交通标志（离地 2.2 m）与地面标记（0 m）恰好只在 $z$ 上区分</em>。所以对 TSR，柱体不是自动的正确选择；<strong>而这正好说明第 3 节那个「砍 $z$」的建议有一个前提：你的任务在 $z$ 上确实没多少结构。</strong></p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <strong>柱体与 C72 模块 04 的 BEV 是同一个东西的两种来路。</strong><em>C72 用几何（IPM 单应）从图像得到 BEV；这里用学习（逐柱 MLP）从点云得到 BEV</em>。<strong>而 C72 模块 04 量到的「均匀网格必然一头过采样一头欠采样」在这里同样成立</strong>——<em>只不过点云的欠采样来自 LiDAR 环距（第 2 节），而图像的欠采样来自透视。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mesh-implicit"><span class="num">6</span>网格与隐式：另外两条路各自解决什么</h2>
+  <table>
+    <thead><tr><th>表示</th><th>存什么</th><th>它解决了什么</th><th>它的难点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>网格（mesh）</strong></td><td>顶点 + 面的连接关系</td><td><strong>表面显式存在</strong>，所以可渲染、可做几何编辑、内存小（5 万顶点 + 10 万面 ≈ 1.8 MB）</td><td><strong>拓扑难学</strong>——<em>顶点位置是连续量可以回归，而「哪三个顶点构成一个面」是离散的</em></td></tr>
+      <tr><td><strong>隐式（SDF / occupancy）</strong></td><td>一个函数 $f(x,y,z)\to$ 距离或占据概率</td><td><strong>分辨率无关</strong>：内存 = 参数量（8 层 256 宽的 MLP ≈ 1.8 MB，<em>而它能表示任意精细的表面</em>）</td><td><strong>查询要做前向计算</strong>；<em>而单个网络通常只表示一个物体或场景</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>隐式表示那个「分辨率无关」值得说清楚，因为它容易被误解。</strong><em>它不是「无限精度」——精度受网络容量与训练数据限制</em>。<strong>它真正的意思是：内存不随你想要的分辨率增长。</strong><em>要 $0.01$ m 的表面细节，密集体素要 8000 倍于 $0.2$ m 的内存，而隐式表示的参数量一个字节都不变</em>——<strong>这就是它绕开第一个乘子的方式。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而两者在本课的定位都是「知道它存在、知道分界线在哪」。</strong><em>本课的任务是判别式的（检测、分割），而这两种表示的主战场是生成与重建</em>——<strong>所以它们属于 C75</strong>。<em>这里给出的判据是：如果你的输出需要「一个连续表面」（渲染、碰撞检测、几何测量），就需要它们；如果输出是「一组框」或「逐点标签」，就不需要。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sampling"><span class="num">7</span>采样：FPS 不是「更好」，是一个方向相反的偏倚</h2>
+  <p>点云网络通常需要固定的输入点数，所以要采样到 $K$ 个点。<strong>而两种常见做法的偏倚方向恰好相反。</strong></p>  <p>实验：用本模块的环扫点云（它天然密度不均匀，&gt;30 m 的点只占 10.4%），采样 $K=512$：</p>  <table>
+    <thead><tr><th>采样方式</th><th>采到的点里「&gt;20 m」的占比</th><th>相对原始分布</th></tr></thead>
+    <tbody>
+      <tr><td>原始点集</td><td>10.4%</td><td>—</td></tr>
+      <tr><td><strong>随机采样</strong></td><td>12.9%</td><td>1.24×（<strong>近似保持分布</strong>）</td></tr>
+      <tr><td><strong>FPS（最远点采样）</strong></td><td><strong>77.7%</strong></td><td><strong>7.49×</strong>（极度偏向远处）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>FPS 常被描述为「覆盖更好的采样」——这是对的，但「覆盖更好」的具体含义是「几何上更均匀」，而几何均匀在密度不均匀的点云上意味着<em>极度偏向稀疏区域</em>。</strong><em>77.7% 对 10.4%，差 7.5 倍；采样点的中位距离从 7.8 m 跳到 55.9 m</em>。<strong>所以 FPS 不是随机采样的改进版，它是一个不同的偏倚。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>哪一个对，取决于任务。</strong><em>如果任务是「不要漏掉远处的稀疏目标」，FPS 的偏倚正是你要的；如果任务是「准确刻画近处目标的形状」，FPS 会把预算浪费在远处的零星点上</em>。<strong>而最坏的情形是：训练用 FPS、部署用随机采样（或反之）</strong>——<em>两者看到的是分布完全不同的输入，而这类不一致在指标上表现为「效果差一点」</em>（<strong>与 C72 模块 01 的「训练/部署预处理不一致」是同一类问题</strong>）。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <p>还有一个纯工程的点：<strong>FPS 是 $O(NK)$ 的串行算法</strong>，$N{=}102{,}668$、$K{=}512$ 时是 5300 万次距离计算，<em>而它无法简单并行（每一步依赖上一步的结果）</em>。<strong>所以实践里常用「随机分块 + 块内 FPS」来近似</strong>，<em>而那又改变了偏倚——所以这个选择必须被记录，而不是当成实现细节。</em></p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="conversions"><span class="num">8</span>表示之间的转换：哪些是有损的</h2>
+  <div class="ascii">   四种表示之间的转换（→ 上标注信息损失）
+
+              量化 (≤ r√3/2)
+     点云 ─────────────────────► 体素
+       ▲  ◄─────────────────────  │
+       │      取格中心（有损）      │  marching cubes
+       │                          ▼      （等值面提取）
+       │        采样表面          网格
+       │  ◄─────────────────────  │
+       │      （有损：只得到样本）   │  拟合 SDF
+       │                          ▼
+       └───────────────────────  隐式
+              查询等值面（有损：受网络容量限制）
+
+   **没有一条是无损的双向转换。**
+   而唯一「几乎无损」的方向是：点云 → 体素（r 足够小时，见模块 00 第 3 节）
+        </div>  <table>
+    <thead><tr><th>转换</th><th>损失</th><th>量级</th><th>可逆吗</th></tr></thead>
+    <tbody>
+      <tr><td>点云 → 体素</td><td>量化误差</td><td>$\le r\sqrt3/2$；均匀时均值 $0.4804r$</td><td><strong>不可逆</strong>（多个点落进同一格）</td></tr>
+      <tr><td>体素 → 点云（取格中心）</td><td>同上，且点数变成格数</td><td><em>本课环扫场景 $r{=}0.05$ m 时格数 67,620 vs 原 102,668 点</em></td><td>不可逆</td></tr>
+      <tr><td>点云 → 网格</td><td>表面重建的假设（法向、拓扑）</td><td>取决于算法；<strong>薄结构与开放边界最容易错</strong></td><td>不可逆，且<strong>可能失败</strong></td></tr>
+      <tr><td>网格 → 点云</td><td>只保留采样点</td><td>取决于采样密度</td><td>不可逆</td></tr>
+      <tr><td>隐式 → 网格</td><td>marching cubes 的分辨率</td><td>等值面提取本身是一次体素化</td><td>不可逆</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <strong>一个真实的工程陷阱：把「点云 → 体素 → 点云」当成预处理。</strong><em>它看起来是恒等变换（点还在，数量差不多），而实际上每个点都被搬到了格中心</em>。<strong>模块 00 的场景在 $r{=}0.1$ m 时平均位移 0.0516 m</strong>——<em>而模块 05 会算出：限速牌沿最薄轴允许的平移误差只有 0.0333 m</em>。<strong>也就是说这一次「无害的预处理」就已经超出了预算。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="picking"><span class="num">9</span>选型：把精度要求翻译成 $r$，再看内存装不装得下</h2>
+  <p>选型不是「哪种表示更好」，而是两个约束的交集是否为空。</p>  <div class="math-block">\[\underbrace{r \le \frac{2\,\varepsilon}{\sqrt3}}_{\text{精度约束}}\qquad\text{与}\qquad\underbrace{r \ge \Bigl(\frac{L_xL_yL_z}{B}\Bigr)^{1/3}}_{\text{内存约束}}\]</div>  <p>其中 $\varepsilon$ 是需要的位置精度、$B$ 是字节预算。<strong>注意内存约束里的 $1/3$ 次方——预算翻 8 倍才能把 $r$ 减半。</strong></p>  <table>
+    <thead><tr><th>精度要求 $\varepsilon$</th><th>允许的最粗 $r$</th><th>100 MB 预算允许的最细 $r$</th><th>交集</th></tr></thead>
+    <tbody>
+      <tr><td>0.30 m</td><td>0.3464 m</td><td>0.0928 m</td><td>✅ 可行</td></tr>
+      <tr><td>0.10 m</td><td>0.1155 m</td><td>0.0928 m</td><td>✅ 可行（余量很小）</td></tr>
+      <tr><td><strong>0.02 m</strong></td><td><strong>0.0231 m</strong></td><td>0.0928 m</td><td><strong>❌ 为空</strong>——密集体素方案不可行</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第三行是最常见的情形，而它有三条出路。</strong>① <strong>上稀疏</strong>（模块 03）——内存变成 $\propto$ 非空格数而不是总格数，<em>而占用率 0.018% 意味着这条路能把预算需求降三个数量级</em>；② <strong>用柱体</strong>（第 4 节）——把第三个乘子换成 1；③ <strong>不用体素</strong>（模块 02 的点云路线）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这张表本身是设计评审时应当先算的东西</strong>，<em>因为它不需要任何数据、也不需要跑任何模型</em>。<strong>notebook 练习 4 把它写成一个函数</strong>，而它会在「交集为空」时明确返回不可行，<em>而不是返回一个「凑合的」分辨率</em>——<strong>这与 C72 模块 04 的「IPM 函数对不贴地的类别直接拒绝」是同一条纪律：在设计阶段就拒绝，比在评测阶段发现便宜得多。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="checklist"><span class="num">10</span>本模块的清单</h2>
+  <ol>
+    <li><strong>在你自己的数据上算「平均每格点数」</strong>（模块 00 练习 1）——它接近 1 时说明分辨率已经饱和，再细就是纯浪费</li>
+    <li><strong>算出点密度随距离的衰减</strong>（第 2 节），并据此把「最少点数」这个过滤条件<strong>做成距离的函数</strong></li>
+    <li><strong>不要跨距离比较点数</strong>——<em>「点数 ∝ 面积」只在同一距离上成立</em></li>
+    <li><strong>$z$ 方向的分辨率可以比 $xy$ 粗</strong>（第 3 节），<em>但先确认你的任务在 $z$ 上确实没多少结构</em>（TSR 恰好相反——标志与地面标记只在 $z$ 上区分）</li>
+    <li><strong>「点云 → 体素 → 点云」不是恒等变换</strong>（第 6 节）——$r{=}0.1$ m 就有约 0.05 m 的平均位移，<em>而它可能已经超出下游的精度预算</em></li>
+    <li><strong>累积窗口按类别设</strong>（第 2b 节）——静止目标长窗口（120 km/h 下 10 帧给 17.2× 的点数），<em>而运动目标 1 秒窗口的拖影已超过车长</em></li>
+    <li><strong>采样方式（随机 / FPS）要记录并在训练与部署间保持一致</strong>（第 5b 节）——<em>两者的偏倚方向相反，差十倍</em></li>
+    <li><strong>选型先算精度约束与内存约束的交集</strong>（第 7 节），为空时明确拒绝而不是凑一个分辨率</li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <strong>如果只做一条，做第 2 条。</strong><em>「最少 N 个点」这个过滤条件在几乎每个点云流水线里都存在，而它几乎总是一个常数</em>——<strong>而一个常数阈值配上 520 倍的密度衰减，等价于悄悄地把远处目标全部丢掉。</strong><em>这类「看起来无害的常数」是本课程反复出现的主题（C70 的 top-k、C71 的迭代次数、C72 的去畸变 n=5）。</em>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与「三个乘子」</div></a>
+    <a class="next" href="../02_pointnet/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 置换不变性与 max-pool</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 3D 检测：从锚框到中心点</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 3D 检测：从锚框到中心点</h1>
+  <p class="subtitle">从零实现旋转框 IoU（多边形裁剪），四个自检精确通过（1 / <strong>1/3</strong> / 1/3 / 1）· <strong>同一个 IoU 阈值对不同长宽比隐含的朝向精度差 3.9 倍</strong>：0.5 对轿车允许 37.1°、对标志只允许 9.6°、<strong>而对方形的行人是 90°（完全不约束）</strong>；<em>IoU 对朝向还是非单调的（方形目标以 90° 为周期）</em> · <strong>2 个朝向的锚框让 45° 的目标拿到 0 个正锚</strong>（最好 IoU 仅 0.4254），<em>而加到 4 个朝向救回了它、却不改善正负比（0.0416% → 0.0403%）</em> · <strong>BEV NMS 会抑制掉在 $z$ 上分开的目标</strong>：标志与它正下方的目标 BEV IoU <strong>0.600</strong> 而 3D IoU <strong>0.000</strong> · <strong>而中心点头对薄目标同样退化</strong>：标志的高斯半径只有 0.08 格，有效正样本面积 <strong>0 格</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01–03；C18 的 2D 检测（anchor / NMS / 正负样本分配）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_detection3d.ipynb（从零实现旋转框 IoU（多边形裁剪，四个自检精确通过）/ <strong>Δθ=45° 时 IoU 只有 0.4254——2 个朝向的锚框让 45° 目标拿到 0 个正锚</strong> / 正负比 0.0416%，而加到 4 朝向<strong>不改善它</strong> / <strong>中心点头对薄目标同样退化：标志的高斯半径 0.08 格</strong> / 角度的三种编码）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Zhou &amp; Tuzel, <em>VoxelNet</em>（CVPR 2018，anchor-based）· Yan et al., <em>SECOND</em>（2018）· Lang et al., <em>PointPillars</em>（CVPR 2019）· Zhou et al., <em>CenterNet</em>（2019，高斯半径）· Yin et al., <em>CenterPoint</em>（CVPR 2021）· 本课程 C54（DETR 与集合预测：第三条路）· C57（小目标）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 45 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#box-params">3D 框的 7 个自由度，以及一个容易漏掉的对称性</a></li>
+      <li><a href="#rotated-iou">旋转框 IoU：多边形裁剪</a></li>
+      <li><a href="#orientation-cost">朝向不匹配的代价</a></li>
+      <li><a href="#iou-threshold">反解：IoU 阈值隐含了多少朝向精度</a></li>
+      <li><a href="#anchors">锚框：朝向必须离散化，而离散得不够就漏掉整个目标</a></li>
+      <li><a href="#nms">3D 的 NMS：两个新问题</a></li>
+      <li><a href="#centerpoint">中心点头：把「匹配」换成「峰值 + 回归」</a></li>
+      <li><a href="#thin-degenerate">中心点头对薄目标同样退化</a></li>
+      <li><a href="#decode">热图怎么解码成框：局部极大值 + top-$k$</a></li>
+      <li><a href="#angle-encoding">角度的三种编码</a></li>
+      <li><a href="#checklist">本模块的清单</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="box-params"><span class="num">1</span>3D 框的 7 个自由度，以及一个容易漏掉的对称性</h2>
+  <div class="math-block">\[\text{box} = (x,\ y,\ z,\ w,\ l,\ h,\ \theta)\]</div>  <p>自动驾驶里通常只保留绕 $z$ 的偏航角（车辆不会侧翻），所以是 7 而不是 9。<strong>而 $\theta$ 这一维带来的问题占了本模块的一半。</strong></p>  <table>
+    <thead><tr><th>性质</th><th>说明</th><th>后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>周期性</strong></td><td>$\theta$ 与 $\theta+2\pi$ 相同</td><td><strong>直接回归 $\theta$ 会在 $\pm\pi$ 处炸</strong>：<em>真值 179°、预测 −179°，几何差 2° 而 L1 损失是 358°——放大 179 倍</em></td></tr>
+      <tr><td><strong>中心对称</strong></td><td>$\theta$ 与 $\theta+\pi$ 给出<em>同一个框</em></td><td><strong>notebook 验证 IoU(0°, 180°) = 1.000000</strong>；<em>所以角度只在 $[0,\pi)$ 内可辨识，而「车头朝哪」需要额外的方向分类头</em></td></tr>
+      <tr><td><strong>与尺寸耦合</strong></td><td>$w$ 与 $l$ 互换 + $\theta$ 转 90° 是同一个框</td><td><em>所以「长宽」的定义必须钉死</em>（本课：$l$ 沿车长、$w$ 沿车宽）</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <strong>三条合起来意味着：$\theta$ 不是一个普通的回归目标。</strong><em>它活在一个商空间 $S^1/\{\pm1\}$ 上，而普通的 L1/L2 损失假设目标活在 $\mathbb{R}$ 上</em>。<strong>第 8 节给出三种编码方式与它们各自解决了上面哪一条。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rotated-iou"><span class="num">2</span>旋转框 IoU：多边形裁剪</h2>
+  <p>2D 的轴对齐 IoU 是两行代码。<strong>旋转框需要真正的多边形求交。</strong>notebook 第 2 节用 Sutherland–Hodgman 裁剪从零实现，并用四个精确自检验证：</p>  <table>
+    <thead><tr><th>自检</th><th>期望值</th><th>实测</th></tr></thead>
+    <tbody>
+      <tr><td>同一个框</td><td>1</td><td><strong>1.0</strong></td></tr>
+      <tr><td>沿长轴平移 $l/2$</td><td>$1/3$</td><td><strong>0.333333333</strong></td></tr>
+      <tr><td>沿宽轴平移 $w/2$</td><td>$1/3$</td><td><strong>0.333333333</strong></td></tr>
+      <tr><td><strong>$\theta$ 转 180°</strong></td><td><strong>1</strong>（中心对称）</td><td><strong>1.0</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第二、三行那个 $1/3$ 值得记，因为它是一个好用的心算基准。</strong><em>两个同尺寸的框沿某轴平移半个边长时，交集是 $1/2$、并集是 $3/2$，所以 IoU 恰好 $1/3$</em>。<strong>而它同时说明「IoU 0.5」比想象的严格：它对应的平移小于半个边长。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而实现上有一个必须注意的细节：多边形的绕向。</strong><em>Sutherland–Hodgman 的「在内侧」判据依赖裁剪多边形是逆时针的；给成顺时针会让所有 IoU 变成 0</em>——<strong>而这个 bug 不会报错，它只会让所有匹配失败</strong>（<em>本课作者第一版就栽在这里，四个自检全变成 0.0</em>）。<strong>所以用有符号面积检查绕向应当是实现的第一步。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="orientation-cost"><span class="num">3</span>朝向不匹配的代价</h2>
+  <p>两个同心、同尺寸的 $4.5\times1.9$ m 框，只差一个角度：</p>  <table>
+    <thead><tr><th>$\Delta\theta$</th><th>0°</th><th>5°</th><th>10°</th><th>15°</th><th>22.5°</th><th><strong>30°</strong></th><th><strong>45°</strong></th><th>60°</th><th>90°</th></tr></thead>
+    <tbody>
+      <tr><td>BEV IoU</td><td>1.0000</td><td>0.8916</td><td>0.8042</td><td>0.7317</td><td>0.6420</td><td><strong>0.5662</strong></td><td><strong>0.4254</strong></td><td>0.3223</td><td>0.2676</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>45° 的朝向误差就把 IoU 压到 0.4254——低于 0.5 的常用阈值。</strong><em>而 30° 时是 0.5662，刚刚过线</em>。<strong>所以「IoU ≥ 0.5」这个阈值隐含了「朝向误差必须小于 37.1°」</strong>（<em>下一节把它对四种长宽比精确反解出来——差别高达 9 倍</em>）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而 90° 时 IoU 还有 0.2676 而不是 0</strong>——<em>因为两个矩形交叉成一个「十字」，中间那块正方形是共有的</em>。<strong>所以对长宽比接近 1 的目标（行人），朝向几乎无所谓；而对细长目标（车、卡车），朝向是主导误差源。</strong><em>这也解释了为什么 nuScenes 的朝向误差（AOE）是一个独立上报的指标，而不是被吸收进 IoU 里。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="iou-threshold"><span class="num">4</span>反解：IoU 阈值隐含了多少朝向精度</h2>
+  <p>上一节只算了一种长宽比。<strong>把它推广到四种目标，就能看出「IoU ≥ 0.5」这个阈值对不同目标其实是完全不同的要求。</strong></p>  <table>
+    <thead><tr><th>目标（长宽比）</th><th>10°</th><th>15°</th><th>20°</th><th>30°</th><th>45°</th><th>90°</th></tr></thead>
+    <tbody>
+      <tr><td>轿车 $4.5\times1.9$（2.37:1）</td><td>0.804</td><td>0.732</td><td>0.670</td><td>0.566</td><td>0.425</td><td>0.268</td></tr>
+      <tr><td>卡车 $10\times2.5$（4:1）</td><td>0.705</td><td>0.594</td><td>0.499</td><td>0.333</td><td>0.215</td><td>0.143</td></tr>
+      <tr><td><strong>行人 $0.6\times0.6$（1:1）</strong></td><td>0.863</td><td>0.816</td><td>0.780</td><td>0.732</td><td>0.707</td><td><strong>1.000</strong></td></tr>
+      <tr><td>标志的 BEV 投影 $0.8\times0.1$（8:1）</td><td>0.486</td><td>0.318</td><td>0.224</td><td>0.143</td><td>0.097</td><td>0.067</td></tr>
+    </tbody>
+  </table>  <h3>反解出允许的朝向误差</h3>  <table>
+    <thead><tr><th>目标</th><th>IoU $\ge$ 0.5 允许</th><th>IoU $\ge$ 0.7 允许</th></tr></thead>
+    <tbody>
+      <tr><td>轿车（2.37:1）</td><td><strong>37.1°</strong></td><td><strong>17.5°</strong></td></tr>
+      <tr><td>卡车（4:1）</td><td>19.9°</td><td>10.2°</td></tr>
+      <tr><td><strong>行人（1:1）</strong></td><td><strong>90.0°</strong></td><td><strong>90.0°</strong></td></tr>
+      <tr><td><strong>标志的 BEV 投影（8:1）</strong></td><td><strong>9.6°</strong></td><td><strong>5.1°</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>同一个阈值 0.5，对轿车允许 37.1° 的朝向误差，对标志的 BEV 投影只允许 9.6°——差 3.9 倍；而对行人<em>完全不约束</em>（90°）。</strong><em>行人那一行的 90° 不是数值问题：正方形转 90° 就是它自己，所以 IoU 回到 1.000</em>——<strong>也就是说 IoU 对朝向不是单调的，对方形目标它以 90° 为周期。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>这解释了两件常见的评测设计。</strong>① <strong>KITTI 对车用 0.7、对行人和骑车人用 0.5</strong>——<em>0.7 对车意味着 17.5° 的朝向要求（合理），而对近方形的行人，任何 IoU 阈值都管不到朝向</em>；② <strong>nuScenes 把朝向误差（AOE）作为独立指标上报</strong>，<em>而不是让它被 IoU 吸收</em>——<strong>因为上表说明「被吸收的程度」完全取决于长宽比。</strong><em>所以「我们的 mAP@0.5 很高」这句话，在方形目标上并不包含任何朝向信息。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="anchors"><span class="num">5</span>锚框：朝向必须离散化，而离散得不够就漏掉整个目标</h2>
+  <p>2D 检测的锚框按「尺度 × 长宽比」枚举。<strong>3D 多了一维：朝向。</strong>而最常见的做法是只放 0° 与 90° 两个朝向（车道平行或垂直）。</p>  <p>notebook 第 4 节在 $80\times80$ m 的 BEV 网格（$0.2$ m，160,000 个位置）上扫全部锚框，统计每个目标能拿到几个 IoU ≥ 0.5 的正锚：</p>  <table>
+    <thead><tr><th>锚框朝向</th><th>总锚框数</th><th>正锚总数</th><th>正负比</th><th>各目标的正锚数（朝向 0° / 22.5° / <strong>45°</strong> / 70°）</th></tr></thead>
+    <tbody>
+      <tr><td><strong>0°, 90°（2 个）</strong></td><td>320,000</td><td>133</td><td><strong>0.0416%</strong></td><td>53 / 37 / <strong>0</strong> / 43</td></tr>
+      <tr><td>0°, 45°, 90°, 135°（4 个）</td><td>640,000</td><td>258</td><td>0.0403%</td><td>53 / 78 / <strong>51</strong> / 76</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <strong>第一行第五列：朝向 45° 的那个目标拿到 0 个正锚。</strong><em>因为 0° 与 90° 的锚框对它的最好 IoU 只有 0.4254（第 3 节），低于 0.5 的阈值</em>。<strong>于是这个目标在训练时<em>完全没有正样本</em>——它对损失的唯一贡献是「所有锚框都应该说这里没有东西」。</strong>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>而第二行说明「加朝向」解决的不是正负比，只是漏掉。</strong><em>正锚从 133 涨到 258（约 2 倍），而总锚框也从 32 万涨到 64 万——正负比几乎不变（0.0416% → 0.0403%）</em>。<strong>所以锚框方案的两个问题要分开看：</strong>① <strong>漏掉</strong>（朝向离散得不够）——加朝向能解决；② <strong>极端的正负不平衡</strong>（万分之四）——加朝框只会更糟。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而 ② 的常规解法是 focal loss / OHEM（C58 的主题）</strong>，<em>但那是在治症状</em>。<strong>真正的结构性修法是放弃「用 IoU 匹配锚框」这件事本身</strong>——<em>而这正是 CenterPoint 的做法（第 6 节）</em>，也是 DETR 用匈牙利匹配替代锚框的动机（<strong>C54</strong>）。<em>三条路的共同点是：让正样本的定义不再依赖一个 IoU 阈值。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="nms"><span class="num">6</span>3D 的 NMS：两个新问题</h2>
+  <p>2D 的 NMS 是「按分数排序，抑制掉 IoU 过高的」。<strong>搬到 3D 会遇到两个新问题，而第二个是真实的失效模式。</strong></p>  <h3>问题一：旋转 IoU 贵 40 倍</h3>  <table>
+    <thead><tr><th>候选数 $N$</th><th>最多的配对数</th><th>轴对齐 IoU</th><th>旋转 IoU（多边形裁剪）</th></tr></thead>
+    <tbody>
+      <tr><td>100</td><td>4,950</td><td>~0.05 MFLOP</td><td>~2.0 MFLOP</td></tr>
+      <tr><td>1,000</td><td>499,500</td><td>~5.0 MFLOP</td><td>~200 MFLOP</td></tr>
+      <tr><td>5,000</td><td>12,497,500</td><td>~125 MFLOP</td><td><strong>~5,000 MFLOP</strong></td></tr>
+    </tbody>
+  </table>  <p><strong>每一对贵约 40 倍</strong>（多边形裁剪 vs 四个 min/max）。<em>所以实践里普遍先按分数取 top-$k$（第 7b 节）再做 NMS，而 $k$ 的选择直接决定这一步的耗时。</em></p>  <h3>问题二：BEV NMS 会抑制掉在 $z$ 上分开的目标</h3>  <p>为了省钱，NMS 常常只在 BEV 平面上做（忽略 $z$）。<strong>而这会把「上下叠在一起的两个目标」当成重复。</strong></p>  <table>
+    <thead><tr><th>目标对（$\delta x{=}0.2$ m）</th><th>$\Delta z$</th><th>BEV IoU</th><th>3D IoU</th></tr></thead>
+    <tbody>
+      <tr><td>轿车 vs 轿车</td><td>0.0 m</td><td>0.915</td><td>0.915</td></tr>
+      <tr><td>轿车 vs 轿车</td><td>0.5 m</td><td><strong>0.915</strong></td><td><strong>0.467</strong></td></tr>
+      <tr><td>轿车 vs 轿车</td><td>1.0 m</td><td><strong>0.915</strong></td><td>0.189</td></tr>
+      <tr><td>标志 vs 标志</td><td>0.5 m</td><td><strong>0.600</strong></td><td>0.164</td></tr>
+      <tr><td><strong>标志 vs 标志</strong></td><td><strong>1.0 m</strong></td><td><strong>0.600</strong></td><td><strong>0.000</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <strong>最后一行是 TSR 的一个真实失效：</strong><em>一块离地 2.2 m 的限速牌，与它正下方的地面标记（或另一块低位牌），在 BEV 上完全重叠（IoU 0.600）而在 3D 上毫不相交（IoU 0.000）</em>。<strong>BEV NMS 会把其中一个抑制掉，而被抑制的通常是分数低的那个——也就是更远、更小、更需要被检出的那个。</strong><em>而这个漏检在「按距离分层的召回」上才看得见，总体 mAP 上看不见。</em>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>修法有三条，成本递增。</strong>① <strong>NMS 时加一个 $z$ 的门</strong>——<em>只有 $|\Delta z| <$ 阈值时才允许抑制；零成本，而它解决了绝大多数情形</em>；② <strong>按类别分组做 NMS</strong>——<em>标志与地面标记本来就是不同类，不该互相抑制</em>；③ 真正的 3D IoU NMS——最贵，且对轴对齐的 $z$ 区间其实只需要多算一维。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这一节要留下的一般性教训是：为了省钱而降维的操作，会在「被降掉的那一维上分开」的样本上失效。</strong><em>模块 01 的柱体（把 $z$ 压掉）有同样的结构；C72 模块 04 的 IPM（假设 $z{=}0$）也是</em>。<strong>三处都是同一个模式：$z$ 是自动驾驶里最容易被压掉、而对交通标志最关键的那一维。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="centerpoint"><span class="num">7</span>中心点头：把「匹配」换成「峰值 + 回归」</h2>
+  <div class="ascii">   锚框头                                中心点头（CenterPoint）
+   ┌────────────────────────┐          ┌────────────────────────┐
+   │ 每个位置 × 每个朝向     │          │ 每个位置一个「是不是中心」│
+   │   → 分类 + 框回归        │          │   → 一张热图（每类一张）  │
+   │ 正样本 = IoU ≥ 0.5      │          │ 正样本 = **目标中心那一格**│
+   │ 需要 NMS                │          │ 需要局部极大值抑制（3×3）  │
+   └────────────────────────┘          └────────────────────────┘
+        │                                      │
+   正负比 0.0416%                        正样本 4/160,000 = 0.0025%
+   45° 目标 → **0 个正样本**              每个目标**恒有** 1 个正样本
+        </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>中心点头的关键性质是「每个目标恒有一个正样本」——与它的尺寸、朝向、长宽比都无关。</strong><em>这直接消掉了第 4 节的问题 ①（漏掉）</em>。<strong>而朝向从「用来枚举锚框」变成「一个待回归的量」</strong>，<em>于是离散化的问题也不存在了。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>但正负比看起来更糟了（0.0025% vs 0.0416%）——而这里有一个关键设计：高斯软标签。</strong><em>CenterNet 不是只把中心那一格标成 1，而是在中心周围画一个高斯，半径由目标尺寸决定</em>（<strong>让「偏移半径个格子的框」仍有 0.7 的 IoU</strong>）。<strong>于是有效正样本面积从 1 格涨到 $\pi r^2$ 格</strong>——<em>而下一节会说明：这个 $r$ 对薄目标会退化到 0。</em></p></div>
+  </div>  <table>
+    <thead><tr><th>目标</th><th>网格尺寸（$0.2$ m 格）</th><th>高斯半径 $r$</th><th>有效正样本面积 $\pi r^2$</th></tr></thead>
+    <tbody>
+      <tr><td>轿车 $1.9\times4.5$ m</td><td>22.5 × 9.5 格</td><td>1.23 格</td><td><strong>4.7 格</strong></td></tr>
+      <tr><td>行人 $0.6\times0.6$ m</td><td>3.0 × 3.0 格</td><td>0.28 格</td><td>0.2 格</td></tr>
+      <tr><td><strong>标志 $0.8\times0.1$ m</strong></td><td>0.5 × 4.0 格</td><td><strong>0.08 格</strong></td><td><strong>0.0 格</strong></td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========================================================= -->
+  <h2 id="thin-degenerate"><span class="num">8</span>中心点头对薄目标同样退化</h2>
+  <p>上一节表格的最后一行是这一节的全部内容。<strong>交通标志在 BEV 里的投影是 $0.8\times0.1$ m——在 $0.2$ m 的网格上只有 $4.0\times0.5$ 格。</strong></p>  <div class="callout danger"><span class="label"></span>
+    <strong>它的宽度（0.5 格）小于一个格子。</strong><em>于是 CenterNet 的高斯半径公式给出 0.08 格，有效正样本面积 $\pi r^2 = 0.02$ 格——四舍五入是 0</em>。<strong>也就是说：热图上只有<em>恰好那一格</em>是正样本，而中心落在格边界上时连那一格都可能标错。</strong>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>所以「从 anchor 换到 center」并没有解决薄目标的问题，它只是把问题从「0 个正锚」换成了「1 个孤立正样本、没有软标签」。</strong><em>而模块 03 已经从另一个方向给出同样的结论：要让标志连通需要 $r{=}0.8$ m 的分辨率，而那时量化误差是 IoU-0.5 预算的 20.8 倍</em>。<strong>两条独立的推理指向同一件事：$0.2$ m 的 BEV 网格对交通标志太粗。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>三条可行的出路，而它们都不是「换检测头」：</strong>① <strong>为薄目标单独用更细的网格</strong>（<em>标志的 $z$ 范围很窄，所以可以只在 1.5–3 m 这一层用 $0.05$ m 的网格，代价可控</em>）；② <strong>不在 BEV 里检测标志</strong>——<em>用图像检测 + C72 模块 03 的已知尺寸测距（50 m 处 ±1.30 m）</em>；③ <strong>换评测口径</strong>——<em>用中心距离而不是 IoU（模块 05），此时 0.2 m 的网格是够用的</em>。<strong>而实践中 TSR 普遍走 ②，这不是因为 LiDAR 不好，而是因为上面这条约束链。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="decode"><span class="num">9</span>热图怎么解码成框：局部极大值 + top-$k$</h2>
+  <p>中心点头输出的是一张热图，<strong>而「取出目标」这一步有两个必须的操作。</strong></p>  <div class="ascii">   热图 (400×400)
+     │
+     │ ① 3×3 局部极大值抑制（等价于一次 max-pool + 比较）
+     │      纯随机热图上保留 11.20% —— 理论值 1/9 = 11.11%
+     ▼
+   17,924 个局部极大（仍然太多）
+     │
+     │ ② 按分数取 top-k
+     ▼
+   k 个候选 → 各自回归 (offset, size, θ) → 框
+        </div>  <table>
+    <thead><tr><th>$k$</th><th>占热图格数</th><th>相对 ~50 个真实目标的召回余量</th></tr></thead>
+    <tbody>
+      <tr><td>100</td><td>0.062%</td><td>2×</td></tr>
+      <tr><td><strong>500</strong></td><td>0.312%</td><td><strong>10×</strong></td></tr>
+      <tr><td>1,000</td><td>0.625%</td><td>20×</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>① 那个 11.20% 值得记：它几乎正好是 $1/9$。</strong><em>因为在无结构的热图上，$3\times3$ 窗口里每个格子等可能是最大的</em>。<strong>所以局部极大值抑制只能把候选降一个数量级，远不够——top-$k$ 是必需的第二步。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而 $k$ 的选择是一个显式的召回-成本取舍。</strong><em>$k$ 太小会截掉低分的真目标（而那些正是远处的小目标）；$k$ 太大会让第 4b 节的旋转 NMS 变贵（成本 $\propto k^2$）</em>。<strong>实践里 $k{=}500$ 给约 10 倍余量，是一个常见的默认值</strong>——<em>而它应当按「场景里最多可能有多少个目标」来定，而不是抄一个数</em>。<strong>而 offset 回归这一项解决的是量化误差</strong>：<em>中心落在格子中间时，热图只能指到格心，而 offset 头把那半个格子（$0.2$ m 网格上是 $\le0.14$ m）补回来</em>——<strong>这正好是模块 01 第 7 节量化误差的一个直接补偿手段。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>offset 回归能补偿多少，是可以算的：</strong><em>它把量化误差从 $r\sqrt3/2$（$0.2$ m 网格上是 0.173 m）降到「offset 头自身的回归误差」</em>。<strong>所以模块 03 第 5b 节那张「量化误差 vs 允许误差」的表，在有 offset 头时应当用回归误差而不是 $r\sqrt3/2$</strong>——<em>而那个数只能实测，本课给不出。但结论的方向不变：网格越粗，offset 头要补的越多。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="angle-encoding"><span class="num">10</span>角度的三种编码</h2>
+  <table>
+    <thead><tr><th>编码</th><th>怎么做</th><th>解决了哪一条</th><th>残留问题</th></tr></thead>
+    <tbody>
+      <tr><td><strong>直接回归 $\theta$</strong></td><td>L1/L2 损失</td><td>无</td><td><strong>周期性：179° vs −179° 的 L1 是 358°，而几何差只有 2°——放大 179 倍</strong></td></tr>
+      <tr><td><strong>$(\sin\theta,\cos\theta)$</strong></td><td>回归两个分量，再 <code>atan2</code></td><td><strong>周期性</strong>：179° vs −179° 的 L2 = 0.03490，<em>恰好等于 $2\sin1°$</em></td><td><strong>不含中心对称</strong>：0° 与 180° 被当成完全不同</td></tr>
+      <tr><td><strong>$(\sin2\theta,\cos2\theta)$</strong></td><td>把角度加倍再编码</td><td><strong>周期性 + 中心对称</strong>：89° 与 −89°（几何差 2°）的 L2 = 0.06980 = $2\sin2°$</td><td><strong>丢掉了「车头朝哪」</strong>——需要一个额外的二分类头</td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <strong>第三行的实现里有一个真实的坑：<code>dir_offset</code>。</strong><em>方向二分类的标签是「$\theta$ 落在 $[0,\pi)$ 还是 $[\pi,2\pi)$」，而这个区间的<strong>起点</strong>是一个超参数</em>（<code>SECOND</code> 与 <code>CenterPoint</code> 的默认值不同）。<strong>起点定在训练数据里朝向的密集处，会让恰好落在边界上的样本标签抖动</strong>——<em>而车辆朝向在直路场景里恰好密集分布在 0° 与 180° 附近。</em>所以 <code>dir_offset</code> 通常取 $\pi/4$ 这类「远离密集处」的值。
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第二行那个「恰好等于 $2\sin1°$」不是巧合：</strong><em>单位圆上两点的弦长就是 $2\sin(\Delta\theta/2)$</em>。<strong>所以 $(\sin,\cos)$ 编码把角度差正确地线性化了（小角度下）</strong>——而这就是它替代直接回归的全部理由。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而第三行的取舍是真实的：中心对称与方向信息不可兼得。</strong><em>$(\sin2\theta,\cos2\theta)$ 把 $\theta$ 与 $\theta+\pi$ 映到同一点，所以它<strong>无法</strong>区分车头车尾</em>。<strong>实践中的标准做法是「$(\sin2\theta,\cos2\theta)$ 回归朝向+ 一个二分类头判方向」</strong>——<em>而这也是 SECOND 引入 direction classifier 的原因</em>。<strong>它把一个「在商空间上回归」的问题拆成「在商空间上回归」+「在商上的纤维里分类」，而这是处理这类对称性的通用套路。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="checklist"><span class="num">11</span>本模块的清单</h2>
+  <ol>
+    <li><strong>实现旋转框 IoU 的第一步是用有符号面积检查绕向</strong>（第 2 节）——<em>给错绕向会让所有 IoU 变成 0，而它不报错</em></li>
+    <li><strong>统计每个目标的正样本数，而不只是总正负比</strong>（第 4 节）——<em>「某个目标 0 个正样本」在总比例上看不出来</em></li>
+    <li><strong>报 IoU 阈值时要说明它对<em>这个类别</em>意味着多少朝向精度</strong>（第 3b 节）——<em>0.5 对轿车是 37.1°，对方形的行人是「不约束」</em></li>
+    <li><strong>加朝向解决漏掉，不解决正负不平衡</strong>（第 4 节）：133 → 258 个正锚，而比例 0.0416% → 0.0403%</li>
+    <li><strong>算一次每类目标的高斯半径</strong>（第 5 节）。<em>$\pi r^2 < 1$ 就说明这一类在当前网格下没有软标签</em></li>
+    <li><strong>薄目标的问题不能靠换检测头解决</strong>（第 6 节）——三条出路是更细的局部网格 / 换传感器通路 / 换评测口径</li>
+    <li><strong>BEV NMS 必须加一个 $z$ 的门或按类别分组</strong>（第 4b 节）——<em>否则标志与它正下方的地面标记会互相抑制（BEV IoU 0.600 而 3D 是 0）</em></li>
+    <li><strong>top-$k$ 按「场景里最多多少个目标」定</strong>（第 6b 节），<em>而不是抄一个数——它同时决定召回余量与旋转 NMS 的成本（$\propto k^2$）</em></li>
+    <li><strong>角度用 $(\sin2\theta,\cos2\theta)$ + 方向二分类</strong>（第 7 节），<em>不要直接回归 $\theta$</em></li>
+  </ol>  <div class="callout paper"><span class="label"></span>
+    <strong>如果只做一条，做第 4 条。</strong><em>「每个目标拿到几个正样本」这个数不需要训练，在数据准备阶段就能算出来</em>；<strong>而它能抓到一整类「某些朝向/尺寸的目标从来学不会」的问题</strong>——<em>而那类问题在总体 mAP 上只表现为「差一点」。</em>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_sparse_voxel/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 体素化与稀疏卷积</div></a>
+    <a class="next" href="../05_seg_eval/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 分割与 3D 评测</div></a>
+  </div>
+
+</div>
+</body>
+</html>

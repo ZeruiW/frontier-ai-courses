@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 体素化与稀疏卷积</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 体素化与稀疏卷积</h1>
+  <p class="subtitle"><strong>规则表才是真实开销</strong>：用 $M\times27$ 估算会高估 2 倍以上 · 而膨胀率与规则密度<strong>排序相反</strong>（散开 22.05× / 1.33 条，实心块 1.59× / 22.75 条），<em>两者之积被核大小 27 框住</em> · <strong>常规稀疏卷积 4 层膨胀 52 倍</strong>，占用率 0.215% → <strong>11.28%</strong>，<strong>FLOPs 优势从 465× 掉到 8.9×</strong>——<em>而这个 53 倍的落差就是膨胀率本身</em> · <strong>子流形卷积的真实代价是可达性</strong>：30 m 处那块标志的 15 个体素被切成 <strong>2 个分量</strong>（间隙 0.50 m），而分量内的地面体素恒为 <strong>0</strong>（同一帧的近车却有 726 个）——<em>无论叠多少层都不交换信息</em> · <strong>而下采样与定位精度直接冲突</strong>：即使 $k{=}0$，量化误差已是 IoU-0.5 预算的 5.2 倍，连通需要 $k{=}2$ 时是 20.8 倍</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01 的占用率与柱体；模块 02 的对称函数</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_sparse_voxel.ipynb（稀疏张量的哈希索引 / <strong>常规稀疏卷积 4 层膨胀 52.54×，占用率 0.215% → 11.28%</strong> / FLOPs 优势从 465.7× 掉到 8.86× / <strong>子流形的真实代价：标志碎成 2 个互不通信的分量，且与地面完全不连通</strong> / 格内特征编码）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Graham, Engelcke &amp; van der Maaten, <em>3D Semantic Segmentation with Submanifold Sparse Convolutional Networks</em>（CVPR 2018）· Choy et al., <em>4D Spatio-Temporal ConvNets (MinkowskiNet)</em>（CVPR 2019）· Yan et al., <em>SECOND</em>（Sensors 2018）· spconv / MinkowskiEngine 的实现文档</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 45 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#sparse-tensor">稀疏张量：坐标 + 特征 + 一张哈希表</a></li>
+      <li><a href="#rulebook">规则表：稀疏卷积的真实开销与它的一个反直觉性质</a></li>
+      <li><a href="#dilation">常规稀疏卷积会膨胀，而膨胀是指数级的</a></li>
+      <li><a href="#flops">FLOPs 优势的消失</a></li>
+      <li><a href="#submanifold">子流形稀疏卷积：把活跃集钉死</a></li>
+      <li><a href="#real-cost">本模块的核心：子流形卷积下，不连通的部分永远不通信</a></li>
+      <li><a href="#downsample-tension">下采样：连通性与定位精度直接冲突</a></li>
+      <li><a href="#vfe">格内怎么聚合：模块 02 的对称函数在这里复用</a></li>
+      <li><a href="#implementations">三种实现方式，以及它们的访存行为</a></li>
+      <li><a href="#checklist">本模块的清单</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="sparse-tensor"><span class="num">1</span>稀疏张量：坐标 + 特征 + 一张哈希表</h2>
+  <p>模块 01 量到占用率 0.2% 量级。<strong>密集张量把 99.8% 的内存与算力花在空气上，而修法在数据结构层面而不是算法层面。</strong></p>  <div class="ascii">   密集张量                      稀疏张量
+   ┌─────────────────┐          coords: (M, 3) int32   ← 只存非空的
+   │ 0 0 0 0 0 0 0 0 │          feats:  (M, C) float32
+   │ 0 0 3 0 0 0 0 0 │          hash:   coord -&gt; row     ← O(1) 邻居查询
+   │ 0 0 0 0 0 7 0 0 │
+   │ 0 0 0 0 0 0 0 0 │          内存 ∝ M（非空数），而不是 ∝ (L/r)³
+   └─────────────────┘
+     4×8 = 32 格，2 个非空       M = 2
+
+   卷积怎么做：
+     对每个输出位置 o，遍历核的 27 个偏移 δ
+       查 hash[o − δ] → 命中就累加 W[δ] @ feats[row]
+     └── 关键：**输出位置的集合怎么定**，决定了下面两节的全部内容
+        </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>最后一行是这一整个模块的枢纽。</strong><em>密集卷积的输出位置是「所有位置」；而稀疏卷积必须显式地决定「哪些位置产出输出」</em>。<strong>两个自然的选择给出完全不同的行为</strong>：① <strong>任何被核覆盖到的位置</strong>都产出 → <em>常规稀疏卷积</em>；② <strong>只有输入非空的位置</strong>产出 → <em>子流形稀疏卷积</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而哈希表这一点值得单说：它让邻居查询变成 $O(1)$，而且这张表可以在层间复用。</strong><em>对比模块 02 第 6b 节：点云路线每一层都要重新建邻域（FPS + 球查询，$N{=}102{,}668$、$M{=}1024$ 时是 1.05 亿次距离计算）</em>；<strong>而体素路线的邻居关系由坐标算术直接给出——只要活跃集不变，规则表（rulebook）也不变。</strong><em>这就是「体素路线 FLOP 更高但更快」的结构性原因。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="rulebook"><span class="num">2</span>规则表：稀疏卷积的真实开销与它的一个反直觉性质</h2>
+  <p>稀疏卷积的实际计算量不是 $M\times27\times C_{in}\times C_{out}$，而是<strong>规则表条目数</strong> $\times C_{in}\times C_{out}$——因为 27 个邻居里大部分是空的。</p>  <div class="math-block">\[\text{rules} = \bigl|\{(o,\delta) : o\in\mathcal{A},\ o-\delta\in\mathcal{A},\ \delta\in K\}\bigr|\]</div>  <p>notebook 第 1b 节在五种活跃集形状上量这两个量：</p>  <table>
+    <thead><tr><th>活跃集形状</th><th>活跃数 $M$</th><th>第一层膨胀率</th><th>规则条目/活跃</th><th>两者之积</th></tr></thead>
+    <tbody>
+      <tr><td><strong>完全散开（随机 2975 点）</strong></td><td>2,975</td><td><strong>22.05×</strong></td><td><strong>1.33</strong></td><td>29.3</td></tr>
+      <tr><td>一条直线（50 体素，模拟杆）</td><td>50</td><td>9.36×</td><td>2.96</td><td>27.7</td></tr>
+      <tr><td>一个薄片（10×10，模拟牌面）</td><td>100</td><td>4.32×</td><td>7.84</td><td>33.9</td></tr>
+      <tr><td>一个大平面（60×60，模拟地面）</td><td>3,600</td><td>3.00×</td><td>—</td><td>—</td></tr>
+      <tr><td><strong>一个实心块（$12^3$）</strong></td><td>1,728</td><td><strong>1.59×</strong></td><td><strong>22.75</strong></td><td>36.2</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>两列的排序恰好相反，而这不是巧合。</strong><em>膨胀率高意味着「活跃体素周围大多是空的」，而那正好意味着规则条目少（真实邻居少）；反之实心块几乎不膨胀，但每个位置有 22.75 个真实邻居要算</em>。<strong>所以两者的积被核大小 27 大致框住（实测 27.7–36.2）</strong>——<em>因为它们从两端数的是同一批「邻接关系」。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>这给出一个反直觉的推论：越稀疏的活跃集，单层卷积反而越<em>便宜</em>（规则少），而它的<em>膨胀</em>越贵。</strong><em>所以「稀疏」在这一层是两个方向的作用力：它降低本层的计算，又加速活跃集的增长</em>。<strong>而子流形卷积的价值正是「拿掉后者、保留前者」</strong>——<em>它让极度稀疏的输入（本课 0.215%）以最低的规则密度被处理，而不必承担 52.54× 的膨胀。</em></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>顺带纠正一个容易犯的估算错误。</strong><em>用 $M\times27$ 估稀疏卷积的乘加次数，在散开的活跃集上会高估 20 倍（实测 1.33 而不是 27）</em>。<strong>正确的估法是先算规则表大小，而它只需要一次邻域查询。</strong><em>这与 C72 模块 02「重投影误差是必要非充分条件」是同一类纪律：代理指标要与它代理的量真正相关。</em>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dilation"><span class="num">3</span>常规稀疏卷积会膨胀，而膨胀是指数级的</h2>
+  <p>「任何被核覆盖到的位置都产出输出」听起来很自然。<strong>而它的后果是每一层把活跃集按 $3^3$ 的邻域膨胀一次。</strong></p>  <p>notebook 第 2 节在一帧真实环扫点云上量（检测范围 $80\times80\times6$ m，$r{=}0.2$ m，网格 $400\times400\times30$）：</p>  <table>
+    <thead><tr><th>层</th><th>常规稀疏卷积的非空数</th><th>占用率</th><th>累计膨胀</th><th>子流形的非空数</th></tr></thead>
+    <tbody>
+      <tr><td>0（输入）</td><td>10,306</td><td>0.2147%</td><td>1.00×</td><td>10,306</td></tr>
+      <tr><td>1</td><td>80,103</td><td>1.6688%</td><td>7.77×</td><td>10,306</td></tr>
+      <tr><td>2</td><td>197,780</td><td>4.1204%</td><td>19.19×</td><td>10,306</td></tr>
+      <tr><td>3</td><td>353,314</td><td>7.3607%</td><td>34.28×</td><td>10,306</td></tr>
+      <tr><td><strong>4</strong></td><td><strong>541,523</strong></td><td><strong>11.2817%</strong></td><td><strong>52.54×</strong></td><td><strong>10,306</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>四层之后占用率从 0.215% 涨到 11.28%——稀疏性基本消失。</strong><em>而第一层就膨胀 7.77×（不是 27×，因为相邻的活跃体素共享很多邻居）；之后每层大约再乘 2.5×，因为活跃区已经连成片</em>。<strong>所以膨胀率不是常数 27，它取决于活跃集自身的形状</strong>——<em>第 1b 节量出的排序是：完全散开 22.05× &gt; 直线 9.36× &gt; 薄片 4.32× &gt; 平面 3.00× &gt; 实心块 1.59×</em>。<strong>也就是说「越散开膨胀越快」，而真实点云的第一层（7.77×）落在散开与薄片之间。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这个膨胀是「无中生有」的：新增的 53 万个活跃位置，对应的输入全是空的。</strong><em>它们的特征来自核的边缘权重乘上少量真实输入——也就是在空气里插值出一片「虚假的占据」</em>。<strong>这不只是浪费算力，它还改变了后续层「看到」的几何：一个薄薄的标志在四层之后会变成一团直径几米的模糊斑块。</strong><em>而这与 C72 模块 04 的「前向映射空洞被形态学闭运算填上」是同一类问题——用插值伪造观测。</em></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="flops"><span class="num">4</span>FLOPs 优势的消失</h2>
+  <table>
+    <thead><tr><th>方案</th><th>活跃位置数</th><th>FLOP（$3^3$，64→64）</th><th>相对密集</th></tr></thead>
+    <tbody>
+      <tr><td>密集卷积</td><td>4,800,000（全部）</td><td><strong>530.84 GFLOP</strong></td><td>1×</td></tr>
+      <tr><td><strong>子流形稀疏</strong></td><td>10,306</td><td><strong>1.140 GFLOP</strong></td><td><strong>465.7× 更少</strong></td></tr>
+      <tr><td>常规稀疏（4 层后）</td><td>541,523</td><td>59.89 GFLOP</td><td><strong>只剩 8.86×</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>稀疏卷积的全部收益就是「占用率的倒数」——所以任何让占用率上升的东西都在直接吃掉收益。</strong><em>465.7× 与 8.86× 相差 53 倍，而这个 53 正好是第 2 节那个累计膨胀率</em>。<strong>换句话说：膨胀率与 FLOPs 收益是同一个数的两种说法。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>所以「用了稀疏卷积」这句话本身不说明任何事——必须问「哪一种，以及活跃集怎么演化」。</strong><em>一个只用常规稀疏卷积的深网络，在最后几层的占用率可能已经超过 50%，此时它比密集卷积只快不到 2 倍，却承担了稀疏实现的全部复杂度</em>。<strong>而这件事在 FLOPs 报表上看不出来</strong>——<em>因为大多数报表只报第一层或平均值。正确的做法是<strong>逐层报活跃数</strong>（练习 2）。</em></p></div>
+  </div>  <h3>逐层的活跃数长什么样</h3>  <table>
+    <thead><tr><th>层</th><th>常规稀疏</th><th>子流形</th></tr></thead>
+    <tbody>
+      <tr><td>0（输入）</td><td>10,306</td><td>10,306</td></tr>
+      <tr><td>1</td><td>80,103</td><td>10,306</td></tr>
+      <tr><td>2</td><td>197,780</td><td>10,306</td></tr>
+      <tr><td>3</td><td>353,314</td><td>10,306</td></tr>
+      <tr><td>4</td><td><strong>541,523</strong></td><td><strong>10,306</strong></td></tr>
+    </tbody>
+  </table>  <p><strong>右边那一列恒定，就是子流形卷积的全部定义。</strong><em>而左边那一列的形状（前两层涨得最快、之后变缓）反映的是活跃集从「散开」逐渐变成「成片」——而第 1b 节量过：散开的膨胀率 22.05×、成片的只有 1.59×</em>。</p>  <div class="callout intuition"><span class="label"></span>
+    <strong>一条零成本的诊断</strong>：在你的稀疏网络里逐层打印 <code>len(coords)</code>。<em>如果它随深度快速增长，说明你用的是常规稀疏卷积；如果它保持不变，说明是子流形</em>。<strong>而如果它增长到网格的百分之几十，那么换成密集卷积可能反而更快（实现更简单、访存更规则）。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="submanifold"><span class="num">5</span>子流形稀疏卷积：把活跃集钉死</h2>
+  <p>Graham et al.（2018）的做法极简：<strong>输出位置 = 输入位置。</strong>核照样看 27 个邻居，但只在<em>本来就非空</em>的位置写输出。</p>  <div class="math-block">\[y_o = \sum_{\delta:\ o-\delta \in \mathcal{A}} W_\delta\, x_{o-\delta},\qquad o \in \mathcal{A}\ \text{（活跃集不变）}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>于是活跃集在整个网络里恒为 10,306，占用率恒为 0.215%，FLOPs 优势恒为 465.7×。</strong><em>而规则表（rulebook）也只需要算一次，可以在所有同分辨率的层之间复用</em>——<strong>这是子流形卷积在工程上真正省时间的地方，而它在 FLOPs 上看不出来。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而「活跃集不变」这一条同时是它的全部代价——下一节展开。</strong><em>直觉上的问题是：如果输出只在原来非空的位置产生，那么信息就无法流到空的位置去；而「空的位置」正是把两个分开的物体部件连起来的地方</em>。<strong>所以子流形卷积的感受野不像密集卷积那样随层数线性增长——它被活跃集的<em>连通结构</em>限制住了。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="real-cost"><span class="num">6</span>本模块的核心：子流形卷积下，不连通的部分永远不通信</h2>
+  <p>把上一节那句话量出来。<strong>对每个目标<em>实例</em>算一次连通分量</strong>（$r{=}0.2$ m、26-邻接；<em>注意必须按实例算——三块标志相距 30–75 m，把它们混在一起算出的「间隙」是 225 个体素，没有意义</em>）：</p>  <table>
+    <thead><tr><th>目标</th><th>点数</th><th>体素数</th><th>分量数</th><th>内部最大间隙</th><th>分量内的地面体素数</th></tr></thead>
+    <tbody>
+      <tr><td>车 #0（20 m）</td><td>413</td><td>128</td><td>7</td><td>81.2 体素（16.24 m）</td><td><strong>726</strong></td></tr>
+      <tr><td>车 #1（35 m）</td><td>131</td><td>82</td><td>8</td><td>105.8 体素（21.15 m）</td><td>297</td></tr>
+      <tr><td>车 #2（60 m）</td><td>30</td><td>30</td><td>6</td><td>8.7 体素（1.73 m）</td><td><strong>0</strong></td></tr>
+      <tr><td>车 #3（80 m）</td><td>14</td><td>14</td><td>8</td><td>9.5 体素（1.90 m）</td><td><strong>0</strong></td></tr>
+      <tr><td><strong>标志 #4（30 m）</strong></td><td>21</td><td>15</td><td><strong>2</strong>（10 + 5）</td><td><strong>2.5 体素（0.50 m）</strong></td><td><strong>0</strong></td></tr>
+      <tr><td>标志 #5（55 m）</td><td>8</td><td>8</td><td>2（4 + 4）</td><td>2.0 体素（0.40 m）</td><td><strong>0</strong></td></tr>
+      <tr><td>标志 #6（75 m）</td><td>3</td><td>3</td><td>1</td><td>—</td><td><strong>0</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <strong>两条结论，而第二条是意外的。</strong><em>① <strong>车与地面连通（轮胎接地）</strong>：20 m 处那辆车的分量里含 726 个地面体素，所以子流形卷积能在车与地面之间传信息；<strong>而标志悬空，分量里的地面体素恒为 0</strong>——而「离地多高」正是区分标志与地面标记的唯一线索（模块 01 第 4 节）。</em><em>② <strong>「接地」这个性质本身随距离退化</strong>：60 m 与 80 m 处的车也变成 0 个地面体素——因为点太疏，车与地面之间已经断开。</em>
+  </div>  <p><strong>而标志自身也碎成多块</strong>：30 m 处那块 15 个体素分成 2 个分量（10 + 5），<strong>内部间隙 2.5 个体素 = 0.50 m</strong>。<em>所以在纯子流形卷积下，同一块标志的两半也不交换信息。</em></p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这不是一个精度问题，是一个可达性问题。</strong><em>子流形卷积的信息传播被限制在活跃集的连通分量内，而稀疏采样让远处的薄物体天然碎成多个分量</em>（<strong>模块 01 量过：73 m 处的标志只有 4.6 个点</strong>）。<strong>所以「越远越碎，越碎越无法聚合」——而这恰好与「越远越需要聚合」相反。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>实践中的解法是：子流形卷积做主体，间隔插入少量<em>会膨胀的</em>算子。</strong><em>最常见的是「带步长的常规稀疏卷积」（stride-2 下采样）——它把分辨率降一半，于是原本相距 3 个体素的两块在下一层就相邻了</em>。<strong>所以真实网络（SECOND、CenterPoint 的骨干）的结构是「若干子流形层 + 一次下采样」重复几轮</strong>，<em>而下采样的次数由「最大的物体要在多少层内连通」决定</em>。<strong>这就是这一层唯一需要人工设计的超参数。</strong></p></div>
+  </div>  <h3>一个可以直接算的设计判据</h3>  <p>给定目标的最大内部间隙 $g$（体素数）与下采样次数 $k$，<strong>连通所需的条件是 $g \le 2^k$</strong>（每次下采样把间隙折半）。<em>本课的标志分量之间最大间隙约 4 个体素（$r{=}0.2$ m 即 0.8 m），所以 $k\ge2$ 就够——而这与真实网络普遍用 3–4 次下采样是一致的</em>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="downsample-tension"><span class="num">7</span>下采样：连通性与定位精度直接冲突</h2>
+  <p>上一节说下采样能把间隙折半。<strong>而它同时把分辨率变粗，于是量化误差按 $2^k$ 增长。</strong>把两件事放在一张表上，会看到一个硬冲突。</p>  <p>参照量：模块 05 会算出<strong>一块 $0.8\times0.1\times0.8$ m 的限速牌，沿最薄轴达到 IoU=0.5 只允许 0.0333 m 的平移误差</strong>。</p>  <table>
+    <thead><tr><th>下采样次数 $k$</th><th>分辨率 $r$</th><th>量化误差上界 $r\sqrt3/2$</th><th>相对允许误差</th><th>标志内部间隙（体素）</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>0.20 m</td><td>0.1732 m</td><td><strong>5.2×</strong></td><td>4.00</td></tr>
+      <tr><td>1</td><td>0.40 m</td><td>0.3464 m</td><td>10.4×</td><td>2.00</td></tr>
+      <tr><td><strong>2</strong></td><td><strong>0.80 m</strong></td><td><strong>0.6928 m</strong></td><td><strong>20.8×</strong></td><td><strong>1.00 ← 连通</strong></td></tr>
+      <tr><td>3</td><td>1.60 m</td><td>1.3856 m</td><td>41.6×</td><td>0.50</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <strong>注意 $k{=}0$ 那一行：即使完全不下采样，$r{=}0.2$ m 的量化误差已经是允许误差的 5.2 倍。</strong><em>而要让标志的两个分量连起来需要 $k\ge2$（间隙 2.5 个体素），此时是 20.8 倍</em>。<strong>所以对又薄又小的目标，体素路线在<em>任何</em>分辨率上都无法同时满足「连通」与「IoU-0.5 的定位精度」。</strong>
+  </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>而正确的结论不是「体素路线不行」，是「这个评测口径不行」。</strong><em>0.0333 m 的定位精度在 50 m 处对<strong>任何</strong>车载传感器都不可达（C72 模块 03 量到最好的补法在 50 m 处是 ±0.68 m）</em>。<strong>所以「IoU ≥ 0.5」这个从 2D 检测继承来的阈值，对薄目标在物理上是不可达的——它不是一个高标准，是一个错标准。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>这正是 nuScenes 用<em>中心距离</em>（0.5/1/2/4 m 四档）而不是 3D IoU 作为匹配判据的原因。</strong><em>中心距离不含「三个乘子」，所以它对目标的尺寸与厚度不敏感</em>；<strong>而对交通标志这类目标，它是唯一物理上可达的口径。</strong><em>模块 05 会把这个对比精确算出来，并给出「什么时候该用哪个口径」的判据。</em><strong>而本节要留下的是这个因果链：架构的分辨率选择 → 量化误差 → 评测口径的可达性。三者是同一个约束链上的三段，不能分开决定。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="vfe"><span class="num">8</span>格内怎么聚合：模块 02 的对称函数在这里复用</h2>
+  <p>体素化之后，一个格子里可能有多个点（模块 01：$r{=}0.2$ m 时平均 4.8 个）。<strong>把它们变成一个特征向量，需要的正是模块 02 那套对称函数。</strong></p>  <table>
+    <thead><tr><th>编码方式</th><th>怎么做</th><th>性质</th></tr></thead>
+    <tbody>
+      <tr><td><strong>二值占据</strong></td><td>非空就是 1</td><td>最简单；<em>丢掉格内的全部信息</em></td></tr>
+      <tr><td><strong>手工统计</strong></td><td>点数、均值、方差、最大 $z$…</td><td>便宜、可解释；<strong>而「点数」这一项要小心</strong>——<em>模块 01 量过它主要由距离决定</em></td></tr>
+      <tr><td><strong>VFE（VoxelNet）</strong></td><td>格内点做逐点 MLP，再 max-pool</td><td><strong>就是一个作用在格内的小 PointNet</strong>；<em>所以模块 02 的临界点集结论在这里同样成立</em></td></tr>
+      <tr><td><strong>PFN（PointPillars）</strong></td><td>同上，但作用在整根柱子上</td><td>柱内点更多（模块 01：$0.16$ m 柱平均 3.44 点），<em>而 $z$ 只作为特征而不是维度</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>VFE 用 max-pool 而不是 mean，理由和模块 02 完全相同：</strong><em>格内点数由距离决定（近处一个格子可能几十个点，远处一个），而 max 对点数的敏感性远小于 sum、且对密度分布免疫</em>。<strong>而模块 02 的临界点集结论在这里变成：一个格子的特征实际上只由格内少数几个极值点决定。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>一个实践上的坑：<code>max_num_points_per_voxel</code> 这个上限。</strong><em>它必须设成「足够覆盖近处最密的格子」，而模块 00 练习 1 的 <code>counts.max()</code> 直接给出这个数</em>。<strong>设小了会静默丢点，而且丢的是近处最密的格子里的点</strong>——<em>幸运的是 max-pool 对此相对不敏感（丢掉的大概率是非临界点），这也是「架构选择恰好兼容工程妥协」的又一个例子</em>。<strong>但如果编码里含「点数」这一项，那么截断就直接篡改了它。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="implementations"><span class="num">9</span>三种实现方式，以及它们的访存行为</h2>
+  <p>同一个稀疏卷积可以用三种方式实现，<strong>而它们的 FLOP 数相同、墙钟时间差很多</strong>——差别全在访存。</p>  <table>
+    <thead><tr><th>实现</th><th>怎么做</th><th>访存特点</th><th>什么时候好</th></tr></thead>
+    <tbody>
+      <tr><td><strong>gather–scatter</strong></td><td>按规则把输入行 gather 成连续矩阵 → 一次 GEMM → scatter 回去</td><td><strong>要物化中间矩阵</strong>：$\text{rules}\times C_{in}$ 个 float</td><td>规则密度低（散开的活跃集，第 1b 节的 1.33）</td></tr>
+      <tr><td><strong>implicit GEMM</strong></td><td>不物化中间矩阵，在 GEMM 的内层循环里按规则取数</td><td>访存不连续，但<strong>省掉一次全量读写</strong></td><td>规则密度高（实心块，22.75）</td></tr>
+      <tr><td><strong>逐偏移 GEMM</strong></td><td>对 27 个偏移各做一次小 GEMM，只用该偏移的规则</td><td>27 次小 GEMM；<em>每次的规则数差异很大</em></td><td>实现最简单，spconv 早期版本用它</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>gather–scatter 的中间矩阵大小可以直接算：</strong><em>本课的输入（$M{=}10{,}306$、规则密度约 1.3、$C_{in}{=}64$）是 $10{,}306\times1.3\times64\times4$ B ≈ 3.4 MB</em>——<strong>还能放进缓存</strong>。<em>而在实心块那种规则密度 22.75 的情形下，同样的 $M$ 会给出 60 MB 的中间矩阵——那就必须走 implicit GEMM 了。</em></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>所以「哪种实现更快」取决于活跃集的形状，而形状随层数变化（第 2 节：越深越成片）。</strong><em>这就是为什么成熟库（spconv 2.x、MinkowskiEngine）会<strong>按层自动选择算法</strong>，并把规则表缓存起来</em>。<strong>而对本课的读者，实用的结论只有一条：不要自己实现稀疏卷积。</strong><em>本课从零实现的是「稀疏卷积的语义」（练习 1–2），不是它的高效实现</em>——<strong>与 C71 模块 04 对受限解码的态度完全一样。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="checklist"><span class="num">10</span>本模块的清单</h2>
+  <ol>
+    <li><strong>逐层打印活跃位置数</strong>（第 3 节）——<em>这是判断「用的是哪一种稀疏卷积」以及「稀疏性还剩多少」的唯一直接手段</em></li>
+    <li><strong>不要只报第一层的 FLOPs</strong>：常规稀疏卷积 4 层后的优势从 465.7× 掉到 8.86×</li>
+    <li><strong>算一次目标的连通分量</strong>（第 5 节）——<em>如果关心的目标碎成多块，纯子流形卷积在架构上就做不到聚合它们</em></li>
+    <li><strong>下采样次数由 $g \le 2^k$ 定</strong>（第 5 节），其中 $g$ 是目标内部的最大间隙（以体素计）</li>
+    <li><strong>但要同时检查那个 $k$ 下的量化误差是否还在预算内</strong>（第 5b 节）——<em>对薄目标两者会直接冲突，而此时该换的是评测口径而不是分辨率</em></li>
+    <li><strong>不要自己实现稀疏卷积</strong>（第 6b 节）：用 spconv / MinkowskiEngine，它们会按层自动选算法并缓存规则表</li>
+    <li><strong>格内编码优先 max 而不是 mean/点数</strong>（第 6 节），理由与模块 02 相同</li>
+    <li><strong><code>max_num_points_per_voxel</code> 用实测的 <code>counts.max()</code> 设</strong>（模块 00 练习 1），<em>并且如果编码里含「点数」，必须确认没有被截断</em></li>
+  </ol>  <div class="callout paper"><span class="label"></span>
+    <strong>如果只做一条，做第 3 条。</strong><em>「目标碎成几块」这个数不需要训练、不需要标签之外的任何东西，而它直接告诉你「这个架构能不能表示这个目标」</em>。<strong>而它在 TSR 上给出的答案是明确的：26 个体素、5 个分量、0 个地面连接——所以纯子流形骨干对交通标志是不够的。</strong>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_pointnet/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 置换不变性与 max-pool</div></a>
+    <a class="next" href="../04_detection3d/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 3D 检测：从锚框到中心点</div></a>
+  </div>
+
+</div>
+</body>
+</html>
