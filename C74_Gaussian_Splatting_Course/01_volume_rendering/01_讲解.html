@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 体渲染与 α 合成的地基</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 体渲染与 α 合成的地基</h1>
+  <p class="subtitle">体渲染积分的三个量：$\sigma$ 是<em>局部</em>性质、$T$ 是<em>路径</em>性质、$C$ 是<em>期望</em> · <strong>$T\sigma\,\mathrm dt$ 是「第一次碰撞」的概率密度，所以 $C$ 是期望而 $T_{\text{final}}$ 是漏光</strong> · <strong>对分段常数密度，α 合成精确到机器精度（$N{=}1$ 误差为 0）</strong>——<em>所以离散化误差只来自 σ 在段内变化，而那时中点法则是<strong>二阶</strong>的（比值 4.00）</em> · <strong>顺序敏感度由 α 决定</strong>：$\alpha\in[0.1,0.7]$ 中位偏差 19.6%，$[0.01,0.05]$ 只有 0.27%（差 73 倍）——<em>这就是「NeRF 不必排序、3DGS 必须排序」的全部原因</em> · <strong>提前终止：245 个高斯里只需处理 19 个，误差严格小于 $T_{\min}$</strong> · 反向传播必须<strong>从后往前</strong>累加，且 $1/(1-\alpha)$ 是唯一的病态点 · <strong>深度图三种口径：$D_{\text{raw}} = A\cdot D_{\text{norm}}$，所以相对偏差<em>恒等于</em> $-(1-A)$</strong>——<em>一个 $\alpha{=}0.9$ 的高斯在 10 m 处给出 9.0 m</em></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">本模块回答</div><div class="v">① 体渲染积分是怎么来的、它的三个物理量各是什么；② 为什么它的离散化叫「α 合成」，而<strong>对分段常数密度它是精确的</strong>；③ <strong>为什么 3DGS 必须排序而 NeRF 不必</strong>；④ 提前终止能省多少、代价是什么；⑤ α 合成的反向传播为什么要<strong>从后往前</strong>走</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_volume_rendering.ipynb（闭式解核对 / <strong>误差 ∝ 1/N²</strong> / 顺序敏感性随 α 与个数的变化 / <strong>提前终止的收益与误差上界</strong> / 解析梯度 vs 数值梯度 / <strong>1/(1−α) 的病态</strong>）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Max, <em>Optical Models for Direct Volume Rendering</em>（TVCG 1995）· Kajiya &amp; Von Herzen（SIGGRAPH 1984，体渲染方程）· Porter &amp; Duff, <em>Compositing Digital Images</em>（SIGGRAPH 1984，α 合成的来源）· Mildenhall et al., <em>NeRF</em>（ECCV 2020，式 (3) 即本模块第 2 节）· Kerbl et al., <em>3D Gaussian Splatting</em>（SIGGRAPH 2023）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#integral">体渲染积分：三个物理量与一个微分方程</a></li>
+      <li><a href="#alpha">离散化：为什么它叫 α 合成，以及一个精确性结论</a></li>
+      <li><a href="#order">顺序：为什么 3DGS 必须排序，而 NeRF 不必</a></li>
+      <li><a href="#saturate">饱和与提前终止：实时性的第一来源</a></li>
+      <li><a href="#backward">反向传播：为什么必须从后往前走</a></li>
+      <li><a href="#byproducts">同一条积分的两个副产物：累积不透明度与深度图</a></li>
+      <li><a href="#position">3DGS 在这个框架里的位置：一个高斯 = 一个 α</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="integral"><span class="num">1</span>体渲染积分：三个物理量与一个微分方程</h2>
+  <p>先把式子写出来，再解释它每一部分从哪来。沿一条从相机出发的射线，位置用 $t$ 参数化，像素颜色是</p>  <div class="math-block">\[C = \int_{t_n}^{t_f} T(t)\,\sigma(t)\,c(t)\,\mathrm{d}t,\qquad T(t) = \exp\Bigl(-\int_{t_n}^{t}\sigma(s)\,\mathrm{d}s\Bigr)\]</div>  <table>
+    <thead><tr><th>量</th><th>名字</th><th>单位</th><th>物理含义</th></tr></thead>
+    <tbody>
+      <tr><td>$\sigma(t)$</td><td>体密度 / 消光系数 (volume density)</td><td>$\mathrm{m}^{-1}$</td><td><strong>单位长度上光被吸收或散射掉的概率</strong>。<em>注意它不是「不透明度」，量纲都不同</em></td></tr>
+      <tr><td>$c(t)$</td><td>自发光颜色 (emitted radiance)</td><td>无量纲（辐射度）</td><td>这一点<em>朝相机方向</em>发出的颜色。<strong>3DGS 里它是球谐的求值结果</strong>（模块 05）</td></tr>
+      <tr><td>$T(t)$</td><td>透射率 (transmittance)</td><td>无量纲，$\in(0,1]$</td><td>从 $t_n$ 走到 $t$ 还<strong>没被挡住</strong>的比例。<em>它是一个累积量，这一点决定了后面的一切</em></td></tr>
+    </tbody>
+  </table>  <h3>$T$ 的指数形式不是假设，是一个一阶微分方程的解</h3>  <p>考虑一束强度 $I$ 的光走过一小段 $\mathrm{d}t$。「密度」的定义就是：这一段里被吸收掉的比例是 $\sigma\,\mathrm{d}t$。所以</p>  <div class="math-block">\[\frac{\mathrm{d}I}{\mathrm{d}t} = -\sigma(t)\,I(t)\;\Longrightarrow\; I(t) = I(t_n)\exp\Bigl(-\int\sigma\Bigr)\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>把这件事想成「一段一段地活下来」。</strong><em>穿过第一段活下来的概率是 $1-\sigma\delta$，第二段又是 $1-\sigma\delta$……走 $N$ 段活下来的概率是 $(1-\sigma\delta)^N$，而 $N\to\infty$ 时它就是 $e^{-\sigma L}$</em>。<strong>指数来自「独立事件的连乘」，而不是任何经验拟合。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而积分里的 $T(t)\sigma(t)$ 这个乘积有一个概率解释，它是本模块后面全部结论的来源：</strong><em>$T(t)\sigma(t)\,\mathrm{d}t$ 是「光子恰好在 $t$ 处第一次被吸收」的概率密度</em>（活着走到 $t$ × 在 $t$ 处被吸收）。<strong>所以 $C$ 是「第一次碰撞点的颜色」的期望</strong>，而 $\int T\sigma\,\mathrm{d}t = 1 - T(t_f) \le 1$——<em>它是一个可能有「漏光」的概率分布，漏掉的那部分 $T(t_f)$ 就是背景</em>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>一句话记住三个量的关系</strong>：$\sigma$ 是<em>局部</em>的性质（这一点有多密），$T$ 是<em>路径</em>的性质（前面挡了多少），$C$ 是<em>期望</em>。<strong>「$T$ 依赖路径」正是「必须排序」的全部原因</strong>——第 3 节会把这句话量出来。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="alpha"><span class="num">2</span>离散化：为什么它叫 α 合成，以及一个精确性结论</h2>
+  <p>把射线切成 $N$ 段，第 $i$ 段长 $\delta_i$、密度 $\sigma_i$、颜色 $c_i$。在这一段内把 $\sigma$ 和 $c$ 当常数，那么这一段的「被吸收概率」是</p>  <div class="math-block">\[\alpha_i = 1 - \exp(-\sigma_i \delta_i)\;\in(0,1)\]</div>  <p>而走到第 $i$ 段之前的透射率是前面各段「活下来」概率的乘积。于是</p>  <div class="math-block">\[C = \sum_{i=1}^{N} T_i\,\alpha_i\,c_i,\qquad T_i = \prod_{j<i}(1-\alpha_j)\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这个式子和图形学里 30 年前的 α 合成（Porter–Duff, 1984）逐字相同。</strong><em>把一叠半透明胶片从前往后叠起来，就是这个公式</em>。<strong>所以「体渲染」与「α 合成」不是两件事：α 合成是体渲染积分在分段常数假设下的离散形式，而 $\alpha_i = 1-e^{-\sigma_i\delta_i}$ 是两者之间唯一的翻译。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而 $\alpha$ 与 $\sigma$ 的区别值得单独记一下，因为混淆它们会导致一类很难查的 bug。</strong><em>$\sigma$ 有量纲（$\mathrm{m}^{-1}$）、可以任意大、与步长无关；$\alpha$ 无量纲、被夹在 $(0,1)$、<strong>依赖步长</strong></em>。<strong>NeRF 的网络输出 $\sigma$，所以换采样步长时 $\alpha$ 自动跟着变；3DGS 直接存 $\alpha$，所以它<em>没有步长</em>这个概念</strong>——<em>这是两者最实质的一个差别，第 6 节会说清后果</em>。</p></div>
+  </div>  <h3>对分段常数密度，α 合成是精确的——连 $N{=}1$ 都对</h3>  <p>$\sigma$、$c$ 在长度 $L$ 上恒定时，积分有闭式解 $C = c\,(1-e^{-\sigma L})$。把这段均分成 $N$ 段做 α 合成：</p>  <div class="math-block">\[\sum_{i=1}^{N} (1-\alpha)^{i-1}\alpha c= c\,\alpha\,\frac{1-(1-\alpha)^N}{\alpha}= c\bigl(1-(1-\alpha)^N\bigr) = c\bigl(1-e^{-\sigma L}\bigr)\]</div>  <table>
+    <thead><tr><th>$N$</th><th>α 合成结果</th><th>与闭式解之差</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>0.760170345305709</td><td><strong>0</strong></td></tr>
+      <tr><td>2</td><td>0.760170345305709</td><td><strong>0</strong></td></tr>
+      <tr><td>4</td><td>0.760170345305709</td><td><strong>0</strong></td></tr>
+      <tr><td>16</td><td>0.760170345305709</td><td>1.1e−16</td></tr>
+      <tr><td>256</td><td>0.760170345305708</td><td>8.9e−16</td></tr>
+    </tbody>
+  </table>  <div class="callout paper"><span class="label"></span>
+    <strong>这个结论把「离散化误差」的来源锁死在唯一一处：$\sigma$ 或 $c$ 在一段之内发生变化。</strong><em>α 合成本身不引入任何误差，$N$ 也不需要大</em>。<strong>而当 $\sigma$ 沿射线变化时，中点法则的误差是 $\propto 1/N^2$（二阶），不是 $\propto 1/N$</strong>——notebook 量到每翻一倍 $N$ 误差降到 <strong>1/4.00</strong>。<em>这解释了为什么 NeRF 用 64+128 个采样点就够了：二阶收敛下，把 64 加到 128 只换来 4 倍精度，边际收益极快地耗尽</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="order"><span class="num">3</span>顺序：为什么 3DGS 必须排序，而 NeRF 不必</h2>
+  <p>$T_i = \prod_{j<i}(1-\alpha_j)$ 里的 $j<i$ 说明 $C$ **依赖求和的顺序**。α 合成不是可交换的。下面是量出来的结果（8 个基元、2000 次随机置换、满量程 1.0）：</p>  <table>
+    <thead><tr><th>$\alpha$ 的范围</th><th>中位偏差</th><th>P95</th><th>最大</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>$[0.30, 0.90]$</td><td><strong>0.2929</strong></td><td>0.5843</td><td>0.8394</td><td><strong>接近满量程的一半</strong></td></tr>
+      <tr><td>$[0.10, 0.70]$</td><td><strong>0.1961</strong></td><td>0.4200</td><td>0.6394</td><td>3DGS 的典型区间</td></tr>
+      <tr><td>$[0.01, 0.05]$</td><td>0.0027</td><td>0.0061</td><td>0.0099</td><td>NeRF 的典型区间（密采样下每点 α 很小）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>两个区间差了 73 倍。而这不是巧合，可以一阶展开看出来：</strong><em>$\alpha$ 都很小时 $T_i = \prod_{j<i}(1-\alpha_j) \approx 1-\sum_{j<i}\alpha_j$，代进 $C$ 后一阶项是 $\sum_i \alpha_i c_i$——<strong>它与顺序无关</strong>，顺序只影响二阶项 $\sum_{i}\sum_{j<i}\alpha_i\alpha_j c_i$</em>。<strong>所以顺序敏感度是 $O(\alpha^2)$，而 $\alpha$ 从 0.03 涨到 0.4 是 13 倍，平方后约 180 倍——量级对得上。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>于是两种方法在「排序」上的处境完全不同。</strong><em>NeRF 沿射线行进，采样点<strong>天然按 $t$ 单调</strong>，顺序是免费的；而且它的 $\alpha$ 很小，就算错了也不致命</em>。<strong>3DGS 把成千上万个高斯投影到屏幕上，它们在内存里的顺序与深度毫无关系，而每个高斯的 $\alpha$ 又大</strong>——<em>所以它必须<strong>显式地按深度排序</strong>，而这个排序就是模块 03 里最贵的一步（50 万高斯要排 200 万个键）</em>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>一个必须说清的诚实之处：3DGS 排的是「高斯中心的深度」，而不是「每个像素上的真实前后关系」。</strong><em>两个相互穿插的椭球，在某些像素上 A 在前、在另一些像素上 B 在前，但它们在整个 tile 里只有一个顺序</em>。<strong>这是 3DGS 的一个已知近似</strong>，它在相机转动时会造成「弹跳」（popping）——<em>顺序在某个视角突然翻转，画面跳一下。后续工作（StopThePop, 2024）用逐像素或分层排序来缓解，代价是速度</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="saturate"><span class="num">4</span>饱和与提前终止：实时性的第一来源</h2>
+  <p>$T_i$ 是单调递减的乘积。一旦它足够小，后面所有基元的贡献 $T_i\alpha_i c_i$ 都被压到可忽略——**可以直接停下来**。累积不透明度 $1-T$ 的增长：</p>  <table>
+    <thead><tr><th>每个 $\alpha$</th><th>1 个</th><th>4 个</th><th>16 个</th><th>32 个</th><th>达 99% 需要</th><th>达 99.9% 需要</th></tr></thead>
+    <tbody>
+      <tr><td>0.1</td><td>0.1000</td><td>0.3439</td><td>0.8147</td><td>0.9657</td><td><strong>44 个</strong></td><td>66 个</td></tr>
+      <tr><td>0.2</td><td>0.2000</td><td>0.5904</td><td>0.9719</td><td>0.9992</td><td><strong>21 个</strong></td><td>31 个</td></tr>
+      <tr><td>0.3</td><td>0.3000</td><td>0.7599</td><td><strong>0.9967</strong></td><td>0.99999</td><td><strong>13 个</strong></td><td>20 个</td></tr>
+      <tr><td>0.5</td><td>0.5000</td><td>0.9375</td><td>0.99999</td><td>1.0000</td><td><strong>7 个</strong></td><td>10 个</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>「达 99% 需要多少个」有闭式解：$n = \lceil \ln(0.01)/\ln(1-\alpha)\rceil$。</strong><em>它对 $\alpha$ 是<strong>对数</strong>依赖，所以 $\alpha$ 从 0.1 涨到 0.5（5 倍）只把 $n$ 从 44 降到 7（6.3 倍）——两者大致成反比</em>。<strong>关键的量级是：不管 $\alpha$ 多少，都是「几十个」，而不是「几百个」或「几个」。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而模块 03 会量出：1920×1080 下每个 tile 平均要处理 245 个高斯。</strong><em>而在 $T_{\min}{=}10^{-4}$ 的判据下，notebook 量到只需处理 <strong>19</strong> 个 —— <strong>92.2% 的工作可以被提前终止省掉</strong></em>。<strong>这是 3DGS 实时性最大的一块来源，而它完全是 $T_i$ 单调递减这个结构性质带来的。</strong><em>注意它是<strong>逐 tile</strong>生效的：天空那样的 tile 只有几个高斯，近处物体的 tile 会在第 19 个左右停下，而<strong>最坏情况（一整 tile 都是低 $\alpha$ 的雾）不会终止</strong>——所以提前终止改善的是平均而不是最坏时延</em>。</p></div>
+  </div>  <h3>代价：它是一个近似，而且是有界的</h3>  <p>在 $T < T_{\min}$ 时停下，丢掉的是 $\sum_{i \ge k} T_i\alpha_i c_i$。因为 $T_i \le T_k < T_{\min}$ 且 $\sum_{i\ge k}\alpha_i \prod(1-\alpha) \le 1$，所以丢掉的量 **严格小于** $T_{\min}\cdot\max_i c_i$。</p>  <div class="callout intuition"><span class="label"></span>
+    <strong>所以 $T_{\min}$ 直接就是误差上界，可以按需要选。</strong><em>官方实现用 $T_{\min} = 10^{-4}$，对应最大误差 $10^{-4}$——远小于 8 bit 显示的 1/255 ≈ 0.0039，所以视觉上完全无损</em>。<strong>而顺带一个 float32 的坑：$\alpha=0.3$ 时 256 个高斯后 $T = 2.2\times10^{-40}$，已经下溢为 0</strong>——<em>所以提前终止不只是优化，它还避免了在下溢的 $T$ 上继续做无意义的乘法</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="backward"><span class="num">5</span>反向传播：为什么必须从后往前走</h2>
+  <p>训练要 $\partial C/\partial\alpha_i$ 与 $\partial C/\partial c_i$。颜色那一项很简单：</p>  <div class="math-block">\[\frac{\partial C}{\partial c_i} = T_i\,\alpha_i\]</div>  <p>$\alpha_i$ 那一项不简单，因为 $\alpha_i$ 同时出现在**自己这一项**里，又出现在**后面所有** $T_k$（$k>i$） 里：</p>  <div class="math-block">\[\frac{\partial C}{\partial \alpha_i} = T_i c_i - \frac{1}{1-\alpha_i}\underbrace{\sum_{k>i} T_k \alpha_k c_k}_{S_{>i}}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第二项的形状决定了实现方式：它需要「$i$ 之后所有项的和」。</strong><em>所以反向传播必须<strong>从最远的基元往近处走</strong>，一边走一边累加 $S_{>i}$</em>。<strong>前向从近到远累积 $T$，反向从远到近累积 $S$——这个「一来一回」是 3DGS 那个 CUDA 内核的核心结构</strong>，<em>而它意味着反向传播必须知道前向的<strong>顺序</strong>，所以排序结果要么存下来、要么重算</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而 $1/(1-\alpha_i)$ 是个明显的病态点。</strong><em>$\alpha_i \to 1$ 时它发散：$\alpha=0.99$ 时是 100，$\alpha=0.9999$ 时是 $10^4$</em>。<strong>真实实现有两道防线</strong>：① <strong>$\alpha$ 存成 logit 过 sigmoid，永远到不了 1</strong>；② <strong>官方内核不算 $1/(1-\alpha)$，而是在反向走的过程中顺便把 $T$ 也<em>反推</em>回来</strong>——<em>它保存前向结束时的 $T_{\text{final}}$，然后每退一步做一次除法恢复 $T_i$，把病态限制在同一个量上而不是每项都乘一次</em>。</p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <strong>这里有一个真实会遇到的坑：反向传播必须重放<em>提前终止</em>。</strong><em>如果前向在第 19 个高斯停了，反向却对全部 245 个求梯度，那些被跳过的高斯会收到<strong>本该是零的梯度</strong></em>——<strong>结果是被完全遮挡的高斯也在被优化，它们会长成「看不见但吃内存」的浮物</strong>。<em>官方内核的做法是：前向记下每个 tile 实际处理到第几个，反向只走那么多</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="byproducts"><span class="num">6</span>同一条积分的两个副产物：累积不透明度与深度图</h2>
+  <p>体渲染积分不只产出颜色。同一组权重 $w_i = T_i\alpha_i$ 换一个被加权的量，就得到 3DGS 实际会输出的另外两张图：</p>  <div class="math-block">\[A = \sum_i w_i = 1 - T_{\text{final}},\qquad D_{\text{raw}} = \sum_i w_i\, t_i,\qquad D_{\text{norm}} = \frac{\sum_i w_i t_i}{\sum_i w_i}\]</div>  <table>
+    <thead><tr><th>量</th><th>是什么</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td>$A$ = 累积不透明度 (accumulated alpha)</td><td>「这条射线一共被挡住了多少」，$\in[0,1)$</td><td><strong>合成背景：$C_{\text{final}} = C + T_{\text{final}}\cdot C_{\text{bg}}$</strong>；也直接当<em>前景 mask</em> 用；训练时常加一项让它逼近 0/1，逼表示变「实心」</td></tr>
+      <tr><td>$D_{\text{raw}}$ = 未归一化期望深度</td><td>$w_i$ 加权的深度</td><td><strong>它有偏，见下</strong></td></tr>
+      <tr><td>$D_{\text{norm}}$ = 归一化深度</td><td>除以 $A$ 之后的加权平均深度</td><td>深度监督、法向估计、导出网格（C75）、与 LiDAR 对齐</td></tr>
+    </tbody>
+  </table>  <h3>$D_{\text{raw}}$ 的偏差有闭式形式，而且不小</h3>  <p>取最简的情形：**一个** $\alpha=0.9$ 的高斯，位于 $t=10\,\mathrm{m}$。那么 $w_1 = 0.9$，于是 $D_{\text{raw}} = 0.9\times 10 = 9.0\,\mathrm{m}$——**偏小 1 m，而真相只有一个表面、深度毫无疑义。**</p>  <div class="math-block">\[D_{\text{raw}} = A\cdot D_{\text{norm}}\;\Longrightarrow\; \text{偏差} = -(1-A)\cdot D_{\text{norm}}\]</div>  <table>
+    <thead><tr><th>配置（表面在 10 m 附近）</th><th>累积 $A$</th><th>$D_{\text{raw}}$</th><th>$D_{\text{norm}}$</th><th>$D_{\text{raw}}$ 的相对偏差</th></tr></thead>
+    <tbody>
+      <tr><td>1 个高斯，$\alpha=0.9$</td><td>0.9000</td><td>9.000</td><td><strong>10.000</strong></td><td><strong>−10.0%</strong></td></tr>
+      <tr><td>20 个，$\alpha=0.05$</td><td>0.6415</td><td>6.666</td><td>10.391</td><td><strong>−33.3%</strong></td></tr>
+      <tr><td>20 个，$\alpha=0.10$</td><td>0.8784</td><td>9.058</td><td>10.312</td><td>−9.4%</td></tr>
+      <tr><td>20 个，$\alpha=0.20$</td><td>0.9885</td><td>10.071</td><td>10.188</td><td>＋0.7%</td></tr>
+      <tr><td>5 个，$\alpha=0.90$</td><td>1.0000</td><td>10.011</td><td>10.011</td><td>0.0%</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>规律很干净：$D_{\text{raw}}$ 的相对偏差就是 $-(1-A)$，所以它只在射线被完全挡住（$A\to1$）时才正确。</strong><em>而「被完全挡住」恰恰是训练早期<strong>不</strong>成立的情形——那时候高斯还稀、$\alpha$ 还小，$A$ 可能只有 0.6</em>。<strong>于是一个很常见的现象有了解释：用未归一化深度做监督时，早期的深度损失会把高斯往相机方向拉</strong>，<em>因为减小 $t$ 与增大 $A$ 对这个损失是等效的，而前者更容易</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>但归一化也不是免费的：$A$ 很小的地方（天空、物体边缘）$D_{\text{norm}}$ 的分母接近 0，噪声被放大。</strong><em>实践中的做法是两者都输出，并<strong>用 $A$ 当置信度把低 $A$ 的像素屏蔽掉</strong>（常见阈值 $A>0.5$ 或 $0.9$）</em>。<strong>还有第三种口径：$w$ 的<em>中位数</em>深度</strong>（表格里 20 个 $\alpha=0.2$ 时是 10.150）——<em>它对「一层薄雾 + 一个实心表面」这种双峰分布比均值稳，所以在做网格提取时（C75）常用它而不是均值</em>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>三个口径会给出不同的数，而它们都叫「深度图」。</strong><em>比较两份 3DGS 的深度结果、或把 3DGS 深度与 LiDAR 对齐时，先确认口径一致</em>——<strong>上表第二行里 $D_{\text{raw}}$ 与 $D_{\text{norm}}$ 差了 3.7 m，这个量级足以让任何评测结论翻转。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="position"><span class="num">7</span>3DGS 在这个框架里的位置：一个高斯 = 一个 α</h2>
+  <table>
+    <thead><tr><th></th><th>NeRF</th><th>3DGS</th></tr></thead>
+    <tbody>
+      <tr><td>基元是什么</td><td>射线上的一个<strong>采样点</strong></td><td>空间里的一个<strong>各向异性椭球</strong></td></tr>
+      <tr><td>$\sigma$ 从哪来</td><td>MLP 的输出，每个采样点跑一次网络</td><td><strong>不存在 $\sigma$</strong>——直接存 $\alpha$，乘上椭球在该像素的高斯衰减值</td></tr>
+      <tr><td>$\delta$（步长）</td><td>相邻采样点的间距，随采样策略变</td><td><strong>没有步长概念</strong>。<em>「一个高斯 = 一个 α」，$\alpha_i = \alpha^{(g)}\exp(-\frac12 d^\top\Sigma'^{-1}d)$</em></td></tr>
+      <tr><td>每像素的基元数</td><td>64 + 128（粗采样 + 细采样）</td><td><strong>该 tile 里排过序的高斯，直到 $T<10^{-4}$（典型十几个）</strong></td></tr>
+      <tr><td>顺序从哪来</td><td>沿 $t$ 单调，<strong>免费</strong></td><td><strong>必须显式排序</strong>（模块 03 里最贵的一步）</td></tr>
+      <tr><td>典型 $\alpha$ 量级</td><td>0.01 – 0.05</td><td><strong>0.1 – 0.9</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第三行是最容易被忽略但最有后果的一条。</strong><em>3DGS 没有步长，等价于说它<strong>放弃了「同一段物质、不同采样密度应给出同样结果」这个性质</strong>。在 NeRF 里，把 64 个采样点换成 128 个，渲出的图基本不变（第 2 节：误差 $\propto 1/N^2$）；在 3DGS 里，把一个高斯换成两个体积各半的高斯，<strong>渲出的图会变</strong>，因为 $\alpha$ 不是从密度算来的</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这恰好是模块 04 里「分裂」这个操作起作用的机制</strong>：<em>分裂不是「等价变换 + 更细的表示」，它<strong>真的改变了渲染结果</strong>，所以分裂之后必须继续优化才能收敛回去</em>。<strong>反过来说，这也是 3DGS 的表示能力比「体密度场 + 固定采样」更强的地方</strong>——<em>它可以用一个大高斯精确表示一层硬边的表面，而基于密度的方法要在那里放很陡的 $\sigma$，进而需要很密的采样</em>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>$\alpha$ 大还有一个不在渲染速度上的后果：它让损失曲面更陡。</strong><em>$\partial C/\partial c_i = T_i\alpha_i$，而 $T_i$ 随 $\alpha$ 增大而更快衰减——所以前几个基元的梯度很大、后面的几乎为零</em>。<strong>于是 3DGS 的优化天然是「近处先收敛、远处后收敛」的，而被完全遮挡的高斯几乎收不到梯度</strong><em>（这既是它能快速收敛的原因，也是浮物问题的来源之一——模块 05 第 5 节）</em>。
+  </div>  <div class="callout paper"><span class="label"></span>
+    <strong>带走这一条：本模块的公式对 NeRF 与 3DGS 是同一条，两者的差别全在「基元是什么」以及由此带来的 $\alpha$ 量级。</strong><em>$\alpha$ 大 ⟹ 必须排序、可以提前终止、每像素只要十几个基元；$\alpha$ 小 ⟹ 顺序无所谓、不能提前终止、每像素要几百个采样</em>。<strong>3DGS 的实时性，追到底就是这一个量级差。</strong>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 课程总览与四个可注入错误的部件</div></a>
+    <a class="next" href="../02_primitive/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 各向异性高斯基元与投影的边界</div></a>
+  </div>
+
+</div>
+</body>
+</html>

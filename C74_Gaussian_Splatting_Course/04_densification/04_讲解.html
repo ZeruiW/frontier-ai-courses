@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 自适应密度控制与判据的可靠性</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 自适应密度控制与判据的可靠性</h1>
+  <p class="subtitle"><strong>把「屏幕位置梯度」这个判据的可靠性量出来</strong>（3 目标 × 5 密度 × 2 种子）：中等密度区秩相关 +0.63~+0.68、top-1/4 命中率 44–56%（基线 25%），<strong>而稀疏区的命中率<em>恰等于</em>随机基线，且有运行给出 −0.262</strong> · <strong>它是启发式而不是定理——而这解释了官方的每一个超参数</strong> · <strong>尺度梯度在每一档都在基线之下（3–28%）</strong>，<em>而我第一次只跑一个配置时它看起来好一倍——这个陷阱比结论本身更值得记住</em> · <strong>克隆让总体积 ×2，分裂让总体积 ×0.488</strong>（临界 $\varphi = 2^{1/3}$）· <strong>256 个 $\alpha{=}0.005$ 的高斯叠出 0.7229</strong>——<em>所以剪枝阈值不是按可见性定的（按可见性该是 2e-5，小 100 倍）</em> · 新高斯的 Adam 动量必须<strong>置零</strong>，于是训练其实是「145 次带预热的重启」 · <strong>要 20× 增长需每轮 +22.1%，而增长率涨 25% 终值涨 1.94 倍</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">本模块回答</div><div class="v">① 为什么必须做密度控制（不做就停在 SfM 点云的密度上）；② <strong>「屏幕位置梯度」这个判据到底多可靠——答案是「中等密度区命中率 44–56%，稀疏区<strong>恰等于随机基线</strong>」，而这解释了官方全部的超参数选择</strong>；③ <strong>克隆 vs 分裂的几何差别：克隆让总体积 ×2，分裂让总体积 ×0.488</strong>；④ 剪枝阈值不能只看单个高斯的贡献；⑤ 不透明度重置为什么是一个<strong>独立</strong>的机制；⑥ 增长率的预算账（<strong>要 20× 需要每轮 +22.1%</strong>）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_densification.ipynb（<strong>把判据的可靠性量出来：3 目标 × 5 密度 × 2 种子 = 每档 6 次</strong> / 克隆与分裂的体积恒等式 / <strong>累积窗口从 100 步换成全程会改变结论</strong> / 剪枝阈值的累积效应 / 增长率与预算）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Kerbl et al., <em>3D Gaussian Splatting</em>（SIGGRAPH 2023，§5.2 与附录 B）· 官方实现 <code>scene/gaussian_model.py</code> 的 <code>densify_and_prune / densify_and_clone / densify_and_split</code> · Zhang et al., <em>Pixel-GS</em>（ECCV 2024，把判据改成像素加权）· Bulò et al., <em>Revising Densification in Gaussian Splatting</em>（ECCV 2024）· Fang &amp; Wang, <em>Mini-Splatting</em>（ECCV 2024，用采样代替克隆/分裂）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why">不做密度控制会怎样</a></li>
+      <li><a href="#criterion">判据：屏幕位置梯度到底多可靠</a></li>
+      <li><a href="#clone-split">克隆 vs 分裂：一个体积恒等式</a></li>
+      <li><a href="#prune">剪枝：为什么阈值不能只看单个高斯</a></li>
+      <li><a href="#optimizer">一个容易漏掉的细节：新高斯的优化器状态</a></li>
+      <li><a href="#reset">不透明度重置：一个独立的机制</a></li>
+      <li><a href="#alternatives">后续工作怎么改这个判据</a></li>
+      <li><a href="#diagnose">怎么诊断密度控制出了问题</a></li>
+      <li><a href="#budget">增长率的预算账</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why"><span class="num">1</span>不做密度控制会怎样</h2>
+  <p>3DGS 的初始化是 SfM 的稀疏点云——**典型 10 万个点左右，而收敛后的场景有 100 万到 500 万个高斯**。这 10–50 倍的差距完全由密度控制补上。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>而「不够」的代价不是「稍微糊一点」。</strong><em>模块 00 量过一个 1D 的版本：用 1 个高斯拟合一条硬边亮带，RMSE 0.2604；用 4 个，0.1222——降到 1/2.13，而这三档在四种优化器设置下数值完全一致（已收敛）</em>。<strong>所以前几倍的高斯买到的是实打实的精度。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>但更重要的是模块 00 的<em>第二</em>个观察：$K\ge8$ 之后结果开始依赖优化器设置，$K{=}64$ 在 lr=0.2 下直接发散到 RMSE 13.8。</strong><em>所以密度控制不是「加得越多越好」——高斯越多，优化越不稳定</em>。<strong>真正的问题是：<em>加在哪里</em>。</strong><em>而这就归结到一个判据，也就是下一节</em>。</p></div>
+  </div>  <div class="ascii">   3DGS 的训练循环（15000 步的典型配置）：
+
+   iter 0        SfM 点云初始化（~10 万个高斯，α 初值 0.1）
+   iter 0-500    只优化，不做密度控制         &lt;- 为什么要等？见第 2 节
+   iter 500      开始每 100 步做一次 densify_and_prune
+   iter 3000     第一次不透明度重置            &lt;- 一个**独立**的机制，第 5 节
+   iter 6000     第二次重置
+   iter 15000    停止密度控制（densify_until_iter）
+   iter 15000-30000  只优化，不再增删
+        </div>
+
+  <!-- ========================================================= -->
+  <h2 id="criterion"><span class="num">2</span>判据：屏幕位置梯度到底多可靠</h2>
+  <p>官方的判据是：累积每个高斯在**屏幕空间**的位置梯度模长 $\Vert \partial L/\partial \mu_{2D}\Vert_2$，在最近 100 步上取平均，超过 $2\times10^{-4}$ 就分裂或克隆。</p>  <p>**这个判据到底成立吗？** notebook 用一个可控的 1D 实验做了检验：三种目标函数（各含一个平坦区与一个高频纹理区）× 5 个高斯密度 × 2 个随机种子 = 每档 6 次独立运行，算「累积平均 $\vert\partial L/\partial\mu\vert$」与「该高斯负责区域内的实际残差 RMS」的秩相关，以及「梯度最大的前 1/4 是不是残差最大的前 1/4」的命中率。</p>  <table>
+    <thead><tr><th>高斯个数 $K$</th><th>秩相关 均值</th><th>最小 / 最大</th><th>top-1/4 命中率</th><th>随机基线</th></tr></thead>
+    <tbody>
+      <tr><td>8</td><td>+0.210</td><td><strong>−0.262</strong> / +0.595</td><td><strong>25%</strong></td><td>25%</td></tr>
+      <tr><td>12</td><td><strong>+0.647</strong></td><td>+0.343 / +0.895</td><td>44%</td><td>25%</td></tr>
+      <tr><td>16</td><td><strong>+0.678</strong></td><td>+0.594 / +0.744</td><td><strong>50%</strong></td><td>25%</td></tr>
+      <tr><td>24</td><td>+0.634</td><td>+0.546 / +0.773</td><td><strong>56%</strong></td><td>25%</td></tr>
+      <tr><td>32</td><td>+0.545</td><td>+0.366 / +0.775</td><td>42%</td><td>25%</td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <strong>结论要说准，三句话：</strong>① <strong>在中等密度区（$K$ = 12–24），判据有真实信号</strong>——<em>秩相关 +0.63 到 +0.68，命中率 44–56%，是随机基线的 1.8–2.2 倍</em>；② <strong>在稀疏区（$K{=}8$）它<em>恰好等于</em>随机基线（25% vs 25%），而某次运行的秩相关是 −0.262</strong>——<em>也就是完全没有信息</em>；③ <strong>它是一个启发式，不是定理。</strong><em>而这不是挑刺——它恰好解释了官方的每一个超参数选择。</em>
+  </div>  <table>
+    <thead><tr><th>官方的做法</th><th>为什么</th><th>对应上表的哪个现象</th></tr></thead>
+    <tbody>
+      <tr><td><code>densify_from_iter = 500</code></td><td>训练早期的判据<strong>不可靠</strong>（注意：不是「没信号」）</td><td><em>notebook 量到：只用最早 100 步时秩相关 +0.330，约为全程的一半，<strong>但 6 次运行里有 1 次是 −0.056</strong></em></td></tr>
+      <tr><td>梯度在 <strong>100 步</strong>上取平均后才用</td><td>单步梯度噪声太大；而<strong>长窗口主要降的是<em>方差</em></strong></td><td><em>$K{=}16$：全程窗口秩相关 +0.678（极差 0.150），最后 100 步 +0.520（<strong>极差 0.618，宽 4.1 倍</strong>）</em></td></tr>
+      <tr><td>阈值 $2\times10^{-4}$ 需要按数据集重调</td><td>判据的标度不稳定</td><td><em>上表的秩相关跨目标从 −0.26 到 +0.90</em></td></tr>
+      <tr><td><code>densify_until_iter = 15000</code> 就停</td><td>后期判据的可靠性下降</td><td><strong>$K$ 从 16 到 32，命中率从 50% 掉到 42%，秩相关从 +0.68 掉到 +0.55</strong></td></tr>
+      <tr><td><strong>另外还有不透明度重置</strong>（第 5 节）</td><td>补判据抓不到的那部分</td><td><em>命中率只有 44–56%，所以必须有第二个机制</em></td></tr>
+    </tbody>
+  </table>  <h3>为什么是<em>位置</em>梯度，而不是别的</h3>  <p>同一个实验顺手比了两个替代判据。把 top-1/4 命中率并排放（随机基线 25%）：</p>  <table>
+    <thead><tr><th>$K$</th><th>$\vert\partial L/\partial\mu\vert$（官方）</th><th>$\vert\partial L/\partial s\vert$</th><th>$\vert\partial L/\partial\alpha\vert$</th></tr></thead>
+    <tbody>
+      <tr><td>8</td><td>25%</td><td>25%</td><td><strong>0%</strong></td></tr>
+      <tr><td>12</td><td><strong>44%</strong></td><td>28%</td><td>11%</td></tr>
+      <tr><td>16</td><td><strong>50%</strong></td><td><strong>12%</strong></td><td>17%</td></tr>
+      <tr><td>24</td><td><strong>56%</strong></td><td><strong>3%</strong></td><td>39%</td></tr>
+      <tr><td>32</td><td>42%</td><td><strong>6%</strong></td><td>48%</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>尺度梯度在<em>每一档</em>都在随机基线之下或持平（3–28%）——它不是一个可用的判据。</strong><em>而我要说清一件事：我第一次只跑了一个目标、一个种子，那次尺度梯度在 $K{=}12$ 上命中 67%，看起来比位置梯度好一倍。跑满 6 次取均值之后是 28%</em>。<strong>「在单一配置上验证一个判据」这个陷阱，比「位置梯度是对的」这个结论本身更值得记住。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而位置梯度胜出的真实理由是<em>方向性</em>。</strong><em>$\partial L/\partial\mu$ 是一个<strong>向量</strong>，它的模长大意味着「这个高斯正被不同的像素/视角往不同方向拉」——而这正是「一个高斯在试图同时表示两处内容」的症状</em>。<strong>尺度与不透明度梯度都是标量，没有方向，所以表达不了这件事。</strong><em>顺带解释了不透明度梯度为什么随 $K$ 变好（0% → 48%）：高斯多了之后，「该不该存在」这个问题比「该往哪挪」更贴近残差</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="clone-split"><span class="num">3</span>克隆 vs 分裂：一个体积恒等式</h2>
+  <p>判据触发后，有两条路。选哪条只看一个条件：**高斯当前的尺度是否超过场景尺度的 1%**（`percent_dense = 0.01`）。</p>  <table>
+    <thead><tr><th></th><th>克隆 (clone)</th><th>分裂 (split)</th></tr></thead>
+    <tbody>
+      <tr><td>触发条件</td><td>尺度 <strong>小</strong>（≤ 1% 场景尺度）</td><td>尺度 <strong>大</strong>（&gt; 1% 场景尺度）</td></tr>
+      <tr><td>诊断为</td><td><strong>欠重建</strong>（under-reconstruction）：<em>这里内容不够，需要更多基元</em></td><td><strong>过重建</strong>（over-reconstruction）：<em>一个大高斯盖住了本该有细节的区域</em></td></tr>
+      <tr><td>操作</td><td>复制一份，沿位置梯度方向平移；<strong>尺度不变</strong></td><td>生成 2 个，<strong>尺度 ÷ 1.6</strong>；位置从父高斯自身的分布里<strong>采样</strong></td></tr>
+      <tr><td>个数</td><td>×2</td><td>×2（父高斯被删除）</td></tr>
+      <tr><td><strong>单个体积</strong></td><td>不变</td><td><strong>÷ 4.10</strong>（$1.6^3$）</td></tr>
+      <tr><td><strong>总体积</strong></td><td><strong>×2.000</strong></td><td><strong>×0.488</strong></td></tr>
+    </tbody>
+  </table>  <div class="math-block">\[\text{总体积倍数} = \frac{2}{\varphi^3},\qquad \varphi = 1.6\;\Longrightarrow\; \frac{2}{4.096} = 0.4883\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>所以两个操作的作用方向是相反的，而这一点常被含糊掉。</strong><em>克隆<strong>增加</strong>总的「物质量」——它在说「这里东西不够多」；分裂<strong>减少</strong>总物质量 51.2%——它在说「这里东西太粗，要细化」</em>。<strong>$\varphi$ 的临界值是 $2^{1/3} = 1.2599$：小于它总体积会涨，大于它会缩。</strong><em>官方选 1.6 意味着「分裂时明确地缩小」，而这也解释了为什么分裂后必须继续优化——渲染结果被<strong>真的</strong>改变了（模块 01 第 7 节：3DGS 没有步长概念，「一个高斯 = 一个 $\alpha$」，所以分裂不是等价变换）</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而「位置从父高斯自身的分布里采样」是一个容易忽略的细节。</strong><em>它不是「放在父高斯两端」，而是从 $\mathcal N(\mu,\Sigma)$ 里抽两个点。所以对一个各向异性的扁平高斯，两个子高斯会自动沿它的<strong>长轴</strong>分布</em>——<strong>方向信息是免费从协方差里继承来的，不需要额外判断。</strong><em>代价是随机性：同一个高斯分裂两次会得到不同结果，所以 3DGS 的训练不是确定性的（即使固定随机种子，分裂的顺序还依赖于梯度累积的浮点求和顺序）</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="prune"><span class="num">4</span>剪枝：为什么阈值不能只看单个高斯</h2>
+  <p>剪枝规则有两条：① $\alpha < 0.005$ 的删掉；② 屏幕半径 > 20 px 或世界尺度 > 10% 场景范围的删掉。</p>  <p>第一条的阈值看起来很好定：$\alpha = 0.005$ 的高斯对一个像素的贡献不到 $1/255 = 0.0039$ 的两倍，几乎看不见。**但这个推理是错的**，因为它只算了一个高斯。</p>  <table>
+    <thead><tr><th>单个 $\alpha$</th><th>1 个</th><th>16 个</th><th>64 个</th><th>256 个</th></tr></thead>
+    <tbody>
+      <tr><td>0.005</td><td>0.0050</td><td>0.0771</td><td>0.2744</td><td><strong>0.7229</strong></td></tr>
+      <tr><td>0.010</td><td>0.0100</td><td>0.1485</td><td>0.4744</td><td><strong>0.9237</strong></td></tr>
+      <tr><td>0.050</td><td>0.0500</td><td>0.5599</td><td>0.9625</td><td>1.0000</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>256 个 $\alpha=0.005$ 的高斯叠起来是 0.72 的不透明度——而模块 03 量过，一个 tile 里平均就有 245 个高斯。</strong><em>所以「几乎透明」的高斯堆在一起完全可以是不透明的</em>。<strong>这说明 0.005 这个阈值不能从「单个高斯的可见性」推出来，它是一个经验值</strong>——<em>而它的真实含义更接近「这个高斯已经不再被优化器有效使用了」，而不是「它看不见」</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而第二条（屏幕半径 &gt; 20 px）在本课里已经出现三次，每次都是不同的理由：</strong><em>① 模块 02：张角 20 px @ f=600 对应 3.82°，正落在仿射近似误差 &lt; 0.05% 的档内；② 模块 03：半径 100 px 的一个高斯抵得上 44 个正常高斯的分箱成本；③ 本节：过大的高斯往往是在「用一片糊补偿几何或位姿的错误」</em>。<strong>一个旋钮同时压住三件事，这在整套系统里很少见。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="optimizer"><span class="num">5</span>一个容易漏掉的细节：新高斯的优化器状态</h2>
+  <p>克隆或分裂产生的新高斯，**它的 Adam 一阶/二阶动量该设成什么？**这个问题看起来是实现细节，但它有明确的后果。</p>  <table>
+    <thead><tr><th>做法</th><th>后果</th></tr></thead>
+    <tbody>
+      <tr><td><strong>置零（官方的选择）</strong></td><td><em>新高斯的前几十步走得很小（Adam 的二阶动量从 0 开始，需要几步才建立起有效的步长），相当于一个自动的<strong>预热</strong></em>。<strong>代价是新高斯要几十步才「活起来」，而密度控制每 100 步就跑一次——所以有相当一部分时间在预热</strong></td></tr>
+      <tr><td>从父高斯继承</td><td><em>新高斯立刻以父高斯的步长移动。问题是父高斯的动量方向是「把它往某处拉」的方向，而<strong>两个子高斯会被拉向<em>同一个</em>方向</strong>——于是它们一起跑，没有分开</em>。<strong>这与分裂的目的（细化）相反</strong></td></tr>
+      <tr><td>随机初始化</td><td><em>Adam 的动量不是一个可以随机初始化的量（它是梯度的滑动平均，没有「合理的随机值」）</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>官方的实现是把整个优化器状态张量按新的高斯数重建，新增位置填零</strong>（<code>_prune_optimizer</code> 与 <code>cat_tensors_to_optimizer</code>）。<em>而剪枝时对应地把被删高斯的动量也删掉——如果只改参数不改优化器状态，动量会错位对齐到别的高斯上</em>，<strong>那是一个很难查的 bug：训练不报错，但高斯会朝莫名的方向漂移。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这解释了模块 04 开头那个观察的一半：「$K\ge8$ 之后结果开始依赖优化器设置」。</strong><em>高斯数变化时优化器状态被重建，于是「有效学习率」在每次 densify 之后都会经历一次瞬变——而 densify 每 100 步一次、共 145 轮</em>。<strong>所以 3DGS 的优化过程严格说不是一个平稳的梯度下降，而是「145 次带预热的重启」。</strong><em>3DGS-MCMC 之所以要固定总数，一部分原因就是想消掉这个瞬变</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="reset"><span class="num">6</span>不透明度重置：一个独立的机制</h2>
+  <p>每 3000 步，把**所有**高斯的不透明度压到 $\min(\alpha, 0.01)$，然后继续优化。这看起来很激进——它确实是。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>它解决的是判据抓不到的那一类问题：<em>浮物</em>（floaters）。</strong><em>浮物是悬在空中、不对应任何真实几何的高斯。它们来自三处：① 相机附近未被充分观测的区域；② 用一片半透明的雾去补偿位姿误差（C72/C75 的产物不完美）；③ 模块 01 第 5 节那个问题——被完全遮挡的高斯仍收到非零梯度</em>。<strong>而浮物的位置梯度往往很小</strong>（它们已经「安顿」下来了），<em>所以密度控制的判据看不见它们</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>重置的机制：把 $\alpha$ 全压到 0.01 之后，真正需要的高斯会在接下来的几百步里把 $\alpha$ 优化回来，而浮物不会</strong>——<em>因为它们对损失没有正贡献，梯度不会推高它们的 $\alpha$</em>。<strong>然后下一次剪枝（$\alpha<0.005$）就把它们清掉了。</strong><em>所以「重置 + 剪枝」是一个成对的机制，单独任何一个都没用</em>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>代价是重置会让 PSNR 暂时掉几个 dB，需要几百步才恢复。</strong><em>所以如果你在训练曲线上看到周期性的尖峰下跌，先确认是不是 <code>opacity_reset_interval</code>——那是正常的</em>。<strong>而如果重置后 PSNR <em>不</em>恢复，说明学习率或<code>densify_until_iter</code> 的配置有问题</strong>，<em>因为重置之后需要密度控制还在运行才能把该长回来的长回来</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="alternatives"><span class="num">7</span>后续工作怎么改这个判据</h2>
+  <p>既然第 2 节量出判据只是「比随机好一点」，那么 2024 年以来的改进几乎全都对着它下手。下面四条按<strong>它们改的是判据的哪个部分</strong>来排。</p>  <table>
+    <thead><tr><th>工作</th><th>它认为原判据的问题是</th><th>怎么改</th><th>代价 / 边界</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Pixel-GS</strong>（ECCV 2024）</td><td>梯度按<em>视角</em>平均，于是「在一个视角里只占几个像素的高斯」与「占几千像素的高斯」被同等对待</td><td><strong>按该高斯在每个视角覆盖的<em>像素数</em>加权</strong>再平均；另外按距离缩放梯度阈值</td><td><em>远处的大高斯更容易被分裂 —— 对以近景为主的场景收益不明显</em></td></tr>
+      <tr><td><strong>Revising Densification</strong>（ECCV 2024）</td><td>克隆/分裂改变了渲染结果（模块 01 第 7 节），所以每次操作都要靠优化「收敛回去」</td><td><strong>推导出让分裂<em>近似保持渲染结果不变</em>的位置/尺度/不透明度修正公式</strong></td><td><em>需要额外的解析推导；对高不透明度的高斯修正不精确</em></td></tr>
+      <tr><td><strong>Mini-Splatting</strong>（ECCV 2024）</td><td>「克隆 + 分裂 + 阈值」这套机制本身就是绕路</td><td><strong>直接按重要度<em>采样</em>：先故意长很多，再按深度重排 + 重要度采样把总数压回预算</strong></td><td><em>要先长到很大（峰值显存高），且采样是全局的、不能增量做</em></td></tr>
+      <tr><td><strong>3DGS-MCMC</strong>（NeurIPS 2024）</td><td>把密度控制当成启发式是错的方向 —— 它应该是采样</td><td><strong>把训练重新解释成 MCMC：克隆/分裂/剪枝换成「重定位」+ 噪声注入，总数<em>固定</em></strong></td><td><em>需要改优化器（加噪声项）；固定总数意味着要先猜对预算</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>四条改的是四个不同的东西，而它们都可以叠加，这本身说明原判据的问题不止一处。</strong><em>Pixel-GS 改<strong>加权</strong>（梯度怎么聚合）；Revising 改<strong>操作</strong>（分裂之后的参数）；Mini-Splatting 改<strong>控制方式</strong>（阈值 → 预算）；MCMC 改<strong>框架</strong>（启发式 → 采样）</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而共同的方向很清楚：从「设阈值让它自由生长」转向「给预算、按重要度分配」。</strong><em>理由就是第 6 节那个复合增长的敏感性——阈值降 20% 可能让终值翻倍</em>。<strong>所以如果你要在生产里用 3DGS，「总数可控」这件事比「PSNR 高 0.3 dB」重要得多</strong>——<em>前者决定它能不能上线，后者只影响一张对比图</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="diagnose"><span class="num">8</span>怎么诊断密度控制出了问题</h2>
+  <p>密度控制的故障有一个共同特征：**它们都表现为「训练看起来在跑，但结果不对」**，而不是报错。下面按可观测的现象组织。</p>  <table>
+    <thead><tr><th>现象</th><th>最可能的原因</th><th>怎么确认</th></tr></thead>
+    <tbody>
+      <tr><td><strong>高斯数几乎不长</strong>（15000 步后仍在 12 万）</td><td>梯度阈值太高；或 <code>densify_from_iter</code> 设得太晚</td><td><em>打印每轮触发克隆/分裂的<strong>个数</strong>。如果是 0，先把阈值降一个数量级看它会不会动</em></td></tr>
+      <tr><td><strong>高斯数爆炸然后 OOM</strong></td><td>阈值太低（第 6 节：指数敏感）</td><td><em>把每轮的总数打成曲线。指数增长在对数坐标上是直线——如果是直线，就是阈值问题；如果是某一轮突然跳，那是重置之后的反弹</em></td></tr>
+      <tr><td><strong>细节永远糊，但高斯数在长</strong></td><td>长错了地方（第 2 节：命中率只有 44–56%）</td><td><em>看新增高斯的<strong>空间分布</strong>。如果它们集中在已经很好的区域，说明判据在这个场景上失效，考虑换 Pixel-GS 的加权</em></td></tr>
+      <tr><td><strong>画面里有悬空的半透明色块</strong></td><td>浮物（第 5 节）</td><td><em>确认 <code>opacity_reset_interval</code> 在跑。另一个快速检验：从<strong>训练集之外</strong>的视角渲一张 —— 浮物在训练视角看不见，换视角就露出来</em></td></tr>
+      <tr><td><strong>PSNR 周期性尖峰下跌</strong></td><td><strong>正常</strong>——那是不透明度重置</td><td><em>周期应等于 <code>opacity_reset_interval</code>（默认 3000）。而如果掉下去<strong>不恢复</strong>，说明重置发生在 <code>densify_until_iter</code> 之后</em></td></tr>
+      <tr><td><strong>换个数据集就要重调阈值</strong></td><td><strong>正常</strong>——判据的标度不稳定（第 2 节：跨目标 −0.26 到 +0.90）</td><td><em>与其调阈值，不如换成「按预算控制总数」的做法</em></td></tr>
+    </tbody>
+  </table>  <div class="callout paper"><span class="label"></span>
+    <strong>最后一行值得单独强调，因为它是本模块最实用的一条结论。</strong><em>「换数据集就要重调密度阈值」不是你没调好，而是这个判据本身的标度就不稳定</em>——<strong>第 2 节的实验里，同一个 $K$ 下换一个目标函数，秩相关就能从 +0.90 变成 −0.26。</strong><em>所以正确的应对是换控制方式（给预算），而不是继续在阈值上花时间</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="budget"><span class="num">9</span>增长率的预算账</h2>
+  <p>密度控制从 iter 500 跑到 iter 15000，每 100 步一次——所以大约 **145 轮**。但每轮的增长不是恒定的（后期触发的高斯变少），而一个有用的粗算是「等效 15 轮的复合增长」。</p>  <table>
+    <thead><tr><th>每轮增长</th><th>15 轮后</th><th>从 10 万个长到</th></tr></thead>
+    <tbody>
+      <tr><td>+5%</td><td>2.08×</td><td>21 万</td></tr>
+      <tr><td>+10%</td><td>4.18×</td><td>42 万</td></tr>
+      <tr><td>+15%</td><td>8.14×</td><td>81 万</td></tr>
+      <tr><td><strong>+22.1%</strong></td><td><strong>20.0×</strong></td><td><strong>200 万</strong></td></tr>
+      <tr><td>+29.8%</td><td>50.0×</td><td>500 万</td></tr>
+    </tbody>
+  </table>  <div class="math-block">\[p = \left(\frac{N_{\text{final}}}{N_{\text{init}}}\right)^{1/15} - 1\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这个式子的用处是<em>反推</em>：给定显存预算，倒算阈值该往哪调。</strong><em>比如 12 GB 显存、SH 阶 3（每高斯 59 个 float = 236 字节，加上 Adam 的一阶二阶动量实际约 3 倍 ≈ 700 字节），能放下大约 1700 万个高斯的参数——但训练时还要放梯度、渲染缓冲与 (高斯,tile) 对，所以实际上限大约在 300–500 万</em>。<strong>要从 10 万到 400 万（40×），需要每轮 +27%。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而复合增长的敏感性值得注意：每轮增长率只涨 25%（+22.1% → +27.6%），终值就涨 1.94 倍；涨到 +29.8% 时是 2.5 倍。</strong><em>所以密度阈值这个超参数是「指数敏感」的——它降低 20%（$2\times10^{-4} \to 1.6\times10^{-4}$）可能让最终高斯数翻倍，进而 OOM</em>。<strong>这也是为什么后续工作（Mini-Splatting、Taming-3DGS 等）都改成<em>直接控制总数</em>：给一个预算 $N_{\max}$，每轮只加最需要的那些，而不是设一个阈值让它自由生长。</strong></p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>把本模块的三个数字并排放：</strong><em>判据的 top-1/4 命中率 44–56%（随机基线 25%）；分裂让总体积 ×0.488；要 20× 增长需要每轮 +22.1%</em>。<strong>合起来说明密度控制是一个「粗但有效」的机制：它每轮只需要比随机猜好一点，靠 145 轮的复合作用把 10 万变成几百万</strong>——<em>而这也解释了为什么它对超参数敏感却又出奇地稳健</em>。
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_rasterization/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 可微分 tile 光栅化</div></a>
+    <a class="next" href="../05_appearance_dynamic/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 外观、动态与何时不该用 3DGS</div></a>
+  </div>
+
+</div>
+</body>
+</html>

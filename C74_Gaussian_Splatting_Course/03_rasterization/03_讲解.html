@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 可微分 tile 光栅化</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 可微分 tile 光栅化</h1>
+  <p class="subtitle">逐像素要排 207 万次，逐 tile 只排 <strong>8160 次</strong>（1920×1080 / 16×16）· <strong>一个 64 位键让一次基数排序同时按 tile 与深度排好</strong>——<em>而深度用 16 位量化会让 <strong>68.75%</strong> 的相邻对顺序未定义，32 位是 0.0025%；官方更进一步：直接位重解释 float32，零精度损失（但它依赖近平面剔除保证深度为正）</em> · <strong>覆盖半径是主控变量</strong>：半径 8→20（2.5 倍）让 (高斯,tile) 对涨 <strong>3.06 倍</strong>，一个 100 px 的高斯抵 44 个正常高斯 · <strong>整帧时延由最慢的那个 tile 决定</strong>——平滑分布 2.67×，而含近处大物体的场景 <strong>8.67×</strong> · <strong>notebook 从零写出光栅化器，并与逐像素暴力实现<em>逐位相等</em></strong>（<em>为此必须先把三个近似列全，第三个是「$3\sigma$ 包围盒是 tile 对齐的」</em>）· <strong>改 tile 尺寸只是把成本在排序与渲染之间搬动，只有剪枝能真正降成本</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">本模块回答</div><div class="v">① 为什么是 <strong>tile</strong> 而不是逐像素或逐高斯；② <strong>一个 64 位键让一次基数排序同时按 tile 与深度排好序</strong>，而深度用几位量化是一个有量化后果的选择；③ 排序成本由<strong>覆盖半径</strong>决定（半径 ×2.5 → 对数 ×3.06）；④ 提前终止省掉 92.2% 的工作；⑤ <strong>整帧时延由最慢的那个 tile 决定</strong>（不均衡 2.67×）；⑥ 反向传播的写冲突：一个 8 px 的高斯要承受 201 次 atomicAdd</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_rasterization.ipynb（<strong>从零写一个能出图的 tile 光栅化器</strong> / 64 位键的正确性与量化位数的碰撞率 / <strong>16 位深度会让 68.75% 的相邻对顺序未定义</strong> / 提前终止的逐 tile 收益 / 负载分布 / <strong>与逐像素暴力实现逐位比对</strong>）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Kerbl et al., <em>3D Gaussian Splatting</em>（SIGGRAPH 2023，§6 光栅化器）· 官方实现 <code>diff-gaussian-rasterization</code>（forward.cu / backward.cu）· Merrill &amp; Grimshaw, <em>High Performance and Scalable Radix Sorting</em>（2011）· Radl et al., <em>StopThePop</em>（SIGGRAPH 2024，逐像素排序）· Ye et al., <em>gsplat</em>（JMLR 2025，开源重实现）· 本课程 <strong>C36</strong>（GPU 内核与性能工程，本模块只讲算法结构不讲 CUDA）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#why-tile">为什么是 tile：两种朴素做法各自死在哪</a></li>
+      <li><a href="#binning">分箱与那个 64 位键</a></li>
+      <li><a href="#render">逐 tile 渲染：分批、共享内存、提前终止</a></li>
+      <li><a href="#backward">反向传播：重放、写冲突、以及必须存什么</a></li>
+      <li><a href="#imbalance">整帧时延由最慢的那个 tile 决定</a></li>
+      <li><a href="#cost">每帧的结构性账：钱花在哪，以及 tile 尺寸为什么是 16</a></li>
+      <li><a href="#verify">怎么验证一个光栅化器是对的</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why-tile"><span class="num">1</span>为什么是 tile：两种朴素做法各自死在哪</h2>
+  <p>目标：给定几十万个已投影成 2D 椭圆的高斯，算出 1920×1080 的图像。而 α 合成要求**每个像素上按深度有序**。有三种组织方式。</p>  <table>
+    <thead><tr><th>做法</th><th>怎么做</th><th>死在哪</th></tr></thead>
+    <tbody>
+      <tr><td><strong>逐像素</strong></td><td>对每个像素，找出覆盖它的高斯，排序，合成</td><td><strong>排序次数 = 像素数 = 207 万次</strong>。<em>每次排序几十到几百个元素，而且相邻像素的排序结果高度重复——全是重复劳动</em></td></tr>
+      <tr><td><strong>逐高斯</strong></td><td>按深度排一次全局序，然后从近到远把每个高斯「涂」上去</td><td><strong>不能提前终止</strong>（不知道哪个像素已经饱和了），而且<strong>写冲突严重</strong>——<em>相邻高斯覆盖同一批像素，GPU 上是读-改-写竞争。更根本的是它无法做 $T$ 的串行累积</em></td></tr>
+      <tr><td><strong>逐 tile（3DGS 的做法）</strong></td><td>把屏幕切成 16×16 的 tile；对每个 tile 收集覆盖它的高斯、排一次序；tile 内 256 个像素<strong>共享这一个顺序</strong></td><td><strong>排序次数降到 8160 次</strong>，<em>而代价是「tile 内共享顺序」这个近似</em>（第 5 节）</td></tr>
+    </tbody>
+  </table>  <div class="ascii">   1920x1080，16x16 的 tile：
+
+   ceil(1920/16) = 120 列   ceil(1080/16) = 68 行   -&gt;  8160 个 tile
+   （1080/16 = 67.5，所以最后一行 tile 只用了 8 行像素）
+
+   ┌────┬────┬────┬─  ...  ─┬────┐
+   │ 0  │ 1  │ 2  │         │119 │   每个 tile = 16x16 = 256 个像素
+   ├────┼────┼────┼─  ...  ─┼────┤   GPU 上：一个 tile = 一个 block
+   │120 │121 │    │         │    │              一个像素 = 一个线程
+   ├────┼────┼────┼─  ...  ─┼────┤
+   ...                                256 个线程共享一份「排好序的高斯列表」
+   └────┴────┴────┴─  ...  ─┴────┘    -&gt; 从共享内存分批读，而不是各自去全局内存取
+        </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>16×16 = 256 不是随便挑的：它正好是一个 CUDA block 的常用线程数，而 256 个线程刚好能协作把高斯数据分批载入共享内存。</strong><em>tile 太大 → 一个 tile 里的高斯列表太长、共享顺序的近似误差变大、而且提前终止的收益被摊薄（因为要等 tile 里最深的那个像素）；tile 太小 → 排序次数变多、每个高斯被重复登记到更多 tile 里</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而「tile 内共享一个顺序」是 3DGS 的一个真实近似，不是实现细节。</strong><em>两个相互穿插的椭球，在 tile 的左半边 A 在前、右半边 B 在前，但它们在这个 tile 里只有一个顺序</em>。<strong>相机转动时这个顺序会在某个角度突然翻转，画面「跳一下」——这就是 popping</strong>，<em>StopThePop（2024）用分层/逐像素排序修它，代价是 2 倍左右的渲染时间</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="binning"><span class="num">2</span>分箱与那个 64 位键</h2>
+  <p>第一步：对每个高斯，算出它的 $3\sigma$ 包围盒覆盖哪些 tile，为每个 (高斯, tile) 组合生成一个条目。这个数字直接决定后面所有成本。</p>  <table>
+    <thead><tr><th>高斯数</th><th>覆盖半径</th><th>每个高斯覆盖的 tile 数</th><th>(高斯,tile) 对总数</th><th>每 tile 平均</th></tr></thead>
+    <tbody>
+      <tr><td>100 k</td><td>8 px</td><td>4.00</td><td>0.40 M</td><td>49.0</td></tr>
+      <tr><td>500 k</td><td>4 px</td><td>2.25</td><td>1.12 M</td><td>137.9</td></tr>
+      <tr><td>500 k</td><td>8 px</td><td>4.00</td><td><strong>2.00 M</strong></td><td><strong>245.1</strong></td></tr>
+      <tr><td>500 k</td><td>20 px</td><td>12.25</td><td><strong>6.12 M</strong></td><td>750.6</td></tr>
+      <tr><td>1 M</td><td>8 px</td><td>4.00</td><td>4.00 M</td><td>490.2</td></tr>
+    </tbody>
+  </table>  <p>覆盖 tile 数 $\approx (2r/16 + 1)^2$。所以**半径从 8 涨到 20（2.5 倍），对数涨 3.06 倍**——而对数就是排序的输入规模。</p>  <div class="callout intuition"><span class="label"></span>
+    <strong>这解释了模块 02 里 <code>max_screen_size = 20</code> 那个剪枝的第二重意义。</strong><em>它不只是为了控制仿射近似的误差（模块 02 第 4 节），更是为了控制排序成本——一个屏幕半径 100 px 的高斯要被登记到 $(200/16+1)^2 \approx 177$ 个 tile 里，抵得上 44 个正常大小的高斯</em>。
+  </div>  <h3>键的设计：一次基数排序解决两件事</h3>  <p>需要的顺序是「先按 tile 分组，组内按深度」。3DGS 的做法是把两者拼进一个 64 位整数：</p>  <div class="ascii">   uint64 key = (tile_id &lt;&lt; 32) | depth_bits
+
+   ┌──────────── 高 32 位 ────────────┬──────────── 低 32 位 ────────────┐
+   │          tile_id (0..8159)        │   深度（单调编码成 uint32）       │
+   └───────────────────────────────────┴──────────────────────────────────┘
+
+   对这个键做一次**基数排序**，结果自动就是「按 tile 分组、组内按深度升序」。
+   然后扫一遍找出每个 tile 的 [start, end) 区间即可。
+
+   官方实现：cub::DeviceRadixSort::SortPairs(...)  —— 一次调用
+        </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>为什么是基数排序而不是快排：基数排序是 $O(P)$，比较排序是 $O(P\log P)$。</strong><em>$P = 2\times10^6$ 时 $\log_2 P = 20.9$——比较排序要多做 21 倍的工作量级</em>。<strong>而基数排序对 64 位键只需固定的几遍扫描（每遍处理 4–8 位），且完全没有分支——正好是 GPU 擅长的形状。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而「深度用多少位」是一个有真实后果的选择，不是实现细节。</strong><em>位数不够时，不同深度的高斯会量化到同一个值，于是它们的相对顺序变成<strong>未定义</strong>（取决于排序是否稳定、以及输入顺序）</em>。<strong>把深度范围 0.5–100 m 量化后，相邻键相等的比例：</strong></p></div>
+  </div>  <table>
+    <thead><tr><th>深度位数</th><th>相邻键相等（顺序未定义）的比例</th><th>后果</th></tr></thead>
+    <tbody>
+      <tr><td>16 位</td><td><strong>68.75%</strong></td><td><strong>三分之二的相邻对顺序随机</strong>——<em>而模块 01 量过，打乱顺序的中位偏差是 19.6%</em></td></tr>
+      <tr><td>20 位</td><td>9.15%</td><td>仍然明显</td></tr>
+      <tr><td>24 位</td><td>0.585%</td><td>大致可接受</td></tr>
+      <tr><td>32 位</td><td><strong>0.0025%</strong></td><td><strong>官方的选择</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout paper"><span class="label"></span>
+    <strong>官方实现的做法比「量化」更聪明：它直接把 float32 的深度按位重解释成 uint32。</strong><em>对<strong>正</strong>浮点数，IEEE 754 的位模式与数值是单调同序的——所以按 uint32 排序就等于按 float 排序，一位精度都不损失</em>。<strong>而这个技巧只对正数成立</strong>，<em>所以它依赖前一步的近平面剔除（$z > 0.2$）已经保证了深度为正</em>——<em>两个看起来无关的实现细节其实是耦合的</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="render"><span class="num">3</span>逐 tile 渲染：分批、共享内存、提前终止</h2>
+  <div class="ascii">   每个 tile 的内层循环（256 个线程 = 256 个像素，同步推进）：
+
+   T = 1.0;  C = 0
+   for (batch of 256 gaussians in this tile's sorted range) {
+       ─── 256 个线程协作，把这 256 个高斯的 (uv, Σ'⁻¹, α, color) 载入共享内存 ───
+       __syncthreads();
+       for (j = 0; j &lt; 256; j++) {              // 每个线程独立走这 256 个
+           alpha = α_j * exp(-0.5 * d^T Σ'⁻¹ d);
+           if (alpha &lt; 1/255) continue;         // 太淡，跳过
+           if (T * (1-alpha) &lt; 1e-4) { done = true; break; }   // 提前终止
+           C += T * alpha * color_j;
+           T *= (1 - alpha);
+       }
+       if (__syncthreads_count(done) == 256) break;   // 整个 tile 都饱和了才退出外层
+   }
+        </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>两个层次的提前终止要分清。</strong><em>① <strong>线程级</strong>：某个像素饱和后它自己 <code>break</code>，不再累加——省的是算术；② <strong>block 级</strong>：只有当 tile 里<strong>全部 256 个像素</strong>都饱和了，才停止从全局内存载入下一批高斯——省的是访存</em>。<strong>后者才是省时间的主项，而它要求整个 tile 一起饱和</strong>——<em>所以一个 tile 里只要有一个像素看向天空（永不饱和），整个 tile 就要把列表走完</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而收益的量级：模块 01 量过，$\alpha\in[0.1,0.7]$、$T_{\min}=10^{-4}$ 时，245 个高斯里只需处理 19 个——92.2% 的算术可以省掉，误差 $2.4\times10^{-5}$（远低于 8 bit 的 1/255）。</strong><em>但这是<strong>单个像素、且 $\alpha$ 都不小</strong>时的数字</em>。<strong>notebook 在它自己那个含大片背景的场景上实测：省下 <em>76.5%</em> 的高斯-像素求值（均值从 34.4 降到 8.1）</strong>——<em>低于 92.2%，因为该场景里 α 偏小、而且大片背景永远不饱和</em>。<strong>而 block 级的收益还要更低，因为它取决于 tile 内最难饱和的那个像素。</strong><em>这是一个真实的、结构性的落差，不该含糊过去：92.2% 是理想上界，76.5% 是一个具体场景的实测，而访存的收益比两者都低</em>。</p></div>
+  </div>  <h3>$\alpha < 1/255$ 就跳过</h3>  <p>这一行看着微不足道，但它与模块 02 的 $3\sigma$ 截断是同一件事的两面。$3\sigma$ 处的衰减因子是 $e^{-4.5} = 0.0111$，所以 $\alpha^{(g)} < 0.353$ 的高斯在 $3\sigma$ 处已低于 $1/255$——**对它们，包围盒的外圈本来就是白算的**。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="backward"><span class="num">4</span>反向传播：重放、写冲突、以及必须存什么</h2>
+  <p>模块 01 已经给出了 α 合成的梯度式。这里的问题是**怎么在 tile 结构上算它**。</p>  <table>
+    <thead><tr><th>需求</th><th>为什么</th><th>实现代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>必须知道前向的顺序</strong></td><td>$T_i$ 依赖前面所有 $\alpha_j$</td><td><strong>排序结果必须保留到反向</strong>（或重排一遍）。<em>官方选择保留：2 M 个 uint64 键 = 16 MB，比重排便宜</em></td></tr>
+      <tr><td><strong>必须重放提前终止点</strong></td><td>被跳过的高斯梯度应为零</td><td>前向记录每个像素的 <code>last_contributor</code>，<em>反向 <code>if (contributor > last_contributor) continue;</code></em></td></tr>
+      <tr><td><strong>必须知道 $T_{\text{final}}$</strong></td><td>反向从末尾往回推 $T_i = T_{i+1}/(1-\alpha_i)$</td><td><em>存一张 $T_{\text{final}}$ 图（每像素一个 float）</em></td></tr>
+      <tr><td><strong>梯度要累加到高斯上</strong></td><td>一个高斯覆盖很多像素，每个像素都贡献一份梯度</td><td><strong>atomicAdd，且冲突严重</strong>——见下</td></tr>
+    </tbody>
+  </table>  <h3>写冲突的量级</h3>  <table>
+    <thead><tr><th>高斯的屏幕半径</th><th>覆盖的像素数</th><th>反向时打到同一高斯的 atomicAdd 次数</th></tr></thead>
+    <tbody>
+      <tr><td>4 px</td><td>≈ 50</td><td>50 × 59 个参数</td></tr>
+      <tr><td>8 px</td><td>≈ 201</td><td><strong>201 × 59 个参数</strong></td></tr>
+      <tr><td>20 px</td><td>≈ 1257</td><td><strong>1257 × 59 个参数</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>这是 3DGS 训练比推理慢得多的主因之一，而它是结构性的。</strong><em>前向是「多个高斯 → 一个像素」（读多写少）；反向是「一个像素 → 多个高斯」（读少写多，且写地址高度重合）</em>。<strong>官方内核的缓解手段是先在 block 内的共享内存里做归约，每个 tile 只对每个高斯发一次全局 atomicAdd</strong>——<em>把 201 次降到「覆盖的 tile 数」次，即 4 次左右</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这又一次说明覆盖半径是主控变量：</strong><em>它同时决定了 ① (高斯,tile) 对数（第 2 节：半径 ×2.5 → 对数 ×3.06）、② 每 tile 的列表长度、③ 反向的 atomicAdd 次数</em>。<strong>所以「剪掉屏幕半径过大的高斯」这一个操作同时改善了仿射近似的精度、排序成本、渲染成本与训练成本</strong>——<em>在整套系统里很少见到这么划算的一个旋钮</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="imbalance"><span class="num">5</span>整帧时延由最慢的那个 tile 决定</h2>
+  <p>GPU 上一个 tile 对应一个 block。**block 之间没有同步，但整帧要等最后一个 block 结束。**所以有意义的量不是每 tile 的平均工作量，而是分布的尾部。</p>  <p>notebook 里量了两个场景。<strong>A</strong> 是一个平滑的、偏向画面下方的合成分布（20 万高斯、半径中位 6 px、1920×1080）；<strong>B</strong> 是 notebook 自己那个含「一面墙 + 一个近处物体」的场景。</p>  <table>
+    <thead><tr><th>统计量</th><th>A：平滑分布</th><th>B：含近处大物体（notebook 的场景）</th></tr></thead>
+    <tbody>
+      <tr><td>均值</td><td>136.1</td><td>34.4</td></tr>
+      <tr><td>中位</td><td>116</td><td>16</td></tr>
+      <tr><td>P95</td><td>311</td><td>160</td></tr>
+      <tr><td><strong>最大</strong></td><td><strong>364</strong></td><td><strong>298</strong></td></tr>
+      <tr><td>空 tile 比例</td><td>7.9%</td><td>5.3%</td></tr>
+      <tr><td><strong>最大 / 均值</strong></td><td><strong>2.67×</strong></td><td><strong>8.67×</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>注意 B 比 A 差三倍多，而 B 才是真实场景的形状。</strong><em>A 的分布是平滑的，所以最大值只是均值的 2.67 倍；而 B 里有一个近处的物体压住十几个 tile，那几个 tile 的列表长是均值的 8.67 倍</em>。<strong>所以「按均值估算帧时延」在平滑场景里低估 2.7 倍，在有近景的场景里低估近 9 倍</strong>——<em>而任何有前景主体的场景都属于后者</em>。<strong>空 tile（5–8%）的 block 几乎立刻退出，它们占的调度资源是浪费的，但代价很小，所以官方没做 tile 合并。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而不均衡与提前终止有一个不太直观的互动。</strong><em>提前终止在「高斯多、$\alpha$ 大」的 tile 上收益最大（近处的实心物体，19/245 就停），而这些恰好是列表最长的 tile</em>。<strong>所以提前终止不只是把平均值降下来，它<em>同时</em>把尾部压平了</strong>——<em>这是两个收益，而后者对帧时延更重要</em>。<strong>反过来，最糟的 tile 是「列表长、但 $\alpha$ 都很小」的那种</strong>：<em>薄雾、半透明的植被、训练早期还没收敛的区域</em>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>一个实际的性能坑：训练早期 FPS 极低，中后期突然变快。</strong><em>原因就是本节——初始化时所有高斯的 $\alpha$ 都被设成一个小值（官方用 0.1 的 inverse-sigmoid），于是没有任何 tile 能提前终止；等不透明度优化上来之后，92% 的工作才开始被省掉</em>。<strong>所以拿训练早期的 iter/s 去外推总时长会严重高估。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="cost"><span class="num">6</span>每帧的结构性账：钱花在哪，以及 tile 尺寸为什么是 16</h2>
+  <p>下面是 500 k 高斯、覆盖半径 8 px、1920×1080 时每帧的<strong>操作计数</strong>。绝对毫秒数取决于硬件，所以这里只给计数与比值——<strong>而比值才是能迁移的那部分。</strong></p>  <table>
+    <thead><tr><th>阶段</th><th>规模</th><th>每帧计数</th><th>正比于</th></tr></thead>
+    <tbody>
+      <tr><td>① 预处理（投影 + 协方差 + SH 求值）</td><td>$O(N)$</td><td>0.50 M 次</td><td><strong>高斯数</strong></td></tr>
+      <tr><td>② 分箱（写 (高斯,tile) 条目）</td><td>$O(P)$</td><td>2.00 M 次写</td><td>$P$</td></tr>
+      <tr><td>③ 基数排序（64 位键，8 位一遍）</td><td>$O(P)$</td><td><strong>2.00 M × 8 遍 = 16.0 M 次扫描</strong></td><td>$P$</td></tr>
+      <tr><td>④ 载入（每 tile 的列表读一次）</td><td>$O(P)$</td><td>2.00 M 个条目 ≈ <strong>72 MB 访存</strong></td><td>$P$</td></tr>
+      <tr><td>⑤ 渲染算术（<em>不</em>提前终止）</td><td>$O(\text{像素}\times P/T)$</td><td><strong>508 M 次高斯-像素求值</strong></td><td>像素数 × 每 tile 列表长</td></tr>
+      <tr><td>⑤ 渲染算术（提前终止，每像素 19 个）</td><td>同上</td><td><strong>39 M 次（省 92.2%）</strong></td><td>像素数 × 实际处理数</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>两个比值把整张账说清了。</strong><em>① $P/N = 4.0$——分箱与排序的规模是高斯数的 4 倍，所以「高斯数」不是成本的直接度量，$P$ 才是；② 渲染求值 / $P$ = 19.7（有终止）vs 254.1（无终止）</em>。<strong>所以提前终止把「渲染」从压倒性的主项变成了与排序同一量级的一项</strong>——<em>这也解释了为什么去掉它之后 3DGS 不只是慢一点，而是<strong>不再实时</strong></em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而 tile 尺寸的取舍现在可以精确写出来。</strong><em>$P \propto (2r/T_s+1)^2$ 而 tile 数 $\propto 1/T_s^2$，所以每 tile 的列表长 $\propto (2r/T_s+1)^2 T_s^2$</em>——<strong>两者往<em>相反</em>方向变，而 16×16 正好在拐点附近：</strong></p></div>
+  </div>  <table>
+    <thead><tr><th>配置</th><th>tile 数</th><th>$P$</th><th>每 tile 列表长</th></tr></thead>
+    <tbody>
+      <tr><td><strong>16×16（基准）</strong></td><td>8160</td><td>2.00 M（1.00×）</td><td>245.1（1.00×）</td></tr>
+      <tr><td>8×8</td><td>32400</td><td><strong>4.50 M（2.25×）</strong></td><td>138.9（<strong>0.57×</strong>）</td></tr>
+      <tr><td>32×32</td><td>2040</td><td>1.12 M（<strong>0.56×</strong>）</td><td><strong>551.5（2.25×）</strong></td></tr>
+      <tr><td>高斯 ×2（16×16）</td><td>8160</td><td>4.00 M（2.00×）</td><td>490.2（2.00×）</td></tr>
+      <tr><td>半径 ×2.5（16×16）</td><td>8160</td><td><strong>6.12 M（3.06×）</strong></td><td><strong>750.6（3.06×）</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout paper"><span class="label"></span>
+    <strong>注意最后两行与前三行的性质完全不同。</strong><em>改 tile 尺寸是把成本在「排序」与「渲染」之间<strong>搬来搬去</strong>（一个 ×2.25、另一个 ×0.57，乘积几乎不变）；而改高斯数或覆盖半径是<strong>两项一起涨</strong></em>。<strong>所以 tile 尺寸只能调优，而剪枝（控制半径与数量）才能真正降成本</strong>——<em>这就是模块 04 的题目</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="verify"><span class="num">7</span>怎么验证一个光栅化器是对的</h2>
+  <p>这一节讲方法，因为 notebook 里就是这么做的，而它对任何自己动手改内核的人都适用。</p>  <ol>
+    <li><strong>与逐像素暴力实现逐位比对——先把近似列全。</strong><em>tile 版一共有<strong>三</strong>个近似，而第三个最容易漏：① 提前终止；② tile 内共享顺序；③ <strong>$3\sigma$ 包围盒是 tile 对齐的</strong>——tile 版对该 tile 里的<strong>每个</strong>像素求值，哪怕那个像素在高斯的精确包围盒之外</em>。<strong>所以暴力版必须用同一个判定集合才能逐位比对</strong>——<em>notebook 里的做法是让暴力版<strong>独立地</strong>对每个像素判断「它所在的 tile 是否落在这个高斯的 tile 区间内」，完全不用分箱的输出，于是这才是一次真正的交叉验证</em>。<strong>这样做之后两者严格相等到机器精度。</strong><em>而第三个近似本身的影响：把包围盒整体去掉，最大图像差是 $1.95\times10^{-3}$，即 <strong>0.50 个 8 bit 色阶</strong>——小但不为零，且与模块 02 算的「3σ 处 α 衰减 0.0111」量级完全对得上</em></li>
+    <li><strong>关掉近似做消融。</strong><em>$T_{\min}=0$、tile 尺寸 = 1×1（退化成逐像素）、$3\sigma$ 截断改成 $\infty$。每关掉一个，差应当降到零</em></li>
+    <li><strong>梯度用数值差分核对</strong>（模块 01 练习 3 的做法）。<em>但要注意：提前终止让损失对参数<strong>不再光滑</strong>——在终止点附近，数值差分与解析梯度会不一致，而这不是 bug</em></li>
+    <li><strong>顺序不变性的反向检查。</strong><em>把输入高斯的<strong>数组顺序</strong>打乱（不是深度顺序），渲染结果应当不变（因为会重新排序）。如果变了，说明排序键有相等项而排序不稳定</em>——<strong>这正好抓住第 2 节那个深度位数问题</strong></li>
+    <li><strong>确定性检查。</strong><em>同一份输入跑两遍，输出必须逐位相同。如果不是，说明某处依赖了哈希顺序、未初始化内存，或（在 GPU 上）依赖了 atomicAdd 的完成次序</em>——<strong>而最后一种在反向传播里几乎必然发生，所以「梯度不确定」是正常的，「前向不确定」不是</strong></li>
+    <li><strong>能量守恒检查。</strong><em>$\sum_i T_i\alpha_i + T_{\text{final}} = 1$ 必须逐像素成立到机器精度（模块 01 第 0 节）。提前终止会破坏它，而破坏的量正好是 $T_{\min}$ 的上界——所以它也是一个可验证的量</em></li>
+  </ol>  <div class="callout paper"><span class="label"></span>
+    <strong>那为什么不干脆逐像素排序，把 popping 彻底解决？算一下就知道。</strong><em>1920×1080 有 207 万个像素，而 tile 只有 8160 个——排序次数差 <strong>254 倍</strong></em>。<strong>而每次排序的元素个数只从「每 tile 245 个」降到「每像素几十个」，降不了 254 倍</strong>——<em>所以逐像素排序的总成本高一个数量级以上</em>。<strong>StopThePop（2024）的折中是「分层」：在 tile 内按 2×2 或 4×4 的子块重排，只对顺序真正会翻转的那些高斯做局部修正</strong>，<em>代价约 2 倍渲染时间，换来 popping 基本消失</em>。
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>第 4 条值得单独记住，因为它把一个看不见的 bug 变成了一行测试。</strong><em>「打乱输入顺序，输出应不变」——如果深度用 16 位量化，68.75% 的相邻对会因为键相等而顺序未定义，于是这条测试立刻失败</em>。<strong>而如果只看图像质量指标，这个 bug 会表现为「PSNR 差了 0.5 dB」，谁也不会想到是排序键的位数。</strong>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_primitive/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 各向异性高斯基元与投影的边界</div></a>
+    <a class="next" href="../04_densification/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 自适应密度控制与判据的可靠性</div></a>
+  </div>
+
+</div>
+</body>
+</html>

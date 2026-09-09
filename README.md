@@ -1,6 +1,6 @@
 # Frontier AI Researcher / Engineer Courses · 前沿 AI 研究工程师课程体系
 
-**74 courses · 472 lesson pages · 472 runnable notebooks · Colab-ready, CPU-first, from-scratch.**
+**75 courses · 478 lesson pages · 478 runnable notebooks · Colab-ready, CPU-first, from-scratch.**
 一套从 model evaluation 起步、长成全栈的前沿 AI 研究/工程课程体系 —— 深度 HTML 讲解 + 真实可跑 notebook，纯 numpy/CPU 优先、优雅降级到真实框架/GPU。
 
 📖 中文 → [跳转](#中文) · 🇬🇧 English → [jump](#english)
@@ -13,7 +13,7 @@
 ### 目录
 - [这是什么](#zh-what)
 - [快速开始](#zh-quickstart)
-- [课程总览（74 门）](#zh-catalog)
+- [课程总览（75 门）](#zh-catalog)
 - [每门课的格式](#zh-format)
 - [学习路径建议](#zh-paths)
 - [仓库结构](#zh-layout)
@@ -49,7 +49,7 @@ jupyter lab
 先打开某模块的 `NN_讲解.html`（或先看 `index.html` 选路径），读完讲解再跑同名的 `.ipynb`。所有课程共用同一份 `assets/style.css`。
 
 <a name="zh-catalog"></a>
-### 课程总览（74 门）
+### 课程总览（75 门）
 
 #### C00–C09 · 核心 LLM / 评测主线
 | 课 | 目录 | 主题 |
@@ -198,6 +198,33 @@ jupyter lab
 > 以 C72 为前提；与 C74/C75 的分工是「离散表示 + 判别式」vs「连续表示 + 生成式」。
 > 两者都明确不碰 C11（检索算法）与 C33（上下文预算），并全程复用它们的定义而不重新定义。
 
+#### C74 · 3D 高斯溅泼（3DGS）与实时渲染
+
+| 课 | 目录 | 主题 | 补的洞 |
+|----|------|------|--------|
+| C74 | `C74_Gaussian_Splatting_Course/` | 3D 高斯溅泼与实时渲染（体渲染与 α 合成的地基 · 各向异性高斯基元与投影的边界 · 可微分 tile 光栅化 · 自适应密度控制与判据的可靠性 · 外观/动态与何时不该用 3DGS） | 全库 472 个讲解页里 `球谐`/`spherical harmonic` 0、`alpha compositing` 0、`tile 光栅化` 0、`EWA` 0；`体渲染`/`α 合成`/`高斯溅泼` 的少数命中全部是 C72/C73/C55 里指向本课的一句带过 |
+
+> **一句话主张**：3DGS 全部工程价值来自**一个量级差** ——
+> 它的基元 α 大（0.1–0.9）而不是小（0.01–0.05）。
+> α 大 ⟹ 每像素只要十几个基元、可提前终止省掉 92%，
+> 但**必须显式排序**并接受「tile 内共享顺序」的近似。
+> 其余一切（协方差参数化、仿射投影、密度控制、球谐）都是为了让这个量级差能被优化出来。
+>
+> **因为选课路径跳过了 NeRF，体渲染与 α 合成的地基由本课模块 01 自带。**
+> notebook 里**从零写出一个能出图的 tile 光栅化器**，并与逐像素暴力实现
+> **逐位相等到机器精度**（为此必须先把三个近似列全）。
+>
+> 四处诚实修正：① 离散化误差是 **∝ 1/N²** 而不是 ∝ 1/N，
+> 而**对分段常数密度 α 合成是精确的、连 N=1 都对**；
+> ② 仿射近似的主变量是**张角**不是离轴（100× vs 1.6×），
+> 而**张角 53° 时投影协方差根本不存在**（二阶矩积分发散）；
+> ③ 逐位比对漏了第三个近似（3σ 包围盒是 tile 对齐的，影响 0.50 个 8 bit 色阶）；
+> ④ 「尺度梯度更适合当密度判据」是单次运行的假象（6 次均值下它在每一档都低于随机基线）。
+>
+> 另外把一个流行说法量化纠正了：**SH 的「角分辨率 180/(ℓ+1)」高估约 1.45 倍**，
+> 实测（20% 相对残差判据）是 **125/(ℓ+1)** —— deg 3 只到半角 **31.2°**，
+> 而抛光塑料要 12.3°、抛光金属 3.4°。
+
 <a name="zh-format"></a>
 ### 每门课的格式
 
@@ -208,7 +235,7 @@ CXX_Xxx_Course/
 ├── glossary.md          术语词典（≥12KB）
 ├── references.md        参考清单（论文/文档，标★必读）
 ├── requirements.txt      依赖（绝大多数课只需要 numpy/pandas/jupyterlab）
-├── assets/style.css      全站共用同一份样式（74 门课字节级一致）
+├── assets/style.css      全站共用同一份样式（75 门课字节级一致）
 ├── 00_setup/
 │   ├── 00_overview.html         课程总览
 │   └── 00_environment_check.ipynb
@@ -243,9 +270,9 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 ├── index.html               全站课程总览页
 ├── COURSES_PLAN.md            课程规划与构建历史的完整记录
 ├── ENV_SETUP.md                本地 conda 环境搭建笔记
-├── requirements-all.txt        全部 74 门课依赖的合集（装一次跑所有课）
+├── requirements-all.txt        全部 75 门课依赖的合集（装一次跑所有课）
 ├── _buildkit/                  house-style 生成器（coursekit.py）+ 各课构建脚本
-├── C00_..._Course/ … C73_..._Course/   74 门课，每门结构见上
+├── C00_..._Course/ … C74_..._Course/   75 门课，每门结构见上
 └── README.md                   就是这份文件
 ```
 
@@ -259,7 +286,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 <a name="zh-env"></a>
 ### 环境与依赖
 
-- **本地全量环境**：一个 conda env（`courses`，Python 3.11）配好 PyTorch + HuggingFace 全家桶 + 常用科学计算库即可跑完全部 74 门课，详见 [`ENV_SETUP.md`](./ENV_SETUP.md)；合集依赖在 [`requirements-all.txt`](./requirements-all.txt)。
+- **本地全量环境**：一个 conda env（`courses`，Python 3.11）配好 PyTorch + HuggingFace 全家桶 + 常用科学计算库即可跑完全部 75 门课，详见 [`ENV_SETUP.md`](./ENV_SETUP.md)；合集依赖在 [`requirements-all.txt`](./requirements-all.txt)。
 - **只想跑单门课**：进对应课程目录 `pip install -r requirements.txt` 即可——大多数课这份文件只有 `numpy`/`pandas`/`jupyterlab`/`ipykernel` 四五行。
 - 所有需要 `transformers`/`bitsandbytes`/`qwen-vl-utils` 等重依赖的真实模型 cell 都包了 `try/except`：装不上/没网/没 GPU 时会优雅降级到纯 Python/numpy 的替代实现或跳过，**不会让整本 notebook 崩掉**。
 
@@ -276,6 +303,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 - 2026-08-31（同日第二轮）：继续扩课，新增 C70（RAG 生产工程）与 C71（提示与上下文的程序化优化）。**先纠正了一次错误的缺口判断**——最初提议的「RAG 评测」与「多 agent 编排」已分别被 C11 与 C34 覆盖，会产出重复课；重新对全库 448 个讲解页做关键词扫描后才定下真实缺口。12 个 notebook、272 个 code cell、48 道练习自测 assert 全部两遍实跑通过。全谱达到 **72 门 · 460 讲解 HTML · 460 notebook**。
 - 2026-09-08：新增 C72（多视角几何与多传感器时空对齐）。**先扫全库 460 个讲解页做缺口验证**，并先列出「查过、确认不用建」的五个方向（缩放律 / 投机解码 / 持续学习 / 标注运维 / 蒸馏，全部已覆盖）；确认为零覆盖的是「像素 → 米」这条几何链。6 个 notebook、115 个 code cell、24 道练习自测两遍实跑通过。**本轮有五处结论是被真实计算否掉后重写的**：DLT 归一化的精度收益在有噪声时消失（无噪声 45.8 倍 → 0.2 px 噪声下只剩 13% 且归一化略差）；「内外参分开标会互相吸收误差」是错的（吸收得非常干净，真正的问题是可辨识性——而分开它们靠扩大图像行覆盖，σ(pitch) 3.74° → 0.035°，改善 106 倍）；PnP 正交化不提高精度（方向误差只改善 1.24 倍、重投影 RMS 反而变差），且第一版量出的「14.5 倍」是一个**度量陷阱**的产物（trace 公式只对正交矩阵有效，非正交时 40–47% 的实现被 clip 成恰好 0.00°）；「等下一个 IMU 采样比外推准」是错的取舍（等待的代价大 2222 倍）；rolling shutter 对小目标不值得建模（0.005 px），而「整帧一个时间戳」值 0.667 m。另有**两处「本课自己的配置通不过自己的验收」**（模块 02 的 5 视角标定栽在边缘覆盖、模块 04 的均匀网格栽在采样率与坡度）——那是设计而非失误。全谱达到 **73 门 · 466 讲解 HTML · 466 notebook**。
 - 2026-09-09：新增 C73（3D 表示与点云深度学习）。扫全库 466 个讲解页确认热门 3D 方向整块零覆盖（PointNet / PointPillars / 体素 / 点云分割 / 双目 / 单目深度 / SDF 全部 0 命中）。6 个 notebook、117 个 code cell、24 道练习自测两遍实跑通过。**本轮有七处结论被真实计算否掉后重写**，其中三处最值得记：`sum`/`mean` 不是逐位置换不变的（浮点加法不满足结合律，相对差 1.43e-15；而 `max`/`min` 是选择操作所以逐位不变）——所以置换不变性的单元测试不能一律用「恰好相等」；`max` 并没有完全丢弃点数（线性探针 $R^2=0.76$，因为极值统计量依赖样本量）；膨胀最快的不是薄结构而是完全散开的点（22.05× vs 薄片 4.32×），而规则密度的排序恰好相反、两者之积被核大小 27 框住。**最硬的一条结论**（推导闭合）：单轴容差恰好 $s_i/3$ ⇒ 交通标志的容差 0.049 m 与典型标注噪声 0.05 m 之比 **0.98×** ⇒ 让预测等于真值、只给真值加标注噪声，AP@IoU0.5 上界只有 **0.392**（卡车与轿车都是 1.000，中心距离口径下四类恒为 1.000）——**所以那一列量的是标注噪声而不是模型能力**。另有三处「本课自己的配置通不过自己的审计」。全谱达到 **74 门 · 472 讲解 HTML · 472 notebook**。
+- 2026-09-09：新增 C74（3D 高斯溅泼与实时渲染），同一批 3D 课单的第二门。缺口验证（全库 472 个讲解页逐关键词 grep）：`球谐`/`spherical harmonic` 0、`alpha compositing` 0、`tile 光栅化` 0、`EWA` 0；而 `体渲染`/`α 合成`/`高斯溅泼`/`NeRF` 的少数命中全部是 C72/C73/C55 里指向本课的一句带过。**因为选课路径跳过了 NeRF，体渲染与 α 合成的地基由本课模块 01 自带。** 6 个 notebook、123 个 code cell、24 道练习自测两遍实跑通过；notebook 里从零写出一个能出图的 tile 光栅化器，并与逐像素暴力实现**逐位相等到机器精度**。**本轮有四处结论被真实计算否掉后重写**，两条最值得记：① **对分段常数密度，α 合成精确到机器精度，连 $N{=}1$ 都对**（$N{=}1$ 误差为 0，$N{=}256$ 是 8.9e−16）——所以离散化误差**只**来自 σ 在段内变化，而那时中点法则是**二阶**的（每翻一倍 $N$ 误差降到 1/4.00，我最初写的 ∝1/N 是错的）；② **张角 53° 时投影后的协方差根本不存在**——2.28% 的质量落在 $z\le0$，$z\to0^+$ 的样本被投到无穷远，二阶矩积分发散（蒙特卡洛估计从 $n{=}10^4$ 到 $10^6$ 涨 9 倍、种子间差 3 倍），**所以「仿射近似在这里误差多少」这个问题问错了，它要对比的真值不存在**。另有两条：逐位比对最初漏了第三个近似（3σ 包围盒是 tile 对齐的，其影响 0.50 个 8 bit 色阶）；「尺度梯度更适合当密度判据」是单次运行的假象（一个目标一个种子时命中 67%，跑满 6 次是 28%，且在每一档都低于随机基线 25%）。顺带把一个流行说法量化纠正了：**SH 的「角分辨率 180/(ℓ+1)」高估约 1.45 倍**，实测（20% 相对残差判据）是 **125/(ℓ+1)**——deg 3 只到半角 **31.2°**，而抛光塑料要 12.3°、抛光金属 3.4°，**所以 SH deg 3 只能勉强表示粗糙塑料级的高光，而这是表示能力的限制、不是优化没收敛**。另有三处「本课自己的配置通不过自己的审计」。全谱达到 **75 门 · 478 讲解 HTML · 478 notebook**。
 
 完整细节见 [`COURSES_PLAN.md`](./COURSES_PLAN.md)。
 
@@ -287,7 +315,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 ### Table of Contents
 - [What This Is](#en-what)
 - [Quick Start](#en-quickstart)
-- [Course Catalog (74 courses)](#en-catalog)
+- [Course Catalog (75 courses)](#en-catalog)
 - [Format of Each Course](#en-format)
 - [Suggested Learning Paths](#en-paths)
 - [Repository Layout](#en-layout)
@@ -323,7 +351,7 @@ jupyter lab
 Read a module's `NN_讲解.html` lesson first (or start from `index.html` to pick a path), then run the matching `.ipynb`. All courses share one `assets/style.css`.
 
 <a name="en-catalog"></a>
-### Course Catalog (74 courses)
+### Course Catalog (75 courses)
 
 #### C00–C09 · Core LLM & Evaluation Track
 | # | Folder | Topic |
@@ -478,6 +506,39 @@ Read a module's `NN_讲解.html` lesson first (or start from `index.html` to pic
 > versus "continuous representations + generative tasks".
 > Neither touches C11 (retrieval algorithms) or C33 (context budget); both reuse those courses' definitions rather than redefining them.
 
+#### C74 · 3D Gaussian Splatting & Real-Time Rendering
+
+| # | Directory | Topic | Gap it fills |
+|---|-----------|-------|--------------|
+| C74 | `C74_Gaussian_Splatting_Course/` | 3D Gaussian Splatting and real-time rendering (the volume-rendering / alpha-compositing foundation · the anisotropic Gaussian primitive and the limits of its projection · differentiable tile rasterization · adaptive density control and how reliable its criterion actually is · appearance, dynamics, and when *not* to use 3DGS) | Across all 472 existing lesson pages: `spherical harmonic` 0 hits, `alpha compositing` 0, `tile rasterization` 0, `EWA` 0; the few hits for volume rendering / alpha compositing / Gaussian Splatting are all one-line pointers in C72/C73/C55 that defer to this course |
+
+> **One-sentence claim**: all of 3DGS's engineering value comes from **one difference in
+> magnitude** — its primitives have *large* alpha (0.1–0.9) rather than small (0.01–0.05).
+> Large alpha means only a dozen or so primitives per pixel and 92% of the work skippable by
+> early termination, but it also means **depth sorting becomes mandatory** and you must accept
+> the "one order shared per tile" approximation. Everything else (the covariance
+> parameterization, the affine projection, density control, spherical harmonics) exists to make
+> that difference in magnitude optimizable.
+>
+> **Because the chosen path through the 3D courses skipped NeRF, module 01 carries its own
+> volume-rendering / alpha-compositing foundation.** The notebooks **build a working tile
+> rasterizer from scratch** and check it against a per-pixel brute-force implementation
+> **bit-for-bit** (which first requires enumerating all three approximations, not two).
+>
+> Four honest corrections: (1) the discretization error is **∝ 1/N²**, not ∝ 1/N — and for
+> piecewise-constant density, **alpha compositing is exact, even at N=1**; (2) the governing
+> variable for the affine approximation is the **subtended angle**, not off-axis position
+> (100× versus 1.6×) — and at a 53° subtended angle **the projected covariance does not exist
+> at all** (the second-moment integral diverges); (3) the bit-for-bit comparison was missing a
+> third approximation (the 3σ bounding box is tile-aligned; its effect is 0.50 of one 8-bit
+> color step); (4) "the scale gradient is a better densification criterion" was an artifact of
+> a single run (averaged over six, it sits below the random baseline at every density).
+>
+> It also quantitatively corrects a widespread claim: **the "angular resolution ≈ 180/(ℓ+1)"
+> rule overstates SH capability by about 1.45×.** The measured limit (at a 20% relative-residual
+> criterion) is **125/(ℓ+1)** — degree 3 only reaches a **31.2°** half-angle, while polished
+> plastic needs 12.3° and polished metal 3.4°.
+
 <a name="en-format"></a>
 ### Format of Each Course
 
@@ -488,7 +549,7 @@ CXX_Xxx_Course/
 ├── glossary.md          Glossary (≥12KB)
 ├── references.md        Reference list (papers/docs, ★ = must-read)
 ├── requirements.txt      Dependencies (most courses need only numpy/pandas/jupyterlab)
-├── assets/style.css      One shared stylesheet across all 74 courses (byte-identical)
+├── assets/style.css      One shared stylesheet across all 75 courses (byte-identical)
 ├── 00_setup/
 │   ├── 00_overview.html         Course overview
 │   └── 00_environment_check.ipynb
@@ -523,9 +584,9 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 ├── index.html               Site-wide course overview page
 ├── COURSES_PLAN.md            Full record of the curriculum plan & build history
 ├── ENV_SETUP.md                Notes for setting up the local conda environment
-├── requirements-all.txt        Union of all 74 courses' dependencies (install once, run all)
+├── requirements-all.txt        Union of all 75 courses' dependencies (install once, run all)
 ├── _buildkit/                  House-style generator (coursekit.py) + each course's build scripts
-├── C00_..._Course/ … C73_..._Course/   74 courses, layout described above
+├── C00_..._Course/ … C74_..._Course/   75 courses, layout described above
 └── README.md                   This file
 ```
 
@@ -539,7 +600,7 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 <a name="en-env"></a>
 ### Environment & Dependencies
 
-- **Full local environment**: one conda env (`courses`, Python 3.11) with PyTorch + the HuggingFace stack + common scientific-computing libraries covers all 74 courses — see [`ENV_SETUP.md`](./ENV_SETUP.md); the combined dependency list is [`requirements-all.txt`](./requirements-all.txt).
+- **Full local environment**: one conda env (`courses`, Python 3.11) with PyTorch + the HuggingFace stack + common scientific-computing libraries covers all 75 courses — see [`ENV_SETUP.md`](./ENV_SETUP.md); the combined dependency list is [`requirements-all.txt`](./requirements-all.txt).
 - **Just want one course**: `cd` into that course's folder and `pip install -r requirements.txt` — for most courses that file is only 4–5 lines (`numpy`/`pandas`/`jupyterlab`/`ipykernel`).
 - Every cell that needs a heavier dependency (`transformers`/`bitsandbytes`/`qwen-vl-utils`, etc.) is wrapped in `try/except`: if it's not installed, there's no network, or no GPU, it degrades gracefully to a pure Python/numpy fallback or is skipped — **it will not crash the whole notebook**.
 
@@ -556,5 +617,6 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 - 2026-08-31 (second round, same day): Added C70 (RAG production engineering) and C71 (prompt and context programming). **A wrong gap analysis was corrected first** — the initially proposed "RAG evaluation" and "multi-agent orchestration" were already covered by C11 and C34 respectively and would have produced duplicate courses; the real gaps were only settled after re-scanning all 448 lesson pages. 12 notebooks, 272 code cells, 48 exercise self-test asserts, all verified two-pass. Reached **72 courses · 460 lesson pages · 460 notebooks**.
 - 2026-09-08: Added C72 (multi-view geometry and multi-sensor spatio-temporal alignment). **The gap was verified by scanning all 460 lesson pages first**, and the five directions that were checked and found *already covered* were listed up front (scaling laws, speculative decoding, continual learning, annotation ops, distillation); what turned out to be genuinely absent was the pixel-to-metre geometric chain. 6 notebooks, 115 code cells, 24 exercise self-tests, all verified two-pass. **Five conclusions in this round were rewritten after real computation contradicted them**: the textbook accuracy benefit of DLT point normalization disappears once there is noise (45.8× with no noise, but only a 13% difference at 0.2 px corner noise — and normalization is *slightly worse*); "calibrating intrinsics and extrinsics separately makes them absorb each other\'s errors and be wrong at range" is false (the absorption is remarkably clean — the real issue is *identifiability*, and the only way to separate $c_y$ from pitch is to widen the image-row coverage: σ(pitch) 3.74° → 0.035°, a **106× improvement**, while the most convenient collection pattern is the worst one); PnP orthogonalization does not improve accuracy (direction error improves only 1.24× and reprojection RMS actually gets *worse*) — and the "14.5×" measured in the first draft was an artefact of a **metric used outside its domain** (the trace formula is only valid for orthogonal matrices; for non-orthogonal ones 40–47% of realizations get clipped to exactly 0.00°); "waiting for the next IMU sample beats extrapolating" is the wrong trade-off (waiting costs 2222× more); and rolling shutter is not worth modelling for small targets (0.005 px) while "one timestamp per frame" costs 0.667 m. There are also **two places where the course\'s own configuration fails its own acceptance checks** (the 5-view calibration set in module 02 fails on edge coverage; the uniform BEV grid in module 04 fails on both sampling rate and slope) — by design, not by accident. Reached **73 courses · 466 lesson pages · 466 notebooks**.
 - 2026-09-09: Added C73 (3D representations and point-cloud deep learning). A scan of all 466 lesson pages confirmed that the whole cluster of current 3D directions had zero coverage (PointNet, PointPillars, voxels, point-cloud segmentation, stereo, monocular depth, SDF — all 0 hits). 6 notebooks, 117 code cells, 24 exercise self-tests, all verified two-pass. **Seven conclusions were rewritten after real computation contradicted them**, three worth singling out: `sum`/`mean` are *not* bitwise permutation-invariant (floating-point addition is not associative; the relative difference is 1.43e-15, whereas `max`/`min` are, being pure selections) — so a permutation-invariance unit test cannot use exact equality for all aggregations; `max` does *not* discard the point count entirely (a linear probe gives $R^2=0.76$, because extreme-value statistics depend on sample size); and the fastest-dilating active set is not a thin structure but a fully scattered one (22.05× versus 4.32× for a sheet), while the rule density orders the opposite way and the product of the two is bounded by the kernel size 27. **The sharpest result** (a closed derivation): the per-axis tolerance is exactly $s_i/3$, so a traffic sign's 0.049 m tolerance sits at **0.98×** typical annotation noise (0.05 m); setting the prediction equal to the ground truth and adding only annotation noise to the labels, the AP@IoU0.5 ceiling on signs is just **0.392** (trucks and cars are both 1.000, and under the center-distance criterion all four classes are 1.000) — **so that column measures annotation noise, not model capability**. There are also three places where the course's own configuration fails its own audits. Reached **74 courses · 472 lesson pages · 472 notebooks**.
+- 2026-09-09: Added C74 (3D Gaussian Splatting and real-time rendering), the second course in the same batch of 3D topics. Gap check (keyword grep across all 472 existing lesson pages): `spherical harmonic` 0 hits, `alpha compositing` 0, `tile rasterization` 0, `EWA` 0; the few hits for volume rendering / alpha compositing / Gaussian Splatting / NeRF are all one-line pointers in C72/C73/C55 that defer to this course. **Because the chosen path through the 3D courses skipped NeRF, module 01 carries its own volume-rendering / alpha-compositing foundation.** 6 notebooks, 123 code cells, 24 exercise self-tests, all verified two-pass; the notebooks build a working tile rasterizer from scratch and check it against a per-pixel brute-force implementation **bit-for-bit**. **Four conclusions were rewritten after real computation contradicted them**, two worth singling out: (1) **for piecewise-constant density, alpha compositing is exact to machine precision, even at $N{=}1$** (error 0 at $N{=}1$, 8.9e−16 at $N{=}256$) — so the discretization error comes *only* from σ varying within a segment, and there the midpoint rule is **second order** (each doubling of $N$ cuts the error by 4.00×; my original ∝1/N was wrong); (2) **at a 53° subtended angle the projected covariance does not exist at all** — 2.28% of the mass falls at $z\le0$, samples approaching $z\to0^+$ project to infinity, and the second-moment integral diverges (the Monte-Carlo estimate grows 9× going from $n{=}10^4$ to $10^6$ and varies 3× across seeds), **so asking "how large is the affine approximation's error here" is the wrong question — the ground truth it would compare against does not exist**. Two more: the bit-for-bit comparison initially missed a third approximation (the 3σ bounding box is tile-aligned; its effect is 0.50 of one 8-bit color step); and "the scale gradient is a better densification criterion" was an artifact of a single run (67% top-quartile hit rate with one target and one seed, 28% averaged over six, and below the 25% random baseline at every density). It also quantitatively corrects a widespread claim: **the "angular resolution ≈ 180/(ℓ+1)" rule overstates SH capability by about 1.45×**; the measured limit (20% relative-residual criterion) is **125/(ℓ+1)** — degree 3 reaches only a **31.2°** half-angle, while polished plastic needs 12.3° and polished metal 3.4°, **so SH degree 3 can barely represent rough-plastic-grade specularity, and that is a limit of representational capacity, not of optimization**. There are also three places where the course's own configuration fails its own audits. Reached **75 courses · 478 lesson pages · 478 notebooks**.
 
 Full details in [`COURSES_PLAN.md`](./COURSES_PLAN.md).
