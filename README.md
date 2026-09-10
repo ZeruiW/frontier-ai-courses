@@ -1,6 +1,6 @@
 # Frontier AI Researcher / Engineer Courses · 前沿 AI 研究工程师课程体系
 
-**76 courses · 484 lesson pages · 484 runnable notebooks · Colab-ready, CPU-first, from-scratch.**
+**77 courses · 490 lesson pages · 490 runnable notebooks · Colab-ready, CPU-first, from-scratch.**
 一套从 model evaluation 起步、长成全栈的前沿 AI 研究/工程课程体系 —— 深度 HTML 讲解 + 真实可跑 notebook，纯 numpy/CPU 优先、优雅降级到真实框架/GPU。
 
 📖 中文 → [跳转](#中文) · 🇬🇧 English → [jump](#english)
@@ -13,7 +13,7 @@
 ### 目录
 - [这是什么](#zh-what)
 - [快速开始](#zh-quickstart)
-- [课程总览（76 门）](#zh-catalog)
+- [课程总览（77 门）](#zh-catalog)
 - [每门课的格式](#zh-format)
 - [学习路径建议](#zh-paths)
 - [仓库结构](#zh-layout)
@@ -49,7 +49,7 @@ jupyter lab
 先打开某模块的 `NN_讲解.html`（或先看 `index.html` 选路径），读完讲解再跑同名的 `.ipynb`。所有课程共用同一份 `assets/style.css`。
 
 <a name="zh-catalog"></a>
-### 课程总览（76 门）
+### 课程总览（77 门）
 
 #### C00–C09 · 核心 LLM / 评测主线
 | 课 | 目录 | 主题 |
@@ -262,6 +262,73 @@ jupyter lab
 > **各值一到两个数量级、合起来 154 倍**；**Chamfer 不是度量**（$20 > 5{+}5$）；
 > **CD-L1 对离群点线性而 CD-L2 平方**（一个离群点 1.31× vs **293×**）。
 
+
+| 课 | 目录 | 主题 | 补的洞 |
+|----|------|------|--------|
+| C76 | `C76_Causal_Inference_Course/` | 因果推断与线上归因（潜在结果框架 · 因果图与后门准则 · 倾向得分/IPW/双重稳健/DML · DiD/IV/RDD/合成控制 · SUTVA 与干扰、集群随机化、多触点归因、代理指标） | 全库 484 个讲解页里 `potential outcome` / `工具变量` / `instrumental variable` / `2SLS` / `双重差分` / `difference-in-differences` / `合成控制` / `synthetic control` / `double machine learning` / `doubly robust` / `双重稳健` / `positivity` / `平行趋势` / `SUTVA` / `溢出效应` / `集群随机` / `switchback` / `多触点` / `last-touch` / `增益模型` / `后门准则` / `back-door` / `AIPW` 全部 **0 命中**；`backdoor` 的 8 处**全是后门攻击**（C29/C44 安全课），`propensity` 的 6 处里 4 处是安全评测里的「倾向性」（capability vs propensity）、2 处是 C47/C63 的位置偏差 IPS；`潜在结果` 的唯一一处在 C10-07，一句话说明「随机分配让 $T$ 与潜在结果独立」—— 正好印证边界 |
+
+> **一条代数恒等式先把整门课框定了**：朴素差 $=$ ATT $+$ 选择偏差。
+> 这不是近似 —— 在本课的合成人群上 `1.582605 = 0.647736 + 0.934869`，**两边之差恰为 0**。
+> 所有识别策略（随机化、后门调整、工具变量、双重差分）做的都是同一件事：
+> **给「选择偏差」这一项一个等于零（或可估计）的理由**。
+>
+> **与 C10 模块 07 零重叠**：那一节拥有整套 A/B 统计工具箱（假设检验、功效与 MDE、
+> 多重比较、序贯检验、CUPED），本课一概不重复。本课的定位是
+> **「C10-07 假设随机化有效；本课处理它无效或不够的情形」**。
+>
+> **一条贯穿全课的线**：因果推断的失效几乎从不表现为错误，而是表现为
+> **「答对了另一个问题」**。本课十几个失效场景里**没有一个会报错** ——
+> 每一个都给出格式正确、置信区间漂亮、换 seed 也复现、能写进周报的数字：
+> 你以为在估全人群 ATE，实际估到的是 ATT（**相差 2.09 倍**）· 或「两臂齐全的层上的 ATE」
+> （$K{=}800$ 时**静默丢弃 22.2% 的样本**）· 或**直接效应**（$2.90 \to 2.00$，丢掉 31%）·
+> 或重叠人群的 ATE（$2.0019 \to 1.4371$，而被排除者的效应是 **+4.96**，最强的那批）·
+> 或与 OLS 无法区分的有偏估计（**1.8009 vs 1.7994**）· 或直接效应而非全局效应（**1.00 vs 2.00**）·
+> 或按曝光顺序分配的会计份额（真实份额 **7.1% 被记成 38.0%**）·
+> 或长期效应中只经由代理指标的那部分（短期 **+1.005**，长期 **−0.999**，**符号反转**）。
+>
+> **两个 bit 级恒等式**（都说明「双重稳健」可以在不报任何错的情况下消失）：
+> ① **常数 $\hat e$ 使 AIPW $\equiv$ G-computation** —— 每臂带截距的 OLS 使臂内残差和恰为 0，
+> 于是修正项整体为 0，**无论 $\hat e$ 对不对**（4 个模型规模上差 $< 2\times10^{-11}$；
+> 而 $q{=}400$ 时 G-comp 已崩到 **+123.44**，AIPW 与它逐位相同）;
+> ② **过拟合把修正项连续吃掉 $4.4\times10^5$ 倍**（$3.15\times10^{-1} \to 7.08\times10^{-7}$，单调）——
+> **越强的结果模型越把纠偏机制关掉**，而没有任何拟合优度指标会标记这件事。
+>
+> **六处诚实修正**，四条最值得记：
+> ① **「RDD 带宽越小偏差越小」在两侧曲率*对称*时是假的** —— 两侧的局部线性偏差
+> **恰好抵消**，最优带宽变成用满全部数据（$h^{*}{=}1.0$）；必须让两侧曲率不同
+> 才出现内点最优（$h^{*}{=}0.2$，而 $h{=}1.0$ 偏 0.4175）。
+> 真正的结论比原来的更有用：**RDD 的偏差取决于两侧形状之*差*，不是曲率大小**；
+> ② **「DML 的交叉拟合总是更好」是错的** —— 在部分线性的残差对残差得分里
+> **四个设定全部更差**（nuisance 的过拟合同时压低 $\tilde T$ 与 $\tilde Y$，在比值里抵消）；
+> 它在 **AIPW 得分**里才必要，而且是**必要条件不是充分条件**
+> （$q{=}320$ 时交叉拟合的 G-comp 仍是 **+36.64**）；
+> ③ **「正交化是一种新估计量」在 OLS nuisance 下是假的** —— Frisch–Waugh–Lovell：
+> `1.4633431908608447` vs `1.4633431908608445`，差 $2.2\times10^{-16}$。
+> 所以「上 DML」在 nuisance 是 OLS 时**不会改变任何数字**；
+> ④ **我第一版的双重稳健表证明不了它想证明的事** —— 我把结果模型的误配设成两臂相同的 $X^2$，
+> 于是它在 $\hat m_1 - \hat m_0$ 里**自动抵消**，「错」的模型给出 1.9928（几乎无偏）。
+> 教训：验证「模型 A 错时会怎样」之前，要先确认 A 真的错在**会影响估计量**的方向上。
+>
+> **两处意外收获**：① **对撞偏差的强度有闭式解** —— 取 $Z = X+Y+\varepsilon$，
+> 条件相关恰为 $-1/(1+\sigma^2)$（实测 $-0.91698$ vs 理论 $-0.91743$），
+> 所以它不是「可能有多大」而是**可以事先算出来**；
+> ② **M-bias 需要四条边同时存在**，断任意一条偏差就从 $-0.31$ 回到 $\pm0.003$ ——
+> 这解释了它在实践中量级常常很小，也说明该节的论点不是「不要控制处理前变量」，
+> 而是**「时间先后不是判据」**。
+>
+> 另有两条被量化的经验规则：**定向投放的盈亏平衡噪声 $\propto \text{sd}(\tau)^2/\text{ATE}$**
+> （**二次**律，$h$ 翻倍容忍的噪声涨 3.79–3.92 倍而不是 2 倍，验证到 0.779–1.130）；
+> **合成控制的 pre 期拟合优度对 post 期精度的预测力是 2/4** —— 掷硬币
+> （无约束 OLS 在 4/4 种设定里 pre 期都更好，post 期只在 2/4 里更好；
+> 而 post 期出现新因子时 **pre RMSE 逐位不变**、post RMSE 涨 3.0 倍）。
+>
+> **五处「本课自己的配置通不过自己的验收」**（刻意设计）：m01 的 RMSE 选出的最优层数
+> $K^{*}{=}200$ 本身已在丢 2.5% 的样本 · m03 的 `DR_COLLAPSED` **有假阳性**
+> （场景 1 触发了它而估计是对的，必须配上折内/折外残差比：1.00 无害 vs 2.63 危险）·
+> m04 的 `in_hull` 代理判定**没有任何阈值能同时做到 TPR>95% 与 FPR<5%**
+> （最优 2.2 处 FPR 仍 13.3%）· m04 的事前登记模板拦住 3/4，**DiD 那个拦不住**
+> （问题在不可检验的那一半里）· m05 的审计器对设计 C 无警报，而它有约 −0.15 的干扰偏差。
+
 <a name="zh-format"></a>
 ### 每门课的格式
 
@@ -272,7 +339,7 @@ CXX_Xxx_Course/
 ├── glossary.md          术语词典（≥12KB）
 ├── references.md        参考清单（论文/文档，标★必读）
 ├── requirements.txt      依赖（绝大多数课只需要 numpy/pandas/jupyterlab）
-├── assets/style.css      全站共用同一份样式（76 门课字节级一致）
+├── assets/style.css      全站共用同一份样式（77 门课字节级一致）
 ├── 00_setup/
 │   ├── 00_overview.html         课程总览
 │   └── 00_environment_check.ipynb
@@ -307,9 +374,9 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 ├── index.html               全站课程总览页
 ├── COURSES_PLAN.md            课程规划与构建历史的完整记录
 ├── ENV_SETUP.md                本地 conda 环境搭建笔记
-├── requirements-all.txt        全部 76 门课依赖的合集（装一次跑所有课）
+├── requirements-all.txt        全部 77 门课依赖的合集（装一次跑所有课）
 ├── _buildkit/                  house-style 生成器（coursekit.py）+ 各课构建脚本
-├── C00_..._Course/ … C75_..._Course/   76 门课，每门结构见上
+├── C00_..._Course/ … C76_..._Course/   77 门课，每门结构见上
 └── README.md                   就是这份文件
 ```
 
@@ -323,7 +390,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 <a name="zh-env"></a>
 ### 环境与依赖
 
-- **本地全量环境**：一个 conda env（`courses`，Python 3.11）配好 PyTorch + HuggingFace 全家桶 + 常用科学计算库即可跑完全部 76 门课，详见 [`ENV_SETUP.md`](./ENV_SETUP.md)；合集依赖在 [`requirements-all.txt`](./requirements-all.txt)。
+- **本地全量环境**：一个 conda env（`courses`，Python 3.11）配好 PyTorch + HuggingFace 全家桶 + 常用科学计算库即可跑完全部 77 门课，详见 [`ENV_SETUP.md`](./ENV_SETUP.md)；合集依赖在 [`requirements-all.txt`](./requirements-all.txt)。
 - **只想跑单门课**：进对应课程目录 `pip install -r requirements.txt` 即可——大多数课这份文件只有 `numpy`/`pandas`/`jupyterlab`/`ipykernel` 四五行。
 - 所有需要 `transformers`/`bitsandbytes`/`qwen-vl-utils` 等重依赖的真实模型 cell 都包了 `try/except`：装不上/没网/没 GPU 时会优雅降级到纯 Python/numpy 的替代实现或跳过，**不会让整本 notebook 崩掉**。
 
@@ -342,6 +409,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 - 2026-09-09：新增 C73（3D 表示与点云深度学习）。扫全库 466 个讲解页确认热门 3D 方向整块零覆盖（PointNet / PointPillars / 体素 / 点云分割 / 双目 / 单目深度 / SDF 全部 0 命中）。6 个 notebook、117 个 code cell、24 道练习自测两遍实跑通过。**本轮有七处结论被真实计算否掉后重写**，其中三处最值得记：`sum`/`mean` 不是逐位置换不变的（浮点加法不满足结合律，相对差 1.43e-15；而 `max`/`min` 是选择操作所以逐位不变）——所以置换不变性的单元测试不能一律用「恰好相等」；`max` 并没有完全丢弃点数（线性探针 $R^2=0.76$，因为极值统计量依赖样本量）；膨胀最快的不是薄结构而是完全散开的点（22.05× vs 薄片 4.32×），而规则密度的排序恰好相反、两者之积被核大小 27 框住。**最硬的一条结论**（推导闭合）：单轴容差恰好 $s_i/3$ ⇒ 交通标志的容差 0.049 m 与典型标注噪声 0.05 m 之比 **0.98×** ⇒ 让预测等于真值、只给真值加标注噪声，AP@IoU0.5 上界只有 **0.392**（卡车与轿车都是 1.000，中心距离口径下四类恒为 1.000）——**所以那一列量的是标注噪声而不是模型能力**。另有三处「本课自己的配置通不过自己的审计」。全谱达到 **74 门 · 472 讲解 HTML · 472 notebook**。
 - 2026-09-09：新增 C74（3D 高斯溅泼与实时渲染），同一批 3D 课单的第二门。缺口验证（全库 472 个讲解页逐关键词 grep）：`球谐`/`spherical harmonic` 0、`alpha compositing` 0、`tile 光栅化` 0、`EWA` 0；而 `体渲染`/`α 合成`/`高斯溅泼`/`NeRF` 的少数命中全部是 C72/C73/C55 里指向本课的一句带过。**因为选课路径跳过了 NeRF，体渲染与 α 合成的地基由本课模块 01 自带。** 6 个 notebook、123 个 code cell、24 道练习自测两遍实跑通过；notebook 里从零写出一个能出图的 tile 光栅化器，并与逐像素暴力实现**逐位相等到机器精度**。**本轮有四处结论被真实计算否掉后重写**，两条最值得记：① **对分段常数密度，α 合成精确到机器精度，连 $N{=}1$ 都对**（$N{=}1$ 误差为 0，$N{=}256$ 是 8.9e−16）——所以离散化误差**只**来自 σ 在段内变化，而那时中点法则是**二阶**的（每翻一倍 $N$ 误差降到 1/4.00，我最初写的 ∝1/N 是错的）；② **张角 53° 时投影后的协方差根本不存在**——2.28% 的质量落在 $z\le0$，$z\to0^+$ 的样本被投到无穷远，二阶矩积分发散（蒙特卡洛估计从 $n{=}10^4$ 到 $10^6$ 涨 9 倍、种子间差 3 倍），**所以「仿射近似在这里误差多少」这个问题问错了，它要对比的真值不存在**。另有两条：逐位比对最初漏了第三个近似（3σ 包围盒是 tile 对齐的，其影响 0.50 个 8 bit 色阶）；「尺度梯度更适合当密度判据」是单次运行的假象（一个目标一个种子时命中 67%，跑满 6 次是 28%，且在每一档都低于随机基线 25%）。顺带把一个流行说法量化纠正了：**SH 的「角分辨率 180/(ℓ+1)」高估约 1.45 倍**，实测（20% 相对残差判据）是 **125/(ℓ+1)**——deg 3 只到半角 **31.2°**，而抛光塑料要 12.3°、抛光金属 3.4°，**所以 SH deg 3 只能勉强表示粗糙塑料级的高光，而这是表示能力的限制、不是优化没收敛**。另有三处「本课自己的配置通不过自己的审计」。全谱达到 **75 门 · 478 讲解 HTML · 478 notebook**。
 - 2026-09-10：新增 C75（三维重建与 3D 生成），同一批 3D 课单的第三门，也是这批的收尾。缺口验证（全库 478 个讲解页逐关键词 grep）：`Structure from Motion` / `bundle adjustment` / `gauge` / `Schur` / `立体匹配` / `代价体` / `plane sweep` / `单目深度` / `TSDF` / `Marching Cubes` / `泊松重建` / `Score Distillation` / `倒角距离` 全部 **0 命中**；`Chamfer` 的 1 处在 C54 的匈牙利匹配上下文，`ICP` 的 9 处全是 **ICPR**（会议名）的子串。6 个 notebook、125 个 code cell、24 道练习自测两遍实跑通过。**与 C72/C73/C74 不同：本课有真实的优化（束调整、平面扫掠、SDS），但不训练任何网络**——因为核心问题就是优化的性质（可观测性、条件数、不动点）。**本轮有六处结论被真实计算否掉后重写**，三条最值得记：① 我第一版测「小基线让条件数爆到 $10^{19}$」时，那个轨迹让相机转 100° 却几乎不平移，于是 **40 个点里有 25–33 个跑到了相机背后**（投影 u 到 52 万像素）——我测的是一个坏掉的场景，不是小基线效应；换成 look-at 轨迹后才得到干净的 $\propto (B/z)^{-2}$（小基线端实测指数 −2.00）。② **前向运动不让 $E$ 退化**（$\sigma_8/\sigma_9 = 1.3\times10^{15}$），退化的是**三角化**（极点附近视线夹角只有外圈的 1/7.5）——这是两件不同的事，混在一起会让人去修错的地方。③ **「SDS 里的 $-\epsilon$ 是降方差的控制变量」只在高噪端或模式附近成立**：逐 $t$ 看效应完全反转，低噪端（$t{=}0.05$）它让方差**涨 391 倍**、高噪端（$t{=}0.95$）降 1533 倍；无条件成立的只有「它不改变期望」这一条（而两个估计量之差恰好不含 $x$，6 个 $x$ 处逐位相同）。**另有两处意外收获**：纯旋转时零空间恰好是 **npt + 6**（5 组配置验证——每个点的深度都不可观测 + 全局旋转 3 + 平移 3，而尺度被并进逐点深度里，所以它随场景规模增长而不是「7 加一点」）；先验权重 $(0.9,0.1)$ 时**次模式不再是吸引子**，SDS 给出 **100%/0%** 而不是 90%/10%——所以「多样性坍缩」不只是概率被压平，而是少数模式在动力学里直接消失。顺带把三条常被含糊的评测口径量化了：单目深度的协议三选（对齐**域** × 自由度 × 逐图/全局）**各值一到两个数量级、合起来 154 倍**，而规则是「对齐域必须与模型的不变性所在的域一致」（两个方向都验了，所以**评测协议不能独立于模型来定**）；**Chamfer 不是度量**（反例 $20 > 5{+}5$，超出 2 倍，所以「CD 差 0.1」没有传递性）；**CD-L1 对离群点线性而 CD-L2 平方**（一个 50 倍半径的离群点让 L1 涨 1.31× 而 L2 涨 **293×**，理论 $(d{-}1)^p/n$ 与实测吻合到 2e-4）。全谱达到 **76 门 · 484 讲解 HTML · 484 notebook**。
+- 2026-09-10：新增 C76（因果推断与线上归因）。缺口验证（全库 484 个讲解页逐关键词 grep）：`potential outcome` / `工具变量` / `instrumental variable` / `2SLS` / `双重差分` / `difference-in-differences` / `合成控制` / `double machine learning` / `doubly robust` / `双重稳健` / `positivity` / `平行趋势` / `SUTVA` / `溢出效应` / `集群随机` / `switchback` / `多触点` / `last-touch` / `增益模型` / `后门准则` / `AIPW` 全部 **0 命中**；`backdoor` 的 8 处**全是后门攻击**（C29/C44），`propensity` 的 6 处里 4 处是安全评测里的「倾向性」、2 处是 C47/C63 的位置偏差 IPS；`潜在结果` 的唯一一处在 C10-07 的一句话里 —— 正好印证边界。6 个 notebook、106 个 code cell、24 道练习自测两遍实跑通过。**与 C10 模块 07 零重叠**：那一节拥有整套 A/B 统计工具箱（假设检验、功效/MDE、多重比较、序贯、CUPED），本课一概不重复，定位是「C10-07 假设随机化有效；本课处理它无效或不够的情形」。**整门课由一条代数恒等式框定**：朴素差 $=$ ATT $+$ 选择偏差 —— 不是近似，实测 `1.582605 = 0.647736 + 0.934869`，**两边之差恰为 0**。**贯穿全课的线：因果推断的失效几乎从不表现为错误，而是表现为「答对了另一个问题」** —— 十几个失效场景里**没有一个会报错**，每一个都给出格式正确、置信区间漂亮、换 seed 也复现的数字（你以为估全人群 ATE，实际估到 ATT，相差 2.09 倍 / 或「两臂齐全的层上的 ATE」，$K{=}800$ 时**静默丢弃 22.2% 的样本** / 或直接效应，$2.90 \to 2.00$ 丢掉 31% / 或重叠人群的 ATE，$2.0019 \to 1.4371$ 而被排除者效应是 **+4.96** / 或与 OLS 无法区分的有偏估计，**1.8009 vs 1.7994** / 或直接效应而非全局效应，**1.00 vs 2.00** / 或按曝光顺序分配的会计份额，真实份额 **7.1% 被记成 38.0%** / 或长期效应中只经由代理指标的那部分，短期 **+1.005** 而长期 **−0.999**，**符号反转**）。**两个 bit 级恒等式**，都说明「双重稳健」可以在不报任何错的情况下消失：① **常数 $\hat e$ 使 AIPW $\equiv$ G-computation** —— 每臂带截距的 OLS 使臂内残差和恰为 0，修正项整体为 0，**无论 $\hat e$ 对不对**（4 个模型规模上差 $< 2\times10^{-11}$；而 $q{=}400$ 时 G-comp 已崩到 **+123.44**，AIPW 与它逐位相同）；② **过拟合把修正项连续吃掉 $4.4\times10^5$ 倍**（$3.15\times10^{-1} \to 7.08\times10^{-7}$，单调）—— **越强的结果模型越把纠偏机制关掉**，而没有任何拟合优度指标会标记这件事。**本轮有六处结论被真实计算否掉后重写**，四条最值得记：① **「RDD 带宽越小偏差越小」在两侧曲率*对称*时是假的** —— 两侧的局部线性偏差**恰好抵消**，最优带宽变成用满全部数据（$h^{*}{=}1.0$）；必须两侧曲率不同才有内点最优（$h^{*}{=}0.2$，$h{=}1.0$ 偏 0.4175）。**RDD 的偏差取决于两侧形状之*差*，不是曲率大小**；② **「DML 的交叉拟合总是更好」是错的** —— 在部分线性的残差对残差得分里**四个设定全部更差**（过拟合同时压低 $\tilde T$ 与 $\tilde Y$，在比值里抵消）；它在 **AIPW 得分**里才必要，且是**必要条件不是充分条件**（$q{=}320$ 时交叉拟合的 G-comp 仍是 **+36.64**）；③ **「正交化是一种新估计量」在 OLS nuisance 下是假的** —— Frisch–Waugh–Lovell：`1.4633431908608447` vs `1.4633431908608445`，差 $2.2\times10^{-16}$，所以「上 DML」在 nuisance 是 OLS 时**不会改变任何数字**；④ **我第一版的双重稳健表证明不了它想证明的事** —— 结果模型的误配设成两臂相同的 $X^2$，于是它在 $\hat m_1 - \hat m_0$ 里**自动抵消**，「错」的模型给出 1.9928（几乎无偏）。教训：验证「模型 A 错时会怎样」之前，要先确认 A 真的错在**会影响估计量**的方向上。**两处意外收获**：**对撞偏差的强度有闭式解**（$Z = X+Y+\varepsilon$ 时条件相关恰为 $-1/(1+\sigma^2)$，实测 $-0.91698$ vs 理论 $-0.91743$，所以它不是「可能有多大」而是**可以事先算出来**）；**M-bias 需要四条边同时存在**，断任意一条偏差就从 $-0.31$ 回到 $\pm0.003$ —— 所以该节的论点不是「不要控制处理前变量」，而是**「时间先后不是判据」**。另有两条被量化的经验规则：**定向投放的盈亏平衡噪声 $\propto \text{sd}(\tau)^2/\text{ATE}$**（**二次**律，$h$ 翻倍容忍的噪声涨 3.79–3.92 倍而不是 2 倍）；**合成控制的 pre 期拟合优度对 post 期精度的预测力是 2/4** —— 掷硬币（无约束 OLS 在 4/4 种设定里 pre 期都更好而 post 期只在 2/4 里更好；post 期出现新因子时 **pre RMSE 逐位不变**、post RMSE 涨 3.0 倍）。另有**五处「本课自己的配置通不过自己的验收」**。全谱达到 **77 门 · 490 讲解 HTML · 490 notebook**。
 
 完整细节见 [`COURSES_PLAN.md`](./COURSES_PLAN.md)。
 
@@ -389,7 +457,7 @@ jupyter lab
 Read a module's `NN_讲解.html` lesson first (or start from `index.html` to pick a path), then run the matching `.ipynb`. All courses share one `assets/style.css`.
 
 <a name="en-catalog"></a>
-### Course Catalog (76 courses)
+### Course Catalog (77 courses)
 
 #### C00–C09 · Core LLM & Evaluation Track
 | # | Folder | Topic |
@@ -617,6 +685,96 @@ Read a module's `NN_讲解.html` lesson first (or start from `index.html` to pic
 > with scene size, rather than being "7 plus a bit"); and with prior weights $(0.9, 0.1)$ the
 > minor mode **stops being an attractor at all** — SDS produces 100%/0%, not 90%/10%.
 
+
+| # | Directory | Topic | Gap it fills |
+|---|-----------|-------|--------------|
+| C76 | `C76_Causal_Inference_Course/` | Causal inference and online attribution (the potential-outcomes framework · causal graphs and the back-door criterion · propensity scores / IPW / doubly robust / DML · DiD / IV / RDD / synthetic control · SUTVA and interference, cluster randomization, multi-touch attribution, surrogate metrics) | Across all 484 existing lesson pages: `potential outcome`, `instrumental variable`, `2SLS`, `difference-in-differences`, `synthetic control`, `double machine learning`, `doubly robust`, `positivity`, `parallel trends`, `SUTVA`, `spillover`, `cluster randomization`, `switchback`, `multi-touch`, `last-touch`, `uplift model`, `back-door criterion` and `AIPW` all had **zero** hits. All eight `backdoor` hits are **backdoor attacks** (C29/C44, security); of the six `propensity` hits, four are "propensity" in the safety-eval sense (capability vs propensity) and two are C47/C63's position-bias IPS; the single `potential outcome` hit is one sentence in C10-07 noting that randomization makes $T$ independent of the potential outcomes — which is exactly the boundary this course starts from |
+
+> **One algebraic identity frames the whole course**: the naive difference $=$ ATT $+$ selection bias.
+> This is not an approximation — on this course's synthetic population
+> `1.582605 = 0.647736 + 0.934869`, and **the two sides differ by exactly 0**.
+> Every identification strategy (randomization, back-door adjustment, instrumental variables,
+> difference-in-differences) does the same one thing: **give the selection-bias term a reason
+> to be zero (or to be estimable)**.
+>
+> **Zero overlap with C10 module 07**, which owns the entire A/B statistics toolkit
+> (hypothesis testing, power and MDE, multiple comparisons, sequential testing, CUPED).
+> None of that is repeated here. This course is positioned as
+> **"C10-07 assumes randomization works; this course handles the cases where it doesn't, or isn't enough."**
+>
+> **The thread running through the whole course**: causal-inference failures almost never
+> show up as errors — they show up as **answering a different question correctly**.
+> **Not one** of the dozen-plus failure scenarios in this course raises an error.
+> Each produces a well-formed, tight-confidence-interval, seed-reproducible number
+> that would sail through a weekly report:
+> you think you are estimating the population ATE, and you get the ATT instead
+> (**2.09× apart**) · or "the ATE over strata that happen to have both arms"
+> (at $K{=}800$ the estimator **silently discards 22.2% of the sample**) ·
+> or the **direct** effect ($2.90 \to 2.00$, losing 31%) ·
+> or the ATE on the overlap population ($2.0019 \to 1.4371$, while the excluded 16.1%
+> have an effect of **+4.96** — the strongest group) ·
+> or an estimate indistinguishable from the one it was meant to fix (**1.8009 vs 1.7994**) ·
+> or the direct rather than the global effect (**1.00 vs 2.00**) ·
+> or an accounting share allocated by exposure order (a true share of **7.1% booked as 38.0%**) ·
+> or only the part of the long-term effect that flows through the surrogate
+> (short-term **+1.005**, long-term **−0.999** — **the sign flips**).
+>
+> **Two bit-level identities**, both showing that "doubly robust" can vanish without any error:
+> (1) **a constant $\hat e$ makes AIPW $\equiv$ G-computation** — per-arm OLS with an intercept
+> forces the within-arm residuals to sum to exactly 0, so the correction term is identically 0
+> **regardless of whether $\hat e$ is right** (agreement to $< 2\times10^{-11}$ across four model
+> sizes; at $q{=}400$ G-computation has already blown up to **+123.44**, and AIPW matches it
+> bit-for-bit); (2) **overfitting eats the correction term continuously, by $4.4\times10^5$**
+> ($3.15\times10^{-1} \to 7.08\times10^{-7}$, monotone) — **a stronger outcome model shuts the
+> de-biasing mechanism off**, and no goodness-of-fit metric flags it.
+>
+> **Six honest corrections**, four worth singling out:
+> (1) **"smaller RDD bandwidth means smaller bias" is false when the curvature is *symmetric*
+> about the cutoff** — the local-linear biases on the two sides **cancel exactly** in the
+> difference, so the optimal bandwidth becomes "use all the data" ($h^{*}{=}1.0$).
+> Only with different curvature on the two sides does an interior optimum appear
+> ($h^{*}{=}0.2$, while $h{=}1.0$ is off by 0.4175). The corrected conclusion is more useful
+> than the original: **RDD bias depends on the *difference* between the two sides' shapes,
+> not on the magnitude of the curvature**;
+> (2) **"cross-fitting in DML always helps" is wrong** — in the partially-linear
+> residual-on-residual score it was **worse in all four setups** (nuisance overfitting deflates
+> $\tilde T$ and $\tilde Y$ together, and they cancel in the ratio). It is necessary in the
+> **AIPW score**, and even there it is a **necessary but not sufficient** condition
+> (at $q{=}320$ the cross-fitted G-computation is still **+36.64**);
+> (3) **"orthogonalization is a new estimator" is false under OLS nuisance** —
+> Frisch–Waugh–Lovell: `1.4633431908608447` vs `1.4633431908608445`, a difference of
+> $2.2\times10^{-16}$. So "switching to DML" **changes nothing** when the nuisance is an OLS;
+> (4) **my first doubly-robust table could not prove what it was meant to prove** —
+> I made the outcome-model misspecification an $X^2$ term identical in both arms, so it
+> **cancelled automatically** in $\hat m_1 - \hat m_0$ and the "wrong" model returned 1.9928
+> (nearly unbiased). The lesson: before verifying "what happens when model A is wrong",
+> confirm that A is wrong in a direction that **actually reaches the estimator**.
+>
+> **Two unexpected findings**: (1) **collider bias has a closed form** — with
+> $Z = X+Y+\varepsilon$ the conditional correlation is exactly $-1/(1+\sigma^2)$
+> (measured $-0.91698$ vs theory $-0.91743$), so its strength is not "how bad might it be"
+> but **computable in advance**; (2) **M-bias requires all four edges to be present at once** —
+> break any one and the bias returns from $-0.31$ to $\pm0.003$. That explains why its
+> practical magnitude is often small, and it means the section's point is not
+> "never control for pre-treatment variables" but **"temporal order is not the criterion."**
+>
+> Two rules of thumb also get quantified: **the break-even CATE-estimation noise for targeted
+> rollout scales as $\text{sd}(\tau)^2/\text{ATE}$** — a **quadratic** law, so doubling the
+> heterogeneity buys 3.79–3.92× more noise tolerance rather than 2× (the invariant holds at
+> 0.779–1.130); and **the predictive value of a synthetic control's pre-period fit for its
+> post-period accuracy is 2/4** — a coin flip (unconstrained OLS fits the pre-period better in
+> 4/4 setups but has lower post-period RMSE in only 2/4; and when a new factor appears in the
+> post period, **the pre-period RMSE is bit-identical** while the post-period RMSE rises 3.0×).
+>
+> **Five places where the course's own configuration fails its own acceptance checks**
+> (deliberate): the RMSE-optimal stratum count in m01, $K^{*}{=}200$, is **already discarding
+> 2.5% of the sample** · m03's `DR_COLLAPSED` alert **has false positives** (scenario 1 fires it
+> while the estimate is correct; it must be paired with the in-fold/out-of-fold residual ratio:
+> 1.00 harmless vs 2.63 dangerous) · m04's `in_hull` proxy has **no threshold that achieves both
+> TPR>95% and FPR<5%** (at the optimum of 2.2 the FPR is still 13.3%) · m04's pre-registration
+> template catches 3/4 of the known-bad analyses and **misses the DiD one** (that problem lives
+> in the unfalsifiable half) · and m05's auditor raises no alert for design C, which nonetheless
+> carries roughly −0.15 of interference bias.
 <a name="en-format"></a>
 ### Format of Each Course
 
@@ -697,5 +855,6 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 - 2026-09-09: Added C73 (3D representations and point-cloud deep learning). A scan of all 466 lesson pages confirmed that the whole cluster of current 3D directions had zero coverage (PointNet, PointPillars, voxels, point-cloud segmentation, stereo, monocular depth, SDF — all 0 hits). 6 notebooks, 117 code cells, 24 exercise self-tests, all verified two-pass. **Seven conclusions were rewritten after real computation contradicted them**, three worth singling out: `sum`/`mean` are *not* bitwise permutation-invariant (floating-point addition is not associative; the relative difference is 1.43e-15, whereas `max`/`min` are, being pure selections) — so a permutation-invariance unit test cannot use exact equality for all aggregations; `max` does *not* discard the point count entirely (a linear probe gives $R^2=0.76$, because extreme-value statistics depend on sample size); and the fastest-dilating active set is not a thin structure but a fully scattered one (22.05× versus 4.32× for a sheet), while the rule density orders the opposite way and the product of the two is bounded by the kernel size 27. **The sharpest result** (a closed derivation): the per-axis tolerance is exactly $s_i/3$, so a traffic sign's 0.049 m tolerance sits at **0.98×** typical annotation noise (0.05 m); setting the prediction equal to the ground truth and adding only annotation noise to the labels, the AP@IoU0.5 ceiling on signs is just **0.392** (trucks and cars are both 1.000, and under the center-distance criterion all four classes are 1.000) — **so that column measures annotation noise, not model capability**. There are also three places where the course's own configuration fails its own audits. Reached **74 courses · 472 lesson pages · 472 notebooks**.
 - 2026-09-09: Added C74 (3D Gaussian Splatting and real-time rendering), the second course in the same batch of 3D topics. Gap check (keyword grep across all 472 existing lesson pages): `spherical harmonic` 0 hits, `alpha compositing` 0, `tile rasterization` 0, `EWA` 0; the few hits for volume rendering / alpha compositing / Gaussian Splatting / NeRF are all one-line pointers in C72/C73/C55 that defer to this course. **Because the chosen path through the 3D courses skipped NeRF, module 01 carries its own volume-rendering / alpha-compositing foundation.** 6 notebooks, 123 code cells, 24 exercise self-tests, all verified two-pass; the notebooks build a working tile rasterizer from scratch and check it against a per-pixel brute-force implementation **bit-for-bit**. **Four conclusions were rewritten after real computation contradicted them**, two worth singling out: (1) **for piecewise-constant density, alpha compositing is exact to machine precision, even at $N{=}1$** (error 0 at $N{=}1$, 8.9e−16 at $N{=}256$) — so the discretization error comes *only* from σ varying within a segment, and there the midpoint rule is **second order** (each doubling of $N$ cuts the error by 4.00×; my original ∝1/N was wrong); (2) **at a 53° subtended angle the projected covariance does not exist at all** — 2.28% of the mass falls at $z\le0$, samples approaching $z\to0^+$ project to infinity, and the second-moment integral diverges (the Monte-Carlo estimate grows 9× going from $n{=}10^4$ to $10^6$ and varies 3× across seeds), **so asking "how large is the affine approximation's error here" is the wrong question — the ground truth it would compare against does not exist**. Two more: the bit-for-bit comparison initially missed a third approximation (the 3σ bounding box is tile-aligned; its effect is 0.50 of one 8-bit color step); and "the scale gradient is a better densification criterion" was an artifact of a single run (67% top-quartile hit rate with one target and one seed, 28% averaged over six, and below the 25% random baseline at every density). It also quantitatively corrects a widespread claim: **the "angular resolution ≈ 180/(ℓ+1)" rule overstates SH capability by about 1.45×**; the measured limit (20% relative-residual criterion) is **125/(ℓ+1)** — degree 3 reaches only a **31.2°** half-angle, while polished plastic needs 12.3° and polished metal 3.4°, **so SH degree 3 can barely represent rough-plastic-grade specularity, and that is a limit of representational capacity, not of optimization**. There are also three places where the course's own configuration fails its own audits. Reached **75 courses · 478 lesson pages · 478 notebooks**.
 - 2026-09-10: Added C75 (3D reconstruction and 3D generation), the third and final course in this batch of 3D topics. Gap check (keyword grep across all 478 existing lesson pages): `Structure from Motion`, `bundle adjustment`, `gauge`, `Schur`, `stereo matching`, `cost volume`, `plane sweep`, `monocular depth`, `TSDF`, `Marching Cubes`, `Poisson reconstruction`, `Score Distillation` and `Chamfer distance` all had **zero** hits; the single `Chamfer` hit sits in C54's Hungarian-matching context, and all nine `ICP` hits are substrings of **ICPR**. 6 notebooks, 125 code cells, 24 exercise self-tests, all verified two-pass. **Unlike C72/C73/C74, this course runs real optimization (bundle adjustment, plane sweep, SDS) but trains no network** — because the core questions here *are* questions about optimization (observability, conditioning, fixed points). **Six conclusions were rewritten after real computation contradicted them**, three worth singling out: (1) when I first measured "a small baseline blows the condition number up to $10^{19}$", the camera trajectory rotated 100° while barely translating, so **25–33 of 40 points ended up behind the camera** (projected $u$ up to 520,000 px) — I was measuring a broken scene, not a small-baseline effect; switching to a look-at trajectory produced the clean $\propto (B/z)^{-2}$ law (measured exponent −2.00 in the small-baseline regime). (2) **Forward motion does not degenerate $E$** ($\sigma_8/\sigma_9 = 1.3\times10^{15}$) — what degenerates is **triangulation** (the ray angle near the epipole is only 1/7.5 of the outer ring); these are two different things, and conflating them sends you to fix the wrong stage. (3) **"The $-\epsilon$ term in SDS is a variance-reducing control variate" holds only at high noise or near a mode**: the effect fully reverses across $t$ — at $t{=}0.05$ it *increases* the variance by **391×**, at $t{=}0.95$ it reduces it by 1533×. The only unconditional statement is that it does not change the expectation (and the difference between the two estimators contains no $x$ at all — bit-identical at six different $x$). **Two unexpected findings**: under pure rotation the null space is exactly **npt + 6** (verified across five configurations — every point's depth is unobservable, plus 3 global rotation and 3 global translation, with scale absorbed into the per-point depths, so it grows with scene size rather than being "7 plus a bit"); and with prior weights $(0.9, 0.1)$ the minor mode **stops being an attractor**, so SDS produces **100%/0%** rather than 90%/10% — meaning "diversity collapse" is not just flattened probabilities but minority modes vanishing from the dynamics outright. It also quantifies three evaluation protocols that are routinely left vague: for monocular depth, the three protocol choices (alignment **domain** × degrees of freedom × per-image vs global) are each worth one to two orders of magnitude and **154× together**, and the rule is that "the alignment domain must match the domain in which the model is invariant" (verified in both directions, which means **the evaluation protocol cannot be defined independently of the model**); **Chamfer distance is not a metric** (counterexample $20 > 5{+}5$, violating by 2×, so "0.1 apart in CD" is not transitive); and **CD-L1 is linear in outliers while CD-L2 is quadratic** (one outlier at 50× the object radius raises L1 by 1.31× and L2 by **293×**, with the closed form $(d{-}1)^p/n$ matching measurement to 2e-4). Reached **76 courses · 484 lesson pages · 484 notebooks**.
+- 2026-09-10: Added C76 (causal inference and online attribution). Gap check (keyword grep across all 484 existing lesson pages): `potential outcome`, `instrumental variable`, `2SLS`, `difference-in-differences`, `synthetic control`, `double machine learning`, `doubly robust`, `positivity`, `parallel trends`, `SUTVA`, `spillover`, `cluster randomization`, `switchback`, `multi-touch`, `last-touch`, `uplift model`, `back-door criterion` and `AIPW` all had **zero** hits; all eight `backdoor` hits are **backdoor attacks** (C29/C44), four of the six `propensity` hits are "propensity" in the safety-eval sense and two are C47/C63's position-bias IPS, and the single `potential outcome` hit is one sentence in C10-07 — which is exactly the boundary this course starts from. 6 notebooks, 106 code cells, 24 exercise self-tests, all verified two-pass. **Zero overlap with C10 module 07**, which owns the entire A/B statistics toolkit (hypothesis testing, power/MDE, multiple comparisons, sequential testing, CUPED); none of it is repeated. The course is positioned as "C10-07 assumes randomization works; this course handles the cases where it doesn't, or isn't enough." **The whole course is framed by one algebraic identity**: the naive difference $=$ ATT $+$ selection bias — not an approximation; measured `1.582605 = 0.647736 + 0.934869`, with **the two sides differing by exactly 0**. **The thread running through the course: causal-inference failures almost never show up as errors — they show up as answering a different question correctly.** **Not one** of the dozen-plus failure scenarios raises an error; each produces a well-formed, tight-interval, seed-reproducible number (you think you are estimating the population ATE and get the ATT, 2.09× apart / or "the ATE over strata that have both arms", with $K{=}800$ **silently discarding 22.2% of the sample** / or the direct effect, $2.90 \to 2.00$, losing 31% / or the overlap-population ATE, $2.0019 \to 1.4371$, while the excluded group's effect is **+4.96** / or an estimate indistinguishable from the one it was meant to fix, **1.8009 vs 1.7994** / or the direct rather than the global effect, **1.00 vs 2.00** / or an accounting share allocated by exposure order, a true share of **7.1% booked as 38.0%** / or only the part of the long-term effect flowing through the surrogate, short-term **+1.005** and long-term **−0.999** — **the sign flips**). **Two bit-level identities**, both showing that "doubly robust" can vanish without any error: (1) **a constant $\hat e$ makes AIPW $\equiv$ G-computation** — per-arm OLS with an intercept forces within-arm residuals to sum to exactly 0, so the correction term is identically 0 **regardless of whether $\hat e$ is right** (agreement to $< 2\times10^{-11}$ across four model sizes; at $q{=}400$ G-computation has already blown up to **+123.44** and AIPW matches it bit-for-bit); (2) **overfitting eats the correction term continuously, by $4.4\times10^5$** ($3.15\times10^{-1} \to 7.08\times10^{-7}$, monotone) — **a stronger outcome model shuts the de-biasing mechanism off**, and no goodness-of-fit metric flags it. **Six conclusions were rewritten after real computation contradicted them**, four worth singling out: (1) **"smaller RDD bandwidth means smaller bias" is false when the curvature is *symmetric* about the cutoff** — the two sides' local-linear biases **cancel exactly** in the difference, so the optimal bandwidth becomes "use all the data" ($h^{*}{=}1.0$); only with different curvature on the two sides does an interior optimum appear ($h^{*}{=}0.2$; $h{=}1.0$ is off by 0.4175). **RDD bias depends on the *difference* between the two sides' shapes, not the magnitude of the curvature**; (2) **"cross-fitting in DML always helps" is wrong** — in the partially-linear residual-on-residual score it was **worse in all four setups** (overfitting deflates $\tilde T$ and $\tilde Y$ together and they cancel in the ratio); it is necessary in the **AIPW score**, and even there it is **necessary but not sufficient** (at $q{=}320$ the cross-fitted G-computation is still **+36.64**); (3) **"orthogonalization is a new estimator" is false under OLS nuisance** — Frisch–Waugh–Lovell: `1.4633431908608447` vs `1.4633431908608445`, differing by $2.2\times10^{-16}$, so "switching to DML" **changes nothing** when the nuisance is an OLS; (4) **my first doubly-robust table could not prove what it was meant to prove** — I made the outcome misspecification an $X^2$ term identical in both arms, so it **cancelled automatically** in $\hat m_1 - \hat m_0$ and the "wrong" model returned 1.9928 (nearly unbiased). The lesson: before verifying "what happens when model A is wrong", confirm A is wrong in a direction that **actually reaches the estimator**. **Two unexpected findings**: **collider bias has a closed form** (with $Z = X+Y+\varepsilon$ the conditional correlation is exactly $-1/(1+\sigma^2)$; measured $-0.91698$ vs theory $-0.91743$ — so its strength is not "how bad might it be" but **computable in advance**); and **M-bias requires all four edges at once**, with the bias returning from $-0.31$ to $\pm0.003$ if any one is broken — so that section's point is not "never control for pre-treatment variables" but **"temporal order is not the criterion."** Two rules of thumb also get quantified: **the break-even CATE-estimation noise for targeted rollout scales as $\text{sd}(\tau)^2/\text{ATE}$** (a **quadratic** law: doubling the heterogeneity buys 3.79–3.92× more noise tolerance, not 2×); and **the predictive value of a synthetic control's pre-period fit for post-period accuracy is 2/4** — a coin flip (unconstrained OLS fits the pre-period better in 4/4 setups but has lower post-period RMSE in only 2/4; when a new factor appears post-period, **the pre-period RMSE is bit-identical** while the post-period RMSE rises 3.0×). There are also **five places where the course's own configuration fails its own acceptance checks**. Reached **77 courses · 490 lesson pages · 490 notebooks**.
 
 Full details in [`COURSES_PLAN.md`](./COURSES_PLAN.md).

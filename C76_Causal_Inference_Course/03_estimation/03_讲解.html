@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 倾向得分、IPW、双重稳健与双重机器学习</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 倾向得分、IPW、双重稳健与双重机器学习</h1>
+  <p class="subtitle">IPW 用<em>真值</em>倾向得分仍然无偏，而<strong>有效样本量从 $4000$ 掉到 $616$</strong>（$85\%$ 的样本不起作用），且<em>诊断量自己也在退化</em>（half-frac 的跨 seed 标准差从 $0$ 涨到 $6.00$ pp）· <strong>截断不是「近似 ATE」，是换了一个人群</strong>：ATE $2.0019$ vs 重叠人群 $1.4371$，而被排除的 $16.1\%$ 效应是 $+4.9556$（最强的那批）· AIPW 只在两个 nuisance <em>都</em>错时失效（$3.492$/$3.476$/$3.491$ vs $\mathbf{2.816}$）· <strong>两个 bit 级恒等式</strong>：FWL 差 $2.2\times10^{-16}$（OLS 下正交化是恒等变换）；<strong>常数 $\hat{e}$ 使 AIPW $\equiv$ G-computation（差 $<2\times10^{-11}$）</strong> · <strong>过拟合把修正项吃掉 $4.4\times10^{5}$ 倍</strong>，同时 G-comp 崩到 $+123.44$——<em>越强的结果模型越把纠偏机制关掉</em> · 而交叉拟合在部分线性得分里<strong>四个设定全部更差</strong>（那里的偏差在残差比值中抵消）</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 01（识别 vs 估计、可忽略性、正性）；模块 02（后门准则决定 $X$ 是什么）；线性回归与岭回归；<em>「双重机器学习」不需要机器学习背景——本课的 nuisance 学习器都是最小二乘</em></div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_estimation.ipynb（<strong>IPW 无偏但方差爆炸</strong>：有效样本量从 $4000$ 掉到 $616$ / <strong>截断改掉了估计目标</strong>：ATE $2.00$ vs 重叠人群 $1.44$ / AIPW 只在两个 nuisance <em>都</em>错时失效（$3.492/3.476/3.491$ vs $\mathbf{2.816}$）/ <strong>两个 bit 级恒等式</strong>：FWL 差 $2.2\times10^{-16}$；常数 $\hat{e}$ 使 AIPW $\equiv$ G-computation（差 $3.1\times10^{-15}$）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Rosenbaum &amp; Rubin, <em>The Central Role of the Propensity Score</em>（Biometrika 1983）· Robins, Rotnitzky &amp; Zhao（JASA 1994，AIPW）· Chernozhukov, Chetverikov, Demirer, Duflo, Hansen, Newey &amp; Robins, <em>Double/Debiased Machine Learning for Treatment and Structural Parameters</em>（Econometrics Journal 2018）· Crump, Hotz, Imbens &amp; Mitnik, <em>Dealing with Limited Overlap</em>（Biometrika 2009，截断规则）· Lovell, <em>A Simple Proof of the FWL Theorem</em>（J Econ Educ 2008）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 60 分钟 + 跑 55 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#ps">倾向得分：把高维调整降成一维</a></li>
+      <li><a href="#ipw">IPW：偏差不是问题，方差是</a></li>
+      <li><a href="#positivity">正性违反：截断悄悄换掉了估计目标</a></li>
+      <li><a href="#dr">双重稳健：一致性的条件从「都对」松到「至少一个对」</a></li>
+      <li><a href="#fwl">两个 bit 级恒等式：DR 可以在不报错的情况下消失</a></li>
+      <li><a href="#estimand_ps">倾向得分模型的「好」不是预测的好</a></li>
+      <li><a href="#dml">正交化与交叉拟合各自解决什么</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ps"><span class="num">1</span>倾向得分：把高维调整降成一维</h2>
+  <p>模块 02 给出了「该控制哪些变量」，本模块处理「怎么控制」。$X$ 一旦超过两三维，分层就不可行了（模块 01 里 $K$ 太大会丢层）。</p>  <p>Rosenbaum 与 Rubin (1983) 的定理：记 $e(x) = P(T{=}1 \mid X{=}x)$ 为<strong>倾向得分</strong>（propensity score），则在可忽略性之下</p>  <div class="math-block">\[\{Y(0), Y(1)\} \perp T \mid X \quad\Longrightarrow\quad \{Y(0), Y(1)\} \perp T \mid e(X)\]</div>  <p>即：<strong>只按一维的 $e(X)$ 调整就够了</strong>，无论 $X$ 有多少维。这是倾向得分之所以成为标准工具的全部理由。</p>  <div class="callout warn"><span class="label">它把「高维调整」换成了「估一个一维函数」，但那个函数必须<strong>估对</strong>。$\hat{e}$ 估错时，定理的结论不成立——而 $\hat{e}$ 的误差与最终估计误差的关系是本模块的核心内容。更麻烦的是：$\hat{e}$ 的<em>预测精度</em>（AUC 之类）与它作为调整工具的<em>好坏</em>没有直接关系，甚至可以反向相关。</span>
+    <p>这个定理不是免费的</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ipw"><span class="num">2</span>IPW：偏差不是问题，方差是</h2>
+  <p>逆概率加权（inverse probability weighting）用 $1/e$ 给处理组加权、$1/(1-e)$ 给对照组加权，把两臂重新配平到同一个人群：</p>  <div class="math-block">\[\widehat{\text{ATE}}_{\text{IPW}} = \frac{1}{n}\sum_i \left[\frac{T_i Y_i}{e(X_i)} - \frac{(1-T_i) Y_i}{1-e(X_i)}\right]\]</div>  <p>notebook 里让 $e = \sigma(aX)$，$a$ 越大重叠越差，而且<strong>用真值 $e$</strong>——所以无偏性不该有任何问题：</p>  <table>
+    <thead><tr><th>$a$</th><th>$\min e$</th><th>$\max w$</th><th>IPW 均值（50 seeds）</th><th>IPW 标准差</th><th>有效样本量 ESS</th></tr></thead>
+    <tbody>
+      <tr><td>$0.0$</td><td>$5.0\times10^{-1}$</td><td>$2.0$</td><td>$+2.0005$</td><td>$0.0649$</td><td>$4000/4000$</td></tr>
+      <tr><td>$0.5$</td><td>$1.3\times10^{-1}$</td><td>$5.4$</td><td>$+1.9973$</td><td>$0.0598$</td><td>$3760/4000$</td></tr>
+      <tr><td>$1.0$</td><td>$2.1\times10^{-2}$</td><td>$20.1$</td><td>$+1.9899$</td><td>$0.0611$</td><td>$3024/4000$</td></tr>
+      <tr><td>$2.0$</td><td>$4.8\times10^{-4}$</td><td>$103.8$</td><td>$+1.9882$</td><td>$0.0977$</td><td>$1288/4000$</td></tr>
+      <tr><td>$3.0$</td><td>$1.1\times10^{-5}$</td><td>$72.8$</td><td>$+1.8702$</td><td>$0.4706$</td><td>$990/4000$</td></tr>
+      <tr><td>$5.0$</td><td>$5.0\times10^{-9}$</td><td>$171.7$</td><td>$+2.2026$</td><td>$0.5141$</td><td>$\mathbf{616/4000}$</td></tr>
+    </tbody>
+  </table>  <p>均值一直在 $2$ 附近（无偏），而标准差从 $0.065$ 涨到 $0.514$（$\mathbf{7.9}$ 倍），有效样本量从 $4000$ 掉到 $616$——<strong>$85\%$ 的样本在加权后不起作用了</strong>。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>直觉：如果某个 $X$ 的取值下几乎所有人都被处理了（$e \approx 1$），那么那一小撮没被处理的人要「代表」一大片人群，他们各自被赋予极大的权重。于是估计值几乎完全由少数几个样本决定。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>有效样本量 $\text{ESS} = (\sum_i w_i)^2 / \sum_i w_i^2$，在权重全等时等于 $n$，在权重集中于一点时趋于 $1$。它是 IPW 方差的直接诊断量：$\text{Var} \propto 1/\text{ESS}$ 而不是 $1/n$。</p></div>
+  </div>  <div class="callout intuition"><span class="label">报告 IPW 结果时应同时报告 <strong>ESS</strong> 与 <strong>$\max w$</strong>，而不只是点估计和置信区间。原因：置信区间在 ESS $=616$ 时仍然会算出来、仍然看起来正常，它只是宽——而「宽」在一份周报里通常不会引起警觉，「$85\%$ 的样本不起作用」会。</span>
+    <p>该报告的诊断量</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="positivity"><span class="num">3</span>正性违反：截断悄悄换掉了估计目标</h2>
+  <p>上一节的 $a$ 再大，正性 $0 < e < 1$ 都仍然成立（只是接近边界）。本节换成<strong>结构性</strong>违反：$X > 1$ 的人 <em>必然</em> 被处理（$e = 1$）。这在业务上极常见——规则准入、分数超阈值自动获批、历史策略是确定性的。</p>  <p>在 notebook 的设定里效应是异质的（$\tau = 2 + 2X$，所以 $X$ 大的人效应大），真 ATE $= 2.0019$，而 $X > 1$ 的 $15.9\%$ 的人没有任何可比的对照：</p>  <table>
+    <thead><tr><th>做法</th><th>结果</th><th>偏差</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>直接 IPW（$e{=}1$ 处 $1/(1-e)$ 爆掉）</td><td>$+2.2502$</td><td>—</td><td>数值上算得出，含义为零</td></tr>
+      <tr><td>截断 $e \in [0.01, 0.99]$</td><td>$+2.2608$</td><td>$+0.2589$</td><td>偏差<strong>随截断变宽而变大</strong></td></tr>
+      <tr><td>截断 $e \in [0.05, 0.95]$</td><td>$+2.3068$</td><td>$+0.3049$</td><td></td></tr>
+      <tr><td>截断 $e \in [0.10, 0.90]$</td><td>$+2.3870$</td><td>$+0.3851$</td><td></td></tr>
+      <tr><td>改问「重叠人群」的 ATE（trim，留 $83.9\%$）</td><td>$+1.4400$</td><td>$+0.0029$</td><td><strong>无偏，但目标变了</strong></td></tr>
+    </tbody>
+  </table>  <p>最后一行是本节的要点：<strong>该子人群的真 ATE 是 $1.4371$，不是 $2.0019$</strong>。trim 给出的是一个不同人群上的、正确的答案；而前三行的截断给出的是同一人群上的、错误的答案，且错误随截断阈值单调增大——所以「多截一点让权重稳定」这个操作是在<em>拿偏差换方差</em>，而它通常不会被记录为这样一次交换。</p>  <div class="callout danger"><span class="label">不要把截断当成「近似 ATE」。正确做法是显式地改变估计目标：报告 <strong>「重叠人群上的 ATE」</strong>，并说明这个人群是谁、占多少（这里是 $83.9\%$，被排除的是 $X$ 大、效应<em>最强</em>的那批人）。Crump 等 (2009) 给出的 $[0.1, 0.9]$ 规则正是为此设计的——它是一个<strong>换目标</strong>的规则，不是一个去偏的规则。</span>
+    <p>诚实的做法</p>
+  </div>  <p>还有一个更根本的观察：$X > 1$ 区域的 ATE <strong>不可识别</strong>，因为那里没有反事实的信息。任何在该区域给出数字的方法（截断、外推、模型化）都是在用<em>假设</em>而不是数据填补——这本身没错，但必须说出来。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="dr"><span class="num">4</span>双重稳健：一致性的条件从「都对」松到「至少一个对」</h2>
+  <p>IPW 只用了倾向模型 $\hat{e}$，G-computation（把结果模型的预测差取平均）只用了结果模型 $\hat{m}_t$。AIPW 把两者结合：</p>  <div class="math-block">\[\widehat{\text{ATE}}_{\text{AIPW}} = \frac{1}{n}\sum_i\Big[\hat{m}_1(X_i) + \frac{T_i(Y_i - \hat{m}_1(X_i))}{\hat{e}(X_i)} - \hat{m}_0(X_i) - \frac{(1-T_i)(Y_i - \hat{m}_0(X_i))}{1-\hat{e}(X_i)}\Big]\]</div>  <p>notebook 里让真效应是非线性的（$\tau = 2 + 1.5X^2$，真 ATE $= 3.4949$），结果模型的「错」版本只含 $X$ 的线性项，倾向模型的「错」版本是常数：</p>  <table>
+    <thead><tr><th>倾向模型</th><th>结果模型</th><th>G-computation</th><th>IPW</th><th>AIPW</th><th>$\vert$AIPW 偏差$\vert$</th></tr></thead>
+    <tbody>
+      <tr><td>对</td><td>对</td><td>$+3.4911$</td><td>$+3.4736$</td><td>$+3.4921$</td><td>$0.0028$</td></tr>
+      <tr><td>对</td><td><strong>错</strong></td><td>$+2.8158$</td><td>$+3.4736$</td><td>$+3.4764$</td><td>$0.0185$</td></tr>
+      <tr><td><strong>错</strong></td><td>对</td><td>$+3.4911$</td><td>$+4.4243$</td><td>$+3.4911$</td><td>$0.0038$</td></tr>
+      <tr><td><strong>错</strong></td><td><strong>错</strong></td><td>$+2.8158$</td><td>$+4.4243$</td><td>$\mathbf{+2.8158}$</td><td>$\mathbf{0.6792}$</td></tr>
+    </tbody>
+  </table>  <p>前三行 AIPW 都对，第四行才失效。这就是「双重稳健」的确切含义：<strong>它不是「更准」，而是把一致性的条件从「两个模型都对」放松到「至少一个对」</strong>。</p>  <div class="callout warn"><span class="label">第一版的结果模型误配是 $\mu_0 = X + X^2$（两臂相同），于是 $X^2$ 项在 $\hat{m}_1 - \hat{m}_0$ 里<strong>自动抵消</strong>，「错」的结果模型给出 $1.9928$（几乎无偏），第四行也就成了 $1.9928$——表格证明不了它想证明的事。必须让误配是<strong>处理依赖</strong>的（$\tau$ 本身非线性）才能显出来。教训：验证「模型 A 错时会怎样」之前，要先确认 A 真的错在<em>会影响估计量</em>的方向上。</span>
+    <p>设计这个实验时我犯了一次错，值得记下来</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="fwl"><span class="num">5</span>两个 bit 级恒等式：DR 可以在不报错的情况下消失</h2>
+  <h3>恒等式 A：常数 $\hat{e}$ 使 AIPW $\equiv$ G-computation</h3>  <p>如果倾向得分被估成常数（例如「实验是随机的，$\hat{e} = \bar{T}$」），而结果模型是<strong>每臂分别拟合的带截距线性模型</strong>，那么正规方程强制臂内残差和恰为 $0$，于是修正项</p>  <div class="math-block">\[\frac{1}{\hat{e}}\cdot\frac{1}{n}\sum_i T_i(Y_i - \hat{m}_1(X_i)) - \frac{1}{1-\hat{e}}\cdot\frac{1}{n}\sum_i (1-T_i)(Y_i - \hat{m}_0(X_i)) = 0 - 0 = 0\]</div>  <table>
+    <thead><tr><th>$q$（结果模型的特征数）</th><th>臂内残差和 $\Sigma_{T=1}$ / $\Sigma_{T=0}$</th><th>G-comp</th><th>AIPW（常数 $\hat{e}$）</th><th>$\vert$差$\vert$</th></tr></thead>
+    <tbody>
+      <tr><td>$10$</td><td>$+9.7\times10^{-13}$ / $-2.4\times10^{-13}$</td><td>$+2.5545$</td><td>$+2.5545$</td><td>$3.1\times10^{-15}$</td></tr>
+      <tr><td>$100$</td><td>$-5.6\times10^{-13}$ / $+5.0\times10^{-13}$</td><td>$+2.2635$</td><td>$+2.2635$</td><td>$2.2\times10^{-15}$</td></tr>
+      <tr><td>$250$</td><td>$+1.5\times10^{-10}$ / $-2.1\times10^{-11}$</td><td>$+2.4215$</td><td>$+2.4215$</td><td>$4.1\times10^{-13}$</td></tr>
+      <tr><td>$400$</td><td>$-6.0\times10^{-9}$ / $+2.2\times10^{-9}$</td><td>$+123.4362$</td><td>$+123.4362$</td><td>$2.0\times10^{-11}$</td></tr>
+    </tbody>
+  </table>  <p><strong>一个被称为「双重稳健」的实现，可以在不报任何错的情况下<em>就是</em>纯插入估计量。</strong>注意最后一行：$q{=}400$ 时 G-comp 已经崩到 $+123.44$（真值约 $2$），而 AIPW 与它逐位相同——修正项完全没有起作用。</p>  <h3>恒等式 B：过拟合把修正项连续吃掉</h3>  <p>换成<strong>真值</strong>倾向得分，让结果模型的特征数 $q$ 从 $10$ 涨到 $400$（每臂样本约 $400$，所以 $q$ 越大越过拟合）：</p>  <table>
+    <thead><tr><th>$q$</th><th>每臂残差范数</th><th>G-comp</th><th>AIPW</th><th>AIPW $-$ G-comp</th></tr></thead>
+    <tbody>
+      <tr><td>$10$</td><td>$2.3\times10^{1}$ / $2.2\times10^{1}$</td><td>$+2.5545$</td><td>$+2.2395$</td><td>$3.15\times10^{-1}$</td></tr>
+      <tr><td>$50$</td><td>$1.9\times10^{1}$ / $1.9\times10^{1}$</td><td>$+2.4167$</td><td>$+2.3087$</td><td>$1.08\times10^{-1}$</td></tr>
+      <tr><td>$150$</td><td>$1.6\times10^{1}$ / $1.5\times10^{1}$</td><td>$+2.2499$</td><td>$+2.2494$</td><td>$4.6\times10^{-4}$</td></tr>
+      <tr><td>$320$</td><td>$9.8\times10^{0}$ / $8.8\times10^{0}$</td><td>$+3.4754$</td><td>$+3.4755$</td><td>$5.3\times10^{-5}$</td></tr>
+      <tr><td>$400$</td><td>$1.3\times10^{0}$ / $3.0\times10^{-9}$</td><td>$+123.4362$</td><td>$+123.4362$</td><td>$\mathbf{7.1\times10^{-7}}$</td></tr>
+    </tbody>
+  </table>  <p>修正项的幅度从 $3.15\times10^{-1}$ 单调降到 $7.1\times10^{-7}$——<strong>$4.4\times10^{5}$ 倍</strong>，同时 G-comp 本身从 $+2.55$ 崩到 $+123.44$。所以「模型越强 → 估计越准」在这里彻底不成立：<strong>越强的结果模型越把纠偏机制关掉</strong>。</p>  <p>$q{=}400$ 时对照臂（$394$ 个样本）已经插值（残差 $3.0\times10^{-9}$），处理臂（$406$ 个）还没有（残差 $1.3$），所以两者的差是 $7\times10^{-7}$ 而不是严格 $0$。把 $q$ 再加大到超过两臂样本量，差会变成机器精度。</p>  <div class="callout paper"><span class="label">修正项 $T(Y - \hat{m})/\hat{e}$ 必须在<strong>没被拟合过</strong>的数据上计算才有内容。在同一份数据上拟合再取残差，残差会被系统性地压向 $0$，而这一压缩<em>不会</em>被任何拟合优度指标标记为异常——恰恰相反，它在训练集上看起来是「模型变好了」。</span>
+    <p>这就是 DML 强制交叉拟合的理由</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="estimand_ps"><span class="num">6</span>倾向得分模型的「好」不是预测的好</h2>
+  <p>一个反复出现的工程习惯是用 AUC 或 log-loss 挑倾向得分模型。这个做法有一个明确的问题：<strong>倾向得分的目标不是预测处理，而是配平协变量</strong>。</p>  <p>极端情形足以说明：如果 $\hat{e}$ 的 AUC 接近 $1$，意味着几乎能从 $X$ 完美预测谁被处理——那正是<strong>重叠最差</strong>的情形，$e$ 大量接近 $0$ 或 $1$，第 1 节的方差爆炸达到最严重。反过来 AUC 接近 $0.5$ 意味着处理几乎与 $X$ 无关，此时权重全等、方差最小，而调整本身也几乎不需要。</p>  <table>
+    <thead><tr><th>$\hat{e}$ 的预测能力</th><th>重叠</th><th>IPW 方差</th><th>调整的必要性</th></tr></thead>
+    <tbody>
+      <tr><td>AUC $\approx 0.5$</td><td>好</td><td>小</td><td>低（几乎是随机实验）</td></tr>
+      <tr><td>AUC 中等</td><td>中</td><td>中</td><td>高（本模块第 1 节的中间几行）</td></tr>
+      <tr><td>AUC $\to 1$</td><td><strong>差</strong></td><td><strong>爆炸</strong></td><td>无法满足（正性接近违反）</td></tr>
+    </tbody>
+  </table>  <p>所以该看的不是预测指标，而是<strong>配平指标</strong>：加权后各协变量在两臂的标准化均值差（standardized mean difference）是否都落在阈值内（常用 $0.1$）。这个量直接对应「$\hat{e}$ 有没有做到它该做的事」，而预测指标对应的是另一件事。</p>  <div class="callout warn"><span class="label">配平差有两种成因：$\hat{e}$ 模型误配（该修模型），或者<strong>真实的重叠不足</strong>（修模型没用，只能换目标人群）。第 2 节的 trim 处理的是后者。区分办法是看 $\hat{e}$ 的分布：如果大量样本堆在 $0$ 或 $1$ 附近，那是重叠问题而不是模型问题。</span>
+    <p>两个指标可以同向恶化，也可以反向</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="dml"><span class="num">7</span>正交化与交叉拟合各自解决什么</h2>
+  <p>双重机器学习（DML）通常被描述成「正交化 + 交叉拟合」。本节把这两件事分开量，结论比通常的说法更有条件。</p>  <h3>正交化在 OLS 下什么也不买：FWL 恒等式</h3>  <p>「先把 $T$ 和 $Y$ 各自对 $X$ 回归取残差，再拿残差对残差回归」听起来像一种新估计量。但当 nuisance 由 OLS 拟合时，它与「$Y$ 对 $[T, X]$ 一起回归，读 $T$ 的系数」<strong>代数上完全相等</strong>（Frisch–Waugh–Lovell 定理）：</p>  <pre><code>朴素插入 theta_hat = 1.4633431908608447
+正交化   theta_hat = 1.4633431908608445
+绝对差 = 2.220e-16   (机器精度)</code></pre>  <p>所以正交化<strong>只在 nuisance 被正则化或用机器学习拟合时</strong>才与朴素插入分离。这决定了 DML 的适用范围：如果你的 nuisance 就是一个 OLS，那么「上 DML」不会改变任何数字。</p>  <h3>交叉拟合的作用取决于估计量的形式</h3>  <p>在<strong>部分线性</strong>的残差对残差得分里，nuisance 的过拟合同时压低 $\tilde{T}$ 与 $\tilde{Y}$，在比值里抵消。notebook 用两种过拟合的 nuisance 测试，结论是<strong>否定</strong>的：</p>  <table>
+    <thead><tr><th>nuisance 学习器</th><th>无交叉拟合</th><th>有交叉拟合（5 折）</th><th>交叉拟合是否更好</th></tr></thead>
+    <tbody>
+      <tr><td>kNN, $k{=}20$</td><td>$+1.3558$</td><td>$+1.4018$</td><td><strong>否</strong></td></tr>
+      <tr><td>kNN, $k{=}60$</td><td>$+1.5474$</td><td>$+1.5886$</td><td><strong>否</strong></td></tr>
+      <tr><td>top-$m$ 选择 + OLS, $m{=}30$</td><td>$+0.9903$</td><td>$+0.9733$</td><td><strong>否</strong></td></tr>
+      <tr><td>top-$m$ 选择 + OLS, $m{=}250$</td><td>$+0.9282$</td><td>$+0.8929$</td><td><strong>否</strong></td></tr>
+    </tbody>
+  </table>  <p>在<strong>AIPW 得分</strong>里就完全不同了，因为修正项 $(Y - \hat{m})/\hat{e}$ 不抵消——上一节的两个恒等式正是这里的机制。notebook 在同一个 $q$ 下对比，交叉拟合让修正项重新活过来（$q{=}150$ 时 AIPW 与 G-comp 的差从 $4.6\times10^{-4}$ 回到 $0.138$）。</p>  <div class="callout danger"><span class="label">同一组实验里，$q{=}320$ 时交叉拟合版本的 G-comp 是 $+36.64$、AIPW 是 $+77.82$——两个都毫无意义。交叉拟合让修正项恢复了内容，但如果 nuisance 本身在<em>样本外</em>也很差，那么恢复的是一个巨大的、方向随机的修正。<strong>DML 的机制保证的是「没有一阶正则化偏差」，不是「nuisance 学不好也没关系」。</strong></span>
+    <p>但交叉拟合是必要条件，不是充分条件</p>
+  </div>  <p>把这一节的结论正面写出来，因为它和通常的表述不同：</p>  <ol>
+    <li><strong>正交化</strong>在 OLS nuisance 下是<em>恒等变换</em>（差 $2.2\times10^{-16}$）；它的价值出现在 nuisance 被正则化时。</li>
+    <li><strong>交叉拟合</strong>在部分线性得分里可能<em>没有</em>帮助（本课的四个设定里全部更差），因为那里的过拟合偏差在残差比值中抵消。</li>
+    <li><strong>交叉拟合在 AIPW / 双重稳健得分里是必要的</strong>，因为那里的过拟合会把修正项吃掉（$4.4\times10^{5}$ 倍）。</li>
+    <li>两者都<strong>不能</strong>补救 nuisance 的样本外误差。</li>
+  </ol>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_dag_backdoor/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 因果图与识别：后门准则、对撞偏差、中介</div></a>
+    <a class="next" href="../04_quasi_experiment/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 准实验：DiD、工具变量、断点回归、合成控制</div></a>
+  </div>
+
+</div>
+</body>
+</html>
