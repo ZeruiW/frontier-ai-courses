@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 3D 生成：SDS 与多视角扩散</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 3D 生成：SDS 与多视角扩散</h1>
+  <p class="subtitle">用一个解析已知的高斯混合当扩散先验，把 SDS 的动力学算到闭式 · <strong>$-\epsilon$ 项不改变期望（两个估计量之差完全不含 $x$）</strong>，<em>而「它降方差」这句话只在高噪端或模式附近成立——低到中噪端它<strong>增加</strong>方差（391 倍）</em> · <strong>SDS 的解是不动点、不是样本</strong>：精确梯度下模式内散布严格为 0，随机版 0.0431（先验 0.35，收缩 8.1 倍）· <strong>而它收敛到的模式内移 21.7%</strong>（±1.5663 vs 真值 ±2.0）——<em>因为它找的是「对 $t$ 平均后的平滑密度」的模式</em> · <strong>$\pi{=}(0.9,0.1)$ 时次模式<em>不再是吸引子</em></strong>——SDS 给出 100%/0% 而不是 90%/10% · <strong>CFG 真正买到的是抵消这个内移，而它会过冲</strong>（cfg≈3 恰好抵消，cfg=100 时外移 18%）· <strong>只采高噪段时两个模式<em>合并</em>成一个中点吸引子</strong> · <strong>Janus 是目标函数的严格最优解</strong>（2.0 &gt; 1.2），不是优化失败</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">本模块回答</div><div class="v">① SDS 的梯度为什么<strong>不含 U-Net 的雅可比</strong>，以及那个 $-\epsilon$ 项去哪了；② <strong>SDS 是模式寻求的：它的解是不动点，不是样本</strong>（随机版的模式内散布比先验收缩 <strong>8.1 倍</strong>，而<em>精确梯度版严格为 0</em>）；③ <strong>它收敛到的模式系统性内移 21.7%</strong>——因为那是「对 $t$ 平均后的平滑密度」的模式；④ <strong>CFG 真正买到的是抵消这个内移，而它会过冲</strong>（cfg≈3 恰好抵消，cfg=100 时外移到数据分布之外 18%）；⑤ Janus 是<strong>目标函数的最优解</strong>，不是优化失败；⑥ 多视角扩散怎么从根上改掉它</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_generation.ipynb（<strong>用一个解析已知的高斯混合当扩散先验，把 SDS 梯度算到闭式</strong> / 不动点与它们的稳定性 / <strong>CFG 的两种效应分开量</strong> / <strong>一个我踩过的坑：cfg=100 配固定 lr 在 400 步后是 $10^{100}$</strong> / Janus 的构造与多视角先验的修法）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Poole et al., <em>DreamFusion: Text-to-3D using 2D Diffusion</em>（ICLR 2023，SDS 的出处）· Wang et al., <em>Score Jacobian Chaining</em>（CVPR 2023，同期的等价推导）· Wang et al., <em>ProlificDreamer / VSD</em>（NeurIPS 2023，把「找模式」改回「采样」）· Liu et al., <em>Zero-1-to-3</em>（ICCV 2023，视角条件化）· Shi et al., <em>MVDream</em>（ICLR 2024，多视角联合先验）· Hong et al., <em>LRM: Large Reconstruction Model</em>（ICLR 2024，前馈路线的对照）· 本课程 <strong>C28</strong>（扩散与流本身）· C74（被 SDS 优化的那个表示）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#setup">问题的形状：用一个 2D 先验去雕一个 3D 表示</a></li>
+      <li><a href="#gradient">SDS 的梯度：那个 $-\epsilon$ 项与消失的雅可比</a></li>
+      <li><a href="#mode-seeking">SDS 的解是不动点，不是样本</a></li>
+      <li><a href="#inward-shift">它收敛到的模式内移 21.7%，而这是可预测的</a></li>
+      <li><a href="#schedule">$w(t)$ 与 $t$ 的采样范围：同一个旋钮的两种写法</a></li>
+      <li><a href="#janus">Janus 是目标函数的最优解</a></li>
+      <li><a href="#routes">三条路线的分工：SDS、多视角扩散、前馈重建</a></li>
+      <li><a href="#diagnose">诊断：SDS 出了问题时该动哪个旋钮</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="setup"><span class="num">1</span>问题的形状：用一个 2D 先验去雕一个 3D 表示</h2>
+  <div class="ascii">   3D 生成（SDS 路线）的循环：
+
+   θ  ──[可微渲染]──&gt;  x = g(θ)  ──[加噪]──&gt;  x_t
+   ↑                                            │
+   │                                    [预训练的 2D 扩散]
+   │                                            │
+   └──────────  梯度  &lt;────────────  ε̂(x_t, t, y) - ε
+
+   θ ：一个 3D 表示的参数（NeRF 的权重、或 C74 的一堆高斯）
+   g ：可微渲染器（C74 模块 03 就是它的一种）
+   y ：文字提示（或一张参考图）
+
+   关键点：**扩散模型完全不知道 3D 的存在**。它只被要求「这张渲出来的图像不像噪声」。
+        </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>所以 SDS 的全部内容是一句话：把「渲出来的每一张图都要像真实图像」当成对 3D 表示的约束。</strong><em>而它的适用条件很宽——不需要任何真实观测，所以它能做「只有文字」或「只有一张图」的情形</em>。<strong>这与前三个模块有一个性质上的差别：① SfM、② MVS、③ 前馈都在拟合<em>看到过的</em>图像，而 SDS 在生成<em>没看到过的</em>部分。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>后果是「对不对」这个问题没有客观判据。</strong><em>模块 01–03 的误差都能对着真值算；SDS 生成的背面本来就不存在真值，所以只能问「它像不像先验认为合理的东西」</em>。<strong>而这决定了本模块的分析方式：不去问「生成得好不好」，而去问「这个目标函数的最优解是什么形状」</strong>——<em>而那是可以精确回答的，本模块就这么做</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="gradient"><span class="num">2</span>SDS 的梯度：那个 $-\epsilon$ 项与消失的雅可比</h2>
+  <p>朴素想法是「把扩散模型的损失当成一个可微的图像评分，直接反传」。而扩散损失 $\mathcal L_{\text{diff}} = \mathbb E\Vert \hat\epsilon(x_t,t) - \epsilon\Vert^2$ 对 $x$ 求导会带上 $\partial\hat\epsilon/\partial x_t$——**U-Net 的雅可比**，既贵又不稳。SDS 的做法是**把它扔掉**：</p>  <div class="math-block">\[\nabla_\theta \mathcal L_{\text{SDS}}= \mathbb E_{t,\epsilon}\Bigl[w(t)\bigl(\hat\epsilon(x_t,t,y) - \epsilon\bigr)\frac{\partial x}{\partial \theta}\Bigr]\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>扔掉雅可比不是近似——它对应一个<em>不同但合理</em>的目标。</strong><em>因为 $\hat\epsilon = -\sigma_t\nabla_{x_t}\log p_t(x_t)$，所以 $(\hat\epsilon - \epsilon)$ 这一项在期望下就是「把 $x$ 往 $\log p_t$ 上升的方向推」</em>。<strong>换句话说：SDS 不是在最小化扩散损失，而是在做<em>平滑后密度的梯度上升</em>。</strong><em>这就是它是模式寻求的根本原因（第 3 节）</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而那个 $-\epsilon$ 项值得单独说：它在期望下<em>为零</em>。</strong><em>因为 $\epsilon\sim\mathcal N(0,I)$ 与 $x$ 无关，所以 $\mathbb E[\epsilon\,\partial x/\partial\theta] = 0$</em>。<strong>notebook 把这一点验到了一个很干净的形式：两个估计量之差恰好是$-\frac1n\sum w(t)\alpha_t\epsilon$，它<em>完全不含 $x$</em></strong>——<em>所以用同一批随机数时，这个差在 6 个不同的 $x$ 处逐位相同（标准差 $1.7\times10^{-17}$）</em>。<strong>也就是说它是一个纯加性的、均值为零的噪声项，不改变任何不动点。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <strong>它常被说成「一个降方差的控制变量」。notebook 实测下来，这句话<em>只在特定条件下成立</em>。</strong><em>逐 $t$ 看效应完全反转：$t{=}0.05$（低噪）时含 $-\epsilon$ 的方差是不含的 <strong>391 倍</strong>；$t{=}0.95$（高噪）时只有 <strong>1/1533</strong></em>。<strong>机制很清楚</strong>：<em>$t\to1$ 时 $x_t\approx\sigma_t\epsilon$，于是 $\hat\epsilon\approx\epsilon$，两者几乎抵消；而 $t\to0$ 时 $\hat\epsilon\approx0$，减去 $\epsilon$ 等于<strong>凭空加进</strong>一个方差为 1 的噪声</em>。<strong>净效应还依赖当前的 $x$</strong>：<em>在模式附近（$\pm2.5$）含 $-\epsilon$ 更好（1.65×），而在两模式之间（0.0）它反而差 0.57×</em>。<strong>无条件成立的只有一条：它不改变期望。</strong><em>我最初写的是「它无条件降方差」，被实测推翻了——但结论的用途没变，因为闭式期望梯度只需要「期望不变」这一条。</em>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>本模块的分析策略就建立在这个观察上。</strong><em>既然 $-\epsilon$ 的期望为零、而 $\hat\epsilon$ 对一个<strong>已知</strong>的先验有闭式，那么整个 SDS 的<strong>期望</strong>梯度就有闭式</em>：<strong>$g(x) = \mathbb E_t\bigl[w(t)\,\alpha_t\,\mathbb E_\epsilon[\hat\epsilon(\alpha_t x + \sigma_t\epsilon, t)]\bigr]$。</strong><em>notebook 用高斯混合当先验、用高斯-埃尔米特求积算 $\mathbb E_\epsilon$、用细网格算 $\mathbb E_t$——于是可以把 SDS 的动力学<strong>精确</strong>地画出来，没有任何随机性</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="mode-seeking"><span class="num">3</span>SDS 的解是不动点，不是样本</h2>
+  <p>先验取一个两模式的高斯混合：$\mu = \pm 2$、$\sigma = 0.35$、等权。把 SDS 的期望梯度算出来，找它的零点：</p>  <table>
+    <thead><tr><th>位置</th><th>$g$ 的斜率</th><th>类型</th></tr></thead>
+    <tbody>
+      <tr><td><strong>−1.5663</strong></td><td>+0.1080</td><td><strong>稳定（吸引子）</strong></td></tr>
+      <tr><td>0.0000</td><td>−0.1496</td><td>不稳定（分水岭）</td></tr>
+      <tr><td><strong>+1.5663</strong></td><td>+0.1080</td><td><strong>稳定（吸引子）</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>两个吸引子、一个分水岭——这是一个确定性的动力系统，不是一个采样过程。</strong><em>用<strong>精确</strong>期望梯度跑，从任何初值出发都收敛到两个点之一，模式内散布<strong>严格为 0</strong></em>。<strong>而真实的 SDS 用蒙特卡洛估计梯度，所以有残余散布</strong>：<em>notebook 用 16 个采样的随机版量到模式内标准差 <strong>0.0431</strong>，而先验是 0.35——收缩 <strong>8.1 倍</strong></em>。<strong>所以「多样性坍缩」的准确说法是：残余的多样性<em>只</em>来自梯度噪声，而不是来自先验的分布。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>另一个后果：落到哪个模式由<em>吸引域</em>决定，而不是由先验的概率质量决定。</strong><em>notebook 把先验权重改掉重跑，结果比「比例被压平」更强</em>：</p></div>
+  </div>  <table>
+    <thead><tr><th>先验权重 $\pi$</th><th>SDS 的不动点结构</th><th>SDS 的模式占比</th></tr></thead>
+    <tbody>
+      <tr><td>(0.5, 0.5)</td><td>±1.5663（吸引子）+ 0（分水岭）</td><td>50.4% / 49.6%</td></tr>
+      <tr><td>(0.7, 0.3)</td><td>−1.7624、+1.1530（吸引子）+ <strong>+0.4851</strong>（分水岭）</td><td><strong>54.4% / 45.6%</strong>（而先验是 70/30）</td></tr>
+      <tr><td><strong>(0.9, 0.1)</strong></td><td><strong>只剩一个吸引子（−1.9138）</strong></td><td><strong>100% / 0%</strong>（而先验是 90/10）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>第二行：占比被<em>压向</em> 50/50（54.4% vs 先验的 70%）</strong>——<em>因为它由分水岭的位置（$+0.4851$）与初值分布决定，而不是由概率质量</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>第三行更强：$\pi{=}(0.9,0.1)$ 时次模式<em>不再是吸引子</em>，不动点只剩一个。</strong><em>所以次模式被生成的概率是<strong>零</strong>，而不是 10%</em>。<strong>这就是「同一个提示词跑十次得到十个几乎一样的东西」的完整机制：不只是概率被压平，而是<em>少数模式在 SDS 的动力学里直接消失</em>。</strong></p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <strong>而 ProlificDreamer（VSD）正是针对这一点：它把「找模式」改回「采样」。</strong><em>做法是维护一个关于 $\theta$ 的<strong>分布</strong>（用一个 LoRA 拟合它的 score），让目标变成两个分布之间的 KL 而不是一个点的密度</em>。<strong>代价是要在优化过程中同时训练那个辅助模型</strong>——<em>所以它慢得多，但输出的多样性与细节都明显更好</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="inward-shift"><span class="num">4</span>它收敛到的模式内移 21.7%，而这是可预测的</h2>
+  <p>上表的吸引子在 $\pm1.5663$，而真实模式在 $\pm2.0$——**内移 21.7%**。这不是数值误差：</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>SDS 找的不是 $p$ 的模式，而是「对 $t$ 平均后的 $p_t$」的模式。</strong><em>而 $p_t$ 是 $p$ 与一个方差 $\sigma_t^2$ 的高斯的卷积——也就是<strong>平滑</strong></em>。<strong>平滑会把两个相邻的模式互相拉近</strong>（<em>极限情况：$\sigma_t$ 足够大时两个模式合并成一个，位置在中点</em>）。<em>所以对 $t$ 求平均（$t$ 从 0.02 到 0.98，覆盖从几乎无噪到几乎纯噪）得到的吸引子必然介于「真模式」与「中点」之间</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>这解释了一个真实的观察：SDS 生成的东西倾向于「更中庸」。</strong><em>细长的结构变短粗、尖锐的特征变圆滑、两个应该分开的部件粘在一起</em>。<strong>而它不是「优化没收敛」或「表示能力不够」，是目标函数的不动点<em>本来</em>就在那里。</strong><em>所以加迭代、加高斯、换渲染器都不会改善它</em>。</p></div>
+  </div>  <h3>而 CFG 真正买到的东西就是抵消这个内移</h3>  <table>
+    <thead><tr><th>cfg</th><th>$\vert g\vert$ @ $x{=}1.5$</th><th>全域 $\max\vert g\vert$</th><th>稳定所需的 $lr$ 上界</th><th><strong>吸引子位置</strong></th><th>相对真模式 ±2.0</th></tr></thead>
+    <tbody>
+      <tr><td>1.0</td><td>0.007</td><td>0.994</td><td>$1.22\times10^{1}$</td><td><strong>±1.5663</strong></td><td><strong>内移 21.7%</strong></td></tr>
+      <tr><td><strong>3.0</strong></td><td>0.150</td><td>2.297</td><td>$3.71\times10^{0}$</td><td><strong>±2.0530</strong></td><td><strong>外移 2.7%（几乎恰好抵消）</strong></td></tr>
+      <tr><td>7.5</td><td>0.470</td><td>5.228</td><td>$1.42\times10^{0}$</td><td>±2.2355</td><td>外移 11.8%</td></tr>
+      <tr><td>30.0</td><td>2.074</td><td>19.882</td><td>$3.46\times10^{-1}$</td><td>±2.3352</td><td>外移 16.8%</td></tr>
+      <tr><td>100.0</td><td>7.064</td><td>65.475</td><td>$1.03\times10^{-1}$</td><td><strong>±2.3594</strong></td><td><strong>外移 18.0%</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>cfg ≈ 3 时内移被恰好抵消；再大就<em>过冲</em>——吸引子跑到数据分布<em>之外</em>。</strong><em>而 DreamFusion 报的经验值是 cfg ≈ 100（图像生成只用 7.5）</em>。<strong>在本课这个玩具先验上，cfg=100 对应外移 18%</strong>——<em>这正是 SDS 结果「过饱和、对比度过高、颜色过艳」的机制：解被推到了比训练数据更极端的地方</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而表格的第 3、4 列说明 CFG 的<em>另一个</em>效应必须分开算：梯度幅度。</strong><em>$\max\vert g\vert$ 从 0.994 涨到 65.5（66 倍，近线性），所以稳定所需的学习率上界从 12.2 掉到 0.103（<strong>118 倍</strong>）</em>。<strong>我第一次做这个实验时正是踩了这个：cfg=100 配固定 $lr{=}0.25$，400 步之后 $x$ 是 $10^{100}$。</strong><em>而我一开始把那个数当成了「CFG 的效应」写进结论里——它其实只是我没缩学习率</em>。<strong>补一句准确的：那次 $10^{100}$ 出现在<em>随机</em>梯度版（无条件先验的代理 score 在数据支撑外线性增长，没有边界）；而 notebook 用网格插值的确定性版本时，同样的违规表现为一个<em>周期-2 的极限环</em>（在 $+0.78$ 与 $+3.33$ 之间来回跳，振幅 2.55，与两模式间距 4.0 同量级）。</strong><em>两者是同一个原因（$lr$ 超过 $2/\max\vert g'\vert$），只是一个无界、一个有界</em>。<strong>所以比较不同 cfg 时必须把 $lr$ 按 $1/\text{cfg}$ 缩放，否则比的是步长而不是形状。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="schedule"><span class="num">5</span>$w(t)$ 与 $t$ 的采样范围：同一个旋钮的两种写法</h2>
+  <p>第 4 节的内移 21.7% 是在 $w(t)=\sigma_t^2$、$t\in[0.02,0.98]$ 下测的。**换掉这两个之中的任何一个，不动点的位置就变了**——所以它们不是超参数细节，而是直接决定目标函数最优解在哪。</p>  <h3>换权重</h3>  <table>
+    <thead><tr><th>$w(t)$</th><th>吸引子位置</th><th>相对真模式 ±2.0</th></tr></thead>
+    <tbody>
+      <tr><td>$\sigma_t^2$（DreamFusion 的选择）</td><td>±1.5663</td><td><strong>内移 21.7%</strong></td></tr>
+      <tr><td>$1$（对 $t$ 均匀）</td><td>±1.8739</td><td>内移 6.3%</td></tr>
+      <tr><td><strong>$\mathrm{SNR} = (\alpha_t/\sigma_t)^2$</strong></td><td>±1.9974</td><td><strong>内移 0.1%</strong></td></tr>
+      <tr><td>$1/\sigma_t^2$</td><td>±1.9919</td><td>内移 0.4%</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>SNR 加权几乎完全消除了内移（0.1%）。</strong><em>因为它把权重压在<strong>低噪</strong>（$\sigma_t$ 小、$\alpha_t$ 大）的那一端，而低噪处的 $p_t$ 几乎就是 $p$，没有平滑</em>。<strong>那为什么 DreamFusion 不用 SNR 加权？</strong><em>因为低噪处的梯度<strong>信息量</strong>也最小——$\hat\epsilon$ 在 $t\to0$ 时趋于噪声本身，梯度趋于零。所以 SNR 加权在玩具先验上「更准」，在真实场景里会几乎不动</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>这是一个真实的取舍，而不是一个「更好的选择」：</strong><em>权重压向低噪 → 不动点更接近真模式，但收敛更慢、更容易卡在初值附近；权重压向高噪 → 收敛快、能大幅改变形状，但不动点更「中庸」</em>。<strong>所以实践中的做法是<em>退火</em>——早期用高噪、后期用低噪。</strong></p></div>
+  </div>  <h3>换 $t$ 的采样范围——而这里有一个质变</h3>  <table>
+    <thead><tr><th>$t$ 的范围</th><th>不动点</th><th>解读</th></tr></thead>
+    <tbody>
+      <tr><td>$[0.02, 0.98]$</td><td>±1.5663（吸引）+ 0（分水岭）</td><td>两个模式可分，内移 21.7%</td></tr>
+      <tr><td>$[0.02, 0.50]$</td><td>±1.9685 + 0</td><td>内移 1.6%</td></tr>
+      <tr><td>$[0.02, 0.30]$</td><td>±1.9999 + 0</td><td><strong>内移 0.0%</strong></td></tr>
+      <tr><td>$[0.30, 0.98]$</td><td>±1.4044 + 0</td><td>内移 29.8%</td></tr>
+      <tr><td><strong>$[0.50, 0.98]$</strong></td><td><strong>只有一个吸引子，在 0.0000</strong></td><td><strong>两个模式合并了</strong></td></tr>
+      <tr><td>$[0.70, 0.98]$</td><td>只有一个吸引子，在 0.0000</td><td>同上</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>关键在于「是否包含小 $t$」，而不是上界多大。</strong><em>只要区间里有低噪的样本，两个吸引子就在；而只采高噪段（$t \ge 0.5$）时，平滑已经把两个模式合成了一个，SDS 的动力系统里<strong>只剩一个位于中点的吸引子</strong></em>。<strong>这就是「SDS 早期生成一团糊」的精确含义</strong>——<em>不是还没收敛，而是那个阶段的目标函数<strong>真的</strong>只有一个「中庸」的最优解</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这给出一条可操作的规则：$t$ 的采样必须包含低噪端。</strong><em>常见的实现是「$t\sim U[0.02, t_{\max}]$ 且 $t_{\max}$ 随迭代退火」——notebook 量了三个阶段：$[0.40,0.98]$ → ±0.9623；$[0.20,0.70]$ → ±1.7446；$[0.02,0.40]$ → ±1.9962</em>。<strong>所以退火 $t_{\max}$ 的作用就是「让吸引子从中庸逐步移向真模式」</strong>——<em>而这与 CFG 在做同一件事（第 4 节），只是机制不同</em>。</p></div>
+  </div>  <h3>两个旋钮不独立</h3>  <table>
+    <thead><tr><th>$t_{\max}$ ＼ cfg</th><th>1.0</th><th>7.5</th><th>30.0</th><th>100.0</th></tr></thead>
+    <tbody>
+      <tr><td>0.98</td><td>±1.566（−21.7%）</td><td>±2.236</td><td>±2.335</td><td><strong>±2.359（+18.0%）</strong></td></tr>
+      <tr><td>0.70</td><td>±1.765</td><td>±2.265</td><td>±2.334</td><td>±2.351</td></tr>
+      <tr><td>0.40</td><td>±1.996（−0.2%）</td><td>±2.169</td><td>±2.191</td><td>±2.196（+9.8%）</td></tr>
+      <tr><td>0.20</td><td><strong>±2.000（0.0%）</strong></td><td>±2.083</td><td>±2.093</td><td><strong>±2.096（+4.8%）</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout danger"><span class="label"></span>
+    <strong>读法：两个旋钮都在抵消同一个内移，所以同时开满会过冲。</strong><em>$t_{\max}{=}0.98$ 时 cfg 从 1 到 100 把偏差从 −21.7% 推到 +18.0%（跨 39.7 个百分点）；而 $t_{\max}{=}0.20$ 时 cfg=1 已经是 0.0%，再加 cfg=100 只带来 +4.8% 的<strong>纯过冲</strong>——没有任何好处</em>。<strong>所以实践中的陷阱是：退火了 $t_{\max}$ 却没有同时降 cfg。</strong><em>症状就是「后期细节变多但颜色越来越艳、形状越来越夸张」</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="janus"><span class="num">6</span>Janus 是目标函数的最优解</h2>
+  <p>**Janus（多面）问题**：生成出来的物体正面和背面都是一张脸、或者一只动物有两个头。它常被当成「优化没收敛」，而它其实是**逐视角独立打分**这个目标的严格最优解。</p>  <div class="ascii">   构造（记「像正面」得 1.0、「像背面」得 0.2）：
+
+   方案                        前视得分   后视得分   总得分
+   ────────────────────────────────────────────────────────
+   一致（前=正面、后=背面）        1.0        0.2       1.2
+   Janus（两侧都是正面）          1.0        1.0     **2.0**   &lt;- 更高
+        </div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>所以只要先验对「背面」的打分低于对「正面」的打分，Janus 就<em>严格优于</em>正确答案。</strong><em>而这个条件几乎总成立：文字提示是「一只猫」，而扩散模型在训练数据里见到的猫绝大多数是正面/侧面</em>。<strong>换句话说：Janus 是先验的<em>视角偏置</em>被逐视角独立目标放大的结果。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这决定了修法必须改<em>目标</em>，不能改优化器。</strong><em>加迭代、换初值、加正则强度都不改变「2.0 > 1.2」这个不等式</em>。<strong>三条真实的修法：</strong>① <strong>视角条件化</strong>——<em>把相机方位放进提示或条件里（Zero-1-to-3），于是「背面」在<em>后视</em>的先验下得分变高</em>；② <strong>联合多视角先验</strong>——<em>一次生成 4–6 个视角并要求它们互相一致（MVDream），于是「两侧都是正面」在联合先验下得分<strong>变低</strong></em>；③ <strong>几何正则</strong>（对称性、法向一致）——<em>最弱的一条，因为它不改先验的偏置，只是加了一个竞争项</em>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>为什么②比①更彻底：它改的是先验的<em>联合</em>结构，而不只是边缘。</strong><em>①（视角条件化）仍然是逐视角独立打分——只是每个视角的打分函数不同了。所以它减轻了偏置，但没有引入「视角之间必须一致」这个约束</em>。<strong>②直接让「不一致」本身变成低分</strong>，<em>于是 Janus 不再是最优解。代价是先验必须重新训练成多视角的，而那需要 3D 或多视角数据——也就是回到了「数据」这个瓶颈</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="routes"><span class="num">7</span>三条路线的分工：SDS、多视角扩散、前馈重建</h2>
+  <table>
+    <thead><tr><th></th><th>SDS（逐场景优化）</th><th>多视角扩散 + 重建</th><th>前馈重建（LRM 类）</th></tr></thead>
+    <tbody>
+      <tr><td>输入</td><td>文字 或 单图</td><td>文字 或 单图</td><td><strong>单图 或 少量图</strong></td></tr>
+      <tr><td>每个资产的成本</td><td><strong>几十分钟的优化</strong></td><td>一次扩散采样 + 一次快速重建</td><td><strong>一次前向（秒级）</strong></td></tr>
+      <tr><td>多样性</td><td><strong>差</strong>（第 3 节：解是不动点）</td><td>好（真的在采样）</td><td>确定性（同一输入同一输出）</td></tr>
+      <tr><td>几何一致性</td><td><strong>差</strong>（第 5 节：Janus）</td><td><strong>好</strong>（联合先验）</td><td>取决于训练数据</td></tr>
+      <tr><td>细节</td><td><strong>好</strong>（可以优化很久）</td><td>受限于扩散的分辨率</td><td>受限于模型容量</td></tr>
+      <tr><td>需要 3D 数据吗</td><td><strong>不需要</strong></td><td>需要（训练多视角先验）</td><td>需要（训练重建模型）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>最后一行是这三条路线的真正分界。</strong><em>SDS 的全部价值在于「只用 2D 先验」——所以它在 2022–2023 年是唯一可行的路，因为那时没有足够的 3D 数据</em>。<strong>而 Objaverse 等大规模 3D 数据集出现之后，②③ 变得可行，且它们在速度与一致性上全面更好。</strong><em>所以 SDS 的地位从「主流方法」变成了「不需要 3D 数据时的兜底」，以及「作为一个精修阶段」</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而本模块的分析对②③同样有用，因为它们里面仍然有 SDS 的影子。</strong><em>很多流程是「多视角扩散给初值 → SDS 精修」，而精修阶段的内移（第 4 节）与过饱和（CFG 过冲）会照样发生</em>。<strong>诊断方式：如果精修之后细节变多但形状变「胖」、颜色变艳，那就是第 4 节的两个效应</strong>——<em>而对策是降 cfg（接受细节少一些）或用 VSD 替代 SDS</em>。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <strong>与本课程其他模块的接口</strong>：<em>SDS 优化的那个表示通常就是 C74 的 3DGS（或 NeRF），所以 C74 模块 03 的可微光栅化正是这里的 $\partial x/\partial\theta$；而生成出来的资产要评测、要出网格，就走本课模块 05；扩散模型本身（DiT、采样器、flow matching）在 C28</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="diagnose"><span class="num">8</span>诊断：SDS 出了问题时该动哪个旋钮</h2>
+  <table>
+    <thead><tr><th>症状</th><th>最可能的原因</th><th>动哪个旋钮</th></tr></thead>
+    <tbody>
+      <tr><td><strong>形状「胖」、细节圆滑、部件粘连</strong></td><td>第 4 节的内移——不动点本来就在那里</td><td><strong>退火 $t_{\max}$</strong>（第 5 节：$[0.02,0.30]$ 时内移 0.0%）；<em>或换 SNR 加权，代价是收敛变慢</em></td></tr>
+      <tr><td><strong>颜色过饱和、对比度过高</strong></td><td>CFG 过冲——吸引子被推到数据分布之外</td><td><strong>降 cfg</strong>。<em>而如果同时已经退火了 $t_{\max}$，那么 cfg 需要降得更多（第 5 节的交互表）</em></td></tr>
+      <tr><td><strong>训练几百步后炸成 NaN / 数值爆掉</strong></td><td>梯度幅度随 cfg 近线性增长（第 4 节：cfg=100 时 66 倍）</td><td><strong>按 $1/\text{cfg}$ 缩学习率</strong>，或加梯度裁剪。<em>这是我自己第一次做实验时踩的坑</em></td></tr>
+      <tr><td><strong>早期一直是一团糊，怎么都不成形</strong></td><td>$t$ 的采样范围没包含低噪端（第 5 节：$t\ge0.5$ 时只有一个中点吸引子）</td><td><strong>把 $t$ 的下界压到 0.02 附近</strong></td></tr>
+      <tr><td><strong>正反两面都是同一张脸 / 两个头</strong></td><td>Janus——目标函数的最优解（第 6 节）</td><td><strong>必须改目标</strong>：视角条件化，或换多视角先验。<em>加迭代、换初值、加正则都不改变「2.0 &gt; 1.2」这个不等式</em></td></tr>
+      <tr><td><strong>同一个提示词跑十次几乎一样</strong></td><td><strong>正常</strong>——SDS 的解是不动点（第 3 节）</td><td><em>要多样性就得换目标（VSD），而不是换随机种子</em></td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <strong>把这张表压成一句话：SDS 的问题几乎都是「目标函数的不动点在哪」的问题，而不是「优化收敛得好不好」的问题。</strong><em>所以调参的正确心态是「我在移动不动点」，而不是「我在帮优化器找到最优解」</em>。<strong>而这也是本模块把 $w(t)$、$t$ 范围、cfg 三个旋钮全部换算成「吸引子位置」来量的原因</strong>——<em>那是它们唯一的共同度量</em>。
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_feedforward/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 前馈回归：单目深度与点图</div></a>
+    <a class="next" href="../05_mesh_eval/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 网格化与 3D 重建评测</div></a>
+  </div>
+
+</div>
+</body>
+</html>

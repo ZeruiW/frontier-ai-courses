@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 前馈回归：单目深度与点图</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 前馈回归：单目深度与点图</h1>
+  <p class="subtitle"><strong>评测协议的三个选择各值一到两个数量级</strong>：对齐<em>域</em>（视差 0.003 vs 深度 0.128）· 自由度（仿射 vs 尺度，108 倍）· 逐图还是全局（<strong>154 倍</strong>）· 而规则是<strong>「对齐域必须与模型的不变性所在的域一致」</strong>——两个方向都验了 · <strong>所以评测协议不能独立于模型来定</strong> · 三个指标对同一种错误的反应差很多（8% 系统偏置下 $\delta<1.25$ 仍是 1.0000）· <strong>点图能精确反解焦距（$1.9\times10^{-16}$）</strong>，所以「pose-free」的真实含义是「内参被<em>输出</em>而不是被<em>输入</em>」——代价是恰好 <strong>3.00×</strong> 过参数化，而射线一致性只能靠网络自己保证 · <strong>而全局对齐的秩亏恰好 7：它<em>就是</em>一次束调整</strong>（我第一版写成 13，多出来的 6 立刻定位了建模 bug）</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">本模块回答</div><div class="v">① 绝对尺度<strong>在原理上</strong>不可观测（图像逐位相同，差 $1.1\times10^{-13}$）；② <strong>评测协议的三个选择各值一到两个数量级</strong>：对齐<em>域</em>、自由度、逐图还是全局；③ 为什么单目深度报的是「仿射不变」而不是「尺度不变」；④ <strong>点图（pointmap）能精确反解焦距（$1.9\times10^{-16}$）</strong>，所以它自带内参——代价是恰好 <strong>3.00×</strong> 过参数化；⑤ 前馈方法绕开了 SfM 的哪三种失败，又引入了什么新的失败</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_feedforward.ipynb（<strong>尺度不可观测的逐位验证</strong> / 对齐域 × 自由度 × 逐图/全局的完整协议表 / <strong>「对齐域必须与模型的不变性所在的域一致」——两个方向都验</strong> / 点图反解内参 / 过参数化的一致性代价）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Ranftl et al., <em>Towards Robust Monocular Depth Estimation</em>（MiDaS, TPAMI 2022）· Ranftl et al., <em>Vision Transformers for Dense Prediction</em>（DPT, ICCV 2021）· Yang et al., <em>Depth Anything</em>（CVPR 2024）/ <em>V2</em>（NeurIPS 2024）· Wang et al., <em>DUSt3R: Geometric 3D Vision Made Easy</em>（CVPR 2024）· Leroy et al., <em>MASt3R</em>（ECCV 2024）· Eigen et al., <em>Depth Map Prediction from a Single Image</em>（NeurIPS 2014，尺度不变损失的出处）· 本课程 <strong>C72</strong> 模块 03（四种补齐缺失自由度的办法）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#unobservable">先把不可能的部分划出去</a></li>
+      <li><a href="#protocol">评测协议的三个选择，每个都值一到两个数量级</a></li>
+      <li><a href="#why-affine">为什么是「仿射不变」而不是「尺度不变」</a></li>
+      <li><a href="#pointmap">点图：把内参也一起回归掉</a></li>
+      <li><a href="#global-align">全局对齐：它<em>就是</em>一次束调整</a></li>
+      <li><a href="#outputs">输出表示的四种选择：各自把哪一部分「构造保证」掉了</a></li>
+      <li><a href="#tradeoff">前馈绕开了什么，又引入了什么</a></li>
+      <li><a href="#diagnose">诊断：一个前馈重建能不能用</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="unobservable"><span class="num">1</span>先把不可能的部分划出去</h2>
+  <p>模块 00 已经给过这个式子，这里把它的后果说完：</p>  <div class="math-block">\[X \to sX,\;\; t \to st \;\Longrightarrow\; \pi(sX) = \pi(X)\]</div>  <table>
+    <thead><tr><th>$s$</th><th>最大像素差</th></tr></thead>
+    <tbody>
+      <tr><td>0.5</td><td>0.000e+00</td></tr>
+      <tr><td>2.0</td><td>0.000e+00</td></tr>
+      <tr><td>$10^{3}$</td><td>$1.14\times10^{-13}$</td></tr>
+      <tr><td>$10^{-3}$</td><td>$1.14\times10^{-13}$</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>所以「单目深度估计」这个任务名字里隐含了一个必须交代的问题：它输出的到底是什么？</strong><em>如果是米，那么这个米从哪来——不可能来自图像</em>。<strong>三种真实的答案：</strong>① <strong>相对深度</strong>（只保证前后关系与比例，不给单位）；② <strong>仿射不变的视差</strong>（差一个尺度与一个位移，见第 3 节）；③ <strong>米</strong>——<em>而这个米来自训练数据里的统计规律（房间大概多大、人大概多高、车道大概多宽）</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>第三种最有用也最脆弱。</strong><em>它把一个几何问题换成了一个统计问题：「这张图的场景尺度与训练分布里哪一类最像」</em>。<strong>所以它在室内数据上训练、拿到航拍图上就会系统性地错，而错的方式是<em>整体缩放</em>——图看起来完全合理，只是尺度不对</strong>。<em>这类错误在任何「相对」指标下都看不见，只在绝对指标下暴露</em>。</p></div>
+  </div>  <div class="callout intuition"><span class="label"></span>
+    <strong>与 C72 模块 03 对照着看会更清楚。</strong><em>C72 列了四种补齐缺失自由度的办法：另一个视角、平面假设、已知尺寸、另一个传感器</em>。<strong>前馈单目方法用的是<em>第五种</em>：一个从数据里学到的先验。</strong><em>而 C72 的那四种都能写出误差传播公式（比如已知尺寸时误差 ∝ 尺寸分类的相对误差），第五种不能——它的误差取决于分布偏移的程度，而那没有闭式</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="protocol"><span class="num">2</span>评测协议的三个选择，每个都值一到两个数量级</h2>
+  <p>拿一个**「视差域仿射意义上完美」**的预测器（即 $\hat d = a\,d_{\text{真}} + b$ 加上 0.2% 噪声，这正是 MiDaS/DPT 类模型的形式），然后用不同的协议去评它：</p>  <h3>选择一：在哪个域对齐</h3>  <table>
+    <thead><tr><th>对齐域</th><th>自由度</th><th>视差域 rel-RMSE</th><th>深度域 AbsRel（中位）</th><th>$\delta<1.25$</th></tr></thead>
+    <tbody>
+      <tr><td><strong>视差域</strong></td><td>仿射（2）</td><td><strong>0.00240</strong></td><td><strong>0.00306</strong></td><td><strong>1.0000</strong></td></tr>
+      <tr><td>视差域</td><td>尺度（1）</td><td>0.25459</td><td>0.33928</td><td>0.2978</td></tr>
+      <tr><td>深度域</td><td>仿射（2）</td><td>$1.03\times10^{6}$</td><td>0.12809</td><td>0.9416</td></tr>
+      <tr><td>深度域</td><td>尺度（1）</td><td>0.48228</td><td>0.20786</td><td>0.5236</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>只有「视差域 + 仿射」能把这个完美预测器还原到 0.3%。</strong><em>其余三种组合都差 40–110 倍</em>。<strong>原因很干净：仿射关系成立的域是视差域，换到深度域之后 $\hat z = 1/(a/z + b)$ 不是 $z$ 的仿射函数</strong>——<em>所以在深度域拟合一条直线，本身就是在拟合一个错的模型</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这条规律是对称的。</strong><em>notebook 反过来测了一个「深度域仿射完美」的预测器：</em><strong>深度域 + 仿射 → AbsRel 0.000304；视差域 + 仿射 → 0.073561（差 242 倍）</strong>。<em>所以规则不是「视差域更好」，而是<strong>「对齐域必须与模型的不变性所在的域一致」</strong></em>。<strong>而这意味着：评测协议不能独立于模型来定。</strong></p></div>
+  </div>  <h3>选择二：逐图对齐还是全数据集共享一组参数</h3>  <p>真实数据里每张图都有自己的未知尺度（不同场景、不同相机）。200 张图、每张有自己的 $(a_i, b_i)$：</p>  <table>
+    <thead><tr><th>协议</th><th>AbsRel 中位</th><th>P90</th></tr></thead>
+    <tbody>
+      <tr><td><strong>逐图 + 仿射</strong></td><td><strong>0.00278</strong></td><td>0.00506</td></tr>
+      <tr><td>逐图 + 尺度</td><td>0.30152</td><td>0.45975</td></tr>
+      <tr><td><strong>全数据集共享一组仿射参数</strong></td><td><strong>0.42713</strong></td><td><strong>1.30902</strong></td></tr>
+    </tbody>
+  </table>  <h3>选择三：用哪个指标——它们对<em>同一种</em>错误的反应差很多</h3>  <p>回到第一张表的第二行（视差域 + 只做尺度对齐）：AbsRel 是 0.33928，而 $\delta<1.25$ 是 0.2978。**两个指标都说「很差」，但它们差的方式不同**：</p>  <table>
+    <thead><tr><th>指标</th><th>定义</th><th>它对什么敏感</th><th>它对什么不敏感</th></tr></thead>
+    <tbody>
+      <tr><td><strong>AbsRel</strong></td><td>$\mathrm{median}\,\vert\hat z - z\vert / z$</td><td><em>相对误差的<strong>典型</strong>大小</em></td><td><strong>尾部</strong>——<em>用中位数时 10% 的极端错误完全不影响它</em></td></tr>
+      <tr><td><strong>$\delta<1.25$</strong></td><td>$\max(\hat z/z,\,z/\hat z) < 1.25$ 的像素比例</td><td><em>「有多少像素<strong>合格</strong>」——一个通过率</em></td><td><strong>合格像素错多少、不合格像素错多离谱</strong>，它都不管</td></tr>
+      <tr><td>RMSE / RMSE-log</td><td>$\sqrt{\mathrm{mean}(\cdot)^2}$</td><td><strong>尾部</strong>（平方 + 均值）</td><td><em>而它被远处的大深度支配，所以 RMSE-log 更常用</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>三个指标里只有 $\delta<1.25$ 有一个绝对的解释：「这个像素的深度可以用吗」。</strong><em>而 25% 这个阈值是一个约定，它来自 Eigen et al.(2014)——并不是某个应用需求推出来的</em>。<strong>所以做一个具体应用时，正确的做法是按需求换阈值</strong>：<em>机器人抓取可能要 $\delta<1.02$，而背景虚化只需要 $\delta<1.5$</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而组合起来看才有意义。</strong><em>AbsRel 小但 $\delta<1.25$ 也低 → 大部分像素略微超标（系统性偏置）；AbsRel 大但 $\delta<1.25$ 高 → 少数像素错得很离谱（离群/遮挡）；两个都差 → 尺度或对齐口径错了（第一张表的第 2、4 行）</em>。<strong>只报一个指标，这三种情形无法区分。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <strong>三个选择合起来，同一个模型的 AbsRel 可以是 0.003 或 0.427——差 154 倍。</strong><em>而三者都是「合理的」协议，只是回答不同的问题</em>：<strong>逐图对齐问「形状对不对」，全局对齐问「形状 + 跨场景的尺度一致性对不对」，不对齐问「绝对尺度对不对」。</strong><em>所以看到一个单目深度的数字时，必须先问三件事：<strong>域、自由度、逐图还是全局</strong>——缺任何一个，这个数字都不可比</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="why-affine"><span class="num">3</span>为什么是「仿射不变」而不是「尺度不变」</h2>
+  <p>尺度歧义只有 1 个自由度（第 1 节），那么第 2 节里那个「位移」$b$ 是从哪来的？</p>  <table>
+    <thead><tr><th>位移 $b$</th><th>尺度对齐的 rel-RMSE</th><th>仿射对齐的 rel-RMSE</th><th>比值</th></tr></thead>
+    <tbody>
+      <tr><td>0.00</td><td>0.00234</td><td>0.00234</td><td>1.0×</td></tr>
+      <tr><td>0.05</td><td>0.04034</td><td>0.00234</td><td>17.2×</td></tr>
+      <tr><td>0.42</td><td>0.25265</td><td>0.00234</td><td><strong>107.9×</strong></td></tr>
+      <tr><td>2.00</td><td>0.53258</td><td>0.00234</td><td>227.5×</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>$b=0$ 时两种对齐完全相同——所以位移项确实是一个<em>额外</em>的自由度，不是尺度的一部分。</strong><em>它的来源是训练侧而不是几何侧</em>：<strong>MiDaS 类模型在十几个数据集上混合训练，而这些数据集的「深度」定义各不相同</strong>——<em>有的是米、有的是视差、有的是相对深度、有的经过未知的重标定；而且很多只有<strong>相对</strong>标注</em>。<strong>要在这些数据上共同训练，就必须用一个对「尺度 + 位移」都不变的损失。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而选<em>视差</em>而不是深度，有一个独立的理由：$z\to\infty$ 时视差 $\to 0$，是有界的。</strong><em>天空、远景在深度域是 $+\infty$（无法回归），在视差域是 0（可以回归）</em>。<strong>所以「预测视差 + 仿射不变损失」这个组合是被两件事同时逼出来的：① 混合数据集的标注不一致；② 深度的无界性。</strong><em>而代价就是第 2 节那张表——用错口径会让数字差两个数量级</em>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>一个由此推出的实践建议：把「模型输出什么」写进接口签名里。</strong><em>返回一个裸的 $H\times W$ 数组时，调用方无法知道它是相对深度、仿射不变视差、还是米——而这三者的下游用法完全不同</em>。<strong>而这类混淆在跨团队协作时几乎必然发生一次</strong>：<em>一方按「米」用，另一方按「视差」出，结果是前后关系整体反转（因为视差与深度是倒数关系）</em>。
+  </div>  <div class="callout paper"><span class="label"></span>
+    <strong>Depth Anything V2 之后的一个变化值得注意：出现了「metric」分支。</strong><em>做法是在仿射不变的骨干上再接一个针对特定域（室内/室外）微调的头，让它直接输出米</em>。<strong>这不是解决了第 1 节的不可观测性，而是把那个统计先验<em>显式化</em>了</strong>——<em>所以它必须按域分开训练与使用，而跨域用就会系统性地缩放错</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="pointmap"><span class="num">4</span>点图：把内参也一起回归掉</h2>
+  <p>DUSt3R 类方法的输出不是深度图，而是**点图**（pointmap）：每个像素对应一个 3D 点 $(X,Y,Z)$，且**两张图的点图在同一个坐标系里**。</p>  <div class="ascii">   深度图 vs 点图：
+
+   深度图：  像素 (u,v) -&gt; z            需要内参 K 才能变成 3D 点
+             1 个通道                    -&gt; 所以内参必须已知或另外估计
+
+   点图：    像素 (u,v) -&gt; (X, Y, Z)     **自带**内参信息
+             3 个通道                    -&gt; 因为 u = cx + f X/Z 反过来能解出 f
+
+   而「两张图共一个坐标系」意味着相对位姿也自带了：
+             对应点的刚体变换 = 相对位姿  -&gt; 所以 SfM 那一步也被吸收了
+        </div>  <table>
+    <thead><tr><th>真值 $f$</th><th>从点图最小二乘反解的 $f$</th><th>相对误差</th></tr></thead>
+    <tbody>
+      <tr><td>300.0</td><td>300.0000</td><td>$1.9\times10^{-16}$</td></tr>
+      <tr><td>600.0</td><td>600.0000</td><td>$1.9\times10^{-16}$</td></tr>
+      <tr><td>1200.0</td><td>1200.0000</td><td>$1.9\times10^{-16}$</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>焦距是<em>精确</em>可解的（$u - c_x = f\,X/Z$ 是一个超定线性方程）。</strong><em>所以「预测点图」这个输出形式把「标定」这一步也吸收进了网络</em>。<strong>这就是 pose-free、calibration-free 的真实含义：不是不需要内参，而是内参被<em>输出</em>而不是被<em>输入</em>。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而代价是过参数化，且倍数恰好是 3.00：</strong><em>点图有 $3HW$ 个自由度，而它要表示的东西只有（深度 $HW$ + 内参 1~4）个</em>。</p></div>
+  </div>  <table>
+    <thead><tr><th>分辨率</th><th>点图的自由度</th><th>深度 + 焦距</th><th><strong>冗余</strong></th></tr></thead>
+    <tbody>
+      <tr><td>48×64</td><td>9,216</td><td>3,073</td><td><strong>3.00×</strong></td></tr>
+      <tr><td>384×512</td><td>589,824</td><td>196,609</td><td><strong>3.00×</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>冗余的后果是「一致性必须靠网络自己保证，而不是被构造保证」。</strong><em>一个合法的深度图 + 内参组合<strong>必然</strong>对应一个「射线一致」的点图（所有点都落在从光心出发的射线束上）；但一个任意的 $3HW$ 张量<strong>不必</strong>如此</em>。<strong>所以网络输出的点图可能是「几何上不自洽」的</strong>——<em>而这种不自洽在可视化上不明显，但在下游（三角化、位姿求解）会放大</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>实践中的对策有两条，都在真实实现里出现：</strong>① <strong>后处理投影</strong>——<em>从点图先解出 $f$，再把每个点投影回它自己的射线上（只保留深度分量），于是自洽性被强制恢复</em>；② <strong>全局对齐</strong>（DUSt3R 的第二阶段）——<em>把多对点图放进一个优化里，同时求各图的位姿与尺度，而这一步<strong>本质上就是一次束调整</strong>（模块 01）</em>。<strong>所以 pose-free 方法并没有真的取消 SfM，它把 SfM 从「必须先做对」变成了「用来收尾」。</strong></p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="global-align"><span class="num">5</span>全局对齐：它<em>就是</em>一次束调整</h2>
+  <p>点图是逐<strong>对</strong>预测的（DUSt3R 一次吃两张图），而每一对有自己的未知尺度。要把 $N$ 张图拼成一个模型，就要同时求各图的位姿、各对的尺度、以及公共的 3D 点——**而这是一个和模块 01 同构的问题**。</p>  <table>
+    <thead><tr><th>$N{=}5$（10 对，60 个点）</th><th>个数</th></tr></thead>
+    <tbody>
+      <tr><td>各图位姿</td><td>$5\times6 = 30$</td></tr>
+      <tr><td>各对尺度</td><td>$10\times1 = 10$</td></tr>
+      <tr><td>场景点</td><td>$60\times3 = 180$</td></tr>
+      <tr><td><strong>参数合计</strong></td><td><strong>220</strong></td></tr>
+      <tr><td>观测（每对两张点图 × 60 点 × 3 维）</td><td>3,600</td></tr>
+      <tr><td><strong>Hessian 的秩亏</strong></td><td><strong>恰好 7</strong>（谱间隙 $3.6\times10^{12}$）</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>秩亏 7——与模块 01 的束调整<em>完全相同</em>，因为它是同一个 gauge：世界坐标系的相似变换。</strong><em>区别只在残差的形式：模块 01 是 2D 重投影差，这里是 3D 点差</em>。<strong>所以模块 01 的全套结论直接适用</strong>：<em>需要固定或投影掉 gauge（否则尺度会随机漂移）、点块是块对角的所以可以用 Schur 补、协方差依赖 gauge 的选择</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这说明「pose-free」并没有取消 SfM，它换了 SfM 的<em>位置</em>：</strong><em>传统流程里 SfM 在最前面，必须先做对，做不对整条链就断（模块 01 第 2、6 节）；前馈流程里前馈网络先给出每对的几何，然后用一次<strong>已经有很好初值</strong>的全局优化收尾</em>。<strong>后者的关键优势不是「不需要优化」，而是「优化不会掉进坏的局部解」</strong>——<em>因为初值不是从零开始的贪心增量，而是网络一次给出的</em>。</p></div>
+  </div>  <h3>而尺度为什么能解出来：靠「点被共享」</h3>  <p>单看一对，那一对的尺度与全局尺度**不可分**（合并成 1 个自由度，而它属于第 1 节说的不可观测部分）。两对一旦共享同一批 3D 点，它们的**相对**尺度就被绑定了。</p>  <table>
+    <thead><tr><th>$N$</th><th>对数</th><th>参数</th><th>观测</th><th>冗余</th></tr></thead>
+    <tbody>
+      <tr><td>2</td><td>1</td><td>133</td><td>240</td><td>+107</td></tr>
+      <tr><td>3</td><td>3</td><td>141</td><td>720</td><td>+579</td></tr>
+      <tr><td>5</td><td>10</td><td>160</td><td>2,400</td><td>+2,240</td></tr>
+      <tr><td>8</td><td>28</td><td>196</td><td>6,720</td><td>+6,524</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <strong>顺带一个很实用的调试技巧，我在做这个实验时用上了。</strong><em>第一版我把残差写成「只用每对的<strong>参考</strong>视图的点图」，结果秩亏是 <strong>13</strong> 而不是 7</em>。<strong>多出来的 6 立刻指出了 bug：相机 4 从来不是任何一对的参考，所以它的 6 个参数完全没出现在残差里</strong>（<em>雅可比里那 6 列的范数是 0</em>）。<strong>所以「数一数零空间的维数」是检查「我的残差是不是漏了某个变量」最快的办法</strong>——<em>它比读代码快，而且给出的是<strong>缺了几个自由度</strong>这个精确信息</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="outputs"><span class="num">6</span>输出表示的四种选择：各自把哪一部分「构造保证」掉了</h2>
+  <p>前馈方法的输出形式不是实现细节——**它决定了哪些一致性是<em>免费</em>的、哪些必须靠网络自己学会**。用「自由度账」来看最清楚（以 $H\times W$ 的图像为单位）：</p>  <table>
+    <thead><tr><th>输出表示</th><th>自由度</th><th>真正需要的自由度</th><th>冗余</th><th>构造上<strong>免费</strong>保证的</th><th>必须靠网络学会的</th></tr></thead>
+    <tbody>
+      <tr><td><strong>相对深度</strong>（视差图）</td><td>$HW$</td><td>$HW$</td><td><strong>1.00×</strong></td><td><em>射线一致性（每个像素只有一个沿射线的量）</em></td><td>尺度与位移（第 3 节：2 个自由度对不上）</td></tr>
+      <tr><td><strong>度量深度</strong></td><td>$HW$</td><td>$HW$</td><td><strong>1.00×</strong></td><td><em>同上，且尺度已定</em></td><td><strong>尺度的正确性</strong>——而它来自分布假设（第 1 节）</td></tr>
+      <tr><td><strong>点图</strong> pointmap</td><td>$3HW$</td><td>$HW+1$</td><td><strong>3.00×</strong></td><td><em>无需内参；相对位姿隐含在两图的点图里</em></td><td><strong>射线一致性 + 内参自洽</strong>（第 4 节）</td></tr>
+      <tr><td><strong>直接出高斯</strong>（Splatter Image 类）</td><td>$\approx 14 HW$ 起（C74 模块 05）</td><td>$HW+1$</td><td><strong>&gt; 14×</strong></td><td><em>可直接渲染，无需后处理</em></td><td><strong>几何 + 外观 + 不透明度全部</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>规律很清楚：冗余越大，网络要自己学会的一致性越多。</strong><em>深度图的冗余是 1.00×，所以它<strong>不可能</strong>输出一个「几何上不自洽」的结果——射线一致性是被表示本身构造保证的</em>。<strong>点图的 3.00× 冗余买到了「不需要内参」，代价是它<em>可以</em>输出不自洽的东西（第 4 节）。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这个取舍与 C74 模块 02 的那个是同一类：</strong><em>C74 里「不直接存协方差、而存 $(s,q)$ 再算 $RSS^\top R^\top$」把正定性<strong>编码进了参数化</strong>，于是优化器再也不可能违反它</em>。<strong>这里是反方向的选择：点图<em>放弃</em>了把射线一致性编码进表示，换来了内参的自由。</strong><em>两个课程、两个方向，而判断的依据相同：「这个约束是硬的还是软的？硬的就编码进表示，软的才交给优化」</em>。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <strong>所以「该选哪种输出」有一个可操作的判据：</strong><em>内参已知且可信 → 用深度图（冗余 1.00×，一致性免费）；内参未知或不可信 → 用点图（多付 3× 冗余，换标定自由）；要直接渲染且不在乎几何精度 → 直接出高斯</em>。<strong>而最后一种在几何评测上通常最差</strong>——<em>因为它把几何、外观、不透明度混在一个 $14HW$ 的张量里，而只有渲染损失在监督它</em>（C74 模块 05 第 7 节的「要几何准就用 2DGS」是同一件事）。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="tradeoff"><span class="num">7</span>前馈绕开了什么，又引入了什么</h2>
+  <table>
+    <thead><tr><th>SfM 的失败模式（模块 01）</th><th>前馈方法还怕它吗</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>视角太少</strong>（1–2 张）</td><td><strong>不怕</strong></td><td><em>先验代替了几何约束——这是它最大的卖点</em></td></tr>
+      <tr><td><strong>基线太短 / 纯旋转</strong>（条件数 $4.4\times10^{17}$）</td><td><strong>不怕</strong></td><td><em>单目预测根本不依赖基线</em></td></tr>
+      <tr><td><strong>无纹理 / 周期纹理</strong>（模块 02）</td><td><strong>基本不怕</strong></td><td><em>先验会「填」进一个合理的表面，而不是像 NCC 一样给出噪声（模块 02 第 3 节）</em></td></tr>
+      <tr><td><strong>共面场景</strong>（$E$ 退化）</td><td>不怕</td><td><em>不解 $E$</em></td></tr>
+    </tbody>
+  </table>  <table>
+    <thead><tr><th>前馈方法<em>新</em>引入的失败模式</th><th>表现</th><th>怎么检测</th></tr></thead>
+    <tbody>
+      <tr><td><strong>尺度分布偏移</strong></td><td>整体缩放错，但图看起来完全合理</td><td><strong>只有绝对指标能抓到</strong>——<em>而第 2 节说逐图对齐会把它完全掩盖掉</em></td></tr>
+      <tr><td><strong>几何不自洽</strong>（第 4 节的过参数化）</td><td>点图不落在射线束上；多对点图拼不起来</td><td><em>投影回射线后看残差；或看全局对齐的收敛残差</em></td></tr>
+      <tr><td><strong>「合理但错」的补全</strong></td><td>遮挡区、玻璃、镜子处给出一个平滑合理的表面，而它不对</td><td><strong>无法从单张图检测</strong>——<em>必须用另一个视角或另一个传感器</em></td></tr>
+      <tr><td><strong>对分布内的场景过于自信</strong></td><td>不输出不确定度，或输出的不确定度与真实误差不相关</td><td><em>需要专门的校准评估（见 C10）</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>把两张表并排读，结论是「两类方法的失败模式几乎不重叠」。</strong><em>几何方法在信息不足时<strong>拒绝回答</strong>（条件数爆掉、代价曲线平）；前馈方法在信息不足时<strong>照样回答</strong>（先验会填）</em>。<strong>所以它们是互补的，而不是替代关系。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这就是 2024 年以来的主流做法：<em>混合</em>。</strong><em>用前馈方法做初始化与「无纹理区的填充」，用几何优化（束调整）做收尾与精度</em>。<strong>MASt3R 就是这个形状：前馈出点图与匹配，再做全局对齐；而 3DGS/2DGS 的位姿也越来越多地由前馈方法给初值、再联合优化。</strong><em>模块 05 会说明这条混合路线对<strong>评测</strong>的影响：当初值来自一个学到的先验时，「重建误差」里混进了「先验有多合适」这一项</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="diagnose"><span class="num">8</span>诊断：一个前馈重建能不能用</h2>
+  <p>按「花的时间从少到多」排列。前两条不需要任何真值。</p>  <ol>
+    <li><strong>射线一致性检验（点图专用，不需要真值）</strong>——<em>从点图先解出 $f$（第 4 节：精确可解），再把每个点投影回它自己的射线上，看残差</em>。<strong>残差大就说明网络输出的 $3HW$ 张量不自洽，而这时任何下游几何计算都不可信</strong></li>
+    <li><strong>换视角渲一张（如果有稠密表示）</strong>——<em>与 C74 模块 05 的浮物检测是同一招。遮挡区被「合理地填」出来的东西，在新视角下立刻露馅</em></li>
+    <li><strong>全局对齐的收敛残差（第 5 节）</strong>——<em>把多对点图放进一次优化。残差小说明各对之间自洽；残差大说明至少有一对是错的，而<strong>看每对的残差就能定位是哪一对</strong></em></li>
+    <li><strong>用一个已知长度做尺度检验</strong>——<em>这是唯一能抓到第 1 节那个「整体缩放错」的办法。而它也是 gauge 无关的（模块 01 第 7 节）</em></li>
+    <li><strong>与几何方法交叉验证</strong>——<em>在纹理充分的区域跑一次 MVS（模块 02），与前馈结果比。<strong>两者的失败模式几乎不重叠（第 7 节），所以它们一致的地方基本可信</strong></em></li>
+  </ol>  <div class="callout intuition"><span class="label"></span>
+    <strong>这五条的顺序不是随意排的：前两条不需要真值，后三条需要。</strong><em>而「不需要真值的自检」在部署时是唯一可用的——线上没有真值，但射线一致性与「换视角渲一张」随时都能做</em>。<strong>所以把它们做成一条自动流水线，比事后拿真值评测更有价值</strong>——<em>后者只能告诉你「上次那批数据上表现如何」，前者能告诉你「这一次的输出可不可信」</em>。
+  </div>  <div class="callout danger"><span class="label"></span>
+    <strong>而有一类问题这五条都抓不到：<em>整个场景</em>的尺度先验用错了，但内部完全自洽。</strong><em>射线一致 ✓、新视角合理 ✓、全局对齐收敛 ✓、与 MVS 一致 ✓（因为 MVS 也只有相对尺度）</em>。<strong>只有第 4 条（已知长度）能抓到它</strong>——<em>所以如果你的应用真的需要米，那么「场景里放一个已知尺寸的标定物」不是可选的工程便利，而是<strong>唯一</strong>的信息来源</em>。
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_mvs/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 稠密多视图立体</div></a>
+    <a class="next" href="../04_generation/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 3D 生成：SDS 与多视角扩散</div></a>
+  </div>
+
+</div>
+</body>
+</html>

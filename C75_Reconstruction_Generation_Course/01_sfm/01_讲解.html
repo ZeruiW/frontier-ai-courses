@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · SfM：对应、增量重建与束调整</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · SfM：对应、增量重建与束调整</h1>
+  <p class="subtitle">两两匹配 $O(N^2)$：$N{=}10^4$ 时 5000 万对（139 小时），而检索式候选是 $O(Nk)$——top-50 只占 <strong>0.50%</strong> · <strong>$J$ 的密度 $2.97\times10^{-5}$，而 Schur 补在 500 相机时快 $10^6$ 倍</strong>（点是「便宜」的、相机是「贵」的）· <strong>秩亏恰好 7，且零空间是<em>解析</em>的</strong>——<em>而两种数值判秩方法都会在有效条件数逼近 $1/$阈值时失效</em> · <strong>投影掉 gauge 后的条件数 $\propto (B/z)^{-2}$</strong>，而 $B/z{=}0$ 时是 $4.4\times10^{17}$ 的悬崖——<em>纯旋转时零空间从 7 涨到 <strong>npt + 6</strong>（5 组配置验证）</em> · <strong>两视图的三种退化各自退化的<em>不是同一件事</em></strong>：共面让 $E$ 退化（零空间 3 维、误差与噪声无关）、而前向运动<strong>不</strong>让 $E$ 退化（退化的是三角化：极点附近视线夹角只有 1/7.5）· <strong>同一次重建能报出 1.65 倍不同的不确定度</strong>（取决于 gauge 怎么定）· 漂移：朝向按 $\sqrt n$，而<strong>尺度是乘性游走、没有上界</strong></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">本模块回答</div><div class="v">① 两两匹配为什么必须换成检索式候选（$N{=}10^4$ 时 5000 万对）；② 束调整的稀疏结构与 <strong>Schur 补的 $10^6$ 倍收益</strong>；③ <strong>为什么 Hessian 的秩亏<em>恰好</em>是 7，而这 7 个方向有解析形式</strong>；④ <strong>「这次重建好不好解」的正确度量：投影掉 gauge 后的条件数，而它 $\propto (B/z)^{-2}$</strong>；⑤ 纯旋转为什么是<strong>悬崖</strong>而不是「精度差」；⑥ 增量式的漂移：朝向按 $\sqrt n$，尺度按乘性游走</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_sfm.ipynb（<strong>解析构造 7 维 gauge 零空间并验证 $\Vert JQ\Vert/\Vert J\Vert \approx 2\times10^{-11}$</strong> / 条件数对 $B/z$ 的标度律（实测指数 −2.00）/ <strong>纯旋转时的 $4.4\times10^{17}$ 悬崖</strong> / Schur 补 / <strong>一个我自己踩过的混淆：坏轨迹把点推到相机背后</strong>）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Hartley &amp; Zisserman, <em>Multiple View Geometry</em>（2nd ed., 第 18 章）· Triggs et al., <em>Bundle Adjustment — A Modern Synthesis</em>（2000，gauge 一节是本模块第 4 节的来源）· Schönberger &amp; Frahm, <em>Structure-from-Motion Revisited</em>（CVPR 2016，COLMAP）· Agarwal et al., <em>Bundle Adjustment in the Large</em>（ECCV 2010）· Ceres Solver 文档的 <em>Bundle Adjustment</em> 一节 · 本课程 <strong>C72</strong> 模块 03（三角测量与 PnP）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#three-parts">SfM 是三个子问题，而只有第三个有干净的数学</a></li>
+      <li><a href="#matching">两两匹配的规模：为什么必须换成检索</a></li>
+      <li><a href="#ba-sparsity">束调整：参数几十万，但 Hessian 是稀疏的</a></li>
+      <li><a href="#gauge">秩亏恰好是 7，而这 7 个方向是解析的</a></li>
+      <li><a href="#conditioning">「这次重建好不好解」的正确度量</a></li>
+      <li><a href="#two-view">两视图初始化：三种退化，而它们退化的<em>不是同一件事</em></a></li>
+      <li><a href="#covariance">不确定度：同一次重建能报出三个不同的数</a></li>
+      <li><a href="#drift">增量式的漂移：两种误差、两种规律</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="three-parts"><span class="num">1</span>SfM 是三个子问题，而只有第三个有干净的数学</h2>
+  <table>
+    <thead><tr><th>子问题</th><th>做什么</th><th>它的性质</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① 找对应</strong></td><td>在哪些图像对之间找匹配、以及每对里哪些点对应</td><td><strong>组合爆炸 + 启发式</strong>。<em>没有闭式解，全靠特征、检索与几何验证</em></td></tr>
+      <tr><td><strong>② 决定顺序</strong></td><td>从哪两张图开始、接下来加哪一张</td><td><strong>贪心 + 启发式</strong>。<em>而顺序会影响结果——同一批图像换个起点可能重建出不同的东西</em></td></tr>
+      <tr><td><strong>③ 束调整</strong></td><td>同时优化所有相机与所有点，最小化重投影误差</td><td><strong>一个定义清楚的非线性最小二乘</strong>。<em>本模块的第 3–5 节全在讲它，因为它是唯一能被精确分析的一环</em></td></tr>
+    </tbody>
+  </table>  <div class="math-block">\[\min_{\{R_i,t_i\},\{X_j\}} \sum_{(i,j)\in\mathcal O}\bigl\Vert \pi(R_i X_j + t_i) - u_{ij}\bigr\Vert^2\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>把这三件事分清很重要，因为 SfM 失败时的表现完全不同。</strong><em>① 失败 → 重建断成几块互不相连的子模型；② 失败 → 重建「歪了」但内部自洽；③ 失败 → 不收敛或收敛到明显错误的解</em>。<strong>而 ③ 的失败几乎总是可以从<em>条件数</em>提前看出来</strong>——<em>这就是第 5 节的内容，也是本模块最实用的一条</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>C72 讲的是「已知对应关系时怎么算」（三角测量、PnP、单应）。</strong><em>本模块假设你已经会那些，问的是规模变大之后的三个新问题：对应从哪来（第 2 节）、几十万个参数怎么解（第 3 节）、以及这个解到底定不定（第 4–5 节）</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="matching"><span class="num">2</span>两两匹配的规模：为什么必须换成检索</h2>
+  <p>找对应的第一步是决定「哪些图像对值得匹配」。朴素做法是全部两两匹配，而它是 $O(N^2)$：</p>  <table>
+    <thead><tr><th>图像数 $N$</th><th>两两对数</th><th>按 10 ms/对 算的耗时</th></tr></thead>
+    <tbody>
+      <tr><td>20</td><td>190</td><td>2 秒</td></tr>
+      <tr><td>100</td><td>4,950</td><td>50 秒</td></tr>
+      <tr><td>500</td><td>124,750</td><td>0.35 小时</td></tr>
+      <tr><td>2,000</td><td>1,999,000</td><td>5.6 小时</td></tr>
+      <tr><td><strong>10,000</strong></td><td><strong>49,995,000</strong></td><td><strong>138.9 小时</strong></td></tr>
+    </tbody>
+  </table>  <p>而真实的做法是先用一个图像检索（词汇树 / VLAD / 学习到的全局描述子）为每张图取 top-$k$ 个候选，只匹配这些对：</p>  <table>
+    <thead><tr><th>$N$</th><th>$k$</th><th>候选对数</th><th>占全量的比例</th></tr></thead>
+    <tbody>
+      <tr><td>500</td><td>20</td><td>5,000</td><td>4.01%</td></tr>
+      <tr><td>2,000</td><td>50</td><td>50,000</td><td>2.50%</td></tr>
+      <tr><td><strong>10,000</strong></td><td><strong>50</strong></td><td><strong>250,000</strong></td><td><strong>0.50%</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>注意候选对数是 $Nk/2$——它对 $N$ 是<em>线性</em>的。</strong><em>所以从 $O(N^2)$ 换成 $O(Nk)$ 不是常数因子的优化，是复杂度的改变</em>。<strong>而 $N{=}10^4$ 时它把 139 小时变成 42 分钟。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>代价是：漏掉的对可能正是关键的那一对。</strong><em>比如一个环形轨迹的首尾两张图——它们视觉上相似（所以检索会找到），但如果检索因为光照变化而漏掉，整个环就闭不上，于是第 6 节的漂移无法被纠正</em>。<strong>所以工程上常在检索候选之外<em>额外</em>加两类对：时间上相邻的（视频/连拍）与「重叠度估计高」的</strong>——<em>前者几乎免费，后者需要一次粗几何</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="ba-sparsity"><span class="num">3</span>束调整：参数几十万，但 Hessian 是稀疏的</h2>
+  <table>
+    <thead><tr><th>相机数</th><th>点数</th><th>相机参数（6 each）</th><th>点参数（3 each）</th><th>总参数</th><th>稠密 $H$ 的元素数</th></tr></thead>
+    <tbody>
+      <tr><td>20</td><td>5,000</td><td>120</td><td>15,000</td><td>15,120</td><td>0.23 G</td></tr>
+      <tr><td>100</td><td>30,000</td><td>600</td><td>90,000</td><td>90,600</td><td>8.21 G</td></tr>
+      <tr><td><strong>500</strong></td><td><strong>100,000</strong></td><td>3,000</td><td>300,000</td><td><strong>303,000</strong></td><td><strong>91.81 G</strong></td></tr>
+      <tr><td>2,000</td><td>500,000</td><td>12,000</td><td>1,500,000</td><td>1,512,000</td><td>2,286 G</td></tr>
+    </tbody>
+  </table>  <p>**稠密地存 $H$ 就已经不可能了**（500 相机时是 918 亿个元素）。但每个观测只碰 $6+3 = 9$ 个参数，所以雅可比极稀疏：</p>  <table>
+    <thead><tr><th>配置</th><th>$J$ 的形状</th><th>非零元素</th><th>密度</th><th>比稠密稀疏</th></tr></thead>
+    <tbody>
+      <tr><td>100 相机 / 30k 点 / 每点 4 次观测</td><td>240,000 × 90,600</td><td>2,160,000</td><td>$9.93\times10^{-5}$</td><td><strong>10,067×</strong></td></tr>
+      <tr><td>500 相机 / 100k 点 / 每点 5 次观测</td><td>1,000,000 × 303,000</td><td>9,000,000</td><td>$2.97\times10^{-5}$</td><td><strong>33,667×</strong></td></tr>
+    </tbody>
+  </table>  <h3>Schur 补：先把点消掉</h3>  <p>$H$ 有一个特殊的**块结构**：点与点之间没有直接耦合（两个 3D 点不出现在同一个残差里）。所以点块 $H_{pp}$ 是**块对角**的，可以逐点求 $3\times3$ 的逆。</p>  <div class="math-block">\[H = \begin{bmatrix} H_{cc} & H_{cp} \\ H_{cp}^\top & H_{pp}\end{bmatrix},\qquad S = H_{cc} - H_{cp}H_{pp}^{-1}H_{cp}^\top\]</div>  <table>
+    <thead><tr><th>相机数</th><th>点数</th><th>直接解 $H$（$n^3$）</th><th>解相机块 $S$</th><th>消点（$n_p \times 27$）</th><th><strong>加速比</strong></th></tr></thead>
+    <tbody>
+      <tr><td>100</td><td>30,000</td><td>$7.44\times10^{14}$</td><td>$2.16\times10^{8}$</td><td>$8.1\times10^{5}$</td><td><strong>$3.43\times10^{6}$</strong></td></tr>
+      <tr><td>500</td><td>100,000</td><td>$2.78\times10^{16}$</td><td>$2.70\times10^{10}$</td><td>$2.7\times10^{6}$</td><td><strong>$1.03\times10^{6}$</strong></td></tr>
+      <tr><td>2,000</td><td>500,000</td><td>$3.46\times10^{18}$</td><td>$1.73\times10^{12}$</td><td>$1.35\times10^{7}$</td><td><strong>$2.00\times10^{6}$</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label"></span>
+    <strong>Schur 补把问题从「几十万维」降到「几千维」，而这是精确的、不是近似。</strong><em>$S$ 只有 $6 n_c \times 6 n_c$（500 相机 → $3000\times3000$），而消点的代价是线性的（每点一个 $3\times3$ 求逆）</em>。<strong>这也解释了为什么 SfM 能处理几十万个点却只能处理几千个相机</strong>——<em>点是「便宜」的（可以被消掉），相机是「贵」的（$S$ 的规模由它决定）</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="gauge"><span class="num">4</span>秩亏恰好是 7，而这 7 个方向是解析的</h2>
+  <p>束调整的解**不唯一**。把整个重建做一次相似变换（旋转 + 平移 + 缩放），所有重投影误差**完全不变**——模块 00 已经验证过尺度那一维。相似变换群有 $3+3+1 = 7$ 个自由度，所以 $H$ 的零空间至少是 7 维的。</p>  <table>
+    <thead><tr><th>实测（5 相机 / 40 点 / 150 个参数）</th><th>结果</th></tr></thead>
+    <tbody>
+      <tr><td>在真解处的残差范数</td><td>$5.6\times10^{-13}$（应为 0）</td></tr>
+      <tr><td>$H$ 的奇异值：第 143 大</td><td>$6.008\times10^{2}$</td></tr>
+      <tr><td>$H$ 的奇异值：第 144 大</td><td>$1.467\times10^{-9}$</td></tr>
+      <tr><td><strong>谱间隙</strong></td><td><strong>$4.10\times10^{11}$</strong></td></tr>
+      <tr><td><strong>秩亏</strong></td><td><strong>恰好 7</strong></td></tr>
+    </tbody>
+  </table>  <h3>但不要靠数值判秩——零空间有闭式</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>7 个零方向可以直接从群作用求导得到，不需要看奇异值。</strong><em>把相似变换作用在参数上（点 $X \to s\,R_w X + \delta$，相机中心跟着同样变、相机朝向乘 $R_w^\top$），对 7 个群参数各求一次导，就得到 $150\times7$ 的矩阵 $G$</em>。<strong>notebook 验证：正交化后的 $Q$ 满足 $\Vert JQ\Vert_F/\Vert J\Vert_F = 1.9\times10^{-11}$</strong>，<em>7 个方向单独的比值在 $2.1\times10^{-12}$ 到 $1.3\times10^{-11}$ 之间——纯数值噪声</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这一点很关键，因为<em>数值判秩在条件数大的时候会给出错的答案</em>。</strong><em>notebook 里我试了两种数值判据，两种都失效：</em>① <strong>固定相对阈值</strong>（$\sigma < \sigma_1 \cdot 10^{-10}$）在条件数大的配置上报出「秩亏 143/150」——<em>因为 $H$ 本身的谱就跨了 10 个数量级</em>；② <strong>「最大谱间隙」</strong>把间隙定位到第 1 与第 2 个奇异值之间——<em>那只是正常的谱宽，不是秩的悬崖</em>。<strong>所以「数值秩」在这里不是一个定义良好的量。</strong></p></div>
+  </div>  <h3>固定 gauge 的两种做法</h3>  <table>
+    <thead><tr><th>做法</th><th>固定了什么</th><th>剩余秩亏</th></tr></thead>
+    <tbody>
+      <tr><td>只固定相机 0 的 6 个参数</td><td>旋转 3 + 平移 3</td><td><strong>1</strong>（尺度仍自由）</td></tr>
+      <tr><td>固定相机 0 + 一个点的一个坐标</td><td>全部 7 个</td><td><strong>0</strong></td></tr>
+      <tr><td><strong>不固定，改用投影</strong></td><td>把 $H$ 投影到 $Q$ 的正交补上</td><td><strong>0，且不引入人为的坐标系偏好</strong></td></tr>
+    </tbody>
+  </table>  <div class="callout warn"><span class="label"></span>
+    <strong>第一行是一个真实会犯的错：只固定第一个相机就以为够了。</strong><em>那时尺度仍然自由，于是求解器会沿尺度方向随机漂移——表现为「每次跑出来的重建大小不一样」，而残差完全相同（所以看不出问题）</em>。<strong>而第三行是 Triggs et al.(2000) 推荐的做法</strong>：<em>固定具体参数会让协方差估计带上「哪个相机被固定了」的偏见，而投影法给出的是 gauge 无关的协方差</em>。
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="conditioning"><span class="num">5</span>「这次重建好不好解」的正确度量</h2>
+  <p>把已知的 7 维 gauge 零空间投影掉之后，剩下的条件数才是有意义的量。下面是 5 相机 / 40 点、相机在弧上始终看向场景中心、**全部点都在画面内**的实测（$B$ = 首尾相机的间距，$z$ = 到场景的距离）：</p>  <table>
+    <thead><tr><th>弧长</th><th>基线 $B$ (m)</th><th>$B/z$</th><th>$\Vert JQ\Vert/\Vert J\Vert$</th><th><strong>投影掉 gauge 后的条件数</strong></th></tr></thead>
+    <tbody>
+      <tr><td>120°</td><td>10.392</td><td>1.732</td><td>$2.3\times10^{-11}$</td><td><strong>288</strong></td></tr>
+      <tr><td>60°</td><td>6.000</td><td>1.000</td><td>$2.2\times10^{-11}$</td><td>$1.84\times10^{3}$</td></tr>
+      <tr><td>20°</td><td>2.084</td><td>0.347</td><td>$1.9\times10^{-11}$</td><td>$4.44\times10^{4}$</td></tr>
+      <tr><td>5°</td><td>0.523</td><td>0.087</td><td>$1.8\times10^{-11}$</td><td>$9.41\times10^{5}$</td></tr>
+      <tr><td>1°</td><td>0.105</td><td>0.017</td><td>$1.7\times10^{-11}$</td><td>$2.40\times10^{7}$</td></tr>
+      <tr><td>0.2°</td><td>0.021</td><td>0.0035</td><td>$1.8\times10^{-11}$</td><td>$6.01\times10^{8}$</td></tr>
+      <tr><td><strong>0°（纯旋转）</strong></td><td><strong>0.000</strong></td><td><strong>0</strong></td><td>$1.4\times10^{-11}$</td><td><strong>$4.40\times10^{17}$</strong></td></tr>
+    </tbody>
+  </table>  <div class="math-block">\[\mathrm{cond}(H \mid \text{gauge}) \;\propto\; (B/z)^{-2}\]</div>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>小基线端的实测指数收敛到 $-2.00$</strong>（<em>$B/z$ 从 0.0349 到 0.0175 时条件数 4.01 倍，指数 $-2.00$；上一档 $-2.02$，再上一档 $-2.10$</em>）。<strong>而这与 C72 的三角测量不确定度是同一件事：</strong><em>$H = J^\top J$，所以 $\mathrm{cond}(H) = \mathrm{cond}(J)^2$；而 $J$ 的最差方向按 $1/B$ 退化，正对应 $\sigma_z = \dfrac{z^2}{fB}\sigma_d \propto 1/B$</em>。<strong>两个独立推导对上了。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而最后一行是<em>悬崖</em>，不是趋势的延续。</strong><em>$B/z = 0.0035$ 时条件数 $6.0\times10^{8}$，而 $B/z$ 严格为 0 时是 $4.4\times10^{17}$——跳了 9 个数量级</em>。<strong>因为纯旋转下深度<em>根本不出现</em>在残差里</strong>（<em>所有点沿视线移动都不改变任何投影</em>），<em>所以那是一整族新的零方向，而不是「测不准」</em>。<strong>float64 的相对精度是 $2.2\times10^{-16}$，所以条件数超过 $10^{16}$ 的问题在数值上已经是奇异的。</strong></p></div>
+  </div>  <div class="callout danger"><span class="label"></span>
+    <strong>我在做这组实验时踩了一个混淆，值得写出来。</strong><em>第一版的相机轨迹是「在半径 $B$ 的圆上均匀取点，但朝向按弧长旋转」。$B$ 调小时相机几乎不动却仍然转 100°，于是<strong>40 个点里有 25–33 个跑到了相机背后</strong>，投影 $u$ 到 52 万像素</em>。<strong>我测到的「条件数 $10^{19}$」其实是一个坏掉的场景，不是小基线效应。</strong><em>换成「始终 look-at 场景中心」的轨迹之后，所有配置下点都在画面内，标度律才干净地出来</em>。<strong>教训：报一个「配置 A 比配置 B 差多少倍」之前，先确认两个配置<em>唯一</em>的差别真的是你想改的那一个。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="two-view"><span class="num">6</span>两视图初始化：三种退化，而它们退化的<em>不是同一件事</em></h2>
+  <p>增量式 SfM 要先选一对图像做初始化。选错了后面全错，所以「哪一对是好的」有明确的判据。用 8 点法的设计矩阵 $A$（$100\times9$）的奇异值来看：$E$ 有 8 个自由度，所以 $A$ 的零空间应当**恰好是 1 维**。</p>  <table>
+    <thead><tr><th>配置</th><th>$A$ 的最小 4 个奇异值</th><th>$\sigma_8/\sigma_9$</th><th>诊断</th></tr></thead>
+    <tbody>
+      <tr><td>一般场景 + 侧向平移</td><td>$2.50\!\cdot\!10^{-1}$, $1.82\!\cdot\!10^{-1}$, $3.67\!\cdot\!10^{-2}$, $1.81\!\cdot\!10^{-16}$</td><td><strong>$2.0\cdot10^{14}$</strong></td><td><strong>零空间干净是 1 维</strong></td></tr>
+      <tr><td><strong>共面场景</strong> + 侧向平移</td><td>$1.80\!\cdot\!10^{-1}$, <strong>$7.60\!\cdot\!10^{-16}$, $1.62\!\cdot\!10^{-16}$, $3.96\!\cdot\!10^{-17}$</strong></td><td><strong>4.1</strong></td><td><strong>零空间是 3 维——$E$ 只被确定到一个 3 参数族</strong></td></tr>
+      <tr><td>一般场景 + <strong>前向运动</strong></td><td>$2.57\!\cdot\!10^{-1}$, $7.97\!\cdot\!10^{-2}$, $4.63\!\cdot\!10^{-2}$, $3.65\!\cdot\!10^{-17}$</td><td>$1.3\cdot10^{15}$</td><td><strong>$E$ 完全没问题</strong>（见下）</td></tr>
+      <tr><td>一般场景 + 小基线（$B{=}0.02$）</td><td>$2.05\!\cdot\!10^{-1}$, $4.46\!\cdot\!10^{-3}$, $7.51\!\cdot\!10^{-4}$, $1.40\!\cdot\!10^{-16}$</td><td>$5.4\cdot10^{12}$</td><td><em>零空间仍是 1 维，但 $\sigma_7,\sigma_8$ 已经很小</em></td></tr>
+      <tr><td>共面 + 前向</td><td>—</td><td>46</td><td><strong>退化</strong></td></tr>
+    </tbody>
+  </table>  <h3>三种退化各自退化了什么</h3>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>共面场景：退化的是 $E$ 本身。</strong><em>零空间 3 维，所以 $E$ 只被确定到一个三参数族</em>。<strong>而它的签名是「与噪声无关」</strong>：<em>notebook 量到共面场景下 $E$ 的方向误差在 0.2 px 与 1.0 px 噪声下<strong>都是 3.15°</strong>（饱和了），而一般场景是 0.38° → 2.31°（随噪声线性退化）</em>。<strong>所以「加噪声不改变误差」是结构性退化的诊断标志</strong>——<em>模块 02 的周期纹理会再次出现这个签名</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>前向运动：退化的<em>不是</em> $E$，而是三角化。</strong><em>$\sigma_8/\sigma_9 = 1.3\times10^{15}$ 说明 $E$ 解得很干净。但沿光轴前进时极点落在画面中心，而靠近极点的点两条视线几乎重合</em>：</p></div>
+  </div>  <table>
+    <thead><tr><th>到极点的归一化距离</th><th>两条视线的夹角（中位）</th><th>相对最外圈</th></tr></thead>
+    <tbody>
+      <tr><td>[0.000, 0.094)</td><td><strong>0.659°</strong></td><td>0.34×</td></tr>
+      <tr><td>[0.154, 0.208)</td><td>1.591°</td><td>0.83×</td></tr>
+      <tr><td>[0.256, 0.355)</td><td>3.334°</td><td>1.74×</td></tr>
+      <tr><td>[0.355, ∞)</td><td>4.928°</td><td>2.57×</td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>画面中心的点视线夹角只有 0.659°，是最外圈的 1/7.5。</strong><em>而三角测量的不确定度与夹角成反比，所以正前方的深度最差</em>。<strong>「车往前开」对<em>正前方</em>的物体是最差的几何</strong>——<em>而那恰好是自动驾驶最关心的区域，也正是 C72 模块 03 要用「已知尺寸 / 地面假设」去补的原因</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>所以初始化的判据不是一个数，而是三个：</strong><em>① 用单应 $H$ 与本质矩阵 $E$ 各拟合一次，比较内点数与残差——$H$ 明显更好就说明场景共面（COLMAP 的 <code>Homography vs Essential</code> 那一步）；② 检查三角化后的<strong>视线夹角</strong>（常用阈值 &gt; 2°～5°），而不只看基线长度；③ 检查内点在画面上的<strong>空间分布</strong>——全挤在极点附近时 ② 会自动把它们滤掉，但也就没剩多少点了</em>。</p></div>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="covariance"><span class="num">7</span>不确定度：同一次重建能报出三个不同的数</h2>
+  <p>束调整收敛之后，常见的需求是「给出每个点/相机的不确定度」。标准做法是 $\Sigma = \sigma^2 (J^\top J)^{-1}$。**但 $J^\top J$ 是奇异的（第 4 节：秩亏 7），所以这个式子需要先处理 gauge。**而<em>怎么处理</em>会改变答案：</p>  <table>
+    <thead><tr><th>弧长</th><th>$B/z$</th><th>① 固定相机 0 + 一个坐标</th><th>② 固定相机 0 + 相机 4 的一个平移分量</th><th>③ <strong>gauge 投影后取伪逆</strong></th></tr></thead>
+    <tbody>
+      <tr><td>60°</td><td>1.000</td><td>0.01337 m</td><td>0.01115 m</td><td><strong>0.00979 m</strong></td></tr>
+      <tr><td>20°</td><td>0.347</td><td>0.03638 m</td><td>0.03183 m</td><td><strong>0.02937 m</strong></td></tr>
+      <tr><td>5°</td><td>0.087</td><td>0.14539 m</td><td>0.13084 m</td><td><strong>0.12654 m</strong></td></tr>
+    </tbody>
+  </table>  <p>（点位协方差迹的平方根，中位数；像素噪声 $\sigma = 0.5$ px）</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>同一次重建、同一份数据，报出的点位不确定度差 1.15–1.37 倍，而差别<em>只</em>来自「固定了哪些参数」。</strong><em>①②③ 三种都是「正确」的计算，它们只是在回答不同的问题：① 问「相对于相机 0 的坐标系，点在哪」；② 问「相对于相机 0 与 4 定的基线，点在哪」；③ 问「点相对于<strong>整个重建自身</strong>有多确定」</em>。<strong>而只有 ③ 是 gauge 无关的，所以只有 ③ 在两份重建之间可比。</strong></p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>顺带这张表第三次印证了第 5 节的标度律。</strong><em>③ 那一列：$B/z$ 从 1.000 到 0.347（2.88 倍）时 σ 涨 3.00 倍；从 0.347 到 0.087（3.98 倍）时涨 4.31 倍——等效指数约 $-1.0$</em>。<strong>而 $\mathrm{cond}(H) = \mathrm{cond}(J)^2$，所以条件数的 $(B/z)^{-2}$ 与 σ 的 $(B/z)^{-1}$ 是同一件事的两种写法</strong>——<em>加上 C72 的 $\sigma_z = z^2\sigma_d/(fB)$，三条独立的推导指向同一个律</em>。</p></div>
+  </div>  <div class="callout warn"><span class="label"></span>
+    <strong>所以「我们的重建精度是 X 毫米」这句话必须附带 gauge 的定义。</strong><em>而实践中更常见的做法是绕开协方差，直接用一个<strong>已知长度</strong>去做尺度检验与端到端误差评估</em>——<strong>那个数是 gauge 无关的，而且不需要相信 $J^\top J$ 的线性化假设。</strong>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="drift"><span class="num">8</span>增量式的漂移：两种误差、两种规律</h2>
+  <p>增量式 SfM 每次加一张图：用已重建的点做 PnP 求它的位姿，再三角化新点，然后（局部或全局）束调整。误差在这个过程里累积，而**朝向与尺度的累积规律不同**：</p>  <table>
+    <thead><tr><th></th><th>朝向误差</th><th>尺度误差</th></tr></thead>
+    <tbody>
+      <tr><td>累积方式</td><td>近似**随机游走**：$\propto\sqrt n$</td><td>**乘性**游走：$\prod(1+\epsilon_i)$</td></tr>
+      <tr><td>10 步（每步 0.05° / ±0.5%）</td><td>0.16°</td><td>P5 0.975 – P95 1.026</td></tr>
+      <tr><td>50 步</td><td>0.35°</td><td>P5 0.944 – P95 1.061</td></tr>
+      <tr><td><strong>200 步</strong></td><td><strong>0.71°</strong></td><td><strong>P5 0.884 – P95 1.122</strong></td></tr>
+      <tr><td>有上界吗</td><td>有（角度被 $180°$ 框住）</td><td><strong>没有</strong>——<em>乘性游走的方差在对数域线性增长</em></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p><strong>尺度漂移是增量式 SfM 最难对付的一项，因为它没有上界也没有「不合理」的迹象。</strong><em>一条 200 步的长廊，重建出来的长度可能是真实的 0.88 或 1.12 倍，而每一步的重投影误差都很小、整个模型内部完全自洽</em>。<strong>所以它只能靠<em>闭环</em>或<em>外部尺度</em>来纠正</strong>，<em>而不能靠「优化得更彻底」</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p><strong>而这解释了为什么全局束调整不能省。</strong><em>局部束调整（只优化最近 $k$ 个相机）成本低，但它无法把误差推回到早期的相机上——所以漂移只会被「固化」</em>。<strong>COLMAP 的做法是：每加入一定比例的新图就跑一次<em>全局</em> BA</strong>，<em>而这也是它比实时 SLAM 慢得多但精确得多的原因</em>。</p></div>
+  </div>  <div class="callout paper"><span class="label"></span>
+    <strong>一个判断「这份重建能不能用」的经验流程</strong>：① <strong>看子模型个数</strong>——<em>$>1$ 说明对应关系断了（第 2 节的检索漏了关键对）</em>；② <strong>看每张图的重投影误差分布，而不是均值</strong>——<em>均值 0.6 px 但 P99 是 8 px，说明有一批图位姿是错的</em>；③ <strong>看相机轨迹的 $B/z$</strong>——<em>低于 0.05 的那些段，第 5 节说它们的条件数已过 $10^6$</em>；④ <strong>用一个已知长度做尺度检验</strong>——<em>这是唯一能抓到尺度漂移的办法</em>。
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 总览：从图像得到几何的四条路线</div></a>
+    <a class="next" href="../02_mvs/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 稠密多视图立体</div></a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,6 +1,6 @@
 # Frontier AI Researcher / Engineer Courses · 前沿 AI 研究工程师课程体系
 
-**75 courses · 478 lesson pages · 478 runnable notebooks · Colab-ready, CPU-first, from-scratch.**
+**76 courses · 484 lesson pages · 484 runnable notebooks · Colab-ready, CPU-first, from-scratch.**
 一套从 model evaluation 起步、长成全栈的前沿 AI 研究/工程课程体系 —— 深度 HTML 讲解 + 真实可跑 notebook，纯 numpy/CPU 优先、优雅降级到真实框架/GPU。
 
 📖 中文 → [跳转](#中文) · 🇬🇧 English → [jump](#english)
@@ -13,7 +13,7 @@
 ### 目录
 - [这是什么](#zh-what)
 - [快速开始](#zh-quickstart)
-- [课程总览（75 门）](#zh-catalog)
+- [课程总览（76 门）](#zh-catalog)
 - [每门课的格式](#zh-format)
 - [学习路径建议](#zh-paths)
 - [仓库结构](#zh-layout)
@@ -49,7 +49,7 @@ jupyter lab
 先打开某模块的 `NN_讲解.html`（或先看 `index.html` 选路径），读完讲解再跑同名的 `.ipynb`。所有课程共用同一份 `assets/style.css`。
 
 <a name="zh-catalog"></a>
-### 课程总览（75 门）
+### 课程总览（76 门）
 
 #### C00–C09 · 核心 LLM / 评测主线
 | 课 | 目录 | 主题 |
@@ -225,6 +225,43 @@ jupyter lab
 > 实测（20% 相对残差判据）是 **125/(ℓ+1)** —— deg 3 只到半角 **31.2°**，
 > 而抛光塑料要 12.3°、抛光金属 3.4°。
 
+#### C75 · 三维重建与 3D 生成
+
+| 课 | 目录 | 主题 | 补的洞 |
+|----|------|------|--------|
+| C75 | `C75_Reconstruction_Generation_Course/` | 三维重建与 3D 生成（四条路线的总览 · SfM 与束调整 · 稠密多视图立体 · 前馈回归（单目深度与点图）· SDS 与多视角扩散 · 网格化与 3D 评测） | 全库 478 个讲解页里 `Structure from Motion` / `bundle adjustment` / `gauge` / `Schur` / `立体匹配` / `代价体` / `plane sweep` / `单目深度` / `TSDF` / `Marching Cubes` / `泊松重建` / `Score Distillation` / `倒角距离` 全部 0 命中（`Chamfer` 的 1 处在 C54 的匈牙利匹配上下文，`ICP` 的 9 处全是 **ICPR** 的子串）|
+
+> **一条原理性的限制先把整门课框定了**：把场景点与相机平移一起乘 $s$，
+> 拍出的图像**逐位相同**（notebook 取 $s$ 到 $10^3$，最大像素差 $1.1\times10^{-13}$）。
+> 所以「从图像得到米」在原理上不可能 —— 每条路线都必须在某处引入外部信息，
+> 而**引入的位置就是这些方法最大的区别**。
+>
+> **与 C72/C73/C74 不同：本课有真实的优化，但没有神经网络训练。**
+> 模块 01 有能收敛的束调整（LM + Schur 补）、模块 02 有平面扫掠、
+> 模块 04 有在解析已知先验上跑的 SDS —— 因为这门课的核心问题**就是**优化的性质
+> （什么可观测、条件数多大、收敛到哪个不动点）。
+> 而模块 03/04 用解析构造的替身，因为它们要验的是**口径**与**目标函数的性质**。
+>
+> **一条贯穿全课的线**：每个模块都有一个「看起来是精度问题、实际是**可观测性**问题」的地方 ——
+> 模块 01 的纯旋转（零空间从 7 涨到 **npt+6**）· 模块 02 的周期纹理（误差与噪声**无关**）·
+> 模块 03 的绝对尺度（原理不可观测）· 模块 04 的 Janus（目标的严格最优解）·
+> 模块 05 的 Chamfer（不是度量，所以「差 0.1」没有传递性）。
+>
+> **六处诚实修正**，三条最值得记：
+> ① 我第一版测「小基线让条件数爆到 $10^{19}$」时，那个轨迹让相机转 100° 却几乎不平移，
+> 于是 **40 个点里有 25–33 个跑到了相机背后**（投影 u 到 52 万像素）——
+> 我测的是一个坏掉的场景。换成 look-at 轨迹后才得到干净的 $\propto (B/z)^{-2}$；
+> ② **前向运动不让 $E$ 退化**（$\sigma_8/\sigma_9 = 1.3\times10^{15}$），退化的是**三角化**；
+> ③ **「SDS 里的 $-\epsilon$ 是降方差的控制变量」只在高噪端或模式附近成立** ——
+> 低噪端它让方差涨 391 倍。无条件成立的只有「它不改变期望」这一条。
+>
+> **两处意外收获**：纯旋转时零空间恰好是 **npt + 6**（随场景规模增长，不是「7 加一点」）；
+> 先验权重 $(0.9,0.1)$ 时**次模式不再是吸引子** —— SDS 给出 100%/0% 而不是 90%/10%。
+>
+> 顺带把三条常被含糊的评测口径量化了：单目深度的协议三选（域 × 自由度 × 逐图/全局）
+> **各值一到两个数量级、合起来 154 倍**；**Chamfer 不是度量**（$20 > 5{+}5$）；
+> **CD-L1 对离群点线性而 CD-L2 平方**（一个离群点 1.31× vs **293×**）。
+
 <a name="zh-format"></a>
 ### 每门课的格式
 
@@ -235,7 +272,7 @@ CXX_Xxx_Course/
 ├── glossary.md          术语词典（≥12KB）
 ├── references.md        参考清单（论文/文档，标★必读）
 ├── requirements.txt      依赖（绝大多数课只需要 numpy/pandas/jupyterlab）
-├── assets/style.css      全站共用同一份样式（75 门课字节级一致）
+├── assets/style.css      全站共用同一份样式（76 门课字节级一致）
 ├── 00_setup/
 │   ├── 00_overview.html         课程总览
 │   └── 00_environment_check.ipynb
@@ -270,9 +307,9 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 ├── index.html               全站课程总览页
 ├── COURSES_PLAN.md            课程规划与构建历史的完整记录
 ├── ENV_SETUP.md                本地 conda 环境搭建笔记
-├── requirements-all.txt        全部 75 门课依赖的合集（装一次跑所有课）
+├── requirements-all.txt        全部 76 门课依赖的合集（装一次跑所有课）
 ├── _buildkit/                  house-style 生成器（coursekit.py）+ 各课构建脚本
-├── C00_..._Course/ … C74_..._Course/   75 门课，每门结构见上
+├── C00_..._Course/ … C75_..._Course/   76 门课，每门结构见上
 └── README.md                   就是这份文件
 ```
 
@@ -286,7 +323,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 <a name="zh-env"></a>
 ### 环境与依赖
 
-- **本地全量环境**：一个 conda env（`courses`，Python 3.11）配好 PyTorch + HuggingFace 全家桶 + 常用科学计算库即可跑完全部 75 门课，详见 [`ENV_SETUP.md`](./ENV_SETUP.md)；合集依赖在 [`requirements-all.txt`](./requirements-all.txt)。
+- **本地全量环境**：一个 conda env（`courses`，Python 3.11）配好 PyTorch + HuggingFace 全家桶 + 常用科学计算库即可跑完全部 76 门课，详见 [`ENV_SETUP.md`](./ENV_SETUP.md)；合集依赖在 [`requirements-all.txt`](./requirements-all.txt)。
 - **只想跑单门课**：进对应课程目录 `pip install -r requirements.txt` 即可——大多数课这份文件只有 `numpy`/`pandas`/`jupyterlab`/`ipykernel` 四五行。
 - 所有需要 `transformers`/`bitsandbytes`/`qwen-vl-utils` 等重依赖的真实模型 cell 都包了 `try/except`：装不上/没网/没 GPU 时会优雅降级到纯 Python/numpy 的替代实现或跳过，**不会让整本 notebook 崩掉**。
 
@@ -304,6 +341,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 - 2026-09-08：新增 C72（多视角几何与多传感器时空对齐）。**先扫全库 460 个讲解页做缺口验证**，并先列出「查过、确认不用建」的五个方向（缩放律 / 投机解码 / 持续学习 / 标注运维 / 蒸馏，全部已覆盖）；确认为零覆盖的是「像素 → 米」这条几何链。6 个 notebook、115 个 code cell、24 道练习自测两遍实跑通过。**本轮有五处结论是被真实计算否掉后重写的**：DLT 归一化的精度收益在有噪声时消失（无噪声 45.8 倍 → 0.2 px 噪声下只剩 13% 且归一化略差）；「内外参分开标会互相吸收误差」是错的（吸收得非常干净，真正的问题是可辨识性——而分开它们靠扩大图像行覆盖，σ(pitch) 3.74° → 0.035°，改善 106 倍）；PnP 正交化不提高精度（方向误差只改善 1.24 倍、重投影 RMS 反而变差），且第一版量出的「14.5 倍」是一个**度量陷阱**的产物（trace 公式只对正交矩阵有效，非正交时 40–47% 的实现被 clip 成恰好 0.00°）；「等下一个 IMU 采样比外推准」是错的取舍（等待的代价大 2222 倍）；rolling shutter 对小目标不值得建模（0.005 px），而「整帧一个时间戳」值 0.667 m。另有**两处「本课自己的配置通不过自己的验收」**（模块 02 的 5 视角标定栽在边缘覆盖、模块 04 的均匀网格栽在采样率与坡度）——那是设计而非失误。全谱达到 **73 门 · 466 讲解 HTML · 466 notebook**。
 - 2026-09-09：新增 C73（3D 表示与点云深度学习）。扫全库 466 个讲解页确认热门 3D 方向整块零覆盖（PointNet / PointPillars / 体素 / 点云分割 / 双目 / 单目深度 / SDF 全部 0 命中）。6 个 notebook、117 个 code cell、24 道练习自测两遍实跑通过。**本轮有七处结论被真实计算否掉后重写**，其中三处最值得记：`sum`/`mean` 不是逐位置换不变的（浮点加法不满足结合律，相对差 1.43e-15；而 `max`/`min` 是选择操作所以逐位不变）——所以置换不变性的单元测试不能一律用「恰好相等」；`max` 并没有完全丢弃点数（线性探针 $R^2=0.76$，因为极值统计量依赖样本量）；膨胀最快的不是薄结构而是完全散开的点（22.05× vs 薄片 4.32×），而规则密度的排序恰好相反、两者之积被核大小 27 框住。**最硬的一条结论**（推导闭合）：单轴容差恰好 $s_i/3$ ⇒ 交通标志的容差 0.049 m 与典型标注噪声 0.05 m 之比 **0.98×** ⇒ 让预测等于真值、只给真值加标注噪声，AP@IoU0.5 上界只有 **0.392**（卡车与轿车都是 1.000，中心距离口径下四类恒为 1.000）——**所以那一列量的是标注噪声而不是模型能力**。另有三处「本课自己的配置通不过自己的审计」。全谱达到 **74 门 · 472 讲解 HTML · 472 notebook**。
 - 2026-09-09：新增 C74（3D 高斯溅泼与实时渲染），同一批 3D 课单的第二门。缺口验证（全库 472 个讲解页逐关键词 grep）：`球谐`/`spherical harmonic` 0、`alpha compositing` 0、`tile 光栅化` 0、`EWA` 0；而 `体渲染`/`α 合成`/`高斯溅泼`/`NeRF` 的少数命中全部是 C72/C73/C55 里指向本课的一句带过。**因为选课路径跳过了 NeRF，体渲染与 α 合成的地基由本课模块 01 自带。** 6 个 notebook、123 个 code cell、24 道练习自测两遍实跑通过；notebook 里从零写出一个能出图的 tile 光栅化器，并与逐像素暴力实现**逐位相等到机器精度**。**本轮有四处结论被真实计算否掉后重写**，两条最值得记：① **对分段常数密度，α 合成精确到机器精度，连 $N{=}1$ 都对**（$N{=}1$ 误差为 0，$N{=}256$ 是 8.9e−16）——所以离散化误差**只**来自 σ 在段内变化，而那时中点法则是**二阶**的（每翻一倍 $N$ 误差降到 1/4.00，我最初写的 ∝1/N 是错的）；② **张角 53° 时投影后的协方差根本不存在**——2.28% 的质量落在 $z\le0$，$z\to0^+$ 的样本被投到无穷远，二阶矩积分发散（蒙特卡洛估计从 $n{=}10^4$ 到 $10^6$ 涨 9 倍、种子间差 3 倍），**所以「仿射近似在这里误差多少」这个问题问错了，它要对比的真值不存在**。另有两条：逐位比对最初漏了第三个近似（3σ 包围盒是 tile 对齐的，其影响 0.50 个 8 bit 色阶）；「尺度梯度更适合当密度判据」是单次运行的假象（一个目标一个种子时命中 67%，跑满 6 次是 28%，且在每一档都低于随机基线 25%）。顺带把一个流行说法量化纠正了：**SH 的「角分辨率 180/(ℓ+1)」高估约 1.45 倍**，实测（20% 相对残差判据）是 **125/(ℓ+1)**——deg 3 只到半角 **31.2°**，而抛光塑料要 12.3°、抛光金属 3.4°，**所以 SH deg 3 只能勉强表示粗糙塑料级的高光，而这是表示能力的限制、不是优化没收敛**。另有三处「本课自己的配置通不过自己的审计」。全谱达到 **75 门 · 478 讲解 HTML · 478 notebook**。
+- 2026-09-10：新增 C75（三维重建与 3D 生成），同一批 3D 课单的第三门，也是这批的收尾。缺口验证（全库 478 个讲解页逐关键词 grep）：`Structure from Motion` / `bundle adjustment` / `gauge` / `Schur` / `立体匹配` / `代价体` / `plane sweep` / `单目深度` / `TSDF` / `Marching Cubes` / `泊松重建` / `Score Distillation` / `倒角距离` 全部 **0 命中**；`Chamfer` 的 1 处在 C54 的匈牙利匹配上下文，`ICP` 的 9 处全是 **ICPR**（会议名）的子串。6 个 notebook、125 个 code cell、24 道练习自测两遍实跑通过。**与 C72/C73/C74 不同：本课有真实的优化（束调整、平面扫掠、SDS），但不训练任何网络**——因为核心问题就是优化的性质（可观测性、条件数、不动点）。**本轮有六处结论被真实计算否掉后重写**，三条最值得记：① 我第一版测「小基线让条件数爆到 $10^{19}$」时，那个轨迹让相机转 100° 却几乎不平移，于是 **40 个点里有 25–33 个跑到了相机背后**（投影 u 到 52 万像素）——我测的是一个坏掉的场景，不是小基线效应；换成 look-at 轨迹后才得到干净的 $\propto (B/z)^{-2}$（小基线端实测指数 −2.00）。② **前向运动不让 $E$ 退化**（$\sigma_8/\sigma_9 = 1.3\times10^{15}$），退化的是**三角化**（极点附近视线夹角只有外圈的 1/7.5）——这是两件不同的事，混在一起会让人去修错的地方。③ **「SDS 里的 $-\epsilon$ 是降方差的控制变量」只在高噪端或模式附近成立**：逐 $t$ 看效应完全反转，低噪端（$t{=}0.05$）它让方差**涨 391 倍**、高噪端（$t{=}0.95$）降 1533 倍；无条件成立的只有「它不改变期望」这一条（而两个估计量之差恰好不含 $x$，6 个 $x$ 处逐位相同）。**另有两处意外收获**：纯旋转时零空间恰好是 **npt + 6**（5 组配置验证——每个点的深度都不可观测 + 全局旋转 3 + 平移 3，而尺度被并进逐点深度里，所以它随场景规模增长而不是「7 加一点」）；先验权重 $(0.9,0.1)$ 时**次模式不再是吸引子**，SDS 给出 **100%/0%** 而不是 90%/10%——所以「多样性坍缩」不只是概率被压平，而是少数模式在动力学里直接消失。顺带把三条常被含糊的评测口径量化了：单目深度的协议三选（对齐**域** × 自由度 × 逐图/全局）**各值一到两个数量级、合起来 154 倍**，而规则是「对齐域必须与模型的不变性所在的域一致」（两个方向都验了，所以**评测协议不能独立于模型来定**）；**Chamfer 不是度量**（反例 $20 > 5{+}5$，超出 2 倍，所以「CD 差 0.1」没有传递性）；**CD-L1 对离群点线性而 CD-L2 平方**（一个 50 倍半径的离群点让 L1 涨 1.31× 而 L2 涨 **293×**，理论 $(d{-}1)^p/n$ 与实测吻合到 2e-4）。全谱达到 **76 门 · 484 讲解 HTML · 484 notebook**。
 
 完整细节见 [`COURSES_PLAN.md`](./COURSES_PLAN.md)。
 
@@ -315,7 +353,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 ### Table of Contents
 - [What This Is](#en-what)
 - [Quick Start](#en-quickstart)
-- [Course Catalog (75 courses)](#en-catalog)
+- [Course Catalog (76 courses)](#en-catalog)
 - [Format of Each Course](#en-format)
 - [Suggested Learning Paths](#en-paths)
 - [Repository Layout](#en-layout)
@@ -351,7 +389,7 @@ jupyter lab
 Read a module's `NN_讲解.html` lesson first (or start from `index.html` to pick a path), then run the matching `.ipynb`. All courses share one `assets/style.css`.
 
 <a name="en-catalog"></a>
-### Course Catalog (75 courses)
+### Course Catalog (76 courses)
 
 #### C00–C09 · Core LLM & Evaluation Track
 | # | Folder | Topic |
@@ -539,6 +577,46 @@ Read a module's `NN_讲解.html` lesson first (or start from `index.html` to pic
 > criterion) is **125/(ℓ+1)** — degree 3 only reaches a **31.2°** half-angle, while polished
 > plastic needs 12.3° and polished metal 3.4°.
 
+#### C75 · 3D Reconstruction & 3D Generation
+
+| # | Directory | Topic | Gap it fills |
+|---|-----------|-------|--------------|
+| C75 | `C75_Reconstruction_Generation_Course/` | 3D reconstruction and 3D generation (an overview of the four routes · SfM and bundle adjustment · dense multi-view stereo · feed-forward regression (monocular depth and pointmaps) · SDS and multi-view diffusion · meshing and 3D evaluation) | Across all 478 existing lesson pages: `Structure from Motion`, `bundle adjustment`, `gauge`, `Schur`, `stereo matching`, `cost volume`, `plane sweep`, `monocular depth`, `TSDF`, `Marching Cubes`, `Poisson reconstruction`, `Score Distillation` and `Chamfer distance` all had **zero** hits (the single `Chamfer` hit is in C54's Hungarian-matching context, and all nine `ICP` hits are substrings of **ICPR**) |
+
+> **One principled constraint frames the whole course**: scale the scene points and the camera
+> translation together by $s$ and the rendered image is **bit-identical** (the notebook takes $s$
+> to $10^3$; the largest pixel difference is $1.1\times10^{-13}$). So "metres from images" is
+> impossible in principle — every route must inject external information somewhere, and
+> **where it injects that information is the biggest difference between these methods.**
+>
+> **Unlike C72/C73/C74, this course runs real optimization but trains no neural network.**
+> Module 01 has a converging bundle adjustment (LM + Schur complement), module 02 a plane sweep,
+> module 04 an SDS loop on an analytically known prior — because the core questions here *are*
+> questions about optimization (what is observable, how large the condition number is, which
+> fixed point it converges to). Modules 03 and 04 use analytically constructed stand-ins,
+> because what they verify are **protocols** and **properties of the objective**.
+>
+> **A thread running through the whole course**: every module contains one thing that looks like
+> a precision problem but is really an **observability** problem — pure rotation in module 01
+> (the null space grows from 7 to **npt+6**), periodic texture in module 02 (the error is
+> **independent of noise**), absolute scale in module 03 (unobservable in principle), Janus in
+> module 04 (the strict optimum of the objective), and Chamfer distance in module 05 (not a
+> metric, so "0.1 apart" is not transitive).
+>
+> **Six honest corrections**, three worth singling out: (1) when I first measured "a small
+> baseline blows the condition number up to $10^{19}$", my camera trajectory rotated 100° while
+> barely translating, so **25–33 of 40 points ended up behind the camera** (projected $u$ up to
+> 520,000 px) — I was measuring a broken scene, not a small-baseline effect; switching to a
+> look-at trajectory produced the clean $\propto (B/z)^{-2}$ law; (2) **forward motion does not
+> degenerate $E$** ($\sigma_8/\sigma_9 = 1.3\times10^{15}$) — what degenerates is
+> **triangulation**; (3) **"the $-\epsilon$ term in SDS is a variance-reducing control variate"
+> holds only at high noise or near a mode** — at low noise it *increases* the variance by 391×.
+> The only unconditional statement is that it does not change the expectation.
+>
+> **Two unexpected findings**: under pure rotation the null space is exactly **npt + 6** (it grows
+> with scene size, rather than being "7 plus a bit"); and with prior weights $(0.9, 0.1)$ the
+> minor mode **stops being an attractor at all** — SDS produces 100%/0%, not 90%/10%.
+
 <a name="en-format"></a>
 ### Format of Each Course
 
@@ -549,7 +627,7 @@ CXX_Xxx_Course/
 ├── glossary.md          Glossary (≥12KB)
 ├── references.md        Reference list (papers/docs, ★ = must-read)
 ├── requirements.txt      Dependencies (most courses need only numpy/pandas/jupyterlab)
-├── assets/style.css      One shared stylesheet across all 75 courses (byte-identical)
+├── assets/style.css      One shared stylesheet across all 76 courses (byte-identical)
 ├── 00_setup/
 │   ├── 00_overview.html         Course overview
 │   └── 00_environment_check.ipynb
@@ -584,9 +662,9 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 ├── index.html               Site-wide course overview page
 ├── COURSES_PLAN.md            Full record of the curriculum plan & build history
 ├── ENV_SETUP.md                Notes for setting up the local conda environment
-├── requirements-all.txt        Union of all 75 courses' dependencies (install once, run all)
+├── requirements-all.txt        Union of all 76 courses' dependencies (install once, run all)
 ├── _buildkit/                  House-style generator (coursekit.py) + each course's build scripts
-├── C00_..._Course/ … C74_..._Course/   75 courses, layout described above
+├── C00_..._Course/ … C75_..._Course/   76 courses, layout described above
 └── README.md                   This file
 ```
 
@@ -600,7 +678,7 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 <a name="en-env"></a>
 ### Environment & Dependencies
 
-- **Full local environment**: one conda env (`courses`, Python 3.11) with PyTorch + the HuggingFace stack + common scientific-computing libraries covers all 75 courses — see [`ENV_SETUP.md`](./ENV_SETUP.md); the combined dependency list is [`requirements-all.txt`](./requirements-all.txt).
+- **Full local environment**: one conda env (`courses`, Python 3.11) with PyTorch + the HuggingFace stack + common scientific-computing libraries covers all 76 courses — see [`ENV_SETUP.md`](./ENV_SETUP.md); the combined dependency list is [`requirements-all.txt`](./requirements-all.txt).
 - **Just want one course**: `cd` into that course's folder and `pip install -r requirements.txt` — for most courses that file is only 4–5 lines (`numpy`/`pandas`/`jupyterlab`/`ipykernel`).
 - Every cell that needs a heavier dependency (`transformers`/`bitsandbytes`/`qwen-vl-utils`, etc.) is wrapped in `try/except`: if it's not installed, there's no network, or no GPU, it degrades gracefully to a pure Python/numpy fallback or is skipped — **it will not crash the whole notebook**.
 
@@ -618,5 +696,6 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 - 2026-09-08: Added C72 (multi-view geometry and multi-sensor spatio-temporal alignment). **The gap was verified by scanning all 460 lesson pages first**, and the five directions that were checked and found *already covered* were listed up front (scaling laws, speculative decoding, continual learning, annotation ops, distillation); what turned out to be genuinely absent was the pixel-to-metre geometric chain. 6 notebooks, 115 code cells, 24 exercise self-tests, all verified two-pass. **Five conclusions in this round were rewritten after real computation contradicted them**: the textbook accuracy benefit of DLT point normalization disappears once there is noise (45.8× with no noise, but only a 13% difference at 0.2 px corner noise — and normalization is *slightly worse*); "calibrating intrinsics and extrinsics separately makes them absorb each other\'s errors and be wrong at range" is false (the absorption is remarkably clean — the real issue is *identifiability*, and the only way to separate $c_y$ from pitch is to widen the image-row coverage: σ(pitch) 3.74° → 0.035°, a **106× improvement**, while the most convenient collection pattern is the worst one); PnP orthogonalization does not improve accuracy (direction error improves only 1.24× and reprojection RMS actually gets *worse*) — and the "14.5×" measured in the first draft was an artefact of a **metric used outside its domain** (the trace formula is only valid for orthogonal matrices; for non-orthogonal ones 40–47% of realizations get clipped to exactly 0.00°); "waiting for the next IMU sample beats extrapolating" is the wrong trade-off (waiting costs 2222× more); and rolling shutter is not worth modelling for small targets (0.005 px) while "one timestamp per frame" costs 0.667 m. There are also **two places where the course\'s own configuration fails its own acceptance checks** (the 5-view calibration set in module 02 fails on edge coverage; the uniform BEV grid in module 04 fails on both sampling rate and slope) — by design, not by accident. Reached **73 courses · 466 lesson pages · 466 notebooks**.
 - 2026-09-09: Added C73 (3D representations and point-cloud deep learning). A scan of all 466 lesson pages confirmed that the whole cluster of current 3D directions had zero coverage (PointNet, PointPillars, voxels, point-cloud segmentation, stereo, monocular depth, SDF — all 0 hits). 6 notebooks, 117 code cells, 24 exercise self-tests, all verified two-pass. **Seven conclusions were rewritten after real computation contradicted them**, three worth singling out: `sum`/`mean` are *not* bitwise permutation-invariant (floating-point addition is not associative; the relative difference is 1.43e-15, whereas `max`/`min` are, being pure selections) — so a permutation-invariance unit test cannot use exact equality for all aggregations; `max` does *not* discard the point count entirely (a linear probe gives $R^2=0.76$, because extreme-value statistics depend on sample size); and the fastest-dilating active set is not a thin structure but a fully scattered one (22.05× versus 4.32× for a sheet), while the rule density orders the opposite way and the product of the two is bounded by the kernel size 27. **The sharpest result** (a closed derivation): the per-axis tolerance is exactly $s_i/3$, so a traffic sign's 0.049 m tolerance sits at **0.98×** typical annotation noise (0.05 m); setting the prediction equal to the ground truth and adding only annotation noise to the labels, the AP@IoU0.5 ceiling on signs is just **0.392** (trucks and cars are both 1.000, and under the center-distance criterion all four classes are 1.000) — **so that column measures annotation noise, not model capability**. There are also three places where the course's own configuration fails its own audits. Reached **74 courses · 472 lesson pages · 472 notebooks**.
 - 2026-09-09: Added C74 (3D Gaussian Splatting and real-time rendering), the second course in the same batch of 3D topics. Gap check (keyword grep across all 472 existing lesson pages): `spherical harmonic` 0 hits, `alpha compositing` 0, `tile rasterization` 0, `EWA` 0; the few hits for volume rendering / alpha compositing / Gaussian Splatting / NeRF are all one-line pointers in C72/C73/C55 that defer to this course. **Because the chosen path through the 3D courses skipped NeRF, module 01 carries its own volume-rendering / alpha-compositing foundation.** 6 notebooks, 123 code cells, 24 exercise self-tests, all verified two-pass; the notebooks build a working tile rasterizer from scratch and check it against a per-pixel brute-force implementation **bit-for-bit**. **Four conclusions were rewritten after real computation contradicted them**, two worth singling out: (1) **for piecewise-constant density, alpha compositing is exact to machine precision, even at $N{=}1$** (error 0 at $N{=}1$, 8.9e−16 at $N{=}256$) — so the discretization error comes *only* from σ varying within a segment, and there the midpoint rule is **second order** (each doubling of $N$ cuts the error by 4.00×; my original ∝1/N was wrong); (2) **at a 53° subtended angle the projected covariance does not exist at all** — 2.28% of the mass falls at $z\le0$, samples approaching $z\to0^+$ project to infinity, and the second-moment integral diverges (the Monte-Carlo estimate grows 9× going from $n{=}10^4$ to $10^6$ and varies 3× across seeds), **so asking "how large is the affine approximation's error here" is the wrong question — the ground truth it would compare against does not exist**. Two more: the bit-for-bit comparison initially missed a third approximation (the 3σ bounding box is tile-aligned; its effect is 0.50 of one 8-bit color step); and "the scale gradient is a better densification criterion" was an artifact of a single run (67% top-quartile hit rate with one target and one seed, 28% averaged over six, and below the 25% random baseline at every density). It also quantitatively corrects a widespread claim: **the "angular resolution ≈ 180/(ℓ+1)" rule overstates SH capability by about 1.45×**; the measured limit (20% relative-residual criterion) is **125/(ℓ+1)** — degree 3 reaches only a **31.2°** half-angle, while polished plastic needs 12.3° and polished metal 3.4°, **so SH degree 3 can barely represent rough-plastic-grade specularity, and that is a limit of representational capacity, not of optimization**. There are also three places where the course's own configuration fails its own audits. Reached **75 courses · 478 lesson pages · 478 notebooks**.
+- 2026-09-10: Added C75 (3D reconstruction and 3D generation), the third and final course in this batch of 3D topics. Gap check (keyword grep across all 478 existing lesson pages): `Structure from Motion`, `bundle adjustment`, `gauge`, `Schur`, `stereo matching`, `cost volume`, `plane sweep`, `monocular depth`, `TSDF`, `Marching Cubes`, `Poisson reconstruction`, `Score Distillation` and `Chamfer distance` all had **zero** hits; the single `Chamfer` hit sits in C54's Hungarian-matching context, and all nine `ICP` hits are substrings of **ICPR**. 6 notebooks, 125 code cells, 24 exercise self-tests, all verified two-pass. **Unlike C72/C73/C74, this course runs real optimization (bundle adjustment, plane sweep, SDS) but trains no network** — because the core questions here *are* questions about optimization (observability, conditioning, fixed points). **Six conclusions were rewritten after real computation contradicted them**, three worth singling out: (1) when I first measured "a small baseline blows the condition number up to $10^{19}$", the camera trajectory rotated 100° while barely translating, so **25–33 of 40 points ended up behind the camera** (projected $u$ up to 520,000 px) — I was measuring a broken scene, not a small-baseline effect; switching to a look-at trajectory produced the clean $\propto (B/z)^{-2}$ law (measured exponent −2.00 in the small-baseline regime). (2) **Forward motion does not degenerate $E$** ($\sigma_8/\sigma_9 = 1.3\times10^{15}$) — what degenerates is **triangulation** (the ray angle near the epipole is only 1/7.5 of the outer ring); these are two different things, and conflating them sends you to fix the wrong stage. (3) **"The $-\epsilon$ term in SDS is a variance-reducing control variate" holds only at high noise or near a mode**: the effect fully reverses across $t$ — at $t{=}0.05$ it *increases* the variance by **391×**, at $t{=}0.95$ it reduces it by 1533×. The only unconditional statement is that it does not change the expectation (and the difference between the two estimators contains no $x$ at all — bit-identical at six different $x$). **Two unexpected findings**: under pure rotation the null space is exactly **npt + 6** (verified across five configurations — every point's depth is unobservable, plus 3 global rotation and 3 global translation, with scale absorbed into the per-point depths, so it grows with scene size rather than being "7 plus a bit"); and with prior weights $(0.9, 0.1)$ the minor mode **stops being an attractor**, so SDS produces **100%/0%** rather than 90%/10% — meaning "diversity collapse" is not just flattened probabilities but minority modes vanishing from the dynamics outright. It also quantifies three evaluation protocols that are routinely left vague: for monocular depth, the three protocol choices (alignment **domain** × degrees of freedom × per-image vs global) are each worth one to two orders of magnitude and **154× together**, and the rule is that "the alignment domain must match the domain in which the model is invariant" (verified in both directions, which means **the evaluation protocol cannot be defined independently of the model**); **Chamfer distance is not a metric** (counterexample $20 > 5{+}5$, violating by 2×, so "0.1 apart in CD" is not transitive); and **CD-L1 is linear in outliers while CD-L2 is quadratic** (one outlier at 50× the object radius raises L1 by 1.31× and L2 by **293×**, with the closed form $(d{-}1)^p/n$ matching measurement to 2e-4). Reached **76 courses · 484 lesson pages · 484 notebooks**.
 
 Full details in [`COURSES_PLAN.md`](./COURSES_PLAN.md).
