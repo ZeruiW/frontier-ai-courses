@@ -16,7 +16,7 @@
 
 读完你应该能：用误差复利模型解释 CoT 为什么有用；推导并模拟 pass@k / consensus@k / Best-of-N 的统计行为；从零实现 ORM 与 PRM 并复现 verifier 不完美时的 Goodhart 过优化曲线；在玩具推理树上手写 beam search、Tree-of-Thoughts 与 MCTS；拟合 inference scaling law 并找出 compute-optimal 的算力分配；量化 overthinking 并设计 budget forcing；用 hint sensitivity 实验测 CoT faithfulness、用 GSM-Symbolic 式扰动设计抗污染评测。
 
-注意分工：[`Post_Training_Course`](../Post_Training_Course/) 05 模块（RLVR/GRPO）讲**怎么训出**推理模型；本课讲训出来之后**怎么花测试时算力、怎么评**。
+注意分工：[`C02 Post_Training_Course`](../C02_Post_Training_Course/) 05 模块（RLVR/GRPO）讲**怎么训出**推理模型；本课讲训出来之后**怎么花测试时算力、怎么评**。
 
 ---
 
@@ -101,12 +101,12 @@ jupyter lab
 
 | 课程 | 关系 |
 |------|------|
-| [`Post_Training_Course`](../Post_Training_Course/) | **同一枚硬币的两面**。其 05 模块（RLVR/GRPO）讲"怎么训出推理模型"——训练时把 verifiable reward 灌进权重；本课讲"训出来之后怎么花测试时算力与怎么评"。两课在 verifier/RLVR 处会师：同一个 verifier，训练时是 reward，测试时是 reranker。 |
-| [`LLM_Evals_Course`](../LLM_Evals_Course/) | **前置**。其 06 模块的 pass@k 与能力引出是本课 02/05 的统计学起点；本课把"采样次数 k"从评测超参数升级为需要优化的算力预算变量。其 02 模块的统计严谨性（CI、paired test）默认贯穿本课所有实验。 |
-| [`Interpretability_Course`](../Interpretability_Course/) | **CoT faithfulness 的另一半证据**。本课 07 用行为实验（hint sensitivity、扰动一致性）测 CoT 是否忠实——黑盒证据；interp 课的 probing/patching 提供激活级的白盒证据。审计一个推理模型两者都要。 |
-| [`LLM_Internals_Course`](../LLM_Internals_Course/) | **地基**。其 04 模块（解码策略）是本课一切采样方法的机制基础；其 05 模块（训练 scaling laws）与本课 05（推理 scaling laws）是同一种幂律方法论用在两条轴上。 |
-| [`Safety_Evals_Course`](../Safety_Evals_Course/) | CoT monitoring 是 AI control 的核心手段之一——前提是 CoT 足够 faithful（本课 07 教你测这个前提成不成立）。 |
-| [`AI_Agents_Course`](../AI_Agents_Course/) | agent 的长 horizon 任务成功率与多步推理的误差复利（本课 01）是同一个数学；其 06 模块的 pass@k vs pass^k 与本课 02 互为镜像。 |
+| [`C02 Post_Training_Course`](../C02_Post_Training_Course/) | **同一枚硬币的两面**。其 05 模块（RLVR/GRPO）讲"怎么训出推理模型"——训练时把 verifiable reward 灌进权重；本课讲"训出来之后怎么花测试时算力与怎么评"。两课在 verifier/RLVR 处会师：同一个 verifier，训练时是 reward，测试时是 reranker。 |
+| [`C03 LLM_Evals_Course`](../C03_LLM_Evals_Course/) | **前置**。其 06 模块的 pass@k 与能力引出是本课 02/05 的统计学起点；本课把"采样次数 k"从评测超参数升级为需要优化的算力预算变量。其 02 模块的统计严谨性（CI、paired test）默认贯穿本课所有实验。 |
+| [`C06 Interpretability_Course`](../C06_Interpretability_Course/) | **CoT faithfulness 的另一半证据**。本课 07 用行为实验（hint sensitivity、扰动一致性）测 CoT 是否忠实——黑盒证据；interp 课的 probing/patching 提供激活级的白盒证据。审计一个推理模型两者都要。 |
+| [`C01 LLM_Internals_Course`](../C01_LLM_Internals_Course/) | **地基**。其 04 模块（解码策略）是本课一切采样方法的机制基础；其 05 模块（训练 scaling laws）与本课 05（推理 scaling laws）是同一种幂律方法论用在两条轴上。 |
+| [`C05 Safety_Evals_Course`](../C05_Safety_Evals_Course/) | CoT monitoring 是 AI control 的核心手段之一——前提是 CoT 足够 faithful（本课 07 教你测这个前提成不成立）。 |
+| [`C04 AI_Agents_Course`](../C04_AI_Agents_Course/) | agent 的长 horizon 任务成功率与多步推理的误差复利（本课 01）是同一个数学；其 06 模块的 pass@k vs pass^k 与本课 02 互为镜像。 |
 
 一句话：**post-training 决定推理能力的上限，test-time compute 决定单次任务上你兑现多少，评测科学决定你对这两者的测量可不可信。**
 

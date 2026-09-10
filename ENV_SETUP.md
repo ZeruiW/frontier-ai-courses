@@ -1,9 +1,12 @@
 # Course environment (conda)
 
-A single shared conda env, **`courses`** (Python 3.11), serves all 38 courses (C00–C37).
-They share one ML/LLM stack, so one env is far lighter than 38 copies.
+A single shared conda env, **`courses`** (Python 3.11), serves all 78 courses (C00–C77).
+They share one ML/LLM stack, so one env is far lighter than 78 copies.
 
-Created: 2026-06-27 · GPU: RTX 4090 · CUDA wheels: cu124
+Note that C38 onward are pure numpy/CPU/offline — they need only `numpy` + `jupyterlab`,
+so they run in this env without any of the GPU/HuggingFace stack below.
+
+Created: 2026-06-27 · last reviewed: 2026-09-10 (C77) · GPU: RTX 4090 · CUDA wheels: cu124
 
 ## Use it
 
@@ -31,7 +34,8 @@ Notebooks embed a per-course kernel name; matching kernels are installed so each
 | `evals` | C03 |
 | `agents` | C04 |
 | `safety` | C05 |
-| `python3` | C06–C37 |
+| `interp` | C06 (3 notebooks) |
+| `python3` | everything else (448 notebooks across 73 courses, C00–C77) |
 | `courses` | generic (use for anything) |
 
 If a notebook ever shows "no kernel", just select **Python (courses)** / any of the above.

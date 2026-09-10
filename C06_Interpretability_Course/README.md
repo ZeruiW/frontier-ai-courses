@@ -96,12 +96,12 @@ jupyter lab
 
 | 课程 | 关系 |
 |------|------|
-| [`LLM_Internals_Course`](../LLM_Internals_Course/) | **前置**。本课默认你已手写过 attention 与 residual connection（其 02 模块）；本课把同一个 residual stream 从"工程部件"重新解读为"通信总线"。 |
-| [`LLM_Evals_Course`](../LLM_Evals_Course/) | **互补的另一半**。行为评测只能告诉你模型在测的分布上做对了没有；interp 提供机制证据回答"它是真会还是背题/走捷径"。probe 的 selectivity 检验与 eval 的统计严谨性是同一种方法论洁癖。 |
-| [`Safety_Evals_Course`](../Safety_Evals_Course/) | **直接下游**。其 05 模块（sandbagging 与评测完整性）和 07 模块（safety case）依赖白盒证据：probing 测谎/检测隐藏目标、refusal direction 解释越狱、model diffing 审计后训练改动——这些正是本课 06/07 模块的内容。 |
-| [`Post_Training_Course`](../Post_Training_Course/) | RLHF/DPO 到底改了模型内部的什么？model diffing 与 refusal direction（本课 06/07）是回答这个问题的工具。 |
-| [`AI_Agents_Course`](../AI_Agents_Course/) | agent 的不可解释行为（如 reward hacking 的内部前兆）是 interp 监控的应用场景。 |
-| [`VLM_Multimodal_Course`](../VLM_Multimodal_Course/) | 多模态分支。probing 与 patching 同样适用于视觉表示。 |
+| [`C01 LLM_Internals_Course`](../C01_LLM_Internals_Course/) | **前置**。本课默认你已手写过 attention 与 residual connection（其 02 模块）；本课把同一个 residual stream 从"工程部件"重新解读为"通信总线"。 |
+| [`C03 LLM_Evals_Course`](../C03_LLM_Evals_Course/) | **互补的另一半**。行为评测只能告诉你模型在测的分布上做对了没有；interp 提供机制证据回答"它是真会还是背题/走捷径"。probe 的 selectivity 检验与 eval 的统计严谨性是同一种方法论洁癖。 |
+| [`C05 Safety_Evals_Course`](../C05_Safety_Evals_Course/) | **直接下游**。其 05 模块（sandbagging 与评测完整性）和 07 模块（safety case）依赖白盒证据：probing 测谎/检测隐藏目标、refusal direction 解释越狱、model diffing 审计后训练改动——这些正是本课 06/07 模块的内容。 |
+| [`C02 Post_Training_Course`](../C02_Post_Training_Course/) | RLHF/DPO 到底改了模型内部的什么？model diffing 与 refusal direction（本课 06/07）是回答这个问题的工具。 |
+| [`C04 AI_Agents_Course`](../C04_AI_Agents_Course/) | agent 的不可解释行为（如 reward hacking 的内部前兆）是 interp 监控的应用场景。 |
+| [`C00 VLM_Multimodal_Course`](../C00_VLM_Multimodal_Course/) | 多模态分支。probing 与 patching 同样适用于视觉表示。 |
 
 一句话：**evals 给你模型行为的统计描述，interp 给你机制解释——audit 一个前沿模型两者缺一不可。**
 

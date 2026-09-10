@@ -59,7 +59,7 @@
 | exact dedup | 精确去重 | 移除逐字节相同（或哈希相同）的文档/段落。简单但只能抓完全重复，抓不住「改了几个字」的近重复。 |
 | near-duplicate | 近重复 | 内容高度相似但不逐字相同的文档（转载、模板微调）。需用 Jaccard/MinHash 等相似度方法识别，是去重的难点与重点。 |
 | shingle / k-gram | shingle / k-元组 | 把文档切成所有长度为 k 的连续词/字符片段构成的集合。两文档的 shingle 集合越像，内容越像，是 Jaccard 相似度的输入表示。 |
-| Jaccard similarity | Jaccard 相似度 | 两集合交集大小 ÷ 并集大小，$\|A\cap B\|/\|A\cup B\|\in[0,1]$。度量两文档 shingle 集合的重叠度，是近重复判定的标准相似度。 |
+| Jaccard similarity | Jaccard 相似度 | 两集合交集大小 ÷ 并集大小，$\vert A\cap B\vert/\vert A\cup B\vert\in[0,1]$。度量两文档 shingle 集合的重叠度，是近重复判定的标准相似度。 |
 | MinHash | MinHash | 用多个随机哈希，取每个哈希下集合元素的最小值组成签名 [Broder 1997]。两签名在某位相等的概率**恰等于** Jaccard 相似度，于是可用短签名近似估计相似度，近线性时间完成大规模去重。 |
 | LSH (locality-sensitive hashing) | 局部敏感哈希 | 把 MinHash 签名分桶（banding），让相似文档大概率落入同一桶，从而只在桶内两两比较，避免 $O(n^2)$ 全比对。大规模近重复去重的工程骨架。 |
 | shuffle buffer | 乱序缓冲 | 流式训练无法把全量数据载入内存全局打乱时，维护一个固定大小缓冲区，每次随机取出一条、补入一条，近似全局 shuffle。缓冲越大越接近真随机，太小则残留顺序偏差。 |

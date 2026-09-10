@@ -501,7 +501,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 ### Table of Contents
 - [What This Is](#en-what)
 - [Quick Start](#en-quickstart)
-- [Course Catalog (76 courses)](#en-catalog)
+- [Course Catalog (78 courses)](#en-catalog)
 - [Format of Each Course](#en-format)
 - [Suggested Learning Paths](#en-paths)
 - [Repository Layout](#en-layout)
@@ -959,7 +959,7 @@ CXX_Xxx_Course/
 ├── glossary.md          Glossary (≥12KB)
 ├── references.md        Reference list (papers/docs, ★ = must-read)
 ├── requirements.txt      Dependencies (most courses need only numpy/pandas/jupyterlab)
-├── assets/style.css      One shared stylesheet across all 76 courses (byte-identical)
+├── assets/style.css      One shared stylesheet across all 78 courses (byte-identical)
 ├── 00_setup/
 │   ├── 00_overview.html         Course overview
 │   └── 00_environment_check.ipynb
@@ -994,9 +994,9 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 ├── index.html               Site-wide course overview page
 ├── COURSES_PLAN.md            Full record of the curriculum plan & build history
 ├── ENV_SETUP.md                Notes for setting up the local conda environment
-├── requirements-all.txt        Union of all 76 courses' dependencies (install once, run all)
+├── requirements-all.txt        Union of all 78 courses' dependencies (install once, run all)
 ├── _buildkit/                  House-style generator (coursekit.py) + each course's build scripts
-├── C00_..._Course/ … C75_..._Course/   76 courses, layout described above
+├── C00_..._Course/ … C77_..._Course/   78 courses, layout described above
 └── README.md                   This file
 ```
 
@@ -1010,7 +1010,7 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 <a name="en-env"></a>
 ### Environment & Dependencies
 
-- **Full local environment**: one conda env (`courses`, Python 3.11) with PyTorch + the HuggingFace stack + common scientific-computing libraries covers all 76 courses — see [`ENV_SETUP.md`](./ENV_SETUP.md); the combined dependency list is [`requirements-all.txt`](./requirements-all.txt).
+- **Full local environment**: one conda env (`courses`, Python 3.11) with PyTorch + the HuggingFace stack + common scientific-computing libraries covers all 78 courses — see [`ENV_SETUP.md`](./ENV_SETUP.md); the combined dependency list is [`requirements-all.txt`](./requirements-all.txt).
 - **Just want one course**: `cd` into that course's folder and `pip install -r requirements.txt` — for most courses that file is only 4–5 lines (`numpy`/`pandas`/`jupyterlab`/`ipykernel`).
 - Every cell that needs a heavier dependency (`transformers`/`bitsandbytes`/`qwen-vl-utils`, etc.) is wrapped in `try/except`: if it's not installed, there's no network, or no GPU, it degrades gracefully to a pure Python/numpy fallback or is skipped — **it will not crash the whole notebook**.
 
