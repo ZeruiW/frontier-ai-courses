@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 世界模型：动作条件、可交互 rollout，与 C41 的分工</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 04 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>04 · 世界模型：动作条件、可交互 rollout，与 C41 的分工</h1>
+  <p class="subtitle"><strong>「这个世界模型准不准」没有答案，除非先说清它要被怎么用</strong> · 同一个模型（分布内一步误差 $\mathbf{0.0395}$）：<strong>被动 rollout 高估奖励 $-13.0\%$，主动规划高估 $\mathbf{+251.2\%}$</strong>——<em>优化器不是在利用噪声，它是在最大化模型的结构误差</em> · <strong>动作条件的收益 $=$ 动作在状态变化里占的方差份额</strong>（$1.01\times$ 到 $28.23\times$，有闭式解），而<strong>喂错动作比不喂动作更糟</strong>（$8$ 种配置全部成立）· <strong>分布偏移本身不是问题，误配 $\times$ 偏移才是</strong>：模型匹配时一步误差在策略幅度跨 $30$ 倍下平坦（$+1.9\%$），误配时涨 $\mathbf{44}$ 倍 · 而误差 vs 训练量的曲线分出<strong>三</strong>种下界：噪声底（无害）/ 估计误差（加数据有用）/ 逼近误差（加数据无用）</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 03（生成侧的漂移：$\vert\hat a\vert^k$、目标函数偏差、不动点）；<strong>C41 模块 04（基于模型与世界模型）</strong>——MPC / 随机打靶 / Dyna / 规划侧的复合误差在那里，本课不重讲；线性系统与最小二乘</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 04_world_model.ipynb（<strong>同一个模型：被动 rollout 高估奖励 $-13.0\%$，主动规划高估 $+251.2\%$</strong>——而它的分布内一步误差只有 $0.0395$ / <strong>动作条件的收益 $= $ 动作在状态变化里占的方差份额</strong>（$1.01\times$ 到 $28.23\times$），而<strong>喂错动作比不喂更糟</strong> / <strong>分布偏移本身不是问题，误配 $\times$ 偏移才是</strong>：模型匹配时一步误差在策略幅度跨 $30$ 倍下平坦（$+1.9\%$），误配时同样偏移下涨 $\mathbf{44}$ 倍）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Ha &amp; Schmidhuber, <em>World Models</em>（NeurIPS 2018）· Hafner et al., <em>Dream to Control / DreamerV3</em>（ICLR 2020 / Nature 2025）· OpenAI, <em>Video generation models as world simulators</em>（Sora 技术报告, 2024）· Bruce et al., <em>Genie: Generative Interactive Environments</em>（ICML 2024，无标注动作的潜在动作学习）· Valevski et al., <em>GameNGen: Diffusion Models Are Real-Time Game Engines</em>（2024）· Yu et al., <em>Cosmos World Foundation Model Platform</em>（NVIDIA, 2025）· 本课程 <strong>C41 模块 04</strong>（规划侧）· C59（VLA / 模仿学习的复合误差）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#two">「世界模型」有两个互不相同的意思</a></li>
+      <li><a href="#exploit">同一个模型，两种用法，两个数量级的差别</a></li>
+      <li><a href="#action">动作条件值多少</a></li>
+      <li><a href="#shift">分布偏移本身不是问题</a></li>
+      <li><a href="#latent_action">没有动作标注怎么办：潜在动作与它的可辨识性</a></li>
+      <li><a href="#memory">世界模型的状态：帧窗口还是循环隐状态</a></li>
+      <li><a href="#why_gap">为什么优化会把误差放大：一个可以算的说法</a></li>
+      <li><a href="#build">把一个可交互世界模型的验收拆开</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="two"><span class="num">1</span>「世界模型」有两个互不相同的意思</h2>
+  <p>这个词在两条不同的文献线里指两件事，而它们的失效机制不同、诊断方式不同、修法也不同：</p>  <table>
+    <thead><tr><th></th><th>作为<strong>规划器的环境</strong>（C41-04）</th><th>作为<strong>可交互的生成器</strong>（本课）</th></tr></thead>
+    <tbody>
+      <tr><td>用途</td><td>在脑中前瞻搜索好的动作序列（MPC）；或生成想象经验去训练策略（Dyna）</td><td>接受用户/智能体的动作，生成后续画面</td></tr>
+      <tr><td>谁在选动作</td><td>一个<strong>优化器</strong>，目标是最大化模型预测的回报</td><td>外部给定（用户操作、录制的轨迹、或一个固定策略）</td></tr>
+      <tr><td>失效机制</td><td><strong>对抗性</strong>：优化器主动去找模型的错误</td><td><strong>分布性</strong>：rollout 慢慢离开数据流形</td></tr>
+      <tr><td>主要诊断</td><td>模型预测回报 vs 真实回报的差</td><td>生成分布 vs 真实分布（模块 03 的平稳性与能量比）</td></tr>
+      <tr><td>主要修法</td><td>悲观化 / 不确定性惩罚 / 限制规划视野</td><td>改训练目标 / 加锚帧 / 调采样参数（模块 03）</td></tr>
+    </tbody>
+  </table>  <p>本课处理右边一列。但下一节会把两者放在<strong>同一个模型</strong>上直接对比，因为那个对比本身是理解这条分界最快的方式。</p>  <div class="callout intuition"><span class="label">两者常被混为一谈，因为它们训练<em>同一个</em>东西：一个动作条件的下一帧/下一状态预测器。而下一节会量出：同一个模型、同样的一步误差（$0.0395$），<strong>被动使用时奖励高估 $-13\%$，被优化器使用时高估 $+251\%$</strong>。所以「这个世界模型准不准」这个问题<em>没有答案</em>，除非先说清它要被怎么用。</span>
+    <p>为什么必须分开</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="exploit"><span class="num">2</span>同一个模型，两种用法，两个数量级的差别</h2>
+  <p>notebook 的设定：真系统的执行器<strong>饱和</strong></p>  <div class="math-block">\[s_{t+1} = A s_t + B \tanh(a_t) + \varepsilon\]</div>  <p>而模型类是<strong>线性</strong>的（$\hat{s}_{t+1} = \hat{A}s_t + \hat{B}a_t$）——所以存在真实的<em>结构</em>误差，而不只是估计噪声。训练数据用 $a \sim U[-0.3, 0.3]$ 收集 $300$ 条轨迹，<strong>分布内的一步预测相对误差是 $0.0395$</strong>（一个很好的模型）。</p>  <p>然后两种用法，都允许动作范围到 $[-a_{\text{pl}}, a_{\text{pl}}]$：</p>  <table>
+    <thead><tr><th>$a_{\text{pl}}$</th><th><strong>主动规划</strong>：模型预测回报</th><th>真实回报</th><th>高估</th><th>相对高估</th><th><strong>被动 rollout</strong>（同幅度随机动作）的相对高估</th></tr></thead>
+    <tbody>
+      <tr><td>$0.3$</td><td>$4.627$</td><td>$4.580$</td><td>$+0.047$</td><td>$1.0\%$</td><td>$-0.2\%$</td></tr>
+      <tr><td>$0.5$</td><td>$6.574$</td><td>$6.267$</td><td>$+0.307$</td><td>$4.9\%$</td><td>$-0.7\%$</td></tr>
+      <tr><td>$1.0$</td><td>$11.442$</td><td>$9.225$</td><td>$+2.217$</td><td>$24.0\%$</td><td>$-3.0\%$</td></tr>
+      <tr><td>$2.0$</td><td>$21.177$</td><td>$11.224$</td><td>$+9.953$</td><td>$88.7\%$</td><td>$-7.9\%$</td></tr>
+      <tr><td>$4.0$</td><td>$40.648$</td><td>$11.573$</td><td>$+29.076$</td><td>$\mathbf{251.2\%}$</td><td>$\mathbf{-13.0\%}$</td></tr>
+    </tbody>
+  </table>  <p>机制很清楚：<strong>线性模型认为「动作越大收益越大」（它没有饱和），于是优化器把 $\vert a \vert$ 顶到边界，而真系统在那里早已 $\tanh$ 饱和</strong>。优化器不是在利用噪声，它是在<em>最大化模型的结构误差</em>。</p>  <p>注意被动那一列的<strong>符号</strong>：它是<em>负</em>的（低估），而且幅度只有主动的二十分之一。被动 rollout 没有任何东西在对抗模型，所以它的误差就是误差，不朝任何方向系统性地累积。</p>  <div class="callout danger"><span class="label">把一个视频世界模型的「一步预测准确率」当作它<strong>能不能被智能体用来规划</strong>的证据，是一次量级上的错误。上表的模型一步误差 $3.95\%$，而被优化器使用时回报高估 $251\%$。<strong>要评估「能不能规划」，必须让一个优化器去攻击它，然后看真实回报</strong>——而这正是 C41 模块 04 的领地，本课只负责说清两者不是同一件事。</span>
+    <p>一个直接的工程后果</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="action"><span class="num">3</span>动作条件值多少</h2>
+  <p>动作条件是「可交互」的最低要求。它值多少？notebook 比较三种预测器：只看状态 $s$、看 $s$ 与动作 $a$、以及看 $s$ 与<strong>打乱的</strong> $a$：</p>  <table>
+    <thead><tr><th>动作幅度</th><th>噪声 sd</th><th>只看 $s$</th><th>看 $s{+}a$</th><th>看 $s{+}$<strong>错的</strong>$a$</th><th>条件化的收益</th></tr></thead>
+    <tbody>
+      <tr><td>$0.1$</td><td>$0.05$</td><td>$0.07396$</td><td>$0.05364$</td><td>$0.08982$</td><td>$1.38\times$</td></tr>
+      <tr><td>$0.1$</td><td>$0.50$</td><td>$0.47690$</td><td>$0.47440$</td><td>$0.47880$</td><td>$1.01\times$</td></tr>
+      <tr><td>$0.5$</td><td>$0.05$</td><td>$0.25074$</td><td>$0.05207$</td><td>$0.35318$</td><td>$4.82\times$</td></tr>
+      <tr><td>$1.0$</td><td>$0.05$</td><td>$0.45372$</td><td>$0.04794$</td><td>$0.64486$</td><td>$9.46\times$</td></tr>
+      <tr><td>$3.0$</td><td>$0.05$</td><td>$0.83535$</td><td>$0.02959$</td><td>$1.19092$</td><td>$\mathbf{28.23\times}$</td></tr>
+      <tr><td>$3.0$</td><td>$0.50$</td><td>$0.85101$</td><td>$0.28356$</td><td>$1.17619$</td><td>$3.00\times$</td></tr>
+    </tbody>
+  </table>  <p><strong>收益等于动作在状态变化里占的方差份额</strong>：动作幅度小或环境噪声大时收益趋于 $1$（条件化白做），动作主导时收益可达 $28\times$。</p>  <p>第三列是要点：<strong>喂错动作比不喂动作更糟</strong>（$0.08982 > 0.07396$，$1.19092 > 0.83535$）。因为模型会<em>照着</em>错动作走——它把一个错误的因当作真的因去外推。</p>  <div class="callout warn"><span class="label">从无标注视频里学「潜在动作」（Genie 一类）时，潜在动作的<strong>推断错误</strong>不是无害的噪声——按上表，它会让模型比根本不做动作条件更差。所以这类系统必须报告一个额外的量：<strong>潜在动作的可辨识性</strong>（同一段真实转移能否被稳定地反推出同一个潜在动作），而不只是报告重建质量。</span>
+    <p>这条对「潜在动作」的做法有直接含义</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="shift"><span class="num">4</span>分布偏移本身不是问题</h2>
+  <p>「在随机动作上训练、用策略动作 rollout」会带来动作分布偏移。这有多要紧？notebook 用两个真系统对比——一个与模型类<strong>完全匹配</strong>（线性），一个<strong>误配</strong>（$\tanh$ 饱和）：</p>  <table>
+    <thead><tr><th>策略增益 $g$</th><th>$\vert a\vert$ 均值</th><th>匹配：$1$ 步误差</th><th>匹配：$10$ 步</th><th><strong>误配</strong>：$1$ 步误差</th><th><strong>误配</strong>：$10$ 步</th></tr></thead>
+    <tbody>
+      <tr><td>$0.0$</td><td>$0.000$</td><td>$0.05360$</td><td>$0.10805$</td><td>$0.05362$</td><td>$0.10809$</td></tr>
+      <tr><td>$0.1$</td><td>$0.109$</td><td>$0.05360$</td><td>$0.13323$</td><td>$0.05368$</td><td>$0.13306$</td></tr>
+      <tr><td>$0.3$</td><td>$0.326$</td><td>$0.05360$</td><td>$0.23663$</td><td>$0.07485$</td><td>$0.57819$</td></tr>
+      <tr><td>$1.0$</td><td>$1.087$</td><td>$0.05370$</td><td>$2.08321$</td><td>$0.53104$</td><td>$40.40066$</td></tr>
+      <tr><td>$3.0$</td><td>$3.261$</td><td>$\mathbf{0.05461}$</td><td>$199.86$</td><td>$\mathbf{2.38179}$</td><td>$4771.81$</td></tr>
+    </tbody>
+  </table>  <p><strong>匹配时的一步误差在策略幅度跨 $30$ 倍的范围内完全平坦</strong>（$0.05360 \to 0.05461$，$+1.9\%$）；而误配时同样的偏移让它涨 <strong>$44$ 倍</strong>（$0.05362 \to 2.38179$）。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>分布偏移之所以危险，不是因为「模型没见过那里」——一个正确指定的线性模型在没见过的地方外推得同样好。危险来自<strong>模型错的那部分在新区域被放大</strong>。所以「加大训练动作范围」有效（它缩小偏移），而「加大数据量」无效（它只减小估计误差，不动误配）。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>记真映射 $f$、模型类 $\mathcal{F}$、拟合结果 $\hat f$。在分布 $P$ 上训练、在 $Q$ 上评估，误差可分解为$\Vert \hat f - f \Vert_Q \leq \Vert \hat f - f^{*} \Vert_Q + \Vert f^{*} - f \Vert_Q$，其中 $f^{*}$ 是 $\mathcal{F}$ 中在 $P$ 上的最优元。第一项是<strong>估计</strong>误差（随 $n$ 消失），第二项是<strong>逼近</strong>误差（不随 $n$ 消失，且在 $Q$ 上可以任意大）。匹配情形下 $f^{*} = f$，第二项恒为 $0$——这正是上表左半边平坦的原因。</p></div>
+  </div>  <p>$10$ 步那两列有一个<strong>混淆因素</strong>必须说清：$g{=}3$ 时闭环系统本身不稳定（$\rho(A + BgK) > 1$），所以真实轨迹与模型轨迹<em>都</em>发散，$199.86$ 这个数里有很大一部分不是模型误差。干净的信号在<strong>一步</strong>那两列。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="latent_action"><span class="num">5</span>没有动作标注怎么办：潜在动作与它的可辨识性</h2>
+  <p>上一节假设动作是<strong>已知的</strong>。而视频数据几乎从不带动作标注——一段游戏录屏、一段行车记录，都只有画面。于是有一类做法（Genie 一线）从无标注视频里<strong>反推</strong>潜在动作：</p>  <div class="ascii">   有标注:    (s_t, a_t) -&gt; s_{t+1}          直接监督
+   无标注:    (s_t, s_{t+1}) -&gt; ẑ_t          反推「发生了什么」
+                    |
+                    v
+              (s_t, ẑ_t) -&gt; s_{t+1}          再用它做动作条件</div>  <p>这个循环有一个明显的退化解：让 $\hat z_t$ 直接编码 $s_{t+1}$ 本身。那样重建完美，而 $\hat z$ 完全不是「动作」——它只是把答案抄了一遍。所以这类方法必须限制 $\hat z$ 的容量（离散、少量码字、低维），让它只能装下「这一步的意图」。</p>  <h3>而第 3 节给出一个必须报告的量</h3>  <p>第 3 节量出<strong>喂错动作比不喂动作更糟</strong>（$8$ 种配置全部成立：例如 $1.19092 > 0.83535$）。这条对潜在动作有直接后果：</p>  <div class="callout danger"><span class="label">如果 $\hat z_t$ 在部署时被推断错了（用户的操作被映射到错误的潜在动作），那么模型会<strong>照着错的动作走</strong>——结果比一个根本不做动作条件的模型<em>更差</em>。所以这类系统必须报告一个额外的量：<strong>潜在动作的可辨识性</strong>——同一段真实转移能否被稳定地反推出同一个 $\hat z$。而<em>重建质量高不能替代它</em>：退化解的重建质量是最高的。</span>
+    <p>潜在动作的推断错误不是无害的噪声</p>
+  </div>  <table>
+    <thead><tr><th>该报告的量</th><th>怎么量</th><th>不报会怎样</th></tr></thead>
+    <tbody>
+      <tr><td>动作条件的收益</td><td>不给 $\hat z$ 的误差 / 给 $\hat z$ 的误差</td><td>动作条件可能是装饰性的（本课实测可低至 $1.01\times$）</td></tr>
+      <tr><td><strong>错动作的惩罚</strong></td><td>喂打乱的 $\hat z$ 的误差 / 不给的误差</td><td>看不出「照着错动作走」这个风险</td></tr>
+      <tr><td><strong>$\hat z$ 的可辨识性</strong></td><td>同一转移在不同上下文/噪声下反推出同一个 $\hat z$ 的比例</td><td>可能学到了退化解（$\hat z$ 抄答案）</td></tr>
+      <tr><td>$\hat z$ 的信息量</td><td>$\hat z$ 的熵；以及它对 $s_{t+1}$ 的互信息</td><td>分不出「$\hat z$ 是意图」与「$\hat z$ 是答案」</td></tr>
+    </tbody>
+  </table>  <p>最后一行是区分退化解的关键：<strong>真正的动作 $\hat z$ 的信息量应当远小于 $s_{t+1}$</strong>。如果 $I(\hat z; s_{t+1})$ 接近 $H(s_{t+1})$，那 $\hat z$ 就是答案的编码而不是意图。本课不实现这一族度量（它需要真实的 tokenizer 与视频），但第 3 节的两列（收益、错动作惩罚）是可以直接搬过去用的。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="memory"><span class="num">6</span>世界模型的状态：帧窗口还是循环隐状态</h2>
+  <p>本模块的模型是<strong>无状态</strong>的：预测 $s_{t+1}$ 只用 $(s_t, a_t)$。真实系统有两条路线，而模块 00 的遮挡悬崖决定了它们的分界。</p>  <table>
+    <thead><tr><th>路线</th><th>机制</th><th>上下文长度</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td>帧窗口（无状态）</td><td>把最近 $h$ 帧拼起来当输入</td><td>硬上限 $h$</td><td>代价 $\propto h^2$（注意力）或 $\propto h$（拼接）</td></tr>
+      <tr><td>循环隐状态</td><td>维护一个 $\dim$ 固定的 $z_t$，$z_{t+1} = g(z_t, s_t, a_t)$</td><td>原则上无限</td><td>$z$ 的容量是瓶颈；且它自己会漂移（第 1–4 节全部适用）</td></tr>
+    </tbody>
+  </table>  <p>模块 00 的遮挡悬崖给出了对第一条路线的<strong>硬约束</strong>：$h$ 必须覆盖「最长不可观测区间 $+ 2$ 帧」，否则误差 $\approx 1.0$（除了均值什么也预测不出）。而这个约束<em>不能</em>通过增大模型来绕过——它是可观测性的问题。</p>  <p>第二条路线原则上没有这个上限，但它把问题挪到了别处：<strong>$z_t$ 自己是一个自回归 rollout</strong>，所以模块 03 的全部内容（$\vert\hat a\vert^k$、一步拟合的偏差、不动点）对 $z$ 的动力学同样成立。区别是 $z$ 的漂移<em>不可见</em>——它不在像素上，所以看画面看不出来。</p>  <div class="callout warn"><span class="label">模块 03 第 4 节的批级诊断（平稳性 + 能量比）<strong>可以直接用在 $z_t$ 上</strong>，而且比用在像素上更灵敏——因为 $z$ 的维度低、统计量更稳。具体做法：跑一批长 rollout，记录 $\Vert z_t\Vert$ 的轨迹，然后对它做「前后半段方差比」与「相对真实 rollout 的能量比」两个检验。这两个数会在画面明显崩坏之前就动。</span>
+    <p>隐状态漂移的诊断</p>
+  </div>  <h3>两条路线的一个混合</h3>  <p>工业上常见的做法是<strong>短帧窗口 $+$ 长期摘要</strong>：最近 $h$ 帧给精细的时间信息（覆盖典型的遮挡时长），而一个低维的、更新缓慢的摘要向量携带「场景的持久属性」（地图、已探索区域、物体清单）。</p>  <p>按本课的框架，这个设计的合理性可以说清：帧窗口负责<strong>可观测性</strong>（模块 00 的硬约束），摘要负责<strong>不随时间衰减的信息</strong>（而它的漂移风险由模块 03 管）。两者的失效模式不同，所以<em>诊断也要分开做</em>——这正是模块 04 第 5 节那张「四项互不蕴含」表的一个具体展开。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="why_gap"><span class="num">7</span>为什么优化会把误差放大：一个可以算的说法</h2>
+  <p>第 2 节量出了 $-13\%$ 与 $+251\%$。这一节说清那个量级差<strong>从哪来</strong>，因为它决定了缓解手段的方向。</p>  <p>设真映射 $f$，模型 $\hat f = f + \epsilon$，其中 $\epsilon$ 是模型误差。被动 rollout 在一个<strong>与 $\epsilon$ 无关</strong>的动作分布上评估，所以</p>  <div class="math-block">\[E_{a \sim \pi_0}[\epsilon(a)] \approx 0 \quad\text{（误差就是误差）}\]</div>  <p>而规划选的是 $a^{*} = \arg\max_a \hat r(a) = \arg\max_a [r(a) + \epsilon(a)]$，所以</p>  <div class="math-block">\[\hat r(a^{*}) - r(a^{*}) = \epsilon(a^{*}) = \max_a[\cdots] \gg E_a[\epsilon(a)]\]</div>  <p><strong>被动看的是 $\epsilon$ 的<em>均值</em>，主动看的是它的<em>最大值</em></strong>。在动作空间上取最大值，所以量级差随<strong>动作空间的大小</strong>增长——这正是第 2 节那张表里「相对高估随 $a_{\text{pl}}$ 单调增长」的原因（$1.0\% \to 4.9\% \to 24.0\% \to 88.7\% \to 251.2\%$）。</p>  <div class="callout intuition"><span class="label">① <strong>缩小 $\max$ 的范围</strong>——限制规划的动作范围到训练分布附近（练习 1 实测它是最直接的旋钮）；② <strong>让 $\epsilon$ 的上界变小</strong>——但注意第 2 节的 $\epsilon$ 是<em>结构</em>误差（线性 vs $\tanh$），所以加数据无效（练习 1 实测：一步误差降了而高估仍是 $251\%$）；③ <strong>把 $\epsilon$ 的不确定性算进目标</strong>——即悲观化：优化 $\hat r(a) - \lambda \sigma(a)$ 而不是 $\hat r(a)$。第三条是 C41 模块 04 的内容，而本节的作用是说清它<em>为什么必要</em>。</span>
+    <p>这个说法给出三条缓解方向</p>
+  </div>  <p>还有一个推论值得记：<strong>这个量级差与模型的一步精度几乎无关</strong>。$\max_a \epsilon(a)$ 由 $\epsilon$ 的<em>形状</em>决定（它在哪里最大），而一步误差量的是它的<em>均值</em>。两者可以任意脱钩——第 2 节的例子里一步误差 $3.95\%$ 而高估 $251\%$，而练习 1 实测把训练量从 $20$ 条加到 $2000$ 条后前者降了、后者没降。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="build"><span class="num">8</span>把一个可交互世界模型的验收拆开</h2>
+  <p>综合本模块与模块 03，一个「可交互视频世界模型」的验收至少有四个互不替代的部分：</p>  <table>
+    <thead><tr><th>验收项</th><th>量什么</th><th>本课的方法</th><th>不做会怎样</th></tr></thead>
+    <tbody>
+      <tr><td>① 一步保真</td><td>分布内的一步预测误差</td><td>常规留出集</td><td>什么都不知道（但这一项<strong>远远不够</strong>）</td></tr>
+      <tr><td>② 动作可辨识</td><td>喂错动作时误差是否变大；潜在动作能否被稳定反推</td><td>本模块第 3 节的三列对比</td><td>动作条件可能是<strong>装饰性</strong>的（收益 $1.01\times$）</td></tr>
+      <tr><td>③ 长程分布</td><td>生成批 vs 真实批的能量比与平稳性</td><td>模块 03 的批级诊断</td><td>分不清「变静止」与「还在累积」</td></tr>
+      <tr><td>④ <strong>抗优化</strong></td><td>让优化器最大化模型回报，看真实回报</td><td>本模块第 2 节</td><td>把 $3.95\%$ 的一步误差当成能规划的证据（实际高估 $251\%$）</td></tr>
+    </tbody>
+  </table>  <p>四项的关系是<strong>递进而不是并列</strong>：① 是必要条件；② 决定「交互」是不是真的；③ 决定长视频能不能用；④ 决定能不能给智能体用。<strong>而 ① 通过不蕴含任何后三项</strong>——本模块第 2 节就是这句话的量化。</p>  <div class="ascii">   一步误差 0.0395  -&gt;  ① 通过
+        |
+        +--&gt; ② 动作条件的收益？   可能只有 1.01x（动作幅度小/噪声大时）
+        |
+        +--&gt; ③ 长程能量比？        可能只有真值的 0.35（模块 03）
+        |
+        +--&gt; ④ 抗优化？            回报高估 251%（本模块第 2 节）
+
+   四项互不蕴含。而工程上通常只报 ①。</div>  <p>而这四项都不需要真实的视频模型就能先想清楚：① 是常规留出集；② 是本模块第 3 节的三列对比；③ 是模块 03 的批级诊断；④ 是本模块第 2 节的抗优化测试。四项<strong>合起来只需要一个动作条件的一步预测器</strong>，而这正是本课全部实验的规模。</p>  <div class="callout paper"><span class="label">C41 模块 04 已经完整覆盖了「有了模型之后怎么规划」：MPC 随机打靶、Dyna 的经验混合、模型误差在多步 rollout 中的累积、以及基于模型 vs 无模型的权衡。本模块<strong>不重复</strong>那些内容，只做两件 C41-04 没做的事：① 把「被动生成」与「主动规划」在<em>同一个模型</em>上量出量级差（$-13\%$ vs $+251\%$）；② 把「动作条件值多少」与「分布偏移什么时候真的伤人」量成两条可以直接用来做验收的规则。</span>
+    <p>本课与 C41-04 的分工，最后说一次</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../03_temporal_drift/03_讲解.html"><div class="dir">← 上一模块</div><div class="t">03 · 时序一致性与自回归漂移</div></a>
+    <a class="next" href="../05_video_eval/05_讲解.html"><div class="dir">下一模块 →</div><div class="t">05 · 视频评测：FVD 的三个病理与运动口径</div></a>
+  </div>
+
+</div>
+</body>
+</html>

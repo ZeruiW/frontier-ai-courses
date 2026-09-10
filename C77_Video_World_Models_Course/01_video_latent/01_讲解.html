@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 视频 latent 与 tokenizer：时间维压缩的账</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 01 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>01 · 视频 latent 与 tokenizer：时间维压缩的账</h1>
+  <p class="subtitle">$p_t$ 是唯一能<strong>平方级</strong>换回算力的旋钮（代价 $\propto 1/p_t^2$），而它换走的是可观测性 · <strong>有效相关性 $\rho^{p_t}$ 给出 $p_t$ 的上限</strong>（$\rho_{\text{eff}}<0.3$ 后时间维已无冗余可用）· <strong>流式（因果）的代价非单调</strong>：corr$=0$ 时 $0.9984\times$、corr$=0.95$ 时峰值 $\mathbf{1.0308\times}$、corr$=0.995$ 时又回到 $1.0060\times$——<em>两端都便宜，因为未来要么无信息、要么与过去冗余</em> · 代价还<strong>集中在每个 chunk 的最后一帧</strong>（$1.11$/$1.09$/$1.09$ vs 邻居 $1.01$），而最后一个 chunk 恒为 $1.00$ · <strong>固定比特预算下「少而大的 token」更划算</strong>：$4$ tok $\times$ $256$ 码本（$0.534$）胜过 $16$ tok $\times$ $4$ 码本（$0.843$），差 $1.58\times$——而<em>判断码本有没有坍缩要看熵 $/\log_2 K$，不能看利用率</em></p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00（时间轴的代价、3D 压缩收益 = 相关性）；<strong>C28 模块 01（Latent Diffusion）</strong>——「为什么不在像素上做扩散」「VAE 的作用」在那里，本课不重讲，只处理<em>时间维</em>；PCA/SVD、k-means（本课的 VQ 用它）</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 01_video_latent.ipynb（<strong>流式（因果）的代价非单调</strong>：corr$=0$ 时 $0.9984\times$、corr$=0.95$ 时峰值 $1.0308\times$、corr$=0.995$ 时又回到 $1.0060\times$ / <strong>代价的峰值落在每个 chunk 的<em>最后</em>一帧</strong>（$1.12$ / $1.09$ / $1.10$），而最后一个 chunk 恒为 $1.00$ / <strong>固定比特预算下「少而大的 token」更划算</strong>：$4$ 个 token $\times$ $256$ 码本（$0.534$）胜过 $16$ 个 token $\times$ $4$ 码本（$0.843$），差 $1.58\times$）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Rombach et al., <em>High-Resolution Image Synthesis with Latent Diffusion Models</em>（CVPR 2022，图像侧的地基，见 C28-01）· Yu et al., <em>MAGVIT-v2: Language Model Beats Diffusion — Tokenizer is Key to Visual Generation</em>（ICLR 2024）· Yu et al., <em>MAGVIT</em>（CVPR 2023，3D VQ）· Agarwal et al., <em>Cosmos Tokenizer</em>（NVIDIA, 2025，因果时空 tokenizer）· Blattmann et al., <em>Stable Video Diffusion</em>（2023，时间层的加法式设计）· van den Oord et al., <em>VQ-VAE</em>（NeurIPS 2017）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 50 分钟 + 跑 45 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#three">视频 latent 的三个决定</a></li>
+      <li><a href="#gain">时间压缩的收益：有效相关性</a></li>
+      <li><a href="#causal">因果（流式）的代价：一个非单调的量</a></li>
+      <li><a href="#discrete">连续 latent 还是离散 token</a></li>
+      <li><a href="#interact">空间压缩与时间压缩不能独立选</a></li>
+      <li><a href="#objective">tokenizer 的训练目标不是下游的生成质量</a></li>
+      <li><a href="#recap">本模块的四个量与它们的来源</a></li>
+      <li><a href="#bridge01">两条恒等式，四条测量</a></li>
+      <li><a href="#summary">选 $p_t$ 的一张决策表</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="three"><span class="num">1</span>视频 latent 的三个决定</h2>
+  <p>C28 模块 01 已经回答了「为什么不在像素上做扩散」。把它推广到视频时要多做三个决定，而这三个决定基本互不影响、可以分开讨论：</p>  <table>
+    <thead><tr><th>决定</th><th>取值范围（工业实践）</th><th>影响什么</th><th>本课量出的账</th></tr></thead>
+    <tbody>
+      <tr><td>空间压缩率 $p_h \times p_w$</td><td>$8\times8$ 到 $16\times16$</td><td>空间细节 / token 数</td><td>与图像同理，C28-01 已覆盖</td></tr>
+      <tr><td><strong>时间压缩率 $p_t$</strong></td><td>$1$（逐帧）到 $8$</td><td>时间细节 / <strong>代价 $\propto 1/p_t^2$</strong></td><td>收益取决于相关性；$\text{corr}^{p_t}$ 是有效相关性</td></tr>
+      <tr><td><strong>因果性</strong></td><td>因果（流式）/ 非因果（整段）</td><td>能不能流式推理 / 能不能与图像共享权重</td><td>代价 $\leq 3.1\%$ 且<strong>非单调</strong></td></tr>
+      <tr><td>连续 vs 离散</td><td>VAE latent / VQ token</td><td>接扩散还是接自回归 LM</td><td>固定比特下「少而大的 token」更划算</td></tr>
+    </tbody>
+  </table>  <p>第二行的 $\propto 1/p_t^2$ 来自模块 00：注意力代价是 $(T/p_t)^2 S^2$，所以 <strong>$p_t$ 是唯一能平方级换回算力的旋钮</strong>。这也是为什么工业模型几乎都做时间压缩，而压多少是一个真正的取舍。</p>  <div class="callout intuition"><span class="label">$p_t = 1$（不做时间压缩）有一个特殊的好处：视频 latent 与图像 latent <strong>逐位兼容</strong>，于是可以直接复用图像 VAE 的权重、也可以在图文混合数据上训练。$p_t > 1$ 一旦引入，这个兼容性就没了——所以「要不要做时间压缩」不只是算力问题，还是<em>能不能继承图像模型</em>的问题。工业上常见的折中是让第一个 latent 帧只看一帧（$p_t=1$）、后续的才压缩，这样单帧输入依然兼容。</span>
+    <p>一个被忽略的约束</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="gain"><span class="num">2</span>时间压缩的收益：有效相关性</h2>
+  <p>模块 00 已经量出「3D 压缩的收益是时间相关性的函数」（corr$=0$ 时 $0.984\times$，corr$=0.99$ 时 $4.49\times$）。本节把它变成一条可以用来<strong>选 $p_t$</strong> 的规则。</p>  <p>如果原始相邻帧的相关性是 $\rho$，且时间结构近似一阶马尔可夫，那么压缩 $p_t$ 倍之后，相邻 <em>latent 帧</em> 之间的有效相关性是</p>  <div class="math-block">\[\rho_{\text{eff}} = \rho^{p_t}\]</div>  <table>
+    <thead><tr><th>$\rho$（原始）</th><th>$p_t{=}1$</th><th>$p_t{=}2$</th><th>$p_t{=}4$</th><th>$p_t{=}8$</th><th>$p_t{=}16$</th></tr></thead>
+    <tbody>
+      <tr><td>$0.99$</td><td>$0.990$</td><td>$0.980$</td><td>$0.961$</td><td>$0.923$</td><td>$0.851$</td></tr>
+      <tr><td>$0.95$</td><td>$0.950$</td><td>$0.903$</td><td>$0.815$</td><td>$0.663$</td><td>$0.440$</td></tr>
+      <tr><td>$0.90$</td><td>$0.900$</td><td>$0.810$</td><td>$0.656$</td><td>$0.430$</td><td>$\mathbf{0.185}$</td></tr>
+      <tr><td>$0.70$</td><td>$0.700$</td><td>$0.490$</td><td>$0.240$</td><td>$\mathbf{0.058}$</td><td>$0.003$</td></tr>
+    </tbody>
+  </table>  <p>把这张表和模块 00 的收益表对照就得到一条判据：<strong>压到 $\rho_{\text{eff}} < 0.3$ 之后，时间维已经几乎没有可利用的冗余</strong>——再增大 $p_t$ 只是在丢信息，不再省下「结构」。对 $\rho{=}0.90$ 的素材这个上限大约是 $p_t{=}12$；对 $\rho{=}0.70$ 只有 $p_t{=}4$。</p>  <div class="callout warn"><span class="label">同一个数据集里，「固定机位的风景」与「快速剪辑的预告片」的 $\rho$ 可以差一个数量级。用全局常数 $p_t$ 意味着对前者压得不够、对后者压过头。notebook 的练习 1 给出 $\rho$ 的一个鲁棒估法，而工程上更彻底的做法是<strong>按镜头切分</strong>（shot detection）后分别压缩——因为 $\rho$ 在镜头边界处会断崖式下降。</span>
+    <p>$\rho$ 必须从数据估，而它在数据集内部差异极大</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="causal"><span class="num">3</span>因果（流式）的代价：一个非单调的量</h2>
+  <p>非因果 tokenizer 可以看到整段视频；因果 tokenizer 只能看过去。后者是流式推理与「无限长视频」的前提，代价是什么？</p>  <p>notebook 的设定让两者<strong>总预算完全相同</strong>（时间下采样步长 $s$、每个 latent $k$ 维），差别只在解码时能用哪些 latent：</p>  <div class="ascii">   总预算相同: (T/s) 个 latent，每个 k 维
+
+   非因果解码第 t 帧:  可用 latent 0 1 2 3 ... T/s-1   （全部）
+                                   ^t 在这里
+   因果解码第 t 帧  :  可用 latent 0 1 2            （只到 t//s）
+                                   ^t 在这里，后面的还没产生</div>  <table>
+    <thead><tr><th>$s$</th><th>$k$</th><th>总预算</th><th>非因果均值</th><th>因果均值</th><th>流式的代价</th></tr></thead>
+    <tbody>
+      <tr><td>$2$</td><td>$8$</td><td>$64$</td><td>$0.18941$</td><td>$0.19342$</td><td>$1.021\times$</td></tr>
+      <tr><td>$4$</td><td>$16$</td><td>$64$</td><td>$0.18635$</td><td>$0.18696$</td><td>$1.003\times$</td></tr>
+      <tr><td>$4$</td><td>$8$</td><td>$32$</td><td>$0.24403$</td><td>$0.25201$</td><td>$\mathbf{1.033\times}$</td></tr>
+      <tr><td>$8$</td><td>$16$</td><td>$32$</td><td>$0.23829$</td><td>$0.24022$</td><td>$1.008\times$</td></tr>
+    </tbody>
+  </table>  <p>代价很小（$\leq 3.3\%$）。但它<strong>不是均匀分布</strong>的。$s{=}4, k{=}8$ 那一行的逐帧比值是</p>  <pre><code>1.05 1.03 1.01 [1.12] | 1.03 1.02 1.01 [1.09] | 1.03 1.02 1.01 [1.10] | 1.00 1.00 1.00 1.00
+                ^ chunk 的最后一帧                                        ^ 最后一个 chunk</code></pre>  <p><strong>峰值落在每个 chunk 的<em>最后</em>一帧</strong>，而不是第一帧——那正是最需要「紧邻的未来」的位置。而最后一个 chunk 恒为 $1.00$，因为那里因果与非因果<em>等价</em>（后面本来就没有 latent 了）。</p>  <h3>代价对相关性是非单调的</h3>  <table>
+    <thead><tr><th>corr</th><th>非因果误差</th><th>因果误差</th><th>流式的代价</th><th>解读</th></tr></thead>
+    <tbody>
+      <tr><td>$0.000$</td><td>$0.77309$</td><td>$0.77187$</td><td>$0.9984\times$</td><td>未来<strong>无信息</strong></td></tr>
+      <tr><td>$0.300$</td><td>$0.70628$</td><td>$0.70719$</td><td>$1.0013\times$</td><td></td></tr>
+      <tr><td>$0.600$</td><td>$0.55280$</td><td>$0.56070$</td><td>$1.0143\times$</td><td></td></tr>
+      <tr><td>$0.800$</td><td>$0.40524$</td><td>$0.41710$</td><td>$1.0293\times$</td><td></td></tr>
+      <tr><td>$\mathbf{0.950}$</td><td>$0.24538$</td><td>$0.25293$</td><td>$\mathbf{1.0308\times}$</td><td><strong>峰值</strong></td></tr>
+      <tr><td>$0.995$</td><td>$0.17215$</td><td>$0.17318$</td><td>$1.0060\times$</td><td>未来与过去<strong>高度冗余</strong></td></tr>
+    </tbody>
+  </table>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>两端都便宜，中间最贵。相关性为零时未来什么也不提供，所以看不见未来毫无损失；相关性接近 1 时未来与过去几乎是同一件事，看过去就等于看了未来。只有在中间——未来带着过去没有的信息、而那信息又确实有用——因果性才真的要付钱。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>记 $I(\cdot)$ 为互信息。因果性的代价正比于$I(X_t ; X_{>t} \mid X_{\leq t})$——未来在<em>给定过去之后</em>还剩下的、关于当前的信息。对 AR(1)，$X_{>t} \perp X_t \mid X_{t}$ 之外的部分随 $\rho$ 变化：$\rho \to 0$ 时 $X_{>t}$ 与 $X_t$ 独立（该条件互信息为 $0$）；$\rho \to 1$ 时 $X_{>t}$ 由 $X_{\leq t}$ 几乎确定（条件互信息也趋于 $0$）。非单调因此是必然的。</p></div>
+  </div>  <div class="callout paper"><span class="label">「因果 tokenizer 会明显掉质量」在本课的设定下<strong>不成立</strong>（最多 $3.3\%$）。而这个小代价还集中在 chunk 边界上，意味着可以用<em>重叠 chunk</em> 或<em>可变 chunk 边界</em>把它进一步摊薄。所以在「流式 / 无限长」是产品需求时，因果 tokenizer 的选择不需要用质量来论证——它的真实成本在别处：<strong>不能与图像 VAE 共享权重</strong>，以及 chunk 边界处的接缝。</span>
+    <p>工程含义</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="discrete"><span class="num">4</span>连续 latent 还是离散 token</h2>
+  <p>连续 latent 接扩散，离散 token 接自回归语言模型。这个选择的时间维版本有一个可以算清的部分：<strong>比特预算怎么花</strong>。</p>  <p>设一段视频编成 $T/p_t$ 个 token、每个 token 从大小为 $K$ 的码本里取，则总比特是 $(T/p_t)\log_2 K$。固定这个总数，「多而小的 token」与「少而大的 token」哪个好？</p>  <table>
+    <thead><tr><th>比特预算</th><th>$p_t$</th><th>token 数</th><th>码本 $K$</th><th>重建相对误差</th><th>码本利用率</th></tr></thead>
+    <tbody>
+      <tr><td>$32$</td><td>$1$</td><td>$16$</td><td>$4$</td><td>$0.84254$</td><td>$100.0\%$</td></tr>
+      <tr><td>$32$</td><td>$2$</td><td>$8$</td><td>$16$</td><td>$0.71348$</td><td>$100.0\%$</td></tr>
+      <tr><td>$32$</td><td>$\mathbf{4}$</td><td>$\mathbf{4}$</td><td>$\mathbf{256}$</td><td>$\mathbf{0.53424}$</td><td>$99.6\%$</td></tr>
+      <tr><td>$64$</td><td>$1$</td><td>$16$</td><td>$16$</td><td>$0.70442$</td><td>$100.0\%$</td></tr>
+      <tr><td>$64$</td><td>$\mathbf{2}$</td><td>$\mathbf{8}$</td><td>$\mathbf{256}$</td><td>$\mathbf{0.50506}$</td><td>$100.0\%$</td></tr>
+    </tbody>
+  </table>  <p><strong>少而大的 token 明显更好</strong>：$32$ 比特下 $0.534$ vs $0.843$（$1.58\times$），$64$ 比特下 $0.505$ vs $0.704$（$1.39\times$）。而码本利用率一直接近 $100\%$——在这个规模上没有出现码本坍缩。</p>  <p>原因和上一节同源：<strong>更长的时间跨度让相关性可以被利用</strong>。一个覆盖 $4$ 帧的 token 可以只编码「这 $4$ 帧共同的运动」，而 $4$ 个各覆盖 $1$ 帧的 token 必须各自重复那份共同信息。</p>  <div class="callout warn"><span class="label">码本增大到某个点会开始<strong>坍缩</strong>（大量码字从不被使用），此时「有效码本大小」远小于 $K$，上面的账就不成立了。本课的规模（$K \leq 256$）没有触到这个边界（利用率 $\geq 99.6\%$），所以<strong>本节的结论只在「码本没坍缩」的前提下有效</strong>，而这个前提必须被单独测量——练习 4 就是测它。工业上应对坍缩的手段（EMA 更新、码本重启、乘积量化 / RVQ）属于 tokenizer 训练的范畴，本课不覆盖。</span>
+    <p>但这条结论有一个已知的边界</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="interact"><span class="num">5</span>空间压缩与时间压缩不能独立选</h2>
+  <p>第 1 节把三个决定说成「基本互不影响、可以分开讨论」。这在<em>代价</em>上是对的（$n = (T/p_t)(H/p_h)(W/p_w)$ 是可分的），但在<strong>收益</strong>上不对——而不对的方式有一个干净的说法。</p>  <p>时间冗余能被利用的前提是<strong>相邻帧在 latent 空间里确实相似</strong>。而空间压缩率越高，latent 越抽象，同一个物体的运动在 latent 上的表现就越<em>不</em>连续：一个物体在像素上移动 $2$ 个像素时 latent 几乎不变（$p_h{=}16$ 时它还在同一个 patch 里），而移动 $20$ 个像素时它跨过了 $1$ 个 latent 格子——<strong>latent 的时间相关性是「运动幅度相对 latent 网格」的函数</strong>。</p>  <div class="math-block">\[\rho_{\text{latent}} \approx f\!\left(\frac{\text{每帧位移(像素)}}{p_h}\right)\]</div>  <table>
+    <thead><tr><th>每帧位移</th><th>$p_h{=}8$ 时跨过的格子</th><th>$p_h{=}16$ 时</th><th>$p_h{=}32$ 时</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>$1$ px</td><td>$0.125$</td><td>$0.06$</td><td>$0.03$</td><td>三种压缩率下 latent 都几乎不变</td></tr>
+      <tr><td>$8$ px</td><td>$1.0$</td><td>$0.5$</td><td>$0.25$</td><td>$p_h{=}8$ 时已经换格子了</td></tr>
+      <tr><td>$32$ px</td><td>$4.0$</td><td>$2.0$</td><td>$1.0$</td><td>$p_h{=}8$ 时 latent 的时间相关性已很低</td></tr>
+    </tbody>
+  </table>  <p>所以<strong>空间压缩率越低（$p_h$ 越小），时间压缩的收益越小</strong>——因为同样的物理运动在更细的 latent 网格上造成更大的 latent 变化。反过来，很高的空间压缩率会让时间维显得异常冗余，于是「大 $p_t$ 看起来很划算」，而实际上损失被藏进了空间。</p>  <div class="callout warn"><span class="label">拿到一个 tokenizer 之后，<strong>在 latent 空间里量 $\rho$</strong>（而不是在像素上量），再用第 2 节的表选 $p_t$。如果你在像素上量出 $\rho{=}0.97$ 就去选 $p_t{=}16$，而 latent 上的 $\rho$ 只有 $0.75$，那么 $\rho_{\text{eff}} = 0.75^{16} = 0.010$——时间维已经被压过头了整整两个数量级，而在像素上完全看不出来。</span>
+    <p>一个可以直接检查的自洽性条件</p>
+  </div>  <h3>这也解释了工业配置的一个规律</h3>  <p>常见的视频 VAE 配置是空间 $8\times$、时间 $4\times$（如 $8{\times}8{\times}4$），而不是空间 $16\times$、时间 $16\times$——尽管后者的 token 数少得多。按上面的分析，$16\times$ 空间压缩会让 latent 过于抽象、而 $16\times$ 时间压缩会把 $\rho_{\text{eff}}$ 压到几乎为零。两者叠加的结果是「token 很少但每个都很难预测」——<strong>省下的算力被更难的建模问题吃掉了</strong>。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="objective"><span class="num">6</span>tokenizer 的训练目标不是下游的生成质量</h2>
+  <p>本模块全部用<strong>重建误差</strong>来评价压缩方案。这是标准做法，也是本课能算的东西。但它与「下游生成模型的质量」<strong>不是同一件事</strong>，而差别的方向是可以说清的。</p>  <table>
+    <thead><tr><th>目标</th><th>偏好什么样的 latent</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td>重建误差</td><td>信息保留最多</td><td>所有信息都被编码，包括不可预测的高频噪声</td></tr>
+      <tr><td>下游生成</td><td><strong>可预测</strong>的信息保留最多</td><td>生成模型要在 latent 上建分布；不可预测的成分只会增加建模难度</td></tr>
+    </tbody>
+  </table>  <p>两者冲突的一个具体形态：<strong>感知损失与对抗损失</strong>。纯 MSE 重建会保留大量高频噪声（它对 MSE 有贡献），于是 latent 里塞进了「噪声的具体实现」这种完全不可预测的东西。而加上感知/对抗损失后重建的 MSE <em>变差</em>，latent 却变得更适合下游生成——因为它编码的是「看起来对」而不是「逐像素对」。</p>  <div class="callout paper"><span class="label">感知损失、对抗判别器、码本的训练技巧（EMA、重启、RVQ）都属于 tokenizer <em>训练</em>的范畴，需要真实数据与网络。本课能给的是<strong>信息论层面的账</strong>：在给定的压缩预算下，时间维能提供多少可利用的冗余（第 2 节），以及比特该怎么在「token 数」与「码本大小」之间分（第 4 节）。这两个账是<strong>训练技巧的上界</strong>——再好的训练也不能让 $\rho_{\text{eff}} = 0.01$ 的时间维变出冗余来。</span>
+    <p>本课不覆盖这一层，但要说清它的存在</p>
+  </div>  <p>还有一条实践含义：<strong>不要用重建 PSNR 来选 $p_t$</strong>。重建 PSNR 会一致地偏好小 $p_t$（信息保留更多），而下游生成质量在 $p_t$ 上有内点最优（太小则 token 太多、太大则 latent 太难预测）。本模块第 5 节的决策表里那五个量，没有一个是重建 PSNR。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="recap"><span class="num">7</span>本模块的四个量与它们的来源</h2>
+  <p>在进入决策表之前，把四个量的<strong>来源</strong>并列一次——因为它们的可靠性差别很大，而这决定了该多信哪一个：</p>  <table>
+    <thead><tr><th>量</th><th>来源</th><th>可靠性</th></tr></thead>
+    <tbody>
+      <tr><td>注意力代价 $(T/p_t)^2$</td><td><strong>恒等式</strong></td><td>完全可靠（与分辨率无关）</td></tr>
+      <tr><td>联合/逐帧的因子 $= T$</td><td><strong>恒等式</strong></td><td>完全可靠</td></tr>
+      <tr><td>3D 压缩的收益</td><td>在合成数据上实测</td><td>趋势可靠；具体数值依赖数据</td></tr>
+      <tr><td>有效相关性 $\rho^{p_t}$</td><td>一阶马尔可夫的<em>近似</em></td><td>notebook 里实测值略高于它（时间平均有平滑作用）</td></tr>
+      <tr><td>流式的代价</td><td>实测（线性编码器）</td><td>趋势与量级可靠；真实 tokenizer 是非线性的</td></tr>
+      <tr><td>比特预算的账</td><td>实测（$k$-means VQ）</td><td>在「码本未坍缩」的前提下可靠</td></tr>
+    </tbody>
+  </table>  <p><strong>前两条是恒等式，可以直接用来做算力规划</strong>；后四条是在合成数据上的测量，它们给出的是<em>方向与量级</em>，不是可以照搬的数字。而本模块刻意把它们都做成了<strong>可以在你自己的数据上重跑</strong>的函数——练习 1 估 $\rho$、练习 2 选 $p_t$、练习 3 量流式代价、练习 4 测码本坍缩。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="bridge01"><span class="num">8</span>两条恒等式，四条测量</h2>
+  <p>本模块的六个量分成两类，而这个区分决定了该多信哪一个：<strong>注意力代价 $(T/p_t)^2$ 与「联合/逐帧的因子 $=T$」是恒等式</strong>，可以直接用来做算力规划；而 3D 收益、有效相关性、流式代价、比特预算这四条是在合成数据上的<strong>测量</strong>，它们给出方向与量级，不是可以照搬的数字。所以本模块的四个练习刻意都做成了<em>可以在你自己的数据上重跑</em>的函数。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="summary"><span class="num">9</span>选 $p_t$ 的一张决策表</h2>
+  <p>把本模块四节合起来，选时间压缩率时该看的量与它们各自的方向：</p>  <table>
+    <thead><tr><th>量</th><th>怎么得到</th><th>增大 $p_t$ 时</th><th>约束</th></tr></thead>
+    <tbody>
+      <tr><td>注意力代价</td><td>$(T/p_t)^2 S^2$</td><td><strong>下降 $\propto 1/p_t^2$</strong></td><td>算力预算的上限</td></tr>
+      <tr><td>有效相关性 $\rho^{p_t}$</td><td>从数据估 $\rho$</td><td>下降</td><td>$\rho_{\text{eff}} < 0.3$ 后收益消失</td></tr>
+      <tr><td>latent 帧数 $T/p_t$</td><td>直接算</td><td>下降</td><td>必须 $\geq$（最长遮挡 $+2$）$/p_t$（模块 00 练习 3）</td></tr>
+      <tr><td>比特效率</td><td>固定比特下的重建误差</td><td><strong>改善</strong>（$1.39$–$1.58\times$）</td><td>码本坍缩的边界</td></tr>
+      <tr><td>与图像模型的兼容</td><td>$p_t{=}1$ 才有</td><td><strong>失去</strong></td><td>能否继承图像 VAE 权重</td></tr>
+    </tbody>
+  </table>  <p>五个量里有<strong>两个</strong>随 $p_t$ 增大而改善（代价、比特效率）、<strong>三个</strong>变差（收益、上下文、兼容性）。所以「调 $p_t$」不是单目标优化——模块 00 的胶囊把这个拉锯做成了一个可执行的体检。</p>  <p>还有一条不在表里但同样重要：<strong>这五个量里没有一个是重建 PSNR</strong>。第 6 节说明了理由——重建误差会一致地偏好小 $p_t$，而下游生成质量在 $p_t$ 上有内点最优。用重建指标选压缩率，会系统性地把 $p_t$ 选得太小，于是算力被浪费在「保留了不可预测的高频」上。</p>  <div class="callout intuition"><span class="label">时间压缩率是本课唯一一个能<strong>平方级</strong>换回算力的旋钮，而它换走的是<strong>可观测性</strong>。前者容易算，后者容易忘——所以选 $p_t$ 时最常见的错误不是压得不够，而是压过了之后再也没有回头检查「模型还能不能看见需要看见的东西」。</span>
+    <p>一句话</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../00_setup/00_overview.html"><div class="dir">← 上一模块</div><div class="t">00 · 总览：时间轴把什么改变了</div></a>
+    <a class="next" href="../02_spacetime_attn/02_讲解.html"><div class="dir">下一模块 →</div><div class="t">02 · 时空注意力：分解的代价与它的精确边界</div></a>
+  </div>
+
+</div>
+</body>
+</html>

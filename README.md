@@ -1,6 +1,6 @@
 # Frontier AI Researcher / Engineer Courses · 前沿 AI 研究工程师课程体系
 
-**77 courses · 490 lesson pages · 490 runnable notebooks · Colab-ready, CPU-first, from-scratch.**
+**78 courses · 496 lesson pages · 496 runnable notebooks · Colab-ready, CPU-first, from-scratch.**
 一套从 model evaluation 起步、长成全栈的前沿 AI 研究/工程课程体系 —— 深度 HTML 讲解 + 真实可跑 notebook，纯 numpy/CPU 优先、优雅降级到真实框架/GPU。
 
 📖 中文 → [跳转](#中文) · 🇬🇧 English → [jump](#english)
@@ -13,7 +13,7 @@
 ### 目录
 - [这是什么](#zh-what)
 - [快速开始](#zh-quickstart)
-- [课程总览（77 门）](#zh-catalog)
+- [课程总览（78 门）](#zh-catalog)
 - [每门课的格式](#zh-format)
 - [学习路径建议](#zh-paths)
 - [仓库结构](#zh-layout)
@@ -49,7 +49,7 @@ jupyter lab
 先打开某模块的 `NN_讲解.html`（或先看 `index.html` 选路径），读完讲解再跑同名的 `.ipynb`。所有课程共用同一份 `assets/style.css`。
 
 <a name="zh-catalog"></a>
-### 课程总览（77 门）
+### 课程总览（78 门）
 
 #### C00–C09 · 核心 LLM / 评测主线
 | 课 | 目录 | 主题 |
@@ -329,6 +329,85 @@ jupyter lab
 > （最优 2.2 处 FPR 仍 13.3%）· m04 的事前登记模板拦住 3/4，**DiD 那个拦不住**
 > （问题在不可检验的那一半里）· m05 的审计器对设计 C 无警报，而它有约 −0.15 的干扰偏差。
 
+
+| 课 | 目录 | 主题 | 补的洞 |
+|----|------|------|--------|
+| C77 | `C77_Video_World_Models_Course/` | 视频与世界模型（时间轴的代价 · 视频 latent 与 tokenizer · 时空注意力的表达力边界 · 自回归漂移 · 世界模型的两义 · 视频评测的三个病理） | 全库 490 个讲解页里 `video generation` / `video diffusion` / `时空注意力` / `3D VAE` / `video tokenizer` / `temporal consistency` / `optical flow` / `帧插值` / `latent video` / `潜在动力学` / `想象中训练` / `动作条件` / `action-conditioned` / `长程漂移` / `FVD` / `Frechet Video` / `video benchmark` / `CLIP-SIM` 全部 **0 命中**；而非零命中逐条核对后**全部是同名不同义或指向本课的一句带过**：`DiT`（词边界）10 处**全是指向 C28 的转介**、C28 里每一处「视频/时空」都是「留待后续」的伏笔 · `世界模型`/`Dreamer` 归 **C41 模块 04**（规划侧）· `因果卷积` 的 4 处是 C20 的 SSM 展开视角与 C35 的音频流式 · `compounding error` 的 4 处分属 C04（agent 级联）、C41-04（规划）、C59（模仿学习）、C63（多级系统）· `时序一致性` 的 12 处全在**感知/评测**语境（C14/C18/C55）· `VBench` 的唯一命中是 **MVBench**（视频*理解*基准）的子串 |
+
+> **一条贯穿全课的形状**：时间轴上的每一个便宜的近似，
+> 都在别处产生一个**精确可算**的代价 —— 而这些代价**全都不会报错**。
+>
+> | 那个便宜的近似 | 精确的代价 | 会不会报错 |
+> |---|---|---|
+> | 时间压缩 $p_t$ | $\rho_{\text{eff}} = \rho^{p_t}$；latent 帧数 $T/p_t$ | 不会 |
+> | 逐帧独立处理 | 3D 收益 $= f(\text{corr})$，corr$=0$ 时为**负**（$0.984\times$）| 不会 |
+> | 分解式时空注意力 | Kronecker 秩 $1$ —— 表示不了加速 | 不会 |
+> | 串联接线（vs 并行）| 秩 $1$ vs $m^2{-}m{+}1$ | 不会 |
+> | 一步拟合（教师强制）| rollout 的运动能量只有真值的 $35\%$–$49\%$ | 不会 |
+> | 报平均而不是中位数 | 均值被 $10\%$ 的崩坏样本主导（差 $10^{16}$）| 不会 |
+> | 「一步准就是好模型」| $3.95\%$ 的一步误差 → $251\%$ 的回报高估 | 不会 |
+> | 在训练分布上做诊断 | $g{=}0$ 时匹配与误配的曲线**逐点相同** | 不会 |
+> | 逐帧特征算 FVD | 帧序敏感度 $7.1\times10^{-15}$ | 不会 |
+> | 不同 $N$ 下比 FVD | 零假设值 $\propto 1/N$（$N{=}64$ 时已是 $9.33$）| 不会 |
+>
+> **与 C28 / C41-04 零重叠**：C28 已经把图像扩散的五块地基讲完
+> （latent diffusion、DiT 架构、flow matching、CFG、一致性模型），
+> 而它里面**每一处**提到「视频」的地方都是指向前方的一句带过
+> （「SoRA 把 patch 推广成时空 patch」「时空一致的 VAE 远比图像难，高质量视频 VAE 仍是瓶颈」
+> 「把 CM/对抗蒸馏扩到视频 DiT 是实时视频生成的关键一步」）。
+> **本课就是那些「一句带过」的展开。** 而 C41 模块 04 拥有规划侧
+> （MPC / Dyna / 规划的复合误差），本课只做生成侧并显式量出两者的分界。
+>
+> **不训练任何神经网络** —— 本课要说明的性质（压缩率、Kronecker 秩、谱半径、
+> 矩匹配、有限样本偏差）都在线性代数与统计层面。用网络反而会把它们藏起来：
+> 「分解式注意力表达不了加速」在一个训练好的模型里会表现为
+> 「某些样本的运动看起来不对」，而不会表现为一个可以断言的秩。
+>
+> **五处诚实修正，其中模块 02 那一处连错了三次**：
+> ① 猜「多个物体各自不同速度就分解不了」—— **错**，最优 Kronecker 逼近误差**恰为 0**
+> （空间重排是<u>一个固定矩阵</u>，所以 $M = A_t \otimes P$ 仍是 Kronecker 积）。
+> 精确的判据是「空间模式与 $t$ 无关、时间模式与 $x$ 无关」，
+> 所以**分解不了的是加速与变向，不是「多个物体」**；
+> ② 猜「多叠几层能补回来」—— **错**，Kronecker 积的乘积仍是 Kronecker 积，八层复合恒为秩 $1$；
+> ③ 猜「残差连接能补回来」—— **也错**，
+> $(I + I{\otimes}A_s)(I + A_t{\otimes}I) = (I + A_t) \otimes (I + A_s)$，验证到 $0.000\times10^{0}$；
+> 第四次才对：**并行分支**才是表达力的来源（秩 $2/4/16$）。
+> ④ 「多步 / rollout 损失能修 $\hat a$ 的向下偏差」—— **错**（最优 $k$ 在 $\{1,2,4\}$ 之间跳，
+> 而模型正确指定时各 $k$ 的预测误差只差在第 4 位小数）。
+> 它的真实作用是在**误配**下把精度从短跨度挪到长跨度，
+> 理由是「一步拟合的模型在 $H{=}4$ 时误差 $1.028 > 1.0$ —— **比直接预测均值还差**」；
+> ⑤ 「动作分布偏移会被 rollout 放大」—— **不成立**（模型匹配时一步误差在策略幅度跨 30 倍下
+> 完全平坦：$0.05360 \to 0.05461$，$+1.9\%$）。统一的说法：
+> **分布偏移本身不是问题，误配 × 偏移才是**（误配时同样偏移下涨 **44 倍**）——
+> 这也解释了为什么「加大训练动作范围」有效而「加大数据量」无效。
+>
+> 另有两处方法层的修正：**平稳性诊断必须在一批序列上做**
+> （单条 $s_2/s_1$ 在 $T{=}400$ 时 p5–p95 跨 $0.67$–$1.59$，而批级中位数是 $0.998 \pm 0.046$）；
+> **能量比必须相对一批真实序列算**，因为 sd 估计量的中位数本身只有真值的 $0.885$。
+>
+> **两处意外收获**：① **并行分支的 Kronecker 秩饱和值有闭式 $m^2 - m + 1$**
+> （$m = \min(T,S)$），七组配置（$m=3,4,5,6$）全部精确命中（$7, 13, 21, 31$），
+> 而它**严格小于**朴素上界 $\min(T^2,S^2)$（$m{=}5$ 时是 21 而不是 25）；
+> ② **FVD 的盲区取决于特征，而好的特征能把高阶差别搬进前两阶** ——
+> 一个均值、方差、时间相关性**全部匹配**、只有峰度从 3 变成 1 的模式坍缩：
+> FVD(逐帧) 的比值是 $0.80$（**低于**同分布基线，完全盲），而 FVD(时空) 放大 $20.9\times$，
+> 机制很具体：$\vert\Delta\vert$ 这个特征把一个**四阶矩**差别转成了**一阶矩**差别。
+>
+> **六处「本课自己的配置通不过自己的验收」**（刻意设计）：
+> m01 的「峰值在 chunk 最后一帧」在 $s{=}2$ 时不成立（chunk 内差 $<5\times10^{-3}$，成立范围是 $s\geq3$）·
+> m02 的整套 Kronecker 分析是**线性算子**层面的，它给出的是下界，
+> **不**证明串联式网络学不会加速 · m03 练习 1 里「多步损失修漂移」这条流行建议
+> 三项测试**两项失败** · m04 第 4 节的 10 步误差有**混淆因素**
+> （$g{=}3$ 时闭环本身不稳定，$\rho(A+B\cdot3K)>1$，那个 $199.86$ 里很大一部分不是模型误差）·
+> m04 练习 4 里「四项验收互不蕴含」**被部分推翻**（① 与 ② 是耦合的，
+> 没有哪个缩放能让 ① 过而 ② 不过；仍成立的是 ① 不蕴含 ③、① 不蕴含 ④）·
+> m05 练习 2 里覆盖率**不是** FVD 盲区的万能补丁（在矩匹配的坍缩上只降到 $0.90\times$）。
+>
+> 而本课的可交付物是**十个可以在几行 numpy 里重跑的检查**：
+> $\rho$ 的估计 · $p_t$ 的上限 · 流式代价 · 码本的熵 · Kronecker 秩 ·
+> 全局连通跳数 · $\rho(\hat A)$ · 崩坏率 · 批级平稳性 · 帧序置换检验。
+> 十个里有**四个**会否决一条流行的做法或说法，而它们全部可以在拿到真实模型**之前**跑。
+
 <a name="zh-format"></a>
 ### 每门课的格式
 
@@ -339,7 +418,7 @@ CXX_Xxx_Course/
 ├── glossary.md          术语词典（≥12KB）
 ├── references.md        参考清单（论文/文档，标★必读）
 ├── requirements.txt      依赖（绝大多数课只需要 numpy/pandas/jupyterlab）
-├── assets/style.css      全站共用同一份样式（77 门课字节级一致）
+├── assets/style.css      全站共用同一份样式（78 门课字节级一致）
 ├── 00_setup/
 │   ├── 00_overview.html         课程总览
 │   └── 00_environment_check.ipynb
@@ -374,9 +453,9 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 ├── index.html               全站课程总览页
 ├── COURSES_PLAN.md            课程规划与构建历史的完整记录
 ├── ENV_SETUP.md                本地 conda 环境搭建笔记
-├── requirements-all.txt        全部 77 门课依赖的合集（装一次跑所有课）
+├── requirements-all.txt        全部 78 门课依赖的合集（装一次跑所有课）
 ├── _buildkit/                  house-style 生成器（coursekit.py）+ 各课构建脚本
-├── C00_..._Course/ … C76_..._Course/   77 门课，每门结构见上
+├── C00_..._Course/ … C77_..._Course/   78 门课，每门结构见上
 └── README.md                   就是这份文件
 ```
 
@@ -390,7 +469,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 <a name="zh-env"></a>
 ### 环境与依赖
 
-- **本地全量环境**：一个 conda env（`courses`，Python 3.11）配好 PyTorch + HuggingFace 全家桶 + 常用科学计算库即可跑完全部 77 门课，详见 [`ENV_SETUP.md`](./ENV_SETUP.md)；合集依赖在 [`requirements-all.txt`](./requirements-all.txt)。
+- **本地全量环境**：一个 conda env（`courses`，Python 3.11）配好 PyTorch + HuggingFace 全家桶 + 常用科学计算库即可跑完全部 78 门课，详见 [`ENV_SETUP.md`](./ENV_SETUP.md)；合集依赖在 [`requirements-all.txt`](./requirements-all.txt)。
 - **只想跑单门课**：进对应课程目录 `pip install -r requirements.txt` 即可——大多数课这份文件只有 `numpy`/`pandas`/`jupyterlab`/`ipykernel` 四五行。
 - 所有需要 `transformers`/`bitsandbytes`/`qwen-vl-utils` 等重依赖的真实模型 cell 都包了 `try/except`：装不上/没网/没 GPU 时会优雅降级到纯 Python/numpy 的替代实现或跳过，**不会让整本 notebook 崩掉**。
 
@@ -410,6 +489,7 @@ notebook 内部的固定节奏：**worked example（讲解配套的最小实现�
 - 2026-09-09：新增 C74（3D 高斯溅泼与实时渲染），同一批 3D 课单的第二门。缺口验证（全库 472 个讲解页逐关键词 grep）：`球谐`/`spherical harmonic` 0、`alpha compositing` 0、`tile 光栅化` 0、`EWA` 0；而 `体渲染`/`α 合成`/`高斯溅泼`/`NeRF` 的少数命中全部是 C72/C73/C55 里指向本课的一句带过。**因为选课路径跳过了 NeRF，体渲染与 α 合成的地基由本课模块 01 自带。** 6 个 notebook、123 个 code cell、24 道练习自测两遍实跑通过；notebook 里从零写出一个能出图的 tile 光栅化器，并与逐像素暴力实现**逐位相等到机器精度**。**本轮有四处结论被真实计算否掉后重写**，两条最值得记：① **对分段常数密度，α 合成精确到机器精度，连 $N{=}1$ 都对**（$N{=}1$ 误差为 0，$N{=}256$ 是 8.9e−16）——所以离散化误差**只**来自 σ 在段内变化，而那时中点法则是**二阶**的（每翻一倍 $N$ 误差降到 1/4.00，我最初写的 ∝1/N 是错的）；② **张角 53° 时投影后的协方差根本不存在**——2.28% 的质量落在 $z\le0$，$z\to0^+$ 的样本被投到无穷远，二阶矩积分发散（蒙特卡洛估计从 $n{=}10^4$ 到 $10^6$ 涨 9 倍、种子间差 3 倍），**所以「仿射近似在这里误差多少」这个问题问错了，它要对比的真值不存在**。另有两条：逐位比对最初漏了第三个近似（3σ 包围盒是 tile 对齐的，其影响 0.50 个 8 bit 色阶）；「尺度梯度更适合当密度判据」是单次运行的假象（一个目标一个种子时命中 67%，跑满 6 次是 28%，且在每一档都低于随机基线 25%）。顺带把一个流行说法量化纠正了：**SH 的「角分辨率 180/(ℓ+1)」高估约 1.45 倍**，实测（20% 相对残差判据）是 **125/(ℓ+1)**——deg 3 只到半角 **31.2°**，而抛光塑料要 12.3°、抛光金属 3.4°，**所以 SH deg 3 只能勉强表示粗糙塑料级的高光，而这是表示能力的限制、不是优化没收敛**。另有三处「本课自己的配置通不过自己的审计」。全谱达到 **75 门 · 478 讲解 HTML · 478 notebook**。
 - 2026-09-10：新增 C75（三维重建与 3D 生成），同一批 3D 课单的第三门，也是这批的收尾。缺口验证（全库 478 个讲解页逐关键词 grep）：`Structure from Motion` / `bundle adjustment` / `gauge` / `Schur` / `立体匹配` / `代价体` / `plane sweep` / `单目深度` / `TSDF` / `Marching Cubes` / `泊松重建` / `Score Distillation` / `倒角距离` 全部 **0 命中**；`Chamfer` 的 1 处在 C54 的匈牙利匹配上下文，`ICP` 的 9 处全是 **ICPR**（会议名）的子串。6 个 notebook、125 个 code cell、24 道练习自测两遍实跑通过。**与 C72/C73/C74 不同：本课有真实的优化（束调整、平面扫掠、SDS），但不训练任何网络**——因为核心问题就是优化的性质（可观测性、条件数、不动点）。**本轮有六处结论被真实计算否掉后重写**，三条最值得记：① 我第一版测「小基线让条件数爆到 $10^{19}$」时，那个轨迹让相机转 100° 却几乎不平移，于是 **40 个点里有 25–33 个跑到了相机背后**（投影 u 到 52 万像素）——我测的是一个坏掉的场景，不是小基线效应；换成 look-at 轨迹后才得到干净的 $\propto (B/z)^{-2}$（小基线端实测指数 −2.00）。② **前向运动不让 $E$ 退化**（$\sigma_8/\sigma_9 = 1.3\times10^{15}$），退化的是**三角化**（极点附近视线夹角只有外圈的 1/7.5）——这是两件不同的事，混在一起会让人去修错的地方。③ **「SDS 里的 $-\epsilon$ 是降方差的控制变量」只在高噪端或模式附近成立**：逐 $t$ 看效应完全反转，低噪端（$t{=}0.05$）它让方差**涨 391 倍**、高噪端（$t{=}0.95$）降 1533 倍；无条件成立的只有「它不改变期望」这一条（而两个估计量之差恰好不含 $x$，6 个 $x$ 处逐位相同）。**另有两处意外收获**：纯旋转时零空间恰好是 **npt + 6**（5 组配置验证——每个点的深度都不可观测 + 全局旋转 3 + 平移 3，而尺度被并进逐点深度里，所以它随场景规模增长而不是「7 加一点」）；先验权重 $(0.9,0.1)$ 时**次模式不再是吸引子**，SDS 给出 **100%/0%** 而不是 90%/10%——所以「多样性坍缩」不只是概率被压平，而是少数模式在动力学里直接消失。顺带把三条常被含糊的评测口径量化了：单目深度的协议三选（对齐**域** × 自由度 × 逐图/全局）**各值一到两个数量级、合起来 154 倍**，而规则是「对齐域必须与模型的不变性所在的域一致」（两个方向都验了，所以**评测协议不能独立于模型来定**）；**Chamfer 不是度量**（反例 $20 > 5{+}5$，超出 2 倍，所以「CD 差 0.1」没有传递性）；**CD-L1 对离群点线性而 CD-L2 平方**（一个 50 倍半径的离群点让 L1 涨 1.31× 而 L2 涨 **293×**，理论 $(d{-}1)^p/n$ 与实测吻合到 2e-4）。全谱达到 **76 门 · 484 讲解 HTML · 484 notebook**。
 - 2026-09-10：新增 C76（因果推断与线上归因）。缺口验证（全库 484 个讲解页逐关键词 grep）：`potential outcome` / `工具变量` / `instrumental variable` / `2SLS` / `双重差分` / `difference-in-differences` / `合成控制` / `double machine learning` / `doubly robust` / `双重稳健` / `positivity` / `平行趋势` / `SUTVA` / `溢出效应` / `集群随机` / `switchback` / `多触点` / `last-touch` / `增益模型` / `后门准则` / `AIPW` 全部 **0 命中**；`backdoor` 的 8 处**全是后门攻击**（C29/C44），`propensity` 的 6 处里 4 处是安全评测里的「倾向性」、2 处是 C47/C63 的位置偏差 IPS；`潜在结果` 的唯一一处在 C10-07 的一句话里 —— 正好印证边界。6 个 notebook、106 个 code cell、24 道练习自测两遍实跑通过。**与 C10 模块 07 零重叠**：那一节拥有整套 A/B 统计工具箱（假设检验、功效/MDE、多重比较、序贯、CUPED），本课一概不重复，定位是「C10-07 假设随机化有效；本课处理它无效或不够的情形」。**整门课由一条代数恒等式框定**：朴素差 $=$ ATT $+$ 选择偏差 —— 不是近似，实测 `1.582605 = 0.647736 + 0.934869`，**两边之差恰为 0**。**贯穿全课的线：因果推断的失效几乎从不表现为错误，而是表现为「答对了另一个问题」** —— 十几个失效场景里**没有一个会报错**，每一个都给出格式正确、置信区间漂亮、换 seed 也复现的数字（你以为估全人群 ATE，实际估到 ATT，相差 2.09 倍 / 或「两臂齐全的层上的 ATE」，$K{=}800$ 时**静默丢弃 22.2% 的样本** / 或直接效应，$2.90 \to 2.00$ 丢掉 31% / 或重叠人群的 ATE，$2.0019 \to 1.4371$ 而被排除者效应是 **+4.96** / 或与 OLS 无法区分的有偏估计，**1.8009 vs 1.7994** / 或直接效应而非全局效应，**1.00 vs 2.00** / 或按曝光顺序分配的会计份额，真实份额 **7.1% 被记成 38.0%** / 或长期效应中只经由代理指标的那部分，短期 **+1.005** 而长期 **−0.999**，**符号反转**）。**两个 bit 级恒等式**，都说明「双重稳健」可以在不报任何错的情况下消失：① **常数 $\hat e$ 使 AIPW $\equiv$ G-computation** —— 每臂带截距的 OLS 使臂内残差和恰为 0，修正项整体为 0，**无论 $\hat e$ 对不对**（4 个模型规模上差 $< 2\times10^{-11}$；而 $q{=}400$ 时 G-comp 已崩到 **+123.44**，AIPW 与它逐位相同）；② **过拟合把修正项连续吃掉 $4.4\times10^5$ 倍**（$3.15\times10^{-1} \to 7.08\times10^{-7}$，单调）—— **越强的结果模型越把纠偏机制关掉**，而没有任何拟合优度指标会标记这件事。**本轮有六处结论被真实计算否掉后重写**，四条最值得记：① **「RDD 带宽越小偏差越小」在两侧曲率*对称*时是假的** —— 两侧的局部线性偏差**恰好抵消**，最优带宽变成用满全部数据（$h^{*}{=}1.0$）；必须两侧曲率不同才有内点最优（$h^{*}{=}0.2$，$h{=}1.0$ 偏 0.4175）。**RDD 的偏差取决于两侧形状之*差*，不是曲率大小**；② **「DML 的交叉拟合总是更好」是错的** —— 在部分线性的残差对残差得分里**四个设定全部更差**（过拟合同时压低 $\tilde T$ 与 $\tilde Y$，在比值里抵消）；它在 **AIPW 得分**里才必要，且是**必要条件不是充分条件**（$q{=}320$ 时交叉拟合的 G-comp 仍是 **+36.64**）；③ **「正交化是一种新估计量」在 OLS nuisance 下是假的** —— Frisch–Waugh–Lovell：`1.4633431908608447` vs `1.4633431908608445`，差 $2.2\times10^{-16}$，所以「上 DML」在 nuisance 是 OLS 时**不会改变任何数字**；④ **我第一版的双重稳健表证明不了它想证明的事** —— 结果模型的误配设成两臂相同的 $X^2$，于是它在 $\hat m_1 - \hat m_0$ 里**自动抵消**，「错」的模型给出 1.9928（几乎无偏）。教训：验证「模型 A 错时会怎样」之前，要先确认 A 真的错在**会影响估计量**的方向上。**两处意外收获**：**对撞偏差的强度有闭式解**（$Z = X+Y+\varepsilon$ 时条件相关恰为 $-1/(1+\sigma^2)$，实测 $-0.91698$ vs 理论 $-0.91743$，所以它不是「可能有多大」而是**可以事先算出来**）；**M-bias 需要四条边同时存在**，断任意一条偏差就从 $-0.31$ 回到 $\pm0.003$ —— 所以该节的论点不是「不要控制处理前变量」，而是**「时间先后不是判据」**。另有两条被量化的经验规则：**定向投放的盈亏平衡噪声 $\propto \text{sd}(\tau)^2/\text{ATE}$**（**二次**律，$h$ 翻倍容忍的噪声涨 3.79–3.92 倍而不是 2 倍）；**合成控制的 pre 期拟合优度对 post 期精度的预测力是 2/4** —— 掷硬币（无约束 OLS 在 4/4 种设定里 pre 期都更好而 post 期只在 2/4 里更好；post 期出现新因子时 **pre RMSE 逐位不变**、post RMSE 涨 3.0 倍）。另有**五处「本课自己的配置通不过自己的验收」**。全谱达到 **77 门 · 490 讲解 HTML · 490 notebook**。
+- 2026-09-10：新增 C77（视频与世界模型）。缺口验证（全库 490 个讲解页逐关键词 grep）：`video generation` / `video diffusion` / `时空注意力` / `3D VAE` / `video tokenizer` / `temporal consistency` / `optical flow` / `帧插值` / `latent video` / `潜在动力学` / `想象中训练` / `动作条件` / `长程漂移` / `FVD` / `Frechet Video` / `video benchmark` / `CLIP-SIM` 全部 **0 命中**；非零命中逐条核对后**全部是同名不同义或指向本课的一句带过**——`DiT`（词边界）10 处全是指向 C28 的转介，而 **C28 里每一处「视频/时空」都是「留待后续」的伏笔**（「SoRA 把 patch 推广成时空 patch」「时空一致的 VAE 远比图像难，高质量视频 VAE 仍是瓶颈」「把 CM/对抗蒸馏扩到视频 DiT 是实时视频生成的关键一步」）；`世界模型`/`Dreamer` 归 C41 模块 04（规划侧）；`因果卷积` 的 4 处是 C20 的 SSM 展开视角与 C35 的音频流式；`compounding error` 的 4 处分属 C04/C41-04/C59/C63 四种不同机制；`时序一致性` 的 12 处全在感知/评测语境；`VBench` 的唯一命中是 **MVBench** 的子串。6 个 notebook、93 个 code cell、24 道练习自测两遍实跑通过。**与 C28 / C41-04 零重叠**：本课就是 C28 那些「一句带过」的展开，而 C41-04 拥有规划侧、本课只做生成侧并显式量出分界。**不训练任何神经网络**——要说明的性质（压缩率、Kronecker 秩、谱半径、矩匹配、有限样本偏差）都在线性代数与统计层面，用网络反而会把它们藏起来。**贯穿全课的形状：时间轴上的每一个便宜的近似，都在别处产生一个精确可算的代价，而这些代价全都不会报错**（十条对照见上方 C77 小节，末列全是「不会」）。**本轮有五处结论被真实计算否掉后重写，其中模块 02 那一处连错了三次**：① 猜「多个物体各自不同速度就分解不了」——**错**，最优 Kronecker 逼近误差**恰为 0**（空间重排是一个固定矩阵，所以 $M = A_t \otimes P$ 仍是 Kronecker 积）；精确的判据是「空间模式与 $t$ 无关、时间模式与 $x$ 无关」，所以**分解不了的是加速与变向，不是「多个物体」**；② 猜「多叠几层能补回来」——**错**，Kronecker 积的乘积仍是 Kronecker 积，八层复合恒为秩 1；③ 猜「残差连接能补回来」——**也错**，$(I + I{\otimes}A_s)(I + A_t{\otimes}I) = (I + A_t) \otimes (I + A_s)$，验证到 $0.000\times10^{0}$；第四次才对：**并行分支**才是表达力的来源（秩 2/4/16，而完全 3D 是 25）。④ 「多步/rollout 损失能修 $\hat a$ 的向下偏差」——**错**（最优 $k$ 在 {1,2,4} 之间跳；模型正确指定时各 $k$ 的预测误差只差在第 4 位小数）；它的真实作用是在**误配**下把精度从短跨度挪到长跨度，理由是「一步拟合的模型在 $H{=}4$ 时误差 $1.028 > 1.0$——**比直接预测均值还差**」。⑤ 「动作分布偏移会被 rollout 放大」——**不成立**（模型匹配时一步误差在策略幅度跨 30 倍下完全平坦：$0.05360 \to 0.05461$，$+1.9\%$）；统一的说法是**分布偏移本身不是问题，误配 × 偏移才是**（误配时同样偏移下涨 **44 倍**），这也解释了为什么「加大训练动作范围」有效而「加大数据量」无效。另有两处方法层修正：**平稳性诊断必须在一批序列上做**（单条 $s_2/s_1$ 在 $T{=}400$ 时 p5–p95 跨 0.67–1.59，批级中位数是 $0.998 \pm 0.046$）；**能量比必须相对一批真实序列算**（sd 估计量的中位数本身只有真值的 0.885）。**两处意外收获**：并行分支的 Kronecker 秩饱和值有闭式 **$m^2-m+1$**（$m=\min(T,S)$），七组配置全部精确命中（7/13/21/31），且**严格小于**朴素上界 $\min(T^2,S^2)$；**FVD 的盲区取决于特征，而好的特征能把高阶差别搬进前两阶**——一个均值、方差、时间相关性全部匹配、只有峰度从 3 变成 1 的模式坍缩，FVD(逐帧) 的比值是 **0.80（低于同分布基线，完全盲）**而 FVD(时空) 放大 **20.9 倍**，机制是 $\vert\Delta\vert$ 把四阶矩差别转成了一阶矩差别。另有**六处「本课自己的配置通不过自己的验收」**。本课的可交付物是**十个可以在几行 numpy 里重跑的检查**，其中四个会否决一条流行的做法，而十个全部可以在拿到真实模型之前跑。全谱达到 **78 门 · 496 讲解 HTML · 496 notebook**。
 
 完整细节见 [`COURSES_PLAN.md`](./COURSES_PLAN.md)。
 
@@ -457,7 +537,7 @@ jupyter lab
 Read a module's `NN_讲解.html` lesson first (or start from `index.html` to pick a path), then run the matching `.ipynb`. All courses share one `assets/style.css`.
 
 <a name="en-catalog"></a>
-### Course Catalog (77 courses)
+### Course Catalog (78 courses)
 
 #### C00–C09 · Core LLM & Evaluation Track
 | # | Folder | Topic |
@@ -775,6 +855,100 @@ Read a module's `NN_讲解.html` lesson first (or start from `index.html` to pic
 > template catches 3/4 of the known-bad analyses and **misses the DiD one** (that problem lives
 > in the unfalsifiable half) · and m05's auditor raises no alert for design C, which nonetheless
 > carries roughly −0.15 of interference bias.
+
+| # | Directory | Topic | Gap it fills |
+|---|-----------|-------|--------------|
+| C77 | `C77_Video_World_Models_Course/` | Video and world models (the cost of the time axis · video latents and tokenizers · the expressivity limits of spatiotemporal attention · autoregressive drift · the two meanings of "world model" · three pathologies of video evaluation) | Across all 490 existing lesson pages: `video generation`, `video diffusion`, `spatiotemporal attention`, `3D VAE`, `video tokenizer`, `temporal consistency`, `optical flow`, `frame interpolation`, `latent video`, `latent dynamics`, `training in imagination`, `action-conditioned`, `long-horizon drift`, `FVD`, `Fréchet Video`, `video benchmark` and `CLIP-SIM` all had **zero** hits. Every non-zero hit was checked one by one and **all of them are either homonyms or one-line pointers to this course**: all 10 word-boundary `DiT` hits are referrals to C28, and *every* mention of video/spacetime inside C28 is an explicit "deferred to later" · `world model`/`Dreamer` belong to **C41 module 04** (the planning side) · the 4 `causal convolution` hits are C20's unrolled-SSM view and C35's streaming audio codecs · the 4 `compounding error` hits belong to C04 (agent cascades), C41-04 (planning), C59 (imitation learning) and C63 (multi-stage systems) · all 12 `temporal consistency` hits sit in **perception/evaluation** contexts (C14/C18/C55) · and the single `VBench` hit is a substring of **MVBench**, a video *understanding* benchmark |
+
+> **One shape runs through the whole course**: every cheap approximation on the time axis
+> produces an **exactly computable** cost somewhere else — and **none of those costs raise an error**.
+>
+> | The cheap approximation | The exact cost | Raises an error? |
+> |---|---|---|
+> | Temporal compression $p_t$ | $\rho_{\text{eff}} = \rho^{p_t}$; latent frame count $T/p_t$ | No |
+> | Treating frames independently | 3D gain $= f(\text{corr})$, and it is **negative** at corr$=0$ ($0.984\times$) | No |
+> | Factorized spatiotemporal attention | Kronecker rank $1$ — cannot represent acceleration | No |
+> | Serial wiring (vs parallel) | rank $1$ vs $m^2{-}m{+}1$ | No |
+> | One-step fitting (teacher forcing) | rollout motion energy is only $35\%$–$49\%$ of the truth | No |
+> | Reporting means instead of medians | the mean is dominated by $10\%$ collapsed samples ($10^{16}$ apart) | No |
+> | "Good one-step accuracy means a good model" | a $3.95\%$ one-step error → a $251\%$ reward overestimate | No |
+> | Diagnosing on the training distribution | at $g{=}0$ the matched and misspecified curves are **pointwise identical** | No |
+> | Computing FVD from per-frame features | frame-order sensitivity $7.1\times10^{-15}$ | No |
+> | Comparing FVD across different $N$ | the null value scales as $1/N$ (already $9.33$ at $N{=}64$) | No |
+>
+> **Zero overlap with C28 / C41-04.** C28 already covers the five foundations of image
+> diffusion (latent diffusion, the DiT architecture, flow matching, CFG, consistency models),
+> and **every single** mention of video inside C28 is a forward-pointer:
+> "SoRA generalizes the patch to spacetime", "a temporally consistent VAE is much harder than
+> an image one, and a high-quality video VAE is still the bottleneck", "extending CM /
+> adversarial distillation to video DiT is the key step for real-time video generation".
+> **This course is the expansion of those one-liners.** And C41 module 04 owns the planning
+> side (MPC / Dyna / compounding error in planning); this course covers only the generative
+> side and quantifies the boundary between them explicitly.
+>
+> **No neural network is trained.** Every property this course establishes — compression
+> ratios, Kronecker rank, spectral radius, moment matching, finite-sample bias — lives at the
+> level of linear algebra and statistics. A network would hide them: inside a trained video
+> model, "factorized attention cannot represent acceleration" shows up as "the motion looks
+> wrong in some samples", never as a rank you can assert.
+>
+> **Five honest corrections, and the one in module 02 was wrong three times in a row**:
+> (1) I guessed "several objects each at a different constant velocity cannot be factorized" —
+> **wrong**, the optimal Kronecker approximation error is **exactly 0** (the spatial
+> re-indexing is <u>a single fixed matrix</u>, so $M = A_t \otimes P$ is still a Kronecker
+> product). The precise criterion is "the spatial pattern must be $t$-independent and the
+> temporal pattern $x$-independent", so **what cannot be factorized is acceleration and
+> direction change, not "multiple objects"**; (2) I guessed "stacking more layers recovers it" —
+> **wrong**, a product of Kronecker products is still a Kronecker product, and eight stacked
+> layers stay at rank $1$; (3) I guessed "residual connections recover it" — **also wrong**,
+> $(I + I{\otimes}A_s)(I + A_t{\otimes}I) = (I + A_t) \otimes (I + A_s)$, verified to
+> $0.000\times10^{0}$. Only the fourth guess was right: **parallel branches** are the source of
+> expressivity (ranks $2/4/16$). (4) "Multi-step / rollout loss fixes the downward bias in
+> $\hat a$" — **wrong** (the best $k$ jumps around $\{1,2,4\}$, and when the model is correctly
+> specified the prediction errors across $k$ differ only in the 4th decimal). Its real function
+> is to shift accuracy from short to long horizons **under misspecification**, and the reason is
+> that "a one-step-fitted model has error $1.028 > 1.0$ at $H{=}4$ — **worse than predicting the
+> mean**". (5) "Action distribution shift gets amplified by rollout" — **does not hold** (with a
+> matched model the one-step error is completely flat across a 30× range of policy gain:
+> $0.05360 \to 0.05461$, $+1.9\%$). The unified statement: **distribution shift alone is not the
+> problem; misspecification × shift is** (the same shift raises the error **44×** under
+> misspecification) — which also explains why "widen the training action range" works while
+> "collect more data" does not.
+>
+> Two further method-level corrections: **stationarity must be diagnosed on a batch**
+> (a single sequence's $s_2/s_1$ spans $0.67$–$1.59$ from p5 to p95 at $T{=}400$, while the
+> batch median is $0.998 \pm 0.046$); and **the energy ratio must be computed against a batch
+> of real sequences**, because the median of the sd estimator is itself only $0.885$ of the truth.
+>
+> **Two unexpected findings**: (1) **the saturation value of the Kronecker rank under parallel
+> branches has a closed form, $m^2 - m + 1$** with $m = \min(T,S)$ — hit exactly on all seven
+> configurations ($m = 3,4,5,6$ giving $7, 13, 21, 31$), and it is **strictly below** the naive
+> bound $\min(T^2,S^2)$ (21 rather than 25 at $m{=}5$); (2) **FVD's blind spot is a property of
+> the feature, and a well-chosen feature can move a higher-moment difference into the first two
+> moments** — for a mode collapse whose mean, variance and temporal correlation are **all
+> matched** and only the kurtosis changes from 3 to 1, the per-frame FVD ratio is $0.80$
+> (**below** the same-distribution baseline, i.e. completely blind) while the spatiotemporal FVD
+> amplifies $20.9\times$; the mechanism is concrete: the $\vert\Delta\vert$ feature converts a
+> **fourth-moment** difference into a **first-moment** one.
+>
+> **Six places where the course's own configuration fails its own acceptance checks**
+> (deliberate): m01's "the peak sits at the last frame of each chunk" does not hold at $s{=}2$
+> (the within-chunk spread is $<5\times10^{-3}$; the claim's scope is $s\geq3$) · m02's entire
+> Kronecker analysis is at the **linear-operator** level, so it gives a lower bound and does
+> **not** prove that a serially-wired network cannot learn acceleration · in m01's exercise 1,
+> the popular advice "use rollout loss to fix drift" **fails two of three tests** · m04 section 4's
+> 10-step errors carry a **confound** (at $g{=}3$ the closed loop is itself unstable,
+> $\rho(A+B\cdot3K)>1$, so a large part of that $199.86$ is not model error) · m04's exercise 4
+> **partially refutes** "the four acceptance checks are mutually independent" (① and ② are
+> coupled — no scaling makes ① pass while ② fails; what still holds is that ① implies neither ③
+> nor ④) · and m05's exercise 2 shows coverage is **not** a universal patch for FVD's blind spot
+> (on a moment-matched collapse it only drops to $0.90\times$).
+>
+> The deliverable is **ten checks that each re-run in a few lines of numpy**: estimating $\rho$ ·
+> the upper bound on $p_t$ · the streaming cost · the codebook's entropy · Kronecker rank ·
+> hops to global connectivity · $\rho(\hat A)$ · the collapse rate · batch-level stationarity ·
+> and the frame-order permutation test. **Four of the ten refute a popular practice or claim**,
+> and all ten can be run *before* a real model exists.
 <a name="en-format"></a>
 ### Format of Each Course
 
@@ -856,5 +1030,6 @@ Every notebook follows the same rhythm: **worked example (a minimal from-scratch
 - 2026-09-09: Added C74 (3D Gaussian Splatting and real-time rendering), the second course in the same batch of 3D topics. Gap check (keyword grep across all 472 existing lesson pages): `spherical harmonic` 0 hits, `alpha compositing` 0, `tile rasterization` 0, `EWA` 0; the few hits for volume rendering / alpha compositing / Gaussian Splatting / NeRF are all one-line pointers in C72/C73/C55 that defer to this course. **Because the chosen path through the 3D courses skipped NeRF, module 01 carries its own volume-rendering / alpha-compositing foundation.** 6 notebooks, 123 code cells, 24 exercise self-tests, all verified two-pass; the notebooks build a working tile rasterizer from scratch and check it against a per-pixel brute-force implementation **bit-for-bit**. **Four conclusions were rewritten after real computation contradicted them**, two worth singling out: (1) **for piecewise-constant density, alpha compositing is exact to machine precision, even at $N{=}1$** (error 0 at $N{=}1$, 8.9e−16 at $N{=}256$) — so the discretization error comes *only* from σ varying within a segment, and there the midpoint rule is **second order** (each doubling of $N$ cuts the error by 4.00×; my original ∝1/N was wrong); (2) **at a 53° subtended angle the projected covariance does not exist at all** — 2.28% of the mass falls at $z\le0$, samples approaching $z\to0^+$ project to infinity, and the second-moment integral diverges (the Monte-Carlo estimate grows 9× going from $n{=}10^4$ to $10^6$ and varies 3× across seeds), **so asking "how large is the affine approximation's error here" is the wrong question — the ground truth it would compare against does not exist**. Two more: the bit-for-bit comparison initially missed a third approximation (the 3σ bounding box is tile-aligned; its effect is 0.50 of one 8-bit color step); and "the scale gradient is a better densification criterion" was an artifact of a single run (67% top-quartile hit rate with one target and one seed, 28% averaged over six, and below the 25% random baseline at every density). It also quantitatively corrects a widespread claim: **the "angular resolution ≈ 180/(ℓ+1)" rule overstates SH capability by about 1.45×**; the measured limit (20% relative-residual criterion) is **125/(ℓ+1)** — degree 3 reaches only a **31.2°** half-angle, while polished plastic needs 12.3° and polished metal 3.4°, **so SH degree 3 can barely represent rough-plastic-grade specularity, and that is a limit of representational capacity, not of optimization**. There are also three places where the course's own configuration fails its own audits. Reached **75 courses · 478 lesson pages · 478 notebooks**.
 - 2026-09-10: Added C75 (3D reconstruction and 3D generation), the third and final course in this batch of 3D topics. Gap check (keyword grep across all 478 existing lesson pages): `Structure from Motion`, `bundle adjustment`, `gauge`, `Schur`, `stereo matching`, `cost volume`, `plane sweep`, `monocular depth`, `TSDF`, `Marching Cubes`, `Poisson reconstruction`, `Score Distillation` and `Chamfer distance` all had **zero** hits; the single `Chamfer` hit sits in C54's Hungarian-matching context, and all nine `ICP` hits are substrings of **ICPR**. 6 notebooks, 125 code cells, 24 exercise self-tests, all verified two-pass. **Unlike C72/C73/C74, this course runs real optimization (bundle adjustment, plane sweep, SDS) but trains no network** — because the core questions here *are* questions about optimization (observability, conditioning, fixed points). **Six conclusions were rewritten after real computation contradicted them**, three worth singling out: (1) when I first measured "a small baseline blows the condition number up to $10^{19}$", the camera trajectory rotated 100° while barely translating, so **25–33 of 40 points ended up behind the camera** (projected $u$ up to 520,000 px) — I was measuring a broken scene, not a small-baseline effect; switching to a look-at trajectory produced the clean $\propto (B/z)^{-2}$ law (measured exponent −2.00 in the small-baseline regime). (2) **Forward motion does not degenerate $E$** ($\sigma_8/\sigma_9 = 1.3\times10^{15}$) — what degenerates is **triangulation** (the ray angle near the epipole is only 1/7.5 of the outer ring); these are two different things, and conflating them sends you to fix the wrong stage. (3) **"The $-\epsilon$ term in SDS is a variance-reducing control variate" holds only at high noise or near a mode**: the effect fully reverses across $t$ — at $t{=}0.05$ it *increases* the variance by **391×**, at $t{=}0.95$ it reduces it by 1533×. The only unconditional statement is that it does not change the expectation (and the difference between the two estimators contains no $x$ at all — bit-identical at six different $x$). **Two unexpected findings**: under pure rotation the null space is exactly **npt + 6** (verified across five configurations — every point's depth is unobservable, plus 3 global rotation and 3 global translation, with scale absorbed into the per-point depths, so it grows with scene size rather than being "7 plus a bit"); and with prior weights $(0.9, 0.1)$ the minor mode **stops being an attractor**, so SDS produces **100%/0%** rather than 90%/10% — meaning "diversity collapse" is not just flattened probabilities but minority modes vanishing from the dynamics outright. It also quantifies three evaluation protocols that are routinely left vague: for monocular depth, the three protocol choices (alignment **domain** × degrees of freedom × per-image vs global) are each worth one to two orders of magnitude and **154× together**, and the rule is that "the alignment domain must match the domain in which the model is invariant" (verified in both directions, which means **the evaluation protocol cannot be defined independently of the model**); **Chamfer distance is not a metric** (counterexample $20 > 5{+}5$, violating by 2×, so "0.1 apart in CD" is not transitive); and **CD-L1 is linear in outliers while CD-L2 is quadratic** (one outlier at 50× the object radius raises L1 by 1.31× and L2 by **293×**, with the closed form $(d{-}1)^p/n$ matching measurement to 2e-4). Reached **76 courses · 484 lesson pages · 484 notebooks**.
 - 2026-09-10: Added C76 (causal inference and online attribution). Gap check (keyword grep across all 484 existing lesson pages): `potential outcome`, `instrumental variable`, `2SLS`, `difference-in-differences`, `synthetic control`, `double machine learning`, `doubly robust`, `positivity`, `parallel trends`, `SUTVA`, `spillover`, `cluster randomization`, `switchback`, `multi-touch`, `last-touch`, `uplift model`, `back-door criterion` and `AIPW` all had **zero** hits; all eight `backdoor` hits are **backdoor attacks** (C29/C44), four of the six `propensity` hits are "propensity" in the safety-eval sense and two are C47/C63's position-bias IPS, and the single `potential outcome` hit is one sentence in C10-07 — which is exactly the boundary this course starts from. 6 notebooks, 106 code cells, 24 exercise self-tests, all verified two-pass. **Zero overlap with C10 module 07**, which owns the entire A/B statistics toolkit (hypothesis testing, power/MDE, multiple comparisons, sequential testing, CUPED); none of it is repeated. The course is positioned as "C10-07 assumes randomization works; this course handles the cases where it doesn't, or isn't enough." **The whole course is framed by one algebraic identity**: the naive difference $=$ ATT $+$ selection bias — not an approximation; measured `1.582605 = 0.647736 + 0.934869`, with **the two sides differing by exactly 0**. **The thread running through the course: causal-inference failures almost never show up as errors — they show up as answering a different question correctly.** **Not one** of the dozen-plus failure scenarios raises an error; each produces a well-formed, tight-interval, seed-reproducible number (you think you are estimating the population ATE and get the ATT, 2.09× apart / or "the ATE over strata that have both arms", with $K{=}800$ **silently discarding 22.2% of the sample** / or the direct effect, $2.90 \to 2.00$, losing 31% / or the overlap-population ATE, $2.0019 \to 1.4371$, while the excluded group's effect is **+4.96** / or an estimate indistinguishable from the one it was meant to fix, **1.8009 vs 1.7994** / or the direct rather than the global effect, **1.00 vs 2.00** / or an accounting share allocated by exposure order, a true share of **7.1% booked as 38.0%** / or only the part of the long-term effect flowing through the surrogate, short-term **+1.005** and long-term **−0.999** — **the sign flips**). **Two bit-level identities**, both showing that "doubly robust" can vanish without any error: (1) **a constant $\hat e$ makes AIPW $\equiv$ G-computation** — per-arm OLS with an intercept forces within-arm residuals to sum to exactly 0, so the correction term is identically 0 **regardless of whether $\hat e$ is right** (agreement to $< 2\times10^{-11}$ across four model sizes; at $q{=}400$ G-computation has already blown up to **+123.44** and AIPW matches it bit-for-bit); (2) **overfitting eats the correction term continuously, by $4.4\times10^5$** ($3.15\times10^{-1} \to 7.08\times10^{-7}$, monotone) — **a stronger outcome model shuts the de-biasing mechanism off**, and no goodness-of-fit metric flags it. **Six conclusions were rewritten after real computation contradicted them**, four worth singling out: (1) **"smaller RDD bandwidth means smaller bias" is false when the curvature is *symmetric* about the cutoff** — the two sides' local-linear biases **cancel exactly** in the difference, so the optimal bandwidth becomes "use all the data" ($h^{*}{=}1.0$); only with different curvature on the two sides does an interior optimum appear ($h^{*}{=}0.2$; $h{=}1.0$ is off by 0.4175). **RDD bias depends on the *difference* between the two sides' shapes, not the magnitude of the curvature**; (2) **"cross-fitting in DML always helps" is wrong** — in the partially-linear residual-on-residual score it was **worse in all four setups** (overfitting deflates $\tilde T$ and $\tilde Y$ together and they cancel in the ratio); it is necessary in the **AIPW score**, and even there it is **necessary but not sufficient** (at $q{=}320$ the cross-fitted G-computation is still **+36.64**); (3) **"orthogonalization is a new estimator" is false under OLS nuisance** — Frisch–Waugh–Lovell: `1.4633431908608447` vs `1.4633431908608445`, differing by $2.2\times10^{-16}$, so "switching to DML" **changes nothing** when the nuisance is an OLS; (4) **my first doubly-robust table could not prove what it was meant to prove** — I made the outcome misspecification an $X^2$ term identical in both arms, so it **cancelled automatically** in $\hat m_1 - \hat m_0$ and the "wrong" model returned 1.9928 (nearly unbiased). The lesson: before verifying "what happens when model A is wrong", confirm A is wrong in a direction that **actually reaches the estimator**. **Two unexpected findings**: **collider bias has a closed form** (with $Z = X+Y+\varepsilon$ the conditional correlation is exactly $-1/(1+\sigma^2)$; measured $-0.91698$ vs theory $-0.91743$ — so its strength is not "how bad might it be" but **computable in advance**); and **M-bias requires all four edges at once**, with the bias returning from $-0.31$ to $\pm0.003$ if any one is broken — so that section's point is not "never control for pre-treatment variables" but **"temporal order is not the criterion."** Two rules of thumb also get quantified: **the break-even CATE-estimation noise for targeted rollout scales as $\text{sd}(\tau)^2/\text{ATE}$** (a **quadratic** law: doubling the heterogeneity buys 3.79–3.92× more noise tolerance, not 2×); and **the predictive value of a synthetic control's pre-period fit for post-period accuracy is 2/4** — a coin flip (unconstrained OLS fits the pre-period better in 4/4 setups but has lower post-period RMSE in only 2/4; when a new factor appears post-period, **the pre-period RMSE is bit-identical** while the post-period RMSE rises 3.0×). There are also **five places where the course's own configuration fails its own acceptance checks**. Reached **77 courses · 490 lesson pages · 490 notebooks**.
+- 2026-09-10: Added C77 (video and world models). Gap check (keyword grep across all 490 existing lesson pages): `video generation`, `video diffusion`, `spatiotemporal attention`, `3D VAE`, `video tokenizer`, `temporal consistency`, `optical flow`, `frame interpolation`, `latent video`, `latent dynamics`, `training in imagination`, `action-conditioned`, `long-horizon drift`, `FVD`, `Fréchet Video`, `video benchmark` and `CLIP-SIM` all had **zero** hits; every non-zero hit was checked one by one and **all are either homonyms or one-line pointers to this course** — all 10 word-boundary `DiT` hits are referrals to C28, and **every mention of video/spacetime inside C28 is an explicit "deferred to later"** ("SoRA generalizes the patch to spacetime", "a temporally consistent VAE is much harder than an image one and a high-quality video VAE is still the bottleneck", "extending CM / adversarial distillation to video DiT is the key step for real-time video generation"); `world model`/`Dreamer` belong to C41 module 04 (planning side); the 4 `causal convolution` hits are C20's unrolled-SSM view and C35's streaming audio; the 4 `compounding error` hits span four distinct mechanisms across C04/C41-04/C59/C63; all 12 `temporal consistency` hits are in perception/evaluation contexts; and the single `VBench` hit is a substring of **MVBench**. 6 notebooks, 93 code cells, 24 exercise self-tests, all verified two-pass. **Zero overlap with C28 / C41-04**: this course is the expansion of C28's one-liners, while C41-04 owns the planning side and this one covers only generation, quantifying the boundary explicitly. **No neural network is trained** — every property here (compression ratios, Kronecker rank, spectral radius, moment matching, finite-sample bias) lives at the level of linear algebra and statistics, and a network would only hide them. **The shape running through the course: every cheap approximation on the time axis produces an exactly computable cost somewhere else, and none of those costs raise an error** (ten of them are tabulated in the C77 section above; the last column is "No" throughout). **Five conclusions were rewritten after real computation contradicted them, and the one in module 02 was wrong three times in a row**: (1) I guessed "several objects each at a different constant velocity cannot be factorized" — **wrong**, the optimal Kronecker approximation error is **exactly 0** (the spatial re-indexing is a single fixed matrix, so $M = A_t \otimes P$ is still a Kronecker product); the precise criterion is "the spatial pattern must be $t$-independent and the temporal pattern $x$-independent", so **what cannot be factorized is acceleration and direction change, not "multiple objects"**; (2) I guessed "stacking more layers recovers it" — **wrong**, a product of Kronecker products is still a Kronecker product and eight layers stay at rank 1; (3) I guessed "residual connections recover it" — **also wrong**, $(I + I{\otimes}A_s)(I + A_t{\otimes}I) = (I + A_t) \otimes (I + A_s)$, verified to $0.000\times10^{0}$; only the fourth guess was right: **parallel branches** are the source of expressivity (ranks 2/4/16, versus 25 for full 3D). (4) "Multi-step / rollout loss fixes the downward bias in $\hat a$" — **wrong** (the best $k$ jumps around {1,2,4}; when the model is correctly specified the prediction errors across $k$ differ only in the 4th decimal); its real function is to shift accuracy from short to long horizons **under misspecification**, and the reason is that "a one-step-fitted model has error $1.028 > 1.0$ at $H{=}4$ — **worse than predicting the mean**". (5) "Action distribution shift gets amplified by rollout" — **does not hold** (with a matched model the one-step error is completely flat across a 30× range of policy gain: $0.05360 \to 0.05461$, $+1.9\%$); the unified statement is that **distribution shift alone is not the problem, misspecification × shift is** (the same shift raises the error **44×** under misspecification), which also explains why "widen the training action range" works while "collect more data" does not. Two further method-level corrections: **stationarity must be diagnosed on a batch** (a single sequence's $s_2/s_1$ spans 0.67–1.59 from p5 to p95 at $T{=}400$; the batch median is $0.998 \pm 0.046$); and **the energy ratio must be computed against a batch of real sequences** (the median of the sd estimator is itself only 0.885 of the truth). **Two unexpected findings**: the saturation value of the Kronecker rank under parallel branches has a closed form, **$m^2-m+1$** with $m=\min(T,S)$, hit exactly on all seven configurations (7/13/21/31) and **strictly below** the naive bound $\min(T^2,S^2)$; and **FVD's blind spot is a property of the feature, while a well-chosen feature can move a higher-moment difference into the first two moments** — for a mode collapse whose mean, variance and temporal correlation are all matched and only the kurtosis changes from 3 to 1, the per-frame FVD ratio is **0.80 (below the same-distribution baseline, i.e. completely blind)** while the spatiotemporal FVD amplifies **20.9×**, the mechanism being that $\vert\Delta\vert$ converts a fourth-moment difference into a first-moment one. There are also **six places where the course's own configuration fails its own acceptance checks**. The deliverable is **ten checks that each re-run in a few lines of numpy**, four of which refute a popular practice, and all ten can be run before a real model exists. Reached **78 courses · 496 lesson pages · 496 notebooks**.
 
 Full details in [`COURSES_PLAN.md`](./COURSES_PLAN.md).

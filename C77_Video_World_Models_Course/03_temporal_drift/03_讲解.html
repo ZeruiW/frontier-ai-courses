@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 时序一致性与自回归漂移</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+</head>
+<body>
+
+<div class="topbar"><div class="inner">
+  <a class="home" href="../index.html">⌂ 课程主页</a>
+  <a href="../glossary.md">术语词典</a>
+  <a href="../references.md">论文清单</a>
+  <span class="spacer"></span>
+  <span style="color:var(--fg-dim)">MODULE 03 / 06</span>
+</div></div>
+
+<div class="wrap">
+
+  <h1>03 · 时序一致性与自回归漂移</h1>
+  <p class="subtitle"><strong>「自回归必然漂移」是错的</strong>：误差按 $\vert\hat a\vert^k$ 演化，$\vert\hat a\vert<1$ 时<em>任何单帧的错误都会被指数地遗忘</em> · 真正累积的是<strong>分布</strong>的错误，而它有两支症状相反的形态 · <strong>一步拟合（教师强制）对持续性的估计向下有偏</strong>（$a{=}0.9,n{=}50$ 时中位数 $0.8835$）$\Rightarrow$ <strong>rollout 的运动能量只有真值的 $35\%$–$49\%$</strong>——<em>「越往后越糊、越静止」不需要神经网络就已出现，而且是目标函数问题不是能力问题</em> · 而尾部：$a{=}0.995,n{=}30$ 时 <strong>$28.60\%$ 的拟合给出 $\vert\hat a\vert>1$</strong>（指数爆炸）· <strong>方差的中位数 $8.93$ 而均值 $1.408\times10^{14}$</strong>——差 $16$ 个数量级，所以长视频指标必须报<strong>中位数 $+$ 崩坏率</strong> · 而<em>「用 rollout 损失修漂移」这条建议被实测限定</em>：它修不了那个偏差，模型正确指定时几乎什么也不改</p>
+
+  <div class="meta-box">
+    <div class="item"><div class="k">前置知识</div><div class="v">模块 00（观测帧不是马尔可夫的）；模块 01（时间压缩与因果性）；<strong>C41 模块 04</strong>（规划侧的复合误差）是本模块的对照——那里的误差累积是<em>对抗性</em>的（优化找模型的洞），本模块处理的是<em>分布性</em>的；AR(1) 与谱半径的基本概念</div></div>
+    <div class="item"><div class="k">配套 notebook</div><div class="v"><span class="badge cpu">CPU</span> 03_temporal_drift.ipynb（<strong>漂移不是必然的</strong>：误差按 $\vert\hat a\vert^k$ 演化，$\vert\hat a\vert<1$ 时初始误差<em>会被遗忘</em> / <strong>一步最小二乘对持续性的估计向下有偏</strong>（$a{=}0.9, n{=}50$ 时 $\hat a$ 中位数 $0.8835$）$\Rightarrow$ rollout 的稳态方差只有真值的 $\mathbf{35\%}$–$49\%$ / 而 $a{=}0.995, n{=}30$ 时有 <strong>$28.6\%$ 的拟合给出 $\vert\hat a\vert > 1$</strong>（那些会指数爆炸）/ <strong>方差的均值 $1.4\times10^{14}$ 而中位数 $8.93$</strong>）</div></div>
+    <div class="item"><div class="k">核心参考</div><div class="v">Ho et al., <em>Video Diffusion Models</em>（NeurIPS 2022，以及其中的自回归长视频扩展）· Harvey et al., <em>Flexible Diffusion Modeling of Long Videos</em>（NeurIPS 2022，层次化 / 关键帧条件）· Villegas et al., <em>Phenaki</em>（ICLR 2023，变长自回归视频）· Marriott, Pope &amp; Stine, <em>Bias in Estimation of Autoregressive Parameters</em>（Biometrika 1954 / Kendall 1954，$\hat a$ 的向下偏差）· Ross &amp; Bagnell, <em>DAgger</em>（AISTATS 2011，自回归 rollout 的分布偏移，与 C59 的模仿学习一节呼应）· 本课程 <strong>C41 模块 04</strong>（规划侧的复合误差）</div></div>
+    <div class="item"><div class="k">预计时长</div><div class="v">读 55 分钟 + 跑 50 分钟</div></div>
+  </div>
+
+  <div class="toc">
+    <h3>本章地图</h3>
+    <ol>
+      <li><a href="#law">误差增长律：漂移不是必然的</a></li>
+      <li><a href="#bias">第一种形态：一步拟合系统性低估了持续性</a></li>
+      <li><a href="#bimodal">第二种形态：少数模型会爆炸，而均值指标会同时错判两者</a></li>
+      <li><a href="#distribution">分布的错误不会自我纠正</a></li>
+      <li><a href="#diffusion">在扩散模型里，这两支各对应什么旋钮</a></li>
+      <li><a href="#teacher">教师强制为什么必然产生这个偏差</a></li>
+      <li><a href="#bridge03">四节的关系</a></li>
+      <li><a href="#fixes">四种修法，各修哪一支</a></li>
+    </ol>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="law"><span class="num">1</span>误差增长律：漂移不是必然的</h2>
+  <p>「自回归生成的视频越往后越糟」是一句几乎无人反驳的话。但它<strong>作为一般命题是错的</strong>，而错在哪里决定了该怎么修。</p>  <p>最简的自回归生成：学一个一步预测器 $\hat x_{t+1} = \hat a x_t$，然后反复代入自己的输出。如果初始帧带有误差 $\delta$，那么 $k$ 步后的误差是 $\vert\hat a\vert^k \delta$：</p>  <table>
+    <thead><tr><th>$\hat a$</th><th>$1$ 步</th><th>$10$ 步</th><th>$50$ 步</th><th>$200$ 步</th><th>增长律</th></tr></thead>
+    <tbody>
+      <tr><td>$0.50$</td><td>$0.5$</td><td>$9.8\times10^{-4}$</td><td>$8.9\times10^{-16}$</td><td>$6.2\times10^{-61}$</td><td><strong>收敛到 0</strong></td></tr>
+      <tr><td>$0.90$</td><td>$0.9$</td><td>$0.349$</td><td>$5.2\times10^{-3}$</td><td>$7.1\times10^{-10}$</td><td><strong>收敛到 0</strong></td></tr>
+      <tr><td>$0.99$</td><td>$0.99$</td><td>$0.904$</td><td>$0.605$</td><td>$0.134$</td><td><strong>收敛到 0</strong></td></tr>
+      <tr><td>$1.00$</td><td>$1$</td><td>$1$</td><td>$1$</td><td>$1$</td><td>恒定</td></tr>
+      <tr><td>$1.01$</td><td>$1.01$</td><td>$1.10$</td><td>$1.64$</td><td>$7.32$</td><td>指数爆炸</td></tr>
+      <tr><td>$1.05$</td><td>$1.05$</td><td>$1.63$</td><td>$11.5$</td><td>$1.7\times10^{4}$</td><td>指数爆炸</td></tr>
+    </tbody>
+  </table>  <div class="callout intuition"><span class="label">$\vert\hat a\vert < 1$ 时，<strong>任何单帧的错误都会被指数地遗忘</strong>。这不是一个近似说法——它是几何级数。所以「一帧生成得不好，后面就全毁了」在稳定动力学下不成立。而现实中的视频动力学在大多数尺度上<em>是</em>稳定的（物体最终会停下、光照会回到均值、镜头会稳住）。</span>
+    <p>稳定的动力学会遗忘错误</p>
+  </div>  <p>那为什么长视频确实会漂？因为真正累积的<strong>不是单条轨迹的误差，而是分布的错误</strong>。下面两节分别处理它的两种形态。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="bias"><span class="num">2</span>第一种形态：一步拟合系统性低估了持续性</h2>
+  <p>训练一步预测器用的是<strong>教师强制</strong>（teacher forcing）：输入真实的 $x_t$，预测真实的 $x_{t+1}$。这个目标函数有一个古老且精确的性质：<strong>它对自回归系数的估计向下有偏</strong>。</p>  <div class="math-block">\[E[\hat a] - a \approx -\frac{1 + 3a}{n}\]</div>  <p>（Kendall 1954 / Marriott–Pope 1954。$n$ 是训练序列长度。）notebook 在 $6000$ 次重复上量它：</p>  <table>
+    <thead><tr><th>真 $a$</th><th>$n$</th><th>$\hat a$ 中位数</th><th>$\hat a$ 均值</th><th>偏差（均值）</th><th>理论 $-(1{+}3a)/n$</th></tr></thead>
+    <tbody>
+      <tr><td>$0.90$</td><td>$50$</td><td>$0.88350$</td><td>$0.86709$</td><td>$-0.03291$</td><td>$-0.07400$</td></tr>
+      <tr><td>$0.90$</td><td>$200$</td><td>$0.89576$</td><td>$0.89181$</td><td>$-0.00819$</td><td>$-0.01850$</td></tr>
+      <tr><td>$0.90$</td><td>$1000$</td><td>$0.89944$</td><td>$0.89861$</td><td>$-0.00139$</td><td>$-0.00370$</td></tr>
+      <tr><td>$0.98$</td><td>$50$</td><td>$0.96745$</td><td>$0.95231$</td><td>$-0.02769$</td><td>$-0.07880$</td></tr>
+      <tr><td>$0.98$</td><td>$1000$</td><td>$0.97915$</td><td>$0.97826$</td><td>$-0.00174$</td><td>$-0.00394$</td></tr>
+    </tbody>
+  </table>  <p>理论式给出的是量级与符号，实测偏差约是它的一半——而<strong>符号与 $1/n$ 的标度是稳定的</strong>。</p>  <h3>后果：生成的视频变静止，而不是爆炸</h3>  <p>$\hat a < a$ 意味着学到的动力学比真实的<strong>更快衰减</strong>。把它拿去 rollout，稳态方差就会偏小：</p>  <table>
+    <thead><tr><th>真 $a$</th><th>$n$</th><th>真稳态方差</th><th>rollout 方差（中位数）</th><th>比值</th></tr></thead>
+    <tbody>
+      <tr><td>$0.90$</td><td>$50$</td><td>$5.263$</td><td>$3.830$</td><td>$0.728$</td></tr>
+      <tr><td>$0.90$</td><td>$1000$</td><td>$5.263$</td><td>$4.547$</td><td>$0.864$</td></tr>
+      <tr><td>$0.98$</td><td>$50$</td><td>$25.253$</td><td>$8.926$</td><td>$\mathbf{0.354}$</td></tr>
+      <tr><td>$0.98$</td><td>$200$</td><td>$25.253$</td><td>$10.974$</td><td>$0.435$</td></tr>
+      <tr><td>$0.98$</td><td>$1000$</td><td>$25.253$</td><td>$12.417$</td><td>$0.492$</td></tr>
+    </tbody>
+  </table>  <p>$a{=}0.98$ 时 rollout 的运动能量只有真实的 <strong>$35\%$–$49\%$</strong>。</p>  <div class="callout danger"><span class="label">这个现象通常被归因于「模型能力不足」或「误差累积」。但本节说明：<strong>即使模型类完全正确、即使训练完美收敛到该目标的最优解，一步拟合本身就会低估动力学的持续性</strong>，于是 rollout 过度衰减、运动逐渐消失。这不是能力问题，是<em>目标函数</em>问题——而它也解释了为什么「多步/rollout 损失」「scheduled sampling」这类做法有用：它们改的正是这个目标。</span>
+    <p>「越往后越糊、越静止」有一个不需要神经网络的解释</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bimodal"><span class="num">3</span>第二种形态：少数模型会爆炸，而均值指标会同时错判两者</h2>
+  <p>上一节看的是中位数。$\hat a$ 还有方差，而 $\hat a$ 一旦超过 $1$，rollout 就<strong>指数爆炸</strong>。notebook 量出这个尾部有多重：</p>  <table>
+    <thead><tr><th>真 $a$</th><th>$n$</th><th>$\hat a$ 中位数</th><th>$P(\vert\hat a\vert > 1)$</th><th>$P(\vert\hat a\vert > 1.01)$</th></tr></thead>
+    <tbody>
+      <tr><td>$0.900$</td><td>$30$</td><td>$0.87435$</td><td>$1.12\%$</td><td>$0.67\%$</td></tr>
+      <tr><td>$0.900$</td><td>$100$</td><td>$0.89175$</td><td>$0.00\%$</td><td>$0.00\%$</td></tr>
+      <tr><td>$0.980$</td><td>$30$</td><td>$0.96213$</td><td>$16.52\%$</td><td>$9.73\%$</td></tr>
+      <tr><td>$0.980$</td><td>$50$</td><td>$0.96745$</td><td>$10.00\%$</td><td>$3.85\%$</td></tr>
+      <tr><td>$0.995$</td><td>$30$</td><td>$0.98727$</td><td>$\mathbf{28.60\%}$</td><td>$14.40\%$</td></tr>
+      <tr><td>$0.995$</td><td>$200$</td><td>$0.99180$</td><td>$9.58\%$</td><td>$0.13\%$</td></tr>
+      <tr><td>$0.995$</td><td>$1000$</td><td>$0.99421$</td><td>$0.15\%$</td><td>$0.00\%$</td></tr>
+    </tbody>
+  </table>  <p>真动力学越接近临界（$a \to 1$）、训练序列越短，不稳定的拟合就越多。$a{=}0.995, n{=}30$ 时<strong>超过四分之一的模型会爆炸</strong>。</p>  <h3>这两种失效的症状完全相反</h3>  <div class="ascii">                        一步拟合的 â 分布
+                              |
+              +---------------+---------------+
+              |                               |
+      多数：â &lt; a （中位数）            尾部：â &gt; 1
+              |                               |
+      rollout 过度衰减                  rollout 指数爆炸
+              |                               |
+      症状：越往后越静止/糊              症状：画面崩坏、数值溢出
+              |                               |
+              +-------------+-----------------+
+                            |
+                  而**均值指标同时错判两者**</div>  <table>
+    <thead><tr><th>真 $a$</th><th>$n$</th><th>真稳态方差</th><th>rollout 方差<strong>中位数</strong></th><th>rollout 方差<strong>均值</strong></th></tr></thead>
+    <tbody>
+      <tr><td>$0.90$</td><td>$50$</td><td>$5.263$</td><td>$3.830$</td><td>$4.721$</td></tr>
+      <tr><td>$0.98$</td><td>$50$</td><td>$25.253$</td><td>$\mathbf{8.926}$</td><td>$\mathbf{1.408\times10^{14}}$</td></tr>
+      <tr><td>$0.98$</td><td>$200$</td><td>$25.253$</td><td>$10.974$</td><td>$1.468\times10^{1}$</td></tr>
+      <tr><td>$0.98$</td><td>$1000$</td><td>$25.253$</td><td>$12.417$</td><td>$1.519\times10^{1}$</td></tr>
+    </tbody>
+  </table>  <p>$a{=}0.98, n{=}50$ 那一行：<strong>中位数 $8.93$，均值 $1.4\times10^{14}$</strong>——差 $16$ 个数量级。$10\%$ 的爆炸样本完全主导了均值。</p>  <div class="callout warn"><span class="label">在一批生成的长视频上报<strong>平均</strong>任何指标（FVD、逐帧 PSNR、运动幅度）都会被少数崩坏样本主导，而那些样本本来应该被单独拎出来看。可操作的做法：报<strong>中位数 + 崩坏率</strong>（例如「$P(\text{任一帧的能量} > 10\times$ 训练分布$)$」），这两个数分别对应上面那张图的两支。</span>
+    <p>所以长视频指标必须报分位数</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="distribution"><span class="num">4</span>分布的错误不会自我纠正</h2>
+  <p>上面两节讲的是 $\hat a$（动力学的持续性）。还有一个量同样会错，而且它的错误<strong>完全不随时间衰减</strong>：噪声尺度。</p>  <p>真动力学 $a{=}0.95$、真噪声 $\text{sd}{=}1.0$，真稳态 $\text{sd} = 1/\sqrt{1-a^2} = 3.2026$。如果模型用错的噪声尺度 rollout：</p>  <table>
+    <thead><tr><th>模型噪声 sd</th><th>第 $5$ 步的 sd</th><th>第 $50$ 步</th><th>第 $500$ 步</th><th>稳态 sd / 真值</th></tr></thead>
+    <tbody>
+      <tr><td>$0.50$</td><td>$2.674$</td><td>$1.599$</td><td>$1.605$</td><td>$\mathbf{0.5012}$</td></tr>
+      <tr><td>$0.80$</td><td>$2.962$</td><td>$2.545$</td><td>$2.568$</td><td>$0.8020$</td></tr>
+      <tr><td>$1.00$</td><td>$3.206$</td><td>$3.179$</td><td>$3.210$</td><td>$1.0024$</td></tr>
+      <tr><td>$1.20$</td><td>$3.481$</td><td>$3.813$</td><td>$3.852$</td><td>$1.2029$</td></tr>
+      <tr><td>$2.00$</td><td>$4.779$</td><td>$6.353$</td><td>$6.421$</td><td>$2.0049$</td></tr>
+    </tbody>
+  </table>  <p>比值恰好等于噪声尺度的比值（$0.5012$、$0.8020$、$1.2029$、$2.0049$）——因为稳态 sd 与噪声 sd 成正比。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>单条轨迹的误差可以被遗忘（第 1 节），但<strong>分布的错误是持久的</strong>：噪声尺度低估让生成越来越静止，高估让它越来越乱，而两者都不会「收敛回正确分布」——因为错的是<em>不动点本身</em>。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>对 $x_{t+1} = a x_t + \varepsilon_t$，$\varepsilon \sim N(0, \sigma^2)$，稳态分布是 $N(0, \sigma^2/(1-a^2))$。误差的遗忘（第 1 节）说的是<strong>转移算子</strong>的收缩性；而不动点由 $(a, \sigma)$ 共同决定。收缩性保证「初值不重要」，它<em>不</em>保证「收敛到正确的分布」——两件事经常被混为一谈。</p></div>
+  </div>  <div class="callout intuition"><span class="label">扩散模型在长 rollout 上「越来越糊」通常被解释为误差累积。更准确的说法是：<strong>采样温度 / 引导强度在自回归 rollout 里的作用被放大了</strong>——它直接决定了不动点的方差。CFG 强度偏高会让画面越来越「锐利到失真」，偏低会越来越糊，而这两个方向都<em>不是</em>误差累积，是不动点选错了。而修法也不同：误差累积要改训练目标（第 2 节），不动点错要改采样参数。</span>
+    <p>这解释了两个常见现象</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="diffusion"><span class="num">5</span>在扩散模型里，这两支各对应什么旋钮</h2>
+  <p>前三节用 AR(1) 做最小模型。放回扩散视频生成的语境，两支失效各自对应一组<strong>具体的、可调的</strong>东西——而它们不重叠。</p>  <table>
+    <thead><tr><th>本课的量</th><th>扩散里的对应物</th><th>调它会怎样</th></tr></thead>
+    <tbody>
+      <tr><td>$\hat a$（动力学的持续性）</td><td>时间层学到的帧间依赖强度</td><td>只能靠训练目标改（多步损失 / 更长的训练窗口）</td></tr>
+      <tr><td>$\vert\hat a\vert > 1$（不稳定）</td><td>自回归段间的能量放大</td><td>谱范数约束 / 更密的锚帧 / 段间重归一化</td></tr>
+      <tr><td>噪声尺度 $\sigma$（不动点）</td><td><strong>采样温度、CFG 强度、噪声调度的末端</strong></td><td>直接决定生成分布的方差 —— 训练完之后还能调</td></tr>
+      <tr><td>起始分布</td><td>第一段的条件（首帧 / 文本）</td><td>第 1 节说明它会被指数遗忘 —— 影响最小</td></tr>
+    </tbody>
+  </table>  <p>第三行是<strong>唯一在训练之后还能调的</strong>，而它恰好对应第 4 节那一支。所以有一条直接可用的分诊规则：</p>  <div class="ascii">   长视频质量下降
+        |
+   平稳吗？（第 4 节的批级诊断）
+        |
+   +----+----------------------+
+   |                           |
+  平稳                      不平稳
+   |                           |
+  不动点错                  还在累积
+   |                           |
+  调采样参数                 改训练目标 / 加锚帧
+  （CFG 强度 / 温度 /        （多步损失 / 谱约束 /
+    噪声调度末端）             更密的锚帧）
+   |                           |
+  **训练后就能试**          **需要重训**</div>  <div class="callout intuition"><span class="label">两支的修法在<strong>成本上差几个数量级</strong>：调采样参数是分钟级的，改训练目标是天级的。而第 4 节的诊断（批级平稳性 + 能量比）只需要一批已经生成好的视频，不需要任何额外的训练或标注。<strong>所以它应该是遇到「长视频质量下降」时的第一步，而不是最后一步。</strong></span>
+    <p>为什么这条分诊值得先做</p>
+  </div>  <h3>CFG 强度在自回归 rollout 里被放大</h3>  <p>单段生成里 CFG 强度影响的是<em>这一段</em>的锐度。而在自回归 rollout 里，每一段的输出成为下一段的条件，于是 CFG 造成的分布偏移<strong>进入了不动点</strong>：</p>  <p>按第 4 节的机制：如果 CFG 让每段的方差相对真实分布乘了 $\kappa$，那么 rollout 的稳态方差就被乘 $\kappa$——<strong>不是 $\kappa^{段数}$（那会是累积），而是一个固定的 $\kappa$</strong>（因为它改的是不动点，而不动点不随时间累积）。这个区别有实践含义：<em>它意味着「越往后越锐」这个现象如果真的在累积，那它<strong>不是</strong> CFG 造成的，而是 $\vert\hat a\vert>1$ 那一支</em>。</p>  <div class="callout paper"><span class="label">验证「CFG 在扩散视频 rollout 里如何影响不动点」需要一个真实的视频扩散模型。本课能给的是<strong>机制层面的对应</strong>：第 4 节已经量出「噪声尺度错 $\Rightarrow$ 稳态方差按同一比例错，且不随时间累积」（比值 $0.5012 / 0.8020 / 1.2029 / 2.0049$，与噪声比值逐位对应），而 CFG 在采样里的作用正是改变有效噪声尺度。把这两件事连起来是一次<em>推断</em>而不是一次测量——所以本课把它标成推断。</span>
+    <p>这一节没有 notebook 实验，理由要说清</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="teacher"><span class="num">6</span>教师强制为什么必然产生这个偏差</h2>
+  <p>第 2 节给出了偏差的数值与经典公式。这一节说清它<strong>为什么必然</strong>——因为这决定了哪些修法在原理上可能有效。</p>  <p>一步最小二乘的解是</p>  <div class="math-block">\[\hat a = \frac{\sum_t x_t x_{t+1}}{\sum_t x_t^2}\]</div>  <p>分子分母<strong>共享同一批 $x_t$</strong>，所以它们相关。而分母 $\sum x_t^2$ 在同一份数据上恰好是<em>偏大</em>的方向与分子偏大的方向相关——于是比值系统性偏小。更直观的说法：<strong>有限长度的序列「看起来」比真实过程更快回到均值</strong>，因为端点效应（序列必须在某处开始和结束）压低了观测到的持续性。</p>  <div class="dual">
+    <div class="plain"><h4>直白说</h4>  <p>想象一个几乎不衰减的过程（$a$ 接近 $1$）。在一段有限的观测里，它看起来像一条缓慢漂移的曲线。而拟合会把「漂移」的一部分解释成「均值回归」——因为在这一段里它确实<em>回到</em>了某个水平（那个水平就是这一段的样本均值）。样本均值本身是随机的，而拟合把它当成了真均值。</p></div>
+    <div class="formal"><h4>严谨说</h4>  <p>严格地说：$\hat a$ 的偏差主要来自「用样本均值代替真均值」。去均值后的序列 $x_t - \bar x$ 的自相关被系统性压低，因为 $\bar x$ 本身随 $x_t$ 变动。这也解释了为什么偏差 $\propto 1/n$：$\bar x$ 的方差 $\propto 1/n_{\text{eff}}$，而 $n_{\text{eff}} \propto n(1-a^2)$。</p></div>
+  </div>  <div class="callout paper"><span class="label">既然偏差来自<strong>有限样本</strong>（而不是目标函数的形状），那么：<strong>更长的训练序列</strong>有效（偏差 $\propto 1/n$，实测跨 $20$ 倍 $n$ 缩小约 $20$ 倍）；<strong>偏差校正</strong>有效（把 $-(1{+}3\hat a)/n$ 加回去）；而<strong>多步损失不必然有效</strong>——练习 1 实测它不修这个偏差。这解释了为什么视频模型的训练窗口长度是一个比它看起来更重要的超参：它同时决定了可观测性（模块 00）与这个偏差的大小。</span>
+    <p>哪些修法在原理上可能有效</p>
+  </div>
+
+  <!-- ========================================================= -->
+  <h2 id="bridge03"><span class="num">7</span>四节的关系</h2>
+  <p>把前四节的关系说清，因为它们不是并列的四个现象，而是一条链：<strong>第 1 节</strong>说明单条轨迹的误差会被遗忘（所以「必然漂移」是错的）；<strong>第 2 节</strong>指出真正累积的是<em>目标函数</em>的偏差（运动能量不足）；<strong>第 3 节</strong>指出这个偏差还有一条方差很大的尾巴（少数模型爆炸），而两支的症状<em>相反</em>；<strong>第 4 节</strong>说明分布的错误（不动点）与前两者都不同——它完全不随时间衰减。下面的修法表就是按「修哪一支」组织的。</p>
+
+  <!-- ========================================================= -->
+  <h2 id="fixes"><span class="num">8</span>四种修法，各修哪一支</h2>
+  <table>
+    <thead><tr><th>做法</th><th>机制</th><th>修的是哪一支</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>多步 / rollout 损失</strong></td><td>训练时就做 $k$ 步 rollout 并对全部步计损失</td><td>第 2 节的<strong>目标函数偏差</strong></td><td>训练慢 $k$ 倍；梯度可能不稳</td></tr>
+      <tr><td><strong>scheduled sampling</strong></td><td>训练时按概率把输入换成模型自己的输出</td><td>同上（更便宜的近似）</td><td>引入偏差-方差的新超参</td></tr>
+      <tr><td><strong>关键帧 / 锚帧条件</strong></td><td>每 $m$ 步用一个真实（或先生成的）锚帧重置</td><td>两支都截断（把 $k$ 上限压到 $m$）</td><td>需要层次化生成；锚帧之间可能不连贯</td></tr>
+      <tr><td><strong>一次性生成整段</strong></td><td>不自回归，一个 forward 出全部 $T$ 帧</td><td>两支<strong>都不存在</strong>（没有 rollout）</td><td>代价 $\propto T^2$（模块 00）；长度固定</td></tr>
+    </tbody>
+  </table>  <p>第三行和第四行值得对照：<strong>一次性生成把「漂移」这个问题整个删掉了</strong>，代价是模块 00 算过的 $(T/p_t)^2$。所以工业上的主流是<strong>层次化</strong>：一次性生成一小段（无漂移），然后用锚帧把小段拼成长视频（把漂移限制在段间）。</p>  <div class="ascii">   纯自回归:      [f1]-&gt;[f2]-&gt;[f3]-&gt;...-&gt;[f100]     漂移累积 100 步
+   一次性:        [f1 f2 ... f16]                   无漂移，但代价 (16)^2
+   层次化:        [f1 ... f16] [f17 ... f32] ...    段内无漂移
+                       ^锚帧      ^锚帧              段间漂移 = 段数（100/16 ≈ 6 步）</div>  <p>notebook 的练习 3 把这个账算清：<strong>锚帧间隔 $m$ 让有效 rollout 步数从 $T$ 降到 $T/m$</strong>，而误差按 $\vert\hat a\vert^{T/m}$ 而不是 $\vert\hat a\vert^{T}$——在不稳定（$\vert\hat a\vert > 1$）的情形下这是指数级的改善。</p>  <p>表里第四行值得多说一句：<strong>一次性生成把「漂移」这个问题整个删掉了</strong>，而它的代价在模块 00 已经算清（$(T/p_t)^2$）。所以「自回归 vs 一次性」这个选择的本质是<em>用平方级的算力换掉一个不会报错的失效模式</em>——而本模块的四节正是在说清那个失效模式到底值多少算力。</p>  <div class="callout paper"><span class="label">C41-04 讲的是<strong>用模型规划</strong>时的复合误差：那里的优化器会<em>主动</em>去找模型的错误，所以失效是<strong>对抗性</strong>的。本模块讲的是<strong>用模型生成</strong>：没有优化器在对抗它，失效是<strong>分布性</strong>的（不动点错、目标函数偏）。<strong>同一个模型、同样的一步误差，两种用法的失效机制不同，修法也不同</strong>——模块 04 会把这两者放在同一个模型上直接对比（被动 $-13\%$ vs 主动 $+251\%$）。</span>
+    <p>本模块与 C41 模块 04 的分界</p>
+  </div>
+
+
+  <div class="pager">
+    <a class="prev" href="../02_spacetime_attn/02_讲解.html"><div class="dir">← 上一模块</div><div class="t">02 · 时空注意力：分解的代价与它的精确边界</div></a>
+    <a class="next" href="../04_world_model/04_讲解.html"><div class="dir">下一模块 →</div><div class="t">04 · 世界模型：动作条件、可交互 rollout，与 C41 的分工</div></a>
+  </div>
+
+</div>
+</body>
+</html>
